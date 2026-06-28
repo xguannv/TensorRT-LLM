@@ -253,6 +253,22 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def mask_indices_outside_pool(global_indices: torch.Tensor,
+                              pool_num_rows: int) -> torch.Tensor:
+    """NVBug 6280721 guardrail: drop global KV-pool indices that fall outside
+    the pool by setting them to the -1 skip sentinel.
+
+    ``convert_req_index_to_global`` can map an out-of-range top-k token index
+    (produced when the indexer's kv_len bound is inflated during MTP-draft
+    CUDA-graph capture) onto a stale block-table entry, yielding a pool row
+    index ``>= pool_num_rows`` -> an unmapped address -> illegal memory access
+    in the sparse FMHA gather. ``-1`` is the kernel's existing "skip" sentinel,
+    so out-of-range entries are dropped instead of dereferenced. Entries that
+    are already ``-1`` (set by the convert kernel) are left untouched.
+    """
+    return global_indices.masked_fill(global_indices >= pool_num_rows, -1)
+
+
 def transform_local_topk_and_prepare_pool_view(
     topk_indices: torch.Tensor,
     attn_metadata: "DSAtrtllmAttentionMetadata",
@@ -285,7 +301,16 @@ def transform_local_topk_and_prepare_pool_view(
         layer_idx,
     )
 
-    return global_indices, attn_metadata._cached_pool_view
+    # NVBug 6280721 guardrail: an inflated kv_len bound during MTP-draft
+    # CUDA-graph capture can yield top-k token indices past the real sequence,
+    # which convert maps (via stale block-table entries) to pool rows outside
+    # the pool -> unmapped address -> illegal memory access in the sparse FMHA
+    # gather. pool_view has exactly num_blocks * stride_factor rows, so any
+    # index >= its row count is out of bounds; drop those to the -1 sentinel.
+    pool_view = attn_metadata._cached_pool_view
+    global_indices = mask_indices_outside_pool(global_indices, pool_view.shape[0])
+
+    return global_indices, pool_view
 
 
 def split_prefill_chunks(
