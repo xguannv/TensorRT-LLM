@@ -27,7 +27,8 @@ namespace torch_ext
 {
 
 th::Tensor convertReqIndexToGlobal(th::Tensor const& reqId, th::Tensor const& blockTable,
-    th::Tensor const& tokenIndices, int64_t blockSize, int64_t numTopkTokens, int64_t strideFactor, int64_t layerId)
+    th::Tensor const& tokenIndices, int64_t blockSize, int64_t numTopkTokens, int64_t strideFactor, int64_t layerId,
+    int64_t numBlocks)
 {
     TORCH_CHECK(reqId.is_cuda() && blockTable.is_cuda() && tokenIndices.is_cuda(), "All tensors must be CUDA tensors");
     TORCH_CHECK(reqId.scalar_type() == th::kInt32, "req_id must be int32");
@@ -61,8 +62,9 @@ th::Tensor convertReqIndexToGlobal(th::Tensor const& reqId, th::Tensor const& bl
 
     tk::invokeConvertReqIndexToGlobal(reqIdC.data_ptr<int32_t>(), blockTableC.data_ptr<int32_t>(),
         tokenIndicesC.data_ptr<int32_t>(), out.data_ptr<int32_t>(), numTokens, static_cast<int32_t>(numTopkTokens),
-        maxNumBlocksPerReq, static_cast<int32_t>(blockSize), static_cast<int32_t>(strideFactor),
-        static_cast<int32_t>(layerId), btStride0, btStride1, tiStride0, tiStride1, outStride0, outStride1, stream);
+        maxNumBlocksPerReq, static_cast<int32_t>(numBlocks), static_cast<int32_t>(blockSize),
+        static_cast<int32_t>(strideFactor), static_cast<int32_t>(layerId), btStride0, btStride1, tiStride0, tiStride1,
+        outStride0, outStride1, stream);
 
     return out;
 }
@@ -75,7 +77,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "convert_req_index_to_global(Tensor req_id, Tensor block_table, Tensor token_indices, int block_size, int "
-        "num_topk_tokens, int stride_factor, int layer_id) -> Tensor");
+        "num_topk_tokens, int stride_factor, int layer_id, int num_blocks) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

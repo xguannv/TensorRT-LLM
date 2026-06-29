@@ -25,9 +25,9 @@ namespace kernels
 {
 
 void invokeConvertReqIndexToGlobal(int32_t const* reqId, int32_t const* blockTable, int32_t const* tokenIndices,
-    int32_t* output, int32_t numTokens, int32_t numTopkTokens, int32_t maxNumBlocksPerReq, int32_t blockSize,
-    int32_t strideFactor, int32_t layerId, int64_t btStride0, int64_t btStride1, int64_t tiStride0, int64_t tiStride1,
-    int64_t outStride0, int64_t outStride1, cudaStream_t stream = 0);
+    int32_t* output, int32_t numTokens, int32_t numTopkTokens, int32_t maxNumBlocksPerReq, int32_t numBlocks,
+    int32_t blockSize, int32_t strideFactor, int32_t layerId, int64_t btStride0, int64_t btStride1, int64_t tiStride0,
+    int64_t tiStride1, int64_t outStride0, int64_t outStride1, cudaStream_t stream = 0);
 
 } // namespace kernels
 

@@ -253,22 +253,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-def mask_indices_outside_pool(global_indices: torch.Tensor,
-                              pool_num_rows: int) -> torch.Tensor:
-    """NVBug 6280721 guardrail: drop global KV-pool indices that fall outside
-    the pool by setting them to the -1 skip sentinel.
-
-    ``convert_req_index_to_global`` can map an out-of-range top-k token index
-    (produced when the indexer's kv_len bound is inflated during MTP-draft
-    CUDA-graph capture) onto a stale block-table entry, yielding a pool row
-    index ``>= pool_num_rows`` -> an unmapped address -> illegal memory access
-    in the sparse FMHA gather. ``-1`` is the kernel's existing "skip" sentinel,
-    so out-of-range entries are dropped instead of dereferenced. Entries that
-    are already ``-1`` (set by the convert kernel) are left untouched.
-    """
-    return global_indices.masked_fill(global_indices >= pool_num_rows, -1)
-
-
 def transform_local_topk_and_prepare_pool_view(
     topk_indices: torch.Tensor,
     attn_metadata: "DSAtrtllmAttentionMetadata",
@@ -291,6 +275,13 @@ def transform_local_topk_and_prepare_pool_view(
         block_table = attn_metadata._cached_block_table_ctx
         req_idx = attn_metadata._cached_req_idx_ctx
 
+    # NVBug 6280721: the convert kernel now drops any pool row index that falls
+    # outside the pool (block-table entry >= num_blocks) to the -1 skip
+    # sentinel, so an inflated kv_len bound during MTP-draft CUDA-graph capture
+    # can no longer produce an out-of-pool global index that the sparse FMHA
+    # gather would dereference as an unmapped address. num_blocks is passed in
+    # so the kernel knows the pool's row bound (pool rows = num_blocks *
+    # stride_factor).
     global_indices = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
@@ -299,18 +290,10 @@ def transform_local_topk_and_prepare_pool_view(
         topk_indices.shape[1],
         attn_metadata._cached_stride_factor,
         layer_idx,
+        attn_metadata._cached_num_blocks,
     )
 
-    # NVBug 6280721 guardrail: an inflated kv_len bound during MTP-draft
-    # CUDA-graph capture can yield top-k token indices past the real sequence,
-    # which convert maps (via stale block-table entries) to pool rows outside
-    # the pool -> unmapped address -> illegal memory access in the sparse FMHA
-    # gather. pool_view has exactly num_blocks * stride_factor rows, so any
-    # index >= its row count is out of bounds; drop those to the -1 sentinel.
-    pool_view = attn_metadata._cached_pool_view
-    global_indices = mask_indices_outside_pool(global_indices, pool_view.shape[0])
-
-    return global_indices, pool_view
+    return global_indices, attn_metadata._cached_pool_view
 
 
 def split_prefill_chunks(
@@ -510,6 +493,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
         self._cached_stride_factor = 0
+        self._cached_num_blocks = 0
         self._cached_tokens_per_block = 0
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
@@ -869,6 +853,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
         self._cached_stride_factor = (num_layers *
                                       self._cached_tokens_per_block)
+        self._cached_num_blocks = num_blocks
         self._cached_block_table_ctx = self.block_table[:self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts:self.
                                                         num_seqs]

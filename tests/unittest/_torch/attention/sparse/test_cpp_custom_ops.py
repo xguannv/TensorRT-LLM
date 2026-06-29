@@ -332,6 +332,7 @@ def _reference_convert_req_index_to_global(
     block_size: int,
     stride_factor: int,
     layer_id: int,
+    num_blocks: int,
 ) -> torch.Tensor:
     """Python reference for convert_req_index_to_global.
 
@@ -344,7 +345,7 @@ def _reference_convert_req_index_to_global(
             inblock_off = tok % block_size + layer_id * block_size
             req = req_id[token_id]
             base = block_table[req, block_id]
-            if block_id >= max_blocks_per_req or base < 0:
+            if block_id >= max_blocks_per_req or base < 0 or base >= num_blocks:
                 out = -1
             else:
                 out = base * stride_factor + inblock_off
@@ -372,7 +373,7 @@ def _reference_convert_req_index_to_global(
                 out_cpu[i, j] = -1
                 continue
             base = block_table_cpu[req, block_id].item()
-            if base < 0:
+            if base < 0 or base >= num_blocks:
                 out_cpu[i, j] = -1
                 continue
             out_cpu[i, j] = base * stride_factor + inblock_off
@@ -419,8 +420,9 @@ def test_convert_req_index_to_global(
 
     # block_table: maps (request, block_id) → physical block index
     # Use positive values; some entries can be -1 (padding)
+    num_blocks = 1000
     block_table = torch.randint(
-        0, 1000, (num_requests, max_blocks_per_req), dtype=torch.int32, device=device
+        0, num_blocks, (num_requests, max_blocks_per_req), dtype=torch.int32, device=device
     )
     # Add some padding (-1) in later blocks
     block_table[:, max_blocks_per_req // 2 :] = -1
@@ -436,12 +438,12 @@ def test_convert_req_index_to_global(
 
     # C++ op
     cpp_out = torch.ops.trtllm.convert_req_index_to_global(
-        req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_id
+        req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_id, num_blocks
     )
 
     # Reference
     ref_out = _reference_convert_req_index_to_global(
-        req_id, block_table, token_indices, block_size, stride_factor, layer_id
+        req_id, block_table, token_indices, block_size, stride_factor, layer_id, num_blocks
     )
 
     assert cpp_out.shape == ref_out.shape
@@ -463,7 +465,7 @@ def test_convert_req_index_to_global_all_invalid():
     token_indices = torch.full((num_tokens, num_topk), -1, dtype=torch.int32, device=device)
 
     out = torch.ops.trtllm.convert_req_index_to_global(
-        req_id, block_table, token_indices, block_size, num_topk, block_size, 0
+        req_id, block_table, token_indices, block_size, num_topk, block_size, 0, 1000
     )
 
     assert (out == -1).all(), "All outputs should be -1 for all-invalid input"
@@ -481,10 +483,36 @@ def test_convert_req_index_to_global_block_table_padding():
     token_indices = torch.randint(0, 128, (num_tokens, num_topk), dtype=torch.int32, device=device)
 
     out = torch.ops.trtllm.convert_req_index_to_global(
-        req_id, block_table, token_indices, block_size, num_topk, block_size, 0
+        req_id, block_table, token_indices, block_size, num_topk, block_size, 0, 1000
     )
 
     assert (out == -1).all(), "All outputs should be -1 when block_table is all padding"
+
+
+def test_convert_req_index_to_global_base_out_of_range():
+    """NVBug 6280721: block_table entries that point past the pool (base >=
+    num_blocks) must be dropped to -1 instead of producing an out-of-pool
+    global index that the sparse FMHA gather would dereference."""
+    device = torch.device("cuda")
+    num_tokens, num_topk, block_size = 2, 64, 16
+    num_blocks = 32  # pool has 32 physical pages -> valid base in [0, 31]
+
+    req_id = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    # block 0 -> in-range base (10); block 1 -> out-of-pool base (9999).
+    block_table = torch.tensor([[10, 9999, -1, -1]], dtype=torch.int32, device=device)
+    # Column 0 maps to block 0 (tok=0 -> in range), column 1 maps to block 1
+    # (tok=block_size -> out-of-pool base).
+    token_indices = torch.zeros((num_tokens, num_topk), dtype=torch.int32, device=device)
+    token_indices[:, 1] = block_size  # forces block_id == 1 -> base 9999
+
+    out = torch.ops.trtllm.convert_req_index_to_global(
+        req_id, block_table, token_indices, block_size, num_topk, block_size, 0, num_blocks
+    )
+
+    # In-range column 0: base 10 -> 10 * block_size + 0 = 160 (not dropped).
+    assert (out[:, 0] == 10 * block_size).all(), "In-range base must be kept"
+    # Out-of-pool column 1: base 9999 >= num_blocks -> -1.
+    assert (out[:, 1] == -1).all(), "Out-of-pool base must be dropped to -1"
 
 
 # ===================================================================

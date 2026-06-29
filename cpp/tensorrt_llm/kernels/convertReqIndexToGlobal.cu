@@ -25,8 +25,9 @@ namespace kernels
 // Grid: (num_tokens, ceil(numTopkTokens / blockDim.x))
 __global__ void convertReqIndexToGlobalKernel(int32_t const* __restrict__ reqId, int32_t const* __restrict__ blockTable,
     int32_t const* __restrict__ tokenIndices, int32_t* __restrict__ output, int32_t numTopkTokens,
-    int32_t maxNumBlocksPerReq, int32_t blockSize, int32_t strideFactor, int32_t layerId, int64_t btStride0,
-    int64_t btStride1, int64_t tiStride0, int64_t tiStride1, int64_t outStride0, int64_t outStride1)
+    int32_t maxNumBlocksPerReq, int32_t numBlocks, int32_t blockSize, int32_t strideFactor, int32_t layerId,
+    int64_t btStride0, int64_t btStride1, int64_t tiStride0, int64_t tiStride1, int64_t outStride0,
+    int64_t outStride1)
 {
     int32_t const tokenId = blockIdx.x;
     int32_t const col = blockIdx.y * blockDim.x + threadIdx.x;
@@ -69,13 +70,25 @@ __global__ void convertReqIndexToGlobalKernel(int32_t const* __restrict__ reqId,
         return;
     }
 
+    // NVBug 6280721: a stale/inflated block-table entry can index past the KV
+    // pool (e.g. when the indexer's kv_len bound is inflated during MTP-draft
+    // CUDA-graph capture). base * strideFactor would then land beyond the
+    // pool's numBlocks * strideFactor rows -> an unmapped address -> illegal
+    // read in the sparse FMHA gather. Drop to the -1 skip sentinel, mirroring
+    // the base < 0 guard above.
+    if (base >= numBlocks)
+    {
+        output[tokenId * outStride0 + col * outStride1] = -1;
+        return;
+    }
+
     output[tokenId * outStride0 + col * outStride1] = base * strideFactor + inblockOff;
 }
 
 void invokeConvertReqIndexToGlobal(int32_t const* reqId, int32_t const* blockTable, int32_t const* tokenIndices,
-    int32_t* output, int32_t numTokens, int32_t numTopkTokens, int32_t maxNumBlocksPerReq, int32_t blockSize,
-    int32_t strideFactor, int32_t layerId, int64_t btStride0, int64_t btStride1, int64_t tiStride0, int64_t tiStride1,
-    int64_t outStride0, int64_t outStride1, cudaStream_t stream)
+    int32_t* output, int32_t numTokens, int32_t numTopkTokens, int32_t maxNumBlocksPerReq, int32_t numBlocks,
+    int32_t blockSize, int32_t strideFactor, int32_t layerId, int64_t btStride0, int64_t btStride1, int64_t tiStride0,
+    int64_t tiStride1, int64_t outStride0, int64_t outStride1, cudaStream_t stream)
 {
     if (numTokens == 0 || numTopkTokens == 0)
     {
@@ -88,8 +101,8 @@ void invokeConvertReqIndexToGlobal(int32_t const* reqId, int32_t const* blockTab
     dim3 const block(kThreadsPerBlock);
 
     convertReqIndexToGlobalKernel<<<grid, block, 0, stream>>>(reqId, blockTable, tokenIndices, output, numTopkTokens,
-        maxNumBlocksPerReq, blockSize, strideFactor, layerId, btStride0, btStride1, tiStride0, tiStride1, outStride0,
-        outStride1);
+        maxNumBlocksPerReq, numBlocks, blockSize, strideFactor, layerId, btStride0, btStride1, tiStride0, tiStride1,
+        outStride0, outStride1);
 }
 
 } // namespace kernels

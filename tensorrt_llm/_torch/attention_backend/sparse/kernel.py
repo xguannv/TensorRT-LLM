@@ -1804,6 +1804,7 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     stride_factor: tl.constexpr,  # elements per physical page in pool
+    num_blocks: tl.constexpr,  # total physical pages in pool (row bound)
     layer_id: tl.constexpr,  # for multi-layer KV cache
     num_kv_heads: tl.constexpr,
     kv_factor: tl.constexpr,
@@ -1857,6 +1858,12 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
     bt_ptr = (block_table_ptr + req * bt_stride0 + page_idx * bt_stride1)
     mem_pool_idx = tl.load(bt_ptr, mask=valid_page, other=0)
 
+    # NVBug 6280721: a stale/inflated block-table entry can point past the pool;
+    # mem_pool_idx * stride_factor would then land beyond the pool's
+    # num_blocks * stride_factor rows -> unmapped address in the FMHA gather.
+    # Treat an out-of-pool page like an invalid page (-> -1 skip sentinel).
+    base_out_of_range = mem_pool_idx >= num_blocks
+
     # Base offset within physical page (invariant across kv_factor loop)
     base_off = (layer_id * kv_factor * num_kv_heads * BLOCK_SIZE +
                 kv_head_idx * BLOCK_SIZE + token_in_page)
@@ -1867,7 +1874,8 @@ def _convert_req_index_to_global_index_kernel_with_stride_factor(
 
         global_idx = mem_pool_idx * stride_factor + inpage_off
 
-        out_val = tl.where(is_invalid_tok | (~valid_page), -1, global_idx)
+        out_val = tl.where(is_invalid_tok | (~valid_page) | base_out_of_range,
+                           -1, global_idx)
 
         out_ptr_ij = (out_ptr + kv_head_idx * out_stride0 +
                       token_id * out_stride1 + kv_factor_idx * out_stride2 +
@@ -1888,6 +1896,7 @@ def triton_convert_req_index_to_global_index(
     layer_id: int = 0,  # for multi-layer KV cache
     num_kv_heads: int = 1,
     kv_factor: int = 1,
+    num_blocks: int = None,  # total physical pages in pool; None disables the bound check
 ):
     """
     Convert request-local token indices to global KV cache pool indices.
@@ -1907,6 +1916,10 @@ def triton_convert_req_index_to_global_index(
     """
     if stride_factor is None:
         stride_factor = kv_factor * num_kv_heads * BLOCK_SIZE
+    if num_blocks is None:
+        # No pool-row bound supplied -> use a sentinel that never trips the
+        # base_out_of_range check (preserves the pre-NVBug-6280721 behaviour).
+        num_blocks = 2**31 - 1
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
@@ -1947,6 +1960,7 @@ def triton_convert_req_index_to_global_index(
         BLOCK_SIZE,
         BLOCK_N,
         stride_factor,
+        num_blocks,
         layer_id,
         num_kv_heads,
         kv_factor,

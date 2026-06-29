@@ -1154,7 +1154,7 @@ def _register_fake():
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
-          stride_factor: int, layer_id: int) -> torch.Tensor:
+          stride_factor: int, layer_id: int, num_blocks: int) -> torch.Tensor:
         return torch.empty_like(token_indices)
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
