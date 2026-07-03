@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import time
 from functools import partial
 from typing import Literal, Optional, Tuple, Union
@@ -152,6 +153,117 @@ def device_memory_info(device: Optional[Union[torch.device, int]] = None) -> Tup
             mem_info = _device_get_memory_info_fn(handle)
         return mem_info.used, mem_info.free, mem_info.total
     return 0, 0, 0  # used, free, total
+
+
+def _resolve_nvml_index(device_id: int) -> int:
+    """Map a logical CUDA device index to the physical NVML index.
+
+    NVML always enumerates *all* GPUs regardless of CUDA_VISIBLE_DEVICES, so
+    when visibility is restricted (e.g. CUDA_VISIBLE_DEVICES=3,4, as Ray does),
+    logical device 0 is really physical GPU 3. Mirrors the remap in
+    ``llmapi.utils.get_numa_aware_cpu_affinity``. In the default MPI path CVD is
+    unset, so the logical index equals the NVML index.
+    """
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is not None and cuda_visible.strip():
+        tokens = [x.strip() for x in cuda_visible.split(",") if x.strip()]
+        if 0 <= device_id < len(tokens) and tokens[device_id].isdigit():
+            return int(tokens[device_id])
+    return device_id
+
+
+def gpu_memory_process_report(
+    device: Optional[Union[torch.device, int]] = None,
+) -> Optional[dict]:
+    """Return per-process GPU memory usage for ``device`` via NVML.
+
+    Unlike ``torch.cuda.mem_get_info`` (which only sees the current process's
+    view), NVML reports *every* process holding memory on the physical GPU,
+    including processes from other jobs — e.g. a residual server that a prior
+    test failed to clean up. This is the key signal for telling an
+    environmental OOM (someone else is squatting on the GPU) apart from a
+    genuine TensorRT-LLM allocation overflow.
+
+    Returns a dict with ``index`` (NVML index), ``used``/``free``/``total``
+    bytes and ``processes`` (list of ``(pid, used_bytes)``), or ``None`` if
+    pynvml is unavailable.
+    """
+    if pynvml is None:
+        return None
+    if device is None:
+        device = torch.cuda.current_device()
+    index = device.index if isinstance(device, torch.device) else device
+    nvml_index = _resolve_nvml_index(index)
+    with PyNVMLContext():
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_index)
+        mem_info = _device_get_memory_info_fn(handle)
+        processes = []
+        try:
+            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                # usedGpuMemory is None when NVML cannot report it (e.g. MIG,
+                # insufficient permissions); keep the pid but record 0 bytes.
+                processes.append((proc.pid, proc.usedGpuMemory or 0))
+        except pynvml.NVMLError:
+            pass
+    return {
+        "index": nvml_index,
+        "used": mem_info.used,
+        "free": mem_info.free,
+        "total": mem_info.total,
+        "processes": processes,
+    }
+
+
+def log_gpu_memory_preflight(
+    device: Optional[Union[torch.device, int]] = None,
+    rank: Optional[int] = None,
+    foreign_warn_bytes: int = 1 << 30,
+) -> None:
+    """Log per-process GPU occupancy before TensorRT-LLM allocates anything.
+
+    Emits one concise line for this rank's GPU. If a process *other* than the
+    current one holds more than ``foreign_warn_bytes`` on this GPU, log at
+    WARNING and flag it as a likely residual/foreign process — a common cause
+    of "OOM at executor creation" that is an environment/cleanup issue rather
+    than a model defect.
+
+    Disabled by setting ``TLLM_MEM_PREFLIGHT=0`` (enabled by default; the check
+    is a single NVML query per rank at startup).
+    """
+    if os.environ.get("TLLM_MEM_PREFLIGHT", "1").lower() in ("0", "false", "off"):
+        return
+    report = gpu_memory_process_report(device)
+    if report is None:
+        return
+
+    GiB = 1 << 30
+    my_pid = os.getpid()
+    prefix = "[mem-preflight]" + (f"[RANK {rank}]" if rank is not None else "")
+    foreign = [(pid, b) for pid, b in report["processes"] if pid != my_pid]
+    foreign_bytes = sum(b for _, b in foreign)
+    procs_str = (
+        ", ".join(
+            f"PID {pid}={b / GiB:.2f}GiB{'(SELF)' if pid == my_pid else ''}"
+            for pid, b in sorted(report["processes"], key=lambda x: -x[1])
+        )
+        or "none"
+    )
+    msg = (
+        f"{prefix} GPU{report['index']} "
+        f"free={report['free'] / GiB:.2f}GiB "
+        f"total={report['total'] / GiB:.2f}GiB "
+        f"used={report['used'] / GiB:.2f}GiB | "
+        f"{len(report['processes'])} process(es): {procs_str}"
+    )
+    if foreign_bytes > foreign_warn_bytes:
+        logger.warning(
+            f"{msg} | WARNING: {len(foreign)} foreign process(es) hold "
+            f"{foreign_bytes / GiB:.2f}GiB on this GPU — likely residual from a "
+            f"prior job. If executor creation OOMs, suspect an environment/"
+            f"cleanup issue, not a model memory defect."
+        )
+    else:
+        logger.info(msg)
 
 
 def bytes_to_target_unit(mem_bytes: int, unit: MemUnitType) -> float:

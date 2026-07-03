@@ -58,6 +58,18 @@ class _ExecutorMemoryMonitor:
         self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
 
+        # Pre-flight GPU occupancy check. By this point torch.cuda.set_device has
+        # already bound this rank to its GPU, but no GPU memory has been
+        # allocated yet (MODEL_ENGINE_MAIN is the first allocation stage). Query
+        # NVML for *all* processes on this GPU so a residual/foreign process
+        # from a prior job is surfaced before the confusing torch OOM appears.
+        # Wrapped defensively: a diagnostic must never break executor creation.
+        try:
+            from tensorrt_llm.profiler import log_gpu_memory_preflight
+            log_gpu_memory_preflight(rank=global_mpi_rank())
+        except Exception as e:
+            logger.debug(f"GPU memory pre-flight check skipped: {e}")
+
     @staticmethod
     def _bytes_to_gib(bytes: int) -> float:
         return bytes / (1024)**3
