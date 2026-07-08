@@ -1010,9 +1010,10 @@ class StorageManager:
                     # overlap with shared sys blocks (which are history).
                     num_scratch = len(scratch)
                     frac_max = self._slot_util_frac_max[lc_idx]
-                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(
-                        num_scratch * frac_max
-                    )
+                    # [DSV4FIXTEST] 满额计 scratch(去掉 frac_max 打折):估算临时池必须能装下
+                    # 单个最坏 context,窗口池(SWA/indexer)的 scratch 被打折会少 1 个 slot → hang。
+                    # 原式: (unique_non_stale - num_scratch) + ceil(num_scratch * frac_max)
+                    num_slots[pg_idx] += unique_non_stale
                 else:
                     num_slots[pg_idx] += unique_non_stale
         return num_slots
