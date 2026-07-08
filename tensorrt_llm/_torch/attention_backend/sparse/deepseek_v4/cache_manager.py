@@ -949,6 +949,27 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)])
                 )
 
+        # --- [DSV4PROBE2] demand-side gap: constraints omit num_extra_kv_tokens (候选③) ---
+        try:
+            import math as _dsv4_m
+            from tensorrt_llm.logger import logger as _dsv4_lg
+            _nx = int(self.num_extra_kv_tokens)
+            _c1_no_extra = _dsv4_m.ceil(max_seq_len / tokens_per_block)
+            _real_with_extra = _dsv4_m.ceil((max_seq_len + _nx) / tokens_per_block)
+            _dsv4_lg.info(
+                f"[DSV4PROBE2] num_extra_kv_tokens={_nx} max_seq_len={max_seq_len} "
+                f"max_num_tokens={max_num_tokens} tokens_per_block={tokens_per_block} "
+                f"fullcache_blocks_constraint_NO_extra={_c1_no_extra} "
+                f"fullcache_blocks_real_WITH_extra={_real_with_extra} "
+                f"gap_blocks={_real_with_extra - _c1_no_extra}")
+        except Exception as _dsv4_e:
+            try:
+                from tensorrt_llm.logger import logger as _dsv4_lg2
+                _dsv4_lg2.warning(f"[DSV4PROBE2] probe failed: {_dsv4_e!r}")
+            except Exception:
+                pass
+        # --- end [DSV4PROBE2] ---
+
         scratch_reuse_config = None
         if self.enable_swa_scratch_reuse:
             # Context requests will allocate num_extra_kv_tokens tokens for spec decoding.

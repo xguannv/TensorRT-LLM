@@ -299,20 +299,24 @@ class StorageManager:
         # 对账 View A/B:每个 pool group 的 供给(分到的 slots) vs 需求(约束要求的 min_slots)。
         try:
             from tensorrt_llm.logger import logger as _dsv4_lg
+
             _quota = [getattr(t, "quota", None) for t in config.cache_tiers]
             _dsv4_lg.info(
                 f"[DSV4PROBE] num_pool_groups={int(self.num_pool_groups)} "
                 f"cache_tier_quota_bytes={_quota} "
                 f"min_slots_from_constraints(DEMAND_floor)={[int(x) for x in self._min_slots]} "
-                f"init_ratio={[float(x) for x in init_ratio]}")
+                f"init_ratio={[float(x) for x in init_ratio]}"
+            )
             for _li, _lvl in enumerate(self._levels):
-                _supply = [int(_lvl.storage.get_num_free_slots(_pg))
-                           for _pg in typed_range(self.num_pool_groups)]
-                _dsv4_lg.info(
-                    f"[DSV4PROBE] level={_li} per_pool_group_slots_SUPPLY={_supply}")
+                _supply = [
+                    int(_lvl.storage.get_num_free_slots(_pg))
+                    for _pg in typed_range(self.num_pool_groups)
+                ]
+                _dsv4_lg.info(f"[DSV4PROBE] level={_li} per_pool_group_slots_SUPPLY={_supply}")
         except Exception as _dsv4_e:  # 探针绝不能影响主流程
             try:
                 from tensorrt_llm.logger import logger as _dsv4_lg2
+
                 _dsv4_lg2.warning(f"[DSV4PROBE] probe failed: {_dsv4_e!r}")
             except Exception:
                 pass
