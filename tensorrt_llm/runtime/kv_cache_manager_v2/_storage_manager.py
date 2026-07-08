@@ -354,6 +354,23 @@ class StorageManager:
         for lc in typed_range(self.num_life_cycles):
             pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
+        # --- [DSV4PROBE3] runtime per-pool-group DEMAND vs SUPPLY(仅记"某 pool group 不够"的分配,前 8 次) ---
+        try:
+            _dsv4_free = [int(storage.get_num_free_slots(_pg))
+                          for _pg in typed_range(self.num_pool_groups)]
+            _dsv4_short = any(int(pg_num_slots[_pg]) > _dsv4_free[_pg]
+                              for _pg in typed_range(self.num_pool_groups))
+            _dsv4_g = globals()
+            if _dsv4_short and _dsv4_g.get("_DSV4_P3_N", 0) < 8:
+                _dsv4_g["_DSV4_P3_N"] = _dsv4_g.get("_DSV4_P3_N", 0) + 1
+                from tensorrt_llm.logger import logger as _dsv4_lg3
+                _dsv4_lg3.info(
+                    f"[DSV4PROBE3] CANT_FIT level={int(level)} "
+                    f"DEMAND_pg_num_slots={[int(x) for x in pg_num_slots]} "
+                    f"SUPPLY_free={_dsv4_free}")
+        except Exception:
+            pass
+        # --- end [DSV4PROBE3] ---
         if any(
             pg_num_slots[pg] > storage.get_num_free_slots(pg)
             for pg in typed_range(self.num_pool_groups)
