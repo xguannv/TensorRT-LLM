@@ -93,11 +93,13 @@ def build_no_fitting_reqs_diagnostic(active_requests, kv_cache_manager) -> str:
 
     kv_info = ""
     # IndexMapper slot info (V2 only).
+    indexmapper_exhausted = False
     idx_mapper = getattr(kv_cache_manager, "index_mapper", None)
     if idx_mapper is not None:
         try:
             free = idx_mapper.num_free_slots()
             in_use = idx_mapper.size()
+            indexmapper_exhausted = free == 0
             kv_info += f", indexmapper_free={free}, indexmapper_in_use={in_use}"
         except Exception:
             pass
@@ -108,14 +110,38 @@ def build_no_fitting_reqs_diagnostic(active_requests, kv_cache_manager) -> str:
     except Exception:
         pass
 
+    # Per-pool-group free slots (V2 only). The aggregate free_blocks above hides
+    # per-group exhaustion: a windowed pool (SWA / indexer) can sit at 0 free
+    # while a full-cache pool has plenty — the signature of a KV cache *sizing*
+    # shortfall rather than load-driven OOM.
+    sizing_shortfall = False
+    try:
+        free_pg, total_pg = kv_cache_manager.free_slots_per_pool_group()
+        kv_info += f", free_slots_per_pool_group={free_pg}/{total_pg}"
+        # A pool group at 0 free while the cache is (near) empty means the pool
+        # cannot hold even a single request — a sizing problem, not runtime OOM.
+        sizing_shortfall = bool(free_pg) and min(free_pg) == 0 and len(active_requests) <= 1
+    except Exception:
+        pass
+
+    if sizing_shortfall:
+        cause = (
+            " A pool group has 0 free slots while the cache is (near) empty: this is a "
+            "KV cache SIZING shortfall, not runtime OOM. Set kv_cache_config.pool_ratio to "
+            "enlarge the exhausted pool group, or report a sizing bug."
+        )
+    elif indexmapper_exhausted:
+        cause = " No free IndexMapper slots (increase max_num_sequences headroom)."
+    else:
+        cause = (
+            " Likely: KV cache pool full, or all active requests are blocked on KV transfer "
+            "(DISAGG_GENERATION_TRANS_IN_PROGRESS). If this persists under load, increase "
+            "free_gpu_memory_fraction or reduce max_seq_len / concurrent batch size."
+        )
+
     return (
         "Scheduler could not fit any request this iteration. "
-        f"active_requests={len(active_requests)} "
-        f"({state_str}){kv_info}. Likely causes: KV cache pool full, "
-        "no free IndexMapper slots, or all active requests are blocked "
-        "on KV transfer (DISAGG_GENERATION_TRANS_IN_PROGRESS). "
-        "If this persists, increase free_gpu_memory_fraction or "
-        "reduce max_seq_len / concurrent batch size."
+        f"active_requests={len(active_requests)} ({state_str}){kv_info}.{cause}"
     )
 
 

@@ -2769,6 +2769,26 @@ class KVCacheManagerV2(BaseResourceManager):
         ])
         return max_num_pages // self.kv_factor
 
+    def free_slots_per_pool_group(self) -> tuple[list[int], list[int]]:
+        """Return ``(free, total)`` GPU slots per pool group. Diagnostics only.
+
+        Aggregate free-block counts hide per-pool-group exhaustion: a windowed
+        pool (e.g. SWA / indexer) can be at zero free slots while a full-cache
+        pool still has plenty. That is the signature of a KV cache *sizing*
+        shortfall (a pool too small to hold even one request) rather than
+        load-driven OOM, so surface the per-group breakdown for diagnostics.
+        """
+        storage = self.impl._storage._levels[GPU_LEVEL].storage
+        free = [
+            int(storage.get_num_free_slots(pg))
+            for pg in typed_range(storage.num_pool_groups)
+        ]
+        total = [
+            int(storage.num_slots(pg))
+            for pg in typed_range(storage.num_pool_groups)
+        ]
+        return free, total
+
     def commit_scheduled_kv_cache_stats(
             self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft or not self.enable_stats:
