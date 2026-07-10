@@ -291,6 +291,33 @@ class StorageManager:
             self._levels, lambda level: level.storage.num_pool_groups
         )
 
+        # --- [DSV4PROBE] supply-side pool-group split (read-only; safe to remove) ---
+        # 对账 View A/B:每个 pool group 的 供给(分到的 slots) vs 需求(约束要求的 min_slots)。
+        try:
+            from tensorrt_llm.logger import logger as _dsv4_lg
+
+            _quota = [getattr(t, "quota", None) for t in config.cache_tiers]
+            _dsv4_lg.info(
+                f"[DSV4PROBE] num_pool_groups={int(self.num_pool_groups)} "
+                f"cache_tier_quota_bytes={_quota} "
+                f"min_slots_from_constraints(DEMAND_floor)={[int(x) for x in self._min_slots]} "
+                f"init_ratio={[float(x) for x in init_ratio]}"
+            )
+            for _li, _lvl in enumerate(self._levels):
+                _supply = [
+                    int(_lvl.storage.get_num_free_slots(_pg))
+                    for _pg in typed_range(self.num_pool_groups)
+                ]
+                _dsv4_lg.info(f"[DSV4PROBE] level={_li} per_pool_group_slots_SUPPLY={_supply}")
+        except Exception as _dsv4_e:  # 探针绝不能影响主流程
+            try:
+                from tensorrt_llm.logger import logger as _dsv4_lg2
+
+                _dsv4_lg2.warning(f"[DSV4PROBE] probe failed: {_dsv4_e!r}")
+            except Exception:
+                pass
+        # --- end [DSV4PROBE] ---
+
     def __del__(self) -> None:
         self.destroy()
 
@@ -323,6 +350,23 @@ class StorageManager:
         for lc in typed_range(self.num_life_cycles):
             pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
+        # --- [DSV4PROBE3] runtime per-pool-group DEMAND vs SUPPLY(仅记"某 pool group 不够"的分配,前 8 次) ---
+        try:
+            _dsv4_free = [int(storage.get_num_free_slots(_pg))
+                          for _pg in typed_range(self.num_pool_groups)]
+            _dsv4_short = any(int(pg_num_slots[_pg]) > _dsv4_free[_pg]
+                              for _pg in typed_range(self.num_pool_groups))
+            _dsv4_g = globals()
+            if _dsv4_short and _dsv4_g.get("_DSV4_P3_N", 0) < 8:
+                _dsv4_g["_DSV4_P3_N"] = _dsv4_g.get("_DSV4_P3_N", 0) + 1
+                from tensorrt_llm.logger import logger as _dsv4_lg3
+                _dsv4_lg3.info(
+                    f"[DSV4PROBE3] CANT_FIT level={int(level)} "
+                    f"DEMAND_pg_num_slots={[int(x) for x in pg_num_slots]} "
+                    f"SUPPLY_free={_dsv4_free}")
+        except Exception:
+            pass
+        # --- end [DSV4PROBE3] ---
         if any(
             pg_num_slots[pg] > storage.get_num_free_slots(pg)
             for pg in typed_range(self.num_pool_groups)
@@ -956,9 +1000,10 @@ class StorageManager:
                     # overlap with shared sys blocks (which are history).
                     num_scratch = len(scratch)
                     frac_max = self._slot_util_frac_max[lc_idx]
-                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(
-                        num_scratch * frac_max
-                    )
+                    # [DSV4FIXTEST] 满额计 scratch(去掉 frac_max 打折):估算临时池必须能装下
+                    # 单个最坏 context,窗口池(SWA/indexer)的 scratch 被打折会少 1 个 slot → hang。
+                    # 原式: (unique_non_stale - num_scratch) + ceil(num_scratch * frac_max)
+                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(num_scratch * frac_max)
                 else:
                     num_slots[pg_idx] += unique_non_stale
         return num_slots
