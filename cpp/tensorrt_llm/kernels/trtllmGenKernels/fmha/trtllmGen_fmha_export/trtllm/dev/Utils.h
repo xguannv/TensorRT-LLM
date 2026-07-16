@@ -32,7 +32,7 @@ namespace dev {
 
 // __block_size__ is only supported in CUDA 13 and later.
 // We can always emit the macro, and it will simply be ignored in CUDA 12.
-#if !defined(TLLM_DISABLE_BLOCK_SIZE) && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
 #define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
 #else
 #define TLLM_BLOCK_SIZE(bx, by, bz)
@@ -263,6 +263,25 @@ template <int N> inline __device__ void cpAsyncWaitGroup() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+// Strong compiler hint to prevent code motion across the fence.
+__forceinline__ __device__ void cfence() {
+#if defined(__CUDA_ARCH__)
+  asm volatile(".pragma \"next knob FenceCode\";\n" : : : "memory");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Lesser compiler hint to prevent code motion across the fence.
+__forceinline__ __device__ void ifence() {
+#if defined(__CUDA_ARCH__)
+  asm volatile(".pragma \"next knob FenceInterference\";\n" : : : "memory");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// {$nv-internal-release end}
 
 inline __device__ uint32_t mulBf16x2(uint32_t a, uint32_t b) {
   uint32_t c;
@@ -303,6 +322,29 @@ inline __device__ uint32_t convert_half4_to_e4m3(uint32_t a, uint32_t b) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+inline __device__ uint32_t exp2bf16(uint32_t x) {
+  uint32_t output_bits;
+  asm("ex2.approx.ftz.bf16x2 %0, %1;\n" : "=r"(output_bits) : "r"(x));
+  return output_bits;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t exp2fp16(uint32_t x) {
+  uint32_t output_bits;
+  asm("ex2.approx.f16x2 %0, %1;\n" : "=r"(output_bits) : "r"(x));
+  return output_bits;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float exp2fp16(float x) {
+  uint32_t output_bits;
+  asm("ex2.approx.f16x2 %0, %1;\n" : "=r"(output_bits) : "r"(reinterpret_cast<uint32_t&>(x)));
+  return reinterpret_cast<float&>(output_bits);
+}
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -392,6 +434,97 @@ inline __device__ float silu(float x) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+
+// Performs a warp-level full validity check on the given smemBuffer. Unlike the partial check, this
+// must evaluate each byte individual as there are no memory atomicity guarantees.
+template <int32_t kNumBytes, uint32_t kInvalidValue>
+__inline__ __device__ bool fullCheckDataValidityWarp(uint32_t* smemPtr) {
+  // Warp size.
+  static constexpr int32_t kWarpSize = 32;
+  // Invalid sentinel value as byte.
+  static constexpr uint8_t kInvalidValueByte = static_cast<uint8_t>(0xFFu & kInvalidValue);
+  // The number of elements to check.
+  static constexpr int32_t kNumElems = kNumBytes / sizeof(uint8_t);
+  static_assert((kNumBytes % sizeof(uint8_t)) == 0,
+                "Number of bytes must be divisible by element size");
+
+  // The lane of thread.
+  int32_t const laneId = threadIdx.x % kWarpSize;
+  // Shared memory pointer as uint8_t.
+  uint8_t* smemPtrByte = reinterpret_cast<uint8_t*>(smemPtr);
+
+  bool isValid = true;
+
+#pragma unroll
+  for (int32_t ii = laneId; ii < kNumElems; ii += kWarpSize) {
+    uint8_t const value = smemPtrByte[ii];
+    isValid = isValid && (kInvalidValueByte != value);
+  }
+
+  isValid = __all_sync(~0, isValid);
+  return isValid;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Performs a warp-level partial validity check on the given smemBuffer
+//
+// This function will only check one 32-bit segment of each 16B chunk. For narrower types it
+// could load less data, but it is unclear if the smem bandwidth savings would be worth it.
+//
+template <int32_t kNumBytes, uint32_t kInvalidValue>
+__inline__ __device__ bool partialCheckDataValidityWarp(uint32_t* smemPtr) {
+
+  // Warp size.
+  static constexpr int32_t kWarpSize = 32;
+  // Chunk size in bytes.
+  static constexpr int32_t kChunkSize = 16;
+  // Number of chunks to check
+  static constexpr int32_t kNumChunks = kNumBytes / kChunkSize;
+  static_assert((kNumBytes % kChunkSize) == 0,
+                "Number of bytes must be divisible by bytes per chunk");
+  // Number of elements per chunk.
+  static constexpr int32_t kElemsPerChunk = kChunkSize / sizeof(int32_t);
+  // The number of elements to check.
+  static constexpr int32_t kNumElems = kNumChunks * kElemsPerChunk;
+  // Number of bytes checked per warp iteration, each thread will check one chunk.
+  static constexpr int32_t kBytesCheckedPerIter = kWarpSize * kChunkSize;
+  static_assert((kBytesCheckedPerIter % sizeof(int32_t)) == 0,
+                "Bytes checked per iter must be divisible by size of int");
+  // Number of elements checked per warp iteration, not all these elements will be actually checked.
+  static constexpr int32_t kElemsCheckedPerIter = kBytesCheckedPerIter / sizeof(int32_t);
+
+  // To avoid bank conflicts, the specific word within a chunk will vary with the thread
+  int32_t const laneId = threadIdx.x % kWarpSize;
+  int32_t const laneOffset = laneId * kElemsPerChunk + laneId / (kWarpSize / kElemsPerChunk);
+
+  bool isValid = true;
+
+#pragma unroll
+  for (int32_t ii = laneOffset; ii < kNumElems; ii += kElemsCheckedPerIter) {
+    uint32_t const value = smemPtr[ii];
+    isValid = isValid && (kInvalidValue != value);
+  }
+
+  isValid = __all_sync(~0, isValid);
+  return isValid;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Performs a warp-level validity check on the given smemBuffer
+template <int32_t kNumBytes, uint32_t kInvalidValue>
+__inline__ __device__ bool checkDataValidityWarp(uint32_t* smemPtr) {
+  // Match the hardware behavior, if 0xFF is used as sentinel value all bytes will be checked.
+  // otherwise only part of each 16B chunk will be checked.
+  if constexpr (kInvalidValue == 0xFFFFFFFFu) {
+    return fullCheckDataValidityWarp<kNumBytes, kInvalidValue>(smemPtr);
+  } else {
+    return partialCheckDataValidityWarp<kNumBytes, kInvalidValue>(smemPtr);
+  }
+}
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

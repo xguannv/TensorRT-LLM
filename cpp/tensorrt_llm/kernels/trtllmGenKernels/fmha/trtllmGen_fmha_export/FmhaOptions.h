@@ -541,7 +541,51 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "MLA generation with mGroupsTokensHeadsQ requires mSelectsGroupedMla.");
   }
 
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+  if (options.mLamportForceValid) {
+    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                     "lamportForceValid is only supported with fuseEpilogueIntoCorr");
+    TLLM_CHECK_ERROR(!tg::dtypeIsBlockFmt(options.mDtypeOut),
+                     "lamportForceValid does not support block scaling outputs");
+    TLLM_CHECK_ERROR(isDisabled(options.mMultiCtasKvMode),
+                     "lamportForceValid does not support multi-CTA mode");
+    TLLM_CHECK_ERROR(
+      isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType) ||
+        isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType),
+      "lamportForceValid has not been tested with context or generation kernel types.");
 
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
+                     "Lamport producer is not compatible with 2 CTA mode");
+
+    TLLM_CHECK_ERROR(
+      options.mHeadDimPerStageKv == 0,
+      "Lamport producer is only compatible with a single iteration of the head dim loop");
+
+    // TODO Are there more features that are not compatible?
+  }
+  if (options.mLamportProducer) {
+    TLLM_CHECK_ERROR(options.mLamportForceValid, "lamportProducer requires lamportForceValid");
+  }
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
+
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+  if (options.mUsesSpcompress) {
+    TLLM_CHECK_ERROR(options.mCudaArch == tg::CudaArch::Sm107a,
+                     "Sparse attention is only supported on sm_107a.");
+    TLLM_CHECK_ERROR(options.mFmhaKernelType == FmhaKernelType::Context,
+                     "Sparse attention is only supported with context kernel.");
+    TLLM_CHECK_ERROR(options.mDtypeQ == tg::Dtype::E4m3 || options.mDtypeQ == tg::Dtype::E4m3,
+                     "Sparse attention is only supported with e4m3.");
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
+                     "Sparse attention is not compatible with 2 CTA mode.");
+    TLLM_CHECK_ERROR(!isCustomMask(options.mMaskType),
+                     "Sparse attention is not compatible with custom mask.");
+  }
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
 
   // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
   if (options.mDtypeQ != options.mDtypeKv) {

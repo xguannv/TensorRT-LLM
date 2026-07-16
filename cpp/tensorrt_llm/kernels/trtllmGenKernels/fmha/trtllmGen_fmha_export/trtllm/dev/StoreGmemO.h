@@ -16,7 +16,15 @@
 
 #pragma once
 
+#ifdef TLLM_PUBLIC_RELEASE                  // {$nv-internal-release}
+#ifdef TLLM_RUBIN_FEATURES                  // {$nv-internal-release}
+#include <cuda_ptx/cuda_ptx_public_rubin.h> // {$nv-internal-release}
+#else                                       // {$nv-internal-release}
 #include <cuda_ptx/cuda_ptx.h>
+#endif                                  // {$nv-internal-release}
+#else                                   // {$nv-internal-release}
+#include <cuda_ptx/cuda_ptx_internal.h> // {$nv-internal-release}
+#endif                                  // {$nv-internal-release}
 
 #include "CutlassBarrier.h"
 #include "FastMath.h"

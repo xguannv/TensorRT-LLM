@@ -31,6 +31,38 @@ namespace dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+// Helper function to force positive zeros
+template <typename T, int N>
+inline __device__ cutlass::Array<T, N> forcePositiveZero(cutlass::Array<T, N> array) {
+
+  // TODO 0.0f + -0.0f = 0.0f might be better
+  // Replace all negative zeros with positive zeros
+#pragma unroll
+  for (int ii = 0; ii < N; ++ii) {
+    if (array[ii] == T{-0.0f}) {
+      array[ii] = T{0.0f};
+    }
+  }
+  return array;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to force positive zeros when using uint32_t type
+template <typename T> inline __device__ uint32_t forcePositiveZero(uint32_t const val) {
+  // Determine number of elements.
+  static const int N = cutlass::sizeof_bits<uint32_t>::value / cutlass::sizeof_bits<T>::value;
+  // Reinterpret as cutlass array.
+  cutlass::Array<T, N> array = reinterpret_cast<cutlass::Array<T, N> const&>(val);
+  // Remove negative zeros.
+  auto out_array = forcePositiveZero(array);
+  // Return as uint32_t again.
+  return reinterpret_cast<uint32_t const&>(out_array);
+}
+#endif // TLLM_RUBIN_FEATURES
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -80,6 +112,44 @@ inline __device__ cutlass::Array<float, 2> ffma2(cutlass::Array<float, 2> inA,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+// Helper function to accept cutlass::Array<float, 2> inputs and uint32_t output (bfloat16x2).
+inline __device__ uint32_t fhadd2_bf16(cutlass::Array<float, 2> inA, cutlass::Array<float, 2> inB) {
+
+  // Convert inputs to uint64_t for assembly (2 floats = 64 bits)
+  uint64_t inA_bits = reinterpret_cast<uint64_t const&>(inA);
+  uint64_t inB_bits = reinterpret_cast<uint64_t const&>(inB);
+  uint32_t output_bits;
+
+  asm volatile("{\n"
+               "add.rz.bf16x2.f32x2.f32x2 %0, %1, %2;\n"
+               "}\n"
+               : "=r"(output_bits)
+               : "l"(inA_bits), "l"(inB_bits));
+
+  return output_bits;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to accept cutlass::Array<float, 2> inputs and uint32_t output (half2).
+inline __device__ uint32_t fhadd2_fp16(cutlass::Array<float, 2> inA, cutlass::Array<float, 2> inB) {
+
+  // Convert inputs to uint64_t for assembly (2 floats = 64 bits)
+  uint64_t inA_bits = reinterpret_cast<uint64_t const&>(inA);
+  uint64_t inB_bits = reinterpret_cast<uint64_t const&>(inB);
+  uint32_t output_bits;
+
+  asm volatile("{\n"
+               "add.rz.ftz.f16x2.f32x2.f32x2 %0, %1, %2;\n"
+               "}\n"
+               : "=r"(output_bits)
+               : "l"(inA_bits), "l"(inB_bits));
+
+  return output_bits;
+}
+
+// {$nv-internal-release end}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Helper function to accept Array<float, 1> inputs.
@@ -728,61 +798,163 @@ inline __device__ uint16_t getCtaMask() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Helper function to get the CTA mask with multicast for A.
-inline __device__ uint16_t getCtaMaskMcastA() {
-  // The cta_idx.y == 0 CTAs are the leaders and do the multicast loads for all other CTAs in the
-  // row
-  //  xooo
-  //  xooo
-  //  xooo
-  //  xooo
-  auto block_id_in_cluster = cute::block_id_in_cluster();
+inline __device__ uint16_t getCtaMaskForClusterCoord(int32_t blockIdX,
+                                                     int32_t blockIdY,
+                                                     int32_t blockIdZ) {
   auto cluster_dim = cute::cluster_shape();
-
-  uint16_t base = 0;
-  for (auto block_id_y = 0; block_id_y < cluster_dim.y; block_id_y++) {
-    base |= uint16_t{1} << (cluster_dim.x * block_id_y);
-  }
-  return base << block_id_in_cluster.x;
+  auto rank = blockIdX + cluster_dim.x * (blockIdY + cluster_dim.y * blockIdZ);
+  return uint16_t{1} << rank;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Helper function to get the CTA mask with multicast for B.
-inline __device__ uint16_t getCtaMaskMcastB() {
-  // For the 2-CTA GEMMs, the cta_idx.x = 0,2 CTAs load the first half of B while the cta_idx.y =
-  // 1,3 CTAs load the second half of B. The cta_idx.x == 0,1 CTAs are the leaders and do the
-  // multicast loads for cta_idx.x = 2,3 CTAs.
-  //  |x |x |x |x |
-  //  | x| x| x| x|
-  //  |o |o |o |o |
-  //  | o| o| o| o|
+inline __device__ uint16_t getCtaMaskTmaMcastAForX(uint32_t blockIdX) {
   auto block_id_in_cluster = cute::block_id_in_cluster();
   auto cluster_dim = cute::cluster_shape();
-  uint16_t base = 0;
-  for (auto block_id_x = 0; block_id_x < cluster_dim.x; block_id_x += 2) {
-    base |= uint16_t(1) << (cute::block_rank_in_cluster() + block_id_x);
-  }
-  return base;
+  auto ctas_per_z = cluster_dim.x * cluster_dim.y;
+
+  // Replicate one X bit across up to four Y positions, then trim it to the active Z slice.
+  uint32_t mask = uint32_t{1} << blockIdX;
+  mask |= mask << cluster_dim.x;
+  mask |= mask << (2 * cluster_dim.x);
+  mask &= (uint32_t{1} << ctas_per_z) - 1;
+  return static_cast<uint16_t>(mask << (ctas_per_z * block_id_in_cluster.z));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Helper function to get the CTA mask with multicast for SfB.
-inline __device__ uint16_t getCtaMaskMcastSfB() {
-  // The cta_idx.x == 0 CTAs are the leaders and do the multicast loads for all other CTAs in the
-  // column
-  //  xxxx
-  //  oooo
-  //  oooo
-  //  oooo
+// Helper function to get the CTA mask used by TMALDG multicast for A.
+inline __device__ uint16_t getCtaMaskTmaMcastA() {
+  // A/SfA TMA: leaders have y == 0 and multicast across the row in the Y direction.
+  // Diagram uses x vertical and y horizontal. For a leader at x0:
+  //      y0 y1 y2 y3
+  //  x0  A  A  A  A
+  //  x1  .  .  .  .
+  //  x2  .  .  .  .
+  //  x3  .  .  .  .
+  return getCtaMaskTmaMcastAForX(cute::block_id_in_cluster().x);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint16_t getCtaMaskTmaMcastBForParity(uint32_t xParity) {
   auto block_id_in_cluster = cute::block_id_in_cluster();
   auto cluster_dim = cute::cluster_shape();
-  uint16_t base = 0;
-  for (auto block_id_x = 0; block_id_x < cluster_dim.x; block_id_x++) {
-    base |= uint16_t(1) << block_id_x;
-  }
-  return base << (block_id_in_cluster.y * cluster_dim.x);
+  auto row_base_rank =
+    cluster_dim.x * (block_id_in_cluster.y + cluster_dim.y * block_id_in_cluster.z);
+
+  // Replicate one parity bit across the two possible 2-CTA X atoms, then trim to the active row.
+  uint32_t mask = uint32_t{1} << xParity;
+  mask |= mask << 2;
+  mask &= (uint32_t{1} << cluster_dim.x) - 1;
+  return static_cast<uint16_t>(mask << row_base_rank);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the CTA mask used by TMALDG multicast for B.
+inline __device__ uint16_t getCtaMaskTmaMcastB() {
+  // B TMA: leaders are x == 0 and x == 1. Each leader multicasts its lane down the column in the
+  // X direction, preserving x parity for the two halves of B.
+  //      y0 y1 y2 y3
+  //  x0  . B0  .  .
+  //  x1  . B1  .  .
+  //  x2  . B0  .  .
+  //  x3  . B1  .  .
+  return getCtaMaskTmaMcastBForParity(cute::block_id_in_cluster().x & 0x1u);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the CTA mask used by TMALDG multicast for SfB.
+inline __device__ uint16_t getCtaMaskTmaMcastSfB() {
+  // SfB TMA: the x == 0 CTA is the only TMA issuer and multicasts down the column in the X
+  // direction.
+  //      y0 y1 y2 y3
+  //  x0  .  S  .  .
+  //  x1  .  S  .  .
+  //  x2  .  S  .  .
+  //  x3  .  S  .  .
+  auto block_id_in_cluster = cute::block_id_in_cluster();
+  auto cluster_dim = cute::cluster_shape();
+  auto row_base_rank =
+    cluster_dim.x * (block_id_in_cluster.y + cluster_dim.y * block_id_in_cluster.z);
+  auto row_mask = (uint32_t{1} << cluster_dim.x) - 1;
+  return static_cast<uint16_t>(row_mask << row_base_rank);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint16_t getCtaMaskTmaMbarMcast(uint16_t ctaMask) {
+  // Each 2-CTA X atom owns one full barrier at its even rank. Fold every odd-rank destination bit
+  // onto the preceding even rank, then discard the odd positions.
+  constexpr uint16_t EvenRankMask{0x5555};
+  return static_cast<uint16_t>((ctaMask | (ctaMask >> 1)) & EvenRankMask);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the full-barrier mask updated by TMALDG multicast for A.
+inline __device__ uint16_t getCtaMaskTmaMbarMcastA() {
+  return getCtaMaskTmaMcastAForX(cute::block_id_in_cluster().x & ~uint32_t{1});
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the full-barrier mask updated by TMALDG multicast for B.
+inline __device__ uint16_t getCtaMaskTmaMbarMcastB() {
+  return getCtaMaskTmaMcastBForParity(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the full-barrier mask updated by TMALDG multicast for SfB.
+inline __device__ uint16_t getCtaMaskTmaMbarMcastSfB() {
+  return getCtaMaskTmaMcastBForParity(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the release mask for the multicast A/SfA TMA pipeline.
+inline __device__ uint16_t getCtaMaskReleaseMcastA() {
+  // A/SfA task leaders are y == 0. The Row/Y empty barrier expects one release
+  // from each Y position, but the released barriers must still be the acquired
+  // producer-owner barriers at y == 0.
+  auto block_id_in_cluster = cute::block_id_in_cluster();
+  auto cluster_dim = cute::cluster_shape();
+  auto ctas_per_z = cluster_dim.x * cluster_dim.y;
+  auto atom_mask =
+    (uint32_t{3} << (block_id_in_cluster.x & ~uint32_t{1})) & ((uint32_t{1} << cluster_dim.x) - 1);
+  return static_cast<uint16_t>(atom_mask << (ctas_per_z * block_id_in_cluster.z));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the release mask for the multicast B TMA pipeline.
+inline __device__ uint16_t getCtaMaskReleaseMcastB() {
+  // B task leaders are x < 2. The Col/X empty barrier expects one release from
+  // each 2x1 X atom group, but the released barriers must still be the acquired
+  // producer-owner barriers in the first X atom.
+  auto block_id_in_cluster = cute::block_id_in_cluster();
+  auto cluster_dim = cute::cluster_shape();
+  auto row_base_rank =
+    cluster_dim.x * (block_id_in_cluster.y + cluster_dim.y * block_id_in_cluster.z);
+  auto atom_mask = uint32_t{3} & ((uint32_t{1} << cluster_dim.x) - 1);
+  return static_cast<uint16_t>(atom_mask << row_base_rank);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to get the release mask for the multicast SfB TMA pipeline.
+inline __device__ uint16_t getCtaMaskReleaseMcastSfB() {
+  // SfB task leaders are x == 0. Like B, the Col/X empty barrier expects one
+  // release from each 2x1 X atom group, but the only acquired producer-owner
+  // barrier is the x == 0 CTA for this y.
+  auto block_id_in_cluster = cute::block_id_in_cluster();
+  auto cluster_dim = cute::cluster_shape();
+  auto row_base_rank =
+    cluster_dim.x * (block_id_in_cluster.y + cluster_dim.y * block_id_in_cluster.z);
+  return static_cast<uint16_t>(uint32_t{1} << row_base_rank);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -796,12 +968,7 @@ inline __device__ int32_t getCtaRankInPair() {
 
 // Helper function to get if lead CTA in CGA with multicast for A.
 inline __device__ uint16_t getIsLeadCtaInCgaMcastA() {
-  // The cta_idx.y == 0 CTAs are the leaders and do the multicast loads for all other CTAs in the
-  // row
-  //  xooo
-  //  xooo
-  //  xooo
-  //  xooo
+  // A/SfA leaders are y == 0; they issue Row/Y multicast TMA.
   return cute::block_id_in_cluster().y == 0;
 }
 
@@ -809,26 +976,16 @@ inline __device__ uint16_t getIsLeadCtaInCgaMcastA() {
 
 // Helper function to get if lead CTA in CGA with multicast for B.
 inline __device__ uint16_t getIsLeadCtaInCgaMcastB() {
-  // For the 2-CTA GEMMs, the cta_idx.x = 0,2 CTAs load the first half of B while the cta_idx.y =
-  // 1,3 CTAs load the second half of B. The cta_idx.x == 0,1 CTAs are the leaders and do the
-  // multicast loads for cta_idx.x = 2,3 CTAs.
-  //  |x |x |x |x |
-  //  | x| x| x| x|
-  //  |o |o |o |o |
-  //  | o| o| o| o|
-  return cute::block_id_in_cluster().x / 2 == 0;
+  // B leaders are the first 2-CTA X atom. They issue the two parity-preserving Col/X multicast
+  // TMAs.
+  return cute::block_id_in_cluster().x < 2;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Helper function to get if lead CTA in CGA with multicast for B.
+// Helper function to get if lead CTA in CGA with multicast for SfB.
 inline __device__ uint16_t getIsLeadCtaInCgaMcastSfB() {
-  // The cta_idx.x == 0 CTAs are the leaders and do the multicast loads for all other CTAs in the
-  // column
-  //  xxxx
-  //  oooo
-  //  oooo
-  //  oooo
+  // SfB has one TMA issuer per Y column.
   return cute::block_id_in_cluster().x == 0;
 }
 
@@ -931,6 +1088,11 @@ inline __device__ uint32_t make_utcmma_desc(uint32_t fmtC,
                                             [[maybe_unused]] bool isQmma) {
   // Setup the Instruction descriptors, see comment on UtcmmaDescriptor above.
   UtcmmaDescriptor desc_mma{0};
+  // {$nv-internal-release begin}
+  // Notes:
+  //  - sparse_id2 is only relevant for tf32/fp16/bf16 which we do not support.
+  //  - metadata format is 0=tid, no plan to use regoffset (currently not even exposed in PTX).
+  // {$nv-internal-release end}
   desc_mma.sparse_flag_ = static_cast<uint32_t>(isSparseA);
   desc_mma.c_format_ = fmtC;
   desc_mma.a_format_ = fmtA;
@@ -939,6 +1101,14 @@ inline __device__ uint32_t make_utcmma_desc(uint32_t fmtC,
   desc_mma.b_major_ = majorNB;
   desc_mma.n_dim_ = instN >> 3;
   desc_mma.m_dim_ = instM >> 4;
+  // {$nv-internal-release begin}
+  // Bit 29 was reserved on Blackwell, and contains K size on Rubin.
+  // HMMA: 0=[TF32-dense: K8, TF32-sparse: K16, F16/BF16-dense: K16, F16/BF16-sparse: K32].
+  // QMMA: 0=[dense: K32, sparse: K64], 1=[dense: K64, sparse: invalid].
+  if (isQmma && !isSparseA && instK == 64) {
+    desc_mma.bit_29_ = 1;
+  }
+  // {$nv-internal-release end}
   return desc_mma.desc_;
 }
 
@@ -996,6 +1166,11 @@ inline __device__ uint32_t make_utcmma_desc_block(uint32_t fmtSf,
                                                   uint32_t instK,
                                                   bool isSparseA,
                                                   [[maybe_unused]] int version,
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+                                                  bool useUniqueSfA,
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
                                                   uint32_t byteOffsetSfA,
                                                   uint32_t byteOffsetSfB,
                                                   [[maybe_unused]] bool isOmma) {
@@ -1004,6 +1179,16 @@ inline __device__ uint32_t make_utcmma_desc_block(uint32_t fmtSf,
   // desc_mma.a_negate_      = 0 (no negate)
   // desc_mma.b_negate_      = 0 (no negate)
   desc_mma.sparse_flag_ = static_cast<uint32_t>(isSparseA);
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+  // Note: metadata format in bit 6 is 0=tid, regoffset invalid on Rubin for {O,Q}MMA with k=128.
+  // Sparsity version: 0=Blackwell, 1=Rubin. Only for OMMA, in bit 12.
+  // For QMMA, fmtB takes bits [10,13). Thus, we write the version to the 3rd bit of fmtB.
+  if (isOmma && isSparseA) {
+    fmtB |= (version << 2);
+  }
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
   desc_mma.scale_format_ = fmtSf;
   desc_mma.a_format_ = fmtA;
   desc_mma.b_format_ = fmtB;
@@ -1014,6 +1199,18 @@ inline __device__ uint32_t make_utcmma_desc_block(uint32_t fmtSf,
   desc_mma.a_sf_id_ = byteOffsetSfA;
   desc_mma.b_sf_id_ = byteOffsetSfB;
   desc_mma.k_size_ = (instK == 96 ? 1 : 0);
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+  // QMMA: bit 31. 0: K=32, 1:K=64.
+  // OMMA: bits 31 (lower) and 3 (upper). 0: K=64, 1: K=96, 2: K=128.
+  if (isOmma && !isSparseA && instK == 128) {
+    desc_mma.bit_3_ = 1;
+  } else if (!isOmma && !isSparseA && instK == 64) {
+    desc_mma.k_size_ = 1;
+  }
+  desc_mma.bit_26_ = useUniqueSfA ? 1 : 0;
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
   return desc_mma.desc_;
 }
 
@@ -1025,6 +1222,23 @@ inline __device__ uint32_t make_utcmma_desc_block(uint32_t fmtSf,
 // out.
 template <int GroupSize, int GroupStride>
 inline __device__ float reduce_group_max_abs_f32(float value, int laneIdx) {
+  // {$nv-internal-release begin}
+  // CREDUX is a whole warp reduction. Reduction for smaller group size N is emulated by:
+  //  - FSEL (only participating threads contribute to the reduction)
+  //  - CREDUX (actual reduction)
+  //  - IMAD.MOV (move the result)
+  // Times that with the number of groups in the warp to get rough number of instructions.
+  // On ther other hand, SHFL-based reduction is a log2(N) operation. In that sense:
+  //  - When N = 32, CREDUX 1 instruction. SHFL 5 instructions.
+  //  - When N = 16, CREDUX 3*2 instructions. SHFL 4 instructions.
+  //  - When N = 8, CREDUX 3*4 instructions. SHFL 3 instructions.
+  // And so on. Taking account of the actual IPC on SM100 where FSEL/CREDUX/IMAD take 2 cycles and
+  // SHFL takes 4 cycles:
+  //  - When N = 32, CREDUX 2 cycles. SHFL 20 cycles.
+  //  - When N = 16, CREDUX 12 cycles. SHFL 16 cycles.
+  //  - When N = 8, CREDUX 24 cycles. SHFL 12 cycles.
+  // As result, CREDUX is better when group size >= 16.
+  // {$nv-internal-release end}
 #if __CUDA_HAS_ARCH_FAMILY_SPECIFIC(100)
   constexpr bool UseRedux = (GroupSize >= 16);
 #else
@@ -1073,6 +1287,40 @@ inline __device__ float reinterpret_uint32_to_float(uint32_t val) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+// Reset hint at the compiler that the block is less likely to be executed.
+__forceinline__ __device__ void resetColdBlock() {
+#if defined(__CUDA_ARCH__)
+  asm volatile(".pragma \"reset knob ColdBlock\";\n" : : : "memory");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Tune XU pipe (e.g., MUFU instruction) scheduling interval. Resets after going out of scope.
+template <int IssueLatency = 1> __forceinline__ __device__ void schedResBusyXu64() {
+#if defined(__CUDA_ARCH__)
+  if constexpr (IssueLatency == 1) {
+    asm volatile(".pragma \"set knob SchedResBusyXU64=1\";\n" : : : "memory");
+  } else if constexpr (IssueLatency == 2) {
+    asm volatile(".pragma \"set knob SchedResBusyXU64=2\";\n" : : : "memory");
+  } else if constexpr (IssueLatency == 4) {
+    asm volatile(".pragma \"set knob SchedResBusyXU64=4\";\n" : : : "memory");
+  }
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Hint at the compiler that the block is less likely to be executed.
+__forceinline__ __device__ void setColdBlock() {
+#if defined(__CUDA_ARCH__)
+  asm volatile(".pragma \"set knob ColdBlock\";\n" : : : "memory");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// {$nv-internal-release end}
 // Returns the reciprocal of a non-zero fp32 value where only exponent bits are set.
 __forceinline__ __device__ float scale_rcp_exp_only(float val) {
   uint32_t bits = 0x7f000000u - reinterpret_cast<uint32_t&>(val);
@@ -1108,6 +1356,14 @@ __forceinline__ __device__ float trunc_abs_float_to_pow2(float val) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+// Hint at the compiler that the next instruction is marked with END_GROUP.
+__forceinline__ __device__ void warpSwitch() {
+#if defined(__CUDA_ARCH__)
+  asm volatile(".pragma \"next knob WarpOpexPrev=1\";\n" : : : "memory");
+#endif
+}
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

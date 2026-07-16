@@ -485,7 +485,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mBalancesWorkloadForCausalMask, false, bool)                                             \
   /* The cluster dimension in the X dimension. */                                                  \
   X(int, mClusterDimX, 1, int)                                                                     \
-  X(bool, mKnob1, true, bool)                                                             \
+  /* Annotate the masking code path with ColdBlock to indicate less traversed path. */             \
+  X(bool, mColdBlockTmemS, true, bool)                                                             \
   /* The CUDA arch. */                                                                             \
   X(tg::CudaArch, mCudaArch, tg::CudaArch::Sm100a, int)                                            \
   /* The data type of MMA accumulators. */                                                         \
@@ -553,6 +554,7 @@ template <> inline std::string toString(MmaOrder e) {
   X(MmaOrder, mMmaOrder, MmaOrder::Pv0_Qk0_Pv1_Qk1, int)                                           \
   /* The multiCtasKvMode. */                                                                       \
   X(MultiCtasKvMode, mMultiCtasKvMode, MultiCtasKvMode::Disabled, int)                             \
+  /* Delay downcast until N-th exps to hide exp latency (17 clks); must be a multiple of 4. */     \
   X(int, mNumDelayedCvtElts, 12, int)                                                              \
   /* The number of elements per block for Sage Attention (for K). */                               \
   /* 0 => we don't use Sage Attention. */                                                          \
@@ -584,7 +586,9 @@ template <> inline std::string toString(MmaOrder e) {
   /* Beneficial only when BMM1 cycles == softmax cycles where neither dominates. */                \
   X(int, mNumKPartitionsMmaPv, 2, int)                                                             \
   /* Signal at the last N remaining exps to cover the */                                           \
+  /* OrderedSequenceBarriers latency (~40 clks). */                                                \
   X(int, mNumLeadingExpElts, 6, int)                                                               \
+  /* Delay exp until N-th FMAs to hide FMA latency (7 clks); must be a multiple of 2. */           \
   X(int, mNumPrefetchedFmas, 4, int)                                                               \
   /* The number of stages of the K/V shared memory buffer. 0 uses the default heuristic. */        \
   X(int32_t, mNumStagesKv, 0, int32_t)                                                             \
@@ -651,9 +655,12 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mUsesOrderedSequence, true, bool)                                                        \
   /* Whether to use CGA reduction (deprecated, kept for benchmarking). */                          \
   X(bool, mUsesCgaReduction, false, bool)                                                          \
-  X(bool, mKnob2, true, bool)                                                      \
-  X(bool, mKnob3, true, bool)                                                         \
-  X(bool, mKnob4, true, bool)
+  /* Switch warps opportunistically during rowsum to unblock softmax sequence. */                  \
+  X(bool, mWarpSwitchTmemSoftmax, true, bool)                                                      \
+  /* Switch warps opportunistically during correction to unblock softmax sequence. */              \
+  X(bool, mWarpSwitchTmemCorr, true, bool)                                                         \
+  /* Switch warps opportunistically during max reduction to unblock softmax sequence. */           \
+  X(bool, mWarpSwitchTmemS, true, bool)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -661,6 +668,41 @@ template <> inline std::string toString(MmaOrder e) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST(X)
+
+#ifdef TLLM_RUBIN_FEATURES
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)                                                   \
+  /* Whether to use fp16 softmax. */                                                               \
+  X(bool, mFp16Softmax, false, bool)                                                        \
+  /* Whether the kernel forces the output to be valid values */                                    \
+  /* (not -0.0 for FP and NAN for UE8m0). */                                                       \
+  X(bool, mLamportForceValid, false, bool)                                                         \
+  /* Whether the kernel is a Lamport producer */                                                   \
+  /* (invalidates output buffer prior to writing results). */                                      \
+  X(bool, mLamportProducer, false, bool)                                                           \
+  /* Whether to use tcgen05.ld.spcompress to compress S before softmax (and thus P). */            \
+  X(bool, mUsesSpcompress, false, bool)
+#endif // TLLM_RUBIN_FEATURES
+
+#if defined(TLLM_RUBIN_FEATURES) && defined(TLLM_TEST)
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST(X)                                            \
+  /* Whether the Lamport Producer kernel invalidates a separate buffer (used for testing only). */ \
+  X(bool, mLamportSeparateInvalidation, false, bool)
+#endif // defined(TLLM_RUBIN_FEATURES) && defined(TLLM_TEST)
+
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)                                                         \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)                                                         \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST(X)
+
+#undef KERNEL_CONFIG_BASE_FIELDS
+#define KERNEL_CONFIG_BASE_FIELDS(X)                                                               \
+  KERNEL_CONFIG_BASE_FIELDS_BASE(X)                                                                \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -727,3 +769,9 @@ template <> struct hash<fmha::KernelConfigBase> {
 
 #undef KERNEL_CONFIG_BASE_FIELDS
 #undef KERNEL_CONFIG_BASE_FIELDS_BASE
+// {$nv-internal-release begin}
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA
+// It's ok to undefine a macro that is not defined.
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_LAMPORT_TEST
+// {$nv-internal-release end}

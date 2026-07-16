@@ -22,6 +22,11 @@
 #include "CutlassSm90Pipeline.h"
 #include <cutlass/pipeline/sm100_pipeline.hpp>
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+#include "cutlass/cuda_ptx_global_knobs.h"
+#endif
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -71,6 +76,7 @@ public:
   CUTLASS_DEVICE void init_masks(ClusterShape cluster_shape,
                                  dim3 block_id_in_cluster = cute::block_id_in_cluster()) {
     // Calculate producer mask
+    // Warp/Role selection should only be done in init_* functions // {$nv-internal-release}
     if (params_.role == ThreadCategory::Producer) {
       // The leader threadblock executing the MMA_2x1SM instruction will signal its peer
       // threadblock when it is done with MMA operations. tmem_sync_mask encodes the
@@ -185,6 +191,7 @@ private:
     cutlass::detail::pipeline_check_is_producer(params_.role);
     uint64_t* smem_ptr = reinterpret_cast<uint64_t*>(&full_barrier_ptr_[stage]);
     if constexpr (is_2sm_mma) {
+      // XXX: this should be updated based on the CGA shape!!!! // {$nv-release-never}
       cutlass::arch::umma_arrive_multicast_2x1SM(smem_ptr, tmem_sync_mask_);
     } else {
       cutlass::arch::umma_arrive(smem_ptr);
@@ -243,6 +250,7 @@ public:
   }
 
   // Constructor for single-sided usage, for example, in Mixed Input Transform //
+  // {$nv-internal-release}
   template <class ClusterShape, class InitMasks = cute::true_type>
   CUTLASS_DEVICE PipelineTmaTransformAsync(FullBarrier* full_barrier_ptr,
                                            EmptyBarrier* empty_barrier_ptr,
@@ -373,6 +381,10 @@ public:
   template <class ClusterShape>
   CUTLASS_DEVICE bool is_same_row(int dst_block_id, dim3 block_id, ClusterShape cluster_shape) {
     return (((dst_block_id % cute::size<0>(cluster_shape)) == block_id.x)
+            // {$nv-internal-release begin}
+            // TODO: https://jirasw.nvidia.com/browse/CFK-10167 Do not rely on ClusterShape and
+            // AtomThrShape_MNK for coordinate reasoning
+            // {$nv-internal-release end}
             // If we are in the same cluster column and using 2CTA MMA, only odd or only even CTAs
             // sync with each other
             && ((dst_block_id % cute::size<0>(cluster_shape)) % cute::size<0>(AtomThrShape_MNK{}) ==
@@ -385,6 +397,10 @@ public:
                                          ClusterShape cluster_shape) {
     return (((dst_block_id % cute::size<0>(cluster_shape)) == block_id.x) ||
             (((dst_block_id / cute::size<0>(cluster_shape)) == block_id.y)
+             // {$nv-internal-release begin}
+             // TODO: https://jirasw.nvidia.com/browse/CFK-10167 Do not rely on ClusterShape and
+             // AtomThrShape_MNK for coordinate reasoning
+             // {$nv-internal-release end}
              // If we are in the same cluster column and using 2CTA MMA, only odd or only even CTAs
              // sync with each other
              &&
@@ -597,6 +613,7 @@ public:
     }
   }
 
+  // Constructor for single-sided usage, for example, in ConvMMA // {$nv-internal-release}
   template <typename InitMasks = cute::true_type>
   CUTLASS_DEVICE PipelineTmaUmmaAsync(FullBarrier* full_barrier_ptr,
                                       EmptyBarrier* empty_barrier_ptr,
@@ -697,6 +714,12 @@ private:
   void consumer_release(uint32_t stage, uint32_t skip) {
     cutlass::detail::pipeline_check_is_consumer(params_.role);
     uint64_t* smem_ptr = reinterpret_cast<uint64_t*>(&empty_barrier_ptr_[stage]);
+    // {$nv-release-never begin}
+    // TODO: Needs to be updated once Blackwell specialized pipeline is implemented.
+    // XMMA style bar_peek will be tested. We will need to revisit skip interface and
+    // what skip means when we have bar_peek functionality.
+    // A separate MR will implement MMA_2x1SM specialized pipeline.
+    // {$nv-release-never end}
     if constexpr (is_2sm_mma) { // Mma cluster shape is 2x1
       if (!skip) {
         cutlass::arch::umma_arrive_multicast_2x1SM(smem_ptr, block_id_mask_);

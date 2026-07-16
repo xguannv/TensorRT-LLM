@@ -59,6 +59,240 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// {$nv-internal-release begin}
+inline __device__ void _qmul4E4m3E2m1E4m3B0(__nv_fp8x4_storage_t& res,
+                                            __nv_fp8x4_storage_t a,
+                                            __nv_fp8x4_storage_t b) {
+#ifdef TLLM_BENCHMARK_E2M1_KV_CACHE
+  // The intended SASS is QMUL4.E4M3x4.E2M1x4.N6420.E4M3x4.Bx. Since the compiler does not support
+  // it yet, we resort to post-compilation SASS editing. We encode .iswzB into .atype. The <iswzB ->
+  // Btype> mapping is described below: B0 -> .e3m2x4; B1 -> .e2m3x4; B2 -> .e5m2x4; B3 -> .ue8m0x4.
+  // After compilation, we only have to replace QMUL4.E4M3x4.E2M1x4.N6420.<Btype>.B3210 with
+  // QMUL4.E4M3x4.E2M1x4.N6420.E4M3x4.<iswzB>, according to the mapping.
+  asm volatile("{\n"
+               "mul.e4m3x4.e2m1x4.e3m2x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#else
+  asm volatile("{\n"
+               ".reg .b32 tmp;\n"
+               "prmt.b32 tmp, %2, 0, 0x0000;\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, %1, tmp;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void _qmul4E4m3E2m1E4m3B1(__nv_fp8x4_storage_t& res,
+                                            __nv_fp8x4_storage_t a,
+                                            __nv_fp8x4_storage_t b) {
+#ifdef TLLM_BENCHMARK_E2M1_KV_CACHE
+  asm volatile("{\n"
+               "mul.e4m3x4.e2m1x4.e2m3x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#else
+  asm volatile("{\n"
+               ".reg .b32 tmp;\n"
+               "prmt.b32 tmp, %2, 0, 0x1111;\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, %1, tmp;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void _qmul4E4m3E2m1E4m3B2(__nv_fp8x4_storage_t& res,
+                                            __nv_fp8x4_storage_t a,
+                                            __nv_fp8x4_storage_t b) {
+#ifdef TLLM_BENCHMARK_E2M1_KV_CACHE
+  asm volatile("{\n"
+               "mul.e4m3x4.e2m1x4.e5m2x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#else
+  asm volatile("{\n"
+               ".reg .b32 tmp;\n"
+               "prmt.b32 tmp, %2, 0, 0x2222;\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, %1, tmp;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void _qmul4E4m3E2m1E4m3B3(__nv_fp8x4_storage_t& res,
+                                            __nv_fp8x4_storage_t a,
+                                            __nv_fp8x4_storage_t b) {
+#ifdef TLLM_BENCHMARK_E2M1_KV_CACHE
+  asm volatile("{\n"
+               "mul.e4m3x4.e2m1x4.ue8m0x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#else
+  asm volatile("{\n"
+               ".reg .b32 tmp;\n"
+               "prmt.b32 tmp, %2, 0, 0x3333;\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, %1, tmp;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void qmul4E4m3E2m1E4m3Bx(__nv_fp8x4_storage_t& res,
+                                           __nv_fp8x4_storage_t a,
+                                           __nv_fp8x4_storage_t b,
+                                           int byteIdxB) {
+  if (byteIdxB == 0) {
+    _qmul4E4m3E2m1E4m3B0(res, a, b);
+  } else if (byteIdxB == 1) {
+    _qmul4E4m3E2m1E4m3B1(res, a, b);
+  } else if (byteIdxB == 2) {
+    _qmul4E4m3E2m1E4m3B2(res, a, b);
+  } else if (byteIdxB == 3) {
+    _qmul4E4m3E2m1E4m3B3(res, a, b);
+  } else {
+    // Should never reach here.
+    assert(false);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void qmul4E4m3E2m1E4m3(__nv_fp8x4_storage_t& res,
+                                         __nv_fp8x4_storage_t a,
+                                         __nv_fp8x4_storage_t b) {
+  asm volatile("{\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(a), "r"(b));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Fused replacement for two qmul4E4m3E2m1E4m3 calls, for architectures without qmul4.
+//   src0, src1: 4 unpacked E2M1 values each (in nibbles 0, 2, 4, 6).
+//   sf:         4 packed E4M3 SFs, shared by both src0 and src1.
+//   dst0, dst1: 4 E4M3 output values each.
+inline __device__ void convertUnpackedE2m1ToE4m3x2(uint32_t& dst0,
+                                                   uint32_t& dst1,
+                                                   uint32_t src0,
+                                                   uint32_t src1,
+                                                   uint32_t sf) {
+  // Interleave: src0 in even nibbles, src1 in odd nibbles.
+  uint32_t packed = src1 * 16 + src0;
+
+  // Duplicate each SF byte for the interleaved pair so both elements at position i
+  // are scaled by sf_i: [sf0,sf0,sf1,sf1] and [sf2,sf2,sf3,sf3], then convert to fp16x2.
+  asm volatile("{\n"
+               ".reg .b32 sfDup01, sfDup23;\n"
+               ".reg .b16 sf01Lo, sf01Hi, sf23Lo, sf23Hi;\n"
+               ".reg .b32 sfFp16_0, sfFp16_1, sfFp16_2, sfFp16_3;\n"
+               ".reg .b8 b0, b1, b2, b3;\n"
+               ".reg .b32 h0, h1, h2, h3;\n"
+               ".reg .b16 e0, e1, e2, e3;\n"
+               ".reg .b32 resLo, resHi;\n"
+               "prmt.b32 sfDup01, %2, %2, 0x1100;\n"
+               "prmt.b32 sfDup23, %2, %2, 0x3322;\n"
+               "mov.b32 {sf01Lo, sf01Hi}, sfDup01;\n"
+               "mov.b32 {sf23Lo, sf23Hi}, sfDup23;\n"
+               "cvt.rn.f16x2.e4m3x2 sfFp16_0, sf01Lo;\n"
+               "cvt.rn.f16x2.e4m3x2 sfFp16_1, sf01Hi;\n"
+               "cvt.rn.f16x2.e4m3x2 sfFp16_2, sf23Lo;\n"
+               "cvt.rn.f16x2.e4m3x2 sfFp16_3, sf23Hi;\n"
+               "mov.b32 {b0, b1, b2, b3}, %3;\n"
+               "cvt.rn.f16x2.e2m1x2 h0, b0;\n"
+               "cvt.rn.f16x2.e2m1x2 h1, b1;\n"
+               "cvt.rn.f16x2.e2m1x2 h2, b2;\n"
+               "cvt.rn.f16x2.e2m1x2 h3, b3;\n"
+               "mul.rn.f16x2 h0, h0, sfFp16_0;\n"
+               "mul.rn.f16x2 h1, h1, sfFp16_1;\n"
+               "mul.rn.f16x2 h2, h2, sfFp16_2;\n"
+               "mul.rn.f16x2 h3, h3, sfFp16_3;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;\n"
+               "mov.b32 resLo, {e0, e1};\n"
+               "mov.b32 resHi, {e2, e3};\n"
+               "prmt.b32 %0, resLo, resHi, 0x6420;\n"
+               "prmt.b32 %1, resLo, resHi, 0x7531;\n"
+               "}\n"
+               : "=r"(dst0), "=r"(dst1)
+               : "r"(sf), "r"(packed));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Fused replacement for two qmul4E4m3E2m1E4m3Bx calls, for architectures without qmul4.
+//   src0, src1: 4 unpacked E2M1 values each (in nibbles 0, 2, 4, 6).
+//   sf0, sf1:   4 packed E4M3 SFs each; byte at byteIdx is selected for both.
+//   dst0, dst1: 4 E4M3 output values each.
+inline __device__ void convertUnpackedE2m1ToE4m3x2Bx(uint32_t& dst0,
+                                                     uint32_t& dst1,
+                                                     uint32_t src0,
+                                                     uint32_t src1,
+                                                     uint32_t sf0,
+                                                     uint32_t sf1,
+                                                     int byteIdx) {
+  // Interleave: src0 in even nibbles, src1 in odd nibbles.
+  uint32_t packed = src1 * 16 + src0;
+
+  // Extract byte byteIdx from sf0 (LSBs) and sf1 (MSBs) via prmt.
+  uint32_t prmtSel = 0x0011u * uint32_t(byteIdx) + 0x0040u;
+  uint32_t packedSf;
+  asm volatile("prmt.b32 %0, %1, %2, %3;" : "=r"(packedSf) : "r"(sf0), "r"(sf1), "r"(prmtSel));
+
+  // Convert the packed e4m3x2 SF to fp16x2 for scaling.
+  uint16_t sfE4m3x2 = uint16_t(packedSf);
+  uint32_t sfFp16x2;
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(sfFp16x2) : "h"(sfE4m3x2));
+
+  // Convert 8 interleaved fp4 values through fp16, scale, and convert to fp8.
+  uint32_t resLo, resHi;
+  asm volatile("{\n"
+               ".reg .b8 b0, b1, b2, b3;\n"
+               ".reg .b32 h0, h1, h2, h3;\n"
+               ".reg .b16 e0, e1, e2, e3;\n"
+               "mov.b32 {b0, b1, b2, b3}, %2;\n"
+               "cvt.rn.f16x2.e2m1x2 h0, b0;\n"
+               "cvt.rn.f16x2.e2m1x2 h1, b1;\n"
+               "cvt.rn.f16x2.e2m1x2 h2, b2;\n"
+               "cvt.rn.f16x2.e2m1x2 h3, b3;\n"
+               "mul.rn.f16x2 h0, h0, %3;\n"
+               "mul.rn.f16x2 h1, h1, %3;\n"
+               "mul.rn.f16x2 h2, h2, %3;\n"
+               "mul.rn.f16x2 h3, h3, %3;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;\n"
+               "cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;\n"
+               "mov.b32 %0, {e0, e1};\n"
+               "mov.b32 %1, {e2, e3};\n"
+               "}\n"
+               : "=r"(resLo), "=r"(resHi)
+               : "r"(packed), "r"(sfFp16x2));
+
+  // Deinterleave: even bytes (src0 results) to dst0, odd bytes (src1 results) to dst1.
+  asm volatile("prmt.b32 %0, %1, %2, 0x6420;" : "=r"(dst0) : "r"(resLo), "r"(resHi));
+  asm volatile("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(dst1) : "r"(resLo), "r"(resHi));
+}
+// {$nv-internal-release end}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ cute::uint128_t e2m1ToFp16(uint32_t src) {
@@ -77,6 +311,151 @@ inline __device__ cute::uint128_t e2m1ToFp16(uint32_t src) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// {$nv-internal-release begin}
+inline __device__ uint32_t qmul4E4m3E2m1E4m3Lower4Elts(uint32_t src, cutlass::float_e4m3_t sf) {
+  uint32_t res;
+  // {$nv-internal-release begin}
+  // NOTE(tizheng): This following PTX should issue QMUL4.E4M3x4.E2M1x4.N3210.E4M3x4.B0.
+  // However, due to the PTX optimization and exposure problem, it does not generate
+  // single QMUL4 instruction as expected. Compiler team is working on this:
+  // - https://nvbugspro.nvidia.com/bug/5221546
+  // - https://nvbugspro.nvidia.com/bug/5229203
+
+  // For now, we create two paths: 1) functionality is not correct but delivers the expected
+  // performance; 2) functionality is correct but performance is low. We use 1) for benchmark and 2)
+  // for validation.
+  // {$nv-internal-release end}
+#ifdef TLLM_BENCHMARK_E2M1_KV_CACHE
+  // {$nv-internal-release begin}
+  // Similar to qmul4E4m3E2m1E4m3Bx, we encode .iswzA into .atype.
+  // The intended SASS is QMUL4.E4M3x4.E2M1x4.N3210.E4M3x4.B0. We encode .N3210 into atype as
+  // .e0m3x4. The .B0 is encoded the same way as qmul4E4m3E2m1E4m3Bx.
+  // {$nv-internal-release end}
+  asm volatile("{\n"
+               "mul.e4m3x4.e0m3x4.e3m2x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(src), "r"(static_cast<uint32_t>(sf.storage)));
+#else
+  // Code for validation.
+  asm volatile("{\n"
+               ".reg .b32 tmp;\n"
+               "prmt.b32 tmp, %2, 0, 0;\n"
+               ".reg .b8 byte0, byte1, byte2, byte3;\n"
+               "mov.b32 {byte0, byte1, byte2, byte3}, %1;\n"
+               ".reg .b32 ra;\n"
+               "mov.b32 ra, {byte0, byte1, _, _};\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, ra, tmp;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(src), "r"(static_cast<uint32_t>(sf.storage)));
+#endif
+
+  return res;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t qmul4E4m3E2m1E4m3Higher4Elts(uint32_t src, cutlass::float_e4m3_t sf) {
+  uint32_t res;
+  // {$nv-internal-release begin}
+  // NOTE(tizheng): This following PTX should issue QMUL4.E4M3x4.E2M1x4.N3210.E4M3x4.B0.
+  // However, due to the PTX optimization and exposure problem, it does not generate
+  // single QMUL4 instruction as expected. Compiler team is working on this:
+  // - https://nvbugspro.nvidia.com/bug/5221546
+  // - https://nvbugspro.nvidia.com/bug/5229203
+
+  // For now, we create two paths: 1) functionality is not correct but delivers the expected
+  // performance; 2) functionality is correct but performance is low. We use 1) for benchmark and 2)
+  // for validation.
+  // {$nv-internal-release end}
+#ifdef TLLM_BENCHMARK_E2M1_KV_CACHE
+  // {$nv-internal-release begin}
+  // The intended SASS is QMUL4.E4M3x4.E2M1x4.N7654.E4M3x4.B0. We encode .N7654 into ctype as
+  // .e3m4x4. We do not encode into atype because we run out of 4-bit atype. If using 8-bit atype,
+  // the generated iswzA and iswzB will both become B3210. The SASS editing will be more than a
+  // simple string replacement.
+  // {$nv-internal-release end}
+  asm volatile("{\n"
+               "mul.e3m4x4.e2m1x4.e3m2x4.satfinite %0, %1, %2;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(src), "r"(static_cast<uint32_t>(sf.storage)));
+#else
+  asm volatile("{\n"
+               ".reg .b32 tmp;\n"
+               "prmt.b32 tmp, %2, 0, 0;\n"
+               ".reg .b8 byte0, byte1, byte2, byte3;\n"
+               "mov.b32 {byte0, byte1, byte2, byte3}, %1;\n"
+               ".reg .b32 ra;\n"
+               "mov.b32 ra, {_, _, byte2, byte3};\n"
+               "mul.e4m3x4.e2m1x4.e4m3x4.satfinite %0, ra, tmp;\n"
+               "}\n"
+               : "=r"(res)
+               : "r"(src), "r"(static_cast<uint32_t>(sf.storage)));
+#endif
+  return res;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::float_e4m3_t sf) {
+  // This function converts 16 E2m1 to E4m3.
+  // Inputs:
+  // - src: 16 E2M1 values packed in uint64_t.
+  // - sf: The scaling factor of the vector, in E4M3 format.
+
+  // The array to hold the 16 FP8 results.
+  uint32_t dst[4];
+
+  // Only Blackwell has the qmul4 instruction.
+#if !(__CUDA_ARCH_SPECIFIC__ == 1000 || __CUDA_ARCH_SPECIFIC__ == 1030)
+  // Convert SF from e4m3 to fp16x2 by packing the byte twice, then converting.
+  uint16_t sfPacked = uint16_t(sf.storage) * 256u + uint16_t(sf.storage);
+  uint32_t sfFp16x2;
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(sfFp16x2) : "h"(sfPacked));
+
+  uint32_t(&srcWords)[2] = reinterpret_cast<uint32_t(&)[2]>(srcX16);
+
+#pragma unroll
+  for (int ii = 0; ii < 2; ++ii) {
+    asm volatile("{\n"
+                 ".reg .b8 b0, b1, b2, b3;\n"
+                 ".reg .b32 h0, h1, h2, h3;\n"
+                 ".reg .b16 e0, e1, e2, e3;\n"
+                 "mov.b32 {b0, b1, b2, b3}, %2;\n"
+                 "cvt.rn.f16x2.e2m1x2 h0, b0;\n"
+                 "cvt.rn.f16x2.e2m1x2 h1, b1;\n"
+                 "cvt.rn.f16x2.e2m1x2 h2, b2;\n"
+                 "cvt.rn.f16x2.e2m1x2 h3, b3;\n"
+                 "mul.rn.f16x2 h0, h0, %3;\n"
+                 "mul.rn.f16x2 h1, h1, %3;\n"
+                 "mul.rn.f16x2 h2, h2, %3;\n"
+                 "mul.rn.f16x2 h3, h3, %3;\n"
+                 "cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;\n"
+                 "cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;\n"
+                 "cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;\n"
+                 "cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;\n"
+                 "mov.b32 %0, {e0, e1};\n"
+                 "mov.b32 %1, {e2, e3};\n"
+                 "}\n"
+                 : "=r"(dst[ii * 2 + 0]), "=r"(dst[ii * 2 + 1])
+                 : "r"(srcWords[ii]), "r"(sfFp16x2));
+  }
+#else
+  // Cast the src into uint32_t array of 2 elements.
+  uint32_t(&e2m1x8Array)[2] = reinterpret_cast<uint32_t(&)[2]>(srcX16);
+
+  // Call QMUL4 to convert E2M1 to E4M3.
+  dst[0] = qmul4E4m3E2m1E4m3Lower4Elts(e2m1x8Array[0], sf);
+  dst[1] = qmul4E4m3E2m1E4m3Higher4Elts(e2m1x8Array[0], sf);
+  dst[2] = qmul4E4m3E2m1E4m3Lower4Elts(e2m1x8Array[1], sf);
+  dst[3] = qmul4E4m3E2m1E4m3Higher4Elts(e2m1x8Array[1], sf);
+#endif
+
+  return reinterpret_cast<cute::uint128_t&>(dst);
+}
+// {$nv-internal-release end}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
@@ -94,6 +473,10 @@ inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
 
   // The output scale.
   // outputScale = reciprocal(fp32(fp8(sfVal * sfScale))) * reciprocal(sfScale))
+  // {$nv-internal-release begin}
+  // Same as
+  // https://gitlab-master.nvidia.com/ftp/tekit/-/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh?ref_type=heads#L443
+  // {$nv-internal-release end}
   outputScale =
     sfVal != 0.f ? reciprocal_approximate_ftz(sfVal * reciprocal_approximate_ftz(sfScale)) : 0.f;
 }
@@ -117,6 +500,9 @@ inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
   // The output scale.
   // outputScale = reciprocal(fp32(fp8(sfVal * sfScale))) * reciprocal(sfScale))
   // Same as
+  // {$nv-internal-release begin}
+  // https://gitlab-master.nvidia.com/ftp/tekit/-/blob/main/cpp/tensorrt_llm/kernels/quantization.cuh?ref_type=heads#L443
+  // {$nv-internal-release end}
   outputScale = sfVal != 0.f ? reciprocal_approximate_ftz(sfVal * sfScaleInv) : 0.f;
 }
 
@@ -346,6 +732,47 @@ inline __device__ int64_t getSfOffset(void const* gmemOutPtr,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// {$nv-internal-release begin}
+template <int sfByteIdx>
+inline __device__ void placeholderMxFp4x8ToBf16x8(uint32_t* eltsBf16x2,
+                                                  uint32_t elts,
+                                                  uint32_t sfE8x4) {
+  // This function generates placeholder instructions that will be replaced through SASS patching.
+  // LOP3.LUT will be replaced with F2FP.BF16.E2M1.UNPACK_B, which does fused conversion of scaling
+  // of E2m1 elements and E8 scaling factors to Bf16.
+  //
+  // I (lsugy) chose his instruction as it can be quite robustly generated and shares a similar
+  // signature with the target instruction. The LUT immediate is used to encode the Bx selectors for
+  // the e2m1 element in B and the scaling factor in C. The LUT values meet the following criteria:
+  //  - Make all three LOP3 operands necessary so the optimizer can't remove any of them or reorder
+  //    them (in the two-operand variant, I've seen it switch operands and change the LUT).
+  //  - Minimize the probability of side effects by avoiding common LUT values (and, or, xor, ...).
+  // At the moment the compiler is not bothered by the fact that Ra and Rb are the same, if that
+  // changes we may need to feed another value into the unused Ra.
+  //
+  // The mapping is as follows:
+  //        | Rc.B0 | Rc.B1 | Rc.B2 | Rc.B3 |
+  //  Rb.B0 |  0x40 |  0x41 |  0x42 |  0x43 |
+  //  Rb.B1 |  0x60 |  0x61 |  0x62 |  0x63 |
+  //  Rb.B2 |  0xb0 |  0xb1 |  0xb2 |  0xb3 |
+  //  Rb.B3 |  0xd0 |  0xd1 |  0xd2 |  0xd3 |
+  //
+  // (70-73 and 80-83 should also be usable in case there's a conflict with any of these)
+
+  asm volatile("lop3.b32 %0, %1, %1, %2, %3;"
+               : "=r"(eltsBf16x2[0])
+               : "r"(elts), "r"(sfE8x4), "n"(0x40 + sfByteIdx));
+  asm volatile("lop3.b32 %0, %1, %1, %2, %3;"
+               : "=r"(eltsBf16x2[1])
+               : "r"(elts), "r"(sfE8x4), "n"(0x60 + sfByteIdx));
+  asm volatile("lop3.b32 %0, %1, %1, %2, %3;"
+               : "=r"(eltsBf16x2[2])
+               : "r"(elts), "r"(sfE8x4), "n"(0xb0 + sfByteIdx));
+  asm volatile("lop3.b32 %0, %1, %1, %2, %3;"
+               : "=r"(eltsBf16x2[3])
+               : "r"(elts), "r"(sfE8x4), "n"(0xd0 + sfByteIdx));
+}
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

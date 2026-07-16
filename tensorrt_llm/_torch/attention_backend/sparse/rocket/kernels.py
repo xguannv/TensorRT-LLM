@@ -6,6 +6,8 @@ from __future__ import annotations
 import math
 
 import torch
+
+from tensorrt_llm._utils import get_sm_version
 import triton
 import triton.language as tl
 import triton.language.core as core
@@ -1138,6 +1140,7 @@ def triton_bmm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        num_warps=8 if get_sm_version() == 107 else 4,
     )
 
     return bmm_results

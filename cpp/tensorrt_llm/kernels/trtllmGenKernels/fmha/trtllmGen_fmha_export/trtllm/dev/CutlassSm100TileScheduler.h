@@ -31,6 +31,11 @@
 #include "cutlass/conv/convnd_problem_shape.hpp"
 #include "cutlass/conv/detail.hpp"
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+#include "cutlass/gemm/kernel/tile_scheduler_detail.hpp"
+#endif
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -38,11 +43,22 @@ namespace trtllm::dev {
 
 using namespace cutlass;
 // clang-format off
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+using cutlass::gemm::kernel::detail::OperandSizeInfo;
+#endif
+// {$nv-internal-release end}
 using cutlass::gemm::kernel::detail::PersistentTileSchedulerSm100Params;
 
 //////////////////// Blackwell Scheduler /////////////////////////
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+template <class ClusterShape_, uint32_t Stages_, bool CageEnabled = false>
+#else
+// {$nv-internal-release end}
 template <class ClusterShape_, uint32_t Stages_>
+#endif // {$nv-internal-release}
 class PersistentTileSchedulerSm100 {
 
 private:
@@ -52,6 +68,7 @@ public:
   using ClusterShape = ClusterShape_;
   using RasterOrder = UnderlyingTileScheduler::RasterOrder;
   using RasterOrderOptions = UnderlyingTileScheduler::RasterOrderOptions;
+  static constexpr bool IsModsEnabled = false; // {$nv-internal-release}
   static constexpr bool IsDynamicPersistent = true;
 
   static constexpr uint32_t Stages = Stages_;
@@ -63,7 +80,13 @@ public:
 
   using WorkTileInfo = typename UnderlyingTileScheduler::WorkTileInfo;
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+  using Params = PersistentTileSchedulerSm100Params<CageEnabled>;
+#else
+// {$nv-internal-release end}
   using Params = PersistentTileSchedulerSm100Params;
+#endif // {$nv-internal-release}
 
   using Pipeline = PipelineCLCFetchAsync<Stages, ClusterShape>;
   using PipelineFullBarrier = typename Pipeline::FullBarrier;
@@ -98,6 +121,7 @@ public:
   // Static Host Methods
   //
 
+  // Used by SM90 kernel layers // {$nv-internal-release}
   template <class ProblemShapeMNKL, class TileShape, class ClusterShape>
   static Params to_underlying_arguments(
     ProblemShapeMNKL problem_shape_mnkl,
@@ -107,6 +131,11 @@ public:
     [[maybe_unused]] Arguments const& args,
     [[maybe_unused]] void* workspace = nullptr,
     [[maybe_unused]] uint32_t NumEpilogueSubTiles = 1,
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+    [[maybe_unused]] OperandSizeInfo const& operand_sizes = {},
+#endif
+// {$nv-internal-release end}
     [[maybe_unused]] uint32_t ktile_start_alignment_count = 1u) {
 
     auto cs = cutlass::detail::select_cluster_shape(ClusterShape_{}, hw_info.cluster_shape);
@@ -119,6 +148,11 @@ public:
                       hw_info,
                       args.max_swizzle_size,
                       args.raster_order
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+                      , operand_sizes
+#endif
+// {$nv-internal-release end}
     );
     return params;
   }
@@ -131,6 +165,11 @@ public:
                                         KernelHardwareInfo const& hw_info,
                                         Arguments const& args,
                                         void* workspace = nullptr
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+                                        , [[maybe_unused]] OperandSizeInfo const& operand_sizes = {}
+#endif
+// {$nv-internal-release end}
   ) {
 
     auto selected_cluster_shape =
@@ -147,6 +186,11 @@ public:
                       hw_info,
                       args.max_swizzle_size,
                       args.raster_order
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+                      , operand_sizes
+#endif
+// {$nv-internal-release end}
     );
     return params;
   }
@@ -165,6 +209,11 @@ public:
     KernelHardwareInfo const& hw_info,
     Arguments const& args,
     void* workspace = nullptr
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+    , OperandSizeInfo const& operand_sizes = {}
+#endif
+// {$nv-internal-release end}
   ) {
 
     auto problem_shape_mnkl = [&]() {
@@ -191,11 +240,17 @@ public:
                                    hw_info,
                                    args,
                                    workspace
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+                                   , operand_sizes
+#endif
+// {$nv-internal-release end}
     );
   }
   // clang-format on
 
   // Given the inputs, computes the physical grid we should launch.
+  // Used by SM90 kernel layers // {$nv-internal-release}
   template <class ProblemShapeMNKL, class BlockShape, class ClusterShape>
   CUTLASS_HOST_DEVICE static dim3 get_grid_shape(Params const& params,
                                                  ProblemShapeMNKL problem_shape_mnk,
@@ -249,6 +304,7 @@ public:
     return grid;
   }
 
+  // Used by SM90 kernel layers // {$nv-internal-release}
   template <class ProblemShape, class ElementAccumulator>
   static size_t get_workspace_size(Arguments const& args,
                                    ProblemShape problem_shape,
@@ -415,6 +471,44 @@ public:
   CUTLASS_DEVICE
   static WorkTileInfo work_tile_info_from_clc_response(uint32_t result_addr) {
     // clang-format off
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+    // Internal-only path that directly accesses and parses the CLC response
+    /*
+      CLCResponse is 16B, little endian  ( bit 0 is LSB )
+      Bits               Contents (if request succeeded)      Contents (if request declined)
+      127..65                     Reserved                           Reserved
+      64                              1                                 0
+      63..48                 Z coordinate of CLC ID                 Reserved
+      47..32                 Y coordinate of CLC ID                 Reserved
+      31..0                  X coordinate of CLC ID                 Decline Reason
+
+      storage                   Bits of 16B response
+      data[3]                         96..127
+      data[2]                         64..95
+      data[1]                         32..63
+      data[0]                         31..0
+    */
+    CLCResponse result;
+    asm volatile(
+      "ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(result.data[0]), "=r"(result.data[1]), "=r"(result.data[2]), "=r"(result.data[3])
+      : "r"(result_addr));
+    cutlass::arch::fence_view_async_shared();
+
+    if (result.data[2] & 1u) {
+      // Set work tile
+      WorkTileInfo work_tile;
+      work_tile.M_idx = result.data[0];
+      work_tile.N_idx = ((result.data[1] & 0x0000FFFFu));
+      work_tile.L_idx = ((result.data[1] & 0xFFFF0000u) >> 16);
+      work_tile.is_valid_tile = true;
+      return work_tile;
+    } else {
+      return WorkTileInfo::invalid_work_tile();
+    }
+#else
+// {$nv-internal-release end}
     WorkTileInfo work_tile_info;
     uint32_t valid = 0;
 
@@ -441,6 +535,7 @@ public:
 #endif
     work_tile_info.is_valid_tile = (valid == 1);
     return work_tile_info;
+#endif // {$nv-internal-release}
     // clang-format on
   }
 
@@ -652,6 +747,31 @@ public:
     FastDivmod divmod_cluster_shape_m,
     FastDivmod divmod_cluster_shape_n) {
     if (raster_order == RasterOrder::AlongN) {
+      // {$nv-internal-release begin}
+      // Determine the current preferred cluster along each of the M and N modes, as
+      // well as the "remainder" offset (which will only be nonzero if we are in a
+      // fallback cluster).
+      //
+      // CLC returns the tile of the first CTA in a cluster. In the case of a cluster
+      // assigned a fallback cluster shape, this may not be divisible by the preferred
+      // cluster shape. For example if preferred cluster shape is 4x1 and fallback cluster
+      // shape is 2x1, a CLC for a returned for a fallback cluster might be (6,0,0).
+      // We want to determine that this CLC is in preferred cluster 1 with a remainder
+      // of 2. It is in preferred cluster 1 since 6 / 4 = 1. It has a remainder of 2 because
+      // 6 % 4 = 2.
+      //
+      // We then use the preferred cluster ID and remainder to calculate the tile that should
+      // be used in the transposed CLC.
+      //
+      // Considering the example above with 4x1 preferred cluster shape and 2x1 fallback cluster
+      // shape, if we receive a CLC of (6, 3):
+      //   cluster_id_m = 6 // 4 = 1
+      //    remainder_m = 6 % 4  = 2
+      //   cluster_id_n = 3 // 1 = 3
+      //    remainder_n = 3 % 1  = 0
+      //   new_clc_m = cluster_id_n * 4 + remainder_m = 3 * 4 + 2 = 14
+      //   new_clc_n = cluster_id_m * 1 + remainder_n = 1 * 1 + 0 = 1
+      // {$nv-internal-release end}
       int cluster_m, remainder_m, cluster_n, remainder_n;
       divmod_cluster_shape_m(cluster_m, remainder_m, M_idx);
       divmod_cluster_shape_n(cluster_n, remainder_n, N_idx);
@@ -690,15 +810,39 @@ public:
     int orig_cta_coord_n = cta_coord_n;
 #endif
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+    if constexpr (CageEnabled) {
+#endif
+      // {$nv-internal-release end}
       // Swizzling is enabled if the swizzle size is greater than 0
       if (params_.divmod_swizzle_size_.divisor > 0) {
         //
         // Swizzling enabled
         //
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+        // Mark this as a cold block to improve performance for the case in which CAGE is
+        // dynamically turned off. Code-gen-level performance optimizations for that setting are
+        // preferred because CAGE is typically dynamically turned off for small problem sizes for
+        // which additional branches and code bloat will more significantly impact performance.
+        //
+        // In contrast, when CAGE is enabled, one is typically more limited by memory bandwidth, and
+        // code-gen inefficiency is less likely to negate the performance benefits that come from
+        // CAGE.
+        ColdBlockKnobScopeGuard cold_block_scope_guard;
+#endif
+        // {$nv-internal-release end}
 
         // Swizzling is performed in terms of clusters. Convert the major and minor CTA coordinates
         // into cluster coordinates.
+        // {$nv-release-never begin}
+        // Since CLC rasterizes along the x mode of the grid first, we place the major mode
+        // of our problem in the grid's x mode. Thus, we retrieve the major offset via cta_coord_m
+        // and the minor offset via cta_coord_n. Transposition is performed at the end of the
+        // swizzling scheduling block for cases in which we rasterize along the N mode.
+        // {$nv-release-never end}
         int32_t cluster_coord_major, cluster_coord_minor, cluster_offset_m, cluster_offset_n;
         params_.divmod_cluster_shape_m_(cluster_coord_major, cluster_offset_m, cta_coord_m);
         params_.divmod_cluster_shape_n_(cluster_coord_minor, cluster_offset_n, cta_coord_n);
@@ -758,6 +902,15 @@ public:
 
         int32_t major_clusters = params_.divmod_cluster_shape_m_.divide(gridDim.x);
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+        // Continuous rasterization
+        if (minor_div_swizz % 2 == 1) {
+          cluster_coord_major = major_clusters - cluster_coord_major - 1;
+          minor_mod_swizz = params_.divmod_swizzle_size_.divisor - minor_mod_swizz - 1;
+        }
+#endif
+        // {$nv-internal-release end}
 
         // Determine the first IDs in the major and minor mode that constitute "residual" space
         int32_t major_clusters_div_swizzle = params_.divmod_swizzle_size_.divide(major_clusters);
@@ -786,6 +939,11 @@ public:
         cta_coord_m = new_major_coord * params_.divmod_cluster_shape_m_.divisor + cluster_offset_m;
         cta_coord_n = new_minor_coord * params_.divmod_cluster_shape_n_.divisor + cluster_offset_n;
       }
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+    } // if constexpr (CageEnabled)
+#endif
+    // {$nv-internal-release end}
 
     // Since we swap the grid x and y modes if raster order is AlongN, swap the M and N tile offsets
     // when raster order is AlongN.

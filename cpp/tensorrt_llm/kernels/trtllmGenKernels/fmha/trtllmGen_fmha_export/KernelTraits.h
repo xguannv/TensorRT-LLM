@@ -169,6 +169,14 @@ struct KernelConfig : public KernelConfigBase {
     }
 
     // The data type of softmax computation.
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mFp16Softmax) {
+      // E4m3 kernels will also use Fp16 for softmax computation.
+      mDtypeSoftmax = (mDtypeQ == tg::Dtype::Bfloat16) ? tg::Dtype::Bfloat16 : tg::Dtype::Fp16;
+    }
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
 
     // The maximum headDim for K and V.
     mMaxHeadDimKv = std::max(mHeadDimQk, mHeadDimV);
@@ -284,10 +292,25 @@ struct KernelConfig : public KernelConfigBase {
       }
     } else {
 
+      // {$nv-internal-release begin}
+      // TODO (perkzz): Rubin has more smem size, which might need to fine-tune numStagesKv for all
+      // kernels.
+      // {$nv-internal-release end}
 
       // If dtypeQ != dtypeKv, the kv elements will be converted to dtypeQ in smemTransformedKv,
       // so the number of stages will be computed based on dtypeQ.
       mNumStagesKv = 3;
+// {$nv-internal-release begin}
+// Set numStagesKv for rubin numInstsQ = 2 kernels.
+#ifdef TLLM_RUBIN_FEATURES
+      if (isArchRubin(options.mCudaArch) && mNumInstsQ == 2) {
+        // Rubin needs a deeper KV pipeline to hide memory latency. Six stages cover the
+        // long-sequence decode cases better than the 96KB smem budget heuristic while preserving
+        // the intended occupancy.
+        mNumStagesKv = 6;
+      }
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
 
       // When the headDim is not split into multiple stages, we can use at most 4 stages for e4m3
       // data type.
@@ -296,6 +319,13 @@ struct KernelConfig : public KernelConfigBase {
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
         TLLM_CHECK_ERROR(options.mSeparateSmemKv, "Not supported");
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+        // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+        if (tg::isArchRubin(options.mCudaArch)) {
+          mNumStagesKv = int32_t{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+        }
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
       } else if (keepsMmaAbForDsMlaGen) {
         // For DS MLA-generation kernels with keepsMmaAb, allocate at most 112 KiB shared memory for
         // 2-CTA mode and 128 KiB shared memory for 1-CTA mode. This preserves the previous stage
@@ -365,6 +395,13 @@ struct KernelConfig : public KernelConfigBase {
 
     // Set the number of tmem cols we will allocate once.
     mNumTmemCols = 512;
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (isArchRubin(options.mCudaArch)) {
+      mNumTmemCols = 576;
+    }
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     // Set the softmax statistics tile size.
     mTileSizeStats = 32;
     // Set epilogue tile sizes for each instance in the M dimension.
@@ -568,6 +605,14 @@ struct MmaTraits {
     // The Atom Mma for Q * K^T.
     mAtomQkM = options.mSwapsMmaAb ? options.mTileSizeKv : options.mTileSizeQ;
     mAtomQkN = options.mSwapsMmaAb ? options.mTileSizeQ : options.mTileSizeKv;
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    // For QMMAs with K=64, the M dimension must be 128 for 1cta mode and 256 for 2cta mode.
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkM == 128) {
+      mAtomQkK = isMma8BitBmm1 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     {
       mAtomQkK = isMma8BitBmm1 ? 32 : 16;
     }
@@ -619,6 +664,13 @@ struct MmaTraits {
     }
 
     // The K dimension.
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomPvM == 128) {
+      mAtomPvK = isMma8BitBmm2 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     {
       mAtomPvK = isMma8BitBmm2 ? 32 : 16;
     }
@@ -788,6 +840,15 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     // Make sure the two MMAs consume the same K width in bits.
     int32_t bmm1KBits = mAtomQkK * tg::dtypeGetNumBits(mDtypeBmm1);
     int32_t bmm2KBits = mAtomPvK * tg::dtypeGetNumBits(mDtypeBmm2);
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    // For Rubin, the K dimension of BMM1 and BMM2 can be different.
+    if (tg::isArchRubin(options.mCudaArch)) {
+      TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits || (mAtomQkK == 64 || mAtomPvK == 64),
+                       "BMM1-K and BMM2-K must have equal K width in bits or one of them is 64.");
+    } else
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
     {
       // For other architectures, the K width in bits of BMM1 and BMM2 must be the same.
       TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits,
@@ -830,6 +891,13 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The HW is designed to have NumEltsIn128B elements consumed by 4 UTC?Mmas in the K
     // dimension.
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkK == 64) {
+      TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 2, "Internal error");
+    } else
+#endif // TLLM_RUBIN_FEATURES
+    // {$nv-internal-release end}
     {
       TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 4, "Internal error");
     }
@@ -1092,7 +1160,7 @@ inline KernelTraits getKernelTraitsFromOptions(FmhaOptions_ const& options) {
 // [...................................FullTmem.....................................................]
 // [.......TmemS0........][.......TmemS1........][TmemP0][TmemP1][.....TmemO0.....][.....TmemO1.....]
 // [TmemStat0]            [TmemStat1]
-// 
+//
 // If mSeparateTmemColsForSAndP and mSeparateTmemColsForSAndStats are both true:
 // [...................................FullTmem.....................................................]
 // [..TmemS0..][..TmemS1..][TmemStat0][TmemStat1][..TmemP0..][..TmemP1..][...TmemO0...][...TmemO1...]
@@ -1257,9 +1325,9 @@ inline int32_t getTmemAllocationTransformedKv(KernelTraits traits) {
 // different rows (across the rows is only supported when tileSizeQ = 64).
 // clang-format off
 // Layout example:
-// stage0: [row0,  col0-127] 
-// stage1: [row0,  col128-255] 
-// stage2: [row16, col0-127] 
+// stage0: [row0,  col0-127]
+// stage1: [row0,  col128-255]
+// stage2: [row16, col0-127]
 // stage3: [row16, col128-255]
 // clang-format on
 

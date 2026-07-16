@@ -55,3 +55,5 @@ class SparseRuntimeParams:
     threshold_scale_factor_prefill: float = 0.0
     # SkipSoftmax decode threshold; diffusion models leave it at zero.
     threshold_scale_factor_decode: float = 0.0
+    # Context-phase spcompress (SM107 only).
+    uses_spcompress: bool = False

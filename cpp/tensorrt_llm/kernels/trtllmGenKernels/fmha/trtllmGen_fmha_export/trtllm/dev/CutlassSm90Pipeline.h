@@ -30,6 +30,11 @@
 #include "cutlass/detail/dependent_false.hpp"
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 
+// {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+#include "cutlass/cuda_ptx_global_knobs.h"
+#endif
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -285,6 +290,11 @@ private:
   void producer_acquire(uint32_t stage, uint32_t phase, cutlass::ProducerToken barrier_token) {
     cutlass::detail::pipeline_check_is_producer(params_.role);
     if (barrier_token != cutlass::BarrierStatus::WaitDone) {
+// {$nv-internal-release begin}
+#if not defined(TLLM_PUBLIC_RELEASE) && (__CUDA_ARCH__ <= 1000)
+      cutlass::ColdBlockKnobScopeGuard cold_block_scope_guard;
+#endif
+      // {$nv-internal-release end}
       empty_barrier_ptr_[stage].wait(phase);
     }
 
@@ -373,6 +383,11 @@ private:
   void consumer_wait(uint32_t stage, uint32_t phase, cutlass::ConsumerToken barrier_token) {
     cutlass::detail::pipeline_check_is_consumer(params_.role);
     if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+// {$nv-internal-release begin}
+#if not defined(TLLM_PUBLIC_RELEASE) && __CUDA_ARCH__ <= 1000
+      cutlass::ColdBlockKnobScopeGuard cold_block_scope_guard;
+#endif
+      // {$nv-internal-release end}
       full_barrier_ptr_[stage].wait(phase);
     }
   }
@@ -585,6 +600,11 @@ private:
     cutlass::detail::pipeline_check_is_consumer(params_.role);
     bool done = full_barrier_ptr_[stage].test_wait(phase);
     if (!done) {
+// {$nv-internal-release begin}
+#if not defined(TLLM_PUBLIC_RELEASE) && __CUDA_ARCH__ < 1000
+      cutlass::ColdBlockKnobScopeGuard cold_block_scope_guard;
+#endif
+      // {$nv-internal-release end}
       full_barrier_ptr_[stage].wait(phase);
     }
   }
@@ -593,6 +613,11 @@ private:
   void consumer_wait(uint32_t stage, uint32_t phase, cutlass::ConsumerToken barrier_token) {
     cutlass::detail::pipeline_check_is_consumer(params_.role);
     if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+// {$nv-internal-release begin}
+#if not defined(TLLM_PUBLIC_RELEASE) && __CUDA_ARCH__ < 1000
+      cutlass::ColdBlockKnobScopeGuard cold_block_scope_guard;
+#endif
+      // {$nv-internal-release end}
       full_barrier_ptr_[stage].wait(phase);
     }
   }
@@ -674,6 +699,74 @@ public:
     init_barriers(&storage.barrier_[0][0], params);
   }
 
+  // {$nv-release-never begin}
+  // In support of Grafia runtime, a user can decide whether to initialize barrier in the
+  // constructor. Therefore, a reloaded constructor is provided for all pipeline classes that Grafia
+  // needs. In order to minimize changes of the default constructor, some of the constructor codes
+  // are duplicated
+
+  // Different from CUTLASS that manages cross-tile scheduling,
+  // Grafia manages cross-task scheduling, so it is necessary for CUTLASS
+  // to restore all its internal stage status during execution.
+  // Since stage_ is a private variable of the OrderedSequenceBarrier class,
+  // we provide a new member function to export the stage information.
+  struct GrafiaPipelineState {
+    cutlass::PipelineState<SequenceDepth> grafia_pipeline_stage;
+  };
+
+  CUTLASS_DEVICE
+  GrafiaPipelineState export_grafia_state() {
+    GrafiaPipelineState state;
+    state.grafia_pipeline_stage = stage_;
+    return state;
+  }
+
+  template <class InitBarriers, class GrafiaPipelineState = void>
+  CUTLASS_DEVICE OrderedSequenceBarrier(Barrier* barrier_ptr,
+                                        Params const& params,
+                                        InitBarriers = cute::true_type{},
+                                        GrafiaPipelineState grafia_pipeline_state = {})
+    : params_(params)
+    , barrier_ptr_(barrier_ptr) {
+
+    // Group 0 - starts with an opposite phase
+    if constexpr (!cute::is_same_v<GrafiaPipelineState, void>) {
+      stage_ = grafia_pipeline_state.grafia_pipeline_stage;
+    } else {
+      stage_ = {0, params.group_id == 0, 0};
+    }
+    int warp_idx = cutlass::canonical_warp_idx_sync();
+
+    static_assert(cute::is_same_v<InitBarriers, cute::true_type> ||
+                  cute::is_same_v<InitBarriers, cute::false_type>);
+
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+
+#if (__CUDA_ARCH__ >= 1000)
+      if (warp_idx == params.initializing_warp) {
+        init_barriers(barrier_ptr_, params);
+      }
+#else
+      int lane_predicate = cute::elect_one_sync();
+      if (warp_idx == params.initializing_warp && lane_predicate) {
+        init_barriers(barrier_ptr_, params);
+      }
+#endif
+      cutlass::arch::fence_barrier_init();
+    }
+  }
+
+  template <class InitBarriers, class GrafiaPipelineState = void>
+  CUTLASS_DEVICE OrderedSequenceBarrier(SharedStorage& storage,
+                                        Params const& params,
+                                        InitBarriers = cute::true_type{},
+                                        GrafiaPipelineState grafia_pipeline_state = {})
+    : OrderedSequenceBarrier(&storage.barrier_[0][0],
+                             params,
+                             InitBarriers{},
+                             grafia_pipeline_state) {}
+
+  // {$nv-release-never end}
   template <typename InitBarriers = cute::true_type>
   CUTLASS_DEVICE OrderedSequenceBarrier(Barrier* barrier_ptr,
                                         Params const& params,

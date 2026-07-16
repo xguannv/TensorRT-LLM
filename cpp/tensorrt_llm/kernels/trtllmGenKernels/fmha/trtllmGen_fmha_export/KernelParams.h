@@ -547,6 +547,13 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrSkipSoftmaxStats,
                          params.ptrSoftmaxStats,
                          params.ptrDebugO,
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+                         params.ptrInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
                          params.mScaleSoftmaxLog2,
                          params.mInflateMax,
                          params.mScaleSfKv,
@@ -595,6 +602,13 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int* skipSoftmaxStatsPtrD,
                                     float2* softmaxStatsD,
                                     void* oDebugPtrD,
+// {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+                                    void* ptrInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+       // {$nv-internal-release end}
                                     float softmaxScale,
                                     float inflateMax,
                                     float kvSfScale,
@@ -826,6 +840,13 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // The sequence lengths for K/V.
   params.ptrSeqLensKv = seqLensKvPtrD;
 
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+  params.ptrInvalidate = ptrInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
 
   params.mAttentionWindowSize = options.mAttentionWindowSize;
   if (options.mChunkedAttentionSize > 0) {

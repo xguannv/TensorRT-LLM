@@ -1085,9 +1085,9 @@ using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
 static std::shared_ptr<AttentionOp> get_attention_op(
-    RunnerPtr const& runner, std::shared_ptr<AttentionOp>& op, int64_t local_layer_idx)
+    RunnerPtr const& runner, std::shared_ptr<AttentionOp>& op, int64_t local_layer_idx, int64_t const ugpuId)
 {
-    auto cache_key = std::make_tuple(op->data(), runner->data());
+    auto cache_key = std::make_tuple(op->data(), runner->data(), ugpuId);
     using CacheKey = decltype(cache_key);
     static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, OpCustomHash<CacheKey>> op_cache;
     static std::shared_mutex op_cache_mutex;
@@ -1151,13 +1151,15 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
-    int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
+    std::optional<bool> uses_spcompress, int64_t sage_attn_num_elts_per_blk_q,
+    int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8,
+    int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens, int64_t const ugpu_id,
+    std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
+    bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
+    std::optional<int64_t> const max_num_sequences,
     std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
@@ -1360,7 +1362,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
-                  || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 120)
+                  || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 107
+                  || tensorrt_llm::common::getSMVersion() == 120)
             && op->mKVCacheQuantMode.hasFp8KvCache();
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
@@ -1378,7 +1381,17 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             = chunked_prefill_buffer_batch_size.has_value() ? chunked_prefill_buffer_batch_size.value() : 1;
     }
 
-    op = get_attention_op(runner, op, local_layer_idx);
+    op->mUsesSpcompress = uses_spcompress.value_or(false);
+    if (op->mUsesSpcompress)
+    {
+        int const smVersion = tensorrt_llm::common::getSMVersion();
+        TORCH_CHECK(smVersion == 107,
+            "Spcompress is only supported on GPUs with SM107 (Rubin) architecture. Got SM version: ", smVersion);
+        TORCH_CHECK(
+            op->mFP8ContextFMHA || op->mFP8ContextMLA, "mUsesSpcompress requires FP8 context FMHA or FP8 context MLA.");
+    }
+
+    op = get_attention_op(runner, op, local_layer_idx, ugpu_id);
 
     int32_t const num_seqs = host_context_lengths.size(0);
     RequestType const* request_types = static_cast<RequestType const*>(host_request_types.data_ptr());

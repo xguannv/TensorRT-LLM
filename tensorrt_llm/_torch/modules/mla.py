@@ -986,6 +986,42 @@ class MLA(nn.Module):
                 latent_cache=latent_cache_gen,
             )
 
+    def _use_kvbproj_strided_out(self) -> bool:
+        """Whether context KV expansion can write directly into strided outputs.
+
+        This requires an SM100-family GPU and an unquantized BF16 kv_b_proj
+        without bias. Other configurations retain the wide-GEMM path.
+        """
+        if not is_sm_100f():
+            return False
+        weight = getattr(self.kv_b_proj, "weight", None)
+        return (
+            weight is not None
+            and weight.dtype == torch.bfloat16
+            and self.kv_b_proj.bias is None
+        )
+
+    def _get_kvbproj_head_weights(self):
+        """Return cached per-head [H, N, K] views of kv_b_proj.weight."""
+        cached = getattr(self, "_kvbproj_head_weights_cache", None)
+        weight = self.kv_b_proj.weight
+        if cached is not None and cached[0] is weight:
+            return cached[1], cached[2]
+
+        nope_rows = self.num_heads_tp * self.qk_nope_head_dim
+        weight_k = weight[:nope_rows].view(
+            self.num_heads_tp,
+            self.qk_nope_head_dim,
+            self.kv_lora_rank,
+        )
+        weight_v = weight[nope_rows:].view(
+            self.num_heads_tp,
+            self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        self._kvbproj_head_weights_cache = (weight, weight_k, weight_v)
+        return weight_k, weight_v
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -997,20 +1033,54 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dense MHA context path: expand KV via kv_b_proj and run attention."""
-        kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
-        )
-
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
-        maybe_compiled_copy_(
-            k[..., : self.qk_nope_head_dim],
-            k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
-        )
+        if self._use_kvbproj_strided_out():
+            num_tokens = compressed_kv.shape[0]
+            weight_k, weight_v = self._get_kvbproj_head_weights()
+            compressed_kv_batched = compressed_kv.unsqueeze(0).expand(
+                self.num_heads_tp,
+                num_tokens,
+                self.kv_lora_rank,
+            )
+
+            k_nope_out = k[..., : self.qk_nope_head_dim].transpose(0, 1)
+            nope_cols = self.num_heads_tp * self.qk_nope_head_dim
+            v_cols = self.num_heads_tp * self.v_head_dim
+            kv_buffer = torch.empty(
+                num_tokens,
+                nope_cols + v_cols,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            v = kv_buffer[:, nope_cols:]
+            v_out = v.unflatten(
+                -1,
+                (self.num_heads_tp, self.v_head_dim),
+            ).transpose(0, 1)
+
+            torch.ops.trtllm.bmm_out(
+                compressed_kv_batched,
+                weight_k.transpose(1, 2),
+                k_nope_out,
+            )
+            torch.ops.trtllm.bmm_out(
+                compressed_kv_batched,
+                weight_v.transpose(1, 2),
+                v_out,
+            )
+        else:
+            kv = self.kv_b_proj(compressed_kv)
+            k_nope, v = kv.split(
+                [
+                    self.num_heads_tp * self.qk_nope_head_dim,
+                    self.num_heads_tp * self.v_head_dim,
+                ],
+                -1,
+            )
+            maybe_compiled_copy_(
+                k[..., : self.qk_nope_head_dim],
+                k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
+            )
         # When rope_fusion=True (apply_rotary_emb=False), the rope portion
         # of k is left uninitialized here; the fused attention kernel
         # handles k_pe RoPE via latent_cache instead.
@@ -1385,9 +1455,14 @@ class MLA(nn.Module):
         )
 
     def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
-        """BMM with optional CuTe DSL bf16 acceleration on Blackwell."""
+        """BMM with optional CuTe DSL bf16 acceleration on Blackwell/Rubin."""
         if self.use_cute_dsl_bf16_bmm and is_sm_100f():
-            torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(a, b_no_transpose, output)
+            bf16_bmm_op = (
+                torch.ops.trtllm.cute_dsl_bf16_bmm_rubin
+                if get_sm_version() == 107
+                else torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell
+            )
+            bf16_bmm_op(a, b_no_transpose, output)
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 

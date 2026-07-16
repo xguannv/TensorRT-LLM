@@ -86,6 +86,46 @@ public:
     uint64_t cta_m_in_cluster,
     uint64_t cta_n_in_cluster) {
 
+    // {$nv-release-never begin}
+    //
+    // This could be changed to get_hier_coord with FastDivmodU64s
+    //
+    // The underlying approach is:
+    // We have our blocks which we rasterize in a given direction
+    //    e.g., (M, N) : (1, M)
+    // We then tile this with our CGA
+    //    e.g., for a 2x2 CGA the shape is ((M / 2, 2), (N / 2, 2))
+    //
+    // Finally we interleave blocks
+    //    e.g., for a 1x1 CGA we may have (M, (2, N / 2)) : (N, (1, M * 2))
+    //          This is M major interleaved
+    //
+    // To get from our linear index (blk_per_grid_dim) to our coordinates
+    // we do the following:
+    //
+    // Calculate the cluster_id within the grid:
+    //    cluster_id = linear index / CGA size major
+    //    cluster_major_offset = linear index % CGA size major
+    // This gives us the cluster we are operating in and the offset within it
+    // We also know based on the way we launch the grid that our cluster minor
+    // offset is blockIdx.x or blockIdx.y since we only launch CGA_M or CGA_N
+    // CTAs in that dimension of the grid.
+    //
+    // Next we can calculate the cluster minor index and cluster major index
+    // First we calculate our swizzle offset, which is
+    //   offset_into_swizzle = cluster_id % (2 ^ log_swizzle_size)
+    //   extra = cluster_id / 2^log_swizzle_size
+    // Then we get our minor index divided by the swizzle and our major index
+    //   cluster_idx_minor_div_swizzle = extra /
+    //       (Problem Size in Major Dimension / CGA size in Major Dimension)
+    //   cluster_idx_major = extra %
+    //       (Problem Size in Major Dimension / CGA size in Major Dimension)
+    // Then we calculate the minor index from the swizzle
+    //   cluster_idx_minor = cluster_idx_minor_div_swizzle * 2^log_swizzle_size + offset
+    // We can then get the index by multiplying the indexes by the cluster shape and adding
+    // our offsets
+    //
+    // {$nv-release-never end}
 
     uint64_t cluster_id, cluster_major_offset = 0, cluster_minor_offset = 0;
     divmod_cluster_shape_major(cluster_id, cluster_major_offset, blk_per_grid_dim);

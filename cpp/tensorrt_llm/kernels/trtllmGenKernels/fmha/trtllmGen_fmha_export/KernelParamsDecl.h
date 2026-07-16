@@ -72,6 +72,15 @@ struct KernelParams {
   float* ptrDsv4OScaleFp32;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
+  // {$nv-internal-release begin}
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+  // The output pointer for invalidation used only to test the Lamport producer feature. This has
+  // the same data type and shape as ptrO and will be filled with the invalid sentinel value.
+  void* ptrInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+  // {$nv-internal-release end}
   // The counter for the multiCtasKv mode.
   int32_t* ptrMultiCtasKvCounter;
   // The device output scale for FP8 quantization. Only needed by trt-llm fp8 kernels as the sca-

@@ -60,7 +60,7 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
         auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
         mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV,
             mFixedParams.dataTypeOut, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
-            mFixedParams.sageBlockSizeV, mFixedParams.fusesDsv4InvRopeFp8Quant));
+            mFixedParams.sageBlockSizeV));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -147,6 +147,7 @@ bool FmhaDispatcher::isSupported()
             // Generation-style kernels on long KV can pick MultiCtasKv cubins
             tllmRunnerParams.mMultiCtasKvMode = true;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
@@ -303,6 +304,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.multiCtasKvScratchPtr = runnerParams.multiCtasKvScratchPtr;
             tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
         }
+        tllmRunnerParams.mUsesSpcompress = mFixedParams.useSpcompress;
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

@@ -25,7 +25,15 @@
 #include "CutlassSm90TileScheduler.h"
 #include "CutlassSm100TileScheduler.h"
 
+#ifdef TLLM_PUBLIC_RELEASE                  // {$nv-internal-release}
+#ifdef TLLM_RUBIN_FEATURES                  // {$nv-internal-release}
+#include <cuda_ptx/cuda_ptx_public_rubin.h> // {$nv-internal-release}
+#else                                       // {$nv-internal-release}
 #include <cuda_ptx/cuda_ptx.h>
+#endif                                  // {$nv-internal-release}
+#else                                   // {$nv-internal-release}
+#include <cuda_ptx/cuda_ptx_internal.h> // {$nv-internal-release}
+#endif                                  // {$nv-internal-release}
 
 #include "Utils.h"
 
@@ -500,6 +508,13 @@ public:
     , mPipeline(
         reinterpret_cast<typename Pipeline::Barrier*>(barrierPtr),
         /* params */ mParams
+  // {$nv-internal-release begin}
+#ifndef TLLM_PUBLIC_RELEASE
+        ,
+        /* InitBarriers */ cute::false_type{},
+        /* grafia_pipeline_state */ typename Pipeline::GrafiaPipelineState{{0, group_id == 0, 0}}
+#endif // TLLM_PUBLIC_RELEASE
+       // {$nv-internal-release end}
       ) {
     static_assert(cute::is_same_v<InitBarriers, cute::true_type> ||
                   cute::is_same_v<InitBarriers, cute::false_type>);
@@ -1062,7 +1077,8 @@ public:
                                                          ClusterShape clusterShape,
                                                          InitBarriers = {},
                                                          InitMasks = {},
-                                                         int32_t barInitWarpId = 0)
+                                                         int32_t barInitWarpId = 0,
+                                                         uint16_t customReleaseMask = 0)
     : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
                 reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{transactionBytes,
@@ -1077,6 +1093,7 @@ public:
                 clusterShape,
                 InitMasks{}}
     , mBlockIdMask{0}
+    , mCustomReleaseMask{customReleaseMask}
     , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
       if (warpId == barInitWarpId) {
@@ -1115,7 +1132,9 @@ public:
     // Override the original consumer_release to use the umma_peer_mask instead of multicast mask.
     uint64_t* smemPtr = reinterpret_cast<uint64_t*>(&mEmptyBarrierPtr[state.index()]);
     if constexpr (IsMma2Sm) {
-      cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr, mBlockIdMask);
+      cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr,
+                                                 mCustomReleaseMask == 0 ? mBlockIdMask
+                                                                         : mCustomReleaseMask);
     } else {
       cutlass::arch::umma_arrive(smemPtr);
     }
@@ -1169,6 +1188,8 @@ private:
   Pipeline mPipeline;
   // The blockId mask.
   uint16_t mBlockIdMask;
+  // The custom release mask. Zero keeps the default peer mask.
+  uint16_t mCustomReleaseMask;
   // The empty barrier pointer.
   EmptyBarrier* mEmptyBarrierPtr;
   // Does it use 2CTA UTCMMA ?
@@ -1207,7 +1228,9 @@ public:
                                                               ClusterShape clusterShape,
                                                               InitBarriers = {},
                                                               InitMasks = {},
-                                                              int32_t barInitWarpId = 0)
+                                                              int32_t barInitWarpId = 0,
+                                                              uint16_t customReleaseMask = 0,
+                                                              uint16_t customTmaMbarMask = 0)
     : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
                 reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 warpId,
@@ -1222,11 +1245,28 @@ public:
                        barInitWarpId},
                 clusterShape,
                 InitBarriers{},
-                InitMasks{}} {}
+                InitMasks{}}
+    , mCustomReleaseMask{customReleaseMask}
+    , mCustomTmaMbarMask{customTmaMbarMask}
+    , mFullBarrierPtr{reinterpret_cast<FullBarrier*>(fullBarrierPtr)}
+    , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)}
+    , mTransactionBytes{transactionBytes}
+    , mIsProducerWarp{warpId == barInitWarpId}
+    , mIsProducerCta{size(clusterShape) == 1 ||
+                     (cute::block_id_in_cluster().x % cute::size<0>(AtomThrShapeMNK{}) == 0)} {}
 
   // Consumer release the barrier.
   inline __device__ void consumer_release(PipelineState const& state) {
-    mPipeline.consumer_release(state);
+    if constexpr (IsMma2Sm) {
+      if (mCustomReleaseMask != 0) {
+        uint64_t* smemPtr = reinterpret_cast<uint64_t*>(&mEmptyBarrierPtr[state.index()]);
+        cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr, mCustomReleaseMask);
+      } else {
+        mPipeline.consumer_release(state);
+      }
+    } else {
+      mPipeline.consumer_release(state);
+    }
   }
 
   // Consumer try to wait at the barrier..
@@ -1245,7 +1285,23 @@ public:
   // Arrive the producer barrier with the transaction_bytes at the same time.
   inline __device__ void producer_acquire(PipelineState const& state, int32_t t = int32_t{0}) {
     cutlass::ProducerToken token = reinterpret_cast<cutlass::ProducerToken const&>(t);
-    mPipeline.producer_acquire(state, token);
+    if constexpr (IsMma2Sm) {
+      if (mCustomTmaMbarMask != 0) {
+        if (token == cutlass::BarrierStatus::WaitAgain) {
+          mEmptyBarrierPtr[state.index()].wait(state.phase());
+        }
+
+        uint32_t const laneIdx = cutlass::canonical_lane_idx();
+        uint32_t const laneMask = laneIdx < 16 ? (uint32_t{1} << laneIdx) : 0;
+        uint32_t const pred = static_cast<uint32_t>(
+          mIsProducerWarp && mIsProducerCta && ((uint32_t{mCustomTmaMbarMask} & laneMask) != 0));
+        mFullBarrierPtr[state.index()].arrive_and_expect_tx(mTransactionBytes, laneIdx, pred);
+      } else {
+        mPipeline.producer_acquire(state, token);
+      }
+    } else {
+      mPipeline.producer_acquire(state, token);
+    }
   }
 
   // Producer arrive at the barrier. It does nothing.
@@ -1275,6 +1331,16 @@ public:
 private:
   // The pipeline.
   Pipeline mPipeline;
+  // The custom release mask. Zero keeps the wrapped pipeline release behavior.
+  uint16_t mCustomReleaseMask;
+  // The full-barrier mask that mirrors the TMALDG mbarrier multicast targets.
+  uint16_t mCustomTmaMbarMask;
+  FullBarrier* mFullBarrierPtr;
+  EmptyBarrier* mEmptyBarrierPtr;
+  uint32_t mTransactionBytes;
+  bool mIsProducerWarp;
+  bool mIsProducerCta;
+  static constexpr bool IsMma2Sm = cute::size(AtomThrShapeMNK{}) > 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1744,6 +1810,568 @@ private:
   Pipeline mPipeline;
 };
 
+// {$nv-internal-release begin}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// *************************************************************************************************
+// PipelineNonBlockingState class.
+// *************************************************************************************************
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <uint32_t Stages_> struct PipelineNonBlockingState {
+  // Number of stages in pipeline.
+  static constexpr int32_t Stages = Stages_;
+  // Mask of stages being used.
+  static constexpr uint32_t StageMask = (0b1 << Stages) - 1;
+  // Use of 32-bit wide bit-vectors limits number of stages.
+  static_assert(Stages <= 32, "Number of stages for non-blocking pipeline must be less than 32");
+  // Bit-vector with conditional phases for each stage.
+  uint32_t mConditionalPhases{0};
+  // Bit-vector with isReserved state for each stage.
+  uint32_t mIsReserved{0};
+  // Ending value for loop iteration.
+  int32_t mLoopEnd{0};
+  // Number of loop iterations.
+  int32_t mLoopIterations{0};
+  // Explicitly store the offset for each stage, thread x stores offset for stage x
+  int32_t mLoopOffset;
+  // Starting value for loop iteration.
+  int32_t mLoopStart{0};
+  // Step size for loop.
+  int32_t mLoopStep{0};
+  // Bit-vector with primary phases for each stage.
+  uint32_t mPrimaryPhases{0};
+  // Step size for overall pipeline.
+  int32_t const mPipelineStep{0};
+  // Bit-vector with stageComplete state for each stage.
+  uint32_t mStageComplete{0};
+  // Stage offset for this workId (used for persistent kernels)
+  int32_t mWorkIdOffset{0};
+  // The lane of the thread.
+  int32_t mLaneId{threadIdx.x % 32};
+
+  __device__ inline PipelineNonBlockingState(int32_t const loopStart,
+                                             int32_t const loopEnd,
+                                             int32_t const loopStep)
+    : mConditionalPhases(StageMask)
+    , mIsReserved(0)
+    , mLoopEnd(loopEnd)
+    , mLoopIterations((loopEnd - loopStart) / loopStep)
+    , mLoopStart(loopStart)
+    , mLoopStep(loopStep)
+    , mPrimaryPhases(StageMask)
+    , mPipelineStep{Stages * mLoopStep}
+    , mStageComplete(0)
+    , mWorkIdOffset(0) {
+
+    mLoopOffset = mLoopStart + mLoopStep * mLaneId;
+    updateStageComplete();
+  }
+
+  // Returns if all stages have finished work.
+  __device__ inline uint32_t allStageComplete() const { return (mStageComplete == StageMask); }
+
+  // Returns the conditional phase for the given stage.
+  __device__ inline uint32_t conditionalPhase(int32_t const index) const {
+    return (mConditionalPhases >> index) & 0b1;
+  }
+
+  // Flips the primary phase.
+  __device__ inline void flipPrimary(int32_t const index) { mPrimaryPhases ^= (0b1 << index); }
+
+  // Returns the next stage index.
+  __device__ inline int32_t getNextStageIndex(int32_t index) const {
+    index++;
+    if (index == Stages) {
+      index = 0;
+    }
+    return index;
+  }
+
+  // Returns if this is the first iteration for this stage.
+  __device__ inline int32_t isFirstIter(int32_t const index) const {
+    return offset(index) == mLoopStep * index;
+  }
+
+  // Returns if the current stage is reserved. A stage is reserved if the destination resource has
+  // been acquired and any required source resources have been waited on.
+  __device__ inline uint32_t isReserved(int32_t const index) const {
+    return (mIsReserved >> index) & 0b1;
+  }
+
+  // Returns if a stage has completed all its tiles.
+  __device__ inline uint32_t isStageComplete(int32_t const index) const {
+    return (mStageComplete >> index) & 0b1;
+  }
+
+  // Returns the offset for the given stage.
+  __device__ inline int32_t offset(int32_t const index) const {
+    int32_t currentOffset;
+    // Use redux to get offset from thread corresponding to current stage.
+    asm("redux.sync.or.b32 %0, %1, 0xffffffff;\n"
+        : "=r"(currentOffset)
+        : "r"(mLoopOffset * (index == mLaneId)));
+    return currentOffset;
+  }
+
+  // Returns the primary phase for the given stage.
+  __device__ inline uint32_t primaryPhase(int32_t const index) const {
+    return (mPrimaryPhases >> index) & 0b1;
+  }
+
+  // Updates the current state after a stage has been relinquished. A stage is relinquished when the
+  // destination resource has been committed and the source resource released.
+  __device__ inline void relinquishAndIncrement(int32_t const index) {
+    mConditionalPhases ^= (0b1 << index);
+    mIsReserved &= ~(0b1 << index);
+    // Update loop offset for this thread.
+    mLoopOffset += mPipelineStep * (mLaneId == index);
+    updateStageComplete();
+  }
+
+  // Resets the barrier for a new workId and returns the starting stageIdx (used in persistent
+  // scheduled kernels).
+  //
+  // For example for a persistent scheduler, if we have 3 stages, tileK=256, and K=512, each CTA
+  // would have 2 k tiles. The assignment of these tiles to the stages is shown in the table below.
+  // When moving to the next work Id, the stage index does not completely reset, it just moves to
+  // the next one in order.
+  //
+  // ┌───────────────┬───────────────────────┬───────────────────────┐
+  // │ Pipeline Iter │          0            │          1            │
+  // ├───────────────┼───────────────────────┼───────────────────────┤
+  // │     Stage   0 │ workId:0 k tile idx:0 │ workId:1 k tile idx:1 │
+  // │     index   1 │ workId:0 k tile idx:1 │ workId:2 k tile idx:0 │
+  // │             2 │ workId:1 k tile idx:0 │ workId:2 k tile idx:1 │
+  // └───────────────┴───────────────────────┴───────────────────────┘
+  __device__ inline int32_t resetForNextWorkId() {
+    // Compute the new stage offset for this workId
+    mWorkIdOffset = (mWorkIdOffset + mLoopIterations) % Stages;
+    // Reset bit-vectors to indicate that none of the stages are reserved or complete
+    mIsReserved = 0u;
+    mStageComplete = 0u;
+    // Update the tile offset data
+    int32_t const startingIndex = (mLaneId + Stages - mWorkIdOffset) % Stages;
+    mLoopOffset = mLoopStart + mLoopStep * startingIndex;
+    updateStageComplete();
+    return mWorkIdOffset;
+  }
+
+  // Indicates that the current stage has successfully been reserved (destination resources acquired
+  // and source resources waited on).
+  __device__ inline void setReserved(int32_t const index) { mIsReserved |= (0b1 << index); }
+
+  // Checks if a tile has finish all its tiles and updates the state
+  __device__ inline void updateStageComplete() {
+    // Determine mask for this thread.
+    uint32_t const threadComplete = (mLoopOffset >= mLoopEnd) ? 1u << mLaneId : 0u;
+    // Collect results with redux.
+    asm("redux.sync.or.b32 %0, %1, 0xffffffff;\n" : "=r"(mStageComplete) : "r"(threadComplete));
+    // Mask out inactive threads.
+    mStageComplete &= StageMask;
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// *************************************************************************************************
+// PipelineLamport class.
+// *************************************************************************************************
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int Stages_, bool UseUmma_> class PipelineLamport {
+public:
+  // Number of stages in pipeline.
+  static constexpr uint32_t Stages = Stages_;
+  // Is the consumer use umma.
+  static constexpr bool UseUmma = UseUmma_;
+
+  // The regular pipeline state will be used by the consumer task
+  using PipelineState = cutlass::PipelineState<Stages>;
+
+  template <typename InitBarriers = cute::true_type>
+  __device__ PipelineLamport(uint64_t* conditionalBarrierPtr,
+                             uint64_t* emptyBarrierPtr,
+                             uint64_t* primaryBarrierPtr,
+                             int32_t consumerArrivalCount,
+                             int32_t producerArrivalCount,
+                             int32_t transactionBytes,
+                             int32_t warpId,
+                             int32_t barInitWarpId,
+                             InitBarriers = {})
+    : mConditionalBarrierPtr(conditionalBarrierPtr)
+    , mEmptyBarrierPtr(emptyBarrierPtr)
+    , mPrimaryBarrierPtr(primaryBarrierPtr)
+    , mTransactionBytes(transactionBytes)
+    , mProducerArrivalCount(producerArrivalCount)
+    , mConsumerArrivalCount(consumerArrivalCount) {
+
+    static_assert(cute::is_same_v<InitBarriers, cute::true_type> ||
+                  cute::is_same_v<InitBarriers, cute::false_type>);
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+      if (warpId == barInitWarpId && cute::elect_one_sync()) {
+#pragma unroll
+        for (int ii = 0; ii < Stages; ++ii) {
+          cuda_ptx::mbarrier_init(&mEmptyBarrierPtr[ii], mConsumerArrivalCount);
+          cuda_ptx::mbarrier_init(&mConditionalBarrierPtr[ii], mProducerArrivalCount);
+          cuda_ptx::mbarrier_init(&mPrimaryBarrierPtr[ii], 1);
+        }
+      }
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //
+  // Producer functions
+  //
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  // Performs an arrive and expect TX on the given stage. For normal TMA pipelines this is fused
+  // with producer-acquire, but Lamport pipelines need this decoupled
+  inline __device__ void producer_arrive(int32_t const index) {
+    cuda_ptx::mbarrier_arrive_expect_tx(cuda_ptx::sem_release_t{},
+                                        cuda_ptx::scope_cta_t{},
+                                        cuda_ptx::space_shared_t{},
+                                        &mPrimaryBarrierPtr[index],
+                                        mTransactionBytes);
+  }
+
+  // Producer commit. For emulated lamport syncs, this will need to explicitly arrive on the
+  // conditional barrier, but will be a no-op with hardware support
+  inline __device__ void producer_commit(int32_t const index) {
+    cuda_ptx::mbarrier_arrive(&mConditionalBarrierPtr[index]);
+  }
+  inline __device__ void producer_commit(PipelineState const& state) {
+    producer_commit(state.index());
+  }
+
+  // Returns pointer to current mbarrier for use in other instructions
+  [[nodiscard]] inline __device__ uint64_t* producer_get_barrier(int32_t const index) {
+    return mPrimaryBarrierPtr + index;
+  }
+  [[nodiscard]] inline __device__ uint64_t* producer_get_barrier(PipelineState const& state) {
+    return producer_get_barrier(state.index());
+  }
+
+  // Producer test-acquire. This will do a non-blocking test-wait on the empty barrier
+  [[nodiscard]] inline __device__ int32_t producer_test_acquire(int32_t const index,
+                                                                uint32_t const phase) {
+    return cuda_ptx::mbarrier_test_wait_parity(&mEmptyBarrierPtr[index], phase);
+  }
+  [[nodiscard]] inline __device__ int32_t producer_test_acquire(PipelineState const& state) {
+    return producer_test_acquire(state.index(), state.phase());
+  }
+  // Producer try-acquire.
+  [[nodiscard]] inline __device__ int32_t producer_try_acquire(PipelineState const& state) {
+    return cuda_ptx::mbarrier_try_wait_parity(&mEmptyBarrierPtr[state.index()], state.phase());
+  }
+  // Producer acquire.
+  inline __device__ void producer_acquire(PipelineState const& state, int32_t t = int32_t{0}) {
+    while (!t) {
+      t = producer_try_acquire(state);
+    }
+    if (bool{cute::elect_one_sync()}) {
+      // Call expect TX.
+      producer_arrive(state.index());
+    }
+  }
+
+  // Performs a producer test-wait on the given stage. Returns true if data is loaded regardless of
+  // validity status.
+  [[nodiscard]] inline __device__ int32_t producer_test_wait(int32_t const index,
+                                                             uint32_t const phase) {
+    return cuda_ptx::mbarrier_test_wait_parity(&mPrimaryBarrierPtr[index], phase);
+  }
+
+  // Performs a producer test-wait on the given stage and checks the validity of the data
+  template <int kNumBytes, uint32_t kInvalidValue>
+  inline __device__ void producer_test_wait_valid(int32_t const index,
+                                                  uint32_t const phase,
+                                                  int32_t* smemPtr,
+                                                  cutlass::Array<bool, 2>& result) {
+    int32_t const is_loaded = producer_test_wait(index, phase);
+
+    int32_t is_valid = false;
+    if (is_loaded) {
+      // TODO Should this be part of the pipeline?
+      is_valid = trtllm::dev::checkDataValidityWarp<kNumBytes, kInvalidValue>(
+        &reinterpret_cast<uint32_t*>(smemPtr)[int32_t{0}]);
+    }
+
+    result[0] = bool{is_loaded};
+    result[1] = bool{is_valid};
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //
+  // Consumer APIs
+  //
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  // Perform a consumer try-wait on current stage
+  [[nodiscard]] inline __device__ int32_t consumer_try_wait(PipelineState const& state) {
+    return cuda_ptx::mbarrier_try_wait_parity(&mConditionalBarrierPtr[state.index()],
+                                              state.phase());
+  }
+
+  // Perform a consumer wait on current stage
+  inline __device__ void consumer_wait(PipelineState const& state, int32_t t = int32_t{0}) {
+    while (!t) {
+      t = consumer_try_wait(state);
+    }
+  }
+
+  // Perform a consumer release on current stage
+  inline __device__ void consumer_release(PipelineState const& state) {
+    if constexpr (UseUmma) {
+      cutlass::arch::umma_arrive(&mEmptyBarrierPtr[state.index()]);
+    } else {
+      cuda_ptx::mbarrier_arrive(&mEmptyBarrierPtr[state.index()]);
+    }
+  }
+
+private:
+  // Conditional barriers are used to signal the consumer that the stage contains valid data. For
+  // software emulation, this barrier will be explicitly arrived on by the producer threads. From
+  // the consumers perspective, there should be no difference between this barrier and the "full"
+  // barrier in a traditional TMA pipeline.
+  uint64_t* mConditionalBarrierPtr{nullptr};
+  // Empty barriers are used to signal the producer that the consumer is finished with a stage. The
+  // consumer threads will arrive on this barrier, and the producer threads will test-wait on it.
+  uint64_t* mEmptyBarrierPtr{nullptr};
+  // Primary barriers are used to indicate if data has been loaded into a stage. This barrier is
+  // only used by the producer threads. It will be passed to the TMA instructions and queried in the
+  // prod-test-wait function.
+  uint64_t* mPrimaryBarrierPtr{nullptr};
+  // Expected number of bytes for primary barrier.
+  int32_t mTransactionBytes{0};
+  // Expected number of threads for conditional barrier.
+  int32_t mProducerArrivalCount{0};
+  // Expected number of threads for empty barrier.
+  int32_t mConsumerArrivalCount{0};
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// *************************************************************************************************
+// PipelinePayloadLamport class.
+// *************************************************************************************************
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int Stages_, bool UseUmma_> class PipelinePayloadLamport {
+public:
+  // Number of stages in pipeline.
+  static constexpr uint32_t Stages = Stages_;
+  // Is the consumer use umma.
+  static constexpr bool UseUmma = UseUmma_;
+
+  // The regular pipeline state will be used by the consumer task
+  using PipelineState = cutlass::PipelineState<Stages>;
+
+  // The ctor.
+  template <typename InitBarriers = cute::true_type>
+  __device__ PipelinePayloadLamport(uint64_t* fullBarrierPtr,
+                                    uint64_t* emptyBarrierPtr,
+                                    int32_t consumerArrivalCount,
+                                    int32_t producerArrivalCount,
+                                    int32_t transactionBytes,
+                                    int32_t warpId,
+                                    int32_t barInitWarpId,
+                                    InitBarriers = {})
+    : mFullBarrierPtr(fullBarrierPtr)
+    , mEmptyBarrierPtr(emptyBarrierPtr)
+    , mTransactionBytes(transactionBytes)
+    , mProducerArrivalCount(producerArrivalCount)
+    , mConsumerArrivalCount(consumerArrivalCount) {
+
+    static_assert(cute::is_same_v<InitBarriers, cute::true_type> ||
+                  cute::is_same_v<InitBarriers, cute::false_type>);
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+      if (warpId == barInitWarpId && cute::elect_one_sync()) {
+#pragma unroll
+        for (int ii = 0; ii < Stages; ++ii) {
+          cuda_ptx::mbarrier_init(cuda_ptx::layout_v1, &mFullBarrierPtr[ii], mProducerArrivalCount);
+          cuda_ptx::mbarrier_init(&mEmptyBarrierPtr[ii], mConsumerArrivalCount);
+        }
+      }
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //
+  // Producer functions
+  //
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  // Performs an arrive and expect TX on the given stage. For normal TMA pipelines this is fused
+  // with producer-acquire, but Lamport pipelines need this decoupled
+  inline __device__ void producer_arrive(int32_t const index) {
+    cuda_ptx::mbarrier_arrive_expect_tx(cuda_ptx::sem_release_t{},
+                                        cuda_ptx::scope_cta_t{},
+                                        cuda_ptx::space_shared_t{},
+                                        &mFullBarrierPtr[index],
+                                        mTransactionBytes);
+  }
+
+  // Producer commit for hardware support: no-op
+  inline __device__ void producer_commit(int32_t const index) {
+    // no-op
+  }
+  inline __device__ void producer_commit(PipelineState const& state) {
+    producer_commit(state.index());
+  }
+
+  // Returns pointer to current mbarrier for use in other instructions
+  [[nodiscard]] inline __device__ uint64_t* producer_get_barrier(int32_t const index) {
+    return mFullBarrierPtr + index;
+  }
+  [[nodiscard]] inline __device__ uint64_t* producer_get_barrier(PipelineState const& state) {
+    return producer_get_barrier(state.index());
+  }
+
+  // Producer test-acquire. This will do a non-blocking test-wait on the empty barrier
+  [[nodiscard]] inline __device__ int32_t producer_test_acquire(int32_t const index,
+                                                                uint32_t const phase) {
+    return cuda_ptx::mbarrier_test_wait_parity(&mEmptyBarrierPtr[index], phase);
+  }
+  [[nodiscard]] inline __device__ int32_t producer_test_acquire(PipelineState const& state) {
+    return producer_test_acquire(state.index(), state.phase());
+  }
+  // Producer try-acquire.
+  [[nodiscard]] inline __device__ int32_t producer_try_acquire(PipelineState const& state) {
+    return cuda_ptx::mbarrier_try_wait_parity(&mEmptyBarrierPtr[state.index()], state.phase());
+  }
+  // Producer acquire.
+  inline __device__ void producer_acquire(PipelineState const& state, int32_t t = int32_t{0}) {
+    while (!t) {
+      t = producer_try_acquire(state);
+    }
+    if (bool{cute::elect_one_sync()}) {
+      // Call expect TX.
+      producer_arrive(state.index());
+    }
+  }
+
+  // Performs a producer test-wait on the given stage. Returns true if data is loaded regardless of
+  // validity status.
+  [[nodiscard]] inline __device__ int32_t producer_test_wait(int32_t const index,
+                                                             uint32_t const phase) {
+    cutlass::Array<bool, 2>& result;
+    producer_test_wait_valid(index, phase, /* smemPtr */ nullptr, result);
+    return result[0];
+  }
+
+  // Performs a producer test-wait on the given stage and checks the validity of the data
+  template <int kNumBytes, uint32_t kInvalidValue>
+  inline __device__ void producer_test_wait_valid(int32_t const index,
+                                                  uint32_t const phase,
+                                                  int32_t* smemPtr,
+                                                  cutlass::Array<bool, 2>& result) {
+    // Unused when using Payload64 barriers.
+    (void)smemPtr;
+    auto barrier = &mFullBarrierPtr[index];
+
+    // {$nv-internal-release begin}
+#if defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    asm volatile(".pragma \"set knob DontInsertYield\";\n" : : : "memory");
+#endif // defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    // {$nv-internal-release end}
+
+    // * wait_complete will be true if the data has been loaded.
+    // * is_report_seen will be true if the data is invalid.
+    bool is_report_seen;
+    bool wait_complete = cuda_ptx::mbarrier_test_wait_parity(cuda_ptx::mbarrier_phase_primary_t{},
+                                                             cuda_ptx::sem_acquire_t{},
+                                                             cuda_ptx::scope_cta_t{},
+                                                             is_report_seen,
+                                                             barrier,
+                                                             phase);
+
+    // {$nv-internal-release begin}
+#if defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    asm volatile(".pragma \"reset knob DontInsertYield\";\n" : : : "memory");
+#endif // defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    // {$nv-internal-release end}
+
+    result[0] = wait_complete;
+    result[1] = !is_report_seen;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //
+  // Consumer APIs
+  //
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  // Perform a consumer try-wait on current stage
+  [[nodiscard]] inline __device__ int32_t consumer_try_wait(PipelineState const& state) {
+    std::uint64_t* barrier = &mFullBarrierPtr[state.index()];
+    std::uint32_t phase = state.phase();
+
+    // {$nv-internal-release begin}
+#if defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    asm volatile(".pragma \"set knob DontInsertYield\";\n" : : : "memory");
+#endif // defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+       // {$nv-internal-release end}
+
+    // Waits on the conditional phase of the barrier to change meaning data is present and valid.
+#if 0
+    // TODO cuda_ptx does not have the acquire semantics version.
+    bool const wait_complete =
+      cuda_ptx::mbarrier_try_wait_parity(cuda_ptx::mbarrier_phase_conditional_t{},
+                                         cuda_ptx::sem_relaxed_t{},
+                                         cuda_ptx::scope_cta_t{},
+                                         barrier,
+                                         phase);
+#else
+    std::uint32_t waitCompleteU32;
+    asm("{\n\t"
+        ".reg .pred P_OUT; \n\t"
+        "mbarrier.try_wait.parity.phase_type::conditional.acquire.cta.shared::cta.b64 P_OUT, [%1], "
+        "%2; \n\t"
+        "selp.b32 %0, 1, 0, P_OUT; \n"
+        "}"
+        : "=r"(waitCompleteU32)
+        : "r"(cuda_ptx::__as_ptr_smem(barrier)), "r"(phase)
+        : "memory");
+    bool const wait_complete = static_cast<bool>(waitCompleteU32);
+#endif
+
+    // {$nv-internal-release begin}
+#if defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    asm volatile(".pragma \"reset knob DontInsertYield\";\n" : : : "memory");
+#endif // defined(JETFIRE_ENABLED) && (CUDA_DONT_INSERT_YIELD_ENABLED)
+    // {$nv-internal-release end}
+
+    return static_cast<bool>(wait_complete);
+  }
+
+  // Perform a consumer wait on current stage
+  inline __device__ void consumer_wait(PipelineState const& state, int32_t t = int32_t{0}) {
+    while (!t) {
+      t = consumer_try_wait(state);
+    }
+  }
+
+  // Perform a consumer release on current stage
+  inline __device__ void consumer_release(PipelineState const& state) {
+    if constexpr (UseUmma) {
+      cutlass::arch::umma_arrive(&mEmptyBarrierPtr[state.index()]);
+    } else {
+      cuda_ptx::mbarrier_arrive(&mEmptyBarrierPtr[state.index()]);
+    }
+  }
+
+private:
+  // Full Payload64 barriers are used to signal that:
+  // 1. The producer has loaded the data into the stage, through payload barrier primary phase
+  // 2. The loaded data is valid, through payload barrier conditional phase
+  uint64_t* mFullBarrierPtr{nullptr};
+  // Empty Trans64  barriers are used to signal the producer that the consumer is finished with a
+  // stage. The consumer threads will arrive on this barrier, and the producer threads will
+  // test-wait on it.
+  uint64_t* mEmptyBarrierPtr{nullptr};
+  // Expected number of bytes for full barrier.
+  int32_t mTransactionBytes{0};
+  // Expected number of threads for full barrier.
+  int32_t mProducerArrivalCount{0};
+  // Expected number of threads for empty barrier.
+  int32_t mConsumerArrivalCount{0};
+};
+// {$nv-internal-release end}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace trtllm::dev

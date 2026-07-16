@@ -120,6 +120,10 @@ template <int32_t NumRows, int32_t NumCols, int NumRegs>
 inline __device__ void storeTransposedSmem8b(cutlass::float_e4m3_t* smemPtr,
                                              uint32_t const (&regsP)[NumRegs],
                                              int32_t warpGrpThreadIdx) {
+  // {$nv-internal-release begin}
+  // See more details in
+  // https://p4hw-swarm.nvidia.com/view/hw/doc/gpu/blackwell/blackwell/design/IAS/SM/ISA/opcodes/opSTSM.htm.
+  // {$nv-internal-release end}
 
   // Make sure NumRows is power of 2 and greater than or equal to 8.
   static_assert(NumRows >= 8 && (NumRows & (NumRows - 1)) == 0, "Not implemented.");
@@ -237,6 +241,10 @@ inline __device__ void storeTransposedSmem64x16b(Dtype* smemPtr,
   // Make sure NumRows is power of 2 and greater than or equal to 8.
   static_assert(NumRows >= 8 && (NumRows & (NumRows - 1)) == 0, "Not implemented.");
 
+  // {$nv-internal-release begin}
+  // See more details in
+  // https://p4hw-swarm.nvidia.com/view/hw/doc/gpu/blackwell/blackwell/design/IAS/SM/ISA/opcodes/opSTSM.htm.
+  // {$nv-internal-release end}
 
   // The number of cols after transposing.
   int32_t constexpr NumCols{64};
@@ -317,6 +325,10 @@ inline __device__ void storeTransposedSmem128x16b(Dtype* smemPtr,
   // Make sure NumRows is power of 2 and greater than or equal to 8.
   static_assert(NumRows >= 8 && (NumRows & (NumRows - 1)) == 0, "Not implemented.");
 
+  // {$nv-internal-release begin}
+  // See more details in
+  // https://p4hw-swarm.nvidia.com/view/hw/doc/gpu/blackwell/blackwell/design/IAS/SM/ISA/opcodes/opSTSM.htm.
+  // {$nv-internal-release end}
 
   // The number of cols after transposing.
   int32_t constexpr NumCols{128};
