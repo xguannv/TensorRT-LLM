@@ -291,15 +291,20 @@ class FusedMoEMethodBase(ABC):
         w3_w1_bias_shape: Optional[tuple[int, int]] = None,
         w2_bias_shape: Optional[tuple[int, int]] = None,
     ):
+        from ...ugpu_utils import get_current_ugpu
+        is_ugpu_weights = get_current_ugpu() is not None
+        device = torch.device('cuda') if is_ugpu_weights else None
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
-                                                dtype=weight_dtype),
+                                                dtype=weight_dtype,
+                                                device=device),
                                     requires_grad=False)
         module.register_parameter("w3_w1_weight", w3_w1_weight)
 
         # down_proj (row parallel)
         w2_weight = nn.Parameter(torch.empty(w2_weight_shape,
-                                             dtype=weight_dtype),
+                                             dtype=weight_dtype,
+                                             device=device),
                                  requires_grad=False)
         module.register_parameter("w2_weight", w2_weight)
 
@@ -807,6 +812,34 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         if getattr(module, "_trtllm_gen_layout_transform_pending", False):
             self.process_weights_after_loading(module)
         super().transform_weights(module)
+
+
+class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
+    """Weight loading for BF16/FP16 CuTE DSL MoE on Rubin (SM107).
+
+    Extends UnquantizedFusedMoEMethod by interleaving FC1 (w3_w1) weights
+    for the fused gather + grouped GEMM + SwiGLU kernel. The SwiGLU fusion
+    requires gate/up weights to be interleaved with granularity=32 along
+    the intermediate dimension (dim=1).
+    """
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                         dst_w3_w1_weight,
+                                         allow_partial_loading)
+        # Interleave gate/up weights for GEMM + SwiGLU fusion.
+        # Per-expert weight layout after super(): [w3(up), w1(gate)] along dim=0.
+        # interleave produces [up_0:32, gate_0:32, up_32:64, gate_32:64, ...].
+        w3_w1 = dst_w3_w1_weight.cuda()
+        w3_w1_interleaved = interleave_linear_and_gate(w3_w1,
+                                                       group_size=32,
+                                                       dim=0)
+        dst_w3_w1_weight.copy_(w3_w1_interleaved)
 
 
 def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
@@ -2220,6 +2253,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        block_scales_vec_size,
                        scaling_vector_size=16,
                        bias_dtype: Optional[torch.dtype] = None):
+        from ...ugpu_utils import get_current_ugpu
+        is_ugpu_weights = get_current_ugpu() is not None
+        ugpu_factor = 2 if is_ugpu_weights else 1
+        device = torch.device('cuda') if is_ugpu_weights else None
 
         module.scaling_vector_size = scaling_vector_size
 
@@ -2228,16 +2265,34 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
          w2_weight_scale_shape) = self.get_weights_shapes(
              module, weight_vec_size, block_scales_vec_size)
 
+        # Apply ugpu_factor to divide weight and scale shapes
+        if ugpu_factor > 1:
+            w3_w1_weight_shape = (w3_w1_weight_shape[0],
+                                  w3_w1_weight_shape[1] // ugpu_factor,
+                                  w3_w1_weight_shape[2])
+            w2_weight_shape = (w2_weight_shape[0],
+                               w2_weight_shape[1] // ugpu_factor,
+                               w2_weight_shape[2])
+            w3_w1_weight_scale_shape = (w3_w1_weight_scale_shape[0],
+                                        w3_w1_weight_scale_shape[1] //
+                                        ugpu_factor,
+                                        w3_w1_weight_scale_shape[2])
+            w2_weight_scale_shape = (w2_weight_scale_shape[0],
+                                     w2_weight_scale_shape[1] // ugpu_factor,
+                                     w2_weight_scale_shape[2])
+
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
         w3_w1_weight_scale = nn.Parameter(torch.ones(w3_w1_weight_scale_shape,
-                                                     dtype=block_scales_dtype),
+                                                     dtype=block_scales_dtype,
+                                                     device=device),
                                           requires_grad=False)
         module.register_parameter("w3_w1_weight_scale", w3_w1_weight_scale)
 
         # row parallel
         w2_weight_scale = nn.Parameter(torch.ones(w2_weight_scale_shape,
-                                                  dtype=block_scales_dtype),
+                                                  dtype=block_scales_dtype,
+                                                  device=device),
                                        requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
@@ -3007,6 +3062,10 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     cat_weight = torch.cat([w3, w1], dim=0)
                     cat_weight = self._maybe_padding_shape(cat_weight, dst)
                     dst.copy_(cat_weight, non_blocking=True)
+                elif w1 is not None:
+                    # Non-gated MoE (e.g. Relu2): dst holds only w1; w3 source is empty.
+                    w1 = self._maybe_padding_shape(w1, dst)
+                    dst.copy_(w1, non_blocking=True)
             delattr(module, 'tmp_cutlass_w3_w1_weights')
 
         # Finalize w3_w1 weight scales: cat + pad + interleave
@@ -3019,6 +3078,11 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     cat_scale = torch.cat([w3_scale, w1_scale], dim=0)
                     cat_scale = self._maybe_padding_shape(cat_scale, dst)
                     dst.copy_(cat_scale)
+                    self._interleave_w3_w1_weight_scale(dst)
+                elif w1_scale is not None:
+                    # Non-gated MoE (e.g. Relu2): dst holds only w1; w3 source is empty.
+                    w1_scale = self._maybe_padding_shape(w1_scale, dst)
+                    dst.copy_(w1_scale)
                     self._interleave_w3_w1_weight_scale(dst)
             delattr(module, 'tmp_cutlass_w3_w1_weight_scales')
 
@@ -3269,6 +3333,11 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                                      w3_weight_scale,
                                                      dst_w3_w1_weight_scale,
                                                      expert_idx=expert_idx)
+        from ...ugpu_utils import get_current_ugpu
+        is_ugpu_weights = get_current_ugpu() is not None
+        ugpu_factor = 2 if is_ugpu_weights else 1
+        # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
+        module.intermediate_size_per_partition * 2 // ugpu_factor
 
         # CuteDsl interleave deferred to process_weights_after_loading().
 

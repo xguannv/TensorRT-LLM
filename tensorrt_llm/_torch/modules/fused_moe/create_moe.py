@@ -65,6 +65,7 @@ def create_moe_backend(
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
+    override_quant_config: Optional[QuantConfig] = None,
 ) -> MoE:
     """
     Create MoE backend instance with validation.
@@ -259,6 +260,7 @@ def create_moe_backend(
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            override_quant_config=override_quant_config,
         )
     elif moe_cls == DeepGemmFusedMoE:
         return moe_cls(
@@ -528,4 +530,5 @@ def create_moe(
         trtllm_gen_activation_type=trtllm_gen_activation_type,
         trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
         trtllm_gen_activation_beta=trtllm_gen_activation_beta,
+        override_quant_config=override_quant_config,
     )

@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -31,7 +31,11 @@ from ...custom_ops.cute_dsl_custom_ops import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
-from ...model_config import ModelConfig
+from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ...distributed import allgather
+from ...model_config import ModelConfig, QuantConfig
+from ...ugpu.policy import UgpuExecutionPlanner
+from ...ugpu.runtime import UgpuRuntime
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
@@ -40,8 +44,9 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
                             MoERejectReason, MoERunContext, MoEStaticCapability,
                             require_comm_plan)
-from .interface import _reject
-from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
+from .interface import AlltoallMethodType, _reject
+from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
+                           NVFP4CuteDslFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -279,6 +284,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
+        # tile_size=512 is only supported on Rubin (SM107).
+        if get_sm_version() == 107:
+            return [128, 256, 512]
         return [128, 256]
 
     def get_tuning_config(self) -> TuningConfig:
@@ -326,13 +334,164 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if tile_size is None:
             return True
 
+        # Build the tuple of runner types that need CTA_M == tile_size check.
+        # Include both Blackwell (Sm100) and Rubin (Sm107) runners.
+        checked_runner_types = [
+            Sm100BlockScaledContiguousGroupedGemmRunner,
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+            Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        ]
+        if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            from ...custom_ops.cute_dsl_custom_ops import (
+                Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner)
+            checked_runner_types.extend([
+                Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+            ])
+
         for runner, tactic in comb:
-            if isinstance(
-                    runner,
-                (Sm100BlockScaledContiguousGroupedGemmRunner,
-                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-                 Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
+            if isinstance(runner, tuple(checked_runner_types)):
+                mma_tiler_mn, *_ = tactic
+                if mma_tiler_mn[0] != tile_size:
+                    return False
+        return True
+
+
+class CuteDslFusedMoEBF16InputsHelper(GroupedGemmInputsHelper):
+    """Helper for CuteDSL BF16 MoE input preprocessing and autotuning."""
+
+    def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
+                 local_expert_offset: int):
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+
+    def infer_shape_num_tokens(self, input_shapes: List[torch.Size]) -> int:
+        return input_shapes[0][0]
+
+    def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        x, token_selected_experts, *others = inputs
+        num_tokens = token_selected_experts.size(0)
+        num_tokens_per_expert = self.generate_num_tokens_per_expert(
+            num_tokens, approx_max_load=True)
+
+        new_token_selected_experts = []
+        for i, curr_num_tokens in enumerate(num_tokens_per_expert,
+                                            start=self.local_expert_offset):
+            new_token_selected_experts.extend([i] * curr_num_tokens)
+        new_token_selected_experts = new_token_selected_experts + [-1] * (
+            num_tokens * self.top_k - len(new_token_selected_experts))
+        new_token_selected_experts = torch.tensor(
+            new_token_selected_experts,
+            dtype=token_selected_experts.dtype,
+            device=token_selected_experts.device)
+        new_token_selected_experts = new_token_selected_experts.view(
+            self.top_k, num_tokens).transpose(0, 1).contiguous()
+        return x, new_token_selected_experts, *others
+
+
+class CuteDslFusedMoEBF16Runner(TunableRunner):
+    """Autotuner runner for BF16/FP16 MoE on Rubin (SM107).
+
+    Selects tile_size from {64, 128, 256} and delegates to run_moe_bf16_impl.
+    """
+    tuning_config_cache = dict()
+
+    def __init__(self,
+                 forward_impl: Callable,
+                 num_experts: int,
+                 top_k: int,
+                 num_local_experts: int,
+                 local_expert_offset: int,
+                 enable_alltoall: bool = False,
+                 output_dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.forward_impl = forward_impl
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.enable_alltoall = enable_alltoall
+        self.output_dtype = output_dtype
+
+    def unique_id(self):
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.enable_alltoall,
+            self.output_dtype,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        return [64, 128, 256]
+
+    def get_tuning_config(self) -> TuningConfig:
+        key = self.unique_id()
+        if key not in self.__class__.tuning_config_cache:
+            helper = CuteDslFusedMoEBF16InputsHelper(self.num_experts,
+                                                     self.top_k,
+                                                     self.num_local_experts,
+                                                     self.local_expert_offset)
+            # BF16 inputs: [x, token_selected_experts, token_final_scales,
+            #               moe_output]
+            self.__class__.tuning_config_cache[key] = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(3, 0, helper.infer_shape_num_tokens),
+                ),
+                inputs_pre_hook=helper.inputs_pre_hook,
+                use_cold_l2_cache=True,
+            )
+        return self.__class__.tuning_config_cache[key]
+
+    def forward(self, inputs: List[torch.Tensor],
+                tactic: Optional[int]) -> torch.Tensor:
+        if isinstance(tactic, int) and tactic > 0:
+            tile_size = tactic
+        else:
+            tile_size = 128
+        return self.forward_impl(*inputs,
+                                 enable_alltoall=self.enable_alltoall,
+                                 tile_size=tile_size)
+
+    @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
+    @staticmethod
+    def runner_tactic_comb_checker(
+            comb: List[Tuple[TunableRunner, Any]]) -> bool:
+        tile_size = None
+        for runner, tactic in comb:
+            if isinstance(runner, CuteDslFusedMoEBF16Runner):
+                tile_size = tactic
+        if tile_size is None:
+            return True
+
+        # BF16 GEMM runners that need CTA_M == tile_size.
+        checked_runner_types = []
+        if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            from ...custom_ops.cute_dsl_custom_ops import (
+                Sm107ContiguousGatherGroupedGemmSwigluFusionRunner,
+                Sm107ContiguousGroupedGemmFinalizeFusionRunner)
+            checked_runner_types.extend([
+                Sm107ContiguousGatherGroupedGemmSwigluFusionRunner,
+                Sm107ContiguousGroupedGemmFinalizeFusionRunner,
+            ])
+
+        for runner, tactic in comb:
+            if isinstance(runner, tuple(checked_runner_types)):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
@@ -357,6 +516,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    def _has_moe_output_memset_aux_stream(self) -> bool:
+        event_dict = getattr(self, "event_dict", None)
+        aux_stream_dict = getattr(self, "aux_stream_dict", None)
+        return (event_dict is not None and aux_stream_dict is not None
+                and EventType.Main in event_dict
+                and EventType.MoeOutputMemset in event_dict
+                and AuxStreamType.MoeOutputMemset in aux_stream_dict)
+
     # ``supports_moe_lora`` is restated because CutlassFusedMoE declares True
     # and the exact-class comparison it replaces answered False here.
     # ``supports_dwdp`` is the capability this backend adds. CuteDslB12xFusedMoE
@@ -365,9 +532,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     capabilities = MoEStaticCapability(supports_moe_lora=False,
                                        supports_dwdp=True)
 
-    @classmethod
+
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103, bfloat16 activations."""
+        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103/SM107, or unquantized BF16 on SM107."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
@@ -385,11 +552,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 f"CuteDslFusedMoE only supports bfloat16 activation (output is hardcoded to bfloat16), "
                 f"got {p.dtype_act}")
 
-        # CuteDslFusedMoE does NOT support unquantized mode
-        if quant_algo is None:
-            return _reject(MoERejectReason.QUANT_UNSUPPORTED,
-                           "CuteDslFusedMoE does not support unquantized mode")
-
         # CuteDslFusedMoE does NOT support swiglu_gptoss_style
         if p.swiglu_gptoss_style:
             return _reject(
@@ -397,12 +559,28 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
-        # NVFP4 - SM in {100, 103}
-        if quant_algo == QuantAlgo.NVFP4:
-            if sm_version not in {100, 103}:
+        # Unquantized BF16 on Rubin (SM107).
+        if quant_algo is None:
+            if sm_version != 107:
                 return _reject(
                     MoERejectReason.SM_UNSUPPORTED,
-                    f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
+                    f"Unquantized CuteDslFusedMoE requires SM107, got SM{sm_version}")
+            if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                return _reject(
+                    MoERejectReason.DEP_MISSING,
+                    "Unquantized CuteDslFusedMoE on SM107 requires CuTE DSL internal")
+            return MoEEligibility.ok()
+
+        # NVFP4 - SM in {100, 103, 107}
+        if quant_algo == QuantAlgo.NVFP4:
+            if sm_version not in {100, 103, 107}:
+                return _reject(
+                    MoERejectReason.SM_UNSUPPORTED,
+                    f"NVFP4 requires SM100, SM103, or SM107, got SM{sm_version}")
+            if sm_version == 107 and not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                return _reject(
+                    MoERejectReason.DEP_MISSING,
+                    "NVFP4 on SM107 (Rubin) requires CuTE DSL internal")
             return MoEEligibility.ok()
 
         # FP8_BLOCK_SCALES lands here on purpose. ``run_moe_fp8_block_scales``
@@ -434,7 +612,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         activation_type: ActivationType = ActivationType.Swiglu,
+        override_quant_config: Optional[QuantConfig] = None,
     ):
+
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -450,11 +630,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            ignore_weights=True,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
 
+        # Output-memset overlap is independent of MoE chunking, so ensure its
+        # stream and events exist even if the parent creates no chunking event.
         if self.aux_stream_dict is None:
-            self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
+            self.aux_stream_dict = {}
         if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
             self.aux_stream_dict[
                 AuxStreamType.MoeOutputMemset] = torch.cuda.Stream()
@@ -463,6 +646,29 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+
+        self.scaling_vector_size = 16
+        self.quant_config = override_quant_config if override_quant_config is not None else self.quant_config
+        # uGPU: fork/join with _ugpu kernel variants + shared output buffers.
+        # Weight splitting happens in post_load_weights_impl after normal loading.
+        self._ugpu_runtime = None
+        self._ugpu_weight_shards = None  # set in post_load_weights_impl
+        planner = UgpuExecutionPlanner(model_config.ugpu_policy)
+        self._ugpu_plan = planner.plan_moe(
+            self.quant_config,
+            moe_backend=model_config.moe_backend,
+            use_fused_finalize=self.use_fused_finalize,
+            dtype_activation=self.dtype,
+        )
+        if self._ugpu_plan.enabled:
+            self._ugpu_runtime = UgpuRuntime(self._ugpu_plan.num_partitions)
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def create_weights(self):
+        if self._weights_created:
+            return
+        super().create_weights()
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
@@ -482,10 +688,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CuteDslFusedMoEMethod()
+            return super()._get_quant_method()
+        # Unquantized: use BF16 method on SM107 for FC1 weight interleaving
+        if get_sm_version() == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            return BF16CuteDslFusedMoEMethod()
         return super()._get_quant_method()
 
     def supports_moe_output_in_alltoall_workspace(self):
-        return self.has_nvfp4
+        return self.has_nvfp4 or (not self.has_any_quant
+                                  and get_sm_version() == 107)
 
     def quantize_input(self,
                        x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -520,6 +731,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.
             pass
+        elif not self.has_any_quant:
+            # Unquantized BF16/FP16: no quantization needed
+            pass
         else:
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
@@ -553,6 +767,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         assert weight_view is not None
         output_dtype = torch.bfloat16
 
+        # uGPU path: fork/join with same fused-kernel logic as non-uGPU.
+        # Kernels use explicit partition_id to write into shared outputs.
+        if self._ugpu_runtime is not None:
+            return self._run_moe_nvfp4_ugpu(x, token_selected_experts,
+                                            token_final_scales, x_sf,
+                                            moe_output, enable_alltoall)
+
+        # Standard path (non-uGPU) via AutoTuner
         if moe_output is None:
             moe_output = torch.empty(
                 (token_final_scales.size(0), self.hidden_size),
@@ -607,6 +829,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         """Non-DWDP NVFP4 MoE implementation using single-tensor ops."""
         output_dtype = torch.bfloat16
+        sm_version = get_sm_version()
+        use_rubin = (sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+
+        if use_rubin and self.activation_type != ActivationType.Swiglu:
+            raise NotImplementedError(
+                "Rubin NVFP4 FC1 gather+grouped GEMM currently supports only "
+                "ActivationType.Swiglu")
+
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
@@ -621,7 +851,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
-        if self.use_fused_finalize:
+        has_aux_streams = self._has_moe_output_memset_aux_stream()
+        if self.use_fused_finalize and has_aux_streams:
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
@@ -629,7 +860,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # Fused gather + GEMM + activation + quantize for FC1.
         # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
         # For non-gated (Relu2): weights are plain, output is N.
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+        gather_swiglu_op = (
+            torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin
+            if use_rubin else torch.ops.trtllm.
+            cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell)
+
+        gather_swiglu_kwargs = dict(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
@@ -645,14 +881,38 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
-            activation_type=self.activation_type,
-            swiglu_limit_scalar=self.swiglu_limit_scalar,
         )
+        if use_rubin:
+            gather_swiglu_kwargs["output_tensor"] = None
+            gather_swiglu_kwargs["output_sf_tensor"] = None
+        else:
+            gather_swiglu_kwargs["activation_type"] = self.activation_type
+            gather_swiglu_kwargs[
+                "swiglu_limit_scalar"] = self.swiglu_limit_scalar
+
+        x, x_sf = gather_swiglu_op(**gather_swiglu_kwargs)
 
         if self.use_fused_finalize:
-            with torch.cuda.stream(
-                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
-                self.event_dict[EventType.Main].wait()
+            if has_aux_streams:
+                with torch.cuda.stream(
+                        self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                    self.event_dict[EventType.Main].wait()
+                    torch.ops.trtllm.moe_output_memset_inplace(
+                        input=moe_output,
+                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                        expanded_idx_to_permuted_idx=
+                        expanded_idx_to_permuted_idx,
+                        permuted_idx_to_expanded_idx=
+                        permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles=num_non_exiting_tiles,
+                        tile_tokens_dim=tile_size,
+                        top_k=effective_top_k,
+                        ep_size=self.mapping.moe_ep_size,
+                        enable_alltoall=enable_alltoall,
+                    )
+                    self.event_dict[EventType.MoeOutputMemset].record()
+                self.event_dict[EventType.MoeOutputMemset].wait()
+            else:
                 torch.ops.trtllm.moe_output_memset_inplace(
                     input=moe_output,
                     tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -664,10 +924,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     ep_size=self.mapping.moe_ep_size,
                     enable_alltoall=enable_alltoall,
                 )
-                self.event_dict[EventType.MoeOutputMemset].record()
-            self.event_dict[EventType.MoeOutputMemset].wait()
 
-            torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+            # FC2: Grouped GEMM + Finalize (scatter-add) fusion
+            finalize_inplace_op = (
+                torch.ops.trtllm.
+                cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin
+                if use_rubin else torch.ops.trtllm.
+                cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell)
+
+            finalize_inplace_op(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
@@ -687,6 +952,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 output_dtype=output_dtype,
             )
         else:
+            if use_rubin:
+                # Rubin does not have a basic grouped GEMM kernel (without
+                # fused finalize) yet. Force use_fused_finalize=True for Rubin.
+                raise NotImplementedError(
+                    "Rubin (SM107) MOE requires use_fused_finalize=True. "
+                    "Basic grouped GEMM without finalize fusion is not yet "
+                    "supported on Rubin.")
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
                 weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
@@ -708,6 +980,475 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 topk_scales=token_final_scales,
             )
+        return moe_output
+
+    def run_moe_bf16(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
+    ) -> torch.Tensor:
+        """Autotuner wrapper for BF16/FP16 MoE on Rubin (SM107)."""
+        assert not self.has_any_quant
+        output_dtype = x.dtype
+        effective_top_k = token_selected_experts.size(-1)
+
+        if self._ugpu_runtime is not None:
+            return self._run_moe_bf16_ugpu(x, token_selected_experts,
+                                           token_final_scales, moe_output,
+                                           enable_alltoall)
+
+        self._ensure_bf16_alpha(x.device)
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_selected_experts.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+        else:
+            assert moe_output.size() == (token_selected_experts.size(0),
+                                         self.hidden_size)
+            assert moe_output.dtype == output_dtype
+
+        tuner = AutoTuner.get()
+        runner = CuteDslFusedMoEBF16Runner(
+            forward_impl=self.run_moe_bf16_impl,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            enable_alltoall=enable_alltoall,
+            output_dtype=output_dtype,
+        )
+
+        inputs = [x, token_selected_experts, token_final_scales, moe_output]
+        _, best_tactic = tuner.choose_one(
+            "CuteDslFusedMoE::run_moe_bf16",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        return runner(inputs, tactic=best_tactic)
+
+    def _ensure_bf16_alpha(self, device: torch.device) -> torch.Tensor:
+        if not hasattr(self, '_bf16_alpha') or self._bf16_alpha is None \
+                or self._bf16_alpha.device != device \
+                or self._bf16_alpha.size(0) != self.expert_size_per_partition:
+            self._bf16_alpha = torch.ones(self.expert_size_per_partition,
+                                          dtype=torch.float32,
+                                          device=device)
+        return self._bf16_alpha
+
+    def run_moe_bf16_impl(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        moe_output: torch.Tensor,
+        enable_alltoall: bool = False,
+        tile_size: int = 128,
+    ) -> torch.Tensor:
+        """BF16/FP16 MoE implementation using CuTE DSL Rubin kernels.
+
+        FC1: gather + grouped GEMM + SwiGLU fusion
+        FC2: grouped GEMM + finalize (scatter-add) fusion
+        """
+        output_dtype = x.dtype
+        effective_top_k = token_selected_experts.size(-1)
+
+        # Step 1: moe_sort — identical to NVFP4 path
+        tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            local_expert_offset=self.slot_start,
+            local_num_experts=self.expert_size_per_partition,
+            tile_tokens_dim=tile_size,
+        )
+
+        # Step 2: Memset overlap for fused finalize
+        has_aux = self._has_moe_output_memset_aux_stream()
+        if has_aux:
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+
+        # Step 3: Alpha = 1.0 for all local experts (no quantization scaling)
+        # The wrapper initializes this before autotuner profiling so allocation
+        # does not happen inside CUDA graph capture.
+        self._ensure_bf16_alpha(x.device)
+
+        # Step 4: FC1 — BF16 gather + grouped GEMM + SwiGLU
+        fc1_out = torch.ops.trtllm.cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin(
+            input=x,
+            weight=self.w3_w1_weight,
+            alpha=self._bf16_alpha,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            tile_size=tile_size,
+            output_tensor=None,
+            partition_id=-1,
+        )
+
+        # Step 5: Memset overlap — zero out moe_output rows not touched by
+        # the finalize kernel (same pattern as NVFP4 path).
+        if has_aux:
+            with torch.cuda.stream(
+                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=moe_output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=effective_top_k,
+                    ep_size=self.mapping.moe_ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+        else:
+            torch.ops.trtllm.moe_output_memset_inplace(
+                input=moe_output,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_tokens_dim=tile_size,
+                top_k=effective_top_k,
+                ep_size=self.mapping.moe_ep_size,
+                enable_alltoall=enable_alltoall,
+            )
+
+        # Step 6: FC2 — BF16 grouped GEMM + finalize (scatter-add) inplace
+        torch.ops.trtllm.cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin(
+            input=fc1_out,
+            weight=self.w2_weight,
+            output=moe_output,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            tile_size=tile_size,
+            output_dtype=output_dtype,
+        )
+        return moe_output
+
+    def _run_moe_nvfp4_ugpu(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        x_sf: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
+        tile_size: int = 128,
+    ) -> torch.Tensor:
+        """uGPU path: half-weight children, shared output buffers, fork/join.
+
+        Each child holds localized half-N weights. The _ugpu kernel variant
+        computes on the half-weight and writes to a contiguous buffer.
+        The runner copies the result back into the shared output buffer's
+        corresponding N/2 columns (same approach as Linear uGPU runner).
+        """
+        output_dtype = torch.bfloat16
+        runtime = self._ugpu_runtime
+        num_partitions = self._ugpu_plan.num_partitions
+        shards = self._ugpu_weight_shards
+        effective_top_k = token_selected_experts.size(-1)
+
+        # --- moe_sort (shared, on main stream) ---
+        (tile_idx_to_expert_idx, tile_idx_to_mn_limit,
+         expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+         total_num_padded_tokens,
+         num_non_exiting_tiles) = torch.ops.trtllm.moe_sort(
+             token_selected_experts=token_selected_experts,
+             token_final_scales=token_final_scales,
+             num_experts=self.num_slots,
+             top_k=effective_top_k,
+             local_expert_offset=self.slot_start,
+             local_num_experts=self.expert_size_per_partition,
+             tile_tokens_dim=tile_size,
+         )
+
+        # --- Allocate shared output ---
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_selected_experts.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+
+        # --- FC1: gather + grouped GEMM + SwiGLU, fork/join ---
+        # Each child has half-N weight [num_exp, inner_size, hidden_size].
+        # Shared output buffers:
+        #   c:    [permute_m, inner_size] — each uGPU writes half via strided layout
+        #   c_sf: [full_sf_size] — each uGPU writes at K-tile offset via full_c_shape
+        #   Kernel uses full_c_shape to compute sfc layout with full M-tile stride,
+        #   so no copy-back or interleave is needed.
+        m = permuted_idx_to_expanded_idx.size(0)
+        shard_weight_n = shards[0]['w3_w1_weight'].size(1)  # half interleaved N
+        shard_interm = shard_weight_n // 2  # post-SwiGLU per partition
+        full_interm = shard_interm * num_partitions
+        fc1_out = torch.empty(m,
+                              shard_interm // 2 * 2,
+                              dtype=torch.float4_e2m1fn_x2,
+                              device=x.device)
+        full_sf_size = m * full_interm // self.scaling_vector_size
+        fc1_out_sf = torch.empty(full_sf_size,
+                                 dtype=torch.uint8,
+                                 device=x.device)
+
+        runtime.fork()
+        for pid in range(num_partitions):
+            s = shards[pid]
+            with runtime.partition_context(pid):
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+                    input=x.view(torch.float4_e2m1fn_x2),
+                    weight=s['w3_w1_weight'].view(torch.float4_e2m1fn_x2),
+                    input_scale=x_sf.view(torch.uint8),
+                    weight_scale=s['fc1_weight_block'].view(torch.uint8),
+                    alpha=s['fc1_global'],
+                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    global_sf=s['fc2_input_scale'],
+                    output_tensor=fc1_out,
+                    output_sf_tensor=fc1_out_sf,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    num_local_experts=self.expert_size_per_partition,
+                    local_expert_offset=self.slot_start,
+                    tile_size=tile_size,
+                    scaling_vector_size=self.scaling_vector_size,
+                    partition_id=pid,
+                )
+        runtime.join()
+
+        fc1_out_sf_merged = fc1_out_sf
+
+        # --- memset + FC2: finalize fusion, fork/join ---
+        assert self.use_fused_finalize, (
+            "uGPU MoE requires use_fused_finalize=True on Rubin")
+
+        # memset on aux stream (overlap with FC1 tail)
+        has_aux = self._has_moe_output_memset_aux_stream()
+        if has_aux:
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+            with torch.cuda.stream(
+                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=moe_output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=effective_top_k,
+                    ep_size=self.mapping.moe_ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+        else:
+            torch.ops.trtllm.moe_output_memset_inplace(
+                input=moe_output,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_tokens_dim=tile_size,
+                top_k=effective_top_k,
+                ep_size=self.mapping.moe_ep_size,
+                enable_alltoall=enable_alltoall,
+            )
+
+        # FC2: finalize with children's half-N weights
+        # Each uGPU reads the FULL FC1 output (K = inner_size), uses localized
+        # half-N FC2 weight (N = hidden_size/2, K = inner_size).
+        # Output written to shared moe_output via contiguous buffer + copy back.
+        runtime.fork()
+        for pid in range(num_partitions):
+            s = shards[pid]
+            with runtime.partition_context(pid):
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin(
+                    input=fc1_out.view(torch.float4_e2m1fn_x2),
+                    weight=s['w2_weight'].view(torch.float4_e2m1fn_x2),
+                    input_scale=fc1_out_sf_merged.view(torch.uint8),
+                    weight_scale=s['fc2_weight_block'].view(torch.uint8),
+                    alpha=s['fc2_global'],
+                    output=moe_output,
+                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    token_final_scales=token_final_scales,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    num_local_experts=self.expert_size_per_partition,
+                    local_expert_offset=self.slot_start,
+                    tile_size=tile_size,
+                    output_dtype=output_dtype,
+                )
+        runtime.join()
+
+        return moe_output
+
+    def _run_moe_bf16_ugpu(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        moe_output: Optional[torch.Tensor] = None,
+        enable_alltoall: bool = False,
+        tile_size: int = 128,
+    ) -> torch.Tensor:
+        """uGPU path for unquantized BF16 MoE on Rubin."""
+        output_dtype = x.dtype
+        runtime = self._ugpu_runtime
+        num_partitions = self._ugpu_plan.num_partitions
+        shards = self._ugpu_weight_shards
+        effective_top_k = token_selected_experts.size(-1)
+
+        (tile_idx_to_expert_idx, tile_idx_to_mn_limit,
+         expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+         total_num_padded_tokens,
+         num_non_exiting_tiles) = torch.ops.trtllm.moe_sort(
+             token_selected_experts=token_selected_experts,
+             token_final_scales=token_final_scales,
+             num_experts=self.num_slots,
+             top_k=effective_top_k,
+             local_expert_offset=self.slot_start,
+             local_num_experts=self.expert_size_per_partition,
+             tile_tokens_dim=tile_size,
+         )
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (token_selected_experts.size(0), self.hidden_size),
+                dtype=output_dtype,
+                device=x.device)
+        else:
+            assert moe_output.size() == (token_selected_experts.size(0),
+                                         self.hidden_size)
+            assert moe_output.dtype == output_dtype
+
+        if not hasattr(self, '_bf16_alpha') or self._bf16_alpha is None \
+                or self._bf16_alpha.device != x.device \
+                or self._bf16_alpha.size(0) != self.expert_size_per_partition:
+            self._bf16_alpha = torch.ones(self.expert_size_per_partition,
+                                          dtype=torch.float32,
+                                          device=x.device)
+
+        m = permuted_idx_to_expanded_idx.size(0)
+        shard_weight_n = shards[0]['w3_w1_weight'].size(1)
+        shard_interm = shard_weight_n // 2
+        full_interm = shard_interm * num_partitions
+        fc1_out = torch.empty(m,
+                              full_interm,
+                              dtype=output_dtype,
+                              device=x.device)
+
+        runtime.fork()
+        for pid in range(num_partitions):
+            s = shards[pid]
+            with runtime.partition_context(pid):
+                torch.ops.trtllm.cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin(
+                    input=x,
+                    weight=s['w3_w1_weight'],
+                    alpha=self._bf16_alpha,
+                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    num_local_experts=self.expert_size_per_partition,
+                    local_expert_offset=self.slot_start,
+                    tile_size=tile_size,
+                    output_tensor=fc1_out,
+                    partition_id=pid,
+                )
+        runtime.join()
+
+        assert self.use_fused_finalize, (
+            "uGPU MoE requires use_fused_finalize=True on Rubin")
+
+        has_aux = self._has_moe_output_memset_aux_stream()
+        if has_aux:
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+            with torch.cuda.stream(
+                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=moe_output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=effective_top_k,
+                    ep_size=self.mapping.moe_ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+        else:
+            torch.ops.trtllm.moe_output_memset_inplace(
+                input=moe_output,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                tile_tokens_dim=tile_size,
+                top_k=effective_top_k,
+                ep_size=self.mapping.moe_ep_size,
+                enable_alltoall=enable_alltoall,
+            )
+
+        runtime.fork()
+        for pid in range(num_partitions):
+            s = shards[pid]
+            with runtime.partition_context(pid):
+                torch.ops.trtllm.cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin(
+                    input=fc1_out,
+                    weight=s['w2_weight'],
+                    output=moe_output,
+                    tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    token_final_scales=token_final_scales,
+                    num_experts=self.num_slots,
+                    top_k=effective_top_k,
+                    num_local_experts=self.expert_size_per_partition,
+                    local_expert_offset=self.slot_start,
+                    tile_size=tile_size,
+                    output_dtype=output_dtype,
+                )
+        runtime.join()
+
         return moe_output
 
     def run_moe_fp8_block_scales(
@@ -803,7 +1544,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Run MoE computation with CuteDSL backend.
 
         This method encapsulates the core MoE computation logic, handling different
-        quantization schemes (fp8_block_scales and nvfp4).
+        quantization schemes (fp8_block_scales, nvfp4, and unquantized BF16).
 
         Returns:
             final_hidden_states tensor.
@@ -836,6 +1577,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_final_scales=token_final_scales,
                 x_sf=x_sf,
                 enable_alltoall=enable_alltoall)
+        elif not self.has_any_quant:
+            return self.run_moe_bf16(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                moe_output=moe_output,
+                enable_alltoall=enable_alltoall)
         else:
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
@@ -847,3 +1595,75 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                      allow_partial_loading: bool = False):
         super().load_weights(weights,
                              allow_partial_loading=allow_partial_loading)
+        # Keep DWDP registration after base weight loading. This preserves
+        # loaded tensors for collector setup and remains compatible with the
+        # later uGPU post_load_weights_impl splitting flow.
+        dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
+        if dwdp_handle_collector is not None:
+            dwdp_handle_collector.register_weights(self)
+
+    def post_load_weights_impl(self):
+        self.quant_method.post_load_weights(self)
+        # Split full weights into per-partition halves on localized memory
+        if self._ugpu_runtime is not None:
+            self._ugpu_weight_shards = self._split_weights_for_ugpu()
+            self._release_full_weights_after_ugpu_split()
+
+    def _release_full_weights_after_ugpu_split(self):
+        """Release full tensors that are replaced by localized uGPU shards."""
+        for param_name in (
+                "w3_w1_weight",
+                "w2_weight",
+                "w3_w1_weight_scale",
+                "w2_weight_scale",
+        ):
+            param = getattr(self, param_name, None)
+            if param is None:
+                continue
+            setattr(
+                self,
+                param_name,
+                torch.nn.Parameter(param.new_empty(0), requires_grad=False),
+            )
+        self.quant_method.setup_quant_scales(self)
+
+    def _split_weights_for_ugpu(self):
+        """Split full N-dimension weights into per-partition halves.
+
+        After normal load_weights + post_load_weights, the full weights
+        are on self. Split them along dim=1 (N) and allocate halves on
+        each uGPU partition's localized memory.
+        """
+        num_p = self._ugpu_plan.num_partitions
+        shards = []
+        for pid in range(num_p):
+            with self._ugpu_runtime.partition_weight_context(pid):
+                n1 = self.w3_w1_weight.size(1)
+                n2 = self.w2_weight.size(1)
+                half_n1 = n1 // num_p
+                half_n2 = n2 // num_p
+                shard = {
+                    'w3_w1_weight':
+                    self.w3_w1_weight[:, pid * half_n1:(pid + 1) *
+                                      half_n1].contiguous().cuda(),
+                    'w2_weight':
+                    self.w2_weight[:, pid * half_n2:(pid + 1) *
+                                   half_n2].contiguous().cuda(),
+                }
+                if self.has_nvfp4:
+                    shard.update({
+                        'fc1_weight_block':
+                        self.quant_scales.fc1_weight_block[:, pid * half_n1:(
+                            pid + 1) * half_n1].contiguous().cuda(),
+                        'fc2_weight_block':
+                        self.quant_scales.fc2_weight_block[:, pid * half_n2:(
+                            pid + 1) * half_n2].contiguous().cuda(),
+                        'fc1_global':
+                        self.quant_scales.fc1_global,
+                        'fc2_global':
+                        self.quant_scales.fc2_global,
+                        'fc2_input_scale':
+                        self.fc2_input_scale,
+                    })
+                shards.append(shard)
+        return shards

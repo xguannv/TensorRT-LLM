@@ -284,6 +284,7 @@ class CutlassFusedMoE(MoE):
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         activation_type: ActivationType = ActivationType.Swiglu,
+        ignore_weights: bool = False,
     ):
 
         super().__init__(
@@ -365,7 +366,7 @@ class CutlassFusedMoE(MoE):
         self.lora = self._maybe_make_lora_marker(model_config)
 
         self._weights_created = False
-        if not model_config.skip_create_weights_in_init:
+        if not model_config.skip_create_weights_in_init and not ignore_weights:
             self.create_weights()
 
     # ---- Routed-expert LoRA helpers ----
@@ -1173,3 +1174,9 @@ class CutlassFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
+
+    def post_load_weights(self):
+        self.post_load_weights_impl()
+
+    def post_load_weights_impl(self):
+        self.quant_method.post_load_weights(self)

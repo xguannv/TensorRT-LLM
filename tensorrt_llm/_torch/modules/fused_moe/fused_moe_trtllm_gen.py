@@ -140,11 +140,11 @@ class TRTLLMGenFusedMoE(MoE):
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
-        # TRTLLMGenFusedMoE requires SM in {100, 103}
-        if sm_version not in {100, 103}:
+        # TRTLLMGenFusedMoE requires SM in {100, 103, 107}
+        if sm_version not in {100, 103, 107}:
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+                f"TRTLLMGenFusedMoE requires SM100, SM103 or SM107, got SM{sm_version}"
             )
 
         # forward_impl asserts x.dtype == torch.bfloat16
@@ -273,6 +273,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
+        self.model_config = model_config
         self.max_num_tokens = model_config.max_num_tokens
 
         # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
@@ -916,6 +917,7 @@ class TRTLLMGenFusedMoE(MoE):
                 output=moe_output,
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
+                use_lamport=self.model_config.use_lamport_sync,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result

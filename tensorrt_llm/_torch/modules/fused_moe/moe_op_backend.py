@@ -332,6 +332,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        use_lamport=False,
     ):
         hidden_size = gemm1_weights.shape[-1] * 2
         if gated_act_type == int(ActType_TrtllmGen.SiTu):
@@ -406,6 +407,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    use_lamport=use_lamport,
                 )
                 if not do_finalize:
                     return outputs
