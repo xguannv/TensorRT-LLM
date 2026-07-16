@@ -1579,6 +1579,8 @@ repos:
     rev: v6.0.0
     hooks:
     -   id: check-added-large-files
+        exclude: |
+            (?x)^(.*cubin.cpp | .*cubin.h | .*cubin.tar.zst | .*KernelMetaInfo\.h)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
@@ -1616,6 +1618,9 @@ repos:
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
+        exclude: |
+            (?x)^(.*cubin.cpp$ | .*_cubin.h | .*KernelMetaInfo\.h)$
+        require_serial: true
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:

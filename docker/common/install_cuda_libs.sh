@@ -47,58 +47,35 @@ install_ubuntu_requirements() {
     dpkg -i cuda-keyring_1.1-1_all.deb
     rm cuda-keyring_1.1-1_all.deb
 
-    apt-get update
-    if [[ $(apt list --installed | grep libcudnn9) ]]; then
-      apt-get remove --purge -y libcudnn9*
-    fi
-    if [[ $(apt list --installed | grep libnccl) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages libnccl*
-    fi
-    if [[ $(apt list --installed | grep libcublas) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages libcublas*
-    fi
-    if [[ $(apt list --installed | grep cuda-nvrtc-dev) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
-    fi
+    #apt-get update
+    #if [[ $(apt list --installed | grep libcudnn9) ]]; then
+    #  apt-get remove --purge -y libcudnn9*
+    #fi
+    #if [[ $(apt list --installed | grep libnccl) ]]; then
+    #  apt-get remove --purge -y --allow-change-held-packages libnccl*
+    #fi
+    #if [[ $(apt list --installed | grep libcublas) ]]; then
+    #  apt-get remove --purge -y --allow-change-held-packages libcublas*
+    #fi
+    #if [[ $(apt list --installed | grep cuda-nvrtc-dev) ]]; then
+    #  apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
+    #fi
 
-    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
-    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
-    NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    #CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    #NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
-    apt-get install -y --no-install-recommends \
-        libcudnn9-cuda-13=${CUDNN_VER} \
-        libcudnn9-dev-cuda-13=${CUDNN_VER} \
-        libcudnn9-headers-cuda-13=${CUDNN_VER} \
-        libnccl2=${NCCL_VER} \
-        libnccl-dev=${NCCL_VER} \
-        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
-        libcublas${CUBLAS_MAJOR_VER}-dev-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
-        cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
+    #apt-get install -y --no-install-recommends \
+    #    libcudnn9-cuda-13=${CUDNN_VER} \
+    #    libcudnn9-dev-cuda-13=${CUDNN_VER} \
+    #    libcudnn9-headers-cuda-13=${CUDNN_VER} \
+    #    libnccl2=${NCCL_VER} \
+    #    libnccl-dev=${NCCL_VER} \
+    #    libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
+    #    libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
+    #    cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
 
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-
-    # cublas >= 13.4.1.2 installs headers to /usr/include/libcublas/<major>/
-    # instead of /usr/local/cuda/include/. Symlink them back for build compatibility.
-    CUBLAS_HDR_DIR="/usr/include/libcublas/${CUBLAS_MAJOR_VER}"
-    if [ -d "${CUBLAS_HDR_DIR}" ]; then
-        for hdr in "${CUBLAS_HDR_DIR}"/*.h; do
-            ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
-        done
-    fi
-
-    # cublas >= 13.4.1.2 installs .so files to /usr/lib/<arch>-linux-gnu/libcublas/<major>/
-    # instead of /usr/local/cuda/lib64/. Symlink them so LD_LIBRARY_PATH=/usr/local/cuda/lib64 finds them.
-    ARCH=$(uname -m)
-    CUBLAS_LIB_DIR="/usr/lib/${ARCH}-linux-gnu/libcublas/${CUBLAS_MAJOR_VER}"
-    if [ -d "${CUBLAS_LIB_DIR}" ]; then
-        for lib in "${CUBLAS_LIB_DIR}"/libcublas*.so*; do
-            [ -e "${lib}" ] || continue
-            target="/usr/local/cuda/lib64/$(basename ${lib})"
-            [ -e "${target}" ] || ln -sf "${lib}" "${target}"
-        done
-    fi
-    ldconfig
+    #apt-get clean
+    #rm -rf /var/lib/apt/lists/*
 }
 
 install_rockylinux_requirements() {

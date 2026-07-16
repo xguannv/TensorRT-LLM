@@ -19,11 +19,18 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
 add_library(trtllm_gen_batched_gemm OBJECT)
-filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 100f)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 107 100f)
 
 target_sources(trtllm_gen_batched_gemm PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(trtllm_gen_batched_gemm
                            PUBLIC TLLM_GEN_EXPORT_INTERFACE TLLM_ENABLE_CUDA)
+
+# Always define TLLM_RUBIN_FEATURES to enable SM107 (Rubin) support in the code.
+# This is required because the generated KernelMetaInfo.h includes Lamport
+# fields in all kernel entries (including SM100), which requires the GemmOptions
+# struct to have those fields defined. Rubin-specific features have runtime
+# guards.
+target_compile_definitions(trtllm_gen_batched_gemm PUBLIC TLLM_RUBIN_FEATURES)
 
 set_property(TARGET trtllm_gen_batched_gemm PROPERTY POSITION_INDEPENDENT_CODE
                                                      ON)
