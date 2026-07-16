@@ -1247,7 +1247,8 @@ class PyExecutor:
         divergent gates (_process_previous_batch, _handle_executed_batch).
         Non-ADP runs handle timeouts inline; the buffer is empty here.
         """
-        if not (self.enable_attention_dp and self.dist.world_size != 1):
+        if not (self.kv_cache_transceiver is not None
+                and self.enable_attention_dp and self.dist.world_size != 1):
             return
         timed_out = self._pending_timed_out_requests
         self._pending_timed_out_requests = []
@@ -4847,6 +4848,8 @@ class PyExecutor:
             self.previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()
         self._process_previous_batch()
+        if self.enable_kv_cache_events:
+            self._add_kv_cache_events()
         self.perf_manager.compute_batch_gpu_times(
             self.previous_batch.scheduled_requests.all_requests())
         self.previous_batch = None
@@ -5335,6 +5338,12 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # KV-cache event flushing performs an attention-DP allgather.
+                # Keep it outside the rank-divergent previous-batch branch so
+                # every rank enters the collective in the same order.
+                if self.enable_kv_cache_events:
+                    self._add_kv_cache_events()
+
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to
                 # the _enqueue_responses([]) call in the else branch.
@@ -5480,8 +5489,6 @@ class PyExecutor:
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
-        if self.enable_kv_cache_events:
-            self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
