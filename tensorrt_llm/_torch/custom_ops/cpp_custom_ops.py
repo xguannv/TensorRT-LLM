@@ -590,9 +590,13 @@ def _register_fake():
         top_k: int,
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        use_cft_counted_writes: bool = False,
+        expert_id_payload_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
+        del use_cft_counted_writes, expert_id_payload_index, invalid_token_expert_id, enable_rank_mask, active_rank_mask
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
             elements_per_token = payload.shape[1]

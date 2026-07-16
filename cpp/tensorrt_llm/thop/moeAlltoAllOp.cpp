@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllCftManager.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
@@ -23,6 +24,8 @@
 
 #include <atomic>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <memory>
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <vector>
@@ -137,9 +140,33 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
     offsets[EPLB_GATHERED_STATS_OFFSET_INDEX] = offset;
     offset += static_cast<size_t>(epSize) * static_cast<size_t>(eplbStatsNumExperts) * SIZEOF_INT32;
 
+    // Counted write counters: each 8B counter must be kCftCounterStride-aligned to avoid
+    // L2 XBAR port camping when concurrent counters update (see NCCL CFT perf study).
+    using tensorrt_llm::kernels::moe_comm::kCftCounterStride;
+
+    // dispatch counted write counters: [ep_size] uint64_t, kCftCounterStride stride
+    offset = alignOffset(offset, kCftCounterStride);
+    offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
+    offset += epSize * kCftCounterStride;
+
+    // combine counted write counters (CFT combine path): per receive-slot uint64
+    // counters, [ep_size * maxNumTokens], kCftCounterStride stride to avoid L2 XBAR camping.
+    offset = alignOffset(offset, kCftCounterStride);
+    offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
+    offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * kCftCounterStride;
+
+    // Lamport sync buffer: 2 * ep_size int32 per rank (double-buffered, CFT dispatch path).
+    // Parity 0 occupies [0, ep_size), parity 1 occupies [ep_size, 2*ep_size).
+    // No extra alignment needed beyond int32 natural alignment.
+    offsets[LAMPORT_BUF_OFFSET_INDEX] = offset;
+    offset += 2 * static_cast<size_t>(epSize) * SIZEOF_INT32;
+
     // payload data
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[PAYLOAD_DATA_OFFSET_INDEX] = offset;
+
+    // Stable combine slot stride (a count, not a byte offset).
+    offsets[MAX_NUM_TOKENS_INDEX] = maxNumTokens;
 
     return offsets;
 }
@@ -169,14 +196,19 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
 
-    // Initialize workspace to zero
-    workspace[epRank].zero_();
-
     int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
     TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
 
     // Calculate auxiliary data offsets
     MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxNumTokens, static_cast<int>(eplbStatsNumExpertsValue));
+
+    // Initialize workspace to zero, then fill lamport buf with 0xFF (-1 as int32).
+    // The Lamport sync protocol requires recv_counters to start at -1 so receivers spin
+    // until a valid non-(-1) count is written by the sender.
+    workspace[epRank].zero_();
+    uint8_t* rankWorkSpacePtr = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
+    cudaMemsetAsync(rankWorkSpacePtr + offsets[LAMPORT_BUF_OFFSET_INDEX], 0xFF,
+        2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
 
     // Return metainfo as a tensor containing offsets
     torch::Tensor metainfo = torch::empty(
@@ -192,6 +224,101 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     tensorrt_llm::mpi::MpiComm::session().barrier();
 
     return metainfo;
+}
+
+// ============================================================================
+// CFT Handle-Based Counted Writes Initialization
+// ============================================================================
+
+// Static CftLeManager — lives for the process lifetime (like workspace).
+static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_manager;
+
+// Cumulative counter baselines (regular device memory, NOT LE-backed).
+// LE counters are never zeroed — they grow monotonically. These baselines
+// track the cumulative expected value so polling uses counter >= baseline + expected.
+static uint64_t* g_cft_dispatch_counter_baseline = nullptr;
+static uint64_t* g_cft_combine_counter_baseline = nullptr;      // [ep_size * maxNumTokens] (CFT combine)
+static uint64_t* g_cft_combine_counter_baseline_next = nullptr; // double-buffer
+
+// Initialize CFT Logical Endpoints for handle-based counted writes.
+//
+// This op:
+//   1. Creates a CftLeManager that loads LE driver APIs
+//   2. Allocates fabric memory for the local rank's LE (recv buffer + counters)
+//   3. Exchanges LE handles with all ranks via MPI allgather
+//   4. Returns a tensor containing peer LE IDs, counter base, and backing pointer
+//
+// The LE memory layout:
+//   [0, payloadSize)                          — payload data (same layout as workspace recv buffers)
+//   [counterBase, counterBase + ep_size * 8)  — per-source-rank 8B counted write counters
+//
+// Args:
+//   workspace: the MNNVL workspace tensor (used for dimensions only)
+//   metainfo: the metainfo tensor from moe_a2a_initialize
+//   inputPayloads: representative payload tensors (for size calculation)
+//   runtimeMaxTokensPerRank: max tokens per rank
+//   epRank: current EP rank
+//   epSize: total EP size
+//
+// Returns:
+//   cft_info: 1D int64 tensor [ep_size + 3] containing:
+//     [0..ep_size-1] : peer LE IDs (uint32_t stored as int64)
+//     [ep_size]      : counter base offset within LE
+//     [ep_size+1]    : local LE backing pointer (CUdeviceptr stored as int64)
+//     [ep_size+2]    : total LE alloc size
+// Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
+// The workspace memory IS the LE backing store — fabric.try_put.counted writes land
+// directly in workspace recv_buffers, eliminating the duplicate allocation and the
+// need to know payload layout at init time.
+//
+// Args:
+//   workspaceMemHandle: CUmemGenericAllocationHandle (as int64) from cuMemCreate
+//   workspaceRankPtr:   VA pointer to this rank's workspace region (as int64)
+//   workspaceSizePerRank: size of the workspace per rank in bytes
+//   epRank, epSize: EP topology
+void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemHandle, int64_t workspaceSizePerRank,
+    int64_t epRank, int64_t epSize)
+{
+    if (g_cft_manager && g_cft_manager->isInitialized())
+        return;
+
+    CHECK_TH_CUDA(workspace);
+    CUdeviceptr workspaceRankPtr
+        = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
+
+    g_cft_manager = std::make_unique<tensorrt_llm::kernels::moe_comm::CftLeManager>();
+
+    TORCH_CHECK(g_cft_manager->loadApis(),
+        "CftLeManager: Failed to load LE driver APIs. "
+        "Ensure CUDA driver 615.00+ is installed.");
+
+    int localDevIdx = -1;
+    cudaGetDevice(&localDevIdx);
+    TORCH_CHECK(g_cft_manager->createEndpointExternal(localDevIdx,
+                    static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle), workspaceRankPtr,
+                    static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank), static_cast<int>(epSize)),
+        "CftLeManager: Failed to create LE endpoint bound to workspace on device ", localDevIdx);
+
+    auto allgatherFn = [](void const* sendBuf, void* recvBuf, size_t bytesPerRank) {
+        tensorrt_llm::mpi::MpiComm::world().allgather(
+            sendBuf, recvBuf, bytesPerRank, tensorrt_llm::mpi::MpiType::kBYTE);
+    };
+
+    TORCH_CHECK(g_cft_manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
+
+    // Counter regions are already zeroed by moeA2AInitializeOp (workspace[epRank].zero_()).
+    // Allocate cumulative counter baselines (regular device memory, NOT LE-backed).
+    size_t baselineBytes = static_cast<size_t>(epSize) * sizeof(uint64_t);
+    cudaMalloc(&g_cft_dispatch_counter_baseline, baselineBytes);
+    cudaMemsetAsync(g_cft_dispatch_counter_baseline, 0, baselineBytes, at::cuda::getCurrentCUDAStream());
+
+    cudaError_t initErr = cudaDeviceSynchronize();
+    if (initErr != cudaSuccess)
+    {
+        fprintf(stderr, "CftLeManager[rank%d]: cudaDeviceSynchronize after init FAILED: %s\n", (int) epRank,
+            cudaGetErrorString(initErr));
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
 // MoE All-to-All Dispatch Operation
@@ -227,7 +354,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
-    bool enableRankMask, torch::optional<torch::Tensor> activeRankMask)
+    bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
+    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask)
+
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -259,6 +388,10 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // numExperts does not need to be divisible by epSize: the kernel performs
     // ceil/floor contiguous partitioning so ranks [0, numExperts % epSize)
     // own (numExperts / epSize + 1) experts and the rest own (numExperts / epSize).
+
+    bool const sanitizeExpertIds = expertIdPayloadIndex.has_value() || invalidTokenExpertId.has_value();
+    TORCH_CHECK(expertIdPayloadIndex.has_value() == invalidTokenExpertId.has_value(),
+        "expert_id_payload_index and invalid_token_expert_id must be provided together");
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
     if (enableEplb)
@@ -319,6 +452,19 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         // Update offset and align to cacheline boundary for the next payload recv buffer.
         currentOffset += bytesPerPayload;
         currentOffset = alignOffset(currentOffset, CACHELINE_ALIGNMENT);
+    }
+
+    int expertIdPayloadIdx = -1;
+    int32_t invalidExpertId = -1;
+    if (sanitizeExpertIds)
+    {
+        expertIdPayloadIdx = static_cast<int>(*expertIdPayloadIndex);
+        TORCH_CHECK(expertIdPayloadIdx >= 0 && expertIdPayloadIdx < static_cast<int>(inputPayloads.size()),
+            "expert_id_payload_index out of range");
+        auto const& expertIdPayload = inputPayloads[expertIdPayloadIdx];
+        CHECK_TYPE(expertIdPayload, torch::kInt32);
+        TORCH_CHECK(expertIdPayload.size(1) == topK, "expert-id payload must have topK columns");
+        invalidExpertId = static_cast<int32_t>(*invalidTokenExpertId);
     }
 
     CHECK_TH_CUDA(workspace);
@@ -382,6 +528,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
             = reinterpret_cast<int*>(targetWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);
         params.completion_flags[target_rank]
             = reinterpret_cast<uint32_t*>(targetWorkSpacePtr + offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]);
+        params.le_dispatch_counters[target_rank]
+            = reinterpret_cast<uint64_t*>(targetWorkSpacePtr + offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX]);
         if (enableEplb)
         {
             params.eplb_gathered_stats[target_rank]
@@ -408,6 +556,61 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         params.eplb_local_stats = nullptr;
     }
 
+    // CFT requires all payloads to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
+    // Fall back to fence-based dispatch if any payload is not aligned.
+    if (useCftCountedWrites)
+    {
+        for (int i = 0; i < num_payloads; i++)
+        {
+            int bytesPerToken = payloadElementSizes[i] * payloadElementsPerToken[i];
+            if (bytesPerToken % 16 != 0)
+            {
+                TLLM_LOG_WARNING(
+                    "CFT counted writes disabled: payload %d has %d bytes per token (not 16B-aligned). "
+                    "Falling back to fence-based dispatch.",
+                    i, bytesPerToken);
+                useCftCountedWrites = false;
+                break;
+            }
+        }
+    }
+    params.use_cft_counted_writes = useCftCountedWrites;
+    params.sanitize_expert_ids = useCftCountedWrites && sanitizeExpertIds;
+    params.expert_id_payload_index = expertIdPayloadIdx;
+    params.invalid_expert_id = invalidExpertId;
+
+    // CFT handle-based counted writes
+    if (useCftCountedWrites)
+    {
+        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
+
+        // Fill peer LE IDs
+        auto const* leIds = g_cft_manager->getAllLeIds();
+        for (int i = 0; i < static_cast<int>(epSize); i++)
+        {
+            params.cft_peer_le_ids[i] = leIds[i];
+        }
+
+        // LE payload offsets = workspace payload offsets (LE IS the workspace).
+        // No separate LE layout — fabric.try_put.counted writes directly into workspace recv_buffers.
+        for (int i = 0; i < num_payloads; i++)
+        {
+            params.cft_le_payload_offsets[i] = payloadRecvBufferOffsets[i];
+        }
+        params.cft_le_counter_base = offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX];
+
+        // recv_buffers and le_dispatch_counters already point to the workspace (set above).
+        // No override needed — workspace IS the LE backing store.
+
+        params.cft_dispatch_counter_baseline = g_cft_dispatch_counter_baseline;
+
+        // Double-buffered Lamport sync: active parity is derived in device code from flag_val.
+        // lamport_stride is the offset (in int32 units) from recv_counters[rank] to lamport_buf[rank].
+        params.lamport_stride = static_cast<int32_t>(
+            (offsets[LAMPORT_BUF_OFFSET_INDEX] - offsets[RECV_COUNTERS_OFFSET_INDEX]) / sizeof(int32_t));
+    }
+
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
@@ -427,6 +630,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Launch the dispatch kernel
     moe_a2a_dispatch_launch(params);
+
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_dispatch kernel launch failed: ", cudaGetErrorString(result));
 
@@ -435,15 +639,23 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
     {
         auto const& payload = inputPayloads[payload_idx];
-        // Create tensor view for this payload using pre-calculated aligned offset
-        auto recvTensor = torch::from_blob(rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx],
-            {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
+        void* recvDataPtr;
+        if (useCftCountedWrites)
+        {
+            // LE IS workspace — recv data is at the same workspace offset regardless of CFT.
+            recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
+        }
+        else
+        {
+            recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
+        }
+        auto recvTensor = torch::from_blob(
+            recvDataPtr, {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
         recvTensors.push_back(recvTensor);
     }
 
     // Compute aligned offset after dispatch payloads for combine payload region
     int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(currentOffset, CACHELINE_ALIGNMENT));
-
     torch::Tensor eplbGatheredStats;
     if (enableEplb)
     {
@@ -473,11 +685,14 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 // In both cases, the combine kernel reads from the workspace at 'combinePayloadOffset'.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
-    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision, bool enableRankMask,
+    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
+    bool useCftCountedWrites = false, bool enableRankMask = false,
     torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
+
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
+    using tensorrt_llm::kernels::moe_comm::moe_a2a_cft_combine_push_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
@@ -496,6 +711,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
+    TORCH_CHECK(!(useLowPrecision && useCftCountedWrites), "CFT combine with low-precision combine is not supported");
 
     // Map torch dtype to tensorrt_llm::DataType
     tensorrt_llm::DataType nvDtype = tensorrt_llm::DataType::kFLOAT;
@@ -583,6 +799,71 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
 
+    // CFT requires the payload to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
+    // Fall back to fence-based combine if the per-token payload is not aligned.
+    if (useCftCountedWrites)
+    {
+        int bytesPerToken = static_cast<int>(elementsPerToken) * static_cast<int>(payload.dtype().itemsize());
+        if (bytesPerToken % 16 != 0)
+        {
+            TLLM_LOG_WARNING(
+                "CFT counted writes disabled: combine payload has %d bytes per token (not 16B-aligned). "
+                "Falling back to fence-based combine.",
+                bytesPerToken);
+            useCftCountedWrites = false;
+        }
+    }
+
+    // ---- CFT combine wiring (counted writes). Sets up dedicated receive region C,
+    // per-slot combine counters, and double-buffered baselines. Fence combine ignores these. ----
+    params.use_cft_for_combine = useCftCountedWrites;
+    if (useCftCountedWrites && g_cft_manager && g_cft_manager->isInitialized())
+    {
+        auto const* leIds = g_cft_manager->getAllLeIds();
+        for (int i = 0; i < static_cast<int>(epSize); i++)
+            params.cft_peer_le_ids[i] = leIds[i];
+
+        // Dedicated combine RECEIVE region C: placed right after region A (combine payload).
+        // prepareCombine never touches C, so only fabric pushes write it -> no proxy aliasing.
+        int64_t combineRecvRegionOffset = alignOffset(combinePayloadOffset + payloadSize, CACHELINE_ALIGNMENT);
+        TORCH_CHECK(combineRecvRegionOffset + payloadSize <= sizePerRank,
+            "CFT combine: workspace too small for combine receive region C: need ",
+            combineRecvRegionOffset + payloadSize, " bytes, got ", sizePerRank);
+        params.cft_le_combine_payload_base = static_cast<uint64_t>(combineRecvRegionOffset);
+        params.cft_le_combine_counter_base = offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX];
+        params.cft_le_combine_counters
+            = reinterpret_cast<uint64_t*>(rankWorkSpacePtr + offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX]);
+        params.cft_le_combine_recv = reinterpret_cast<void*>(rankWorkSpacePtr + combineRecvRegionOffset);
+
+        // Per-slot baselines [ep_size * maxNumTokens], allocated lazily; memset 0 = fresh cumulative state.
+        {
+            static size_t g_combine_baseline_slots = 0;
+            int const staticMaxTokens = static_cast<int>(offsets[MAX_NUM_TOKENS_INDEX]);
+            params.combine_counter_ep_stride = staticMaxTokens;
+            size_t needSlots = static_cast<size_t>(epSize) * static_cast<size_t>(staticMaxTokens);
+            if (g_cft_combine_counter_baseline == nullptr || g_combine_baseline_slots < needSlots)
+            {
+                if (g_cft_combine_counter_baseline)
+                    cudaFree(g_cft_combine_counter_baseline);
+                if (g_cft_combine_counter_baseline_next)
+                    cudaFree(g_cft_combine_counter_baseline_next);
+                size_t bytes = needSlots * sizeof(uint64_t);
+                cudaMalloc(&g_cft_combine_counter_baseline, bytes);
+                cudaMalloc(&g_cft_combine_counter_baseline_next, bytes);
+                auto st = at::cuda::getCurrentCUDAStream();
+                cudaMemsetAsync(g_cft_combine_counter_baseline, 0, bytes, st);
+                cudaMemsetAsync(g_cft_combine_counter_baseline_next, 0, bytes, st);
+                g_combine_baseline_slots = needSlots;
+            }
+        }
+        params.cft_combine_counter_baseline = g_cft_combine_counter_baseline;
+        params.cft_combine_counter_baseline_next = g_cft_combine_counter_baseline_next;
+    }
+    else
+    {
+        params.use_cft_for_combine = false;
+    }
+
     params.enable_rank_mask = enableRankMask;
     if (params.enable_rank_mask)
     {
@@ -599,7 +880,13 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     moe_a2a_prepare_combine_launch(params);
 
-    // Launch the combine kernel
+    // CFT combine push: processing rank pushes results back to originating rank's LE.
+    if (params.use_cft_for_combine)
+    {
+        moe_a2a_cft_combine_push_launch(params);
+    }
+
+    // Launch the combine kernel.
     moe_a2a_combine_launch(params);
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_combine kernel launch failed: ", cudaGetErrorString(result));
@@ -689,13 +976,25 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int num_experts, "
         "Tensor? eplb_local_stats=None, "
-        "bool enable_rank_mask=False, Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "bool use_cft_counted_writes=False, "
+        "int? expert_id_payload_index=None, "
+        "int? invalid_token_expert_id=None, "
+        "bool enable_rank_mask=False, "
+        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
-        "bool payload_in_workspace, bool use_low_precision=False, "
-        "bool enable_rank_mask=False, Tensor? active_rank_mask=None) -> Tensor");
+        "bool payload_in_workspace, "
+        "bool use_low_precision=False, "
+        "bool use_cft_counted_writes=False, "
+        "bool enable_rank_mask=False, "
+        "Tensor? active_rank_mask=None) -> Tensor");
+
+    module.def(
+        "moe_a2a_cft_initialize(Tensor workspace, int workspace_mem_handle, "
+        "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None) -> Tensor");
@@ -719,4 +1018,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl("moe_a2a_sanitize_expert_ids", &tensorrt_llm::torch_ext::moe_comm::moeA2ASanitizeExpertIdsOp);
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
+    module.impl("moe_a2a_cft_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftInitializeOp);
 }

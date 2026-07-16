@@ -31,6 +31,7 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -190,6 +191,7 @@ class ModelConfig(Generic[TConfig]):
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
+    use_lamport_sync: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
     # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
@@ -216,6 +218,9 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_blockscaling_bmm: bool = False
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
+
+    # uGPU execution policy (controls partitioned linear/MoE execution)
+    ugpu_policy: UgpuPolicy = field(default_factory=UgpuPolicy)
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -286,6 +291,8 @@ class ModelConfig(Generic[TConfig]):
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+        self.extra_attrs["ugpu_policy"] = self.ugpu_policy
 
     @property
     def torch_dtype(self) -> torch.dtype:

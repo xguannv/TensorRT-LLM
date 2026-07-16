@@ -36,6 +36,24 @@ static_assert(kRankMaskWords * 64 >= kMaxRanks, "active_rank_mask too small for 
 // Default completion-flag wait budget: 300 s at an assumed 2 GHz clock64 rate.
 static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000ll;
 
+// CFT counted write counter stride: 256B per counter to avoid L2 XBAR port camping
+// when concurrent counters update. See NCCL CFT perf study (CST tracking structure).
+static constexpr size_t kCftCounterStride = 256;
+static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64_t);
+
+// Smem slot reserved for an mbarrier in the CFT dispatch / push-combine kernels.
+// The mbarrier itself is only 8 B (a uint64_t initialized via mbarrier.init.shared.b64);
+// the 64 B reservation is padding so the staging buffer that immediately follows is
+// 16 B-aligned (cp.async.bulk requires 16 B-aligned source AND destination).
+static constexpr int kCftMbarrierSlotBytes = 64;
+
+// Fixed-size LE ID array passed by value as a kernel argument (no device allocation needed).
+// Used by the CFT combine push kernel.
+struct CftPeerLeIds
+{
+    uint32_t ids[kMaxRanks];
+};
+
 // Describes a single payload type to be communicated
 struct PayloadDescriptor
 {
@@ -52,11 +70,15 @@ struct DispatchKernelPointers
     void const* src_data_ptrs[kMaxPayloads];     // Array of source data pointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
-
-    // Completion flags for synchronization
+    // Completion flags for synchronization (fence-based path)
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
+
+    // LE dispatch counters: HW-incremented byte counters for dispatch data.
+    // le_dispatch_counters[target_rank][source_rank] is incremented by fabric engine
+    // by the number of bytes written from source_rank to target_rank.
+    uint64_t* le_dispatch_counters[kMaxRanks];
 
     // Local aux data pointers
     int* send_counters;            // [ep_size] How many tokens have been sent to each target rank
@@ -72,9 +94,18 @@ struct DispatchKernelPointers
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
-    // Active-rank bitmask: bit i set => rank i participates in this collective.
-    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. The masked kernel
-    // rejects inactive route targets and skips their peer counters, stats, and flags.
+    // CFT handle-based counted writes (fabric.try_put.counted via Logical Endpoints)
+    uint32_t peer_le_ids[kMaxRanks];
+    uint64_t le_payload_offsets[kMaxPayloads];
+    uint64_t le_counter_base;
+    uint64_t* dispatch_counter_baseline;
+    int32_t lamport_stride;
+    bool sanitize_expert_ids;
+    int expert_id_payload_index;
+    int32_t invalid_expert_id;
+
+    // Active-rank bitmask: bit i set means rank i participates in this collective.
+    // Masked routes and peer synchronization are skipped when rank-mask mode is enabled.
     uint64_t active_rank_mask[kRankMaskWords];
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -88,7 +119,7 @@ struct CombineKernelPointers
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
 
-    // Completion flags for synchronization
+    // Completion flags for synchronization (fence-based path)
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
@@ -97,8 +128,15 @@ struct CombineKernelPointers
     int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
     int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
-    // completion flag writes/waits to/from inactive peers.
+    // CFT combine counted-write fields. Unused by the fence combine path.
+    uint32_t peer_le_ids[kMaxRanks];
+    uint64_t* combine_counters;
+    uint64_t* combine_counter_baseline;
+    uint64_t* combine_counter_baseline_next;
+    int combine_counter_ep_stride = 0;
+    void const* combine_src_payload;
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask.
     uint64_t active_rank_mask[kRankMaskWords];
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -138,6 +176,7 @@ struct MoeA2ADispatchParams
     int* recv_counters[kMaxRanks]; // tracks tokens received from each source rank. Each rank has [ep_size] counters
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
+    uint64_t* le_dispatch_counters[kMaxRanks];   // HW-incremented byte counters (counted writes path)
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // Per-rank receive buffers for each payload
 
     // Optional: Statistics for EPLB
@@ -146,14 +185,21 @@ struct MoeA2ADispatchParams
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
-    // Whether to instantiate a kernel with active-rank checks.
-    // This is a launch-lifetime mode, independent of future execution-abort handling.
+    // Whether to instantiate kernels with active-rank checks.
     bool enable_rank_mask{false};
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
-    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
+    // CFT handle-based counted writes.
+    bool use_cft_counted_writes{false};
+    uint32_t cft_peer_le_ids[kMaxRanks];
+    uint64_t cft_le_payload_offsets[kMaxPayloads];
+    uint64_t cft_le_counter_base;
+    uint64_t* cft_dispatch_counter_baseline;
+    int32_t lamport_stride;
+    bool sanitize_expert_ids;
+    int expert_id_payload_index;
+    int32_t invalid_expert_id;
+
+    // Active-rank bitmask. Defaults to all ranks active for backward compatibility.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -213,14 +259,21 @@ struct MoeA2ACombineParams
                                            // rank has signaled the target rank
     void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
 
-    // Whether to instantiate a kernel with active-rank checks in peer synchronization.
-    // This is a launch-lifetime mode, independent of future execution-abort handling.
+    // Whether to instantiate kernels with active-rank checks.
     bool enable_rank_mask{false};
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
-    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
-    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
-    // CUDA graph replay until generation-scoped invalidation and recapture are available.
+    // CFT combine counted-write path. Unused when use_cft_for_combine is false.
+    bool use_cft_for_combine{false};
+    uint32_t cft_peer_le_ids[kMaxRanks];
+    uint64_t cft_le_combine_payload_base;
+    uint64_t cft_le_combine_counter_base;
+    uint64_t* cft_le_combine_counters;
+    void* cft_le_combine_recv;
+    uint64_t* cft_combine_counter_baseline;
+    uint64_t* cft_combine_counter_baseline_next;
+    int combine_counter_ep_stride = 0;
+
+    // Active-rank bitmask. Defaults to all ranks active for backward compatibility.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -234,6 +287,9 @@ struct MoeA2ACombineParams
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
+
+// CFT combine push: processing rank pushes expert output back to originating rank's LE.
+void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)

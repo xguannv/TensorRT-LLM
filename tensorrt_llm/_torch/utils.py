@@ -370,6 +370,11 @@ def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def infer_output_m_shape(input_shapes: List[List[int]]):
+    """Infer the M dimension of the output tensor from the first input tensor."""
+    return input_shapes[0][0]
+
+
 def fp8_scale_infer_shape(input_shapes: List[List[int]]):
     """Calculate the dimensions of the fp8 scale tensor.
     """

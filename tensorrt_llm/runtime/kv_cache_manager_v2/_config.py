@@ -44,6 +44,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int  # in bytes
+    enable_ugpu: bool = False
 
     @property
     def tier(self) -> CacheTier:
@@ -51,6 +52,7 @@ class GpuCacheTierConfig:
 
     def assert_valid(self) -> None:
         assert self.quota > 0, "Quota must be positive"
+        assert isinstance(self.enable_ugpu, bool), "enable_ugpu must be a bool"
 
 
 @dataclass(slots=True)

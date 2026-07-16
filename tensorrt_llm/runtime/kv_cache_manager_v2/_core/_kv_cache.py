@@ -329,7 +329,7 @@ class _KVCache:
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
         self._base_page_indices = make_typed(
-            lambda _: make_typed(lambda _: array.array("i"), self.manager._storage.num_life_cycles),
+            lambda _: make_typed(lambda _: array.array("q"), self.manager._storage.num_life_cycles),
             self.beam_width,
         )
         self._committed_tokens = []
@@ -380,11 +380,14 @@ class _KVCache:
         old_indices = self._base_page_indices[beam_idx][layer_group_id]
         new_indices: IndexSeq
         if buf is None:
-            new_indices = array.array("i", old_indices[:length])
+            new_indices = array.array("q", old_indices[:length])
         else:
             assert buf.ndim == 1 and buf.format == "i" and len(buf) >= length
-            buf[:length] = old_indices[:length]
-            buf[length:] = array.array("i", [BAD_PAGE_INDEX]) * (len(buf) - length)
+            # old_indices is array("q") (int64) but buf is int32 memoryview.
+            # Cast via an intermediate array matching buf's format.
+            fmt = buf.format
+            buf[:length] = array.array(fmt, old_indices[:length])
+            buf[length:] = array.array(fmt, [BAD_PAGE_INDEX]) * (len(buf) - length)
             new_indices = buf
         self._base_page_indices[beam_idx][layer_group_id] = new_indices
 
@@ -601,10 +604,18 @@ class _KVCache:
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
             manager._try_update_target_ratios()
-        with self._record_event():
+        record_finish_event = self._cuda_stream is not None
+        if record_finish_event:
+            with self._record_event():
+                self._clear_blocks()
+                self._ssm_blocks = None
+        else:
+            # Fresh/suspended caches may be closed before any CUDA stream is assigned.
+            self._ssm_blocks = None
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
+        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -808,7 +819,7 @@ class _KVCache:
                     if type(indices) is array.array:
                         del indices[new_num_blocks:]
                     else:
-                        indices[new_num_blocks:] = array.array("i", [BAD_PAGE_INDEX]) * (
+                        indices[new_num_blocks:] = array.array(indices.format, [BAD_PAGE_INDEX]) * (
                             len(indices) - new_num_blocks
                         )
 
@@ -853,8 +864,9 @@ class _KVCache:
                 try:
                     new_slots = storage.new_gpu_slots(
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles),
-                        self._record_migrated_slots,
-                        self._record_dropped_pages,
+                        ugpu_id=self.ugpu_id,
+                        migration_recorder=self._record_migrated_slots,
+                        drop_recorder=self._record_dropped_pages,
                     )
                 except OutOfPagesError:
                     self._recover_excess_scratch_slots(excess_scratch_slots)
@@ -1229,7 +1241,10 @@ class _KVCache:
         if any(c > 0 for c in num_slots):
             try:
                 tmp_slots = storage.new_gpu_slots(
-                    num_slots, self._record_migrated_slots, self._record_dropped_pages
+                    num_slots,
+                    ugpu_id=self.ugpu_id,
+                    migration_recorder=self._record_migrated_slots,
+                    drop_recorder=self._record_dropped_pages,
                 )
             except OutOfPagesError:
                 return False
@@ -1457,6 +1472,11 @@ class _KVCache:
     def tokens_per_block(self) -> int:
         return self._tokens_per_block
 
+    @property
+    def ugpu_id(self) -> int | None:
+        """The uGPU this KV cache is pinned to, or None if non-localized."""
+        return self._reuse_scope.ugpu_id
+
     def _page(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex, life_cycle: LifeCycleId
     ) -> BlockPage:
@@ -1494,7 +1514,7 @@ class _KVCache:
         pg_idx = storage.get_pool_group_index(lc_idx)
         for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
-                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1, ugpu_id=self.ugpu_id)[0]
             except OutOfPagesError:
                 continue
             cuda_stream = self.cuda_stream

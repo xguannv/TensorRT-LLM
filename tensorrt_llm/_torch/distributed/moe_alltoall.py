@@ -14,7 +14,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, ActiveRankMaskSnapshot,
@@ -24,6 +24,38 @@ from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
+
+_DISABLE_CFT_COUNTED_WRITES_ENV = "TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES"
+_CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
+_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
+# CFT combine wins at small/medium batch and ties/regresses at large batch, so it is gated by the
+# same per-call token-count threshold as dispatch. Set the env very large to force CFT combine on
+# for all batch sizes, or 0 to force it off.
+_CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
+_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+
+
+def _get_cft_max_batch(env_name: str, default: int) -> int:
+    env_value = os.environ.get(env_name)
+    if env_value is None:
+        return default
+    try:
+        threshold = int(env_value)
+    except ValueError as e:
+        raise ValueError(f"{env_name} must be an integer") from e
+    if threshold < 0:
+        raise ValueError(f"{env_name} must be non-negative")
+    return threshold
+
+
+def _get_cft_max_batch_for_dispatch() -> int | None:
+    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_DISPATCH_ENV,
+                              _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH)
+
+
+def _get_cft_max_batch_for_combine() -> int | None:
+    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV,
+                              _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
 
 
 @dataclass
@@ -43,8 +75,8 @@ class MoeAlltoAll:
     and auxiliary data structures needed for cross-GPU communication.
     """
 
-    # Single shared workspace/memory across the process
-    _WORKSPACE: dict | None = None
+    # Shared workspace/memory across the process, separated by handle type.
+    _WORKSPACES: Dict[bool, dict] = {}
 
     _METAINFO_INDEX: Dict[str, int] | None = None
 
@@ -92,6 +124,11 @@ class MoeAlltoAll:
         workspace_size += ep_size * max_num_tokens * hidden_size * element_size
         workspace_size = pad_up(workspace_size, 128)
 
+        # CFT combine: dedicated combine RECEIVE region C (peer pushes land here;
+        # prepareCombine never touches it -> no proxy aliasing). Same size as the combine region.
+        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+        workspace_size = pad_up(workspace_size, 128)
+
         return workspace_size
 
     @classmethod
@@ -113,6 +150,8 @@ class MoeAlltoAll:
                 int(thop.MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX),
                 "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX":
                 int(thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX),
+                "DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX":
+                int(thop.MOE_A2A_DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX),
                 "TOPK_TARGET_RANKS_OFFSET_INDEX":
                 int(thop.MOE_A2A_TOPK_TARGET_RANKS_OFFSET_INDEX),
                 "TOPK_SEND_INDICES_OFFSET_INDEX":
@@ -133,6 +172,7 @@ class MoeAlltoAll:
         num_slots: int,
         workspace_size_per_rank: int,
         num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
         ep_group_health: Optional[EPGroupHealthLike] = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s:
@@ -151,6 +191,9 @@ class MoeAlltoAll:
                 Note: The terminology is mapped to `num_experts` in this class and the kernels.
             num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
+            can_use_cft_counted_writes: If True, allow CFT handle-based counted
+                writes (fabric.try_put.counted via Logical Endpoints) for dispatch.
+                Requires sm_100+ (Blackwell) or later with CUDA driver 615.00+.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
@@ -196,42 +239,56 @@ class MoeAlltoAll:
                 f"{num_slots} and num_experts={num_experts}")
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
+        # Master off-switch, consistent with NVLinkOneSided: env forces fence for both stages.
+        if os.environ.get(_DISABLE_CFT_COUNTED_WRITES_ENV) == "1":
+            can_use_cft_counted_writes = False
+        self.can_use_cft_counted_writes = can_use_cft_counted_writes
+        self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
+        self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
 
-        if self._WORKSPACE is None:
+        workspace_key = self.can_use_cft_counted_writes
+        workspace_entry = self._WORKSPACES.get(workspace_key)
+        memory_cls = CftMnnvlMemory if self.can_use_cft_counted_writes else MnnvlMemory
+
+        if workspace_entry is None:
             tllm_logger.info(
                 f"NVLinkOneSided AlltoAll: Allocating workspace with size {workspace_size_per_rank} bytes. ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, max_num_tokens: {self.max_num_tokens}"
             )
-            mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
+            mnnvl_mem = memory_cls(mapping, workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             metainfo = torch.ops.trtllm.moe_a2a_initialize(
                 workspace, self.ep_rank, self.ep_size, self.max_num_tokens,
                 self.eplb_stats_num_experts)
-            MoeAlltoAll._WORKSPACE = {
+            workspace_entry = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": self.max_num_tokens,
                 "ep_rank": self.ep_rank,
                 "ep_size": self.ep_size,
                 "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
             }
+            MoeAlltoAll._WORKSPACES[workspace_key] = workspace_entry
         else:
-            assert self._WORKSPACE[
+            assert workspace_entry[
                 "workspace_size_per_rank"] == workspace_size_per_rank, "mistakenly reusing workspace with different workspace_size_per_rank"
-            assert self._WORKSPACE[
+            assert workspace_entry[
                 "max_num_tokens"] == self.max_num_tokens, "mistakenly reusing workspace with different max_num_tokens"
-            assert self._WORKSPACE[
+            assert workspace_entry[
                 "ep_rank"] == self.ep_rank, "mistakenly reusing workspace with different ep_rank"
-            assert self._WORKSPACE[
+            assert workspace_entry[
                 "ep_size"] == self.ep_size, "mistakenly reusing workspace with different ep_size"
-            assert self._WORKSPACE[
+            assert workspace_entry[
                 "eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
                     "reuse workspace with different eplb_stats_num_experts")
+            assert workspace_entry[
+                "can_use_cft_counted_writes"] == self.can_use_cft_counted_writes, "reuse workspace with different CFT mode"
 
-        self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
-        self.workspace = self._WORKSPACE["workspace"]
-        self.metainfo = self._WORKSPACE["metainfo"]
+        self.mnnvl_mem = workspace_entry["mnnvl_mem"]
+        self.workspace = workspace_entry["workspace"]
+        self.metainfo = workspace_entry["metainfo"]
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
@@ -276,6 +333,37 @@ class MoeAlltoAll:
         if not sys.is_finalizing():
             self.destroy()
 
+    def use_cft_for_dispatch(self, runtime_max_tokens_per_rank: int) -> bool:
+        if not self.can_use_cft_counted_writes:
+            return False
+        if self.cft_max_batch_for_dispatch is None:
+            return True
+        return runtime_max_tokens_per_rank <= self.cft_max_batch_for_dispatch
+
+    def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
+        if not self.can_use_cft_counted_writes:
+            return False
+        if self.cft_max_batch_for_combine is None:
+            return True
+        return runtime_max_tokens_per_rank <= self.cft_max_batch_for_combine
+
+    def cft_initialize(self):
+        """
+        Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
+        Must be called once before the first dispatch when can_use_cft_counted_writes=True.
+        """
+        assert self.can_use_cft_counted_writes, "cft_initialize called but can_use_cft_counted_writes is False"
+        torch.ops.trtllm.moe_a2a_cft_initialize(
+            self.workspace,
+            self.mnnvl_mem.local_mem_handle,
+            int(self.workspace.size(1)),
+            self.ep_rank,
+            self.ep_size,
+        )
+        tllm_logger.info(
+            f"CFT LE initialized (workspace-bound): ep_rank={self.ep_rank}, ep_size={self.ep_size}"
+        )
+
     def dispatch(self,
                  token_selected_experts: torch.Tensor,
                  input_payloads: list[torch.Tensor],
@@ -305,6 +393,13 @@ class MoeAlltoAll:
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
+        can_use_cft_for_dispatch = self.use_cft_for_dispatch(
+            runtime_max_tokens_per_rank)
+        # Auto-initialize CFT LEs on first dispatch only
+        if self.can_use_cft_counted_writes and not getattr(
+                MoeAlltoAll, '_cft_initialized', False):
+            self.cft_initialize()
+            MoeAlltoAll._cft_initialized = True
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
             assert eplb_local_stats.dim(
@@ -312,6 +407,11 @@ class MoeAlltoAll:
             assert eplb_local_stats.size(
                 0
             ) == self.eplb_stats_num_experts, "eplb_local_stats size must match eplb_stats_num_experts"
+        can_fuse_sanitize = (
+            can_use_cft_for_dispatch and invalid_token_expert_id is not None
+            and expert_id_payload_index is not None and all(
+                (payload.shape[1] * payload.element_size()) % 16 == 0
+                for payload in input_payloads))
 
         requested_active_rank_mask = active_rank_mask
         if (not self._rank_mask_enabled
@@ -332,6 +432,9 @@ class MoeAlltoAll:
             self.top_k,
             self.num_experts,
             eplb_local_stats,
+            can_use_cft_for_dispatch,
+            expert_id_payload_index if can_fuse_sanitize else None,
+            invalid_token_expert_id if can_fuse_sanitize else None,
             self._rank_mask_enabled,
             active_rank_mask,
         )
@@ -348,7 +451,7 @@ class MoeAlltoAll:
         self._state.active_rank_mask_snapshot = active_rank_mask_snapshot
         self._state.phase = "dispatched"
 
-        if invalid_token_expert_id is not None:
+        if invalid_token_expert_id is not None and not can_fuse_sanitize:
             assert expert_id_payload_index is not None, "expert_id_payload_index must be provided if invalid_token_expert_id is not None"
             # Sanitize expert IDs for invalid tokens directly on the recv tensor payload
             recv_token_selected_experts = recv_tensors[expert_id_payload_index]
@@ -403,6 +506,7 @@ class MoeAlltoAll:
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
             payload_in_workspace, use_low_precision_combine,
+            self.use_cft_for_combine(runtime_max_tokens_per_rank),
             self._rank_mask_enabled, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
