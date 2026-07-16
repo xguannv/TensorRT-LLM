@@ -149,7 +149,7 @@ def create_sparse_attn_weights(self) -> None:
             ),
             requires_grad=False,
         )
-        if is_sm_100f():
+        if is_sm_100f() and self.use_cute_dsl_blockscaling_bmm:
             self.o_a_proj = nn.Parameter(
                 torch.empty(
                     (
@@ -289,7 +289,11 @@ def project_sparse_attn_output(
 
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
-    fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_100f()
+    fused_inv_rope_fp8 = (
+        self.o_a_proj.dtype == torch.float8_e4m3fn
+        and self.use_cute_dsl_blockscaling_bmm
+        and is_sm_100f()
+    )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
         attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(

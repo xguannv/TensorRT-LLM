@@ -3452,7 +3452,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + _kv_draft
+                    new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
                         logger.warning_once(

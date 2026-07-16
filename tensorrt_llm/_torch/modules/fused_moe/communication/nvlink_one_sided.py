@@ -725,7 +725,8 @@ class NVLinkOneSided(Communication):
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
             bool(self.use_low_precision_combine),
-            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            self.use_cft_for_combine(runtime_max_tokens_per_rank)
+            and not self.use_low_precision_combine,
             self._rank_mask_enabled,
             active_rank_mask,
         )

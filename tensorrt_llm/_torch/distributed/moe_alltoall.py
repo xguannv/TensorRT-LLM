@@ -506,7 +506,8 @@ class MoeAlltoAll:
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
             payload_in_workspace, use_low_precision_combine,
-            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            self.use_cft_for_combine(runtime_max_tokens_per_rank)
+            and not use_low_precision_combine,
             self._rank_mask_enabled, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
