@@ -51,6 +51,11 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
+
+try:
+    from cutlass.cute.nvgpu.common import CacheEvictionPriority
+except ImportError:
+    CacheEvictionPriority = None
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
@@ -59,6 +64,12 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+)
+
+_NO_ALLOCATE_KWARGS = (
+    {"l1c_evict_priority": CacheEvictionPriority.NO_ALLOCATE}
+    if CacheEvictionPriority is not None
+    else {}
 )
 
 
@@ -126,6 +137,7 @@ class PersistentDenseGemmKernel:
         use_tma_store: bool = True,
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
+        split_k_slices: int = 1,
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -136,6 +148,14 @@ class PersistentDenseGemmKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_tma_store = use_tma_store
         self.arch = "sm_100"
+        # Split-K: number of partitions of the K dimension.  When > 1, each
+        # output tile is computed by ``split_k_slices`` CTAs that each reduce a
+        # contiguous slice of the K tiles and write an FP32 partial into a
+        # workspace with logical L = (batch * split_k_slices).  A separate
+        # reduction kernel (see ``split_k_reduction``) sums the partials and
+        # applies the final epilogue/cast.  ``split_k_slices == 1`` keeps the
+        # original single-pass behaviour byte-for-byte.
+        self.split_k_slices = split_k_slices
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -425,11 +445,11 @@ class PersistentDenseGemmKernel:
                 num_threads=32 * len(self.epilogue_warp_id),
             )
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         # Cluster arrive after barrier init
@@ -520,11 +540,23 @@ class PersistentDenseGemmKernel:
         if warp_idx == self.tma_warp_id:
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
+                # When split-K is active the scheduler L coordinate enumerates
+                # ``batch * split_k_slices`` tiles.  A/B are indexed by the real
+                # batch (``batch_idx``); the K-tile range is restricted to this
+                # split's slice (``k_tile_begin .. k_tile_begin + k_tiles_this``).
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    batch_idx = cur_tile_coord[2] // self.split_k_slices
+                    split_idx = cur_tile_coord[2] % self.split_k_slices
+                else:
+                    batch_idx = cur_tile_coord[2]
+                    split_idx = 0
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
-                    cur_tile_coord[2],
+                    batch_idx,
                 )
+
+                k_tile_begin, k_tiles_this = self._split_k_range(k_tile_cnt, split_idx)
 
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
                 tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
@@ -532,26 +564,26 @@ class PersistentDenseGemmKernel:
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tiles_this, 1, unroll=1):
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
 
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, handle.count)],
+                        tAgA_slice[(None, k_tile_begin + handle.count)],
                         tAsA[(None, handle.index)],
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, handle.count)],
+                        tBgB_slice[(None, k_tile_begin + handle.count)],
                         tBsB[(None, handle.index)],
                         tma_bar_ptr=handle.barrier,
                         mcast_mask=b_full_mcast_mask,
                     )
 
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if handle.count + 1 < k_tile_cnt:
+                    if handle.count + 1 < k_tiles_this:
                         peek_ab_empty_status = ab_producer.try_acquire()
 
                 tile_sched.advance_to_next_work()
@@ -571,11 +603,6 @@ class PersistentDenseGemmKernel:
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_mnl = (
-                    cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
-                    cur_tile_coord[1],
-                    cur_tile_coord[2],
-                )
 
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
@@ -590,7 +617,16 @@ class PersistentDenseGemmKernel:
                 # Reset ACCUMULATE for each new output tile
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                for k_tile in range(k_tile_cnt):
+                # split_k_slices == 1: iterate the full (dynamic) K-tile count,
+                # exactly like the original kernel.  split_k_slices > 1: restrict
+                # to this split's K-tile range (derived from the scheduler L
+                # coordinate).
+                if cutlass.const_expr(self.split_k_slices == 1):
+                    k_tiles_this = k_tile_cnt
+                else:
+                    split_idx = cur_tile_coord[2] % self.split_k_slices
+                    _, k_tiles_this = self._split_k_range(k_tile_cnt, split_idx)
+                for k_tile in cutlass.range(0, k_tiles_this, 1, unroll=1):
                     if is_leader_cta:
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
 
@@ -606,7 +642,7 @@ class PersistentDenseGemmKernel:
                         handle.release()
 
                         peek_ab_full_status = cutlass.Boolean(1)
-                        if handle.count + 1 < k_tile_cnt:
+                        if handle.count + 1 < k_tiles_this:
                             peek_ab_full_status = ab_consumer.try_wait()
 
                 if is_leader_cta:
@@ -732,10 +768,7 @@ class PersistentDenseGemmKernel:
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
 
                     # Fence and barrier
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     epilog_threads = 32 * len(self.epilogue_warp_id)
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
@@ -765,6 +798,200 @@ class PersistentDenseGemmKernel:
 
         # PDL: Launch dependent kernels
         griddepcontrol_launch_dependents()
+
+    @cute.kernel
+    def _split_k_reduction_kernel(
+        self,
+        gAcc: cute.Tensor,
+        gC: cute.Tensor,
+        cC: cute.Tensor,
+        shape: cute.Shape,
+        spatial_blocks: cutlass.Int32,
+        thr_layout: cute.Layout,
+        val_layout: cute.Layout,
+        need_pred: cutlass.Constexpr,
+        epilogue_op: cutlass.Constexpr,
+    ):
+        """Sum ``split_k_slices`` FP32 partials into the final output tile.
+
+        ``gAcc`` is the FP32 workspace tiled as ``((TileM,TileN),(RestM,RestN,L))``
+        with logical L = ``batch * split_k_slices``; ``gC`` is the output tiled the
+        same way over its ``batch`` L slots; ``cC`` is the identity coordinate
+        tensor for one (M, N) plane (rest mode ``(RestM, RestN)``).
+
+        Modes [1..] of each rest group are addressed with a single *linear*
+        coordinate (CuTe maps it through the layout iterator).  ``spatial_blocks``
+        is ``RestM * RestN`` (blocks per batch).  Each CTA owns one output block:
+
+            block_idx = bidx % spatial_blocks      # spatial (M, N) tile
+            batch_idx = bidx // spatial_blocks     # output batch
+
+        and the workspace slot for ``(block_idx, batch_idx, split)`` is
+
+            acc_linear = block_idx + (batch_idx * split_k_slices + split) * spatial_blocks
+
+        matching the GEMM, which writes split ``s`` of batch ``b`` to workspace
+        L slot ``b * split_k_slices + s``.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        block_idx = bidx % spatial_blocks
+        batch_idx = bidx // spatial_blocks
+
+        # The workspace partials are read exactly once and never reused, so tag
+        # the loads/stores NO_ALLOCATE to avoid polluting L1/L2.  The DSL chooses
+        # the copy width from the provable pointer alignment; we keep the value
+        # layout contiguous so it can widen when alignment allows.
+        copy_atom_load = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            gAcc.element_type,
+            **_NO_ALLOCATE_KWARGS,
+        )
+        copy_atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            gC.element_type,
+            **_NO_ALLOCATE_KWARGS,
+        )
+
+        tiled_copy_acc = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
+        tiled_copy_c = cute.make_tiled_copy_tv(copy_atom_store, thr_layout, val_layout)
+
+        thr_copy_acc = tiled_copy_acc.get_slice(tidx)
+        thr_copy_c = tiled_copy_c.get_slice(tidx)
+
+        # Output block (linear index over (RestM, RestN, batch)).
+        blk_c = gC[((None, None), bidx)]
+        blk_crd = cC[((None, None), block_idx)]
+        thr_c = thr_copy_c.partition_S(blk_c)
+        thr_crd = thr_copy_c.partition_S(blk_crd)
+
+        frg_c = cute.make_fragment_like(thr_c)
+        frg_acc = cute.make_fragment_like(thr_c, dtype=gAcc.element_type)
+        frg_acc.fill(0.0)
+
+        # Boundary predicate (only built when the tile does not evenly divide the
+        # (M, N) plane).  When ``need_pred`` is False the fast path issues fully
+        # vectorized, unpredicated 128-bit copies — this is the common case for
+        # the shapes split-K targets (N a multiple of the tile, M tiled exactly).
+        frg_pred = None
+        if cutlass.const_expr(need_pred):
+            frg_pred = cute.make_rmem_tensor(thr_crd.shape, cutlass.Boolean)
+            for i in cutlass.range(cute.size(frg_pred), unroll_full=True):
+                frg_pred[i] = cute.elem_less(thr_crd[i], shape)
+
+        # Base workspace L slot for this (batch, block); advance by a constant
+        # ``spatial_blocks`` stride per split instead of recomputing the index.
+        acc_base = block_idx + batch_idx * self.split_k_slices * spatial_blocks
+        for split in cutlass.range(self.split_k_slices, unroll=1):
+            blk_acc = gAcc[((None, None), acc_base + split * spatial_blocks)]
+            thr_acc = thr_copy_acc.partition_S(blk_acc)
+            frg_acc_split = cute.make_fragment_like(thr_acc)
+            if cutlass.const_expr(need_pred):
+                cute.copy(copy_atom_load, thr_acc, frg_acc_split, pred=frg_pred)
+            else:
+                cute.copy(copy_atom_load, thr_acc, frg_acc_split)
+            frg_acc.store(frg_acc_split.load() + frg_acc.load())
+
+        acc_vec = epilogue_op(frg_acc.load())
+        frg_c.store(acc_vec.to(gC.element_type))
+        if cutlass.const_expr(need_pred):
+            cute.copy(copy_atom_store, frg_c, thr_c, pred=frg_pred)
+        else:
+            cute.copy(copy_atom_store, frg_c, thr_c)
+
+    @cute.jit
+    def split_k_reduction(
+        self,
+        m_acc: cute.Tensor,
+        m_c: cute.Tensor,
+        stream: cuda.CUstream,
+        m: cutlass.Constexpr = None,
+        n: cutlass.Constexpr = None,
+        epilogue_op: cutlass.Constexpr = lambda x: x,
+        copy_bits: cutlass.Constexpr = 128,
+    ):
+        """Launch the split-K reduction over an FP32 workspace.
+
+        Args:
+            m_acc: FP32 workspace, logical shape ``(M, N, batch * split_k_slices)``.
+            m_c: Output tensor, logical shape ``(M, N, batch)``.
+            stream: CUDA stream.
+            m, n: Static output dims, if known by the caller.  Used to decide at
+                compile time whether boundary predication is needed (so the fast
+                path can issue unpredicated vectorized copies).  If ``None``,
+                predication is conservatively enabled.
+            epilogue_op: Elementwise op applied to the FP32 sum before cast.
+            copy_bits: Vectorization width for the universal copy (default 128b).
+        """
+        dtype = m_acc.element_type
+        vector_size = copy_bits // dtype.width
+
+        thr_layout = cute.make_ordered_layout((4, 32), order=(1, 0))
+        val_layout = cute.make_ordered_layout((4, vector_size), order=(1, 0))
+        tiler_mn, _ = cute.make_layout_tv(thr_layout, val_layout)
+
+        # Tile the (M, N) plane; keep the L (batch * splits) mode as a separate dim.
+        gAcc = cute.zipped_divide(m_acc, tiler_mn)  # ((TileM,TileN),(RestM,RestN,L))
+        gC = cute.zipped_divide(m_c, tiler_mn)
+
+        mn_shape = cute.select(m_c.shape, mode=[0, 1])
+        id_c = cute.make_identity_tensor(mn_shape)
+        cC = cute.zipped_divide(id_c, tiler=tiler_mn)  # ((TileM,TileN),(RestM,RestN))
+
+        # If the TV tile divides the (M, N) plane exactly, no boundary
+        # predication is needed and the kernel can issue fully-vectorized copies.
+        # Decide at compile time from the caller-supplied static (m, n); if those
+        # are unknown, conservatively predicate.
+        tile_m = cute.size(tiler_mn, mode=[0])
+        tile_n = cute.size(tiler_mn, mode=[1])
+        if cutlass.const_expr(m is not None and n is not None):
+            need_pred = (m % tile_m != 0) or (n % tile_n != 0)
+        else:
+            need_pred = True
+
+        # Spatial (M, N) blocks per batch, and the total CTA grid (one per
+        # output block per batch).
+        spatial_blocks = cute.size(cC, mode=[1])
+        num_blocks = cute.size(gC, mode=[1])
+        self._split_k_reduction_kernel(
+            gAcc,
+            gC,
+            cC,
+            mn_shape,
+            cutlass.Int32(spatial_blocks),
+            thr_layout,
+            val_layout,
+            need_pred,
+            epilogue_op,
+        ).launch(
+            grid=[num_blocks, 1, 1],
+            block=[cute.size(thr_layout), 1, 1],
+            stream=stream,
+        )
+
+    def _split_k_range(self, k_tile_cnt, split_idx):
+        """Return ``(k_tile_begin, k_tiles_this_split)`` for a given split.
+
+        Uses a balanced partition that spreads the remainder K tiles across
+        the leading splits:
+
+            begin = floor(k_tile_cnt * split_idx       / splits)
+            end   = floor(k_tile_cnt * (split_idx + 1) / splits)
+
+        ``split_idx`` is a runtime value; ``k_tile_cnt`` and ``self.split_k_slices``
+        are compile-time constants, so this is pure integer arithmetic with no
+        data-dependent branch.  For ``split_k_slices == 1`` the range collapses
+        to the full ``[0, k_tile_cnt)`` and matches the original kernel exactly.
+        """
+        if cutlass.const_expr(self.split_k_slices == 1):
+            # Keep static (compile-time) bounds so the mainloop unrolls exactly
+            # as the original kernel does.
+            return 0, k_tile_cnt
+        splits = self.split_k_slices
+        k_tile_begin = (k_tile_cnt * split_idx) // splits
+        k_tile_end = (k_tile_cnt * (split_idx + 1)) // splits
+        return k_tile_begin, k_tile_end - k_tile_begin
 
     @staticmethod
     def _compute_grid(
@@ -1013,14 +1240,17 @@ class PersistentDenseGemmKernel:
         c_tensor: cute.Tensor,
         a_stride_m: cutlass.Int32,
         a_stride_batch: cutlass.Int32,
+        b_stride_n: cutlass.Int32,
+        b_stride_batch: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        """Executes the GEMM kernel with explicit A tensor strides.
+        """Executes the GEMM kernel with explicit A and B tensor strides.
 
-        Like ``wrapper`` but allows non-contiguous A tensors by accepting
-        the M and batch strides directly.  The K stride is assumed to be 1
-        (row-major in K).  B is always contiguous.
+        Like ``wrapper`` but allows non-contiguous A and B tensors by
+        accepting the M/N and batch strides directly.  The K stride is
+        assumed to be 1 for both operands (K innermost); callers must
+        reject K-strided (e.g. transposed-view) operands.
 
         Args:
             m: The M dimension of the GEMM problem.
@@ -1032,6 +1262,8 @@ class PersistentDenseGemmKernel:
             c_tensor: Output tensor as cute.Tensor.
             a_stride_m: Stride of A along the M dimension (in elements).
             a_stride_batch: Stride of A along the batch dimension (in elements).
+            b_stride_n: Stride of B along the N dimension (in elements).
+            b_stride_batch: Stride of B along the batch dimension (in elements).
             max_active_clusters: Maximum number of active clusters.
             stream: CUDA stream for the operation.
         """
@@ -1043,12 +1275,12 @@ class PersistentDenseGemmKernel:
                 stride=(a_stride_m, 1, a_stride_batch),
             ),
         )
-        # B is always contiguous: (N, K, batch_size) with K innermost
+        # B with explicit strides: (N, K, batch_size), K stride = 1
         b_tensor = cute.make_tensor(
             b_ptr,
-            layout=cute.make_ordered_layout(
+            layout=cute.make_layout(
                 (n, k, batch_size),
-                order=(1, 0, 2),
+                stride=(b_stride_n, 1, b_stride_batch),
             ),
         )
 

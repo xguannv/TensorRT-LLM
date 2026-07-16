@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -43,4 +43,4 @@ tllm_add_cubin_archive_sources(
   trtllm_gen_batched_gemm
   "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_bmm_export/cubins"
   NAMESPACE batchedGemm tensorrt_llm ${TRTLLM_ABI_NAMESPACE} kernels
-  ARCHS 100 103 100f)
+  ARCHS 100 103 107 100f)
