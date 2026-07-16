@@ -11,6 +11,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from itertools import accumulate
 from typing import (Any, Callable, Dict, Hashable, List, Optional, Sequence,
                     Tuple, Union)
 
@@ -153,6 +154,18 @@ def _make_single_token_context_graph_batch(
     promoted_context_request_ids = frozenset(request.py_request_id
                                              for request in context_requests)
     return graph_batch, promoted_context_request_ids
+
+def _ugpu_forkjoin_enabled(kv_cache_manager) -> bool:
+    """Whether to drive fork-join attention for *kv_cache_manager*.
+
+    True iff the manager is :class:`KVCacheManagerV2` with
+    ``num_ugpus > 1`` and ``LlmArgs.enable_ugpu=True``.
+    """
+    if not isinstance(kv_cache_manager, KVCacheManagerV2):
+        return False
+    if kv_cache_manager.num_ugpus <= 1:
+        return False
+    return getattr(kv_cache_manager, "fork_join_attn", False)
 
 
 def _resolve_mm_encoder_token_budget(base_budget: int,
@@ -2884,17 +2897,46 @@ class PyTorchModelEngine(ModelEngine):
         max_encoder_output_len = (
             self._get_max_encoder_output_len(resource_manager)
             if is_enc_dec else None)
+        num_long_requests = 1
+        available_tokens_batch_size = batch_size
+        short_ugpu_ids = None
+        max_seq_len_ugpu_ids = None
+        if isinstance(kv_cache_manager,
+                      KVCacheManagerV2) and kv_cache_manager.num_ugpus > 1:
+            num_ugpus = kv_cache_manager.num_ugpus
+            num_long_requests = min(num_ugpus, batch_size)
+            available_tokens_batch_size = math.ceil(batch_size /
+                                                    num_long_requests)
+            # Give each active uGPU one longest request so CUDA graph capture
+            # grows every per-uGPU attention workspace to the long-sequence
+            # bound. Short requests start from uGPU 0 to keep the request split
+            # balanced after the generation-only dispatcher sort.
+            short_ugpu_ids = [
+                request_idx % num_ugpus
+                for request_idx in range(batch_size - num_long_requests)
+            ]
+            max_seq_len_ugpu_ids = list(range(num_long_requests))
+
+        num_short_requests = batch_size - num_long_requests
+        short_request_ids = list(range(num_short_requests))
+        max_seq_len_request_ids = list(range(num_short_requests, batch_size))
         num_mixed_contexts = len(mixed_context_encoder_output_lens or
                                  ()) if is_enc_dec else 0
-        if num_mixed_contexts >= batch_size:
+        if num_mixed_contexts > num_short_requests:
             return None
 
-        # Add (batch_size - 1) dummy requests with the minimal sequence
-        # length. Mixed capture must create its context rows as real context
-        # requests; converting generation dummies afterward leaves their
-        # native prompt/context bookkeeping at one token.
+        def ugpu_kwargs(ids):
+            return {"ugpu_ids": ids} if ids is not None else {}
+
+        # Allocate every short request ID exactly once. Mixed encoder-decoder
+        # capture uses real context requests for its leading rows; the remaining
+        # short rows are generation requests.
+        requests = []
         if mixed_context_encoder_output_lens:
-            context_request_ids = list(range(num_mixed_contexts))
+            context_request_ids = short_request_ids[:num_mixed_contexts]
+            context_ugpu_ids = (
+                short_ugpu_ids[:num_mixed_contexts]
+                if short_ugpu_ids is not None else None)
             context_requests = kv_cache_manager.add_dummy_requests(
                 context_request_ids,
                 token_nums=[mixed_context_query_len] * num_mixed_contexts,
@@ -2905,14 +2947,17 @@ class PyTorchModelEngine(ModelEngine):
                 max_beam_width=self.max_beam_width,
                 encoder_output_lens=list(mixed_context_encoder_output_lens),
                 num_extra_decoding_steps=num_extra_decoding_steps,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                **ugpu_kwargs(context_ugpu_ids))
             if context_requests is None:
                 return None
 
-            generation_request_ids = list(
-                range(num_mixed_contexts, batch_size - 1))
+            generation_request_ids = short_request_ids[num_mixed_contexts:]
             generation_requests = []
             if generation_request_ids:
+                generation_ugpu_ids = (
+                    short_ugpu_ids[num_mixed_contexts:]
+                    if short_ugpu_ids is not None else None)
                 generation_requests = kv_cache_manager.add_dummy_requests(
                     generation_request_ids,
                     token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM] *
@@ -2925,7 +2970,8 @@ class PyTorchModelEngine(ModelEngine):
                     encoder_output_lens=[max_encoder_output_len] *
                     len(generation_request_ids),
                     num_extra_decoding_steps=num_extra_decoding_steps,
-                    draft_kv_cache_manager=draft_kv_cache_manager)
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                    **ugpu_kwargs(generation_ugpu_ids))
                 if generation_requests is None:
                     for request in context_requests:
                         kv_cache_manager.free_resources(request)
@@ -2933,13 +2979,13 @@ class PyTorchModelEngine(ModelEngine):
                             draft_kv_cache_manager.free_resources(request)
                     return None
             requests = context_requests + generation_requests
-        else:
+        elif num_short_requests > 0:
             token_nums = ([ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM] *
-                          (batch_size - 1)) if is_enc_dec else None
+                          num_short_requests) if is_enc_dec else None
             encoder_output_lens = ([max_encoder_output_len] *
-                                   (batch_size - 1)) if is_enc_dec else None
+                                   num_short_requests) if is_enc_dec else None
             requests = kv_cache_manager.add_dummy_requests(
-                list(range(batch_size - 1)),
+                short_request_ids,
                 token_nums=token_nums,
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_token_buffer_width,
@@ -2948,17 +2994,18 @@ class PyTorchModelEngine(ModelEngine):
                 max_beam_width=self.max_beam_width,
                 encoder_output_lens=encoder_output_lens,
                 num_extra_decoding_steps=num_extra_decoding_steps,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                **ugpu_kwargs(short_ugpu_ids))
             if requests is None:
                 return None
 
         def free_warmup_requests() -> None:
-            for r in requests:
-                kv_cache_manager.free_resources(r)
+            for request in requests:
+                kv_cache_manager.free_resources(request)
                 if draft_kv_cache_manager is not None:
-                    draft_kv_cache_manager.free_resources(r)
+                    draft_kv_cache_manager.free_resources(request)
 
-        # Add one dummy request with the maximum possible sequence length.
+        # Add one max-length dummy request for each active uGPU.
         max_seq_len = min(
             self.max_seq_len if max_seq_len is None else max_seq_len,
             kv_cache_manager.max_seq_len)
@@ -2968,13 +3015,13 @@ class PyTorchModelEngine(ModelEngine):
         _kv_draft = self.max_draft_loop_tokens
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=max_seq_len,
-            batch_size=batch_size,
+            batch_size=available_tokens_batch_size,
             max_num_draft_tokens=_kv_draft)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
-                batch_size=batch_size,
+                batch_size=available_tokens_batch_size,
                 token_num_upper_bound=max_seq_len,
                 max_num_draft_tokens=_kv_draft)
             available_tokens = min(available_tokens, draft_available_tokens)
@@ -3007,27 +3054,24 @@ class PyTorchModelEngine(ModelEngine):
         token_num = int(
             token_num)  # Ensure int for range() in add_dummy_requests
 
-        max_seq_len_request = kv_cache_manager.add_dummy_requests(
-            request_ids=[batch_size - 1],
-            token_nums=[token_num],
+        max_seq_len_requests = kv_cache_manager.add_dummy_requests(
+            request_ids=max_seq_len_request_ids,
+            token_nums=[token_num] * num_long_requests,
             is_gen=True,
             max_num_draft_tokens=runtime_draft_token_buffer_width,
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
-            encoder_output_lens=[max_encoder_output_len]
+            encoder_output_lens=[max_encoder_output_len] * num_long_requests
             if is_enc_dec else None,
             num_extra_decoding_steps=num_extra_decoding_steps,
-            draft_kv_cache_manager=draft_kv_cache_manager)
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            **ugpu_kwargs(max_seq_len_ugpu_ids))
 
-        if max_seq_len_request is None:
+        if max_seq_len_requests is None:
             free_warmup_requests()
             return None
-        else:
-            max_seq_len_request = max_seq_len_request[0]
-
         if mixed_context_encoder_output_lens:
-            requests.append(max_seq_len_request)
             for request in requests[:num_mixed_contexts]:
                 request.state = LlmRequestState.CONTEXT_INIT
                 request.context_current_position = 0
@@ -3035,12 +3079,12 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = 0
                 request.py_batch_idx = None
             result.context_requests_last_chunk = requests[:num_mixed_contexts]
-            result.generation_requests = requests[num_mixed_contexts:]
+            result.generation_requests = (
+                max_seq_len_requests + requests[num_mixed_contexts:])
         else:
-            # Insert the longest request first to simulate padding for the CUDA
-            # graph.
-            requests.insert(0, max_seq_len_request)
-            result.generation_requests = requests
+            # Put longest requests first so each uGPU group starts with the
+            # max-length dummy request after the stable uGPU sort.
+            result.generation_requests = max_seq_len_requests + requests
         if spec_resource_manager is not None:
             spec_resource_manager.add_dummy_requests(
                 request_ids=list(range(batch_size)))
@@ -5246,7 +5290,45 @@ class PyTorchModelEngine(ModelEngine):
                 cross_encoder_seq_lens.append(0)
                 cross_encoder_cached_tokens_per_seq.append(encoder_output_len)
 
-        for request in scheduled_requests.context_requests:
+        # Reorder context requests so tokens are contiguous per uGPU —
+        # the fork-join attention kernel requires per-uGPU contiguous
+        # input slices. We rewrite the underlying chunking and last-chunk
+        # lists in-place, so ``scheduled_batch.context_requests`` (which
+        # HandleLogits and the sampler iterate) sees the uGPU-sorted
+        # order. Note: the concatenation ``chunking + last_chunk`` is
+        # uGPU-monotonic within each sub-list, not across them.
+        _ugpu_reorder = _ugpu_forkjoin_enabled(kv_cache_manager)
+        # Skip ctx reorder when chunked prefill is active. Fork-join ctx
+        # attention already falls back to the single-kernel path for MLA's
+        # chunked-prefill ctx (see ``is_mla_chunked_prefill_ctx`` in
+        # ``TrtllmAttention.forward``), so per-uGPU sub-batch contiguity
+        # for ctx reqs is not needed here. Reordering ctx under chunked
+        # prefill + uGPU localization was observed to drop GSM8K accuracy
+        # by ~6 points (64.177 → 57.6), while keeping scheduler order
+        # recovers the baseline; root cause appears to be a subtle
+        # interaction between multi-ctx reorder and the chunked cached-KV
+        # state kept across forwards.
+        _ugpu_reorder_ctx = (
+            _ugpu_reorder
+            and not (self.attn_runtime_features is not None
+                     and self.attn_runtime_features.chunked_prefill))
+
+        _ctx_requests = scheduled_requests.context_requests
+        if _ugpu_reorder_ctx:
+            n_ctx = len(_ctx_requests)
+            _ctx_perm = sorted(range(n_ctx),
+                               key=lambda i: _ctx_requests[i].py_ugpu_id)
+            _ctx_requests = [_ctx_requests[i] for i in _ctx_perm]
+            # context_requests is a computed property — reorder the
+            # underlying lists so downstream sees sorted order.
+            scheduled_requests.context_requests_chunking = [
+                r for r in _ctx_requests if not r.is_last_context_chunk
+            ]
+            scheduled_requests.context_requests_last_chunk = [
+                r for r in _ctx_requests if r.is_last_context_chunk
+            ]
+
+        for request in _ctx_requests:
             request_ids.append(request.py_request_id)
             draft_lens.append(0)
             begin_compute = request.context_current_position
@@ -5411,6 +5493,32 @@ class PyTorchModelEngine(ModelEngine):
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
+        #
+        # Sort ALL generation requests by uGPU before categorizing so that
+        # extend/first_draft/generation lists are each uGPU-contiguous.
+        # This is required for fork-join attention with speculative decoding.
+        #
+        # Reorder scheduled_requests.generation_requests in-place so
+        # downstream code (sampler, HandleLogits, spec-decode) sees the
+        # same uGPU-sorted order as the model input.  This eliminates
+        # the need for a logit un-permutation step.
+        _all_gen_reqs = list(scheduled_requests.generation_requests)
+        _gen_dispatch_ugpu: dict[int, int] = {}
+        if _ugpu_reorder and _all_gen_reqs:
+            _all_gen_perm = sorted(range(len(_all_gen_reqs)),
+                                   key=lambda i: _all_gen_reqs[i].py_ugpu_id)
+            _all_gen_reqs = [_all_gen_reqs[i] for i in _all_gen_perm]
+            scheduled_requests.generation_requests = _all_gen_reqs
+            if scheduled_requests.num_context_requests == 0:
+                num_ugpus_local = kv_cache_manager.num_ugpus
+                assert num_ugpus_local == 2, (
+                    "balanced generation uGPU dispatch currently supports "
+                    "num_ugpus == 2; got {}".format(num_ugpus_local))
+                half = (len(_all_gen_reqs) + 1) // 2
+                for idx, req in enumerate(_all_gen_reqs):
+                    _gen_dispatch_ugpu[
+                        req.py_request_id] = 0 if idx < half else 1
+
         extend_requests = []
         extend_dummy_requests = []
         generation_requests = []
@@ -5418,7 +5526,7 @@ class PyTorchModelEngine(ModelEngine):
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
-        for request in scheduled_requests.generation_requests:
+        for request in _all_gen_reqs:
             is_promoted_context = (request.py_request_id
                                    in promoted_context_request_ids)
             if not is_promoted_context:
@@ -5619,6 +5727,10 @@ class PyTorchModelEngine(ModelEngine):
         helix_is_inactive_rank, helix_position_offsets = [], []
         # Cache invariant method result to avoid repeated calls per-request
         _has_cp_helix = self.mapping.has_cp_helix()
+
+        # generation_requests are already uGPU-sorted from the pre-sort
+        # above (all gen request types sorted together before categorization).
+
         _n_gen = len(generation_requests)
         # One-shot batch-level flag — True iff any generation request actually
         # carries multimodal payload. Lets the strip_mm_data branch below
@@ -6201,6 +6313,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.beam_width = 1
 
         attn_metadata.request_ids = request_ids
+        attn_metadata.is_warmup = self.is_warmup
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
         # Use num_chunked_ctx_requests to record the number of extend context requests,
@@ -6218,6 +6331,45 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
+
+        # Compute uGPU split points for fork-join attention.  The single
+        # ``attn_metadata.kv_cache_manager`` (set above) is shared across
+        # uGPUs — V2 encodes per-uGPU addressing via global block indices,
+        # so we don't need a per-uGPU manager list.
+        if _ugpu_reorder:
+            attn_metadata.ugpu_enabled = True
+            num_ugpus = kv_cache_manager.num_ugpus
+
+            # Count per-uGPU requests and tokens (requests are already
+            # ordered by uGPU from the context/generation loops above).
+            per_ugpu_ctx_reqs = [0] * num_ugpus
+            per_ugpu_ctx_tokens = [0] * num_ugpus
+            per_ugpu_gen_reqs = [0] * num_ugpus
+            per_ugpu_gen_tokens = [0] * num_ugpus
+
+            for i, request in enumerate(_ctx_requests):
+                u = request.py_ugpu_id
+                per_ugpu_ctx_reqs[u] += 1
+                per_ugpu_ctx_tokens[u] += sequence_lengths[i]
+
+            gen_sequence_lengths = sequence_lengths[num_ctx_requests:]
+            for i, request in enumerate(_all_gen_reqs):
+                u = _gen_dispatch_ugpu.get(request.py_request_id,
+                                           request.py_ugpu_id)
+                per_ugpu_gen_reqs[u] += 1
+                per_ugpu_gen_tokens[u] += gen_sequence_lengths[i]
+
+            # Build cumulative split arrays (length N+1).
+            attn_metadata.ugpu_ctx_req_splits = [0] + list(
+                accumulate(per_ugpu_ctx_reqs))
+            attn_metadata.ugpu_gen_req_splits = [0] + list(
+                accumulate(per_ugpu_gen_reqs))
+            attn_metadata.ugpu_ctx_token_splits = [0] + list(
+                accumulate(per_ugpu_ctx_tokens))
+            attn_metadata.ugpu_gen_token_splits = [0] + list(
+                accumulate(per_ugpu_gen_tokens))
+            attn_metadata.ugpu_num_ctx_tokens = per_ugpu_ctx_tokens
+            attn_metadata.ugpu_num_gen_tokens = per_ugpu_gen_tokens
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
@@ -6540,6 +6692,7 @@ class PyTorchModelEngine(ModelEngine):
             ), "Only vanilla and trtllm attention metadata are supported for no cache attention for now"
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = request_ids
+            attn_metadata.is_warmup = self.is_warmup
             attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
@@ -6805,6 +6958,7 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         attn_metadata.request_ids = request_ids
+        attn_metadata.is_warmup = self.is_warmup
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = num_contexts
         attn_metadata.num_queries = num_queries

@@ -40,6 +40,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..ugpu.policy import UgpuPolicy
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
@@ -1418,11 +1419,13 @@ class ModelLoader:
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
+            use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
+            use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
             video_pruning_rate=self.llm_args.multimodal_config.
             video_pruning_rate,
             multimodal_config=self.llm_args.multimodal_config,
-            use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
-            use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            use_lamport_sync=self.llm_args.use_lamport_sync,
+            ugpu_policy=UgpuPolicy(enabled=self.llm_args.enable_ugpu),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -1461,6 +1464,7 @@ class ModelLoader:
                 f"Could not read allreduce pre-allocation config from "
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
+        config.extra_attrs['ugpu_policy'] = config.ugpu_policy
 
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,

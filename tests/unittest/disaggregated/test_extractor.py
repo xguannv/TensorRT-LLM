@@ -21,6 +21,7 @@ from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecR
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     _build_v2_mamba_state_pool,
+    _get_pool_num_slots,
     build_page_table,
     build_page_table_from_manager,
 )
@@ -68,6 +69,17 @@ class DummyRankInfo:
     @property
     def kv_factor(self) -> int:
         return 2 if not self.is_mla else 1
+
+
+@pytest.mark.parametrize("num_slots", [17, lambda: 17])
+def test_get_pool_num_slots_supports_property_and_method(num_slots):
+    class Pool:
+        pass
+
+    pool = Pool()
+    pool.num_slots = num_slots
+
+    assert _get_pool_num_slots(pool) == 17
 
 
 @pytest.mark.cuda

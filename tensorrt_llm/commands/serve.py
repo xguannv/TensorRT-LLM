@@ -222,6 +222,7 @@ def get_llm_args(
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
+        enable_ugpu: bool = False,
         video_pruning_rate: Optional[float] = None,
         telemetry: bool = True,
         agent_percentage: float = 0.0,
@@ -296,6 +297,8 @@ def get_llm_args(
         enable_chunked_prefill,
         "enable_attention_dp":
         enable_attention_dp,
+        "enable_ugpu":
+        enable_ugpu,
         "revision":
         revision,
         "reasoning_parser":
@@ -1162,6 +1165,12 @@ def launch_visual_gen_server(
                   default=False,
                   help="Enable attention data parallel.",
                   status="beta")
+@stability_option(
+    "--enable_ugpu",
+    is_flag=True,
+    default=False,
+    help="Enable uGPU execution for supported PyTorch backend ops.",
+    status="prototype")
 @stability_option("--media_io_kwargs",
                   type=str,
                   default=None,
@@ -1271,7 +1280,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           server_role: Optional[str],
           fail_fast_on_attention_window_too_large: bool,
           otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
+          enable_attention_dp: bool, enable_ugpu: bool, disagg_cluster_uri: Optional[str],
           media_io_kwargs: Optional[str], agent_percentage: float,
           agent_types: Optional[str], video_pruning_rate: Optional[float],
           telemetry: bool, custom_module_dirs: list[Path],
@@ -1377,6 +1386,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
+            enable_ugpu=enable_ugpu,
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,

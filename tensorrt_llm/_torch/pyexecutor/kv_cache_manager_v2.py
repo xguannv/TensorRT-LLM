@@ -1153,6 +1153,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
         self._allocated_draft_lens: dict[int, int] = {}
 
+        # Overlap-scheduler slack (the extra draft_len in
+        # _required_gen_capacity's 1 + 2 * draft_len growth) granted to each
+        # request and not yet reclaimed.  The sampler's py_rewind_len only
+        # covers the rejected part of the recurring 1 + draft_len growth, so
+        # update_resources must additionally trim this slack — otherwise it
+        # compounds, leaking draft_len tokens of capacity per generation
+        # iteration until the request's block count overruns
+        # max_blocks_per_seq ("User-provided base page indices is too short").
+        self._pending_overlap_slack: dict[int, int] = {}
+
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -2342,9 +2352,23 @@ class KVCacheManagerV2(BaseResourceManager):
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
-        Grows *current_capacity* by 1 + draft tokens.
+        Grows *current_capacity* by 1 + draft tokens, plus another draft_len
+        of slack for one-model speculative decoding: under the overlap
+        scheduler the device-side KV position runs one verification round
+        ahead of host bookkeeping (up to draft_len accepted-but-uncommitted
+        tokens), and the MTP draft layers then append draft KV beyond that
+        position. Without the slack, the draft KV append can address a block
+        ordinal the host has not allocated yet whenever the overrun crosses a
+        tokens_per_block boundary — an illegal memory access in the MLA rope
+        generation kernel (observed with DSV4 DEP+MTP3 at 128k, where the
+        first window-slide boundary crossing after prefill faults).
+
+        The slack must stay a *constant* offset over the request's lifetime:
+        py_rewind_len only rewinds the rejected part of the recurring
+        1 + draft_len growth, so every call site records the extra draft_len
+        in _pending_overlap_slack and update_resources trims it back.
         """
-        return current_capacity + 1 + self._effective_draft_len(req)
+        return current_capacity + 1 + 2 * self._effective_draft_len(req)
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
@@ -2363,7 +2387,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+            return False
+        if draft_len > 0:
+            self._pending_overlap_slack[req.py_request_id] = (
+                self._pending_overlap_slack.get(req.py_request_id, 0) + draft_len
+            )
+        return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2384,9 +2414,19 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_len = self._allocated_draft_lens.pop(
             req.py_request_id, self._effective_draft_len(req)
         )
-        reverted_cap = kv_cache.capacity - 1 - draft_len
+        # Mirror the 1 + 2 * draft_len growth in _required_gen_capacity.
+        reverted_cap = kv_cache.capacity - 1 - 2 * draft_len
         if reverted_cap < 0:
             return
+        # The reverted growth included draft_len of overlap slack; deduct it
+        # so update_resources does not trim slack that no longer exists.
+        if draft_len > 0:
+            req_id = req.py_request_id
+            remaining = self._pending_overlap_slack.get(req_id, 0) - draft_len
+            if remaining > 0:
+                self._pending_overlap_slack[req_id] = remaining
+            else:
+                self._pending_overlap_slack.pop(req_id, None)
         if not kv_cache.resize(reverted_cap):
             raise RuntimeError(
                 f"Failed to revert KV cache capacity for request "
@@ -2595,9 +2635,16 @@ class KVCacheManagerV2(BaseResourceManager):
         if allocated is None:
             return
         current_draft_len = get_draft_token_length(request)
-        delta = current_draft_len - allocated
+        # Growth is 1 + 2 * draft_len (see _required_gen_capacity), so the
+        # padding delta scales by 2 as well.
+        delta = 2 * (current_draft_len - allocated)
         if delta <= 0:
             return
+        # Half of the delta tops up the overlap slack; record it so
+        # update_resources reclaims the full slack for this iteration.
+        self._pending_overlap_slack[request.py_request_id] = self._pending_overlap_slack.get(
+            request.py_request_id, 0
+        ) + (current_draft_len - allocated)
         kv_cache = self.kv_cache_map[request.py_request_id]
         new_capacity = kv_cache.capacity + delta
         success = kv_cache.resize(new_capacity)
@@ -2704,6 +2751,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                    )
+                slack = self._effective_draft_len(req)
+                if slack > 0:
+                    self._pending_overlap_slack[req.py_request_id] = (
+                        self._pending_overlap_slack.get(req.py_request_id, 0) + slack
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
@@ -3319,12 +3371,22 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Saturated IndexMapper (e.g. disagg gen trans in progress)
                 # returns None; retry next iter.
                 if kv_cache is None:
+                    logger.warning_once(
+                        f"Unable to create KV cache for dummy request "
+                        f"{req.py_request_id}; IndexMapper capacity is "
+                        f"temporarily exhausted",
+                        key="dummy_kv_cache_create_failed",
+                    )
                     release_resources(req)
                     return None
                 assert kv_cache.ugpu_id == ugpu_id
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
+                    logger.warning_once(
+                        f"Unable to resume KV cache for dummy request {req.py_request_id}",
+                        key="dummy_kv_cache_resume_failed",
+                    )
                     release_resources(req)
                     return None
                 kv_cache.stop_committing()
@@ -3335,6 +3397,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 # optimization and match the solver's pool budget.
                 success = kv_cache.resize(dummy_capacity, history_length=history_hint)
                 if not success:
+                    logger.warning_once(
+                        f"Unable to resize KV cache for dummy request "
+                        f"{req.py_request_id} to capacity {dummy_capacity} "
+                        f"(history_length={history_hint})",
+                        key="dummy_kv_cache_resize_failed",
+                    )
                     release_resources(req)
                     return None
                 draft_kv_cache = None
@@ -3347,18 +3415,34 @@ class KVCacheManagerV2(BaseResourceManager):
                         is_dummy=req.is_dummy,
                         ugpu_id=ugpu_id,
                     )
-                    assert draft_kv_cache.ugpu_id == ugpu_id
                     # Dummy path: see comment above, no salt.
                     if draft_kv_cache is None:
+                        logger.warning_once(
+                            f"Unable to create draft KV cache for dummy "
+                            f"request {req.py_request_id}",
+                            key="dummy_draft_kv_cache_create_failed",
+                        )
                         release_resources(req)
                         return None
+                    assert draft_kv_cache.ugpu_id == ugpu_id
                     success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
+                        logger.warning_once(
+                            f"Unable to resume draft KV cache for dummy "
+                            f"request {req.py_request_id}",
+                            key="dummy_draft_kv_cache_resume_failed",
+                        )
                         release_resources(req, free_draft_resources=True)
                         return None
                     draft_kv_cache.stop_committing()
                     success = draft_kv_cache.resize(dummy_capacity)
                     if not success:
+                        logger.warning_once(
+                            f"Unable to resize draft KV cache for dummy "
+                            f"request {req.py_request_id} to capacity "
+                            f"{dummy_capacity}",
+                            key="dummy_draft_kv_cache_resize_failed",
+                        )
                         release_resources(req, free_draft_resources=True)
                         return None
 
@@ -3371,11 +3455,23 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + _kv_draft
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
+                        logger.warning_once(
+                            f"Unable to extend generation dummy request "
+                            f"{req.py_request_id} to capacity {new_capacity} "
+                            f"(history_length={history_hint})",
+                            key="generation_dummy_kv_cache_resize_failed",
+                        )
                         release_resources(req, free_draft_resources=draft_kv_cache is not None)
                         return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
                         if not success:
+                            logger.warning_once(
+                                f"Unable to extend generation draft dummy "
+                                f"request {req.py_request_id} to capacity "
+                                f"{new_capacity}",
+                                key="generation_dummy_draft_kv_cache_resize_failed",
+                            )
                             release_resources(req, free_draft_resources=True)
                             return None
 
@@ -3429,6 +3525,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._pending_overlap_slack.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -3787,16 +3884,17 @@ class KVCacheManagerV2(BaseResourceManager):
             rewind_len = req.py_rewind_len
             if self.is_draft:
                 runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
-                # Dynamic-tree draft managers reserve K * max_draft_len slots,
-                # which can exceed the tree's runtime draft width. Reclaim that
-                # reserve slack together with rejected draft tokens; otherwise
-                # it accumulates in the draft KV cache after every generation
-                # step. Target managers do not allocate this reserve slack.
+                # Reclaim dynamic-tree reserve slack together with rejected draft tokens.
                 rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
+            # Reclaim this iteration's overlap slack so it does not compound.
+            overlap_slack = self._pending_overlap_slack.pop(req.py_request_id, 0)
             new_capacity = (
                 None
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - rewind_len
+                else max(
+                    kv_cache.capacity - rewind_len - overlap_slack,
+                    req.max_beam_num_tokens - 1,
+                )
             )
             history_length = (
                 None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1

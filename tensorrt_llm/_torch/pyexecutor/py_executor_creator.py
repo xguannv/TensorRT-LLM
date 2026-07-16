@@ -49,8 +49,8 @@ from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
-_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
-_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
@@ -898,11 +898,7 @@ def create_py_executor(
     estimating_kv_cache = False
     kv_cache_creator = None
 
-    # Create the execution stream for model forward operations
-    # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
     execution_stream = torch.cuda.Stream()
-    logger.info(
-        f"[create_py_executor] Created execution_stream: {execution_stream}")
 
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache

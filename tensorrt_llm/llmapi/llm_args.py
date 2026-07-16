@@ -1228,6 +1228,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
     target_sparsity: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="Target sparsity for prefill and/or decode phases. "
@@ -1313,7 +1316,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -4539,6 +4543,11 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable attention data parallel.",
         status="beta")
 
+    enable_ugpu: bool = Field(
+        default=False,
+        description="Enable uGPU execution for supported PyTorch backend ops.",
+        status="prototype")
+
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
         description="Enable LM head TP in attention dp.",
@@ -5413,6 +5422,13 @@ class TorchLlmArgs(BaseLlmArgs):
         default=True,
         description=
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
+        status="prototype")
+
+    use_lamport_sync: bool = Field(
+        default=False,
+        description=
+        "Enable Lamport synchronization for MoE kernels. When enabled, uses Lamport-sync kernel variants "
+        "that overlap communication with computation for improved performance on multi-GPU setups.",
         status="prototype")
 
     enable_layerwise_nvtx_marker: bool = Field(

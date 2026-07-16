@@ -1258,8 +1258,11 @@ class KvCacheCreator:
         # For KVCacheManagerV2, KvCacheCreator controls capacity using max_gpu_total_bytes only.
         # This leaves max_tokens as a user-defined constraint.
 
+        is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
+                                            KVCacheManagerV2)
+
         # ---------------------------handle max_tokens---------------------------------
-        if self._is_kv_cache_manager_v2:
+        if is_kv_cache_manager_v2:
             # KVCacheManagerV2 doesn't rely on max_tokens to control capacity, so restore user provided value
             self._kv_cache_config.max_tokens = self._max_kv_tokens_in
         else:
@@ -1298,6 +1301,25 @@ class KvCacheCreator:
             logger.info(
                 f"max_gpu_total_bytes={self._max_gpu_total_bytes_in / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
+
+        if is_kv_cache_manager_v2:
+            # KVCacheManagerV2 normally uses max_gpu_total_bytes alone, so
+            # we'd just restore the user-provided max_tokens here. However,
+            # when a one-model speculative-decoding draft KV cache shares
+            # the same config, max_gpu_total_bytes doesn't scale with the
+            # draft's much smaller per-token byte footprint (which depends
+            # on num_local_layers), so both managers read the same cap and
+            # the draft double-claims the budget -> OOM. Mirror V1's
+            # behaviour: derive max_tokens from the final estimated memory
+            # so V2's quota = min(max_gpu_total_bytes, max_tokens *
+            # bytes_per_token) naturally picks the layer-scaled draft
+            # budget when the draft manager reads the shared config.
+            # Respect an explicit user-provided max_tokens if present.
+            if self._max_kv_tokens_in is not None:
+                self._kv_cache_config.max_tokens = self._max_kv_tokens_in
+            else:
+                self._kv_cache_config.max_tokens = (self._get_kv_size_per_token(
+                ).tokens_for_budget(kv_cache_max_memory))
 
         logger.info(
             f"Estimated max memory in KV cache : {kv_cache_max_memory / (GB):.2f} GiB"
@@ -1348,6 +1370,7 @@ class KvCacheCreator:
             enable_kv_cache_stats=self._enable_kv_cache_stats()
             and not estimating_kv_cache,
             execution_stream=self._execution_stream,
+            enable_ugpu=self._llm_args.enable_ugpu,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
         )
@@ -1387,9 +1410,11 @@ class KvCacheCreator:
         back to the target model's config via _get_effective_draft_config().
         """
         if self._mapping.enable_attention_dp:
+            # Attention-DP uses the target KV cache manager for MTP draft layers
+            # so draft cache state follows the DP-sharded target requests.
             logger.info(
-                "Attention DP is enabled, separate draft KV cache is not supported."
-            )
+                "Attention DP does not support a separate draft KV cache "
+                "manager; MTP layers share the target manager.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
@@ -1527,6 +1552,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            enable_ugpu=self._llm_args.enable_ugpu,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2116,6 +2142,7 @@ def _create_kv_cache_manager(
         estimating_kv_cache: bool = False,
         enable_kv_cache_stats: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        enable_ugpu: bool = False,
         # Optional overrides for one-model draft case (when model_engine is None)
         model_config: Optional[ModelConfig] = None,
         dtype: Optional[torch.dtype] = None,
@@ -2255,6 +2282,7 @@ def _create_kv_cache_manager(
             draft_config_for_kv)
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+        manager_extra_kwargs["enable_ugpu"] = enable_ugpu
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg

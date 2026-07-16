@@ -2887,7 +2887,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_kv_heads,
             self.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
-            metadata.max_seq_len,  # attention_window_size
+            int(metadata.max_seq_len),  # attention_window_size
             metadata.beam_width,
             self.quant_mode,
             self.q_scaling,

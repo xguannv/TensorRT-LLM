@@ -2441,7 +2441,10 @@ class SpecWorkerBase(nn.Module, ABC):
         return None
 
     @contextmanager
-    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+    def draft_kv_cache_context(self,
+                               attn_metadata,
+                               draft_kv_cache_manager,
+                               enable_draft_ugpu_forkjoin: bool = False):
         """
         Select draft attention metadata for one-engine speculative decoding.
 
@@ -2451,14 +2454,12 @@ class SpecWorkerBase(nn.Module, ABC):
         tables and kernel wrappers are manager-specific.
         """
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
-            yield attn_metadata
-            return
-
         from ..attention_backend.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
+            draft_metadata = (attn_metadata if draft_kv_cache_manager is None
+                              else attn_metadata.get_draft_metadata(
+                                  draft_kv_cache_manager))
+            yield draft_metadata
             return
 
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
@@ -2467,13 +2468,38 @@ class SpecWorkerBase(nn.Module, ABC):
 
         saved_state = prepare_attn_metadata_for_draft_replay(
             attn_metadata, draft_kv_cache_manager)
-        if saved_state is None:
-            yield attn_metadata
-            return
+        saved_ugpu_attrs = []
+
+        def patch_ugpu_metadata(name, value):
+            saved_ugpu_attrs.append((name, getattr(attn_metadata, name)))
+            setattr(attn_metadata, name, value)
+
+        using_separate_draft_cache = saved_state is not None
+        draft_manager_supports_ugpu_forkjoin = getattr(
+            draft_kv_cache_manager, "fork_join_attn", False)
 
         try:
+            if attn_metadata.ugpu_enabled:
+                if not enable_draft_ugpu_forkjoin:
+                    patch_ugpu_metadata("ugpu_enabled", False)
+                elif using_separate_draft_cache:
+                    if draft_manager_supports_ugpu_forkjoin:
+                        draft_ugpu_block_offsets = (
+                            attn_metadata.draft_ugpu_kv_cache_block_offsets)
+                        if draft_ugpu_block_offsets is None:
+                            raise RuntimeError(
+                                "uGPU fork-join is enabled for the draft KV "
+                                "cache, but draft_ugpu_kv_cache_block_offsets "
+                                "was not prepared.")
+                        patch_ugpu_metadata(
+                            "ugpu_kv_cache_block_offsets",
+                            draft_ugpu_block_offsets)
+                    else:
+                        patch_ugpu_metadata("ugpu_enabled", False)
             yield attn_metadata
         finally:
+            for name, value in reversed(saved_ugpu_attrs):
+                setattr(attn_metadata, name, value)
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
     def _sample_tokens_for_batch(

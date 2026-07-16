@@ -899,8 +899,6 @@ class PyExecutor:
             if self.draft_model_engine is not None:
                 self.draft_model_engine.warmup(self.resource_manager)
 
-        # Ensure the default stream waits for execution_stream to complete
-        # before subsequent operations.
         torch.cuda.current_stream().wait_stream(self.execution_stream)
         self.encoder_launch_executor = (ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="encoder-launch")
@@ -2810,7 +2808,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
-                if not can_queue:
+                    self._finalize_adp_dummy_allocation(False)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -3542,6 +3540,16 @@ class PyExecutor:
                 if getattr(req, "py_skip_gen_alloc_revert", False):
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
+
+    def _terminate_attention_dp_dummy_requests(self) -> None:
+        """Terminate every local attention-DP dummy without assuming order."""
+        for request in list(self.active_requests):
+            if not request.is_attention_dp_dummy:
+                continue
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -5170,7 +5178,6 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
-
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
@@ -5857,6 +5864,12 @@ class PyExecutor:
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
             new_requests = new_requests_cur_rank
+
+        kv_cache_manager = self.kv_cache_manager
+        if kv_cache_manager is not None:
+            for req_item in new_requests:
+                if req_item.is_normal_request:
+                    req_item.ugpu_id = kv_cache_manager.pick_ugpu(req_item.id)
 
         # 7. Merge requests
         return merge_requests(new_requests,
@@ -6926,20 +6939,28 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
-    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+    def _update_adp_dummy_role(
+            self, candidates: List[Union[LlmRequest,
+                                         RequestQueueItem]]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
         has_ctx = False
         has_gen = False
-        for req in candidates:
+        for candidate in candidates:
+            req = (candidate.request
+                   if isinstance(candidate, RequestQueueItem) else candidate)
             rt = getattr(req, "llm_request_type", None)
-            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+            request_type = getattr(req, "request_type", None)
+            if (rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+                    or request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY):
                 has_ctx = True
-            elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+            elif (rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+                  or request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY):
                 has_gen = True
         # Prefer the CTX role when both types are present this iteration: a CTX
-        # dummy is padded to max_num_tokens so idle ranks keep MoE all-to-all
-        # token counts comparable with ranks doing real context work.
+        # dummy is padded to the largest legal single-sequence context so idle
+        # ranks keep MoE all-to-all token counts comparable with ranks doing
+        # real context work.
         if has_ctx:
             self._adp_dummy_is_gen = False
         elif has_gen:
@@ -7032,13 +7053,24 @@ class PyExecutor:
 
         if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            )
+            # KVCacheManagerV2 returns None when its IndexMapper or KV pages
+            # are temporarily exhausted.  Leaving this rank's batch empty is
+            # safe: _can_queue() all-gathers batch sizes and makes every ADP
+            # rank skip this forward iteration, then retry on the next one.
+            if dummy_requests is None:
+                logger.warning_once(
+                    "Unable to allocate attention-DP dummy request; "
+                    "skipping this forward iteration and retrying",
+                    key="attention_dp_dummy_allocation_failed")
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -7736,13 +7768,7 @@ class PyExecutor:
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests

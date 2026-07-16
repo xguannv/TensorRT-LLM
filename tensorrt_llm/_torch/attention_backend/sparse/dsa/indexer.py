@@ -1353,7 +1353,7 @@ class Indexer(nn.Module):
                 context_lens,
                 block_table,
                 scheduler_metadata_buffer,
-                max_seq_len,
+                int(max_seq_len),
             )
         return fp8_paged_mqa_logits(
             q_decode,
@@ -1362,7 +1362,7 @@ class Indexer(nn.Module):
             context_lens,
             block_table,
             scheduler_metadata_buffer,
-            max_seq_len,
+            int(max_seq_len),
         )
 
     def sparse_attn_indexer(
@@ -1770,7 +1770,7 @@ class Indexer(nn.Module):
                         fp8_ctx_lens,
                         fp8_block_table,
                         fp8_schedule_meta,
-                        indexer_max_seq_len,
+                        int(indexer_max_seq_len),
                     )
             else:
                 decode_q_scale = (

@@ -154,6 +154,9 @@ class BaseResourceManager(ABC):
     def add_dummy_requests(self, request_ids: List[int]):
         pass
 
+    def pick_ugpu(self, request_id: int) -> int | None:
+        return None
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
@@ -1128,6 +1131,13 @@ class KVCacheManager(BaseResourceManager):
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
             request)
+
+    def impl_add_sequence(self, req_id: int, token_num: int, beam_width: int,
+                          req: LlmRequest) -> None:
+        self.impl.add_sequence(req_id, token_num, beam_width, req)
+
+    def impl_add_token(self, req_id: int) -> None:
+        self.impl.add_token(req_id)
 
     def add_dummy_requests(
         self,

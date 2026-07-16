@@ -324,7 +324,11 @@ def merge_requests_to_llm_requests(
     req_with_children = []
     for req_item in new_requests:
         req = executor_request_to_llm_request(
-            req_item.id, req_item.request, req_item.child_req_ids, exclude_last_generation_logits
+            req_item.id,
+            req_item.request,
+            req_item.child_req_ids,
+            exclude_last_generation_logits,
+            ugpu_id=req_item.ugpu_id,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -368,6 +372,7 @@ def merge_helix_requests(
             exclude_last_generation_logits=exclude_last_generation_logits,
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
+            ugpu_id=req_item.ugpu_id,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
@@ -438,7 +443,12 @@ def merge_star_attention_requests(
         ctx_blocks_list = [0] * (block_size + anchor_block_size)
 
         req = executor_request_to_llm_request(
-            req_id, exe_req, exclude_last_generation_logits, ctx_blocks_list
+            req_id=req_id,
+            executor_request=exe_req,
+            child_req_ids=req_item.child_req_ids,
+            exclude_last_generation_logits=exclude_last_generation_logits,
+            input_token_ids=ctx_blocks_list,
+            ugpu_id=req_item.ugpu_id,
         )
         req.gen_iters = 0
         req.ctx_iters = 0

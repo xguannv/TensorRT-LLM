@@ -908,6 +908,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            ugpu_id: Optional[int] = None,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -1025,6 +1026,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Python-side uGPU ownership. ``None`` is used for non-localized
+        # execution; localized requests must pass a concrete value at creation.
+        self.py_ugpu_id = ugpu_id
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as
@@ -1493,7 +1497,8 @@ def executor_request_to_llm_request(
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
-        position_ids: Optional[List] = None) -> LlmRequest:
+        position_ids: Optional[List] = None,
+        ugpu_id: Optional[int] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
@@ -1636,6 +1641,7 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
+        ugpu_id=ugpu_id,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
