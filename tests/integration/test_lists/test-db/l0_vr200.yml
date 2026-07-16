@@ -1,0 +1,18 @@
+version: 0.0.1
+# VR200 = Vera Rubin NVL72 (Vera aarch64 CPU + Rubin GPU).
+l0_vr200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      compute_capability: "10.7"
+  tests:
+  # ------------- PyTorch tests ---------------
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4

@@ -21,9 +21,14 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
+from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
+from tensorrt_llm._torch.utils import (Fp4QuantizedTensor,
+                                       is_nvfp4_marlin_supported_sm,
+                                       model_extra_attrs)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -105,8 +110,8 @@ def test_fp4_linear(dtype, mnk):
 @pytest.mark.skipif(sys.version_info < (3, 12),
                     reason="cutlass-dsl 4.1.0 requires Python 3.12+")
 @pytest.mark.skipif(
-    get_sm_version() not in [100, 103],
-    reason="This test is only supported in sm100 and sm103 architecture",
+    get_sm_version() not in [100, 103, 107],
+    reason="This test is only supported in sm100, sm103, and sm107 architecture",
 )
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
                     reason="cutlass-dsl is not available")
@@ -177,6 +182,588 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
     # compare
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)
+
+
+def _skip_if_no_ugpu():
+    is_ugpu_enabled.cache_clear()
+    if not is_ugpu_enabled():
+        pytest.skip("uGPU localization is not enabled/supported on this system")
+
+
+def _create_fp4_weights(output_size, hidden_size, dtype):
+    weight = torch.randn((output_size, hidden_size), dtype=dtype).cuda()
+    weight_sf_global = (448 * 6) / weight.abs().max().float()
+    weight_fp4, weight_sf_block = torch.ops.trtllm.fp4_quantize(
+        weight, weight_sf_global, scaling_vector_size, False)
+    weight_sf_block_unswizzled = (
+        torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_sf_block.cpu().view(pad_up(output_size, 128), -1)))
+    return weight_fp4, weight_sf_block, weight_sf_block_unswizzled, weight_sf_global
+
+
+def _create_fp4_input(seq_len, hidden_size, dtype):
+    input_raw = torch.randn(seq_len, hidden_size, dtype=dtype).cuda()
+    input_sf_global = (448 * 6) / input_raw.abs().max().float()
+    input_fp4, input_sf_block = torch.ops.trtllm.fp4_quantize(
+        input_raw, input_sf_global, scaling_vector_size, False)
+    return Fp4QuantizedTensor(input_fp4, input_sf_block), input_sf_global
+
+
+def _make_ugpu_weight_dict(weight_fp4,
+                           weight_sf_block_unswizzled,
+                           input_sf_global,
+                           weight_sf_global,
+                           bias=None):
+    weight_dict = {
+        "input_scale": 1.0 / input_sf_global.cpu(),
+        "weight": weight_fp4.cpu(),
+        "weight_scale": weight_sf_block_unswizzled.view(torch.float8_e4m3fn),
+        "weight_scale_2": 1.0 / weight_sf_global.cpu(),
+    }
+    if bias is not None:
+        weight_dict["bias"] = bias
+    return [weight_dict]
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("mnk", [(128, 7168, 2112), (128, 1536, 12288)])
+def test_fp4_linear_ugpu_correctness(mnk):
+    _skip_if_no_ugpu()
+    seq_len, output_size, hidden_size = mnk
+    dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    base_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=False,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=False))
+    ugpu_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=False,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=True))
+
+    weight_fp4, _, weight_sf_unswizzled, weight_sf_global = _create_fp4_weights(
+        output_size, hidden_size, dtype)
+    input_tensor, input_sf_global = _create_fp4_input(seq_len, hidden_size,
+                                                      dtype)
+    weight_dict = _make_ugpu_weight_dict(weight_fp4, weight_sf_unswizzled,
+                                         input_sf_global, weight_sf_global)
+
+    base_linear.load_weights(weight_dict)
+    base_linear = base_linear.cuda()
+    base_linear.post_load_weights()
+    ugpu_linear.load_weights(weight_dict)
+    ugpu_linear = ugpu_linear.cuda()
+    ugpu_linear.post_load_weights()
+
+    with torch.inference_mode(), autotune(tune_mode=True):
+        output_base = base_linear.forward(input_tensor)
+    with torch.inference_mode(), autotune(tune_mode=True):
+        output_ugpu = ugpu_linear.forward(input_tensor)
+
+    torch.cuda.synchronize()
+    assert ugpu_linear.partition_plan.enabled
+    assert ugpu_linear.partition_plan.num_partitions == 2
+    torch.testing.assert_close(output_base, output_ugpu, rtol=1e-2, atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+                    reason="Rubin CuTe DSL internal package is not available")
+def test_fp4_linear_cute_dsl_mixed_cluster_ugpu_strided_output():
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+
+    m = 256
+    n = 4096
+    k = 7168
+    packed_k = k // 2
+    sf_vec_size = 16
+    sf_m = pad_up(m, 128)
+    sf_n = pad_up(n, 128)
+    sf_k = pad_up(k // sf_vec_size, 4)
+
+    act_fp4 = torch.randint(0,
+                            16, (m, packed_k),
+                            dtype=torch.uint8,
+                            device="cuda")
+    weight_fp4 = torch.randint(0,
+                               16, (n, packed_k),
+                               dtype=torch.uint8,
+                               device="cuda")
+    act_sf = torch.ones(sf_m * sf_k, dtype=torch.float8_e4m3fn,
+                        device="cuda").view(torch.uint8)
+    weight_sf = torch.ones(sf_n * sf_k,
+                           dtype=torch.float8_e4m3fn,
+                           device="cuda").view(torch.uint8)
+    alpha_one = torch.ones(1, dtype=torch.float32, device="cuda")
+    alpha_scaled = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    runner = cute_dsl_custom_ops.CuteDSLNVFP4InplaceRubinLinear(
+        torch.bfloat16, to_userbuffers=False, use_tvm_ffi=True)
+    output_one = torch.empty(m, n * 2, dtype=torch.bfloat16, device="cuda")
+    output_scaled = torch.empty_like(output_one)
+    tactics = runner.get_valid_tactics(
+        [act_fp4, weight_fp4, act_sf, weight_sf, alpha_one, output_one], None)
+    mixed_tactics = [
+        tactic for tactic in tactics
+        if tactic[0] == "mixed_clusters" and tactic[-1] is False
+    ]
+    assert mixed_tactics, "expected at least one no-prefetch mixed-cluster tactic"
+
+    preferred_tactic = ("mixed_clusters", (128, 64, 256), (128, 64, 128),
+                        (4, 2), (2, 1), True, False)
+    tactic = preferred_tactic if preferred_tactic in mixed_tactics else mixed_tactics[
+        0]
+
+    for ugpu_id in range(2):
+        output_one.fill_(float("nan"))
+        runner([act_fp4, weight_fp4, act_sf, weight_sf, alpha_one, output_one],
+               tactic=tactic,
+               partition_id=ugpu_id)
+        torch.cuda.synchronize()
+
+        output_scaled.fill_(float("nan"))
+        runner([
+            act_fp4, weight_fp4, act_sf, weight_sf, alpha_scaled, output_scaled
+        ],
+               tactic=tactic,
+               partition_id=ugpu_id)
+        torch.cuda.synchronize()
+
+        output_one_slice = output_one[:, ugpu_id * n:(ugpu_id + 1) * n]
+        output_scaled_slice = output_scaled[:, ugpu_id * n:(ugpu_id + 1) * n]
+        other_one_slice = output_one[:, (1 - ugpu_id) * n:(2 - ugpu_id) * n]
+        other_scaled_slice = output_scaled[:,
+                                           (1 - ugpu_id) * n:(2 - ugpu_id) * n]
+        assert torch.isfinite(output_one_slice.float()).all()
+        assert torch.isfinite(output_scaled_slice.float()).all()
+        assert torch.isnan(other_one_slice).all()
+        assert torch.isnan(other_scaled_slice).all()
+        assert output_one_slice.float().abs().max() > 0
+        torch.testing.assert_close(output_scaled_slice.float(),
+                                   output_one_slice.float() *
+                                   alpha_scaled.item(),
+                                   rtol=1e-2,
+                                   atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("nk", [(7168, 2112), (1536, 12288)])
+def test_split_weights_for_ugpu(nk):
+    _skip_if_no_ugpu()
+    output_size, hidden_size = nk
+    dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    linear = Linear(in_features=hidden_size,
+                    out_features=output_size,
+                    bias=True,
+                    dtype=dtype,
+                    quant_config=quant_config,
+                    nvfp4_allowed_backends=["cutedsl"],
+                    ugpu_policy=UgpuPolicy(enabled=True))
+    assert linear.partition_plan.enabled
+
+    weight_fp4, _, weight_sf_unswizzled, weight_sf_global = _create_fp4_weights(
+        output_size, hidden_size, dtype)
+    input_sf_global = torch.tensor(1.0 / (448 * 6))
+    bias_data = torch.randn(output_size, dtype=dtype)
+    weight_dict = _make_ugpu_weight_dict(weight_fp4, weight_sf_unswizzled,
+                                         input_sf_global, weight_sf_global,
+                                         bias_data)
+
+    linear.load_weights(weight_dict)
+    linear = linear.cuda()
+
+    full_weight = linear.weight.data.clone()
+    full_bias = linear.bias.data.clone()
+
+    linear.post_load_weights()
+    shards = linear._ugpu_weight_shards
+
+    num_partitions = linear.partition_plan.num_partitions
+    assert len(shards) == num_partitions
+
+    layout = linear.partition_plan.layout
+    assert layout is not None
+    assert layout.padded_axis_extent == full_weight.size(0)
+    partition_n = layout.per_partition_axis_extent(padded=True)
+    for shard in shards:
+        assert shard["weight"].shape == (partition_n, full_weight.shape[1])
+
+    reconstructed = torch.cat([shard["weight"] for shard in shards], dim=0)
+    assert torch.equal(reconstructed.cpu(), full_weight.cpu())
+
+    reconstructed_bias = torch.cat([shard["bias"] for shard in shards], dim=0)
+    assert torch.equal(reconstructed_bias.cpu(), full_bias.cpu())
+
+    assert linear.weight.numel() == 0
+    assert linear.weight_scale.numel() == 0
+    assert linear.bias is not None
+    assert torch.equal(linear.bias.cpu(), full_bias.cpu())
+
+    expected_keys = {"weight", "weight_scale", "bias"}
+    for shard in shards:
+        assert set(shard.keys()) == expected_keys
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("mnk", [(128, 7168, 2112)])
+def test_fp4_linear_ugpu_bias_correctness(mnk):
+    _skip_if_no_ugpu()
+    seq_len, output_size, hidden_size = mnk
+    dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    base_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=True,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=False))
+    ugpu_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=True,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=True))
+
+    weight_fp4, _, weight_sf_unswizzled, weight_sf_global = _create_fp4_weights(
+        output_size, hidden_size, dtype)
+    input_tensor, input_sf_global = _create_fp4_input(seq_len, hidden_size,
+                                                      dtype)
+    bias_data = torch.randn(output_size, dtype=dtype)
+    weight_dict = _make_ugpu_weight_dict(weight_fp4, weight_sf_unswizzled,
+                                         input_sf_global, weight_sf_global,
+                                         bias_data)
+
+    base_linear.load_weights(weight_dict)
+    base_linear = base_linear.cuda()
+    base_linear.post_load_weights()
+    ugpu_linear.load_weights(weight_dict)
+    ugpu_linear = ugpu_linear.cuda()
+    ugpu_linear.post_load_weights()
+
+    assert ugpu_linear._ugpu_weight_shards is not None
+    assert "bias" in ugpu_linear._ugpu_weight_shards[0]
+
+    with torch.inference_mode():
+        output_base_forward = base_linear(input_tensor)
+        output_ugpu_forward = ugpu_linear(input_tensor)
+        output_base = base_linear.apply_linear(input_tensor, base_linear.bias)
+        output_ugpu = ugpu_linear.apply_linear(input_tensor, True)
+        output_base_no_bias = base_linear.apply_linear(input_tensor, None)
+        output_ugpu_no_bias = ugpu_linear.apply_linear(input_tensor, None)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output_base_forward,
+                               output_ugpu_forward,
+                               rtol=1e-2,
+                               atol=0.15)
+    torch.testing.assert_close(output_base, output_ugpu, rtol=1e-2, atol=0.15)
+    torch.testing.assert_close(output_base_no_bias,
+                               output_ugpu_no_bias,
+                               rtol=1e-2,
+                               atol=0.15)
+    assert (output_ugpu - output_ugpu_no_bias).abs().max() > 0
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+def test_cute_dsl_nvfp4_inplace_rubin_tvm_ffi_ugpu_correctness():
+    _skip_if_no_ugpu()
+    seq_len, output_size, hidden_size = (128, 1024, 3200)
+    dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    base_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=False,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=False))
+    ugpu_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=False,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=True))
+
+    weight_fp4, _, weight_sf_unswizzled, weight_sf_global = _create_fp4_weights(
+        output_size, hidden_size, dtype)
+    input_tensor, input_sf_global = _create_fp4_input(seq_len, hidden_size,
+                                                      dtype)
+    weight_dict = _make_ugpu_weight_dict(weight_fp4, weight_sf_unswizzled,
+                                         input_sf_global, weight_sf_global)
+
+    base_linear.load_weights(weight_dict)
+    base_linear = base_linear.cuda()
+    base_linear.post_load_weights()
+    ugpu_linear.load_weights(weight_dict)
+    ugpu_linear = ugpu_linear.cuda()
+    ugpu_linear.post_load_weights()
+
+    assert ugpu_linear.partition_plan.enabled
+    act_fp4, act_sf, alpha = ugpu_linear.quant_method._input_prepare(
+        ugpu_linear, input_tensor)
+    output_ffi = torch.empty(
+        act_fp4.shape[0],
+        ugpu_linear.partition_plan.layout.padded_axis_extent,
+        dtype=dtype,
+        device="cuda")
+
+    with torch.inference_mode():
+        output_base = base_linear.forward(input_tensor)
+        for partition_id, shard in enumerate(ugpu_linear._ugpu_weight_shards):
+            torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin(
+                act_fp4,
+                shard["weight"],
+                act_sf,
+                shard["weight_scale"],
+                alpha,
+                dtype,
+                False,
+                True,
+                output_ffi,
+                partition_id,
+            )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output_base,
+                               output_ffi[:, :output_size],
+                               rtol=1e-2,
+                               atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("use_tvm_ffi", [True, False])
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_cute_dsl_nvfp4_inplace_rubin_mixed_clusters_ugpu_correctness(
+        use_tvm_ffi, swap_ab):
+    _skip_if_no_ugpu()
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    seq_len, output_size, hidden_size = (512, 1024, 2048)
+    dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    base_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=False,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=False))
+    ugpu_linear = Linear(in_features=hidden_size,
+                         out_features=output_size,
+                         bias=False,
+                         dtype=dtype,
+                         quant_config=quant_config,
+                         nvfp4_allowed_backends=["cutedsl"],
+                         ugpu_policy=UgpuPolicy(enabled=True))
+
+    weight_fp4, _, weight_sf_unswizzled, weight_sf_global = _create_fp4_weights(
+        output_size, hidden_size, dtype)
+    input_tensor, input_sf_global = _create_fp4_input(seq_len, hidden_size,
+                                                      dtype)
+    weight_dict = _make_ugpu_weight_dict(weight_fp4, weight_sf_unswizzled,
+                                         input_sf_global, weight_sf_global)
+
+    base_linear.load_weights(weight_dict)
+    base_linear = base_linear.cuda()
+    base_linear.post_load_weights()
+    ugpu_linear.load_weights(weight_dict)
+    ugpu_linear = ugpu_linear.cuda()
+    ugpu_linear.post_load_weights()
+
+    assert ugpu_linear.partition_plan.enabled
+    act_fp4, act_sf, alpha = ugpu_linear.quant_method._input_prepare(
+        ugpu_linear, input_tensor)
+    output_mixed = torch.empty(
+        act_fp4.shape[0],
+        ugpu_linear.partition_plan.layout.padded_axis_extent,
+        dtype=dtype,
+        device="cuda")
+
+    first_shard = ugpu_linear._ugpu_weight_shards[0]
+    with AutoTuner.get().capture() as capture, torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin(
+            act_fp4,
+            first_shard["weight"],
+            act_sf,
+            first_shard["weight_scale"],
+            alpha,
+            dtype,
+            False,
+            use_tvm_ffi,
+            output_mixed,
+            0,
+        )
+
+    mixed_tactic = None
+    for tactic in capture:
+        _, tactic_value = tactic[0]
+        if (isinstance(tactic_value, tuple)
+                and tactic_value[0] == "mixed_clusters"
+                and tactic_value[5] == swap_ab):
+            mixed_tactic = tactic
+            break
+    if mixed_tactic is None:
+        pytest.skip(
+            f"No mixed_clusters tactic is available for swap_ab={swap_ab}")
+
+    output_mixed.zero_()
+    with torch.inference_mode():
+        output_base = base_linear.forward(input_tensor)
+        for partition_id, shard in enumerate(ugpu_linear._ugpu_weight_shards):
+            with AutoTuner.get().replay(mixed_tactic):
+                torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin(
+                    act_fp4,
+                    shard["weight"],
+                    act_sf,
+                    shard["weight_scale"],
+                    alpha,
+                    dtype,
+                    False,
+                    use_tvm_ffi,
+                    output_mixed,
+                    partition_id,
+                )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output_base,
+                               output_mixed[:, :output_size],
+                               rtol=1e-2,
+                               atol=0.15)
+
+
+def test_nvfp4_gemm_fake_rejects_legacy_output_args():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops  # noqa: F401
+
+    with FakeTensorMode():
+        act_fp4 = torch.empty((2, 4), dtype=torch.uint8, device="cuda")
+        weight = torch.empty((8, 4), dtype=torch.uint8, device="cuda")
+        act_sf = torch.empty((2, 1), dtype=torch.uint8, device="cuda")
+        weight_scale = torch.empty((8, 1), dtype=torch.uint8, device="cuda")
+        alpha = torch.empty((1, ), dtype=torch.float32, device="cuda")
+        output_tensor = torch.empty((2, 16),
+                                    dtype=torch.bfloat16,
+                                    device="cuda")
+
+        with pytest.raises(ValueError, match="nvfp4_gemm_inplace"):
+            torch.ops.trtllm.nvfp4_gemm(
+                act_fp4,
+                weight,
+                act_sf,
+                weight_scale,
+                alpha,
+                torch.bfloat16,
+                False,
+                "cutlass",
+                None,
+                output_tensor,
+                0,
+            )
+
+        with pytest.raises(ValueError, match="partition_id"):
+            torch.ops.trtllm.nvfp4_gemm(
+                act_fp4,
+                weight,
+                act_sf,
+                weight_scale,
+                alpha,
+                torch.bfloat16,
+                False,
+                "cutlass",
+                None,
+                None,
+                0,
+            )
+
+
+def test_cute_dsl_rubin_fake_rejects_legacy_output_args():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    import tensorrt_llm._torch.custom_ops  # noqa: F401
+
+    try:
+        op = torch.ops.trtllm.cute_dsl_nvfp4_gemm_rubin
+    except AttributeError:
+        pytest.skip("internal CuteDSL Rubin GEMM op is not registered")
+
+    with FakeTensorMode():
+        act_fp4 = torch.empty((2, 4), dtype=torch.uint8, device="cuda")
+        weight = torch.empty((8, 4), dtype=torch.uint8, device="cuda")
+        act_sf = torch.empty((2, 1), dtype=torch.uint8, device="cuda")
+        weight_scale = torch.empty((8, 1), dtype=torch.uint8, device="cuda")
+        alpha = torch.empty((1, ), dtype=torch.float32, device="cuda")
+        output_tensor = torch.empty((2, 16),
+                                    dtype=torch.bfloat16,
+                                    device="cuda")
+
+        with pytest.raises(ValueError,
+                           match="cute_dsl_nvfp4_gemm_inplace_rubin"):
+            op(
+                act_fp4,
+                weight,
+                act_sf,
+                weight_scale,
+                alpha,
+                torch.bfloat16,
+                False,
+                True,
+                output_tensor,
+                0,
+            )
+
+        with pytest.raises(ValueError, match="partition_id"):
+            op(
+                act_fp4,
+                weight,
+                act_sf,
+                weight_scale,
+                alpha,
+                torch.bfloat16,
+                False,
+                True,
+                None,
+                0,
+            )
 
 
 def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):

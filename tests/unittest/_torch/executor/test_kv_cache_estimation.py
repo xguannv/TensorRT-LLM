@@ -211,6 +211,16 @@ def _no_gpu():
 # ---------------------------------------------------------------------------
 
 
+def test_cache_cost_tokens_for_budget_not_int_division():
+    """Regression: V2 KV cache capacity must derive max_tokens via
+    ``CacheCost.tokens_for_budget``, not ``budget // CacheCost``."""
+    budget = 10_000
+    cost = CacheCost(slope=512, intercept=128)
+    assert cost.tokens_for_budget(budget) == (budget - 128) // 512
+    with pytest.raises(TypeError):
+        _ = budget // cost
+
+
 def test_adp_reduces_blocks_to_per_rank_share():
     """With ADP + tp_size duplicated requests the result must equal a single
     rank's share, not the sum across all duplicates."""

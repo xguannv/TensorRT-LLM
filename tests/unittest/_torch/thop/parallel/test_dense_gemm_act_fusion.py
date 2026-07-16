@@ -24,7 +24,7 @@ fall back to below that floor.
 import pytest
 import torch
 import torch.nn.functional as F
-from utils.util import skip_pre_blackwell
+from utils.util import skip_pre_blackwell, skip_rubin
 
 from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
@@ -69,6 +69,7 @@ def _sf_match(c_sf, ref_sf, m, n):
 # GELU (non-gated, optional bias)
 # ---------------------------------------------------------------------------
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("m, k, n", [(64, 256, 512), (128, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_bf16out(m: int, k: int, n: int, use_bias: bool):
@@ -94,6 +95,7 @@ def test_dense_gemm_gelu_bf16out(m: int, k: int, n: int, use_bias: bool):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("m, k, n", [(128, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_fp4out(m: int, k: int, n: int, use_bias: bool):
@@ -146,6 +148,7 @@ def _swiglu_ref(a, b, a_sf, b_sf, alpha):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("m, k, inter", [(64, 256, 512), (128, 256, 512), (256, 512, 1024)])
 def test_dense_gemm_swiglu_bf16out(m: int, k: int, inter: int):
     """bf16-out fused gate-up GEMM + SwiGLU. m=64 < _FP4OUT_MIN_M (fallback)."""
@@ -167,6 +170,7 @@ def test_dense_gemm_swiglu_bf16out(m: int, k: int, inter: int):
 
 
 @skip_pre_blackwell
+@skip_rubin
 @pytest.mark.parametrize("m, k, inter", [(128, 256, 512), (256, 512, 1024)])
 def test_dense_gemm_swiglu_fp4out(m: int, k: int, inter: int):
     """fp4-out fused gate-up GEMM + SwiGLU + NVFP4 quant (m >= _FP4OUT_MIN_M)."""

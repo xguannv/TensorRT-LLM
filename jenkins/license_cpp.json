@@ -50,6 +50,20 @@
         "tensorrt_llm/common/sha256/sha256_arm_shani.cpp": "external (Bitcoin Core MIT)",
         "tensorrt_llm/common/sha256/sha256_endian.h": "external (Bitcoin Core MIT)",
         "tensorrt_llm/common/sha256/sha256_x86_shani.cpp": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cbl2.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cbl2_cuda_base_driver.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cluster_prototype.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cpuopsys.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cuda_packing.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cuda_stdint.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/cuda_uuid.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/g_nvconfig.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/green_context.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/nvtypes.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/sm_disable_mask.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/tools_common_types.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/tools_device.h": "temporary uGPU internal imported header",
+        "tensorrt_llm/runtime/ugpu/ugpu_internal/ugpu_localization.h": "temporary uGPU internal imported header",
         "_": "don't remove, for trailing comma"
     }
 }

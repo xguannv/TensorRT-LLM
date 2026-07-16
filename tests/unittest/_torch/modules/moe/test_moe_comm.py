@@ -286,6 +286,9 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
+        False,  # use_cft_counted_writes
+        None,  # expert_id_payload_index
+        None,  # invalid_token_expert_id
         enable_rank_mask,
         active_rank_mask,
     )
@@ -325,6 +328,7 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
+        False,  # use_cft_counted_writes
         enable_rank_mask,
         active_rank_mask,
     )

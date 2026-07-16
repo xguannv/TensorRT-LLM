@@ -40,6 +40,7 @@ from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
@@ -76,6 +77,8 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
+from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
+from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -195,9 +198,13 @@ def create_test_backend(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
     n_shared_experts: int = 0,
+    ugpu_policy: Optional[UgpuPolicy] = None,
+    use_lamport_sync: bool = False,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
+    if ugpu_policy is None:
+        ugpu_policy = UgpuPolicy(enabled=False)
 
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
@@ -221,6 +228,8 @@ def create_test_backend(
         quant_config=quant_config,
         mapping=mapping,
         moe_backend=moe_backend_value,
+        ugpu_policy=ugpu_policy,
+        use_lamport_sync=use_lamport_sync,
     )
     if n_shared_experts > 0:
         # The shared-expert-fusion gate runs after the eager create_weights()
@@ -904,6 +913,41 @@ CI_SWIGLU_COMBOS = [
 SWIGLU_COMBOS = CI_SWIGLU_COMBOS if IS_CI_MODE else LOCAL_SWIGLU_COMBOS
 
 
+def should_skip_ugpu_param(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    activation_type: ActivationType,
+    swiglu_gptoss_style: bool,
+) -> Optional[str]:
+    """Return a static skip reason for uGPU MoE backend params."""
+    if backend_type != MoeBackendType.CUTEDSL:
+        return "uGPU MoE backend test only supports CuteDSL"
+    if quant_algo not in (QuantAlgo.NVFP4, None):
+        return "uGPU MoE backend test only supports NVFP4 or BF16"
+    if activation_type != ActivationType.Swiglu:
+        return "uGPU MoE backend test only supports SwiGLU"
+    if swiglu_gptoss_style:
+        return "uGPU MoE backend test does not cover GPT-OSS SwiGLU style"
+    return None
+
+
+def should_skip_ugpu_runtime(enable_ugpu: bool) -> Optional[str]:
+    """Return a runtime skip reason for uGPU MoE backend params."""
+    if not enable_ugpu:
+        return None
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        return f"Rubin (SM 107) required, got SM {sm_version}"
+    if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        return "internal CuteDSL Rubin kernels are not available"
+    is_ugpu_enabled.cache_clear()
+    if not is_ugpu_enabled():
+        return "uGPU is not enabled/supported on this system"
+    return None
+
+
 def generate_test_params() -> List:
     """
     Generate test parameter combinations, filtering out unsupported configurations.
@@ -948,8 +992,40 @@ def generate_test_params() -> List:
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            False,
         )
         params.append(create_test_param(param_values, test_id))
+
+        if quant_algo in (QuantAlgo.NVFP4, None):
+            swiglu_gptoss_style = (
+                swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+            )
+            ugpu_skip_reason = should_skip_ugpu_param(
+                backend_type,
+                quant_algo,
+                ActivationType.Swiglu,
+                swiglu_gptoss_style,
+            )
+            ugpu_param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                ActivationType.Swiglu,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+                True,
+            )
+            params.append(
+                create_test_param(
+                    ugpu_param_values,
+                    f"ugpu=enabled-{test_id}",
+                    ugpu_skip_reason,
+                )
+            )
 
     return params
 
@@ -1002,6 +1078,7 @@ def generate_element_wise_test_params() -> List:
                 None,
                 None,
                 None,
+                False,
             )
             params.append(create_test_param(param_values, test_id))
     return params
@@ -1071,7 +1148,8 @@ TEST_PARAMS += generate_element_wise_test_params()
 # =============================================================================
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
-    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit",
+    "routing_method_cls,activation_type,swiglu_alpha,swiglu_beta,swiglu_limit,"
+    "enable_ugpu",
     TEST_PARAMS,
 )
 def test_moe_backend(
@@ -1086,6 +1164,7 @@ def test_moe_backend(
     swiglu_beta: Optional[float],
     swiglu_limit: Optional[float],
     monkeypatch: pytest.MonkeyPatch,
+    enable_ugpu: bool,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
@@ -1111,6 +1190,11 @@ def test_moe_backend(
         # swiglu_gptoss_style is True when any swiglu parameter deviates from default
         # Default values: alpha=1, beta=0, limit=inf
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+
+    ugpu_runtime_skip = should_skip_ugpu_runtime(enable_ugpu)
+    if ugpu_runtime_skip:
+        pytest.skip(ugpu_runtime_skip)
+    ugpu_policy = UgpuPolicy(enabled=enable_ugpu)
 
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
@@ -1205,6 +1289,7 @@ def test_moe_backend(
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
             weight_loading_mode=weight_loading_mode,
             activation_type=activation_type,
+            ugpu_policy=ugpu_policy,
         )
 
         # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 require backend-layout-aware
@@ -1225,6 +1310,9 @@ def test_moe_backend(
         backend.load_weights([weights])
         backend.post_load_weights()
         backend.cuda()
+        if enable_ugpu:
+            assert backend._ugpu_runtime is not None
+            assert backend._ugpu_weight_shards is not None
 
         # Create reference
         if ref_cls is not None:
@@ -1238,6 +1326,8 @@ def test_moe_backend(
 
         # Clear autotuner cache before autotune phase
         AutoTuner.get().clear_cache()
+        if enable_ugpu:
+            AutoTuner.get().reset_statistics()
 
         # Get reference output first
         with torch.inference_mode():
@@ -1268,6 +1358,11 @@ def test_moe_backend(
         # Use cache_path to speed up subsequent runs by reusing tuning results
         with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
             _ = run_moe()
+        if enable_ugpu:
+            gather_failures = autotuner.stats.failed_profiling_count.get(
+                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin", set()
+            )
+            assert not gather_failures
 
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
@@ -1805,3 +1900,95 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.M
                 backend.w2_weight_scaling_factor.data[slot],
                 down.weight_scale.data[:, scale_rows],
             )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+def test_moe_backend_trtllm_nvfp4_lamport(num_tokens: int):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        pytest.skip(f"Lamport sync requires SM107 (Rubin), got SM{sm_version}")
+
+    dtype_activation = torch.bfloat16
+    backend_type = MoeBackendType.TRTLLM
+    quant_algo = QuantAlgo.NVFP4
+    activation_type = ActivationType.Relu2
+
+    num_experts = 2048
+    top_k = 32
+    hidden_size = 1024
+    intermediate_size = 1024
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype_activation, device="cuda")
+        router_logits = torch.randn(
+            (num_tokens, num_experts), dtype=dtype_activation, device="cuda"
+        )
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype_activation,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=activation_type,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype_activation,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=activation_type,
+            use_lamport_sync=True,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype_activation,
+                router_logits,
+            )
+
+            ref_fused_moe.check_accuracy(output, ref_output)
