@@ -15,13 +15,18 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_manager_v2_module
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    _create_gpu_cache_tier_config,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -39,6 +44,29 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+@pytest.mark.parametrize("enable_ugpu", [False, True])
+def test_cpp_gpu_cache_tier_config_disables_ugpu(enable_ugpu: bool) -> None:
+    constructor = MagicMock(return_value=object())
+    with (
+        patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "cpp"),
+        patch.object(kv_cache_manager_v2_module, "GpuCacheTierConfig", constructor),
+    ):
+        _create_gpu_cache_tier_config(4096, enable_ugpu)
+
+    constructor.assert_called_once_with(quota=4096)
+
+
+def test_python_gpu_cache_tier_config_preserves_ugpu() -> None:
+    constructor = MagicMock(return_value=object())
+    with (
+        patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "python"),
+        patch.object(kv_cache_manager_v2_module, "GpuCacheTierConfig", constructor),
+    ):
+        _create_gpu_cache_tier_config(4096, True)
+
+    constructor.assert_called_once_with(quota=4096, enable_ugpu=True)
 
 
 class _FakeKVCache:

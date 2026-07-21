@@ -39,6 +39,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
@@ -120,6 +121,18 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     for field_name in KV_CACHE_ITERATION_STATS_DELTA_FIELDS
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
+
+
+def _create_gpu_cache_tier_config(quota: int, enable_ugpu: bool) -> GpuCacheTierConfig:
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        if enable_ugpu:
+            logger.warning_once(
+                "uGPU KV-cache localization is not supported by the C++ KV cache manager V2; "
+                "disabling it.",
+                key="disable_ugpu_for_cpp_kv_cache_manager_v2",
+            )
+        return GpuCacheTierConfig(quota=quota)
+    return GpuCacheTierConfig(quota=quota, enable_ugpu=enable_ugpu)
 
 
 class Role:
@@ -1017,7 +1030,7 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [
-            GpuCacheTierConfig(quota=int(quota), enable_ugpu=enable_ugpu)
+            _create_gpu_cache_tier_config(int(quota), enable_ugpu)
         ]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
