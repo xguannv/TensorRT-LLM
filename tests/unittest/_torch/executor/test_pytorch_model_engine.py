@@ -150,6 +150,12 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
 
+    def test_release_cuda_graphs_tolerates_partial_initialization(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine._cleanup_done = True
+
+        engine._release_cuda_graphs()
+
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
         request = LlmRequest(

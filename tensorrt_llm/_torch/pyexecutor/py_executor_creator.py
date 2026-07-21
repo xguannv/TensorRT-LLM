@@ -4,17 +4,24 @@
 import copy
 import gc
 import importlib
+import math
 import os
+import time
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
-from itertools import chain
 from typing import Optional, Tuple
 
 import torch
 from strenum import StrEnum
 
 import tensorrt_llm
+from tensorrt_llm._torch.mem_probe import (GpuProcessSnapshot, GpuProcessUsage,
+                                           MemoryTrace, OomFinding,
+                                           OomReportResult, ProcessRelation,
+                                           SnapshotContext, StageRecord,
+                                           capture_process_snapshot, is_gpu_oom,
+                                           log_oom_report, log_snapshot)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
@@ -59,21 +66,149 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
 
 
 class _ExecutorMemoryMonitor:
-    """Currently this focuses on tracking memory usage and related errors."""
+    """Track executor creation memory and preserve history for runtime OOMs."""
 
-    @dataclass(frozen=True)
-    class _GpuMemoryUsageSample:
-        creation_stage: ExecutorMemoryType
-        free_gpu_memory_bytes_pre: int
-        free_gpu_memory_bytes_post: int
+    def __init__(self, rank: Optional[int] = None) -> None:
+        self._rank = rank
+        self._trace = MemoryTrace()
+        free_gpu_memory_bytes, total_gpu_memory_bytes = torch.cuda.mem_get_info(
+        )
+        process_snapshot = self._warn_if_gpu_not_empty(free_gpu_memory_bytes,
+                                                       total_gpu_memory_bytes)
+        log_snapshot(
+            "startup/baseline",
+            capture_phase="startup",
+            context=SnapshotContext(
+                rank=rank,
+                prefetched_device_free_bytes=free_gpu_memory_bytes,
+                prefetched_device_total_bytes=total_gpu_memory_bytes,
+            ),
+        )
+        self._trace.record_baseline(
+            StageRecord(
+                stage="startup/baseline",
+                timestamp_ns=time.time_ns(),
+                device_free_bytes_pre=free_gpu_memory_bytes,
+                device_free_bytes_post=free_gpu_memory_bytes,
+                device_total_bytes=total_gpu_memory_bytes,
+                process_snapshot=process_snapshot,
+            ))
 
-    def __init__(self):
-        self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
-        self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
+    @property
+    def trace(self) -> MemoryTrace:
+        return self._trace
 
     @staticmethod
     def _bytes_to_gib(bytes: int) -> float:
         return bytes / (1024)**3
+
+    @staticmethod
+    def _env_float(
+        name: str,
+        default: float,
+        *,
+        minimum: float,
+        maximum: Optional[float] = None,
+    ) -> float:
+        """Parse a bounded finite float without allowing diagnostics to fail startup."""
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            value = math.nan
+        if (not math.isfinite(value) or value < minimum
+                or (maximum is not None and value > maximum)):
+            logger.warning(
+                f"Ignoring invalid {name}={raw!r}; using default {default}.")
+            return default
+        return value
+
+    def _warn_if_gpu_not_empty(
+        self,
+        free_gpu_memory_bytes: int,
+        total_gpu_memory_bytes: int,
+    ) -> Optional[GpuProcessSnapshot]:
+        """Startup preflight: warn if this rank's GPU already holds significant
+        memory before we allocate anything.
+
+        A common flaky failure (e.g. in CI) is a leftover process from a
+        previous job still occupying the GPU, which later surfaces as an opaque
+        out-of-memory error during weight loading with a misleading "reduce
+        max_num_tokens / shard the model" suggestion. Detecting the non-empty
+        GPU up front -- and naming the offending PIDs -- makes the real cause
+        obvious immediately.
+
+        Runs on every rank (each measures its own bound GPU) and only logs when
+        that GPU is not clean, so healthy runs stay silent. Thresholds are
+        overridable via env vars for CI tuning:
+          TLLM_STARTUP_FREE_MEM_INFO_RATIO (default 0.9): below this free/total
+            ratio -> at least an info line.
+          TLLM_STARTUP_FREE_MEM_WARN_RATIO (default 0.75): below this -> warning.
+          TLLM_STARTUP_FREE_MEM_MIN_GIB (default 2): ignore usage smaller than
+            this absolute floor (CUDA context / NCCL / caching allocator).
+        Non-finite and out-of-range values fall back to the default with a warning.
+        """
+        total = total_gpu_memory_bytes
+        if total <= 0:
+            return None
+        used = total - free_gpu_memory_bytes
+        free_ratio = free_gpu_memory_bytes / total
+
+        info_ratio = self._env_float("TLLM_STARTUP_FREE_MEM_INFO_RATIO",
+                                     0.9,
+                                     minimum=0.0,
+                                     maximum=1.0)
+        warn_ratio = self._env_float("TLLM_STARTUP_FREE_MEM_WARN_RATIO",
+                                     0.75,
+                                     minimum=0.0,
+                                     maximum=1.0)
+        gib = 1 << 30
+        used_floor_gib = self._env_float(
+            "TLLM_STARTUP_FREE_MEM_MIN_GIB",
+            2.0,
+            minimum=0.0,
+        )
+
+        # Trivial usage (CUDA context, NCCL, torch caching allocator, ...) is
+        # expected -- require both a low free ratio and a non-trivial absolute
+        # amount so small GPUs don't false-positive on fixed overhead. Gate on
+        # max(info, warn) so an (unusual) warn_ratio > info_ratio still reaches
+        # the tier decision below instead of being silenced here.
+        if free_ratio >= max(info_ratio,
+                             warn_ratio) or used / gib < used_floor_gib:
+            return None
+
+        # Attribute the usage to concrete PIDs on this rank's physical GPU.
+        process_snapshot = capture_process_snapshot()
+        non_self = [
+            process for process in process_snapshot.processes
+            if process.relation is ProcessRelation.NON_SELF
+        ]
+
+        if non_self:
+            culprit = (" Non-self processes visible on this GPU: " +
+                       self._format_processes(non_self) +
+                       ". Determine their ownership before reclaiming memory.")
+        else:
+            culprit = (" No non-self compute process is visible via NVML (it"
+                       " may be in another container/PID namespace, or NVML is"
+                       " unavailable).")
+
+        msg = (
+            f"GPU is not empty at startup: "
+            f"{self._bytes_to_gib(free_gpu_memory_bytes):.2f} GiB free of "
+            f"{self._bytes_to_gib(total):.2f} GiB total "
+            f"({self._bytes_to_gib(used):.2f} GiB already in use before weight "
+            f"loading).{culprit} If this is unexpected, a leftover process may "
+            f"be holding memory -- check `nvidia-smi`; weight loading may OOM.")
+
+        if free_ratio < warn_ratio or non_self:
+            logger.warning(msg)
+        else:
+            logger.info(msg)
+        return process_snapshot
 
     memory_type_friendly_names = {
         ExecutorMemoryType.SAMPLER:
@@ -126,10 +261,42 @@ class _ExecutorMemoryMonitor:
         "reduce max_num_tokens",
     }
 
-    def _maybe_explain_if_oom(self, e: Exception, *,
-                              current_stage: ExecutorMemoryType,
-                              free_gpu_memory_bytes_pre: int) -> Optional[str]:
-        if isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e):
+    @classmethod
+    def _format_processes(cls, processes: Iterable[GpuProcessUsage]) -> str:
+        descriptions = []
+        for process in sorted(processes,
+                              key=lambda item: item.used_bytes
+                              if item.used_bytes is not None else -1,
+                              reverse=True):
+            memory_text = (f"{cls._bytes_to_gib(process.used_bytes):.2f} GiB" if
+                           process.used_bytes is not None else "memory unknown")
+            descriptions.append(f"PID {process.pid} ({memory_text})")
+        return ", ".join(descriptions)
+
+    @classmethod
+    def _format_request_condition(cls, finding: OomFinding) -> Optional[str]:
+        if (finding.requested_bytes is None
+                or finding.device_free_bytes is None):
+            return None
+        shortfall_bytes = max(
+            finding.requested_bytes - finding.device_free_bytes,
+            0,
+        )
+        return (
+            "Failed allocation (GiB): "
+            f"requested={cls._bytes_to_gib(finding.requested_bytes):.2f}, "
+            f"current_free={cls._bytes_to_gib(finding.device_free_bytes):.2f}, "
+            f"shortfall={cls._bytes_to_gib(shortfall_bytes):.2f}")
+
+    def _maybe_explain_if_oom(
+        self,
+        e: Exception,
+        *,
+        current_stage: ExecutorMemoryType,
+        free_gpu_memory_bytes_pre: int,
+        diagnostic: Optional[OomReportResult] = None,
+    ) -> Optional[str]:
+        if is_gpu_oom(e):
             msg = "Executor creation failed due to insufficient GPU memory."
         elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
               and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
@@ -139,30 +306,74 @@ class _ExecutorMemoryMonitor:
         else:
             return None
 
-        msg = "\n".join([
+        baseline, samples = self._trace.diagnostic_history()
+        total_gpu_memory_bytes = (baseline.device_total_bytes
+                                  if baseline is not None else None)
+        total_gpu_memory_text = (
+            f"{self._bytes_to_gib(total_gpu_memory_bytes):.2f}"
+            if total_gpu_memory_bytes is not None else "unknown")
+
+        previous_stages = []
+        for sample in samples:
+            try:
+                previous_stages.append(ExecutorMemoryType(sample.stage))
+            except ValueError:
+                continue
+
+        explanation_lines = [
             msg,
             "",
             f"The following component could not be created: {self.memory_type_friendly_names[current_stage]}",
-            f"Total GPU memory (GiB): {self._bytes_to_gib(self._total_gpu_memory_bytes):.2f}",
+            f"Total GPU memory (GiB): {total_gpu_memory_text}",
             f"Free GPU memory before component creation attempt (GiB): {self._bytes_to_gib(free_gpu_memory_bytes_pre):.2f}",
             "",
             "Previously created components and free GPU memory before/after creation (GiB):",
-            *((f"{sample.creation_stage.value}: "
-               f"{self._bytes_to_gib(sample.free_gpu_memory_bytes_pre):.2f} / {self._bytes_to_gib(sample.free_gpu_memory_bytes_post):.2f}"
-               ) for sample in self._samples),
+            *((f"{sample.stage}: "
+               f"{self._bytes_to_gib(sample.device_free_bytes_pre):.2f} / {self._bytes_to_gib(sample.device_free_bytes_post):.2f}"
+               )
+              for sample in samples if sample.device_free_bytes_pre is not None
+              and sample.device_free_bytes_post is not None),
+        ]
+
+        non_self_finding = next(
+            (finding for finding in diagnostic.findings
+             if finding.code == "NON_SELF_PROCESS_PRESSURE"),
+            None,
+        ) if diagnostic is not None else None
+        request_finding = next(
+            (finding for finding in diagnostic.findings
+             if finding.code == "REQUEST_EXCEEDS_FREE"),
+            None,
+        ) if diagnostic is not None else None
+        request_condition = (self._format_request_condition(request_finding)
+                             if request_finding is not None else None)
+
+        if request_condition is not None:
+            explanation_lines.extend(["", request_condition])
+
+        if non_self_finding is not None:
+            explanation_lines.extend([
+                "",
+                ("Supporting non-self GPU-process evidence "
+                 f"({non_self_finding.process_snapshot_source}): " +
+                 self._format_processes(non_self_finding.non_self_processes)),
+                f"Process action: {non_self_finding.action}",
+            ])
+
+        explanation_lines.extend([
             "",
             ("Please refer to the TensorRT LLM documentation for information on how "
              "to control the memory usage through TensorRT LLM configuration options. "
              "Possible options include:"),
             *(f"  {stage.value}: {self.memory_type_tuning_suggestion[stage]}"
-              for stage in chain((sample.creation_stage
-                                  for sample in self._samples), [current_stage])
+              for stage in (*previous_stages, current_stage)
               if stage in self.memory_type_tuning_suggestion),
         ])
-        return msg
+        return "\n".join(explanation_lines)
 
     @contextmanager
-    def observe_creation_stage(self, current_stage: ExecutorMemoryType):
+    def observe_creation_stage(
+            self, current_stage: ExecutorMemoryType) -> Iterator[None]:
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
@@ -170,20 +381,42 @@ class _ExecutorMemoryMonitor:
         try:
             yield
         except Exception as e:
+            diagnostic = log_oom_report(
+                stage=current_stage.value,
+                error=e,
+                trace=self._trace,
+                capture_phase="startup_error",
+                context=SnapshotContext(rank=self._rank),
+            )
             explanation = self._maybe_explain_if_oom(
                 e,
                 current_stage=current_stage,
-                free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre)
+                free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
+                diagnostic=diagnostic,
+            )
             if explanation is None:
                 raise  # not an OOM
             raise RuntimeError(explanation) from e
         else:
-            free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
-            self._samples.append(
-                self._GpuMemoryUsageSample(
-                    creation_stage=current_stage,
-                    free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
-                    free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
+            free_gpu_memory_bytes_post, total_gpu_memory_bytes = torch.cuda.mem_get_info(
+            )
+            log_snapshot(
+                f"stage/{current_stage.value}",
+                capture_phase="startup",
+                context=SnapshotContext(
+                    rank=self._rank,
+                    prefetched_device_free_bytes=free_gpu_memory_bytes_post,
+                    prefetched_device_total_bytes=total_gpu_memory_bytes,
+                ),
+            )
+            self._trace.record_healthy(
+                StageRecord(
+                    stage=current_stage.value,
+                    timestamp_ns=time.time_ns(),
+                    device_free_bytes_pre=free_gpu_memory_bytes_pre,
+                    device_free_bytes_post=free_gpu_memory_bytes_post,
+                    device_total_bytes=total_gpu_memory_bytes,
+                    process_snapshot=None,
                 ))
 
 
@@ -529,7 +762,7 @@ def create_py_executor(
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
-    mem_monitor = _ExecutorMemoryMonitor()
+    mem_monitor = _ExecutorMemoryMonitor(rank=dist.rank)
 
     @contextmanager
     def allocation_scope(current_stage: ExecutorMemoryType):
@@ -1088,6 +1321,7 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
+    py_executor.memory_trace = mem_monitor.trace
     py_executor.start_worker()
 
     return py_executor
