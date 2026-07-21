@@ -2116,9 +2116,9 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
     int element_size;
     switch (params.dtype)
     {
-    case nvinfer1::DataType::kHALF: element_size = sizeof(half); break;
-    case nvinfer1::DataType::kBF16: element_size = sizeof(__nv_bfloat16); break;
-    case nvinfer1::DataType::kFLOAT: element_size = sizeof(float); break;
+    case tensorrt_llm::DataType::kHALF: element_size = sizeof(half); break;
+    case tensorrt_llm::DataType::kBF16: element_size = sizeof(__nv_bfloat16); break;
+    case tensorrt_llm::DataType::kFLOAT: element_size = sizeof(float); break;
     default: TLLM_CHECK_WITH_INFO(false, "Unsupported dtype for combine push"); return;
     }
     int bytes_per_token = params.elements_per_token * element_size;
@@ -2284,9 +2284,9 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         int element_size;
         switch (params.dtype)
         {
-        case nvinfer1::DataType::kHALF: element_size = sizeof(half); break;
-        case nvinfer1::DataType::kBF16: element_size = sizeof(__nv_bfloat16); break;
-        case nvinfer1::DataType::kFLOAT: element_size = sizeof(float); break;
+        case tensorrt_llm::DataType::kHALF: element_size = sizeof(half); break;
+        case tensorrt_llm::DataType::kBF16: element_size = sizeof(__nv_bfloat16); break;
+        case tensorrt_llm::DataType::kFLOAT: element_size = sizeof(float); break;
         default: element_size = 2; break; // fallback
         }
         int64_t cft_stride
