@@ -135,6 +135,46 @@ def _create_gpu_cache_tier_config(quota: int, enable_ugpu: bool) -> GpuCacheTier
     return GpuCacheTierConfig(quota=quota, enable_ugpu=enable_ugpu)
 
 
+def _get_num_ugpus(impl) -> int:
+    """Return the effective uGPU count supported by the selected backend."""
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        return 1
+    return impl.num_ugpus
+
+
+def _get_kv_cache_ugpu_id(kv_cache) -> int | None:
+    """Return the cache-local uGPU id supported by the selected backend."""
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        return None
+    return kv_cache.ugpu_id
+
+
+def _create_backend_kv_cache(
+    impl,
+    lora_task_id: int | None,
+    salt: int | None,
+    input_tokens: Sequence[TokenIdExt] | None,
+    request_id: int,
+    expected_prompt_length: int | None,
+    ugpu_id: int | None,
+):
+    if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
+        assert ugpu_id is None, "The C++ KV cache manager V2 does not support uGPU localization"
+        return impl.create_kv_cache(
+            ReuseScope(lora_id=lora_task_id, salt=salt),
+            input_tokens,
+            id=request_id,
+            expected_prompt_length=expected_prompt_length,
+        )
+    return impl.create_kv_cache(
+        ReuseScope(lora_id=lora_task_id, salt=salt, ugpu_id=ugpu_id),
+        input_tokens,
+        id=request_id,
+        expected_prompt_length=expected_prompt_length,
+        ugpu_id=ugpu_id,
+    )
+
+
 class Role:
     KEY = DataRole("key")
     VALUE = DataRole("value")
@@ -1132,7 +1172,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # Cache the fork-join attention flag at construction time so the
         # manager's per-uGPU metadata invariants stay stable for its lifetime.
-        self._fork_join_attn = self.impl.num_ugpus > 1 and enable_ugpu
+        self._fork_join_attn = self.num_ugpus > 1 and enable_ugpu
         self.num_pools = len(self.impl.layer_grouping)
         self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
         for pool_group in self.impl.pool_group_descs:
@@ -2265,7 +2305,7 @@ class KVCacheManagerV2(BaseResourceManager):
     @property
     def num_ugpus(self) -> int:
         """Number of uGPUs. Returns 1 for non-localized configurations."""
-        return self.impl.num_ugpus
+        return _get_num_ugpus(self.impl)
 
     def get_per_ugpu_free_slots(self) -> list[int]:
         """Free slot count per uGPU, summed across all pool groups."""
@@ -2304,12 +2344,12 @@ class KVCacheManagerV2(BaseResourceManager):
             f"(num_ugpus={self.num_ugpus}, "
             f"kv_cache_map size={len(self.kv_cache_map)})"
         )
-        assert kv_cache.ugpu_id is not None, (
+        assert _get_kv_cache_ugpu_id(kv_cache) is not None, (
             f"get_ugpu: request {request_id} has no concrete ugpu_id "
             f"(num_ugpus={self.num_ugpus}, "
             f"kv_cache_map size={len(self.kv_cache_map)})"
         )
-        return kv_cache.ugpu_id
+        return _get_kv_cache_ugpu_id(kv_cache)
 
     @property
     def fork_join_attn(self) -> bool:
@@ -2541,7 +2581,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 if kv_cache is None:
                     return False
-                assert kv_cache.ugpu_id == ugpu_id
+                assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2725,7 +2765,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         # slots free up, before the request runs any spec-dec
                         # forward that needs the mirror.
                         continue
-                    assert kv_cache.ugpu_id == ugpu_id
+                    assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -3392,7 +3432,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     release_resources(req)
                     return None
-                assert kv_cache.ugpu_id == ugpu_id
+                assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
@@ -3437,7 +3477,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                         release_resources(req)
                         return None
-                    assert draft_kv_cache.ugpu_id == ugpu_id
+                    assert _get_kv_cache_ugpu_id(draft_kv_cache) == ugpu_id
                     success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
                         logger.warning_once(
@@ -3999,12 +4039,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
-        kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int, ugpu_id=ugpu_id),
+        kv_cache = _create_backend_kv_cache(
+            self.impl,
+            lora_task_id,
+            salt_int,
             input_tokens,
-            id=request_id,
-            expected_prompt_length=expected_prompt_length,
-            ugpu_id=ugpu_id,
+            request_id,
+            expected_prompt_length,
+            ugpu_id,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:

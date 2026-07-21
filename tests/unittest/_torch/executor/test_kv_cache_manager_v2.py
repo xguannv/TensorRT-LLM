@@ -25,7 +25,10 @@ from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_manag
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
+    _create_backend_kv_cache,
     _create_gpu_cache_tier_config,
+    _get_kv_cache_ugpu_id,
+    _get_num_ugpus,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -67,6 +70,67 @@ def test_python_gpu_cache_tier_config_preserves_ugpu() -> None:
         _create_gpu_cache_tier_config(4096, True)
 
     constructor.assert_called_once_with(quota=4096, enable_ugpu=True)
+
+
+def test_cpp_backend_reports_single_ugpu_without_native_property() -> None:
+    with patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "cpp"):
+        assert _get_num_ugpus(object()) == 1
+
+
+def test_python_backend_reads_native_num_ugpus() -> None:
+    impl = SimpleNamespace(num_ugpus=2)
+    with patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "python"):
+        assert _get_num_ugpus(impl) == 2
+
+
+def test_cpp_backend_cache_has_no_native_ugpu_property() -> None:
+    with patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "cpp"):
+        assert _get_kv_cache_ugpu_id(object()) is None
+
+
+def test_python_backend_reads_native_cache_ugpu_id() -> None:
+    kv_cache = SimpleNamespace(ugpu_id=1)
+    with patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "python"):
+        assert _get_kv_cache_ugpu_id(kv_cache) == 1
+
+
+def test_cpp_backend_omits_ugpu_cache_creation_arguments() -> None:
+    impl = SimpleNamespace(create_kv_cache=MagicMock(return_value=object()))
+    reuse_scope = object()
+    constructor = MagicMock(return_value=reuse_scope)
+    with (
+        patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "cpp"),
+        patch.object(kv_cache_manager_v2_module, "ReuseScope", constructor),
+    ):
+        _create_backend_kv_cache(impl, 7, 11, [1, 2], 13, 17, None)
+
+    constructor.assert_called_once_with(lora_id=7, salt=11)
+    impl.create_kv_cache.assert_called_once_with(
+        reuse_scope,
+        [1, 2],
+        id=13,
+        expected_prompt_length=17,
+    )
+
+
+def test_python_backend_preserves_ugpu_cache_creation_arguments() -> None:
+    impl = SimpleNamespace(create_kv_cache=MagicMock(return_value=object()))
+    reuse_scope = object()
+    constructor = MagicMock(return_value=reuse_scope)
+    with (
+        patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", "python"),
+        patch.object(kv_cache_manager_v2_module, "ReuseScope", constructor),
+    ):
+        _create_backend_kv_cache(impl, 7, 11, [1, 2], 13, 17, 1)
+
+    constructor.assert_called_once_with(lora_id=7, salt=11, ugpu_id=1)
+    impl.create_kv_cache.assert_called_once_with(
+        reuse_scope,
+        [1, 2],
+        id=13,
+        expected_prompt_length=17,
+        ugpu_id=1,
+    )
 
 
 class _FakeKVCache:
