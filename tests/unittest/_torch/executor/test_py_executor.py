@@ -13,6 +13,7 @@ to PyExecutor, including:
 - Event-loop crash propagation to await_responses callers (nvbug 6038228)
 """
 
+import contextlib
 import threading
 import time
 import types
@@ -21,6 +22,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -1102,6 +1104,56 @@ class TestAwaitSingleResponseShutdown:
             stub._await_single_response(id=1, timeout=5.0)
 
         crash_thread.join(timeout=1.0)
+
+
+class _EventLoopWrapperStub:
+    def __init__(self, error):
+        self._error = error
+        self._event_loop_error = None
+        self.is_warmup = False
+        self.garbage_collection_gen0_threshold = None
+        self.memory_trace = None
+        self.global_rank = 0
+        self.device_id = 0
+        self.cleaned_up = False
+
+    def event_loop(self):
+        raise self._error
+
+    def _executor_loop_cleanup(self):
+        self.cleaned_up = True
+
+    _event_loop_wrapper = PyExecutor._event_loop_wrapper
+
+
+def test_event_loop_oom_report_preserves_original_error(monkeypatch):
+    original = RuntimeError("CUDA out of memory")
+    stub = _EventLoopWrapperStub(original)
+    report = Mock(side_effect=lambda **kwargs: assert_event_loop_error(stub, original))
+    monkeypatch.setattr(py_executor_module, "log_oom_report", report)
+    monkeypatch.setattr(
+        py_executor_module,
+        "host_profiler_context",
+        lambda **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        py_executor_module,
+        "customized_gc_thresholds",
+        lambda threshold: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        stub._event_loop_wrapper()
+
+    assert raised.value is original
+    assert stub._event_loop_error is original
+    assert stub.cleaned_up is True
+    report.assert_called_once()
+    assert report.call_args.kwargs["capture_phase"] == "runtime_post_unwind"
+
+
+def assert_event_loop_error(stub, expected):
+    assert stub._event_loop_error is expected
 
 
 # ---------------------------------------------------------------------------

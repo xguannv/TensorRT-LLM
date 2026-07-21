@@ -50,6 +50,7 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
+from ..mem_probe import MemoryTrace, SnapshotContext, log_oom_report
 from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
@@ -540,6 +541,7 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
+        self.memory_trace: Optional[MemoryTrace] = None
         # Store the execution stream for decoder/model forward operations.
         # This stream is used for proper synchronization with
         # KVCacheTransferManager. execution_stream can be provided by
@@ -1188,17 +1190,25 @@ class PyExecutor:
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
+            # Publish the original failure before running optional diagnostics.
+            # Diagnostics may query NVML when explicitly enabled.
+            self._event_loop_error = e
+            log_oom_report(
+                stage="event_loop",
+                error=e,
+                trace=self.memory_trace,
+                capture_phase="runtime_post_unwind",
+                context=SnapshotContext(
+                    rank=self.global_rank,
+                    device_index=self.device_id,
+                ),
+            )
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
-            # Stash the original error so local consumers
-            # (_await_single_response and BaseWorker.AwaitResponseHelper)
-            # can surface it instead of letting callers hang. We do NOT
-            # call _handle_errors / _enqueue_responses here: they trigger
-            # tp_gather / allgather collectives that would deadlock when
-            # only this rank crashed. The is_shutdown notification in
-            # _executor_loop_cleanup is enough to wake local waiters.
-            self._event_loop_error = e
-            raise e
+            # Do not call _handle_errors / _enqueue_responses here: they trigger
+            # collectives that would deadlock when only this rank crashed. The
+            # cleanup notification is enough to wake local waiters.
+            raise
         finally:
             self._executor_loop_cleanup()
 
