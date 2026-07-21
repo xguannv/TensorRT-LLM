@@ -4361,11 +4361,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
+        # Keep the output M dimension aligned with input0's bucketed M so
+        # profiling uses consistent BMM shapes and runtime cache keys can be
+        # shared by inputs that map to the same bucket.
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 1, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
-            constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape), ),
+            constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape),
+                              ConstraintSpec(
+                                  4, 1,
+                                  lambda input_shapes: input_shapes[0][1])),
         )
 
         def __init__(self,
@@ -9428,10 +9434,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ============================================================================
     # Rubin (SM107) Support
     # ============================================================================
-    # The following code provides CuteDSL NVFP4 GEMM support for Rubin GPUs.
+    # The following code provides CuTe DSL GEMM support for Rubin GPUs.
     # Requires nvidia-cutlass-dsl-internal package.
 
     if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        from ..cute_dsl_kernels.rubin.blockwise_gemm import \
+            SM107BlockwiseGemmKernel
         from ..cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import \
             PersistentDenseGemmKernel as RubinBf16PersistentDenseGemmKernel
         from ..cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import \
@@ -9442,6 +9450,272 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Sm107BlockScaledPersistentDenseGemmMixedClustersKernel)
         from ..cute_dsl_kernels.rubin.dense_gemm_persistent import \
             SM107PersistentDenseGemmKernel
+
+        class CuteDSLFp8RubinBmmRunner(CuteDSLFp8BlackwellBmmRunner):
+            """FP8 1x128/128x128 block-scaled BMM runner for SM107."""
+
+            kernel_class = SM107BlockwiseGemmKernel
+            kernel_cache = dict()
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple]:
+                if get_sm_version() != 107:
+                    logger.debug("CuteDSL FP8 Rubin BMM only supports SM107. "
+                                 "Skipping all tactics.")
+                    return []
+
+                batch_size, m, k = inputs[0].shape
+                n = inputs[1].shape[1]
+                mma_candidates = [
+                    (False, (128, 128, 128), (128, 128, 64)),
+                    (False, (256, 128, 128), (128, 128, 64)),
+                    (True, (256, 128, 128), (256, 128, 64)),
+                    (True, (512, 128, 128), (256, 128, 64)),
+                ]
+                cluster_shape_mn_candidates = [
+                    (1, 1),
+                    (1, 2),
+                    (1, 4),
+                    (2, 1),
+                    (2, 2),
+                    (2, 4),
+                    (4, 1),
+                    (4, 2),
+                    (4, 4),
+                ]
+
+                return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
+                         cluster_shape_mn) for use_2cta_instrs, mma_tiler,
+                        mma_inst_shape in mma_candidates
+                        for cluster_shape_mn in cluster_shape_mn_candidates
+                        if self.__class__.kernel_class.can_implement(
+                            cutlass.Float8E4M3FN,
+                            cutlass.Float8E4M3FN,
+                            cutlass.Float32,
+                            cutlass.BFloat16,
+                            use_2cta_instrs,
+                            mma_tiler,
+                            mma_inst_shape,
+                            cluster_shape_mn,
+                            m,
+                            n,
+                            k,
+                            batch_size,
+                            "k",
+                            "k",
+                            "n",
+                        )]
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                """Run FP8 block-scaled BMM with TRT-LLM tensor layouts."""
+                if isinstance(tactic, tuple):
+                    (use_2cta_instrs, mma_tiler, mma_inst_shape,
+                     cluster_shape_mn) = tactic
+                else:
+                    use_2cta_instrs = False
+                    mma_tiler = (128, 128, 128)
+                    mma_inst_shape = (128, 128, 64)
+                    cluster_shape_mn = (1, 1)
+
+                a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
+                c_tmp = c_tensor.permute(1, 2, 0)
+
+                batch_size, m, k = a_tensor.shape
+                n = b_tensor.shape[1]
+                sf_m = pad_up(m, 4)
+                sf_k = ceil_div(k, 128)
+                sf_n = ceil_div(n, 128)
+
+                if not self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    a_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        a_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        b_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream)
+
+                cache_key = (
+                    use_2cta_instrs,
+                    mma_tiler,
+                    mma_inst_shape,
+                    cluster_shape_mn,
+                    self.use_tvm_ffi,
+                )
+                if cache_key not in self.__class__.kernel_cache:
+                    if self.use_tvm_ffi:
+                        a_ptr = make_ptr(
+                            cutlass.Float8E4M3FN,
+                            a_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        b_ptr = make_ptr(
+                            cutlass.Float8E4M3FN,
+                            b_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        a_sf_ptr = make_ptr(
+                            cutlass.Float32,
+                            a_sf_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        b_sf_ptr = make_ptr(
+                            cutlass.Float32,
+                            b_sf_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        c_cute_tensor = cute.runtime.from_dlpack(
+                            c_tmp).mark_layout_dynamic(leading_dim=1)
+                        stream = cute.runtime.make_fake_stream(
+                            use_tvm_ffi_env_stream=True)
+
+                    gemm = self.__class__.kernel_class(
+                        cutlass.Float32,
+                        use_2cta_instrs=use_2cta_instrs,
+                        mma_tiler=mma_tiler,
+                        mma_inst_shape=mma_inst_shape,
+                        cluster_shape_mn=cluster_shape_mn,
+                    )
+                    hardware_info = cutlass.utils.HardwareInfo()
+                    max_active_clusters = hardware_info.get_max_active_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                if self.use_tvm_ffi:
+                    compiled_gemm(
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_tensor.data_ptr(),
+                        b_tensor.data_ptr(),
+                        a_sf_tensor.data_ptr(),
+                        b_sf_tensor.data_ptr(),
+                        c_tmp,
+                    )
+                else:
+                    compiled_gemm(
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        stream=stream,
+                    )
+
+        @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_rubin",
+                                 mutates_args=("output", ),
+                                 device_types="cuda")
+        def cute_dsl_fp8_bmm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    "CuteDSL FP8 Rubin BMM only supports bfloat16 output, "
+                    f"got {output_dtype}")
+            if get_sm_version() != 107:
+                raise ValueError(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    "CuteDSL FP8 Rubin BMM only supports SM107.")
+
+            runner = CuteDSLFp8RubinBmmRunner(output_dtype=output_dtype,
+                                              use_tvm_ffi=use_tvm_ffi)
+            inputs = [input, weight, input_scale, weight_scale, output]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_fp8_bmm_rubin::gemm",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            batch_size, m, _ = mat_a.shape
+            n = mat_b.shape[1]
+            assert output.dtype == torch.bfloat16, \
+                "CuTe DSL FP8 Rubin BMM output dtype must be BF16"
+            assert output.shape == (batch_size, m, n), \
+                "CuTe DSL FP8 Rubin BMM output shape is incorrect"
 
         class CuteDSLNVFP4RubinLinear(TunableRunner):
             """CuteDSL NVFP4 Linear runner for Rubin (SM107) GPUs.
@@ -9985,7 +10259,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     compile_kwargs = {
                         "options":
-                        f"--opt-level 2 --enable-tvm-ffi"
+                        "--opt-level 2 --enable-tvm-ffi"
                         if self.use_tvm_ffi else "--opt-level 2",
                     }
 

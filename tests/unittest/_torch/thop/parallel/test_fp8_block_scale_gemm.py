@@ -23,7 +23,9 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
 from utils.util import getSMVersion, isSM100Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 
 
 @pytest.mark.skipif(
@@ -355,6 +357,126 @@ def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups, use_tvm_ffi):
                                                 use_tvm_ffi=use_tvm_ffi)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
+                    reason="The test requires CuTe DSL support.")
+def test_cute_dsl_fp8_block_scale_bmm_autotune_profiles() -> None:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLFp8BlackwellBmmRunner
+
+    batch_size, n, k = 2, 128, 128
+
+    def make_inputs(m: int) -> list[torch.Tensor]:
+        scale_m = (m + 3) // 4 * 4
+        return [
+            torch.empty((batch_size, m, k)),
+            torch.empty((batch_size, n, k)),
+            torch.empty((batch_size, k // 128, scale_m)),
+            torch.empty((batch_size, n // 128, k // 128)),
+            torch.empty((batch_size, m, n)),
+        ]
+
+    tuning_config = CuteDSLFp8BlackwellBmmRunner.tuning_config
+    profiles = AutoTuner()._optimization_profiles(tuning_config,
+                                                  make_inputs(m=7))
+    profile_shapes = [profile.get_opt_shapes() for profile in profiles]
+    assert [(shapes[0][1], shapes[2][2], shapes[4][1])
+            for shapes in profile_shapes] == [
+                (1, 4, 1),
+                (2, 4, 2),
+                (4, 4, 4),
+                (7, 8, 7),
+            ]
+
+    def cache_profile(m: int) -> tuple[tuple[int, ...], ...]:
+        input_shapes = tuple(tensor.shape for tensor in make_inputs(m))
+        return AutoTuner._find_nearest_profile(
+            input_shapes,
+            tuning_config.dynamic_tensor_specs,
+            tuning_config.constraint_specs,
+            tuning_config.tune_max_num_tokens,
+        )
+
+    assert cache_profile(5) == cache_profile(7)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
+@pytest.mark.parametrize("m", [1, 7, 128])
+@pytest.mark.parametrize("use_tvm_ffi", [True, False])
+def test_cute_dsl_fp8_block_scale_bmm_rubin(m, use_tvm_ffi):
+    k = 4096
+    n = 1024
+    num_groups = 8
+    dtype = torch.bfloat16
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=dtype) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=dtype) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty(
+        (num_groups, n // 128, k // 128),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+
+    output_expected = torch.einsum("mgk,gnk->gmn", a, b)
+    output = torch.empty((num_groups, m, n), device="cuda", dtype=dtype)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(
+        a_fp8,
+        b_fp8,
+        a_scales,
+        b_scales,
+        output,
+        use_tvm_ffi=use_tvm_ffi,
+    )
+
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
+def test_cute_dsl_fp8_block_scale_bmm_rubin_cuda_graph():
+    m, n, k, num_groups = 7, 1024, 4096, 8
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty(
+        (num_groups, n // 128, k // 128),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+
+    output = torch.empty((num_groups, m, n),
+                         device="cuda",
+                         dtype=torch.bfloat16)
+    args = (a_fp8, b_fp8, a_scales, b_scales, output)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(*args)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(*args)
+    output.fill_(float("nan"))
+    graph.replay()
+
+    output_expected = torch.einsum("mgk,gnk->gmn", a, b)
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 

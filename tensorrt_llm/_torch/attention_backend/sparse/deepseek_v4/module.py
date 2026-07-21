@@ -12,6 +12,10 @@ from torch import nn
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.mla import (
+    _cute_dsl_fp8_bmm_out,
+    _is_cute_dsl_fp8_bmm_available,
+)
 from tensorrt_llm._torch.modules.multi_stream_utils import (
     do_multi_stream,
     maybe_execute_in_parallel,
@@ -149,18 +153,31 @@ def create_sparse_attn_weights(self) -> None:
             ),
             requires_grad=False,
         )
-        if is_sm_100f() and self.use_cute_dsl_blockscaling_bmm:
-            self.o_a_proj = nn.Parameter(
-                torch.empty(
-                    (
-                        self.n_local_groups,
-                        self.o_lora_rank,
-                        self.num_heads * self.qk_head_dim // self.num_groups,
+        if is_sm_100f():
+            if _is_cute_dsl_fp8_bmm_available():
+                self.o_a_proj = nn.Parameter(
+                    torch.empty(
+                        (
+                            self.n_local_groups,
+                            self.o_lora_rank,
+                            self.num_heads * self.qk_head_dim // self.num_groups,
+                        ),
+                        dtype=torch.float8_e4m3fn,
                     ),
-                    dtype=torch.float8_e4m3fn,
-                ),
-                requires_grad=False,
-            )
+                    requires_grad=False,
+                )
+            else:
+                self.o_a_proj_dequant = nn.Parameter(
+                    torch.empty(
+                        (
+                            self.n_local_groups,
+                            self.o_lora_rank,
+                            self.num_heads * self.qk_head_dim // self.num_groups,
+                        ),
+                        dtype=self.dtype,
+                    ),
+                    requires_grad=False,
+                )
     else:
         self.o_a_proj_scale = None
 
@@ -207,7 +224,7 @@ def _run_dsv4_o_lora_bmms(
         phase_o_lora_output: torch.Tensor,
     ) -> None:
         attn_fp8, attn_scale = o_lora_bmm_input
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        _cute_dsl_fp8_bmm_out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,
@@ -291,8 +308,7 @@ def project_sparse_attn_output(
     # This is independent of the K/V absorption BMM implementation.
     fused_inv_rope_fp8 = (
         self.o_a_proj.dtype == torch.float8_e4m3fn
-        and self.use_cute_dsl_blockscaling_bmm
-        and is_sm_100f()
+        and _is_cute_dsl_fp8_bmm_available()
     )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
@@ -312,7 +328,7 @@ def project_sparse_attn_output(
             device=attn_output_tensor.device,
             dtype=self.dtype,
         )
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        _cute_dsl_fp8_bmm_out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,

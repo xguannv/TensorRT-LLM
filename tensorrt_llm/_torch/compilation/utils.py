@@ -6,6 +6,7 @@ from torch.fx import Node
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
+from ..cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 
 
 def get_symint_val(i: Union[torch.SymInt | int]):
@@ -239,4 +240,8 @@ def inplace_info():
                 1: "x",
                 2: "residual"
             }
+    if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        inplace_map[torch.ops.trtllm.cute_dsl_fp8_bmm_rubin.default] = {
+            1: "output"
+        }
     return inplace_map
