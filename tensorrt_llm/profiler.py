@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import os
 import time
+from dataclasses import dataclass
 from functools import partial
 from typing import Literal, Optional, Tuple, Union
 
@@ -153,6 +155,102 @@ def device_memory_info(device: Optional[Union[torch.device, int]] = None) -> Tup
             mem_info = _device_get_memory_info_fn(handle)
         return mem_info.used, mem_info.free, mem_info.total
     return 0, 0, 0  # used, free, total
+
+
+@dataclass(frozen=True)
+class DeviceProcessUsage:
+    pid: int
+    used_bytes: Optional[int]
+
+
+@dataclass(frozen=True)
+class DeviceProcessInfoStatus:
+    source_available: bool
+    processes: Tuple[DeviceProcessUsage, ...]
+    error: Optional[str] = None
+
+
+def _safe_error_text(error: BaseException) -> str:
+    try:
+        return str(error)
+    except Exception:
+        return f"<{type(error).__name__}: message unavailable>"
+
+
+def device_process_info_status(
+    device: Optional[Union[torch.device, int]] = None,
+) -> DeviceProcessInfoStatus:
+    """Return a status-preserving NVML compute-process query.
+
+    Query failure, an empty process table, unavailable per-process bytes, and
+    a known zero-byte value remain distinct.  The function never raises.
+    """
+    if pynvml is None:
+        return DeviceProcessInfoStatus(
+            source_available=False,
+            processes=(),
+            error="pynvml is unavailable",
+        )
+    try:
+        if device is None:
+            device = torch.cuda.current_device()
+        index = device.index if isinstance(device, torch.device) else device
+
+        device_uuid = None
+        try:
+            raw_device_uuid = torch.cuda.get_device_properties(index).uuid
+            if raw_device_uuid is not None:
+                device_uuid = str(raw_device_uuid)
+        except (AttributeError, AssertionError, RuntimeError):
+            # Older torch may not expose .uuid; fall back to NVML index below.
+            pass
+
+        with pynvml_context():
+            if device_uuid is not None:
+                nvml_uuid = (
+                    device_uuid
+                    if device_uuid.startswith(("GPU-", "MIG-"))
+                    else f"GPU-{device_uuid}"
+                )
+                handle = pynvml.nvmlDeviceGetHandleByUUID(nvml_uuid.encode())
+            elif os.environ.get("CUDA_VISIBLE_DEVICES"):
+                return DeviceProcessInfoStatus(
+                    source_available=False,
+                    processes=(),
+                    error=(
+                        "CUDA device UUID is unavailable while CUDA_VISIBLE_DEVICES "
+                        "is set; refusing an ambiguous NVML index lookup"
+                    ),
+                )
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            result = []
+            for process in procs:
+                used = getattr(process, "usedGpuMemory", None)
+                # Older pynvml uses a large sentinel when accounting is not
+                # available for a visible process.
+                if used is not None and used >= (1 << 63):
+                    used = None
+                result.append(
+                    DeviceProcessUsage(
+                        pid=int(process.pid),
+                        used_bytes=None if used is None else int(used),
+                    )
+                )
+        return DeviceProcessInfoStatus(
+            source_available=True,
+            processes=tuple(result),
+        )
+    except Exception as error:
+        # This is a diagnostic boundary used from OOM paths.  NVML and CUDA
+        # version mismatches can raise several package-specific exception
+        # types, none of which may escape to the caller.
+        return DeviceProcessInfoStatus(
+            source_available=False,
+            processes=(),
+            error=_safe_error_text(error),
+        )
 
 
 def bytes_to_target_unit(mem_bytes: int, unit: MemUnitType) -> float:
