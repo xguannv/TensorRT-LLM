@@ -406,6 +406,53 @@ def test_cute_dsl_fp8_block_scale_bmm_autotune_profiles() -> None:
     getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+@pytest.mark.parametrize(
+    "use_tvm_ffi",
+    [True, False],
+)
+def test_cute_dsl_fp8_block_scale_gemm_rubin(dtype, m, k, n, use_tvm_ffi):
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    output_expected = a @ b.t()
+
+    with autotune():
+        cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_rubin(
+            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf, use_tvm_ffi=use_tvm_ffi)
+
+    cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_rubin(
+        act_a_fp8, act_b_fp8, act_a_sf, act_b_sf, use_tvm_ffi=use_tvm_ffi)
+
+    diff = calc_diff(cute_dsl_output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(cute_dsl_output,
+                               output_expected,
+                               atol=1e-3,
+                               rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
 @pytest.mark.parametrize("m", [1, 7, 128])
 @pytest.mark.parametrize("use_tvm_ffi", [True, False])
 def test_cute_dsl_fp8_block_scale_bmm_rubin(m, use_tvm_ffi):
