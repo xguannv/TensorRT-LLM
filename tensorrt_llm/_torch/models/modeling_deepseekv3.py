@@ -390,8 +390,13 @@ class DeepseekV3WeightLoader:
                 mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
-                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
+                    kv_b_proj_is_excluded = self.model_config.quant_config.is_module_excluded_from_quantization(
                         name)
+                    # Experts-only checkpoints also exclude kv_b_proj, but
+                    # store it directly in BF16 and have no scale tensor.
+                    kv_b_proj_has_fp8_scale = f"{name}.weight_scale_inv" in weights
+                    dequant_kv_b_proj = (kv_b_proj_is_excluded
+                                         and kv_b_proj_has_fp8_scale)
                     if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
                             name)
