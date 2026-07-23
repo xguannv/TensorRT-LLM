@@ -265,6 +265,34 @@ def test_quant_cfg_fp8_pb_wo_alias_canonicalized():
         assert quant_config.group_size == 128
 
 
+def test_quant_cfg_fp8_pb_per_layer_alias_canonicalized():
+    """Per-layer ``FP8_PB`` is canonicalized to FP8_BLOCK_SCALES."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model_dir = Path(tmp_dir)
+        hf_quant_config_file = _write_hf_quant_config(
+            model_dir, {
+                "producer": {
+                    "name": "modelopt"
+                },
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.down_proj": {
+                            "quant_algo": "FP8_PB",
+                            "group_size": 128,
+                        },
+                    },
+                },
+            })
+        quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
+            hf_quant_config_file, model_dir, None)
+
+        assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+        layer_config = layer_quant_config["model.layers.0.mlp.down_proj"]
+        assert layer_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        assert layer_config.group_size == 128
+
+
 def test_quant_cfg_fp8_block_scales_trtllm_default_excludes():
     """TRTLLM moe_backend + FP8_BLOCK_SCALES + no excludes → defaults applied."""
     with tempfile.TemporaryDirectory() as tmp_dir:

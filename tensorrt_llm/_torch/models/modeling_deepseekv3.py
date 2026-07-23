@@ -1397,8 +1397,42 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 quant_algo=None,
                 kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
             )
+
+        if quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION:
+            return quant_config
+
+        quant_config_dict = model_config.quant_config_dict
+        if quant_config_dict is None:
+            raise ValueError(
+                "MIXED_PRECISION requires per-layer quantization configs")
+
+        config = model_config.pretrained_config
+        is_moe_layer = (config.n_routed_experts is not None
+                        and layer_idx >= config.first_k_dense_replace
+                        and layer_idx % config.moe_layer_freq == 0)
+
+        if is_moe_layer:
+            candidate_names = (
+                f"{layer_name}.mlp.experts",
+                f"{layer_name}.mlp.experts.0.down_proj",
+                f"{layer_name}.mlp.experts.0.gate_proj",
+                f"{layer_name}.mlp.experts.0.up_proj",
+            )
         else:
-            return model_config.quant_config
+            candidate_names = (
+                f"{layer_name}.mlp.down_proj",
+                f"{layer_name}.mlp.gate_proj",
+                f"{layer_name}.mlp.up_proj",
+            )
+
+        for candidate_name in candidate_names:
+            if candidate_name in quant_config_dict:
+                return quant_config_dict[candidate_name]
+
+        layer_kind = "MoE" if is_moe_layer else "dense"
+        raise ValueError(
+            f"Cannot resolve the {layer_kind} quantization config for "
+            f"{layer_name} from MIXED_PRECISION")
 
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:

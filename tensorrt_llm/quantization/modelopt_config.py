@@ -45,6 +45,7 @@ _KV_SCHEME_DICT_MAP = {
     ("int", 8): "INT8",
 }
 _KV_SCHEME_STRING_ALGOS = {"FP8", "NVFP4", "INT8"}
+_FP8_BLOCK_SCALES_ALIASES = {"fp8_pb_wo", "FP8_PB"}
 
 
 def _kv_cache_scheme_to_algo(scheme: Any) -> Optional[str]:
@@ -97,9 +98,19 @@ def read_modelopt_quant_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             f"Not a modelopt quant config (producer={raw.get('producer')!r}, "
             f"quant_method={raw.get('quant_method')!r})"
         )
-    # Canonicalize the fp8_pb_wo legacy alias.
-    if result.get("quant_algo") == "fp8_pb_wo":
+    # Canonicalize ModelOpt aliases for FP8 128x128 block scales.
+    if result.get("quant_algo") in _FP8_BLOCK_SCALES_ALIASES:
         result["quant_algo"] = "FP8_BLOCK_SCALES"
+
+    quantized_layers = result.get("quantized_layers")
+    if isinstance(quantized_layers, dict):
+        normalized_layers = {}
+        for name, layer_config in quantized_layers.items():
+            if layer_config.get("quant_algo") in _FP8_BLOCK_SCALES_ALIASES:
+                layer_config = dict(layer_config)
+                layer_config["quant_algo"] = "FP8_BLOCK_SCALES"
+            normalized_layers[name] = layer_config
+        result["quantized_layers"] = normalized_layers
     return result
 
 
