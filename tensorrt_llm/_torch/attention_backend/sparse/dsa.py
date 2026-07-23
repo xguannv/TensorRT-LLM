@@ -1784,8 +1784,33 @@ class Indexer(nn.Module):
         """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
+        wk_weight = self.wk.weight.data
+        if wk_weight.dtype == torch.float8_e4m3fn:
+            block_size = 128
+            weight_scale = getattr(self.wk, "weight_scale", None)
+            if weight_scale is None:
+                raise RuntimeError(
+                    "FP8 indexer.wk requires weight_scale for post-load "
+                    "dequantization")
+            expected_scale_shape = (
+                math.ceil(wk_weight.shape[0] / block_size),
+                math.ceil(wk_weight.shape[1] / block_size),
+            )
+            if tuple(weight_scale.shape) != expected_scale_shape:
+                raise RuntimeError(
+                    "Unexpected FP8 indexer.wk weight_scale shape: "
+                    f"expected {expected_scale_shape}, got "
+                    f"{tuple(weight_scale.shape)}")
+            expanded_scale = weight_scale.float().repeat_interleave(
+                block_size, dim=0).repeat_interleave(block_size, dim=1)
+            num_rows, num_cols = wk_weight.shape
+            expanded_scale = expanded_scale[:num_rows, :num_cols]
+            wk_weight = wk_weight.float() * expanded_scale
+        else:
+            wk_weight = wk_weight.float()
+
         self._fused_wk_wp_weight = torch.cat(
-            [self.wk.weight.data, self.weights_proj.weight.data], dim=0)
+            [wk_weight, self.weights_proj.weight.data.float()], dim=0)
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()

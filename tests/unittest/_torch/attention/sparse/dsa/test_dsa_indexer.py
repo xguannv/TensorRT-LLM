@@ -115,6 +115,28 @@ def test_indexer_post_load_weights_caches_fused_weight():
     assert not hasattr(indexer, "_weights_transformed")
 
 
+def test_indexer_post_load_weights_dequantizes_fp8_block_scaled_wk():
+    indexer = Indexer.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.wk = torch.nn.Module()
+    indexer.wk.weight = torch.nn.Parameter(
+        torch.ones((2, 3), dtype=torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    indexer.wk.weight_scale = torch.nn.Parameter(
+        torch.tensor([[2.0]], dtype=torch.float32),
+        requires_grad=False,
+    )
+    indexer.weights_proj = torch.nn.Linear(3, 4, bias=False)
+    indexer.weights_proj.weight.data.fill_(3.0)
+
+    indexer.post_load_weights()
+
+    assert indexer._fused_wk_wp_weight.dtype == torch.float32
+    assert torch.equal(indexer._fused_wk_wp_weight[:2], torch.full((2, 3), 2.0))
+    assert torch.equal(indexer._fused_wk_wp_weight[2:], torch.full((4, 3), 3.0))
+
+
 def _ceil_to_ue8m0(x: torch.Tensor):
     """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
