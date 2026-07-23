@@ -467,6 +467,40 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def _exclude_unaligned_fp8_block_kv_b_proj(
+            pretrained_config, quant_config,
+            layer_quant_config: Optional[Dict[str, QuantConfig]]):
+        """Use the dequant loader when FP8 blocks cannot be split per head."""
+        if not layer_quant_config:
+            return
+
+        qk_nope_head_dim = getattr(pretrained_config, "qk_nope_head_dim", None)
+        v_head_dim = getattr(pretrained_config, "v_head_dim", None)
+        if qk_nope_head_dim is None or v_head_dim is None:
+            return
+
+        excluded = list(quant_config.exclude_modules or [])
+        added = []
+        for name, layer_config in layer_quant_config.items():
+            if (not name.endswith(".kv_b_proj")
+                    or layer_config.quant_algo != QuantAlgo.FP8_BLOCK_SCALES):
+                continue
+            group_size = layer_config.group_size or 128
+            if (qk_nope_head_dim % group_size == 0
+                    and v_head_dim % group_size == 0):
+                continue
+            if name not in excluded:
+                excluded.append(name)
+                added.append(name)
+
+        if added:
+            quant_config.exclude_modules = excluded
+            logger.info(
+                "Loading %d FP8 block-scaled kv_b_proj module(s) through the "
+                "BF16 dequant path because their scale blocks do not align "
+                "with per-head dimensions.", len(added))
+
+    @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
         if quant_algo is None and not is_dynamic_quant:
@@ -1193,6 +1227,10 @@ class ModelConfig(Generic[TConfig]):
         if architecture in _MINIMAX_M3_ARCHITECTURES:
             layer_quant_config = cls._set_minimax_m3_layer_quant_config(
                 pretrained_config, layer_quant_config)
+
+        cls._exclude_unaligned_fp8_block_kv_b_proj(pretrained_config,
+                                                   quant_config,
+                                                   layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

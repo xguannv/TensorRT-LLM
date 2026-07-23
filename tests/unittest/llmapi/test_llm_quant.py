@@ -1,11 +1,13 @@
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
 def test_quant_cfg_from_quant_cfg_json():
@@ -291,6 +293,48 @@ def test_quant_cfg_fp8_pb_per_layer_alias_canonicalized():
         layer_config = layer_quant_config["model.layers.0.mlp.down_proj"]
         assert layer_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         assert layer_config.group_size == 128
+
+
+def test_mixed_fp8_block_kv_b_proj_with_unaligned_heads_is_dequantized():
+    """An unaligned FP8 kv_b scale cannot be split into per-head blocks."""
+    kv_b_name = "model.layers.0.self_attn.kv_b_proj"
+    aligned_name = "model.layers.0.self_attn.o_proj"
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION,
+        exclude_modules=["lm_head"],
+    )
+    layer_quant_config = {
+        kv_b_name:
+        QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128),
+        aligned_name:
+        QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128),
+    }
+    pretrained_config = SimpleNamespace(qk_nope_head_dim=192, v_head_dim=256)
+
+    ModelConfig._exclude_unaligned_fp8_block_kv_b_proj(pretrained_config,
+                                                       quant_config,
+                                                       layer_quant_config)
+
+    assert quant_config.exclude_modules == ["lm_head", kv_b_name]
+    assert quant_config.is_module_excluded_from_quantization(kv_b_name)
+    assert not quant_config.is_module_excluded_from_quantization(aligned_name)
+
+
+def test_mixed_fp8_block_kv_b_proj_with_aligned_heads_stays_quantized():
+    """Keep the FP8 runtime path when scale blocks align with each head."""
+    kv_b_name = "model.layers.0.self_attn.kv_b_proj"
+    quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    layer_quant_config = {
+        kv_b_name:
+        QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128),
+    }
+    pretrained_config = SimpleNamespace(qk_nope_head_dim=128, v_head_dim=256)
+
+    ModelConfig._exclude_unaligned_fp8_block_kv_b_proj(pretrained_config,
+                                                       quant_config,
+                                                       layer_quant_config)
+
+    assert quant_config.exclude_modules is None
 
 
 def test_quant_cfg_fp8_block_scales_trtllm_default_excludes():
