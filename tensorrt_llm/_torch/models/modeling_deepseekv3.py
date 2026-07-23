@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -78,6 +79,8 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
+_DEQUANTIZE_FP8_ATTENTION_ENV = "TRTLLM_DEQUANTIZE_FP8_ATTENTION"
+
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -110,7 +113,8 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
 
 def weight_dequant(x: torch.Tensor,
                    s: torch.Tensor,
-                   block_size: int = 128) -> torch.Tensor:
+                   block_size: int = 128,
+                   output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor.
 
@@ -129,11 +133,53 @@ def weight_dequant(x: torch.Tensor,
     ), 'Input tensors must be contiguous'
     assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
     M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    y = torch.empty_like(x,
+                         dtype=output_dtype if output_dtype is not None else
+                         torch.get_default_dtype())
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']),
                          triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+def _dequantize_fp8_block_scaled_linear(linear: Linear) -> bool:
+    """Replace a loaded FP8 block-scaled Linear weight with its dense value."""
+    quant_config = getattr(linear, "quant_config", None)
+    if (linear.weight.dtype != torch.float8_e4m3fn or quant_config is None
+            or quant_config.quant_algo != QuantAlgo.FP8_BLOCK_SCALES):
+        return False
+
+    weight_scale = getattr(linear, "weight_scale", None)
+    if weight_scale is None:
+        raise RuntimeError(
+            "FP8 block-scaled attention weight is missing weight_scale")
+
+    target_dtype = linear.dtype or torch.get_default_dtype()
+    dense_weight = weight_dequant(
+        linear.weight.data.contiguous(),
+        weight_scale.data.contiguous(),
+        output_dtype=target_dtype,
+    )
+    linear.weight = nn.Parameter(dense_weight, requires_grad=False)
+
+    # Keep the KV-cache setting, but switch this Linear to the ordinary dense
+    # implementation. The scale parameters may remain registered because the
+    # unquantized method does not consume them.
+    linear.quant_config = QuantConfig(
+        kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+    linear.quant_method = linear.get_quant_method(linear.quant_config)
+    linear._weights_transformed = False
+    return True
+
+
+def _dequantize_fp8_attention_linears(model: nn.Module) -> List[str]:
+    converted = []
+    for name, module in model.named_modules():
+        if ".self_attn." not in name or not isinstance(module, Linear):
+            continue
+        if _dequantize_fp8_block_scaled_linear(module):
+            converted.append(name)
+    return converted
 
 
 @torch.compile(dynamic=True)
@@ -2037,6 +2083,12 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def load_weights(self, weights: ConsumableWeightsDict):
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
+        if os.getenv(_DEQUANTIZE_FP8_ATTENTION_ENV, "0") == "1":
+            converted = _dequantize_fp8_attention_linears(self)
+            logger.info(
+                "Converted %d FP8 block-scaled attention Linear weight(s) "
+                "to dense weights because %s=1.", len(converted),
+                _DEQUANTIZE_FP8_ATTENTION_ENV)
 
     def setup_aliases(self) -> None:
         for idx, layer in enumerate(

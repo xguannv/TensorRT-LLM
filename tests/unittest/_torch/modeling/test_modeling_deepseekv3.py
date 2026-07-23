@@ -14,10 +14,16 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
-from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3DecoderLayer
+from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+    DeepseekV3DecoderLayer,
+    _dequantize_fp8_block_scaled_linear,
+)
+from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -65,3 +71,33 @@ def test_get_mixed_decoder_layer_quant_config_requires_layer_entry() -> None:
         ValueError, match="Cannot resolve the MoE quantization config for model.layers.3"
     ):
         decoder_layer._get_decoder_layer_quant_config(model_config, 3)
+
+
+@patch(
+    "tensorrt_llm._torch.models.modeling_deepseekv3.weight_dequant",
+    return_value=torch.full((2, 3), 4.0, dtype=torch.bfloat16),
+)
+def test_dequantize_fp8_block_scaled_linear_uses_dense_method(
+    mock_weight_dequant,
+) -> None:
+    linear = Linear(
+        3,
+        2,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            group_size=128,
+        ),
+    )
+
+    assert _dequantize_fp8_block_scaled_linear(linear)
+
+    mock_weight_dequant.assert_called_once()
+    assert mock_weight_dequant.call_args.kwargs["output_dtype"] == torch.bfloat16
+    assert linear.weight.dtype == torch.bfloat16
+    assert torch.equal(linear.weight, torch.full((2, 3), 4.0, dtype=torch.bfloat16))
+    assert isinstance(linear.quant_method, UnquantizedLinearMethod)
+    assert linear.quant_config.quant_algo is None
+    assert linear.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
