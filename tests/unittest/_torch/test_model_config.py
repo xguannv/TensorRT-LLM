@@ -128,6 +128,24 @@ def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
+def test_validate_and_set_kv_cache_quant_updates_mixed_layer_configs():
+    layer_quant_configs = {
+        "model.layers.0.self_attn.q_proj": QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        "model.layers.0.mlp.experts.0.up_proj": QuantConfig(quant_algo=QuantAlgo.NVFP4),
+    }
+    model_config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict=layer_quant_configs,
+    )
+
+    validate_and_set_kv_cache_quant(model_config, "fp8")
+
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert all(
+        config.kv_cache_quant_algo == QuantAlgo.FP8 for config in layer_quant_configs.values()
+    )
+
+
 def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
