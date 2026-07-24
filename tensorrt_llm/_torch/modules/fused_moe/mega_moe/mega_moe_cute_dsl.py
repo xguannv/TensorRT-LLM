@@ -362,7 +362,7 @@ class MegaMoECuteDsl(MoE):
         if not is_sm_100f(d.env.sm):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"MegaMoECuteDsl requires SM100 family (SM100 or SM103); got SM{d.env.sm}.",
+                f"MegaMoECuteDsl requires an SM100-family GPU (SM100-SM109); got SM{d.env.sm}.",
             )
         if p.dtype_act not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return _reject(

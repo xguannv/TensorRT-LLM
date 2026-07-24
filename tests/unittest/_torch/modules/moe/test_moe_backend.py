@@ -736,6 +736,24 @@ def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     assert moe.tactic_autotune is False
 
 
+@pytest.mark.parametrize(
+    "sm_version, expected",
+    [
+        (90, False),
+        (100, True),
+        (103, True),
+        (107, True),
+        (109, True),
+        (110, False),
+        (120, False),
+    ],
+)
+def test_megamoe_cutedsl_sm100_family_gate(sm_version: int, expected: bool) -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op
+
+    assert cute_dsl_megamoe_custom_op._is_megamoe_supported_sm(sm_version) is expected
+
+
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 

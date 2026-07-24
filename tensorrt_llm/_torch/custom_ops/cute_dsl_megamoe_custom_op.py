@@ -39,7 +39,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version
+from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
 from ..autotuner import (
     AutoTuner,
@@ -60,6 +60,11 @@ def _import_megamoe_kernel():
     from ..cute_dsl_kernels.mega_moe_nvfp4.token_comm import CombineFormat
 
     return import_kernel(), CombineFormat
+
+
+def _is_megamoe_supported_sm(sm_version: int) -> bool:
+    """Return whether the generic SM100 MegaMoE kernel supports the device."""
+    return is_sm_100f(sm_version)
 
 
 __all__ = [
@@ -1120,10 +1125,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             tactic_autotune: bool = False,
         ) -> None:
             super().__init__()
-            if (sm_version := get_sm_version()) not in (100, 103):
+            if not _is_megamoe_supported_sm(sm_version := get_sm_version()):
                 raise ValueError(
-                    f"Sm100MegaMoENvfp4Runner requires SM 100 (B200) or SM 103 "
-                    f"(B300); got SM {sm_version}."
+                    f"Sm100MegaMoENvfp4Runner requires an SM100-family GPU "
+                    f"(SM100-SM109); got SM {sm_version}."
                 )
             if num_experts_per_rank <= 0:
                 raise ValueError(
@@ -1714,10 +1719,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         arguments.
         """
         sm_version = get_sm_version()
-        if sm_version not in (100, 103):
+        if not _is_megamoe_supported_sm(sm_version):
             raise RuntimeError(
-                f"cute_dsl_megamoe_nvfp4_blackwell requires SM 100 (B200) or "
-                f"SM 103 (B300); got SM {sm_version}."
+                f"cute_dsl_megamoe_nvfp4_blackwell requires an SM100-family "
+                f"GPU (SM100-SM109); got SM {sm_version}."
             )
 
         # Live-token trim: TopkReduce sizes its grid from THIS tensor's dim0,
