@@ -1,3 +1,5 @@
+cccl-0-gpgpu/0.gpgpu.99.3.4.0.20260506-1:
+  license: a8a2bf0bb11b7bafb559139d9b4b92c2
 cppzmq/v4.10.0:
   license: bd784f7765275865fbdb1bcb522b3c0a
   source: https://github.com/zeromq/cppzmq/tree/v4.10.0
@@ -7,12 +9,24 @@ cpython/3.12.3:
   license: 6b70c6504cc6568717ab251175a8699d
 cpython/3.12.3-1ubuntu0.10:
   license: 372bbae375b8828b3a20ea23c46c7ada
+cpython/3.12.3-1ubuntu0.13:
+  license: ca56ff80381c00551629a93a910ac5f5
 cpython/3.12.3-1ubuntu0.9:
   license: 372bbae375b8828b3a20ea23c46c7ada
+cublas-dev-0-gpgpu/37919747-1:
+  license: ec7a38236d4dddb7b6bce0f090b0d54c
 cublas/13.2.0.9-1:
   license: 2c87cfab9e957b479ea6a78eb0216e3e
+cuda/0.gpgpu.37919747-1:
+  license: ec7a38236d4dddb7b6bce0f090b0d54c
 cuda/13.1:
   license: fea620923810592cdac232cf283cf62c
+curand-dev-0-gpgpu/37960139-1:
+  license: ec7a38236d4dddb7b6bce0f090b0d54c
+cusolver-dev-0-gpgpu/37960139-1:
+  license: ec7a38236d4dddb7b6bce0f090b0d54c
+cusparse-dev-0-gpgpu/37960139-1:
+  license: ec7a38236d4dddb7b6bce0f090b0d54c
 cutlass/v4.2.1:
   copyright: d947127725edf33c1500800079a57db6
   license: d20f16a5b120b638d901622bcebaaacf
@@ -20,6 +34,10 @@ cutlass/v4.3.0:
   copyright: 501a1dd5925b22dbe66ce8f195440dec
   license: 0d49472f2c1269d573d79e5603778a9f
   source: https://github.com/NVIDIA/cutlass/tree/v4.3.0
+cutlass/v4.4.2:
+  copyright: aa8578535b24304362e63f0e170d8e60
+  license: 1078b45037d7c56c5c2af36977a4d08e
+  source: https://github.com/NVIDIA/cutlass/tree/v4.4.2
 deep_ep/5be51b228a7c82dbdb213ea58e77bffd12b38af8:
   license: 452b3ef002dc6ec283fb723f0dd84997
   source: https://github.com/deepseek-ai/DeepEP/tree/5be51b228a7c82dbdb213ea58e77bffd12b38af8
@@ -49,6 +67,8 @@ nanobind/a0ed2587f1089ef7657e2ed49ad6756b01c74e9f:
   source: https://github.com/wjakob/nanobind/tree/a0ed2587f1089ef7657e2ed49ad6756b01c74e9f
 nccl/2.28.9-1+cuda13.0:
   license: 4298d3289e0199f28acd651c007e42fb
+nccl/2.30.3+gr100-1+cuda13.4:
+  license: 16fff8bf7c657170eead780e546d3712
 nixl/0.8.0:
   copyright: cb99251e73f1a5b0d1b0b8f439706f6c
   license: bbeeb3b0c2f141b529675daf92632dc6
@@ -74,6 +94,8 @@ rdma-core/48.0-1.el8:
   license: eec97e837a0d52da36561c007217addc
 rdma-core/50.0-2ubuntu0.2:
   license: 4c30c6f2038e5bb7fa56d509956f4187
+rdma-core/59.1-1:
+  license: 4c30c6f2038e5bb7fa56d509956f4187
 robin-map/v1.4.0:
   license: 4b2ffa3f44ee005bc77967654efc7ef4
 tensorrt/10.14.1:
@@ -82,6 +104,9 @@ tensorrt/10.14.1:
 torch/2.10.0a0+b4e4ee81d3.nv25.12:
   attribution: 48d075fc0e5fbb2ba08f86611b695294
   license: 169131c8cef5eadb022ea205db4d2740
+torch/2.12.0a0+0291f960b6.nvinternal.rubin.50875765:
+  attribution: 48d075fc0e5fbb2ba08f86611b695294
+  license: 5e845e9f2ea84a11f3528e1fb75f5d41
 torch/2.9.1+cu130:
   attribution: 48d075fc0e5fbb2ba08f86611b695294
   license: 77373b86cfc1cd5b85d571fa55dda65f

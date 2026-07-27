@@ -4174,11 +4174,15 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
 
 
 def _deepseekv4_pro_agg_llm_kwargs(**overrides):
+    disable_cuda_graph = os.environ.get("DSV4_DIAG_DISABLE_CUDA_GRAPH") == "1"
+    disable_attention_dp = os.environ.get("DSV4_DIAG_DISABLE_ATTN_DP") == "1"
+    disable_mtp = os.environ.get("DSV4_DIAG_DISABLE_MTP") == "1"
+    mtp_nextn = int(os.environ.get("DSV4_DIAG_MTP_NEXTN", "1"))
     kwargs = dict(
-        tensor_parallel_size=8,
-        moe_expert_parallel_size=8,
+        tensor_parallel_size=4,
+        moe_expert_parallel_size=4,
         moe_config=MoeConfig(backend="TRTLLM"),
-        enable_attention_dp=True,
+        enable_attention_dp=not disable_attention_dp,
         max_seq_len=4096,
         max_batch_size=16,
         max_num_tokens=8192,
@@ -4192,11 +4196,13 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
                                       dtype="fp8",
                                       host_cache_size=0,
                                       free_gpu_memory_fraction=0.6),
-        cuda_graph_config=CudaGraphConfig(batch_sizes=[
+        cuda_graph_config=None
+        if disable_cuda_graph else CudaGraphConfig(batch_sizes=[
             1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024
         ],
-                                          enable_padding=True),
-        speculative_config=MTPDecodingConfig(max_draft_len=1),
+                                                   enable_padding=True),
+        speculative_config=None if disable_mtp or mtp_nextn == 0 else
+        MTPDecodingConfig(max_draft_len=mtp_nextn),
     )
     kwargs.update(overrides)
     return kwargs
@@ -4369,7 +4375,7 @@ _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_mpi_world_size(8)
+@pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
@@ -4380,7 +4386,7 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
         system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
     )
 
-    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_full_accuracy(self):
         with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -4388,7 +4394,8 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
                 dtype=llm.args.dtype,
                 quant_algo=llm.args.quant_config.quant_algo,
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-                spec_dec_algo=llm.args.speculative_config.decoding_type)
+                spec_dec_algo=(llm.args.speculative_config.decoding_type
+                               if llm.args.speculative_config else None))
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
                 score = task.evaluate(

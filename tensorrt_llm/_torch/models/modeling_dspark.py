@@ -574,10 +574,12 @@ class DSparkDraftModel(nn.Module):
     def _derive_draft_model_config(cls, model_config, base: int, num_stages: int):
         """Return a draft-only ``model_config`` copy with draft-specific fixes.
 
-        Applies (1) the ``compress_ratios`` draft slice and (2) the
+        Applies (1) the ``compress_ratios`` draft slice, (2) the
         ``quant_config_dict`` MXFP4 extension for the draft layers' routed
-        experts. A single shallow copy is made (and only when something needs to
-        change) so the shared ``model_config`` and the target model are untouched.
+        experts, and (3) default EPLB assignments for draft layers omitted from
+        a target-only assignment file. A single shallow copy is made (and only
+        when something needs to change) so the shared ``model_config`` and the
+        target model are untouched.
 
         The draft MoE backend is **inherited** from the target's
         ``model_config.moe_backend`` (carried by the shallow copy) — not pinned —
@@ -595,7 +597,8 @@ class DSparkDraftModel(nn.Module):
         new_sa = cls._draft_sparse_config(model_config, base, num_stages)
         new_qcd = cls._draft_quant_config_dict(model_config, base, num_stages)
         new_qc = cls._draft_normalized_quant_config(model_config)
-        if new_sa is None and new_qcd is None and new_qc is None:
+        new_mlb = cls._draft_moe_load_balancer_config(model_config, base, num_stages)
+        if new_sa is None and new_qcd is None and new_qc is None and new_mlb is None:
             return model_config
         draft_cfg = copy.copy(model_config)
         # ModelConfig is a frozen dataclass; bypass the guard for these fields.
@@ -605,7 +608,34 @@ class DSparkDraftModel(nn.Module):
             object.__setattr__(draft_cfg, "quant_config_dict", new_qcd)
         if new_qc is not None:
             object.__setattr__(draft_cfg, "quant_config", new_qc)
+        if new_mlb is not None:
+            object.__setattr__(draft_cfg, "moe_load_balancer", new_mlb)
         return draft_cfg
+
+    @staticmethod
+    def _draft_moe_load_balancer_config(model_config, base: int, num_stages: int):
+        """EPLB config with deterministic defaults for omitted draft layers."""
+        load_balancer = getattr(model_config, "moe_load_balancer", None)
+        assignments = (
+            getattr(load_balancer, "initial_global_assignments", None)
+            if load_balancer is not None
+            else None
+        )
+        if assignments is None or all(base + stage in assignments for stage in range(num_stages)):
+            return None
+
+        num_experts = model_config.pretrained_config.n_routed_experts
+        ep_size = model_config.mapping.moe_ep_size
+        local_slots = load_balancer.num_slots // ep_size
+        default_assignments = [
+            (ep_rank * num_experts // ep_size + local_slot) % num_experts
+            for ep_rank in range(ep_size)
+            for local_slot in range(local_slots)
+        ]
+        draft_assignments = dict(assignments)
+        for stage in range(num_stages):
+            draft_assignments.setdefault(base + stage, default_assignments)
+        return load_balancer.model_copy(update={"initial_global_assignments": draft_assignments})
 
     @staticmethod
     def _draft_normalized_quant_config(model_config):
