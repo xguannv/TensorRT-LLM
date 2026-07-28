@@ -250,13 +250,70 @@ framework's default SwiGLU activation; it is only a communication and baseline
 regression result, not evidence for Kimi SiTU. The explicit activation
 assertion above prevents that distinction from being lost.
 
+### Real-checkpoint and routing-stress EP8 parity
+
+The same production-size EP8 comparison subsequently passed with all 896
+layer-1 routed experts loaded from
+`model-00002-of-000096.safetensors`. The 16 GiB shard was staged to
+container-local storage before worker launch so the eight ranks shared the
+node page cache instead of issuing concurrent random reads through S3FS.
+
+Three real-weight MegaMoE cases passed:
+
+- Random routing, which naturally leaves most experts empty with eight tokens
+  per rank.
+- Deliberately hot routing: every token on every rank selected experts 0-15,
+  concentrating the entire EP8 workload on the rank owning those experts.
+- Uniform-coverage routing: the 64 global tokens supplied 1024 assignments
+  that covered all 896 experts at least once.
+
+The success markers were:
+
+```text
+B300_EP8_896E_TOP16_KIMI_REAL_WEIGHT_SITU_PARITY_PASS
+B300_EP8_896E_TOP16_KIMI_REAL_WEIGHT_SITU_HOT_PARITY_PASS
+B300_EP8_896E_TOP16_KIMI_REAL_WEIGHT_SITU_UNIFORM_PARITY_PASS
+```
+
+### Direct TRTLLM-Gen EP8 comparison
+
+TRTLLM-Gen also passed a production-size, real-weight SiTU EP8
+fused-versus-reference case. It used the `ALLGATHER` communication fallback:
+the optimized NVLink one-sided and two-sided strategies require
+`SYS_PTRACE`/pidfd access that was not enabled when the validation container
+was created.
+
+TRTLLM-Gen's grouped DeepSeek routing kernel supports at most top-8, so the
+direct top-16 backend comparison used the supported `Default` routing type.
+Routing ran in Python, and both backends received identical expert IDs,
+routing weights, BF16 inputs, and checkpoint weights. This isolates the
+SiTU expert and EP dispatch/combine semantics from the model-specific gate.
+
+The aggregate MegaMoE-versus-TRTLLM-Gen result across all eight ranks was:
+
+| Metric | Result |
+| --- | ---: |
+| Cosine similarity | 0.99936855 |
+| Relative L2 | 3.575343% |
+| Mean absolute error | 0.00234384 |
+| p99 absolute error | 0.00805664 |
+| Maximum absolute error | 0.01562500 |
+
+Each rank independently had cosine similarity of approximately 0.999389 and
+relative L2 of approximately 3.575%. The comparison passed the existing
+semantic-parity requirements:
+
+```text
+B300_EP8_896E_TOP16_KIMI_REAL_WEIGHT_MEGAMOE_VS_TRTLLM_GEN_DIRECT_PARITY_PASS
+```
+
 ## Remaining Work
 
-1. **EP8 reference and routing-stress coverage**
-   - Repeat the production EP8 comparison with real Kimi checkpoint weights.
-   - Compare MegaMoE fused dispatch/combine numerically against the TRTLLM-Gen
-     EP path.
-   - Cover empty experts, uniform routing, and deliberately hot experts.
+1. **Additional EP8 integration coverage**
+   - Re-run the optimized TRTLLM-Gen NVLink communication comparison in a
+     container created with the required `SYS_PTRACE` capability.
+   - Add a committed, resource-gated version of the B300 real-weight EP8
+     harness if this validation should run regularly.
    - Treat shared-node results as correctness-only; interference invalidates
      performance measurements.
 
