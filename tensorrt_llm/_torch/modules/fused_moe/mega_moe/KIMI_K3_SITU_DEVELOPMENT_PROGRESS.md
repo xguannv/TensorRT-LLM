@@ -173,37 +173,44 @@ without hiding the expected quantization-order difference.
 Setting DeepGEMM `fast_math=False` produced the same reported metrics, so the
 observed difference is not caused by the fast reciprocal used in sigmoid.
 
+### Production-scale and real-checkpoint parity
+
+Follow-up validation on `umbriel-b200-027` completed the two remaining
+single-GPU parity milestones:
+
+- Full production routed bank: 896 experts, top-16, 128 tokens, hidden 3584,
+  and intermediate 3072. The result was cosine similarity 0.99908459 and
+  relative L2 error 4.326262%.
+- Real Kimi K3 layer-1 expert weights: 896 experts, top-16, and 128 tokens.
+  The routed-kernel result was cosine similarity 0.99947089 and relative L2
+  error 3.310431%.
+- Real layer-1 routed latent path: the checkpoint router, 7168-to-3584 down
+  projection, 896-expert top-16 MoE, routed RMSNorm, and 3584-to-7168 up
+  projection. The result was cosine similarity 0.99968600, relative L2 error
+  2.506052%, p99 absolute error 0.00073242, and maximum absolute error
+  0.00177956. The MegaMoE output contained no NaN or Inf values.
+
+The 896-expert runs bounded the MegaMoE symmetric workspace to 128 tokens.
+The 16 GiB checkpoint shard was staged from S3FS to node-local storage before
+the real-weight runs to avoid random page-fault stalls.
+
 ## Remaining Work
 
-1. **Full 896-expert single-GPU parity**
-   - Run top-16 with the complete routed expert count.
-   - Limit `max_num_tokens` to 128 or 256 so the MegaMoE symmetric workspace
-     is sized for the test rather than the default 8192 tokens.
-   - Use an otherwise idle B200; the packed raw weights are approximately
-     14.64 GiB per backend before transformed-weight and workspace overhead.
-
-2. **Real checkpoint single-layer parity**
-   - Load one Kimi K3 MoE layer from the checkpoint.
-   - Compare the complete latent path: routed down projection, gate, top-16
-     routed MoE, routed norm, and routed up projection.
-   - Record routing identity, cosine similarity, relative L2, NaN/Inf, and
-     per-token worst error.
-
-3. **EP8 parity**
+1. **EP8 parity**
    - Use 896 experts with 112 experts per rank.
    - Compare MegaMoE fused dispatch/combine against the TRTLLM-Gen EP path.
    - Cover empty experts, uniform routing, and deliberately hot experts.
    - Run only when all eight GPUs are available; shared-node interference
      invalidates both collective correctness triage and performance results.
 
-4. **Accuracy and performance smoke tests**
+2. **Accuracy and performance smoke tests**
    - After backend and EP parity pass, run a small fixed-prompt or golden
      output set through Kimi K3.
    - Full-model execution is a final integration and accuracy check, not a
      prerequisite for backend-level SiTU validation.
    - Benchmark latency and throughput only after correctness is established.
 
-5. **Upstreaming**
+3. **Upstreaming**
    - Upstream or otherwise stabilize the DeepGEMM dependency commit.
    - Re-run the TRT-LLM MoE test matrix and relevant B200 CI stages.
 
