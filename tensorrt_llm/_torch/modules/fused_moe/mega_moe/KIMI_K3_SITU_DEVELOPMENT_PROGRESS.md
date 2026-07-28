@@ -194,14 +194,37 @@ The 896-expert runs bounded the MegaMoE symmetric workspace to 128 tokens.
 The 16 GiB checkpoint shard was staged from S3FS to node-local storage before
 the real-weight runs to avoid random page-fault stalls.
 
+### Initial EP8 validation
+
+Eight-rank validation also completed on the same B200 node:
+
+- An NCCL all-reduce and barrier smoke test passed on all eight GPUs. GPU 2,
+  whose `nvidia-smi` utilization counter remained at 100% without a process or
+  memory allocation, participated normally.
+- A full fused-versus-reference EP8 parity case passed with 32 experts,
+  top-16 routing, hidden 3584, and intermediate 3072. This exercises the
+  DeepGEMM fused dispatch, local expert compute, and combine path with the K3
+  GEMM geometry.
+- A production-size 896-expert, top-16 EP8 fused-forward smoke test passed
+  with 112 experts per rank. Every rank returned a finite, nonzero `[8, 3584]`
+  output, and the output sum, norm, and maximum matched across all ranks.
+
+The generic test's production-size numerical reference remains impractical:
+it expands the complete 896-expert BF16 reference bank on every rank and
+estimates 220.5 GiB per GPU, exceeding the B200's 178.3 GiB. The fused backend
+itself stayed well within memory limits. A sharded or CPU/offloaded reference
+is required for full 896-expert EP8 numerical parity.
+
 ## Remaining Work
 
-1. **EP8 parity**
-   - Use 896 experts with 112 experts per rank.
-   - Compare MegaMoE fused dispatch/combine against the TRTLLM-Gen EP path.
+1. **Full production-size EP8 numerical parity**
+   - Add a sharded or CPU/offloaded reference for 896 experts with 112 experts
+     per rank; the existing generic reference cannot fit on one B200.
+   - Compare MegaMoE fused dispatch/combine numerically against the TRTLLM-Gen
+     EP path.
    - Cover empty experts, uniform routing, and deliberately hot experts.
-   - Run only when all eight GPUs are available; shared-node interference
-     invalidates both collective correctness triage and performance results.
+   - Treat shared-node results as correctness-only; interference invalidates
+     performance measurements.
 
 2. **Accuracy and performance smoke tests**
    - After backend and EP parity pass, run a small fixed-prompt or golden
