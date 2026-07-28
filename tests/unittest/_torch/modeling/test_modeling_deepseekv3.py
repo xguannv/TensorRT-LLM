@@ -22,6 +22,7 @@ import torch
 from tensorrt_llm._torch.models.modeling_deepseekv3 import (
     DeepseekV3DecoderLayer,
     _dequantize_fp8_block_scaled_linear,
+    _dequantize_fp8_shared_expert_linears,
 )
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -101,3 +102,38 @@ def test_dequantize_fp8_block_scaled_linear_uses_dense_method(
     assert isinstance(linear.quant_method, UnquantizedLinearMethod)
     assert linear.quant_config.quant_algo is None
     assert linear.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+@patch(
+    "tensorrt_llm._torch.models.modeling_deepseekv3._dequantize_fp8_block_scaled_linear",
+    return_value=True,
+)
+def test_dequantize_fp8_shared_expert_linears_filters_main_model(
+    mock_dequantize,
+) -> None:
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    layer = model.model.layers[0]
+    layer.mlp = torch.nn.Module()
+    layer.mlp.shared_experts = torch.nn.Module()
+    layer.mlp.shared_experts.gate_up_proj = Linear(3, 2, bias=False)
+    layer.mlp.shared_experts.down_proj = Linear(2, 3, bias=False)
+    layer.mlp.dense_proj = Linear(3, 2, bias=False)
+    layer.self_attn = torch.nn.Module()
+    layer.self_attn.q_proj = Linear(3, 2, bias=False)
+    model.draft_model = torch.nn.Module()
+    model.draft_model.mlp = torch.nn.Module()
+    model.draft_model.mlp.shared_experts = torch.nn.Module()
+    model.draft_model.mlp.shared_experts.down_proj = Linear(2, 3, bias=False)
+
+    converted = _dequantize_fp8_shared_expert_linears(model)
+
+    assert converted == [
+        "model.layers.0.mlp.shared_experts.gate_up_proj",
+        "model.layers.0.mlp.shared_experts.down_proj",
+    ]
+    assert [call.args[0] for call in mock_dequantize.call_args_list] == [
+        layer.mlp.shared_experts.gate_up_proj,
+        layer.mlp.shared_experts.down_proj,
+    ]

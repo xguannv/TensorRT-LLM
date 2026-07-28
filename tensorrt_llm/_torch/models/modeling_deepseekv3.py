@@ -80,6 +80,7 @@ from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
 _DEQUANTIZE_FP8_ATTENTION_ENV = "TRTLLM_DEQUANTIZE_FP8_ATTENTION"
+_DEQUANTIZE_FP8_SHARED_EXPERTS_ENV = "TRTLLM_DEQUANTIZE_FP8_SHARED_EXPERTS"
 
 
 @triton.jit
@@ -176,6 +177,18 @@ def _dequantize_fp8_attention_linears(model: nn.Module) -> List[str]:
     converted = []
     for name, module in model.named_modules():
         if ".self_attn." not in name or not isinstance(module, Linear):
+            continue
+        if _dequantize_fp8_block_scaled_linear(module):
+            converted.append(name)
+    return converted
+
+
+def _dequantize_fp8_shared_expert_linears(model: nn.Module) -> List[str]:
+    converted = []
+    for name, module in model.named_modules():
+        if (not name.startswith("model.layers.")
+                or ".mlp.shared_experts." not in name
+                or not isinstance(module, Linear)):
             continue
         if _dequantize_fp8_block_scaled_linear(module):
             converted.append(name)
@@ -2089,6 +2102,12 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 "Converted %d FP8 block-scaled attention Linear weight(s) "
                 "to dense weights because %s=1.", len(converted),
                 _DEQUANTIZE_FP8_ATTENTION_ENV)
+        if os.getenv(_DEQUANTIZE_FP8_SHARED_EXPERTS_ENV, "0") == "1":
+            converted = _dequantize_fp8_shared_expert_linears(self)
+            logger.info(
+                "Converted %d FP8 block-scaled shared-expert Linear "
+                "weight(s) to dense weights because %s=1.", len(converted),
+                _DEQUANTIZE_FP8_SHARED_EXPERTS_ENV)
 
     def setup_aliases(self) -> None:
         for idx, layer in enumerate(
