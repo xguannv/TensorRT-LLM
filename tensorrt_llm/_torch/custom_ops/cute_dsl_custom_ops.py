@@ -11100,34 +11100,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # The following code provides CuteDSL NVFP4 grouped GEMM kernels for
         # Mixture-of-Experts (MoE) on Rubin GPUs (SM107).
         # Two fused kernels are provided:
-        #   1. Gather + Grouped GEMM + SwiGLU fusion (FC1 layer)
+        #   1. Gather + Grouped GEMM + activation fusion (FC1 layer)
         #   2. Grouped GEMM + Finalize (scatter-add) fusion (FC2 layer)
 
-        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_swiglu_fusion import \
-            Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel
+        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import \
+            Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
 
-        class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+        class Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
                 TunableRunner):
-            """Rubin (SM107) runner for gather + grouped GEMM + SwiGLU fusion (FC1).
+            """Rubin runner for gather + grouped GEMM + activation fusion.
 
-            This is the Rubin counterpart to
-            Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner.
+            SM107 counterpart to Blackwell's
+            ``Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner``.
+            Supports SwiGLU and Relu2.
             Key differences from Blackwell:
             - Uses LDGSTS (cp.async) for A/SFA loading instead of TMA
             - Supports B-reuse pattern (mma_tiler_m = 2 * mma_inst_shape_m)
             - Takes mma_inst_shape and mma_tiler as 3-tuples (not 2-tuples)
             """
-            kernel_class = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel
+            kernel_class = Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
             kernel_cache = dict()
             tuning_config_cache = dict()
 
-            def __init__(self,
-                         num_experts: int,
-                         top_k: int,
-                         num_local_experts: int,
-                         local_expert_offset: int,
-                         tile_size: int,
-                         scaling_vector_size: int = 16):
+            def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    scaling_vector_size: int = 16,
+                    activation_type: ActivationType = ActivationType.Swiglu):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -11135,6 +11138,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.local_expert_offset = local_expert_offset
                 self.tile_size = tile_size
                 self.scaling_vector_size = scaling_vector_size
+                self.activation_type = ActivationType(int(activation_type))
+                if self.activation_type not in (ActivationType.Swiglu,
+                                                ActivationType.Relu2):
+                    raise ValueError(
+                        f"Rubin NVFP4 CuteDSL FC1 does not support "
+                        f"{self.activation_type.name}")
+                self.is_gated = is_gated_activation(self.activation_type)
 
                 if (sm_version := get_sm_version()) != 107:
                     raise ValueError(
@@ -11154,6 +11164,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.local_expert_offset,
                     self.tile_size,
                     self.scaling_vector_size,
+                    int(self.activation_type),
                 )
 
             def get_valid_tactics(
@@ -11221,9 +11232,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         continue
                     if mma_tiler_m != self.tile_size:
                         continue
-                    # SwiGLU halves the interleaved GEMM N dimension in the
-                    # epilogue. The current Rubin epilogue stores full output
-                    # and SFC subtiles only, so partial N tiles are not valid.
+                    # The Rubin epilogue stores full output and SFC subtiles
+                    # only, so partial GEMM N tiles are not valid.
                     if n % mma_n != 0:
                         continue
 
@@ -11322,10 +11332,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m = permuted_idx_to_expanded_idx.size(0)
                 l, n = b.size(0), b.size(1)  # noqa: E741
                 scale_k = k // self.scaling_vector_size
-                interm_size = n // 2
+                interm_size = n // 2 if self.is_gated else n
                 assert m % self.tile_size == 0
                 assert k % (self.scaling_vector_size * 4) == 0
-                assert n % (self.scaling_vector_size * 4 * 2) == 0
+                n_alignment = self.scaling_vector_size * 4 * (2 if self.is_gated
+                                                              else 1)
+                assert n % n_alignment == 0
                 assert b.size(2) * 2 == k
                 assert a_sf.size(0) == orig_m
                 assert a_sf.size(1) == scale_k
@@ -11349,6 +11361,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 partition_id = kwargs.get("partition_id", -1)
                 ugpu_half_gemm = output_tensor is not None or output_sf_tensor is not None
                 if ugpu_half_gemm:
+                    if not self.is_gated:
+                        raise ValueError(
+                            "Rubin uGPU half-GEMM currently supports SwiGLU only"
+                        )
                     if partition_id < 0 or partition_id >= 2:
                         raise ValueError(
                             "partition_id must be 0 or 1 when output tensors are provided."
@@ -11447,7 +11463,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, raster_along_m, ugpu_half_gemm,
-                             a_path)
+                             a_path, int(self.activation_type))
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -11459,6 +11475,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         raster_along_m=raster_along_m,
                         ugpu_half_gemm=ugpu_half_gemm,
                         a_path=a_path,
+                        activation_type=self.activation_type,
                     )
                     max_active_clusters = get_max_activate_clusters(
                         cluster_shape_mn[0] * cluster_shape_mn[1])
@@ -11517,12 +11534,80 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 return c, c_sf
 
+        def _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: Optional[torch.Tensor],
+            output_sf_tensor: Optional[torch.Tensor],
+            scaling_vector_size: int,
+            partition_id: int,
+            activation_type: ActivationType,
+            tuner_key: str,
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            tuner = AutoTuner.get()
+            if output_tensor is not None or output_sf_tensor is not None:
+                if output_tensor is None or output_sf_tensor is None:
+                    raise ValueError(
+                        "output_tensor and output_sf_tensor must be provided together."
+                    )
+                if partition_id < 0 or partition_id >= 2:
+                    raise ValueError(
+                        "partition_id must be 0 or 1 when output tensors are provided."
+                    )
+            elif partition_id != -1:
+                raise ValueError(
+                    "partition_id must be -1 when output tensors are not provided."
+                )
+
+            runner = Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                scaling_vector_size,
+                activation_type=activation_type,
+            )
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
+                output_tensor, output_sf_tensor
+            ]
+            choose_one_kwargs = {}
+            if output_tensor is not None:
+                choose_one_kwargs["partition_id"] = partition_id
+
+            _, best_tactic = tuner.choose_one(
+                tuner_key,
+                [runner],
+                runner.get_tuning_config(),
+                inputs,
+                **choose_one_kwargs,
+            )
+            output, output_sf = runner(inputs,
+                                       tactic=best_tactic,
+                                       partition_id=partition_id)
+            if output_tensor is not None:
+                return None, None
+            return output, output_sf
+
         @torch.library.custom_op(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin",
-            mutates_args=(
-                "output_tensor",
-                "output_sf_tensor",
-            ),
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin",
+            mutates_args=("output_tensor", "output_sf_tensor"),
             schema=
             "(Tensor input, Tensor weight, Tensor input_scale, Tensor weight_scale, Tensor alpha, "
             "Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
@@ -11530,10 +11615,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
             "SymInt local_expert_offset, SymInt tile_size, "
             "Tensor(a16!)? output_tensor, Tensor(a17!)? output_sf_tensor, "
-            "SymInt scaling_vector_size=16, SymInt partition_id=-1) "
-            "-> (Tensor?, Tensor?)",
+            "SymInt scaling_vector_size=16, SymInt partition_id=-1, "
+            f"SymInt activation_type={int(ActivationType.Swiglu)}) -> (Tensor?, Tensor?)",
             device_types="cuda")
-        def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+        def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
             input: torch.Tensor,
             weight: torch.Tensor,
             input_scale: torch.Tensor,
@@ -11553,52 +11638,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_sf_tensor: Optional[torch.Tensor],
             scaling_vector_size: int = 16,
             partition_id: int = -1,
+            activation_type: int = int(ActivationType.Swiglu),
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-            tuner = AutoTuner.get()
-            if output_tensor is not None or output_sf_tensor is not None:
-                if output_tensor is None or output_sf_tensor is None:
-                    raise ValueError(
-                        "output_tensor and output_sf_tensor must be provided together."
-                    )
-                if partition_id < 0 or partition_id >= 2:
-                    raise ValueError(
-                        "partition_id must be 0 or 1 when output tensors are provided."
-                    )
-            elif partition_id != -1:
-                raise ValueError(
-                    "partition_id must be -1 when output tensors are not provided."
-                )
-
-            runner = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
-                num_experts, top_k, num_local_experts, local_expert_offset,
-                tile_size, scaling_vector_size)
-            inputs = [
+            return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
                 input, weight, input_scale, weight_scale, alpha,
                 tile_idx_to_group_idx, tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
-                output_tensor, output_sf_tensor
-            ]
-            choose_one_kwargs = {}
-            if output_tensor is not None:
-                choose_one_kwargs["partition_id"] = partition_id
-
-            _, best_tactic = tuner.choose_one(
-                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin",
-                [runner],
-                runner.get_tuning_config(),
-                inputs,
-                **choose_one_kwargs,
-            )
-
-            output, output_sf = runner(inputs,
-                                       tactic=best_tactic,
-                                       partition_id=partition_id)
-            if output_tensor is not None:
-                return None, None
-            return output, output_sf
+                num_experts, top_k, num_local_experts, local_expert_offset,
+                tile_size, output_tensor, output_sf_tensor, scaling_vector_size,
+                partition_id, ActivationType(activation_type),
+                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
 
         @torch.library.register_fake(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin")
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
         def _(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -11619,10 +11671,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_sf_tensor: Optional[torch.Tensor],
             scaling_vector_size: int = 16,
             partition_id: int = -1,
+            activation_type: int = int(ActivationType.Swiglu),
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             m = permuted_idx_to_expanded_idx.size(0)
             n = weight.size(1)
-            interm_size = n // 2
+            is_gated = is_gated_activation(ActivationType(activation_type))
+            interm_size = n // 2 if is_gated else n
             if output_tensor is not None or output_sf_tensor is not None:
                 assert output_tensor is not None
                 assert output_sf_tensor is not None

@@ -99,13 +99,13 @@ if IS_CUDA_TILE_AVAILABLE:
 
 if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
     from .cute_dsl_custom_ops import (
-        cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin,
+        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin,
         cute_dsl_nvfp4_gemm_rubin,
         cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin,
         cute_dsl_nvfp4_grouped_gemm_finalize_rubin)
     __all__ += [
         'cute_dsl_nvfp4_gemm_rubin',
-        'cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin',
+        'cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin',
         'cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin',
         'cute_dsl_nvfp4_grouped_gemm_finalize_rubin',
     ]

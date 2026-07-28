@@ -58,8 +58,8 @@ parser_keywords = [
     ),
     # Rubin NVFP4 (BlockScaled) MoE grouped GEMM kernels
     (
-        "CuteDSLGroupedGemmSwiglu",
-        ["cute_dsl_kernels", "BlockScaled", "SwigluFusionKernel"],
+        "CuteDSLGroupedGemmAct",
+        ["cute_dsl_kernels", "BlockScaled", "ActFusionKernel"],
     ),
     (
         "CuteDSLGroupedGemmFinalize",

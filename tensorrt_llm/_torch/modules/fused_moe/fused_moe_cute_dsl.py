@@ -344,10 +344,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         ]
         if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
             from ...custom_ops.cute_dsl_custom_ops import (
-                Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+                Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
                 Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner)
             checked_runner_types.extend([
-                Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+                Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
                 Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
             ])
 
@@ -765,11 +765,19 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         """
         assert self.has_nvfp4
         assert weight_view is not None
+        if self.activation_type not in (ActivationType.Swiglu,
+                                        ActivationType.Relu2):
+            raise NotImplementedError(
+                "CuteDSL NVFP4 FC1 supports only SwiGLU and Relu2; "
+                f"got {self.activation_type.name}")
         output_dtype = torch.bfloat16
 
         # uGPU path: fork/join with same fused-kernel logic as non-uGPU.
         # Kernels use explicit partition_id to write into shared outputs.
         if self._ugpu_runtime is not None:
+            if self.activation_type != ActivationType.Swiglu:
+                raise NotImplementedError(
+                    "Rubin uGPU NVFP4 MoE currently supports SwiGLU only")
             return self._run_moe_nvfp4_ugpu(x, token_selected_experts,
                                             token_final_scales, x_sf,
                                             moe_output, enable_alltoall)
@@ -832,11 +840,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         sm_version = get_sm_version()
         use_rubin = (sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 
-        if use_rubin and self.activation_type != ActivationType.Swiglu:
-            raise NotImplementedError(
-                "Rubin NVFP4 FC1 gather+grouped GEMM currently supports only "
-                "ActivationType.Swiglu")
-
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
@@ -860,12 +863,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # Fused gather + GEMM + activation + quantize for FC1.
         # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
         # For non-gated (Relu2): weights are plain, output is N.
-        gather_swiglu_op = (
-            torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin
+        gather_act_op = (
+            torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin
             if use_rubin else torch.ops.trtllm.
             cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell)
 
-        gather_swiglu_kwargs = dict(
+        gather_act_kwargs = dict(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
@@ -883,14 +886,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
         )
         if use_rubin:
-            gather_swiglu_kwargs["output_tensor"] = None
-            gather_swiglu_kwargs["output_sf_tensor"] = None
+            gather_act_kwargs["output_tensor"] = None
+            gather_act_kwargs["output_sf_tensor"] = None
         else:
-            gather_swiglu_kwargs["activation_type"] = self.activation_type
-            gather_swiglu_kwargs[
-                "swiglu_limit_scalar"] = self.swiglu_limit_scalar
+            gather_act_kwargs["activation_type"] = self.activation_type
+            gather_act_kwargs["swiglu_limit_scalar"] = self.swiglu_limit_scalar
+        gather_act_kwargs["activation_type"] = self.activation_type
 
-        x, x_sf = gather_swiglu_op(**gather_swiglu_kwargs)
+        x, x_sf = gather_act_op(**gather_act_kwargs)
 
         if self.use_fused_finalize:
             if has_aux_streams:
@@ -1218,7 +1221,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for pid in range(num_partitions):
             s = shards[pid]
             with runtime.partition_context(pid):
-                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
                     input=x.view(torch.float4_e2m1fn_x2),
                     weight=s['w3_w1_weight'].view(torch.float4_e2m1fn_x2),
                     input_scale=x_sf.view(torch.uint8),
@@ -1238,6 +1241,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     tile_size=tile_size,
                     scaling_vector_size=self.scaling_vector_size,
                     partition_id=pid,
+                    activation_type=self.activation_type,
                 )
         runtime.join()
 

@@ -1419,7 +1419,7 @@ def test_moe_backend(
             _ = run_moe()
         if enable_ugpu:
             gather_failures = autotuner.stats.failed_profiling_count.get(
-                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin", set()
+                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin", set()
             )
             assert not gather_failures
 

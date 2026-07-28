@@ -997,18 +997,32 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["swiglu", "relu2"],
+)
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
-def test_nvfp4_gather_grouped_gemm_swiglu_rubin(
-    num_tokens: int, top_k: int, ep_size: int, tile_size: int
+def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    tile_size: int,
+    activation_type: ActivationType,
 ):
-    """Test gather-based grouped GEMM with SwiGLU fusion on Rubin (SM107).
+    """Test gather-based grouped GEMM with fused activation on Rubin (SM107).
 
-    Same test logic as test_nvfp4_gather_grouped_gemm_swiglu_blackwell
-    but calls the Rubin-specific custom op.
+    This test validates the gather kernel which:
+    1. Uses gather for A/SFA loading with permuted_idx_to_expanded_idx
+    2. Performs GEMM with (interleaved for gated) weights
+    3. Applies the fused activation (SwiGLU for gated, Relu2 for non-gated)
+    4. Quantizes output to FP4 with scale factor generation
     """
+    is_gated = is_gated_activation(activation_type)
+    weight_n_multiplier = 2 if is_gated else 1
     sf_vec_size = 16
     hidden_size = 4096
     interm_size = 8192
@@ -1020,6 +1034,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin(
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
     token_selected_experts = token_selected_experts.to(torch.int32)
     token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    # Ensure at least one valid token
     token_selected_experts[0] = 0
 
     (
@@ -1049,7 +1064,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin(
     b = torch.randint(
         -5,
         5,
-        (num_local_experts, interm_size * 2, hidden_size),
+        (num_local_experts, interm_size * weight_n_multiplier, hidden_size),
         dtype=torch.int32,
         device="cuda",
     ).to(torch.bfloat16)
@@ -1062,22 +1077,25 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin(
     a_sf_unswizzled = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
     b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
     b = b.view(torch.float4_e2m1fn_x2)
-    b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    weight_n = interm_size * weight_n_multiplier
+    b_sf = b_sf.view(num_local_experts, weight_n, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
 
-    # Interleave weights for SwiGLU
-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
-        torch.float4_e2m1fn_x2
-    )
-    b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
-        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
-    )
-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
-    b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
-        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
-    )
+    b_kernel = b
+    b_sf_kernel = b_sf
+    if is_gated:
+        b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+            torch.float4_e2m1fn_x2
+        )
+        b_sf_unswizzled = unswizzle_sf(b_sf, weight_n, hidden_size).view(
+            num_local_experts, weight_n, hidden_size // sf_vec_size
+        )
+        b_sf_unswizzled = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+        b_sf_kernel = swizzle_sf(b_sf_unswizzled, weight_n, hidden_size).view(
+            num_local_experts, weight_n, hidden_size // sf_vec_size
+        )
 
-    # Compute reference: manually gather, compute GEMM, apply SwiGLU, then quantize
+    # Compute reference: manually gather, compute GEMM, apply activation, then quantize
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
@@ -1113,16 +1131,16 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = swiglu_ref(c_ref)
+    c_ref = apply_activation_ref(c_ref, activation_type)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call Rubin gather kernel
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         a,
-        b_interleaved,
+        b_kernel,
         a_sf_unswizzled,
-        b_sf_interleaved,
+        b_sf_kernel,
         alpha,
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
@@ -1137,6 +1155,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin(
         output_tensor=None,
         output_sf_tensor=None,
         scaling_vector_size=sf_vec_size,
+        activation_type=activation_type,
     )
 
     # Verify output (only compare valid tokens, skip padding)
@@ -1308,7 +1327,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
         global_sf = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         a,
         b_interleaved,
         a_sf_unswizzled,
@@ -1327,6 +1346,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
         output_tensor=None,
         output_sf_tensor=None,
         scaling_vector_size=sf_vec_size,
+        activation_type=ActivationType.Swiglu,
     )
 
     # Verify output for valid (non-padding) tokens
@@ -1873,7 +1893,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
     alpha = a_global_sf * weight_global_sf
     global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
-    c_ref, c_sf_ref = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+    c_ref, c_sf_ref = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         a_fp4,
         weight,
         a_sf_unswizzled,
@@ -1893,6 +1913,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
         output_tensor=None,
         output_sf_tensor=None,
         partition_id=-1,
+        activation_type=ActivationType.Swiglu,
     )
 
     half_weight_n = weight.size(1) // 2
@@ -1915,7 +1936,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
                     weight_sf_shard = weight_sf[
                         :, ugpu_id * half_weight_n : (ugpu_id + 1) * half_weight_n
                     ].contiguous()
-                    torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_rubin(
+                    torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
                         a_fp4,
                         weight_shard,
                         a_sf_unswizzled,
@@ -1935,6 +1956,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_ugpu_rubin(
                         output_tensor=c_ugpu,
                         output_sf_tensor=c_sf_ugpu,
                         partition_id=ugpu_id,
+                        activation_type=ActivationType.Swiglu,
                     )
     finally:
         end_for_all_ugpu()
