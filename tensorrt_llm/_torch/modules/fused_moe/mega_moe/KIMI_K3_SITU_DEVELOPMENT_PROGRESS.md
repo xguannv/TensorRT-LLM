@@ -212,14 +212,48 @@ Eight-rank validation also completed on the same B200 node:
 The generic test's production-size numerical reference remains impractical:
 it expands the complete 896-expert BF16 reference bank on every rank and
 estimates 220.5 GiB per GPU, exceeding the B200's 178.3 GiB. The fused backend
-itself stayed well within memory limits. A sharded or CPU/offloaded reference
-is required for full 896-expert EP8 numerical parity.
+itself stayed well within memory limits. Completing the same numerical case on
+B200 would require a sharded or CPU/offloaded reference; the B300 run below
+instead provides enough device memory for the existing full reference.
+
+### Full production EP8 SiTU parity on B300
+
+The memory-limited numerical case was subsequently completed on Slurm job
+`3317909`, node `umb-b300-004`, using eight NVIDIA B300 GPUs with 275040 MiB
+per GPU. The validation container was
+`jonasl-kimi-k3-megamoe-ep8`, based on
+`tensorrt_llm/devel:latest`, with the current locally built TRT-LLM wheel.
+
+The complete fused-versus-reference case used:
+
+- EP8 with 112 local experts per rank.
+- 896 routed experts and top-16 routing.
+- Eight tokens per rank.
+- Hidden size 3584 and intermediate size 3072.
+- BF16 inputs, MXFP4 weights, and MXFP8 activation quantization.
+- DeepSeek-V3-style routing with FP32 router logits.
+- Kimi SiTU with gate beta 4.0 and linear beta 25.0.
+
+The harness asserted that every fused backend instance resolved its activation
+configuration to `("situ", 4.0, 25.0)`. Its reference used the same FP32 SiTU
+math as the Kimi HF implementation and retained MegaMoE's pre-L2 routing-weight
+placement. All eight ranks passed the existing MXFP4/MXFP8 numerical accuracy
+criteria, and the process exited successfully with:
+
+```text
+B300_EP8_896E_TOP16_KIMI_SITU_FULL_PARITY_PASS
+```
+
+This closes the production-dimension synthetic-weight EP8 numerical milestone.
+The earlier generic run on the same B300 node also passed but used the test
+framework's default SwiGLU activation; it is only a communication and baseline
+regression result, not evidence for Kimi SiTU. The explicit activation
+assertion above prevents that distinction from being lost.
 
 ## Remaining Work
 
-1. **Full production-size EP8 numerical parity**
-   - Add a sharded or CPU/offloaded reference for 896 experts with 112 experts
-     per rank; the existing generic reference cannot fit on one B200.
+1. **EP8 reference and routing-stress coverage**
+   - Repeat the production EP8 comparison with real Kimi checkpoint weights.
    - Compare MegaMoE fused dispatch/combine numerically against the TRTLLM-Gen
      EP path.
    - Cover empty experts, uniform routing, and deliberately hot experts.
