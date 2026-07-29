@@ -1,4 +1,19 @@
-#! /bin/bash
+#!/bin/bash
+#
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 set -u
 set -e
 set -x
@@ -64,13 +79,30 @@ fi
 
 echo "config_file: ${config_file}"
 
-nsys_prefix=""
+nsys_prefix=()
 if [ "${enable_nsys}" != "true" ]; then
     echo "nsys is not enabled, start normal flow"
 else
+    nsys_bin="${NSYS_BIN:-nsys}"
+    if ! command -v "${nsys_bin}" >/dev/null 2>&1; then
+        echo "ERROR: Nsight Systems executable not found: ${nsys_bin}" >&2
+        exit 1
+    fi
+    echo "Using Nsight Systems executable: $(command -v "${nsys_bin}")"
+    "${nsys_bin}" --version
+
     nsys_file=${log_dir}/nsys_worker_proc_${role}_${instance_id}_${SLURM_PROCID}
     echo "nsys is enabled on ${role} GPUs, TLLM_PROFILE_START_STOP=${TLLM_PROFILE_START_STOP}"
-    nsys_prefix="nsys profile -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
+    nsys_prefix=(
+        "${nsys_bin}" profile
+        -o "${nsys_file}"
+        -f true
+        -t cuda,nvtx,python-gil
+        -c cudaProfilerApi
+        --cuda-graph-trace node
+        --capture-range-end=stop
+        --gpu-metrics-devices=none
+    )
 fi
 
 # In-place (.pth-style) TRT-LLM installs may lack the trtllm-serve console
@@ -80,7 +112,7 @@ if ! command -v trtllm-serve >/dev/null 2>&1; then
     trtllm_serve_cmd="python3 -m tensorrt_llm.commands.serve"
 fi
 
-${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
+"${nsys_prefix[@]}" trtllm-llmapi-launch ${numa_bind_cmd} \
     ${trtllm_serve_cmd} ${model_path} \
         --host $(hostname) --port ${port} \
         --config ${config_file}
