@@ -60,7 +60,10 @@ def main() -> None:
         max_seq_len=4096,
         max_num_tokens=4096,
         enable_chunked_prefill=True,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+        cuda_graph_config=CudaGraphConfig(
+            max_batch_size=8,
+            enable_padding=True,
+        ),
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=args.enable_block_reuse,
             free_gpu_memory_fraction=0.7,

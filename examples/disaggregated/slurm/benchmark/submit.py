@@ -464,8 +464,14 @@ def submit_job(config, log_dir, dry_run):
         'enable_attention_dp', False) else 1
     gen_dp_size = gen_tp_size if worker_config['gen'].get(
         'enable_attention_dp', False) else 1
-    ucx_warmup_requests = 2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size \
-        if benchmark_config['mode'] == "e2e" else 0
+    default_ucx_warmup_requests = (
+        2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size
+        if benchmark_config['mode'] == "e2e" else 0)
+    ucx_warmup_requests = int(
+        benchmark_config.get('ucx_warmup_requests',
+                             default_ucx_warmup_requests))
+    if ucx_warmup_requests < 0:
+        raise ValueError("benchmark.ucx_warmup_requests must be >= 0")
 
     if compact_packing:
         # Compact packing: pack all workers into the minimum number of nodes,
@@ -757,6 +763,7 @@ def submit_job(config, log_dir, dry_run):
     # Append accuracy test commands
     if config['accuracy']['enable_accuracy_test']:
         env_var = config['accuracy'].get('env_var', {})
+        accuracy_executable = config['accuracy'].get('executable', 'lm_eval')
         accuracy_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
@@ -778,7 +785,8 @@ def submit_job(config, log_dir, dry_run):
             }
             model = config['accuracy']['tasks'][task]['model']
             accuracy_cmd = [
-                'lm_eval', '--model', model, '--tasks', task, '--model_args',
+                accuracy_executable, '--model', model, '--tasks', task,
+                '--model_args',
                 f"model={env_config['model_path']},base_url=http://{disagg_server_hostname}:{disagg_server_port}/{end_point_map[model]},{config['accuracy']['tasks'][task]['model_args_extra']}",
                 '--log_samples', '--output_path',
                 f'{log_dir}/accuracy_eval_{task}', extra_kwargs_str,
