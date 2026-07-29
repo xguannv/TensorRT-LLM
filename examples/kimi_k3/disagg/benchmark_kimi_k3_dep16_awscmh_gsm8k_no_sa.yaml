@@ -16,7 +16,10 @@ slurm:
   script_file: "disaggr_torch.slurm"
   partition: "batch"
   account: "coreai_comparch_trtllm"
-  job_time: "02:00:00"
+  # 3h rather than OCIAGA's 2h: on top of the cold-cache startup cost, this
+  # config raises max_gen_toks from the 256 used by the 95.91% OCIAGA run to
+  # 1024, so the full 1319-question sweep takes longer than that reference run.
+  job_time: "03:00:00"
   job_name: "k3-disagg-gsm8k-no-sa"
   extra_args: "--gpus-per-node=4"
   # Emits --segment=8 so the 32 GPUs land in one NVL72 domain. Rack-spanning

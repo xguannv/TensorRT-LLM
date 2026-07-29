@@ -16,7 +16,9 @@ slurm:
   script_file: "disaggr_torch.slurm"
   partition: "batch"
   account: "coreai_comparch_trtllm"
-  job_time: "02:00:00"
+  # 3h rather than OCIAGA's 2h: weight loading, FlashInfer cubin download and
+  # autotune cost 15-17 min on a cold cache, and AWS CMH has not warmed one yet.
+  job_time: "03:00:00"
   job_name: "k3-disagg-8k1k-no-sa"
   extra_args: "--gpus-per-node=4"
   # Emits --segment=8 so the 32 GPUs land in one NVL72 domain. Rack-spanning
