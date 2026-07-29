@@ -19,12 +19,28 @@
 #   - Every worker is launched under the explicitly selected Nsys 2025.5
 #     binary shipped in the AWS CMH image.
 #
-# The profile ranges below are calibrated from the completed non-Nsys baseline
-# (job 2714952, run_records/kimi_k3_disagg/logs/awscmh_8k1k_20260729_022937).
 # Both workers spend most of their iterations on the 512-request UCX warmup, so
 # the harness defaults (ctx 10-30, gen 200-250) land in warmup and would capture
-# no formal 8192-token traffic at all. Recalibrate whenever ucx_warmup_requests,
-# the concurrency list or multi_round change, since all three move the offset.
+# no formal 8192-token traffic at all.
+#
+# The formal traffic does not start at a reproducible iteration, because the
+# number of warmup iterations is itself not reproducible. Two measured runs:
+#
+#   job 2714952 (logs/awscmh_8k1k_20260729_022937)       formal CTX 2613-2673
+#   job 2715591 (logs/awscmh_8k1k_nsys_20260729_040930)  formal CTX 2470-2534
+#
+# That is 143 iterations of drift, so no narrow window can hit both. Note also
+# that the context worker does NOT advance its iteration counter while idle --
+# in the first run the last warmup iteration is 2612 and the first formal one is
+# 2613, with no gap across the idle period between them. Job 2715591 confirmed
+# the failure mode: a window of 2635-2655 was never reached, because that worker
+# stopped iterating at 2534, and no context report was produced at all.
+#
+# The ranges below are therefore chosen for reachability rather than tightness.
+# Only the START iteration has to be reached: with --capture-range-end=stop, a
+# stop iteration that never arrives still leaves Nsys writing what it collected
+# when the process exits. So each start sits far below the earliest observed
+# warmup end, and each stop is generous.
 
 slurm:
   script_file: "disaggr_torch.slurm"
@@ -73,15 +89,17 @@ environment:
 
 profiling:
   nsys_on: true
-  # Baseline rank-0 iteration map (see the header comment for the source run):
-  #   CTX  1-2612 UCX warmup (~105 tokens/iter), 2613-2673 the 64 formal
-  #        8192-token prefills -- exactly 61 contiguous iterations, ~2.2 s apart.
-  #   GEN  1-260 warmup, 261-5142 the formal decode -- contiguous, ~33 ms/iter.
-  # Each window sits mid-span so a drift in the warmup iteration count still
-  # lands inside real traffic: CTX keeps ~22 iterations of slack on either side,
-  # GEN ~2400.
-  ctx_profile_range: "2635-2655"
-  gen_profile_range: "2700-2750"
+  # CTX: the two observed warmup ends are 2469 and 2612, so starting at 1800
+  # leaves at least 669 iterations of margin -- about 4.7x the drift measured so
+  # far -- and the capture then runs through every formal prefill under either
+  # offset. The cost is ~670-810 warmup iterations of trace, which is cheap:
+  # those iterations carry ~105 tokens each against 8192 for a formal prefill.
+  ctx_profile_range: "1800-2800"
+  # GEN: the formal decode spans roughly 250-5100 in both runs, so this window
+  # is never in danger of missing. It is widened from the 50 iterations of job
+  # 2715591 to 200 purely to sample more decode steps; at ~33 ms/iter that is
+  # ~6.6 s of trace, and 50 iterations already cost only ~29 MB per rank.
+  gen_profile_range: "1500-1700"
 
 accuracy:
   enable_accuracy_test: false
