@@ -11,6 +11,7 @@ cuda_graph_config:
   enable_padding: true
   max_batch_size: 32
 moe_config:
+  backend: MEGAMOE_DEEPGEMM
   max_num_tokens: 131072
   use_low_precision_moe_combine: true
 kv_cache_config:
