@@ -48,9 +48,12 @@ hardware:
 
 environment:
   container_mount: "/home/xguan/dev/trtllm_work:/code/tensorrt_llm,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-301be1b_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-301be1b_orig"
-  # Built by notes/aws_scripts/make_image.sh from commit 63034f4126.
-  # Ships TensorRT-LLM 1.3.0rc21 + Nsight Systems 2025.5.0.
-  container_image: "/home/xguan/dev/containers/trtllm-awscmh-gb300-dev-63034f4126-nsys2025.5-20260729_063503Z.sqsh"
+  # Built by notes/aws_scripts/make_image.sh. Ships TensorRT-LLM 1.3.0rc21,
+  # Nsight Systems 2025.5.0, and the Kimi K3 prerequisites: fla-core 0.5.2,
+  # einops 0.8.2 and FlashInfer 0.6.15 (the K3 fork, not the pinned 0.6.14).
+  # The predecessor image lacked fla, which killed all 32 ranks of job 2714660
+  # at model init.
+  container_image: "/home/xguan/dev/containers/trtllm-awscmh-gb300-dev-9e4492bf4e-nsys2025.5-20260729.sqsh"
   model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-301be1b_orig"
   trtllm_repo: ""
   build_wheel: false
