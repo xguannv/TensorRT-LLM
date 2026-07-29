@@ -19,10 +19,12 @@
 #   - Every worker is launched under the explicitly selected Nsys 2025.5
 #     binary shipped in the AWS CMH image.
 #
-# Before submitting, replace ctx_profile_range and gen_profile_range with
-# iteration windows calibrated from a completed non-Nsys baseline. Context
-# workers advance their executor iteration during idle periods, so the generic
-# 10-30 range is not guaranteed to contain the formal 8192-token requests.
+# The profile ranges below are calibrated from the completed non-Nsys baseline
+# (job 2714952, run_records/kimi_k3_disagg/logs/awscmh_8k1k_20260729_022937).
+# Both workers spend most of their iterations on the 512-request UCX warmup, so
+# the harness defaults (ctx 10-30, gen 200-250) land in warmup and would capture
+# no formal 8192-token traffic at all. Recalibrate whenever ucx_warmup_requests,
+# the concurrency list or multi_round change, since all three move the offset.
 
 slurm:
   script_file: "disaggr_torch.slurm"
@@ -71,9 +73,15 @@ environment:
 
 profiling:
   nsys_on: true
-  # Replace these initial harness defaults after inspecting the baseline logs.
-  ctx_profile_range: "10-30"
-  gen_profile_range: "200-250"
+  # Baseline rank-0 iteration map (see the header comment for the source run):
+  #   CTX  1-2612 UCX warmup (~105 tokens/iter), 2613-2673 the 64 formal
+  #        8192-token prefills -- exactly 61 contiguous iterations, ~2.2 s apart.
+  #   GEN  1-260 warmup, 261-5142 the formal decode -- contiguous, ~33 ms/iter.
+  # Each window sits mid-span so a drift in the warmup iteration count still
+  # lands inside real traffic: CTX keeps ~22 iterations of slack on either side,
+  # GEN ~2400.
+  ctx_profile_range: "2635-2655"
+  gen_profile_range: "2700-2750"
 
 accuracy:
   enable_accuracy_test: false
