@@ -89,17 +89,22 @@ environment:
 
 profiling:
   nsys_on: true
-  # CTX: the two observed warmup ends are 2469 and 2612, so starting at 1800
-  # leaves at least 669 iterations of margin -- about 4.7x the drift measured so
-  # far -- and the capture then runs through every formal prefill under either
-  # offset. The cost is ~670-810 warmup iterations of trace, which is cheap:
-  # those iterations carry ~105 tokens each against 8192 for a formal prefill.
-  ctx_profile_range: "1800-2800"
-  # GEN: the formal decode spans roughly 250-5100 in both runs, so this window
-  # is never in danger of missing. It is widened from the 50 iterations of job
-  # 2715591 to 200 purely to sample more decode steps; at ~33 ms/iter that is
-  # ~6.6 s of trace, and 50 iterations already cost only ~29 MB per rank.
-  gen_profile_range: "1500-1700"
+  # CTX: capture everything. Windowing this worker has failed repeatedly because
+  # the formal prefills are a tiny, badly-located target: three runs put their
+  # start at 2613, 2470 and 1819 -- 794 iterations of drift, trending down --
+  # and they are only ~65 of the worker's ~1885 iterations, i.e. 3.5% of the
+  # run, sitting right at its end. Job 2715591 lost its context report entirely
+  # this way. A start iteration of 1 is the only one guaranteed to be reached.
+  # The cost is low because context iterations are sparse: the formal prefills
+  # are ~2.2 s apart and the worker is idle in between, so most of the captured
+  # span carries no kernels at all.
+  ctx_profile_range: "1-99999"
+  # GEN: keep a window. The asymmetry with CTX is the point -- generation spends
+  # thousands of contiguous iterations in formal decode (261-5142 in job 2714952,
+  # ~1721-5115 in job 2716479), so a mid-range window cannot realistically miss,
+  # while capturing all of it would cost ~2.9 GB per rank (~46 GB per run) and
+  # make the SQLite export step painfully slow.
+  gen_profile_range: "3000-3200"
 
 accuracy:
   enable_accuracy_test: false
