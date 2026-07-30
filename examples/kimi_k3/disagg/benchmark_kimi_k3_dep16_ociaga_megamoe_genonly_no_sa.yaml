@@ -1,0 +1,145 @@
+# Hybrid variant: MegaMoE on the GENERATION server only, TRTLLM-Gen on CONTEXT.
+#
+# Derived from benchmark_kimi_k3_dep16_ociaga_megamoe_no_sa.yaml by deleting the
+# ctx moe_config block. Everything else -- topology, dataset, image, checkout,
+# TRTLLM_DISABLE_GPU_MASK, every worker_config value -- is byte-identical, so
+# this is directly comparable to the three runs already recorded.
+#
+# ---- Why -------------------------------------------------------------------
+#
+# MegaMoE fuses the routed-expert all-to-all into one kernel. Measured on OCIAGA
+# (nsys, CTX rank 0, same rank, same run, jobs 323831/323832), comparing a step
+# where only one DP rank holds a prefill against a step where every rank does:
+#
+#                          1 rank prefilling    all ranks prefilling    scaling
+#   baseline A2A + expert     313.6 ms              782.8 ms             2.50x
+#   MegaMoE fused kernel      241.1 ms             1656.1 ms             6.87x
+#   MegaMoE vs baseline        -23.1%                +111.6%
+#
+# Non-MoE work is identical in both cases (attention 1.00x, deep_gemm 1.01x,
+# norm/conv 1.00x, same call counts), so the whole difference is the MoE path.
+#
+# So the fused kernel wins at decode shape (few tokens per rank) and loses at
+# prefill shape once many ranks are active at once. GEN confirms the win side:
+# the three moeA2A kernels (28% of GPU kernel time) collapse into the mega
+# kernel and the routed-expert path drops ~47%, cross-checked on two ranks.
+#
+# Full-MegaMoE measured +6.99% output throughput and -10.86% median TPOT, but
+# also a rigid ~+0.7 s shift in TTFT. This config tests whether keeping CTX on
+# TRTLLM-Gen preserves the decode gain while removing the prefill regression.
+#
+# Expected if the model above is right: TPOT stays near the full-MegaMoE value,
+# TTFT returns toward the baseline, throughput >= full MegaMoE.
+#
+# ---- Reading the result ----------------------------------------------------
+#
+# Compare against, on the same nodes and image:
+#   A baseline + GPU mask        367.42 out tok/s   job 323529
+#   B baseline, no GPU mask      362.80 out tok/s   job 323685   <- the control
+#   C MegaMoE everywhere         388.15 out tok/s   job 323612
+#
+# B is the right control: it has TRTLLM_DISABLE_GPU_MASK=1 like this config.
+#
+# Note the ctx worker still needs TRTLLM_DISABLE_GPU_MASK=1 even though it no
+# longer runs MegaMoE: worker_env_var is global to both roles here, and keeping
+# it identical to C is what makes the comparison single-variable.
+#
+# See notes/run_records/kimi_k3/0730_megamoe_disagg_ociaga.md.
+
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "batch"
+  account: "coreai_comparch_trtllm"
+  job_time: "02:00:00"
+  job_name: "k3-disagg-8k1k-megamoe-genonly-no-sa"
+  extra_args: "--gpus-per-node=4"
+  set_segment: true
+  numa_bind: true
+
+benchmark:
+  mode: "e2e"
+  use_nv_sa_benchmark: false
+  multi_round: 4
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: "16"
+  input_length: 8192
+  output_length: 1024
+  dataset_file: "/home/xguan/dev/run_records/kimi_k3_disagg/datasets/kimi_k3_8192_1024_128req_trtllm_custom.jsonl"
+  env_var:
+    TRTLLM_PATH_PREPEND: "/code/tensorrt_llm/.venv-3.12/bin"
+    TRTLLM_PYTHONPATH_PREPEND: "/code/tensorrt_llm"
+
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+
+environment:
+  container_mount: "/home/xguan/dev/trtllm_work3:/code/tensorrt_llm,/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work3:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work3,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  container_image: "/home/xguan/dev/containers/trtllm-ociaga-gb300-k3-base-nsys2025.5-20260729.sqsh"
+  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  trtllm_repo: ""
+  build_wheel: false
+  trtllm_wheel_path: ""
+  work_dir: ""
+  worker_env_var: "TRTLLM_DISABLE_GPU_MASK=1 TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/code/tensorrt_llm/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/code/tensorrt_llm TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/code/tensorrt_llm/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/code/tensorrt_llm"
+
+profiling:
+  nsys_on: false
+  ctx_profile_range: "10-30"
+  gen_profile_range: "200-250"
+
+accuracy:
+  enable_accuracy_test: false
+
+worker_config:
+  gen:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    moe_config:
+      backend: MEGAMOE_DEEPGEMM
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config:
+      max_batch_size: 32
+    max_batch_size: 32
+    max_num_tokens: 256
+    max_seq_len: 9236
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
+
+  ctx:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true

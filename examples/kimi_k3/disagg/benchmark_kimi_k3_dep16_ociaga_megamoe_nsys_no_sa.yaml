@@ -1,0 +1,172 @@
+# Nsys variant of benchmark_kimi_k3_dep16_ociaga_megamoe_no_sa.yaml.
+#
+# Four differences from that config, and nothing else:
+#
+#   1. slurm.job_name                     += "-nsys"
+#   2. benchmark.ucx_warmup_requests: 16  (new key; default here would be 512)
+#   3. worker_env_var                     += NSYS_BIN=<2025.5 absolute path>
+#   4. profiling.nsys_on: true, and both profile ranges retargeted
+#
+# ---- Why ucx_warmup_requests: 16 -------------------------------------------
+#
+# ctx/gen_profile_range are fed to TLLM_PROFILE_START_STOP and are counted in
+# forward ITERATIONS, not seconds. submit.py defaults ucx_warmup_requests to
+#     2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size = 2*1*16*1*16 = 512
+# and those 512 requests batch nondeterministically across DP16, so the first
+# real 8192-token prefill lands at a wildly different CTX iteration each run.
+# Measured on AWS-CMH over four runs: 2613, 2470, 1819, 770 -- a 1843-iteration
+# spread, monotonically falling. No fixed window is safe; a "conservative" lower
+# bound of 1000 would have been broken by the 770 run.
+#
+# Worse, the real traffic sits at the very END of the run, so a stop that covers
+# it is a stop that is never reached, and nsys never flushes. That is structural,
+# not a tuning problem.
+#
+# Shrinking the warmup to 16 collapses the drift: real traffic then starts at a
+# low, predictable iteration, so the window both triggers AND completes, and nsys
+# writes the report on range end instead of being killed mid-flush.
+# See notes/run_records/kimi_k3/0729_disagg_benchmark_8k1k.md, option A.
+#
+# COST, and it is a real one: 16 warmup requests establish fewer UCX connections
+# than 512, so the end-to-end numbers from an nsys run are NOT comparable to the
+# non-nsys baselines. Use these runs for kernel-level attribution only. The
+# comparable e2e numbers already exist:
+#     baseline masked    367.42 out tok/s   job 323529
+#     megamoe unmasked   388.15 out tok/s   job 323612
+#
+# ---- Why these ranges ------------------------------------------------------
+#
+# ctx "1-40": the STOP is what matters, not the start. CTX runs
+# max_batch_size=1, so its iteration count tracks its REQUEST count, not decode
+# steps -- measured ceilings were 67 (baseline) and 77 (megamoe) under a
+# 16-request warmup, i.e. two orders of magnitude below GEN. An earlier attempt
+# used "1-120": profiling started at iteration 1 and the stop was never reached,
+# so nsys never flushed and ZERO CTX reports were written (jobs 323730/323731,
+# 16 GEN reports each, 0 CTX). 40 leaves 27+ iterations of margin against the
+# lower observed ceiling, still spans the warmup->real-traffic boundary at
+# ~iteration 17, and still includes iteration 1.
+#
+# Note the coupling: shrinking ucx_warmup_requests also shrinks the CTX
+# iteration ceiling, so these two settings must be chosen together. Raising the
+# warmup back to 512 would move the ceiling up but reintroduce the start-point
+# drift (2613/2470/1819/770 across four AWS-CMH runs) that motivated option A.
+#
+# gen "300-500": the warmup generates ~10 tokens per request (measured: 512
+# requests produced 5120 tokens), so 16 warmup requests cost at most ~160 GEN
+# iterations -- 300 is clear of it. The real run decodes 64 requests x 1024
+# tokens at concurrency 16 over 4 rounds, i.e. O(10^4) iterations, so 500 is
+# reached with a large margin. 200 iterations is also a tractable trace size.
+#
+# ---- Other nsys traps already handled --------------------------------------
+#
+# NSYS_BIN must be the absolute 2025.5 path: the base image also ships 2026.2.1,
+# under which TensorRT-LLM hangs. The image built for this checkout repoints a
+# bare `nsys` to 2025.5 as well, but the configs set NSYS_BIN explicitly because
+# start_worker.sh falls back to a bare lookup only when it is unset.
+#
+# Export note for later: CTX and GEN are two independent srun steps and both see
+# SLURM_PROCID 0-15, so every rank id collides across roles. Hard-link the
+# reports into per-role directories before exporting (do not copy -- tens of GB).
+#
+# This variant keeps moe_config.backend: MEGAMOE_DEEPGEMM on both ctx and gen.
+
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "batch"
+  account: "coreai_comparch_trtllm"
+  job_time: "02:00:00"
+  job_name: "k3-disagg-8k1k-megamoe-no-sa-nsys"
+  extra_args: "--gpus-per-node=4"
+  set_segment: true
+  numa_bind: true
+
+benchmark:
+  mode: "e2e"
+  use_nv_sa_benchmark: false
+  multi_round: 4
+  benchmark_ratio: 0.8
+  streaming: true
+  ucx_warmup_requests: 16
+  concurrency_list: "16"
+  input_length: 8192
+  output_length: 1024
+  dataset_file: "/home/xguan/dev/run_records/kimi_k3_disagg/datasets/kimi_k3_8192_1024_128req_trtllm_custom.jsonl"
+  env_var:
+    TRTLLM_PATH_PREPEND: "/code/tensorrt_llm/.venv-3.12/bin"
+    TRTLLM_PYTHONPATH_PREPEND: "/code/tensorrt_llm"
+
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+
+environment:
+  container_mount: "/home/xguan/dev/trtllm_work3:/code/tensorrt_llm,/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work3:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work3,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  container_image: "/home/xguan/dev/containers/trtllm-ociaga-gb300-k3-base-nsys2025.5-20260729.sqsh"
+  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  trtllm_repo: ""
+  build_wheel: false
+  trtllm_wheel_path: ""
+  work_dir: ""
+  worker_env_var: "TRTLLM_DISABLE_GPU_MASK=1 TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes NSYS_BIN=/opt/nvidia/nsight-systems-cli/2025.5.0/target-linux-sbsa-armv8/nsys TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/code/tensorrt_llm/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/code/tensorrt_llm TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/code/tensorrt_llm/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/code/tensorrt_llm"
+
+profiling:
+  nsys_on: true
+  ctx_profile_range: "1-40"
+  gen_profile_range: "300-500"
+
+accuracy:
+  enable_accuracy_test: false
+
+worker_config:
+  gen:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    moe_config:
+      backend: MEGAMOE_DEEPGEMM
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config:
+      max_batch_size: 32
+    max_batch_size: 32
+    max_num_tokens: 256
+    max_seq_len: 9236
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
+
+  ctx:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    moe_config:
+      backend: MEGAMOE_DEEPGEMM
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
