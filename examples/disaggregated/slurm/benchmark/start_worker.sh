@@ -42,6 +42,18 @@ if [ -f "${gpu_map_file}" ]; then
         exit 1
     fi
     export CUDA_VISIBLE_DEVICES=${gpu_id}
+elif [ "${TRTLLM_DISABLE_GPU_MASK:-0}" = "1" ]; then
+    # MegaMoE opt-out. Torch symmetric-memory rendezvous compares device
+    # ordinals across ranks, and MegaMoEDeepGemm picks its device as
+    #   local_rank % torch.cuda.device_count()
+    # so masking each rank to a single GPU makes device_count 1, every rank
+    # resolve to cuda:0, and the rendezvous abort with
+    #   CUDASymmetricMemoryAllocator::rendezvous: detected allocations from
+    #   overlapping devices from different ranks
+    # Leaving every node GPU visible restores distinct ordinals. Safe only for
+    # default packing (one worker per node); the gpu_map branch above still
+    # masks, because there two workers share a node and would collide.
+    echo "TRTLLM_DISABLE_GPU_MASK=1: leaving all node GPUs visible (CUDA_VISIBLE_DEVICES unset)"
 else
     export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
 fi
