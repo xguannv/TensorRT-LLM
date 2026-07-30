@@ -2,10 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the fused Kimi K3 attention-residual + RMSNorm op."""
 
+from unittest import mock
+
 import pytest
 import torch
+from torch import nn
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._torch.models import modeling_kimi_linear
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
+    KimiK3RMSNorm,
+    _apply_attn_res,
+    _apply_attn_res_and_rmsnorm,
+)
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 HIDDEN_SIZE = 7168
 ATTN_RES_RMS_EPS = 1e-6
@@ -174,5 +184,80 @@ def test_attn_res_rmsnorm_cuda_graph_replay() -> None:
     torch.cuda.synchronize()
 
     cosine, relative_l2 = _similarity(actual, expected)
+    assert cosine > 0.9999
+    assert relative_l2 < 5e-3
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "num_snapshots"),
+    [
+        (1, 3),
+        (64, 5),
+    ],
+)
+@torch.no_grad()
+def test_model_helper_dispatches_fused_attn_res_rmsnorm(
+    num_tokens: int,
+    num_snapshots: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layer_residual,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    ) = _make_inputs(num_tokens, num_snapshots)
+    projection = nn.Linear(
+        HIDDEN_SIZE,
+        1,
+        bias=False,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    score_norm = KimiK3RMSNorm(
+        HIDDEN_SIZE,
+        eps=ATTN_RES_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    output_norm = RMSNorm(
+        hidden_size=HIDDEN_SIZE,
+        eps=OUTPUT_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    projection.weight.copy_(res_weight.reshape(1, -1))
+    score_norm.weight.copy_(score_rms_weight)
+    output_norm.weight.copy_(output_rms_weight)
+
+    prefix_sum = layer_residual[:, 0, :]
+    block_kernel_layout = block_residual[:, :, 0, :]
+    expected = output_norm(
+        _apply_attn_res(
+            prefix_sum,
+            block_kernel_layout,
+            projection,
+            score_norm,
+        )
+    )
+    unexpected_fallback = mock.Mock(
+        side_effect=AssertionError("model helper did not dispatch the fused op")
+    )
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "_apply_attn_res",
+        unexpected_fallback,
+    )
+    actual = _apply_attn_res_and_rmsnorm(
+        prefix_sum,
+        block_kernel_layout,
+        projection,
+        score_norm,
+        output_norm,
+    )
+
+    cosine, relative_l2 = _similarity(actual, expected)
+    unexpected_fallback.assert_not_called()
     assert cosine > 0.9999
     assert relative_l2 < 5e-3

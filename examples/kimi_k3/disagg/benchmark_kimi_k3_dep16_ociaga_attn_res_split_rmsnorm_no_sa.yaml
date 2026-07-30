@@ -1,0 +1,105 @@
+# OCIAGA Kimi K3 disaggregated-serving control for attention-residual
+# trailing-RMSNorm fusion:
+#   - 1 x DEP16 context server (4 nodes, 16 GB300 GPUs)
+#   - 1 x DEP16 generation server (4 nodes, 16 GB300 GPUs)
+#   - exact 8192-token input / 1024-token output synthetic workload
+#   - fused attn_res enabled, trailing RMSNorm kept as a separate kernel
+#
+# Keep this byte-identical to the fused config except for job_name and
+# KIMI_K3_FUSED_ATTN_RES_RMSNORM.
+
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "batch"
+  account: "coreai_comparch_trtllm"
+  job_time: "02:00:00"
+  job_name: "k3-attnres-split-rms-8k1k"
+  extra_args: "--gpus-per-node=4"
+  set_segment: true
+  numa_bind: true
+
+benchmark:
+  mode: "e2e"
+  use_nv_sa_benchmark: false
+  multi_round: 4
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: "16"
+  input_length: 8192
+  output_length: 1024
+  dataset_file: "/home/xguan/dev/run_records/kimi_k3_disagg/datasets/kimi_k3_8192_1024_128req_trtllm_custom.jsonl"
+  env_var:
+    TRTLLM_PATH_PREPEND: "/code/tensorrt_llm/.venv-3.12/bin"
+    TRTLLM_PYTHONPATH_PREPEND: "/code/tensorrt_llm"
+
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+
+environment:
+  container_mount: "/home/xguan/dev/trtllm_work2:/code/tensorrt_llm,/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work2:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work2,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  container_image: "/home/xguan/dev/containers/trtllm-ociaga-gb300-k3-trtllm_work2-da58b4d54f-20260730.sqsh"
+  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  trtllm_repo: ""
+  build_wheel: false
+  trtllm_wheel_path: ""
+  work_dir: ""
+  worker_env_var: "KIMI_K3_FUSED_ATTN_RES_RMSNORM=0 TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/code/tensorrt_llm/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/code/tensorrt_llm TRITON_CACHE_DIR=/tmp/triton-cache-k3-attnres FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-attnres HF_HOME=/tmp/hf-cache-k3-attnres HF_MODULES_CACHE=/tmp/hf-modules-k3-attnres XDG_CACHE_HOME=/tmp/xdg-cache-k3-attnres"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/code/tensorrt_llm/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/code/tensorrt_llm"
+
+profiling:
+  nsys_on: false
+  ctx_profile_range: "10-30"
+  gen_profile_range: "200-250"
+
+accuracy:
+  enable_accuracy_test: false
+
+worker_config:
+  gen:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config:
+      max_batch_size: 32
+    max_batch_size: 32
+    max_num_tokens: 256
+    max_seq_len: 9236
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
+
+  ctx:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
