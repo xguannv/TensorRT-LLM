@@ -67,6 +67,16 @@ __inline__ __device__ float block_reduce_sum(float val, float* ws) {
 }
 
 __device__ __forceinline__
+bf16_t apply_output_rms_norm(bf16_t value, float rsigma, bf16_t weight) {
+    // Preserve KimiK3RMSNorm semantics: normalize in FP32, round to the
+    // activation dtype, then apply the BF16 weight.
+    bf16_t const normalized =
+        __float2bfloat16_rn(__bfloat162float(value) * rsigma);
+    return __float2bfloat16_rn(
+        __bfloat162float(normalized) * __bfloat162float(weight));
+}
+
+__device__ __forceinline__
 const bf16_t* v_addr(const bf16_t* block_res, const bf16_t* layer_res,
                      int n, int N, int t, int b, int T, int B, int H) {
     if (n < N - 1)
@@ -217,18 +227,19 @@ void cp_async_bulk(void* smem_dst, const void* gmem_src, int bytes, uint64_t& mb
 }
 
 template <int H, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
-          bool FULL_N12 = false>
+          bool FULL_N12 = false, bool FUSE_OUTPUT_RMS_NORM = false>
 __global__ void __launch_bounds__(BLK, 1)
 attn_res_fwd_online_v2_kernel(
     const bf16_t* __restrict__ block_res,
     const bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ res_w,
     const bf16_t* __restrict__ rms_w,
+    const bf16_t* __restrict__ output_rms_w,
     bf16_t* __restrict__ output,
     float* __restrict__ rsigma_out,
     float* __restrict__ probs_out,
     float* __restrict__ logits_out,
-    int N, int T, int B, float rms_eps)
+    int N, int T, int B, float rms_eps, float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     constexpr float LOG2_E = 1.4426950408889634f;
@@ -699,59 +710,142 @@ attn_res_fwd_online_v2_kernel(
 
                 if (comp_wid == 0 && lane < an) {
                     int ng = ns + lane;
-                    rsigma_out[(long long)ng * TB + tb] = local_rsig;
+                    if (rsigma_out) {
+                        rsigma_out[(long long)ng * TB + tb] = local_rsig;
+                    }
                     plan.logits_all[ng] = local_logit;
                 }
             }
 
             float inv_s = 1.f / s_running;
             bf16_t* out_ptr = output + (long long)tb * H;
+            float output_rsigma = 0.f;
+            if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                float output_sq_local = 0.f;
+                #pragma unroll
+                for (int si = 0; si < SLICES_PER_GROUP; si++) {
+                    int valid_items = VEC;
+                    if constexpr (H == 7168) {
+                        if (si == SLICES_PER_GROUP - 1) {
+                            valid_items = 4;
+                        }
+                    }
+                    int dt = si * CONSUMER_GROUPS + group;
+                    if (dt >= NHT && valid_items == VEC) continue;
+                    #pragma unroll
+                    for (int j = 0; j < VEC; j++) {
+                        if (j < valid_items) {
+                            bf16_t const mixed = __float2bfloat16_rn(
+                                acc32[si * VEC + j] * inv_s);
+                            float const mixed_float =
+                                __bfloat162float(mixed);
+                            acc32[si * VEC + j] = mixed_float;
+                            output_sq_local = fmaf(
+                                mixed_float, mixed_float, output_sq_local);
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    output_sq_local += __shfl_xor_sync(
+                        0xffffffff, output_sq_local, offset);
+                }
+                if (lane == 0) {
+                    plan.ws_stats[comp_wid][0].x = output_sq_local;
+                }
+                cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
+                if (comp_wid == 0 && lane == 0) {
+                    float output_sq = 0.f;
+                    #pragma unroll
+                    for (int w = 0; w < CONSUMER_WARPS; w++) {
+                        output_sq += plan.ws_stats[w][0].x;
+                    }
+                    plan.ws_stats[0][0].x =
+                        rsqrtf(output_sq / H + output_rms_eps);
+                }
+                cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
+                output_rsigma = plan.ws_stats[0][0].x;
+                // No consumer may reuse ws_stats for the next token until all
+                // consumers have read the shared output scale.
+                cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
+            }
+
             #pragma unroll
             for (int si = 0; si < SLICES_PER_GROUP; si++) {
                 if constexpr (H == 7168) {
                     if (si == SLICES_PER_GROUP - 1) {
                         int h_base = 6 * K_TILE + group * (K_TILE / 2) +
                                      ct_in_group * 4;
-                        uint2 ov;
-                        __nv_bfloat162* ov2 =
-                            reinterpret_cast<__nv_bfloat162*>(&ov);
-                        float2 inv2 = make_float2(inv_s, inv_s);
-                        #pragma unroll
-                        for (int j = 0; j < 2; j++) {
-                            float2 old = make_float2(
-                                acc32[si * VEC + 2 * j],
-                                acc32[si * VEC + 2 * j + 1]);
-                            ov2[j] = __float22bfloat162_rn(
-                                float2_mul(old, inv2));
+                        if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                            #pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                bf16_t const mixed =
+                                    __float2bfloat16_rn(
+                                        acc32[si * VEC + j]);
+                                out_ptr[h_base + j] =
+                                    apply_output_rms_norm(
+                                        mixed, output_rsigma,
+                                        output_rms_w[h_base + j]);
+                            }
+                        } else {
+                            uint2 ov;
+                            __nv_bfloat162* ov2 =
+                                reinterpret_cast<__nv_bfloat162*>(&ov);
+                            float2 inv2 = make_float2(inv_s, inv_s);
+                            #pragma unroll
+                            for (int j = 0; j < 2; j++) {
+                                float2 old = make_float2(
+                                    acc32[si * VEC + 2 * j],
+                                    acc32[si * VEC + 2 * j + 1]);
+                                ov2[j] = __float22bfloat162_rn(
+                                    float2_mul(old, inv2));
+                            }
+                            *reinterpret_cast<uint2*>(
+                                out_ptr + h_base) = ov;
                         }
-                        *reinterpret_cast<uint2*>(out_ptr + h_base) = ov;
                         continue;
                     }
                 }
                 int dt = si * CONSUMER_GROUPS + group;
                 if (dt >= NHT) continue;
                 int h_base = dt * K_TILE + k_local;
-                uint4 ov;
-                __nv_bfloat162* ov2 =
-                    reinterpret_cast<__nv_bfloat162*>(&ov);
-                float2 inv2 = make_float2(inv_s, inv_s);
-                #pragma unroll
-                for (int j = 0; j < VEC / 2; j++) {
-                    float2 old = make_float2(
-                        acc32[si * VEC + 2 * j],
-                        acc32[si * VEC + 2 * j + 1]);
-                    ov2[j] = __float22bfloat162_rn(
-                        float2_mul(old, inv2));
+                if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                    #pragma unroll
+                    for (int j = 0; j < VEC; j++) {
+                        bf16_t const mixed = __float2bfloat16_rn(
+                            acc32[si * VEC + j]);
+                        out_ptr[h_base + j] = apply_output_rms_norm(
+                            mixed, output_rsigma,
+                            output_rms_w[h_base + j]);
+                    }
+                } else {
+                    uint4 ov;
+                    __nv_bfloat162* ov2 =
+                        reinterpret_cast<__nv_bfloat162*>(&ov);
+                    float2 inv2 = make_float2(inv_s, inv_s);
+                    #pragma unroll
+                    for (int j = 0; j < VEC / 2; j++) {
+                        float2 old = make_float2(
+                            acc32[si * VEC + 2 * j],
+                            acc32[si * VEC + 2 * j + 1]);
+                        ov2[j] = __float22bfloat162_rn(
+                            float2_mul(old, inv2));
+                    }
+                    *reinterpret_cast<uint4*>(out_ptr + h_base) = ov;
                 }
-                *reinterpret_cast<uint4*>(out_ptr + h_base) = ov;
             }
 
             if (comp_wid == 0 && lane < (FULL_N12 ? 12 : N)) {
                 long long out_idx = (long long)lane * TB + tb;
                 float lg = plan.logits_all[lane];
-                logits_out[out_idx] = lg;
-                probs_out[out_idx] =
-                    exp2f((lg - m_running) * LOG2_E) * inv_s;
+                if (logits_out) {
+                    logits_out[out_idx] = lg;
+                }
+                if (probs_out) {
+                    probs_out[out_idx] =
+                        exp2f((lg - m_running) * LOG2_E) * inv_s;
+                }
             }
         }
     }
@@ -770,17 +864,19 @@ attn_res_fwd_online_v2_kernel(
 
 // N=1 specialization: softmax is degenerate, so output is the layer row.
 // Tile multiple contiguous TB rows per CTA to reduce cp.async.bulk overhead.
-template <int H, int TB_TILE, bool RELEASE_TMEM = true>
+template <int H, int TB_TILE, bool RELEASE_TMEM = true,
+          bool FUSE_OUTPUT_RMS_NORM = false>
 __global__ void __launch_bounds__(BLK, 1)
 attn_res_fwd_n1_ttile_kernel(
     const bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ res_w,
     const bf16_t* __restrict__ rms_w,
+    const bf16_t* __restrict__ output_rms_w,
     bf16_t* __restrict__ output,
     float* __restrict__ rsigma_out,
     float* __restrict__ probs_out,
     float* __restrict__ logits_out,
-    int T, int B, float rms_eps)
+    int T, int B, float rms_eps, float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     constexpr int NHT = H / K_TILE;
@@ -891,6 +987,7 @@ attn_res_fwd_n1_ttile_kernel(
                 bf16_t* out_ptr = output + (long long)tb * H;
                 float sq_local = 0.f;
                 float dot_local = 0.f;
+                int4 v_cache[SLICES_PER_GROUP];
 
                 #pragma unroll
                 for (int si = 0; si < SLICES_PER_GROUP; si++) {
@@ -900,7 +997,11 @@ attn_res_fwd_n1_ttile_kernel(
                     float qv[VEC];
                     tmem_ld_32dp32bNx<VEC>(my_tmem + si * VEC, qv);
                     int4 vp = *reinterpret_cast<const int4*>(row_ptr + h_base);
-                    *reinterpret_cast<int4*>(out_ptr + h_base) = vp;
+                    if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                        v_cache[si] = vp;
+                    } else {
+                        *reinterpret_cast<int4*>(out_ptr + h_base) = vp;
+                    }
 
                     __nv_bfloat162* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
                     float2 f0 = __bfloat1622float2(v2[0]);
@@ -938,11 +1039,39 @@ attn_res_fwd_n1_ttile_kernel(
                             totals, plan.ws_stats[w][0]);
                     }
                     float rs = rsqrtf(totals.x / H + rms_eps);
-                    rsigma_out[tb] = rs;
+                    if (rsigma_out) rsigma_out[tb] = rs;
                     if (logits_out) logits_out[tb] = totals.y * rs;
                     if (probs_out) probs_out[tb] = 1.f;
+                    if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                        plan.ws_stats[0][0].x =
+                            rsqrtf(totals.x / H + output_rms_eps);
+                    }
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
+
+                if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                    float const output_rsigma = plan.ws_stats[0][0].x;
+                    #pragma unroll
+                    for (int si = 0; si < SLICES_PER_GROUP; si++) {
+                        int dt = si * CONSUMER_GROUPS + group;
+                        if (dt >= NHT) continue;
+                        int h_base = dt * K_TILE + k_local;
+                        int4 vp = v_cache[si];
+                        bf16_t* values =
+                            reinterpret_cast<bf16_t*>(&vp);
+                        #pragma unroll
+                        for (int j = 0; j < VEC; j++) {
+                            out_ptr[h_base + j] =
+                                apply_output_rms_norm(
+                                    values[j], output_rsigma,
+                                    output_rms_w[h_base + j]);
+                        }
+                    }
+                    // Prevent the next row from overwriting the shared scale
+                    // while a consumer still uses it.
+                    cutlass::arch::NamedBarrier::sync(
+                        CONSUMER_THREADS, 1);
+                }
             }
             cute::arrive_barrier(plan.bar_consumed[slot]);
         }
@@ -959,18 +1088,20 @@ attn_res_fwd_n1_ttile_kernel(
 }
 
 template <int H, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
-          bool FULL_N12 = false>
+          bool FULL_N12 = false, bool FUSE_OUTPUT_RMS_NORM = false>
 static void launch_fwd(
     const bf16_t* block_residual,
     const bf16_t* layer_residual,
     const bf16_t* res_weight,
     const bf16_t* rms_weight,
+    const bf16_t* output_rms_weight,
     bf16_t* output,
     float* rsigma,
     float* probs,
     float* logits,
     int N, int T, int B,
     float rms_eps,
+    float output_rms_eps,
     int num_sm,
     cudaStream_t stream)
 {
@@ -978,7 +1109,8 @@ static void launch_fwd(
         ((size_t)CHUNK_DEPTH * NC * H * sizeof(bf16_t) + sizeof(FwdSmemPlan<NC>) + 15) &
         ~size_t(15);
     auto kernel =
-        &attn_res_fwd_online_v2_kernel<H, NC, RELEASE_TMEM, FULL_N12>;
+        &attn_res_fwd_online_v2_kernel<
+            H, NC, RELEASE_TMEM, FULL_N12, FUSE_OUTPUT_RMS_NORM>;
     static bool attrs_set = false;
     if (!attrs_set) {
         if (smem_size > 48 * 1024) {
@@ -990,25 +1122,28 @@ static void launch_fwd(
     int grid = RELEASE_TMEM ? num_sm * 2 : num_sm;
     kernel<<<grid, BLK, smem_size, stream>>>(
         block_residual, layer_residual, res_weight, rms_weight,
-        output, rsigma, probs, logits, N, T, B, rms_eps);
+        output_rms_weight, output, rsigma, probs, logits, N, T, B,
+        rms_eps, output_rms_eps);
 }
 
 // Small-N counterpart to the Triton one-program topology.  One CTA owns the
 // complete token, with exactly 28 hidden elements per thread at H=7168.  For
 // N=2/4, packed BF16 V remains in registers across the statistics/softmax
 // boundary; N=1 can write V directly because its softmax is identically one.
-template <int N>
+template <int N, bool FUSE_OUTPUT_RMS_NORM = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_single_cta_kernel(
     const bf16_t* __restrict__ block_res,
     const bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ res_w,
     const bf16_t* __restrict__ rms_w,
+    const bf16_t* __restrict__ output_rms_w,
     bf16_t* __restrict__ output,
     float* __restrict__ rsigma_out,
     float* __restrict__ probs_out,
     float* __restrict__ logits_out,
-    float rms_eps)
+    float rms_eps,
+    float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     constexpr int H = 7168;
@@ -1021,11 +1156,14 @@ attn_res_fwd_s1_single_cta_kernel(
 
     __shared__ float2 warp_stats[WARPS * N];
     __shared__ float weights[N];
+    __shared__ bf16_t mixed_cache[
+        FUSE_OUTPUT_RMS_NORM ? H : 1];
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
 
     float2 stats[N] = {};
+    float output_sq_local = 0.f;
     uint32_t v_cache_bf16[ITEMS][(N + 1) / 2];
     #pragma unroll
     for (int item = 0; item < ITEMS; item++) {
@@ -1041,7 +1179,13 @@ attn_res_fwd_s1_single_cta_kernel(
             bf16_t packed_v = row[h];
             float v = __bfloat162float(packed_v);
             if constexpr (N == 1) {
-                output[h] = packed_v;
+                if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                    mixed_cache[h] = packed_v;
+                    output_sq_local =
+                        fmaf(v, v, output_sq_local);
+                } else {
+                    output[h] = packed_v;
+                }
             } else {
                 item_v[n] = packed_v;
             }
@@ -1111,9 +1255,9 @@ attn_res_fwd_s1_single_cta_kernel(
         #pragma unroll
         for (int n = 0; n < N; n++) {
             weights[n] *= inv_denominator;
-            rsigma_out[n] = local_rsigma[n];
-            logits_out[n] = local_logits[n];
-            probs_out[n] = weights[n];
+            if (rsigma_out) rsigma_out[n] = local_rsigma[n];
+            if (logits_out) logits_out[n] = local_logits[n];
+            if (probs_out) probs_out[n] = weights[n];
         }
     }
     __syncthreads();
@@ -1134,7 +1278,41 @@ attn_res_fwd_s1_single_cta_kernel(
                 value = fmaf(weights[2 * pair + 1], v.y, value);
             }
             int h = tid + item * THREADS;
-            output[h] = __float2bfloat16_rn(value);
+            bf16_t const mixed = __float2bfloat16_rn(value);
+            if constexpr (FUSE_OUTPUT_RMS_NORM) {
+                mixed_cache[h] = mixed;
+                float const mixed_float = __bfloat162float(mixed);
+                output_sq_local = fmaf(
+                    mixed_float, mixed_float, output_sq_local);
+            } else {
+                output[h] = mixed;
+            }
+        }
+    }
+
+    if constexpr (FUSE_OUTPUT_RMS_NORM) {
+        output_sq_local = warp_reduce_sum(output_sq_local);
+        if (lane == 0) {
+            warp_stats[warp].x = output_sq_local;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float output_sq = 0.f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; w++) {
+                output_sq += warp_stats[w].x;
+            }
+            weights[0] =
+                rsqrtf(output_sq / H + output_rms_eps);
+        }
+        __syncthreads();
+
+        float const output_rsigma = weights[0];
+        #pragma unroll
+        for (int item = 0; item < ITEMS; item++) {
+            int h = tid + item * THREADS;
+            output[h] = apply_output_rms_norm(
+                mixed_cache[h], output_rsigma, output_rms_w[h]);
         }
     }
 #else
@@ -1144,39 +1322,46 @@ attn_res_fwd_s1_single_cta_kernel(
 #endif
 }
 
-template <int N>
+template <int N, bool FUSE_OUTPUT_RMS_NORM = false>
 static void launch_s1_single_cta(
     const bf16_t* block_residual,
     const bf16_t* layer_residual,
     const bf16_t* res_weight,
     const bf16_t* rms_weight,
+    const bf16_t* output_rms_weight,
     bf16_t* output,
     float* rsigma,
     float* probs,
     float* logits,
     float rms_eps,
+    float output_rms_eps,
     cudaStream_t stream)
 {
-    attn_res_fwd_s1_single_cta_kernel<N><<<1, 256, 0, stream>>>(
+    attn_res_fwd_s1_single_cta_kernel<
+        N, FUSE_OUTPUT_RMS_NORM><<<1, 256, 0, stream>>>(
         block_residual, layer_residual, res_weight, rms_weight,
-        output, rsigma, probs, logits, rms_eps);
+        output_rms_weight, output, rsigma, probs, logits, rms_eps,
+        output_rms_eps);
 }
 
 // Single-token split-K specialization.  The complete grid is one CTA cluster:
 // rank g owns a disjoint H/GROUPS slice, keeps that slice of FP32 V in its
 // rank-local shared memory, and exchanges only (square, dot) partials via DSM.
-template <int N, int GROUPS = 8>
+template <int N, int GROUPS = 8,
+          bool FUSE_OUTPUT_RMS_NORM = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_splitk_kernel(
     const bf16_t* __restrict__ block_res,
     const bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ res_w,
     const bf16_t* __restrict__ rms_w,
+    const bf16_t* __restrict__ output_rms_w,
     bf16_t* __restrict__ output,
     float* __restrict__ rsigma_out,
     float* __restrict__ probs_out,
     float* __restrict__ logits_out,
-    float rms_eps)
+    float rms_eps,
+    float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     namespace cg = cooperative_groups;
@@ -1283,15 +1468,16 @@ attn_res_fwd_s1_splitk_kernel(
         for (int n = 0; n < N; n++) {
             weights[n] *= inv_sum;
             if (group == 0) {
-                rsigma_out[n] = local_rsigma[n];
-                logits_out[n] = local_logits[n];
-                probs_out[n] = weights[n];
+                if (rsigma_out) rsigma_out[n] = local_rsigma[n];
+                if (logits_out) logits_out[n] = local_logits[n];
+                if (probs_out) probs_out[n] = weights[n];
             }
         }
     }
 
     cluster.sync();
 
+    float output_sq_local = 0.f;
     #pragma unroll
     for (int ki = tid; ki < K_PER_CTA; ki += THREADS) {
         float value = 0.0f;
@@ -1300,7 +1486,58 @@ attn_res_fwd_s1_splitk_kernel(
             value = fmaf(
                 weights[n], v_cache[(size_t)n * K_PER_CTA + ki], value);
         }
-        output[h_begin + ki] = __float2bfloat16_rn(value);
+        bf16_t const mixed = __float2bfloat16_rn(value);
+        if constexpr (FUSE_OUTPUT_RMS_NORM) {
+            float const mixed_float = __bfloat162float(mixed);
+            // The first candidate row is dead after mixing. Reuse it to
+            // retain the BF16-rounded attention-residual output.
+            v_cache[ki] = mixed_float;
+            output_sq_local = fmaf(
+                mixed_float, mixed_float, output_sq_local);
+        } else {
+            output[h_begin + ki] = mixed;
+        }
+    }
+
+    if constexpr (FUSE_OUTPUT_RMS_NORM) {
+        output_sq_local = warp_reduce_sum(output_sq_local);
+        if (lane == 0) {
+            warp_stats[warp].x = output_sq_local;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float output_sq = 0.f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; w++) {
+                output_sq += warp_stats[w].x;
+            }
+            warp_stats[0].x = output_sq;
+        }
+
+        cluster.sync();
+
+        if (tid == 0) {
+            float output_sq = 0.f;
+            #pragma unroll
+            for (int g = 0; g < GROUPS; g++) {
+                const float2* remote_stats =
+                    cluster.map_shared_rank(warp_stats, g);
+                output_sq += remote_stats[0].x;
+            }
+            weights[0] =
+                rsqrtf(output_sq / H + output_rms_eps);
+        }
+        __syncthreads();
+
+        float const output_rsigma = weights[0];
+        #pragma unroll
+        for (int ki = tid; ki < K_PER_CTA; ki += THREADS) {
+            bf16_t const mixed =
+                __float2bfloat16_rn(v_cache[ki]);
+            int const h = h_begin + ki;
+            output[h] = apply_output_rms_norm(
+                mixed, output_rsigma, output_rms_w[h]);
+        }
     }
 #else
     if (cute::thread0()) {
@@ -1309,17 +1546,20 @@ attn_res_fwd_s1_splitk_kernel(
 #endif
 }
 
-template <int N, int GROUPS = 8>
+template <int N, int GROUPS = 8,
+          bool FUSE_OUTPUT_RMS_NORM = false>
 static void launch_s1_splitk(
     const bf16_t* block_residual,
     const bf16_t* layer_residual,
     const bf16_t* res_weight,
     const bf16_t* rms_weight,
+    const bf16_t* output_rms_weight,
     bf16_t* output,
     float* rsigma,
     float* probs,
     float* logits,
     float rms_eps,
+    float output_rms_eps,
     cudaStream_t stream)
 {
     constexpr int K_PER_CTA = 7168 / GROUPS;
@@ -1328,7 +1568,8 @@ static void launch_s1_splitk(
         (size_t)N * K_PER_CTA * sizeof(float) +
         (size_t)WARPS * N * sizeof(float2) +
         (size_t)N * sizeof(float);
-    auto kernel = &attn_res_fwd_s1_splitk_kernel<N, GROUPS>;
+    auto kernel = &attn_res_fwd_s1_splitk_kernel<
+        N, GROUPS, FUSE_OUTPUT_RMS_NORM>;
     static bool attrs_set = false;
     if (!attrs_set) {
         cudaFuncSetAttribute(
@@ -1340,7 +1581,9 @@ static void launch_s1_splitk(
         const_cast<bf16_t**>(&layer_residual),
         const_cast<bf16_t**>(&res_weight),
         const_cast<bf16_t**>(&rms_weight),
-        &output, &rsigma, &probs, &logits, &rms_eps};
+        const_cast<bf16_t**>(&output_rms_weight),
+        &output, &rsigma, &probs, &logits, &rms_eps,
+        &output_rms_eps};
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(GROUPS);
     config.blockDim = dim3(256);
@@ -1357,24 +1600,28 @@ static void launch_s1_splitk(
         &config, reinterpret_cast<const void*>(kernel), args);
 }
 
-template <int H, int TB_TILE>
+template <int H, int TB_TILE,
+          bool FUSE_OUTPUT_RMS_NORM = false>
 static void launch_n1_ttile(
     const bf16_t* layer_residual,
     const bf16_t* res_weight,
     const bf16_t* rms_weight,
+    const bf16_t* output_rms_weight,
     bf16_t* output,
     float* rsigma,
     float* probs,
     float* logits,
     int T, int B,
     float rms_eps,
+    float output_rms_eps,
     int num_sm,
     cudaStream_t stream)
 {
     constexpr size_t smem_size =
         ((size_t)CHUNK_DEPTH * TB_TILE * H * sizeof(bf16_t) +
          sizeof(FwdSmemPlan<1>) + 15) & ~size_t(15);
-    auto kernel = &attn_res_fwd_n1_ttile_kernel<H, TB_TILE, true>;
+    auto kernel = &attn_res_fwd_n1_ttile_kernel<
+        H, TB_TILE, true, FUSE_OUTPUT_RMS_NORM>;
     static bool attrs_set = false;
     if (!attrs_set) {
         if (smem_size > 48 * 1024) {
@@ -1384,8 +1631,9 @@ static void launch_n1_ttile(
         attrs_set = true;
     }
     kernel<<<num_sm * 2, BLK, smem_size, stream>>>(
-        layer_residual, res_weight, rms_weight,
-        output, rsigma, probs, logits, T, B, rms_eps);
+        layer_residual, res_weight, rms_weight, output_rms_weight,
+        output, rsigma, probs, logits, T, B, rms_eps,
+        output_rms_eps);
 }
 
 } // namespace fwd_prod_v2
@@ -1416,7 +1664,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::kimiK3AttnRes
 {
 
-void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
+template <bool FUSE_OUTPUT_RMS_NORM>
+void invokeAttnResFwdImpl(
+    AttnResFwdParams const& params, cudaStream_t stream)
 {
     using namespace sm100::fwd_prod_v2;
 
@@ -1424,6 +1674,7 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     bf16_t const* layer_residual = params.layerResidual;
     bf16_t const* res_weight = params.resWeight;
     bf16_t const* rms_weight = params.rmsWeight;
+    bf16_t const* output_rms_weight = params.outputRmsWeight;
     bf16_t* output = params.output;
     float* rsigma = params.rsigma;
     float* probs = params.probs;
@@ -1433,6 +1684,7 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     int const B = params.batchSize;
     int const H = params.hiddenSize;
     float const rms_eps = params.rmsEps;
+    float const output_rms_eps = params.outputRmsEps;
 
     int dev = 0;
     cudaGetDevice(&dev);
@@ -1446,86 +1698,136 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     {
         if (N == 1)
         {
-            launch_n1_ttile<8192, 2>(
-                layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, T, B, rms_eps, num_sm, stream);
+            launch_n1_ttile<8192, 2, FUSE_OUTPUT_RMS_NORM>(
+                layer_residual, res_weight, rms_weight, output_rms_weight,
+                output, rsigma, probs, logits, T, B, rms_eps,
+                output_rms_eps, num_sm, stream);
         }
         else if (N <= 2)
         {
-            launch_fwd<8192, 2, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-                logits, N, T, B, rms_eps, num_sm, stream);
+            launch_fwd<8192, 2, true, false,
+                FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                N, T, B, rms_eps, output_rms_eps, num_sm, stream);
         }
         else
         {
-            launch_fwd<8192, 4, false>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-                logits, N, T, B, rms_eps, num_sm, stream);
+            launch_fwd<8192, 4, false, false,
+                FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                N, T, B, rms_eps, output_rms_eps, num_sm, stream);
         }
     }
     else if (H == 7168)
     {
         if (T == 1 && N == 1)
         {
-            launch_s1_single_cta<1>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_single_cta<1, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
         }
         else if (T == 1 && N == 2)
         {
-            launch_s1_single_cta<2>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_single_cta<2, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
         }
         else if (T == 1 && N == 4)
         {
-            launch_s1_single_cta<4>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_single_cta<4, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
         }
         else if (T == 1 && N == 8)
         {
-            launch_s1_splitk<8, 8>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_splitk<8, 8, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
         }
         else if (T == 1 && N == 12)
         {
-            launch_s1_splitk<12, 8>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_splitk<12, 8, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
         }
         else if (N == 12 && T == 1024)
         {
-            launch_fwd<7168, 4, false, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma,
-                probs, logits, N, T, B, rms_eps, num_sm - 1, stream);
+            launch_fwd<7168, 4, false, true,
+                FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                N, T, B, rms_eps, output_rms_eps, num_sm - 1, stream);
         }
         else
         {
-            launch_fwd<7168, 4, false>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-                logits, N, T, B, rms_eps, num_sm, stream);
+            launch_fwd<7168, 4, false, false,
+                FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                N, T, B, rms_eps, output_rms_eps, num_sm, stream);
         }
     }
     else if (H == 6144)
     {
-        launch_fwd<6144, 4, false>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-            logits, N, T, B, rms_eps, num_sm, stream);
+        launch_fwd<6144, 4, false, false,
+            FUSE_OUTPUT_RMS_NORM>(
+            block_residual, layer_residual, res_weight, rms_weight,
+            output_rms_weight, output, rsigma, probs, logits,
+            N, T, B, rms_eps, output_rms_eps, num_sm, stream);
     }
     else if (H == 5120)
     {
-        launch_fwd<5120, 4, false>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-            logits, N, T, B, rms_eps, num_sm, stream);
+        launch_fwd<5120, 4, false, false,
+            FUSE_OUTPUT_RMS_NORM>(
+            block_residual, layer_residual, res_weight, rms_weight,
+            output_rms_weight, output, rsigma, probs, logits,
+            N, T, B, rms_eps, output_rms_eps, num_sm, stream);
     }
     else if (H == 4096)
     {
         if (N == 1)
         {
-            launch_n1_ttile<4096, 4>(
-                layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, T, B, rms_eps, num_sm, stream);
+            launch_n1_ttile<4096, 4, FUSE_OUTPUT_RMS_NORM>(
+                layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                T, B, rms_eps, output_rms_eps, num_sm, stream);
         }
         else if (N <= 4)
         {
-            launch_fwd<4096, 2, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-                logits, N, T, B, rms_eps, num_sm, stream);
+            launch_fwd<4096, 2, true, false,
+                FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                N, T, B, rms_eps, output_rms_eps, num_sm, stream);
         }
         else
         {
-            launch_fwd<4096, 3, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
-                logits, N, T, B, rms_eps, num_sm, stream);
+            launch_fwd<4096, 3, true, false,
+                FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                N, T, B, rms_eps, output_rms_eps, num_sm, stream);
         }
     }
+}
+
+void invokeAttnResFwd(
+    AttnResFwdParams const& params, cudaStream_t stream)
+{
+    invokeAttnResFwdImpl<false>(params, stream);
+}
+
+void invokeAttnResRmsNormFwd(
+    AttnResFwdParams const& params, cudaStream_t stream)
+{
+    invokeAttnResFwdImpl<true>(params, stream);
 }
 
 } // namespace kernels::kimiK3AttnRes
