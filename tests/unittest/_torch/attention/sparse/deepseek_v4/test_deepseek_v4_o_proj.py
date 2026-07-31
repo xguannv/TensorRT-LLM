@@ -185,7 +185,13 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         pretrained_config=pretrained_config,
         sparse_attention_config=sparse_config,
         quant_config=quant_config,
-        use_cute_dsl_blockscaling_mm=(dtype_str == "fp8" and sm_version in (100, 103)),
+        use_cute_dsl_blockscaling_mm=(
+            dtype_str == "fp8"
+            and (
+                sm_version in (100, 103)
+                or (sm_version == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
+            )
+        ),
     )
 
     # Setup positional embedding params
@@ -276,9 +282,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             mla.o_b_proj.weight.data = fp8_b_weight
             mla.o_b_proj.weight_scale.data = fp8_b_scale
             if sm_version == 107:
-                # Rubin does not yet have a CuTe DSL block-scaled dense GEMM.
-                # Match the production DeepGEMM path for the unrelated o_b
-                # projection so this test isolates the new o_a BMM.
+                # Match production's post-load K128-to-K32 R128c4 transform.
                 mla.o_b_proj.transform_weights()
 
     # Generate test inputs

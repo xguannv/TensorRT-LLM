@@ -363,6 +363,87 @@ def test_fp4_linear_cute_dsl_mixed_cluster_ugpu_strided_output():
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="Rubin CuTe DSL internal package is not available",
+)
+@pytest.mark.parametrize(
+    "m,mma_tiler,mma_inst_shape",
+    [
+        (4096, (128, 192, 256), (128, 192, 128)),
+        (512, (256, 192, 256), (256, 192, 128)),
+    ],
+)
+def test_cute_dsl_nvfp4_rubin_mixed_clusters_n192_fallback(
+        m, mma_tiler, mma_inst_shape):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4RubinLinear
+
+    n, k = 7168, 384
+    sf_vec_size = 16
+    packed_k = k // 2
+    sf_m = pad_up(m, 128)
+    sf_n = pad_up(n, 128)
+    sf_k = pad_up(k // sf_vec_size, 4)
+
+    torch.manual_seed(41)
+    act_fp4 = torch.randint(0,
+                            256, (m, packed_k),
+                            dtype=torch.uint8,
+                            device="cuda")
+    weight_fp4 = torch.randint(0,
+                               256, (n, packed_k),
+                               dtype=torch.uint8,
+                               device="cuda")
+    act_sf = torch.ones(sf_m * sf_k, dtype=torch.float8_e4m3fn,
+                        device="cuda").view(torch.uint8)
+    weight_sf = torch.ones(sf_n * sf_k,
+                           dtype=torch.float8_e4m3fn,
+                           device="cuda").view(torch.uint8)
+    alpha = torch.ones(1, dtype=torch.float32, device="cuda")
+    inputs = [act_fp4, weight_fp4, act_sf, weight_sf, alpha]
+
+    runner = CuteDSLNVFP4RubinLinear(output_dtype=torch.bfloat16,
+                                     use_tvm_ffi=True)
+    base_tactic = (
+        "base",
+        mma_tiler,
+        mma_inst_shape,
+        (2, 1),
+        False,
+        True,
+    )
+    mixed_tactic = (
+        "mixed_clusters",
+        mma_tiler,
+        mma_inst_shape,
+        (4, 2),
+        (2, 1),
+        False,
+        True,
+    )
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert base_tactic in tactics
+    assert mixed_tactic in tactics
+
+    base_output = runner(inputs, tactic=base_tactic)
+    mixed_output = runner(inputs, tactic=mixed_tactic)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(mixed_output).all()
+    assert mixed_output.float().abs().max() > 0
+    torch.testing.assert_close(
+        mixed_output,
+        base_output,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
 @pytest.mark.parametrize("nk", [(7168, 2112), (1536, 12288)])
 def test_split_weights_for_ugpu(nk):
     _skip_if_no_ugpu()

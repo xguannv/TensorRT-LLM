@@ -241,6 +241,36 @@ def test_mlp_fp4out_min_m_switch():
         )
 
 
+@pytest.mark.parametrize("sm_version, expected", [(100, True), (103, True), (107, False)])
+def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, expected):
+    """SM107 must keep NVFP4 gate/up weights in the unfused Rubin layout."""
+    import types
+
+    from tensorrt_llm._torch.modules import linear as linear_module
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    layer = Linear.__new__(Linear)
+    torch.nn.Module.__init__(layer)
+    layer.use_cute_dsl_blockscaling_mm = True
+    layer.use_cute_dsl_nvfp4_swiglu_blackwell = True
+    layer.has_bias = False
+    layer._weights_created = True
+    layer.quant_config = types.SimpleNamespace(
+        layer_quant_mode=types.SimpleNamespace(has_nvfp4=lambda: True),
+    )
+
+    monkeypatch.setattr(linear_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: sm_version)
+
+    mlp = GatedMLP.__new__(GatedMLP)
+    torch.nn.Module.__init__(mlp)
+    mlp.gate_up_proj = layer
+
+    assert layer.can_use_cute_dsl_nvfp4_swiglu_blackwell() is expected
+    assert mlp._can_fuse_gate_up_swiglu() is expected
+
+
 # ---------------------------------------------------------------------------
 # The fused MLP flattens a rank-3 Fp4QuantizedTensor to 2D before the (2D-only)
 # GEMM. A fused rmsnorm hands it [B, S, D/2]; the path previously flattened only

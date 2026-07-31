@@ -4,7 +4,7 @@
 import functools
 import itertools
 import math
-from typing import List, Optional, Tuple, Type
+from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
 
@@ -24,7 +24,8 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      infer_output_m_shape, is_gated_activation,
-                     last_positive_power_of_2, next_positive_power_of_2)
+                     last_positive_power_of_2, mxfp8_scale_infer_shape,
+                     next_positive_power_of_2)
 from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
                                         nvmmh_max_tactics, rank_configs)
@@ -9977,25 +9978,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert output.shape == (batch_size, m, n), \
                 "CuTe DSL FP8 Rubin BMM output shape is incorrect"
 
-        class CuteDSLNVFP4RubinLinear(TunableRunner):
-            """CuteDSL NVFP4 Linear runner for Rubin (SM107) GPUs.
+        class CuteDSLBlockScaledRubinLinear(TunableRunner):
+            """Datatype-agnostic block-scaled Linear runner for Rubin GPUs.
 
-            This class is the Rubin counterpart to CuteDSLNVFP4BlackwellLinear,
-            using Sm107BlockScaledPersistentDenseGemmKernel for SM107-specific
-            optimizations (larger SMEM/TMEM, different K blocksize, etc.).
+            Concrete datatypes provide their element types, scale-factor
+            geometry, K alignment, MMA shape, and tuning constraints.
             """
             kernel_class = Sm107BlockScaledPersistentDenseGemmKernel
-            kernel_cache = dict()
-            tuning_config = TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0, 0, get_last_power_of_2_num_tokens_buckets,
-                    last_positive_power_of_2), ),
-                constraint_specs=(ConstraintSpec(2, 0,
-                                                 fp4_scale_infer_shape), ),
-                use_cold_l2_cache=True,
-                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
-                use_cuda_graph=True,
-            )
+            kernel_cache: ClassVar[dict]
+            gemm_name: ClassVar[str]
+            a_dtype: ClassVar[type]
+            b_dtype: ClassVar[type]
+            sf_dtype: ClassVar[type]
+            sf_vec_size: ClassVar[int]
+            packed_k_multiplier: ClassVar[int]
+            k_alignment: ClassVar[int]
+            ab_assumed_align: ClassVar[int]
+            sf_assumed_align: ClassVar[int]
+            mma_tiler_k: ClassVar[int]
+            mma_inst_shape_k: ClassVar[int]
+            allow_unswapped_small_m_fallback: ClassVar[bool]
+            tuning_config: ClassVar[TuningConfig]
 
             def __init__(self,
                          output_dtype: torch.dtype,
@@ -10005,8 +10008,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 if output_dtype != torch.bfloat16:
                     raise ValueError(
-                        f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
-                    )
+                        f"CuteDSL {self.gemm_name} only supports bfloat16 output, "
+                        f"got {output_dtype}")
                 self.output_dtype = output_dtype
                 self.to_userbuffers = to_userbuffers
                 self.use_tvm_ffi = use_tvm_ffi
@@ -10030,12 +10033,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 profile: OptimizationProfile,
                 **kwargs,
             ) -> List[Tuple[int, int]]:
-                # Early exit: Check SM version - CuteDSL NVFP4 Rubin only supports SM 107
+                # Early exit: Rubin dense block-scaled GEMM only supports SM107.
                 if (sm_version := get_sm_version()) != 107:
                     logger.debug(
                         f"CuteDSL: SM version {sm_version} is not supported. "
-                        f"CuteDSL NVFP4 Rubin only supports SM 107. Skipping all tactics."
-                    )
+                        f"CuteDSL {self.gemm_name} Rubin only supports SM 107. "
+                        f"Skipping all tactics.")
                     return []
 
                 assert inputs[0].dim() == 2
@@ -10044,23 +10047,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m = inputs[0].shape[0]
                 n = inputs[1].shape[0]
                 k = inputs[0].shape[1]
-                # Note: the input tensor use uint8 to store fp4, so the real_k is k * 2
-                real_k = k * 2
+                real_k = k * self.packed_k_multiplier
                 batch_size = 1
-                sf_vec_size = 16
+                sf_vec_size = self.sf_vec_size
 
-                # Fixed layout for FP4: A and B are always K-major
+                # A and B are always K-major.
                 a_major = "k"
                 b_major = "k"
 
                 # Early exit: Check K dimension alignment
-                # For K-major layout (A and B tensors), K is the major mode (contiguous dimension).
-                # 16-byte alignment requirement: K must be divisible by 32 for FP4 (128 bits / 4 bits = 32)
-                if real_k % 32 != 0:
+                if real_k % self.k_alignment != 0:
                     logger.debug(
                         f"CuteDSL: K={real_k} does not meet 16-byte alignment requirement "
-                        f"(K%32={real_k%32}, expected 0). Skipping all tactics."
-                    )
+                        f"(K%{self.k_alignment}={real_k % self.k_alignment}, "
+                        f"expected 0). Skipping all tactics.")
                     return []
 
                 # Optimize swap_ab candidates based on M and N alignment
@@ -10089,6 +10089,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     n_aligned,
                     swap_ab_allowed=(not strided_output or n_aligned),
                 )
+                if (not swap_ab_candidates
+                        and self.allow_unswapped_small_m_fallback and m <= 128
+                        and n_aligned):
+                    swap_ab_candidates = [False]
                 if not swap_ab_candidates:
                     logger.debug(
                         f"CuteDSL: Forced swap_ab policy has no valid C layout for "
@@ -10100,15 +10104,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSL: M={m}(aligned={m_aligned}), N={n}(aligned={n_aligned}), K={real_k}(aligned=True). "
                     f"Using swap_ab={swap_ab_candidates}")
 
-                # Rubin 4xFP4 tile sizes (from CUTLASS DSL R0 documentation):
-                # Without b-reuse: {128,256}x{64,128,192,256}x256
-                # With b-reuse: {256,512}x{64,128,192,256}x256
+                # Rubin dense block-scaled tile sizes.
                 # b-reuse is enabled when mma_tiler_m = 2 * mma_inst_shape_m
-                #
-                # mma_inst_shape for 4xFP4: (M, N, K) where K=128 (fixed)
-                # mma_tiler for 4xFP4: (M, N, K) where K=256 (fixed)
-                mma_tiler_k = 256  # Fixed for 4xFP4
-                mma_inst_shape_k = 128  # Fixed for 4xFP4
+                mma_tiler_k = self.mma_tiler_k
+                mma_inst_shape_k = self.mma_inst_shape_k
 
                 # Valid (mma_tiler_m, mma_inst_shape_m) combinations:
                 # Without b-reuse: mma_tiler_m == mma_inst_shape_m
@@ -10160,9 +10159,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     if self.__class__.kernel_class.can_implement(
                         (kernel_m, kernel_n, real_k, batch_size),  # mnkl
-                            cutlass.Float4E2M1FN,  # a_dtype
-                            cutlass.Float4E2M1FN,  # b_dtype
-                            cutlass.Float8E4M3FN,  # sf_dtype
+                            self.a_dtype,
+                            self.b_dtype,
+                            self.sf_dtype,
                             cutlass.BFloat16,  # c_dtype
                             a_major,
                             b_major,
@@ -10196,9 +10195,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                     if Sm107BlockScaledPersistentDenseGemmMixedClustersKernel.can_implement(
                         (kernel_m, kernel_n, real_k, batch_size),
-                            cutlass.Float4E2M1FN,
-                            cutlass.Float4E2M1FN,
-                            cutlass.Float8E4M3FN,
+                            self.a_dtype,
+                            self.b_dtype,
+                            self.sf_dtype,
                             cutlass.BFloat16,
                             a_major,
                             b_major,
@@ -10253,14 +10252,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 **kwargs,
             ) -> torch.Tensor:
                 """
-                Performs fp4 blockwise gemm operation using CuTe DSL for Rubin.
+                Performs a dense block-scaled GEMM using CuTe DSL for Rubin.
 
                 Args:
                     inputs (List[torch.Tensor]):
-                        inputs[0]: Input tensor of shape (m, k), dtype: fp4.
-                        inputs[1]: Weight tensor of shape (n, k), dtype: fp4.
-                        inputs[2]: Input scale tensor of shape (k//16, m), dtype: fp8.
-                        inputs[3]: Weight scale tensor of shape (n, k//16), dtype: fp8.
+                        inputs[0]: Input tensor of shape (m, k).
+                        inputs[1]: Weight tensor of shape (n, k).
+                        inputs[2]: Input scale tensor in R128c4 layout.
+                        inputs[3]: Weight scale tensor in R128c4 layout.
                         inputs[4]: Alpha scaling factor. dtype: float32.
                     tactic: Tiling and cluster strategy for Rubin:
                         (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab, use_prefetch)
@@ -10268,7 +10267,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 Returns:
                     torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
                 """
-                sf_vec_size = 16
+                sf_vec_size = self.sf_vec_size
 
                 if (isinstance(tactic, tuple) and len(tactic) > 0
                         and isinstance(tactic[0], str)):
@@ -10285,8 +10284,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     # fallback to default tactic for Rubin
                     kernel_variant = "base"
-                    mma_tiler_mnk = (128, 128, 256)
-                    mma_inst_shape = (128, 128, 128)
+                    mma_tiler_mnk = (128, 128, self.mma_tiler_k)
+                    mma_inst_shape = (128, 128, self.mma_inst_shape_k)
                     cluster_shape_mn = (1, 1)
                     swap_ab = False
                     use_prefetch = False
@@ -10331,15 +10330,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if swap_ab:
                     c_tensor = c_tensor.permute(1, 0)
 
-                real_k = k * 2
+                real_k = k * self.packed_k_multiplier
                 sf_m = pad_up(m, 128)
                 sf_k = pad_up(real_k // sf_vec_size, 4)
                 sf_n = pad_up(n, 128)
 
-                # Reshape scale factors to CuteDSL's expected format
-                # Input format (from CUTLASS/cuBLASLt): (m*k//16,) and (n*k//16,)
-                # CuteDSL format: (sf_m*sf_k,) and (sf_n*sf_k,)
-                # Note: This is just a view change, no memory copy
+                # Scale factors already use CuTe DSL's physical R128c4 layout.
+                # Only flatten their storage here; no memory copy is required.
                 expected_a_sf_size = sf_m * sf_k
                 expected_b_sf_size = sf_n * sf_k
 
@@ -10364,13 +10361,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
                 a_ptr = self.make_cute_dsl_global_pointer(
-                    a_tensor, cutlass.Float4E2M1FN, 32)
+                    a_tensor, self.a_dtype, self.ab_assumed_align)
                 b_ptr = self.make_cute_dsl_global_pointer(
-                    b_tensor, cutlass.Float4E2M1FN, 32)
+                    b_tensor, self.b_dtype, self.ab_assumed_align)
                 a_sf_ptr = self.make_cute_dsl_global_pointer(
-                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                    a_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 b_sf_ptr = self.make_cute_dsl_global_pointer(
-                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                    b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 c_ptr = self.make_cute_dsl_global_pointer(
                     c_tensor, cutlass.BFloat16, 16)
 
@@ -10439,13 +10436,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if cache_key not in self.__class__.kernel_cache:
                     if self.use_tvm_ffi:
                         a_ptr = self.make_cute_dsl_global_pointer(
-                            a_tensor, cutlass.Float4E2M1FN, 32)
+                            a_tensor, self.a_dtype, self.ab_assumed_align)
                         b_ptr = self.make_cute_dsl_global_pointer(
-                            b_tensor, cutlass.Float4E2M1FN, 32)
+                            b_tensor, self.b_dtype, self.ab_assumed_align)
                         a_sf_ptr = self.make_cute_dsl_global_pointer(
-                            a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                            a_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         b_sf_ptr = self.make_cute_dsl_global_pointer(
-                            b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                            b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         c_ptr = self.make_cute_dsl_global_pointer(
                             c_tensor, cutlass.BFloat16, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
@@ -10578,6 +10575,60 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     return
 
+        class CuteDSLNVFP4RubinLinear(CuteDSLBlockScaledRubinLinear):
+            """Rubin NVFP4 runner backed by the persistent dense kernel."""
+
+            kernel_cache = dict()
+            gemm_name = "NVFP4"
+            a_dtype = cutlass.Float4E2M1FN
+            b_dtype = cutlass.Float4E2M1FN
+            sf_dtype = cutlass.Float8E4M3FN
+            sf_vec_size = 16
+            packed_k_multiplier = 2
+            k_alignment = 32
+            ab_assumed_align = 32
+            sf_assumed_align = 16
+            mma_tiler_k = 256
+            mma_inst_shape_k = 128
+            allow_unswapped_small_m_fallback = False
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 0,
+                                                 fp4_scale_infer_shape), ),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
+        class CuteDSLMXFP8RubinLinear(CuteDSLBlockScaledRubinLinear):
+            """Rubin MXFP8 runner backed by the persistent dense kernel."""
+
+            kernel_cache = dict()
+            gemm_name = "MXFP8"
+            a_dtype = cutlass.Float8E4M3FN
+            b_dtype = cutlass.Float8E4M3FN
+            sf_dtype = cutlass.Float8E8M0FNU
+            sf_vec_size = 32
+            packed_k_multiplier = 1
+            k_alignment = 16
+            ab_assumed_align = 16
+            sf_assumed_align = 16
+            mma_tiler_k = 128
+            mma_inst_shape_k = 64
+            allow_unswapped_small_m_fallback = True
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 0,
+                                                 mxfp8_scale_infer_shape), ),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
         class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
             kernel_cache = dict()
             tuning_config = TuningConfig(
@@ -10590,6 +10641,56 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
                 use_cuda_graph=True,
             )
+
+        @torch.library.custom_op("trtllm::cute_dsl_mxfp8_gemm_rubin",
+                                 mutates_args=(),
+                                 device_types="cuda")
+        def cute_dsl_mxfp8_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            """Run Rubin dense MXFP8 GEMM with K32 R128c4 UE8M0 scales."""
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
+                    f"{output_dtype}")
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL MXFP8 Rubin requires SM107, got SM{sm_version}.")
+            if input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "CuteDSL MXFP8 input and weight must be FP8 E4M3")
+            if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
+                raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
+
+            alpha = torch.ones((), dtype=torch.float32, device=input.device)
+            runner = CuteDSLMXFP8RubinLinear(output_dtype=output_dtype,
+                                             use_tvm_ffi=use_tvm_ffi)
+            inputs = [input, weight, input_scale, weight_scale, alpha]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_mxfp8_gemm_rubin",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            return runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake("trtllm::cute_dsl_mxfp8_gemm_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            shape = list(mat_a.shape)
+            shape[-1] = mat_b.shape[-2]
+            return mat_a.new_empty(shape, dtype=torch.bfloat16)
 
         # a/b: fp4, scale: fp8, output: bf16 - Rubin (SM107) variant
         @torch.library.custom_op(

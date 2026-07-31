@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import math
 import os
 import threading
 from dataclasses import dataclass
@@ -359,6 +360,14 @@ def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
                                                      sf_vec_size=16)
     return scale_shape * 2
+
+
+def mxfp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the number of bytes in an R128c4 MXFP8 scale tensor."""
+    input_shape = input_shapes[0]
+    m = math.prod(input_shape[:-1])
+    k = input_shape[-1]
+    return pad_up(m, 128) * pad_up(ceil_div(k, 32), 4)
 
 
 def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):

@@ -155,15 +155,36 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
-    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+@pytest.mark.parametrize("sm_version,expected_cute_dsl", [(100, False), (107, True)])
+def test_deepseek_v4_model_defaults(monkeypatch, sm_version, expected_cute_dsl):
+    class LlmArgs:
+        pass
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: sm_version
+    )
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
     assert defaults == {
         "kv_cache_config": {
             "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
-        }
+        },
+        "use_cute_dsl_blockscaling_mm": expected_cute_dsl,
     }
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
+
+
+def test_deepseek_v4_kv_cache_defaults_and_v2_preference(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 100
+    )
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+    assert defaults["kv_cache_config"] == {
+        "tokens_per_block": 128,
+        "enable_swa_scratch_reuse": True,
+    }
+    assert defaults["use_cute_dsl_blockscaling_mm"] is False
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
@@ -609,6 +630,7 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
         pretrained_config=config,
         mapping=Mapping(world_size=4, rank=2, tp_size=4),
         quant_config=quant_config,
+        use_cute_dsl_blockscaling_mm=True,
     )
 
     mtp_layer = DeepseekV4MTP(
@@ -627,6 +649,8 @@ def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
     assert mtp_layer.h_proj.out_features == config.hidden_size
     assert mtp_layer.e_proj.reduce_output is True
     assert mtp_layer.h_proj.reduce_output is True
+    assert mtp_layer.e_proj.use_cute_dsl_blockscaling_mm is True
+    assert mtp_layer.h_proj.use_cute_dsl_blockscaling_mm is True
     assert mtp_layer.e_proj.weight.dtype is torch.float8_e4m3fn
     assert mtp_layer.h_proj.weight.dtype is torch.float8_e4m3fn
     assert hasattr(mtp_layer.e_proj, "weight_scale")

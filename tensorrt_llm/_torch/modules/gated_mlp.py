@@ -118,6 +118,9 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_nvfp4_swiglu_blackwell=(use_cute_dsl_blockscaling_mm
+                                                 and activation == F.silu
+                                                 and not bias),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
@@ -213,16 +216,11 @@ class GatedMLP(nn.Module):
     def _can_fuse_gate_up_swiglu(self):
         """Check if fused GEMM + SwiGLU path is available.
 
-        Returns True when all conditions are met:
-        - CuteDSL blockscaling mode is enabled (implies Blackwell + CuteDSL)
-        - Activation is plain SwiGLU (F.silu), see _is_plain_swiglu
-        - gate_up_proj uses NVFP4 quantization
-        - gate_up_proj has no bias (bias not supported in fused kernel)
+        The projection owns the capability predicate because weight loading
+        must make exactly the same decision as forward dispatch.
         """
-        return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
-                and self._is_plain_swiglu()
-                and self.gate_up_proj.has_nvfp4_activation_quantization
-                and not self.gate_up_proj.has_bias)
+        return (self.activation == F.silu and self._is_plain_swiglu()
+                and self.gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell())
 
     def _can_fuse_gate_up_swiglu_fp4out(self):
         """Check if fused GEMM + SwiGLU with FP4 output path is available.
