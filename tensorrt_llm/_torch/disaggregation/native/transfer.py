@@ -749,12 +749,15 @@ class Sender(SenderBase):
         src_token_start: int,
         dst_token_start: int,
         tokens_per_block: int,
+        minimum_token_start: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Align src/dst block arrays using explicit token-start positions.
 
         Both src_token_start and dst_token_start must be block-aligned
         (multiples of tokens_per_block), which is always true for prefix-cache
-        boundaries in current KV cache managers.
+        boundaries in current KV cache managers. minimum_token_start applies a
+        shared lower bound, such as an SWA stale boundary, and trims both arrays
+        instead of relabeling their first blocks.
 
         Returns the (src, dst) sub-arrays that cover the shared token overlap.
         Returns a pair of empty arrays when there is no overlap (i.e. this
@@ -767,7 +770,7 @@ class Sender(SenderBase):
           4. Chunked context (each slice has its own token_range)  → correct
              overlap even when the slice is entirely before dst_token_start
         """
-        overlap_start = max(src_token_start, dst_token_start)
+        overlap_start = max(src_token_start, dst_token_start, minimum_token_start)
         src_skip = (overlap_start - src_token_start) // tokens_per_block
         dst_skip = (overlap_start - dst_token_start) // tokens_per_block
         n_transfer = min(src_block_ids.size - src_skip, dst_block_ids.size - dst_skip)
@@ -854,39 +857,6 @@ class Sender(SenderBase):
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
 
-            peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
-            dst_block_ids = Sender._trim_receiver_window_head(
-                src_block_ids,
-                dst_block_ids,
-                peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
-                beam_width=task._beam_width,
-            )
-
-            # Both sides trim block lists to ceil(prompt_len / tpb) in
-            # _create_kv_slice, so dst must never exceed src. A smaller dst
-            # (generation prefix-cache reuse) is handled via dst_start below.
-            block_diff = dst_block_ids.size - src_block_ids.size
-            if block_diff > 0:
-                src_blocks = np.array2string(src_block_ids, threshold=16, edgeitems=4)
-                dst_blocks = np.array2string(dst_block_ids, threshold=16, edgeitems=4)
-                logger.error(
-                    f"KV block-count mismatch: unique_rid={req_info.unique_rid}, "
-                    f"sender_req_id={req_info.sender_req_id}, slice_id={task.slice_id}, "
-                    f"peer={req_info.instance_name}:{req_info.instance_rank}, "
-                    f"self_layer_group={self_lg}, self_pool={self_pi}, "
-                    f"peer_layer_group={peer_lg}, peer_pool={peer_pi}, "
-                    f"prompt_len={task._prompt_len}, token_range={token_range}, "
-                    f"dst_start_token={req_info.dst_start_token}, "
-                    f"tokens_per_block={tpb}, beam_width={task._beam_width}, "
-                    f"src_count={src_block_ids.size}, dst_count={dst_block_ids.size}, "
-                    f"src_blocks={src_blocks}, dst_blocks={dst_blocks}"
-                )
-                raise ValueError(
-                    f"src/dst block count mismatch: {src_block_ids.size} vs "
-                    f"{dst_block_ids.size} (dst must not exceed src)"
-                )
-
-
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
             slice_end = token_range.end if token_range is not None else 0
@@ -907,8 +877,7 @@ class Sender(SenderBase):
             )
             src_start = (total_blocks - src_beam0_blocks) * tpb
             dst_start = (total_blocks - dst_beam0_blocks) * tpb
-            if req_info.dst_start_token is not None:
-                dst_start = max(dst_start, req_info.dst_start_token)
+            minimum_start = req_info.dst_start_token or 0
             if window_size is not None:
                 # SWA stale_end uses the request prompt_len (not slice_end —
                 # they differ for non-final slices). prompt_len must be plumbed
@@ -919,14 +888,14 @@ class Sender(SenderBase):
                     "set TxSession(prompt_len=request.prompt_len)."
                 )
                 stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                src_start = max(stale_end * tpb, src_start)
-                dst_start = max(stale_end * tpb, dst_start)
+                minimum_start = max(minimum_start, stale_end * tpb)
             src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                 src_block_ids,
                 dst_block_ids,
                 src_token_start=src_start,
                 dst_token_start=dst_start,
                 tokens_per_block=tpb,
+                minimum_token_start=minimum_start,
             )
 
             src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)

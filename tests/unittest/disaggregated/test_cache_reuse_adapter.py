@@ -78,6 +78,29 @@ class TestAlignKvBlocks:
         np.testing.assert_array_equal(src, [10, 11, 12])
         np.testing.assert_array_equal(dst, [21, 22, 23])
 
+    def test_dst_has_wider_speculative_swa_window(self):
+        # CTX keeps a 128-token window while GEN reserves 128 + 7 draft
+        # tokens. At this prompt boundary GEN therefore exposes one extra
+        # leading block; the shared SWA boundary must trim that destination
+        # block before pairing the remaining suffix.
+        prompt_len = 38659
+        tokens_per_block = 128
+        total_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+        src_start = (total_blocks - 2) * tokens_per_block
+        dst_start = (total_blocks - 3) * tokens_per_block
+
+        src, dst = Sender._align_kv_blocks(
+            np.array([1, 3], dtype=np.int64),
+            np.array([7, 6, 5], dtype=np.int64),
+            src_token_start=src_start,
+            dst_token_start=dst_start,
+            tokens_per_block=tokens_per_block,
+            minimum_token_start=src_start,
+        )
+
+        np.testing.assert_array_equal(src, [1, 3])
+        np.testing.assert_array_equal(dst, [6, 5])
+
     def test_both_offset(self):
         src, dst = self._align(
             [10, 11, 12],
