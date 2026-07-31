@@ -273,6 +273,15 @@ def _apply_attn_res_rmsnorm_fused(
         return None
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
+    # The attention-residual kernel uses one persistent CTA per SM and loops
+    # over tokens.  Folding a CTA-wide RMSNorm reduction into that loop is
+    # beneficial for the production decode shape (M=1), but serializes the
+    # reduction for large prefill batches.  On GB300 at M=8192 the fused
+    # kernel is 41-108% slower than attn_res_fwd + FlashInfer RMSNorm even
+    # after removing one barrier per token.  Keep prefill on the two-kernel
+    # topology, which exposes one independent RMSNorm CTA per token.
+    if M != 1:
+        return None
     if K + 1 > 12 or M > 16384 or not (4096 <= H <= 8192 and H % 1024 == 0):
         return None
     try:

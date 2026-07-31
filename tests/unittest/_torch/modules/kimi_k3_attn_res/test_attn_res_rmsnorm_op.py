@@ -14,6 +14,7 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import (
     KimiK3RMSNorm,
     _apply_attn_res,
     _apply_attn_res_and_rmsnorm,
+    _apply_attn_res_rmsnorm_fused,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -196,7 +197,6 @@ def test_attn_res_rmsnorm_cuda_graph_replay() -> None:
     ("num_tokens", "num_snapshots"),
     [
         (1, 3),
-        (64, 5),
     ],
 )
 @torch.no_grad()
@@ -263,5 +263,70 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
 
     cosine, relative_l2 = _similarity(actual, expected)
     unexpected_fallback.assert_not_called()
+    assert cosine > 0.9999
+    assert relative_l2 < 5e-3
+
+
+@torch.no_grad()
+def test_model_helper_keeps_multi_token_rmsnorm_split() -> None:
+    (
+        layer_residual,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    ) = _make_inputs(num_tokens=64, num_snapshots=5)
+    projection = nn.Linear(
+        HIDDEN_SIZE,
+        1,
+        bias=False,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    score_norm = KimiK3RMSNorm(
+        HIDDEN_SIZE,
+        eps=ATTN_RES_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    output_norm = RMSNorm(
+        hidden_size=HIDDEN_SIZE,
+        eps=OUTPUT_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    projection.weight.copy_(res_weight.reshape(1, -1))
+    score_norm.weight.copy_(score_rms_weight)
+    output_norm.weight.copy_(output_rms_weight)
+
+    prefix_sum = layer_residual[:, 0, :]
+    block_kernel_layout = block_residual[:, :, 0, :]
+    assert (
+        _apply_attn_res_rmsnorm_fused(
+            prefix_sum,
+            block_kernel_layout,
+            projection,
+            score_norm,
+            output_norm,
+        )
+        is None
+    )
+
+    expected = output_norm(
+        _apply_attn_res(
+            prefix_sum,
+            block_kernel_layout,
+            projection,
+            score_norm,
+        )
+    )
+    actual = _apply_attn_res_and_rmsnorm(
+        prefix_sum,
+        block_kernel_layout,
+        projection,
+        score_norm,
+        output_norm,
+    )
+    cosine, relative_l2 = _similarity(actual, expected)
     assert cosine > 0.9999
     assert relative_l2 < 5e-3
