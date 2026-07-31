@@ -70,6 +70,8 @@ def is_kda_optimized_supported() -> bool:
 
 _PREFILL_MODULE: Optional[ModuleType] = None
 _PREFILL_IMPORT_ERROR: Optional[BaseException] = None
+_STATE_MODULE: Optional[ModuleType] = None
+_STATE_IMPORT_ERROR: Optional[BaseException] = None
 
 
 def _load_prefill_module() -> ModuleType:
@@ -90,10 +92,28 @@ def _load_prefill_module() -> ModuleType:
     return module
 
 
+def _load_state_module() -> ModuleType:
+    """Import the KDA state-pool custom-op module (registers the op)."""
+    global _STATE_MODULE, _STATE_IMPORT_ERROR
+    if _STATE_MODULE is not None:
+        return _STATE_MODULE
+    if _STATE_IMPORT_ERROR is not None:
+        raise _STATE_IMPORT_ERROR
+    try:
+        module = importlib.import_module(
+            "tensorrt_llm._torch.modules.kimi_kda._kda_state")
+    except BaseException as exc:  # ImportError when Triton is unavailable
+        _STATE_IMPORT_ERROR = exc
+        raise
+    _STATE_MODULE = module
+    return module
+
+
 def is_intree_prefill_available() -> bool:
-    """True when the in-tree CuTe DSL prefill op can be imported."""
+    """True when the in-tree prefill and state-write ops can be imported."""
     try:
         _load_prefill_module()
+        _load_state_module()
         return True
     except Exception:
         return False
@@ -249,6 +269,8 @@ class KDAKernelDispatch:
         safe_gate: bool,
         lower_bound: Optional[float],
         cu_seqlens: Optional[torch.Tensor],
+        final_state_pool: Optional[torch.Tensor] = None,
+        final_state_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
@@ -262,14 +284,17 @@ class KDAKernelDispatch:
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
 
-        State layout contract (both paths): ``initial_state`` is consumed
-        and ``final_state`` returned in the V-first ``[N, H, V, K]`` layout —
-        the layout of the executor's ssm pool and of the fused decode
-        kernel. The in-tree prefill op natively uses the FLA-default K-first
-        ``[N, H, K, V]`` layout, so the optimized path transposes at both
-        boundaries (K == V == 128 for Kimi K3, so shapes alone cannot catch
-        a mix-up — the transpose is semantic).
+        State layout contract: ``initial_state`` and a returned
+        ``final_state`` use the pool's V-first ``[N, H, V, K]`` layout. When
+        ``final_state_pool`` and ``final_state_indices`` are supplied, the
+        optimized path instead transposes and scatters its native K-first
+        output directly into the pool and returns ``final_state=None``. This
+        avoids materializing a V-first temporary before the pool write.
         """
+        if (final_state_pool is None) != (final_state_indices is None):
+            raise ValueError(
+                "final_state_pool and final_state_indices must be supplied together"
+            )
         use_optimized = self.prefill_kernel_path == "optimized"
         chunk_indices = None
         if use_optimized and cu_seqlens is not None:
@@ -342,11 +367,20 @@ class KDAKernelDispatch:
             if out.shape[1] != real_T:
                 out = out[:, :real_T]
             if final_state is not None and final_state.numel() > 0:
-                # Op K-first [N, H, K, V] -> pool V-first [N, H, V, K].
-                # .contiguous() also detaches the result from the op's
-                # shared per-shape S_out scratch, which the next same-shape
-                # call overwrites.
-                final_state = final_state.transpose(-1, -2).contiguous()
+                if final_state_pool is not None:
+                    state_module = _load_state_module()
+                    state_module.kda_state_transpose_scatter(
+                        final_state,
+                        final_state_pool,
+                        final_state_indices,
+                    )
+                    final_state = None
+                else:
+                    # Op K-first [N, H, K, V] -> V-first [N, H, V, K].
+                    # .contiguous() also detaches the result from the op's
+                    # shared per-shape S_out scratch, which the next
+                    # same-shape call overwrites.
+                    final_state = final_state.transpose(-1, -2).contiguous()
             return out, final_state
 
         from fla.ops.kda import chunk_kda

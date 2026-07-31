@@ -1139,8 +1139,8 @@ class KimiKDARuntime(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=mixer.head_dim)
 
         # Kernel dispatch (in-tree trtllm::kda_prefill or FLA chunk_kda).
-        # Both paths exchange states in the pool's V-first [N, H, V, K]
-        # layout, so recurrent_in / final_state map to ssm_pool 1:1.
+        # The optimized path transposes and scatters K4's K-first output
+        # directly into ssm_pool; FLA returns a dense V-first final_state.
         lower_bound = mixer.gate_lower_bound
         o, final_state = mixer.prefill_chunk_kda(
             q=q,
@@ -1155,13 +1155,19 @@ class KimiKDARuntime(nn.Module):
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            final_state_pool=ssm_pool,
+            final_state_indices=slot_indices,
         )
 
         # Persist per-request states into the pools.
         conv_pool.index_copy_(
             0, slot_indices,
             torch.cat([conv_q, conv_k, conv_v], dim=1).to(conv_pool.dtype))
-        ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
+        if final_state is not None:
+            # The optimized path scatters K4's K-first state directly into
+            # this V-first pool. FLA fallbacks still return a dense state.
+            ssm_pool.index_copy_(0, slot_indices,
+                                 final_state.to(ssm_pool.dtype))
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).
