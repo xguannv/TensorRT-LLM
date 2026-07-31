@@ -315,8 +315,8 @@ static constexpr uint32_t fhcSmemSize()
         + SMEM_RC + barriers * 8 + 4 + 32;
 }
 
-using FusedRoutFn
-    = void (*)(uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, float*, float*);
+using FusedRoutFn = void (*)(uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap,
+    float const*, float const*, float*, float*);
 
 template <uint32_t Hidden, uint32_t KS>
 static FusedRoutFn fhcInstance()
@@ -464,8 +464,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
     dim3 const grid(m_tiles * ks);
     dim3 const block(FHC_NUM_MMA_TH + FHC_NUM_PMAP_TH);
-    fa<<<grid, block, fused_smem, stream>>>(
-        m_u, desc_res, desc_x, desc_b, desc_res_out, desc_post, desc_comb, y_acc_workspace, r_acc_workspace);
+    fa<<<grid, block, fused_smem, stream>>>(m_u, desc_res, desc_x, desc_b, desc_res_out, desc_post, desc_comb,
+        post_mix_prev, comb_mix_prev, y_acc_workspace, r_acc_workspace);
 
     // ---- Step 2: big-fuse postlogue (RMS + sigmoid + Sinkhorn + pre-apply) ----
     // Delegate to mhcBigFuseLaunch (defined in mhcKernels.cu) to avoid
