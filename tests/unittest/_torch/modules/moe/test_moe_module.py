@@ -133,7 +133,7 @@ def _get_free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def test_external_comm_scheduler_staggers_a2a_chunk_dispatch(monkeypatch):
+def test_external_comm_scheduler_serializes_a2a_collectives(monkeypatch):
     log = []
     current_stream = {"name": "main"}
 
@@ -175,13 +175,19 @@ def test_external_comm_scheduler_staggers_a2a_chunk_dispatch(monkeypatch):
             current_stream["name"] = previous_stream
 
     comm = FakeComm()
-    dispatch_done = FakeEvent("dispatch_done")
     moe = SimpleNamespace(
         use_dp=False,
         enable_alltoall=True,
         comm=comm,
         aux_stream="aux",
-        _a2a_dispatch_done_event=dispatch_done,
+        _a2a_dispatch_done_events=(
+            FakeEvent("dispatch_done_0"),
+            FakeEvent("dispatch_done_1"),
+        ),
+        _a2a_compute_done_events=(
+            FakeEvent("compute_done_0"),
+            FakeEvent("compute_done_1"),
+        ),
         event_dict={
             EventType.Main: FakeEvent("main"),
             EventType.MoeChunkingOverlap: FakeEvent("join"),
@@ -192,40 +198,64 @@ def test_external_comm_scheduler_staggers_a2a_chunk_dispatch(monkeypatch):
         split_chunk=lambda token_count, num_chunks: [token_count // num_chunks] * num_chunks,
     )
     scheduler = ExternalCommMoEScheduler(moe)
-    next_chunk = iter(range(2))
 
-    def fake_forward_chunk_impl(x_chunk, *args, dispatch_done_event=None, **kwargs):
-        chunk_idx = next(next_chunk)
+    def fake_prepare_chunk_dispatch(x_chunk, router_logits, *args, **kwargs):
+        chunk_idx = int(x_chunk[0, 0].item() // 4)
         log.append(("dispatch", chunk_idx, current_stream["name"], comm.active_slot))
-        if dispatch_done_event is not None:
-            dispatch_done_event.record()
+        return x_chunk, None, None, None
+
+    def fake_run_chunk_moe(x_chunk, *args, **kwargs):
+        chunk_idx = int(x_chunk[0, 0].item() // 4)
         log.append(("compute", chunk_idx, current_stream["name"], comm.active_slot))
         return x_chunk
 
-    monkeypatch.setattr(torch.cuda, "stream", fake_cuda_stream)
-    monkeypatch.setattr(scheduler, "_forward_chunk_impl", fake_forward_chunk_impl)
+    def fake_combine_chunk(x_chunk, *args, **kwargs):
+        chunk_idx = int(x_chunk[0, 0].item() // 4)
+        log.append(("combine", chunk_idx, current_stream["name"], comm.active_slot))
+        return x_chunk
 
-    x = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    monkeypatch.setattr(torch.cuda, "stream", fake_cuda_stream)
+    monkeypatch.setattr(scheduler, "_prepare_chunk_dispatch", fake_prepare_chunk_dispatch)
+    monkeypatch.setattr(scheduler, "_run_chunk_moe", fake_run_chunk_moe)
+    monkeypatch.setattr(scheduler, "_combine_chunk", fake_combine_chunk)
+
+    x = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     output = scheduler._forward_multiple_chunks(
         x=x,
-        router_logits=torch.zeros((4, 2)),
-        num_chunks=2,
+        router_logits=torch.zeros((6, 2)),
+        num_chunks=3,
         output_dtype=torch.float32,
-        all_rank_num_tokens=[4],
+        all_rank_num_tokens=[6],
         use_dp_padding=False,
     )
 
     torch.testing.assert_close(output, x)
-    assert ("dispatch", 0, "aux", 0) in log
+    assert ("dispatch", 0, "main", 0) in log
     assert ("dispatch", 1, "main", 1) in log
-    assert log.index(("dispatch", 0, "aux", 0)) < log.index(
-        ("dispatch_done", "record", "aux")
-    )
-    assert log.index(("dispatch_done", "record", "aux")) < log.index(
+    assert ("dispatch", 2, "main", 0) in log
+    assert ("compute", 0, "aux", 0) in log
+    assert ("compute", 1, "aux", 1) in log
+    assert ("compute", 2, "aux", 0) in log
+    assert ("combine", 0, "main", 0) in log
+    assert ("combine", 1, "main", 1) in log
+    assert ("combine", 2, "main", 0) in log
+
+    communication_launches = [
+        entry for entry in log if entry[0] in {"dispatch", "combine"}
+    ]
+    assert communication_launches == [
+        ("dispatch", 0, "main", 0),
+        ("dispatch", 1, "main", 1),
+        ("combine", 0, "main", 0),
+        ("dispatch", 2, "main", 0),
+        ("combine", 1, "main", 1),
+        ("combine", 2, "main", 0),
+    ]
+    assert log.index(("dispatch_done_0", "wait", "aux")) < log.index(
         ("compute", 0, "aux", 0)
     )
-    assert log.index(("dispatch_done", "wait", "main")) < log.index(
-        ("dispatch", 1, "main", 1)
+    assert log.index(("compute_done_0", "wait", "main")) < log.index(
+        ("combine", 0, "main", 0)
     )
 
 

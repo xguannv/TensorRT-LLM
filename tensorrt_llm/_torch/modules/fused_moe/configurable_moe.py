@@ -228,15 +228,21 @@ class ConfigurableMoE(MoE):
             self.event_dict = {
                 key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeChunkingOverlap]
             }
-            self._a2a_dispatch_done_event = (
-                torch.cuda.Event()
+            self._a2a_dispatch_done_events = (
+                tuple(torch.cuda.Event() for _ in range(2))
                 if self.comm is not None and self.comm.supports_multi_stream_chunking()
+                else None
+            )
+            self._a2a_compute_done_events = (
+                tuple(torch.cuda.Event() for _ in range(2))
+                if self._a2a_dispatch_done_events is not None
                 else None
             )
         else:
             self.aux_stream = None
             self.event_dict = None
-            self._a2a_dispatch_done_event = None
+            self._a2a_dispatch_done_events = None
+            self._a2a_compute_done_events = None
 
         # Validate configuration
         self.validate_config()
