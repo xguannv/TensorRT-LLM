@@ -362,9 +362,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             // Load the two row-wise pmap coefficient tiles asynchronously.
             // Only the pmap warp group consumes them, so it waits on full_mix
             // independently while this warp continues filling input/B stages.
-            tma_copy<HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+            deep_gemm::tma::copy<HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
                 &tensor_map_post, full_mix, smem_post, /*inner_idx=*/0, m_offset);
-            tma_copy<HC_MULT * HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+            deep_gemm::tma::copy<HC_MULT * HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
                 &tensor_map_comb, full_mix, smem_comb, /*inner_idx=*/0, m_offset);
             full_mix->arrive_and_expect_tx(SMEM_POST_SIZE + SMEM_COMB_SIZE);
 
@@ -964,9 +964,9 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         {
             // Fetch coefficient tiles asynchronously while this warp starts
             // filling the regular input/B pipeline. Only pmap waits on full_mix.
-            tma_copy<HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+            deep_gemm::tma::copy<HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
                 &tensor_map_post, full_mix, smem_post, /*inner_idx=*/0, m_offset);
-            tma_copy<HC_MULT * HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
+            deep_gemm::tma::copy<HC_MULT * HC_MULT, BLOCK_M, /*kSwizzleMode=*/0>(
                 &tensor_map_comb, full_mix, smem_comb, /*inner_idx=*/0, m_offset);
             full_mix->arrive_and_expect_tx(SMEM_POST_SIZE + SMEM_COMB_SIZE);
 
