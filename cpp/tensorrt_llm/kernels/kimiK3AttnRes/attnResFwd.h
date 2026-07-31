@@ -38,9 +38,11 @@ struct AttnResFwdParams
 {
     __nv_bfloat16 const* blockResidual;   // [N-1, T, B, H], nullptr iff N == 1
     __nv_bfloat16 const* layerResidual;   // [T, B, H]
+    __nv_bfloat16 const* layerResidualAdd; // [T, B, H], optional fused addend
     __nv_bfloat16 const* resWeight;       // [H]
     __nv_bfloat16 const* rmsWeight;       // [H]
     __nv_bfloat16 const* outputRmsWeight; // [H], nullptr unless trailing RMSNorm is fused
+    __nv_bfloat16* updatedLayerResidual;  // [T, B, H], optional fused-add output
     __nv_bfloat16* output;                // [T, B, H]
     float* rsigma;                        // [N, T, B], optional
     float* probs;                         // [N, T, B], optional
@@ -60,6 +62,12 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream);
 //! same kernel. The BF16 attention-residual output rounding boundary is
 //! preserved before applying outputRmsWeight.
 void invokeAttnResRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream);
+
+//! Launches the production decode specialization with
+//! updatedLayerResidual = bf16(layerResidual + layerResidualAdd), then uses
+//! that rounded value as the final attention-residual candidate and fuses the
+//! immediately following RMSNorm. Supported only for T=B=1, H=7168.
+void invokeAttnResAddRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream);
 
 } // namespace kernels::kimiK3AttnRes
 

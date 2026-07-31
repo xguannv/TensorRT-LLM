@@ -225,6 +225,16 @@ attention-residual mixing and RMSNorm. Default: fused with fallback.
 _FUSED_ATTN_RES_RMSNORM_ENABLED = os.environ.get(
     KIMI_K3_FUSED_ATTN_RES_RMSNORM_ENV, "1") == "1"
 
+KIMI_K3_FUSED_ATTN_RES_ADD_RMSNORM_ENV = \
+    "KIMI_K3_FUSED_ATTN_RES_ADD_RMSNORM"
+"""Set to ``0`` to keep the attention-output residual add as a separate
+kernel. The fused path is decode-only and returns both the BF16-rounded
+updated prefix sum and the normalized attention-residual output.
+"""
+
+_FUSED_ATTN_RES_ADD_RMSNORM_ENABLED = os.environ.get(
+    KIMI_K3_FUSED_ATTN_RES_ADD_RMSNORM_ENV, "1") == "1"
+
 
 def _apply_attn_res_fused(prefix_sum: torch.Tensor,
                           block_residual: torch.Tensor, proj: nn.Linear,
@@ -299,6 +309,46 @@ def _apply_attn_res_rmsnorm_fused(
     return output.reshape(M, H)
 
 
+def _apply_attn_res_add_rmsnorm_fused(
+        prefix_sum: torch.Tensor, addend: torch.Tensor,
+        block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm,
+        output_norm: nn.Module
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fuse ``prefix_sum + addend``, attention-residual, and trailing norm.
+
+    The production residual add produces a BF16 tensor that remains live
+    across the following MLP. The kernel therefore returns that materialized,
+    BF16-rounded prefix sum alongside the normalized attention-residual
+    output, while avoiding a separate add launch and a re-read of the
+    intermediate by attention-residual selection.
+    """
+    if (prefix_sum.dtype is not torch.bfloat16
+            or addend.dtype is not torch.bfloat16 or not prefix_sum.is_cuda
+            or not addend.is_cuda or not block_residual.is_cuda
+            or prefix_sum.shape != addend.shape):
+        return None
+    M, H = prefix_sum.shape
+    K = int(block_residual.shape[0])
+    N = K + 1
+    if M != 1 or H != 7168 or (N > 9 and N != 12):
+        return None
+    try:
+        attn_res_add_rmsnorm_op = \
+            torch.ops.trtllm.attn_res_add_rmsnorm_fwd
+    except (AttributeError, RuntimeError):
+        return None
+    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
+    addend_kernel = addend.reshape(M, 1, H).contiguous()
+    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
+    updated_prefix_sum, output = attn_res_add_rmsnorm_op(
+        layer_kernel, addend_kernel, block_kernel,
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        output_norm.weight.to(torch.bfloat16).contiguous(), float(norm.eps),
+        _rms_norm_eps(output_norm))
+    return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
+
+
 def _apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor,
                     proj: nn.Linear, norm: KimiK3RMSNorm) -> torch.Tensor:
     """Exact port of HF ``modeling_kimi._apply_attn_res`` (fp32 math).
@@ -341,6 +391,22 @@ def _apply_attn_res_and_rmsnorm(
         if fused is not None:
             return fused
     return output_norm(_apply_attn_res(prefix_sum, block_residual, proj, norm))
+
+
+def _apply_attn_res_add_and_rmsnorm(
+        prefix_sum: torch.Tensor, addend: torch.Tensor,
+        block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm,
+        output_norm: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Add an attention output to the running residual, then select and norm."""
+    if (_FUSED_ATTN_RES_ENABLED and _FUSED_ATTN_RES_RMSNORM_ENABLED
+            and _FUSED_ATTN_RES_ADD_RMSNORM_ENABLED):
+        fused = _apply_attn_res_add_rmsnorm_fused(
+            prefix_sum, addend, block_residual, proj, norm, output_norm)
+        if fused is not None:
+            return fused
+    updated_prefix_sum = prefix_sum + addend
+    return updated_prefix_sum, _apply_attn_res_and_rmsnorm(
+        updated_prefix_sum, block_residual, proj, norm, output_norm)
 
 
 # ---------------------------------------------------------------------------
@@ -1959,14 +2025,16 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = self.self_attn(hidden_states, attn_metadata,
                                            mla_rt)
 
-        if prefix_sum is not None:
-            prefix_sum = prefix_sum + hidden_states
-        else:
+        if prefix_sum is None:
             prefix_sum = hidden_states
-
-        hidden_states = _apply_attn_res_and_rmsnorm(
-            prefix_sum, block_residual, self.mlp_res_proj, self.mlp_res_norm,
-            self.post_attention_layernorm)
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                prefix_sum, block_residual, self.mlp_res_proj,
+                self.mlp_res_norm, self.post_attention_layernorm)
+        else:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                prefix_sum, hidden_states, block_residual,
+                self.mlp_res_proj, self.mlp_res_norm,
+                self.post_attention_layernorm)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states,
@@ -2024,7 +2092,8 @@ class KimiLinearModel(DecoderModel):
         logger.info_once(
             "Kimi K3 attention-residual kernels: "
             f"attn_res={_FUSED_ATTN_RES_ENABLED}, "
-            f"trailing_rmsnorm={_FUSED_ATTN_RES_RMSNORM_ENABLED}",
+            f"trailing_rmsnorm={_FUSED_ATTN_RES_RMSNORM_ENABLED}, "
+            f"attention_add={_FUSED_ATTN_RES_ADD_RMSNORM_ENABLED}",
             key="kimi_k3_attn_res_fusion")
 
         self.has_mla = any(not layer.is_kda for layer in self.layers)

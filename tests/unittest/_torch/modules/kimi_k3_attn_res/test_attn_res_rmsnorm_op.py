@@ -13,6 +13,8 @@ from tensorrt_llm._torch.models import modeling_kimi_linear
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     KimiK3RMSNorm,
     _apply_attn_res,
+    _apply_attn_res_add_and_rmsnorm,
+    _apply_attn_res_add_rmsnorm_fused,
     _apply_attn_res_and_rmsnorm,
     _apply_attn_res_rmsnorm_fused,
 )
@@ -126,6 +128,26 @@ def _fused(
     )
 
 
+def _fused_add(
+    layer_residual: torch.Tensor,
+    layer_residual_add: torch.Tensor,
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    score_rms_weight: torch.Tensor,
+    output_rms_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.trtllm.attn_res_add_rmsnorm_fwd(
+        layer_residual,
+        layer_residual_add,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+        ATTN_RES_RMS_EPS,
+        OUTPUT_RMS_EPS,
+    )
+
+
 def _similarity(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -191,6 +213,190 @@ def test_attn_res_rmsnorm_cuda_graph_replay() -> None:
     cosine, relative_l2 = _similarity(actual, expected)
     assert cosine > 0.9999
     assert relative_l2 < 5e-3
+
+
+@pytest.mark.parametrize("num_snapshots", list(range(9)) + [11])
+@torch.no_grad()
+def test_attn_res_add_rmsnorm_matches_separate_add(
+    num_snapshots: int,
+) -> None:
+    inputs = _make_inputs(num_tokens=1, num_snapshots=num_snapshots)
+    layer_residual_add = (
+        torch.randn_like(inputs[0]) * 0.05
+    ).contiguous()
+    expected_updated = inputs[0] + layer_residual_add
+    expected_output = _unfused_reference(
+        expected_updated,
+        inputs[1],
+        inputs[2],
+        inputs[3],
+        inputs[4],
+    )
+    actual_updated, actual_output = _fused_add(
+        inputs[0],
+        layer_residual_add,
+        inputs[1],
+        inputs[2],
+        inputs[3],
+        inputs[4],
+    )
+
+    assert torch.equal(actual_updated, expected_updated)
+    cosine, relative_l2 = _similarity(actual_output, expected_output)
+    assert cosine > 0.9999
+    assert relative_l2 < 5e-3
+
+
+@pytest.mark.parametrize("num_snapshots", [3, 7, 8])
+@torch.no_grad()
+def test_attn_res_add_rmsnorm_cuda_graph_replay(
+    num_snapshots: int,
+) -> None:
+    inputs = _make_inputs(num_tokens=1, num_snapshots=num_snapshots)
+    layer_residual_add = (
+        torch.randn_like(inputs[0]) * 0.05
+    ).contiguous()
+    expected_updated = inputs[0] + layer_residual_add
+    expected_output = _unfused_reference(
+        expected_updated,
+        inputs[1],
+        inputs[2],
+        inputs[3],
+        inputs[4],
+    )
+
+    _fused_add(inputs[0], layer_residual_add, *inputs[1:])
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_updated, actual_output = _fused_add(
+            inputs[0], layer_residual_add, *inputs[1:])
+    for _ in range(100):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_updated, expected_updated)
+    cosine, relative_l2 = _similarity(actual_output, expected_output)
+    assert cosine > 0.9999
+    assert relative_l2 < 5e-3
+
+
+@torch.no_grad()
+def test_model_helper_dispatches_fused_attn_res_add_rmsnorm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layer_residual,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    ) = _make_inputs(num_tokens=1, num_snapshots=3)
+    layer_residual_add = (
+        torch.randn_like(layer_residual) * 0.05
+    ).contiguous()
+    projection = nn.Linear(
+        HIDDEN_SIZE,
+        1,
+        bias=False,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    score_norm = KimiK3RMSNorm(
+        HIDDEN_SIZE,
+        eps=ATTN_RES_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    output_norm = RMSNorm(
+        hidden_size=HIDDEN_SIZE,
+        eps=OUTPUT_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    projection.weight.copy_(res_weight.reshape(1, -1))
+    score_norm.weight.copy_(score_rms_weight)
+    output_norm.weight.copy_(output_rms_weight)
+
+    prefix_sum = layer_residual[:, 0, :]
+    addend = layer_residual_add[:, 0, :]
+    block_kernel_layout = block_residual[:, :, 0, :]
+    expected_updated = prefix_sum + addend
+    expected_output = output_norm(
+        _apply_attn_res(
+            expected_updated,
+            block_kernel_layout,
+            projection,
+            score_norm,
+        )
+    )
+    unexpected_fallback = mock.Mock(
+        side_effect=AssertionError("model helper did not dispatch fused add")
+    )
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "_apply_attn_res_and_rmsnorm",
+        unexpected_fallback,
+    )
+    actual_updated, actual_output = _apply_attn_res_add_and_rmsnorm(
+        prefix_sum,
+        addend,
+        block_kernel_layout,
+        projection,
+        score_norm,
+        output_norm,
+    )
+
+    unexpected_fallback.assert_not_called()
+    assert torch.equal(actual_updated, expected_updated)
+    cosine, relative_l2 = _similarity(actual_output, expected_output)
+    assert cosine > 0.9999
+    assert relative_l2 < 5e-3
+
+
+@torch.no_grad()
+def test_model_helper_rejects_multi_token_fused_add() -> None:
+    (
+        layer_residual,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    ) = _make_inputs(num_tokens=64, num_snapshots=5)
+    layer_residual_add = (
+        torch.randn_like(layer_residual) * 0.05
+    ).contiguous()
+    projection = nn.Linear(
+        HIDDEN_SIZE,
+        1,
+        bias=False,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    score_norm = KimiK3RMSNorm(
+        HIDDEN_SIZE,
+        eps=ATTN_RES_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    output_norm = RMSNorm(
+        hidden_size=HIDDEN_SIZE,
+        eps=OUTPUT_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    projection.weight.copy_(res_weight.reshape(1, -1))
+    score_norm.weight.copy_(score_rms_weight)
+    output_norm.weight.copy_(output_rms_weight)
+
+    assert _apply_attn_res_add_rmsnorm_fused(
+        layer_residual[:, 0, :],
+        layer_residual_add[:, 0, :],
+        block_residual[:, :, 0, :],
+        projection,
+        score_norm,
+        output_norm,
+    ) is None
 
 
 @pytest.mark.parametrize(
