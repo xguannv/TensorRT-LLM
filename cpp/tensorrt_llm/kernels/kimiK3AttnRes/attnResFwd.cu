@@ -1457,15 +1457,24 @@ attn_res_fwd_s1_splitk_kernel(
 
     // One thread per candidate reduces across CTA ranks.  Parallelizing this
     // avoids making a single leader issue all GROUPS*N remote DSM reads.
+    float2 cluster_total = {};
     if (tid < N) {
-        float2 total = {};
         #pragma unroll
         for (int g = 0; g < GROUPS; g++) {
             const float2* remote_stats =
                 cluster.map_shared_rank(warp_stats, g);
-            total = float2_add(total, remote_stats[tid]);
+            cluster_total = float2_add(cluster_total, remote_stats[tid]);
         }
-        warp_stats[tid] = total;
+    }
+
+    // No rank may overwrite its published DSM partial until every other rank
+    // has finished reading it.  This second cluster barrier is required even
+    // though every rank traverses the same remote-rank loop: CTAs can make
+    // progress independently, especially at the higher-register N=9/12
+    // specializations.
+    cluster.sync();
+    if (tid < N) {
+        warp_stats[tid] = cluster_total;
     }
     __syncthreads();
 
@@ -1550,7 +1559,12 @@ attn_res_fwd_s1_splitk_kernel(
             weights[0] =
                 rsqrtf(output_sq / H + output_rms_eps);
         }
-        __syncthreads();
+
+        // Keep every source CTA alive until all remote DSM reads above have
+        // completed.  A block-local barrier is insufficient: a faster CTA
+        // could otherwise leave the cluster while a peer still reads its
+        // rank-local output-square partial.
+        cluster.sync();
 
         float const output_rsigma = weights[0];
         #pragma unroll
