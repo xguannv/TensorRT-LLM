@@ -2462,6 +2462,140 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+@pytest.mark.skipif(
+    MPI.COMM_WORLD.Get_size() != 4,
+    reason="run with four direct MPI ranks to exercise concurrent MNNVL workspaces",
+)
+def test_nvlink_onesided_two_workspace_overlap():
+    """Run two correct A2A pipelines concurrently on independent workspaces."""
+    mpi_world = MPI.COMM_WORLD
+    rank = mpi_world.Get_rank()
+    local_rank = int(os.environ.get("SLURM_LOCALID", rank))
+    torch.cuda.set_device(0 if torch.cuda.device_count() == 1 else local_rank)
+
+    config = CommTestConfig(
+        comm_type=COMM_NVLINK_ONE_SIDED,
+        ep_size=4,
+        num_experts=FIXED_NUM_EXPERTS,
+        top_k=2,
+        hidden_size=1024,
+        all_num_tokens=[8] * 4,
+    )
+    mapping = Mapping(
+        rank=rank,
+        tp_size=config.ep_size,
+        moe_ep_size=config.ep_size,
+        world_size=config.ep_size,
+    )
+    comm = None
+    try:
+        comm = NVLinkOneSided(
+            mapping=mapping,
+            num_slots=config.num_experts,
+            top_k=config.top_k,
+            max_num_tokens_per_rank=max(config.all_num_tokens),
+            hidden_size=config.hidden_size,
+            dtype=torch.bfloat16,
+            num_workspace_slots=2,
+        )
+        worker_inputs = [_prepare_worker_inputs(rank, config) for _ in range(2)]
+
+        aux_stream = torch.cuda.Stream()
+        main_ready = torch.cuda.Event()
+        dispatch_done = torch.cuda.Event()
+        aux_done = torch.cuda.Event()
+        main_ready.record()
+        with torch.cuda.stream(aux_stream):
+            main_ready.wait()
+
+        def run_compute_and_combine(
+            dispatch_outputs: DispatchOutputs,
+            inputs: WorkerInputs,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            recv_hs_bf16 = _to_bf16(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_sf,
+                inputs.global_scale,
+                config.quant_mode,
+            )
+            _, local_slot_start, local_slot_end = _compute_ep_partition(
+                config.num_experts, config.ep_size, rank
+            )
+            moe_output = simple_moe(
+                recv_hs_bf16,
+                dispatch_outputs.recv_slots,
+                dispatch_outputs.recv_scales,
+                local_slot_start,
+                local_slot_end,
+            )
+            combined = comm.combine(
+                moe_output,
+                all_rank_max_num_tokens=max(config.all_num_tokens),
+            )
+            return moe_output, combined
+
+        with comm.workspace_slot(0), torch.cuda.stream(aux_stream):
+            dispatch_0 = _run_worker_dispatch(comm, worker_inputs[0], config)
+            dispatch_done.record()
+            moe_output_0, combined_0 = run_compute_and_combine(
+                dispatch_0, worker_inputs[0]
+            )
+
+        dispatch_done.wait()
+        with comm.workspace_slot(1):
+            dispatch_1 = _run_worker_dispatch(comm, worker_inputs[1], config)
+            moe_output_1, combined_1 = run_compute_and_combine(
+                dispatch_1, worker_inputs[1]
+            )
+
+        with torch.cuda.stream(aux_stream):
+            aux_done.record()
+        aux_done.wait()
+        torch.cuda.synchronize()
+
+        rank_results = []
+        for inputs, dispatch_outputs, moe_output, combined in (
+            (worker_inputs[0], dispatch_0, moe_output_0, combined_0),
+            (worker_inputs[1], dispatch_1, moe_output_1, combined_1),
+        ):
+            recv_source_info = decode_source_info(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_hs.dtype,
+                dispatch_outputs.recv_hs.shape[1],
+            )
+            rank_results.append(
+                _build_worker_result(
+                    rank,
+                    inputs,
+                    dispatch_outputs,
+                    combined,
+                    moe_output,
+                    recv_source_info,
+                    config,
+                )
+            )
+
+        gathered_results = mpi_world.gather(rank_results, root=0)
+        verification_error = None
+        if rank == 0:
+            try:
+                for chunk_idx in range(2):
+                    chunk_results = [
+                        result_per_rank[chunk_idx] for result_per_rank in gathered_results
+                    ]
+                    verify_dispatch_results(chunk_results, config)
+                    verify_combine_results(chunk_results, config)
+            except Exception:
+                verification_error = traceback.format_exc()
+        verification_error = mpi_world.bcast(verification_error, root=0)
+        assert verification_error is None, verification_error
+    finally:
+        mpi_world.Barrier()
+        if comm is not None:
+            comm.destroy()
+        mpi_world.Barrier()
+
+
 # ============================================================================
 # Test Class
 # ============================================================================
