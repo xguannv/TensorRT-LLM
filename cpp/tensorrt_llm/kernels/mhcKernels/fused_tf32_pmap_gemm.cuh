@@ -352,8 +352,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     }
     uint32_t const num_total_stages = h_tiles_this_split * HC_MULT;
 
-    // Pmap threads load their own post_mix/comb_mix rows directly into registers,
-    // so the MMA/TMA warps can start filling the TMA pipeline immediately.
+    // The TMA warp loads the post_mix/comb_mix tiles into shared memory,
+    // then continues filling the regular input/B pipeline while pmap waits on full_mix.
     if (warp_idx < kNumMMAThreads / 32)
     {
         // ----- TMA warp (warp 0) -----
@@ -510,26 +510,20 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
-        {
-            static_assert(HC_MULT == 4, "float4 row loads assume HC_MULT == 4");
-            const uint32_t gm_u = m_offset + upper_row;
-            const uint32_t gm_l = m_offset + lower_row;
-            auto load_row4
-                = [](float const* base, uint32_t row, uint32_t row_floats, uint32_t vec_idx, bool valid) -> float4
-            {
-                if (!valid)
-                    return float4{0.f, 0.f, 0.f, 0.f};
-                return __ldg(reinterpret_cast<float4 const*>(base + row * row_floats) + vec_idx);
-            };
-            bool const valid_u = gm_u < shape_m;
-            bool const valid_l = gm_l < shape_m;
-            *reinterpret_cast<float4*>(pm_u) = load_row4(post_mix, gm_u, HC_MULT, 0, valid_u);
-            *reinterpret_cast<float4*>(pm_l) = load_row4(post_mix, gm_l, HC_MULT, 0, valid_l);
 #pragma unroll
-            for (uint32_t j = 0; j < HC_MULT; ++j)
+        for (uint32_t hc = 0; hc < HC_MULT; ++hc)
+        {
+            pm_u[hc] = smem_post[upper_row * HC_MULT + hc];
+            pm_l[hc] = smem_post[lower_row * HC_MULT + hc];
+        }
+#pragma unroll
+        for (uint32_t j = 0; j < HC_MULT; ++j)
+        {
+#pragma unroll
+            for (uint32_t hc = 0; hc < HC_MULT; ++hc)
             {
-                *reinterpret_cast<float4*>(cm_u[j]) = load_row4(comb_mix, gm_u, HC_MULT * HC_MULT, j, valid_u);
-                *reinterpret_cast<float4*>(cm_l[j]) = load_row4(comb_mix, gm_l, HC_MULT * HC_MULT, j, valid_l);
+                cm_u[j][hc] = smem_comb[upper_row * HC_MULT * HC_MULT + j * HC_MULT + hc];
+                cm_l[j][hc] = smem_comb[lower_row * HC_MULT * HC_MULT + j * HC_MULT + hc];
             }
         }
 
