@@ -43,7 +43,7 @@ import torch  # noqa
 
 
 def _setup_cutlass_dsl_compatibility():
-    """Expose legacy CuTe type locations required by bundled dependencies."""
+    """Expose legacy CuTe APIs required by TensorRT-LLM and its dependencies."""
     try:
         import cutlass.cute as cute
     except ImportError:
@@ -56,6 +56,10 @@ def _setup_cutlass_dsl_compatibility():
     for name in ("ThrCopy", "ThrMma"):
         if hasattr(cute, name) and not hasattr(cute.core, name):
             setattr(cute.core, name, getattr(cute, name))
+
+    # CUTLASS DSL renamed make_fragment to make_rmem_tensor.
+    if hasattr(cute, "make_rmem_tensor") and not hasattr(cute, "make_fragment"):
+        cute.make_fragment = cute.make_rmem_tensor
 
 
 _setup_cutlass_dsl_compatibility()
