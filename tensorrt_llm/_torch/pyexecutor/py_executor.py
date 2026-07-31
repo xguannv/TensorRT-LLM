@@ -1053,6 +1053,8 @@ class PyExecutor:
         # adding an unnecessary polling delay after synchronous progress.
         self._sync_disagg_transfer_made_progress = False
         self._benchmark_sync_progress_global = False
+        self._benchmark_local_terminal_no_fit = False
+        self._benchmark_has_insufficient_kv_global = False
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
@@ -3710,13 +3712,13 @@ class PyExecutor:
             return 1
 
     def _allgather_model_parallel_status(
-            self, local_status: Tuple[int, bool]) -> List[Tuple[int, bool]]:
-        """Gather a status over the TP+CP scheduling group.
+        self, local_status: Tuple[int, bool, int, bool]
+    ) -> List[Tuple[int, bool, int, bool]]:
+        """Gather benchmark fill status over the TP+CP scheduling group.
 
         Args:
-            local_status: Caller-defined ``(state, flag)`` pair from this rank.
-                The fill gate uses ``(ready, synchronous_progress)`` and the
-                fail-fast path uses ``(all_fetched, terminal_no_fit)``.
+            local_status: ``(ready, synchronous_progress, all_fetched,
+                terminal_no_fit)`` status from this rank.
 
         Returns:
             One status pair per TP+CP rank in the current pipeline-parallel
@@ -3798,16 +3800,15 @@ class PyExecutor:
                 # blocking on un-finished ones.
                 self._check_disagg_ctx_cache_transfer_status(0)
 
-    def _sync_gen_only_benchmark_has_insufficient_kv(
+    def _gen_only_benchmark_has_terminal_kv_exhaustion(
             self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],
             wait_for_disagg_gen_transfer_progress: bool) -> bool:
-        """Return whether benchmark fill has terminal KV exhaustion.
+        """Return whether this rank has terminal benchmark KV exhaustion.
 
-        Model-parallel ranks can make different local scheduling decisions.
-        Every rank must therefore vote before entering the collective error-
-        handling path. One terminal rank prevents the global benchmark fill
-        gate from opening. The vote is fill-only to avoid adding a collective
-        to every decode iteration after the gate opens.
+        This method is deliberately local because a synchronous generation
+        receive can block on only a subset of model-parallel ranks. The result
+        is included in the existing benchmark fill-gate collective after each
+        rank returns from scheduling.
 
         Args:
             scheduler_fitting_disagg_gen_init_requests: Generation INIT
@@ -3819,8 +3820,7 @@ class PyExecutor:
                 progress can unblock a deferred request.
 
         Returns:
-            True when every TP+CP rank has fetched its full benchmark queue and
-            at least one rank has an INIT request that cannot fit KV capacity
+            True when this rank has an INIT request that cannot fit KV capacity
             and has no transfer progress that can unblock it; otherwise False.
         """
         if (self.benchmark_req_queues_size <= 0 or self.is_warmup
@@ -3829,20 +3829,13 @@ class PyExecutor:
 
         local_has_stuck = any(req.is_disagg_generation_init_state
                               for req in self.active_requests)
-        local_all_fetched = (self.num_fetch_requests
-                             >= self.benchmark_req_queues_size)
-        local_terminal_no_fit = (local_has_stuck and
-                                 not scheduler_fitting_disagg_gen_init_requests
-                                 and not wait_for_disagg_gen_transfer_progress)
-        local_status = (local_all_fetched, local_terminal_no_fit)
-
-        all_rank_status = self._allgather_model_parallel_status(local_status)
-        all_ranks_fetched = all(status[0] for status in all_rank_status)
-        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
-        return all_ranks_fetched and any_rank_terminal_no_fit
+        return (local_has_stuck
+                and not scheduler_fitting_disagg_gen_init_requests
+                and not wait_for_disagg_gen_transfer_progress)
 
     def _prepare_and_schedule_batch(self):
         self._sync_disagg_transfer_made_progress = False
+        self._benchmark_local_terminal_no_fit = False
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -3973,22 +3966,10 @@ class PyExecutor:
             # Check the scheduler result from before transfer admission. An
             # empty admitted list can mean that active transfers are
             # temporarily consuming the transfer budget.
-            has_insufficient_kv = self._sync_gen_only_benchmark_has_insufficient_kv(
-                scheduler_fitting_disagg_gen_init_requests,
-                wait_for_disagg_gen_transfer_progress)
-            if has_insufficient_kv:
-                error_msg = (
-                    f"Insufficient KV cache for gen-only benchmark mode: "
-                    f"one or more requests are waiting for KV cache allocation "
-                    f"on a model-parallel rank whose scheduler could not fit "
-                    f"any of them. Increase free_gpu_memory_fraction or reduce "
-                    f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} (currently "
-                    f"{self.benchmark_req_queues_size}).")
-                logger.error(error_msg)
-                # Fail all active and waiting requests on every rank so every
-                # client receives an error instead of hanging.
-                self._handle_errors(error_msg, requests=self.active_requests)
-                return None, None
+            self._benchmark_local_terminal_no_fit = (
+                self._gen_only_benchmark_has_terminal_kv_exhaustion(
+                    scheduler_fitting_disagg_gen_init_requests,
+                    wait_for_disagg_gen_transfer_progress))
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -4079,13 +4060,19 @@ class PyExecutor:
 
         local_ok = int(local_all_fetched and local_all_past_transfer
                        and local_no_inflight)
-        local_status = (local_ok, bool(local_sync_progress))
+        local_status = (local_ok, bool(local_sync_progress),
+                        int(local_all_fetched),
+                        self._benchmark_local_terminal_no_fit)
 
         all_rank_status = self._allgather_model_parallel_status(local_status)
         all_ranks_ok = [status[0] for status in all_rank_status]
         global_ok = min(all_ranks_ok) == 1
         self._benchmark_sync_progress_global = any(
             status[1] for status in all_rank_status)
+        all_ranks_fetched = all(status[2] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(status[3] for status in all_rank_status)
+        self._benchmark_has_insufficient_kv_global = (all_ranks_fetched and
+                                                      any_rank_terminal_no_fit)
 
         if self.dist.rank == 0:
             if global_ok:
@@ -4141,6 +4128,17 @@ class PyExecutor:
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch, sync_transfer_made_progress)
             sync_transfer_made_progress = self._benchmark_sync_progress_global
+            if self._benchmark_has_insufficient_kv_global:
+                error_msg = (
+                    f"Insufficient KV cache for gen-only benchmark mode: "
+                    f"one or more requests are waiting for KV cache allocation "
+                    f"on a model-parallel rank whose scheduler could not fit "
+                    f"any of them. Increase free_gpu_memory_fraction or reduce "
+                    f"TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                    f"{self.benchmark_req_queues_size}).")
+                logger.error(error_msg)
+                self._handle_errors(error_msg, requests=self.active_requests)
+                return False, False
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
@@ -4288,6 +4286,8 @@ class PyExecutor:
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
+                if self._benchmark_has_insufficient_kv_global:
+                    break
                 if should_retry:
                     if self._is_kv_manager_v2:
                         for req in scheduled_batch.generation_requests:
@@ -5112,6 +5112,8 @@ class PyExecutor:
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
+                if self._benchmark_has_insufficient_kv_global:
+                    break
                 if should_retry:
                     if self._is_kv_manager_v2:
                         for req in scheduled_batch.generation_requests:

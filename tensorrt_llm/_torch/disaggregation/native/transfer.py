@@ -849,7 +849,6 @@ class Sender(SenderBase):
                 continue
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
-
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
@@ -862,6 +861,31 @@ class Sender(SenderBase):
                 peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
                 beam_width=task._beam_width,
             )
+
+            # Both sides trim block lists to ceil(prompt_len / tpb) in
+            # _create_kv_slice, so dst must never exceed src. A smaller dst
+            # (generation prefix-cache reuse) is handled via dst_start below.
+            block_diff = dst_block_ids.size - src_block_ids.size
+            if block_diff > 0:
+                src_blocks = np.array2string(src_block_ids, threshold=16, edgeitems=4)
+                dst_blocks = np.array2string(dst_block_ids, threshold=16, edgeitems=4)
+                logger.error(
+                    f"KV block-count mismatch: unique_rid={req_info.unique_rid}, "
+                    f"sender_req_id={req_info.sender_req_id}, slice_id={task.slice_id}, "
+                    f"peer={req_info.instance_name}:{req_info.instance_rank}, "
+                    f"self_layer_group={self_lg}, self_pool={self_pi}, "
+                    f"peer_layer_group={peer_lg}, peer_pool={peer_pi}, "
+                    f"prompt_len={task._prompt_len}, token_range={token_range}, "
+                    f"dst_start_token={req_info.dst_start_token}, "
+                    f"tokens_per_block={tpb}, beam_width={task._beam_width}, "
+                    f"src_count={src_block_ids.size}, dst_count={dst_block_ids.size}, "
+                    f"src_blocks={src_blocks}, dst_blocks={dst_blocks}"
+                )
+                raise ValueError(
+                    f"src/dst block count mismatch: {src_block_ids.size} vs "
+                    f"{dst_block_ids.size} (dst must not exceed src)"
+                )
+
 
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
