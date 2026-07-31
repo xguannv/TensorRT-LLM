@@ -145,9 +145,13 @@ def _similarity(
     [
         (1, 0),  # N=1 single-CTA decode
         (1, 1),  # N=2 single-CTA decode
-        (1, 2),  # N=3 general decode
+        (1, 2),  # N=3 single-CTA decode
         (1, 3),  # N=4 single-CTA decode
+        (1, 4),  # N=5 CTA-cluster decode
+        (1, 5),  # N=6 CTA-cluster decode
+        (1, 6),  # N=7 CTA-cluster decode
         (1, 7),  # N=8 CTA-cluster decode
+        (1, 8),  # N=9 CTA-cluster decode
         (1, 11),  # N=12 CTA-cluster decode
         (16, 1),  # multi-token general path
         (64, 5),  # multi-token, partially filled candidate chunk

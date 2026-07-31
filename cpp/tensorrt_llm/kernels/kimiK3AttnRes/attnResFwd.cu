@@ -214,6 +214,8 @@ struct FwdSmemPlan {
     alignas(16) uint64_t bar_consumed[CHUNK_DEPTH];
     alignas(16) float2 ws_stats[CONSUMER_WARPS][NC];
     alignas(16) float logits_all[N_MAX];
+    alignas(16) float output_sq[CONSUMER_WARPS];
+    float output_rsigma;
     uint32_t tmem_base;
 };
 
@@ -752,23 +754,25 @@ attn_res_fwd_online_v2_kernel(
                         0xffffffff, output_sq_local, offset);
                 }
                 if (lane == 0) {
-                    plan.ws_stats[comp_wid][0].x = output_sq_local;
+                    plan.output_sq[comp_wid] = output_sq_local;
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
                 if (comp_wid == 0 && lane == 0) {
                     float output_sq = 0.f;
                     #pragma unroll
                     for (int w = 0; w < CONSUMER_WARPS; w++) {
-                        output_sq += plan.ws_stats[w][0].x;
+                        output_sq += plan.output_sq[w];
                     }
-                    plan.ws_stats[0][0].x =
+                    plan.output_rsigma =
                         rsqrtf(output_sq / H + output_rms_eps);
                 }
                 cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
-                output_rsigma = plan.ws_stats[0][0].x;
-                // No consumer may reuse ws_stats for the next token until all
-                // consumers have read the shared output scale.
-                cutlass::arch::NamedBarrier::sync(CONSUMER_THREADS, 1);
+                output_rsigma = plan.output_rsigma;
+                // The next token may overwrite output_sq immediately.  It
+                // cannot overwrite output_rsigma until its first reduction
+                // barrier, by which point every consumer has finished reading
+                // this token's scale.  Keeping output state separate from
+                // ws_stats removes the former third barrier per token.
             }
 
             #pragma unroll
@@ -1128,8 +1132,9 @@ static void launch_fwd(
 
 // Small-N counterpart to the Triton one-program topology.  One CTA owns the
 // complete token, with exactly 28 hidden elements per thread at H=7168.  For
-// N=2/4, packed BF16 V remains in registers across the statistics/softmax
-// boundary; N=1 can write V directly because its softmax is identically one.
+// N=2/3/4, packed BF16 V remains in registers across the statistics/softmax
+// boundary.  The fused output is also retained in registers for the trailing
+// RMSNorm, preserving the BF16 boundary without a shared-memory round trip.
 template <int N, bool FUSE_OUTPUT_RMS_NORM = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_single_cta_kernel(
@@ -1152,12 +1157,10 @@ attn_res_fwd_s1_single_cta_kernel(
     constexpr int ITEMS = H / THREADS;
     constexpr float LOG2_E = 1.4426950408889634f;
     static_assert(H % THREADS == 0);
-    static_assert(N == 1 || N == 2 || N == 4);
+    static_assert(N >= 1 && N <= 4);
 
     __shared__ float2 warp_stats[WARPS * N];
     __shared__ float weights[N];
-    __shared__ bf16_t mixed_cache[
-        FUSE_OUTPUT_RMS_NORM ? H : 1];
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -1165,6 +1168,7 @@ attn_res_fwd_s1_single_cta_kernel(
     float2 stats[N] = {};
     float output_sq_local = 0.f;
     uint32_t v_cache_bf16[ITEMS][(N + 1) / 2];
+    bf16_t mixed_cache[ITEMS];
     #pragma unroll
     for (int item = 0; item < ITEMS; item++) {
         int h = tid + item * THREADS;
@@ -1180,7 +1184,7 @@ attn_res_fwd_s1_single_cta_kernel(
             float v = __bfloat162float(packed_v);
             if constexpr (N == 1) {
                 if constexpr (FUSE_OUTPUT_RMS_NORM) {
-                    mixed_cache[h] = packed_v;
+                    mixed_cache[item] = packed_v;
                     output_sq_local =
                         fmaf(v, v, output_sq_local);
                 } else {
@@ -1202,6 +1206,15 @@ attn_res_fwd_s1_single_cta_kernel(
                 packed.bf16x2 = __halves2bfloat162(
                     item_v[2 * pair], item_v[2 * pair + 1]);
                 v_cache_bf16[item][pair] = packed.bits;
+            }
+            if constexpr (N % 2 == 1) {
+                union {
+                    __nv_bfloat162 bf16x2;
+                    uint32_t bits;
+                } packed;
+                packed.bf16x2 = __halves2bfloat162(
+                    item_v[N - 1], __float2bfloat16_rn(0.f));
+                v_cache_bf16[item][N / 2] = packed.bits;
             }
         }
     }
@@ -1277,10 +1290,19 @@ attn_res_fwd_s1_single_cta_kernel(
                 value = fmaf(weights[2 * pair], v.x, value);
                 value = fmaf(weights[2 * pair + 1], v.y, value);
             }
+            if constexpr (N % 2 == 1) {
+                union {
+                    __nv_bfloat162 bf16x2;
+                    uint32_t bits;
+                } packed;
+                packed.bits = v_cache_bf16[item][N / 2];
+                float2 v = __bfloat1622float2(packed.bf16x2);
+                value = fmaf(weights[N - 1], v.x, value);
+            }
             int h = tid + item * THREADS;
             bf16_t const mixed = __float2bfloat16_rn(value);
             if constexpr (FUSE_OUTPUT_RMS_NORM) {
-                mixed_cache[h] = mixed;
+                mixed_cache[item] = mixed;
                 float const mixed_float = __bfloat162float(mixed);
                 output_sq_local = fmaf(
                     mixed_float, mixed_float, output_sq_local);
@@ -1312,7 +1334,7 @@ attn_res_fwd_s1_single_cta_kernel(
         for (int item = 0; item < ITEMS; item++) {
             int h = tid + item * THREADS;
             output[h] = apply_output_rms_norm(
-                mixed_cache[h], output_rsigma, output_rms_w[h]);
+                mixed_cache[item], output_rsigma, output_rms_w[h]);
         }
     }
 #else
@@ -1369,6 +1391,7 @@ attn_res_fwd_s1_splitk_kernel(
     constexpr int K_PER_CTA = H / GROUPS;
     constexpr int THREADS = 256;
     constexpr int WARPS = THREADS / 32;
+    constexpr int ITEMS = (K_PER_CTA + THREADS - 1) / THREADS;
     constexpr float LOG2_E = 1.4426950408889634f;
     static_assert(H % GROUPS == 0);
 
@@ -1478,8 +1501,10 @@ attn_res_fwd_s1_splitk_kernel(
     cluster.sync();
 
     float output_sq_local = 0.f;
+    bf16_t mixed_cache[ITEMS];
     #pragma unroll
-    for (int ki = tid; ki < K_PER_CTA; ki += THREADS) {
+    for (int ki = tid, item = 0; ki < K_PER_CTA;
+         ki += THREADS, item++) {
         float value = 0.0f;
         #pragma unroll
         for (int n = 0; n < N; n++) {
@@ -1489,9 +1514,7 @@ attn_res_fwd_s1_splitk_kernel(
         bf16_t const mixed = __float2bfloat16_rn(value);
         if constexpr (FUSE_OUTPUT_RMS_NORM) {
             float const mixed_float = __bfloat162float(mixed);
-            // The first candidate row is dead after mixing. Reuse it to
-            // retain the BF16-rounded attention-residual output.
-            v_cache[ki] = mixed_float;
+            mixed_cache[item] = mixed;
             output_sq_local = fmaf(
                 mixed_float, mixed_float, output_sq_local);
         } else {
@@ -1531,12 +1554,11 @@ attn_res_fwd_s1_splitk_kernel(
 
         float const output_rsigma = weights[0];
         #pragma unroll
-        for (int ki = tid; ki < K_PER_CTA; ki += THREADS) {
-            bf16_t const mixed =
-                __float2bfloat16_rn(v_cache[ki]);
+        for (int ki = tid, item = 0; ki < K_PER_CTA;
+             ki += THREADS, item++) {
             int const h = h_begin + ki;
             output[h] = apply_output_rms_norm(
-                mixed, output_rsigma, output_rms_w[h]);
+                mixed_cache[item], output_rsigma, output_rms_w[h]);
         }
     }
 #else
@@ -1736,6 +1758,13 @@ void invokeAttnResFwdImpl(
                 output_rms_weight, output, rsigma, probs, logits,
                 rms_eps, output_rms_eps, stream);
         }
+        else if (T == 1 && N == 3)
+        {
+            launch_s1_single_cta<3, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
+        }
         else if (T == 1 && N == 4)
         {
             launch_s1_single_cta<4, FUSE_OUTPUT_RMS_NORM>(
@@ -1743,9 +1772,37 @@ void invokeAttnResFwdImpl(
                 output_rms_weight, output, rsigma, probs, logits,
                 rms_eps, output_rms_eps, stream);
         }
+        else if (T == 1 && N == 5)
+        {
+            launch_s1_splitk<5, 8, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
+        }
+        else if (T == 1 && N == 6)
+        {
+            launch_s1_splitk<6, 8, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
+        }
+        else if (T == 1 && N == 7)
+        {
+            launch_s1_splitk<7, 8, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
+        }
         else if (T == 1 && N == 8)
         {
             launch_s1_splitk<8, 8, FUSE_OUTPUT_RMS_NORM>(
+                block_residual, layer_residual, res_weight, rms_weight,
+                output_rms_weight, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, stream);
+        }
+        else if (T == 1 && N == 9)
+        {
+            launch_s1_splitk<9, 8, FUSE_OUTPUT_RMS_NORM>(
                 block_residual, layer_residual, res_weight, rms_weight,
                 output_rms_weight, output, rsigma, probs, logits,
                 rms_eps, output_rms_eps, stream);
