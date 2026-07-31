@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +24,8 @@ Key Design: Communication dispatch can happen BEFORE or AFTER quantization
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 
@@ -100,6 +101,23 @@ class Communication(ABC):
         Default: True for most strategies (post-quant is more common)
         """
         return True
+
+    def supports_multi_stream_chunking(self) -> bool:
+        """Whether independent chunks may use this communicator concurrently."""
+        return False
+
+    @contextmanager
+    def workspace_slot(self, slot: int) -> Iterator[None]:
+        """Select per-chunk communication state for a multi-stream forward.
+
+        Communication strategies that support concurrent chunks override this
+        method and provide independent state for every supported slot.
+        """
+        if slot != 0:
+            raise ValueError(
+                f"{self.__class__.__name__} does not provide workspace slot {slot}"
+            )
+        yield
 
     def prepare_dispatch(
         self,

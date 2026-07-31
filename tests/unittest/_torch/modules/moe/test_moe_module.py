@@ -34,8 +34,9 @@ import socket
 import sys
 import tempfile
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from itertools import product
+from types import SimpleNamespace
 from typing import List, Optional
 
 import cloudpickle
@@ -89,6 +90,7 @@ from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
@@ -108,6 +110,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
+from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
@@ -128,6 +131,102 @@ def _get_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def test_external_comm_scheduler_staggers_a2a_chunk_dispatch(monkeypatch):
+    log = []
+    current_stream = {"name": "main"}
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self):
+            log.append((self.name, "record", current_stream["name"]))
+
+        def wait(self):
+            log.append((self.name, "wait", current_stream["name"]))
+
+    class FakeComm:
+        def __init__(self):
+            self.active_slot = 0
+
+        def supports_multi_stream_chunking(self):
+            return True
+
+        @contextmanager
+        def workspace_slot(self, slot):
+            previous_slot = self.active_slot
+            self.active_slot = slot
+            log.append(("slot", "enter", slot))
+            try:
+                yield
+            finally:
+                log.append(("slot", "exit", slot))
+                self.active_slot = previous_slot
+
+    @contextmanager
+    def fake_cuda_stream(stream):
+        previous_stream = current_stream["name"]
+        current_stream["name"] = stream
+        try:
+            yield
+        finally:
+            current_stream["name"] = previous_stream
+
+    comm = FakeComm()
+    dispatch_done = FakeEvent("dispatch_done")
+    moe = SimpleNamespace(
+        use_dp=False,
+        enable_alltoall=True,
+        comm=comm,
+        aux_stream="aux",
+        _a2a_dispatch_done_event=dispatch_done,
+        event_dict={
+            EventType.Main: FakeEvent("main"),
+            EventType.MoeChunkingOverlap: FakeEvent("join"),
+        },
+        backend=object(),
+        repeat_idx=0,
+        repeat_count=1,
+        split_chunk=lambda token_count, num_chunks: [token_count // num_chunks] * num_chunks,
+    )
+    scheduler = ExternalCommMoEScheduler(moe)
+    next_chunk = iter(range(2))
+
+    def fake_forward_chunk_impl(x_chunk, *args, dispatch_done_event=None, **kwargs):
+        chunk_idx = next(next_chunk)
+        log.append(("dispatch", chunk_idx, current_stream["name"], comm.active_slot))
+        if dispatch_done_event is not None:
+            dispatch_done_event.record()
+        log.append(("compute", chunk_idx, current_stream["name"], comm.active_slot))
+        return x_chunk
+
+    monkeypatch.setattr(torch.cuda, "stream", fake_cuda_stream)
+    monkeypatch.setattr(scheduler, "_forward_chunk_impl", fake_forward_chunk_impl)
+
+    x = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    output = scheduler._forward_multiple_chunks(
+        x=x,
+        router_logits=torch.zeros((4, 2)),
+        num_chunks=2,
+        output_dtype=torch.float32,
+        all_rank_num_tokens=[4],
+        use_dp_padding=False,
+    )
+
+    torch.testing.assert_close(output, x)
+    assert ("dispatch", 0, "aux", 0) in log
+    assert ("dispatch", 1, "main", 1) in log
+    assert log.index(("dispatch", 0, "aux", 0)) < log.index(
+        ("dispatch_done", "record", "aux")
+    )
+    assert log.index(("dispatch_done", "record", "aux")) < log.index(
+        ("compute", 0, "aux", 0)
+    )
+    assert log.index(("dispatch_done", "wait", "main")) < log.index(
+        ("dispatch", 1, "main", 1)
+    )
 
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:

@@ -38,6 +38,49 @@ from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
 
+def _get_nvlink_onesided_workspace_options(
+    model_config: ModelConfig,
+    *,
+    enable_eplb: bool,
+    ep_group_health: Optional[object],
+) -> tuple[int, int]:
+    """Return per-slot token capacity and slot count for one-sided A2A.
+
+    The scheduler chunks the DP-padded tensor against the global
+    ``moe_max_num_tokens`` limit. Therefore a slot only needs
+    ``ceil(moe_max_num_tokens / dp_size)`` rows per rank. Two such slots let
+    alternating CUDA streams overlap one chunk's dispatch with the preceding
+    chunk's expert compute without doubling the normal full-size payload
+    capacity.
+    """
+    max_num_tokens = model_config.max_num_tokens
+    if os.environ.get("TRTLLM_MOE_A2A_COMPUTE_OVERLAP", "0") != "1":
+        return max_num_tokens, 1
+
+    mapping = model_config.mapping
+    default_moe_max_num_tokens = max_num_tokens * mapping.dp_size
+    moe_max_num_tokens = model_config.moe_max_num_tokens
+    if moe_max_num_tokens >= default_moe_max_num_tokens:
+        logger.info(
+            "MoE A2A/compute overlap requested but disabled because MoE chunking is inactive"
+        )
+        return max_num_tokens, 1
+    if enable_eplb or ep_group_health is not None:
+        logger.info(
+            "MoE A2A/compute overlap requested but disabled with EPLB or wide-EP fault tolerance"
+        )
+        return max_num_tokens, 1
+
+    max_num_tokens_per_slot = (
+        moe_max_num_tokens + mapping.dp_size - 1
+    ) // mapping.dp_size
+    logger.info(
+        "Enabling MoE A2A/compute overlap with two NVLinkOneSided "
+        f"workspace slots of {max_num_tokens_per_slot} tokens per rank"
+    )
+    return max_num_tokens_per_slot, 2
+
+
 class CommunicationFactory:
     """
     Factory for creating MoE communication methods
@@ -140,16 +183,24 @@ class CommunicationFactory:
             ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
                 model_config
             )
+            max_num_tokens_per_rank, num_workspace_slots = (
+                _get_nvlink_onesided_workspace_options(
+                    model_config,
+                    enable_eplb=enable_eplb,
+                    ep_group_health=ep_group_health,
+                )
+            )
             strategy = NVLinkOneSided(
                 mapping,
                 num_slots,
                 top_k,
-                max_num_tokens,
+                max_num_tokens_per_rank,
                 payload_in_workspace,
                 hidden_size=hidden_size,
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                num_workspace_slots=num_workspace_slots,
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
@@ -305,16 +356,24 @@ class CommunicationFactory:
             ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
                 model_config
             )
+            max_num_tokens_per_rank, num_workspace_slots = (
+                _get_nvlink_onesided_workspace_options(
+                    model_config,
+                    enable_eplb=enable_eplb,
+                    ep_group_health=ep_group_health,
+                )
+            )
             return NVLinkOneSided(
                 mapping,
                 num_slots,
                 top_k,
-                max_num_tokens,
+                max_num_tokens_per_rank,
                 payload_in_workspace,
                 hidden_size=hidden_size,
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                num_workspace_slots=num_workspace_slots,
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,

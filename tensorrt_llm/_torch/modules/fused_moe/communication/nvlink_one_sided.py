@@ -25,7 +25,8 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
-from typing import Callable, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -161,6 +162,7 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
+        num_workspace_slots: int = 1,
         ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
@@ -183,6 +185,9 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
+            num_workspace_slots: Number of independent symmetric workspaces.
+                Two slots allow dispatch/combine state from alternating chunks
+                to be live concurrently on two CUDA streams.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
@@ -202,6 +207,9 @@ class NVLinkOneSided(Communication):
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
         self.use_low_precision_combine = use_low_precision_combine
+        if num_workspace_slots < 1:
+            raise ValueError("num_workspace_slots must be at least 1")
+        self.num_workspace_slots = num_workspace_slots
         if num_experts is not None:
             assert num_experts > 0 and num_experts <= num_slots, (
                 "num_experts must be in (0, num_slots]"
@@ -244,115 +252,163 @@ class NVLinkOneSided(Communication):
             )
             self.workspace_size_per_rank = 2048 * 1024 * 1024
 
-        # Initialize or reuse workspace.  The C++ op computes payload offsets
-        # from the current tensors at dispatch time, while the Python singleton
-        # owns the symmetric memory backing those offsets.  Keep separate
-        # workspaces for different payload layouts so one test/layer cannot
-        # reuse stale one-sided state from another shape.
+        # Initialize or reuse workspace. The C++ op computes payload offsets
+        # from the current tensors at dispatch time, while Python owns the
+        # symmetric memory and dispatch/combine state. Multi-stream chunking
+        # needs one independent state slot per stream: chunk 0 may still be
+        # computing/combining while chunk 1 dispatches.
         MnnvlMemory.initialize()
-        self._workspace_key = (
-            self.workspace_size_per_rank,
-            self.max_num_tokens_per_rank,
-            self.ep_rank,
-            self.ep_size,
-            self.eplb_stats_num_experts,
-            self.num_experts,
-            self.top_k,
-            hidden_size,
-            dtype,
-            self.use_low_precision_combine,
-        )
+        self.ep_group_health = ep_group_health
+        # Keep the kernel specialization stable for this communicator's lifetime.
+        self._rank_mask_enabled = ep_group_health is not None
+        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
+            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
 
-        workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
-        if workspace_state is None:
-            tllm_logger.info(
-                f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
-                f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
-            )
-            mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
-            workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            metainfo = torch.ops.trtllm.moe_a2a_initialize(
-                workspace,
+        self._workspace_slots = []
+        for slot_idx in range(self.num_workspace_slots):
+            workspace_key = (
+                self.workspace_size_per_rank,
+                self.max_num_tokens_per_rank,
                 self.ep_rank,
                 self.ep_size,
-                self.max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
+                self.num_experts,
+                self.top_k,
+                hidden_size,
+                dtype,
+                self.use_low_precision_combine,
+                slot_idx,
             )
-            workspace_state = {
-                "workspace_size_per_rank": self.workspace_size_per_rank,
-                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
-                "ep_rank": self.ep_rank,
-                "ep_size": self.ep_size,
-                "eplb_stats_num_experts": self.eplb_stats_num_experts,
-                "num_experts": self.num_experts,
-                "top_k": self.top_k,
-                "hidden_size": hidden_size,
-                "dtype": dtype,
-                "use_low_precision_combine": self.use_low_precision_combine,
-                "mnnvl_mem": mnnvl_mem,
-                "workspace": workspace,
-                "metainfo": metainfo,
-            }
-            NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
-        else:
-            expected_workspace_state = {
-                "workspace_size_per_rank": self.workspace_size_per_rank,
-                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
-                "ep_rank": self.ep_rank,
-                "ep_size": self.ep_size,
-                "eplb_stats_num_experts": self.eplb_stats_num_experts,
-                "num_experts": self.num_experts,
-                "top_k": self.top_k,
-                "hidden_size": hidden_size,
-                "dtype": dtype,
-                "use_low_precision_combine": self.use_low_precision_combine,
-            }
-            for key, expected_value in expected_workspace_state.items():
-                assert workspace_state[key] == expected_value, (
-                    f"reuse workspace with different {key}"
-                )
 
-        NVLinkOneSided._WORKSPACE = workspace_state
-        NVLinkOneSided._WORKSPACE_REFCOUNTS[self._workspace_key] = (
-            NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
-        )
+            workspace_state = NVLinkOneSided._WORKSPACES.get(workspace_key)
+            if workspace_state is None:
+                tllm_logger.info(
+                    f"NVLinkOneSided: Allocating workspace slot {slot_idx} "
+                    f"with size {self.workspace_size_per_rank} bytes. "
+                    f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, "
+                    f"top_k: {self.top_k}, "
+                    f"max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
+                )
+                mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
+                workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+                metainfo = torch.ops.trtllm.moe_a2a_initialize(
+                    workspace,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.max_num_tokens_per_rank,
+                    self.eplb_stats_num_experts,
+                )
+                workspace_state = {
+                    "workspace_size_per_rank": self.workspace_size_per_rank,
+                    "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                    "ep_rank": self.ep_rank,
+                    "ep_size": self.ep_size,
+                    "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                    "num_experts": self.num_experts,
+                    "top_k": self.top_k,
+                    "hidden_size": hidden_size,
+                    "dtype": dtype,
+                    "use_low_precision_combine": self.use_low_precision_combine,
+                    "workspace_slot": slot_idx,
+                    "mnnvl_mem": mnnvl_mem,
+                    "workspace": workspace,
+                    "metainfo": metainfo,
+                }
+                NVLinkOneSided._WORKSPACES[workspace_key] = workspace_state
+            else:
+                expected_workspace_state = {
+                    "workspace_size_per_rank": self.workspace_size_per_rank,
+                    "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                    "ep_rank": self.ep_rank,
+                    "ep_size": self.ep_size,
+                    "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                    "num_experts": self.num_experts,
+                    "top_k": self.top_k,
+                    "hidden_size": hidden_size,
+                    "dtype": dtype,
+                    "use_low_precision_combine": self.use_low_precision_combine,
+                    "workspace_slot": slot_idx,
+                }
+                for key, expected_value in expected_workspace_state.items():
+                    assert workspace_state[key] == expected_value, (
+                        f"reuse workspace with different {key}"
+                    )
+
+            NVLinkOneSided._WORKSPACE = workspace_state
+            NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = (
+                NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) + 1
+            )
+            watchdog_coordinator = AlltoAllWatchdogCoordinator(
+                workspace_state=workspace_state,
+                workspace=workspace_state["workspace"],
+                metainfo=workspace_state["metainfo"],
+                metainfo_index={
+                    "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
+                    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
+                    "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
+                },
+                ep_rank=self.ep_rank,
+                health=self.ep_group_health,
+            )
+            alltoall_watchdog = None
+            if alltoall_watchdog_timeout_s is not None:
+                alltoall_watchdog = watchdog_coordinator.acquire_watchdog(
+                    ep_size=self.ep_size,
+                    timeout_s=alltoall_watchdog_timeout_s,
+                    poll_interval_s=alltoall_watchdog_poll_interval_s,
+                    on_timeout=alltoall_watchdog_on_timeout,
+                )
+            self._workspace_slots.append(
+                {
+                    "key": workspace_key,
+                    "state": workspace_state,
+                    "watchdog_coordinator": watchdog_coordinator,
+                    "alltoall_watchdog": alltoall_watchdog,
+                    "dispatch_state": {"phase": "idle"},
+                }
+            )
+
         self._destroyed = False
+        self._active_workspace_slot = 0
+        self._activate_workspace_slot(0)
+
+        # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
+        self.invalid_token_expert_id: int = -1
+
+    def _activate_workspace_slot(self, slot_idx: int) -> None:
+        """Expose one slot through the legacy single-workspace attributes."""
+        if not 0 <= slot_idx < len(self._workspace_slots):
+            raise ValueError(
+                f"workspace slot {slot_idx} is out of range for "
+                f"{len(self._workspace_slots)} slots"
+            )
+        slot = self._workspace_slots[slot_idx]
+        workspace_state = slot["state"]
+        self._active_workspace_slot = slot_idx
+        self._workspace_key = slot["key"]
         self._workspace_state = workspace_state
         self.mnnvl_mem = workspace_state["mnnvl_mem"]
         self.workspace = workspace_state["workspace"]
         self.moe_a2a_metainfo = workspace_state["metainfo"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
-        self.ep_group_health = ep_group_health
-        # Keep the kernel specialization stable for this communicator's lifetime.
-        self._rank_mask_enabled = ep_group_health is not None
-        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
-            workspace_state=workspace_state,
-            workspace=self.workspace,
-            metainfo=self.moe_a2a_metainfo,
-            metainfo_index={
-                "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
-                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
-                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
-            },
-            ep_rank=self.ep_rank,
-            health=self.ep_group_health,
-        )
-        self._alltoall_watchdog: AlltoAllWatchdog | None = None
-        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
-            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
-        if alltoall_watchdog_timeout_s is not None:
-            self._alltoall_watchdog = self._watchdog_coordinator.acquire_watchdog(
-                ep_size=self.ep_size,
-                timeout_s=alltoall_watchdog_timeout_s,
-                poll_interval_s=alltoall_watchdog_poll_interval_s,
-                on_timeout=alltoall_watchdog_on_timeout,
-            )
+        self._watchdog_coordinator = slot["watchdog_coordinator"]
+        self._alltoall_watchdog = slot["alltoall_watchdog"]
+        self._dispatch_state = slot["dispatch_state"]
+        NVLinkOneSided._WORKSPACE = workspace_state
 
-        # Initialize dispatch state
-        self._dispatch_state = {"phase": "idle"}
+    def supports_multi_stream_chunking(self) -> bool:
+        """Return True when dispatch/combine has two independent state slots."""
+        return self.num_workspace_slots >= 2
 
-        # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
-        self.invalid_token_expert_id: int = -1
+    @contextmanager
+    def workspace_slot(self, slot: int) -> Iterator[None]:
+        """Use one independent A2A state slot for the enclosed chunk launch."""
+        previous_slot = self._active_workspace_slot
+        self._activate_workspace_slot(slot)
+        try:
+            yield
+        finally:
+            self._activate_workspace_slot(previous_slot)
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -368,36 +424,40 @@ class NVLinkOneSided(Communication):
         return True
 
     def destroy(self):
-        """Release this instance's reference to the shared symmetric workspace."""
+        """Release this instance's references to all symmetric workspaces."""
         if getattr(self, "_destroyed", False):
             return
 
         self._destroyed = True
-        if self._alltoall_watchdog is not None:
-            self._watchdog_coordinator.release_watchdog(self._alltoall_watchdog)
-            self._alltoall_watchdog = None
-        workspace_key = getattr(self, "_workspace_key", None)
-        if workspace_key is None:
-            return
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
-        if refcount > 0:
-            NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
-        else:
-            NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
-            workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
-            if NVLinkOneSided._WORKSPACE is workspace_state:
-                NVLinkOneSided._WORKSPACE = None
-            if workspace_state is not None:
-                workspace_state.clear()
+        for slot in getattr(self, "_workspace_slots", []):
+            watchdog = slot["alltoall_watchdog"]
+            if watchdog is not None:
+                slot["watchdog_coordinator"].release_watchdog(watchdog)
+                slot["alltoall_watchdog"] = None
 
+            workspace_key = slot["key"]
+            refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+            if refcount > 0:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+            else:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+                workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
+                if NVLinkOneSided._WORKSPACE is workspace_state:
+                    NVLinkOneSided._WORKSPACE = None
+                if workspace_state is not None:
+                    workspace_state.clear()
+
+        self._workspace_slots = []
         self.mnnvl_mem = None
         self.workspace = None
         self.moe_a2a_metainfo = None
         self._workspace_state = None
+        self._alltoall_watchdog = None
+        self._watchdog_coordinator = None
         self._dispatch_state = {"phase": "destroyed"}
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
@@ -641,7 +701,9 @@ class NVLinkOneSided(Communication):
         ``combine`` — e.g. because an OOM aborted the forward. Without this,
         the next ``dispatch`` would raise ``dispatch called twice``.
         """
-        self._dispatch_state = {"phase": "idle"}
+        dispatch_state = {"phase": "idle"}
+        self._workspace_slots[self._active_workspace_slot]["dispatch_state"] = dispatch_state
+        self._dispatch_state = dispatch_state
 
     def get_combine_payload_tensor_in_workspace(
         self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype

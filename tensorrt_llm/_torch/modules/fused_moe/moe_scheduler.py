@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -363,6 +364,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         workspace: Optional[dict] = None,
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        dispatch_done_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -531,6 +533,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # No comm: just quantize
             x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
+        if dispatch_done_event is not None:
+            # Record after dispatch and its sanitize step, but before expert
+            # compute. Another stream may now launch the next chunk's dispatch
+            # while this stream proceeds into run_moe.
+            dispatch_done_event.record()
+
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
         final_hidden_states = moe.backend.run_moe(
@@ -614,7 +622,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
             input_ids.split(chunk_size_list) if input_ids is not None else [None] * num_chunks
         )
 
-        use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
+        use_a2a_compute_overlap = (
+            moe.enable_alltoall
+            and moe.comm is not None
+            and moe.comm.supports_multi_stream_chunking()
+            and getattr(moe, "_a2a_dispatch_done_event", None) is not None
+        )
+        use_multi_stream = moe.aux_stream is not None and (
+            not moe.enable_alltoall or use_a2a_compute_overlap
+        )
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -666,12 +682,43 @@ class ExternalCommMoEScheduler(MoEScheduler):
         ):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
+            dispatch_done_event = (
+                moe._a2a_dispatch_done_event
+                if use_a2a_compute_overlap and idx_chunk == 0
+                else None
+            )
+            if use_a2a_compute_overlap and idx_chunk == 1:
+                # Do not launch D1 alongside D0. Once D0 finishes, the aux
+                # stream continues with C0 while the main stream starts D1.
+                moe._a2a_dispatch_done_event.wait()
+            comm_workspace = (
+                moe.comm.workspace_slot(idx_chunk % 2)
+                if use_a2a_compute_overlap
+                else nullcontext()
+            )
 
-            if use_multi_stream:
-                # Alternate streams; each chunk fully owns its (forward + reducescatter).
-                # Even chunks use aux_stream so chunk 0 is isolated from outer main-stream traffic.
-                if idx_chunk % 2 == 0:
-                    with torch.cuda.stream(moe.aux_stream):
+            with comm_workspace:
+                if use_multi_stream:
+                    # Alternate streams; each chunk fully owns dispatch,
+                    # expert compute, and combine. Even chunks use aux_stream
+                    # so chunk 0 is isolated from outer main-stream traffic.
+                    if idx_chunk % 2 == 0:
+                        with torch.cuda.stream(moe.aux_stream):
+                            outputs = self._forward_chunk_impl(
+                                x_chunk,
+                                router_logits_chunk,
+                                output_dtype,
+                                all_rank_num_tokens_list[idx_chunk],
+                                use_dp_padding,
+                                is_first_call,
+                                is_last_call,
+                                do_finalize,
+                                workspace=workspace_0,
+                                input_ids=input_ids_chunk,
+                                lora_params=lora_params,
+                                dispatch_done_event=dispatch_done_event,
+                            )
+                    else:
                         outputs = self._forward_chunk_impl(
                             x_chunk,
                             router_logits_chunk,
@@ -681,7 +728,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             is_first_call,
                             is_last_call,
                             do_finalize,
-                            workspace=workspace_0,
+                            workspace=workspace_1,
                             input_ids=input_ids_chunk,
                             lora_params=lora_params,
                         )
@@ -695,24 +742,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         is_first_call,
                         is_last_call,
                         do_finalize,
-                        workspace=workspace_1,
+                        workspace=workspace_0,
                         input_ids=input_ids_chunk,
                         lora_params=lora_params,
                     )
-            else:
-                outputs = self._forward_chunk_impl(
-                    x_chunk,
-                    router_logits_chunk,
-                    output_dtype,
-                    all_rank_num_tokens_list[idx_chunk],
-                    use_dp_padding,
-                    is_first_call,
-                    is_last_call,
-                    do_finalize,
-                    workspace=workspace_0,
-                    input_ids=input_ids_chunk,
-                    lora_params=lora_params,
-                )
 
             if chunked_used[idx_chunk]:
                 outputs_list.append(outputs)

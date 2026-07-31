@@ -53,6 +53,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock
 
@@ -65,6 +66,9 @@ import tensorrt_llm as tllm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
+)
+from tensorrt_llm._torch.modules.fused_moe.communication.communication_factory import (
+    _get_nvlink_onesided_workspace_options,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
@@ -115,6 +119,64 @@ FIXED_NUM_EXPERTS = 32
 # Force consistent NVLinkOneSided workspace size across varying top_k
 # to avoid _WORKSPACE singleton assertion failures.
 NVLINK_WORKSPACE_MB = "512"
+
+
+def test_nvlink_onesided_overlap_workspace_options(monkeypatch):
+    model_config = SimpleNamespace(
+        mapping=SimpleNamespace(dp_size=16),
+        max_num_tokens=8448,
+        moe_max_num_tokens=67584,
+    )
+
+    monkeypatch.delenv("TRTLLM_MOE_A2A_COMPUTE_OVERLAP", raising=False)
+    assert _get_nvlink_onesided_workspace_options(
+        model_config, enable_eplb=False, ep_group_health=None
+    ) == (8448, 1)
+
+    monkeypatch.setenv("TRTLLM_MOE_A2A_COMPUTE_OVERLAP", "1")
+    assert _get_nvlink_onesided_workspace_options(
+        model_config, enable_eplb=False, ep_group_health=None
+    ) == (4224, 2)
+
+    model_config.moe_max_num_tokens = 8448 * 16
+    assert _get_nvlink_onesided_workspace_options(
+        model_config, enable_eplb=False, ep_group_health=None
+    ) == (8448, 1)
+
+
+def test_nvlink_onesided_workspace_slot_isolates_dispatch_state(monkeypatch):
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm.num_workspace_slots = 2
+    comm._workspace_slots = []
+    for slot_idx in range(2):
+        comm._workspace_slots.append(
+            {
+                "key": ("test", slot_idx),
+                "state": {
+                    "mnnvl_mem": f"memory-{slot_idx}",
+                    "workspace": f"workspace-{slot_idx}",
+                    "metainfo": f"metainfo-{slot_idx}",
+                    "max_num_tokens_per_rank": 32,
+                },
+                "watchdog_coordinator": f"coordinator-{slot_idx}",
+                "alltoall_watchdog": None,
+                "dispatch_state": {"phase": "idle"},
+            }
+        )
+    comm._active_workspace_slot = 0
+    comm._activate_workspace_slot(0)
+
+    with comm.workspace_slot(1):
+        assert comm.workspace == "workspace-1"
+        comm._dispatch_state["phase"] = "dispatched"
+        assert comm._workspace_slots[0]["dispatch_state"]["phase"] == "idle"
+        comm.reset_state()
+
+    assert comm.workspace == "workspace-0"
+    assert comm._dispatch_state["phase"] == "idle"
+    assert comm._workspace_slots[1]["dispatch_state"]["phase"] == "idle"
+
 
 # ============================================================================
 # Test Configuration
