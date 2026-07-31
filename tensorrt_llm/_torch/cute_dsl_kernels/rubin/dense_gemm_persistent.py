@@ -34,18 +34,26 @@ from typing import Literal, Optional, Tuple, Type, Union
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+
+from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+
+if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    from cutlass import testing
+else:
+    import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from nvidia_cutlass_dsl.examples.CuTeDSL.cute.blackwell.kernel.dense_gemm.dense_gemm_persistent import (
-    PersistentDenseGemmKernel as SM100PersistentDenseGemmKernel,
-)
 
 # Customized epilogue with a_scale/b_scale support for FP8 per-tensor GEMM
 from tensorrt_llm._torch.cute_dsl_kernels.utils.gemm import sm100 as gemm_sm100
+
+from ..blackwell.dense_gemm_persistent import (
+    PersistentDenseGemmKernel as SM100PersistentDenseGemmKernel,
+)
+from ..blackwell.dense_gemm_persistent import _compute_stages
 
 """
 A high-performance persistent batched dense GEMM example for the NVIDIA Rubin SM107 architecture
@@ -291,10 +299,6 @@ class SM107PersistentDenseGemmKernel(SM100PersistentDenseGemmKernel):
             )
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
-        from nvidia_cutlass_dsl.examples.CuTeDSL.cute.blackwell.kernel.dense_gemm.dense_gemm_persistent import (
-            _compute_stages,
-        )
-
         _, self.num_ab_stage, self.num_c_stage = _compute_stages(
             tiled_mma,
             self.mma_tiler,
@@ -872,8 +876,16 @@ class SM107PersistentDenseGemmKernel(SM100PersistentDenseGemmKernel):
             raise testing.CantImplementError(
                 f"This example only supports Float32 or Float16 accumulator, got {self.acc_dtype}"
             )
-        # Call parent to check additional constraints
-        return super().check_supported_dtypes(a_dtype, b_dtype, c_dtype)
+        if not SM100PersistentDenseGemmKernel.check_supported_dtypes(
+            a_dtype,
+            b_dtype,
+            self.acc_dtype,
+            c_dtype,
+            allow_mixed_ab=True,
+        ):
+            raise testing.CantImplementError(
+                f"Unsupported dtype combination: {a_dtype}, {b_dtype}, {self.acc_dtype}, {c_dtype}"
+            )
 
     def check_mma_tiler_and_cluster_shape(self):
         """Validate the MMA tiler and cluster shape for Rubin.
@@ -899,6 +911,38 @@ class SM107PersistentDenseGemmKernel(SM100PersistentDenseGemmKernel):
             )
         # Call parent to check common constraints
         super().check_mma_tiler_and_cluster_shape()
+
+    def can_implement(
+        self,
+        mnkl: Tuple[int, int, int, int],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
+        a_major: str,
+        b_major: str,
+        c_major: str,
+    ) -> bool:
+        """Determine whether this Rubin kernel supports the configuration."""
+        try:
+            self.check_supported_dtypes(a_dtype, b_dtype, c_dtype)
+            self.check_mma_tiler_and_cluster_shape()
+            m, n, k, batch_size = mnkl
+            self.check_tensor_alignment(
+                m,
+                n,
+                k,
+                batch_size,
+                a_dtype,
+                b_dtype,
+                c_dtype,
+                a_major,
+                b_major,
+                c_major,
+            )
+            self.check_epilog_store_option(m, n)
+        except testing.CantImplementError:
+            return False
+        return True
 
     @cute.jit
     def __call__(

@@ -55,17 +55,12 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
-# Import from the nvidia-cutlass-dsl wheel's Blackwell kernel (not TRT-LLM's modified version)
-# The wheel's Blackwell kernel is the correct parent for Rubin
-from nvidia_cutlass_dsl.examples.CuTeDSL.cute.blackwell.kernel.blockscaled_gemm import (
-    dense_blockscaled_gemm_persistent as _sm100_blockscaled_gemm,
+# Import the unified Blackwell blockscaled base rather than the internal-only
+# cutlass examples package.
+from ..blackwell.dense_blockscaled_gemm_persistent import (
+    Sm100BlockScaledPersistentDenseGemmKernel,
+    scaled_mm,
 )
-
-Sm100BlockScaledPersistentDenseGemmKernel = (
-    _sm100_blockscaled_gemm.Sm100BlockScaledPersistentDenseGemmKernel
-)
-scaled_mm = _sm100_blockscaled_gemm.scaled_mm
-
 
 """
 This example provides an implementation of the SM107 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.

@@ -50,6 +50,13 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+
+from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+
+if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    from cutlass import testing
+else:
+    import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 try:
@@ -251,7 +258,7 @@ class PersistentDenseGemmKernel:
             )
 
         self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
-            tiled_mma, self.mma_tiler, self.num_acc_stage
+            tiled_mma, self.mma_tiler, self.num_acc_stage, self.arch
         )
 
     @cute.jit
@@ -1022,11 +1029,12 @@ class PersistentDenseGemmKernel:
         tiled_mma: cute.TiledMma,
         mma_tiler: Tuple[int, int, int],
         num_acc_stage: int,
+        arch: str = "sm_100",
     ) -> int:
         """Compute the number of tensor memory allocation columns."""
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
-        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake, arch=arch)
         return num_tmem_alloc_cols
 
     @staticmethod
@@ -1035,6 +1043,7 @@ class PersistentDenseGemmKernel:
         b_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
+        allow_mixed_ab: bool = False,
     ) -> bool:
         """Check if the dtypes are valid."""
         valid_ab_dtypes = {
@@ -1048,7 +1057,7 @@ class PersistentDenseGemmKernel:
         }
         if a_dtype not in valid_ab_dtypes or b_dtype not in valid_ab_dtypes:
             return False
-        if a_dtype != b_dtype:
+        if not allow_mixed_ab and a_dtype != b_dtype:
             return False
         if acc_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.Int32}:
             return False
@@ -1064,7 +1073,9 @@ class PersistentDenseGemmKernel:
             cutlass.Float16: {cutlass.Float16, cutlass.Float8E4M3FN, cutlass.Float8E5M2},
             cutlass.Int32: {cutlass.Uint8, cutlass.Int8},
         }
-        if a_dtype not in acc_ab_compatibility.get(acc_dtype, set()):
+        if a_dtype not in acc_ab_compatibility.get(
+            acc_dtype, set()
+        ) or b_dtype not in acc_ab_compatibility.get(acc_dtype, set()):
             return False
 
         acc_c_compatibility = {
@@ -1092,6 +1103,73 @@ class PersistentDenseGemmKernel:
             return False
 
         return True
+
+    def check_mma_tiler_and_cluster_shape(self) -> None:
+        """Raise when the configured MMA tiler or cluster shape is invalid."""
+        if not self.is_valid_mma_tiler_and_cluster_shape(
+            self.use_2cta_instrs,
+            self.mma_tiler_mn,
+            self.cluster_shape_mn,
+        ):
+            raise testing.CantImplementError(
+                "Invalid MMA tiler, CTA mode, or cluster shape: "
+                f"{self.mma_tiler_mn}, {self.use_2cta_instrs}, "
+                f"{self.cluster_shape_mn}"
+            )
+
+    def check_tensor_alignment(
+        self,
+        m: int,
+        n: int,
+        k: int,
+        batch_size: int,
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
+        a_major: str,
+        b_major: str,
+        c_major: str,
+    ) -> None:
+        """Raise when a tensor's contiguous dimension is not 16-byte aligned."""
+
+        def is_aligned(dtype, is_mode0_major, tensor_shape):
+            major_mode_idx = 0 if is_mode0_major else 1
+            num_contiguous_elements = 16 * 8 // dtype.width
+            return tensor_shape[major_mode_idx] % num_contiguous_elements == 0
+
+        if (
+            not is_aligned(a_dtype, a_major == "m", (m, k, batch_size))
+            or not is_aligned(b_dtype, b_major == "n", (n, k, batch_size))
+            or not is_aligned(c_dtype, c_major == "m", (m, n, batch_size))
+        ):
+            raise testing.CantImplementError(
+                "Invalid tensor alignment: "
+                f"{m}, {n}, {k}, {batch_size}, {a_dtype}, {b_dtype}, "
+                f"{c_dtype}, {a_major}, {b_major}, {c_major}"
+            )
+
+    def check_epilog_store_option(self, m: int, n: int) -> None:
+        """Raise when a non-TMA epilogue cannot cover the problem exactly."""
+        if self.use_tma_store:
+            return
+
+        cta_tile_shape_mn = (
+            self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
+            self.mma_tiler_mn[1],
+        )
+        if m % cta_tile_shape_mn[0] != 0 or n % cta_tile_shape_mn[1] != 0:
+            raise testing.CantImplementError(
+                f"Problem shape {m}, {n} must be divisible by CTA tile shape "
+                f"{cta_tile_shape_mn} for non-TMA store"
+            )
+
+        m_per_swizzle = (m // cta_tile_shape_mn[0]) // self.cluster_shape_mn[0]
+        n_per_swizzle = (n // cta_tile_shape_mn[1]) // self.cluster_shape_mn[1]
+        if m_per_swizzle % self.swizzle_size != 0 or n_per_swizzle % self.swizzle_size != 0:
+            raise testing.CantImplementError(
+                f"Problem shape {m}, {n} must be divisible by swizzle size "
+                f"{self.swizzle_size} for non-TMA store"
+            )
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(

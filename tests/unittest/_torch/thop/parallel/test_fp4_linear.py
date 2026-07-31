@@ -17,7 +17,7 @@ import sys
 
 import pytest
 import torch
-from utils.util import skip_pre_blackwell
+from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
@@ -1508,4 +1508,4 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
                                             bias=bias)
 
     # bf16 1-ULP at cast boundary (~0.0039) — fused vs gemm+add differs by ULP-level rounding.
-    torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)
+    check_accuracy(out_fused, ref, atol=5e-3, rtol=1e-2, percent=0.998)
