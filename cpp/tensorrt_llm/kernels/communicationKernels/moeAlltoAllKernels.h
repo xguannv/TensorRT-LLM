@@ -47,11 +47,11 @@ static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64
 // 16 B-aligned (cp.async.bulk requires 16 B-aligned source AND destination).
 static constexpr int kCftMbarrierSlotBytes = 64;
 
-// Fixed-size LE ID array passed by value as a kernel argument (no device allocation needed).
-// Used by the CFT combine push kernel.
+// Fixed-size peer metadata passed by value to the CFT combine push kernel.
 struct CftPeerLeIds
 {
     uint32_t ids[kMaxRanks];
+    uint64_t active_rank_mask[kRankMaskWords];
 };
 
 // Describes a single payload type to be communicated
@@ -81,10 +81,11 @@ struct DispatchKernelPointers
     uint64_t* le_dispatch_counters[kMaxRanks];
 
     // Local aux data pointers
-    int* send_counters;            // [ep_size] How many tokens have been sent to each target rank
-    int* recv_counters[kMaxRanks]; // How many tokens have been received from each source rank. Each rank has [ep_size]
-                                   // counters
-    int* local_token_counter;      // Atomic counter for completed tokens
+    int* send_counters; // [ep_size] How many tokens have been sent to each target rank
+    // Each rank owns recv_counters[parity][source_rank]. The two parity banks
+    // alternate between A2A rounds.
+    int* recv_counters[kMaxRanks];
+    int* local_token_counter; // Atomic counter for completed tokens
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
@@ -95,17 +96,24 @@ struct DispatchKernelPointers
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
     // CFT handle-based counted writes (fabric.try_put.counted via Logical Endpoints)
-    uint32_t peer_le_ids[kMaxRanks];
-    uint64_t le_payload_offsets[kMaxPayloads];
-    uint64_t le_counter_base;
-    uint64_t* dispatch_counter_baseline;
-    int32_t lamport_stride;
+    uint32_t peer_le_ids[kMaxRanks];           // LE ID per target rank (from CftLeManager)
+    uint64_t le_payload_offsets[kMaxPayloads]; // Byte offset of each payload's recv region within LE
+    uint64_t le_counter_base;                  // Base byte offset for per-source-rank 8B counters within LE
+
+    // Cumulative counter baseline for dispatch data counters (regular device memory, not LE-backed).
+    // LE counters grow monotonically; the baseline tracks the previous cumulative value.
+    uint64_t* dispatch_counter_baseline; // [ep_size]
+
+    // Optional CFT dispatch-side expert-id sanitization.  Invalid padding tokens in the received
+    // expert-id payload are filled after recv_counters are known, avoiding a separate sanitize kernel.
     bool sanitize_expert_ids;
     int expert_id_payload_index;
     int32_t invalid_expert_id;
 
-    // Active-rank bitmask: bit i set means rank i participates in this collective.
-    // Masked routes and peer synchronization are skipped when rank-mask mode is enabled.
+    // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
+    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Tokens routed to a masked
+    // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
+    // The local rank's own bit must always be set; this is checked at launch time.
     uint64_t active_rank_mask[kRankMaskWords];
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -128,15 +136,15 @@ struct CombineKernelPointers
     int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
     int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
-    // CFT combine counted-write fields. Unused by the fence combine path.
-    uint32_t peer_le_ids[kMaxRanks];
+    // ---- CFT combine (counted-write) fields. Unused by the fence combine path. ----
+    // Local LE combine counters: per receive-slot HW-incremented byte counters.
     uint64_t* combine_counters;
-    uint64_t* combine_counter_baseline;
-    uint64_t* combine_counter_baseline_next;
-    int combine_counter_ep_stride = 0;
-    void const* combine_src_payload;
-
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask.
+    // Cumulative per-slot counter baselines (regular device memory, single-buffer, advanced in place by reduce).
+    uint64_t* combine_counter_baseline; // [ep_size * max_tokens_per_rank]
+    int combine_counter_ep_stride = 0;  // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
+    // writes/waits to/from masked peers and also skips per-token accumulation for ranks that
+    // become inactive between dispatch and combine.
     uint64_t active_rank_mask[kRankMaskWords];
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -173,7 +181,9 @@ struct MoeA2ADispatchParams
                             // per k, -1 for duplicates
 
     // Distributed aux data and recv buffers
-    int* recv_counters[kMaxRanks]; // tracks tokens received from each source rank. Each rank has [ep_size] counters
+    // Each rank owns recv_counters[parity][source_rank]. The two parity banks
+    // alternate between A2A rounds.
+    int* recv_counters[kMaxRanks];
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     uint64_t* le_dispatch_counters[kMaxRanks];   // HW-incremented byte counters (counted writes path)
@@ -185,21 +195,23 @@ struct MoeA2ADispatchParams
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
-    // Whether to instantiate kernels with active-rank checks.
-    bool enable_rank_mask{false};
+    // CFT handle-based counted writes: use fabric.try_put.counted via Logical Endpoints
+    bool use_cft_counted_writes;
+    uint32_t cft_peer_le_ids[kMaxRanks];           // LE ID per target rank
+    uint64_t cft_le_payload_offsets[kMaxPayloads]; // Byte offset of each payload's recv region within LE
+    uint64_t cft_le_counter_base;                  // Base byte offset for per-source-rank 8B counters within LE
 
-    // CFT handle-based counted writes.
-    bool use_cft_counted_writes{false};
-    uint32_t cft_peer_le_ids[kMaxRanks];
-    uint64_t cft_le_payload_offsets[kMaxPayloads];
-    uint64_t cft_le_counter_base;
-    uint64_t* cft_dispatch_counter_baseline;
-    int32_t lamport_stride;
+    // Cumulative counter baselines (regular device memory)
+    uint64_t* cft_dispatch_counter_baseline; // [ep_size]
+
+    // Optional CFT dispatch-side expert-id sanitization.
     bool sanitize_expert_ids;
     int expert_id_payload_index;
     int32_t invalid_expert_id;
 
-    // Active-rank bitmask. Defaults to all ranks active for backward compatibility.
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
+    // copies these words into the kernel pointers struct. Defaults to all-ones for
+    // backwards-compatible "no masking" behavior.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -235,8 +247,17 @@ struct MoeA2ACombineParams
     int max_tokens_per_rank; // Maximum tokens per rank for pre-allocation TODO: Rename to runtime_max_tokens_per_rank
     int top_k;               // Number of experts per token
 
-    // Prepare-only field: original payload tensor pointer used to stage into workspace
-    void const* prepare_payload;
+    // Resolved payload plan. The source always points to the MoE output tensor;
+    // the host determines all storage strides before launching any kernel.
+    void const* source_payload;
+    int source_stride_per_token;
+    int workspace_stride_per_token;
+    int wire_bytes_per_token;
+    int prepare_first_token;
+    int prepare_num_tokens;
+    void const* cft_push_payload;
+    int cft_push_stride_per_token;
+    int reduce_stride_per_token;
 
     // Output tensor
     void* output_data; // Output buffer [local_num_tokens, elements_per_token]
@@ -252,28 +273,30 @@ struct MoeA2ACombineParams
                             // per k, -1 for duplicates
     int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
                             // per k, -1 for duplicates
-    int const* recv_counters; // [ep_size] number of valid tokens per source rank for this target
+    // Local recv_counters[parity][source_rank]. The two parity banks alternate
+    // between A2A rounds.
+    int const* recv_counters;
 
     // Distributed aux data and recv buffers
     uint32_t* completion_flags[kMaxRanks]; // If completion_flags[target_rank][source_rank] == *flag_val, then source
                                            // rank has signaled the target rank
     void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
 
-    // Whether to instantiate kernels with active-rank checks.
-    bool enable_rank_mask{false};
+    // ---- CFT combine (counted-write) path. Gated by use_cft_for_combine. ----
+    // When true, moe_a2a_combine_launch takes the CFT push+reduce path and the base fence
+    // combine below is bypassed. The base fence combine is unaffected when false.
+    bool use_cft_for_combine;
+    uint32_t cft_peer_le_ids[kMaxRanks];    // LE ID per target rank
+    uint64_t cft_le_combine_payload_base;   // LE byte offset for combine payload (region C)
+    uint64_t cft_le_combine_counter_base;   // LE byte offset for combine counters
+    uint64_t* cft_le_combine_counters;      // Direct pointer to local LE combine counters
+    void* cft_le_combine_recv;              // Direct pointer to local LE combine payload region (C)
+    uint64_t* cft_combine_counter_baseline; // [ep_size * max_tokens_per_rank] regular device memory
+    int combine_counter_ep_stride = 0;      // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
 
-    // CFT combine counted-write path. Unused when use_cft_for_combine is false.
-    bool use_cft_for_combine{false};
-    uint32_t cft_peer_le_ids[kMaxRanks];
-    uint64_t cft_le_combine_payload_base;
-    uint64_t cft_le_combine_counter_base;
-    uint64_t* cft_le_combine_counters;
-    void* cft_le_combine_recv;
-    uint64_t* cft_combine_counter_baseline;
-    uint64_t* cft_combine_counter_baseline_next;
-    int combine_counter_ep_stride = 0;
-
-    // Active-rank bitmask. Defaults to all ranks active for backward compatibility.
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
+    // copies these words into the kernel pointers struct. Defaults to all-ones for
+    // backwards-compatible "no masking" behavior.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -293,10 +316,10 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);
 
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)
-// recv_counters: [ep_size] (int32), number of valid tokens per source
+// recv_counters: [2, ep_size] (int32), number of valid tokens per source
 // invalid_id: value to fill for invalid tokens' expert ids
-void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, int32_t invalid_id,
-    int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
+void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters, uint32_t const* flag_val,
+    int32_t invalid_id, int ep_size, int max_tokens_per_rank, int top_k, cudaStream_t stream);
 
 } // namespace kernels::moe_comm
 

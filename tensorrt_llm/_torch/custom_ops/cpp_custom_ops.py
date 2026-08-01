@@ -624,7 +624,6 @@ def _register_fake():
         ep_size: int,
         top_k: int,
         combine_payload_offset: int,
-        payload_in_workspace: bool,
         use_low_precision: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,

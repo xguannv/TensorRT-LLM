@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 MoE All-to-All Operations
 
@@ -27,14 +39,37 @@ from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
-_DISABLE_CFT_COUNTED_WRITES_ENV = "TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES"
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
-# CFT combine wins at small/medium batch and ties/regresses at large batch, so it is gated by the
-# same per-call token-count threshold as dispatch. Set the env very large to force CFT combine on
-# for all batch sizes, or 0 to force it off.
+# CFT combine wins at small/medium batch and ties/regresses at large batch, so
+# it is gated by the same per-call token-count threshold as dispatch.
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+
+
+def get_force_cft() -> bool | None:
+    value = os.environ.get(FORCE_CFT_ENV)
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    return None
+
+
+def should_use_cft(
+    can_use_cft: bool,
+    force_cft: bool | None,
+    max_batch: int | None,
+    runtime_max_tokens_per_rank: int,
+) -> bool:
+    if not can_use_cft:
+        return False
+    if force_cft is not None:
+        return force_cft
+    if max_batch is None:
+        return True
+    return runtime_max_tokens_per_rank <= max_batch
 
 
 def _get_cft_max_batch(env_name: str, default: int) -> int:
@@ -241,12 +276,16 @@ class MoeAlltoAll:
                 f"{num_slots} and num_experts={num_experts}")
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
-        # Master off-switch, consistent with NVLinkOneSided: env forces fence for both stages.
-        if os.environ.get(_DISABLE_CFT_COUNTED_WRITES_ENV) == "1":
+        self._force_cft = get_force_cft()
+        if self._force_cft is False:
             can_use_cft_counted_writes = False
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
-        self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
-        self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
+        if self._force_cft is None:
+            self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
+            self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
+        else:
+            self.cft_max_batch_for_dispatch = None
+            self.cft_max_batch_for_combine = None
 
         workspace_key = self.can_use_cft_counted_writes
         workspace_entry = self._WORKSPACES.get(workspace_key)
@@ -296,8 +335,7 @@ class MoeAlltoAll:
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
-        workspace_state = self._WORKSPACE
-        assert workspace_state is not None
+        workspace_state = workspace_entry
         metainfo_index = self._METAINFO_INDEX
         assert metainfo_index is not None
         self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
@@ -336,18 +374,14 @@ class MoeAlltoAll:
             self.destroy()
 
     def use_cft_for_dispatch(self, runtime_max_tokens_per_rank: int) -> bool:
-        if not self.can_use_cft_counted_writes:
-            return False
-        if self.cft_max_batch_for_dispatch is None:
-            return True
-        return runtime_max_tokens_per_rank <= self.cft_max_batch_for_dispatch
+        return should_use_cft(self.can_use_cft_counted_writes, self._force_cft,
+                              self.cft_max_batch_for_dispatch,
+                              runtime_max_tokens_per_rank)
 
     def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
-        if not self.can_use_cft_counted_writes:
-            return False
-        if self.cft_max_batch_for_combine is None:
-            return True
-        return runtime_max_tokens_per_rank <= self.cft_max_batch_for_combine
+        return should_use_cft(self.can_use_cft_counted_writes, self._force_cft,
+                              self.cft_max_batch_for_combine,
+                              runtime_max_tokens_per_rank)
 
     def cft_initialize(self):
         """
@@ -471,7 +505,6 @@ class MoeAlltoAll:
         self,
         payload,
         runtime_max_tokens_per_rank: int,
-        payload_in_workspace: bool = False,
         use_low_precision_combine: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
     ):
@@ -481,7 +514,6 @@ class MoeAlltoAll:
         Args:
             payload: [ep_size, max_tokens_per_rank, num_elements_per_token] tensor to combine. The dtype must be float32, bfloat16 or float16.
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
-            payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink transfer (halves NVLink bandwidth usage, output precision is preserved).
             active_rank_mask: Optional uint64 CPU tensor. In rank-mask mode, it must match the mask captured by
                 dispatch for this collective when supplied. A committed-generation change since dispatch aborts
@@ -507,10 +539,9 @@ class MoeAlltoAll:
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace, use_low_precision_combine,
-            self.use_cft_for_combine(runtime_max_tokens_per_rank)
-            and not use_low_precision_combine, self._rank_mask_enabled,
-            active_rank_mask)
+            use_low_precision_combine,
+            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            self._rank_mask_enabled, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 
@@ -534,7 +565,7 @@ class MoeAlltoAll:
             dtype: torch.dtype) -> torch.Tensor:
         """
         Return the combine payload tensor in the workspace, which could be used as the output of MoE kernel to avoid extra copy.
-        See "payload_in_workspace" in combine method.
+        Passing the returned tensor to combine lets the C++ op detect workspace ownership.
         """
         if self._state.phase != "dispatched":
             raise RuntimeError(

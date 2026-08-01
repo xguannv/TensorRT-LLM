@@ -47,14 +47,37 @@ from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication
 
-_DISABLE_CFT_COUNTED_WRITES_ENV = "TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES"
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
 # CFT combine wins at small/medium batch and ties/regresses at large batch, so it is gated by the
-# same per-call token-count threshold as dispatch. Set the env very large to force CFT combine on
-# for all batch sizes, or 0 to force it off.
+# same per-call token-count threshold as dispatch.
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+
+
+def get_force_cft() -> bool | None:
+    value = os.environ.get(FORCE_CFT_ENV)
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    return None
+
+
+def should_use_cft(
+    can_use_cft: bool,
+    force_cft: bool | None,
+    max_batch: int | None,
+    runtime_max_tokens_per_rank: int,
+) -> bool:
+    if not can_use_cft:
+        return False
+    if force_cft is not None:
+        return force_cft
+    if max_batch is None:
+        return True
+    return runtime_max_tokens_per_rank <= max_batch
 
 
 def _get_cft_max_batch(env_name: str, default: int) -> int:
@@ -190,7 +213,6 @@ class NVLinkOneSided(Communication):
         num_slots: int,
         top_k: int,
         max_num_tokens_per_rank: int,
-        payload_in_workspace: bool = False,
         hidden_size: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
@@ -210,7 +232,6 @@ class NVLinkOneSided(Communication):
                 Note: The terminology is mapped to `num_experts` in this class and the kernels.
             top_k: Number of experts per token
             max_num_tokens_per_rank: Maximum number of tokens per rank (for workspace allocation)
-            payload_in_workspace: If True, final_hidden_states is already in workspace
             hidden_size: Hidden dimension size (optional, for auto workspace calculation)
             dtype: Data type (optional, for auto workspace calculation)
             num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
@@ -221,8 +242,8 @@ class NVLinkOneSided(Communication):
             can_use_cft_counted_writes: If True, allow CFT handle-based counted
                 writes (fabric.try_put.counted via Logical Endpoints) for dispatch.
                 Requires sm_100+ (Blackwell) or later with CUDA driver 615.00+.
-                CFT is enabled by default; set TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES=1
-                to force the fence-based dispatch path.
+                Set TRTLLM_MOE_A2A_FORCE_CFT=0 to force the fence path or 1 to
+                force CFT for supported workloads. Other values use automatic selection.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
@@ -240,7 +261,6 @@ class NVLinkOneSided(Communication):
         self.num_experts = num_slots
         self.top_k = top_k
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
-        self.payload_in_workspace = payload_in_workspace
         self.use_low_precision_combine = use_low_precision_combine
         if num_experts is not None:
             assert num_experts > 0 and num_experts <= num_slots, (
@@ -252,17 +272,23 @@ class NVLinkOneSided(Communication):
             )
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
-        # CFT counted writes are used only for dispatch; combine stays on the fence path.
-        if os.environ.get(_DISABLE_CFT_COUNTED_WRITES_ENV) == "1":
+        self._force_cft = get_force_cft()
+        if self._force_cft is False:
             can_use_cft_counted_writes = False
-        self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
-        self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
+        if self._force_cft is None:
+            self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
+            self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
+        else:
+            self.cft_max_batch_for_dispatch = None
+            self.cft_max_batch_for_combine = None
         if can_use_cft_counted_writes:
             tllm_logger.info(
                 "NVLinkOneSided AlltoAll: CFT handle-based counted writes enabled for dispatch"
             )
-            if self.cft_max_batch_for_dispatch is not None:
+            if self._force_cft is True:
+                tllm_logger.info("NVLinkOneSided AlltoAll: CFT forced for supported workloads")
+            elif self.cft_max_batch_for_dispatch is not None:
                 tllm_logger.info(
                     "NVLinkOneSided AlltoAll: CFT dispatch disabled above "
                     f"runtime_max_tokens_per_rank={self.cft_max_batch_for_dispatch}"
@@ -491,18 +517,20 @@ class NVLinkOneSided(Communication):
         return True
 
     def use_cft_for_dispatch(self, runtime_max_tokens_per_rank: int) -> bool:
-        if not self.can_use_cft_counted_writes:
-            return False
-        if self.cft_max_batch_for_dispatch is None:
-            return True
-        return runtime_max_tokens_per_rank <= self.cft_max_batch_for_dispatch
+        return should_use_cft(
+            self.can_use_cft_counted_writes,
+            self._force_cft,
+            self.cft_max_batch_for_dispatch,
+            runtime_max_tokens_per_rank,
+        )
 
     def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
-        if not self.can_use_cft_counted_writes:
-            return False
-        if self.cft_max_batch_for_combine is None:
-            return True
-        return runtime_max_tokens_per_rank <= self.cft_max_batch_for_combine
+        return should_use_cft(
+            self.can_use_cft_counted_writes,
+            self._force_cft,
+            self.cft_max_batch_for_combine,
+            runtime_max_tokens_per_rank,
+        )
 
     def dispatch(
         self,
@@ -723,7 +751,6 @@ class NVLinkOneSided(Communication):
             self.ep_size,
             self.top_k,
             int(combine_payload_offset),
-            bool(self.payload_in_workspace),
             bool(self.use_low_precision_combine),
             self.use_cft_for_combine(runtime_max_tokens_per_rank)
             and not self.use_low_precision_combine,
@@ -755,7 +782,7 @@ class NVLinkOneSided(Communication):
         """
         Return the combine payload tensor in the workspace, which could be used
         as the output of MoE kernel to avoid extra copy.
-        See "payload_in_workspace" in combine method.
+        Passing the returned tensor to combine lets the C++ op detect workspace ownership.
 
         Args:
             runtime_max_tokens_per_rank: Runtime max tokens per rank
