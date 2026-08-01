@@ -15,8 +15,9 @@
 """
 uGPU Execution Planning: centralized enable/disable decisions.
 
-All scattered checks (IS_CUTLASS_DSL_AVAILABLE, is_ugpu_enabled, has_nvfp4,
-weight_mode==VANILLA, out_features%2==0, etc.) are consolidated here.
+All scattered checks (CuteDSL availability, uGPU hardware support, effective
+quantization, supported weight modes, partition alignment, etc.) are
+consolidated here.
 """
 
 from __future__ import annotations
@@ -26,7 +27,11 @@ from typing import Literal, Optional
 
 import torch
 
-from tensorrt_llm._torch.ugpu.layout import PartitionedTensorLayout, make_nvfp4_linear_output_layout
+from tensorrt_llm._torch.ugpu.layout import (
+    PartitionedTensorLayout,
+    make_bf16_linear_output_layout,
+    make_nvfp4_linear_output_layout,
+)
 
 
 @dataclass(frozen=True)
@@ -36,7 +41,15 @@ class UgpuPolicy:
     enabled: bool = False
     num_partitions: int = 2
     allowed_ops: frozenset = field(
-        default_factory=lambda: frozenset({"nvfp4_linear", "nvfp4_moe", "bf16_moe"})
+        default_factory=lambda: frozenset(
+            {
+                "nvfp4_linear",
+                "bf16_linear",
+                "bf16_bmm",
+                "nvfp4_moe",
+                "bf16_moe",
+            }
+        )
     )
     allowed_backends: tuple = ("cutlass", "cublaslt", "cuda_core")
 
@@ -67,6 +80,7 @@ class LinearPartitionPlan(PartitionPlan):
 
     partition_axis: int = 0  # partition along output dimension
     layout: Optional[PartitionedTensorLayout] = None
+    op_kind: Optional[Literal["nvfp4_linear", "bf16_linear"]] = None
 
 
 # Singleton disabled plan
@@ -94,6 +108,10 @@ class UgpuExecutionPlanner:
         out_features: int,
         quant_config,
         weight_mode,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        use_cute_dsl_bf16_gemm: bool = False,
+        enable_ugpu_bf16_linear: bool = False,
     ) -> LinearPartitionPlan:
         """Decide whether to partition a Linear layer for uGPU execution.
 
@@ -107,6 +125,7 @@ class UgpuExecutionPlanner:
         )
         from tensorrt_llm._torch.modules.linear import WeightMode
         from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
+        from tensorrt_llm.quantization.mode import QuantAlgo
 
         # Policy check
         if not self.policy.enabled:
@@ -118,20 +137,42 @@ class UgpuExecutionPlanner:
                 enabled=False, reason_if_disabled="uGPU not supported on this hardware"
             )
 
-        # Op type check
-        if "nvfp4_linear" not in self.policy.allowed_ops:
+        # Select the kernel family from the final effective weight
+        # quantization. KV-cache-only quantization does not quantize Linear
+        # weights and is therefore eligible for the BF16 path.
+        layer_quant_mode = getattr(quant_config, "layer_quant_mode", None)
+        is_nvfp4 = layer_quant_mode is not None and layer_quant_mode.has_nvfp4()
+        if is_nvfp4 and getattr(quant_config, "quant_algo", None) == QuantAlgo.NVFP4_ARC:
             return LinearPartitionPlan(
-                enabled=False, reason_if_disabled="nvfp4_linear not in allowed_ops"
+                enabled=False,
+                reason_if_disabled=("NVFP4_ARC scale geometry is not supported by uGPU Linear"),
+            )
+        has_weight_quant = layer_quant_mode is not None and layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True
+        )
+        is_bf16 = (
+            not has_weight_quant
+            and dtype == torch.bfloat16
+            and use_cute_dsl_bf16_gemm
+            and enable_ugpu_bf16_linear
+        )
+        if is_nvfp4:
+            op_kind = "nvfp4_linear"
+        elif is_bf16:
+            op_kind = "bf16_linear"
+        else:
+            return LinearPartitionPlan(
+                enabled=False,
+                reason_if_disabled=(
+                    "Linear is neither NVFP4 nor an explicitly enabled CuTeDSL BF16 uGPU operation"
+                ),
             )
 
-        # Quantization check
-        is_nvfp4 = (
-            quant_config is not None
-            and hasattr(quant_config, "layer_quant_mode")
-            and quant_config.layer_quant_mode.has_nvfp4()
-        )
-        if not is_nvfp4:
-            return LinearPartitionPlan(enabled=False, reason_if_disabled="Not NVFP4 quantization")
+        if op_kind not in self.policy.allowed_ops:
+            return LinearPartitionPlan(
+                enabled=False,
+                reason_if_disabled=f"{op_kind} not in allowed_ops",
+            )
 
         # uGPU uses Rubin-only CuteDSL kernels from the internal package.
         if not IS_CUTLASS_DSL_AVAILABLE:
@@ -141,19 +182,53 @@ class UgpuExecutionPlanner:
                 enabled=False, reason_if_disabled="CuteDSL internal Rubin kernels not available"
             )
 
-        # Weight mode check (only vanilla supported)
-        if weight_mode != WeightMode.VANILLA:
+        supported_weight_modes = (
+            WeightMode.VANILLA,
+            WeightMode.FUSED_GATE_UP_LINEAR,
+        )
+        if weight_mode not in supported_weight_modes:
+            supported_names = ", ".join(mode.name for mode in supported_weight_modes)
             return LinearPartitionPlan(
                 enabled=False,
-                reason_if_disabled=f"Weight mode {weight_mode} not supported, "
-                f"only VANILLA is supported for uGPU",
+                reason_if_disabled=(
+                    f"Weight mode {weight_mode} not supported for {op_kind}; "
+                    f"supported modes: {supported_names}"
+                ),
             )
 
-        layout = make_nvfp4_linear_output_layout(
-            out_features,
-            in_features,
-            self.policy.num_partitions,
-        )
+        if op_kind == "nvfp4_linear":
+            # NVFP4 packs two K elements per byte, while the transformed
+            # weight requires a 16-byte-aligned packed K dimension. Reject
+            # shapes that would pad only the weight: the shared activation is
+            # not K-padded and the uGPU composite requires exact packed-K
+            # equality.
+            if in_features % 32 != 0:
+                return LinearPartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=(
+                        f"in_features={in_features} not divisible by NVFP4 "
+                        "packed-K alignment (32 elements)"
+                    ),
+                )
+            layout = make_nvfp4_linear_output_layout(
+                out_features,
+                in_features,
+                self.policy.num_partitions,
+            )
+        else:
+            if in_features % 8 != 0:
+                return LinearPartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=(
+                        f"in_features={in_features} not divisible by BF16 "
+                        "16-byte alignment (8 elements)"
+                    ),
+                )
+            layout = make_bf16_linear_output_layout(
+                out_features,
+                in_features,
+                self.policy.num_partitions,
+            )
         layout_reason = layout.disabled_reason_for_padding_free_split()
         if layout_reason is not None:
             return LinearPartitionPlan(enabled=False, reason_if_disabled=layout_reason)
@@ -165,6 +240,7 @@ class UgpuExecutionPlanner:
             merge_kind="concat",
             partition_axis=0,
             layout=layout,
+            op_kind=op_kind,
         )
 
     def plan_moe(
@@ -241,4 +317,50 @@ class UgpuExecutionPlanner:
             num_partitions=self.policy.num_partitions,
             backend="cutedsl",
             merge_kind="none",
+        )
+
+    def plan_bf16_bmm(
+        self,
+        *,
+        dtype: torch.dtype,
+        use_cute_dsl_bf16_bmm: bool,
+    ) -> PartitionPlan:
+        """Decide whether Rubin BF16 BMM may use two uGPU partitions."""
+        from tensorrt_llm._torch.cute_dsl_utils import (
+            IS_CUTLASS_DSL_AVAILABLE,
+            IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+        )
+        from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
+
+        if not self.policy.enabled:
+            return PartitionPlan(enabled=False, reason_if_disabled="UgpuPolicy is disabled")
+        if not is_ugpu_enabled():
+            return PartitionPlan(
+                enabled=False,
+                reason_if_disabled="uGPU not supported on this hardware",
+            )
+        if "bf16_bmm" not in self.policy.allowed_ops:
+            return PartitionPlan(enabled=False, reason_if_disabled="bf16_bmm not in allowed_ops")
+        if not use_cute_dsl_bf16_bmm:
+            return PartitionPlan(
+                enabled=False,
+                reason_if_disabled="CuTeDSL BF16 BMM is disabled",
+            )
+        if dtype != torch.bfloat16:
+            return PartitionPlan(
+                enabled=False,
+                reason_if_disabled=f"BF16 uGPU BMM requires bfloat16, got {dtype}",
+            )
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return PartitionPlan(enabled=False, reason_if_disabled="CuteDSL not available")
+        if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+            return PartitionPlan(
+                enabled=False,
+                reason_if_disabled="CuteDSL internal Rubin kernels not available",
+            )
+        return PartitionPlan(
+            enabled=True,
+            num_partitions=self.policy.num_partitions,
+            backend="cutedsl",
+            merge_kind="concat",
         )

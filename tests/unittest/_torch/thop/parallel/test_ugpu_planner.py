@@ -29,7 +29,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.ugpu.layout import make_nvfp4_linear_output_layout
+from tensorrt_llm._torch.ugpu.layout import (
+    make_bf16_linear_output_layout,
+    make_nvfp4_linear_output_layout,
+)
 from tensorrt_llm._torch.ugpu.policy import (
     DISABLED_PLAN,
     LinearPartitionPlan,
@@ -61,12 +64,16 @@ class _FakeQuantMode:
     def has_nvfp4(self):
         return self._nvfp4
 
+    def has_any_quant(self, exclude_kv_cache=False):
+        return self._nvfp4
+
 
 class _FakeQuantConfig:
     """Minimal stub for QuantConfig."""
 
-    def __init__(self, nvfp4: bool = True):
+    def __init__(self, nvfp4: bool = True, quant_algo=None):
         self.layer_quant_mode = _FakeQuantMode(nvfp4)
+        self.quant_algo = quant_algo
 
 
 # Import WeightMode lazily to avoid heavy module load
@@ -82,6 +89,12 @@ def _fused_qkv_weight_mode():
     return WeightMode.FUSED_QKV_LINEAR
 
 
+def _fused_gate_up_weight_mode():
+    from tensorrt_llm._torch.modules.linear import WeightMode
+
+    return WeightMode.FUSED_GATE_UP_LINEAR
+
+
 # ---------------------------------------------------------------------------
 # Policy dataclass tests
 # ---------------------------------------------------------------------------
@@ -95,6 +108,8 @@ class TestUgpuPolicy:
         assert not policy.enabled
         assert policy.num_partitions == 2
         assert "nvfp4_linear" in policy.allowed_ops
+        assert "bf16_linear" in policy.allowed_ops
+        assert "bf16_bmm" in policy.allowed_ops
         assert "nvfp4_moe" in policy.allowed_ops
         assert "bf16_moe" in policy.allowed_ops
 
@@ -185,12 +200,36 @@ class TestPartitionedTensorLayout:
         assert layout.padded_shape == (7200, 2048)
         assert "NVFP4 row alignment" in layout.disabled_reason_for_padding_free_split()
 
+    def test_bf16_linear_layout_requires_aligned_partition_rows(self):
+        layout = make_bf16_linear_output_layout(
+            out_features=2112,
+            in_features=7168,
+            num_partitions=2,
+        )
+        assert layout.logical_shape == layout.padded_shape
+        assert layout.partition_axis_slice(0, padded=False) == slice(0, 1056)
+        assert layout.partition_axis_slice(1, padded=False) == slice(1056, 2112)
+        assert layout.disabled_reason_for_padding_free_split() is None
+
+        unaligned = make_bf16_linear_output_layout(
+            out_features=2114,
+            in_features=7168,
+            num_partitions=2,
+        )
+        assert "BF16 uGPU row alignment" in (unaligned.disabled_reason_for_padding_free_split())
+
 
 class TestUgpuExecutionPlanner:
     """Tests for plan_linear() enable/disable decisions."""
 
     def _plan(
-        self, policy=None, in_features=2048, out_features=7168, quant_config=None, weight_mode=None
+        self,
+        policy=None,
+        in_features=2048,
+        out_features=7168,
+        quant_config=None,
+        weight_mode=None,
+        **kwargs,
     ):
         """Helper: run plan_linear with sensible defaults."""
         if policy is None:
@@ -200,7 +239,7 @@ class TestUgpuExecutionPlanner:
         if weight_mode is None:
             weight_mode = _vanilla_weight_mode()
         planner = UgpuExecutionPlanner(policy)
-        return planner.plan_linear(in_features, out_features, quant_config, weight_mode)
+        return planner.plan_linear(in_features, out_features, quant_config, weight_mode, **kwargs)
 
     # --- Policy checks ---
 
@@ -255,6 +294,15 @@ class TestUgpuExecutionPlanner:
         plan = planner.plan_linear(2048, 7168, None, _vanilla_weight_mode())
         assert not plan.enabled
 
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    def test_nvfp4_arc_disables(self, mock_ugpu):
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        plan = self._plan(quant_config=_FakeQuantConfig(nvfp4=True, quant_algo=QuantAlgo.NVFP4_ARC))
+        assert not plan.enabled
+        assert "NVFP4_ARC" in plan.reason_if_disabled
+
     # --- CuteDSL availability ---
 
     @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
@@ -283,6 +331,13 @@ class TestUgpuExecutionPlanner:
         assert not plan.enabled
         assert "VANILLA" in plan.reason_if_disabled
 
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    def test_nvfp4_fused_gate_up_weight_mode_enables(self, mock_ugpu):
+        plan = self._plan(weight_mode=_fused_gate_up_weight_mode())
+        assert plan.enabled
+        assert plan.op_kind == "nvfp4_linear"
+
     # --- Divisibility check ---
 
     @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
@@ -298,6 +353,13 @@ class TestUgpuExecutionPlanner:
         plan = self._plan(out_features=7170)
         assert not plan.enabled
         assert "row alignment" in plan.reason_if_disabled
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    def test_unaligned_nvfp4_packed_k_disables(self, mock_ugpu):
+        plan = self._plan(in_features=2064)
+        assert not plan.enabled
+        assert "packed-K alignment" in plan.reason_if_disabled
 
     @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
     @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
@@ -317,7 +379,104 @@ class TestUgpuExecutionPlanner:
         assert plan.merge_kind == "concat"
         assert plan.partition_axis == 0
         assert plan.layout == make_nvfp4_linear_output_layout(7168, 2048, 2)
+        assert plan.op_kind == "nvfp4_linear"
         assert plan.reason_if_disabled is None
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    @pytest.mark.parametrize(
+        (
+            "weight_mode_factory",
+            "in_features",
+            "out_features",
+            "enable_ugpu_bf16_linear",
+            "expected_enabled",
+            "reason_substrings",
+        ),
+        [
+            pytest.param(None, 7168, 2112, False, False, (), id="requires-opt-in"),
+            pytest.param(None, 7168, 2112, True, True, (), id="vanilla"),
+            pytest.param(
+                _fused_gate_up_weight_mode,
+                7168,
+                2112,
+                True,
+                True,
+                (),
+                id="fused-gate-up",
+            ),
+            pytest.param(
+                _fused_qkv_weight_mode,
+                7168,
+                2112,
+                True,
+                False,
+                ("FUSED_QKV_LINEAR", "not supported for bf16_linear"),
+                id="fused-qkv",
+            ),
+            pytest.param(None, 7169, 2112, True, False, ("alignment",), id="unaligned-k"),
+            pytest.param(None, 7168, 2114, True, False, ("alignment",), id="unaligned-n"),
+        ],
+    )
+    def test_bf16_linear_decision_table(
+        self,
+        mock_ugpu,
+        weight_mode_factory,
+        in_features,
+        out_features,
+        enable_ugpu_bf16_linear,
+        expected_enabled,
+        reason_substrings,
+    ):
+        weight_mode = (
+            _vanilla_weight_mode() if weight_mode_factory is None else weight_mode_factory()
+        )
+        plan = self._plan(
+            quant_config=_FakeQuantConfig(nvfp4=False),
+            in_features=in_features,
+            out_features=out_features,
+            weight_mode=weight_mode,
+            dtype=torch.bfloat16,
+            use_cute_dsl_bf16_gemm=True,
+            enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+        )
+
+        assert plan.enabled is expected_enabled
+        if expected_enabled:
+            assert plan.op_kind == "bf16_linear"
+            assert plan.layout == make_bf16_linear_output_layout(out_features, in_features, 2)
+        else:
+            for reason in reason_substrings:
+                assert reason in plan.reason_if_disabled
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    def test_bf16_fused_gate_up_requires_canonical_mapping(self, mock_ugpu):
+        from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
+
+        linear = Linear(
+            in_features=7168,
+            out_features=2112,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=_FakeQuantConfig(nvfp4=False),
+            weights_loading_config=WeightsLoadingConfig(
+                weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
+            ),
+            skip_create_weights_in_init=True,
+            use_cute_dsl_bf16_gemm=True,
+            enable_ugpu_bf16_linear=True,
+            fused_weight_shard_indices_mapping={
+                "up": (0, 1056),
+                "gate": (1056, 1056),
+            },
+            ugpu_policy=UgpuPolicy(enabled=True),
+        )
+
+        linear._replan_ugpu()
+
+        assert not linear.partition_plan.enabled
+        assert "canonical [gate | up]" in linear.partition_plan.reason_if_disabled
 
     def test_linear_reads_policy_from_model_extra_attrs(self):
         from tensorrt_llm._torch.modules.linear import Linear
@@ -330,6 +489,7 @@ class TestUgpuExecutionPlanner:
                 quant_config=_FakeQuantConfig(nvfp4=True),
                 skip_create_weights_in_init=True,
             )
+            linear._replan_ugpu()
 
         assert not linear.partition_plan.enabled
         assert "disabled" in linear.partition_plan.reason_if_disabled
@@ -353,6 +513,7 @@ class TestUgpuExecutionPlanner:
                 quant_config=_FakeQuantConfig(nvfp4=True),
                 skip_create_weights_in_init=True,
             )
+            linear._replan_ugpu()
 
         assert shared_backends == ["cutlass", "cublaslt", "cuda_core"]
         assert linear.nvfp4_allowed_backends is not shared_backends
@@ -362,6 +523,66 @@ class TestUgpuExecutionPlanner:
             "cuda_core",
             "cutedsl",
         ]
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    @pytest.mark.parametrize("start_nvfp4", [True, False], ids=["nvfp4-to-bf16", "bf16-to-nvfp4"])
+    def test_linear_replans_after_quant_override(self, mock_ugpu, start_nvfp4):
+        from tensorrt_llm._torch.modules.linear import Linear
+
+        linear = Linear(
+            in_features=7168,
+            out_features=2112,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=_FakeQuantConfig(nvfp4=start_nvfp4),
+            skip_create_weights_in_init=True,
+            use_cute_dsl_bf16_gemm=True,
+            enable_ugpu_bf16_linear=True,
+            ugpu_policy=UgpuPolicy(enabled=True),
+        )
+        linear._replan_ugpu()
+        initial_runtime = linear._ugpu_runtime
+        initial_op_kind = "nvfp4_linear" if start_nvfp4 else "bf16_linear"
+        final_op_kind = "bf16_linear" if start_nvfp4 else "nvfp4_linear"
+        assert linear.partition_plan.op_kind == initial_op_kind
+        assert linear._ugpu_added_cutedsl_backend is start_nvfp4
+
+        linear.quant_config = _FakeQuantConfig(nvfp4=not start_nvfp4)
+        linear._replan_ugpu()
+
+        assert linear.partition_plan.op_kind == final_op_kind
+        assert linear._ugpu_runtime is not initial_runtime
+        assert linear._ugpu_added_cutedsl_backend is not start_nvfp4
+        assert ("cutedsl" in linear.nvfp4_allowed_backends) is (not start_nvfp4)
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True)
+    def test_linear_replan_after_sharding_requires_reload(self, mock_ugpu):
+        from tensorrt_llm._torch.modules.linear import Linear
+
+        linear = Linear(
+            in_features=7168,
+            out_features=2112,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=_FakeQuantConfig(nvfp4=True),
+            skip_create_weights_in_init=True,
+            ugpu_policy=UgpuPolicy(enabled=True),
+        )
+        linear._replan_ugpu()
+        original_plan = linear.partition_plan
+        original_runtime = linear._ugpu_runtime
+        shards = [{"weight": object()}, {"weight": object()}]
+        linear._ugpu_weight_shards = shards
+        linear.quant_config = _FakeQuantConfig(nvfp4=False)
+
+        with pytest.raises(RuntimeError, match="reload"):
+            linear._replan_ugpu()
+
+        assert linear.partition_plan is original_plan
+        assert linear._ugpu_runtime is original_runtime
+        assert linear._ugpu_weight_shards is shards
 
     def test_model_config_exports_ugpu_policy(self):
         from tensorrt_llm._torch.model_config import ModelConfig
@@ -481,3 +702,52 @@ class TestUgpuMoePlanner:
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True))
         assert not plan.enabled
         assert "internal" in plan.reason_if_disabled
+
+
+class TestUgpuBf16BmmPlanner:
+    """Tests for plan_bf16_bmm() enable/disable decisions."""
+
+    @patch("tensorrt_llm._torch.ugpu_utils.is_ugpu_enabled", return_value=True)
+    @pytest.mark.parametrize(
+        (
+            "allowed_ops",
+            "dtype",
+            "use_cute_dsl_bf16_bmm",
+            "expected_enabled",
+            "reason",
+        ),
+        [
+            pytest.param(None, torch.bfloat16, True, True, None, id="enabled"),
+            pytest.param(
+                frozenset({"bf16_linear"}),
+                torch.bfloat16,
+                True,
+                False,
+                "allowed_ops",
+                id="op-not-allowed",
+            ),
+            pytest.param(None, torch.float16, True, False, None, id="wrong-dtype"),
+            pytest.param(None, torch.bfloat16, False, False, None, id="backend-disabled"),
+        ],
+    )
+    def test_bf16_bmm_decision_table(
+        self,
+        mock_ugpu,
+        allowed_ops,
+        dtype,
+        use_cute_dsl_bf16_bmm,
+        expected_enabled,
+        reason,
+    ):
+        policy_kwargs = {} if allowed_ops is None else {"allowed_ops": allowed_ops}
+        planner = UgpuExecutionPlanner(UgpuPolicy(enabled=True, **policy_kwargs))
+        plan = planner.plan_bf16_bmm(
+            dtype=dtype,
+            use_cute_dsl_bf16_bmm=use_cute_dsl_bf16_bmm,
+        )
+
+        assert plan.enabled is expected_enabled
+        if expected_enabled:
+            assert plan.merge_kind == "concat"
+        elif reason is not None:
+            assert reason in plan.reason_if_disabled

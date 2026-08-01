@@ -148,18 +148,6 @@ protected:
         StreamHolder() = default;
         StreamHolder(StreamHolder const&) = delete;
         StreamHolder& operator=(StreamHolder const&) = delete;
-
-        ~StreamHolder() noexcept
-        {
-            if (stream != nullptr)
-            {
-                auto result = cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream));
-                if (result != cudaSuccess)
-                {
-                    ADD_FAILURE() << "cudaStreamDestroy failed during cleanup: " << cudaGetErrorString(result);
-                }
-            }
-        }
     };
 
     std::unique_ptr<UgpuLocalizationHandle> mHandle;
@@ -361,6 +349,14 @@ TEST_F(UgpuLocalizationTest, MallocFreeOnUgpu0)
     ASSERT_NO_THROW(mHandle->ugpuMalloc(&devPtr, size, 0));
     ASSERT_NE(devPtr, nullptr);
 
+#if CUDA_VERSION >= 13040
+    int localityDomain = -1;
+    ASSERT_EQ(cuPointerGetAttribute(
+                  &localityDomain, CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL, reinterpret_cast<CUdeviceptr>(devPtr)),
+        CUDA_SUCCESS);
+    EXPECT_EQ(localityDomain, 0);
+#endif
+
     // Free memory
     ASSERT_NO_THROW(mHandle->ugpuFree(devPtr));
 }
@@ -380,6 +376,14 @@ TEST_F(UgpuLocalizationTest, MallocFreeOnUgpu1)
     ASSERT_NO_THROW(mHandle->ugpuMalloc(&devPtr, size, 1));
     ASSERT_NE(devPtr, nullptr);
 
+#if CUDA_VERSION >= 13040
+    int localityDomain = -1;
+    ASSERT_EQ(cuPointerGetAttribute(
+                  &localityDomain, CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL, reinterpret_cast<CUdeviceptr>(devPtr)),
+        CUDA_SUCCESS);
+    EXPECT_EQ(localityDomain, 1);
+#endif
+
     // Free memory
     ASSERT_NO_THROW(mHandle->ugpuFree(devPtr));
 }
@@ -395,8 +399,7 @@ TEST_F(UgpuLocalizationTest, CreateLocalizedStreamUgpu0)
     // Create stream localized to UGPU 0
     CUstream stream = mHandle->createUgpuLocalizedStream(0);
     ASSERT_NE(stream, nullptr);
-
-    TLLM_CUDA_CHECK(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream)));
+    EXPECT_EQ(mHandle->createUgpuLocalizedStream(0), stream);
 }
 
 // Test 6: Create localized stream on UGPU 1
@@ -410,8 +413,7 @@ TEST_F(UgpuLocalizationTest, CreateLocalizedStreamUgpu1)
     // Create stream localized to UGPU 1
     CUstream stream = mHandle->createUgpuLocalizedStream(1);
     ASSERT_NE(stream, nullptr);
-
-    TLLM_CUDA_CHECK(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream)));
+    EXPECT_EQ(mHandle->createUgpuLocalizedStream(1), stream);
 }
 
 // Bandwidth checks allocate tens of GiB and are disabled in normal unit-test runs.

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -431,6 +433,16 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp(
         ctx.shutdown()
         for gen in gens:
             gen.shutdown()
+
+
+def test_build_page_table_from_manager_rejects_localized_kv_cache() -> None:
+    manager = SimpleNamespace(
+        num_ugpus=2,
+        impl=SimpleNamespace(layer_grouping=[]),
+    )
+
+    with pytest.raises(NotImplementedError, match="enable_ugpu=True"):
+        build_page_table_from_manager(manager)
 
 
 @pytest.mark.cpu_only

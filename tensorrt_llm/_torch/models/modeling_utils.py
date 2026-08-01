@@ -547,6 +547,8 @@ class DecoderModelForCausalLM(nn.Module,
                             module.quant_config = q
                             break
                 elif isinstance(module, Linear):
+                    if getattr(module, "_skip_layerwise_quant_config", False):
+                        continue
                     weight_mode = module.weights_loading_config.weight_mode
                     prefix_name = '.'.join(name.split('.')[:-1])
                     if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:

@@ -1362,6 +1362,7 @@ class DeepseekV4Attention(MLA):
             o_lora_rank=config.o_lora_rank,
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
+            enable_ugpu_bf16_linear=True,
         )
 
 

@@ -46,6 +46,8 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_A
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph
+from ..ugpu.policy import UgpuExecutionPlanner, UgpuPolicy
+from ..ugpu.runtime import UgpuRuntime
 from ..utils import (
     AuxStreamType,
     Fp4QuantizedTensor,
@@ -254,6 +256,7 @@ class MLA(nn.Module):
         o_lora_rank: int = 1024,
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
+        enable_ugpu_bf16_linear: bool = False,
     ):
         """
         Initialize the MLA module.
@@ -285,6 +288,7 @@ class MLA(nn.Module):
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
+            enable_ugpu_bf16_linear (bool): Enable localized BF16 MLA projections.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -424,6 +428,12 @@ class MLA(nn.Module):
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
+        ugpu_policy = config.extra_attrs.get("ugpu_policy")
+        self._ugpu_policy = ugpu_policy if ugpu_policy is not None else UgpuPolicy()
+        self.enable_ugpu_bf16_linear = enable_ugpu_bf16_linear
+        self._ugpu_runtime: Optional[UgpuRuntime] = None
+        self._ugpu_k_b_proj_trans_shards: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._ugpu_v_b_proj_shards: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
         if not self.is_lite:
             kv_a_out_features = self.kv_lora_rank + self.qk_rope_head_dim
@@ -473,6 +483,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
         else:
             self.kv_a_proj_with_mqa = Linear(
@@ -501,6 +513,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
             self.q_b_proj = self.q_proj
 
@@ -551,6 +565,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
             self.v_b_proj = nn.Parameter(
                 torch.empty(
@@ -632,6 +648,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+                enable_ugpu_bf16_linear=enable_ugpu_bf16_linear,
+                ugpu_policy=self._ugpu_policy,
             )
             self.attention_output_hidden_size = self.o_proj.in_features
 
@@ -736,7 +754,17 @@ class MLA(nn.Module):
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
+        self._ugpu_k_b_proj_trans_shards = None
+        self._ugpu_v_b_proj_shards = None
+        self._kvbproj_head_weights_cache = None
         self._weights_transformed = False
+
+    def _bind_v_b_proj_weight(self, weight: torch.Tensor) -> None:
+        """Bind the V absorption weight without retaining a released full weight."""
+        plan = self.kv_b_proj.partition_plan
+        if plan.enabled and plan.op_kind == "bf16_linear":
+            weight = weight.clone(memory_format=torch.contiguous_format)
+        self.v_b_proj = nn.Parameter(weight, requires_grad=False)
 
     def apply_rope(
         self,
@@ -1019,10 +1047,17 @@ class MLA(nn.Module):
         """
         if not is_sm_100f():
             return False
-        weight = getattr(self.kv_b_proj, "weight", None)
+        w = getattr(self.kv_b_proj, "weight", None)
+        expected_shape = (
+            self.num_heads_tp * (self.qk_nope_head_dim + self.v_head_dim),
+            self.kv_lora_rank,
+        )
+        expected_numel = math.prod(expected_shape)
         return (
-            weight is not None
-            and weight.dtype == torch.bfloat16
+            w is not None
+            and w.dtype == torch.bfloat16
+            and tuple(w.shape) == expected_shape
+            and w.numel() == expected_numel
             and self.kv_b_proj.bias is None
         )
 
@@ -1479,17 +1514,117 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
 
-    def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
+    def _bmm_bf16_out(
+        self,
+        a: torch.Tensor,
+        b_no_transpose: torch.Tensor,
+        b_transposed: torch.Tensor,
+        output: torch.Tensor,
+        ugpu_weight_shards: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> None:
         """BMM with optional CuTe DSL bf16 acceleration on Blackwell/Rubin."""
-        if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+        if not self.use_cute_dsl_bf16_bmm:
+            torch.ops.trtllm.bmm_out(a, b_transposed, output)
+            return
+
+        sm_version = get_sm_version()
+        if sm_version == 107 and ugpu_weight_shards is not None:
+            weight_0, weight_1 = ugpu_weight_shards
+            torch.ops.trtllm.cute_dsl_bf16_bmm_ugpu_inplace_rubin(a, weight_0, weight_1, output)
+        elif is_sm_100f(sm_version):
             bf16_bmm_op = (
                 torch.ops.trtllm.cute_dsl_bf16_bmm_rubin
-                if get_sm_version() == 107
+                if sm_version == 107
                 else torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell
             )
             bf16_bmm_op(a, b_no_transpose, output)
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
+
+    def _has_full_absorption_weights(self) -> bool:
+        if getattr(self, "kv_lora_rank", None) != 512 or getattr(self, "v_head_dim", None) != 128:
+            return False
+        # The Rubin BF16 BMM requires its K dimension to be 16-byte aligned.
+        # qk_nope_head_dim is K for the absorbed K projection.
+        if getattr(self, "qk_nope_head_dim", 0) % 8 != 0:
+            return False
+
+        k_weight = getattr(self, "k_b_proj_trans", None)
+        v_weight = getattr(self, "v_b_proj", None)
+        if not isinstance(k_weight, torch.Tensor) or not isinstance(v_weight, torch.Tensor):
+            return False
+        if k_weight.is_meta or v_weight.is_meta:
+            return False
+
+        expected_k_shape = (
+            self.num_heads_tp,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+        )
+        expected_v_shape = (
+            self.num_heads_tp_cp,
+            self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        return (
+            k_weight.dtype == v_weight.dtype
+            and tuple(k_weight.shape) == expected_k_shape
+            and tuple(v_weight.shape) == expected_v_shape
+            and k_weight.numel() == math.prod(expected_k_shape)
+            and v_weight.numel() == math.prod(expected_v_shape)
+        )
+
+    def _copy_absorption_weight_shards(
+        self, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._ugpu_runtime is not None
+        num_partitions = self._ugpu_runtime.num_partitions
+        assert weight.shape[1] % num_partitions == 0
+
+        shard_n = weight.shape[1] // num_partitions
+        shards = []
+        for partition_id in range(num_partitions):
+            weight_slice = weight[
+                :,
+                partition_id * shard_n : (partition_id + 1) * shard_n,
+                :,
+            ]
+            with self._ugpu_runtime.partition_weight_context(partition_id):
+                shard = torch.empty_like(
+                    weight_slice,
+                    memory_format=torch.contiguous_format,
+                )
+                shard.copy_(weight_slice)
+            shards.append(shard)
+        assert len(shards) == 2
+        return shards[0], shards[1]
+
+    def _rebuild_ugpu_bf16_bmm_weight_shards(self) -> None:
+        """Rebuild localized BF16 absorption weights from the full parameters."""
+        self._ugpu_k_b_proj_trans_shards = None
+        self._ugpu_v_b_proj_shards = None
+
+        if getattr(self, "is_deepseek_v4", False) or not self._has_full_absorption_weights():
+            return
+
+        ugpu_policy = getattr(self, "_ugpu_policy", None)
+        if ugpu_policy is None:
+            return
+        plan = UgpuExecutionPlanner(ugpu_policy).plan_bf16_bmm(
+            dtype=self.k_b_proj_trans.dtype,
+            use_cute_dsl_bf16_bmm=getattr(self, "use_cute_dsl_bf16_bmm", False),
+        )
+        if not plan.enabled:
+            return
+
+        if getattr(self, "_ugpu_runtime", None) is None:
+            self._ugpu_runtime = UgpuRuntime(plan.num_partitions)
+
+        k_shards = self._copy_absorption_weight_shards(self.k_b_proj_trans)
+        v_shards = self._copy_absorption_weight_shards(self.v_b_proj)
+        self._ugpu_runtime.prepare_for_capture(plan)
+        self._ugpu_k_b_proj_trans_shards = k_shards
+        self._ugpu_v_b_proj_shards = v_shards
 
     def forward_absorption_generation(
         self,
@@ -1587,6 +1722,7 @@ class MLA(nn.Module):
                         self.k_b_proj_trans,
                         self.k_b_proj_trans.transpose(1, 2),
                         q_nope_out,
+                        self._ugpu_k_b_proj_trans_shards,
                     ),
                     _mla_gen_rope,
                     self.ln_events[0],
@@ -1666,6 +1802,7 @@ class MLA(nn.Module):
                 self.v_b_proj,
                 self.v_b_proj.transpose(1, 2),
                 attn_output.transpose(0, 1),
+                self._ugpu_v_b_proj_shards,
             )
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
@@ -1725,6 +1862,7 @@ class MLA(nn.Module):
                     self.k_b_proj_trans,
                     self.k_b_proj_trans.transpose(1, 2),
                     q_nope_out,
+                    self._ugpu_k_b_proj_trans_shards,
                 )
             elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
                 # [num_heads, num_tokens, self.kv_lora_rank]
@@ -1788,6 +1926,7 @@ class MLA(nn.Module):
                 self.v_b_proj,
                 self.v_b_proj.transpose(1, 2),
                 attn_output.transpose(0, 1),
+                self._ugpu_v_b_proj_shards,
             )
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
@@ -1967,7 +2106,10 @@ class MLA(nn.Module):
         self._weights_transformed = True
 
     def cache_derived_state(self) -> None:
+        self._kvbproj_head_weights_cache = None
+        self._rebuild_ugpu_bf16_bmm_weight_shards()
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:
         self.transform_weights()
+        self.cache_derived_state()

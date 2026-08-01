@@ -49,7 +49,8 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2)
+                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
+                     mxfp8_scale_infer_shape)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -564,6 +565,15 @@ class FP4GemmRunner(TunableRunner):
         last_positive_power_of_2), ),
                                  constraint_specs=(ConstraintSpec(
                                      2, 0, fp4_scale_infer_shape), ))
+    mxfp8_tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0,
+            0,
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ), ),
+        constraint_specs=(ConstraintSpec(2, 0, mxfp8_scale_infer_shape), ),
+    )
 
     def __init__(
         self,
@@ -1253,7 +1263,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     BufferKind.USERBUFFERS))
                 return CuteDSLNVFP4RubinLinear(
                     self.output_dtype, to_userbuffers)(inputs,
-                                                       tactic=sub_tactic)
+                                                       tactic=sub_tactic,
+                                                       bias=bias)
             else:
                 # Blackwell: SM 100, 103
                 return CuteDSLNVFP4BlackwellRunner(
@@ -1456,6 +1467,7 @@ def nvfp4_gemm_inplace(
             [runner],
             NVFP4GemmInplaceUnifiedRunner.tuning_config,
             [act_fp4, weight, act_sf, weight_scale, alpha, output_tensor],
+            partition_id=partition_id,
         )
     except IndexError as e:
         logger.error(
@@ -1856,7 +1868,7 @@ def w4a8_mxfp4_fp8_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
         [w4a8_mxfp4_fp8_gemm_runner],
-        FP4GemmRunner.tuning_config,
+        FP4GemmRunner.mxfp8_tuning_config,
         [act_fp8, weight, act_sf, weight_scale, alpha],
     )
 

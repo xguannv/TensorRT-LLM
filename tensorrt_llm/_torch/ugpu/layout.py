@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 NVFP4_WEIGHT_ROW_ALIGNMENT = 32
+BF16_PARTITION_ROW_ALIGNMENT = 8
 
 
 def pad_up(value: int, alignment: int) -> int:
@@ -149,4 +150,30 @@ def make_nvfp4_linear_output_layout(
         axis_name="out_features",
         axis_alignment=NVFP4_WEIGHT_ROW_ALIGNMENT,
         alignment_name="NVFP4 row alignment",
+    )
+
+
+def make_bf16_linear_output_layout(
+    out_features: int,
+    in_features: int,
+    num_partitions: int,
+) -> PartitionedTensorLayout:
+    """Build padding-free BF16 Linear layout metadata for an output-N split.
+
+    The Rubin BF16 kernel requires each partition's contiguous N dimension to
+    be 16-byte aligned. BF16 elements are two bytes, so the full output
+    dimension must be a multiple of ``8 * num_partitions`` elements.
+    """
+    output_row_alignment = BF16_PARTITION_ROW_ALIGNMENT * num_partitions
+    return PartitionedTensorLayout(
+        logical_shape=(out_features, in_features),
+        padded_shape=(
+            pad_up(out_features, output_row_alignment),
+            in_features,
+        ),
+        partition_axis=0,
+        num_partitions=num_partitions,
+        axis_name="out_features",
+        axis_alignment=output_row_alignment,
+        alignment_name="BF16 uGPU row alignment",
     )

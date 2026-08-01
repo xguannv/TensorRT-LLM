@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -103,6 +118,9 @@ def inplace_info():
         },
         torch.ops.trtllm.moe_output_memset_inplace.default: {
             1: "input"
+        },
+        torch.ops.trtllm.nvfp4_gemm_inplace.default: {
+            1: "output_tensor"
         },
         torch.ops.trtllm.megamoe_prepare.default: {
             1: "x_out",
@@ -244,4 +262,26 @@ def inplace_info():
         inplace_map[torch.ops.trtllm.cute_dsl_fp8_bmm_rubin.default] = {
             1: "output"
         }
+        inplace_map[torch.ops.trtllm.cute_dsl_bf16_bmm_rubin.default] = {
+            1: "output"
+        }
+        inplace_map[torch.ops.trtllm.cute_dsl_bf16_gemm_rubin.default] = {
+            1: "output"
+        }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_bf16_bmm_ugpu_inplace_rubin.default] = {
+                1: "output"
+            }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_bf16_gemm_ugpu_inplace_rubin.default] = {
+                1: "output"
+            }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin.default] = {
+                1: "output_tensor"
+            }
+        inplace_map[
+            torch.ops.trtllm.cute_dsl_nvfp4_gemm_ugpu_inplace_rubin.default] = {
+                1: "output_tensor"
+            }
     return inplace_map

@@ -39,7 +39,7 @@ from _torch.modules.moe.moe_test_utils import (
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1007,6 +1007,38 @@ def should_skip_ugpu_runtime(enable_ugpu: bool) -> Optional[str]:
     return None
 
 
+def test_ci_acceleration_keeps_only_ugpu_cutedsl_bf16(monkeypatch: pytest.MonkeyPatch):
+    from _torch.modules.moe import moe_test_utils
+
+    monkeypatch.setattr(moe_test_utils, "IS_CI_MODE", True)
+    model_config = MoeModelConfig(60, 4, 2048, 1408)
+    common_kwargs = {
+        "backend_type": MoeBackendType.CUTEDSL,
+        "quant_algo": None,
+        "model_config": model_config,
+        "routing_method_cls": RenormalizeMoeRoutingMethod,
+        "activation_type": ActivationType.Swiglu,
+    }
+
+    assert should_skip_to_accelerate_ci(dtype=torch.bfloat16, **common_kwargs) is not None
+    assert (
+        should_skip_to_accelerate_ci(
+            dtype=torch.bfloat16,
+            enable_ugpu=True,
+            **common_kwargs,
+        )
+        is None
+    )
+    assert (
+        should_skip_to_accelerate_ci(
+            dtype=torch.float16,
+            enable_ugpu=True,
+            **common_kwargs,
+        )
+        is not None
+    )
+
+
 def generate_test_params() -> List:
     """
     Generate test parameter combinations, filtering out unsupported configurations.
@@ -1224,6 +1256,7 @@ def test_moe_backend(
     swiglu_limit: Optional[float],
     monkeypatch: pytest.MonkeyPatch,
     enable_ugpu: bool,
+    tmp_path,
 ):
     """
     Test MoE backend with autotune to capture all tactics.
@@ -1264,6 +1297,7 @@ def test_moe_backend(
         seq_len=seq_len,
         swiglu_gptoss_style=swiglu_gptoss_style,
         activation_type=activation_type,
+        enable_ugpu=enable_ugpu,
     )
     if ci_skip:
         pytest.skip(ci_skip)
@@ -1415,13 +1449,26 @@ def test_moe_backend(
 
         # Autotune phase: tune kernels to find best tactics
         # Use cache_path to speed up subsequent runs by reusing tuning results
-        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+        cache_path = (
+            str(tmp_path / "moe_autotuner_cache.json")
+            if enable_ugpu
+            else "/tmp/moe_autotuner_cache.json"
+        )
+        with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
         if enable_ugpu:
-            gather_failures = autotuner.stats.failed_profiling_count.get(
-                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin", set()
+            quant_name = "nvfp4" if quant_algo == QuantAlgo.NVFP4 else "bf16"
+            expected_tuning_ops = (
+                f"CuteDslFusedMoE::run_moe_{quant_name}::ugpu_end_to_end",
+                f"trtllm::cute_dsl_{quant_name}_gather_grouped_gemm_"
+                f"{'act_fusion' if quant_algo == QuantAlgo.NVFP4 else 'swiglu'}"
+                "_rubin::ugpu_concurrent",
+                f"trtllm::cute_dsl_{quant_name}_grouped_gemm_finalize_"
+                "inplace_rubin::ugpu_concurrent",
             )
-            assert not gather_failures
+            for op_name in expected_tuning_ops:
+                assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
+                assert not autotuner.stats.failed_profiling_count.get(op_name, set())
 
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
@@ -1431,6 +1478,40 @@ def test_moe_backend(
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
+
+            # Replaying every outer tile is deliberately exhaustive and would
+            # multiply the inner FC tactic replay for every matrix member. One
+            # representative production shape per uGPU path covers that
+            # outer-tile contract; all matrix members still validate their
+            # tuned/failed statistics and replay the tactics selected for their
+            # own shape below.
+            representative_outer_tile_replay = (
+                enable_ugpu
+                and quant_algo in (QuantAlgo.NVFP4, None)
+                and seq_len == 1
+                and (num_experts, top_k, hidden_size, intermediate_size) == (60, 4, 2048, 1408)
+            )
+            if representative_outer_tile_replay:
+                # The regular Cartesian replay contains inner FC tactics only
+                # for the selected outer tile. Exercise every outer tile
+                # directly after tuning, when all corresponding FC caches have
+                # been prepared, so a non-winning tile cannot silently regress.
+                outer_context = all_tactics._captured_contexts[0]
+                outer_runner = outer_context["runners"][0]
+                outer_tactics = outer_runner.get_valid_tactics(
+                    outer_context["inputs"], OptimizationProfile()
+                )
+                expected_outer_tactics = (
+                    {128, 256, 512} if quant_algo == QuantAlgo.NVFP4 else {64, 128, 256}
+                )
+                assert set(outer_tactics) == expected_outer_tactics
+                for outer_tactic in outer_tactics:
+                    # Direct runner replay reuses the captured inplace output;
+                    # reset it to the fresh-output baseline used by run_moe().
+                    with torch.inference_mode():
+                        outer_context["inputs"][-1].zero_()
+                        output = outer_runner(outer_context["inputs"], tactic=outer_tactic)
+                    ref_fused_moe.check_accuracy(output, ref_output)
 
             # Replay phase: test each tactic for correctness
             # Set fail_fast=True to stop on first failure, False to run all and report summary

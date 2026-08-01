@@ -2194,6 +2194,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             Sm107BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment(
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
+            # The grid uses a half-sized per-CTA M tile for 2-CTA MMA.
+            # Requiring enough real M tiles avoids phantom cluster peers, which
+            # can issue out-of-bounds TMA accesses for skinny-M problems.
+            cta_tile_m = mma_tiler[0] // (2 if mma_inst_shape[0] == 256 else 1)
+            ctas_m = (m + cta_tile_m - 1) // cta_tile_m
+            if ctas_m < cluster_shape_mn[0]:
+                return False
         except testing.CantImplementError as e:
             print(f"[DSL ERROR] CantImplementError: {e}")
             return False

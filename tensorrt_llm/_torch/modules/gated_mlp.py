@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -38,6 +41,7 @@ class GatedMLP(nn.Module):
         swiglu_limit: Optional[float] = None,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        enable_ugpu_bf16_linear: bool = False,
     ):
 
         super().__init__()
@@ -118,10 +122,14 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-            use_cute_dsl_nvfp4_swiglu_blackwell=(use_cute_dsl_blockscaling_mm
-                                                 and activation == F.silu
-                                                 and not bias),
+            use_cute_dsl_nvfp4_swiglu_blackwell=(
+                use_cute_dsl_blockscaling_mm and activation == F.silu
+                and not bias
+                and (swiglu_limit is None or swiglu_limit == float("inf"))),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_ugpu_bf16_linear=(use_cute_dsl_bf16_gemm
+                                     and enable_ugpu_bf16_linear),
+            ugpu_policy=config.ugpu_policy,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
@@ -154,6 +162,9 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_ugpu_bf16_linear=(use_cute_dsl_bf16_gemm
+                                     and enable_ugpu_bf16_linear),
+            ugpu_policy=config.ugpu_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
@@ -213,7 +224,7 @@ class GatedMLP(nn.Module):
         return ((self.swiglu_alpha is None or self.swiglu_alpha == 1.0)
                 and (self.swiglu_beta is None or self.swiglu_beta == 0.0))
 
-    def _can_fuse_gate_up_swiglu(self):
+    def _can_fuse_gate_up_swiglu(self) -> bool:
         """Check if fused GEMM + SwiGLU path is available.
 
         The projection owns the capability predicate because weight loading
@@ -222,7 +233,7 @@ class GatedMLP(nn.Module):
         return (self.activation == F.silu and self._is_plain_swiglu()
                 and self.gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell())
 
-    def _can_fuse_gate_up_swiglu_fp4out(self):
+    def _can_fuse_gate_up_swiglu_fp4out(self) -> bool:
         """Check if fused GEMM + SwiGLU with FP4 output path is available.
 
         Extends _can_fuse_gate_up_swiglu with additional conditions:

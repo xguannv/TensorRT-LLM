@@ -14,13 +14,37 @@
 
 from collections.abc import Callable
 from operator import getitem
+from unittest.mock import patch
 
 import pytest
 import torch
-from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
+from torch._higher_order_ops.auto_functionalize import auto_functionalized, auto_functionalized_v2
 from torch.fx import Graph
 
 import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
+import tensorrt_llm._torch.custom_ops  # noqa: F401
+
+
+def _fake_inplace(input, output, output_sf=None):
+    pass
+
+
+def _fake_inplace_map():
+    return {_fake_inplace: {1: "output", 2: "output_sf"}}
+
+
+def _run_remove_copy(graph):
+    with patch.object(remove_copy_pass, "inplace_info", _fake_inplace_map):
+        remove_copy_pass.remove_copy_for_mutates_args(graph)
+    graph.lint()
+
+
+def _call_function_nodes(graph):
+    return [node for node in graph.nodes if node.op == "call_function"]
+
+
+def _targets(graph):
+    return [node.target for node in _call_function_nodes(graph)]
 
 # Registers torch.ops.trtllm.mla_custom_op_inplace, used below. The op is a
 # module-import side effect that the eagerly loaded model zoo used to provide
@@ -166,3 +190,106 @@ def test_remove_copy_for_mla_restores_final_output_mutation() -> None:
     assert inplace_nodes[0].kwargs["output"] is output
     assert clone.args[0] is output
     graph.lint()
+
+
+def test_remove_copy_for_mutates_args_rejects_getitem_for_optional_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = Graph()
+    hidden_states = graph.placeholder("hidden_states")
+    output = graph.placeholder("output")
+    inplace_func = torch.ops.trtllm.mla_custom_op_inplace.default
+    functionalized = graph.call_function(
+        auto_functionalized_v2,
+        args=(inplace_func,),
+        kwargs={
+            "hidden_states": hidden_states,
+            "position_ids": None,
+            "layer_idx": "0",
+            "latent_cache_gen": None,
+            "enable_dsv4_epilogue_fusion": False,
+            "_all_bases": (output,),
+            "_output_base_index": 0,
+            "_dsv4_output_base_index": None,
+            "_dsv4_output_sf_base_index": None,
+        },
+    )
+    optional_output = graph.call_function(getitem, args=(functionalized, 2))
+    clone = graph.call_function(torch.ops.aten.clone.default, args=(optional_output,))
+    graph.output(clone)
+
+    monkeypatch.setattr(
+        remove_copy_pass,
+        "inplace_info",
+        lambda: {inplace_func: {1: "output", 2: "dsv4_output"}},
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "getitem user for optional output 'dsv4_output' has no "
+            "base tensor -- graph is malformed"
+        ),
+    ):
+        remove_copy_pass.remove_copy_for_mutates_args(graph)
+
+
+def test_remove_copy_handles_named_functionalized_outputs():
+    graph = Graph()
+    input_node = graph.placeholder("input")
+    output = graph.placeholder("output")
+    output_sf = graph.placeholder("output_sf")
+    functionalized = graph.call_function(
+        auto_functionalized,
+        args=(_fake_inplace,),
+        kwargs={
+            "input": input_node,
+            "output": output,
+            "output_sf": output_sf,
+        },
+    )
+    output_getitem = graph.call_function(getitem, args=(functionalized, "output"))
+    output_sf_getitem = graph.call_function(getitem, args=(functionalized, "output_sf"))
+    graph.output((output_getitem, output_sf_getitem))
+
+    _run_remove_copy(graph)
+
+    targets = _targets(graph)
+    assert auto_functionalized not in targets
+    assert getitem not in targets
+    assert _fake_inplace in targets
+
+
+def test_remove_copy_uses_registered_nvfp4_inplace_mapping():
+    inplace_op = torch.ops.trtllm.nvfp4_gemm_inplace.default
+    graph = Graph()
+    output_tensor = graph.placeholder("output_tensor")
+    functionalized = graph.call_function(
+        auto_functionalized,
+        args=(inplace_op,),
+        kwargs={
+            "act_fp4": graph.placeholder("act_fp4"),
+            "weight": graph.placeholder("weight"),
+            "act_sf": graph.placeholder("act_sf"),
+            "weight_scale": graph.placeholder("weight_scale"),
+            "alpha": graph.placeholder("alpha"),
+            "output_dtype": torch.bfloat16,
+            "to_userbuffers": False,
+            "allowed_backends": "cutedsl",
+            "output_tensor": output_tensor,
+            "partition_id": 0,
+        },
+    )
+    output_getitem = graph.call_function(getitem, args=(functionalized, 1))
+    graph.output(output_getitem)
+
+    remove_copy_pass.remove_copy_for_mutates_args(graph)
+    graph.lint()
+
+    targets = _targets(graph)
+    assert auto_functionalized not in targets
+    assert getitem not in targets
+    inplace_node = next(node for node in _call_function_nodes(graph) if node.target is inplace_op)
+    assert inplace_node.kwargs["output_tensor"] is output_tensor
+    output_node = next(node for node in graph.nodes if node.op == "output")
+    assert output_node.args == (output_tensor,)

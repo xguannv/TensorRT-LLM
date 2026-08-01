@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.ugpu.policy import PartitionPlan
 from tensorrt_llm._torch.ugpu_utils import (
     end_for_all_ugpu,
+    get_ugpu_compute_sm_counts,
     get_ugpu_mempool,
     get_ugpu_stream,
     initialize_ugpu_resources,
@@ -55,6 +56,14 @@ class UgpuRuntime:
     def partition_mempool(self, partition_id: int) -> torch.cuda.MemPool:
         """Get the memory pool for a specific partition."""
         return get_ugpu_mempool(partition_id)
+
+    def topology_identity(self) -> tuple[tuple[int, int], ...]:
+        """Return a stable identity for the actual public CUDA compute split."""
+        initialize_ugpu_resources()
+        return tuple(
+            get_ugpu_compute_sm_counts(partition_id) or (0, 0)
+            for partition_id in range(self.num_partitions)
+        )
 
     @contextmanager
     def partition_context(self, partition_id: int):

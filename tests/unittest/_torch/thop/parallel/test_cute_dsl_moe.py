@@ -1,9 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 import torch
 from utils.util import check_accuracy
 
-from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
+from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TunableRunner
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+    GroupedGemmInputsHelper,
+    _get_sm107_nvfp4_default_mma_config,
+)
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import (
+    CuteDslFusedMoE,
+    _runner_tactics_match_tile_size,
+    _UgpuConcurrentTunableRunner,
+    cute_dsl_nvfp4_grouped_gemm_ref,
+)
 from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
 from tensorrt_llm._torch.ugpu_utils import (
     end_for_all_ugpu,
@@ -14,6 +43,7 @@ from tensorrt_llm._torch.ugpu_utils import (
 )
 from tensorrt_llm._torch.utils import (
     ActivationType,
+    Fp4QuantizedTensor,
     is_gated_activation,
     relu2,
     swizzle_sf,
@@ -1854,6 +1884,1194 @@ def test_moe_output_memset_aux_stream_guard_requires_full_aux_state():
     assert backend._has_moe_output_memset_aux_stream()
 
 
+def test_runner_tactics_match_tile_size_unwraps_ugpu_runner():
+    class OuterRunner:
+        pass
+
+    class FakeOpRunner(TunableRunner):
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return []
+
+        def forward(self, inputs, tactic):
+            return None
+
+    op_runner = FakeOpRunner()
+    runner = _UgpuConcurrentTunableRunner(
+        op_runner,
+        SimpleNamespace(num_partitions=2),
+        2,
+        lambda *_: None,
+    )
+    outer_runner = OuterRunner()
+    matching_tactic = ((128, 128, 64), (128, 128, 16), (1, 1), False)
+    mismatched_tactic = ((64, 128, 64), (64, 128, 16), (1, 1), False)
+    assert _runner_tactics_match_tile_size(
+        [(outer_runner, 128), (runner, matching_tactic)],
+        OuterRunner,
+        (FakeOpRunner,),
+    )
+    assert not _runner_tactics_match_tile_size(
+        [(outer_runner, 128), (runner, mismatched_tactic)],
+        OuterRunner,
+        (FakeOpRunner,),
+    )
+
+
+def test_ugpu_concurrent_tunable_runner_delegates_and_launches_all_partitions():
+    class FakeOpRunner(TunableRunner):
+        def __init__(self):
+            self.tactics_call = None
+
+        def unique_id(self):
+            return ("fake-op", 7)
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            self.tactics_call = (id(inputs), profile, kwargs)
+            return [-1, ("fast", 128)]
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            raise AssertionError("the wrapper must call launch_fn, not the op runner")
+
+    class FakeRuntime:
+        def __init__(self, topology):
+            self.topology = topology
+            self.events = []
+
+        def topology_identity(self):
+            return self.topology
+
+        def fork(self):
+            self.events.append(("fork",))
+
+        @contextmanager
+        def partition_context(self, partition_id):
+            self.events.append(("enter", partition_id))
+            yield
+            self.events.append(("exit", partition_id))
+
+        def join(self):
+            self.events.append(("join",))
+
+    op_runner = FakeOpRunner()
+    runtime = FakeRuntime(((100, 212), (100, 212), (12, 212)))
+    inputs = [torch.empty(1)]
+
+    def launch(partition_id, launch_inputs, tactic):
+        runtime.events.append(("launch", partition_id, id(launch_inputs), tactic))
+
+    runner = _UgpuConcurrentTunableRunner(op_runner, runtime, 3, launch)
+    profile = OptimizationProfile()
+
+    assert runner.get_valid_tactics(inputs, profile, marker="x") == [-1, ("fast", 128)]
+    assert op_runner.tactics_call == (id(inputs), profile, {"marker": "x"})
+    assert runner.unique_id()[0] == op_runner.unique_id()
+    assert runner.op_runner is op_runner
+
+    other_runtime = FakeRuntime(((106, 212), (106, 212), (0, 212)))
+    other_runner = _UgpuConcurrentTunableRunner(op_runner, other_runtime, 3, launch)
+    assert runner.unique_id() != other_runner.unique_id()
+
+    tactic = ("chosen", 256)
+    assert runner(inputs, tactic=tactic) is None
+    assert runtime.events == [
+        ("fork",),
+        ("enter", 0),
+        ("launch", 0, id(inputs), tactic),
+        ("exit", 0),
+        ("enter", 1),
+        ("launch", 1, id(inputs), tactic),
+        ("exit", 1),
+        ("enter", 2),
+        ("launch", 2, id(inputs), tactic),
+        ("exit", 2),
+        ("join",),
+    ]
+
+
+@pytest.mark.parametrize(
+    "runner_name,num_inputs,output_idx,tile_sizes",
+    [
+        ("CuteDslFusedMoENvfp4Runner", 5, 4, [128, 256, 512]),
+        ("CuteDslFusedMoEBF16Runner", 4, 3, [64, 128, 256]),
+    ],
+)
+def test_ugpu_outer_preparation_disables_memset_overlap(
+    monkeypatch,
+    runner_name: str,
+    num_inputs: int,
+    output_idx: int,
+    tile_sizes: list[int],
+):
+    from tensorrt_llm._torch.modules.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    preparation_calls = []
+
+    def forward_impl(*args, **kwargs):
+        preparation_calls.append((args, kwargs))
+        return args[output_idx]
+
+    runner_cls = getattr(fused_moe_cute_dsl, runner_name)
+    runner = runner_cls(
+        forward_impl,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        local_expert_offset=0,
+        workload_identity=("ugpu",),
+    )
+    inputs = [torch.empty(0) for _ in range(num_inputs)]
+
+    result = runner(inputs, tactic=-1, do_preparation=True)
+
+    assert result is inputs[output_idx]
+    assert [kwargs["tile_size"] for _, kwargs in preparation_calls] == tile_sizes
+    for args, kwargs in preparation_calls:
+        assert args == tuple(inputs)
+        assert kwargs["enable_alltoall"] is False
+        assert kwargs["overlap_moe_output_memset"] is False
+
+
+@pytest.mark.parametrize(
+    "enable_dwdp,enable_load_balancer,error_match",
+    [
+        (True, False, "does not support DWDP"),
+        (False, True, "does not support EPLB"),
+    ],
+)
+def test_cute_dsl_ugpu_rejects_runtime_weight_rebinding(
+    enable_dwdp: bool,
+    enable_load_balancer: bool,
+    error_match: str,
+):
+    backend = SimpleNamespace(_ugpu_plan=SimpleNamespace(enabled=True))
+    moe = SimpleNamespace(
+        enable_dwdp=enable_dwdp,
+        _using_load_balancer=lambda: enable_load_balancer,
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        CuteDslFusedMoE.validate_configurable_moe(backend, moe)
+
+
+@pytest.mark.parametrize("quantized", [True, False], ids=["nvfp4", "bf16"])
+def test_cute_dsl_moe_zero_tokens_short_circuits_autotune(quantized: bool):
+    hidden_size = 8
+    top_k = 2
+    token_selected_experts = torch.empty((0, top_k), dtype=torch.int32)
+    token_final_scales = torch.empty((0, top_k), dtype=torch.float32)
+    moe_output = torch.empty((0, hidden_size), dtype=torch.bfloat16)
+
+    if quantized:
+        backend = SimpleNamespace(
+            has_nvfp4=True,
+            has_deepseek_fp8_block_scales=False,
+            has_any_quant=True,
+            activation_type=ActivationType.Swiglu,
+            _ugpu_runtime=object(),
+            hidden_size=hidden_size,
+            scaling_vector_size=4,
+        )
+        x, x_sf = CuteDslFusedMoE.quantize_input(
+            backend,
+            Fp4QuantizedTensor(
+                fp4_tensor=torch.empty((0, hidden_size // 2), dtype=torch.uint8),
+                scaling_factor=torch.empty(0, dtype=torch.uint8),
+                is_sf_swizzled=False,
+            ),
+        )
+        assert x_sf.shape == (0, hidden_size // backend.scaling_vector_size)
+        output = CuteDslFusedMoE.run_moe_nvfp4(
+            backend,
+            x,
+            token_selected_experts,
+            token_final_scales,
+            x_sf=x_sf,
+            moe_output=moe_output,
+            weight_view=object(),
+        )
+    else:
+        backend = SimpleNamespace(
+            has_any_quant=False,
+            hidden_size=hidden_size,
+        )
+        output = CuteDslFusedMoE.run_moe_bf16(
+            backend,
+            torch.empty((0, hidden_size), dtype=torch.bfloat16),
+            token_selected_experts,
+            token_final_scales,
+            moe_output=moe_output,
+        )
+
+    assert output is moe_output
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
+    hidden_size = 32
+    scaling_vector_size = 16
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        has_deepseek_fp8_block_scales=False,
+        has_any_quant=True,
+        fc31_input_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
+        hidden_size=hidden_size,
+        scaling_vector_size=scaling_vector_size,
+    )
+
+    x, x_sf = CuteDslFusedMoE.quantize_input(
+        backend,
+        torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda"),
+    )
+
+    assert x.shape == (0, hidden_size // 2)
+    assert x_sf.shape == (0, hidden_size // scaling_vector_size)
+
+
+def test_sm107_nvfp4_tile512_fallback_uses_two_cta_cluster():
+    mma_tiler, mma_inst_shape, cluster_shape_mn = _get_sm107_nvfp4_default_mma_config(512)
+
+    assert mma_tiler == (512, 128, 256)
+    assert mma_inst_shape == (256, 128, 128)
+    assert cluster_shape_mn == (2, 1)
+
+
+def _make_sm107_nvfp4_finalize_inputs(n: int = 384) -> list[torch.Tensor]:
+    m = 128
+    packed_k = 32
+    scale_k = packed_k * 2 // 16
+    num_tokens = 2
+    return [
+        torch.empty((m, packed_k), dtype=torch.float4_e2m1fn_x2),
+        torch.empty((1, n, packed_k), dtype=torch.float4_e2m1fn_x2),
+        torch.empty(m * scale_k, dtype=torch.uint8),
+        torch.empty((1, n, scale_k), dtype=torch.uint8),
+        torch.empty(1, dtype=torch.float32),
+        torch.empty((num_tokens, n), dtype=torch.bfloat16),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(m, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty((num_tokens, 1), dtype=torch.float32),
+    ]
+
+
+def _make_sm107_nvfp4_finalize_runner(monkeypatch):
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
+    runner_cls = cute_dsl_custom_ops.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner
+    return runner_cls(
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        local_expert_offset=0,
+        tile_size=128,
+        output_dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="This test requires the internal CuteDSL package",
+)
+def test_sm107_nvfp4_finalize_get_valid_tactics_filters_n_tiling(monkeypatch):
+    runner = _make_sm107_nvfp4_finalize_runner(monkeypatch)
+    monkeypatch.setattr(runner.kernel_class, "can_implement", lambda **_: True)
+
+    tactics = runner.get_valid_tactics(_make_sm107_nvfp4_finalize_inputs(), OptimizationProfile())
+
+    assert tactics
+    assert all(384 % (tactic[0][1] * tactic[2][1]) == 0 for tactic in tactics)
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="This test requires the internal CuteDSL package",
+)
+def test_sm107_nvfp4_finalize_forward_rejects_incompatible_n_tiling(monkeypatch):
+    runner = _make_sm107_nvfp4_finalize_runner(monkeypatch)
+    incompatible_tactic = ((128, 128, 256), (128, 128, 128), (1, 2), False)
+
+    with pytest.raises(ValueError, match="incompatible with N=384"):
+        runner(_make_sm107_nvfp4_finalize_inputs(), tactic=incompatible_tactic)
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="This test requires the internal CuteDSL package",
+)
+def test_sm107_nvfp4_finalize_accepts_two_cta_n_tiling():
+    runner_cls = cute_dsl_custom_ops.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner
+
+    assert runner_cls._is_n_tiling_compatible(n=256, mma_n=128, cluster_n=2)
+
+
+def _get_registered_rubin_moe_op(name: str):
+    try:
+        return getattr(torch.ops.trtllm, name)
+    except AttributeError:
+        pytest.skip("internal CuteDSL Rubin MoE ops are not registered")
+
+
+def _assert_rubin_moe_op_schema(
+    op_name: str,
+    argument_names: tuple[str, ...],
+    default_values: dict[str, bool | int | None],
+    mutated_arguments: set[str],
+    return_types: tuple[str, ...],
+) -> None:
+    schema = _get_registered_rubin_moe_op(op_name).default._schema
+
+    assert tuple(argument.name for argument in schema.arguments) == argument_names
+    assert {
+        argument.name: argument.default_value
+        for argument in schema.arguments
+        if argument.has_default_value()
+    } == default_values
+    assert {
+        argument.name
+        for argument in schema.arguments
+        if argument.alias_info is not None and argument.alias_info.is_write
+    } == mutated_arguments
+    assert tuple(str(result.type) for result in schema.returns) == return_types
+
+
+@pytest.mark.parametrize(
+    "op_name,argument_names,default_values,mutated_arguments,return_types",
+    [
+        pytest.param(
+            "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin",
+            (
+                "input",
+                "weight",
+                "input_scale",
+                "weight_scale",
+                "alpha",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "global_sf",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_tensor",
+                "output_sf_tensor",
+                "scaling_vector_size",
+                "partition_id",
+                "activation_type",
+                "precomputed_tactic",
+            ),
+            {
+                "scaling_vector_size": 16,
+                "partition_id": -1,
+                "activation_type": int(ActivationType.Swiglu),
+                "precomputed_tactic": None,
+            },
+            {"output_tensor", "output_sf_tensor"},
+            ("Optional[Tensor]", "Optional[Tensor]"),
+            id="nvfp4_fc1",
+        ),
+        pytest.param(
+            "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin",
+            (
+                "input",
+                "weight",
+                "input_scale",
+                "weight_scale",
+                "alpha",
+                "output",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "token_final_scales",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_dtype",
+                "scaling_vector_size",
+                "precomputed_tactic",
+            ),
+            {"scaling_vector_size": 16, "precomputed_tactic": None},
+            {"output"},
+            (),
+            id="nvfp4_fc2",
+        ),
+        pytest.param(
+            "cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin",
+            (
+                "input",
+                "weight",
+                "alpha",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_tensor",
+                "partition_id",
+                "precomputed_tactic",
+            ),
+            {"precomputed_tactic": None},
+            {"output_tensor"},
+            ("Optional[Tensor]",),
+            id="bf16_fc1",
+        ),
+        pytest.param(
+            "cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin",
+            (
+                "input",
+                "weight",
+                "output",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "token_final_scales",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_dtype",
+                "precomputed_tactic",
+            ),
+            {"precomputed_tactic": None},
+            {"output"},
+            (),
+            id="bf16_fc2",
+        ),
+    ],
+)
+def test_rubin_moe_leaf_schema(
+    op_name: str,
+    argument_names: tuple[str, ...],
+    default_values: dict[str, bool | int | None],
+    mutated_arguments: set[str],
+    return_types: tuple[str, ...],
+) -> None:
+    _assert_rubin_moe_op_schema(
+        op_name,
+        argument_names,
+        default_values,
+        mutated_arguments,
+        return_types,
+    )
+
+
+def _make_fake_rubin_moe_tensors(quantized: bool) -> SimpleNamespace:
+    dtype = torch.uint8 if quantized else torch.bfloat16
+    fc1_n = 32 if quantized else 8
+    fc2_n = 32 if quantized else 4
+    output_n = 32 if quantized else 8
+    return SimpleNamespace(
+        input=torch.empty((2, 4), dtype=dtype, device="cuda"),
+        fc1_weight=torch.empty((1, fc1_n, 4), dtype=dtype, device="cuda"),
+        fc2_weight=torch.empty((1, fc2_n, 4), dtype=dtype, device="cuda"),
+        input_scale=torch.empty(2, dtype=torch.uint8, device="cuda"),
+        fc1_weight_scale=torch.empty((1, fc1_n, 1), dtype=torch.uint8, device="cuda"),
+        fc2_weight_scale=torch.empty((1, fc2_n, 1), dtype=torch.uint8, device="cuda"),
+        alpha=torch.empty(1, dtype=torch.float32, device="cuda"),
+        tile_idx_to_group_idx=torch.empty(1, dtype=torch.int32, device="cuda"),
+        tile_idx_to_mn_limit=torch.empty(1, dtype=torch.int32, device="cuda"),
+        expanded_idx_to_permuted_idx=torch.empty((2, 1), dtype=torch.int32, device="cuda"),
+        permuted_idx_to_expanded_idx=torch.empty(2, dtype=torch.int32, device="cuda"),
+        num_non_exiting_tiles=torch.empty(1, dtype=torch.int32, device="cuda"),
+        global_sf=torch.empty(1, dtype=torch.float32, device="cuda"),
+        token_final_scales=torch.empty((2, 1), dtype=torch.float32, device="cuda"),
+        fc1_output=torch.empty((2, 8), dtype=dtype, device="cuda"),
+        fc1_output_sf=torch.empty(2, dtype=torch.uint8, device="cuda"),
+        output=torch.empty((2, output_n), dtype=torch.bfloat16, device="cuda"),
+    )
+
+
+def test_rubin_moe_precomputed_tactic_fake_signatures():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    fc1_op = _get_registered_rubin_moe_op("cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
+    fc2_op = _get_registered_rubin_moe_op("cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin")
+
+    with FakeTensorMode():
+        tensors = _make_fake_rubin_moe_tensors(quantized=True)
+
+        output, output_sf = fc1_op(
+            input=tensors.input,
+            weight=tensors.fc1_weight,
+            input_scale=tensors.input_scale,
+            weight_scale=tensors.fc1_weight_scale,
+            alpha=tensors.alpha,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            global_sf=tensors.global_sf,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_tensor=None,
+            output_sf_tensor=None,
+            scaling_vector_size=16,
+            partition_id=-1,
+            activation_type=int(ActivationType.Swiglu),
+            precomputed_tactic=repr(-1),
+        )
+        assert output.shape == (2, 8)
+        assert output_sf.shape == (2,)
+
+        result = fc2_op(
+            input=tensors.input,
+            weight=tensors.fc2_weight,
+            input_scale=tensors.input_scale,
+            weight_scale=tensors.fc2_weight_scale,
+            alpha=tensors.alpha,
+            output=tensors.output,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            token_final_scales=tensors.token_final_scales,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=16,
+            precomputed_tactic=repr(-1),
+        )
+        assert result is None
+
+
+def test_rubin_bf16_moe_precomputed_tactic_fake_signatures():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    fc1_op = _get_registered_rubin_moe_op("cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin")
+    fc2_op = _get_registered_rubin_moe_op("cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin")
+
+    with FakeTensorMode():
+        tensors = _make_fake_rubin_moe_tensors(quantized=False)
+
+        result = fc1_op(
+            input=tensors.input,
+            weight=tensors.fc1_weight,
+            alpha=tensors.alpha,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_tensor=tensors.fc1_output,
+            partition_id=0,
+            precomputed_tactic=repr(-1),
+        )
+        assert result is None
+
+        result = fc2_op(
+            input=tensors.input,
+            weight=tensors.fc2_weight,
+            output=tensors.output,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            token_final_scales=tensors.token_final_scales,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_dtype=torch.bfloat16,
+            precomputed_tactic=repr(-1),
+        )
+        assert result is None
+
+
+@pytest.mark.parametrize(
+    "op_name,argument_names,default_values,mutated_arguments",
+    [
+        pytest.param(
+            "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_ugpu_inplace_rubin",
+            (
+                "input",
+                "weight_0",
+                "weight_1",
+                "input_scale",
+                "weight_scale_0",
+                "weight_scale_1",
+                "alpha",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "global_sf",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_tensor",
+                "output_sf_tensor",
+                "scaling_vector_size",
+                "activation_type",
+            ),
+            {
+                "scaling_vector_size": 16,
+                "activation_type": int(ActivationType.Swiglu),
+            },
+            {"output_tensor", "output_sf_tensor"},
+            id="nvfp4_fc1",
+        ),
+        pytest.param(
+            "cute_dsl_nvfp4_grouped_gemm_finalize_ugpu_inplace_rubin",
+            (
+                "input",
+                "weight_0",
+                "weight_1",
+                "input_scale",
+                "weight_scale_0",
+                "weight_scale_1",
+                "alpha",
+                "output",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "expanded_idx_to_permuted_idx",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "token_final_scales",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_dtype",
+                "ep_size",
+                "enable_alltoall",
+                "scaling_vector_size",
+            ),
+            {"enable_alltoall": False, "scaling_vector_size": 16},
+            {"output"},
+            id="nvfp4_fc2",
+        ),
+        pytest.param(
+            "cute_dsl_bf16_gather_grouped_gemm_swiglu_ugpu_inplace_rubin",
+            (
+                "input",
+                "weight_0",
+                "weight_1",
+                "alpha",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_tensor",
+            ),
+            {},
+            {"output_tensor"},
+            id="bf16_fc1",
+        ),
+        pytest.param(
+            "cute_dsl_bf16_grouped_gemm_finalize_ugpu_inplace_rubin",
+            (
+                "input",
+                "weight_0",
+                "weight_1",
+                "output",
+                "tile_idx_to_group_idx",
+                "tile_idx_to_mn_limit",
+                "expanded_idx_to_permuted_idx",
+                "permuted_idx_to_expanded_idx",
+                "num_non_exiting_tiles",
+                "token_final_scales",
+                "num_experts",
+                "top_k",
+                "num_local_experts",
+                "local_expert_offset",
+                "tile_size",
+                "output_dtype",
+                "ep_size",
+                "enable_alltoall",
+            ),
+            {"enable_alltoall": False},
+            {"output"},
+            id="bf16_fc2",
+        ),
+    ],
+)
+def test_rubin_moe_ugpu_composite_schema(
+    op_name: str,
+    argument_names: tuple[str, ...],
+    default_values: dict[str, bool | int | None],
+    mutated_arguments: set[str],
+) -> None:
+    _assert_rubin_moe_op_schema(
+        op_name,
+        argument_names,
+        default_values,
+        mutated_arguments,
+        (),
+    )
+
+
+def test_rubin_nvfp4_moe_ugpu_composite_fake_signatures():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    fc1_op = _get_registered_rubin_moe_op(
+        "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_ugpu_inplace_rubin"
+    )
+    fc2_op = _get_registered_rubin_moe_op("cute_dsl_nvfp4_grouped_gemm_finalize_ugpu_inplace_rubin")
+
+    with FakeTensorMode():
+        tensors = _make_fake_rubin_moe_tensors(quantized=True)
+
+        result = fc1_op(
+            input=tensors.input,
+            weight_0=tensors.fc1_weight,
+            weight_1=tensors.fc1_weight,
+            input_scale=tensors.input_scale,
+            weight_scale_0=tensors.fc1_weight_scale,
+            weight_scale_1=tensors.fc1_weight_scale,
+            alpha=tensors.alpha,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            global_sf=tensors.global_sf,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_tensor=tensors.fc1_output,
+            output_sf_tensor=tensors.fc1_output_sf,
+            scaling_vector_size=16,
+            activation_type=int(ActivationType.Swiglu),
+        )
+        assert result is None
+
+        result = fc2_op(
+            input=tensors.input,
+            weight_0=tensors.fc2_weight,
+            weight_1=tensors.fc2_weight,
+            input_scale=tensors.input_scale,
+            weight_scale_0=tensors.fc2_weight_scale,
+            weight_scale_1=tensors.fc2_weight_scale,
+            alpha=tensors.alpha,
+            output=tensors.output,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=tensors.expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            token_final_scales=tensors.token_final_scales,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_dtype=torch.bfloat16,
+            ep_size=1,
+            enable_alltoall=False,
+            scaling_vector_size=16,
+        )
+        assert result is None
+
+
+def test_rubin_bf16_moe_ugpu_composite_fake_signatures():
+    try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+    except ImportError:
+        pytest.skip("FakeTensorMode is not available")
+
+    fc1_op = _get_registered_rubin_moe_op(
+        "cute_dsl_bf16_gather_grouped_gemm_swiglu_ugpu_inplace_rubin"
+    )
+    fc2_op = _get_registered_rubin_moe_op("cute_dsl_bf16_grouped_gemm_finalize_ugpu_inplace_rubin")
+
+    with FakeTensorMode():
+        tensors = _make_fake_rubin_moe_tensors(quantized=False)
+
+        result = fc1_op(
+            input=tensors.input,
+            weight_0=tensors.fc1_weight,
+            weight_1=tensors.fc1_weight,
+            alpha=tensors.alpha,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_tensor=tensors.fc1_output,
+        )
+        assert result is None
+
+        result = fc2_op(
+            input=tensors.input,
+            weight_0=tensors.fc2_weight,
+            weight_1=tensors.fc2_weight,
+            output=tensors.output,
+            tile_idx_to_group_idx=tensors.tile_idx_to_group_idx,
+            tile_idx_to_mn_limit=tensors.tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=tensors.expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx=tensors.permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=tensors.num_non_exiting_tiles,
+            token_final_scales=tensors.token_final_scales,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            local_expert_offset=0,
+            tile_size=128,
+            output_dtype=torch.bfloat16,
+            ep_size=1,
+            enable_alltoall=False,
+        )
+        assert result is None
+
+
+@pytest.mark.parametrize(
+    "composite_name,leaf_name,runner_name,quantized,is_fc1",
+    [
+        (
+            "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_ugpu_inplace_rubin",
+            "cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin",
+            "Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner",
+            True,
+            True,
+        ),
+        (
+            "cute_dsl_nvfp4_grouped_gemm_finalize_ugpu_inplace_rubin",
+            "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin",
+            "Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner",
+            True,
+            False,
+        ),
+        (
+            "cute_dsl_bf16_gather_grouped_gemm_swiglu_ugpu_inplace_rubin",
+            "cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin",
+            "Sm107ContiguousGatherGroupedGemmSwigluFusionRunner",
+            False,
+            True,
+        ),
+        (
+            "cute_dsl_bf16_grouped_gemm_finalize_ugpu_inplace_rubin",
+            "cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin",
+            "Sm107ContiguousGroupedGemmFinalizeFusionRunner",
+            False,
+            False,
+        ),
+    ],
+)
+def test_rubin_moe_ugpu_composite_owns_concurrent_tuning(
+    monkeypatch,
+    composite_name: str,
+    leaf_name: str,
+    runner_name: str,
+    quantized: bool,
+    is_fc1: bool,
+):
+    composite_op = getattr(cute_dsl_custom_ops, composite_name, None)
+    if composite_op is None:
+        pytest.skip("internal CuteDSL Rubin MoE composite op is not registered")
+
+    tuning_config = object()
+    chosen_tactic = ("chosen", 128)
+    runner_instances = []
+    runtime_instances = []
+    tune_calls = []
+    concurrent_calls = []
+    leaf_calls = []
+    memset_calls = []
+    execution_order = []
+    tuner_state = SimpleNamespace(is_tuning_mode=not is_fc1)
+
+    class FakeOpRunner:
+        def __init__(self, *args, **kwargs):
+            self.init_call = (args, kwargs)
+            self.tuning_config_calls = []
+            runner_instances.append(self)
+
+        def get_tuning_config(self, *args, **kwargs):
+            self.tuning_config_calls.append((args, kwargs))
+            return tuning_config
+
+    class FakeRuntime:
+        def __init__(self, num_partitions: int):
+            self.num_partitions = num_partitions
+            runtime_instances.append(self)
+
+    class FakeConcurrentRunner:
+        def __init__(self, launch_partition):
+            self.launch_partition = launch_partition
+
+        def __call__(self, inputs, *, tactic):
+            execution_order.append("launch")
+            concurrent_calls.append((inputs, tactic))
+            for partition_id in range(2):
+                self.launch_partition(partition_id, inputs, tactic)
+
+    def fake_tune_ugpu_concurrent(
+        op_name,
+        op_runner,
+        runtime,
+        num_partitions,
+        launch_partition,
+        inputs,
+        actual_tuning_config,
+    ):
+        execution_order.append("tune")
+        tune_calls.append(
+            (
+                op_name,
+                op_runner,
+                runtime,
+                num_partitions,
+                launch_partition,
+                inputs,
+                actual_tuning_config,
+            )
+        )
+        return FakeConcurrentRunner(launch_partition), chosen_tactic
+
+    def fake_leaf_op(*args, **kwargs):
+        leaf_calls.append((args, kwargs))
+
+    def fake_moe_output_memset(*args, **kwargs):
+        execution_order.append("reset")
+        memset_calls.append((args, kwargs))
+
+    monkeypatch.setattr(cute_dsl_custom_ops, runner_name, FakeOpRunner)
+    monkeypatch.setattr(cute_dsl_custom_ops, "UgpuRuntime", FakeRuntime)
+    monkeypatch.setattr(
+        cute_dsl_custom_ops,
+        "tune_ugpu_concurrent",
+        fake_tune_ugpu_concurrent,
+    )
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        staticmethod(lambda: tuner_state),
+    )
+    monkeypatch.setattr(torch.ops.trtllm, leaf_name, fake_leaf_op)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "moe_output_memset_inplace",
+        fake_moe_output_memset,
+    )
+
+    dtype = torch.uint8 if quantized else torch.bfloat16
+    input_tensor = torch.empty((2, 4), dtype=dtype)
+    weight_0 = torch.empty((1, 8, 4), dtype=dtype)
+    weight_1 = torch.empty_like(weight_0)
+    alpha = torch.empty((1,), dtype=torch.float32)
+    tile_idx_to_group_idx = torch.empty((1,), dtype=torch.int32)
+    tile_idx_to_mn_limit = torch.empty((1,), dtype=torch.int32)
+    expanded_idx_to_permuted_idx = torch.empty((2, 1), dtype=torch.int32)
+    permuted_idx_to_expanded_idx = torch.empty((2,), dtype=torch.int32)
+    num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32)
+    token_final_scales = torch.empty((2, 1), dtype=torch.float32)
+    output = torch.empty((2, 16), dtype=torch.bfloat16)
+
+    common_kwargs = {
+        "input": input_tensor,
+        "weight_0": weight_0,
+        "weight_1": weight_1,
+        "tile_idx_to_group_idx": tile_idx_to_group_idx,
+        "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+        "permuted_idx_to_expanded_idx": permuted_idx_to_expanded_idx,
+        "num_non_exiting_tiles": num_non_exiting_tiles,
+        "num_experts": 1,
+        "top_k": 1,
+        "num_local_experts": 1,
+        "local_expert_offset": 0,
+        "tile_size": 128,
+    }
+    if is_fc1:
+        call_kwargs = {
+            **common_kwargs,
+            "alpha": alpha,
+            "output_tensor": output if not quantized else torch.empty((2, 8), dtype=torch.uint8),
+        }
+        if quantized:
+            weight_scale_0 = torch.empty((1, 8, 1), dtype=torch.uint8)
+            weight_scale_1 = torch.empty_like(weight_scale_0)
+            call_kwargs.update(
+                {
+                    "input_scale": torch.empty((2,), dtype=torch.uint8),
+                    "weight_scale_0": weight_scale_0,
+                    "weight_scale_1": weight_scale_1,
+                    "global_sf": torch.empty((1,), dtype=torch.float32),
+                    "output_sf_tensor": torch.empty((2,), dtype=torch.uint8),
+                    "scaling_vector_size": 16,
+                    "activation_type": int(ActivationType.Swiglu),
+                }
+            )
+    else:
+        call_kwargs = {
+            **common_kwargs,
+            "output": output,
+            "expanded_idx_to_permuted_idx": expanded_idx_to_permuted_idx,
+            "token_final_scales": token_final_scales,
+            "output_dtype": torch.bfloat16,
+            "ep_size": 4,
+            "enable_alltoall": True,
+        }
+        if quantized:
+            weight_scale_0 = torch.empty((1, 8, 1), dtype=torch.uint8)
+            weight_scale_1 = torch.empty_like(weight_scale_0)
+            call_kwargs.update(
+                {
+                    "input_scale": torch.empty((2,), dtype=torch.uint8),
+                    "weight_scale_0": weight_scale_0,
+                    "weight_scale_1": weight_scale_1,
+                    "alpha": alpha,
+                    "scaling_vector_size": 16,
+                }
+            )
+
+    # Exercise the registered Python implementation directly; dispatcher and
+    # fake contracts are covered separately by the schema/fake tests above.
+    assert composite_op._init_fn(**call_kwargs) is None
+
+    assert len(runner_instances) == 1
+    assert len(runtime_instances) == 1
+    assert runtime_instances[0].num_partitions == 2
+    assert len(tune_calls) == 1
+    (
+        tune_key,
+        tuned_op_runner,
+        tuned_runtime,
+        num_partitions,
+        _,
+        tuned_inputs,
+        actual_tuning_config,
+    ) = tune_calls[0]
+    assert tune_key == f"trtllm::{leaf_name}"
+    assert tuned_op_runner is runner_instances[0]
+    assert tuned_runtime is runtime_instances[0]
+    assert num_partitions == 2
+    assert actual_tuning_config is tuning_config
+    assert len(runner_instances[0].tuning_config_calls) == 1
+    runner_args, runner_kwargs = runner_instances[0].init_call
+    if quantized and is_fc1:
+        assert runner_args == (1, 1, 1, 0, 128, 16)
+        assert runner_kwargs == {"activation_type": ActivationType.Swiglu}
+    elif quantized:
+        assert runner_args == (1, 1, 1, 0, 128, torch.bfloat16, 16)
+        assert not runner_kwargs
+    elif is_fc1:
+        assert runner_args == (1, 1, 1, 0, 128)
+        assert runner_kwargs == {"input_dtype": torch.bfloat16}
+        assert runner_instances[0].tuning_config_calls == [((), {"has_output_tensor": True})]
+    else:
+        assert runner_args == (1, 1, 1, 0, 128, torch.bfloat16)
+        assert runner_kwargs == {"input_dtype": torch.bfloat16}
+    if quantized or not is_fc1:
+        assert runner_instances[0].tuning_config_calls == [((), {})]
+    assert len(concurrent_calls) == 1
+    assert concurrent_calls[0][0] is tuned_inputs
+    assert concurrent_calls[0][1] == chosen_tactic
+
+    assert len(leaf_calls) == 2
+    assert leaf_calls[0][1]["weight"] is weight_0
+    assert leaf_calls[1][1]["weight"] is weight_1
+    for _, leaf_kwargs in leaf_calls:
+        assert leaf_kwargs["input"] is input_tensor
+        assert leaf_kwargs["tile_idx_to_group_idx"] is tile_idx_to_group_idx
+        assert leaf_kwargs["tile_idx_to_mn_limit"] is tile_idx_to_mn_limit
+        assert leaf_kwargs["permuted_idx_to_expanded_idx"] is permuted_idx_to_expanded_idx
+        assert leaf_kwargs["num_non_exiting_tiles"] is num_non_exiting_tiles
+        assert leaf_kwargs["num_experts"] == 1
+        assert leaf_kwargs["top_k"] == 1
+        assert leaf_kwargs["num_local_experts"] == 1
+        assert leaf_kwargs["local_expert_offset"] == 0
+        assert leaf_kwargs["tile_size"] == 128
+        assert leaf_kwargs["precomputed_tactic"] == repr(chosen_tactic)
+    if is_fc1:
+        assert [kwargs["partition_id"] for _, kwargs in leaf_calls] == [0, 1]
+        assert all(kwargs["alpha"] is alpha for _, kwargs in leaf_calls)
+        assert all(
+            kwargs["output_tensor"] is call_kwargs["output_tensor"] for _, kwargs in leaf_calls
+        )
+        assert not memset_calls
+        assert execution_order == ["tune", "launch"]
+    else:
+        assert all("partition_id" not in kwargs for _, kwargs in leaf_calls)
+        assert all(kwargs["output"] is output for _, kwargs in leaf_calls)
+        assert all(kwargs["token_final_scales"] is token_final_scales for _, kwargs in leaf_calls)
+        assert all(kwargs["output_dtype"] == torch.bfloat16 for _, kwargs in leaf_calls)
+        assert execution_order == ["tune", "reset", "launch"]
+        assert len(memset_calls) == 1
+        reset_args, reset_kwargs = memset_calls[0]
+        assert not reset_args
+        assert reset_kwargs == {
+            "input": output,
+            "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+            "expanded_idx_to_permuted_idx": expanded_idx_to_permuted_idx,
+            "permuted_idx_to_expanded_idx": permuted_idx_to_expanded_idx,
+            "num_non_exiting_tiles": num_non_exiting_tiles,
+            "tile_tokens_dim": 128,
+            "top_k": 1,
+            "ep_size": 4,
+            "enable_alltoall": True,
+        }
+        execution_order.clear()
+        memset_calls.clear()
+        tuner_state.is_tuning_mode = False
+        assert composite_op._init_fn(**call_kwargs) is None
+        assert execution_order == ["tune", "launch"]
+        assert not memset_calls
+    if quantized:
+        assert leaf_calls[0][1]["weight_scale"] is weight_scale_0
+        assert leaf_calls[1][1]["weight_scale"] is weight_scale_1
+        assert all(kwargs["input_scale"] is call_kwargs["input_scale"] for _, kwargs in leaf_calls)
+        assert all(kwargs["alpha"] is alpha for _, kwargs in leaf_calls)
+        assert all(kwargs["scaling_vector_size"] == 16 for _, kwargs in leaf_calls)
+        if is_fc1:
+            assert all(kwargs["global_sf"] is call_kwargs["global_sf"] for _, kwargs in leaf_calls)
+            assert all(
+                kwargs["output_sf_tensor"] is call_kwargs["output_sf_tensor"]
+                for _, kwargs in leaf_calls
+            )
+            assert all(
+                kwargs["activation_type"] == int(ActivationType.Swiglu) for _, kwargs in leaf_calls
+            )
+
+
 @pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
@@ -2347,24 +3565,37 @@ def test_moe_module_ugpu_correctness_rubin(num_tokens: int, top_k: int):
                 init_load_balancer=False,
             )
             backend.load_weights([weights])
+            source_storage_ptrs = {}
+            if enable_ugpu and top_k == 2:
+                source_storage_ptrs = {
+                    "w3_w1_weight": backend.w3_w1_weight.untyped_storage().data_ptr(),
+                    "w2_weight": backend.w2_weight.untyped_storage().data_ptr(),
+                    "fc1_weight_block": backend.quant_scales.fc1_weight_block.untyped_storage().data_ptr(),
+                    "fc2_weight_block": backend.quant_scales.fc2_weight_block.untyped_storage().data_ptr(),
+                }
             backend.post_load_weights()
             backend.cuda()
-            return backend
+            return backend, source_storage_ptrs
 
-        base_backend = create_backend(False)
-        ugpu_backend = create_backend(True)
+        base_backend, _ = create_backend(False)
+        ugpu_backend, source_storage_ptrs = create_backend(True)
 
-        assert ugpu_backend._ugpu_runtime is not None
-        assert ugpu_backend._ugpu_weight_shards is not None
-        for param_name in (
-            "w3_w1_weight",
-            "w2_weight",
-            "w3_w1_weight_scale",
-            "w2_weight_scale",
-        ):
-            assert getattr(ugpu_backend, param_name).numel() == 0
-        assert ugpu_backend.quant_scales.fc1_weight_block.numel() == 0
-        assert ugpu_backend.quant_scales.fc2_weight_block.numel() == 0
+        if top_k == 2:
+            assert ugpu_backend._ugpu_runtime is not None
+            assert ugpu_backend._ugpu_weight_shards is not None
+            assert hasattr(ugpu_backend, "_cached_reserved_moe_output_memset_stream")
+            for shard in ugpu_backend._ugpu_weight_shards:
+                for name, source_storage_ptr in source_storage_ptrs.items():
+                    assert shard[name].untyped_storage().data_ptr() != source_storage_ptr
+            for param_name in (
+                "w3_w1_weight",
+                "w2_weight",
+                "w3_w1_weight_scale",
+                "w2_weight_scale",
+            ):
+                assert getattr(ugpu_backend, param_name).numel() == 0
+            assert ugpu_backend.quant_scales.fc1_weight_block.numel() == 0
+            assert ugpu_backend.quant_scales.fc2_weight_block.numel() == 0
 
         with torch.inference_mode():
             base_output = base_backend.forward_chunk(input_tensor, router_logits)
@@ -2378,9 +3609,7 @@ def test_moe_module_ugpu_correctness_rubin(num_tokens: int, top_k: int):
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-@pytest.mark.parametrize("num_tokens", [128])
-@pytest.mark.parametrize("top_k", [1, 2])
-def test_moe_module_bf16_ugpu_correctness_rubin(num_tokens: int, top_k: int):
+def test_moe_module_bf16_ugpu_lifecycle_and_forward_chunk_rubin():
     _skip_if_no_ugpu()
 
     from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -2397,6 +3626,8 @@ def test_moe_module_bf16_ugpu_correctness_rubin(num_tokens: int, top_k: int):
     hidden_size = 2048
     intermediate_size = 1536
     num_experts = 256
+    num_tokens = 128
+    top_k = 2
     dtype = torch.bfloat16
 
     mapping = Mapping()
@@ -2450,24 +3681,39 @@ def test_moe_module_bf16_ugpu_correctness_rubin(num_tokens: int, top_k: int):
                 init_load_balancer=False,
             )
             backend.load_weights([weights])
-            full_w3_w1 = backend.w3_w1_weight.data.clone()
-            full_w2 = backend.w2_weight.data.clone()
+            full_w3_w1 = None
+            full_w2 = None
+            source_storage_ptrs = ()
+            if enable_ugpu:
+                full_w3_w1 = backend.w3_w1_weight.data.clone()
+                full_w2 = backend.w2_weight.data.clone()
+                source_storage_ptrs = (
+                    backend.w3_w1_weight.untyped_storage().data_ptr(),
+                    backend.w2_weight.untyped_storage().data_ptr(),
+                )
             backend.post_load_weights()
             backend.cuda()
-            return backend, full_w3_w1, full_w2
+            return backend, full_w3_w1, full_w2, source_storage_ptrs
 
-        base_backend, _, _ = create_backend(False)
-        ugpu_backend, full_w3_w1, full_w2 = create_backend(True)
+        base_backend, _, _, _ = create_backend(False)
+        ugpu_backend, full_w3_w1, full_w2, source_storage_ptrs = create_backend(True)
 
         assert ugpu_backend._ugpu_runtime is not None
         assert ugpu_backend._ugpu_weight_shards is not None
+        assert hasattr(ugpu_backend, "_cached_reserved_moe_output_memset_stream")
 
         shards = ugpu_backend._ugpu_weight_shards
+        for shard in shards:
+            assert shard["w3_w1_weight"].untyped_storage().data_ptr() != source_storage_ptrs[0]
+            assert shard["w2_weight"].untyped_storage().data_ptr() != source_storage_ptrs[1]
         assert torch.equal(torch.cat([s["w3_w1_weight"] for s in shards], dim=1), full_w3_w1)
         assert torch.equal(torch.cat([s["w2_weight"] for s in shards], dim=1), full_w2)
         assert ugpu_backend.w3_w1_weight.numel() == 0
         assert ugpu_backend.w2_weight.numel() == 0
 
+        # Keep the production-shape lifecycle and public forward_chunk
+        # integration here. Broad accuracy, autotune, capture, and outer-tile
+        # replay are covered by the unified backend matrix.
         with torch.inference_mode():
             base_output = base_backend.forward_chunk(input_tensor, router_logits)
             ugpu_output = ugpu_backend.forward_chunk(input_tensor, router_logits)

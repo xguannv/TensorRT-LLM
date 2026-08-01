@@ -97,6 +97,8 @@ def initialize_sparse_attn(self) -> None:
         force_dynamic_quantization=self.force_dynamic_quantization,
         use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+        enable_ugpu_bf16_linear=self.enable_ugpu_bf16_linear,
+        ugpu_policy=self._ugpu_policy,
     )
 
     self.has_dsv4_indexer = _has_dsv4_indexer(self)
@@ -1013,6 +1015,7 @@ def forward_sparse_attn(
         self.has_dsv4_indexer
         and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
         and self.q_b_proj.bias is None
+        and getattr(self.q_b_proj, "_ugpu_weight_shards", None) is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
         and not _is_fused_q_fp8_quant_enabled(
             self, num_generations=num_generations, num_contexts=num_contexts

@@ -21,7 +21,11 @@ This package provides a clean separation of concerns for uGPU execution:
 - runtime: Stream/mempool/event management
 """
 
-from tensorrt_llm._torch.ugpu.layout import PartitionedTensorLayout, make_nvfp4_linear_output_layout
+from tensorrt_llm._torch.ugpu.layout import (
+    PartitionedTensorLayout,
+    make_bf16_linear_output_layout,
+    make_nvfp4_linear_output_layout,
+)
 from tensorrt_llm._torch.ugpu.policy import (
     LinearPartitionPlan,
     PartitionPlan,
@@ -35,6 +39,7 @@ __all__ = [
     "PartitionPlan",
     "LinearPartitionPlan",
     "PartitionedTensorLayout",
+    "make_bf16_linear_output_layout",
     "make_nvfp4_linear_output_layout",
     "UgpuExecutionPlanner",
     "UgpuRuntime",

@@ -241,9 +241,17 @@ def test_mlp_fp4out_min_m_switch():
         )
 
 
-@pytest.mark.parametrize("sm_version, expected", [(100, True), (103, True), (107, False)])
-def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, expected):
-    """SM107 must keep NVFP4 gate/up weights in the unfused Rubin layout."""
+@pytest.mark.parametrize(
+    "sm_version, partitioned, expected",
+    [
+        (100, False, True),
+        (103, False, True),
+        (100, True, False),
+        (107, False, False),
+    ],
+)
+def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned, expected):
+    """SM107 and uGPU shards must keep gate/up weights in the Rubin layout."""
     import types
 
     from tensorrt_llm._torch.modules import linear as linear_module
@@ -255,6 +263,7 @@ def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, expected):
     layer.use_cute_dsl_blockscaling_mm = True
     layer.use_cute_dsl_nvfp4_swiglu_blackwell = True
     layer.has_bias = False
+    layer.partition_plan = types.SimpleNamespace(enabled=partitioned)
     layer._weights_created = True
     layer.quant_config = types.SimpleNamespace(
         layer_quant_mode=types.SimpleNamespace(has_nvfp4=lambda: True),

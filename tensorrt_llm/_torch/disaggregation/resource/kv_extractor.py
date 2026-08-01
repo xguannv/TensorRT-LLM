@@ -466,6 +466,12 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     by layer_group_id while ``pool_group_idx`` points at the shared
     physical pool group entry, so per-window transfer logic keeps working.
     """
+    if manager.num_ugpus > 1:
+        raise NotImplementedError(
+            "Disaggregated KV transfer does not support enable_ugpu=True: "
+            "the page-table registration currently covers only one locality domain"
+        )
+
     config = manager.impl.init_config
     pool_group_descs = manager.impl.pool_group_descs
 

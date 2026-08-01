@@ -559,6 +559,14 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        ugpu_policy = getattr(config, "ugpu_policy", None)
+        if (load_format == LoadFormat.GMS
+                and getattr(ugpu_policy, "enabled", False)):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with uGPU localized weights. "
+                "GMS shares registered parameters, while uGPU execution "
+                "releases those parameters after creating partition-local "
+                "weight shards.")
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
@@ -1154,6 +1162,9 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        ugpu_policy = getattr(model.model_config, "ugpu_policy", None)
+        if getattr(ugpu_policy, "enabled", False):
+            enabled_features.add(PostTransformFeature.UGPU_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,

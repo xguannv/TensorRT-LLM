@@ -40,12 +40,15 @@ from tensorrt_llm._utils import get_sm_version
 __all__ = [
     "get_ugpu_stream",
     "get_ugpu_mempool",
+    "get_ugpu_compute_sm_counts",
     "is_ugpu_supported",
     "initialize_ugpu_resources",
     "ugpu_device",
     "get_current_ugpu",
     "start_for_all_ugpu",
     "end_for_all_ugpu",
+    "get_reserved_remainder_stream",
+    "node_local_max_active_clusters",
 ]
 
 
@@ -76,6 +79,11 @@ class UgpuResourceManager:
         # Per-device resources, Key: (device_id, ugpu_id)
         self.streams: dict[tuple[int, int], torch.cuda.Stream] = {}
         self.mempools: dict[tuple[int, int], torch.cuda.MemPool] = {}
+        # Per-device compute topology, Key: (device_id, ugpu_id),
+        # Value: (localized partition SM count, full-device SM count).
+        self.compute_sm_counts: dict[tuple[int, int], tuple[int, int] | None] = {}
+        # Per-device non-localized remainder stream for the strict public split.
+        self.reserved_remainder_streams: dict[int, torch.cuda.Stream | None] = {}
         # Per-device events, Key: device_id
         self.events: dict[int, tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] = {}
         # Shared allocator holders and allocators (not per-device)
@@ -107,6 +115,8 @@ class UgpuResourceManager:
         as they may still be referenced elsewhere. It only clears our references.
         """
         self.streams.clear()
+        self.compute_sm_counts.clear()
+        self.reserved_remainder_streams.clear()
         self.events.clear()
         import gc
 
@@ -373,13 +383,37 @@ def initialize_ugpu_resources() -> None:
 
         # Initialize resources for uGPU0 and uGPU1
         for ugpu_id in [0, 1]:
+            get_sm_counts = getattr(ugpu_handle, "get_ugpu_compute_sm_counts", None)
+            sm_counts = get_sm_counts(ugpu_id) if get_sm_counts else (0, 0)
+            partition_sm_count, total_sm_count = (int(value) for value in sm_counts)
+            manager.compute_sm_counts[(device_id, ugpu_id)] = (
+                (partition_sm_count, total_sm_count)
+                if 0 < partition_sm_count <= total_sm_count
+                else None
+            )
+
             # Create UGPU localized stream
             stream_ptr = ugpu_handle.create_ugpu_localized_stream(ugpu_id)
-            # Wrap the raw stream pointer in a PyTorch CUDA stream
-            manager.streams[(device_id, ugpu_id)] = torch.cuda.Stream(stream_ptr=stream_ptr)
+            # The C++ process-lifetime singleton owns the cached raw stream.
+            manager.streams[(device_id, ugpu_id)] = torch.cuda.ExternalStream(
+                stream_ptr, device=device_id
+            )
 
             ugpu_mempool = torch.cuda.MemPool(manager.allocators[ugpu_id])
             manager.mempools[(device_id, ugpu_id)] = ugpu_mempool
+
+        # The strict public split creates a third, non-localized green context
+        # from the remainder resource (12 SMs on Rubin). Its stream is owned by
+        # the process-lifetime C++ uGPU resource and borrowed by PyTorch.
+        get_remainder_stream = getattr(
+            ugpu_handle,
+            "get_reserved_remainder_stream",
+            None,
+        )
+        remainder_ptr = get_remainder_stream() if get_remainder_stream else 0
+        manager.reserved_remainder_streams[device_id] = (
+            torch.cuda.ExternalStream(remainder_ptr, device=device_id) if remainder_ptr else None
+        )
 
         manager.events[device_id] = (
             torch.cuda.Event(blocking=False, interprocess=False),
@@ -414,6 +448,47 @@ def get_ugpu_stream(ugpu_id: int) -> torch.cuda.Stream:
         initialize_ugpu_resources()
 
     return manager.streams[(device_id, ugpu_id)]
+
+
+def get_ugpu_compute_sm_counts(ugpu_id: int) -> tuple[int, int] | None:
+    """Return the actual compute-partition and full-device SM counts."""
+    if ugpu_id not in [0, 1]:
+        raise ValueError(f"ugpu_id must be 0 or 1, got {ugpu_id}")
+
+    manager = get_ugpu_resource_manager()
+    device_id = torch.cuda.current_device()
+    if not manager.is_initialized(device_id):
+        initialize_ugpu_resources()
+    return manager.compute_sm_counts.get((device_id, ugpu_id))
+
+
+def node_local_max_active_clusters(max_active_full_device: int) -> int | None:
+    """Scale a full-device cluster limit to the active uGPU partition.
+
+    The cached counts come from the validated public CUDA resource split, so
+    strict partitions scale to the locality-domain SM count while balanced
+    partitions include their backfilled SMs.
+    """
+    ugpu_id = get_current_ugpu()
+    if ugpu_id is None:
+        return None
+
+    sm_counts = get_ugpu_compute_sm_counts(ugpu_id)
+    if sm_counts is None:
+        return None
+    partition_sm_count, total_sm_count = sm_counts
+    if max_active_full_device <= 0 or not 0 < partition_sm_count <= total_sm_count:
+        return None
+    return max(1, max_active_full_device * partition_sm_count // total_sm_count)
+
+
+def get_reserved_remainder_stream() -> torch.cuda.Stream | None:
+    """Return the strict split's non-localized remainder stream, if present."""
+    manager = get_ugpu_resource_manager()
+    device_id = torch.cuda.current_device()
+    if not manager.is_initialized(device_id):
+        initialize_ugpu_resources()
+    return manager.reserved_remainder_streams.get(device_id)
 
 
 def start_for_all_ugpu():

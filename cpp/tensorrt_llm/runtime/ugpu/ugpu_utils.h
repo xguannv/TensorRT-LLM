@@ -19,6 +19,9 @@
 
 #include <cuda.h>
 
+#include <cstddef>
+#include <utility>
+
 namespace tensorrt_llm
 {
 
@@ -41,14 +44,35 @@ public:
     UgpuLocalizationHandle(UgpuLocalizationHandle&&) noexcept;
     UgpuLocalizationHandle& operator=(UgpuLocalizationHandle&&) noexcept;
 
+    //! Return whether both public compute and memory locality-domain APIs are usable.
     bool supportsUgpuLocalization() const;
+    //! Return whether public locality-domain VMM allocation is usable.
+    bool supportsUgpuMemoryLocalization() const;
+    //! Return whether public locality-domain Green Context partitioning is usable.
+    bool supportsUgpuComputeLocalization() const;
 
     void ugpuMalloc(void** localizedDevPtr, size_t size, int ugpuId);
     void ugpuFree(void* localizedDevPtr);
+
     CUmemGenericAllocationHandle createUgpuLocalizedAllocationHandle(
         size_t size, int ugpuId, unsigned int requestedHandleTypes, bool gpuDirectRDMACapable);
+    CUmemGenericAllocationHandle createUgpuLocalizedAllocationHandle(
+        size_t size, int ugpuId, unsigned int requestedHandleTypes, bool gpuDirectRDMACapable, unsigned int usage);
+    CUresult tryCreateUgpuLocalizedAllocationHandle(CUmemGenericAllocationHandle* handle, size_t size, int ugpuId,
+        unsigned int requestedHandleTypes, bool gpuDirectRDMACapable, unsigned int usage) noexcept;
 
+    size_t getUgpuLocalizedAllocationGranularity(
+        int ugpuId, unsigned int requestedHandleTypes, bool gpuDirectRDMACapable, unsigned int usage);
+    CUresult tryGetUgpuLocalizedAllocationGranularity(size_t* granularity, int ugpuId,
+        unsigned int requestedHandleTypes, bool gpuDirectRDMACapable, unsigned int usage) noexcept;
+
+    //! Return a process-lifetime cached stream owned by the localization singleton.
+    //! Callers must not destroy the returned stream.
     CUstream createUgpuLocalizedStream(int ugpuId);
+    //! Return (localized partition SM count, full-device SM count), or (0, 0) when unavailable.
+    std::pair<unsigned int, unsigned int> getUgpuComputeSmCounts(int ugpuId) const noexcept;
+    //! Return a borrowed process-lifetime remainder stream, or nullptr. The caller must not destroy it.
+    CUstream getReservedRemainderStream();
 
 private:
     UgpuLocalization* mImpl;
