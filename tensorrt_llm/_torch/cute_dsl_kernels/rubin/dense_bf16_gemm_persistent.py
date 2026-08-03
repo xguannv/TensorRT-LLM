@@ -96,8 +96,12 @@ class PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
             split_k_slices=split_k_slices,
         )
         # Override architecture for Rubin – everything else is inherited.
-        # Use "sm_107a" (accelerated variant) as required by MMA ops.
-        self.arch = "sm_107a"
+        # ``self.arch`` is read only by ``_compute_num_tmem_alloc_cols``
+        # (blackwell/dense_gemm_persistent.py:261 -> :1037), which forwards it
+        # to ``utils.get_num_tmem_alloc_cols``; it never selects MMA
+        # instructions, so the base "sm_107" name is correct here and matches
+        # the sibling Rubin kernels (rubin/dense_gemm_persistent.py:181).
+        self.arch = "sm_107"
         # Optional cap on A/B pipeline stages.  Rubin's larger SMEM (328 KiB)
         # causes the auto-computed num_ab_stage to be ~9, but profiling shows
         # that 6 stages (matching Blackwell) can be faster due to reduced
