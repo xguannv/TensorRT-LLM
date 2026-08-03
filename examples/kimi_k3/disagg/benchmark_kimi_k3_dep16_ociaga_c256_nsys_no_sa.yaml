@@ -1,7 +1,7 @@
 # Nsys variant of benchmark_kimi_k3_dep16_ociaga_c256_no_sa.yaml.
 #
 # Identical workload, topology, dataset, image and warmup; the only changes are
-# profiling.nsys_on, the two profile ranges, and NSYS_BIN in worker_env_var.
+# profiling.nsys_on and the two profile ranges.
 #
 # ---- Where the profile ranges come from --------------------------------------
 #
@@ -31,13 +31,21 @@
 # attempt at c16 used ctx "1-120" and produced 16 GEN reports and 0 CTX reports
 # (jobs 323730/323731). Both stops here sit far below the observed ceilings.
 #
-# ---- Why NSYS_BIN is set -----------------------------------------------------
+# ---- Why NSYS_BIN is NOT set -------------------------------------------------
 #
-# start_worker.sh does nsys_bin="${NSYS_BIN:-nsys}", i.e. it falls back to a
-# bare PATH lookup. TensorRT-LLM hangs under Nsight Systems 2026, so the version
-# must be pinned rather than discovered. make_k3_image.sh verifies that both the
-# bare name and this absolute path resolve to 2025.5 in the saved image, and
-# prints this exact line as the value to put here.
+# TensorRT-LLM hangs under Nsight Systems 2026, so which nsys the workers pick
+# up matters. start_worker.sh does nsys_bin="${NSYS_BIN:-nsys}", i.e. it falls
+# back to a bare PATH lookup, and that lookup is safe for this image:
+#
+#   - make_k3_image.sh asserts, in the SAVED image, that both the bare name and
+#     /opt/nvidia/nsight-systems-cli/2025.5.0/.../nsys report 2025.5.0. The
+#     build of this image passed that check.
+#   - nothing on the workers' PATH shadows it: the venv bin directory that
+#     TRTLLM_PATH_PREPEND puts first contains no nsys, and no pip-installed
+#     nsight package exists in its site-packages.
+#
+# If the image is ever rebuilt or replaced, re-check both of those before
+# trusting a bare lookup again.
 #
 # OCIAGA Kimi K3 disaggregated serving at concurrency 256.
 #   - 1 x DEP16 context server (4 nodes, 16 GB300 GPUs)
@@ -145,7 +153,7 @@ environment:
   build_wheel: false
   trtllm_wheel_path: ""
   work_dir: ""
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes NSYS_BIN=/opt/nvidia/nsight-systems-cli/2025.5.0/target-linux-sbsa-armv8/nsys TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work"
 
 profiling:
