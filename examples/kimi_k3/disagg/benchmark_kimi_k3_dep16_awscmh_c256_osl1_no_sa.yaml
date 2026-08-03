@@ -4,10 +4,18 @@
 # TRTLLM_*_PREPEND pairs are unchanged; only the image, the checkpoint and
 # the job name differ.
 #
-# The checkpoint here is hf-301be1b_orig, which is what awscmh_env.sh points
-# at. ociaga runs used hf-9f62e4e_orig. Both exist on this cluster, so the
-# choice is deliberate rather than forced -- but it does mean numbers from
-# here and from ociaga are not a controlled comparison.
+# The checkpoint is hf-9f62e4e_orig at the same absolute path the ociaga
+# configs use, so the two clusters run the same weights. awscmh_env.sh
+# defaults to hf-9f62e4e_orig instead; that default is deliberately not
+# followed here, because aligning costs nothing -- both checkpoints are
+# already present on this cluster -- and it removes a variable from any
+# cross-cluster comparison.
+#
+# Verified identical rather than assumed: the 96 safetensors have the same
+# names and sizes on both clusters (listing hash 06d0c916ca0f31a1). ociaga's
+# copy also carries 88 interrupted-download shards named
+# *.safetensors<digits> totalling 1.10 TB, which is why a naive du shows
+# 2.6T there against 1.5T here; the real weights are 1.5T on both.
 #
 # Prefill-isolating variant of benchmark_kimi_k3_dep16_awscmh_c256_no_sa.yaml:
 # same 8192-token input, but one output token instead of 1024.
@@ -135,7 +143,7 @@ environment:
   # but unrunnable -- while `import tensorrt_llm` still succeeds through the
   # PYTHONPATH prepend. That asymmetry is what makes the mistake quiet, and it
   # is why an import-only check is not sufficient evidence that this is right.
-  container_mount: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-301be1b_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-301be1b_orig"
+  container_mount: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
   # The image is the base SBSA container plus Nsight Systems 2025.5 and nothing
   # else; TensorRT-LLM, its compiled .so files and every K3 prerequisite live in
   # the checkout. The image name carries the checkout it was built for, because
@@ -152,7 +160,7 @@ environment:
   # `pip install fla-core einops` is a no-op for einops when the base image
   # already ships it.
   container_image: "/home/xguan/dev/containers/trtllm-awscmh-gb300-k3-trtllm_work-base-nsys2025.5-20260803.sqsh"
-  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-301be1b_orig"
+  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
   trtllm_repo: ""
   build_wheel: false
   trtllm_wheel_path: ""
