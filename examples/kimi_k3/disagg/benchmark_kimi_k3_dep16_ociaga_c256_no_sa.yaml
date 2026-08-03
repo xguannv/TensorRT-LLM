@@ -1,0 +1,164 @@
+# OCIAGA Kimi K3 disaggregated serving at concurrency 256.
+#   - 1 x DEP16 context server (4 nodes, 16 GB300 GPUs)
+#   - 1 x DEP16 generation server (4 nodes, 16 GB300 GPUs)
+#   - exact 8192-token input / 1024-token output synthetic workload
+#   - suffix-automaton speculative decoding disabled
+#
+# Derived from benchmark_kimi_k3_dep16_ociaga_no_sa.yaml (concurrency 16).
+# Everything except the three items below is identical, so the two are directly
+# comparable.
+#
+# ---- Why concurrency 256 -----------------------------------------------------
+#
+# At c16 every generation rank decodes a batch of exactly ONE: attention DP is
+# on with tp=16, so the 16 in-flight requests are spread one per DP rank.
+# Measured at c16: gen num_scheduled_requests mean=1.0, gen and ctx
+# kv_cache_util both <=0.9%, and the context server's GPU sat idle 87% of
+# steady-state wall time. That is the least favourable batch size for MoE --
+# the all-to-all pays full latency while moving almost nothing -- and it is the
+# bottom of the range this dep16 recipe is meant for (examples/kimi_k3/README.md
+# lists dep16 as the throughput recipe, c 16-1024).
+#
+# c256 / dp16 = 16 requests per rank, still under gen max_batch_size=32.
+#
+# ---- Why a different dataset -------------------------------------------------
+#
+# run_benchmark.sh computes num_prompts = concurrency * multi_round, so c256
+# needs 1024 prompts where c16 needed 64. CustomDataset.sample() walks the file
+# once and stops at num_requests -- it does NOT cycle -- so a short file is
+# silently truncated and the requested concurrency is never reached. The
+# 128-request file therefore caps this workload at c32. The 1024-request file
+# below is the same generator: exactly 8192 input tokens, max_tokens 1024,
+# token ids uniform over the same 0..163839 range, seed 20260730.
+#
+# ---- Why ucx_warmup_requests is pinned ---------------------------------------
+#
+# 512 is what submit.py would compute anyway for this topology
+# (2 * ctx_num * ctx_dp * gen_num * gen_dp = 2*1*16*1*16), but it is written out
+# because it drives where the profile ranges have to sit in the nsys variant.
+#
+# This is a run-specific config. Keep the generic
+# benchmark_kimi_k3_dep16.yaml template unchanged.
+
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "batch"
+  account: "coreai_comparch_trtllm"
+  job_time: "02:00:00"
+  job_name: "k3-disagg-8k1k-c256-no-sa"
+  extra_args: "--gpus-per-node=4"
+  set_segment: true
+  numa_bind: true
+
+benchmark:
+  mode: "e2e"
+  use_nv_sa_benchmark: false
+  multi_round: 4
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: "256"
+  ucx_warmup_requests: 512
+  input_length: 8192
+  output_length: 1024
+  dataset_file: "/home/xguan/dev/run_records/kimi_k3_disagg/datasets/kimi_k3_8192_1024_1024req_trtllm_custom.jsonl"
+  env_var:
+    TRTLLM_PATH_PREPEND: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work/.venv-3.12/bin"
+    TRTLLM_PYTHONPATH_PREPEND: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work"
+
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+
+environment:
+  # The checkout is mounted at its own PHYSICAL path, deliberately NOT aliased
+  # to /code/tensorrt_llm. notes/oci_scripts/kimi_k3/make_k3_image.sh builds and
+  # installs at that physical path ("install path == job path"): the K3 sbatch
+  # entries take REPO from $SLURM_SUBMIT_DIR, and Slurm records the physical
+  # path even when the job was submitted through the /home/xguan/dev symlink.
+  #
+  # The venv's console scripts (trtllm-serve, trtllm-bench, ...) carry an
+  # absolute shebang into that same path, so an alias mount leaves them on PATH
+  # but unrunnable -- while `import tensorrt_llm` still succeeds through the
+  # PYTHONPATH prepend. That asymmetry is what makes the mistake quiet, and it
+  # is why an import-only check is not sufficient evidence that this is right.
+  container_mount: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work,/home/xguan/dev/run_records:/home/xguan/dev/run_records,/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig:/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  # The image is the base SBSA container plus Nsight Systems 2025.5 and nothing
+  # else; TensorRT-LLM, its compiled .so files and every K3 prerequisite live in
+  # the checkout. The image name carries the checkout it was built for, because
+  # Phase 2 installs into that checkout's .venv-3.12 -- image and checkout are a
+  # matched pair, not independently swappable.
+  #
+  # Resolution verified by make_k3_image.sh Phase 2 at this exact path
+  # (notes log: run_records/build_k3_trtllm_work_20260730.log):
+  #   tensorrt_llm 1.3.0rc21             -> checkout tree
+  #   flashinfer 0.6.15, fla-core 0.5.2  -> checkout .venv-3.12
+  #   einops 0.8.2                       -> image dist-packages
+  # einops resolving image-side is by design, not a gap: build_wheel.py creates
+  # .venv-3.12 with include-system-site-packages=true, so the README's
+  # `pip install fla-core einops` is a no-op for einops when the base image
+  # already ships it.
+  container_image: "/home/xguan/dev/containers/trtllm-ociaga-gb300-k3-trtllm_work-base-nsys2025.5-20260730.sqsh"
+  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf/hf-9f62e4e_orig"
+  trtllm_repo: ""
+  build_wheel: false
+  trtllm_wheel_path: ""
+  work_dir: ""
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work"
+
+profiling:
+  nsys_on: false
+  ctx_profile_range: "10-30"
+  gen_profile_range: "200-250"
+
+accuracy:
+  enable_accuracy_test: false
+
+worker_config:
+  gen:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config:
+      max_batch_size: 32
+    max_batch_size: 32
+    max_num_tokens: 256
+    max_seq_len: 9236
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
+
+  ctx:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
