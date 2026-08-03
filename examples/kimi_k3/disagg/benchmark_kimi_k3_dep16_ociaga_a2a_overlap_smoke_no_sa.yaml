@@ -1,5 +1,6 @@
 # One-request full DEP16 1P1D correctness smoke for the experimental CTX-only
-# NVLinkOneSided A2A/compute overlap path with 64-thread A2A blocks.
+# NVLinkOneSided A2A/compute overlap path with high-priority communication and
+# 64-thread A2A blocks.
 # Keep this separate from the
 # concurrency-16 performance config so smoke results cannot be mistaken for
 # throughput measurements.
@@ -9,7 +10,7 @@ slurm:
   partition: "batch"
   account: "coreai_comparch_trtllm"
   job_time: "01:00:00"
-  job_name: "k3-ctx-a2a-overlap-bs64-smoke"
+  job_name: "k3-ctx-a2a-hp-bs64-smoke"
   extra_args: "--gpus-per-node=4"
   set_segment: true
   numa_bind: true
@@ -42,7 +43,7 @@ environment:
   trtllm_wheel_path: ""
   work_dir: ""
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4 TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg TRTLLM_DISABLE_GPU_MASK=1"
-  ctx_worker_env_var: "TRTLLM_MOE_A2A_COMPUTE_OVERLAP=1 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMM=0 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMPUTE=0 TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE=64 TLLM_MOE_A2A_COMBINE_BLOCK_SIZE=64"
+  ctx_worker_env_var: "TRTLLM_MOE_A2A_COMPUTE_OVERLAP=1 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMM=1 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMPUTE=0 TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE=64 TLLM_MOE_A2A_COMBINE_BLOCK_SIZE=64"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4"
 
 profiling:
