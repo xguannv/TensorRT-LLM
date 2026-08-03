@@ -145,6 +145,20 @@ def test_moe_chunk_capacity_override():
     assert model_config.moe_max_num_tokens == 16384
 
 
+def test_moe_chunk_count_is_read_from_wrapper():
+    """Chunk-count reporting follows ConfigurableMoE, not its scheduler."""
+    from types import SimpleNamespace
+
+    from .build import _calculate_num_chunks_safe
+
+    moe = SimpleNamespace(
+        calculate_num_chunks=lambda all_rank_num_tokens: 2,
+        scheduler=SimpleNamespace(calculate_num_chunks=lambda all_rank_num_tokens: 99),
+    )
+
+    assert _calculate_num_chunks_safe(moe, [8192] * 4) == 2
+
+
 # --------------------------------------------------------------------------- #
 # Test 2: MoE forward launch count (GPU + optional cupti; golden-pinned)
 # --------------------------------------------------------------------------- #

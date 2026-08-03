@@ -84,10 +84,9 @@ def _comm_method_name(moe) -> str:
 
 def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[int]:
     """Best-effort lookup of ``num_chunks`` for the case we are about to time."""
-    scheduler = getattr(moe, "scheduler", None)
-    if scheduler is None:
-        return None
-    fn = getattr(scheduler, "calculate_num_chunks", None)
+    # Chunk capacity is wrapper state and ConfigurableMoE owns this helper;
+    # ExternalCommMoEScheduler only consumes its result during forward.
+    fn = getattr(moe, "calculate_num_chunks", None)
     if fn is None:
         return None
     try:
