@@ -2,8 +2,8 @@
 # NVLinkOneSided A2A/compute overlap path. This matches
 # benchmark_kimi_k3_dep16_ociaga_no_sa.yaml except for:
 #   - TRTLLM_MOE_A2A_COMPUTE_OVERLAP=1
-#   - TRTLLM_MOE_A2A_HIGH_PRIORITY_COMM=1, keeping the one-sided kernels
-#     schedulable while expert BMMs occupy the normal-priority compute stream
+#   - TRTLLM_MOE_A2A_HIGH_PRIORITY_COMPUTE=1, keeping expert BMMs schedulable
+#     while the one-sided kernels occupy the default-priority communication stream
 #   - CTX moe_config.max_num_tokens=67584, producing two 8192-token chunks
 #     at attention-DP size 16 and two 4224-token/rank workspace slots.
 
@@ -12,7 +12,7 @@ slurm:
   partition: "batch"
   account: "coreai_comparch_trtllm"
   job_time: "02:00:00"
-  job_name: "k3-disagg-a2a-overlap-hp"
+  job_name: "k3-disagg-a2a-overlap-hpcompute"
   extra_args: "--gpus-per-node=4"
   set_segment: true
   numa_bind: true
@@ -44,7 +44,7 @@ environment:
   build_wheel: false
   trtllm_wheel_path: ""
   work_dir: ""
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4 TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg TRTLLM_DISABLE_GPU_MASK=1 TRTLLM_MOE_A2A_COMPUTE_OVERLAP=1 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMM=1"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4 TRITON_CACHE_DIR=/tmp/triton-cache-k3-disagg FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-k3-disagg HF_HOME=/tmp/hf-cache-k3-disagg HF_MODULES_CACHE=/tmp/hf-modules-k3-disagg XDG_CACHE_HOME=/tmp/xdg-cache-k3-disagg TRTLLM_DISABLE_GPU_MASK=1 TRTLLM_MOE_A2A_COMPUTE_OVERLAP=1 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMM=0 TRTLLM_MOE_A2A_HIGH_PRIORITY_COMPUTE=1"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/xguan/dev/trtllm_work4"
 
 profiling:
