@@ -28,6 +28,7 @@ Design Principles:
 """
 
 import copy
+import os
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
@@ -64,6 +65,8 @@ _BACKEND_SYNC_ATTRS = (
     "slot_end",
     "expert_size_per_partition",
 )
+
+_A2A_HIGH_PRIORITY_COMM_ENV = "TRTLLM_MOE_A2A_HIGH_PRIORITY_COMM"
 
 
 class ConfigurableMoE(MoE):
@@ -238,11 +241,32 @@ class ConfigurableMoE(MoE):
                 if self._a2a_dispatch_done_events is not None
                 else None
             )
+            use_high_priority_comm = (
+                self._a2a_dispatch_done_events is not None
+                and os.environ.get(_A2A_HIGH_PRIORITY_COMM_ENV, "0") == "1"
+            )
+            self._a2a_comm_stream = (
+                torch.cuda.Stream(priority=-1) if use_high_priority_comm else None
+            )
+            self._a2a_main_to_comm_event = (
+                torch.cuda.Event() if use_high_priority_comm else None
+            )
+            self._a2a_comm_to_main_event = (
+                torch.cuda.Event() if use_high_priority_comm else None
+            )
+            if use_high_priority_comm:
+                logger.info_once(
+                    "MoE A2A/compute overlap uses a high-priority communication stream",
+                    key="moe_a2a_high_priority_comm_stream",
+                )
         else:
             self.aux_stream = None
             self.event_dict = None
             self._a2a_dispatch_done_events = None
             self._a2a_compute_done_events = None
+            self._a2a_comm_stream = None
+            self._a2a_main_to_comm_event = None
+            self._a2a_comm_to_main_event = None
 
         # Validate configuration
         self.validate_config()

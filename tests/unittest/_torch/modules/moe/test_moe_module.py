@@ -133,7 +133,10 @@ def _get_free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def test_external_comm_scheduler_serializes_a2a_collectives(monkeypatch):
+@pytest.mark.parametrize("use_comm_stream", [False, True])
+def test_external_comm_scheduler_serializes_a2a_collectives(
+    monkeypatch, use_comm_stream
+):
     log = []
     current_stream = {"name": "main"}
 
@@ -188,6 +191,13 @@ def test_external_comm_scheduler_serializes_a2a_collectives(monkeypatch):
             FakeEvent("compute_done_0"),
             FakeEvent("compute_done_1"),
         ),
+        _a2a_comm_stream="comm" if use_comm_stream else None,
+        _a2a_main_to_comm_event=(
+            FakeEvent("main_to_comm") if use_comm_stream else None
+        ),
+        _a2a_comm_to_main_event=(
+            FakeEvent("comm_to_main") if use_comm_stream else None
+        ),
         event_dict={
             EventType.Main: FakeEvent("main"),
             EventType.MoeChunkingOverlap: FakeEvent("join"),
@@ -230,33 +240,41 @@ def test_external_comm_scheduler_serializes_a2a_collectives(monkeypatch):
     )
 
     torch.testing.assert_close(output, x)
-    assert ("dispatch", 0, "main", 0) in log
-    assert ("dispatch", 1, "main", 1) in log
-    assert ("dispatch", 2, "main", 0) in log
+    communication_stream = "comm" if use_comm_stream else "main"
+    assert ("dispatch", 0, communication_stream, 0) in log
+    assert ("dispatch", 1, communication_stream, 1) in log
+    assert ("dispatch", 2, communication_stream, 0) in log
     assert ("compute", 0, "aux", 0) in log
     assert ("compute", 1, "aux", 1) in log
     assert ("compute", 2, "aux", 0) in log
-    assert ("combine", 0, "main", 0) in log
-    assert ("combine", 1, "main", 1) in log
-    assert ("combine", 2, "main", 0) in log
+    assert ("combine", 0, communication_stream, 0) in log
+    assert ("combine", 1, communication_stream, 1) in log
+    assert ("combine", 2, communication_stream, 0) in log
 
     communication_launches = [
         entry for entry in log if entry[0] in {"dispatch", "combine"}
     ]
     assert communication_launches == [
-        ("dispatch", 0, "main", 0),
-        ("dispatch", 1, "main", 1),
-        ("combine", 0, "main", 0),
-        ("dispatch", 2, "main", 0),
-        ("combine", 1, "main", 1),
-        ("combine", 2, "main", 0),
+        ("dispatch", 0, communication_stream, 0),
+        ("dispatch", 1, communication_stream, 1),
+        ("combine", 0, communication_stream, 0),
+        ("dispatch", 2, communication_stream, 0),
+        ("combine", 1, communication_stream, 1),
+        ("combine", 2, communication_stream, 0),
     ]
     assert log.index(("dispatch_done_0", "wait", "aux")) < log.index(
         ("compute", 0, "aux", 0)
     )
-    assert log.index(("compute_done_0", "wait", "main")) < log.index(
-        ("combine", 0, "main", 0)
+    assert log.index(("compute_done_0", "wait", communication_stream)) < log.index(
+        ("combine", 0, communication_stream, 0)
     )
+    if use_comm_stream:
+        assert log.index(("main_to_comm", "wait", "comm")) < log.index(
+            ("dispatch", 0, "comm", 0)
+        )
+        assert log.index(("comm_to_main", "record", "comm")) < log.index(
+            ("comm_to_main", "wait", "main")
+        )
 
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:

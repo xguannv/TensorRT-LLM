@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -823,11 +824,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
     ) -> torch.Tensor:
         """Pipeline one-sided communication and expert compute safely.
 
-        All dispatch/combine kernels stay on the main stream, giving every EP
-        rank the same collective launch order. Expert compute stays on the
-        auxiliary stream. For chunks D/C/R, the steady-state schedule is:
+        Dispatch/combine kernels stay on one ordered communication stream,
+        giving every EP rank the same collective launch order. By default that
+        is the main stream; the experimental high-priority communication path
+        uses a dedicated stream. Expert compute stays on the auxiliary stream.
+        For chunks D/C/R, the steady-state schedule is:
 
-            main: D0, D1, R0, D2, R1, ..., Rlast
+            comm: D0, D1, R0, D2, R1, ..., Rlast
             aux:      C0,     C1,     C2, ...
 
         This overlaps D(i+1) with C(i), then R(i) with C(i+1), without ever
@@ -839,9 +842,24 @@ class ExternalCommMoEScheduler(MoEScheduler):
         num_chunks = len(x_list)
         dispatch_done_events = moe._a2a_dispatch_done_events
         compute_done_events = moe._a2a_compute_done_events
+        comm_stream = getattr(moe, "_a2a_comm_stream", None)
+        main_to_comm_event = getattr(moe, "_a2a_main_to_comm_event", None)
+        comm_to_main_event = getattr(moe, "_a2a_comm_to_main_event", None)
         workspaces = (workspace_0, workspace_1)
         computed_outputs = [None] * num_chunks
         outputs_list = []
+
+        def comm_stream_context() -> AbstractContextManager:
+            return (
+                torch.cuda.stream(comm_stream)
+                if comm_stream is not None
+                else nullcontext()
+            )
+
+        if comm_stream is not None:
+            main_to_comm_event.record()
+            with comm_stream_context():
+                main_to_comm_event.wait()
 
         for idx_chunk, (x_chunk, router_logits_chunk, input_ids_chunk) in enumerate(
             zip(x_list, router_logits_list, input_ids_list)
@@ -850,18 +868,19 @@ class ExternalCommMoEScheduler(MoEScheduler):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
 
-            # Main stream: route, quantize, and complete D(i).
-            with moe.comm.workspace_slot(slot):
-                dispatched = self._prepare_chunk_dispatch(
-                    x_chunk,
-                    router_logits_chunk,
-                    all_rank_num_tokens_list[idx_chunk],
-                    use_dp_padding,
-                    is_first_call,
-                    is_last_call,
-                    input_ids=input_ids_chunk,
-                )
-            dispatch_done_events[slot].record()
+            # Ordered communication stream: route, quantize, and complete D(i).
+            with comm_stream_context():
+                with moe.comm.workspace_slot(slot):
+                    dispatched = self._prepare_chunk_dispatch(
+                        x_chunk,
+                        router_logits_chunk,
+                        all_rank_num_tokens_list[idx_chunk],
+                        use_dp_padding,
+                        is_first_call,
+                        is_last_call,
+                        input_ids=input_ids_chunk,
+                    )
+                dispatch_done_events[slot].record()
 
             # Aux stream: C(i) waits only for its dispatch.
             with torch.cuda.stream(moe.aux_stream):
@@ -878,33 +897,41 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     )
                 compute_done_events[slot].record()
 
-            # Main stream: D(i) is enqueued before R(i-1). This deterministic
+            # Communication stream: D(i) is enqueued before R(i-1). This deterministic
             # communication order is the deadlock-avoidance invariant.
             if idx_chunk > 0:
                 previous = idx_chunk - 1
                 previous_slot = previous % 2
-                compute_done_events[previous_slot].wait()
-                with moe.comm.workspace_slot(previous_slot):
-                    output = self._combine_chunk(
-                        computed_outputs[previous],
-                        all_rank_num_tokens_list[previous],
-                        previous == num_chunks - 1
-                        and moe.repeat_idx == moe.repeat_count - 1,
-                    )
+                with comm_stream_context():
+                    compute_done_events[previous_slot].wait()
+                    with moe.comm.workspace_slot(previous_slot):
+                        output = self._combine_chunk(
+                            computed_outputs[previous],
+                            all_rank_num_tokens_list[previous],
+                            previous == num_chunks - 1
+                            and moe.repeat_idx == moe.repeat_count - 1,
+                        )
                 if chunked_used[previous]:
                     outputs_list.append(output)
 
         last = num_chunks - 1
         last_slot = last % 2
-        compute_done_events[last_slot].wait()
-        with moe.comm.workspace_slot(last_slot):
-            output = self._combine_chunk(
-                computed_outputs[last],
-                all_rank_num_tokens_list[last],
-                last == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1,
-            )
+        with comm_stream_context():
+            compute_done_events[last_slot].wait()
+            with moe.comm.workspace_slot(last_slot):
+                output = self._combine_chunk(
+                    computed_outputs[last],
+                    all_rank_num_tokens_list[last],
+                    last == num_chunks - 1
+                    and moe.repeat_idx == moe.repeat_count - 1,
+                )
+            if comm_stream is not None:
+                comm_to_main_event.record()
         if chunked_used[last]:
             outputs_list.append(output)
+
+        if comm_stream is not None:
+            comm_to_main_event.wait()
 
         return torch.cat(outputs_list)
 
