@@ -111,6 +111,9 @@ class ModelSpec:
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
+    trtllm_gen_activation_type: Optional[str] = None
+    trtllm_gen_activation_alpha: Optional[float] = None
+    trtllm_gen_activation_beta: Optional[float] = None
 
     @property
     def routing_method_cls(self) -> type:
@@ -309,6 +312,20 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         intermediate_size=2048,
         quant_algo="FP8_BLOCK_SCALES",
         routing_method="DEEPSEEK_V3",
+    ),
+    "kimi_k3": ModelSpec(
+        name="kimi_k3",
+        num_experts=896,
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        quant_algo="W4A8_MXFP4_MXFP8",
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        trtllm_gen_activation_type="SiTu",
+        trtllm_gen_activation_alpha=4.0,
+        trtllm_gen_activation_beta=25.0,
     ),
     # DeepSeek-V4-Pro: 1.6T total / 49B activated. quant_algo intentionally
     # left None: pass --quant on the CLI to pin the mode (the released

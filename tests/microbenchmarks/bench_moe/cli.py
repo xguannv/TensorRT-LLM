@@ -562,6 +562,9 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
         swiglu_alpha=base.swiglu_alpha,
         swiglu_beta=base.swiglu_beta,
         swiglu_limit=base.swiglu_limit,
+        trtllm_gen_activation_type=base.trtllm_gen_activation_type,
+        trtllm_gen_activation_alpha=base.trtllm_gen_activation_alpha,
+        trtllm_gen_activation_beta=base.trtllm_gen_activation_beta,
     )
 
 

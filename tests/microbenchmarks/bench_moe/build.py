@@ -30,6 +30,7 @@ from typing import Dict, List, Optional
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -193,6 +194,13 @@ def _build_moe_module(
         swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
         swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
         swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+        trtllm_gen_activation_type=(
+            ActType_TrtllmGen[model.trtllm_gen_activation_type]
+            if model.trtllm_gen_activation_type is not None
+            else None
+        ),
+        trtllm_gen_activation_alpha=model.trtllm_gen_activation_alpha,
+        trtllm_gen_activation_beta=model.trtllm_gen_activation_beta,
     )
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:

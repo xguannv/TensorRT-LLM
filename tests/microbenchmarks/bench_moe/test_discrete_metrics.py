@@ -159,6 +159,23 @@ def test_moe_chunk_count_is_read_from_wrapper():
     assert _calculate_num_chunks_safe(moe, [8192] * 4) == 2
 
 
+def test_kimi_k3_model_spec_matches_production_moe():
+    """The K3 benchmark preset keeps the routed-MoE cubin geometry faithful."""
+    from .specs import BUILT_IN_MODELS
+
+    model = BUILT_IN_MODELS["kimi_k3"]
+
+    assert (model.num_experts, model.top_k) == (896, 16)
+    assert (model.hidden_size, model.intermediate_size) == (3584, 3072)
+    assert model.quant_algo == "W4A8_MXFP4_MXFP8"
+    assert (model.n_group, model.topk_group) == (1, 1)
+    assert model.trtllm_gen_activation_type == "SiTu"
+    assert (model.trtllm_gen_activation_alpha, model.trtllm_gen_activation_beta) == (
+        4.0,
+        25.0,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Test 2: MoE forward launch count (GPU + optional cupti; golden-pinned)
 # --------------------------------------------------------------------------- #

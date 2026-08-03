@@ -198,6 +198,15 @@ capacity of 16384 run as two 4096-token-per-rank chunks:
 --balanced_total_num_tokens 32768 --moe_max_num_tokens 16384
 ```
 
+For Kimi K3, the `kimi_k3` preset also selects its production routed-expert
+shape, MXFP4/MXFP8 mode, and TRTLLM-Gen SiTu activation parameters:
+
+```bash
+--model kimi_k3 --backend TRTLLM --parallel_mode DEP \
+--comm_method NVLINK_ONE_SIDED \
+--balanced_total_num_tokens 32768 --moe_max_num_tokens 16384
+```
+
 ### Case G: local-only communication baseline
 
 ```bash
