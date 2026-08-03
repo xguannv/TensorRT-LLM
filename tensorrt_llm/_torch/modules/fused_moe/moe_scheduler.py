@@ -829,15 +829,24 @@ class ExternalCommMoEScheduler(MoEScheduler):
         is the main stream; the experimental high-priority communication path
         uses a dedicated stream. Expert compute stays on the auxiliary stream,
         or on a dedicated high-priority compute stream when requested.
-        For chunks D/C/R, the steady-state schedule is:
+        For chunks D/C/R, the default two-slot schedule is:
+
+            comm: D0, D1,        R0, R1, D2, D3,        R2, R3, ...
+            aux:          C0, C1,                 C2, C3, ...
+
+        This overlaps D(i+1) with C(i), but waits for both expert-compute
+        chunks before launching either combine. Nsys showed that one-sided
+        combine polling concurrent with the next expert GEMM can starve the
+        GEMM for tens of milliseconds. Dispatch overlap did not show that
+        slowdown, so it remains enabled. Two workspace slots are sufficient
+        because both combines complete before the next dispatch window reuses
+        them.
+
+        Set TRTLLM_MOE_A2A_COMBINE_COMPUTE_OVERLAP=1 to retain the more
+        aggressive steady-state schedule for controlled A/B experiments:
 
             comm: D0, D1, R0, D2, R1, ..., Rlast
             aux:      C0,     C1,     C2, ...
-
-        This overlaps D(i+1) with C(i), then R(i) with C(i+1), without ever
-        allowing a dispatch kernel on one rank to race a combine kernel on
-        another rank. Two workspace slots are sufficient because R(i)
-        completes on the main stream before D(i+2) reuses the same slot.
 
         The first two dispatches must both be enqueued before C0. If C0 is
         enqueued immediately after D0, a large expert GEMM can occupy every SM
@@ -856,6 +865,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
         main_to_comm_event = getattr(moe, "_a2a_main_to_comm_event", None)
         comm_to_main_event = getattr(moe, "_a2a_comm_to_main_event", None)
         workspaces = (workspace_0, workspace_1)
+        allow_combine_compute_overlap = (
+            os.environ.get("TRTLLM_MOE_A2A_COMBINE_COMPUTE_OVERLAP", "0") == "1"
+        )
         dispatched_chunks = [None] * num_chunks
         computed_outputs = [None] * num_chunks
         outputs_list = []
@@ -926,25 +938,41 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if chunked_used[idx_chunk]:
                 outputs_list.append(output)
 
-        # Fill both workspace slots before expert compute. Host enqueue order is
-        # D0, D1, C0, C1, so D1 is already eligible when C0 starts.
-        fill_count = min(num_chunks, 2)
-        for idx_chunk in range(fill_count):
-            dispatch_chunk(idx_chunk)
-        for idx_chunk in range(fill_count):
-            compute_chunk(idx_chunk)
+        if allow_combine_compute_overlap:
+            # Fill both workspace slots before expert compute. Host enqueue
+            # order is D0, D1, C0, C1, so D1 is already eligible when C0
+            # starts.
+            fill_count = min(num_chunks, 2)
+            for idx_chunk in range(fill_count):
+                dispatch_chunk(idx_chunk)
+            for idx_chunk in range(fill_count):
+                compute_chunk(idx_chunk)
 
-        # Reuse slot i only after R(i-2) has consumed its computed output.
-        # This keeps every rank's communication order identical:
-        # D0, D1, R0, D2, R1, D3, ..., Rlast.
-        for idx_chunk in range(2, num_chunks):
-            combine_chunk(idx_chunk - 2)
-            dispatch_chunk(idx_chunk)
-            compute_chunk(idx_chunk)
+            # Reuse slot i only after R(i-2) has consumed its computed output.
+            # Every rank therefore uses D0,D1,R0,D2,R1,D3,...,Rlast.
+            for idx_chunk in range(2, num_chunks):
+                combine_chunk(idx_chunk - 2)
+                dispatch_chunk(idx_chunk)
+                compute_chunk(idx_chunk)
 
-        # Drain the two in-flight workspace slots in chunk order.
-        for idx_chunk in range(max(0, num_chunks - 2), num_chunks):
-            combine_chunk(idx_chunk)
+            # Drain the two in-flight workspace slots in chunk order.
+            for idx_chunk in range(max(0, num_chunks - 2), num_chunks):
+                combine_chunk(idx_chunk)
+        else:
+            # Run two chunks per workspace window. Both dispatches are queued
+            # before compute, preserving D1/C0 overlap. Waiting for the final
+            # compute event is sufficient because all computes share one
+            # ordered stream; no combine can poll while a GEMM is running.
+            for window_start in range(0, num_chunks, 2):
+                window_end = min(window_start + 2, num_chunks)
+                for idx_chunk in range(window_start, window_end):
+                    dispatch_chunk(idx_chunk)
+                for idx_chunk in range(window_start, window_end):
+                    compute_chunk(idx_chunk)
+                with comm_stream_context():
+                    compute_done_events[(window_end - 1) % 2].wait()
+                for idx_chunk in range(window_start, window_end):
+                    combine_chunk(idx_chunk)
 
         if comm_stream is not None:
             with comm_stream_context():

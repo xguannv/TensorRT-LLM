@@ -138,8 +138,13 @@ def _get_free_tcp_port() -> int:
     [(False, False), (True, False), (False, True), (True, True)],
 )
 @pytest.mark.parametrize("num_chunks", [2, 3, 4])
+@pytest.mark.parametrize("combine_compute_overlap", [False, True])
 def test_external_comm_scheduler_serializes_a2a_collectives(
-    monkeypatch, use_comm_stream, use_compute_stream, num_chunks
+    monkeypatch,
+    use_comm_stream,
+    use_compute_stream,
+    num_chunks,
+    combine_compute_overlap,
 ):
     log = []
     current_stream = {"name": "main"}
@@ -233,6 +238,10 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
     monkeypatch.setattr(scheduler, "_prepare_chunk_dispatch", fake_prepare_chunk_dispatch)
     monkeypatch.setattr(scheduler, "_run_chunk_moe", fake_run_chunk_moe)
     monkeypatch.setattr(scheduler, "_combine_chunk", fake_combine_chunk)
+    monkeypatch.setenv(
+        "TRTLLM_MOE_A2A_COMBINE_COMPUTE_OVERLAP",
+        "1" if combine_compute_overlap else "0",
+    )
 
     x = torch.arange(num_chunks * 4, dtype=torch.float32).reshape(num_chunks * 2, 2)
     output = scheduler._forward_multiple_chunks(
@@ -257,43 +266,73 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
     communication_launches = [
         entry for entry in log if entry[0] in {"dispatch", "combine"}
     ]
-    expected_communication_launches = [
-        ("dispatch", idx, communication_stream, idx % 2) for idx in range(2)
-    ]
-    for idx in range(2, num_chunks):
+    if combine_compute_overlap:
+        expected_communication_launches = [
+            ("dispatch", idx, communication_stream, idx % 2) for idx in range(2)
+        ]
+        for idx in range(2, num_chunks):
+            expected_communication_launches.extend(
+                [
+                    ("combine", idx - 2, communication_stream, idx % 2),
+                    ("dispatch", idx, communication_stream, idx % 2),
+                ]
+            )
         expected_communication_launches.extend(
-            [
-                ("combine", idx - 2, communication_stream, idx % 2),
-                ("dispatch", idx, communication_stream, idx % 2),
-            ]
+            ("combine", idx, communication_stream, idx % 2)
+            for idx in range(max(0, num_chunks - 2), num_chunks)
         )
-    expected_communication_launches.extend(
-        ("combine", idx, communication_stream, idx % 2)
-        for idx in range(max(0, num_chunks - 2), num_chunks)
-    )
+    else:
+        expected_communication_launches = []
+        for window_start in range(0, num_chunks, 2):
+            window_end = min(window_start + 2, num_chunks)
+            expected_communication_launches.extend(
+                ("dispatch", idx, communication_stream, idx % 2)
+                for idx in range(window_start, window_end)
+            )
+            expected_communication_launches.extend(
+                ("combine", idx, communication_stream, idx % 2)
+                for idx in range(window_start, window_end)
+            )
     assert communication_launches == expected_communication_launches
 
     pipeline_launches = [
         entry for entry in log if entry[0] in {"dispatch", "compute", "combine"}
     ]
-    expected_pipeline_launches = [
-        ("dispatch", idx, communication_stream, idx % 2) for idx in range(2)
-    ]
-    expected_pipeline_launches.extend(
-        ("compute", idx, compute_stream, idx % 2) for idx in range(2)
-    )
-    for idx in range(2, num_chunks):
+    if combine_compute_overlap:
+        expected_pipeline_launches = [
+            ("dispatch", idx, communication_stream, idx % 2) for idx in range(2)
+        ]
         expected_pipeline_launches.extend(
-            [
-                ("combine", idx - 2, communication_stream, idx % 2),
-                ("dispatch", idx, communication_stream, idx % 2),
-                ("compute", idx, compute_stream, idx % 2),
-            ]
+            ("compute", idx, compute_stream, idx % 2) for idx in range(2)
         )
-    expected_pipeline_launches.extend(
-        ("combine", idx, communication_stream, idx % 2)
-        for idx in range(max(0, num_chunks - 2), num_chunks)
-    )
+        for idx in range(2, num_chunks):
+            expected_pipeline_launches.extend(
+                [
+                    ("combine", idx - 2, communication_stream, idx % 2),
+                    ("dispatch", idx, communication_stream, idx % 2),
+                    ("compute", idx, compute_stream, idx % 2),
+                ]
+            )
+        expected_pipeline_launches.extend(
+            ("combine", idx, communication_stream, idx % 2)
+            for idx in range(max(0, num_chunks - 2), num_chunks)
+        )
+    else:
+        expected_pipeline_launches = []
+        for window_start in range(0, num_chunks, 2):
+            window_end = min(window_start + 2, num_chunks)
+            expected_pipeline_launches.extend(
+                ("dispatch", idx, communication_stream, idx % 2)
+                for idx in range(window_start, window_end)
+            )
+            expected_pipeline_launches.extend(
+                ("compute", idx, compute_stream, idx % 2)
+                for idx in range(window_start, window_end)
+            )
+            expected_pipeline_launches.extend(
+                ("combine", idx, communication_stream, idx % 2)
+                for idx in range(window_start, window_end)
+            )
     assert pipeline_launches == expected_pipeline_launches
     assert log.index(("dispatch_done_0", "wait", compute_stream)) < log.index(
         ("compute", 0, compute_stream, 0)
@@ -301,6 +340,10 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
     assert log.index(("compute_done_0", "wait", communication_stream)) < log.index(
         ("combine", 0, communication_stream, 0)
     )
+    if not combine_compute_overlap and num_chunks >= 2:
+        assert log.index(("compute_done_1", "wait", communication_stream)) < log.index(
+            ("combine", 0, communication_stream, 0)
+        )
     if use_comm_stream:
         assert log.index(("main_to_comm", "wait", "comm")) < log.index(
             ("dispatch", 0, "comm", 0)
