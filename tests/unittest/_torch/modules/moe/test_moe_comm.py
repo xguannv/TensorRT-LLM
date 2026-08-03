@@ -2500,7 +2500,10 @@ def test_nvlink_onesided_two_workspace_overlap():
         )
         worker_inputs = [_prepare_worker_inputs(rank, config) for _ in range(2)]
 
+        comm_stream = torch.cuda.Stream(priority=-1)
         aux_stream = torch.cuda.Stream()
+        main_to_comm = torch.cuda.Event()
+        comm_to_main = torch.cuda.Event()
         dispatch_done = [torch.cuda.Event() for _ in range(2)]
         compute_done = [torch.cuda.Event() for _ in range(2)]
 
@@ -2526,36 +2529,43 @@ def test_nvlink_onesided_two_workspace_overlap():
             )
             return moe_output
 
-        # Keep every collective on the main stream in identical rank order.
-        with comm.workspace_slot(0):
-            dispatch_0 = _run_worker_dispatch(comm, worker_inputs[0], config)
-        dispatch_done[0].record()
+        # Keep every collective on one high-priority stream in identical rank order.
+        main_to_comm.record()
+        with torch.cuda.stream(comm_stream):
+            main_to_comm.wait()
+            with comm.workspace_slot(0):
+                dispatch_0 = _run_worker_dispatch(comm, worker_inputs[0], config)
+            dispatch_done[0].record()
         with torch.cuda.stream(aux_stream):
             dispatch_done[0].wait()
             moe_output_0 = run_compute(dispatch_0, worker_inputs[0])
             compute_done[0].record()
 
-        with comm.workspace_slot(1):
-            dispatch_1 = _run_worker_dispatch(comm, worker_inputs[1], config)
-        dispatch_done[1].record()
+        with torch.cuda.stream(comm_stream):
+            with comm.workspace_slot(1):
+                dispatch_1 = _run_worker_dispatch(comm, worker_inputs[1], config)
+            dispatch_done[1].record()
         with torch.cuda.stream(aux_stream):
             dispatch_done[1].wait()
             moe_output_1 = run_compute(dispatch_1, worker_inputs[1])
             compute_done[1].record()
 
-        compute_done[0].wait()
-        with comm.workspace_slot(0):
-            combined_0 = comm.combine(
-                moe_output_0,
-                all_rank_max_num_tokens=max(config.all_num_tokens),
-            )
-        compute_done[1].wait()
-        with comm.workspace_slot(1):
-            combined_1 = comm.combine(
-                moe_output_1,
-                all_rank_max_num_tokens=max(config.all_num_tokens),
-            )
+        with torch.cuda.stream(comm_stream):
+            compute_done[0].wait()
+            with comm.workspace_slot(0):
+                combined_0 = comm.combine(
+                    moe_output_0,
+                    all_rank_max_num_tokens=max(config.all_num_tokens),
+                )
+            compute_done[1].wait()
+            with comm.workspace_slot(1):
+                combined_1 = comm.combine(
+                    moe_output_1,
+                    all_rank_max_num_tokens=max(config.all_num_tokens),
+                )
+            comm_to_main.record()
 
+        comm_to_main.wait()
         torch.cuda.synchronize()
 
         rank_results = []
