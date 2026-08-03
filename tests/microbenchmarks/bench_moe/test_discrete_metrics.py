@@ -125,6 +125,7 @@ def test_moe_chunk_capacity_override():
     mapping = Mapping(
         world_size=4,
         rank=0,
+        tp_size=4,
         moe_ep_size=4,
         moe_tp_size=1,
         enable_attention_dp=True,
