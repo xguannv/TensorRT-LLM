@@ -838,6 +838,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
         allowing a dispatch kernel on one rank to race a combine kernel on
         another rank. Two workspace slots are sufficient because R(i)
         completes on the main stream before D(i+2) reuses the same slot.
+
+        The first two dispatches must both be enqueued before C0. If C0 is
+        enqueued immediately after D0, a large expert GEMM can occupy every SM
+        before D1 becomes runnable. D1 then starts only after each rank's C0
+        finishes, turning expert-load skew into long one-sided polling tails.
+        Filling both workspace slots first makes D1 eligible alongside C0 and
+        preserves the intended pipeline on the device, not just in the host
+        communication-call order.
         """
         moe = self.moe
         num_chunks = len(x_list)
@@ -848,6 +856,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         main_to_comm_event = getattr(moe, "_a2a_main_to_comm_event", None)
         comm_to_main_event = getattr(moe, "_a2a_comm_to_main_event", None)
         workspaces = (workspace_0, workspace_1)
+        dispatched_chunks = [None] * num_chunks
         computed_outputs = [None] * num_chunks
         outputs_list = []
 
@@ -863,17 +872,20 @@ class ExternalCommMoEScheduler(MoEScheduler):
             with comm_stream_context():
                 main_to_comm_event.wait()
 
-        for idx_chunk, (x_chunk, router_logits_chunk, input_ids_chunk) in enumerate(
-            zip(x_list, router_logits_list, input_ids_list)
-        ):
+        def dispatch_chunk(idx_chunk: int) -> None:
             slot = idx_chunk % 2
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
-            is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
+            is_last_call = (
+                idx_chunk == num_chunks - 1
+                and moe.repeat_idx == moe.repeat_count - 1
+            )
+            x_chunk = x_list[idx_chunk]
+            router_logits_chunk = router_logits_list[idx_chunk]
+            input_ids_chunk = input_ids_list[idx_chunk]
 
-            # Ordered communication stream: route, quantize, and complete D(i).
             with comm_stream_context():
                 with moe.comm.workspace_slot(slot):
-                    dispatched = self._prepare_chunk_dispatch(
+                    dispatched_chunks[idx_chunk] = self._prepare_chunk_dispatch(
                         x_chunk,
                         router_logits_chunk,
                         all_rank_num_tokens_list[idx_chunk],
@@ -884,13 +896,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     )
                 dispatch_done_events[slot].record()
 
-            # Aux stream: C(i) waits only for its dispatch.
+        def compute_chunk(idx_chunk: int) -> None:
+            slot = idx_chunk % 2
             with torch.cuda.stream(compute_stream):
                 dispatch_done_events[slot].wait()
                 with moe.comm.workspace_slot(slot):
                     computed_outputs[idx_chunk] = self._run_chunk_moe(
-                        *dispatched,
-                        router_logits_chunk,
+                        *dispatched_chunks[idx_chunk],
+                        router_logits_list[idx_chunk],
                         output_dtype,
                         all_rank_num_tokens_list[idx_chunk],
                         do_finalize,
@@ -899,40 +912,43 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     )
                 compute_done_events[slot].record()
 
-            # Communication stream: D(i) is enqueued before R(i-1). This deterministic
-            # communication order is the deadlock-avoidance invariant.
-            if idx_chunk > 0:
-                previous = idx_chunk - 1
-                previous_slot = previous % 2
-                with comm_stream_context():
-                    compute_done_events[previous_slot].wait()
-                    with moe.comm.workspace_slot(previous_slot):
-                        output = self._combine_chunk(
-                            computed_outputs[previous],
-                            all_rank_num_tokens_list[previous],
-                            previous == num_chunks - 1
-                            and moe.repeat_idx == moe.repeat_count - 1,
-                        )
-                if chunked_used[previous]:
-                    outputs_list.append(output)
+        def combine_chunk(idx_chunk: int) -> None:
+            slot = idx_chunk % 2
+            with comm_stream_context():
+                compute_done_events[slot].wait()
+                with moe.comm.workspace_slot(slot):
+                    output = self._combine_chunk(
+                        computed_outputs[idx_chunk],
+                        all_rank_num_tokens_list[idx_chunk],
+                        idx_chunk == num_chunks - 1
+                        and moe.repeat_idx == moe.repeat_count - 1,
+                    )
+            if chunked_used[idx_chunk]:
+                outputs_list.append(output)
 
-        last = num_chunks - 1
-        last_slot = last % 2
-        with comm_stream_context():
-            compute_done_events[last_slot].wait()
-            with moe.comm.workspace_slot(last_slot):
-                output = self._combine_chunk(
-                    computed_outputs[last],
-                    all_rank_num_tokens_list[last],
-                    last == num_chunks - 1
-                    and moe.repeat_idx == moe.repeat_count - 1,
-                )
-            if comm_stream is not None:
-                comm_to_main_event.record()
-        if chunked_used[last]:
-            outputs_list.append(output)
+        # Fill both workspace slots before expert compute. Host enqueue order is
+        # D0, D1, C0, C1, so D1 is already eligible when C0 starts.
+        fill_count = min(num_chunks, 2)
+        for idx_chunk in range(fill_count):
+            dispatch_chunk(idx_chunk)
+        for idx_chunk in range(fill_count):
+            compute_chunk(idx_chunk)
+
+        # Reuse slot i only after R(i-2) has consumed its computed output.
+        # This keeps every rank's communication order identical:
+        # D0, D1, R0, D2, R1, D3, ..., Rlast.
+        for idx_chunk in range(2, num_chunks):
+            combine_chunk(idx_chunk - 2)
+            dispatch_chunk(idx_chunk)
+            compute_chunk(idx_chunk)
+
+        # Drain the two in-flight workspace slots in chunk order.
+        for idx_chunk in range(max(0, num_chunks - 2), num_chunks):
+            combine_chunk(idx_chunk)
 
         if comm_stream is not None:
+            with comm_stream_context():
+                comm_to_main_event.record()
             comm_to_main_event.wait()
 
         return torch.cat(outputs_list)

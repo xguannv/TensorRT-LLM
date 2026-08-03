@@ -137,8 +137,9 @@ def _get_free_tcp_port() -> int:
     "use_comm_stream,use_compute_stream",
     [(False, False), (True, False), (False, True), (True, True)],
 )
+@pytest.mark.parametrize("num_chunks", [2, 3, 4])
 def test_external_comm_scheduler_serializes_a2a_collectives(
-    monkeypatch, use_comm_stream, use_compute_stream
+    monkeypatch, use_comm_stream, use_compute_stream, num_chunks
 ):
     log = []
     current_stream = {"name": "main"}
@@ -233,13 +234,13 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
     monkeypatch.setattr(scheduler, "_run_chunk_moe", fake_run_chunk_moe)
     monkeypatch.setattr(scheduler, "_combine_chunk", fake_combine_chunk)
 
-    x = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    x = torch.arange(num_chunks * 4, dtype=torch.float32).reshape(num_chunks * 2, 2)
     output = scheduler._forward_multiple_chunks(
         x=x,
-        router_logits=torch.zeros((6, 2)),
-        num_chunks=3,
+        router_logits=torch.zeros_like(x),
+        num_chunks=num_chunks,
         output_dtype=torch.float32,
-        all_rank_num_tokens=[6],
+        all_rank_num_tokens=[x.shape[0]],
         use_dp_padding=False,
     )
 
@@ -248,25 +249,52 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
     compute_stream = "compute" if use_compute_stream else "aux"
     assert ("dispatch", 0, communication_stream, 0) in log
     assert ("dispatch", 1, communication_stream, 1) in log
-    assert ("dispatch", 2, communication_stream, 0) in log
     assert ("compute", 0, compute_stream, 0) in log
     assert ("compute", 1, compute_stream, 1) in log
-    assert ("compute", 2, compute_stream, 0) in log
     assert ("combine", 0, communication_stream, 0) in log
     assert ("combine", 1, communication_stream, 1) in log
-    assert ("combine", 2, communication_stream, 0) in log
 
     communication_launches = [
         entry for entry in log if entry[0] in {"dispatch", "combine"}
     ]
-    assert communication_launches == [
-        ("dispatch", 0, communication_stream, 0),
-        ("dispatch", 1, communication_stream, 1),
-        ("combine", 0, communication_stream, 0),
-        ("dispatch", 2, communication_stream, 0),
-        ("combine", 1, communication_stream, 1),
-        ("combine", 2, communication_stream, 0),
+    expected_communication_launches = [
+        ("dispatch", idx, communication_stream, idx % 2) for idx in range(2)
     ]
+    for idx in range(2, num_chunks):
+        expected_communication_launches.extend(
+            [
+                ("combine", idx - 2, communication_stream, idx % 2),
+                ("dispatch", idx, communication_stream, idx % 2),
+            ]
+        )
+    expected_communication_launches.extend(
+        ("combine", idx, communication_stream, idx % 2)
+        for idx in range(max(0, num_chunks - 2), num_chunks)
+    )
+    assert communication_launches == expected_communication_launches
+
+    pipeline_launches = [
+        entry for entry in log if entry[0] in {"dispatch", "compute", "combine"}
+    ]
+    expected_pipeline_launches = [
+        ("dispatch", idx, communication_stream, idx % 2) for idx in range(2)
+    ]
+    expected_pipeline_launches.extend(
+        ("compute", idx, compute_stream, idx % 2) for idx in range(2)
+    )
+    for idx in range(2, num_chunks):
+        expected_pipeline_launches.extend(
+            [
+                ("combine", idx - 2, communication_stream, idx % 2),
+                ("dispatch", idx, communication_stream, idx % 2),
+                ("compute", idx, compute_stream, idx % 2),
+            ]
+        )
+    expected_pipeline_launches.extend(
+        ("combine", idx, communication_stream, idx % 2)
+        for idx in range(max(0, num_chunks - 2), num_chunks)
+    )
+    assert pipeline_launches == expected_pipeline_launches
     assert log.index(("dispatch_done_0", "wait", compute_stream)) < log.index(
         ("compute", 0, compute_stream, 0)
     )
