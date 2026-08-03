@@ -50,21 +50,18 @@ using bf16_t = __nv_bfloat16;
 static constexpr int ATTN_RES_BLOCK = 256;
 static constexpr int ATTN_RES_WARPS = ATTN_RES_BLOCK / 32;
 
-int get_attn_res_pdl_mode() {
-    static int const mode = [] {
+bool get_attn_res_pdl_enabled() {
+    static bool const enabled = [] {
         char const* env = std::getenv("KIMI_K3_ATTN_RES_PDL");
         if (env != nullptr && env[0] == '0' && env[1] == '\0') {
-            return 0;
+            return false;
         }
         if (env != nullptr && env[0] == '1' && env[1] == '\0') {
-            return 1;
+            return true;
         }
-        if (env != nullptr && env[0] == '2' && env[1] == '\0') {
-            return 2;
-        }
-        return tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+        return tensorrt_llm::common::getEnvEnablePDL();
     }();
-    return mode;
+    return enabled;
 }
 
 __inline__ __device__ float warp_reduce_sum(float val) {
@@ -1155,7 +1152,7 @@ static void launch_fwd(
 // boundary.  The fused output is also retained in registers for the trailing
 // RMSNorm, preserving the BF16 boundary without a shared-memory round trip.
 template <int N, bool FUSE_OUTPUT_RMS_NORM = false,
-          bool FUSE_LAYER_ADD = false, int PDL_MODE = 0>
+          bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_single_cta_kernel(
     const bf16_t* __restrict__ block_res,
@@ -1173,7 +1170,7 @@ attn_res_fwd_s1_single_cta_kernel(
     float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-    if constexpr (PDL_MODE != 0) {
+    if constexpr (ENABLE_PDL) {
         cudaGridDependencySynchronize();
     }
 
@@ -1346,10 +1343,6 @@ attn_res_fwd_s1_single_cta_kernel(
         }
     }
 
-    if constexpr (PDL_MODE == 2 && FUSE_OUTPUT_RMS_NORM) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-
     if constexpr (FUSE_OUTPUT_RMS_NORM) {
         output_sq_local = warp_reduce_sum(output_sq_local);
         if (lane == 0) {
@@ -1376,8 +1369,7 @@ attn_res_fwd_s1_single_cta_kernel(
         }
     }
 
-    if constexpr (PDL_MODE == 1
-                  || (PDL_MODE == 2 && !FUSE_OUTPUT_RMS_NORM)) {
+    if constexpr (ENABLE_PDL) {
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #else
@@ -1405,13 +1397,9 @@ static void launch_s1_single_cta(
     float output_rms_eps,
     cudaStream_t stream)
 {
-    int const pdl_mode = get_attn_res_pdl_mode();
-    if (pdl_mode != 0) {
-        auto kernel = pdl_mode == 2
-            ? &attn_res_fwd_s1_single_cta_kernel<
-                  N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, 2>
-            : &attn_res_fwd_s1_single_cta_kernel<
-                  N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, 1>;
+    if (get_attn_res_pdl_enabled()) {
+        auto kernel = &attn_res_fwd_s1_single_cta_kernel<
+            N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>;
         cudaLaunchConfig_t config{};
         config.gridDim = dim3(1);
         config.blockDim = dim3(256);
@@ -1428,7 +1416,7 @@ static void launch_s1_single_cta(
             output_rms_eps);
     } else {
         attn_res_fwd_s1_single_cta_kernel<
-            N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, 0>
+            N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>
             <<<1, 256, 0, stream>>>(
                 block_residual, layer_residual, layer_residual_add,
                 res_weight, rms_weight, output_rms_weight,
@@ -1463,7 +1451,7 @@ static void launch_s1_single_cta(
 // rank-local shared memory, and exchanges only (square, dot) partials via DSM.
 template <int N, int GROUPS = 8,
           bool FUSE_OUTPUT_RMS_NORM = false,
-          bool FUSE_LAYER_ADD = false, int PDL_MODE = 0>
+          bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_splitk_kernel(
     const bf16_t* __restrict__ block_res,
@@ -1481,7 +1469,7 @@ attn_res_fwd_s1_splitk_kernel(
     float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-    if constexpr (PDL_MODE != 0) {
+    if constexpr (ENABLE_PDL) {
         cudaGridDependencySynchronize();
     }
 
@@ -1639,10 +1627,6 @@ attn_res_fwd_s1_splitk_kernel(
         }
     }
 
-    if constexpr (PDL_MODE == 2 && FUSE_OUTPUT_RMS_NORM) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-
     if constexpr (FUSE_OUTPUT_RMS_NORM) {
         output_sq_local = warp_reduce_sum(output_sq_local);
         if (lane == 0) {
@@ -1688,8 +1672,7 @@ attn_res_fwd_s1_splitk_kernel(
         }
     }
 
-    if constexpr (PDL_MODE == 1
-                  || (PDL_MODE == 2 && !FUSE_OUTPUT_RMS_NORM)) {
+    if constexpr (ENABLE_PDL) {
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #else
@@ -1724,16 +1707,12 @@ static void launch_s1_splitk(
         (size_t)N * K_PER_CTA * sizeof(float) +
         (size_t)WARPS * N * sizeof(float2) +
         (size_t)N * sizeof(float);
-    int const pdl_mode = get_attn_res_pdl_mode();
-    bool const enable_pdl = pdl_mode != 0;
-    auto kernel = pdl_mode == 2
+    bool const enable_pdl = get_attn_res_pdl_enabled();
+    auto kernel = enable_pdl
         ? &attn_res_fwd_s1_splitk_kernel<
-              N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, 2>
-        : pdl_mode == 1
-            ? &attn_res_fwd_s1_splitk_kernel<
-                  N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, 1>
-            : &attn_res_fwd_s1_splitk_kernel<
-                  N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, 0>;
+              N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>
+        : &attn_res_fwd_s1_splitk_kernel<
+              N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>;
     static bool attrs_set = false;
     if (!attrs_set) {
         cudaFuncSetAttribute(
