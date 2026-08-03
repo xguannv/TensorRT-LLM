@@ -143,8 +143,15 @@ def _time_graph(
     fn: Callable[[], Any],
     iterations: int,
     samples: int,
+    chain_length: int,
 ) -> tuple[float, float, float]:
-    graph, output = _capture(fn)
+    def chained_fn() -> Any:
+        output = None
+        for _ in range(chain_length):
+            output = fn()
+        return output
+
+    graph, output = _capture(chained_fn)
     del output
     for _ in range(20):
         graph.replay()
@@ -159,7 +166,8 @@ def _time_graph(
             graph.replay()
         end.record()
         end.synchronize()
-        timings.append(start.elapsed_time(end) * 1000.0 / iterations)
+        timings.append(
+            start.elapsed_time(end) * 1000.0 / iterations / chain_length)
     return statistics.median(timings), min(timings), max(timings)
 
 
@@ -182,6 +190,7 @@ def _benchmark_case(
     num_candidates: int,
     iterations: int,
     samples: int,
+    chain_length: int,
 ) -> dict[str, float | int]:
     inputs = _make_inputs(num_candidates)
     expected_prefix, expected_output = _two_kernel(inputs)
@@ -200,19 +209,21 @@ def _benchmark_case(
         lambda: inputs.prefix_sum + inputs.attention_output,
         iterations,
         samples,
+        chain_length,
     )
     three_us, three_min_us, three_max_us = _time_graph(
-        lambda: _three_kernel(inputs), iterations, samples)
+        lambda: _three_kernel(inputs), iterations, samples, chain_length)
     two_us, two_min_us, two_max_us = _time_graph(
-        lambda: _two_kernel(inputs), iterations, samples)
+        lambda: _two_kernel(inputs), iterations, samples, chain_length)
     fused_us, fused_min_us, fused_max_us = _time_graph(
-        lambda: _fused(inputs), iterations, samples)
+        lambda: _fused(inputs), iterations, samples, chain_length)
 
     return {
         "num_tokens": 1,
         "num_candidates": num_candidates,
         "iterations": iterations,
         "samples": samples,
+        "chain_length": chain_length,
         "cosine": cosine,
         "relative_l2": relative_l2,
         "add_us": add_us,
@@ -277,11 +288,20 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=2000)
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument(
+        "--chain-length",
+        type=int,
+        default=1,
+        help="Capture this many copies of each mode in one CUDA graph.",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Emit eager kernels in NVTX ranges for Nsys instead of timing.",
     )
     args = parser.parse_args()
+
+    if args.chain_length < 1:
+        parser.error("--chain-length must be positive")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -309,7 +329,8 @@ def main() -> None:
             print(
                 json.dumps(
                     _benchmark_case(
-                        num_candidates, args.iterations, args.samples),
+                        num_candidates, args.iterations, args.samples,
+                        args.chain_length),
                     sort_keys=True,
                 ),
                 flush=True,

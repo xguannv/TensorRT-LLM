@@ -30,9 +30,11 @@
 // Attention_residual kernel at e7f934124acc915575f9f7561f9d1e373ab43089.
 
 #include "tensorrt_llm/kernels/kimiK3AttnRes/attnResFwd.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cfloat>
 #include <cooperative_groups.h>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cute/arch/tmem_allocator_sm100.hpp>
@@ -47,6 +49,20 @@ using bf16_t = __nv_bfloat16;
 
 static constexpr int ATTN_RES_BLOCK = 256;
 static constexpr int ATTN_RES_WARPS = ATTN_RES_BLOCK / 32;
+
+bool get_attn_res_pdl_enabled() {
+    static bool const enabled = [] {
+        char const* env = std::getenv("KIMI_K3_ATTN_RES_PDL");
+        if (env != nullptr && env[0] == '0' && env[1] == '\0') {
+            return false;
+        }
+        if (env != nullptr && env[0] == '1' && env[1] == '\0') {
+            return true;
+        }
+        return tensorrt_llm::common::getEnvEnablePDL();
+    }();
+    return enabled;
+}
 
 __inline__ __device__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -1136,7 +1152,7 @@ static void launch_fwd(
 // boundary.  The fused output is also retained in registers for the trailing
 // RMSNorm, preserving the BF16 boundary without a shared-memory round trip.
 template <int N, bool FUSE_OUTPUT_RMS_NORM = false,
-          bool FUSE_LAYER_ADD = false>
+          bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_single_cta_kernel(
     const bf16_t* __restrict__ block_res,
@@ -1154,6 +1170,10 @@ attn_res_fwd_s1_single_cta_kernel(
     float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    if constexpr (ENABLE_PDL) {
+        cudaGridDependencySynchronize();
+    }
+
     constexpr int H = 7168;
     constexpr int THREADS = 256;
     constexpr int WARPS = THREADS / 32;
@@ -1348,6 +1368,10 @@ attn_res_fwd_s1_single_cta_kernel(
                 mixed_cache[item], output_rsigma, output_rms_w[h]);
         }
     }
+
+    if constexpr (ENABLE_PDL) {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #else
     if (cute::thread0()) {
         printf("attn_res_fwd_s1_single_cta_kernel requires sm_100a\n");
@@ -1373,11 +1397,32 @@ static void launch_s1_single_cta(
     float output_rms_eps,
     cudaStream_t stream)
 {
-    attn_res_fwd_s1_single_cta_kernel<
-        N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD><<<1, 256, 0, stream>>>(
-        block_residual, layer_residual, layer_residual_add, res_weight,
-        rms_weight, output_rms_weight, updated_layer_residual, output,
-        rsigma, probs, logits, rms_eps, output_rms_eps);
+    if (get_attn_res_pdl_enabled()) {
+        auto kernel = &attn_res_fwd_s1_single_cta_kernel<
+            N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>;
+        cudaLaunchConfig_t config{};
+        config.gridDim = dim3(1);
+        config.blockDim = dim3(256);
+        config.stream = stream;
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(
+            &config, kernel, block_residual, layer_residual,
+            layer_residual_add, res_weight, rms_weight, output_rms_weight,
+            updated_layer_residual, output, rsigma, probs, logits, rms_eps,
+            output_rms_eps);
+    } else {
+        attn_res_fwd_s1_single_cta_kernel<
+            N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>
+            <<<1, 256, 0, stream>>>(
+                block_residual, layer_residual, layer_residual_add,
+                res_weight, rms_weight, output_rms_weight,
+                updated_layer_residual, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps);
+    }
 }
 
 template <int N, bool FUSE_OUTPUT_RMS_NORM = false>
@@ -1406,7 +1451,7 @@ static void launch_s1_single_cta(
 // rank-local shared memory, and exchanges only (square, dot) partials via DSM.
 template <int N, int GROUPS = 8,
           bool FUSE_OUTPUT_RMS_NORM = false,
-          bool FUSE_LAYER_ADD = false>
+          bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false>
 __global__ void __launch_bounds__(256, 1)
 attn_res_fwd_s1_splitk_kernel(
     const bf16_t* __restrict__ block_res,
@@ -1424,6 +1469,10 @@ attn_res_fwd_s1_splitk_kernel(
     float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    if constexpr (ENABLE_PDL) {
+        cudaGridDependencySynchronize();
+    }
+
     namespace cg = cooperative_groups;
     constexpr int H = 7168;
     constexpr int K_PER_CTA = H / GROUPS;
@@ -1622,6 +1671,10 @@ attn_res_fwd_s1_splitk_kernel(
                 mixed_cache[item], output_rsigma, output_rms_w[h]);
         }
     }
+
+    if constexpr (ENABLE_PDL) {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #else
     if (cute::thread0()) {
         printf("attn_res_fwd_s1_splitk_kernel requires sm_100a\n");
@@ -1654,8 +1707,12 @@ static void launch_s1_splitk(
         (size_t)N * K_PER_CTA * sizeof(float) +
         (size_t)WARPS * N * sizeof(float2) +
         (size_t)N * sizeof(float);
-    auto kernel = &attn_res_fwd_s1_splitk_kernel<
-        N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD>;
+    bool const enable_pdl = get_attn_res_pdl_enabled();
+    auto kernel = enable_pdl
+        ? &attn_res_fwd_s1_splitk_kernel<
+              N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>
+        : &attn_res_fwd_s1_splitk_kernel<
+              N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>;
     static bool attrs_set = false;
     if (!attrs_set) {
         cudaFuncSetAttribute(
@@ -1676,13 +1733,18 @@ static void launch_s1_splitk(
     config.blockDim = dim3(256);
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
-    cudaLaunchAttribute attribute{};
-    attribute.id = cudaLaunchAttributeClusterDimension;
-    attribute.val.clusterDim.x = GROUPS;
-    attribute.val.clusterDim.y = 1;
-    attribute.val.clusterDim.z = 1;
-    config.attrs = &attribute;
-    config.numAttrs = 1;
+    cudaLaunchAttribute attributes[2]{};
+    attributes[0].id = cudaLaunchAttributeClusterDimension;
+    attributes[0].val.clusterDim.x = GROUPS;
+    attributes[0].val.clusterDim.y = 1;
+    attributes[0].val.clusterDim.z = 1;
+    if (enable_pdl) {
+        attributes[1].id =
+            cudaLaunchAttributeProgrammaticStreamSerialization;
+        attributes[1].val.programmaticStreamSerializationAllowed = 1;
+    }
+    config.attrs = attributes;
+    config.numAttrs = enable_pdl ? 2 : 1;
     cudaLaunchKernelExC(
         &config, reinterpret_cast<const void*>(kernel), args);
 }
