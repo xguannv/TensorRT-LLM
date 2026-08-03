@@ -368,6 +368,16 @@ def parse_args() -> argparse.Namespace:
             "enables --search comm."
         ),
     )
+    runtime_group.add_argument(
+        "--moe_max_num_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override ModelConfig.moe_max_num_tokens to force the MoE scheduler's "
+            "chunk capacity. By default the benchmark uses max_num_tokens * dp_size, "
+            "which keeps a balanced workload in one chunk."
+        ),
+    )
 
     timing_group = parser.add_argument_group("Timing")
     timing_group.add_argument(
@@ -637,6 +647,8 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
 
     if parallel_mode == "CUSTOM" and (args.moe_ep_size is None or args.moe_tp_size is None):
         raise ValueError("--parallel_mode=CUSTOM requires both --moe_ep_size and --moe_tp_size")
+    if args.moe_max_num_tokens is not None and args.moe_max_num_tokens <= 0:
+        raise ValueError("--moe_max_num_tokens must be > 0")
 
     return ConfigSpec(
         backend=backend,
@@ -647,6 +659,7 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
         comm_method=comm_method,
         cuda_graph=bool(args.cuda_graph),
         use_low_precision_moe_combine=bool(args.use_low_precision_moe_combine),
+        moe_max_num_tokens=args.moe_max_num_tokens,
     )
 
 

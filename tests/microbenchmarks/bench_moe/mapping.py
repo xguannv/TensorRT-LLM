@@ -165,6 +165,7 @@ def _build_model_config(
     moe_backend: str,
     use_cuda_graph: bool,
     max_num_tokens: int,
+    moe_max_num_tokens: Optional[int],
     use_low_precision_moe_combine: bool,
     dtype: torch.dtype,
 ) -> ModelConfig:
@@ -185,6 +186,7 @@ def _build_model_config(
         moe_backend=moe_backend,
         moe_disable_finalize_fusion=False,
         max_num_tokens=max(int(max_num_tokens), 1),
+        moe_max_num_tokens=moe_max_num_tokens,
         use_cuda_graph=use_cuda_graph,
         use_low_precision_moe_combine=use_low_precision_moe_combine,
     )

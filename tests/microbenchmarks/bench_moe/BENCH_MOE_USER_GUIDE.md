@@ -190,6 +190,14 @@ mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 4 \
 Use this to study max tokens per rank, padding, workspace use, and chunking when
 one source rank has many more tokens.
 
+To force the scheduler to split a balanced workload, set its global MoE chunk
+capacity explicitly. For example, four ranks with 8192 tokens per rank and a
+capacity of 16384 run as two 4096-token-per-rank chunks:
+
+```bash
+--balanced_total_num_tokens 32768 --moe_max_num_tokens 16384
+```
+
 ### Case G: local-only communication baseline
 
 ```bash

@@ -214,6 +214,7 @@ class ConfigSpec:
     comm_method: str = "AUTO"
     cuda_graph: bool = True
     use_low_precision_moe_combine: bool = False
+    moe_max_num_tokens: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return _to_jsonable_dict(self)

@@ -143,6 +143,7 @@ def _build_moe_module(
         moe_backend=moe_backend,
         use_cuda_graph=use_cuda_graph,
         max_num_tokens=max_num_tokens,
+        moe_max_num_tokens=config.moe_max_num_tokens,
         use_low_precision_moe_combine=use_low_precision_moe_combine,
         dtype=dtype,
     )

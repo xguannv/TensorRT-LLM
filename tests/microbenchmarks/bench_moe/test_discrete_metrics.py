@@ -106,6 +106,44 @@ def test_moe_backend_selection(
     )
 
 
+def test_moe_chunk_capacity_override():
+    """The benchmark can reproduce a production multi-chunk MoE schedule."""
+    from tensorrt_llm.mapping import Mapping
+
+    from .mapping import _build_model_config
+    from .specs import ModelSpec
+
+    model = ModelSpec(
+        name="custom",
+        num_experts=8,
+        top_k=2,
+        hidden_size=256,
+        intermediate_size=256,
+        quant_algo=None,
+        routing_method="RENORMALIZE",
+    )
+    mapping = Mapping(
+        world_size=4,
+        rank=0,
+        moe_ep_size=4,
+        moe_tp_size=1,
+        enable_attention_dp=True,
+    )
+    model_config = _build_model_config(
+        model=model,
+        mapping=mapping,
+        moe_backend="CUTLASS",
+        use_cuda_graph=False,
+        max_num_tokens=8192,
+        moe_max_num_tokens=16384,
+        use_low_precision_moe_combine=False,
+        dtype=torch.bfloat16,
+    )
+
+    assert model_config.max_num_tokens == 8192
+    assert model_config.moe_max_num_tokens == 16384
+
+
 # --------------------------------------------------------------------------- #
 # Test 2: MoE forward launch count (GPU + optional cupti; golden-pinned)
 # --------------------------------------------------------------------------- #
