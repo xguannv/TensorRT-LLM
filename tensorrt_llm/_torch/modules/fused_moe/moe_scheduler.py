@@ -827,7 +827,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
         Dispatch/combine kernels stay on one ordered communication stream,
         giving every EP rank the same collective launch order. By default that
         is the main stream; the experimental high-priority communication path
-        uses a dedicated stream. Expert compute stays on the auxiliary stream.
+        uses a dedicated stream. Expert compute stays on the auxiliary stream,
+        or on a dedicated high-priority compute stream when requested.
         For chunks D/C/R, the steady-state schedule is:
 
             comm: D0, D1, R0, D2, R1, ..., Rlast
@@ -843,6 +844,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         dispatch_done_events = moe._a2a_dispatch_done_events
         compute_done_events = moe._a2a_compute_done_events
         comm_stream = getattr(moe, "_a2a_comm_stream", None)
+        compute_stream = getattr(moe, "_a2a_compute_stream", moe.aux_stream)
         main_to_comm_event = getattr(moe, "_a2a_main_to_comm_event", None)
         comm_to_main_event = getattr(moe, "_a2a_comm_to_main_event", None)
         workspaces = (workspace_0, workspace_1)
@@ -883,7 +885,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 dispatch_done_events[slot].record()
 
             # Aux stream: C(i) waits only for its dispatch.
-            with torch.cuda.stream(moe.aux_stream):
+            with torch.cuda.stream(compute_stream):
                 dispatch_done_events[slot].wait()
                 with moe.comm.workspace_slot(slot):
                     computed_outputs[idx_chunk] = self._run_chunk_moe(

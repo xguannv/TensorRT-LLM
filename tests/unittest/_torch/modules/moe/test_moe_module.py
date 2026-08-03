@@ -133,9 +133,12 @@ def _get_free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-@pytest.mark.parametrize("use_comm_stream", [False, True])
+@pytest.mark.parametrize(
+    "use_comm_stream,use_compute_stream",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
 def test_external_comm_scheduler_serializes_a2a_collectives(
-    monkeypatch, use_comm_stream
+    monkeypatch, use_comm_stream, use_compute_stream
 ):
     log = []
     current_stream = {"name": "main"}
@@ -192,6 +195,7 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
             FakeEvent("compute_done_1"),
         ),
         _a2a_comm_stream="comm" if use_comm_stream else None,
+        _a2a_compute_stream="compute" if use_compute_stream else "aux",
         _a2a_main_to_comm_event=(
             FakeEvent("main_to_comm") if use_comm_stream else None
         ),
@@ -241,12 +245,13 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
 
     torch.testing.assert_close(output, x)
     communication_stream = "comm" if use_comm_stream else "main"
+    compute_stream = "compute" if use_compute_stream else "aux"
     assert ("dispatch", 0, communication_stream, 0) in log
     assert ("dispatch", 1, communication_stream, 1) in log
     assert ("dispatch", 2, communication_stream, 0) in log
-    assert ("compute", 0, "aux", 0) in log
-    assert ("compute", 1, "aux", 1) in log
-    assert ("compute", 2, "aux", 0) in log
+    assert ("compute", 0, compute_stream, 0) in log
+    assert ("compute", 1, compute_stream, 1) in log
+    assert ("compute", 2, compute_stream, 0) in log
     assert ("combine", 0, communication_stream, 0) in log
     assert ("combine", 1, communication_stream, 1) in log
     assert ("combine", 2, communication_stream, 0) in log
@@ -262,8 +267,8 @@ def test_external_comm_scheduler_serializes_a2a_collectives(
         ("combine", 1, communication_stream, 1),
         ("combine", 2, communication_stream, 0),
     ]
-    assert log.index(("dispatch_done_0", "wait", "aux")) < log.index(
-        ("compute", 0, "aux", 0)
+    assert log.index(("dispatch_done_0", "wait", compute_stream)) < log.index(
+        ("compute", 0, compute_stream, 0)
     )
     assert log.index(("compute_done_0", "wait", communication_stream)) < log.index(
         ("combine", 0, communication_stream, 0)
