@@ -4605,11 +4605,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
-            // Remove stale nvidia-cutlass-dsl to prevent namespace directory corruption
-            // when pip installs the version pinned in requirements.txt. Necessary because
-            // flashinfer 0.6.12+ imports cutlass unconditionally at module level.
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
+            // Preserve the internal Cutlass DSL overlay when the base image provides it.
+            // Removing the shared namespace replaces its patched compiler files with the
+            // public package and breaks FlashInfer CuTe RMSNorm on SM107.
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: '''
+                if python3 -m pip show nvidia-cutlass-dsl-internal >/dev/null 2>&1; then
+                    echo "Preserving the base image's nvidia-cutlass-dsl-internal overlay"
+                else
+                    pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true
+                    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*
+                fi
+            ''')
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             // Gateway adapters are opt-in extras excluded from requirements.txt;
             // each gateway declares its pins in a dedicated
@@ -6358,10 +6364,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                             // Remove the python3-pygments pip package because the dlfw image already includes a Debian pygments package, which conflicts with the pip-installed version.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
-                            // Remove stale nvidia-cutlass-dsl from the base image to prevent namespace
-                            // directory corruption when pip upgrades to the version required by tensorrt_llm.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
+                            // Preserve the internal Cutlass DSL overlay when the base image provides it.
+                            // Removing the shared namespace replaces its patched compiler files with the
+                            // public package and breaks FlashInfer CuTe RMSNorm on SM107.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: '''
+                                if python3 -m pip show nvidia-cutlass-dsl-internal >/dev/null 2>&1; then
+                                    echo "Preserving the base image's nvidia-cutlass-dsl-internal overlay"
+                                else
+                                    pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true
+                                    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*
+                                fi
+                            ''')
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
