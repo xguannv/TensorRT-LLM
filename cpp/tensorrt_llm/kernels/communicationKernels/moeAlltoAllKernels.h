@@ -142,9 +142,8 @@ struct CombineKernelPointers
     // Cumulative per-slot counter baselines (regular device memory, single-buffer, advanced in place by reduce).
     uint64_t* combine_counter_baseline; // [ep_size * max_tokens_per_rank]
     int combine_counter_ep_stride = 0;  // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
-    // writes/waits to/from masked peers and also skips per-token accumulation for ranks that
-    // become inactive between dispatch and combine.
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
+    // completion flag writes/waits to/from inactive peers.
     uint64_t active_rank_mask[kRankMaskWords];
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -209,9 +208,14 @@ struct MoeA2ADispatchParams
     int expert_id_payload_index;
     int32_t invalid_expert_id;
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
-    // copies these words into the kernel pointers struct. Defaults to all-ones for
-    // backwards-compatible "no masking" behavior.
+    // Whether to instantiate a kernel with active-rank checks.
+    // This is a launch-lifetime mode, independent of future execution-abort handling.
+    bool enable_rank_mask{false};
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
+    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
+    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
+    // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
@@ -294,9 +298,14 @@ struct MoeA2ACombineParams
     uint64_t* cft_combine_counter_baseline; // [ep_size * max_tokens_per_rank] regular device memory
     int combine_counter_ep_stride = 0;      // STABLE static stride (maxNumTokens) for counter/baseline slot indexing
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
-    // copies these words into the kernel pointers struct. Defaults to all-ones for
-    // backwards-compatible "no masking" behavior.
+    // Whether to instantiate a kernel with active-rank checks in peer synchronization.
+    // This is a launch-lifetime mode, independent of future execution-abort handling.
+    bool enable_rank_mask{false};
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
+    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
+    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
+    // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().

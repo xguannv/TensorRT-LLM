@@ -598,7 +598,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
     // exactly reproduces the pre-fault-tolerance kernel behavior.
-    if (enableRankMask)
+    params.enable_rank_mask = enableRankMask;
+    if (params.enable_rank_mask)
     {
         resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
     }
@@ -823,7 +824,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     }
 
     // Resolve the optional active-rank mask. Default (no mask) = all bits set.
-    if (enableRankMask)
+    params.enable_rank_mask = enableRankMask;
+    if (params.enable_rank_mask)
     {
         resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
     }
