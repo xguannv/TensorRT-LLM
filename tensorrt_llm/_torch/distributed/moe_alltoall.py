@@ -46,6 +46,7 @@ _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+_CFT_ALIGNMENT_BYTES = 16
 
 
 def get_force_cft() -> bool | None:
@@ -70,6 +71,41 @@ def should_use_cft(
     if max_batch is None:
         return True
     return runtime_max_tokens_per_rank <= max_batch
+
+
+def _use_cft_for_dispatch_payloads(use_cft: bool,
+                                   payloads: list[torch.Tensor]) -> bool:
+    if not use_cft:
+        return False
+    for payload_index, payload in enumerate(payloads):
+        bytes_per_token = payload.shape[1] * payload.element_size()
+        if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: dispatch payload "
+                f"{payload_index} has {bytes_per_token} bytes per token, which is not "
+                f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based dispatch.",
+                key=
+                f"moe_a2a_cft_dispatch_alignment_{payload_index}_{bytes_per_token}",
+            )
+            return False
+    return True
+
+
+def _use_cft_for_combine_payload(use_cft: bool, payload: torch.Tensor,
+                                 use_low_precision: bool) -> bool:
+    if not use_cft:
+        return False
+    wire_element_size = 1 if use_low_precision else payload.element_size()
+    bytes_per_token = payload.shape[-1] * wire_element_size
+    if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: combine payload has "
+            f"{bytes_per_token} bytes per token, which is not "
+            f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based combine.",
+            key=f"moe_a2a_cft_combine_alignment_{bytes_per_token}",
+        )
+        return False
+    return True
 
 
 def _get_cft_max_batch(env_name: str, default: int) -> int:
@@ -431,6 +467,8 @@ class MoeAlltoAll:
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
         can_use_cft_for_dispatch = self.use_cft_for_dispatch(
             runtime_max_tokens_per_rank)
+        can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
+            can_use_cft_for_dispatch, input_payloads)
         # Auto-initialize CFT LEs on first dispatch only
         if self.can_use_cft_counted_writes and not getattr(
                 MoeAlltoAll, '_cft_initialized', False):
@@ -443,11 +481,9 @@ class MoeAlltoAll:
             assert eplb_local_stats.size(
                 0
             ) == self.eplb_stats_num_experts, "eplb_local_stats size must match eplb_stats_num_experts"
-        can_fuse_sanitize = (
-            can_use_cft_for_dispatch and invalid_token_expert_id is not None
-            and expert_id_payload_index is not None and all(
-                (payload.shape[1] * payload.element_size()) % 16 == 0
-                for payload in input_payloads))
+        can_fuse_sanitize = (can_use_cft_for_dispatch
+                             and invalid_token_expert_id is not None
+                             and expert_id_payload_index is not None)
 
         requested_active_rank_mask = active_rank_mask
         if (not self._rank_mask_enabled
@@ -535,12 +571,14 @@ class MoeAlltoAll:
                 "active_rank_mask requires committed EP group health")
         active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
             active_rank_mask_snapshot, requested_active_rank_mask)
+        use_cft_for_combine = _use_cft_for_combine_payload(
+            self.use_cft_for_combine(runtime_max_tokens_per_rank), payload,
+            use_low_precision_combine)
         output = torch.ops.trtllm.moe_a2a_combine(
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            use_low_precision_combine,
-            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            use_low_precision_combine, use_cft_for_combine,
             self._rank_mask_enabled, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)

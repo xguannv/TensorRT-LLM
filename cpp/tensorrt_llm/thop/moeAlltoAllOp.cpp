@@ -546,21 +546,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     }
 
     // CFT requires all payloads to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
-    // Fall back to fence-based dispatch if any payload is not aligned.
     if (useCftCountedWrites)
     {
         for (int i = 0; i < num_payloads; i++)
         {
             int bytesPerToken = payloadElementSizes[i] * payloadElementsPerToken[i];
-            if (bytesPerToken % 16 != 0)
-            {
-                TLLM_LOG_WARNING(
-                    "CFT counted writes disabled: payload %d has %d bytes per token (not 16B-aligned). "
-                    "Falling back to fence-based dispatch.",
-                    i, bytesPerToken);
-                useCftCountedWrites = false;
-                break;
-            }
+            TORCH_CHECK(bytesPerToken % 16 == 0, "CFT dispatch payload ", i, " has ", bytesPerToken,
+                " bytes per token; CFT counted writes require 16-byte alignment");
         }
     }
     params.use_cft_counted_writes = useCftCountedWrites;
@@ -778,17 +770,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     }
 
     // CFT requires the payload to be 16B-aligned (fabric.try_put.counted operates on 16B chunks).
-    // Fall back to fence-based combine if the per-token payload is not aligned.
     if (useCftCountedWrites)
     {
-        if (params.wire_bytes_per_token % 16 != 0)
-        {
-            TLLM_LOG_WARNING(
-                "CFT counted writes disabled: combine payload has %d bytes per token (not 16B-aligned). "
-                "Falling back to fence-based combine.",
-                params.wire_bytes_per_token);
-            useCftCountedWrites = false;
-        }
+        TORCH_CHECK(params.wire_bytes_per_token % 16 == 0, "CFT combine payload has ", params.wire_bytes_per_token,
+            " bytes per token; CFT counted writes require 16-byte alignment");
     }
 
     // ---- CFT combine wiring (counted writes). Sets up dedicated receive region C,

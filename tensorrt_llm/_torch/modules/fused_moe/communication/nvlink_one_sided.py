@@ -54,6 +54,7 @@ _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+_CFT_ALIGNMENT_BYTES = 16
 
 
 def get_force_cft() -> bool | None:
@@ -78,6 +79,40 @@ def should_use_cft(
     if max_batch is None:
         return True
     return runtime_max_tokens_per_rank <= max_batch
+
+
+def _use_cft_for_dispatch_payloads(use_cft: bool, payloads: list[torch.Tensor]) -> bool:
+    if not use_cft:
+        return False
+    for payload_index, payload in enumerate(payloads):
+        bytes_per_token = payload.shape[1] * payload.element_size()
+        if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: dispatch payload "
+                f"{payload_index} has {bytes_per_token} bytes per token, which is not "
+                f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_dispatch_alignment_{payload_index}_{bytes_per_token}",
+            )
+            return False
+    return True
+
+
+def _use_cft_for_combine_payload(
+    use_cft: bool, payload: torch.Tensor, use_low_precision: bool
+) -> bool:
+    if not use_cft:
+        return False
+    wire_element_size = 1 if use_low_precision else payload.element_size()
+    bytes_per_token = payload.shape[-1] * wire_element_size
+    if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: combine payload has "
+            f"{bytes_per_token} bytes per token, which is not "
+            f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based combine.",
+            key=f"moe_a2a_cft_combine_alignment_{bytes_per_token}",
+        )
+        return False
+    return True
 
 
 def _get_cft_max_batch(env_name: str, default: int) -> int:
@@ -581,10 +616,11 @@ class NVLinkOneSided(Communication):
         payloads.append(token_selected_slots)
         if token_final_scales is not None:
             payloads.append(token_final_scales)
-        expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
-        can_fuse_sanitize = can_use_cft_for_dispatch and all(
-            (payload.shape[1] * payload.element_size()) % 16 == 0 for payload in payloads
+        can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
+            can_use_cft_for_dispatch, payloads
         )
+        expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
+        can_fuse_sanitize = can_use_cft_for_dispatch
 
         eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
@@ -741,6 +777,11 @@ class NVLinkOneSided(Communication):
             active_rank_mask_snapshot,
             requested_active_rank_mask,
         )
+        use_cft_for_combine = _use_cft_for_combine_payload(
+            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            final_hidden_states,
+            self.use_low_precision_combine,
+        )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -752,8 +793,7 @@ class NVLinkOneSided(Communication):
             self.top_k,
             int(combine_payload_offset),
             bool(self.use_low_precision_combine),
-            self.use_cft_for_combine(runtime_max_tokens_per_rank)
-            and not self.use_low_precision_combine,
+            use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
         )
