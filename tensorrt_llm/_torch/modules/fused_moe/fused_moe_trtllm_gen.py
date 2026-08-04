@@ -436,6 +436,13 @@ class TRTLLMGenFusedMoE(MoE):
     def _requires_separated_routing(self) -> bool:
         """BF16 FlashInfer uses separated routing, except DeepSeekV3 which uses
         the fused kernel (its separated variant has accuracy issues)."""
+        # Routing methods the C++ kernels can't route natively (e.g. DeepSeek-V4
+        # sqrtsoftplus + hash gating) must be routed in Python. They report
+        # routing_method_type=DeepSeekV3 for compatibility, so feeding their raw
+        # logits to the fused kernel picks the DSv3 routing kernel, which derefs
+        # a null routing bias on DSV4 hash-gated layers (illegal memory access).
+        if self.routing_method.requires_separated_routing:
+            return True
         if not (self.use_flashinfer and self._is_unquantized_path()):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)

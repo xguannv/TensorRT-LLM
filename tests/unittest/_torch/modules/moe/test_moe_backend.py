@@ -50,6 +50,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -130,6 +131,12 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
     with pytest.raises(RuntimeError, match="no valid fallback tactic"):
         _select_explicit_fallback_tactic([])
+
+
+def test_trtllm_gen_honors_separated_routing_requirement():
+    backend = SimpleNamespace(routing_method=SimpleNamespace(requires_separated_routing=True))
+
+    assert TRTLLMGenFusedMoE._requires_separated_routing(backend)
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
