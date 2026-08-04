@@ -293,3 +293,69 @@ def test_remove_copy_uses_registered_nvfp4_inplace_mapping():
     assert inplace_node.kwargs["output_tensor"] is output_tensor
     output_node = next(node for node in graph.nodes if node.op == "output")
     assert output_node.args == (output_tensor,)
+
+
+def test_inplace_info_declares_every_mutated_arg():
+    """Every inplace_info entry must name ALL of its op's mutates_args.
+
+    remove_copy_for_mutates_args rebuilds the direct call from
+    ``{k: v for k, v in node.kwargs.items() if not k.startswith("_")}`` plus the
+    names in inplace_info. auto_functionalize hoists every mutable argument into
+    underscore-prefixed metadata, so a mutable arg missing from the map is
+    dropped from the rewritten call entirely — and the failure surfaces far away,
+    as a bare "missing value for argument" RuntimeError at execution time rather
+    than anywhere near this table.
+
+    That is how nvbugs/6474888 recurred: DSv4 epilogue fusion added
+    ``dsv4_output``/``dsv4_output_sf`` to ``mla_custom_op_inplace``'s
+    mutates_args, this map still listed only ``output``, and 4xVR200
+    torch_compile runs died with
+    ``mla_custom_op_inplace() is missing value for argument 'dsv4_output'``.
+
+    Asserting the invariant rather than that one op is deliberate: the same
+    omission is available to every future in-place custom op, and the point fix
+    would not catch the next one.
+    """
+    # Importing mla registers trtllm::mla_custom_op_inplace. Without it,
+    # get_optional_trtllm_op() returns None, inplace_info() omits the entry
+    # entirely, and this test would pass by checking nothing -- the vacuous
+    # pass is indistinguishable from a real one.
+    import tensorrt_llm._torch.modules.mla  # noqa: F401
+    from tensorrt_llm._torch.compilation.utils import inplace_info
+
+    table = inplace_info()
+    assert table, "inplace_info() is empty; no op was registered, so this test would be vacuous"
+    registered = {op._schema.name for op in table}
+    assert "trtllm::mla_custom_op_inplace" in registered, (
+        "trtllm::mla_custom_op_inplace is absent from inplace_info(); the "
+        "regression this test exists for could not be detected. Registered: "
+        f"{sorted(registered)}"
+    )
+
+    mismatches = []
+    for op_overload, declared in table.items():
+        schema = op_overload._schema
+        actual = [
+            argument.name
+            for argument in schema.arguments
+            if argument.alias_info is not None and argument.alias_info.is_write
+        ]
+        # Ordered comparison: inplace_info values follow the op's schema
+        # declaration order, so order is part of the contract. The KEYS
+        # are deliberately NOT asserted here. Most entries key by 1-based
+        # position among the op's mutable args, but
+        # verify_dynamic_tree_rejection_out_op instead keys by position in
+        # the full argument list ({5, 6, 7} for the three Tensor(a!)/(b!)/
+        # (c!) args in cpp/tensorrt_llm/thop/dynamicTreeOp.cpp), so
+        # asserting the key convention here would go red today. That
+        # divergence is split out as a separate defect: it costs a silent
+        # missed copy-removal on the non-v2 path, where the getitem
+        # indices are absent from output_replacements and the pass bails.
+        # It is out of scope for nvbugs/6474888.
+        if list(declared.values()) != actual:
+            mismatches.append(
+                f"{schema.name}: inplace_info declares {list(declared.values())}, "
+                f"op mutates {actual}"
+            )
+
+    assert not mismatches, "inplace_info is out of sync with op schemas:\n" + "\n".join(mismatches)
