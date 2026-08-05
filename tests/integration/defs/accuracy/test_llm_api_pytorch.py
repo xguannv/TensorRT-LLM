@@ -1719,7 +1719,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
-    # Chunked Prefill for MLA can only be enabled on SM100
+    # Chunked Prefill for MLA: SM90/100/103/107/120 (see _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
