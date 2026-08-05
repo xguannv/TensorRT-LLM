@@ -129,11 +129,8 @@ class DeepseekV4Indexer(Indexer):
         )
         return q
 
-    def _project_and_quantize_q(
-        self, qr: torch.Tensor, position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Project and quantize Q, using the fused MXFP4 path when supported."""
-        use_fused_project_mxfp4 = (
+    def _is_fused_project_mxfp4_enabled(self, input_dtype: torch.dtype) -> bool:
+        return (
             self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE
             and not HAS_FAST_HADAMARD
             and not self.rotary_emb.is_neox
@@ -145,9 +142,15 @@ class DeepseekV4Indexer(Indexer):
                 torch.ops.trtllm,
                 "cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell",
             )
-            and qr.dtype == torch.bfloat16
+            and input_dtype == torch.bfloat16
             and is_sm_100f()
         )
+
+    def _project_and_quantize_q(
+        self, qr: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project and quantize Q, using the fused MXFP4 path when supported."""
+        use_fused_project_mxfp4 = self._is_fused_project_mxfp4_enabled(qr.dtype)
         if use_fused_project_mxfp4:
             q_fp4, q_scale = torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell(
                 qr,
@@ -236,10 +239,15 @@ class DeepseekV4Indexer(Indexer):
         prepare path skip its own aux-stream launch and consume these results
         directly.
 
-        Returns ``None`` when multi-stream mode is off (caller should fall
-        back to the normal ``forward()`` call without ``pre_aux``).
+        Returns ``None`` when multi-stream mode is off or fused Indexer-Q
+        requires serial prepare (caller should fall back to the normal
+        ``forward()`` call without ``pre_aux``).
         """
         if not (do_multi_stream() and self.aux_stream is not None):
+            return None
+        # The CuTe DSL fused Q projection is not safe to run concurrently
+        # with the auxiliary compressor under CUDA graph replay.
+        if self._is_fused_project_mxfp4_enabled(hidden_states.dtype):
             return None
         self.indexer_start_event.record()
         with torch.cuda.stream(self.aux_stream):
@@ -308,15 +316,15 @@ class DeepseekV4Indexer(Indexer):
                 self.k_cache_update_event.record()
         else:
             weights, k_fp8, k_scale = pre_aux
-            # pre_aux tensors were allocated on aux_stream; record on the
-            # consuming stream so the caching allocator can't recycle them mid-use.
-            cur_stream = torch.cuda.current_stream()
-            weights.record_stream(cur_stream)
-            if k_fp8 is not None:
-                k_fp8.record_stream(cur_stream)
-            if k_scale is not None:
-                k_scale.record_stream(cur_stream)
             q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
+
+        # Aux-stream tensors are consumed on the current stream after waits.
+        cur_stream = torch.cuda.current_stream()
+        weights.record_stream(cur_stream)
+        if k_fp8 is not None:
+            k_fp8.record_stream(cur_stream)
+        if k_scale is not None:
+            k_scale.record_stream(cur_stream)
 
         self.weights_proj_event.wait()
         weights = self._apply_weight_scale(weights, q_scale)
@@ -363,7 +371,12 @@ class DeepseekV4Indexer(Indexer):
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
     ):
-        if do_multi_stream() and self.aux_stream is not None:
+        use_overlapped_prepare = (
+            do_multi_stream()
+            and self.aux_stream is not None
+            and not self._is_fused_project_mxfp4_enabled(qr.dtype)
+        )
+        if use_overlapped_prepare:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
                 qr,
                 hidden_states,
@@ -372,7 +385,7 @@ class DeepseekV4Indexer(Indexer):
                 pre_aux=pre_aux,
             )
         else:
-            assert pre_aux is None, "pre_aux requires multi-stream mode"
+            assert pre_aux is None, "pre_aux requires the overlapped indexer prepare path"
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
                 qr, hidden_states, metadata, position_ids
             )
