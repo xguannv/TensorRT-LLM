@@ -457,8 +457,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
         FilteredTopKKernelVarlenDecode
-    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_prefill_varlen import \
-        FilteredTopKKernelVarlenPrefill
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
         STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
@@ -4454,7 +4452,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[int]:
 
-            if (sm_version := get_sm_version()) not in (100, 103):
+            if (sm_version := get_sm_version()) not in (100, 103, 107):
                 logger.debug(
                     f"CuteDSL: SM version {sm_version} is not supported. "
                     f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
@@ -4703,7 +4701,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL FP8 BMM only supports bfloat16 output, got {output_dtype}"
             )
-        if (sm_version := get_sm_version()) not in (100, 103):
+        if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
                 f"CuteDSL: SM version {sm_version} is not supported. "
                 f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
@@ -5530,7 +5528,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Attributes:
             kernel_cache: Class-level dict mapping configuration tuples to compiled kernels.
                          Keys are (dtype, num_cols, top_k, next_n, return_val, num_copy_bits,
-                         large_occupancy, overflow_policy).
+                         load_balance, large_occupancy).
 
         Note:
             - Requires Blackwell architecture (SM100+)
@@ -5542,16 +5540,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         buffers = get_memory_buffers()
 
         @classmethod
-        def _compile(cls,
-                     dtype,
-                     bucketed_num_cols,
-                     top_k,
-                     next_n,
-                     return_val,
-                     num_copy_bits,
-                     large_occupancy,
-                     overflow_policy,
-                     cache_smem_values=False):
+        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
+                     num_copy_bits, load_balance, large_occupancy):
             """Compile and cache a single-CTA top-k kernel for the given config."""
             key = (
                 dtype,
@@ -5560,9 +5550,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
+                load_balance,
                 large_occupancy,
-                overflow_policy,
-                cache_smem_values,
             )
             if key in cls.kernel_cache:
                 return
@@ -5574,15 +5563,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                                stride_order=(1,
                                                                              0),
                                                                assumed_align=32)
-            if overflow_policy == "GMEM_SPILL":
-                buffer_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n_rows, cute.sym_int(), n_cols),
-                    stride_order=(2, 1, 0),
-                    assumed_align=32,
-                )
-            else:
-                buffer_fake = None
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, cute.sym_int(), n_cols),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
             seqlen_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ),
@@ -5612,18 +5598,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
                 large_occupancy=large_occupancy,
-                overflow_policy=overflow_policy,
-                cache_smem_values=cache_smem_values,
+                num_sms=_get_num_sms(),
             )
+            if load_balance:
+                g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (1, ), stride_order=(0, ))
+            else:
+                g_global_counter_fake = None
             compiled_kernel = cute.compile(
                 filtered_topk_func,
                 input_fake,
                 None,  # indices_fake
                 buffer_fake,
+                g_global_counter_fake,
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
                 stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=4 if large_occupancy else 1,
                 options="--enable-tvm-ffi",
             )
@@ -5638,9 +5630,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: int,
             return_val: bool = False,
             num_copy_bits: int = 256,
-            overflow_policy: str = "REREAD",
+            load_balance: bool = False,
             output_indices: Optional[torch.Tensor] = None,
-            cache_smem_values: bool = False,
         ):
             """Execute filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -5658,9 +5649,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
+                load_balance,
                 large_occupancy,
-                overflow_policy,
-                cache_smem_values,
             )
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
@@ -5684,272 +5674,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 output_values_torch = None
 
-            # Prepare buffer (GMEM_SPILL only; other policies use None)
-            if overflow_policy == "GMEM_SPILL":
-                # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
-                # fp32: up to 256 MB (256 * 2 * 262144 * 4)
-                # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
-                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
-                buffer_torch = cls.buffers.get_buffer(
-                    [num_rows, buffer_numbers, bucketed_num_cols],
-                    torch.int32,
-                    buffer_name="single_cta_buffer",
-                    reserve_buffer=reserve)
-                buffer_torch = buffer_torch[:, :, :num_cols]
+            # Prepare buffer
+            # extra buffer: num_rows * buffer_numbers * num_cols * 4 bytes
+            # fp32: up to 256 MB (256 * 2 * 262144 * 4)
+            # fp16/bf16: up to 128 MB (256 * 1 * 262144 * 4)
+            if dtype == cutlass.Float32:
+                buffer_numbers = 2
             else:
-                buffer_torch = None
+                buffer_numbers = 1
+            buffer_torch = cls.buffers.get_buffer(
+                [num_rows, buffer_numbers, bucketed_num_cols],
+                torch.int32,
+                buffer_name="single_cta_buffer",
+                reserve_buffer=reserve)
+            buffer_torch = buffer_torch[:, :, :num_cols]
+            # Prepare global counter for persistent dynamic scheduling
+            if load_balance:
+                g_global_counter_torch = cls.buffers.get_buffer(
+                    [1],
+                    torch.int32,
+                    buffer_name="single_cta_g_global_counter",
+                    reserve_buffer=reserve)
+                g_global_counter_torch.zero_()
+            else:
+                g_global_counter_torch = None
 
             # Execute kernel (TVM FFI uses env stream automatically)
             compiled_kernel(
                 input_values,
                 None,  # indices
                 buffer_torch,
-                seq_lens,
-                output_indices_torch,
-                output_values_torch,
-            )
-
-            return output_indices_torch, output_values_torch
-
-    # TODO: rename,  CuteDSLTopKDecodeRadixFilterSPMultiCTARunner -> CuteDSLRadixFilterTopKSPMultiCTARunner
-    class CuteDSLTopKDecodeRadixFilterSPMultiCTARunner:
-        """Runner for the radix-FILTER single-pass multi-CTA decode top-k kernel.
-
-        Distinct from the existing radix-SELECT SP multi-CTA runners
-        (``CuteDSLTopKDecodeSinglePassMultiCTA[Cluster]Runner``): this one drives
-        ``FilteredTopKKernelVarlenDecode`` with ``single_pass_multi_cta=True`` —
-        a cluster of ``cluster_size`` CTAs cooperates on one row via DSMEM
-        histogram merge + DSMEM prefix-scan collection (no GMEM state).
-
-        ``cluster_size`` is a REQUIRED argument (no auto-config yet — radix-select's
-        ``_get_chunk_config`` tuning does not transfer; auto-config is a documented
-        TODO). ``chunk_size_per_cta = ceil(bucketed_num_cols / cluster_size)``.
-        """
-        kernel_cache = dict()
-        buffers = get_memory_buffers()
-
-        @classmethod
-        def _compile(
-            cls,
-            dtype,
-            bucketed_num_cols,
-            top_k,
-            next_n,
-            return_val,
-            num_copy_bits,
-            cluster_size,
-            chunk_size_per_cta,
-            overflow_policy,
-            cache_smem_values=False,
-        ):
-            key = (
-                dtype,
-                bucketed_num_cols,
-                top_k,
-                next_n,
-                return_val,
-                num_copy_bits,
-                cluster_size,
-                chunk_size_per_cta,
-                overflow_policy,
-                cache_smem_values,
-            )
-            if key in cls.kernel_cache:
-                return
-            n_rows = cute.sym_int()
-            n_cols = cute.sym_int()
-            n_batch = cute.sym_int()
-            input_fake = cute.runtime.make_fake_compact_tensor(dtype,
-                                                               (n_rows, n_cols),
-                                                               stride_order=(1,
-                                                                             0),
-                                                               assumed_align=32)
-            if overflow_policy == "GMEM_SPILL":
-                # Per-CTA spill buffer: (num_rows * cluster_size, num_buffers,
-                # chunk_size_per_cta) — independent dims from the input tensor.
-                buffer_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                    stride_order=(2, 1, 0),
-                    assumed_align=32,
-                )
-            else:
-                buffer_fake = None
-            seqlen_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32, (n_batch, ), stride_order=(0, ))
-            output_indices_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32, (n_rows, top_k), stride_order=(1, 0))
-            if return_val:
-                output_values_fake = cute.runtime.make_fake_compact_tensor(
-                    dtype, (n_rows, top_k), stride_order=(1, 0))
-            else:
-                output_values_fake = None
-            fake_stream = cute.runtime.make_fake_stream(
-                use_tvm_ffi_env_stream=True)
-
-            filtered_topk_func = FilteredTopKKernelVarlenDecode(
-                dtype,
-                bucketed_num_cols,
-                top_k,
-                next_n,
-                num_copy_bits=num_copy_bits,
-                return_val=return_val,
-                chunk_size_per_cta=chunk_size_per_cta,
-                num_ctas_per_row=cluster_size,
-                overflow_policy=overflow_policy,
-                cache_smem_values=cache_smem_values,
-                single_pass_multi_cta=True,
-            )
-            compiled_kernel = cute.compile(
-                filtered_topk_func,
-                input_fake,
-                None,  # indices_fake
-                buffer_fake,
-                seqlen_fake,
-                output_indices_fake,
-                output_values_fake,
-                stream=fake_stream,
-                min_blocks_per_mp=1,
-                options="--enable-tvm-ffi",
-            )
-            cls.kernel_cache[key] = compiled_kernel
-
-        @staticmethod
-        def auto_cluster_size(num_tokens: int,
-                              num_rows: int,
-                              is_fp32: bool,
-                              num_sms: Optional[int] = None) -> int:
-            """cluster_size for the REREAD overflow policy (has the large_occupancy
-            re-scan cliff). Shares peak_cs/occ_cap with auto_cluster_size_truncate
-            but floors nr > num_sms at cs=2 for huge N to dodge the single-CTA
-            large_occupancy REREAD blowup. Re-tuned on a B200 REREAD sweep
-            (~1.2% mean overhead vs oracle). Caveat: tuned on randn, fixed-length
-            seqlen inputs; real (concentrated) logits or varlen may shift it.
-            """
-            num_sms = num_sms or _get_num_sms()
-            n = num_tokens
-            # peak_cs by N; fp32 stays single up to 16K (4 refine rounds cost more).
-            peak = (1 if n <= 8192 or (is_fp32 and n <= 16384) else
-                    4 if n <= 32768 else 8 if n <= 131072 else 16)
-            # occ_cap by num_rows; grid budget tightens as cs grows. nr > num_sms
-            # -> cs=2 for huge N (split the row so single-CTA large_occupancy REREAD
-            # blowup is avoided), else single.
-            occ = (16 if num_rows <= 4 else 8 if num_rows <= 8 else 4 if
-                   num_rows <= 32 else 2 if num_rows <= 64 else 1 if num_rows <=
-                   num_sms else 2 if n >= 262144 else 1)
-            cs = min(peak, occ, _query_max_cluster_size())
-            return cs if cs >= 2 else 1
-
-        @staticmethod
-        def auto_cluster_size_truncate(num_tokens: int,
-                                       num_rows: int,
-                                       is_fp32: bool,
-                                       num_sms: Optional[int] = None) -> int:
-            """cluster_size for cliff-free overflow policies (TRUNCATE/GMEM_SPILL).
-            NOT interchangeable with auto_cluster_size (REREAD-tuned): here
-            nr > num_sms uses single-CTA (no REREAD large_occupancy blowup).
-            Re-tuned on a B200 TRUNCATE sweep (~0.6% mean overhead vs oracle).
-            Caveat: tuned on randn, fixed-length seqlen inputs; real (concentrated)
-            logit distributions or varlen seqlens may shift the optimum.
-            """
-            num_sms = num_sms or _get_num_sms()
-            n = num_tokens
-            # peak_cs by N; fp32 stays single up to 16K (4 refine rounds cost more).
-            peak = (1 if n <= 8192 or (is_fp32 and n <= 16384) else
-                    4 if n <= 32768 else 8 if n <= 131072 else 16)
-            # occ_cap by num_rows; grid budget tightens as cs grows. nr > num_sms
-            # -> single, except a narrow just-over-one-wave SP band at large N.
-            occ = (16 if num_rows <= 4 else
-                   8 if num_rows <= 8 else 4 if num_rows <= 32 else
-                   2 if num_rows <= 64 else 1 if num_rows <= num_sms else 2 if
-                   (num_rows <= 200 and n >= 131072) else 1)
-            cs = min(peak, occ, _query_max_cluster_size())
-            return cs if cs >= 2 else 1
-
-        @classmethod
-        def forward(
-            cls,
-            input_values: torch.Tensor,
-            seq_lens: torch.Tensor,
-            top_k: int,
-            next_n: int,
-            cluster_size: int,
-            return_val: bool = False,
-            num_copy_bits: int = 256,
-            overflow_policy: str = "REREAD",
-            output_indices: Optional[torch.Tensor] = None,
-            cache_smem_values: bool = False,
-        ):
-            """Execute radix-filter SP multi-CTA cluster top-k.
-
-            ``cluster_size`` (= ctas_per_group) must be provided by the caller.
-            """
-            assert cluster_size >= 1, f"cluster_size must be >= 1, got {cluster_size}"
-            hw_max_cluster = _query_max_cluster_size()
-            assert cluster_size <= hw_max_cluster, (
-                f"cluster_size={cluster_size} exceeds hardware max cluster "
-                f"size {hw_max_cluster}")
-            torch_dtype = input_values.dtype
-            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
-            num_rows, num_cols = input_values.shape
-            bucketed_num_cols = next_positive_power_of_2(num_cols)
-            chunk_size_per_cta = math.ceil(bucketed_num_cols / cluster_size)
-
-            key = (
-                dtype,
-                bucketed_num_cols,
-                top_k,
-                next_n,
-                return_val,
-                num_copy_bits,
-                cluster_size,
-                chunk_size_per_cta,
-                overflow_policy,
-                cache_smem_values,
-            )
-            cls._compile(*key)
-            compiled_kernel = cls.kernel_cache[key]
-            reserve = torch.cuda.is_current_stream_capturing()
-
-            if output_indices is not None:
-                output_indices_torch = output_indices
-            else:
-                output_indices_torch = cls.buffers.get_buffer(
-                    [num_rows, top_k],
-                    torch.int32,
-                    buffer_name="rf_sp_multi_cta_output_indices",
-                    reserve_buffer=reserve,
-                )
-            if return_val:
-                output_values_torch = cls.buffers.get_buffer(
-                    [num_rows, top_k],
-                    torch_dtype,
-                    buffer_name="rf_sp_multi_cta_output_values",
-                    reserve_buffer=reserve,
-                )
-            else:
-                output_values_torch = None
-
-            if overflow_policy == "GMEM_SPILL":
-                # Per-CTA extra buffer: (num_rows * cluster_size, buffer_numbers,
-                # chunk_size_per_cta).
-                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
-                buffer_torch = cls.buffers.get_buffer(
-                    [
-                        num_rows * cluster_size, buffer_numbers,
-                        chunk_size_per_cta
-                    ],
-                    torch.int32,
-                    buffer_name="rf_sp_multi_cta_buffer",
-                    reserve_buffer=reserve,
-                )
-            else:
-                buffer_torch = None
-
-            compiled_kernel(
-                input_values,
-                None,  # indices
-                buffer_torch,
+                g_global_counter_torch,
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
@@ -5966,6 +5721,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        load_balance: bool = False,
     ) -> torch.Tensor:
         """CuteDSL-based Top-K selection optimized for Blackwell decode phase.
 
@@ -5975,6 +5731,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: Number of top elements to select (max 16384)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+            load_balance: Enable persistent dynamic scheduling for load balancing
 
         Returns:
             indices: Top-k indices [batch_size * next_n, top_k]
@@ -6024,6 +5781,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n=next_n,
             return_val=False,  # Only return indices
             num_copy_bits=num_copy_bits,
+            load_balance=load_balance,
         )
         return indices
 
@@ -6034,6 +5792,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        load_balance: bool = False,
     ):
         num_rows = input_values.shape[0]
         input_values.dtype
@@ -6041,229 +5800,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Create output tensors matching the custom op return signature: (values, indices)
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
         return indices
-
-    class CuteDSLTopKPrefillSingleCTARunner:
-        """Runner for CuTE DSL Top-K prefill kernel (single CTA per row).
-
-        Uses FilteredTopKKernelVarlenPrefill with large_occupancy=True (512
-        threads/CTA, reduced SMEM). Row extents are supplied as row_starts /
-        row_ends tensors; output indices are LOCAL (0-indexed within each row's
-        valid range), matching the CUDA indexer_topk_prefill convention.
-
-        All methods are class-level — no instantiation needed.
-        """
-
-        kernel_cache: dict = {}
-        buffers = get_memory_buffers()
-
-        @classmethod
-        def _compile(cls,
-                     dtype,
-                     bucketed_num_cols,
-                     top_k,
-                     return_val,
-                     num_copy_bits,
-                     overflow_policy,
-                     cache_smem_values=False):
-            """Compile and cache a single-CTA prefill top-k kernel."""
-            key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits,
-                   overflow_policy, cache_smem_values)
-            if key in cls.kernel_cache:
-                return
-            n_rows = cute.sym_int()
-            n_cols = cute.sym_int()
-            input_fake = cute.runtime.make_fake_compact_tensor(
-                dtype,
-                (n_rows, n_cols),
-                stride_order=(1, 0),
-                assumed_align=32,
-            )
-            row_starts_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_rows, ),
-                stride_order=(0, ),
-            )
-            row_ends_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_rows, ),
-                stride_order=(0, ),
-            )
-            if overflow_policy == "GMEM_SPILL":
-                buffer_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n_rows, cute.sym_int(), n_cols),
-                    stride_order=(2, 1, 0),
-                    assumed_align=32,
-                )
-            else:
-                buffer_fake = None
-            output_indices_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (n_rows, top_k),
-                stride_order=(1, 0),
-            )
-            if return_val:
-                output_values_fake = cute.runtime.make_fake_compact_tensor(
-                    dtype,
-                    (n_rows, top_k),
-                    stride_order=(1, 0),
-                )
-            else:
-                output_values_fake = None
-            fake_stream = cute.runtime.make_fake_stream(
-                use_tvm_ffi_env_stream=True)
-
-            filtered_topk_func = FilteredTopKKernelVarlenPrefill(
-                dtype,
-                bucketed_num_cols,
-                top_k,
-                num_copy_bits=num_copy_bits,
-                return_val=return_val,
-                overflow_policy=overflow_policy,
-                cache_smem_values=cache_smem_values,
-            )
-            compiled_kernel = cute.compile(
-                filtered_topk_func,
-                input_fake,
-                row_starts_fake,
-                row_ends_fake,
-                buffer_fake,
-                output_indices_fake,
-                output_values_fake,
-                stream=fake_stream,
-                min_blocks_per_mp=4,
-                options="--enable-tvm-ffi",
-            )
-            cls.kernel_cache[key] = compiled_kernel
-
-        @classmethod
-        def forward(
-            cls,
-            input_values: torch.Tensor,
-            row_starts: torch.Tensor,
-            row_ends: torch.Tensor,
-            top_k: int,
-            return_val: bool = False,
-            num_copy_bits: int = 256,
-            overflow_policy: str = "REREAD",
-            output_indices: Optional[torch.Tensor] = None,
-            cache_smem_values: bool = False,
-        ):
-            """Execute filtered top-k selection for prefill rows."""
-            torch_dtype = input_values.dtype
-            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
-            num_rows, num_cols = input_values.shape
-            bucketed_num_cols = next_positive_power_of_2(num_cols)
-
-            key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits,
-                   overflow_policy, cache_smem_values)
-            cls._compile(*key)
-            compiled_kernel = cls.kernel_cache[key]
-            reserve = torch.cuda.is_current_stream_capturing()
-
-            if output_indices is not None:
-                output_indices_torch = output_indices
-            else:
-                output_indices_torch = cls.buffers.get_buffer(
-                    [num_rows, top_k],
-                    torch.int32,
-                    buffer_name="prefill_single_cta_output_indices",
-                    reserve_buffer=reserve,
-                )
-            if return_val:
-                output_values_torch = cls.buffers.get_buffer(
-                    [num_rows, top_k],
-                    torch_dtype,
-                    buffer_name="prefill_single_cta_output_values",
-                    reserve_buffer=reserve,
-                )
-            else:
-                output_values_torch = None
-
-            if overflow_policy == "GMEM_SPILL":
-                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
-                buffer_torch = cls.buffers.get_buffer(
-                    [num_rows, buffer_numbers, bucketed_num_cols],
-                    torch.int32,
-                    buffer_name="prefill_single_cta_buffer",
-                    reserve_buffer=reserve,
-                )
-                buffer_torch = buffer_torch[:, :, :num_cols]
-            else:
-                buffer_torch = None
-
-            compiled_kernel(
-                input_values,
-                row_starts,
-                row_ends,
-                buffer_torch,
-                output_indices_torch,
-                output_values_torch,
-            )
-            return output_indices_torch, output_values_torch
-
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_indexer_topk_prefill_blackwell",
-        mutates_args=("output_indices", ),
-        device_types="cuda",
-    )
-    def cute_dsl_indexer_topk_prefill_blackwell(
-        input_values: torch.Tensor,
-        row_starts: torch.Tensor,
-        row_ends: torch.Tensor,
-        output_indices: torch.Tensor,
-        top_k: int,
-        num_copy_bits: int = 256,
-        overflow_policy: str = "REREAD",
-        cache_smem_values: bool = False,
-    ) -> None:
-        """CuTE DSL radix-based top-k for prefill.
-
-        Args:
-            input_values:   Logits tensor of shape (num_rows, num_cols).
-            row_starts:     Per-row start column (inclusive), shape (num_rows,), int32.
-            row_ends:       Per-row end column (exclusive), shape (num_rows,), int32.
-            top_k:          Number of top-k indices to select per row.
-            num_copy_bits:  Vector copy width in bits (default 256).
-            overflow_policy: How to handle threshold-bucket SMEM overflow.
-                             "GMEM_SPILL" (default, exact) or "TRUNCATE" (non-exact,
-                             no extra buffer).
-            cache_smem_values: Cache ordered values in SMEM to avoid re-reading from
-                               GMEM in refinement rounds (reduces S by 2x).
-
-            output_indices: Pre-allocated Int32 tensor of shape (num_rows, top_k),
-                            written in place with LOCAL indices (0-indexed within
-                            [row_start, row_end) for each row). Padding positions
-                            are -1.
-        """
-        # Write into the caller-provided output_indices (mutates_args) rather than
-        # returning the runner's reusable pool buffer, matching the decode op and
-        # the CUDA indexer_topk_prefill contract (write into a caller buffer slice).
-        CuteDSLTopKPrefillSingleCTARunner.forward(
-            input_values,
-            row_starts,
-            row_ends,
-            top_k,
-            return_val=False,
-            num_copy_bits=num_copy_bits,
-            overflow_policy=overflow_policy,
-            cache_smem_values=cache_smem_values,
-            output_indices=output_indices,
-        )
-
-    @torch.library.register_fake(
-        "trtllm::cute_dsl_indexer_topk_prefill_blackwell")
-    def _(
-        input_values: torch.Tensor,
-        row_starts: torch.Tensor,
-        row_ends: torch.Tensor,
-        output_indices: torch.Tensor,
-        top_k: int,
-        num_copy_bits: int = 256,
-        overflow_policy: str = "REREAD",
-        cache_smem_values: bool = False,
-    ):
-        return None
 
     class CuteDSLTopKDecodeMultiCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (multi CTA version).
@@ -6306,12 +5842,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      next_n,
                      return_val,
                      num_copy_bits,
+                     load_balance,
                      large_occupancy,
                      chunk_size_per_cta,
                      num_ctas_per_row,
-                     overflow_policy="REREAD",
-                     dynamic=False,
-                     cache_smem_values=False):
+                     dynamic=False):
             """Compile and cache multi-CTA top-k kernels for the given config."""
             key = (
                 dtype,
@@ -6319,12 +5854,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
+                load_balance,
                 large_occupancy,
                 chunk_size_per_cta,
                 num_ctas_per_row,
-                overflow_policy,
                 dynamic,
-                cache_smem_values,
             )
             if key in cls.kernel_cache:
                 return
@@ -6336,17 +5870,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                                stride_order=(1,
                                                                              0),
                                                                assumed_align=32)
-            # extra_buffer for GMEM_SPILL: spills threshold-bin candidates that
-            # overflow SMEM. Not needed for TRUNCATE/REREAD/REREAD_ALWAYS.
-            if overflow_policy == "GMEM_SPILL":
-                buffer_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                    stride_order=(2, 1, 0),
-                    assumed_align=32,
-                )
-            else:
-                buffer_fake = None
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
             seqlen_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ),
@@ -6381,18 +5910,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row=num_ctas_per_row,
                 merge_blocks=False,
                 enable_dynamic_multi_cta=dynamic,
-                overflow_policy=overflow_policy,
-                cache_smem_values=cache_smem_values,
             )
             compiled_kernel_first = cute.compile(
                 filtered_topk_func_first,
                 input_fake,
                 None,  # indices_fake
                 buffer_fake,
+                None,  # g_global_counter_fake
                 seqlen_fake,
                 first_kernel_output_indices_fake,
                 first_kernel_output_values_fake,
                 stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
                 options="--enable-tvm-ffi",
             )
@@ -6429,18 +5958,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_multi_cta=False,
                 merge_blocks=True,
                 varlen_merge_input=dynamic,
-                overflow_policy=overflow_policy,
-                cache_smem_values=cache_smem_values,
             )
             compiled_kernel_second = cute.compile(
                 filtered_topk_func_second,
                 input_fake,
                 indices_fake,
                 buffer_fake,
+                None,  # g_global_counter_fake
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
                 stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
                 options="--enable-tvm-ffi",
             )
@@ -6457,10 +5986,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
             chunk_size_per_cta: int = 16384,
-            overflow_policy: str = "REREAD",
             dynamic: bool = True,
             output_indices: Optional[torch.Tensor] = None,
-            cache_smem_values: bool = False,
         ):
             """Execute multi-CTA filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -6469,6 +5996,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
+            load_balance = False
 
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
             merge_cols = num_ctas_per_row * top_k
@@ -6479,17 +6007,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 next_n,
                 return_val,
                 num_copy_bits,
+                load_balance,
                 large_occupancy,
                 chunk_size_per_cta,
                 num_ctas_per_row,
-                overflow_policy,
                 dynamic,
-                cache_smem_values,
             )
             cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
             reserve = torch.cuda.is_current_stream_capturing()
+
+            if dtype == cutlass.Float32:
+                buffer_numbers = 2
+            else:
+                buffer_numbers = 1
 
             # Intermediate buffers for first kernel output
             first_output_indices = cls.buffers.get_buffer(
@@ -6503,18 +6035,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_name="multi_cta_first_output_values",
                 reserve_buffer=reserve)
 
-            # extra_buffer for GMEM_SPILL: spills threshold-bin candidates that
-            # overflow SMEM. Not needed for TRUNCATE/REREAD/REREAD_ALWAYS.
-            if overflow_policy == "GMEM_SPILL":
-                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
-                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-                buffer_torch = cls.buffers.get_buffer(
-                    [num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2],
-                    torch.int32,
-                    buffer_name="multi_cta_buffer",
-                    reserve_buffer=reserve)
-            else:
-                buffer_torch = None
+            # Shared buffer for both kernels (they run sequentially)
+            buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+            buffer_torch = cls.buffers.get_buffer(
+                [num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2],
+                torch.int32,
+                buffer_name="multi_cta_buffer",
+                reserve_buffer=reserve)
 
             # Final output tensors
             if output_indices is not None:
@@ -6539,6 +6066,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 input_values,
                 None,  # indices
                 buffer_torch,
+                None,  # g_global_counter_torch
                 seq_lens,
                 first_output_indices,
                 first_output_values,
@@ -6549,6 +6077,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 first_output_values,
                 first_output_indices,
                 buffer_torch,
+                None,  # g_global_counter_torch
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
@@ -7013,31 +6542,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
         return indices
 
-    def _radix_select_preferred(dtype, num_tokens: int, num_rows: int) -> bool:
-        """radix-SELECT SP beats radix-FILTER at small N: select loads the whole
-        chunk into SMEM and radix-selects in place, which is leaner than filter's
-        histogram + refine when the chunk fits SMEM and the fixed overhead is not
-        amortized over few elements. SMEM-capacity driven, so distribution-robust.
-        fp32 (4B) fills SMEM at half the N and its 4 refine rounds favor filter ->
-        always filter. Tuned on a B200 randn sweep (filter-vs-select, best-vs-best
-        + tuned): bf16 wins up to ~32%, fp16 up to ~12%.
-
-        bf16 N=32768 is batch-split: select wins only at large batch (grid
-        pressure forces both to single-CTA, where select single beats filter
-        single); at small batch filter's cluster is better, so keep filter.
-        """
-        # Large batch (num_rows > num_sms) forces the filter path to single-CTA
-        # (auto_cluster_size -> cs=1), which beats the radix-SELECT cluster runner
-        # here; only prefer select while the batch still fits within one SM wave.
-        num_sms = _get_num_sms()
-        if dtype == torch.bfloat16:
-            return num_rows <= num_sms and (num_tokens <= 16384 or
-                                            (num_tokens == 32768
-                                             and num_rows >= 74))
-        if dtype == torch.float16:
-            return num_rows <= num_sms and num_tokens <= 16384
-        return False
-
     @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
@@ -7051,32 +6555,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
-        overflow_policy: str = "REREAD",
-        cache_smem_values: bool = False,
-        radix_filter_single_pass_multi_cta: bool = True,
     ) -> None:
-        """Unified CuTE DSL decode Top-K. Writes results directly into the
-        pre-allocated ``output_indices`` buffer.
+        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
+        single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
+        and multi-CTA (1-pass multi-CTA). When single_pass_multi_cta=False, it selects between
+        single-CTA and multi-CTA (2-pass multi-CTA).
 
-        Three mutually exclusive dispatch modes, selected by boolean with
-        precedence ``radix_filter_single_pass_multi_cta`` >
-        ``single_pass_multi_cta`` > 2-pass (evaluated as an if/elif chain, so
-        the first True wins and the others are ignored):
-
-        1. ``radix_filter_single_pass_multi_cta=True`` (default) -- ADAPTIVE,
-           best-performance path. Internally auto-selects among radix-SELECT
-           (small N), radix-FILTER single-pass multi-CTA cluster, and
-           single-CTA by (dtype, N, num_rows, overflow_policy); no caller
-           tuning needed. Prefer this. When it is enabled the other two mode
-           booleans MUST be left False (asserted below) -- they would be
-           silently ignored otherwise.
-        2. ``single_pass_multi_cta=True`` (only when mode 1 is False) -- legacy
-           single-pass multi-CTA path (kept for A/B and fallback). Auto-selects
-           single-CTA vs single-pass multi-CTA by the SM-wave heuristic below;
-           ``single_pass_multi_cta_cluster=True`` forces the cluster variant
-           within this mode (no effect in the other modes).
-        3. neither set -- legacy 2-pass multi-CTA path (A/B and fallback);
-           vocab-threshold + SM-utilization heuristic.
+        Writes results directly into the pre-allocated ``output_indices`` buffer.
 
         Dispatch logic (``single_pass_multi_cta=True`` path):
 
@@ -7113,17 +6598,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
             dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
-            single_pass_multi_cta: Mode-2 override -- use the legacy single-pass
-                multi-CTA path. Only takes effect when
-                radix_filter_single_pass_multi_cta=False.
-            single_pass_multi_cta_cluster: Force the cluster-accelerated variant
-                within mode 2 (only effective when single_pass_multi_cta=True).
-            overflow_policy: Threshold-bucket SMEM overflow handling
-                ("REREAD" default, exact). See FilteredTopKKernelVarlen.
-            cache_smem_values: Cache ordered values in SMEM to skip a reload.
-            radix_filter_single_pass_multi_cta: Mode-1 (default True) -- the
-                adaptive best-performance path; see the mode list above. Set
-                False to select mode 2 or 3.
+            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
+            single_pass_multi_cta_cluster: Force cluster-accelerated variant
+                (only effective when single_pass_multi_cta=True)
         """
         # Validate inputs
         if top_k <= 0 or top_k > 16384:
@@ -7134,71 +6611,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
 
-        if radix_filter_single_pass_multi_cta:
-            # Mode 1 is the adaptive default and dominates the if/elif chain
-            # below. Reject a conflicting mode-2/3 override rather than silently
-            # ignoring it (set radix_filter_single_pass_multi_cta=False to opt
-            # into the legacy single_pass_multi_cta / 2-pass paths).
-            assert not single_pass_multi_cta and not single_pass_multi_cta_cluster, (
-                "radix_filter_single_pass_multi_cta (adaptive default) takes "
-                "precedence over single_pass_multi_cta / "
-                "single_pass_multi_cta_cluster; set it False to use those "
-                "legacy overrides.")
-            _R = CuteDSLTopKDecodeRadixFilterSPMultiCTARunner
-            _is_fp32 = input_values.dtype == torch.float32
-            # At small N (bf16 <= 32K, fp16 <= 16K) radix-SELECT SP beats
-            # radix-FILTER; route there. The select cluster runner auto-picks
-            # ctas (=1 => select single-CTA for small batch, else cluster), so
-            # this covers both. Falls through to filter only if select can't
-            # fit the problem (capacity -> None), which small N never hits.
-            if _radix_select_preferred(input_values.dtype, num_tokens,
-                                       num_rows):
-                _sel = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
-                    input_values=input_values,
-                    seq_lens=seq_lens,
-                    top_k=top_k,
-                    next_n=next_n,
-                    return_val=False,
-                    num_copy_bits=num_copy_bits,
-                    output_indices=output_indices,
-                )
-                if _sel[0] is not None:
-                    return
-            # radix-FILTER single-CTA vs SP multi-CTA (cluster DSMEM). Heuristic
-            # is overflow-policy-coupled: REREAD has a large_occupancy re-scan
-            # cliff, cliff-free policies don't -> pick the matching tune.
-            if overflow_policy == "REREAD":
-                cluster_size = _R.auto_cluster_size(num_tokens, num_rows,
-                                                    _is_fp32)
-            else:
-                cluster_size = _R.auto_cluster_size_truncate(
-                    num_tokens, num_rows, _is_fp32)
-            if cluster_size >= 2:
-                CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
-                    input_values=input_values,
-                    seq_lens=seq_lens,
-                    top_k=top_k,
-                    next_n=next_n,
-                    cluster_size=cluster_size,
-                    return_val=False,
-                    num_copy_bits=num_copy_bits,
-                    overflow_policy=overflow_policy,
-                    output_indices=output_indices,
-                    cache_smem_values=cache_smem_values,
-                )
-            else:
-                CuteDSLTopKDecodeSingleCTARunner.forward(
-                    input_values=input_values,
-                    seq_lens=seq_lens,
-                    top_k=top_k,
-                    next_n=next_n,
-                    return_val=False,
-                    num_copy_bits=num_copy_bits,
-                    overflow_policy=overflow_policy,
-                    output_indices=output_indices,
-                    cache_smem_values=cache_smem_values,
-                )
-        elif single_pass_multi_cta:
+        if single_pass_multi_cta:
             # --- heuristic for single-CTA vs single-pass multi-CTA ---
             # Determines whether the single-pass multi-CTA kernel
             # is faster than single-CTA based on SM wave occupancy analysis.
@@ -7278,9 +6691,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     next_n=next_n,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
-                    overflow_policy=overflow_policy,
                     output_indices=output_indices,
-                    cache_smem_values=cache_smem_values,
                 )
         else:
             # --- 2-pass multi-CTA dispatch ---
@@ -7312,10 +6723,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     return_val=False,
                     num_copy_bits=num_copy_bits,
                     chunk_size_per_cta=chunk_size_per_cta,
-                    overflow_policy=overflow_policy,
                     dynamic=dynamic,
                     output_indices=output_indices,
-                    cache_smem_values=cache_smem_values,
                 )
             else:
                 CuteDSLTopKDecodeSingleCTARunner.forward(
@@ -7325,9 +6734,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     next_n=next_n,
                     return_val=False,
                     num_copy_bits=num_copy_bits,
-                    overflow_policy=overflow_policy,
                     output_indices=output_indices,
-                    cache_smem_values=cache_smem_values,
                 )
 
     @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
@@ -7341,81 +6748,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         dynamic: bool = True,
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
-        overflow_policy: str = "REREAD",
-        cache_smem_values: bool = False,
-        radix_filter_single_pass_multi_cta: bool = True,
     ) -> None:
         return None
-
-    def warmup_cute_dsl_radix_topk_decode(
-        top_k: int,
-        num_cols: int,
-        next_n: int = 1,
-        dtype: torch.dtype = torch.float32,
-        num_copy_bits: int = 256,
-        num_sms: Optional[int] = None,
-    ) -> None:
-        """Pre-compile the radix-filter DSL decode top-k for every
-        ``cluster_size`` variant the runtime dispatch can pick for this
-        deployment.
-
-        ``cute_dsl_indexer_topk_decode`` JIT-compiles a fresh CuTe DSL kernel
-        per compile-key ``(dtype, bucketed_num_cols, top_k, next_n, ...,
-        cluster_size)`` on first touch (~seconds). Every key dimension is
-        fixed for a deployment (``num_cols = indexer_max_seq_len``) except
-        ``cluster_size = auto_cluster_size(num_cols, num_rows, ...)``, which
-        steps across the coarse ``num_rows`` occupancy bands
-        (<=4 / <=8 / <=32 / <=64 / <=num_sms / >num_sms). CUDA-graph warmup
-        only exercises ``cuda_graph_batch_sizes``; eager iters (mixed
-        prefill+decode batch, or ``cuda_graph`` disabled) whose ``num_rows``
-        lands in an uncovered band otherwise pay the JIT stall on a live
-        request. Issuing one decode per representative ``num_rows`` funnels
-        every ``cluster_size`` compile into warmup — the op's own dispatch
-        (radix-SELECT / radix-FILTER cluster / single-CTA) picks and compiles
-        exactly what the runtime would.
-
-        Meant to run during warmup, before serving. Captured geometries are
-        already compiled by the warmup-step forwards; this fills in the bands
-        the eager (non-captured) path can still hit. Best-effort: per-band
-        failures are logged and skipped so one broken bucket does not abort
-        startup.
-        """
-        if top_k <= 0 or num_cols <= 0 or next_n <= 0:
-            return
-        num_sms = num_sms or _get_num_sms()
-        device = torch.device("cuda")
-        # One representative num_rows per auto_cluster_size occupancy band.
-        # Rounded up to a multiple of next_n (kernel shape contract:
-        # num_rows % next_n == 0); identical num_rows are de-duplicated.
-        band_targets = (4, 8, 32, 64, num_sms, num_sms + 1)
-        seen = set()
-        for target in band_targets:
-            num_gen = max(1, -(-target // next_n))  # ceil(target / next_n)
-            num_rows = num_gen * next_n
-            if num_rows in seen:
-                continue
-            seen.add(num_rows)
-            logits = torch.zeros((num_rows, num_cols),
-                                 dtype=dtype,
-                                 device=device)
-            seq_lens = torch.full((num_gen, ),
-                                  num_cols,
-                                  dtype=torch.int32,
-                                  device=device)
-            output_indices = torch.empty((num_rows, top_k),
-                                         dtype=torch.int32,
-                                         device=device)
-            try:
-                torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-                    logits, seq_lens, output_indices, top_k, next_n,
-                    num_copy_bits)
-            except RuntimeError as e:
-                logger.warning(
-                    f"[DSL topk warmup] radix-filter prewarm failed for "
-                    f"num_rows={num_rows} (num_cols={num_cols}, top_k={top_k}, "
-                    f"next_n={next_n}); skipping band. "
-                    f"{type(e).__name__}: {e}")
-        torch.cuda.synchronize()
 
     # ------------------------------------------------------------------ #
     #  CuTe DSL GVR Top-K Decode                                         #
@@ -8052,6 +7386,148 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # LB decode lives inside CuteDSLGvrTopKDecodeRunner — see
     # ``_compile_lb`` and the ``counters is not None`` branch of
     # ``forward`` (shares ``_pick_tuning`` with the single-CTA path).
+
+    def warmup_cute_dsl_indexer_topk(
+        dtype: torch.dtype,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        min_seq_len_log2: int = 10,
+        max_seq_len_log2: int = 18,
+        single_pass_multi_cta: bool = False,
+        single_pass_multi_cta_cluster: bool = False,
+    ) -> None:
+        """Pre-compile all CuTE DSL top-k kernel variants for every
+        power-of-2 bucketed_num_cols in [2^min_seq_len_log2, 2^max_seq_len_log2].
+
+        Because the kernel compilation key uses
+        ``bucketed_num_cols = next_positive_power_of_2(num_cols)``, only
+        a small number of distinct kernels are needed regardless of the
+        actual ``max_seq_len``.  This allows warmup to be called at model
+        init time without knowing the runtime ``max_seq_len``.
+
+        Must be called before CUDA Graph capture so that JIT compilation
+        does not occur during capture/replay.
+
+        Args:
+            dtype: Data type of the logits (e.g. torch.bfloat16).
+            top_k: Number of top elements to select.
+            next_n: Number of candidates per sequence (speculative decoding).
+            num_copy_bits: Vectorized memory copy width (128 or 256).
+            min_seq_len_log2: Log2 of minimum bucketed_num_cols (default 10 → 1024).
+            max_seq_len_log2: Log2 of maximum bucketed_num_cols (default 18 → 262144).
+            single_pass_multi_cta: Use single-pass multi-CTA radix top-k
+                dispatch path instead of the legacy two-pass kernels.
+            single_pass_multi_cta_cluster: Force cluster-accelerated variant
+                (only effective when single_pass_multi_cta=True).
+        """
+        cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[dtype]
+        return_val = False
+        chunk_size_per_cta = 16384
+
+        # Multi-CTA vocab thresholds by dtype
+        if dtype == torch.float32:
+            multi_cta_threshold = 65536
+        else:
+            multi_cta_threshold = 131072
+
+        # SingleCTA: enumerate all power-of-2 bucketed_num_cols
+        for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+            bucketed_num_cols = 1 << log2_n
+            for large_occupancy in (False, True):
+                CuteDSLTopKDecodeSingleCTARunner._compile(
+                    cutlass_dtype,
+                    bucketed_num_cols,
+                    top_k,
+                    next_n,
+                    return_val,
+                    num_copy_bits,
+                    load_balance=False,
+                    large_occupancy=large_occupancy,
+                )
+
+        if single_pass_multi_cta:
+            # Single-pass multi-CTA: enumerate all (chunk_size, ctas_per_group)
+            # pairs.  chunk_size is snapped to power-of-2 (+ max_chunk clamp),
+            # so the set of possible values is small and deterministic.
+            num_sms = _get_num_sms()
+            possible_chunks = CuteDSLTopKDecodeSinglePassMultiCTARunner._get_possible_chunk_sizes(
+                cutlass_dtype, num_copy_bits)
+            max_chunk, vec_size = CuteDSLTopKDecodeSinglePassMultiCTARunner._compute_max_chunk(
+                cutlass_dtype, num_copy_bits)
+            single_pass_multi_cta_configs = set()
+            for cs in possible_chunks:
+                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                    num_cols = 1 << log2_n
+                    ctas = math.ceil(num_cols / cs)
+                    if ctas >= 1:
+                        single_pass_multi_cta_configs.add((cs, ctas))
+            # Also cover FlashInfer-style fallback path (large batch):
+            # ctas_per_group = ceil(num_cols / max_chunk), chunk_size aligned
+            for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                num_cols = 1 << log2_n
+                ctas = math.ceil(num_cols / max_chunk)
+                if ctas >= 1:
+                    cs = math.ceil(num_cols / ctas)
+                    cs = ((cs + vec_size - 1) // vec_size) * vec_size
+                    if cs > max_chunk:
+                        cs = max_chunk
+                    single_pass_multi_cta_configs.add((cs, ctas))
+            for cs, ctas in sorted(single_pass_multi_cta_configs):
+                CuteDSLTopKDecodeSinglePassMultiCTARunner._compile(
+                    cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
+                    num_sms, return_val)
+
+            # Cluster variant: enumerate configs using the cluster runner's
+            # _get_chunk_config (which clamps to hw max cluster size).
+            cluster_configs = set()
+            if single_pass_multi_cta_cluster:
+                for log2_n in range(min_seq_len_log2, max_seq_len_log2 + 1):
+                    num_cols = 1 << log2_n
+                    for nr in [1, 4, 16, 64, 256]:
+                        cfg = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._get_chunk_config(
+                            cutlass_dtype,
+                            num_cols,
+                            num_copy_bits=num_copy_bits,
+                            num_rows=nr)
+                        if cfg[0] is not None:
+                            cluster_configs.add((cfg[0], cfg[1]))
+                for cs, ctas in sorted(cluster_configs):
+                    CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner._compile(
+                        cutlass_dtype, cs, top_k, next_n, num_copy_bits, ctas,
+                        num_sms, return_val)
+
+            multi_cta_info = (
+                f"SinglePassMultiCTA ({len(single_pass_multi_cta_configs)} configs"
+                f", cluster {len(cluster_configs)} configs)")
+        else:
+            # 2-pass MultiCTA: enumerate all possible num_ctas_per_row values
+            # num_ctas_per_row = ceil(num_cols / chunk_size_per_cta)
+            # fp32: num_cols in [65536, 262144] → num_ctas_per_row in [4, 16]
+            # fp16/bf16: num_cols in [131072, 262144] → num_ctas_per_row in [8, 16]
+            min_ctas = math.ceil(multi_cta_threshold / chunk_size_per_cta)
+            max_ctas = math.ceil((1 << max_seq_len_log2) / chunk_size_per_cta)
+            for num_ctas_per_row in range(min_ctas, max_ctas + 1):
+                for large_occupancy in (False, True):
+                    CuteDSLTopKDecodeMultiCTARunner._compile(
+                        cutlass_dtype,
+                        top_k,
+                        next_n,
+                        return_val,
+                        num_copy_bits,
+                        load_balance=False,
+                        large_occupancy=large_occupancy,
+                        chunk_size_per_cta=chunk_size_per_cta,
+                        num_ctas_per_row=num_ctas_per_row,
+                        dynamic=True,
+                    )
+            multi_cta_info = (
+                f"MultiCTA num_ctas_per_row=[{min_ctas}..{max_ctas}]")
+
+        logger.info(
+            f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
+            f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
+            f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
 
     # ------------------------------------------------------------------ #
     #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
@@ -10060,6 +9536,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_tiler_k: ClassVar[int]
             mma_inst_shape_k: ClassVar[int]
             allow_unswapped_small_m_fallback: ClassVar[bool]
+            raster_order_candidates: ClassVar[Tuple[str, ...]] = ("m", )
+            scheduler_mode_candidates: ClassVar[Tuple[str,
+                                                      ...]] = ("static",
+                                                               "clc_dynamic")
             tuning_config: ClassVar[TuningConfig]
 
             def __init__(self,
@@ -10178,16 +9658,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     (1, 2),
                     (2, 1),
                     (2, 2),
+                    (4, 2),
                 ]
+                raster_order_candidates = self.raster_order_candidates
                 use_prefetch_candidates = [True, False]
 
                 valid_tactics = []
                 for (
                         mma_tiler_m, mma_inst_m
-                ), mma_n, cluster_shape_mn, swap_ab, use_prefetch in itertools.product(
+                ), mma_n, cluster_shape_mn, raster_order, swap_ab, use_prefetch in itertools.product(
                         mma_m_candidates, mma_n_candidates,
-                        cluster_shape_mn_candidates, base_swap_ab_candidates,
-                        use_prefetch_candidates):
+                        cluster_shape_mn_candidates, raster_order_candidates,
+                        base_swap_ab_candidates, use_prefetch_candidates):
 
                     # Check 2CTA cluster constraint: cluster_m must be divisible by 2
                     if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
@@ -10219,16 +9701,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             mma_inst_shape,
                             cluster_shape_mn,
                     ):
-                        valid_tactics.append(
-                            ("base", mma_tiler_mnk, mma_inst_shape,
-                             cluster_shape_mn, swap_ab, use_prefetch))
+                        for scheduler_mode in self.scheduler_mode_candidates:
+                            valid_tactics.append(
+                                ("base", mma_tiler_mnk, mma_inst_shape,
+                                 cluster_shape_mn, swap_ab, use_prefetch,
+                                 scheduler_mode, raster_order))
 
                 preferred_cluster_shape_mn = (4, 2)
                 fallback_cluster_shape_mn = (2, 1)
-                for (mma_tiler_m, mma_inst_m
-                     ), mma_n, swap_ab, use_prefetch in itertools.product(
-                         mma_m_candidates, mma_n_candidates,
-                         mixed_swap_ab_candidates, use_prefetch_candidates):
+                for (
+                        mma_tiler_m, mma_inst_m
+                ), mma_n, raster_order, swap_ab, use_prefetch in itertools.product(
+                        mma_m_candidates, mma_n_candidates,
+                        raster_order_candidates, mixed_swap_ab_candidates,
+                        use_prefetch_candidates):
                     mma_tiler_mnk = (mma_tiler_m, mma_n, mma_tiler_k)
                     mma_inst_shape = (mma_inst_m, mma_n, mma_inst_shape_k)
 
@@ -10256,10 +9742,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             preferred_cluster_shape_mn,
                             fallback_cluster_shape_mn,
                     ):
+                        # Mixed-cluster kernels use their own static scheduler;
+                        # only raster order is tunable here.
                         valid_tactics.append(
                             ("mixed_clusters", mma_tiler_mnk, mma_inst_shape,
                              preferred_cluster_shape_mn,
-                             fallback_cluster_shape_mn, swap_ab, use_prefetch))
+                             fallback_cluster_shape_mn, swap_ab, use_prefetch,
+                             raster_order))
 
                 valid_tactics = list(dict.fromkeys(valid_tactics))
 
@@ -10276,13 +9765,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tuning_config: TuningConfig,
                 **kwargs,
             ) -> bool:
-                # get_valid_tactics emits 6 fields for base tactics and 7 fields
-                # for mixed-cluster tactics:
-                # ("base", mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
-                #  swap_ab, use_prefetch) or with preferred/fallback clusters for
-                #  "mixed_clusters".
-                return (isinstance(tactic, tuple) and len(tactic) in (6, 7)
-                        and tactic[0] in {"base", "mixed_clusters"})
+                if (not isinstance(tactic, tuple) or not tactic
+                        or tactic[0] not in {"base", "mixed_clusters"}):
+                    return False
+                if tactic[0] == "base":
+                    if len(tactic) not in {6, 7, 8}:
+                        return False
+                    if not isinstance(tactic[5], bool):
+                        return False
+                    if (len(tactic) >= 7 and tactic[6]
+                            not in self.scheduler_mode_candidates):
+                        return False
+                    return (len(tactic) < 8
+                            or tactic[7] in self.raster_order_candidates)
+
+                if len(tactic) not in {7, 8, 9}:
+                    return False
+                if not isinstance(tactic[6], bool):
+                    return False
+                if len(tactic) == 7:
+                    return True
+                if len(tactic) == 8:
+                    # New tactics carry raster order only. Accept the old
+                    # scheduler-only schema for persistent-cache compatibility.
+                    return (tactic[7] in self.raster_order_candidates
+                            or tactic[7] == "static")
+                # The prior full mixed-cluster schema carried an explicit
+                # static scheduler followed by raster order.
+                return (tactic[7] == "static"
+                        and tactic[8] in self.raster_order_candidates)
 
             def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                              assumed_align: int):
@@ -10311,7 +9822,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         inputs[3]: Weight scale tensor in R128c4 layout.
                         inputs[4]: Alpha scaling factor. dtype: float32.
                     tactic: Tiling and cluster strategy for Rubin:
-                        (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab, use_prefetch)
+                        base: ("base", mma_tiler_mnk, mma_inst_shape,
+                        cluster_shape, swap_ab, use_prefetch, scheduler_mode,
+                        raster_order)
+                        mixed: ("mixed_clusters", mma_tiler_mnk,
+                        mma_inst_shape, preferred_cluster_shape,
+                        fallback_cluster_shape, swap_ab, use_prefetch,
+                        raster_order)
                     bias: Optional per-N bias [N]. Added post-GEMM for the
                         non-inplace path.
 
@@ -10324,13 +9841,45 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         and isinstance(tactic[0], str)):
                     kernel_variant = tactic[0]
                     if kernel_variant == "mixed_clusters":
-                        _, mma_tiler_mnk, mma_inst_shape, preferred_cluster_shape_mn, cluster_shape_mn, swap_ab, use_prefetch = tactic
+                        if len(tactic) not in {7, 8, 9}:
+                            raise ValueError(
+                                "CuteDSL Rubin mixed-cluster tactics must use "
+                                "Boolean use_prefetch with an optional raster "
+                                "order")
+                        (_, mma_tiler_mnk, mma_inst_shape,
+                         preferred_cluster_shape_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch, *tuning_options) = tactic
+                        scheduler_mode = "static"
+                        if len(tuning_options) == 0:
+                            raster_order = "m"
+                        elif len(tuning_options) == 1:
+                            # New mixed-cluster tactics carry raster only. The
+                            # old length-8 schema carried only "static".
+                            raster_order = ("m" if tuning_options[0] == "static"
+                                            else tuning_options[0])
+                        else:
+                            # Accept full tactics cached before scheduler
+                            # profiling was restricted to base kernels.
+                            scheduler_mode, raster_order = tuning_options
                     else:
-                        _, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab, use_prefetch = tactic
+                        if len(tactic) not in {6, 7, 8}:
+                            raise ValueError(
+                                "CuteDSL Rubin base tactics must use Boolean "
+                                "use_prefetch with an optional scheduler mode "
+                                "and raster order")
+                        (_, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
+                         swap_ab, use_prefetch, *tuning_options) = tactic
                         preferred_cluster_shape_mn = None
+                        scheduler_mode = (tuning_options[0]
+                                          if tuning_options else "static")
+                        raster_order = (tuning_options[1]
+                                        if len(tuning_options) == 2 else "m")
                 elif isinstance(tactic, tuple) and len(tactic) == 5:
                     kernel_variant = "base"
-                    mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab, use_prefetch = tactic
+                    (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab,
+                     use_prefetch) = tactic
+                    raster_order = "m"
+                    scheduler_mode = "static"
                     preferred_cluster_shape_mn = None
                 else:
                     # fallback to default tactic for Rubin
@@ -10340,7 +9889,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn = (1, 1)
                     swap_ab = False
                     use_prefetch = False
+                    raster_order = "m"
+                    scheduler_mode = "static"
                     preferred_cluster_shape_mn = None
+
+                if not isinstance(use_prefetch, bool):
+                    raise ValueError(
+                        "CuteDSL Rubin use_prefetch must be Boolean")
+                if raster_order not in {"m", "n"}:
+                    raise ValueError("CuteDSL Rubin raster_order must be 'm' "
+                                     f"or 'n', got {raster_order!r}")
+                if kernel_variant == "mixed_clusters" and scheduler_mode != "static":
+                    raise ValueError(
+                        "CuteDSL Rubin mixed-cluster GEMM only supports the "
+                        "static persistent scheduler")
+                if scheduler_mode not in {"static", "clc_dynamic"}:
+                    raise ValueError("Unsupported CuteDSL Rubin scheduler mode "
+                                     f"{scheduler_mode!r}")
 
                 assert len(inputs) == 5 or len(inputs) == 6
                 if len(inputs) == 5:
@@ -10484,8 +10049,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
                              mma_inst_shape, preferred_cluster_shape_mn,
                              cluster_shape_mn, swap_ab, use_prefetch,
-                             ugpu_half_gemm, self.use_tvm_ffi,
-                             max_active_preferred_clusters, max_active_clusters)
+                             raster_order, scheduler_mode, ugpu_half_gemm,
+                             self.use_tvm_ffi, max_active_preferred_clusters,
+                             max_active_clusters)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 # get stream
@@ -10530,14 +10096,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             preferred_cluster_shape_mn,
                             cluster_shape_mn,
                             None if use_prefetch else 0,
+                            raster_order=raster_order,
                         )
                     else:
+                        scheduler_types = {
+                            "static":
+                            cutlass.utils.StaticPersistentTileScheduler,
+                            "clc_dynamic":
+                            cutlass.utils.ClcDynamicPersistentTileScheduler,
+                        }
+                        scheduler_type = scheduler_types[scheduler_mode]
                         gemm = self.__class__.kernel_class(
                             sf_vec_size,
                             mma_inst_shape,
                             mma_tiler_mnk,
                             cluster_shape_mn,
                             None if use_prefetch else 0,
+                            raster_order=raster_order,
+                            scheduler_type=scheduler_type,
                         )
                     # Note: when tvm_ffi fake stream is used, at least one parameter should be tensor type,
                     # so we make alpha as the cute.Tensor type in the jit func.
@@ -10675,6 +10251,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_tiler_k = 128
             mma_inst_shape_k = 64
             allow_unswapped_small_m_fallback = True
+            raster_order_candidates = ("m", "n")
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
                     0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -14511,14 +14088,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 kernel_class = self._select_kernel_class(kernel_variant)
                 if kernel_variant == "preferred_cluster":
-                    gemm = kernel_class(
-                        cutlass.Float32,
+                    preferred_cluster_kwargs = dict(
+                        acc_dtype=cutlass.Float32,
                         use_2cta_instrs=use_2cta_instrs,
                         mma_tiler_mn=mma_tiler_mn,
                         preferred_cluster_shape_mn=preferred_cluster_shape_mn,
                         fallback_cluster_shape_mn=cluster_shape_mn,
-                        max_num_ab_stage=max_num_ab_stage,
                     )
+                    if self.target_sm == "rubin":
+                        preferred_cluster_kwargs[
+                            "max_num_ab_stage"] = max_num_ab_stage
+                    gemm = kernel_class(**preferred_cluster_kwargs)
                 else:
                     gemm_kwargs = dict(
                         acc_dtype=cutlass.Float32,
@@ -15157,14 +14737,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 kernel_class = self._select_kernel_class(kernel_variant)
                 if kernel_variant == "preferred_cluster":
-                    gemm = kernel_class(
-                        cutlass.Float32,
+                    preferred_cluster_kwargs = dict(
+                        acc_dtype=cutlass.Float32,
                         use_2cta_instrs=use_2cta_instrs,
                         mma_tiler_mn=mma_tiler_mn,
                         preferred_cluster_shape_mn=preferred_cluster_shape_mn,
                         fallback_cluster_shape_mn=cluster_shape_mn,
-                        max_num_ab_stage=max_num_ab_stage,
                     )
+                    if self.target_sm == "rubin":
+                        preferred_cluster_kwargs[
+                            "max_num_ab_stage"] = max_num_ab_stage
+                    gemm = kernel_class(**preferred_cluster_kwargs)
                 else:
                     gemm_kwargs = dict(
                         acc_dtype=cutlass.Float32,
@@ -15172,8 +14755,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_tiler_mn=mma_tiler_mn,
                         cluster_shape_mn=cluster_shape_mn,
                     )
-                    if (get_sm_version() == 107
-                            and IS_CUTLASS_DSL_INTERNAL_AVAILABLE):
+                    if self.target_sm == "rubin":
                         gemm_kwargs["max_num_ab_stage"] = max_num_ab_stage
                     gemm = kernel_class(**gemm_kwargs)
                 compile_args = [
@@ -15339,8 +14921,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     split_k_slices=split_k_slices,
                 )
-                if (get_sm_version() == 107
-                        and IS_CUTLASS_DSL_INTERNAL_AVAILABLE):
+                if self.target_sm == "rubin":
                     gemm_kwargs["max_num_ab_stage"] = max_num_ab_stage
                 gemm = kernel_class(**gemm_kwargs)
 

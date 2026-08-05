@@ -581,6 +581,69 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_multi_wave(
     getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
+def test_cute_dsl_mxfp8_gemm_rubin_clc_dynamic_prefetch_multi_wave():
+    """CLC dynamic scheduling supports Boolean-enabled prefetch."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLMXFP8RubinLinear
+
+    m, n, k = 2048, 8192, 1536
+    torch.random.manual_seed(43)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.02
+
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(a)
+    b_fp8, b_sf_k128 = per_block_cast_to_fp8_e8m0(b)
+    b_sf = fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(b_sf_k128,
+                                                                   mn=n,
+                                                                   k=k)
+    alpha = torch.ones((), dtype=torch.float32, device="cuda")
+    inputs = [a_fp8, b_fp8, a_sf, b_sf, alpha]
+
+    static_tactic = (
+        "base",
+        (256, 256, 128),
+        (256, 256, 64),
+        (4, 2),
+        False,
+        True,
+        "static",
+        "m",
+    )
+    dynamic_tactic = (
+        "base",
+        (256, 256, 128),
+        (256, 256, 64),
+        (4, 2),
+        False,
+        True,
+        "clc_dynamic",
+        "n",
+    )
+    runner = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
+                                     use_tvm_ffi=True)
+    valid_tactics = runner.get_valid_tactics(inputs, None)
+    assert static_tactic in valid_tactics
+    assert dynamic_tactic in valid_tactics
+    for scheduler_mode in ("static", "clc_dynamic"):
+        for raster_order in ("m", "n"):
+            tactic = (*static_tactic[:-2], scheduler_mode, raster_order)
+            assert tactic in valid_tactics
+
+    static_output = runner(inputs, tactic=static_tactic)
+    dynamic_output = runner(inputs, tactic=dynamic_tactic)
+    torch.cuda.synchronize()
+
+    expected = a @ b.t()
+    assert torch.isfinite(dynamic_output).all()
+    assert calc_diff(static_output, expected) < 1e-3
+    assert calc_diff(dynamic_output, expected) < 1e-3
+    torch.testing.assert_close(dynamic_output, static_output, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
 @pytest.mark.parametrize("m", [1, 7, 128])
 @pytest.mark.parametrize("use_tvm_ffi", [True, False])
 def test_cute_dsl_fp8_block_scale_bmm_rubin(m, use_tvm_ffi):

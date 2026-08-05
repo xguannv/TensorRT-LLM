@@ -197,6 +197,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         prefetch_dist: Union[int, None] = None,
         swizzle_size: int = 1,
         raster_order: Literal["m", "n"] = "m",
+        scheduler_type: Type = None,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
 
@@ -222,6 +223,47 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         # Prefetch configuration: None=auto (num_ab_stage), 0=disable, >0=explicit distance
         self.prefetch_dist_param = prefetch_dist
+
+        if scheduler_type is None:
+            scheduler_type = utils.StaticPersistentTileScheduler
+        self.scheduler_type = scheduler_type
+        self.use_clc_dynamic_scheduler = issubclass(
+            self.scheduler_type, utils.ClcDynamicPersistentTileScheduler
+        )
+        self.sched_warp_id = 6
+        self.num_clc_stage = 1 if self.use_clc_dynamic_scheduler else 0
+        self.num_clc_response_bytes = 16
+        if self.use_clc_dynamic_scheduler:
+            self.threads_per_cta = self.threads_per_warp * (len(self.epilog_warp_id) + 3)
+
+    def _compute_grid(
+        self,
+        c: cute.Tensor,
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        max_active_clusters,
+        swizzle_size: int,
+        raster_along_m: bool,
+    ):
+        """Compute static or CLC-dynamic persistent scheduler parameters."""
+        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
+        gc = cute.zipped_divide(c, tiler=c_shape)
+        num_ctas_mnl = gc[(0, (None, None, None))].shape
+        cluster_shape_mnl = (*cluster_shape_mn, 1)
+
+        if self.use_clc_dynamic_scheduler:
+            tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+                num_ctas_mnl, cluster_shape_mnl, swizzle_size, raster_along_m
+            )
+            grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
+        else:
+            tile_sched_params = utils.PersistentTileSchedulerParams(
+                num_ctas_mnl, cluster_shape_mnl, swizzle_size, raster_along_m
+            )
+            grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+                tile_sched_params, max_active_clusters
+            )
+        return tile_sched_params, grid
 
     # Override parent's wrapper to use Rubin-specific __call__ interface
     @cute.jit
@@ -1026,7 +1068,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.cluster_shape_mn,
             max_active_clusters,
             self.swizzle_size,
-            self.raster_order,
+            self.raster_order == "m",
         )
 
         self.buffer_align_bytes = 1024
@@ -1040,6 +1082,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_clc_stage * 2]
+            clc_response: cute.struct.MemRange[cutlass.Int32, self.num_clc_response_bytes // 4]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -1137,7 +1181,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         tCtSFB_layout: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params,
         epilogue_op: cutlass.Constexpr,
         cluster_shape_mn: Tuple[int, int],
         num_tma_producer: int,
@@ -1215,6 +1259,44 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
+
+        # CLC dynamic scheduling publishes each cancelled cluster's tile
+        # coordinate to the TMA, MMA, and epilogue warp roles in every CTA.
+        clc_pipeline = None
+        clc_response_ptr = None
+        clc_consumer_state = None
+        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+            clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            cluster_size = cute.size(self.cluster_shape_mn)
+            num_clc_consumer_threads = 32 * len(
+                (
+                    self.sched_warp_id,
+                    *(
+                        cluster_size
+                        * (
+                            self.tma_warp_id,
+                            self.mma_warp_id,
+                            *self.epilog_warp_id,
+                        )
+                    ),
+                )
+            )
+            clc_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, num_clc_consumer_threads
+            )
+            clc_pipeline = pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=storage.clc_mbar_ptr.data_ptr(),
+                num_stages=self.num_clc_stage,
+                producer_group=clc_pipeline_producer_group,
+                consumer_group=clc_pipeline_consumer_group,
+                tx_count=self.num_clc_response_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+            clc_response_ptr = storage.clc_response.data_ptr()
+            clc_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_clc_stage
+            )
 
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
@@ -1383,9 +1465,17 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         #
         # Construct the scheduler
         #
-        tile_sched = utils.StaticPersistentTileScheduler.create(
-            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-        )
+        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+            tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                tile_sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                clc_response_ptr,
+            )
+        else:
+            tile_sched = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
         work_tile = tile_sched.initial_work_tile_info()
 
         #
@@ -1511,8 +1601,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 # Advance to next tile
                 #
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work_tile = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             #
             # Wait A/B buffer empty
@@ -1523,6 +1619,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
+            # The dynamic scheduler carries SSA state for the local response
+            # buffer, so each specialized role creates its own view.
+            if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+                tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                    tile_sched_params,
+                    cute.arch.block_idx(),
+                    cute.arch.grid_dim(),
+                    clc_response_ptr,
+                )
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
@@ -1731,8 +1836,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 # Advance to next tile
                 #
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work_tile = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             #
             # Wait for accumulator buffer empty
@@ -1774,6 +1885,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             # Persistent tile scheduling loop
             #
             work_tile = tile_sched.initial_work_tile_info()
+            epi_tiles_executed = cutlass.Int32(0)
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
@@ -1783,8 +1895,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[2],
                 )
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work_tile = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+                epi_tiles_executed += 1
 
                 acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
                     self,
@@ -1795,7 +1914,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     sC,
                     tCgC,
                     epi_tile,
-                    tile_sched.num_tiles_executed,
+                    epi_tiles_executed,
                     lambda x: epilogue_op(alpha_value * x),
                     mma_tile_coord_mnl,
                     acc_consumer_state,
@@ -1810,6 +1929,27 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
+
+        #
+        # Specialized scheduler warp (CLC dynamic only)
+        #
+        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+            is_first_cta_in_cluster = cta_rank_in_cluster == 0
+            if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
+                clc_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.ProducerConsumer,
+                    self.num_clc_stage,
+                )
+                while work_tile.is_valid_tile:
+                    clc_pipeline.producer_acquire(clc_producer_state)
+                    mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
+                    tile_sched.advance_to_next_work(mbarrier_addr)
+                    clc_producer_state.advance()
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work_tile = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                clc_pipeline.producer_tail(clc_producer_state)
 
     # GPU device kernel
     @cute.kernel
@@ -1839,7 +1979,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         tCtSFB_layout: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
@@ -2450,6 +2590,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         preferred_cluster_shape_mn: Tuple[int, int],
         fallback_cluster_shape_mn: Tuple[int, int],
         prefetch_dist: Union[int, None] = None,
+        swizzle_size: int = 1,
+        raster_order: Literal["m", "n"] = "m",
     ):
         super().__init__(
             sf_vec_size,
@@ -2457,6 +2599,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
             mma_tiler,
             preferred_cluster_shape_mn,
             prefetch_dist,
+            swizzle_size=swizzle_size,
+            raster_order=raster_order,
         )
 
         # Providing explicit cluster shapes for preferred and fallback
@@ -3007,6 +3151,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
             self.fallback_cluster_shape_mn,
             preferred_max_active_clusters,
             fallback_max_active_clusters,
+            self.swizzle_size,
+            self.raster_order == "m",
         )
 
         self.buffer_align_bytes = 1024
@@ -3221,6 +3367,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         fallback_cluster_shape_mn: Tuple[int, int],
         preferred_max_active_clusters: cutlass.Constexpr,
         fallback_max_active_clusters: cutlass.Constexpr,
+        swizzle_size: int,
+        raster_along_m: bool,
     ) -> Tuple[
         utils.PersistentTileSchedulerParams,
         Tuple[int, int, int],
@@ -3239,6 +3387,10 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         :type preferred_max_active_clusters: cutlass.Constexpr
         :param fallback_max_active_clusters: Maximum number of fallback active clusters.
         :type fallback_max_active_clusters: cutlass.Constexpr
+        :param swizzle_size: Number of adjacent cluster tiles to swizzle.
+        :type swizzle_size: int
+        :param raster_along_m: Whether to rasterize clusters along M first.
+        :type raster_along_m: bool
 
         :return: A tuple containing:
             - preferred_tile_sched_params: Parameters for the preferred persistent tile scheduler.
@@ -3259,7 +3411,10 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         preferred_cluster_shape_mnl = (*preferred_cluster_shape_mn, 1)
 
         preferred_tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, preferred_cluster_shape_mnl
+            num_ctas_mnl,
+            preferred_cluster_shape_mnl,
+            swizzle_size,
+            raster_along_m,
         )
         preferred_grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             preferred_tile_sched_params, preferred_max_active_clusters
@@ -3269,7 +3424,10 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         fallback_cluster_shape_mnl = (*fallback_cluster_shape_mn, 1)
 
         fallback_tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, fallback_cluster_shape_mnl
+            num_ctas_mnl,
+            fallback_cluster_shape_mnl,
+            swizzle_size,
+            raster_along_m,
         )
         fallback_grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             fallback_tile_sched_params, fallback_max_active_clusters
