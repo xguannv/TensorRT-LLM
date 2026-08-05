@@ -378,6 +378,8 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    mamba_metadata_cls: type | None = None
+
     @staticmethod
     def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
         """Whether the checkpoint stores a quantized lm_head (a weight scale).
