@@ -593,11 +593,13 @@ public:
             auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
             const CUfunction func = findIter->second.mDeviceFunction;
 
-            // mGroupsHeadsQ and mGroupsTokensHeadsQ are part of the hashID, so the matched cubin
-            // already agrees with the AutoTuner decision. Re-assign from kernelMeta anyway to keep
-            // options authoritative w.r.t. the actual cubin used for setKernelParams.
+            // mGroupsHeadsQ, mGroupsTokensHeadsQ, and mNumInsts{Q,Kv} are part of the hashID, so the
+            // matched cubin already agrees with the AutoTuner decision. Re-assign from kernelMeta
+            // anyway to keep options authoritative w.r.t. the actual cubin used for setKernelParams.
             options.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
             options.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
+            options.mNumInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
+            options.mNumInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
 
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
@@ -667,7 +669,7 @@ private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool fp16Softmax,
-        bool usesSpcompress, bool groupsHeadsQ, bool groupsTokensHeadsQ) const
+        bool usesSpcompress, bool groupsHeadsQ, bool groupsTokensHeadsQ, int numInstsQ, int numInstsKv) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -681,6 +683,10 @@ private:
         TLLM_CHECK_WITH_INFO((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
             "The tileSizeQ and tileSizeKv must be power of 2.");
         TLLM_CHECK_WITH_INFO(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
+        // Only (1,1), (2,1), and (1,2) are supported by FmhaOptions.
+        TLLM_CHECK_WITH_INFO(
+            (numInstsQ == 1 || numInstsQ == 2) && (numInstsKv == 1 || numInstsKv == 2) && (numInstsQ * numInstsKv <= 2),
+            "Expect numInstsQ/Kv in {(1,1),(2,1),(1,2)}, got numInstsQ=%d, numInstsKv=%d", numInstsQ, numInstsKv);
         // Format of the hash key:
         // Bit 0  - 3 : qkvLayout.
         // Bit 4  - 7 : maskType.
@@ -701,6 +707,8 @@ private:
         // Bit 59 - 59: usesSpcompress.
         // Bit 60 - 60: groupsHeadsQ.
         // Bit 61 - 61: groupsTokensHeadsQ.
+        // Bit 62 - 62: (numInstsQ == 2). Distinguishes Q128Kv256 vs Q256Kv128 cubins that share tile sizes.
+        // Bit 63 - 63: (numInstsKv == 2).
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -711,16 +719,24 @@ private:
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
             | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(fp16Softmax) << 58)
             | (static_cast<uint64_t>(usesSpcompress) << 59) | (static_cast<uint64_t>(groupsHeadsQ) << 60)
-            | (static_cast<uint64_t>(groupsTokensHeadsQ) << 61);
+            | (static_cast<uint64_t>(groupsTokensHeadsQ) << 61) | (static_cast<uint64_t>(numInstsQ == 2) << 62)
+            | (static_cast<uint64_t>(numInstsKv == 2) << 63);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
     {
+        TLLM_CHECK_WITH_INFO(kernelMeta.mTileSizeQ > 0 && kernelMeta.mTileSizeKv > 0
+                && kernelMeta.mStepQ % kernelMeta.mTileSizeQ == 0 && kernelMeta.mStepKv % kernelMeta.mTileSizeKv == 0,
+            "Invalid step/tile sizes in FMHA kernel meta: stepQ=%d tileSizeQ=%d stepKv=%d tileSizeKv=%d",
+            kernelMeta.mStepQ, kernelMeta.mTileSizeQ, kernelMeta.mStepKv, kernelMeta.mTileSizeKv);
+        int const numInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
+        int const numInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
             kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mFp16Softmax,
-            kernelMeta.mUsesSpcompress, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ);
+            kernelMeta.mUsesSpcompress, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ, numInstsQ,
+            numInstsKv);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -750,20 +766,21 @@ private:
             + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible) + ", fp16Softmax="
             + std::to_string(options.mFp16Softmax) + ", usesSpcompress=" + std::to_string(options.mUsesSpcompress)
-            + ", groupsHeadsQ=" + std::to_string(options.mGroupsHeadsQ)
-            + ", groupsTokensHeadsQ=" + std::to_string(options.mGroupsTokensHeadsQ)
+            + ", groupsHeadsQ=" + std::to_string(options.mGroupsHeadsQ) + ", groupsTokensHeadsQ="
+            + std::to_string(options.mGroupsTokensHeadsQ) + ", numInstsQ=" + std::to_string(options.mNumInstsQ)
+            + ", numInstsKv=" + std::to_string(options.mNumInstsKv)
             + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(options.mFusesDsv4InvRopeFp8Quant);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
-        return std::make_pair(
-            hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
-                static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
-                static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
-                static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
-                static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
-                static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mFp16Softmax,
-                options.mUsesSpcompress, options.mGroupsHeadsQ, options.mGroupsTokensHeadsQ),
+        return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
+                                  static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
+                                  static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
+                                  static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
+                                  static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
+                                  static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible,
+                                  options.mFp16Softmax, options.mUsesSpcompress, options.mGroupsHeadsQ,
+                                  options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv),
             info);
     }
 
@@ -1316,11 +1333,12 @@ private:
             + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible)
             + ", fp16Softmax=" + std::to_string(selectKernelParams.mFp16Softmax)
-            + ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress)
+            + ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) + ", numInstsQ=1, numInstsKv=1"
             + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mDsv4EpilogueFusion.enabled);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
+        // Legacy path: SelectKernelParams has no numInsts fields; default to (1,1).
         return std::make_pair(
             hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(selectKernelParams.mMaskType),
                 static_cast<int>(selectKernelParams.mKernelType), static_cast<int>(selectKernelParams.mTileScheduler),
@@ -1329,7 +1347,8 @@ private:
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
                 selectKernelParams.mSkipsSoftmaxWhenPossible, selectKernelParams.mFp16Softmax,
-                selectKernelParams.mUsesSpcompress, /* groupsHeadsQ */ false, /* groupsTokensHeadsQ */ false),
+                selectKernelParams.mUsesSpcompress, /* groupsHeadsQ */ false, /* groupsTokensHeadsQ */ false,
+                /* numInstsQ */ 1, /* numInstsKv */ 1),
             info);
     }
 
