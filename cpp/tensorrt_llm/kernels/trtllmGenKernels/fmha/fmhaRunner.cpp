@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
     mTotalDeviceMemory = totalMemory;
     TLLM_CHECK_WITH_INFO(mTotalDeviceMemory > 0, "Total device memory is invalid");
     mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeK, mDtypeV, mDtypeOut, mSM, numEltsPerSageAttnBlkQ,
-        numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
+        numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, mFusesDsv4InvRopeFp8Quant);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

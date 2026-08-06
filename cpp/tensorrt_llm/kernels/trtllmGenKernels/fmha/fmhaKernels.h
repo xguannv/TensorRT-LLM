@@ -213,8 +213,9 @@ public:
                 // Make sure the hashIds are not duplicated.
                 // Except for the case where we have both family version and specific version of the same config.
                 auto const hash = hashID(kernelMeta);
-                auto it = mFunctions.find(hash);
-                if (it != mFunctions.end())
+                auto& functions = getFunctions(kernelMeta.mFusesDsv4InvRopeFp8Quant);
+                auto it = functions.find(hash);
+                if (it != functions.end())
                 {
                     auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
                     TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
@@ -227,7 +228,7 @@ public:
                 }
                 else
                 {
-                    mFunctions[hash] = funcInfo;
+                    functions[hash] = funcInfo;
                 }
             }
         }
@@ -302,7 +303,8 @@ public:
         algoFilterForCubinPath(options);
         auto [hashId, info] = hashFromFmhaOptions(options);
 
-        if (mFunctions.find(hashId) == mFunctions.end())
+        auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant);
+        if (functions.find(hashId) == functions.end())
         {
             TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
             return std::make_pair(false, info);
@@ -475,6 +477,15 @@ public:
         {
             return;
         }
+
+        // Keep the additional fail-fast validation Rubin-only so other architectures retain their existing behavior.
+        // The output and scale-buffer shape are already validated by the Python caller; the inverse-RoPE cache has no
+        // equivalent guard before reaching this ABI boundary.
+        if (mSM == kSM_107 && params.mDsv4EpilogueFusion.enabled)
+        {
+            TLLM_CHECK_WITH_INFO(params.mDsv4EpilogueFusion.cosSinCache != nullptr,
+                "SM107 DSV4 FMHA epilogue fusion requires a non-null inverse-RoPE cos/sin cache.");
+        }
         runJITWarmupGridIfRequested(params);
 
         int32_t ctaDim = 512;
@@ -573,9 +584,10 @@ public:
             auto [hashId, info] = hashFromFmhaOptions(options);
 
             // load from cubin
-            auto const findIter = mFunctions.find(hashId);
+            auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant);
+            auto const findIter = functions.find(hashId);
             // Add debug info when kernels are not found.
-            TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "Trtllm-gen kernels not found: " + info);
+            TLLM_CHECK_WITH_INFO(findIter != functions.end(), "Trtllm-gen kernels not found: " + info);
 
             auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
             const CUfunction func = findIter->second.mDeviceFunction;
@@ -736,7 +748,8 @@ private:
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible) + ", fp16Softmax="
             + std::to_string(options.mFp16Softmax) + ", usesSpcompress=" + std::to_string(options.mUsesSpcompress)
             + ", groupsHeadsQ=" + std::to_string(options.mGroupsHeadsQ)
-            + ", groupsTokensHeadsQ=" + std::to_string(options.mGroupsTokensHeadsQ);
+            + ", groupsTokensHeadsQ=" + std::to_string(options.mGroupsTokensHeadsQ)
+            + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(options.mFusesDsv4InvRopeFp8Quant);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
         return std::make_pair(
@@ -942,6 +955,11 @@ private:
         fmhaData.mScales.outputScaleD = params.outputScalePtr;
         fmhaData.mScales.kvSfScaleD = params.kvSfScalePtr;
         fmhaData.mScales.oSfScaleD = params.oSfScalePtr;
+        if (params.mDsv4EpilogueFusion.enabled)
+        {
+            fmhaData.mInputBuffers.dsv4InvRopeCosSinCacheD = params.mDsv4EpilogueFusion.cosSinCache;
+            fmhaData.mScales.dsv4OScaleFp32D = static_cast<float*>(params.oSfPtr);
+        }
         // Sage Attention scaling factors
         fmhaData.mScales.sageAttnSfsQPtrD = params.sageAttnSfsQPtr;
         fmhaData.mScales.sageAttnSfsKPtrD = params.sageAttnSfsKPtr;
@@ -1082,6 +1100,12 @@ private:
         if (options.mQkvLayout != QkvLayout::PackedQkv)
         {
             options.mSupportsDiffSeqLensForQAndKv = true;
+        }
+        if (params.mDsv4EpilogueFusion.enabled)
+        {
+            options.mFusesDsv4InvRopeFp8Quant = true;
+            options.mDtypeOut = tg::Dtype::E4m3;
+            options.mDsv4ScaleBufM = params.mDsv4EpilogueFusion.scaleBufM;
         }
 
         // Enables the optimization to skip the correction step when possible.
@@ -1288,7 +1312,8 @@ private:
             + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible)
             + ", fp16Softmax=" + std::to_string(selectKernelParams.mFp16Softmax)
-            + ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
+            + ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress)
+            + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mDsv4EpilogueFusion.enabled);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
@@ -1362,7 +1387,20 @@ private:
         CUfunction mDeviceFunction;
     };
 
-    std::unordered_map<uint64_t, KernelInfo> mFunctions;
+    using KernelMap = std::unordered_map<uint64_t, KernelInfo>;
+
+    KernelMap& getFunctions(bool fusesDsv4InvRopeFp8Quant)
+    {
+        return fusesDsv4InvRopeFp8Quant ? mDsv4FusedFunctions : mFunctions;
+    }
+
+    KernelMap const& getFunctions(bool fusesDsv4InvRopeFp8Quant) const
+    {
+        return fusesDsv4InvRopeFp8Quant ? mDsv4FusedFunctions : mFunctions;
+    }
+
+    KernelMap mFunctions;
+    KernelMap mDsv4FusedFunctions;
 
     FmhaInterface mFmhaInterface{false, 1};
 };
@@ -1376,7 +1414,8 @@ public:
 
     KernelType* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
         Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
-        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0,
+        bool fusesDsv4InvRopeFp8Quant = false)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
@@ -1385,7 +1424,7 @@ public:
             "SageAttention allows numEltsPerSageAttnBlk up to 64.");
 
         auto const id = hashID(dtypeQ, dtypeK, dtypeV, dtypeOut, sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK,
-            numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
+            numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, fusesDsv4InvRopeFp8Quant);
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
@@ -1414,8 +1453,8 @@ private:
     TllmFmhaKernelFactory() = default;
 
     inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm,
-        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
-        int numEltsPerSageAttnBlkV) const
+        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
+        bool fusesDsv4InvRopeFp8Quant) const
     {
         auto const computeLog2BlockSizePlus1 = [](int blockSize) -> int
         {
@@ -1436,12 +1475,14 @@ private:
         // Bit 35 - 37: log2NumEltsPerSageAttnBlkK + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkK is 64.
         // Bit 38 - 40: log2NumEltsPerSageAttnBlkP + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkP is 64.
         // Bit 41 - 43: log2NumEltsPerSageAttnBlkV + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkV is 64.
+        // Bit 44 - 44: fusesDsv4InvRopeFp8Quant.
         return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeK) << 20
             | static_cast<uint64_t>(dtypeV) << 24 | static_cast<uint64_t>(dtypeOut) << 28
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkQ)) << 32)
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkK)) << 35)
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkP)) << 38)
-            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41);
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41)
+            | (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 44);
     }
 
     std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
@@ -1449,13 +1490,14 @@ private:
 
 inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
     unsigned int sm, int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
-    int numEltsPerSageAttnBlkV = 0)
+    int numEltsPerSageAttnBlkV = 0, bool fusesDsv4InvRopeFp8Quant = false)
 {
 
 #ifndef EXCLUDE_SM_100F
     return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
         sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeK, dtypeV, dtypeOut,
-        sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
+        sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV,
+        fusesDsv4InvRopeFp8Quant);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100F
