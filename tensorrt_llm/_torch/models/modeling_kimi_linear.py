@@ -102,6 +102,7 @@ from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -1332,9 +1333,9 @@ class KimiKDARuntime(nn.Module):
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
-        # index_copy_/index_select need int64 indices; the int64 mirror is
-        # prepared once per step by Mamba2Metadata.prepare() so KDA layers
-        # do not each replay an int32->int64 cast inside the decode graph.
+        # index_copy_/index_select need int64 indices; the K3 metadata prepares
+        # a mirror once per step so KDA layers do not each replay an
+        # int32-to-int64 cast inside the decode graph.
         state_indices = getattr(mamba_metadata, "state_indices_long", None)
         if state_indices is None or state_indices.shape[0] != batch_size:
             state_indices = mamba_metadata.state_indices[:batch_size].long()
@@ -1523,6 +1524,9 @@ class KimiKDARuntime(nn.Module):
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            chunk_indices=mamba_metadata.kda_chunk_indices,
+            varlen_is_aligned=mamba_metadata.kda_varlen_is_aligned,
+            single_sequence_length=mamba_metadata.kda_single_sequence_length,
         )
 
         # Persist per-request states into the pools.
@@ -2440,6 +2444,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     text backbone by the multimodal ``KimiK3ForConditionalGeneration`` wrapper
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
+
+    mamba_metadata_cls = KimiK3MambaMetadata
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
