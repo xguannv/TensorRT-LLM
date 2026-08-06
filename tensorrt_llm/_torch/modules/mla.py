@@ -257,7 +257,8 @@ class MLA(nn.Module):
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
         enable_ugpu_bf16_linear: bool = False,
-    ):
+        flashinfer_mla_backend: Optional[str] = None,
+    ) -> None:
         """
         Initialize the MLA module.
 
@@ -289,6 +290,9 @@ class MLA(nn.Module):
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
             enable_ugpu_bf16_linear (bool): Enable localized BF16 MLA projections.
+            flashinfer_mla_backend (Optional[str]): Generation backend for the
+                FlashInfer/TRTLLM-Gen MLA dispatcher. ``None`` preserves the
+                attention backend default.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -598,6 +602,7 @@ class MLA(nn.Module):
             dtype=dtype,
             aux_stream=mqa_aux_stream,
             rope_append=True,
+            flashinfer_mla_backend=flashinfer_mla_backend,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")

@@ -840,6 +840,33 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fp8_context_fmha=fp8_context_fmha,
         )
 
+        effective_mla_backend = self._get_effective_mla_backend(metadata, num_tokens)
+        if is_gen_only and attn.is_mla_enable and effective_mla_backend == "cute-dsl":
+            if metadata.kv_cache_manager is None:
+                raise RuntimeError("CuTeDSL MLA requires a paged KV cache manager.")
+            max_batch_size = metadata.max_num_sequences or metadata.max_num_requests
+            max_num_pages = metadata.kv_cache_manager.max_blocks_per_seq
+            tokens_per_block = metadata.tokens_per_block or 64
+            pages_per_superblock = 128 // tokens_per_block
+            padded_num_pages = (
+                math.ceil(max_num_pages / pages_per_superblock) * pages_per_superblock
+            )
+            _, _, buffer_metadata_size = _get_cute_dsl_mla_buffer_layout(
+                max_batch_size, padded_num_pages
+            )
+            assert self._multi_processor_count is not None
+            cute_dsl_workspace_size = _get_cute_dsl_mla_workspace_size(
+                max_batch_size,
+                max(1, attn.predicted_tokens_per_seq),
+                attn.num_heads,
+                int(attn.kv_lora_rank or 0),
+                self._multi_processor_count,
+            )
+            required_workspace_size = max(
+                required_workspace_size, buffer_metadata_size + cute_dsl_workspace_size
+            )
+            required_workspace_size = math.ceil(required_workspace_size / 4) * 4
+
         current_workspace_size = workspace.numel() * workspace.element_size()
         if current_workspace_size < required_workspace_size:
             if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
@@ -855,6 +882,25 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if counter_buffer is None:
             raise RuntimeError("The trtllm-gen multi-CTA KV counter buffer is not initialized.")
         return counter_buffer
+
+    def _get_effective_mla_backend(self, meta: "TrtllmAttentionMetadata", num_tokens: int) -> str:
+        """Select the MLA decode backend for the current scheduler batch.
+
+        CuTe-DSL reuses one staged page table across MLA layers for a
+        generation-only, one-token-per-request batch. A mixed
+        context/generation batch cannot use that reuse key, so selecting
+        CuTe-DSL would repeat the staging copies in every MLA layer and regress
+        time to first token. K3's 128 padded query heads also restrict the
+        CuTe-DSL kernel to one query token per request. Keep the requested
+        CuTe-DSL fast path for plain decode and use TRTLLM-Gen for mixed batches
+        and speculative multi-token verification.
+        """
+        is_single_token_generation = num_tokens == meta.num_generations
+        if self._mla_backend == "cute-dsl" and (
+            meta.num_contexts > 0 or not is_single_token_generation
+        ):
+            return "trtllm-gen"
+        return self._mla_backend
 
     @staticmethod
     def _compute_window_left(
@@ -1170,6 +1216,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
+        effective_mla_backend = self._get_effective_mla_backend(meta, params.num_tokens)
         if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
             raise NotImplementedError(
                 "Sliding-window attention is not supported by MLA decode path."
@@ -1195,6 +1242,18 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             batch_beam,  # batch_size
             params.attention_input.dtype,  # dtype
         )
+
+        pages_per_superblock = 128 // params.tokens_per_block
+        if pages_per_superblock > 1 and effective_mla_backend != "cute-dsl":
+            # The cute-dsl branch stages the page table into a
+            # zero-initialized workspace region already padded to
+            # ``padded_num_pages`` below, so padding here would launch a
+            # redundant device kernel per layer.
+            num_blocks = block_tables.size(-1)
+            remainder = num_blocks % pages_per_superblock
+            if remainder != 0:
+                pad = pages_per_superblock - remainder
+                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
 
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_nope_head_dim = attn.qk_nope_head_dim or 0
@@ -1239,7 +1298,51 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             )
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
-        workspace_buffer = params.workspace.view(-1, 4)
+        if effective_mla_backend == "cute-dsl":
+            padded_num_pages = (
+                math.ceil(block_tables.size(-1) / pages_per_superblock) * pages_per_superblock
+            )
+            # Every MLA layer of one forward step shares this metadata, its
+            # workspace, and (for a single paged pool) identical block tables
+            # and sequence lengths — so the staged copies are byte-identical
+            # across layers. Stage once per step: the first generation-only
+            # call copies, subsequent layers with a matching key skip the 3
+            # copy kernels. ``prepare()`` / ``update_spec_dec_param`` reset
+            # the key each step so eager forwards always re-stage; under CUDA
+            # graphs the first layer's captured copies replay once per step.
+            # The capture flag is part of the key: CUDA-graph capture is
+            # preceded by warmup forwards on the same metadata without an
+            # intervening prepare(), and the capture pass MUST re-record the
+            # staging copies (a skip would freeze stale page tables into the
+            # graph).
+            staging_key = (
+                torch.cuda.is_current_stream_capturing(),
+                params.workspace.data_ptr(),
+                block_tables.data_ptr(),
+                tuple(block_tables.shape),
+                params.sequence_lengths.data_ptr(),
+                params.seq_offset,
+                batch_beam,
+                padded_num_pages,
+            )
+            skip_staging_copy = (
+                meta.num_contexts == 0
+                and getattr(meta, "_cute_dsl_mla_staging_key", None) == staging_key
+            )
+            workspace_buffer, block_tables, sequence_lengths = _prepare_cute_dsl_mla_buffers(
+                params.workspace,
+                block_tables,
+                params.sequence_lengths,
+                padded_num_pages,
+                skip_copy=skip_staging_copy,
+            )
+            if meta.num_contexts == 0:
+                meta._cute_dsl_mla_staging_key = staging_key
+            uses_shared_paged_kv_idx = True
+        else:
+            sequence_lengths = params.sequence_lengths
+            workspace_buffer = params.workspace.view(-1, 4)
+            uses_shared_paged_kv_idx = self.USE_SHARED_PAGED_KV_IDX
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
@@ -1249,7 +1352,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_lora_rank,  # kv_lora_rank
             qk_rope_head_dim,  # qk_rope_head_dim
             block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
+            sequence_lengths,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
             params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
@@ -1258,8 +1361,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.attention_sinks,  # sinks
             None,  # skip_softmax_threshold_scale_factor
             self._enable_pdl,  # enable_pdl
-            "trtllm-gen",  # backend
-            True,  # is_var_seq
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            backend=effective_mla_backend,
+            is_var_seq=True,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cute_dsl_impl="monolithic",
+            multi_ctas_kv_counter_buffer=(
+                self._get_multi_ctas_kv_counter_buffer()
+                if effective_mla_backend == "trtllm-gen"
+                else None
+            ),
         )

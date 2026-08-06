@@ -12,6 +12,22 @@ from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
 )
 
 
+class _AttentionStub:
+    def __init__(
+        self,
+        *,
+        is_mla_enable: bool,
+        has_fp8_kv_cache: bool,
+        flashinfer_mla_backend: str = "trtllm-gen",
+    ) -> None:
+        self.is_mla_enable = is_mla_enable
+        self.has_fp8_kv_cache = has_fp8_kv_cache
+        self.flashinfer_mla_backend = flashinfer_mla_backend
+        self.kv_lora_rank = 512 if is_mla_enable else None
+        self.head_dim = 576
+        self.v_head_dim = 512 if is_mla_enable else None
+
+
 def _get_total_num_blocks(manager: SimpleNamespace, kv_factor: int = 2) -> int:
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = kv_factor
@@ -96,3 +112,42 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
             forward_args=SimpleNamespace(),
             workspace=SimpleNamespace(),
         )
+
+
+def test_flashinfer_cute_dsl_mla_backend_rejects_fp8_kv_cache() -> None:
+    attn = _AttentionStub(
+        is_mla_enable=True,
+        has_fp8_kv_cache=True,
+        flashinfer_mla_backend="cute-dsl",
+    )
+
+    with pytest.raises(ValueError, match="does not support FP8 KV cache"):
+        FlashInferTrtllmGenFmha(attn)
+
+
+@pytest.mark.parametrize(
+    ("requested_backend", "num_contexts", "num_generations", "num_tokens", "expected_backend"),
+    [
+        ("cute-dsl", 0, 4, 4, "cute-dsl"),
+        ("cute-dsl", 1, 3, 4, "trtllm-gen"),
+        ("cute-dsl", 0, 4, 8, "trtllm-gen"),
+        ("trtllm-gen", 1, 3, 4, "trtllm-gen"),
+    ],
+)
+def test_flashinfer_mla_backend_falls_back_for_mixed_batches(
+    requested_backend: str,
+    num_contexts: int,
+    num_generations: int,
+    num_tokens: int,
+    expected_backend: str,
+) -> None:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._mla_backend = requested_backend
+
+    assert (
+        fmha._get_effective_mla_backend(
+            SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations),
+            num_tokens,
+        )
+        == expected_backend
+    )
