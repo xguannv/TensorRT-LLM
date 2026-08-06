@@ -480,6 +480,105 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
 
 
 @pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
+@pytest.mark.parametrize("m", [1, 128])
+def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
+    """Validate production decode shapes, including CUDA Graph replay."""
+    num_heads, head_dim, nope_dim, k = 16, 512, 448, 1536
+    n = num_heads * head_dim
+    eps = 1e-6
+    torch.random.manual_seed(17)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / k**0.5
+
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(a)
+    ref_a_fp8, ref_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a, use_ue8m0=True)
+    a_sf_k128 = ref_a_sf[:, :m].t().contiguous().float()
+    assert torch.equal(a_fp8.view(torch.uint8), ref_a_fp8.view(torch.uint8))
+    b_fp8, b_sf_k128 = per_block_cast_to_fp8_e8m0(b)
+    b_sf = fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(b_sf_k128,
+                                                                   mn=n,
+                                                                   k=k)
+
+    position_ids = torch.arange(m, dtype=torch.int32, device="cuda")
+    cu_q_seqlens = torch.tensor([0, m], dtype=torch.int32, device="cuda")
+    kv_cache_lengths = torch.tensor([m], dtype=torch.int32, device="cuda")
+    quant_scale_qkv = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    rope_dim = head_dim - nope_dim
+    freq_idx = torch.arange(0, rope_dim, 2, dtype=torch.float32, device="cuda")
+    inv_freq = 1.0 / (10000.0**(freq_idx / rope_dim))
+    angles = torch.outer(position_ids.float(), inv_freq)
+    duplicated_angles = torch.cat([angles, angles], dim=-1)
+    cos_sin_cache = torch.stack(
+        [duplicated_angles.cos(),
+         duplicated_angles.sin()], dim=-1).contiguous()
+
+    def run_fusion():
+        return torch.ops.trtllm.cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+            a_fp8,
+            b_fp8,
+            a_sf,
+            b_sf,
+            cos_sin_cache,
+            cu_q_seqlens,
+            kv_cache_lengths,
+            position_ids,
+            quant_scale_qkv,
+            eps,
+        )
+
+    run_fusion()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run_fusion()
+    quant_scale_qkv.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output) == 0
+    quant_scale_qkv.fill_(1.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    output = output.view(m, num_heads, head_dim)
+
+    a_scale = a_sf_k128.repeat_interleave(128, dim=1)[:, :k]
+    b_scale = b_sf_k128.repeat_interleave(128, dim=0)[:n].repeat_interleave(
+        128, dim=1)[:, :k]
+    q_proj = ((a_fp8.float() * a_scale) @ (b_fp8.float() * b_scale).t()).to(
+        torch.bfloat16)
+    q_proj = q_proj.view(m, num_heads, head_dim).float()
+    inv_rms = torch.rsqrt(q_proj.square().mean(dim=-1, keepdim=True) + eps)
+    normed = q_proj * inv_rms
+
+    expected_nope = normed[..., :nope_dim].to(torch.float8_e4m3fn)
+    q_pe = normed[..., nope_dim:].to(torch.bfloat16).float()
+    coefficient = cos_sin_cache[position_ids.long(), :rope_dim //
+                                2].unsqueeze(1)
+    q0, q1 = q_pe[..., 0::2], q_pe[..., 1::2]
+    cos, sin = coefficient[..., 0], coefficient[..., 1]
+    rotated = torch.stack([cos * q0 - sin * q1, cos * q1 + sin * q0],
+                          dim=-1).flatten(-2)
+    expected_rope = rotated.to(torch.bfloat16).to(torch.float8_e4m3fn)
+    expected = torch.cat([expected_nope, expected_rope], dim=-1)
+
+    torch.testing.assert_close(
+        output[..., :nope_dim].float(),
+        expected[..., :nope_dim].float(),
+        rtol=0.25,
+        atol=2.0**-8,
+    )
+    torch.testing.assert_close(
+        output[..., nope_dim:].float(),
+        expected[..., nope_dim:].float(),
+        rtol=0.25,
+        atol=2.0**-5,
+    )
+
+
+@pytest.mark.skipif(
     not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
     reason="The test requires internal CuTe DSL support.",
 )

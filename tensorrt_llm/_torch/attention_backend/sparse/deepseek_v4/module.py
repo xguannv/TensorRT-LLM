@@ -11,6 +11,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, AttentionMetadata
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.modules.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mla import (
     _cute_dsl_fp8_bmm_out,
@@ -442,6 +444,108 @@ def _is_fused_q_fp8_quant_enabled(
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
 
+def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+) -> bool:
+    """Whether q_b can use the SM107 GEMM, norm, and RoPE fusion."""
+    if os.environ.get("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", "0") == "1":
+        return False
+    num_contexts = attn_metadata.num_contexts
+    num_generations = attn_metadata.num_generations
+    if num_contexts > 0 and num_generations > 0:
+        return False
+    if not _is_fused_q_fp8_quant_enabled(
+        self, num_generations=num_generations, num_contexts=num_contexts
+    ):
+        return False
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+        return False
+    if self.apply_rotary_emb or position_ids is None:
+        return False
+    if q.dtype != torch.bfloat16 or q.dim() != 2 or not q.is_contiguous():
+        return False
+    if q.shape != (attn_metadata.num_tokens, self.q_lora_rank):
+        return False
+    if position_ids.numel() != q.shape[0] or position_ids.device != q.device:
+        return False
+    attention_backend = getattr(self.mqa, "attn", self.mqa)
+    if not isinstance(attention_backend, TrtllmAttention):
+        return False
+    if self.q_b_proj.bias is not None or self.q_b_proj.lora is not None:
+        return False
+    if getattr(self.q_b_proj, "_ugpu_weight_shards", None) is not None:
+        return False
+    if not self.q_b_proj.has_fp8_block_scales:
+        return False
+    if not (self.q_b_proj.use_cute_dsl_blockscaling_mm or self.q_b_proj.disable_deep_gemm):
+        return False
+    if self.q_b_proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    if self.q_b_proj.weight_scale.dtype != torch.uint8:
+        return False
+    if self.q_b_proj.weight.shape != (
+        self.num_heads_tp * self.qk_head_dim,
+        self.q_lora_rank,
+    ):
+        return False
+    if self.q_lora_rank % 128 != 0:
+        return False
+    cu_q_seqlens = attn_metadata.cu_q_seqlens
+    if cu_q_seqlens is None and num_contexts == 0:
+        generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+        if generation_cu_seqlens is not None:
+            cu_q_seqlens = generation_cu_seqlens[: num_generations + 1]
+    kv_cache_lengths = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+    if cu_q_seqlens is None or kv_cache_lengths is None:
+        return False
+    if cu_q_seqlens.numel() != kv_cache_lengths.numel() + 1:
+        return False
+    if cu_q_seqlens.dtype != torch.int32 or kv_cache_lengths.dtype != torch.int32:
+        return False
+    if cu_q_seqlens.device != q.device or kv_cache_lengths.device != q.device:
+        return False
+    return kv_cache_lengths.numel() <= 128
+
+
+def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse FP8 q_b GEMM, per-head RMSNorm, RoPE, and output quantization."""
+    assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
+    if getattr(self, "_quant_scale_qkv", None) is None:
+        self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
+    q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
+    position_ids_i32 = position_ids.reshape(-1)
+    if position_ids_i32.dtype != torch.int32:
+        position_ids_i32 = position_ids_i32.to(torch.int32)
+    attention_backend = getattr(self.mqa, "attn", self.mqa)
+    attention_backend._ensure_rope_table_size(attn_metadata.max_seq_len)
+    quant_q_buffer = torch.ops.trtllm.cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+        q_fp8,
+        self.q_b_proj.weight,
+        q_scale,
+        self.q_b_proj.weight_scale,
+        attention_backend.rotary_cos_sin,
+        (
+            attn_metadata.cu_q_seqlens
+            if attn_metadata.cu_q_seqlens is not None
+            else attn_metadata.cu_seq_lens_cuda[: attn_metadata.num_generations + 1]
+        ),
+        attn_metadata.kv_lens_cuda_runtime,
+        position_ids_i32,
+        self._quant_scale_qkv,
+        float(self.q_b_layernorm.variance_epsilon),
+    )
+    placeholder_q = q.new_empty((q.shape[0], self.num_heads_tp * self.qk_head_dim))
+    return placeholder_q, quant_q_buffer, self._quant_scale_qkv
+
+
 def _is_fused_prologue_active(
     self: MLA, *, num_contexts: int, num_generations: int, rope_specs: list
 ) -> bool:
@@ -661,13 +765,17 @@ def forward_generation_sparse_attn(
     fused_q_fp8_pe = getattr(self, "_fused_q_pe", None)
     fused_q_fp8_buf = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_fp8_scale = getattr(self, "_quant_scale_qkv", None)
+    fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
-        fused_q_fp8_pe is not None and fused_q_fp8_buf is not None and fused_q_fp8_scale is not None
+        fused_q_fp8_buf is not None
+        and fused_q_fp8_scale is not None
+        and (fused_q_fp8_pe is not None or fused_q_rope_applied)
     )
     if use_fused_q_fp8:
         # Suffix slice: the Q branch ran over the whole batch.
-        gen_offset = fused_q_fp8_pe.shape[0] - num_tokens
-        q_pe = fused_q_fp8_pe[gen_offset:]
+        gen_offset = fused_q_fp8_buf.shape[0] - num_tokens
+        if not fused_q_rope_applied:
+            q_pe = fused_q_fp8_pe[gen_offset:]
 
     num_seqs = attn_metadata.num_seqs
 
@@ -718,7 +826,7 @@ def forward_generation_sparse_attn(
     _kv_hoisted = getattr(self, "_fused_kv_norm_hoisted", False)
     # q_b_layernorm already rotated the rope segment into the FP8 Q buffer, so no Q
     # work is left -- but the KV half still runs, hence kv_only.
-    _q_rope_done = use_fused_q_fp8 and _fused_kv_norm
+    _q_rope_done = use_fused_q_fp8 and (fused_q_rope_applied or _fused_kv_norm)
     assert not (_q_rope_done and not precomputed_cu_seqlens), (
         "fused Q RoPE drops the kernel that fills cu_q_seqlens; "
         "attention metadata must precompute them"
@@ -744,6 +852,7 @@ def forward_generation_sparse_attn(
             # Non-None tells the launcher q_nope is already FP8, so it drops the q_nope
             # quantize rows (1024 of 1161 at head_num 128) from the grid.
             quant_scale_qkv=quant_scale_qkv,
+            q_rope_applied=fused_q_rope_applied,
             kv_only=_q_rope_done and not _kv_hoisted,
             precomputed_cu_seqlens=precomputed_cu_seqlens,
             # `_deepseek_v4_local_to_global_kernel` emits the tile counter and bmm
@@ -826,11 +935,14 @@ def forward_context_sparse_attn(
     quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_pe = getattr(self, "_fused_q_pe", None)
     quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
+    fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
-        quant_q_buffer is not None and fused_q_pe is not None and quant_scale_qkv is not None
+        quant_q_buffer is not None
+        and quant_scale_qkv is not None
+        and (fused_q_pe is not None or fused_q_rope_applied)
     )
     if use_fused_q_fp8:
-        q_pe = fused_q_pe[:num_tokens]
+        q_pe = None if fused_q_rope_applied else fused_q_pe[:num_tokens]
         quant_q_buffer = quant_q_buffer[:num_tokens].view(
             num_tokens,
             self.num_heads_tp,
@@ -1073,6 +1185,21 @@ def forward_sparse_attn(
         )
 
     def _q_branch():
+        self._fused_q_rope_applied = False
+        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
+            self, q, position_ids, attn_metadata
+        ):
+            assert position_ids is not None
+            placeholder_q, quant_q_buffer, quant_scale_qkv = (
+                _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
+                    self, q, position_ids, attn_metadata
+                )
+            )
+            self._fused_quant_q_buffer = quant_q_buffer
+            self._fused_q_pe = None
+            self._fused_q_rope_applied = True
+            self._quant_scale_qkv = quant_scale_qkv
+            return placeholder_q
         if _use_q_b_cute:
             q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
             # The context path detects fusion from these buffers, so clear stale state.
@@ -1237,6 +1364,7 @@ def forward_sparse_attn(
     # generation half.
     self._fused_quant_q_buffer = None
     self._fused_q_pe = None
+    self._fused_q_rope_applied = False
     self._fused_q_rope_cos_sin = None
     self._fused_q_rope_specs_cached = []
     self._fused_kv_norm_active = False

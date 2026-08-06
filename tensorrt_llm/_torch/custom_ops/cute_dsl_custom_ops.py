@@ -8989,6 +8989,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             Sm107BlockScaledPersistentDenseGemmMixedClustersKernel)
         from ..cute_dsl_kernels.rubin.dense_gemm_persistent import \
             SM107PersistentDenseGemmKernel
+        from ..cute_dsl_kernels.rubin.dsv4_qb_fusion.kernel import \
+            compile as compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant
 
         # Rubin (SM107) FP8 blockwise GEMM
         # ====================================================================
@@ -10325,6 +10327,128 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
+            mutates_args=(),
+            device_types="cuda",
+        )
+        def cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            cu_q_seqlens: torch.Tensor,
+            kv_cache_lengths: torch.Tensor,
+            position_ids: torch.Tensor,
+            quant_scale_qkv: torch.Tensor,
+            eps: float,
+        ) -> torch.Tensor:
+            """Run the SM107 DSv4 q_b GEMM + RMSNorm + RoPE + FP8 fusion."""
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"DSv4 q_b GEMM fusion requires SM107, got SM{sm_version}.")
+            if input.dim() != 2 or weight.dim() != 2:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects 2D input and weight")
+            if input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects FP8 E4M3 input and weight")
+            if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects UE8M0 uint8 scales")
+            if input.shape[1] != weight.shape[1] or input.shape[1] % 128 != 0:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion requires matching K dimensions divisible by 128"
+                )
+            if weight.shape[0] % 512 != 0:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion requires N divisible by 512")
+            if not input.is_contiguous() or not weight.is_contiguous():
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects contiguous input and weight")
+            if not input_scale.is_contiguous(
+            ) or not weight_scale.is_contiguous():
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects contiguous scale buffers")
+            if cos_sin_cache.dtype != torch.float32 or cos_sin_cache.numel(
+            ) % 128 != 0:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects an FP32 cos/sin cache with 128 floats per position"
+                )
+            if cu_q_seqlens.dtype != torch.int32 or kv_cache_lengths.dtype != torch.int32:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects int32 sequence metadata")
+            if cu_q_seqlens.numel() != kv_cache_lengths.numel() + 1:
+                raise ValueError(
+                    "cu_q_seqlens must contain batch_size + 1 entries")
+            if kv_cache_lengths.numel() > 128:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion supports at most 128 sequences")
+            if position_ids.dtype != torch.int32 or position_ids.numel(
+            ) != input.shape[0]:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects one int32 position per token")
+            if quant_scale_qkv.dtype != torch.float32 or quant_scale_qkv.numel(
+            ) < 1:
+                raise ValueError(
+                    "quant_scale_qkv must be a non-empty FP32 tensor")
+
+            output = input.new_empty((input.shape[0], weight.shape[0]),
+                                     dtype=torch.float8_e4m3fn)
+            compiled = compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+                mma_inst_tile=(256, 256),
+                cluster_shape_mn=(4, 2),
+                fallback_cluster_shape_mn=(2, 1),
+                store_mode="stg256",
+                swizzle_size=1,
+                raster_along_m=True,
+                with_quant_scale=True,
+            )
+
+            from cutlass.cute.runtime import from_dlpack
+
+            def _from_dlpack(tensor: torch.Tensor, alignment: int = 16):
+                return from_dlpack(tensor,
+                                   assumed_align=alignment,
+                                   enable_tvm_ffi=True)
+
+            compiled(
+                _from_dlpack(input),
+                _from_dlpack(
+                    input_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                _from_dlpack(weight),
+                _from_dlpack(
+                    weight_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                _from_dlpack(output, 32),
+                _from_dlpack(cos_sin_cache.reshape(1, -1)),
+                _from_dlpack(cu_q_seqlens, 4),
+                _from_dlpack(kv_cache_lengths, 4),
+                _from_dlpack(position_ids.reshape(-1), 4),
+                _from_dlpack(quant_scale_qkv.reshape(-1), 4),
+                eps,
+                cuda.CUstream(
+                    torch.cuda.current_stream(input.device).cuda_stream),
+            )
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            cu_q_seqlens: torch.Tensor,
+            kv_cache_lengths: torch.Tensor,
+            position_ids: torch.Tensor,
+            quant_scale_qkv: torch.Tensor,
+            eps: float,
+        ) -> torch.Tensor:
+            return input.new_empty((input.shape[0], weight.shape[0]),
+                                   dtype=torch.float8_e4m3fn)
 
         # a/b: fp4, scale: fp8, output: bf16 - Rubin (SM107) variant
         @torch.library.custom_op(

@@ -2825,6 +2825,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_only: bool = False,
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
+        q_rope_applied: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2904,4 +2905,5 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_only,
             kv_done_elsewhere,
             quant_scale_qkv,
+            q_rope_applied,
         )
