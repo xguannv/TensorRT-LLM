@@ -69,7 +69,10 @@ from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
-from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
+    NVLinkOneSided,
+    _use_cft_for_combine_payload,
+)
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashinfer import (
     NVLinkTwoSidedFlashinfer,
@@ -86,6 +89,23 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+def test_cft_combine_disabled_for_low_precision(hidden_size):
+    """moe_a2a_combine rejects CFT counted writes together with low-precision
+    combine, so the payload gate has to turn CFT off before we get there.
+
+    Single-process and CPU-only on purpose: the gate is a pure function, and the
+    combination it guards otherwise only shows up as a TORCH_CHECK abort deep in
+    a multi-rank run.
+    """
+    payload = torch.empty((1, 1, hidden_size), dtype=torch.bfloat16)
+
+    assert not _use_cft_for_combine_payload(True, payload, use_low_precision=True)
+    # Same payload without low-precision stays on CFT, so the gate is not just
+    # returning False for everything.
+    assert _use_cft_for_combine_payload(True, payload, use_low_precision=False)
 
 # ============================================================================
 # Constants

@@ -102,8 +102,30 @@ def _use_cft_for_combine_payload(
 ) -> bool:
     if not use_cft:
         return False
-    wire_element_size = 1 if use_low_precision else payload.element_size()
-    bytes_per_token = payload.shape[-1] * wire_element_size
+    if use_low_precision:
+        # WORKAROUND -- DELETE THIS BRANCH when d3ce546876 ("Add scale-free FP8
+        # combine to CFT counted-writes", on feat/rubin-bringup) is ported here.
+        #
+        # This branch is not fixing a bug in this function. The rest of it is
+        # already written for the two coexisting: `use_low_precision` exists to
+        # give the alignment check the right wire element size (1 byte on the
+        # wire when low-precision), and feat/rubin-bringup runs that code
+        # unchanged. What this branch works around is that only half of that
+        # design reached this branch -- the Python arrived, the C++ did not, so
+        # moe_a2a_combine still carries
+        #     TORCH_CHECK(!(useLowPrecision && useCftCountedWrites))
+        # and every rank aborts in executor init.
+        #
+        # Leaving this in after the port would silently disable FP8 CFT combine:
+        # no error, no log beyond the line below, just a slower path.
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: low-precision combine is enabled, and "
+            "this branch's moe_a2a_combine does not support the two together. "
+            "Falling back to fence-based combine.",
+            key="moe_a2a_cft_combine_low_precision",
+        )
+        return False
+    bytes_per_token = payload.shape[-1] * payload.element_size()
     if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
         tllm_logger.warning_once(
             "CFT counted writes disabled: combine payload has "

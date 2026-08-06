@@ -190,9 +190,17 @@ VENV=${TRTLLM_VENV:-$REPO/.venv-3.12}
 #   footprint and KV budget: drafter weights, capture buffer, and DFlash
 #   context-KV slots leave less headroom than the SA config assumes
 #   (0.25/8192 OOM'd in warmup on GB300).
+#
+# KV_FRAC is 0.35 because the V2 KV-cache manager needs more than 0.25 gives.
+# At 0.25 executor init dies outright: "The V2 Mamba GPU cache quota is too
+# small for live recurrent states and attention pages: got 13945790848 bytes,
+# need at least 15453388800 bytes". 0.30 clears that check but leaves so little
+# room that no request is ever scheduled -- the engine comes up, accepts all
+# requests and then produces nothing until the job hits its time limit. 0.35 is
+# the first value measured to run GSM8K to completion (Rubin/SM107, 16 GPU).
 MAX_BATCH_SIZE=32
 MAX_NUM_TOKENS=8192
-KV_FRAC=0.25
+KV_FRAC=0.35
 KV_REUSE_ARG="--disable_kv_cache_reuse"
 case "$MODE" in
     sa)
