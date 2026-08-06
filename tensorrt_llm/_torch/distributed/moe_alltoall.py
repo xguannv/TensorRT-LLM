@@ -366,6 +366,7 @@ class MoeAlltoAll:
         self.mnnvl_mem = workspace_entry["mnnvl_mem"]
         self.workspace = workspace_entry["workspace"]
         self.metainfo = workspace_entry["metainfo"]
+        self._workspace_entry = workspace_entry
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
@@ -469,11 +470,11 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank)
         can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
             can_use_cft_for_dispatch, input_payloads)
-        # Auto-initialize CFT LEs on first dispatch only
-        if self.can_use_cft_counted_writes and not getattr(
-                MoeAlltoAll, '_cft_initialized', False):
+        # Auto-initialize one CFT LE per shared workspace on first dispatch.
+        if self.can_use_cft_counted_writes and not self._workspace_entry.get(
+                "cft_initialized", False):
             self.cft_initialize()
-            MoeAlltoAll._cft_initialized = True
+            self._workspace_entry["cft_initialized"] = True
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
             assert eplb_local_stats.dim(

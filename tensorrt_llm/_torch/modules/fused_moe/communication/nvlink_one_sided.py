@@ -475,9 +475,7 @@ class NVLinkOneSided(Communication):
 
         # Initialize CFT Logical Endpoints by binding the LE to the workspace.
         # The LE IS the workspace — no separate allocation or payload layout needed.
-        if self.can_use_cft_counted_writes and not getattr(
-            NVLinkOneSided, "_cft_initialized", False
-        ):
+        if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
             torch.ops.trtllm.moe_a2a_cft_initialize(
                 self.workspace,
                 self.mnnvl_mem.local_mem_handle,
@@ -485,10 +483,7 @@ class NVLinkOneSided(Communication):
                 self.ep_rank,
                 self.ep_size,
             )
-            NVLinkOneSided._cft_initialized = True
-            from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
-
-            MoeAlltoAll._cft_initialized = True
+            workspace_state["cft_initialized"] = True
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -530,11 +525,13 @@ class NVLinkOneSided(Communication):
             NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
         else:
             NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
-            workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
-            if NVLinkOneSided._WORKSPACE is workspace_state:
-                NVLinkOneSided._WORKSPACE = None
-            if workspace_state is not None:
-                workspace_state.clear()
+            workspace_state = NVLinkOneSided._WORKSPACES.get(workspace_key)
+            if workspace_state is None or not workspace_state.get("cft_initialized", False):
+                workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
+                if NVLinkOneSided._WORKSPACE is workspace_state:
+                    NVLinkOneSided._WORKSPACE = None
+                if workspace_state is not None:
+                    workspace_state.clear()
 
         self.mnnvl_mem = None
         self.workspace = None
