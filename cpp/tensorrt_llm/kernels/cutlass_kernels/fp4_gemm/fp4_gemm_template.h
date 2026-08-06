@@ -449,7 +449,7 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
     }
     else if constexpr (fp4GemmType == FP4GemmType::W8A8_MXFP8_MXFP8)
     {
-        if (mSm == 100 || mSm == 103)
+        if (tk::isSM100Family(mSm))
         {
             return dispatchMXFP8xMXFP8GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
                 batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
