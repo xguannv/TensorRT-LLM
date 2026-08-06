@@ -58,9 +58,9 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     if (mUseTllmGen)
     {
         auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV, mFixedParams.dataTypeOut,
-                mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0, mFixedParams.sageBlockSizeV));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV,
+            mFixedParams.dataTypeOut, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
+            mFixedParams.sageBlockSizeV, mFixedParams.fusesDsv4InvRopeFp8Quant));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");

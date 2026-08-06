@@ -30,7 +30,8 @@ namespace kernels
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
-    int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV)
+    int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
+    bool fusesDsv4InvRopeFp8Quant)
     : mSM(tensorrt_llm::common::getSMVersion())
     , mDtypeQ(dtypeQ)
     , mDtypeK(dtypeK)
@@ -40,6 +41,7 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_ty
     , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
     , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
     , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
+    , mFusesDsv4InvRopeFp8Quant(fusesDsv4InvRopeFp8Quant)
 {
     TLLM_CHECK_WITH_INFO(tensorrt_llm::common::isSM100Family(mSM), "Unsupported architecture");
 #ifdef TRTLLM_FAKE_RUBIN

@@ -3157,7 +3157,8 @@ int AttentionOp::initialize() noexcept
                 }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
-                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, kvDataType, outputDataType));
+                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+                    qDataType, kvDataType, kvDataType, outputDataType, 0, 0, 0, 0, mFusesDsv4InvRopeFp8Quant));
             }
             else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {
