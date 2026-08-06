@@ -542,6 +542,7 @@ public:
 
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
+        fmha::checkSkipCorrThreshold(options, fmhaData.mMetaData.skipCorrThreshold);
 
         if (shouldUseNvrtc(options))
         {
@@ -613,13 +614,15 @@ public:
                 fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
                 fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
                 fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
-                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
-                fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
-                options.mUsesSharedPagedKvIdx);
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mMetaData.skipCorrThreshold,
+                fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
+                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
-            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+            float const softmaxPScale
+                = fmha::getSoftmaxPScale(fmha::getDtypeBmm2(options), kernelParams.mSkipCorrThreshold);
+            runFmhaReduction(kernelMeta, kernelParams, softmaxPScale, params.mMultiProcessorCount, params.stream);
         }
     }
 
@@ -946,6 +949,7 @@ private:
         fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
+        fmhaData.mMetaData.skipCorrThreshold = params.mSkipCorrThreshold;
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
 
         // Fill Scales

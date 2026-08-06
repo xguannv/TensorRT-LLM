@@ -173,6 +173,9 @@ inline bool isTokenSparse(SparseType sparseType)
     return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
 }
 
+// The threshold-enabled E4M3 P scale is 1.75, and 1.75 * 2^8 equals the E4M3 maximum of 448.
+inline constexpr float kDsv4SkipCorrThreshold = 8.0F;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 enum class TileScheduler
@@ -354,6 +357,8 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
+    // Skip correction when the running row max increase does not exceed this threshold.
+    float mSkipCorrThreshold{0.0F};
     // Sparse attention type.
     SparseType mSparseAttention;
     // The top k value for sparse attention.

@@ -58,9 +58,9 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     if (mUseTllmGen)
     {
         auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
-        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV,
-            mFixedParams.dataTypeOut, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
-            mFixedParams.sageBlockSizeV));
+        mTllmGenFMHARunner.reset(
+            new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV, mFixedParams.dataTypeOut,
+                mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0, mFixedParams.sageBlockSizeV));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -286,6 +286,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
             if (useDynamicSparseMLA)
             {
+                tllmRunnerParams.mSkipCorrThreshold = kDsv4SkipCorrThreshold;
                 TLLM_CHECK_WITH_INFO(runnerParams.sparse_params.sliding_window_kv_cache_pool != nullptr,
                     "SWA KV pool must be set for dynamic sparse MLA.");
                 // Dynamic sparse MLA always has an SWA pool. The compressed pool is optional; when it

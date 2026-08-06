@@ -67,6 +67,14 @@ inline bool usesKOnlyTransformPipeline(FmhaOptions_ const& options) {
          options.mDtypeV == tg::Dtype::E4m3 && tg::isArchBlackwell(options.mCudaArch);
 }
 
+// The dtype used by the softmax output P and V operands of BMM2.
+template <typename FmhaOptions_>
+inline tg::Dtype getDtypeBmm2(FmhaOptions_ const& options)
+{
+  return usesKOnlyTransformPipeline(options) ? options.mDtypeV
+                                             : (options.mDtypeK != options.mDtypeQ ? options.mDtypeQ : options.mDtypeV);
+}
+
 // Whether the kernel is a Blackwell BF16Q+FP8KV generation kernel.
 template <typename FmhaOptions_> inline bool isBf16QFp8KvGeneration(FmhaOptions_ const& options) {
   return !isContextKernel(options.mFmhaKernelType) && options.mDtypeQ == tg::Dtype::Bfloat16 &&
@@ -322,7 +330,21 @@ struct KernelConfig : public KernelConfigBase {
         // {$nv-internal-release begin}
 #ifdef TLLM_RUBIN_FEATURES
         if (tg::isArchRubin(options.mCudaArch)) {
-          mNumStagesKv = int32_t{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+            int32_t const numStagesKvDeep{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+            int32_t const estimatedNumBytesPerRowSmemQ{
+                ceilDiv(tg::dtypeGetNumBits(mDtypeQ) * mHeadDimQk / 8, 128) * 128};
+            int64_t const estimatedNumBytesSmemQ{int64_t{mNumStagesQ} * mTileSizeQ * estimatedNumBytesPerRowSmemQ};
+            int64_t const estimatedNumBytesSmemKvDeep{
+                numStagesKvDeep * calculateSmemKvStageBytes(mDtypeQ, options.mClusterDimX)};
+            // Keep Q+KV within 200 KiB, reserving space below Rubin's 227-KiB normal dynamic-SMEM
+            // limit for page offsets, epilogue buffers, and barriers. Larger unsplit tiles retain the
+            // four-stage default instead of entering the 328-KiB oversized mode with only 8 KiB L1.
+            bool const fitsDeepKvPipelineSmemBudget{
+                estimatedNumBytesSmemQ + estimatedNumBytesSmemKvDeep <= int64_t{200} * 1024};
+            if (fitsDeepKvPipelineSmemBudget)
+            {
+                mNumStagesKv = numStagesKvDeep;
+            }
         }
 #endif // TLLM_RUBIN_FEATURES
        // {$nv-internal-release end}
@@ -569,10 +591,9 @@ struct MmaTraits {
   // The constructor.
   template <typename FmhaOptions_>
   MmaTraits(FmhaOptions_ const& options)
-    : mDtypeBmm1{options.mDtypeQ}
-    , mDtypeBmm2(usesKOnlyTransformPipeline(options)
-                   ? options.mDtypeV
-                   : (options.mDtypeK != options.mDtypeQ ? options.mDtypeQ : options.mDtypeV)) {
+      : mDtypeBmm1{options.mDtypeQ}
+      , mDtypeBmm2{getDtypeBmm2(options)}
+  {
 
     // Whether to use 2-CTA mode for UTCMMA.
     mUseUtcmma2CtaMode = options.mClusterDimX == 2;

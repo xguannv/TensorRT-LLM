@@ -1241,6 +1241,7 @@ int AttentionOp::mlaGeneration(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
             if (useDynamicSparseMLA)
             {
+                tllmRunnerParams.mSkipCorrThreshold = kDsv4SkipCorrThreshold;
                 TLLM_CHECK_WITH_INFO(mRuntimeSparseAttentionParams.sliding_window_kv_cache_pool != nullptr,
                     "SWA KV pool must be set for dynamic sparse MLA.");
                 // Dynamic sparse MLA always has an SWA pool. The compressed pool is optional; when it

@@ -248,6 +248,29 @@ inline bool hasOutputSfs(tg::Dtype dtype) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Check whether the runtime skip-correction threshold is valid for the selected kernel.
+inline void checkSkipCorrThreshold(FmhaOptions const& options, float skipCorrThreshold)
+{
+  TLLM_CHECK_ERROR(skipCorrThreshold >= 0.f, "skipCorrThreshold must be non-negative.");
+  TLLM_CHECK_ERROR(skipCorrThreshold <= 0.f || options.mSkipsCorrWhenPossible,
+      "A positive skipCorrThreshold requires skipsCorrWhenPossible.");
+
+  if (skipCorrThreshold > 0.f)
+  {
+    auto const dtypeBmm2 = getDtypeBmm2(options);
+    TLLM_CHECK_ERROR(dtypeBmm2 != tg::Dtype::E2m1, "Threshold-based correction skipping does not support E2M1 BMM2.");
+    if (dtypeBmm2 == tg::Dtype::E4m3)
+    {
+        // A skipped correction can increase the scaled P value by up to 2^threshold. The
+        // threshold-enabled P scale is 1.75, and 1.75 * 2^8 == 448, the E4M3 maximum, making 8 the
+        // recommended threshold.
+        TLLM_CHECK_ERROR(skipCorrThreshold <= 8.f, "skipCorrThreshold must be <= 8 for E4M3 BMM2.");
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Check if the options are valid or not.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {

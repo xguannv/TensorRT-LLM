@@ -471,6 +471,17 @@ template <> inline std::string toString(MmaOrder e) {
 
 #endif // !TLLM_FMHA_TRTLLM_COMPAT (enum types, toString, helpers)
 
+__host__ __device__ inline float getSoftmaxPScale(tg::Dtype dtypeBmm2,
+                                                  float skipCorrThreshold = 0.f) {
+  if (dtypeBmm2 != tg::Dtype::E4m3) {
+    return 1.f;
+  }
+  // A skipped correction can increase the scaled P value by up to 2^threshold. At threshold 8,
+  // 1.75 * 2^8 == 448, the E4M3 maximum. Preserve the legacy 448 scale when threshold-based
+  // correction skipping is disabled at runtime.
+  return skipCorrThreshold > 0.f ? 1.75f : 448.f;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
 // KernelConfigBase: Base class shared between FmhaOptions and KernelConfig.

@@ -556,6 +556,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
        // {$nv-internal-release end}
                          params.mScaleSoftmaxLog2,
                          params.mInflateMax,
+                         params.mSkipCorrThreshold,
                          params.mScaleSfKv,
                          params.mScaleSfO,
                          params.mStartTokenIdxSfO,
@@ -611,6 +612,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
        // {$nv-internal-release end}
                                     float softmaxScale,
                                     float inflateMax,
+                                    float skipCorrThreshold,
                                     float kvSfScale,
                                     float oSfScale,
                                     int32_t startTokenIdxSfO,
@@ -858,6 +860,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   params.mBatchSize = options.mBatchSize;
 
   params.mInflateMax = inflateMax;
+  params.mSkipCorrThreshold = skipCorrThreshold;
 
   // Compute the logs for the numbers of elements in the Sage Attention blocks.
   int32_t logNumEltsPerSageAttnBlkK{-1};
@@ -982,6 +985,7 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     int*,
                                     float2*,
                                     void*,
+                                    float,
                                     float,
                                     float,
                                     float,
