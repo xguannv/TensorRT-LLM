@@ -857,6 +857,25 @@ class Sender(SenderBase):
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
 
+            # Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
+            # _create_kv_slice, so dst must not exceed src. A smaller dst
+            # (generation prefix-cache reuse) is handled via dst_start below.
+            block_diff = dst_block_ids.size - src_block_ids.size
+            if block_diff > 0:
+                # A windowed receiver keeps a larger window when only it runs
+                # speculative decoding, so its suffix starts earlier. Drop the
+                # extra head: dst_start is derived from len(dst), so trimming
+                # the tail instead would shift every block by block_diff.
+                peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
+                peer_window = getattr(peer_lg_info, "sliding_window_size", None)
+                if peer_window is not None and task._beam_width <= 1:
+                    dst_block_ids = dst_block_ids[block_diff:]
+                else:
+                    raise ValueError(
+                        f"src/dst block count mismatch: {src_block_ids.size} vs "
+                        f"{dst_block_ids.size} (dst must not exceed src)"
+                    )
+
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
             slice_end = token_range.end if token_range is not None else 0
