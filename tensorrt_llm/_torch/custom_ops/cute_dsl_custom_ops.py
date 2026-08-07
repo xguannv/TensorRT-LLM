@@ -40,6 +40,7 @@ except ImportError:
 
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
+_CUDA_MAX_GRID_DIM_Z = 65_535
 
 
 def _with_input_cuda_device(function):
@@ -430,6 +431,22 @@ def get_dense_gemm_approximate_cta_nums(
     clustered_ctas_m = pad_up(ceil_div(M, tile_m), cluster_m)
     clustered_ctas_n = pad_up(ceil_div(N, tile_n), cluster_n)
     return clustered_ctas_m * clustered_ctas_n
+
+
+def _clc_raster_n_has_launchable_grid(
+    m: int,
+    n: int,
+    batch_size: int,
+    mma_tiler_mn: Tuple[int, int],
+    use_2cta_instrs: bool,
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a CLC raster-N launch fits CUDA's grid-Z limit."""
+    cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
+    num_ctas = get_dense_gemm_approximate_cta_nums(
+        m, n, (cta_tile_m, mma_tiler_mn[1]), cluster_shape_mn)
+    num_clusters = (num_ctas * batch_size) // math.prod(cluster_shape_mn)
+    return num_clusters <= _CUDA_MAX_GRID_DIM_Z
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -9704,6 +9721,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             cluster_shape_mn,
                     ):
                         for scheduler_mode in self.scheduler_mode_candidates:
+                            if (scheduler_mode == "clc_dynamic"
+                                    and raster_order == "n"
+                                    and not _clc_raster_n_has_launchable_grid(
+                                        kernel_m,
+                                        kernel_n,
+                                        batch_size,
+                                        mma_tiler_mnk[:2],
+                                        mma_inst_m == 256,
+                                        cluster_shape_mn,
+                                    )):
+                                continue
                             valid_tactics.append(
                                 ("base", mma_tiler_mnk, mma_inst_shape,
                                  cluster_shape_mn, swap_ab, use_prefetch,
