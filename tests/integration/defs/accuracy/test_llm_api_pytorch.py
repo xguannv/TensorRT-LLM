@@ -4458,6 +4458,40 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
                 acceptance_length)
 
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_dep8_megamoe_cutedsl(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)
