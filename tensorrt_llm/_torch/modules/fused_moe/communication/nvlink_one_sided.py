@@ -504,6 +504,25 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    @classmethod
+    def _release_workspace(cls, workspace_key: Tuple[object, ...]) -> None:
+        """Release a shared workspace after its last communicator is destroyed."""
+        workspace_state = cls._WORKSPACES.get(workspace_key)
+        if workspace_state is None:
+            return
+
+        if workspace_state.get("cft_initialized", False):
+            # The C++ manager owns an LE bound to this allocation. Destroy it
+            # before clearing the final Python references to the MNNVL memory.
+            torch.ops.trtllm.moe_a2a_cft_release(
+                workspace_state["workspace"], workspace_state["ep_rank"]
+            )
+
+        cls._WORKSPACES.pop(workspace_key)
+        if cls._WORKSPACE is workspace_state:
+            cls._WORKSPACE = None
+        workspace_state.clear()
+
     def destroy(self):
         """Release this instance's reference to the shared symmetric workspace."""
         if getattr(self, "_destroyed", False):
@@ -525,13 +544,7 @@ class NVLinkOneSided(Communication):
             NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
         else:
             NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
-            workspace_state = NVLinkOneSided._WORKSPACES.get(workspace_key)
-            if workspace_state is None or not workspace_state.get("cft_initialized", False):
-                workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
-                if NVLinkOneSided._WORKSPACE is workspace_state:
-                    NVLinkOneSided._WORKSPACE = None
-                if workspace_state is not None:
-                    workspace_state.clear()
+            NVLinkOneSided._release_workspace(workspace_key)
 
         self.mnnvl_mem = None
         self.workspace = None

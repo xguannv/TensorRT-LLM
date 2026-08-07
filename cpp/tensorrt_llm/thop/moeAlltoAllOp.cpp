@@ -237,8 +237,11 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 using CftLeManager = tensorrt_llm::kernels::moe_comm::CftLeManager;
 
 // Each workspace has a distinct MNNVL allocation handle and needs its own LE.
-// Managers live for the process lifetime because the driver endpoint remains
-// bound to the workspace allocation.
+// An entry owns an endpoint bound to the workspace allocation, so it must be
+// erased before that allocation can be freed and its VA reused. The Python
+// NVLinkOneSided teardown calls moe_a2a_cft_release while the workspace is
+// still alive. MoeAlltoAll retains its shared workspaces for the process
+// lifetime, so those entries remain valid until static destruction.
 static std::unordered_map<CUdeviceptr, std::unique_ptr<CftLeManager>> g_cft_managers;
 
 static CftLeManager* getCftManager(CUdeviceptr workspaceRankPtr)
@@ -319,7 +322,21 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
             cudaGetErrorString(initErr));
     }
     tensorrt_llm::mpi::MpiComm::world().barrier();
-    g_cft_managers.emplace(workspaceRankPtr, std::move(manager));
+    g_cft_managers.insert_or_assign(workspaceRankPtr, std::move(manager));
+}
+
+// Release the CFT manager before the workspace allocation is freed. Erasing
+// the pointer-keyed entry destroys the endpoint and prevents a recycled VA
+// from resolving to a manager bound to an old allocation.
+void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
+{
+    CHECK_TH_CUDA(workspace);
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
+    TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "epRank must be in the range [0, epSize)");
+
+    CUdeviceptr workspaceRankPtr
+        = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
+    g_cft_managers.erase(workspaceRankPtr);
 }
 
 // MoE All-to-All Dispatch Operation
@@ -974,6 +991,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
     module.def(
         "moe_a2a_cft_initialize(Tensor workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
+    module.def("moe_a2a_cft_release(Tensor workspace, int ep_rank) -> ()");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None) -> Tensor");
@@ -998,4 +1016,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, module)
     module.impl(
         "moe_a2a_get_combine_payload_tensor", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetCombinePayloadTensorOp);
     module.impl("moe_a2a_cft_initialize", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftInitializeOp);
+    module.impl("moe_a2a_cft_release", &tensorrt_llm::torch_ext::moe_comm::moeA2ACftReleaseOp);
 }
