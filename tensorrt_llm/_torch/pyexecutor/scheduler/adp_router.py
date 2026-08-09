@@ -922,13 +922,16 @@ class ConversationAwareADPRouter(ADPRouter):
             max_num_active_requests,
         )
 
-        # 2) Loose soft cap for spreading new conversations across ranks; sticky
-        #    returns may exceed it (hard cap), so it is re-bumped after the loop.
+        # 2) Soft cap for spreading new conversations across ranks, clamped to
+        #    the per-rank seq-slot capacity: every placement path must respect
+        #    max_num_active_requests or a rank can be routed more requests than
+        #    it has slots (matches the Default and prefix routers).
         expected_num_active_requests = self._expected_num_active_requests(
             all_ranks_num_active_requests,
             len(remaining_unscheduled),
             tp_size,
             multiplier=self._fair_share_multiplier,
+            hard_cap=max_num_active_requests,
         )
 
         def _least_loaded(soft_cap: int) -> int:
