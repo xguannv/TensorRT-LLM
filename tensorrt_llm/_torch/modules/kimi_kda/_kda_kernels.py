@@ -62,8 +62,8 @@ def get_kda_sm_version() -> int:
 
 
 def is_kda_optimized_supported() -> bool:
-    """The optimized prefill/decode kernels are Blackwell sm_100 only."""
-    return get_kda_sm_version() in (100, 103)
+    """The optimized prefill/decode kernels need Blackwell sm_100 or Rubin sm_107."""
+    return get_kda_sm_version() in (100, 103, 107)
 
 
 # ---------------------------------------------------------------------------
