@@ -29,7 +29,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
-                      Fp4QuantizedTensor)
+                      Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from ..gated_mlp import GatedMLP
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
@@ -58,6 +58,16 @@ class RoutingParams:
     n_group: Optional[int]
     topk_group: Optional[int]
     routed_scaling_factor: Optional[float]
+
+
+# Read once at import, not per call. os._Environ has no own .get, so
+# MutableMapping.get raises and catches a KeyError on every lookup when the
+# variable is unset (the default) -- 679 ns/call measured, which is 62 us per
+# decode step across K3's 92 routed MoE layers. Workers receive their
+# environment at launch, so nothing needs a live re-read. Mirrors
+# FORCE_SEPARATED_ROUTING in moe_scheduler.py.
+_K3_DISABLE_FUSED_ROUTE_QUANT = os.environ.get(
+    "TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -111,6 +121,15 @@ class TRTLLMGenFusedMoE(MoE):
         QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
+
+    # One-shot process-global markers for the Kimi K3 fused route+quant path.
+    # Set on the class (not the instance) so the 92 routed-MoE layers emit one
+    # line between them, not 92. Guarding on these keeps the steady-state cost
+    # of the self-proof at one attribute load; the message and the failure
+    # reason are only ever built once. Under CUDA-graph replay this whole
+    # function is not executed at all, so the cost there is exactly zero.
+    _k3_route_quant_logged_on = False
+    _k3_route_quant_logged_off = False
 
     # Quantization algorithms that support full swiglu_gptoss_style.
     # FP8_BLOCK_SCALES supports the DSV4-style uniform swiglu_limit_scalar
@@ -680,6 +699,121 @@ class TRTLLMGenFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
+
+    def try_fused_kimi_route_quant(
+        self,
+        x: Union[torch.Tensor, MxFp8QuantizedTensor],
+        router_logits: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                        torch.Tensor]]:
+        """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
+
+        This launch-overhead optimization is deliberately specialized to the
+        K3 decode shape. Returning ``None`` keeps every other model, shape,
+        architecture, and op backend on the existing unfused path.
+        """
+        # get_sm_version() is deliberately last: it touches the CUDA driver,
+        # while everything before it is a dict lookup or an isinstance. Tests
+        # that stub the SM probe must be able to reach the cheap rejections
+        # without the probe running at all.
+        if (_K3_DISABLE_FUSED_ROUTE_QUANT
+                or isinstance(x, MxFp8QuantizedTensor)
+                or not self.has_w4a8_mxfp4_mxfp8
+                or not isinstance(self.op_backend, TRTLLMOpBackend)
+                or not isinstance(self.routing_method,
+                                  DeepSeekV3MoeRoutingMethod)
+                or not 100 <= get_sm_version() < 110):
+            if not TRTLLMGenFusedMoE._k3_route_quant_logged_off:
+                self._log_k3_route_quant_declined(x, router_logits)
+            return None
+
+        routing = self.routing_method.routing_impl
+        bias = self.routing_method.e_score_correction_bias
+        if (not routing.is_fused or routing.n_group != 1
+                or routing.topk_group != 1 or routing.top_k != 16
+                or router_logits.ndim != 2 or router_logits.shape[1] != 896
+                or router_logits.dtype != torch.float32
+                or not router_logits.is_contiguous()
+                or bias.dtype != torch.float32 or not bias.is_contiguous()
+                or x.ndim != 2 or x.shape != (router_logits.shape[0], 3584)
+                or not 0 < x.shape[0] <= 64 or x.dtype != torch.bfloat16
+                or not x.is_contiguous()):
+            if not TRTLLMGenFusedMoE._k3_route_quant_logged_off:
+                self._log_k3_route_quant_declined(x, router_logits)
+            return None
+
+        if not TRTLLMGenFusedMoE._k3_route_quant_logged_on:
+            TRTLLMGenFusedMoE._k3_route_quant_logged_on = True
+            logger.info(
+                "Kimi K3 fused route+MXFP8 quant ENABLED "
+                f"(SM{get_sm_version()}, num_tokens={x.shape[0]}); "
+                "expect kimi_k3_noaux_tc_mxfp8_quant_kernel to replace the "
+                "deepseek_v3_topk_kernel + MXFP8-quantize pair. "
+                "Set TLLM_K3_DISABLE_FUSED_ROUTE_QUANT=1 to fall back.")
+
+        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+            router_logits, bias, x, routing.routed_scaling_factor)
+
+    def _log_k3_route_quant_declined(self, x, router_logits) -> None:
+        """Report, once per process, why the fused route+quant path bailed out.
+
+        The predicates are re-walked here rather than in the hot ``or`` chains
+        so that the reason string costs nothing on the steady-state path: this
+        body runs at most once, and only after the fast chain has already
+        decided to decline.
+        """
+        if TRTLLMGenFusedMoE._k3_route_quant_logged_off:
+            return
+        TRTLLMGenFusedMoE._k3_route_quant_logged_off = True
+
+        # Same order as the fast chain, so the reported reason is the one that
+        # actually fired.
+        if _K3_DISABLE_FUSED_ROUTE_QUANT:
+            reason = "TLLM_K3_DISABLE_FUSED_ROUTE_QUANT=1"
+        elif isinstance(x, MxFp8QuantizedTensor):
+            # The K3 fused latent-down MXFP8 epilogue already quantized x.
+            # Only reachable when the MoE has no communication object.
+            reason = "input is already MxFp8QuantizedTensor (pre-quantized handoff)"
+        elif not self.has_w4a8_mxfp4_mxfp8:
+            reason = "quant algo is not W4A8_MXFP4_MXFP8"
+        elif not isinstance(self.op_backend, TRTLLMOpBackend):
+            reason = f"op backend is {type(self.op_backend).__name__}, not TRTLLMOpBackend"
+        elif not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+            reason = f"routing method is {type(self.routing_method).__name__}"
+        elif not 100 <= get_sm_version() < 110:
+            reason = f"SM{get_sm_version()} outside [100, 110)"
+        else:
+            routing = self.routing_method.routing_impl
+            bias = self.routing_method.e_score_correction_bias
+            checks = (
+                (not routing.is_fused, "routing_impl.is_fused is False"),
+                (routing.n_group != 1, f"n_group={routing.n_group} != 1"),
+                (routing.topk_group != 1,
+                 f"topk_group={routing.topk_group} != 1"),
+                (routing.top_k != 16, f"top_k={routing.top_k} != 16"),
+                (router_logits.ndim != 2 or router_logits.shape[1] != 896,
+                 f"router_logits shape {tuple(router_logits.shape)} is not [M, 896]"),
+                (router_logits.dtype != torch.float32,
+                 f"router_logits dtype {router_logits.dtype} != float32"),
+                (not router_logits.is_contiguous(),
+                 "router_logits is not contiguous"),
+                (bias.dtype != torch.float32,
+                 f"e_score_correction_bias dtype {bias.dtype} != float32"),
+                (not bias.is_contiguous(),
+                 "e_score_correction_bias is not contiguous"),
+                (x.ndim != 2 or x.shape != (router_logits.shape[0], 3584),
+                 f"x shape {tuple(x.shape)} is not [M, 3584]"),
+                (not 0 < x.shape[0] <= 64,
+                 f"num_tokens={x.shape[0]} outside (0, 64]"),
+                (x.dtype != torch.bfloat16, f"x dtype {x.dtype} != bfloat16"),
+                (not x.is_contiguous(), "x is not contiguous"),
+            )
+            reason = next((msg for failed, msg in checks if failed),
+                          "unknown (predicates re-evaluated as passing)")
+
+        logger.info(
+            f"Kimi K3 fused route+MXFP8 quant DISABLED: {reason}. "
+            "Falling back to separate routing + MXFP8 quantization.")
 
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
