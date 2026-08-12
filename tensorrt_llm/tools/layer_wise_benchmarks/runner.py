@@ -431,6 +431,16 @@ class Runner:
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
             load_format=load_format,
+            # Must agree with `mapping`, which the loader takes separately:
+            # to_mapping() derives world_size from tp*pp*cp, so the 1-GPU defaults
+            # reject every rank above 0.
+            tensor_parallel_size=mapping.tp_size,
+            pipeline_parallel_size=mapping.pp_size,
+            context_parallel_size=mapping.cp_size,
+            moe_expert_parallel_size=mapping.moe_ep_size,
+            moe_cluster_parallel_size=mapping.moe_cluster_size,
+            enable_attention_dp=mapping.enable_attention_dp,
+            gpus_per_node=mapping.gpus_per_node,
             **{} if use_cuda_graph else {"cuda_graph_config": None},
             moe_config=MoeConfig(
                 backend=moe_backend,
@@ -447,6 +457,11 @@ class Runner:
             ),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             use_cute_dsl_bf16_bmm=use_cute_dsl_bf16_bmm,
+        )
+        # Serving applies these in py_executor_creator; the harness builds llm_args
+        # by hand, so without this every model default is off here only.
+        llm_args = ModelLoader.load_config_and_apply_defaults(
+            pretrained_model_name_or_path, llm_args, checkpoint_loader
         )
         model_loader = ModelLoader(
             llm_args=llm_args,
@@ -482,13 +497,20 @@ class Runner:
                     )
                     residual = hidden_states
                 else:
-                    residual_fusion = "residual" in inspect.signature(layer.forward).parameters
-                    if residual_fusion:
+                    params = inspect.signature(layer.forward).parameters
+                    layer_kwargs = dict(kwargs)
+                    # Hashed MoE gates route on token ids, so plain decoder layers
+                    # need input_ids too, not just the MTP layers above.
+                    if "input_ids" in params:
+                        layer_kwargs["input_ids"] = input_ids
+                    if "residual" in params:
                         hidden_states, residual = layer(
-                            position_ids, hidden_states, attn_metadata, residual, **kwargs
+                            position_ids, hidden_states, attn_metadata, residual, **layer_kwargs
                         )
                     else:
-                        hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
+                        hidden_states = layer(
+                            position_ids, hidden_states, attn_metadata, **layer_kwargs
+                        )
             return hidden_states, residual
 
         model.forward = forward

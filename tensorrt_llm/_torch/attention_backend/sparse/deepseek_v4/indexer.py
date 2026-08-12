@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -130,6 +131,8 @@ class DeepseekV4Indexer(Indexer):
         return q
 
     def _is_fused_project_mxfp4_enabled(self, input_dtype: torch.dtype) -> bool:
+        if os.environ.get('TRTLLM_DISABLE_DSA_FUSED_INDEXER_Q', '0') == '1':
+            return False
         return (
             self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE
             and not HAS_FAST_HADAMARD
@@ -229,6 +232,7 @@ class DeepseekV4Indexer(Indexer):
         self,
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
+        start_event: Optional[torch.cuda.Event] = None,
     ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
         """Pre-launch the qr-independent half of the indexer prepare phase.
 
@@ -245,13 +249,11 @@ class DeepseekV4Indexer(Indexer):
         """
         if not (do_multi_stream() and self.aux_stream is not None):
             return None
-        # The CuTe DSL fused Q projection is not safe to run concurrently
-        # with the auxiliary compressor under CUDA graph replay.
-        if self._is_fused_project_mxfp4_enabled(hidden_states.dtype):
-            return None
-        self.indexer_start_event.record()
+        if start_event is None:
+            start_event = self.indexer_start_event
+            start_event.record()
         with torch.cuda.stream(self.aux_stream):
-            self.indexer_start_event.wait()
+            start_event.wait()
             weights = self.weights_proj(hidden_states)
             self.weights_proj_event.record()
             k_fp8, k_scale = self.compressor(hidden_states, metadata)
@@ -374,7 +376,7 @@ class DeepseekV4Indexer(Indexer):
         use_overlapped_prepare = (
             do_multi_stream()
             and self.aux_stream is not None
-            and not self._is_fused_project_mxfp4_enabled(qr.dtype)
+            and (pre_aux is not None or not self._is_fused_project_mxfp4_enabled(qr.dtype))
         )
         if use_overlapped_prepare:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(

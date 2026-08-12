@@ -465,7 +465,8 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
         return False
     if self.apply_rotary_emb or position_ids is None:
         return False
-    if q.dtype != torch.bfloat16 or q.dim() != 2 or not q.is_contiguous():
+    # q is the pre-q_a_layernorm split view; the kernel reads the norm output.
+    if q.dtype != torch.bfloat16 or q.dim() != 2:
         return False
     if q.shape != (attn_metadata.num_tokens, self.q_lora_rank):
         return False
@@ -510,6 +511,20 @@ def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
     return kv_cache_lengths.numel() <= 128
 
 
+def _dsv4_q_b_gemm_cu_q_seqlens(
+    self: MLA, attn_metadata: AttentionMetadata
+) -> Optional[torch.Tensor]:
+    if attn_metadata.cu_q_seqlens is not None:
+        return attn_metadata.cu_q_seqlens
+    if attn_metadata.num_contexts > 0:
+        prep_ctx = getattr(attn_metadata, 'mla_prepare_ctx_cu_seqlens', None)
+        return prep_ctx() if prep_ctx is not None else None
+    generation_cu_seqlens = getattr(attn_metadata, 'cu_seq_lens_cuda', None)
+    if generation_cu_seqlens is None:
+        return None
+    return generation_cu_seqlens[: attn_metadata.num_generations + 1]
+
+
 def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
     self: MLA,
     q: torch.Tensor,
@@ -518,6 +533,7 @@ def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse FP8 q_b GEMM, per-head RMSNorm, RoPE, and output quantization."""
     assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
+    assert q.is_contiguous(), 'fused q_b GEMM needs a contiguous q_lora'
     if getattr(self, "_quant_scale_qkv", None) is None:
         self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
     q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
@@ -532,11 +548,7 @@ def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
         q_scale,
         self.q_b_proj.weight_scale,
         attention_backend.rotary_cos_sin,
-        (
-            attn_metadata.cu_q_seqlens
-            if attn_metadata.cu_q_seqlens is not None
-            else attn_metadata.cu_seq_lens_cuda[: attn_metadata.num_generations + 1]
-        ),
+        _dsv4_q_b_gemm_cu_q_seqlens(self, attn_metadata),
         attn_metadata.kv_lens_cuda_runtime,
         position_ids_i32,
         self._quant_scale_qkv,
@@ -1053,23 +1065,27 @@ def forward_sparse_attn(
     _prelaunch_compressor = _use_indexer_overlap or (
         _v4_extra_overlap and do_multi_stream() and self.compressor_stream is not None
     )
-    if _prelaunch_compressor:
+    if _prelaunch_compressor or _use_indexer_overlap:
         self.dsv4_compressor_start_event.record()
+
+    q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
+        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
+    )
+
+    if _prelaunch_compressor:
         with torch.cuda.stream(self.compressor_stream):
             self.dsv4_compressor_start_event.wait()
             self.compressor(hidden_states, attn_metadata)
             if not _use_indexer_overlap:
                 self.dsv4_compressor_event.record()
 
-    # Precompute QR-independent indexer work while the caller stream prepares KV.
-    # Passing pre_aux later prevents the indexer from launching this work again.
     _indexer_pre_aux = None
     if _use_indexer_overlap:
-        _indexer_pre_aux = self.indexer.precompute_aux(hidden_states, attn_metadata)
-
-    q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
-        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
-    )
+        _indexer_pre_aux = self.indexer.precompute_aux(
+            hidden_states,
+            attn_metadata,
+            start_event=self.dsv4_compressor_start_event,
+        )
 
     # Fused kv-norm: the KV kernels apply kv_a_layernorm themselves, so skip the
     # standalone RMSNorm and the concat and hand them the RAW latent. Resolved here,
