@@ -34,9 +34,9 @@ LLM_DOCKER_IMAGE = env.dockerImage
 
 // RubinBringup CUDA13.4 images - architecture-specific
 // x86_64 version
-LLM_DOCKER_IMAGE_RUBIN_X86_64 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-x86_64-ubuntu24.04-trt10.16.1.11-20260724-upgraded"
+LLM_DOCKER_IMAGE_RUBIN_X86_64 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-x86_64-ubuntu24.04-trt10.16.1.11-20260627-upgraded"
 // aarch64 version
-LLM_DOCKER_IMAGE_RUBIN_AARCH64 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-sbsa-ubuntu24.04-trt10.16.1.11-20260724-upgraded"
+LLM_DOCKER_IMAGE_RUBIN_AARCH64 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-rubin-py3-sbsa-ubuntu24.04-trt10.16.1.11-20260627-upgraded"
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 
