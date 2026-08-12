@@ -1666,13 +1666,25 @@ class KimiKDARuntime(nn.Module):
             recurrent_in[~has_init] = 0
 
         q, conv_q = mixer.q_conv1d(
-            q_proj_states, cache=conv_q_in, output_final_state=True, cu_seqlens=cu_seqlens
+            q_proj_states,
+            cache=conv_q_in,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=mamba_metadata.kda_chunk_indices,
         )
         k, conv_k = mixer.k_conv1d(
-            k_proj_states, cache=conv_k_in, output_final_state=True, cu_seqlens=cu_seqlens
+            k_proj_states,
+            cache=conv_k_in,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=mamba_metadata.kda_chunk_indices,
         )
         v, conv_v = mixer.v_conv1d(
-            v_proj_states, cache=conv_v_in, output_final_state=True, cu_seqlens=cu_seqlens
+            v_proj_states,
+            cache=conv_v_in,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=mamba_metadata.kda_chunk_indices,
         )
 
         if self._bfa_proj_weight is not None:
