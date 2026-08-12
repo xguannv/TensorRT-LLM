@@ -483,10 +483,10 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
     getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",
 )
-@pytest.mark.parametrize("m", [1, 128])
+@pytest.mark.parametrize("m", [1, 32, 128, 192, 256])
 def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
     """Validate production decode shapes, including CUDA Graph replay."""
-    num_heads, head_dim, nope_dim, k = 16, 512, 448, 1536
+    num_heads, head_dim, nope_dim, k = 128, 512, 448, 1536
     n = num_heads * head_dim
     eps = 1e-6
     torch.random.manual_seed(17)
@@ -503,8 +503,17 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
                                                                    k=k)
 
     position_ids = torch.arange(m, dtype=torch.int32, device="cuda")
-    cu_q_seqlens = torch.tensor([0, m], dtype=torch.int32, device="cuda")
-    kv_cache_lengths = torch.tensor([m], dtype=torch.int32, device="cuda")
+    batch_size = min(m, 32)
+    tokens_per_sequence = torch.full((batch_size, ),
+                                     m // batch_size,
+                                     dtype=torch.int32,
+                                     device="cuda")
+    tokens_per_sequence[:m % batch_size] += 1
+    cu_q_seqlens = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        tokens_per_sequence.cumsum(0, dtype=torch.int32),
+    ])
+    kv_cache_lengths = tokens_per_sequence.clone()
     quant_scale_qkv = torch.ones(1, dtype=torch.float32, device="cuda")
 
     rope_dim = head_dim - nope_dim
@@ -530,8 +539,17 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
             eps,
         )
 
+    # Exercise the eager fallback first, then profile both registered tactics.
     run_fusion()
     torch.cuda.synchronize()
+    custom_op = "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant"
+    with autotune():
+        run_fusion()
+    torch.cuda.synchronize()
+    tuner = AutoTuner.get()
+    assert tuner.stats.tuned_op_profiled_configs.get(custom_op, 0) >= 4
+    assert not tuner.stats.failed_profiling_count.get(custom_op, set())
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run_fusion()

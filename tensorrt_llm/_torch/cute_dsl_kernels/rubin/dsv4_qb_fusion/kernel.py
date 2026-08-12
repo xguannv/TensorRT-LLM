@@ -90,10 +90,10 @@ K32 slots.
 from __future__ import annotations
 
 import os
-from functools import partial
 from typing import NamedTuple, Optional, Tuple
 
 import cuda.bindings.driver as cuda_driver
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -101,19 +101,24 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
+
+from cutlass._mlir import ir as mlir_ir
+from cutlass._mlir.dialects import llvm as mlir_llvm
 from cutlass._mlir.dialects import nvvm
-from cutlass.cute.arch import nvvm_wrappers as _arch_nvvm_wrappers
-from cutlass.cute.experimental import iket
+from cutlass._mlir.dialects import vector as mlir_vector
+from cutlass._mlir.dialects.nvvm import FPRoundingMode
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.common import CacheEvictionPriority
+from cutlass.utils.gemm import sm100 as gemm_sm100
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.utils.gemm import sm100 as gemm_sm100
 
 from .clc_tile_scheduler import (
     ClcDynamicPersistentTileScheduler,
     ClcDynamicPersistentTileSchedulerParams,
 )
+from cutlass.cute.experimental import iket
 
 DEFAULT_Q_LORA_RANK = 1536
 DEFAULT_NUM_Q_HEADS = 128
@@ -124,22 +129,128 @@ K_QUANT_BLOCK = 128
 HEAD_DIM = DEFAULT_QK_NOPE_HEAD_DIM + DEFAULT_QK_ROPE_HEAD_DIM
 
 
-def _fma_packed_bf16x2_nvvm(res, src_a, src_b, src_c, *, rnd=None, ftz=None, loc=None, ip=None):
-    del ftz
-    src_a_bf16x2 = _arch_nvvm_wrappers.cvt_f32x2_bf16x2(src_a, loc=loc, ip=ip)
-    return _arch_nvvm_wrappers.nvvm.fma_packed_f32x2_bf16x2_f32x2_f32x2(
-        res, src_a_bf16x2, src_b, src_c, rnd=rnd, loc=loc, ip=ip
+@dsl_user_op
+def _prmt_trunc_bf16x2(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Truncate two fp32 to bf16 and pack into one bf16x2 register.
+
+    A single PRMT selecting the high two bytes of each source
+    (selector 0x7632: result = [v0.b2, v0.b3, v1.b2, v1.b3]) -- the
+    same numerics as masking the low 16 mantissa bits (truncate
+    instead of rn), one instruction per pair, and no F2FP
+    conversion-pipe traffic.
+
+    NOTE: builds the vector<2xbf16> via cutlass._mlir plumbing
+    (llvm.bitcast) -- there is no public wrapper accepting a
+    pre-packed bf16x2 operand; revisit when one appears."""
+    packed_i32 = cute.arch.prmt(
+        v0.bitcast(cutlass.Int32, loc=loc, ip=ip),
+        v1.bitcast(cutlass.Int32, loc=loc, ip=ip),
+        cutlass.Int32(0x7632),
+        loc=loc,
+        ip=ip,
+    )
+    return mlir_llvm.bitcast(
+        mlir_ir.VectorType.get([2], cutlass.BFloat16.mlir_type, loc=loc),
+        packed_i32,
+        loc=loc,
+        ip=ip,
     )
 
 
-_fma_packed_f32x2_bf16x2_f32x2_f32x2 = getattr(
-    cute.arch,
-    "fma_packed_f32x2_bf16x2_f32x2_f32x2",
-    partial(
-        _arch_nvvm_wrappers.calc_packed_f32x2_op,
-        calc_func=_fma_packed_bf16x2_nvvm,
-    ),
-)
+@dsl_user_op
+def _prmt_trunc_bf16x2_neg_lo(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Like _prmt_trunc_bf16x2 but with the LOW bf16 half negated:
+    returns packed (-bf16(v0), bf16(v1)).
+
+    Used for the rope rotation's mixed-sign multiply: (x1, x0) *
+    (-sin, +sin) == (-x1, x0) * (sin, sin), which replaces the f32
+    sin negation (an FADD that LLVM hoists away from the FMA,
+    defeating ptxas's .NP-modifier folding) with one sign-bit LOP3 on
+    the packed operand and lets the b operand be a scalar broadcast."""
+    packed_i32 = cute.arch.prmt(
+        v0.bitcast(cutlass.Int32, loc=loc, ip=ip),
+        v1.bitcast(cutlass.Int32, loc=loc, ip=ip),
+        cutlass.Int32(0x7632),
+        loc=loc,
+        ip=ip,
+    )
+    negated = cute.arch.lop3(
+        cutlass.Int32(packed_i32),
+        cutlass.Int32(0x00008000),
+        cutlass.Int32(0),
+        0x3C,  # a XOR b
+        loc=loc,
+        ip=ip,
+    )
+    return mlir_llvm.bitcast(
+        mlir_ir.VectorType.get([2], cutlass.BFloat16.mlir_type, loc=loc),
+        negated.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _fma_packed_f32x2_bf16x2_f32x2_f32x2(
+    vec_a,
+    src_b,
+    src_c,
+    *,
+    loc=None,
+    ip=None,
+):
+    """fma_packed_f32x2_bf16x2_f32x2_f32x2 with a pre-packed bf16x2
+    src_a (vector<2xbf16> ir.Value), skipping the wrapper's per-element
+    f32->bf16 conversion (the F2FP)."""
+    vec_res_type = mlir_ir.VectorType.get(
+        [2], cutlass.Float32.mlir_type, loc=loc
+    )
+    vec_b = mlir_vector.from_elements(
+        vec_res_type,
+        tuple(v.ir_value(loc=loc, ip=ip) for v in src_b),
+        loc=loc,
+        ip=ip,
+    )
+    vec_c = mlir_vector.from_elements(
+        vec_res_type,
+        tuple(v.ir_value(loc=loc, ip=ip) for v in src_c),
+        loc=loc,
+        ip=ip,
+    )
+    rn = next(mode for mode in FPRoundingMode if str(mode) == "rn")
+    vec_res = nvvm.fma_packed_f32x2_bf16x2_f32x2_f32x2(
+        vec_res_type,
+        vec_a,
+        vec_b,
+        vec_c,
+        rnd=rn,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Float32(
+            mlir_vector.extract(
+                vec_res,
+                dynamic_position=[],
+                static_position=[i],
+                loc=loc,
+                ip=ip,
+            )
+        )
+        for i in range(2)
+    )
 
 
 class S2TCopyBundle(NamedTuple):
@@ -175,6 +286,7 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         rms_norm_eps: float = DEFAULT_RMS_NORM_EPS,
         max_batch: int = 128,
         tma_prefetch_dist: int = 0,
+        enable_pdl: bool = True,
     ):
         if int(max_batch) < 1:
             raise ValueError("max_batch must be >= 1")
@@ -182,11 +294,14 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         if int(tma_prefetch_dist) < 0:
             raise ValueError("tma_prefetch_dist must be >= 0")
         self.tma_prefetch_dist = int(tma_prefetch_dist)
+        self.enable_pdl = bool(enable_pdl)
         if tuple(mma_inst_tile) not in ((128, 256), (256, 256)):
             raise ValueError("mma_inst_tile must be (128, 256) or (256, 256)")
         mma_m = mma_inst_tile[0]
         self.use_2cta_instrs = mma_m == 256
-        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
         self.atom_thr_size = 2 if self.use_2cta_instrs else 1
         self.mma_inst_shape = (mma_m, 256, 64)
         self.mma_tiler = (mma_m, 512, 128)
@@ -196,13 +311,19 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         self.cluster_shape_mn = tuple(cluster_shape_mn)
         self._check_cluster(self.cluster_shape_mn, "cluster_shape_mn")
         self.fallback_cluster_shape_mn: Optional[Tuple[int, int]] = (
-            tuple(fallback_cluster_shape_mn) if fallback_cluster_shape_mn is not None else None
+            tuple(fallback_cluster_shape_mn)
+            if fallback_cluster_shape_mn is not None
+            else None
         )
         if self.fallback_cluster_shape_mn is not None:
             fb = self.fallback_cluster_shape_mn
             self._check_cluster(fb, "fallback_cluster_shape_mn")
             pref = self.cluster_shape_mn
-            if pref[0] % fb[0] or pref[1] % fb[1] or fb[0] * fb[1] >= pref[0] * pref[1]:
+            if (
+                pref[0] % fb[0]
+                or pref[1] % fb[1]
+                or fb[0] * fb[1] >= pref[0] * pref[1]
+            ):
                 raise ValueError(
                     "fallback cluster must divide the preferred shape per "
                     "dimension and be strictly smaller"
@@ -248,7 +369,8 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         )
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=2,
-            num_threads=self.threads_per_warp * len((self.mma_warp_id, *self.epilog_warp_id)),
+            num_threads=self.threads_per_warp
+            * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
         self.arch = "sm_107"
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
@@ -269,11 +391,12 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         self.f32_bytes = cutlass.Float32.width // 8
         self.i32_bytes = cutlass.Int32.width // 8
         self.rope_cache_row_floats = 2 * self.qk_rope_head_dim
-        self.rope_smem_row_words = self.qk_rope_head_dim
-        self.rope_cp_bytes = 16
-        self.rope_cp_chunks = (self.rope_smem_row_words * self.f32_bytes) // self.rope_cp_bytes
-        self.rope_rows_per_cp = 32 // self.rope_cp_chunks
-        self.rope_cp_iters = 32 // self.rope_rows_per_cp
+        self.rope_smem_row_words = self.qk_rope_head_dim // 2
+        self.rope_row_quads = self.qk_rope_head_dim // 4
+        self.rope_half_quads = self.rope_row_quads // 2
+        self.rope_ldg_row_threads = self.rope_half_quads
+        self.rope_ldg_rows_per_iter = 32 // self.rope_ldg_row_threads
+        self.rope_ldg_iters = 32 // self.rope_ldg_rows_per_iter
 
     def _check_cluster(self, shape_mn, name: str) -> None:
         cm, cn = shape_mn
@@ -356,8 +479,12 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             self.mma_tiler[2],
         )
 
-        a_one = sm100_utils.make_smem_layout_a(tiled_mma_akeep, self.mma_tiler, self.a_dtype, 1)
-        b_one = sm100_utils.make_smem_layout_b(tiled_mma_akeep, self.mma_tiler, self.b_dtype, 1)
+        a_one = sm100_utils.make_smem_layout_a(
+            tiled_mma_akeep, self.mma_tiler, self.a_dtype, 1
+        )
+        b_one = sm100_utils.make_smem_layout_b(
+            tiled_mma_akeep, self.mma_tiler, self.b_dtype, 1
+        )
         sfa_one = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma_akeep, self.mma_tiler, self.sf_vec_size, 1
         )
@@ -377,10 +504,14 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         )
         mbar_helpers_bytes = 1024 + batch_meta_bytes
         self.rope_smem_bytes = (
-            self.cta_tile_shape_mnk[0] * self.rope_smem_row_words * self.f32_bytes
+            self.cta_tile_shape_mnk[0]
+            * self.rope_smem_row_words
+            * self.f32_bytes
         )
         self.out_stage_bytes = (
-            self.out_ring_slots * self.cta_tile_shape_mnk[0] * self.out_plane_cols
+            self.out_ring_slots
+            * self.cta_tile_shape_mnk[0]
+            * self.out_plane_cols
             if self.use_tma_store
             else 0
         )
@@ -392,7 +523,8 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         ) // stage_bytes
         if os.environ.get("CUTE_DSL_DUMP_STAGES"):
             print(
-                f"[stages] num_ab_stage={self.num_ab_stage} stage_bytes={stage_bytes}",
+                f"[stages] num_ab_stage={self.num_ab_stage} "
+                f"stage_bytes={stage_bytes}",
                 flush=True,
             )
 
@@ -422,14 +554,20 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0)),
         )
         self.num_sfa_tmem_cols = (
-            cute.cosize(cute.recast_layout(32, self.sf_dtype.width, self.tCtSFA_layout))
+            cute.cosize(
+                cute.recast_layout(32, self.sf_dtype.width, self.tCtSFA_layout)
+            )
             & 0x0000FFFF
         )
         self.num_sfb_tmem_cols = (
-            cute.cosize(cute.recast_layout(32, self.sf_dtype.width, self.tCtSFB_layout))
+            cute.cosize(
+                cute.recast_layout(32, self.sf_dtype.width, self.tCtSFB_layout)
+            )
             & 0x0000FFFF
         )
-        self.num_accumulator_tmem_cols = cute.size(self.cta_tile_shape_mnk[1])
+        self.num_accumulator_tmem_cols = cute.size(
+            self.cta_tile_shape_mnk[1]
+        )
 
         rope_atom = tcgen05.make_smem_layout_atom(
             tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Float32
@@ -489,7 +627,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         rope_positions = cos_sin_cache.shape[1] // self.rope_cache_row_floats
 
         self._setup_attributes()
-        tiled_mma_akeep, tiled_mma_areuse, tiled_mma_sfb = self._make_tiled_mmas()
+        tiled_mma_akeep, tiled_mma_areuse, tiled_mma_sfb = (
+            self._make_tiled_mmas()
+        )
 
         a_tensor = cute.make_tensor(
             activation.iterator,
@@ -501,11 +641,15 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         )
         sfa_tensor = cute.make_tensor(
             activation_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(a_tensor.shape, self.sf_vec_size),
+            blockscaled_utils.tile_atom_to_shape_SF(
+                a_tensor.shape, self.sf_vec_size
+            ),
         )
         sfb_tensor = cute.make_tensor(
             weight_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(b_tensor.shape, self.sf_vec_size),
+            blockscaled_utils.tile_atom_to_shape_SF(
+                b_tensor.shape, self.sf_vec_size
+            ),
         )
         out_tensor = cute.make_tensor(
             out.iterator,
@@ -544,10 +688,18 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         else:
             fb_atoms, fb_tensors = pref_atoms, pref_tensors
 
-        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
-        sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+        a_smem_layout = cute.slice_(
+            self.a_smem_layout_staged, (None, None, None, 0)
+        )
+        b_smem_layout = cute.slice_(
+            self.b_smem_layout_staged, (None, None, None, 0)
+        )
+        sfa_smem_layout = cute.slice_(
+            self.sfa_smem_layout_staged, (None, None, None, 0)
+        )
+        sfb_smem_layout = cute.slice_(
+            self.sfb_smem_layout_staged, (None, None, None, 0)
+        )
         self.num_tma_load_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_layout)
             + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
@@ -581,14 +733,18 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         @cute.struct
         class SharedStorage:
             sRope: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(self.rope_smem_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(self.rope_smem_layout)
+                ],
                 1024,
             ]
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
-            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_clc_stage * 2]
+            clc_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_clc_stage * 2
+            ]
             clc_response: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, self.num_clc_stage * 4],
                 16,
@@ -605,26 +761,38 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             sOut: cute.struct.Align[
                 cute.struct.MemRange[
                     self.c_dtype,
-                    (cute.cosize(self.out_smem_layout_staged) if self.use_tma_store else 0),
+                    (
+                        cute.cosize(self.out_smem_layout_staged)
+                        if self.use_tma_store
+                        else 0
+                    ),
                 ],
                 1024,
             ]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             sA: cute.struct.Align[
-                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+                cute.struct.MemRange[
+                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                ],
                 self.buffer_align_bytes,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                cute.struct.MemRange[
+                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                ],
                 self.buffer_align_bytes,
             ]
             sSFA: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)
+                ],
                 self.buffer_align_bytes,
             ]
             sSFB: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                ],
                 self.buffer_align_bytes,
             ]
 
@@ -688,12 +856,22 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         vmnk, sfb_vmnk, _, _ = self._cluster_layouts(
             cluster_shape_mn, tiled_mma_akeep, tiled_mma_sfb
         )
-        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
-        sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+        a_smem_layout = cute.slice_(
+            self.a_smem_layout_staged, (None, None, None, 0)
+        )
+        b_smem_layout = cute.slice_(
+            self.b_smem_layout_staged, (None, None, None, 0)
+        )
+        sfa_smem_layout = cute.slice_(
+            self.sfa_smem_layout_staged, (None, None, None, 0)
+        )
+        sfb_smem_layout = cute.slice_(
+            self.sfb_smem_layout_staged, (None, None, None, 0)
+        )
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            sm100_utils.cluster_shape_to_tma_atom_A(cluster_shape_mn, tiled_mma_akeep.thr_id),
+            sm100_utils.cluster_shape_to_tma_atom_A(
+                cluster_shape_mn, tiled_mma_akeep.thr_id
+            ),
             a_tensor,
             a_smem_layout,
             self.mma_tiler,
@@ -701,7 +879,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             vmnk.shape,
         )
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            sm100_utils.cluster_shape_to_tma_atom_B(cluster_shape_mn, tiled_mma_akeep.thr_id),
+            sm100_utils.cluster_shape_to_tma_atom_B(
+                cluster_shape_mn, tiled_mma_akeep.thr_id
+            ),
             b_tensor,
             b_smem_layout,
             self.mma_tiler,
@@ -709,7 +889,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             vmnk.shape,
         )
         tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-            sm100_utils.cluster_shape_to_tma_atom_A(cluster_shape_mn, tiled_mma_akeep.thr_id),
+            sm100_utils.cluster_shape_to_tma_atom_A(
+                cluster_shape_mn, tiled_mma_akeep.thr_id
+            ),
             sfa_tensor,
             sfa_smem_layout,
             self.mma_tiler,
@@ -718,7 +900,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             internal_type=cutlass.Int16,
         )
         tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
-            sm100_utils.cluster_shape_to_tma_atom_SFB(cluster_shape_mn, tiled_mma_akeep.thr_id),
+            sm100_utils.cluster_shape_to_tma_atom_SFB(
+                cluster_shape_mn, tiled_mma_akeep.thr_id
+            ),
             sfb_tensor,
             sfb_smem_layout,
             self.mma_tiler_sfb,
@@ -750,7 +934,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             swizzle_size,
             raster_along_m,
         )
-        grid = ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
+        grid = ClcDynamicPersistentTileScheduler.get_grid_shape(
+            tile_sched_params
+        )
         return tile_sched_params, grid
 
     @cute.kernel
@@ -799,7 +985,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             )
         else:
             cbdim_x, cbdim_y, cbdim_z = cute.arch.block_in_cluster_dim()
-            if (cbdim_x == self.cluster_shape_mn[0]) & (cbdim_y == self.cluster_shape_mn[1]):
+            if (cbdim_x == self.cluster_shape_mn[0]) & (
+                cbdim_y == self.cluster_shape_mn[1]
+            ):
                 self.kernel_body(
                     tiled_mma_akeep,
                     tiled_mma_areuse,
@@ -875,7 +1063,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             cluster_layout_sfb_vmnk,
             is_a_mcast,
             is_b_mcast,
-        ) = self._cluster_layouts(launch_cluster_shape_mn, tiled_mma_akeep, tiled_mma_sfb)
+        ) = self._cluster_layouts(
+            launch_cluster_shape_mn, tiled_mma_akeep, tiled_mma_sfb
+        )
 
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -890,18 +1080,20 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma_akeep.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
+        )
+        block_in_cluster_coord_sfb_vmnk = (
+            cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         )
         tidx, _, _ = cute.arch.thread_idx()
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # CUTLASS DSL 4.5 expresses multicast signaling through the consumer
-        # thread count; this is API adaptation only.
         num_mcast_ctas_a = cute.size(cluster_layout_vmnk.shape[2])
         num_mcast_ctas_b = cute.size(cluster_layout_vmnk.shape[1])
         num_tma_producers = num_mcast_ctas_a + num_mcast_ctas_b - 1
@@ -909,12 +1101,16 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_producers),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, num_tma_producers
+            ),
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        num_acc_consumer_threads = 32 * len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        num_acc_consumer_threads = (
+            32 * len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=1,
@@ -926,7 +1122,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             defer_sync=True,
         )
         cluster_size = cute.size(cluster_layout_vmnk.shape)
-        num_clc_consumer_threads = 32 * (1 + cluster_size * (1 + len(self.epilog_warp_id) + 1))
+        num_clc_consumer_threads = 32 * (
+            1 + cluster_size * (1 + len(self.epilog_warp_id) + 1)
+        )
         clc_pipeline = pipeline.PipelineClcFetchAsync.create(
             barrier_storage=storage.clc_mbar_ptr.data_ptr(),
             num_stages=self.num_clc_stage,
@@ -946,7 +1144,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
             arch=self.arch,
         )
-        pipeline_init_arrive(cluster_shape_mn=launch_cluster_shape_mn, is_relaxed=True)
+        pipeline_init_arrive(
+            cluster_shape_mn=launch_cluster_shape_mn, is_relaxed=True
+        )
 
         sA = storage.sA.get_tensor(
             self.a_smem_layout_staged.outer,
@@ -1000,7 +1200,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         tCgSFA = thr_mma.partition_A(gSFA_mkl)
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
 
-        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+        )
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
@@ -1008,7 +1210,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+        )
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
@@ -1067,15 +1271,455 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         work_tile = tile_sched.initial_work_tile_info()
         iket.range_pop()
 
+        s_cu_seqlens = storage.sCuSeqlens.get_tensor(
+            cute.make_layout(self.max_batch + 1)
+        )
+        s_kv_lengths = storage.sKvLengths.get_tensor(
+            cute.make_layout(self.max_batch)
+        )
+        s_rope_t = storage.sRope.get_tensor(
+            self.rope_smem_layout.outer,
+            swizzle=self.rope_smem_layout.inner,
+        )
+        if cutlass.const_expr(self.use_tma_store):
+            sOut = storage.sOut.get_tensor(
+                self.out_smem_layout_staged.outer,
+                swizzle=self.out_smem_layout_staged.inner,
+            )
+
+        if warp_idx < self.mma_warp_id:
+            cute.arch.setmaxregister_increase(self.epilog_reg_count)
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_wait()
+            for meta_i in cutlass.range(
+                0, (batch_size + 128) // 128, 1, unroll=1
+            ):
+                meta_idx = tidx + meta_i * cutlass.Int32(128)
+                if meta_idx < batch_size + 1:
+                    s_cu_seqlens[meta_idx] = cu_q_seqlens[meta_idx]
+                if meta_idx < batch_size:
+                    s_kv_lengths[meta_idx] = kv_cache_lengths[meta_idx]
+            if cutlass.const_expr(quant_scale_qkv is None):
+                quant_scale_value = cutlass.Float32(1.0)
+            else:
+                quant_scale_value = quant_scale_qkv[0]
+            tmem.allocate(self.num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            tCtAcc_epi = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_x = gemm_sm100.transform_partitioned_tensor_layout(
+                tCtAcc_epi
+            )
+            tCgC_x = gemm_sm100.transform_partitioned_tensor_layout(tCgC)
+            epi_tile = (self.cta_tile_shape_mnk[0], self.epi_chunk)
+            tAcc_epi = cute.flat_divide(tCtAcc_x, epi_tile)
+            gC_epi = cute.flat_divide(tCgC_x, epi_tile)
+            copy_atom_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(
+                    tcgen05.copy.Repetition(self.epi_chunk)
+                ),
+                self.acc_dtype,
+            )
+            tiled_copy_t2r = tcgen05.make_tmem_copy(
+                copy_atom_t2r, tAcc_epi[(None, None, 0, 0)]
+            )
+            thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+            tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+            tTR_gC_part = thr_copy_t2r.partition_D(gC_epi)
+            tTR_rAcc = cute.make_rmem_tensor(
+                tTR_gC_part[(None, None, None, 0, 0, 0, 0, 0)].shape,
+                self.acc_dtype,
+            )
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+            tTR_rAcc_flat = cute.make_tensor(
+                tTR_rAcc.iterator, cute.make_layout((self.epi_chunk,))
+            )
+            tTR_rC_flat = cute.make_tensor(
+                tTR_rC.iterator, cute.make_layout((self.epi_chunk,))
+            )
+            simt_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyR2GOp(),
+                self.c_dtype,
+                num_bits_per_copy=256,
+                l1c_evict_priority=CacheEvictionPriority.NO_ALLOCATE,
+            )
+            tTR_rC_quads = cute.tiled_divide(tTR_rC_flat, (16,))
+            sts_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.c_dtype,
+                num_bits_per_copy=128,
+            )
+            pred_store = cute.make_rmem_tensor(
+                (1, *tTR_rC.shape[1:]), cutlass.Boolean
+            )
+            if cutlass.const_expr(self.use_tma_store):
+                s_out_quads = cute.tiled_divide(sOut, (1, 16))
+                gC_store = cute.local_tile(
+                    mC_tma, self.epi_store_tile, (None, None, None)
+                )
+                bSG_sC, bSG_gC = cpasync.tma_partition(
+                    tma_atom_c,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sOut, 0, 2),
+                    cute.group_modes(gC_store, 0, 2),
+                )
+
+            acc_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 1
+            )
+            s_rope_quads = cute.tiled_divide(s_rope_t, (1, 4))
+            cache_quads = cute.tiled_divide(cos_sin_cache, (1, 4))
+            cs_vec_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float32,
+                num_bits_per_copy=128,
+            )
+            cs_ldg_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyG2ROp(),
+                cutlass.Float32,
+                num_bits_per_copy=128,
+                load_cache_mode=cute.nvgpu.common.LoadCacheMode.GLOBAL,
+            )
+            lane = tidx & cutlass.Int32(31)
+            row_in_cta = warp_idx * cutlass.Int32(32) + lane
+            ldg_row_sel = lane >> cutlass.Int32(3)
+            ldg_chunk = lane & cutlass.Int32(
+                self.rope_ldg_row_threads - 1
+            )
+            warp_row0 = warp_idx * cutlass.Int32(32)
+            cache_qcols = cache_quads[((0, None), 0, None)]
+            cs_cache_addr = cache_qcols.iterator.toint().to(cutlass.Int64)
+            cs_stage_flat = cute.make_rmem_tensor(
+                (self.qk_rope_head_dim,), cutlass.Float32
+            )
+            cs_stage = cute.tiled_divide(cs_stage_flat, (4,))
+            cs_row_flat = cute.make_rmem_tensor(
+                (self.qk_rope_head_dim,), cutlass.Float32
+            )
+            cs_row = cute.tiled_divide(cs_row_flat, (4,))
+
+            while work_tile.is_valid_tile:
+                iket.range_push("epi_tile")
+
+                def cs_transpose_half(h):
+                    for ldg_i in cutlass.range_constexpr(
+                        self.rope_ldg_iters
+                    ):
+                        cute.copy(
+                            cs_vec_atom,
+                            cs_stage[
+                                (None, h * self.rope_ldg_iters + ldg_i)
+                            ],
+                            s_rope_quads[
+                                (
+                                    (0, None),
+                                    warp_row0
+                                    + cutlass.Int32(
+                                        self.rope_ldg_rows_per_iter
+                                        * ldg_i
+                                    )
+                                    + ldg_row_sel,
+                                    ldg_chunk,
+                                )
+                            ],
+                        )
+                    cute.arch.sync_warp()
+                    for qc in cutlass.range_constexpr(
+                        self.rope_half_quads
+                    ):
+                        cute.copy(
+                            cs_vec_atom,
+                            s_rope_quads[((0, None), row_in_cta, qc)],
+                            cs_row[(None, h * self.rope_half_quads + qc)],
+                        )
+                    cute.arch.sync_warp()
+                cur_tile_coord = work_tile.tile_idx
+                head_id = cur_tile_coord[1]
+                coord_m_cta = cur_tile_coord[0] * cutlass.Int32(
+                    self.cta_tile_shape_mnk[0]
+                )
+                row = coord_m_cta + row_in_cta
+                row_in_bounds = row < m
+                if cutlass.const_expr(self.use_tma_store):
+                    bSG_gC_tile = bSG_gC[
+                        (None, cur_tile_coord[0], None, 0)
+                    ]
+                else:
+                    pred_store[(0, 0, 0)] = row_in_bounds
+                mma_coord_m = cur_tile_coord[0] // cute.size(
+                    tiled_mma_akeep.thr_id.shape
+                )
+                tTR_gC_tile = tTR_gC_part[
+                    (None, None, None, None, None, mma_coord_m, head_id, 0)
+                ]
+
+                iket.range_push("epi_position")
+                position = cutlass.Int32(-1)
+                if row_in_bounds:
+                    candidate = self._position_for_row(
+                        s_cu_seqlens,
+                        s_kv_lengths,
+                        helix_position_offsets,
+                        row,
+                        batch_size,
+                    )
+                    if candidate >= 0 and candidate < rope_positions:
+                        position = candidate
+                iket.range_pop()
+
+                iket.range_push("epi_cs_stage")
+                pos_qcol_base = position * cutlass.Int32(
+                    self.rope_cache_row_floats // 4
+                )
+                src_qcols, src_addrs = [], []
+                for ldg_i in cutlass.range_constexpr(self.rope_ldg_iters):
+                    src_lane = (
+                        cutlass.Int32(
+                            self.rope_ldg_rows_per_iter * ldg_i
+                        )
+                        + ldg_row_sel
+                    )
+                    src_qcol = cute.arch.shuffle_sync(
+                        pos_qcol_base, src_lane
+                    )
+                    src_qcols.append(src_qcol)
+                    src_addrs.append(
+                        cs_cache_addr
+                        + (src_qcol + ldg_chunk).to(cutlass.Int64)
+                        * cutlass.Int64(16)
+                    )
+                for ldg_i in cutlass.range_constexpr(self.rope_ldg_iters):
+                    if src_qcols[ldg_i] >= 0:
+                        for h in cutlass.range_constexpr(2):
+                            src_ptr = cute.make_ptr(
+                                cutlass.Float32,
+                                src_addrs[ldg_i]
+                                + cutlass.Int64(
+                                    h * self.rope_half_quads * 16
+                                ),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            cute.copy(
+                                cs_ldg_atom,
+                                cute.make_tensor(
+                                    src_ptr, cute.make_layout((4,))
+                                ),
+                                cs_stage[
+                                    (None, h * self.rope_ldg_iters + ldg_i)
+                                ],
+                            )
+                iket.range_pop()
+
+                cs_transpose_half(1)
+
+                iket.range_push("epi_wait_acc")
+                acc_pipeline.consumer_wait(acc_consumer_state)
+                iket.range_pop()
+
+                iket.range_push("epi_rmsnorm_reduce")
+                f32_zero = self.acc_dtype(0.0)
+                sum_sq_pairs = [
+                    (self.acc_dtype(0.0), self.acc_dtype(0.0))
+                    for _ in range(4)
+                ]
+                for chunk in cutlass.range_constexpr(self.epi_chunks):
+                    cute.copy(
+                        tiled_copy_t2r,
+                        tTR_tAcc[(None, None, None, 0, chunk)],
+                        tTR_rAcc,
+                    )
+                    for pair in cutlass.range_constexpr(self.epi_chunk // 2):
+                        pair_vec = (
+                            tTR_rAcc_flat[pair * 2],
+                            tTR_rAcc_flat[pair * 2 + 1],
+                        )
+                        sum_sq_pairs[pair & 3] = cute.arch.fma_packed_f32x2(
+                            pair_vec, pair_vec, sum_sq_pairs[pair & 3]
+                        )
+                sum_sq_pairs01 = cute.arch.add_packed_f32x2(sum_sq_pairs[0], sum_sq_pairs[1])
+                sum_sq_pairs23 = cute.arch.add_packed_f32x2(sum_sq_pairs[2], sum_sq_pairs[3])
+                sum_sq_pair = cute.arch.add_packed_f32x2(sum_sq_pairs01, sum_sq_pairs23)
+                sum_sq = sum_sq_pair[0] + sum_sq_pair[1]
+                inv_rms = cute.math.rsqrt(
+                    sum_sq / self.acc_dtype(self.head_dim) + eps
+                )
+                norm_quant_scale = inv_rms * quant_scale_value
+                iket.range_pop()
+
+                if cutlass.const_expr(self.use_tma_store):
+                    if warp_idx == 0:
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    self.epilog_sync_barrier.arrive_and_wait()
+
+                def rope_chunk_body(chunk):
+                    col_base = chunk * self.epi_chunk
+                    for quad_i in cutlass.range_constexpr(
+                        self.epi_chunk // 4
+                    ):
+                        elem0 = quad_i * 4
+                        quad_idx = (
+                            col_base - self.qk_nope_head_dim
+                        ) // 4 + quad_i
+                        cs_quad = cs_row[(None, quad_idx)].load()
+                        for sub in cutlass.range_constexpr(2):
+                            e0 = elem0 + sub * 2
+                            cos_value = cs_quad[sub * 2]
+                            sin_value = cs_quad[sub * 2 + 1]
+                            z_pk = _prmt_trunc_bf16x2(
+                                tTR_rAcc_flat[e0],
+                                tTR_rAcc_flat[e0 + 1],
+                            )
+                            x0, x1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
+                                z_pk,
+                                (inv_rms, inv_rms),
+                                (f32_zero, f32_zero),
+                            )
+                            x_pk = _prmt_trunc_bf16x2(x0, x1)
+                            x_pk_rev = _prmt_trunc_bf16x2_neg_lo(x1, x0)
+                            t_pair = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
+                                x_pk,
+                                (cos_value, cos_value),
+                                (f32_zero, f32_zero),
+                            )
+                            y0, y1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
+                                x_pk_rev,
+                                (sin_value, sin_value),
+                                t_pair,
+                            )
+                            y_pk = _prmt_trunc_bf16x2(y0, y1)
+                            o0, o1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
+                                y_pk,
+                                (quant_scale_value, quant_scale_value),
+                                (f32_zero, f32_zero),
+                            )
+                            tTR_rAcc_flat[e0] = o0
+                            tTR_rAcc_flat[e0 + 1] = o1
+                    return tTR_rAcc_flat.load()
+
+                def store_chunk(chunk, out_ssa):
+                    tTR_rC_flat.store(out_ssa.to(self.c_dtype))
+                    if cutlass.const_expr(self.use_tma_store):
+                        q0 = (chunk & 3) * 2
+                        slot = (chunk >> 2) & (self.out_ring_slots - 1)
+                        for h in cutlass.range_constexpr(2):
+                            cute.copy(
+                                sts_atom,
+                                tTR_rC_quads[(None, h)],
+                                s_out_quads[
+                                    ((0, None), row_in_cta, q0 + h, slot)
+                                ],
+                            )
+                    else:
+                        cute.copy(
+                            simt_atom,
+                            tTR_rC,
+                            tTR_gC_tile[(None, None, None, 0, chunk)],
+                            pred=pred_store,
+                        )
+
+                rope_hi_chunk = self.epi_chunks - 1
+                out_hi = rope_chunk_body(rope_hi_chunk)
+                store_chunk(rope_hi_chunk, out_hi)
+
+
+                cs_transpose_half(0)
+                for chunk_i in cutlass.range_constexpr(self.nope_chunks):
+                    chunk = self.nope_chunks - 1 - chunk_i
+                    cute.copy(
+                        tiled_copy_t2r,
+                        tTR_tAcc[(None, None, None, 0, chunk)],
+                        tTR_rAcc,
+                    )
+                    if cutlass.const_expr(chunk_i % 2 == 1):
+                        cute.arch.fence_view_async_tmem_load()
+                    for pair in cutlass.range_constexpr(self.epi_chunk // 2):
+                        e0 = pair * 2
+                        z_pk = _prmt_trunc_bf16x2(
+                            tTR_rAcc_flat[e0],
+                            tTR_rAcc_flat[e0 + 1],
+                        )
+                        o0, o1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
+                            z_pk,
+                            (norm_quant_scale, norm_quant_scale),
+                            (f32_zero, f32_zero),
+                        )
+                        tTR_rAcc_flat[e0] = o0
+                        tTR_rAcc_flat[e0 + 1] = o1
+                    out_ssa = tTR_rAcc_flat.load()
+                    store_chunk(chunk, out_ssa)
+
+                rope_lo_chunk = self.nope_chunks
+                cute.copy(
+                    tiled_copy_t2r,
+                    tTR_tAcc[(None, None, None, 0, rope_lo_chunk)],
+                    tTR_rAcc,
+                )
+
+                cute.arch.fence_view_async_tmem_load()
+                nvvm.tcgen05_fence(
+                    nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC
+                )
+                acc_pipeline.consumer_release(acc_consumer_state)
+                out_lo = rope_chunk_body(rope_lo_chunk)
+                acc_consumer_state.advance()
+                store_chunk(rope_lo_chunk, out_lo)
+
+                if cutlass.const_expr(self.use_tma_store):
+                    iket.range_push("epi_fence+tmastg")
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    if warp_idx == 0:
+                        for plane in cutlass.range_constexpr(
+                            self.planes_per_head
+                        ):
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, plane)],
+                                bSG_gC_tile[
+                                    (
+                                        None,
+                                        head_id * self.planes_per_head
+                                        + plane,
+                                    )
+                                ],
+                            )
+                        cute.arch.cp_async_bulk_commit_group()
+                    iket.range_pop()
+
+                iket.range_push("epi_wait_clc")
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                iket.range_pop()
+                work_tile = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
+                iket.range_pop()
+
+            iket.range_push("epi_wait_tail")
+            if cutlass.const_expr(self.use_tma_store):
+                if warp_idx == 0:
+                    cute.arch.cp_async_bulk_wait_group(0)
+            tmem.relinquish_alloc_permit()
+            tmem.free(acc_tmem_ptr)
+            iket.range_pop()
+
         if warp_idx == self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.mainloop_reg_count)
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_wait()
+            a_cache_policy = cute.CacheEvictionPriority.EVICT_LAST
+            a_cache_policy = cutlass.Int64(0x14F0000000000000) # L2 evict_last
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
             while work_tile.is_valid_tile:
                 iket.range_push("tma_tile")
                 cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma_akeep.thr_id.shape)
+                mma_tile_coord_m = cur_tile_coord[0] // cute.size(
+                    tiled_mma_akeep.thr_id.shape
+                )
                 head_id = cur_tile_coord[1]
 
                 tAgA_slice = tAgA[(None, mma_tile_coord_m, None, 0)]
@@ -1090,27 +1734,42 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                         1,
                         unroll=1,
                     ):
-                        cute.prefetch(tma_atom_a, tAgA_slice[(None, pf_k_tile)])
-                        cute.prefetch(tma_atom_sfa, tAgSFA_slice[(None, pf_k_tile)])
-                        cute.prefetch(tma_atom_b, tBgB_slice[(None, pf_k_tile)])
-                        cute.prefetch(tma_atom_sfb, tBgSFB_slice[(None, pf_k_tile)])
+                        cute.prefetch(
+                            tma_atom_a, tAgA_slice[(None, pf_k_tile)]
+                        )
+                        cute.prefetch(
+                            tma_atom_sfa, tAgSFA_slice[(None, pf_k_tile)]
+                        )
+                        cute.prefetch(
+                            tma_atom_b, tBgB_slice[(None, pf_k_tile)]
+                        )
+                        cute.prefetch(
+                            tma_atom_sfb, tBgSFB_slice[(None, pf_k_tile)]
+                        )
 
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
-                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(
+                        ab_producer_state
+                    )
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     iket.range_push("tma_wait", k_tile)
-                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    ab_pipeline.producer_acquire(
+                        ab_producer_state, peek_ab_empty_status
+                    )
                     iket.range_pop()
                     iket.range_push("tma_issue")
-                    tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+                    tma_bar = ab_pipeline.producer_get_barrier(
+                        ab_producer_state
+                    )
                     cute.copy(
                         tma_atom_a,
                         tAgA_slice[(None, ab_producer_state.count)],
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=a_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfa,
@@ -1118,6 +1777,7 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfa_full_mcast_mask,
+                        cache_policy=a_cache_policy,
                     )
 
                     cute.copy(
@@ -1137,15 +1797,25 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                     if cutlass.const_expr(self.tma_prefetch_dist > 0):
                         pf_k_tile = k_tile + self.tma_prefetch_dist
                         if pf_k_tile < k_tile_cnt:
-                            cute.prefetch(tma_atom_a, tAgA_slice[(None, pf_k_tile)])
-                            cute.prefetch(tma_atom_sfa, tAgSFA_slice[(None, pf_k_tile)])
-                            cute.prefetch(tma_atom_b, tBgB_slice[(None, pf_k_tile)])
-                            cute.prefetch(tma_atom_sfb, tBgSFB_slice[(None, pf_k_tile)])
+                            cute.prefetch(
+                                tma_atom_a, tAgA_slice[(None, pf_k_tile)]
+                            )
+                            cute.prefetch(
+                                tma_atom_sfa, tAgSFA_slice[(None, pf_k_tile)]
+                            )
+                            cute.prefetch(
+                                tma_atom_b, tBgB_slice[(None, pf_k_tile)]
+                            )
+                            cute.prefetch(
+                                tma_atom_sfb, tBgSFB_slice[(None, pf_k_tile)]
+                            )
                     iket.range_pop()
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
-                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(
+                            ab_producer_state
+                        )
                 iket.range_push("tma_wait_clc")
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 iket.range_pop()
@@ -1153,32 +1823,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                 clc_pipeline.consumer_release(clc_consumer_state)
                 clc_consumer_state.advance()
                 iket.range_pop()
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
             ab_pipeline.producer_tail(ab_producer_state)
-
-        if warp_idx == self.sched_warp_id:
-            cute.arch.setmaxregister_decrease(self.mainloop_reg_count)
-            if is_first_cta_in_cluster:
-                clc_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.ProducerConsumer,
-                    self.num_clc_stage,
-                )
-                while work_tile.is_valid_tile:
-                    iket.range_push("sched_tile")
-                    iket.range_push("sched_wait_empty")
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    iket.range_pop()
-                    iket.range_push("sched_query")
-                    mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
-                    tile_sched.advance_to_next_work(mbarrier_addr)
-                    clc_producer_state.advance()
-
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                    iket.range_pop()
-                    iket.range_pop()
-                clc_pipeline.producer_tail(clc_producer_state)
 
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.mainloop_reg_count)
@@ -1191,7 +1838,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             )
             tCtSFA = cute.make_tensor(sfa_tmem_ptr, self.tCtSFA_layout)
             sfb_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols,
+                acc_tmem_ptr
+                + self.num_accumulator_tmem_cols
+                + self.num_sfa_tmem_cols,
                 dtype=self.sf_dtype,
             )
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, self.tCtSFB_layout)
@@ -1202,13 +1851,17 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
-            acc_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+            acc_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 1
+            )
             while work_tile.is_valid_tile:
                 iket.range_push("mma_tile")
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
-                    peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+                    peek_ab_full_status = ab_pipeline.consumer_try_wait(
+                        ab_consumer_state
+                    )
                 iket.range_push("mma_wait_acc")
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
@@ -1217,12 +1870,18 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     if is_leader_cta:
                         iket.range_push("mma_wait", k_tile)
-                        ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        ab_pipeline.consumer_wait(
+                            ab_consumer_state, peek_ab_full_status
+                        )
                         iket.range_pop()
                         iket.range_push("mma_issue")
-                        self._mainloop_s2t_copies(ab_consumer_state.index, sfa_s2t, sfb_s2t)
+                        self._mainloop_s2t_copies(
+                            ab_consumer_state.index, sfa_s2t, sfb_s2t
+                        )
                         num_kblocks = cute.size(tCrA, mode=[2])
-                        for k_block in cutlass.range(num_kblocks, unroll_full=True):
+                        for k_block in cutlass.range(
+                            num_kblocks, unroll_full=True
+                        ):
                             a_kblk_crd = (
                                 None,
                                 0,
@@ -1238,7 +1897,9 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                                     ab_consumer_state.index,
                                 )
                                 sfb_kblk_crd = (None, n_set, k_block)
-                                tCtAcc_set = tCtAcc_base[(None, 0, n_set)]
+                                tCtAcc_set = tCtAcc_base[
+                                    (None, 0, n_set)
+                                ]
                                 if cutlass.const_expr(n_set == 0):
                                     tiled_mma_akeep.set(
                                         tcgen05.Field.ACCUMULATE,
@@ -1281,7 +1942,11 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
-                            peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+                            peek_ab_full_status = (
+                                ab_pipeline.consumer_try_wait(
+                                    ab_consumer_state
+                                )
+                            )
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
@@ -1294,326 +1959,41 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                 iket.range_pop()
             acc_pipeline.producer_tail(acc_producer_state)
 
-        # CUTLASS DSL 4.5 cannot carry a cute.struct through a dynamic
-        # warp-role branch. Materialize SMEM tensors before that branch.
-        s_cu_seqlens = storage.sCuSeqlens.get_tensor(cute.make_layout(self.max_batch + 1))
-        s_kv_lengths = storage.sKvLengths.get_tensor(cute.make_layout(self.max_batch))
-        sOut = None
-        if cutlass.const_expr(self.use_tma_store):
-            sOut = storage.sOut.get_tensor(
-                self.out_smem_layout_staged.outer,
-                swizzle=self.out_smem_layout_staged.inner,
-            )
-        s_rope_t = storage.sRope.get_tensor(
-            self.rope_smem_layout.outer,
-            swizzle=self.rope_smem_layout.inner,
-        )
+        if warp_idx == self.sched_warp_id:
+            cute.arch.setmaxregister_decrease(self.mainloop_reg_count)
+            if is_first_cta_in_cluster:
+                clc_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.ProducerConsumer,
+                    self.num_clc_stage,
+                )
+                while work_tile.is_valid_tile:
+                    iket.range_push("sched_tile")
+                    iket.range_push("sched_wait_empty")
+                    clc_pipeline.producer_acquire(clc_producer_state)
+                    iket.range_pop()
+                    iket.range_push("sched_query")
+                    mbarrier_addr = clc_pipeline.producer_get_barrier(
+                        clc_producer_state
+                    )
+                    tile_sched.advance_to_next_work(mbarrier_addr)
+                    clc_producer_state.advance()
+
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work_tile = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                    iket.range_pop()
+                    iket.range_pop()
+                clc_pipeline.producer_tail(clc_producer_state)
 
         if warp_idx == self.pad_warp_id:
             cute.arch.setmaxregister_decrease(self.mainloop_reg_count)
 
-        if warp_idx < self.mma_warp_id:
-            cute.arch.setmaxregister_increase(self.epilog_reg_count)
-            for meta_i in cutlass.range(0, (batch_size + 128) // 128, 1, unroll=1):
-                meta_idx = tidx + meta_i * cutlass.Int32(128)
-                if meta_idx < batch_size + 1:
-                    s_cu_seqlens[meta_idx] = cu_q_seqlens[meta_idx]
-                if meta_idx < batch_size:
-                    s_kv_lengths[meta_idx] = kv_cache_lengths[meta_idx]
-
-            tmem.allocate(self.num_tmem_alloc_cols)
-            tmem.wait_for_alloc()
-            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-
-            if cutlass.const_expr(quant_scale_qkv is None):
-                quant_scale_value = cutlass.Float32(1.0)
-            else:
-                quant_scale_value = quant_scale_qkv[0]
-
-            tCtAcc_epi = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
-            tCtAcc_x = gemm_sm100.transform_partitioned_tensor_layout(tCtAcc_epi)
-            tCgC_x = gemm_sm100.transform_partitioned_tensor_layout(tCgC)
-            epi_tile = (self.cta_tile_shape_mnk[0], self.epi_chunk)
-            tAcc_epi = cute.flat_divide(tCtAcc_x, epi_tile)
-            gC_epi = cute.flat_divide(tCgC_x, epi_tile)
-            copy_atom_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.epi_chunk)),
-                self.acc_dtype,
-            )
-            tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
-            thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-            tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
-            tTR_gC_part = thr_copy_t2r.partition_D(gC_epi)
-            tTR_rAcc = cute.make_rmem_tensor(
-                tTR_gC_part[(None, None, None, 0, 0, 0, 0, 0)].shape,
-                self.acc_dtype,
-            )
-            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
-            tTR_rAcc_flat = cute.make_tensor(tTR_rAcc.iterator, cute.make_layout((self.epi_chunk,)))
-            tTR_rC_flat = cute.make_tensor(tTR_rC.iterator, cute.make_layout((self.epi_chunk,)))
-            simt_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyR2GOp(),
-                self.c_dtype,
-                num_bits_per_copy=256,
-                l1c_evict_priority=CacheEvictionPriority.NO_ALLOCATE,
-            )
-            tTR_rC_quads = cute.tiled_divide(tTR_rC_flat, (16,))
-            sts_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                self.c_dtype,
-                num_bits_per_copy=128,
-            )
-            pred_store = cute.make_rmem_tensor((1, *tTR_rC.shape[1:]), cutlass.Boolean)
-            if cutlass.const_expr(self.use_tma_store):
-                s_out_quads = cute.tiled_divide(sOut, (1, 16))
-                gC_store = cute.local_tile(mC_tma, self.epi_store_tile, (None, None, None))
-                bSG_sC, bSG_gC = cpasync.tma_partition(
-                    tma_atom_c,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sOut, 0, 2),
-                    cute.group_modes(gC_store, 0, 2),
-                )
-
-            acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-            s_rope_quads = cute.tiled_divide(s_rope_t, (1, 4))
-            cache_quads = cute.tiled_divide(cos_sin_cache, (1, 4))
-            cs_copy_atom = cute.make_copy_atom(
-                cpasync.CopyG2SOp(), cutlass.Float32, num_bits_per_copy=128
-            )
-            lane = tidx & cutlass.Int32(31)
-            row_in_cta = warp_idx * cutlass.Int32(32) + lane
-            cp_chunk = lane & cutlass.Int32(self.rope_cp_chunks - 1)
-            cp_row_sel = lane >> cutlass.Int32(4)
-            warp_row0 = warp_idx * cutlass.Int32(32)
-            cache_qcols = cache_quads[((0, None), 0, None)]
-
-            while work_tile.is_valid_tile:
-                iket.range_push("epi_tile")
-                cur_tile_coord = work_tile.tile_idx
-                head_id = cur_tile_coord[1]
-                coord_m_cta = cur_tile_coord[0] * cutlass.Int32(self.cta_tile_shape_mnk[0])
-                row = coord_m_cta + row_in_cta
-                row_in_bounds = row < m
-                if cutlass.const_expr(self.use_tma_store):
-                    bSG_gC_tile = bSG_gC[(None, cur_tile_coord[0], None, 0)]
-                else:
-                    pred_store[(0, 0, 0)] = row_in_bounds
-                mma_coord_m = cur_tile_coord[0] // cute.size(tiled_mma_akeep.thr_id.shape)
-                tTR_gC_tile = tTR_gC_part[(None, None, None, None, None, mma_coord_m, head_id, 0)]
-
-                iket.range_push("epi_position")
-                position = cutlass.Int32(-1)
-                if row_in_bounds:
-                    candidate = self._position_for_row(
-                        s_cu_seqlens,
-                        s_kv_lengths,
-                        helix_position_offsets,
-                        row,
-                        batch_size,
-                    )
-                    if candidate >= 0 and candidate < rope_positions:
-                        position = candidate
-                iket.range_pop()
-
-                iket.range_push("epi_cs_stage")
-                pos_qcol_base = position * cutlass.Int32(self.rope_cache_row_floats // 4)
-                for cp_i in cutlass.range_constexpr(self.rope_cp_iters):
-                    src_lane = cutlass.Int32(2 * cp_i) + cp_row_sel
-                    src_qcol = cute.arch.shuffle_sync(pos_qcol_base, src_lane)
-                    if src_qcol >= 0:
-                        cute.copy(
-                            cs_copy_atom,
-                            cache_qcols[(None, src_qcol + cp_chunk)],
-                            s_rope_quads[((0, None), warp_row0 + src_lane, cp_chunk)],
-                        )
-                cute.arch.cp_async_commit_group()
-                iket.range_pop()
-
-                iket.range_push("epi_wait_acc")
-                acc_pipeline.consumer_wait(acc_consumer_state)
-                iket.range_pop()
-
-                iket.range_push("epi_rmsnorm_reduce")
-                f32_zero = self.acc_dtype(0.0)
-                sum_sq_pairs = [(self.acc_dtype(0.0), self.acc_dtype(0.0)) for _ in range(4)]
-                for chunk in cutlass.range_constexpr(self.epi_chunks):
-                    cute.copy(
-                        tiled_copy_t2r,
-                        tTR_tAcc[(None, None, None, 0, chunk)],
-                        tTR_rAcc,
-                    )
-                    for pair in cutlass.range_constexpr(self.epi_chunk // 2):
-                        pair_vec = (
-                            tTR_rAcc_flat[pair * 2],
-                            tTR_rAcc_flat[pair * 2 + 1],
-                        )
-                        sum_sq_pairs[pair & 3] = cute.arch.fma_packed_f32x2(
-                            pair_vec, pair_vec, sum_sq_pairs[pair & 3]
-                        )
-                sum_sq_pairs01 = cute.arch.add_packed_f32x2(sum_sq_pairs[0], sum_sq_pairs[1])
-                sum_sq_pairs23 = cute.arch.add_packed_f32x2(sum_sq_pairs[2], sum_sq_pairs[3])
-                sum_sq_pair = cute.arch.add_packed_f32x2(sum_sq_pairs01, sum_sq_pairs23)
-                sum_sq = sum_sq_pair[0] + sum_sq_pair[1]
-                inv_rms = cute.math.rsqrt(sum_sq / self.acc_dtype(self.head_dim) + eps)
-                norm_quant_scale = inv_rms * quant_scale_value
-                iket.range_pop()
-
-                iket.range_push("epi_cs_drain")
-                cute.arch.cp_async_wait_group(0)
-                if cutlass.const_expr(self.use_tma_store):
-                    if warp_idx == 0:
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                self.epilog_sync_barrier.arrive_and_wait()
-                iket.range_pop()
-
-                for rope_rev in cutlass.range_constexpr(self.rope_chunks):
-                    chunk = self.epi_chunks - 1 - rope_rev
-                    if cutlass.const_expr(rope_rev != 0):
-                        cute.copy(
-                            tiled_copy_t2r,
-                            tTR_tAcc[(None, None, None, 0, chunk)],
-                            tTR_rAcc,
-                        )
-                    iket.range_push("epi_rope")
-                    col_base = chunk * self.epi_chunk
-                    for quad_i in cutlass.range_constexpr(self.epi_chunk // 4):
-                        elem0 = quad_i * 4
-                        quad_idx = (col_base - self.qk_nope_head_dim) // 4 + quad_i
-                        cs_quad = s_rope_quads[((0, None), row_in_cta, quad_idx)].load()
-                        for sub in cutlass.range_constexpr(2):
-                            e0 = elem0 + sub * 2
-                            cos_value = cs_quad[sub * 2]
-                            sin_value = cs_quad[sub * 2 + 1]
-                            x0, x1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
-                                (
-                                    tTR_rAcc_flat[e0],
-                                    tTR_rAcc_flat[e0 + 1],
-                                ),
-                                (inv_rms, inv_rms),
-                                (f32_zero, f32_zero),
-                            )
-                            t_pair = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
-                                (x0, x1),
-                                (cos_value, cos_value),
-                                (f32_zero, f32_zero),
-                            )
-                            y0, y1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
-                                (x1, x0),
-                                (-sin_value, sin_value),
-                                t_pair,
-                            )
-                            o0, o1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
-                                (y0, y1),
-                                (quant_scale_value, quant_scale_value),
-                                (f32_zero, f32_zero),
-                            )
-                            tTR_rAcc_flat[e0] = o0
-                            tTR_rAcc_flat[e0 + 1] = o1
-                    out_ssa = tTR_rAcc_flat.load()
-                    iket.range_pop()
-                    iket.range_push("epi_quant+stg")
-                    tTR_rC_flat.store(out_ssa.to(self.c_dtype))
-                    if cutlass.const_expr(self.use_tma_store):
-                        q0 = (chunk & 3) * 2
-                        slot = (chunk >> 2) & (self.out_ring_slots - 1)
-                        for h in cutlass.range_constexpr(2):
-                            cute.copy(
-                                sts_atom,
-                                tTR_rC_quads[(None, h)],
-                                s_out_quads[((0, None), row_in_cta, q0 + h, slot)],
-                            )
-                    else:
-                        cute.copy(
-                            simt_atom,
-                            tTR_rC,
-                            tTR_gC_tile[(None, None, None, 0, chunk)],
-                            pred=pred_store,
-                        )
-                    iket.range_pop()
-                for chunk_i in cutlass.range_constexpr(self.nope_chunks):
-                    chunk = self.nope_chunks - 1 - chunk_i
-                    cute.copy(
-                        tiled_copy_t2r,
-                        tTR_tAcc[(None, None, None, 0, chunk)],
-                        tTR_rAcc,
-                    )
-                    if cutlass.const_expr(chunk_i % 2 == 1):
-                        cute.arch.fence_view_async_tmem_load()
-                    for pair in cutlass.range_constexpr(self.epi_chunk // 2):
-                        e0 = pair * 2
-                        o0, o1 = _fma_packed_f32x2_bf16x2_f32x2_f32x2(
-                            (
-                                tTR_rAcc_flat[e0],
-                                tTR_rAcc_flat[e0 + 1],
-                            ),
-                            (norm_quant_scale, norm_quant_scale),
-                            (f32_zero, f32_zero),
-                        )
-                        tTR_rAcc_flat[e0] = o0
-                        tTR_rAcc_flat[e0 + 1] = o1
-                    out_ssa = tTR_rAcc_flat.load()
-                    if cutlass.const_expr(chunk_i == self.nope_chunks - 1):
-                        nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
-                        acc_pipeline.consumer_release(acc_consumer_state)
-                        acc_consumer_state.advance()
-                    iket.range_push("epi_quant+stg")
-                    tTR_rC_flat.store(out_ssa.to(self.c_dtype))
-                    if cutlass.const_expr(self.use_tma_store):
-                        q0 = (chunk & 3) * 2
-                        slot = (chunk >> 2) & (self.out_ring_slots - 1)
-                        for h in cutlass.range_constexpr(2):
-                            cute.copy(
-                                sts_atom,
-                                tTR_rC_quads[(None, h)],
-                                s_out_quads[((0, None), row_in_cta, q0 + h, slot)],
-                            )
-                    else:
-                        cute.copy(
-                            simt_atom,
-                            tTR_rC,
-                            tTR_gC_tile[(None, None, None, 0, chunk)],
-                            pred=pred_store,
-                        )
-                    iket.range_pop()
-
-                if cutlass.const_expr(self.use_tma_store):
-                    iket.range_push("epi_fence+tmastg")
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    self.epilog_sync_barrier.arrive_and_wait()
-                    if warp_idx == 0:
-                        for plane in cutlass.range_constexpr(self.planes_per_head):
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, plane)],
-                                bSG_gC_tile[
-                                    (
-                                        None,
-                                        head_id * self.planes_per_head + plane,
-                                    )
-                                ],
-                            )
-                        cute.arch.cp_async_bulk_commit_group()
-                    iket.range_pop()
-
-                iket.range_push("epi_wait_clc")
-                clc_pipeline.consumer_wait(clc_consumer_state)
-                iket.range_pop()
-                work_tile = tile_sched.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
-                iket.range_pop()
-
-            iket.range_push("epi_wait_tail")
-            if cutlass.const_expr(self.use_tma_store):
-                if warp_idx == 0:
-                    cute.arch.cp_async_bulk_wait_group(0)
-            tmem.relinquish_alloc_permit()
-            tmem.free(acc_tmem_ptr)
-            iket.range_pop()
 
     @cute.jit
-    def _mainloop_s2t_copy_and_partition(self, sSF: cute.Tensor, tSF: cute.Tensor) -> S2TCopyBundle:
+    def _mainloop_s2t_copy_and_partition(
+        self, sSF: cute.Tensor, tSF: cute.Tensor
+    ) -> S2TCopyBundle:
         """Tiled S2T (UTCCP) copy for one SF tensor + its partitions."""
         tCsSF_compact = cute.filter_zeros(sSF)
         tCtSF_compact = cute.filter_zeros(tSF)
@@ -1627,8 +2007,12 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         def append_mn_broadcast_mode(smem_layout: cute.Layout):
             mn_dim = cute.get(smem_layout, mode=[0, 0])
             mn_dim = cute.append(mn_dim, cute.make_layout((4), stride=(0)))
-            layout = cute.append(cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1]))
-            layout = cute.append(cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1]))
+            layout = cute.append(
+                cute.group_modes(mn_dim, 0), cute.get(smem_layout, mode=[0, 1])
+            )
+            layout = cute.append(
+                cute.group_modes(layout, 0), cute.get(smem_layout, mode=[1])
+            )
             layout = cute.append(layout, cute.get(smem_layout, mode=[2]))
             layout = cute.append(layout, cute.get(smem_layout, mode=[3]))
             return layout
@@ -1638,9 +2022,13 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             append_mn_broadcast_mode(tCsSF_compact.layout),
         )
         tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact_bcast)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
+        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_s2t, tCsSF_compact_s2t_
+        )
         tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-        return S2TCopyBundle(tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t)
+        return S2TCopyBundle(
+            tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
+        )
 
     @cute.jit
     def _mainloop_s2t_copies(
@@ -1699,6 +2087,7 @@ def compile(
     raster_along_m: bool = True,
     with_quant_scale: bool = True,
     tma_prefetch_dist: int = 0,
+    enable_pdl: bool = True,
 ):
     """Compile ONE handle serving every (M, N, K) problem shape.
 
@@ -1717,6 +2106,7 @@ def compile(
         swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
         tma_prefetch_dist=tma_prefetch_dist,
+        enable_pdl=enable_pdl,
     )
     key = (
         tuple(mma_inst_tile),
@@ -1727,6 +2117,7 @@ def compile(
         op.raster_along_m,
         bool(with_quant_scale),
         op.tma_prefetch_dist,
+        op.enable_pdl,
     )
     if key in _COMPILE_CACHE:
         return _COMPILE_CACHE[key]
@@ -1741,23 +2132,21 @@ def compile(
     sym_batch = cute.sym_int64()
     sym_positions = cute.sym_int64()
     fake_q = make_fake_compact_tensor(
-        cutlass.Float8E4M3FN,
-        (sym_m, sym_k),
-        stride_order=(1, 0),
+        cutlass.Float8E4M3FN, (sym_m, sym_k), stride_order=(1, 0),
         assumed_align=16,
     )
     fake_w = make_fake_compact_tensor(
-        cutlass.Float8E4M3FN,
-        (sym_n, sym_k),
-        stride_order=(1, 0),
+        cutlass.Float8E4M3FN, (sym_n, sym_k), stride_order=(1, 0),
         assumed_align=16,
     )
-    fake_qsf = make_fake_compact_tensor(cutlass.Float8E8M0FNU, (sym_qsf,), assumed_align=16)
-    fake_wsf = make_fake_compact_tensor(cutlass.Float8E8M0FNU, (sym_wsf,), assumed_align=16)
+    fake_qsf = make_fake_compact_tensor(
+        cutlass.Float8E8M0FNU, (sym_qsf,), assumed_align=16
+    )
+    fake_wsf = make_fake_compact_tensor(
+        cutlass.Float8E8M0FNU, (sym_wsf,), assumed_align=16
+    )
     fake_out = make_fake_compact_tensor(
-        cutlass.Float8E4M3FN,
-        (sym_m, sym_n),
-        stride_order=(1, 0),
+        cutlass.Float8E4M3FN, (sym_m, sym_n), stride_order=(1, 0),
         assumed_align=32,
     )
     sym_cu = cute.sym_int64()
@@ -1769,8 +2158,12 @@ def compile(
         assumed_align=16,
     )
     fake_cu = make_fake_compact_tensor(cutlass.Int32, (sym_cu,), assumed_align=4)
-    fake_kv = make_fake_compact_tensor(cutlass.Int32, (sym_batch,), assumed_align=4)
-    fake_helix = make_fake_compact_tensor(cutlass.Int32, (sym_helix,), assumed_align=4)
+    fake_kv = make_fake_compact_tensor(
+        cutlass.Int32, (sym_batch,), assumed_align=4
+    )
+    fake_helix = make_fake_compact_tensor(
+        cutlass.Int32, (sym_helix,), assumed_align=4
+    )
     fake_qs = (
         make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         if with_quant_scale
