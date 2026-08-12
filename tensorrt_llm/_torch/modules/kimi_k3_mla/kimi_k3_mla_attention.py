@@ -26,6 +26,27 @@ from ..mla import MLA
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 
+# Deliberate divergence from upstream, which defaults this to "cute-dsl".
+#
+# On the FlashInfer/CuTe-DSL pair this branch currently ships, the CuTe-DSL MLA
+# decode path cannot initialize at all. flashinfer 0.6.15 unpacks the MLA
+# scheduler params one MLIR value per field
+# (flashinfer/cute_dsl/attention/monolithic/mla_helpers.py), while the installed
+# nvidia-cutlass-dsl-internal 0.3.0+20260529 serializes FastDivmodDivisor as two
+# SSA values (cutlass issue #3243). Every rank dies during executor init with
+#
+#     ValueError: FastDivmodDivisor expects exactly 2 MLIR values
+#                 (encoded divisor + scalar divisor SSA), got 1.
+#
+# which gives no hint that the MLA backend selection is what caused it.
+#
+# This is a package-pairing problem, not an architecture limit: nothing on that
+# path inspects the SM version. So this is a default flip rather than a hard
+# block -- set TLLM_K3_MLA_GEN_BACKEND=cute-dsl to opt back in wherever the
+# FlashInfer and CuTe-DSL builds do agree (for example the K3 FlashInfer fork
+# used on GB300). Restore the upstream default once the shipped pair is aligned.
+_KIMI_K3_MLA_GEN_BACKEND_DEFAULT = "trtllm-gen"
+
 
 def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     """Select K3's absorbed-generation MLA backend.
@@ -33,8 +54,13 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     K3 was tuned with the FlashInfer CuTe-DSL backend for BF16 KV cache.
     FP8 KV cache carries device scales that CuTe-DSL does not support, so
     retain the TRTLLM-Gen fallback used by the pre-refactor implementation.
+
+    The default is TRTLLM-Gen on this branch; see
+    ``_KIMI_K3_MLA_GEN_BACKEND_DEFAULT`` for why.
     """
-    backend = os.environ.get(_KIMI_K3_MLA_GEN_BACKEND_ENV, "cute-dsl")
+    backend = os.environ.get(
+        _KIMI_K3_MLA_GEN_BACKEND_ENV, _KIMI_K3_MLA_GEN_BACKEND_DEFAULT
+    )
     has_fp8_kv_cache = bool(
         quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
     )

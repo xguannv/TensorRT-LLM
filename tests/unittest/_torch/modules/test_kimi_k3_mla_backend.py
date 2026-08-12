@@ -7,6 +7,7 @@ from typing import Optional
 import pytest
 
 from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import (
+    _KIMI_K3_MLA_GEN_BACKEND_DEFAULT,
     _KIMI_K3_MLA_GEN_BACKEND_ENV,
     _kimi_k3_mla_decode_backend_policy,
     _select_mla_generation_backend,
@@ -14,9 +15,24 @@ from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import (
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
+def test_kimi_k3_mla_generation_backend_default_is_trtllm_gen() -> None:
+    # This branch diverges from upstream, which defaults to cute-dsl: the
+    # shipped FlashInfer / CuTe-DSL pair cannot initialize the CuTe-DSL MLA
+    # decode kernel, and every rank dies during executor init. Pinning the
+    # default here makes that divergence fail loudly if someone reverts it
+    # without also realigning the packages.
+    assert _KIMI_K3_MLA_GEN_BACKEND_DEFAULT == "trtllm-gen"
+
+
 @pytest.mark.parametrize(
     ("configured_backend", "expected_backend"),
-    [(None, "cute-dsl"), ("trtllm-gen", "trtllm-gen")],
+    [
+        (None, "trtllm-gen"),
+        ("trtllm-gen", "trtllm-gen"),
+        # The env var still opts back in, so the CuTe-DSL path stays reachable
+        # wherever the FlashInfer and CuTe-DSL builds do agree.
+        ("cute-dsl", "cute-dsl"),
+    ],
 )
 def test_select_kimi_k3_mla_generation_backend(
     monkeypatch: pytest.MonkeyPatch,

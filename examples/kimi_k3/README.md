@@ -221,4 +221,9 @@ decoding requires the default cache manager, which cannot reuse blocks.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
+- The MLA generation backend defaults to trtllm-gen on this branch. Upstream
+  defaults to cute-dsl, but the FlashInfer / CuTe-DSL pair shipped here cannot
+  initialize that kernel — see `_KIMI_K3_MLA_GEN_BACKEND_DEFAULT` in
+  `tensorrt_llm/_torch/modules/kimi_k3_mla/kimi_k3_mla_attention.py`. Set
+  `TLLM_K3_MLA_GEN_BACKEND=cute-dsl` to opt back in where the builds agree.
 - Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Combining speculation with disaggregated serving is not yet supported.

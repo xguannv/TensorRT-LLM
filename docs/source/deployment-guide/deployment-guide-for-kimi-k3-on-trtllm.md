@@ -32,6 +32,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
 * **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) trtllm-gen generation kernel.
 * **Speculative decoding and disaggregated serving are not yet available** for Kimi K3; support is under development. See the "Current limitations" section of `examples/kimi_k3/README.md`.
+* **The MLA generation backend defaults to trtllm-gen on this branch** (upstream defaults to cute-dsl). The FlashInfer / CuTe-DSL pair shipped here cannot initialize the cute-dsl MLA decode kernel; `TLLM_K3_MLA_GEN_BACKEND=cute-dsl` opts back in where the builds agree. See `_KIMI_K3_MLA_GEN_BACKEND_DEFAULT` in `tensorrt_llm/_torch/modules/kimi_k3_mla/kimi_k3_mla_attention.py`.
 
 ## Deployment Steps
 
