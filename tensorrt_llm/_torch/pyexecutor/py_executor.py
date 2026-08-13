@@ -2240,6 +2240,17 @@ class PyExecutor:
             else:
                 stats.specdec_stats.acceptance_length = 0.0
 
+            if self.print_log:
+                logger.info(
+                    f"SpecDec AL: iter = {stats.iter}, "
+                    f"global_rank = {self.global_rank}, "
+                    f"rank = {self.dist.rank}, "
+                    f"num_draft_tokens = {total_draft_tokens}, "
+                    f"num_accepted_draft_tokens = {total_accepted_tokens}, "
+                    f"num_requests_with_draft_tokens = {num_requests_with_draft}, "
+                    f"acceptance_length = {stats.specdec_stats.acceptance_length:.6f}"
+                )
+
             # Get draft latency from drafter if available (only for two-model mode)
             # Only use draft latency if there were actually draft tokens in this iteration
             draft_latency_ms = 0.0

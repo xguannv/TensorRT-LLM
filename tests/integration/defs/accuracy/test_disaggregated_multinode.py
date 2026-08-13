@@ -205,6 +205,8 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         },
         "enable_chunked_prefill": False,
         "disable_overlap_scheduler": True,
+        "enable_iter_perf_stats": True,
+        "print_iter_log": True,
         "custom_tokenizer": "deepseek_v4",
         "cache_transceiver_config": {
             "backend": "NIXL",
