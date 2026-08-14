@@ -62,6 +62,31 @@ _PYTEST_SUMMARY_RE = re.compile(
     r"(?P<summary>\d+\s+(?:passed|failed|skipped|xfailed|xpassed|error|errors|warnings|deselected)"
     r"(?:,\s*\d+\s+\w+)*(?:\s+in\s+\S+(?:\s+\([^)]*\))?)?)"
 )
+_MONITOR_INTERVAL_SECONDS = 5
+_TERMINAL_SLURM_STATES = {
+    "COMPLETED",
+    "CANCELLED",
+    "FAILED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "PREEMPTED",
+}
+_EARLY_FAILURE_RE = re.compile(
+    r"prte has detected an attempt to run as root|MPI_ERR_[A-Z_]+|OPAL ERROR|"
+    r"Traceback \(most recent call last\)|CUDA error|CUDA out of memory|"
+    r"OutOfMemoryError|NCCL (?:WARN|ERROR)|AssertionError|RuntimeError:|"
+    r"Connection refused|Address already in use|"
+    r"(?:ctx|context|gen|generation|disagg|disaggregated)[^\n]{0,120}"
+    r"(?:failed|failure|error|exception|not ready|unavailable)|"
+    r"(?:failed|failure|error|exception|not ready|unavailable)[^\n]{0,120}"
+    r"(?:ctx|context|gen|generation|disagg|disaggregated)",
+    re.IGNORECASE,
+)
+_ROLE_RE = re.compile(
+    r"\b(?:ctx|context|gen|generation|disagg|disaggregated)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_trtllm_repo_root(path: Path) -> bool:
@@ -321,7 +346,10 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
                 raise ValueError(f"Test file does not exist: {selector}")
 
     if not args.dry_run:
-        for command in ("sbatch", "srun"):
+        commands = ["sbatch", "srun"]
+        if not args.no_wait:
+            commands.extend(["squeue", "sacct", "scancel"])
+        for command in commands:
             if shutil.which(command) is None:
                 raise ValueError(f"Required Slurm command is not on PATH: {command}")
 
@@ -334,6 +362,10 @@ def _shell_env_lines(args: argparse.Namespace) -> list[str]:
             "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache",
         ),
         "TLLM_LOG_LEVEL": "INFO",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+        "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+        "PRTE_ALLOW_RUN_AS_ROOT": "1",
+        "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
         "PMIX_MCA_gds": "hash",
         "PYTHONPATH": "",
         "TRTLLM_ACCURACY_NO_REFERENCE": "1",
@@ -397,8 +429,8 @@ def _pytest_command(
     return (
         [
             "env",
-            "OMPI_ALLOW_RUN_AS_ROOT=1",
-            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PRTE_ALLOW_RUN_AS_ROOT=1",
+            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
             "python3",
             "-m",
             "pytest",
@@ -416,6 +448,15 @@ def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
     lines = ["set -eu", *_shell_env_lines(args)]
     lines.extend(_install_lines(args))
     lines.append(f"cd {shlex.quote(workdir)}")
+    if job.scope == "multi-node":
+        lines.append(
+            'if [ "$(id -u)" -eq 0 ] && '
+            '{ [ "${PRTE_ALLOW_RUN_AS_ROOT:-}" != "1" ] || '
+            '[ "${PRTE_ALLOW_RUN_AS_ROOT_CONFIRM:-}" != "1" ]; }; then '
+            "echo 'MPI root-spawn environment is not configured; refusing to start the model.' >&2; "
+            "exit 1; "
+            "fi"
+        )
     lines.append(f"exec {shlex.join(command)}")
     return "\n".join(lines)
 
@@ -443,8 +484,6 @@ def _sbatch_command(args: argparse.Namespace, job: GuardJob) -> list[str]:
         "sbatch",
         "--parsable",
     ]
-    if not args.no_wait:
-        command.append("--wait")
     command.extend(
         [
             f"--job-name=coreai_comparch_trtllm-{job.name}",
@@ -528,6 +567,124 @@ def _job_log_path(
     return max(fresh_logs, key=lambda path: path.stat().st_mtime)
 
 
+def _job_log_paths(args: argparse.Namespace, job_id: str, started_at: float) -> list[Path]:
+    primary = args.log_dir / f"job-{job_id}.log"
+    paths = [primary]
+    role_names = ("ctx", "context", "gen", "generation", "disagg")
+    for path in args.log_dir.rglob("*.log"):
+        if path in paths:
+            continue
+        try:
+            recent = path.stat().st_mtime >= started_at - 5
+        except OSError:
+            continue
+        if recent and (
+            job_id in path.name or any(role in path.stem.lower() for role in role_names)
+        ):
+            paths.append(path)
+    return paths
+
+
+def _read_new_log(path: Path, offset: int) -> tuple[int, list[str]]:
+    try:
+        size = path.stat().st_size
+        if size < offset:
+            offset = 0
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            stream.seek(offset)
+            text = stream.read()
+            offset = stream.tell()
+    except OSError:
+        return offset, []
+    return offset, text.splitlines()
+
+
+def _failure_context(line: str) -> str | None:
+    if _EARLY_FAILURE_RE.search(line) is None:
+        return None
+    role_map = {
+        "ctx": "ctx",
+        "context": "ctx",
+        "gen": "gen",
+        "generation": "gen",
+        "disagg": "disagg",
+        "disaggregated": "disagg",
+    }
+    roles: list[str] = []
+    for raw_role in _ROLE_RE.findall(line):
+        role = role_map[raw_role.lower()]
+        if role not in roles:
+            roles.append(role)
+    label = "/".join(roles) if roles else "disagg/ctx/gen"
+    return f"{label}: {line.strip()}"
+
+
+def _scan_new_logs(paths: Sequence[Path], offsets: dict[Path, int]) -> str | None:
+    for path in paths:
+        offset, lines = _read_new_log(path, offsets.get(path, 0))
+        offsets[path] = offset
+        for line in lines:
+            context = _failure_context(line)
+            if context is not None:
+                return f"{path}: {context}"
+    return None
+
+
+def _slurm_job_state(job_id: str) -> str | None:
+    for command in (
+        ["squeue", "-h", "-j", job_id, "-o", "%T"],
+        ["sacct", "-X", "-n", "-P", "-j", job_id, "--format=State"],
+    ):
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            state = line.strip().split("|", 1)[0].split("+", 1)[0]
+            if state:
+                return state
+    return None
+
+
+def _cancel_slurm_job(job_id: str) -> None:
+    result = subprocess.run(
+        ["scancel", job_id],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"[job {job_id}] scancel failed: {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+
+
+def _monitor_job(args: argparse.Namespace, job: GuardJob, job_id: str, started_at: float) -> bool:
+    offsets: dict[Path, int] = {}
+    print(f"[{job.name}] MONITORING job {job_id} for ctx/gen/disagg failures")
+    while True:
+        failure = _scan_new_logs(_job_log_paths(args, job_id, started_at), offsets)
+        if failure is not None:
+            print(f"[{job.name}] EARLY FAILURE: {failure}", file=sys.stderr)
+            _cancel_slurm_job(job_id)
+            return False
+
+        state = _slurm_job_state(job_id)
+        if state in _TERMINAL_SLURM_STATES:
+            failure = _scan_new_logs(_job_log_paths(args, job_id, started_at), offsets)
+            if failure is not None:
+                print(f"[{job.name}] FAILURE: {failure}", file=sys.stderr)
+                return False
+            if state != "COMPLETED":
+                print(f"[{job.name}] Slurm terminal state: {state}", file=sys.stderr)
+                return False
+            return True
+        time.sleep(_MONITOR_INTERVAL_SECONDS)
+
+
 def _print_test_results(
     args: argparse.Namespace,
     job: GuardJob,
@@ -596,17 +753,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         sbatch_output = result.stdout if result.stdout.strip() else result.stderr
-        _print_test_results(args, job, sbatch_output, started_at)
+        failure_message = f"sbatch exit {result.returncode}"
+        passed = False
         if result.returncode == 0:
-            print(f"[{job.name}] PASS")
-        else:
-            failures += 1
-            print(
-                f"[{job.name}] FAIL (sbatch exit {result.returncode})",
-                file=sys.stderr,
-            )
-            if not args.continue_on_failure:
-                break
+            job_id = _job_id_from_output(sbatch_output)
+            if args.no_wait:
+                _print_test_results(args, job, sbatch_output, started_at)
+                continue
+            if job_id is None:
+                failure_message = "sbatch returned no job id"
+            else:
+                passed = _monitor_job(args, job, job_id, started_at)
+            _print_test_results(args, job, sbatch_output, started_at)
+            if passed:
+                print(f"[{job.name}] PASS")
+                continue
+            if job_id is not None:
+                failure_message = "early log monitor detected a failure"
+
+        failures += 1
+        print(
+            f"[{job.name}] FAIL ({failure_message})",
+            file=sys.stderr,
+        )
+        if not args.continue_on_failure:
+            break
 
     return 1 if failures else 0
 

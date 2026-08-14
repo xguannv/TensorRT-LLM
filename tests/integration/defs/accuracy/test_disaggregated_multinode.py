@@ -191,6 +191,7 @@ def _worker_env() -> dict[str, str]:
         {
             "OMPI_ALLOW_RUN_AS_ROOT": "1",
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+            "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
         }
     )
     return env
@@ -210,7 +211,7 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "max_num_tokens": 4096,
         "kv_cache_config": {
             "enable_block_reuse": False,
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.6,
         },
         "enable_chunked_prefill": False,
         "disable_overlap_scheduler": True,
