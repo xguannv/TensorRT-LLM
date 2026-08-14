@@ -179,12 +179,21 @@ def _is_generation_node() -> bool:
 
 
 def _worker_env() -> dict[str, str]:
-    return {
+    env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_"))
         and key not in {"UCX_TLS", "UCX_NET_DEVICES"}
     }
+    # Pyxis starts these worker processes as root; preserve the explicit
+    # Open MPI container override for mpi4py dynamic worker spawn.
+    env.update(
+        {
+            "OMPI_ALLOW_RUN_AS_ROOT": "1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+        }
+    )
+    return env
 
 
 def _worker_config(enable_dspark: bool) -> dict[str, object]:

@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Submit the DSV4 branch guard tests through Slurm.
+
+The runner deliberately keeps the Slurm allocation and container launch in this
+file so that the same command can be reviewed, reproduced, and run from a
+checked-out branch.
+
+Examples:
+    # Editable repository guard (explicit; also the default).
+    python3 scripts/run_branch_guard_tests.py \
+        --scope all \
+        --install-from-repo \
+        --image /path/to/trtllm.sqsh \
+        --partition batch-xdr \
+        --account coreai_comparch_aarwlt \
+        --model-root /path/to/llm-models
+
+    # Image-only guard.
+    python3 scripts/run_branch_guard_tests.py \
+        --scope all \
+        --skip-install \
+        --image /path/to/trtllm.sqsh \
+        --partition batch-xdr \
+        --account coreai_comparch_aarwlt \
+        --model-root /path/to/llm-models
+
+The guards install this checkout into the container in editable mode by
+default. Use ``--skip-install`` to exercise the image as-is.
+
+Set TRTLLM_TEST_IMAGE, TRTLLM_SLURM_PARTITION, TRTLLM_SLURM_ACCOUNT, and
+LLM_MODELS_ROOT to avoid repeating those options.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+_PYTEST_SUMMARY_RE = re.compile(
+    r"(?P<summary>\d+\s+(?:passed|failed|skipped|xfailed|xpassed|error|errors|warnings|deselected)"
+    r"(?:,\s*\d+\s+\w+)*(?:\s+in\s+\S+(?:\s+\([^)]*\))?)?)"
+)
+
+
+def _is_trtllm_repo_root(path: Path) -> bool:
+    return all(
+        (path / marker).exists()
+        for marker in (
+            "tensorrt_llm",
+            "tests",
+            "pyproject.toml",
+        )
+    )
+
+
+SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _detect_trtllm_repo_root() -> Path:
+    configured_root = os.environ.get("TRTLLM_REPO_ROOT")
+    if configured_root:
+        root = Path(configured_root).expanduser().resolve()
+        if not _is_trtllm_repo_root(root):
+            raise RuntimeError(f"TRTLLM_REPO_ROOT is not a TensorRT-LLM repository: {root}")
+        return root
+
+    if _is_trtllm_repo_root(SCRIPT_REPO_ROOT):
+        return SCRIPT_REPO_ROOT
+
+    raise RuntimeError(
+        "Unable to detect a TensorRT-LLM repository two levels above the script; "
+        "pass --repo-root or set TRTLLM_REPO_ROOT."
+    )
+
+
+REPO_ROOT = _detect_trtllm_repo_root()
+
+SINGLE_NODE_SELECTORS = (
+    "tests/integration/defs/accuracy/test_llm_api_pytorch.py"
+    "::TestDeepSeekV4Pro::test_gsm8k_full_accuracy",
+)
+
+MULTI_NODE_TESTS: dict[str, int] = {
+    "tests/integration/defs/accuracy/test_disaggregated_multinode.py"
+    "::TestDeepSeekV4ProDSparkMultinode::test_gsm8k_1p1d_dep4": 2,
+}
+
+
+@dataclass(frozen=True)
+class GuardJob:
+    name: str
+    scope: str
+    selectors: tuple[str, ...]
+    nodes: int
+    ntasks: int
+    ntasks_per_node: int
+    gpus_per_node: int
+    use_pmix: bool
+
+
+GUARD_JOBS = (
+    GuardJob(
+        name="dsv4-single-node",
+        scope="single-node",
+        selectors=SINGLE_NODE_SELECTORS,
+        nodes=1,
+        ntasks=4,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=True,
+    ),
+    *(
+        GuardJob(
+            name=f"dsv4-multi-node-{test_name.rsplit('::', maxsplit=1)[-1]}",
+            scope="multi-node",
+            selectors=(test_name,),
+            nodes=num_nodes,
+            ntasks=num_nodes,
+            ntasks_per_node=1,
+            gpus_per_node=4,
+            use_pmix=False,
+        )
+        for test_name, num_nodes in MULTI_NODE_TESTS.items()
+    ),
+)
+
+
+def _default(value: str, environment_name: str) -> str:
+    return os.environ.get(environment_name, value)
+
+
+def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the DSV4 single-node and multi-node branch guards on Slurm."
+    )
+    parser.add_argument(
+        "--scope",
+        choices=("all", "single-node", "multi-node"),
+        default="all",
+        help="Which Slurm guard job to submit (default: all).",
+    )
+    parser.add_argument(
+        "--image",
+        default=os.environ.get("TRTLLM_TEST_IMAGE", ""),
+        help="Pyxis container image (or set TRTLLM_TEST_IMAGE).",
+    )
+    parser.add_argument(
+        "--partition",
+        default=os.environ.get("TRTLLM_SLURM_PARTITION", ""),
+        help="Slurm partition (or set TRTLLM_SLURM_PARTITION).",
+    )
+    parser.add_argument(
+        "--account",
+        default=os.environ.get("TRTLLM_SLURM_ACCOUNT", ""),
+        help="Slurm account (or set TRTLLM_SLURM_ACCOUNT).",
+    )
+    parser.add_argument(
+        "--model-root",
+        "--llm-models-root",
+        dest="model_root",
+        default=os.environ.get("LLM_MODELS_ROOT", ""),
+        help="LLM model root visible inside the container.",
+    )
+    parser.add_argument(
+        "--mounts",
+        default=_default(
+            "/lustre:/lustre",
+            "TRTLLM_CONTAINER_MOUNTS",
+        ),
+        help="Pyxis container mounts (default: /lustre:/lustre).",
+    )
+    parser.add_argument(
+        "--repo-root",
+        "--trtllm-repo-root",
+        type=Path,
+        default=Path(os.environ.get("TRTLLM_REPO_ROOT", str(REPO_ROOT))),
+        help=(
+            "TensorRT-LLM repository path visible inside the container "
+            "(default: auto-detected; or set TRTLLM_REPO_ROOT)."
+        ),
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "TRTLLM_GUARD_LOG_DIR",
+                str(REPO_ROOT / "build_images" / "branch_guard_logs"),
+            )
+        ),
+        help="Directory for Slurm stdout/stderr logs.",
+    )
+    parser.add_argument(
+        "--single-node-time",
+        default="04:00:00",
+        help="Time limit for the single-node job.",
+    )
+    parser.add_argument(
+        "--multi-node-time",
+        default="04:00:00",
+        help="Time limit for the multi-node job.",
+    )
+    parser.add_argument("--qos", default=os.environ.get("TRTLLM_SLURM_QOS", ""))
+    parser.add_argument(
+        "--constraint",
+        default=os.environ.get("TRTLLM_SLURM_CONSTRAINT", ""),
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Additional environment assignment inside the container.",
+    )
+    parser.add_argument(
+        "--pytest-arg",
+        action="append",
+        default=[],
+        help="Additional argument passed to pytest; may be repeated.",
+    )
+    install_group = parser.add_mutually_exclusive_group()
+    install_group.add_argument(
+        "--install-from-repo",
+        dest="install_from_repo",
+        action="store_true",
+        default=True,
+        help="Install the detected repository with pip install -e inside the container.",
+    )
+    install_group.add_argument(
+        "--skip-install",
+        dest="install_from_repo",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--continue-on-failure",
+        action="store_true",
+        help="Submit the next scope even if the previous job fails.",
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Return after submission instead of waiting for each job.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List the guards without validating Slurm arguments.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print exact sbatch commands without submitting jobs.",
+    )
+    return parser.parse_args(argv)
+
+
+def _selected_jobs(scope: str) -> tuple[GuardJob, ...]:
+    if scope == "all":
+        return GUARD_JOBS
+    return tuple(job for job in GUARD_JOBS if job.scope == scope)
+
+
+def _selector_path(repo_root: Path, selector: str) -> Path:
+    return repo_root / selector.split("::", maxsplit=1)[0]
+
+
+def _validate_env_assignments(assignments: Sequence[str]) -> None:
+    for assignment in assignments:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", assignment):
+            raise ValueError(f"Invalid --env assignment: {assignment!r}")
+
+
+def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
+    args.repo_root = args.repo_root.expanduser().resolve()
+    args.log_dir = args.log_dir.expanduser().resolve()
+    if not _is_trtllm_repo_root(args.repo_root):
+        raise ValueError(f"Not a TensorRT-LLM repository: {args.repo_root}")
+
+    required = {
+        "--image": args.image,
+        "--partition": args.partition,
+        "--account": args.account,
+        "--model-root": args.model_root,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing and not args.dry_run:
+        raise ValueError("Missing required Slurm inputs: " + ", ".join(missing))
+
+    if args.image and not Path(args.image).is_file() and not args.dry_run:
+        raise ValueError(f"Container image does not exist: {args.image}")
+    if args.model_root and not Path(args.model_root).is_dir() and not args.dry_run:
+        raise ValueError(f"Model root does not exist: {args.model_root}")
+
+    _validate_env_assignments(args.env)
+    for job in jobs:
+        for selector in job.selectors:
+            if not _selector_path(args.repo_root, selector).is_file():
+                raise ValueError(f"Test file does not exist: {selector}")
+
+    if not args.dry_run:
+        for command in ("sbatch", "srun"):
+            if shutil.which(command) is None:
+                raise ValueError(f"Required Slurm command is not on PATH: {command}")
+
+
+def _shell_env_lines(args: argparse.Namespace) -> list[str]:
+    values = {
+        "LLM_MODELS_ROOT": args.model_root,
+        "HF_HOME": os.environ.get(
+            "HF_HOME",
+            "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache",
+        ),
+        "TLLM_LOG_LEVEL": "INFO",
+        "PMIX_MCA_gds": "hash",
+        "PYTHONPATH": "",
+        "TRTLLM_ACCURACY_NO_REFERENCE": "1",
+    }
+    lines = [f"export {key}={shlex.quote(value)}" for key, value in values.items()]
+    lines.append("unset TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES")
+    lines.extend(f"export {assignment}" for assignment in args.env)
+    return lines
+
+
+def _install_lines(args: argparse.Namespace) -> list[str]:
+    if not args.install_from_repo:
+        return []
+    command = shlex.join(
+        [
+            "python3",
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-build-isolation",
+            "-e",
+            str(args.repo_root),
+        ]
+    )
+    install_shell = "; ".join([*_shell_env_lines(args), command])
+    return [
+        f'flock "/tmp/trtllm_branch_guard_install_"$SLURM_JOB_ID".lock" '
+        f"bash -lc {shlex.quote(install_shell)}",
+    ]
+
+
+def _pytest_command(
+    args: argparse.Namespace,
+    job: GuardJob,
+) -> tuple[list[str], str]:
+    pytest_args = ["-x"] if not args.continue_on_failure else []
+    pytest_args.extend(args.pytest_arg)
+    pytest_args.extend(str(args.repo_root / selector) for selector in job.selectors)
+
+    if job.scope == "single-node":
+        return (
+            [
+                str(args.repo_root / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch"),
+                # The launcher scrubs OMPI_* before starting pytest.
+                # Re-add the explicit container-root override after that scrub.
+                "env",
+                "OMPI_ALLOW_RUN_AS_ROOT=1",
+                "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                "python3",
+                "-m",
+                "pytest",
+                "-v",
+                "-s",
+                "--rootdir=/tmp",
+                *pytest_args,
+            ],
+            "/tmp",
+        )
+
+    return (
+        [
+            "env",
+            "OMPI_ALLOW_RUN_AS_ROOT=1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "python3",
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            "--rootdir=/tmp",
+            *pytest_args,
+        ],
+        str(args.repo_root),
+    )
+
+
+def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
+    command, workdir = _pytest_command(args, job)
+    lines = ["set -eu", *_shell_env_lines(args)]
+    lines.extend(_install_lines(args))
+    lines.append(f"cd {shlex.quote(workdir)}")
+    lines.append(f"exec {shlex.join(command)}")
+    return "\n".join(lines)
+
+
+def _srun_command(args: argparse.Namespace, job: GuardJob) -> list[str]:
+    command = [
+        "srun",
+        "--kill-on-bad-exit=1",
+        f"--ntasks={job.ntasks}",
+        f"--ntasks-per-node={job.ntasks_per_node}",
+        f"--container-image={args.image}",
+        f"--container-mounts={args.mounts}",
+        f"--container-workdir={args.repo_root}",
+    ]
+    if job.use_pmix:
+        command.append("--mpi=pmix")
+    command.extend(["bash", "-lc", _container_shell(args, job)])
+    return command
+
+
+def _sbatch_command(args: argparse.Namespace, job: GuardJob) -> list[str]:
+    time_limit = args.single_node_time if job.scope == "single-node" else args.multi_node_time
+    log_dir = str(args.log_dir)
+    command = [
+        "sbatch",
+        "--parsable",
+    ]
+    if not args.no_wait:
+        command.append("--wait")
+    command.extend(
+        [
+            f"--job-name=coreai_comparch_trtllm-{job.name}",
+            f"--partition={args.partition}",
+            f"--account={args.account}",
+            f"--nodes={job.nodes}",
+            f"--ntasks={job.ntasks}",
+            f"--ntasks-per-node={job.ntasks_per_node}",
+            f"--time={time_limit}",
+            f"--output={log_dir}/job-%j.log",
+            f"--error={log_dir}/job-%j.log",
+        ]
+    )
+    if args.qos:
+        command.append(f"--qos={args.qos}")
+    if args.constraint:
+        command.append(f"--constraint={args.constraint}")
+    command.extend(["--wrap", shlex.join(_srun_command(args, job))])
+    return command
+
+
+def _print_jobs(jobs: Sequence[GuardJob]) -> None:
+    for job in jobs:
+        mpi = "pmix" if job.use_pmix else "none"
+        selectors = ", ".join(job.selectors)
+        print(
+            f"{job.name}: scope={job.scope}, nodes={job.nodes}, "
+            f"tasks={job.ntasks} ({job.ntasks_per_node}/node), "
+            f"gpus/node={job.gpus_per_node}, mpi={mpi}"
+        )
+        print(f"  tests: {selectors}")
+
+
+def _job_id_from_output(output: str) -> str | None:
+    for line in reversed(output.splitlines()):
+        job_id = line.strip().split(";", maxsplit=1)[0]
+        if job_id.isdigit():
+            return job_id
+    return None
+
+
+def _test_result_summaries(log_path: Path) -> list[str]:
+    try:
+        log_text = log_path.read_text(errors="replace")
+    except OSError:
+        return []
+
+    counts: dict[str, int] = {}
+    for line in log_text.splitlines():
+        match = _PYTEST_SUMMARY_RE.search(line)
+        if match is not None:
+            summary = " ".join(match.group("summary").split())
+            counts[summary] = counts.get(summary, 0) + 1
+
+    return [
+        summary if count == 1 else f"{summary} (reported {count} times)"
+        for summary, count in counts.items()
+    ]
+
+
+def _job_log_path(
+    args: argparse.Namespace,
+    sbatch_output: str,
+    started_at: float,
+) -> Path | None:
+    job_id = _job_id_from_output(sbatch_output)
+    if job_id is not None:
+        log_path = args.log_dir / f"job-{job_id}.log"
+        if log_path.exists():
+            return log_path
+
+    fresh_logs: list[Path] = []
+    for log_path in args.log_dir.glob("job-*.log"):
+        try:
+            if log_path.stat().st_mtime >= started_at - 5:
+                fresh_logs.append(log_path)
+        except OSError:
+            continue
+    if not fresh_logs:
+        return None
+    return max(fresh_logs, key=lambda path: path.stat().st_mtime)
+
+
+def _print_test_results(
+    args: argparse.Namespace,
+    job: GuardJob,
+    sbatch_output: str,
+    started_at: float,
+) -> None:
+    job_id = _job_id_from_output(sbatch_output)
+    if args.no_wait:
+        if job_id is None:
+            print(f"[{job.name}] SUBMITTED; Slurm output: {sbatch_output.strip()}")
+        else:
+            print(f"[{job.name}] SUBMITTED job {job_id}")
+        return
+
+    log_path = _job_log_path(args, sbatch_output, started_at)
+    if log_path is None:
+        print(f"[{job.name}] TEST RESULTS: no completed Slurm log found")
+        return
+    summaries = _test_result_summaries(log_path)
+    print(f"[{job.name}] LOG: {log_path}")
+    if not summaries:
+        print(f"[{job.name}] TEST RESULTS: no pytest summary found")
+        return
+
+    print(f"[{job.name}] TEST RESULTS:")
+    for summary in summaries:
+        print(f"  {summary}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    jobs = _selected_jobs(args.scope)
+    if args.list:
+        _print_jobs(jobs)
+        return 0
+
+    try:
+        _validate_args(args, jobs)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    if not args.dry_run:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
+
+    failures = 0
+    for job in jobs:
+        command = _sbatch_command(args, job)
+        print(f"\n[{job.name}]")
+        print(shlex.join(command))
+        if args.dry_run:
+            continue
+
+        started_at = time.time()
+        result = subprocess.run(
+            command,
+            cwd=args.repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.stderr:
+            print(
+                result.stderr,
+                end="" if result.stderr.endswith("\n") else "\n",
+                file=sys.stderr,
+            )
+        sbatch_output = result.stdout if result.stdout.strip() else result.stderr
+        _print_test_results(args, job, sbatch_output, started_at)
+        if result.returncode == 0:
+            print(f"[{job.name}] PASS")
+        else:
+            failures += 1
+            print(
+                f"[{job.name}] FAIL (sbatch exit {result.returncode})",
+                file=sys.stderr,
+            )
+            if not args.continue_on_failure:
+                break
+
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
