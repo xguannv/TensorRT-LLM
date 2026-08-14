@@ -2451,13 +2451,13 @@ class PyTorchModelEngine(ModelEngine):
                     # capture values (0.7 / 50 / 0.9). Defer cleanup during
                     # warmup-only because the real capture pass reuses that
                     # pass's cached metadata.
-                    if not self.cuda_graph_runner.is_warmup_only:
-                        cleared = (self.cuda_graph_runner.
-                                   clear_capture_only_spec_state())
+                    cleared = (
+                        self.cuda_graph_runner.
+                        clear_capture_only_spec_state_after_capture_pass())
+                    if cleared is not None:
                         logger.info(
                             "Cleared capture-only sampling override from "
-                            f"{cleared} cached CUDA graph spec metadata "
-                            "object(s).")
+                            f"{cleared} cached CUDA graph spec metadata object(s).")
 
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
