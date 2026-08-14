@@ -77,7 +77,7 @@ DEFAULT_BENCHMARK_REPO = SHARED_TOOLS_ROOT / "bench-trtllm-disagg-perf-dsv4"
 DEFAULT_SRTCTL = SHARED_TOOLS_ROOT / "srt-slurm" / ".venv-submit" / "bin" / "srtctl"
 DEFAULT_SETUP_SCRIPTS_DIR = SHARED_TOOLS_ROOT / "srt-slurm" / "configs"
 DEFAULT_WAIT_TIMEOUT_SECONDS = 4 * 60 * 60
-CUTLASS_DSL_UNINSTALL_COMMAND = "python3 -m pip uninstall --yes nvidia-cutlass-dsl"
+CUTLASS_DSL_UNINSTALL_COMMAND = ""
 TERMINAL_SLURM_STATES = {
     "BOOT_FAIL",
     "CANCELLED",
