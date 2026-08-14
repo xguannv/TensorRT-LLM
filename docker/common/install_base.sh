@@ -74,6 +74,10 @@ init_ubuntu() {
   # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
+  ARCH=$(uname -m)
+  LIB_PATH="/usr/lib/${ARCH}-linux-gnu"
+  ln -sf ${LIB_PATH}/libmlx5.so.1 ${LIB_PATH}/libmlx5.so
+  git config --global --add safe.directory /workspace/TensorRT-LLM/cpp/build/_deps/googletest-src
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
@@ -105,6 +109,7 @@ init_ubuntu() {
   # and ubuntu22.04 (currently not used) shouldn't be affected.
   pip3 config set global.break-system-packages true
   pip3 install pip wheel
+  pip3 install --upgrade cmake
   # WAR: pin setuptools<80; setuptools>=80 breaks `python setup_library.py develop`
   # used by cutlass. Use --ignore-installed to avoid failing on system setuptools
   # that lack a RECORD file (installed via apt without pip metadata).

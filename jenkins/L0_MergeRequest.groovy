@@ -1757,19 +1757,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 testStageName = "[Test-x86_64-Multi-GPU] Remote Run"
-                stage(testStageName) {
-                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
-                        echo "x86_64 test job is skipped due to Jenkins configuration"
-                        return
-                    }
-                    try {
-                        def testFilterJson = writeJSON returnText: true, json: testFilter
-                        def additionalParameters = [
-                            'testFilter': testFilterJson,
-                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
-                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
-                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
-                        ]
+                //stage(testStageName) {
+                //    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                //        echo "x86_64 test job is skipped due to Jenkins configuration"
+                //        return
+                //    }
+                //    try {
+                //        def testFilterJson = writeJSON returnText: true, json: testFilter
+                //        def additionalParameters = [
+                //            'testFilter': testFilterJson,
+                //            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                //            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                //            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                //        ]
 
                 //         launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
 
@@ -1917,19 +1917,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
-                stage(testStageName) {
-                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
-                        echo "SBSA test job is skipped due to Jenkins configuration"
-                        return
-                    }
-                    try {
-                        def testFilterJson = writeJSON returnText: true, json: testFilter
-                        def additionalParameters = [
-                            'testFilter': testFilterJson,
-                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
-                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
-                        ]
+                // testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
+                // stage(testStageName) {
+                //     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                //         echo "SBSA test job is skipped due to Jenkins configuration"
+                //         return
+                //     }
+                //     try {
+                //         def testFilterJson = writeJSON returnText: true, json: testFilter
+                //         def additionalParameters = [
+                //             'testFilter': testFilterJson,
+                //             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                //             'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                //         ]
 
                 //     } catch (InterruptedException e) {
                 //         throw e
