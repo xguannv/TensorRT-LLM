@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingP
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._torch.modules.mla import MLA, _is_cute_dsl_fp8_bmm_available

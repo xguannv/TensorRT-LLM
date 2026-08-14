@@ -9291,6 +9291,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_class = SM107BlockwiseGemmKernel
             kernel_cache = dict()
 
+            def __init__(
+                self,
+                output_dtype: torch.dtype = torch.bfloat16,
+                use_tvm_ffi: bool = True,
+                fp8_quantize_1x128: bool = False,
+            ):
+                super().__init__(output_dtype=torch.bfloat16,
+                                 use_tvm_ffi=use_tvm_ffi)
+                self.fp8_quantize_1x128 = fp8_quantize_1x128
+
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
@@ -9310,11 +9320,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_inst_shape in _RUBIN_FP8_BLOCKWISE_MMA_CANDIDATES
                         for cluster_shape_mn in
                         _RUBIN_FP8_BLOCKWISE_CLUSTER_CANDIDATES
-                        if self.__class__.kernel_class.can_implement(
+                        if (not self.fp8_quantize_1x128 or mma_tiler[0] //
+                            (2 if use_2cta_instrs else 1) == 128)
+                        and self.__class__.kernel_class.can_implement(
                             cutlass.Float8E4M3FN,
                             cutlass.Float8E4M3FN,
                             cutlass.Float32,
-                            cutlass.BFloat16,
+                            (cutlass.Float8E4M3FN if self.
+                             fp8_quantize_1x128 else cutlass.BFloat16),
                             use_2cta_instrs,
                             mma_tiler,
                             mma_inst_shape,
@@ -9343,7 +9356,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_inst_shape = (128, 128, 64)
                     cluster_shape_mn = (1, 1)
 
-                a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
+                if self.fp8_quantize_1x128:
+                    (
+                        a_tensor,
+                        b_tensor,
+                        a_sf_tensor,
+                        b_sf_tensor,
+                        c_tensor,
+                        scale_tensor,
+                    ) = inputs
+                else:
+                    a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
+                    scale_tensor = None
                 c_tmp = c_tensor.permute(1, 2, 0)
 
                 batch_size, m, k = a_tensor.shape
@@ -9351,6 +9375,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sf_m = pad_up(m, 4)
                 sf_k = ceil_div(k, 128)
                 sf_n = ceil_div(n, 128)
+
+                scale_cute = None
+                if self.fp8_quantize_1x128:
+                    expected_scale_numel = pad_up(m, 128) * pad_up(
+                        ceil_div(batch_size * n, 32), 4)
+                    if (c_tensor.dtype != torch.float8_e4m3fn
+                            or scale_tensor.dtype != torch.uint8
+                            or not scale_tensor.is_contiguous()
+                            or scale_tensor.numel() != expected_scale_numel):
+                        raise ValueError(
+                            "Fused FP8 BMM output requires E4M3 output and a "
+                            "flat contiguous uint8 R128c4 scale tensor with "
+                            f"{expected_scale_numel} elements.")
+                    scale_cute = cute.runtime.from_dlpack(
+                        scale_tensor).mark_layout_dynamic(leading_dim=0)
 
                 if not self.use_tvm_ffi:
                     a_ptr = make_ptr(
@@ -9388,6 +9427,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_inst_shape,
                     cluster_shape_mn,
                     self.use_tvm_ffi,
+                    self.fp8_quantize_1x128,
                 )
                 if cache_key not in self.__class__.kernel_cache:
                     if self.use_tvm_ffi:
@@ -9426,36 +9466,59 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         mma_tiler=mma_tiler,
                         mma_inst_shape=mma_inst_shape,
                         cluster_shape_mn=cluster_shape_mn,
+                        fp8_quantize_1x128=self.fp8_quantize_1x128,
                     )
                     hardware_info = cutlass.utils.HardwareInfo()
                     max_active_clusters = hardware_info.get_max_active_clusters(
                         cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                    compiled_gemm = cute.compile(
-                        gemm.wrapper,
-                        m,
-                        n,
-                        k,
-                        sf_m,
-                        sf_n,
-                        sf_k,
-                        batch_size,
-                        a_ptr,
-                        b_ptr,
-                        a_sf_ptr,
-                        b_sf_ptr,
-                        c_cute_tensor,
-                        max_active_clusters=max_active_clusters,
-                        stream=stream,
-                        options="--opt-level 2 --enable-tvm-ffi"
-                        if self.use_tvm_ffi else "--opt-level 2",
-                    )
+                    if self.fp8_quantize_1x128:
+                        compiled_gemm = cute.compile(
+                            gemm.wrapper_fp8_quantized,
+                            m,
+                            n,
+                            k,
+                            sf_m,
+                            sf_n,
+                            sf_k,
+                            batch_size,
+                            a_ptr,
+                            b_ptr,
+                            a_sf_ptr,
+                            b_sf_ptr,
+                            c_cute_tensor,
+                            scale_cute,
+                            max_active_clusters=max_active_clusters,
+                            stream=stream,
+                            options="--opt-level 2 --enable-tvm-ffi"
+                            if self.use_tvm_ffi else "--opt-level 2",
+                        )
+                    else:
+                        compiled_gemm = cute.compile(
+                            gemm.wrapper,
+                            m,
+                            n,
+                            k,
+                            sf_m,
+                            sf_n,
+                            sf_k,
+                            batch_size,
+                            a_ptr,
+                            b_ptr,
+                            a_sf_ptr,
+                            b_sf_ptr,
+                            c_cute_tensor,
+                            max_active_clusters=max_active_clusters,
+                            stream=stream,
+                            options="--opt-level 2 --enable-tvm-ffi"
+                            if self.use_tvm_ffi else "--opt-level 2",
+                        )
                     self.__class__.kernel_cache[cache_key] = compiled_gemm
                 else:
                     compiled_gemm = self.__class__.kernel_cache[cache_key]
 
                 if self.use_tvm_ffi:
-                    compiled_gemm(
+                    runtime_args = (
                         m,
                         n,
                         k,
@@ -9469,8 +9532,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_tensor.data_ptr(),
                         c_tmp,
                     )
+                    if self.fp8_quantize_1x128:
+                        compiled_gemm(*runtime_args, scale_tensor)
+                    else:
+                        compiled_gemm(*runtime_args)
                 else:
-                    compiled_gemm(
+                    runtime_args = (
                         m,
                         n,
                         k,
@@ -9483,8 +9550,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         a_sf_ptr,
                         b_sf_ptr,
                         c_cute_tensor,
-                        stream=stream,
                     )
+                    if self.fp8_quantize_1x128:
+                        compiled_gemm(*runtime_args, scale_cute, stream=stream)
+                    else:
+                        compiled_gemm(*runtime_args, stream=stream)
+
+        class CuteDSLFp8RubinBmmQuantRunner(CuteDSLFp8RubinBmmRunner):
+            """Rubin FP8 BMM runner with dynamic packed output scales."""
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 1, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(
+                    ConstraintSpec(2, 2, fp8_scale_infer_shape),
+                    ConstraintSpec(4, 1,
+                                   lambda input_shapes: input_shapes[0][1]),
+                    ConstraintSpec(
+                        5,
+                        0,
+                        lambda input_shapes: pad_up(input_shapes[0][1], 128) *
+                        pad_up(
+                            ceil_div(input_shapes[0][0] * input_shapes[1][1], 32
+                                     ), 4),
+                    ),
+                ),
+            )
+
+            def __init__(self, use_tvm_ffi: bool = True):
+                super().__init__(
+                    use_tvm_ffi=use_tvm_ffi,
+                    fp8_quantize_1x128=True,
+                )
 
         @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_rubin",
                                  mutates_args=("output", ),
@@ -9534,6 +9632,83 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 "CuTe DSL FP8 Rubin BMM output dtype must be BF16"
             assert output.shape == (batch_size, m, n), \
                 "CuTe DSL FP8 Rubin BMM output shape is incorrect"
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_fp8_bmm_quantize_rubin_out",
+            mutates_args=("output", "packed_scale"),
+            device_types="cuda",
+        )
+        def cute_dsl_fp8_bmm_quantize_rubin_out(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            packed_scale: torch.Tensor,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            if get_sm_version() != 107:
+                raise ValueError(
+                    "CuTe DSL FP8 BMM quantization requires SM107.")
+            batch_size, m, _ = input.shape
+            n = weight.shape[1]
+            if n % 128 != 0:
+                raise ValueError(
+                    "Fused FP8 BMM quantization requires N divisible by 128, "
+                    f"got {n}.")
+            expected_scale_numel = pad_up(m, 128) * pad_up(
+                ceil_div(batch_size * n, 32), 4)
+            if output.shape != (batch_size, m, n):
+                raise ValueError(
+                    "Fused FP8 BMM output must have shape "
+                    f"{(batch_size, m, n)}, got {tuple(output.shape)}.")
+            if (output.dtype != torch.float8_e4m3fn
+                    or packed_scale.dtype != torch.uint8
+                    or not packed_scale.is_contiguous()
+                    or packed_scale.shape != (expected_scale_numel, )):
+                raise ValueError(
+                    "Fused FP8 BMM requires E4M3 output and a flat contiguous "
+                    f"uint8 R128c4 scale tensor with {expected_scale_numel} elements."
+                )
+
+            runner = CuteDSLFp8RubinBmmQuantRunner(use_tvm_ffi=use_tvm_ffi)
+            inputs = [
+                input,
+                weight,
+                input_scale,
+                weight_scale,
+                output,
+                packed_scale,
+            ]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_fp8_bmm_quantize_rubin::gemm",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_fp8_bmm_quantize_rubin_out")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            packed_scale: torch.Tensor,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            del input_scale, weight_scale, use_tvm_ffi
+            batch_size, m, _ = input.shape
+            n = weight.shape[1]
+            assert output.dtype == torch.float8_e4m3fn
+            assert output.shape == (batch_size, m, n)
+            expected_scale_numel = pad_up(m, 128) * pad_up(
+                ceil_div(batch_size * n, 32), 4)
+            assert packed_scale.dtype == torch.uint8
+            assert packed_scale.shape == (expected_scale_numel, )
+            assert packed_scale.is_contiguous()
 
         class CuteDSLBlockScaledRubinLinear(TunableRunner):
             """Datatype-agnostic block-scaled Linear runner for Rubin GPUs.

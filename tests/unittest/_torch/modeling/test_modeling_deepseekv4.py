@@ -4,10 +4,11 @@
 import inspect
 import json
 import struct
+import types
 import weakref
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -153,6 +154,37 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
 
     monkeypatch.setenv("TRTLLM_MHC_ENABLE_FUSED_HC", "0")
     assert _resolve_enable_fused_hc(config) is False
+
+
+def test_entry_boundary_always_fuses_norm():
+    normed_layer_input = torch.randn(2, 3)
+    fused_output = (object(), object(), object(), normed_layer_input)
+    fused_hc = Mock(return_value=fused_output)
+    input_layernorm = Mock(return_value=normed_layer_input)
+    input_layernorm.weight = torch.ones(3)
+    input_layernorm.variance_epsilon = 1e-6
+    layer = types.SimpleNamespace(
+        is_first_layer=False,
+        hc_attn=types.SimpleNamespace(fused_hc=fused_hc),
+        input_layernorm=input_layernorm,
+    )
+    hc_state = types.SimpleNamespace(
+        is_deferred=True,
+        x_prev=torch.randn(2, 3),
+        residual=torch.randn(2, 3),
+        post_mix=torch.randn(2, 1),
+        comb_mix=torch.randn(2, 1),
+    )
+
+    actual = DeepseekV4DecoderLayer._entry_boundary(layer, hc_state, None, False)
+
+    for actual_item, expected_item in zip(actual[:3], fused_output[:3]):
+        assert actual_item is expected_item
+    assert actual[3] is normed_layer_input
+    fused_kwargs = fused_hc.call_args.kwargs
+    input_layernorm.assert_not_called()
+    assert fused_kwargs["norm_weight"] is input_layernorm.weight
+    assert fused_kwargs["norm_eps"] == input_layernorm.variance_epsilon
 
 
 @pytest.mark.parametrize("sm_version,expected_cute_dsl", [(100, False), (107, True)])

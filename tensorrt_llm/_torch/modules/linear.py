@@ -1250,6 +1250,38 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
               bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
+        if isinstance(input, tuple):
+            if len(input) != 2:
+                raise ValueError(
+                    "Pre-quantized FP8 input must contain activation and scale")
+            activation, activation_scale = input
+            sm_version = get_sm_version()
+            uses_cute_dsl_rubin = (activation_scale.dtype == torch.uint8
+                                   and sm_version == 107
+                                   and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+                                   and (module.use_cute_dsl_blockscaling_mm
+                                        or module.disable_deep_gemm))
+            if uses_cute_dsl_rubin:
+                output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                    activation, module.weight, activation_scale,
+                    module.weight_scale)
+            elif (activation_scale.dtype == torch.int32 and is_sm_100f()
+                  and not module.disable_deep_gemm):
+                output = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+                    activation,
+                    activation_scale,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
+            else:
+                raise RuntimeError(
+                    "Pre-quantized FP8 scale layout is incompatible with the "
+                    "selected block-scale GEMM backend")
+            if bias is not None:
+                output = output + bias
+            return output
+
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape

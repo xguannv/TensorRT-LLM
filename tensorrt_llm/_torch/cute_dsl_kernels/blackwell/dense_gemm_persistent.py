@@ -57,7 +57,9 @@ if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
     from cutlass import testing
 else:
     import cutlass.cute.testing as testing
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 try:
     from cutlass.cute.nvgpu.common import CacheEvictionPriority
@@ -78,6 +80,66 @@ _NO_ALLOCATE_KWARGS = (
     if CacheEvictionPriority is not None
     else {}
 )
+
+
+@dsl_user_op
+def _atomic_max_shared_u32(ptr, value, *, loc=None, ip=None):
+    """Atomically maximize a positive-float bit pattern in shared memory."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                ptr.toint(loc=loc, ip=ip).ir_value(),
+                cutlass.Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.shared.max.u32 $0, [$1], $2;",
+            "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _f32_as_u32(value, *, loc=None, ip=None):
+    return cutlass.Uint32(llvm.bitcast(T.i32(), cutlass.Float32(value).ir_value(loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def _u32_as_f32(value, *, loc=None, ip=None):
+    return cutlass.Float32(llvm.bitcast(T.f32(), cutlass.Uint32(value).ir_value(loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def _round_up_ue8m0(value, *, loc=None, ip=None):
+    """Convert positive FP32 to UE8M0 with round-toward-positive-infinity."""
+    packed = llvm.inline_asm(
+        T.i16(),
+        [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+        "cvt.rp.satfinite.ue8m0x2.f32 $0, 0f00000000, $1;",
+        "=h,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Uint8(
+        llvm.inline_asm(
+            T.i32(),
+            [packed],
+            "mov.b32 $0, { $1, 0 };",
+            "=r,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _compute_stages(
@@ -145,6 +207,7 @@ class PersistentDenseGemmKernel:
         swizzle_size: int = 1,
         raster_along: Literal["m", "n"] = "m",
         split_k_slices: int = 1,
+        fp8_quantize_1x128: bool = False,
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -163,6 +226,7 @@ class PersistentDenseGemmKernel:
         # applies the final epilogue/cast.  ``split_k_slices == 1`` keeps the
         # original single-pass behaviour byte-for-byte.
         self.split_k_slices = split_k_slices
+        self.fp8_quantize_1x128 = fp8_quantize_1x128
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -270,6 +334,7 @@ class PersistentDenseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        fp8_scale: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation."""
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -352,6 +417,7 @@ class PersistentDenseGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            fp8_scale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -379,6 +445,7 @@ class PersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        fp8_scale: Optional[cute.Tensor],
     ):
         """GPU device kernel performing the Persistent batched GEMM computation."""
         warp_idx = cute.arch.warp_idx()
@@ -497,6 +564,10 @@ class PersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
+        cC_mnl = cute.make_identity_tensor(mC_mnl.shape)
+        cC_mnl = cute.local_tile(
+            cC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+        )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         # Partition global tensor for TiledMMA_A/B/C
@@ -504,6 +575,7 @@ class PersistentDenseGemmKernel:
         tCgA = thr_mma.partition_A(gA_mkl)
         tCgB = thr_mma.partition_B(gB_nkl)
         tCgC = thr_mma.partition_C(gC_mnl)
+        tCcC = thr_mma.partition_C(cC_mnl)
 
         # Partition global/shared tensor for TMA load A/B
         a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
@@ -669,6 +741,15 @@ class PersistentDenseGemmKernel:
                 byte_alignment=128,
                 swizzle=c_smem_layout_staged.inner,
             )
+        sAmax = None
+        if cutlass.const_expr(self.fp8_quantize_1x128):
+            sAmax = smem.allocate_tensor(
+                element_type=cutlass.Uint32,
+                layout=cute.make_layout(
+                    (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 128)
+                ),
+                byte_alignment=16,
+            )
 
         # Specialized epilogue warps
         if warp_idx < self.mma_warp_id:
@@ -702,6 +783,8 @@ class PersistentDenseGemmKernel:
 
             gC_mnl_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None, None)], epi_tile)
             tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
+            cC_mnl_epi = cute.flat_divide(tCcC[((None, None), 0, 0, None, None, None)], epi_tile)
+            tTR_cC = thr_copy_t2r.partition_D(cC_mnl_epi)
             tTR_rAcc = cute.make_fragment(
                 tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
             )
@@ -755,10 +838,49 @@ class PersistentDenseGemmKernel:
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                tTR_cC_tile = tTR_cC[(None, None, None, None, None, *mma_tile_coord_mnl)]
+                tTR_cC_tile = cute.group_modes(tTR_cC_tile, 3, cute.rank(tTR_cC_tile))
 
                 # Store accumulator to global memory in sub-tiles
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = (num_tiles_executed - 1) * subtile_cnt
+
+                epilog_threads = 32 * len(self.epilogue_warp_id)
+                if cutlass.const_expr(self.fp8_quantize_1x128):
+                    assert sAmax is not None and fp8_scale is not None
+                    for amax_idx in cutlass.range(tidx, cute.size(sAmax), epilog_threads):
+                        sAmax[amax_idx] = cutlass.Uint32(0)
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id,
+                        number_of_threads=epilog_threads,
+                    )
+
+                    # First pass: round the GEMM result to BF16 and collect one
+                    # CTA-local amax for every 1x128 output block.
+                    for subtile_idx in cutlass.range(subtile_cnt):
+                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load().to(cutlass.BFloat16)
+                        coord_vec = tiled_copy_r2s.retile(
+                            tTR_cC_tile[(None, None, None, subtile_idx)]
+                        )
+                        for value_idx in cutlass.range_constexpr(cute.size(acc_vec.shape)):
+                            coord = coord_vec[value_idx]
+                            value = cutlass.Float32(acc_vec[value_idx])
+                            if cute.elem_less(coord, mC_mnl.shape):
+                                local_m = coord[0] % self.cta_tile_shape_mnk[0]
+                                local_sf = (coord[1] % self.cta_tile_shape_mnk[1]) // 128
+                                value = cute.arch.fmax(value, -value)
+                                _atomic_max_shared_u32(
+                                    sAmax.iterator
+                                    + local_m * (self.cta_tile_shape_mnk[1] // 128)
+                                    + local_sf,
+                                    _f32_as_u32(value),
+                                )
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id,
+                        number_of_threads=epilog_threads,
+                    )
 
                 for subtile_idx in cutlass.range(subtile_cnt):
                     # Load accumulator from TMEM to RMEM
@@ -767,7 +889,49 @@ class PersistentDenseGemmKernel:
 
                     # Convert to output type and apply epilogue op
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                    if cutlass.const_expr(self.fp8_quantize_1x128):
+                        coord_vec = tiled_copy_r2s.retile(
+                            tTR_cC_tile[(None, None, None, subtile_idx)]
+                        )
+                        quantized = cute.make_rmem_tensor(acc_vec.shape, self.c_dtype)
+                        sf_bytes = fp8_scale
+                        flat_k = mC_mnl.shape[1] * mC_mnl.shape[2]
+                        sf_k_padded = ((flat_k + 31) // 32 + 3) // 4 * 4
+                        for value_idx in cutlass.range_constexpr(cute.size(acc_vec.shape)):
+                            coord = coord_vec[value_idx]
+                            bf16_value = acc_vec[value_idx].to(cutlass.BFloat16)
+                            if cute.elem_less(coord, mC_mnl.shape):
+                                local_m = coord[0] % self.cta_tile_shape_mnk[0]
+                                local_sf = (coord[1] % self.cta_tile_shape_mnk[1]) // 128
+                                amax_bits = sAmax[
+                                    local_m * (self.cta_tile_shape_mnk[1] // 128) + local_sf
+                                ]
+                                amax = cute.arch.fmax(_u32_as_f32(amax_bits), 1.0e-10)
+                                sf_byte = _round_up_ue8m0(amax / 448.0)
+                                quant_exp = cutlass.Uint32(254) - cutlass.Uint32(sf_byte)
+                                if sf_byte == 0:
+                                    quant_exp = cutlass.Uint32(127)
+                                quant_scale = _u32_as_f32(quant_exp << 23)
+                                quantized[value_idx] = (
+                                    cutlass.Float32(bf16_value) * quant_scale
+                                ).to(self.c_dtype)
+                                if coord[1] % 128 == 0:
+                                    sf_k_base = (coord[2] * mC_mnl.shape[1] + coord[1]) // 32
+                                    for sf_replica in cutlass.range_constexpr(4):
+                                        sf_k = sf_k_base + sf_replica
+                                        byte_offset = (
+                                            (
+                                                ((coord[0] // 128) * (sf_k_padded // 4) + sf_k // 4)
+                                                * 32
+                                                + coord[0] % 32
+                                            )
+                                            * 4
+                                            + (coord[0] % 128) // 32
+                                        ) * 4 + sf_k % 4
+                                        sf_bytes[byte_offset] = sf_byte
+                        acc_vec = quantized.load()
+                    else:
+                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                     tRS_rC.store(acc_vec)
 
                     # Store to SMEM
@@ -776,7 +940,6 @@ class PersistentDenseGemmKernel:
 
                     # Fence and barrier
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    epilog_threads = 32 * len(self.epilogue_warp_id)
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
@@ -1305,6 +1468,48 @@ class PersistentDenseGemmKernel:
             c_tensor,
             max_active_clusters,
             stream,
+        )
+
+    @cute.jit
+    def wrapper_strided_fp8_quantized(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
+        scale_tensor: cute.Tensor,
+        a_stride_m: cutlass.Int32,
+        a_stride_batch: cutlass.Int32,
+        b_stride_n: cutlass.Int32,
+        b_stride_batch: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Execute strided batched BF16 GEMM with fused FP8 quantization."""
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_layout(
+                (m, k, batch_size),
+                stride=(a_stride_m, 1, a_stride_batch),
+            ),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_layout(
+                (n, k, batch_size),
+                stride=(b_stride_n, 1, b_stride_batch),
+            ),
+        )
+        self(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            max_active_clusters,
+            stream,
+            fp8_scale=scale_tensor,
         )
 
     @cute.jit

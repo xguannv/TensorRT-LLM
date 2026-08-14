@@ -178,7 +178,7 @@ def test_dspark_block_uses_stage_id_as_attention_layer_idx(monkeypatch):
 
 @pytest.mark.parametrize("enable_fused_hc", [True, False])
 def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
-    """The draft stage must use the inherited fused-HC rollback setting."""
+    """The draft stage must honor the fused HC setting."""
     torch.manual_seed(71)
     num_requests, block_size, hc_mult, hidden_size = 1, 2, 2, 3
     h = torch.randn(num_requests, block_size, hc_mult, hidden_size)
@@ -264,12 +264,12 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
     # attention-DP and single-GPU paths keep it disabled.
     assert stage.mlp.call_args.kwargs["final_all_reduce_params"].enable_allreduce is True
     if enable_fused_hc:
-        assert events == ["fused", "ffn_post"]
         hc_ffn.fused_hc.assert_called_once()
         hc_attn.post_mapping.assert_not_called()
         hc_ffn.pre_mapping.assert_not_called()
-        post_attention_layernorm.assert_not_called()
         fused_kwargs = hc_ffn.fused_hc.call_args.kwargs
+        assert events == ["fused", "ffn_post"]
+        post_attention_layernorm.assert_not_called()
         assert fused_kwargs["norm_weight"] is post_attention_layernorm.weight
         assert fused_kwargs["norm_eps"] == post_attention_layernorm.variance_epsilon
     else:

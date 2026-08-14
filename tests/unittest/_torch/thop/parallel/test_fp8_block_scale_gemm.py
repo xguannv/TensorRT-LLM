@@ -836,6 +836,147 @@ def test_cute_dsl_fp8_block_scale_bmm_rubin(m, use_tvm_ffi):
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 
+def _allocate_fp8_bmm_quant_outputs(a_fp8, b_fp8):
+    num_groups, m, _ = a_fp8.shape
+    n = b_fp8.shape[1]
+    flat_n = num_groups * n
+    fp8_output = torch.empty((m, flat_n),
+                             dtype=torch.float8_e4m3fn,
+                             device=a_fp8.device)
+    fp8_batched = fp8_output.view(m, num_groups, n).permute(1, 0, 2)
+    scale_numel = ((m + 127) // 128 * 128 *
+                   (((flat_n + 31) // 32 + 3) // 4 * 4))
+    packed_scale = torch.empty((scale_numel, ),
+                               dtype=torch.uint8,
+                               device=a_fp8.device)
+    return fp8_output, fp8_batched, packed_scale
+
+
+def _valid_fp8_bmm_quant_scale_indices(m, flat_n, device):
+    sf_k_padded = ((flat_n + 31) // 32 + 3) // 4 * 4
+    indices = []
+    for row in range(m):
+        for sf_n_base in range(0, flat_n, 128):
+            sf_k_base = sf_n_base // 32
+            for sf_replica in range(4):
+                sf_k = sf_k_base + sf_replica
+                byte_offset = ((
+                    ((row // 128) *
+                     (sf_k_padded // 4) + sf_k // 4) * 32 + row % 32) * 4 +
+                               (row % 128) // 32) * 4 + sf_k % 4
+                indices.append(byte_offset)
+    return torch.tensor(indices, dtype=torch.int64, device=device)
+
+
+def _assert_valid_fp8_bmm_quant_scales_equal(fused_scale, ref_scale, m, flat_n):
+    indices = _valid_fp8_bmm_quant_scale_indices(m, flat_n, fused_scale.device)
+    assert torch.equal(
+        fused_scale.view(-1)[indices],
+        ref_scale.contiguous().view(-1)[indices])
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
+@pytest.mark.parametrize("m", [1, 16, 128, 256])
+def test_cute_dsl_fp8_bmm_quantize_rubin_matches_separate(m):
+    k, n, num_groups = 4096, 1024, 8
+    torch.manual_seed(314)
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty(
+        (num_groups, n // 128, k // 128),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+
+    bf16_output = torch.empty((num_groups, m, n),
+                              device="cuda",
+                              dtype=torch.bfloat16)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(a_fp8, b_fp8, a_scales, b_scales,
+                                            bf16_output)
+    flat_bf16 = bf16_output.permute(1, 0, 2).reshape(m, num_groups * n)
+    ref_fp8, ref_scale = (
+        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(flat_bf16))
+
+    fused_fp8, fused_batched, fused_scale = _allocate_fp8_bmm_quant_outputs(
+        a_fp8, b_fp8)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(
+        a_fp8,
+        b_fp8,
+        a_scales,
+        b_scales,
+        fused_batched,
+        fused_scale,
+    )
+    torch.cuda.synchronize()
+
+    _assert_valid_fp8_bmm_quant_scales_equal(fused_scale, ref_scale, m,
+                                             num_groups * n)
+    torch.testing.assert_close(fused_fp8.float(),
+                               ref_fp8.float(),
+                               rtol=0.0,
+                               atol=1.0 / 16.0)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.",
+)
+def test_cute_dsl_fp8_bmm_quantize_rubin_cuda_graph():
+    m, n, k, num_groups = 7, 1024, 4096, 8
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty(
+        (num_groups, n // 128, k // 128),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+
+    fused_fp8, fused_batched, fused_scale = _allocate_fp8_bmm_quant_outputs(
+        a_fp8, b_fp8)
+    args = (
+        a_fp8,
+        b_fp8,
+        a_scales,
+        b_scales,
+        fused_batched,
+        fused_scale,
+    )
+    torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(*args)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    bf16_output = torch.empty((num_groups, m, n),
+                              device="cuda",
+                              dtype=torch.bfloat16)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(a_fp8, b_fp8, a_scales, b_scales,
+                                            bf16_output)
+    flat_bf16 = bf16_output.permute(1, 0, 2).reshape(m, num_groups * n)
+    ref_fp8, ref_scale = (
+        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(flat_bf16))
+    _assert_valid_fp8_bmm_quant_scales_equal(fused_scale, ref_scale, m,
+                                             num_groups * n)
+    torch.testing.assert_close(fused_fp8.float(),
+                               ref_fp8.float(),
+                               rtol=0.0,
+                               atol=1.0 / 16.0)
+
+
 @pytest.mark.skipif(
     getSMVersion() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
     reason="The test requires SM107 and Rubin CuTe DSL support.",

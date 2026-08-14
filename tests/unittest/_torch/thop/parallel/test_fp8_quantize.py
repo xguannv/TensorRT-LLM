@@ -480,6 +480,36 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4_zero_blocks(m, k):
     assert torch.equal(fused_scale, expected_scale)
 
 
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="silu_and_mul_fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@pytest.mark.parametrize("use_r128c4_layout", [False, True])
+@pytest.mark.parametrize("m,k,swiglu_limit", [
+    (1, 128, None),
+    (3, 256, None),
+    (16, 1536, None),
+    (32, 3072, None),
+    (32, 7168, None),
+    (7, 512, 7.0),
+])
+def test_silu_and_mul_fp8_quantize_1x128_packed_ue8m0_matches_separate(
+        m, k, swiglu_limit, use_r128c4_layout):
+    """Fused SwiGLU quantization should match separate SwiGLU and quantize."""
+    torch.manual_seed(0)
+    gate_up = torch.randn((m, 2 * k), device="cuda", dtype=torch.bfloat16)
+
+    fused_fp8, fused_packed = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
+        gate_up, swiglu_limit, use_r128c4_layout)
+
+    swiglu = torch.ops.trtllm.silu_and_mul(gate_up, swiglu_limit=swiglu_limit)
+    reference_fp8, reference_packed = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        swiglu, use_r128c4_layout)
+
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       reference_fp8.view(torch.uint8))
+    assert torch.equal(fused_packed.contiguous(), reference_packed.contiguous())
+
+
 @pytest.mark.skipif(not isSM100Family(),
                     reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
 @pytest.mark.parametrize("m,k", [

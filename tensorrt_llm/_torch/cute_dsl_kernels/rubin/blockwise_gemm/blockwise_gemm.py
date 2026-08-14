@@ -42,12 +42,132 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.rubin_helpers as sm107_utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import CollectorOp
+from cutlass.cutlass_dsl import Int32, T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ...blackwell.blockwise_gemm.blockwise_gemm import Sm100BlockwiseGemmKernel
+
+
+@dsl_user_op
+def _store_global_b32(gmem_ptr, value: Int32, *, loc=None, ip=None) -> None:
+    gmem_addr = gmem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            gmem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _store_global_b64(gmem_ptr, value_lo: Int32, value_hi: Int32, *, loc=None, ip=None) -> None:
+    gmem_addr = gmem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            gmem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value_lo).ir_value(loc=loc, ip=ip),
+            Int32(value_hi).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n  .reg .b64 packed;\n  mov.b64 packed, {$1, $2};\n  st.global.u64 [$0], packed;\n}",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _load_shared_b32(smem_ptr, *, loc=None, ip=None) -> Int32:
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_addr.ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _store_shared_b128(
+    smem_ptr,
+    value0: Int32,
+    value1: Int32,
+    value2: Int32,
+    value3: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            smem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value0).ir_value(loc=loc, ip=ip),
+            Int32(value1).ir_value(loc=loc, ip=ip),
+            Int32(value2).ir_value(loc=loc, ip=ip),
+            Int32(value3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _scale_bf16x4_to_e4m3x4(
+    values01: Int32, values23: Int32, scale: Int32, *, loc=None, ip=None
+) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(values01).ir_value(loc=loc, ip=ip),
+                Int32(values23).ir_value(loc=loc, ip=ip),
+                Int32(scale).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n"
+            "  .reg .b32 scaled01;\n"
+            "  .reg .b32 scaled23;\n"
+            "  .reg .b16 lo;\n"
+            "  .reg .b16 hi;\n"
+            "  mul.rn.bf16x2 scaled01, $1, $3;\n"
+            "  mul.rn.bf16x2 scaled23, $2, $3;\n"
+            "  cvt.rn.satfinite.e4m3x2.bf16x2 lo, scaled01;\n"
+            "  cvt.rn.satfinite.e4m3x2.bf16x2 hi, scaled23;\n"
+            "  mov.b32 $0, {lo, hi};\n"
+            "}",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
 
 """
 A high-performance persistent blockwise dense GEMM
@@ -158,6 +278,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         mma_tiler: Tuple[int, int, int],
         mma_inst_shape: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
+        fp8_quantize_1x128: bool = False,
     ):
         """Initialize the Rubin persistent blockwise dense GEMM kernel.
 
@@ -188,6 +309,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.mma_tiler = mma_tiler
         self.mma_inst_shape = mma_inst_shape
+        self.fp8_quantize_1x128 = fp8_quantize_1x128
         # Bkeep-Breuse pattern is controlled by mma_inst_shape and mma_tiler
         self.enable_breuse = True if mma_tiler[0] // mma_inst_shape[0] == 2 else False
         # TMEM allocation columns for SM107
@@ -287,6 +409,8 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        if self.fp8_quantize_1x128 and self.cta_tile_shape_mnk[:2] != (128, 128):
+            raise ValueError("Fused FP8 quantization requires a 128x128 CTA output tile")
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -345,6 +469,11 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.num_smem_capacity,
             self.occupancy,
         )
+        if self.fp8_quantize_1x128:
+            # The direct fused epilogue reuses this allocation as one
+            # row-major 128x128 FP8 scratch tile (16 KiB). Two 128x32 BF16
+            # epilogue stages provide exactly that capacity.
+            self.num_c_stage = 2
 
         # SM107 TMEM (576 cols) can not fit multiple staging stages when
         # MMA_M=2 (cta_tile_M==256), so only keep one staging + one final.
@@ -410,6 +539,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        fp8_scale: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps for SM107.
 
@@ -436,12 +566,20 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
-        self.c_dtype: Type[cutlass.Numeric] = c.element_type
+        self.c_dtype: Type[cutlass.Numeric] = (
+            cutlass.BFloat16 if self.fp8_quantize_1x128 else c.element_type
+        )
         self.sfa_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.sfb_dtype: Type[cutlass.Numeric] = sfb.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
+
+        if cutlass.const_expr(self.fp8_quantize_1x128):
+            if cutlass.const_expr(c.element_type is not cutlass.Float8E4M3FN):
+                raise TypeError("Fused FP8 quantization requires Float8E4M3FN C")
+            if cutlass.const_expr(fp8_scale is None or fp8_scale.element_type is not cutlass.Uint8):
+                raise TypeError("Fused FP8 quantization requires Uint8 output scales")
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -487,14 +625,17 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         # Setup TMA store for C
         tma_atom_c = None
         tma_tensor_c = None
-        c_cta_v_layout = cute.composition(cute.make_identity_layout(c.shape), self.epi_tile)
-        epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            c,
-            epi_smem_layout,
-            c_cta_v_layout,
-        )
+        if cutlass.const_expr(not self.fp8_quantize_1x128):
+            c_cta_v_layout = cute.composition(cute.make_identity_layout(c.shape), self.epi_tile)
+            epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+            tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                c,
+                epi_smem_layout,
+                c_cta_v_layout,
+            )
+        else:
+            tma_tensor_c = c
 
         tensor_sfa = cute.make_tensor(
             sfa.iterator,
@@ -605,6 +746,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            fp8_scale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -638,6 +780,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        fp8_scale: cute.Tensor,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation for SM107.
@@ -659,7 +802,8 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            cpasync.prefetch_descriptor(tma_atom_c)
+            if cutlass.const_expr(not self.fp8_quantize_1x128):
+                cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -837,8 +981,12 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             (None, None, None),
         )
         # coordinate
+        cC_mnl = cute.make_identity_tensor(cute.shape(mC_mnl))
         cSFA_mkl = cute.make_identity_tensor(cute.shape(mSFA_mkl))
         cSFB_nkl = cute.make_identity_tensor(cute.shape(mSFB_nkl))
+        cC = cute.local_tile(
+            cC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+        )
         # (bM, bK, loopM, loopK, loopL)
         cSFA = cute.local_tile(
             cSFA_mkl,
@@ -863,6 +1011,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        tCcC = thr_mma.partition_C(cC)
 
         # scale viewed as C tensor
         sSFA_view_as_C_layout = cute.make_layout(
@@ -1737,6 +1886,11 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             ) = self.epilog_tmem_copy_and_partition(
                 epi_tidx, tCtAcc_final, tCgC, epi_tile, use_2cta_instrs
             )
+            tTR_cC = None
+            if cutlass.const_expr(not self.fp8_quantize_1x128):
+                cC_t = transform_partitioned_tensor_layout(tCcC)
+                cC_epi = cute.flat_divide(cC_t, epi_tile)
+                tTR_cC = tiled_copy_t2r.get_slice(epi_tidx).partition_D(cC_epi)
 
             tTR_rC = None
             tiled_copy_r2s = None
@@ -1744,15 +1898,16 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             tRS_sC = None
             bSG_sC = None
             bSG_gC_partitioned = None
-            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
-            tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
-                tiled_copy_t2r, tTR_rC, epi_tidx, sC
-            )
-            (
-                tma_atom_c,
-                bSG_sC,
-                bSG_gC_partitioned,
-            ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
+            if cutlass.const_expr(not self.fp8_quantize_1x128):
+                tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+                tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+                    tiled_copy_t2r, tTR_rC, epi_tidx, sC
+                )
+                (
+                    tma_atom_c,
+                    bSG_sC,
+                    bSG_gC_partitioned,
+                ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
 
             #
             # Persistent tile scheduling loop
@@ -1765,15 +1920,16 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             epi_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
 
             c_pipeline = None
-            # Threads/warps participating in tma store pipeline
-            c_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                32 * len(self.epilog_warp_id),
-            )
-            c_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.num_c_stage,
-                producer_group=c_producer_group,
-            )
+            if cutlass.const_expr(not self.fp8_quantize_1x128):
+                # Threads/warps participating in tma store pipeline
+                c_producer_group = pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    32 * len(self.epilog_warp_id),
+                )
+                c_pipeline = pipeline.PipelineTmaStore.create(
+                    num_stages=self.num_c_stage,
+                    producer_group=c_producer_group,
+                )
 
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
@@ -1804,17 +1960,18 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                 # Slice to per mma tile index
                 #
                 bSG_gC = None
-                # ((ATOM_V, REST_V), EPI_M, EPI_N)
-                bSG_gC = bSG_gC_partitioned[
-                    (
-                        None,
-                        None,
-                        None,
-                        mma_tile_coord_mnl[0],
-                        mma_tile_coord_mnl[1],
-                        mma_tile_coord_mnl[2],
-                    )
-                ]
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    # ((ATOM_V, REST_V), EPI_M, EPI_N)
+                    bSG_gC = bSG_gC_partitioned[
+                        (
+                            None,
+                            None,
+                            None,
+                            mma_tile_coord_mnl[0],
+                            mma_tile_coord_mnl[1],
+                            mma_tile_coord_mnl[2],
+                        )
+                    ]
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
@@ -1826,62 +1983,77 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
                 epi_pipeline.consumer_wait(epi_consumer_state)
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                tTR_cC_tile = None
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                    tTR_cC_tile = tTR_cC[(None, None, None, None, None, *mma_tile_coord_mnl)]
+                    tTR_cC_tile = cute.group_modes(tTR_cC_tile, 3, cute.rank(tTR_cC_tile))
 
                 #
                 # Store accumulator to global memory in subtiles
                 #
-                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                for subtile_idx in cutlass.range(subtile_cnt):
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-
-                    #
-                    # Convert to C type
-                    #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
-                    tRS_rC.store(acc_vec)
-
-                    #
-                    # Store C to shared memory
-                    #
-                    num_prev_subtiles = num_prev_subtiles + 1
-                    c_buffer = num_prev_subtiles % self.num_c_stage
-                    cute.copy(
-                        tiled_copy_r2s,
-                        tRS_rC,
-                        tRS_sC[(None, None, None, c_buffer)],
+                if cutlass.const_expr(self.fp8_quantize_1x128):
+                    assert fp8_scale is not None
+                    self._epilog_fp8_register_scratch(
+                        tiled_copy_t2r,
+                        tTR_tAcc,
+                        tTR_rAcc,
+                        sC,
+                        epi_consumer_state,
+                        epi_pipeline,
+                        epi_tidx // 32,
+                        lane_idx,
+                        mma_tile_coord_mnl,
+                        mma_tile_coord_v,
+                        epilogue_op,
+                        mC_mnl,
+                        fp8_scale,
                     )
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
-                    self.epilog_sync_barrier.arrive_and_wait()
+                else:
+                    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                    for subtile_idx in cutlass.range(subtile_cnt):
+                        # Load accumulator from tensor memory buffer to register.
+                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                    #
-                    # TMA store C to global memory
-                    #
-                    if warp_idx == self.epilog_warp_id[0]:
+                        # Convert to C type.
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                        tRS_rC.store(acc_vec)
+
+                        # Store C to shared memory.
+                        num_prev_subtiles = num_prev_subtiles + 1
+                        c_buffer = num_prev_subtiles % self.num_c_stage
                         cute.copy(
-                            tma_atom_c,
-                            bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx)],
+                            tiled_copy_r2s,
+                            tRS_rC,
+                            tRS_sC[(None, None, None, c_buffer)],
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
-                        c_pipeline.producer_commit()
-                        c_pipeline.producer_acquire()
-                    self.epilog_sync_barrier.arrive_and_wait()
+                        # Fence and barrier to make the shared-memory store
+                        # visible to the TMA store.
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                        # TMA store C to global memory.
+                        if warp_idx == self.epilog_warp_id[0]:
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buffer)],
+                                bSG_gC[(None, subtile_idx)],
+                            )
+                            c_pipeline.producer_commit()
+                            c_pipeline.producer_acquire()
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                 #
                 # Async arrive accumulator buffer empty
                 #
-                epi_pipeline.consumer_release(epi_consumer_state)
-                epi_consumer_state.advance()
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    epi_pipeline.consumer_release(epi_consumer_state)
+                    epi_consumer_state.advance()
 
                 #
                 # Advance to next tile
@@ -1906,7 +2078,155 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             #
             # Wait for C store complete
             #
-            c_pipeline.producer_tail()
+            if cutlass.const_expr(not self.fp8_quantize_1x128):
+                c_pipeline.producer_tail()
+
+    @cute.jit
+    def _epilog_fp8_register_scratch(
+        self,
+        tiled_copy_t2r,
+        tTR_tAcc,
+        tTR_rAcc,
+        sC,
+        epi_consumer_state,
+        epi_pipeline,
+        epi_warp_idx,
+        lane_idx,
+        mma_tile_coord_mnl,
+        mma_tile_coord_v,
+        epilogue_op,
+        mC_mnl,
+        fp8_scale,
+    ):
+        """Release TMEM before quantization and coalesce FP8 output stores."""
+        tile_m_base = (
+            mma_tile_coord_mnl[0] * self.mma_tiler[0]
+            + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+        )
+        # The scheduler never emits a tile wholly beyond M. Keep the remaining
+        # row count as a DSL integer because Python min/max cannot consume its
+        # dynamic Boolean comparisons during lowering.
+        valid_rows = mC_mnl.shape[0] - tile_m_base
+        global_n_base = mma_tile_coord_mnl[1] * self.mma_tiler[1]
+        num_sf_cols = (mC_mnl.shape[1] * mC_mnl.shape[2]) // 32
+        global_sf_col = (mma_tile_coord_mnl[2] * mC_mnl.shape[1] + global_n_base) // 32
+        num_sf_col_tiles = (num_sf_cols + 3) // 4
+        output_sf_tile_base = (tile_m_base // 128) * num_sf_col_tiles * 512 + (
+            global_sf_col // 4
+        ) * 512
+
+        # LDTM.32x32 gives each epilogue thread one complete row fragment.
+        # Retain all four N32 fragments in registers so each thread computes
+        # one complete 1x128 scale without a cross-lane reduction.
+        row_values = cute.make_rmem_tensor(
+            cute.make_layout((16, 4), stride=(1, 16)),
+            cutlass.Int32,
+        )
+        flat_tTR_rAcc = cute.make_tensor(tTR_rAcc.iterator, cute.make_layout((32,)))
+        local_absmax = cutlass.Float32(0.0)
+        for segment_idx in range(4):
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, segment_idx)],
+                tTR_rAcc,
+            )
+            rounded_values = cute.make_rmem_tensor((32,), cutlass.BFloat16)
+            rounded_values.store(epilogue_op(flat_tTR_rAcc.load().to(cutlass.BFloat16)))
+            packed_values = cute.recast_tensor(rounded_values, cutlass.Int32)
+            for packed_idx in range(16):
+                row_values[(packed_idx, segment_idx)] = packed_values[packed_idx]
+            for elem_idx in range(32):
+                value_f32 = cutlass.Float32(rounded_values[elem_idx])
+                local_absmax = cute.arch.fmax(
+                    local_absmax,
+                    cute.arch.fmax(value_f32, -value_f32),
+                )
+
+        # The complete row is now independent of TMEM. Release it before the
+        # quantization and global stores so accumulator-update warps can begin
+        # publishing the next persistent tile.
+        cute.arch.fence_view_async_tmem_load()
+        epi_pipeline.consumer_release(epi_consumer_state)
+        epi_consumer_state.advance()
+
+        block_absmax = cute.arch.fmax(local_absmax, cutlass.Float32(1e-10))
+        output_sf = (block_absmax * cutlass.Float32(1.0 / 448.0)).to(cutlass.Float8E8M0FNU)
+        output_sf_vec = cute.make_rmem_tensor((4,), cutlass.Float8E8M0FNU)
+        for sf_copy_idx in range(4):
+            output_sf_vec[sf_copy_idx] = output_sf
+        output_sf_packed = cutlass.Uint32(cute.recast_tensor(output_sf_vec, cutlass.Uint32)[0])
+        output_sf_code = output_sf_packed & cutlass.Uint32(0xFF)
+        output_scale_bf16_bits = (cutlass.Uint32(254) - output_sf_code) << cutlass.Uint32(7)
+        output_scale_bf16x2 = cutlass.Int32(
+            output_scale_bf16_bits | (output_scale_bf16_bits << cutlass.Uint32(16))
+        )
+
+        epi_row = epi_warp_idx * 32 + lane_idx
+        if epi_row < valid_rows:
+            output_sf_offset = output_sf_tile_base + (epi_row % 32) * 16 + (epi_row // 32) * 4
+            _store_global_b32(
+                fp8_scale.iterator + output_sf_offset,
+                cutlass.Int32(output_sf_packed),
+            )
+
+        # Quantize into the row-major 128x128 FP8 scratch tile. The sC
+        # allocation is 1024-byte aligned and has exactly 16 KiB in this path.
+        scratch_i32_ptr = cute.recast_ptr(sC.iterator, dtype=cutlass.Int32)
+        for segment_idx in range(4):
+            packed_output = cute.make_rmem_tensor((8,), cutlass.Int32)
+            for output_idx in range(8):
+                packed_idx = output_idx * 2
+                packed_output[output_idx] = _scale_bf16x4_to_e4m3x4(
+                    row_values[(packed_idx, segment_idx)],
+                    row_values[(packed_idx + 1, segment_idx)],
+                    output_scale_bf16x2,
+                )
+            scratch_word_offset = epi_row * 32 + segment_idx * 8
+            _store_shared_b128(
+                scratch_i32_ptr + scratch_word_offset,
+                packed_output[0],
+                packed_output[1],
+                packed_output[2],
+                packed_output[3],
+            )
+            _store_shared_b128(
+                scratch_i32_ptr + scratch_word_offset + 4,
+                packed_output[4],
+                packed_output[5],
+                packed_output[6],
+                packed_output[7],
+            )
+
+        # Four adjacent lanes cooperatively store one contiguous output row;
+        # each lane transfers eight bytes, producing coalesced 32-byte sectors.
+        # Epilogue warps own disjoint 32-row scratch slices, so warp-local
+        # synchronization is sufficient.
+        cute.arch.sync_warp()
+        row_group_idx = lane_idx // 4
+        row_lane_idx = lane_idx % 4
+        for row_batch_idx in range(4):
+            output_row = epi_warp_idx * 32 + row_batch_idx * 8 + row_group_idx
+            if output_row < valid_rows:
+                for segment_idx in range(4):
+                    scratch_word_offset = output_row * 32 + segment_idx * 8 + row_lane_idx * 2
+                    value_lo = _load_shared_b32(scratch_i32_ptr + scratch_word_offset)
+                    value_hi = _load_shared_b32(scratch_i32_ptr + scratch_word_offset + 1)
+                    _store_global_b64(
+                        cute.domain_offset(
+                            (
+                                tile_m_base + output_row,
+                                global_n_base + segment_idx * 32 + row_lane_idx * 8,
+                                mma_tile_coord_mnl[2],
+                            ),
+                            mC_mnl,
+                        ).iterator,
+                        value_lo,
+                        value_hi,
+                    )
+
+        # Prevent this warp from overwriting its scratch slice on the next
+        # persistent tile until all lanes have drained the current one.
+        cute.arch.sync_warp()
 
     def acc_update_tmem_copy_and_partition(
         self,
@@ -2105,6 +2425,53 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             stream,
         )
 
+    @cute.jit
+    def wrapper_fp8_quantized(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        sf_m: cutlass.Int32,
+        sf_n: cutlass.Int32,
+        sf_k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_tensor: cute.Tensor,
+        scale_tensor: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Run blockwise GEMM with fused packed FP8 1x128 output."""
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout((m, k, batch_size), order=(1, 0, 2)),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout((n, k, batch_size), order=(1, 0, 2)),
+        )
+        sfa_tensor = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout((sf_m, sf_k, batch_size), order=(0, 1, 2)),
+        )
+        sfb_tensor = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout((sf_n, sf_k, batch_size), order=(1, 0, 2)),
+        )
+        self(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            max_active_clusters,
+            stream,
+            fp8_scale=scale_tensor,
+        )
+
     @staticmethod
     def can_implement(
         a_dtype: Type[cutlass.Numeric],
@@ -2135,7 +2502,12 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             can_impl = False
         if acc_dtype not in {cutlass.Float32}:
             can_impl = False
-        if c_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16}:
+        if c_dtype not in {
+            cutlass.Float32,
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
+        }:
             can_impl = False
 
         # Check MMA instruction shape for K=64 constraint

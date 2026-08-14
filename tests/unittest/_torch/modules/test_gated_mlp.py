@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import Mock
 
 import pytest
@@ -84,6 +85,35 @@ def test_swiglu_limit_controls_gate_up_fusion_capability(
     )
 
     assert mlp.gate_up_proj.use_cute_dsl_nvfp4_swiglu_blackwell is expected
+
+
+@pytest.mark.parametrize(
+    ("activation", "expected"),
+    [
+        pytest.param(F.silu, True, id="plain-swiglu"),
+        pytest.param(lambda value: value, False, id="custom-swiglu-oai"),
+    ],
+)
+def test_activation_controls_fp8_quant_fusion_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    activation: Callable[[torch.Tensor], torch.Tensor],
+    expected: bool,
+) -> None:
+    mlp = GatedMLP(
+        hidden_size=2,
+        intermediate_size=2,
+        bias=False,
+        activation=activation,
+    )
+    down_proj = nn.Module()
+    down_proj.has_fp8_block_scales = True
+    down_proj.use_cute_dsl_blockscaling_mm = True
+    down_proj.disable_deep_gemm = False
+    mlp.down_proj = down_proj
+    monkeypatch.setattr(gated_mlp_module, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(gated_mlp_module, "IS_CUTLASS_DSL_INTERNAL_AVAILABLE", True)
+
+    assert mlp._can_fuse_swiglu_fp8_quant() is expected
 
 
 @pytest.mark.parametrize(
