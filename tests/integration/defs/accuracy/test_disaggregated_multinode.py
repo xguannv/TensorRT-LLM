@@ -204,7 +204,7 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "moe_expert_parallel_size": 4,
         "enable_attention_dp": True,
         "moe_config": {
-            "backend": "MEGAMOE_CUTEDSL",
+            "backend": "TRTLLM",
         },
         "max_batch_size": 128,
         "max_seq_len": 4096,

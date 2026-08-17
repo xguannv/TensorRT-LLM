@@ -550,6 +550,37 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
     assert tuner.stats.tuned_op_profiled_configs.get(custom_op, 0) >= 4
     assert not tuner.stats.failed_profiling_count.get(custom_op, set())
 
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner
+
+    runner = CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner()
+    profile_inputs = [
+        a_fp8.new_empty((8192, k)),
+        b_fp8,
+        a_sf,
+        b_sf,
+        cos_sin_cache,
+        cu_q_seqlens,
+        kv_cache_lengths,
+        position_ids.new_empty(8192),
+        quant_scale_qkv,
+    ]
+    small_profile_ms = {
+        profile.get_opt_shapes()[0][0]
+        for profile in tuner._optimization_profiles(runner.tuning_config,
+                                                    profile_inputs)
+    }
+    assert small_profile_ms == {32, 128, 192, 256}
+
+    profile_inputs[0] = a_fp8.new_empty((16384, k))
+    profile_inputs[7] = position_ids.new_empty(16384)
+    large_profile_ms = {
+        profile.get_opt_shapes()[0][0]
+        for profile in tuner._optimization_profiles(
+            runner.large_m_tuning_config, profile_inputs)
+    }
+    assert large_profile_ms == {32, 128, 192, 256, 16384}
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run_fusion()

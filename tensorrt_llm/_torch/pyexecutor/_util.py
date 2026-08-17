@@ -42,6 +42,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
+from ..attention_backend.sparse.params import get_indexer_mqa_logits_workspace_bytes
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -411,6 +412,14 @@ def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
         w_bytes_per_token * kv_len_cap, budget_bytes * w_bytes_per_token /
         (k_bytes_per_token + w_bytes_per_token))
     return reserve, int(reserve / w_bytes_per_token)
+
+
+def get_indexer_mqa_logits_workspace_reserve(
+    kv_cache_memory: int, workspace_memory: int
+) -> int:
+    if kv_cache_memory <= 0 or workspace_memory <= 0:
+        return 0
+    return min(workspace_memory, kv_cache_memory)
 
 
 def _normalize_attention_windows(
@@ -1215,6 +1224,21 @@ class KvCacheCreator:
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+
+        sparse_algorithm = getattr(self._sparse_attention_config, 'algorithm', None)
+        if sparse_algorithm == 'deepseek_v4':
+            workspace_memory = get_indexer_mqa_logits_workspace_bytes()
+            budget_before = kv_cache_max_memory
+            workspace_reserve = get_indexer_mqa_logits_workspace_reserve(
+                budget_before, workspace_memory
+            )
+            if workspace_reserve > 0:
+                kv_cache_max_memory = int(budget_before - workspace_reserve)
+                logger.info(
+                    f"Reserving {workspace_reserve / GB:.2f} GiB for the DeepSeek-V4 Indexer MQA "
+                    f"logits workspace (workspace cap {workspace_memory / GB:.2f} GiB): KV cache budget "
+                    f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
+                )
 
         # Reserve headroom for the attention workspace the selected backend declares (today: fp8
         # context-MLA), which the profiling forward under-measures (fresh-prefill dummies never exercise

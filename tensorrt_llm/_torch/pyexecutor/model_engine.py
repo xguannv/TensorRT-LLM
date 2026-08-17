@@ -428,6 +428,7 @@ class PyTorchModelEngine(ModelEngine):
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
+        self._completed_autotuner_warmup_num_tokens: Optional[int] = None
         self.encoder_batch_size = (llm_args.encoder_max_batch_size
                                    if llm_args.encoder_max_batch_size
                                    is not None else self.batch_size)
@@ -1890,8 +1891,6 @@ class PyTorchModelEngine(ModelEngine):
         """Runs forward passes to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
-        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
-        logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -1899,6 +1898,14 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
+
+        if self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens:
+            logger.info("Skipping autotuner warmup for an already completed token shape: %s",
+                        curr_max_num_tokens)
+            return
+
+        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
+        logger.info("Running autotuner warmup...")
 
         warmup_configs = [(curr_max_num_tokens, 0)]
         if (not self.is_draft_model and self.guided_decoder is None
@@ -1957,6 +1964,8 @@ class PyTorchModelEngine(ModelEngine):
         # profiler, reducing memory available for activations during inference.
         clear_memory_buffers()
         torch.cuda.empty_cache()
+        if ran_forward:
+            self._completed_autotuner_warmup_num_tokens = curr_max_num_tokens
 
     def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager):
         """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.

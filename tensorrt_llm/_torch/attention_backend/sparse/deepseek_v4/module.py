@@ -12,7 +12,7 @@ from torch import nn
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm._torch.modules.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mla import (
     _cute_dsl_fp8_bmm_out,
@@ -323,6 +323,11 @@ def prepare_sparse_attn_outputs(
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
+        if get_sm_version() == 107:
+            # Rubin keeps its quantized O-LoRA projection in the standard output
+            # path. The FMHA epilogue was inherited from main and its SM107
+            # quantized-attention output is not numerically compatible.
+            return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):
@@ -608,8 +613,11 @@ def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
         self._quant_scale_qkv,
         float(self.q_b_layernorm.variance_epsilon),
     )
-    placeholder_q = q.new_empty((q.shape[0], self.num_heads_tp * self.qk_head_dim))
-    return placeholder_q, quant_q_buffer, self._quant_scale_qkv
+    if attn_metadata.num_contexts > 0:
+        q_shape_carrier = q
+    else:
+        q_shape_carrier = q.new_empty((q.shape[0], self.num_heads_tp * self.qk_head_dim))
+    return q_shape_carrier, quant_q_buffer, self._quant_scale_qkv
 
 
 def _is_fused_prologue_active(
@@ -996,7 +1004,6 @@ def forward_context_sparse_attn(
         raise RuntimeError("DeepSeek-V4 is not supported on pre-Blackwell GPUs")
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
-    q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
 
     quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_pe = getattr(self, "_fused_q_pe", None)
@@ -1015,6 +1022,7 @@ def forward_context_sparse_attn(
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
     else:
+        q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
         quant_q_buffer = None
         quant_scale_qkv = None
 

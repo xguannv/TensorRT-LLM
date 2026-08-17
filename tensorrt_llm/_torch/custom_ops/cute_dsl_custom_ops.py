@@ -5,6 +5,7 @@ import ast
 import functools
 import itertools
 import math
+from dataclasses import replace
 from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
@@ -10574,6 +10575,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ConstraintSpec(7, 0, infer_output_m_shape),
                 ),
                 inputs_pre_hook=_prepare_dsv4_qb_fusion_tuning_inputs,
+                # Do not let the generic tuner append the actual warmup M:
+                # runtime maps every 257..16383 shape back to the 256 bucket,
+                # so profiling that large output cannot affect dispatch.
+                tune_max_num_tokens=_DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS[-1],
                 use_cold_l2_cache=True,
                 use_cuda_graph=True,
                 # CuTe modules are cached in process, so every rank must tune
@@ -10582,6 +10587,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 distributed_tuning_strategy=(
                     DistributedTuningStrategy.INDEPENDENT),
             )
+
+            large_m_tuning_config = replace(
+                tuning_config,
+                tune_max_num_tokens=_DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET)
 
             _tactics = (
                 (
@@ -10784,10 +10793,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 position_ids,
                 quant_scale_qkv,
             ]
+            tuning_config = (runner.__class__.large_m_tuning_config
+                             if input.shape[0]
+                             >= _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET else
+                             runner.__class__.tuning_config)
             _, best_tactic = AutoTuner.get().choose_one(
                 "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
                 [runner],
-                runner.__class__.tuning_config,
+                tuning_config,
                 inputs,
                 eps=eps,
             )

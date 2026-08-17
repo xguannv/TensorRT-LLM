@@ -131,7 +131,7 @@ def test_create_mla_outputs_custom_op_returns_tensor() -> None:
     assert [str(return_value.type) for return_value in schema.returns] == ["Tensor"]
 
 
-def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
+def test_dsv4_epilogue_fusion_supports_mixed_batch_on_sm100() -> None:
     mla_layer = _make_dsv4_epilogue_layer()
     metadata = SimpleNamespace(num_contexts=1, num_generations=1)
     hidden_states = torch.empty(8, 16)
@@ -139,6 +139,9 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     with patch(
         "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module.is_sm_100f",
         return_value=True,
+    ), patch(
+        "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module.get_sm_version",
+        return_value=100,
     ):
         outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
 
@@ -146,6 +149,31 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     assert outputs[0].shape == (8, 8, 3)
     assert outputs[0].dtype == torch.bfloat16
     mla_layer.create_output.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "num_generations"), [(1, 0), (0, 1), (1, 1)]
+)
+def test_dsv4_epilogue_fusion_rejects_sm107(
+    num_contexts: int, num_generations: int
+) -> None:
+    mla_layer = _make_dsv4_epilogue_layer()
+    fallback = torch.empty(8, 16)
+    mla_layer.create_output.return_value = fallback
+    metadata = SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations)
+    hidden_states = torch.empty(8, 16)
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module.is_sm_100f",
+        return_value=True,
+    ), patch(
+        "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module.get_sm_version",
+        return_value=107,
+    ):
+        outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
+
+    assert outputs == [fallback]
+    mla_layer.create_output.assert_called_once_with(hidden_states, num_contexts)
 
 
 def test_dsv4_fusion_create_output_uses_bucket_token_count() -> None:

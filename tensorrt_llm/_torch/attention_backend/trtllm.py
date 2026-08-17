@@ -2508,8 +2508,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 raise ValueError(
                     "In MLA, TrtllmAttention can only support context_only or generation_only, not mixed."
                 )
-            assert q.shape[
-                1] == qkv_hidden_size, f"q.shape[1] must be equal to qkv_hidden_size, got {q.shape[1]=}, {qkv_hidden_size=}"
+            uses_compact_prequantized_q = (
+                attention_input_type == AttentionInputType.context_only
+                and forward_args.quant_scale_qkv is not None
+                and q.shape[1] == self.q_lora_rank)
+            assert q.shape[1] == qkv_hidden_size or uses_compact_prequantized_q, (
+                "MLA Q expects the regular layout, or compact q_lora when Q is "
+                f"pre-quantized; got {q.shape[1]=}, {qkv_hidden_size=}")
 
         batch_size = metadata.kv_lens_cuda_runtime.shape[0]
         assert metadata.kv_lens_runtime.shape[0] == batch_size

@@ -14,10 +14,28 @@
 # limitations under the License.
 """Shared sparse attention parameter types."""
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+_INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET = 1 << 31
+_INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT = 4
+
+
+def get_indexer_mqa_logits_elem_budget() -> int:
+    """Return the per-call Indexer MQA-logits cap used by the runtime."""
+    return int(
+        os.environ.get(
+            "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", _INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET
+        )
+    )
+
+
+def get_indexer_mqa_logits_workspace_bytes() -> int:
+    """Return the maximum transient bytes for one FP32 MQA-logits tile."""
+    return get_indexer_mqa_logits_elem_budget() * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
 
 
 class SparseParams:

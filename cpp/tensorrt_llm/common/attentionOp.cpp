@@ -1865,6 +1865,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.is_last_chunk
             = !mAttentionChunkSize.has_value() || (params.input_seq_length == params.max_past_kv_length);
 
+        if (!(mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->q_rope_applied))
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
             TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
@@ -1967,6 +1968,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             invokeQKVPreprocessing(preprocessingParams, stream);
         }
         sync_check_cuda_error(stream);
+        if (!(mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->q_rope_applied))
         {
             std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
             TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
