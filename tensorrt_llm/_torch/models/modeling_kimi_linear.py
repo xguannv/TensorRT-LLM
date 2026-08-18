@@ -274,6 +274,19 @@ KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 
 _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
+KIMI_K3_FUSED_ATTN_RES_NORM_ENV = "KIMI_K3_FUSED_ATTN_RES_NORM"
+"""Set to ``0`` to keep the trailing RMSNorm out of the attention-residual
+kernel, i.e. ``trtllm::attn_res_fwd`` followed by the production RMSNorm
+module.
+
+This is the *only* knob that isolates the norm-fusing ops
+(``attn_res_rmsnorm_fwd`` / ``attn_res_add_rmsnorm_fwd``) from the
+attention-residual selection itself. ``KIMI_K3_FUSED_ATTN_RES=0`` disables
+both and falls all the way back to the exact fp32 reference, so it cannot be
+used to A/B the norm fusion against the unfused-norm path."""
+
+_FUSED_ATTN_RES_NORM_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_NORM_ENV, "1") == "1"
+
 
 def _apply_attn_res_fused(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
@@ -318,6 +331,23 @@ def _rms_norm_eps(norm: nn.Module) -> float:
     return float(norm.variance_epsilon)
 
 
+def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> None:
+    """Report whether the fused path was actually reached, once per shape.
+
+    ``_FUSED_ATTN_RES_ENABLED`` only says the feature is switched on. It does
+    not say the shape gate below let the call through, and a rejected call
+    looks exactly like a disabled one in the logs. Under attention-DP the
+    per-rank token count decides it, so one job can fuse at low concurrency and
+    fall back at high concurrency -- without this line, a benchmark that shows
+    no change is indistinguishable from one that never ran the kernel.
+    """
+    logger.info_once(
+        f"Kimi K3 attn-res fusion [{site}]: "
+        f"{'FUSED' if fused else 'fallback'} (M={M}, H={H}, N={N})",
+        key=f"kimi_k3_attn_res_fusion_{site}_{fused}_{M}_{H}_{N}",
+    )
+
+
 def _apply_attn_res_rmsnorm_fused(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -339,6 +369,7 @@ def _apply_attn_res_rmsnorm_fused(
     # Keep prefill on attn_res_fwd + the production RMSNorm, which exposes
     # independent work across tokens and was 41-108% faster in GB300 tests.
     if M != 1 or H != 7168 or (N > 9 and N != 12):
+        _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
     try:
         attn_res_rmsnorm_op = torch.ops.trtllm.attn_res_rmsnorm_fwd
@@ -355,6 +386,7 @@ def _apply_attn_res_rmsnorm_fused(
         float(norm.eps),
         _rms_norm_eps(output_norm),
     )
+    _note_attn_res_fusion("attn_res+norm", True, M, H, N)
     return output.reshape(M, H)
 
 
@@ -387,6 +419,7 @@ def _apply_attn_res_add_rmsnorm_fused(
     K = int(block_residual.shape[0])
     N = K + 1
     if M != 1 or H != 7168 or (N > 9 and N != 12):
+        _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
     try:
         attn_res_add_rmsnorm_op = torch.ops.trtllm.attn_res_add_rmsnorm_fwd
@@ -405,6 +438,7 @@ def _apply_attn_res_add_rmsnorm_fused(
         float(norm.eps),
         _rms_norm_eps(output_norm),
     )
+    _note_attn_res_fusion("add+attn_res+norm", True, M, H, N)
     return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
 
 
@@ -444,7 +478,7 @@ def _apply_attn_res_and_rmsnorm(
     output_norm: nn.Module,
 ) -> torch.Tensor:
     """Apply attention-residual selection and the next RMSNorm."""
-    if _FUSED_ATTN_RES_ENABLED:
+    if _FUSED_ATTN_RES_ENABLED and _FUSED_ATTN_RES_NORM_ENABLED:
         fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
         if fused is not None:
             return fused
@@ -460,7 +494,7 @@ def _apply_attn_res_add_and_rmsnorm(
     output_norm: nn.Module,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm."""
-    if _FUSED_ATTN_RES_ENABLED:
+    if _FUSED_ATTN_RES_ENABLED and _FUSED_ATTN_RES_NORM_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
             prefix_sum, addend, block_residual, proj, norm, output_norm
         )
@@ -2291,7 +2325,8 @@ class KimiLinearModel(DecoderModel):
         self.output_attn_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
         logger.info_once(
-            f"Kimi K3 attention-residual kernels: fused={_FUSED_ATTN_RES_ENABLED}",
+            f"Kimi K3 attention-residual kernels: fused={_FUSED_ATTN_RES_ENABLED}, "
+            f"fused_norm={_FUSED_ATTN_RES_NORM_ENABLED}",
             key="kimi_k3_attn_res_fusion",
         )
 
