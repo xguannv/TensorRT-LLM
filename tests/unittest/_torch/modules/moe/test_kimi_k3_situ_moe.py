@@ -1558,47 +1558,6 @@ def test_fp8_checkpoint_scale_bridge_matches_the_roundtrip_path():
 
 
 @nvfp4_moe_supported
-def test_fp8_weight_read_prefers_the_checkpoint_pair():
-    """``from_linear`` must use a stashed FP8_PB_WO pair when one is present.
-
-    Three call sites convert attention projections to the FP8 weight-read
-    Linear, all through ``from_linear``, so that is the one place the
-    checkpoint-direct route has to be honoured. Without this the loader would
-    stash the pair and nothing would read it -- silently falling back to the
-    BF16 round trip, which is exactly what this is meant to avoid.
-    """
-    import torch.nn as nn
-
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _K3_CKPT_FP8_ATTR
-    from tensorrt_llm._torch.models.modeling_kimi_linear import (
-        _Fp8BlockScaleWeightReadLinear as FP8Linear,
-    )
-    from tensorrt_llm.deep_gemm.utils.math import per_block_cast_to_fp8
-
-    out_features, in_features = 256, 512
-    torch.manual_seed(6)
-    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16, device="cuda") * 0.05
-    ckpt_fp8, ckpt_scale = per_block_cast_to_fp8(weight, use_ue8m0=False)
-
-    linear = nn.Linear(in_features, out_features, bias=False, dtype=torch.bfloat16, device="cuda")
-    with torch.no_grad():
-        # Deliberately NOT the weight the pair came from: if from_linear
-        # re-quantized linear.weight instead of using the pair, the result
-        # would follow this garbage and the assert below would catch it.
-        linear.weight.copy_(torch.zeros_like(weight))
-    setattr(linear.weight, _K3_CKPT_FP8_ATTR, (ckpt_fp8, ckpt_scale.float()))
-
-    converted = FP8Linear.from_linear(linear)
-    expected_w, expected_s = FP8Linear.prepare_checkpoint_scale(ckpt_fp8, ckpt_scale.float())
-    assert _bitwise_equal(converted.weight, expected_w)
-    assert _bitwise_equal(converted.weight_scale, expected_s)
-    # float8 supports almost no arithmetic (no abs_cuda), so probe the bytes.
-    assert converted.weight.view(torch.uint8).any().item(), (
-        "fell back to re-quantizing the zeroed BF16 weight"
-    )
-
-
-@nvfp4_moe_supported
 def test_fused_fp8_from_checkpoint_slices_matches_the_bf16_concat():
     """Fusing checkpoint FP8 slices == quantizing the BF16 concatenation.
 
@@ -1706,10 +1665,10 @@ def test_fp8_placeholder_fill_contract():
 # ---------------------------------------------------------------------------
 # Phase 3a: construction-time FP8-resident KDA projections.
 #
-# The load-time FP8 weight read (KIMI_K3_FP8_WEIGHT_READ) converts *after* the
-# BF16 weight has been allocated and filled. DEP8's OOM happens during module
-# CONSTRUCTION, so only building the projections FP8 from the start can fix it.
-# These cover the pieces that make that safe.
+# The retired load-time FP8 weight read converted *after* the BF16 weight had
+# been allocated and filled. DEP8's OOM happens during module CONSTRUCTION, so
+# only building the projections FP8 from the start can fix it. These cover the
+# pieces that make that safe.
 # ---------------------------------------------------------------------------
 
 
@@ -1756,26 +1715,51 @@ def test_fill_kda_fp8_resident_matches_the_bf16_conversion():
 
     Two routes to the same fused ``qkvg_proj``:
 
-      A (shipping) ``torch.cat`` four BF16 weights -> ``quantize_weight``, i.e.
-        checkpoint FP8 -> BF16 (at load) -> FP8 again.
-      B (this work) ``fuse_checkpoint_fp8`` on the four checkpoint FP8 tensors,
+      A (the retired load-time path, reproduced here) ``torch.cat`` four BF16
+        weights -> ``quantize_weight``, i.e. checkpoint FP8 -> BF16 (at load)
+        -> FP8 again.
+      B (shipping) ``fuse_checkpoint_fp8`` on the four checkpoint FP8 tensors,
         never materializing BF16 at all.
 
-    Equality here is what licenses skipping the round trip, and it is not
+    Equality here is what licensed skipping the round trip, and it is not
     free: it holds only because every 128x128 block lies wholly inside one
     projection, so concatenating before or after quantizing cannot change a
     block's scale. That is exactly the assumption the fused build rests on, so
     it is asserted rather than argued -- and it is asserted BITWISE, because a
     tolerance would hide precisely the misalignment being ruled out.
+
+    Route A is now test-local: production no longer has a BF16 conversion to
+    call. Keeping it here keeps the block-alignment assumption under test.
     """
     from tensorrt_llm._torch.models.modeling_kimi_linear import (
-        _convert_kda_projections_to_fp8_weight_read,
         _fill_kda_fp8_resident_projections,
         _k3_kda_fp8_resident_jobs,
     )
     from tensorrt_llm._torch.models.modeling_kimi_linear import (
         _Fp8BlockScaleWeightReadLinear as FP8Linear,
     )
+
+    def _convert_kda_projections_to_fp8_weight_read(model) -> int:
+        """The retired load-time conversion, kept as this test's reference."""
+        count = 0
+        for layer in model.layers:
+            mixer = layer.self_attn.mixer
+            group = [(a, getattr(mixer, a)) for a in ("q_proj", "k_proj", "v_proj", "g_proj")]
+            fused_bf16 = torch.cat([c.weight.data for _, c in group], dim=0)
+            fused_fp8, fused_scale = FP8Linear.quantize_weight(fused_bf16)
+            fused = FP8Linear(fused_fp8, fused_scale, fused_bf16.shape[0])
+            mixer.qkvg_proj = fused
+            mixer.qkvg_split_sizes = [c.out_features for _, c in group]
+            offset = 0
+            for attr, child in group:
+                n = child.out_features
+                _, own_scale = FP8Linear.quantize_weight(child.weight.data)
+                setattr(mixer, attr, FP8Linear(fused.weight[offset : offset + n], own_scale, n))
+                offset += n
+                count += 1
+            mixer.o_proj = FP8Linear.from_linear(mixer.o_proj)
+            count += 1
+        return count
 
     hidden, proj_out = 256, 384
     torch.manual_seed(11)
@@ -1937,13 +1921,64 @@ def test_k3_attn_stored_fp8_requires_every_projection():
 
 
 @nvfp4_moe_supported
-def test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree():
-    """The dequantize->requantize round trip is a no-op on a checkpoint weight.
+def test_fp8_weight_read_prefers_the_checkpoint_pair():
+    """``from_linear`` must use a stashed FP8_PB_WO pair when one is present.
 
-    Production reaches the FP8 attention weights two different ways:
+    🔴 This guards a CORRECTNESS requirement, not an optimization. The MLA
+    conversion goes through ``from_linear``, so this is the one place the
+    checkpoint-direct route has to be honoured. Without it the loader stashes
+    the pair and nothing reads it, silently falling back to
+    ``quantize_weight(BF16)`` -- which on the real ModelOpt-quantized
+    checkpoint rewrites 16-19% of bytes (see ``_K3_CKPT_FP8_ATTR`` and
+    ``examples/kimi_k3/check_fp8_roundtrip_identity.py``).
+
+    ⚠️ Do not delete this alongside the FP8 weight-read envs. It was deleted
+    once on the reasoning that the stash went with them; the stash stayed, and
+    for two commits it had no coverage at all.
+
+    The BF16 weight is deliberately ZEROED: if ``from_linear`` re-quantized it
+    instead of using the pair, the result would follow that garbage and the
+    final assertion catches it.
+    """
+    import torch.nn as nn
+
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _K3_CKPT_FP8_ATTR
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _Fp8BlockScaleWeightReadLinear as FP8Linear,
+    )
+    from tensorrt_llm.deep_gemm.utils.math import per_block_cast_to_fp8
+
+    out_features, in_features = 256, 512
+    torch.manual_seed(6)
+    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16, device="cuda") * 0.05
+    ckpt_fp8, ckpt_scale = per_block_cast_to_fp8(weight, use_ue8m0=False)
+
+    linear = nn.Linear(in_features, out_features, bias=False, dtype=torch.bfloat16, device="cuda")
+    with torch.no_grad():
+        linear.weight.copy_(torch.zeros_like(weight))
+    setattr(linear.weight, _K3_CKPT_FP8_ATTR, (ckpt_fp8, ckpt_scale.float()))
+
+    converted = FP8Linear.from_linear(linear)
+    expected_w, expected_s = FP8Linear.prepare_checkpoint_scale(ckpt_fp8, ckpt_scale.float())
+    assert _bitwise_equal(converted.weight, expected_w)
+    assert _bitwise_equal(converted.weight_scale, expected_s)
+    # float8 supports almost no arithmetic (no abs_cuda), so probe the bytes.
+    assert converted.weight.view(torch.uint8).any().item(), (
+        "fell back to re-quantizing the zeroed BF16 weight"
+    )
+
+
+@nvfp4_moe_supported
+def test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree():
+    """The dequantize->requantize round trip is a no-op on a SYNTHETIC weight.
+
+    There were two ways to reach the FP8 attention weights:
 
         load-time  (q/k/v/g):  ckpt FP8 -> BF16 (dequantize) -> FP8 (requantize)
         construction-time:     ckpt FP8 -> FP8                (direct)
+
+    Only the construction-time one survives; the load-time route is
+    reproduced here so the claim below stays under test.
 
     It is tempting to assume the first loses something -- it widens to BF16 and
     then re-derives a 128x128 block scale. It does not: per_block_cast_to_fp8
@@ -1953,9 +1988,23 @@ def test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree():
     This test was originally written asserting the OPPOSITE, to explain the
     4-question GSM8K gap between jobs 484543 (load-time, 96.4367/96.3609) and
     484704 (construction-time, 96.1334). It failed, which is how that
-    explanation was discovered to be wrong. Keeping it inverted here so the
-    same wrong story cannot be told twice: **the weights are identical, so the
-    GSM8K gap is not caused by them.**
+    explanation was discovered to be wrong.
+
+    🔴 SCOPE -- READ BEFORE CITING THIS TEST.
+
+    What it proves is narrow: ``per_block_cast_to_fp8`` is IDEMPOTENT. The
+    "checkpoint" pair below is manufactured by calling that very function, so
+    the round trip re-applies the quantizer that produced the input. It says
+    NOTHING about whether a real checkpoint agrees with ``per_block_cast_to_fp8``.
+
+    It does not. ``nvidia/Kimi-K3-NVFP4`` is quantized by ModelOpt, and on the
+    real weights the same round trip differs in 16-19% of bytes -- measured over
+    10 MLA projections by ``examples/kimi_k3/check_fp8_roundtrip_identity.py`` (job 514653).
+
+    That distinction is load-bearing: this test was once read as licensing the
+    removal of the ``_K3_CKPT_FP8_ATTR`` stash, which silently re-quantized
+    every MLA projection. Anything that reads the checkpoint's own FP8 must keep
+    using those bytes; only weights that are BF16 on disk may be quantized here.
     """
     from tensorrt_llm._torch.models.modeling_kimi_linear import _FP8_BLOCK
     from tensorrt_llm._torch.models.modeling_kimi_linear import (
@@ -1970,8 +2019,8 @@ def test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree():
     ckpt_scale = ckpt_scale.float()
 
     # Load-time route: dequantize (mirrors _dequantize_fp8_block_scaled) then
-    # re-quantize (mirrors the cat + quantize_weight in
-    # _convert_kda_projections_to_fp8_weight_read).
+    # re-quantize (mirrors the cat + quantize_weight the retired load-time
+    # conversion did).
     expanded = ckpt_scale.repeat_interleave(_FP8_BLOCK, dim=0).repeat_interleave(_FP8_BLOCK, dim=1)
     dequantized = (
         ckpt_fp8.to(torch.float32) * expanded[: pristine.shape[0], : pristine.shape[1]]

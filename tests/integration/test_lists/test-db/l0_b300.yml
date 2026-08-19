@@ -45,6 +45,7 @@ l0_b300:
   # if they were ours. Those are reported separately; these are green.
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_expert_ckpt_spec_selection
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_block_scaled_dequantization
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_weight_read_prefers_the_checkpoint_pair
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_materialize_handles_scalar_lazy_safetensors
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads1]
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_expert_load_matches_whole_checkpoint[threads4]
@@ -56,7 +57,6 @@ l0_b300:
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_match_situ_reference[static_1.0]
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_checkpoint_scale_bridge_matches_the_roundtrip_path
-  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_weight_read_prefers_the_checkpoint_pair
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fused_fp8_from_checkpoint_slices_matches_the_bf16_concat
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fp8_placeholder_fill_contract
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_fill_kda_fp8_resident_matches_the_bf16_conversion

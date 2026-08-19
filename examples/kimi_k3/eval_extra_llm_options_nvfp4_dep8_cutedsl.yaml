@@ -12,8 +12,8 @@
 # NOT carry this value over to a MEGAMOE_* backend, where it is instead the
 # SymmBuffer capacity.
 #
-# Accuracy (DEP8, GB300/SM103, KIMI_K3_FP8_WEIGHT_READ=1,
-# KIMI_K3_FP8_ATTN_RESIDENT=1, --max_batch_size 8 --max_seq_len 8192
+# Accuracy (DEP8, GB300/SM103, FP8-resident attention + the MoE-MLP FP8 cast,
+# both now the default, --max_batch_size 8 --max_seq_len 8192
 # --kv_cache_free_gpu_memory_fraction 0.35 --disable_kv_cache_reuse):
 #
 #   GSM8K    96.89  (CUTLASS control, identical config: 96.21)

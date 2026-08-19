@@ -31,7 +31,7 @@
 #
 #   PART=batch NODES=2 TIME=3:00:00 JOB=k3-gsm8k-served \
 #   EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_nvfp4_dep8_megamoe.yaml \
-#   TP_SIZE=8 KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_ATTN_RESIDENT=1 \
+#   TP_SIZE=8 \
 #   ./k3sub.sh --export=ALL examples/kimi_k3/run_gsm8k_served_kimi_k3.sbatch \
 #       --model /path/to/kimi-k3-checkpoint --image /path/to/container.sqsh
 #
@@ -172,12 +172,10 @@ HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk 'NR == 1')
 # Forward only the K3 precision switches the submitter actually set. Exporting
 # an unset switch as "" is NOT equivalent: the model reads them with
 # os.environ.get(ENV, <default>) and tests '!= "0"', so "" is truthy and would
-# override a layout-aware default. Same construction as run_gsm8k_kimi_k3.
+# override the default. Both default ON, so the usual reason to set either is
+# to turn it OFF for an A/B. Same construction as run_gsm8k_kimi_k3.
 K3_FP8_SWITCHES="
-KIMI_K3_FP8_WEIGHT_READ_KDA
-KIMI_K3_FP8_WEIGHT_READ_MLA
 KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
-KIMI_K3_FP8_WEIGHT_READ_GATE_UP
 KIMI_K3_FP8_ATTN_RESIDENT
 "
 K3_SUBSWITCH_EXPORTS=""
@@ -215,8 +213,6 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
         export TLLM_LOG_LEVEL=\${TLLM_LOG_LEVEL:-info}
 
-        export KIMI_K3_FP8_WEIGHT_READ=\"${KIMI_K3_FP8_WEIGHT_READ:-0}\"
-        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ=\$KIMI_K3_FP8_WEIGHT_READ\"
         $K3_SUBSWITCH_EXPORTS
         for n in $K3_FP8_SWITCH_NAMES; do
             echo \"[k3] \$n=\${!n:-(default)}\"

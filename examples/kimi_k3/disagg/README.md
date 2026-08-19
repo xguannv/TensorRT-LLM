@@ -36,10 +36,10 @@ for constraints.
     ~273 GiB/rank for weights alone against a 288 GiB card. That estimate
     predated **FP8-resident attention**, which keeps the replicated KDA
     projections at FP8 on device instead of expanding them to BF16 and is
-    worth ~34 GiB/rank. DEP8 additionally needs
-    `KIMI_K3_FP8_ATTN_RESIDENT=1`, a `max_batch_size` low enough for the V2
-    Mamba minimum (which scales with resident sequences), and an explicit
-    `moe_config.max_num_tokens` on a CUTLASS worker.
+    worth ~34 GiB/rank and is on by default. DEP8 additionally needs a
+    `max_batch_size` low enough for the V2 Mamba minimum (which scales with
+    resident sequences), and an explicit `moe_config.max_num_tokens` on a
+    CUTLASS worker.
   - **GB200 (186 GiB) is still ruled out** — 239.70 GiB/rank does not fit
     there, so the original conclusion stands for that part.
 - **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the

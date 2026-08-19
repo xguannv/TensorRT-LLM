@@ -301,22 +301,17 @@ if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi
 
-# Forward the FP8 weight-read sub-switches into the container, but ONLY the
-# ones the submitter actually set. Exporting an unset switch as an empty string
-# is not equivalent: the model reads them with os.environ.get(ENV, <default>)
-# and tests '!= "0"', so "" is truthy and would silently override the default.
-# That matters for GATE_UP, whose default is layout-aware (on under attention
-# DP, off under TP) rather than a constant.
+# Forward the FP8 precision switches into the container, but ONLY the ones the
+# submitter actually set. Exporting an unset switch as an empty string is not
+# equivalent: the model reads them with os.environ.get(ENV, <default>) and
+# tests '!= "0"', so "" is truthy and would silently override the default.
 #
-# Listed by FULL name rather than built from a common prefix: they do not share
-# one. KIMI_K3_FP8_ATTN_RESIDENT is a peer of the master switch, not a
-# KIMI_K3_FP8_WEIGHT_READ_* sub-switch, and a prefix loop would silently omit
-# it -- which is the exact failure this forwarding exists to prevent.
+# Both default ON, so the usual reason to set either is to turn it OFF for an
+# A/B. Listed by FULL name rather than built from a common prefix: they do not
+# share one, and a prefix loop would silently omit KIMI_K3_FP8_ATTN_RESIDENT --
+# which is the exact failure this forwarding exists to prevent.
 K3_FP8_SWITCHES="
-KIMI_K3_FP8_WEIGHT_READ_KDA
-KIMI_K3_FP8_WEIGHT_READ_MLA
 KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
-KIMI_K3_FP8_WEIGHT_READ_GATE_UP
 KIMI_K3_FP8_ATTN_RESIDENT
 "
 K3_SUBSWITCH_EXPORTS=""
@@ -350,7 +345,7 @@ srun --mpi=pmix \
 
         # DeepGEMM JIT writes compiled artifacts through a temporary file +
         # rename. Sharing one cache across ranks lets two compilers race that
-        # rename (seen with KIMI_K3_FP8_WEIGHT_READ=1 on Rubin). Keep it
+        # rename (seen with the FP8 weight read on Rubin). Keep it
         # node-local and per-rank, like the Triton cache above.
         export DG_JIT_CACHE_DIR=/tmp/deep-gemm-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$DG_JIT_CACHE_DIR\"
@@ -393,10 +388,8 @@ srun --mpi=pmix \
         # either has the setting it was submitted with or fails visibly - a
         # silently-unset precision flag would look like a clean A/B while
         # actually re-running the same configuration twice.
-        export KIMI_K3_FP8_WEIGHT_READ=\"${KIMI_K3_FP8_WEIGHT_READ:-0}\"
-        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ=\$KIMI_K3_FP8_WEIGHT_READ\"
-        # Per-region sub-switches (built by the submit shell above, so that only
-        # the ones actually set are exported), then echoed like the master.
+        # Precision switches (built by the submit shell above, so that only the
+        # ones actually set are exported), then echoed.
         $K3_SUBSWITCH_EXPORTS
         for n in $K3_FP8_SWITCH_NAMES; do
             echo \"[k3] \$n=\${!n:-(default)}\"
