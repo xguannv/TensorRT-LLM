@@ -1017,6 +1017,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         tactic: Optional[Tuple] = None,
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
     ) -> int:
@@ -1074,6 +1076,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             epi_flag_batch=tuple(epi_flag_batch),
             apply_topk_in_fc1=bool(apply_topk_in_fc1),
             gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
+            situ_beta=(None if situ_beta is None else float(situ_beta)),
+            situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
             **_LOCKED_KERNEL_KWARGS,
         )
         # The probe MUST build the SAME kernel that runs (same combine_format):
@@ -1120,6 +1124,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             output_dtype: torch.dtype,
             apply_topk_in_fc1: bool = True,
             gate_up_clamp: Optional[float] = None,
+            situ_beta: Optional[float] = None,
+            situ_linear_beta: Optional[float] = None,
             in_kernel_fc2_reduce: bool = False,
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
@@ -1156,6 +1162,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # per-call runtime kwargs.
             self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
             self.gate_up_clamp = None if gate_up_clamp is None else float(gate_up_clamp)
+            # SiTU constants are baked into the generated kernel exactly like
+            # gate_up_clamp, so they are part of unique_id() below.
+            self.situ_beta = None if situ_beta is None else float(situ_beta)
+            self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
             # Symmetric profiling scratch, set by the op around ``choose_one``
             # so the pre-hook routes cross-rank inputs through symmetric
             # memory; None outside tuning and for single-rank.
@@ -1188,6 +1198,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 str(self.output_dtype),
                 self.apply_topk_in_fc1,
                 self.gate_up_clamp,
+                self.situ_beta,
+                self.situ_linear_beta,
                 self.in_kernel_fc2_reduce,
                 self.combine_format,
             )
@@ -1380,6 +1392,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 epi_flag_batch=tuple(epi_flag_batch),
                 apply_topk_in_fc1=self.apply_topk_in_fc1,
                 gate_up_clamp=self.gate_up_clamp,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
                 **_LOCKED_KERNEL_KWARGS,
             )
             kernel_cls, CombineFormat = _import_megamoe_kernel()
@@ -1691,6 +1705,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         peer_offsets: List[int],
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
@@ -1745,6 +1761,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             output_dtype=combine_output.dtype,
             apply_topk_in_fc1=apply_topk_in_fc1,
             gate_up_clamp=gate_up_clamp,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_format=combine_format,
             tactic_autotune=tactic_autotune,
@@ -1857,6 +1875,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         peer_offsets: List[int],
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
