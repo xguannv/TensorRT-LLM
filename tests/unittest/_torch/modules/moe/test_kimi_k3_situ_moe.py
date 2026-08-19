@@ -1715,3 +1715,288 @@ def test_fp8_placeholder_fill_contract():
     single.load_checkpoint_pair([pairs[0]])
     ref = FP8Linear.from_checkpoint_fp8(pairs[0][0], pairs[0][1], outs[0])
     assert _bitwise_equal(single.weight, ref.weight)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3a: construction-time FP8-resident KDA projections.
+#
+# The load-time FP8 weight read (KIMI_K3_FP8_WEIGHT_READ) converts *after* the
+# BF16 weight has been allocated and filled. DEP8's OOM happens during module
+# CONSTRUCTION, so only building the projections FP8 from the start can fix it.
+# These cover the pieces that make that safe.
+# ---------------------------------------------------------------------------
+
+
+def _fp8_ckpt_pair(weight_bf16):
+    """A checkpoint FP8_PB_WO pair in ``nvidia/Kimi-K3-NVFP4`` spelling.
+
+    Returns the 2-D-normalized scale the loader's ``_checkpoint_fp8_pair``
+    hands on (the checkpoint itself stores it 4-D).
+    """
+    from tensorrt_llm.deep_gemm.utils.math import per_block_cast_to_fp8
+
+    fp8, scale = per_block_cast_to_fp8(weight_bf16, use_ue8m0=False)
+    return fp8, scale.float()
+
+
+class _FakeKDAMixer(torch.nn.Module):
+    """Just enough of KimiKDALinearAttention for the conversion helpers."""
+
+    def __init__(self, hidden, proj_out, factory):
+        super().__init__()
+        for attr in ("q_proj", "k_proj", "v_proj", "g_proj"):
+            setattr(self, attr, factory(hidden, proj_out))
+        self.o_proj = factory(proj_out, hidden)
+
+
+class _FakeKDALayer(torch.nn.Module):
+    def __init__(self, mixer, fp8_resident):
+        super().__init__()
+        self.is_kda = True
+        self.self_attn = torch.nn.Module()
+        self.self_attn.mixer = mixer
+        self.self_attn._fp8_resident_projections = fp8_resident
+
+
+class _FakeModel(torch.nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+
+
+@nvfp4_moe_supported
+def test_fill_kda_fp8_resident_matches_the_bf16_conversion():
+    """Filling placeholders from checkpoint FP8 lands where the BF16 path lands.
+
+    Two routes to the same fused ``qkvg_proj``:
+
+      A (shipping) ``torch.cat`` four BF16 weights -> ``quantize_weight``, i.e.
+        checkpoint FP8 -> BF16 (at load) -> FP8 again.
+      B (this work) ``fuse_checkpoint_fp8`` on the four checkpoint FP8 tensors,
+        never materializing BF16 at all.
+
+    Equality here is what licenses skipping the round trip, and it is not
+    free: it holds only because every 128x128 block lies wholly inside one
+    projection, so concatenating before or after quantizing cannot change a
+    block's scale. That is exactly the assumption the fused build rests on, so
+    it is asserted rather than argued -- and it is asserted BITWISE, because a
+    tolerance would hide precisely the misalignment being ruled out.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _convert_kda_projections_to_fp8_weight_read,
+        _fill_kda_fp8_resident_projections,
+        _k3_kda_fp8_resident_jobs,
+    )
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _Fp8BlockScaleWeightReadLinear as FP8Linear,
+    )
+
+    hidden, proj_out = 256, 384
+    torch.manual_seed(11)
+    weights = {
+        attr: torch.randn(
+            proj_out if attr != "o_proj" else hidden,
+            hidden if attr != "o_proj" else proj_out,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+        for attr in ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
+    }
+
+    # ---- Path A: today's BF16 conversion.
+    def _linear(in_f, out_f):
+        lin = torch.nn.Linear(in_f, out_f, bias=False).cuda().to(torch.bfloat16)
+        return lin
+
+    mixer_a = _FakeKDAMixer(hidden, proj_out, _linear)
+    for attr, w in weights.items():
+        getattr(mixer_a, attr).weight.data.copy_(w)
+    model_a = _FakeModel([_FakeKDALayer(mixer_a, fp8_resident=False)])
+    assert _convert_kda_projections_to_fp8_weight_read(model_a) == 5
+
+    # ---- Path B: construction-time placeholders filled from checkpoint FP8.
+    mixer_b = _FakeKDAMixer(
+        hidden, proj_out, lambda in_f, out_f: FP8Linear.empty_placeholder(out_f, in_f)
+    )
+    model_b = _FakeModel([_FakeKDALayer(mixer_b, fp8_resident=True)])
+    pairs = {attr: _fp8_ckpt_pair(w) for attr, w in weights.items()}
+    jobs = list(_k3_kda_fp8_resident_jobs(model_b, prefix=""))
+    assert len(jobs) == 5, f"expected 5 jobs, got {[j[2] for j in jobs]}"
+    key_to_attr = {key: attr for _li, _m, attr, key in jobs}
+    filled = _fill_kda_fp8_resident_projections(jobs, lambda key: pairs[key_to_attr[key]])
+    assert filled == 5
+
+    # The fused weight is the payload; the per-projection views hang off it.
+    assert _bitwise_equal(mixer_b.qkvg_proj.weight, mixer_a.qkvg_proj.weight), "fused FP8 differs"
+    assert _bitwise_equal(mixer_b.qkvg_proj.weight_scale, mixer_a.qkvg_proj.weight_scale), (
+        "fused prepared scale differs"
+    )
+    assert mixer_b.qkvg_split_sizes == mixer_a.qkvg_split_sizes
+
+    for attr in ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj"):
+        a, b = getattr(mixer_a, attr), getattr(mixer_b, attr)
+        assert _bitwise_equal(b.weight, a.weight), f"{attr} weight differs"
+        assert _bitwise_equal(b.weight_scale, a.weight_scale), f"{attr} scale differs"
+
+    # q/k/v/g must be VIEWS of the fused storage, not copies -- that is the
+    # whole reason for fusing. Checked through the data pointer, since an
+    # equal-valued copy would pass every assertion above.
+    offset = 0
+    for attr in ("q_proj", "k_proj", "v_proj", "g_proj"):
+        mod = getattr(mixer_b, attr)
+        assert mod.weight.data_ptr() == mixer_b.qkvg_proj.weight[offset:].data_ptr(), (
+            f"{attr} is not a view of the fused weight"
+        )
+        offset += mod.out_features
+
+
+@nvfp4_moe_supported
+def test_fp8_resident_projections_survive_the_module_dtype_cast():
+    """``_meta_safe_cast_dtype`` must not re-cast an FP8 weight to bf16.
+
+    It casts anything reporting ``is_floating_point()``, and float8 does. The
+    mixer calls it on the whole module right after building the projections,
+    so without the float8 guard an FP8-resident projection would be silently
+    widened to bf16 -- losing both the values and the dtype the loader matches
+    on, with nothing raising.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _Fp8BlockScaleWeightReadLinear as FP8Linear,
+    )
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _meta_safe_cast_dtype
+
+    mixer = _FakeKDAMixer(
+        256, 384, lambda in_f, out_f: FP8Linear.empty_placeholder(out_f, in_f)
+    ).cuda()
+    _meta_safe_cast_dtype(mixer, torch.bfloat16)
+    for attr in ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj"):
+        assert getattr(mixer, attr).weight.dtype is torch.float8_e4m3fn, attr
+
+
+@nvfp4_moe_supported
+def test_fill_prepared_rejects_the_three_ways_it_can_be_misused():
+    """A second fill, a wrong out_features, and an unquantized weight."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _Fp8BlockScaleWeightReadLinear as FP8Linear,
+    )
+
+    torch.manual_seed(12)
+    w = torch.randn(256, 384, dtype=torch.bfloat16, device="cuda") * 0.05
+    fp8, scale = _fp8_ckpt_pair(w)
+    prepared_w, prepared_s = FP8Linear.prepare_checkpoint_scale(fp8, scale)
+
+    ph = FP8Linear.empty_placeholder(256, 384)
+    ph.fill_prepared(prepared_w, prepared_s)
+    assert not ph.is_placeholder
+    with pytest.raises(RuntimeError, match="filled twice"):
+        ph.fill_prepared(prepared_w, prepared_s)
+
+    with pytest.raises(ValueError, match="out_features"):
+        FP8Linear.empty_placeholder(128, 384).fill_prepared(prepared_w, prepared_s)
+
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
+        FP8Linear.empty_placeholder(256, 384).fill_prepared(w, prepared_s)
+
+
+def test_k3_attn_stored_fp8_requires_every_projection():
+    """All five declared FP8 block-scaled, or the layer is not eligible.
+
+    A partial declaration must not convert the subset: the remaining
+    projections would still allocate BF16, so it would not buy the
+    construction-time headroom this exists for while making the shortfall
+    harder to see. Pure config logic -- no GPU.
+
+    The algo under test is taken from ``canonicalize_quant_algo`` rather than
+    written out, because that is the whole subtlety here. The checkpoint spells
+    it ``FP8_PB_WO``; Blocker #0 rewrites the alias on the way in, so
+    ``quant_config_dict`` only ever holds the canonical name and there is no
+    ``QuantAlgo.FP8_PB_WO`` to compare against. The first version of this test
+    hardcoded the checkpoint spelling and caught a resolver that would have
+    raised AttributeError the first time the flag was set. Deriving it here
+    means the resolver and the alias table cannot drift apart silently.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _K3_KDA_FP8_RESIDENT_PROJECTIONS,
+        _k3_attn_stored_fp8_block_scaled,
+    )
+    from tensorrt_llm.quantization.modelopt_config import canonicalize_quant_algo
+
+    stored_algo = QuantAlgo(canonicalize_quant_algo("FP8_PB_WO"))
+    assert stored_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+    def _cfg(entries):
+        return SimpleNamespace(quant_config_dict=entries)
+
+    def _entries(prefix, projections, algo=stored_algo):
+        return {
+            f"{prefix}layers.7.self_attn.{p}": SimpleNamespace(quant_algo=algo) for p in projections
+        }
+
+    all_five = _K3_KDA_FP8_RESIDENT_PROJECTIONS
+    # Every prefix spelling the checkpoint emits is accepted.
+    for prefix in ("language_model.model.", "model.", ""):
+        assert _k3_attn_stored_fp8_block_scaled(_cfg(_entries(prefix, all_five)), 7)
+
+    # One missing -> not eligible.
+    assert not _k3_attn_stored_fp8_block_scaled(_cfg(_entries("model.", all_five[:-1])), 7)
+    # Declared, but not FP8 block-scaled.
+    assert not _k3_attn_stored_fp8_block_scaled(
+        _cfg(_entries("model.", all_five, algo=QuantAlgo.NVFP4)), 7
+    )
+    # A different layer, and the moonshotai checkpoint's "nothing declared".
+    assert not _k3_attn_stored_fp8_block_scaled(_cfg(_entries("model.", all_five)), 8)
+    assert not _k3_attn_stored_fp8_block_scaled(_cfg({}), 7)
+    assert not _k3_attn_stored_fp8_block_scaled(SimpleNamespace(), 7)
+
+
+@nvfp4_moe_supported
+def test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree():
+    """The dequantize->requantize round trip is a no-op on a checkpoint weight.
+
+    Production reaches the FP8 attention weights two different ways:
+
+        load-time  (q/k/v/g):  ckpt FP8 -> BF16 (dequantize) -> FP8 (requantize)
+        construction-time:     ckpt FP8 -> FP8                (direct)
+
+    It is tempting to assume the first loses something -- it widens to BF16 and
+    then re-derives a 128x128 block scale. It does not: per_block_cast_to_fp8
+    recovers the same block maximum and therefore the same FP8 codes, so both
+    routes land on the checkpoint's own bytes.
+
+    This test was originally written asserting the OPPOSITE, to explain the
+    4-question GSM8K gap between jobs 484543 (load-time, 96.4367/96.3609) and
+    484704 (construction-time, 96.1334). It failed, which is how that
+    explanation was discovered to be wrong. Keeping it inverted here so the
+    same wrong story cannot be told twice: **the weights are identical, so the
+    GSM8K gap is not caused by them.**
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _FP8_BLOCK
+    from tensorrt_llm._torch.models.modeling_kimi_linear import (
+        _Fp8BlockScaleWeightReadLinear as FP8Linear,
+    )
+    from tensorrt_llm.deep_gemm.utils.math import per_block_cast_to_fp8
+
+    torch.manual_seed(21)
+    pristine = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda") * 0.05
+
+    ckpt_fp8, ckpt_scale = per_block_cast_to_fp8(pristine, use_ue8m0=False)
+    ckpt_scale = ckpt_scale.float()
+
+    # Load-time route: dequantize (mirrors _dequantize_fp8_block_scaled) then
+    # re-quantize (mirrors the cat + quantize_weight in
+    # _convert_kda_projections_to_fp8_weight_read).
+    expanded = ckpt_scale.repeat_interleave(_FP8_BLOCK, dim=0).repeat_interleave(_FP8_BLOCK, dim=1)
+    dequantized = (
+        ckpt_fp8.to(torch.float32) * expanded[: pristine.shape[0], : pristine.shape[1]]
+    ).to(torch.bfloat16)
+    a_w, a_s = FP8Linear.quantize_weight(dequantized)
+
+    # Construction-time route: straight from the checkpoint pair.
+    b_w, b_s = FP8Linear.prepare_checkpoint_scale(ckpt_fp8, ckpt_scale)
+
+    # Construction-time carries the checkpoint's bytes through untouched.
+    assert _bitwise_equal(b_w, ckpt_fp8), "construction-time altered the checkpoint's FP8 weights"
+    # And so, it turns out, does the round trip -- weights AND prepared scale.
+    assert _bitwise_equal(a_w, b_w), "the two routes disagree on the FP8 weights"
+    assert _bitwise_equal(a_s, b_s), "the two routes disagree on the prepared scale"

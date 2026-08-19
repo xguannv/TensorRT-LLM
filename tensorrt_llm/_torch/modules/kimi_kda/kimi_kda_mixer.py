@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from einops import rearrange
@@ -62,6 +62,14 @@ def _meta_safe_cast_dtype(module, dtype):
 
     def _cast(t):
         if not t.is_floating_point():
+            return t
+        # 8-bit float weights are quantized storage carrying their own block
+        # scale, never the module's compute dtype. They report
+        # is_floating_point() == True, so without this guard a projection held
+        # at FP8 would be silently re-cast to bf16 here -- losing the value
+        # (and, for an as-yet-unfilled placeholder, the dtype the loader
+        # matches on) with nothing raising.
+        if t.dtype in (_torch.float8_e4m3fn, _torch.float8_e5m2):
             return t
         if t.is_meta:
             return _torch.empty_like(t, dtype=dtype)
@@ -199,6 +207,7 @@ class KimiKDALinearAttention(nn.Module):
         use_optimized_decode: bool = True,
         gate_lower_bound_override: Optional[float] = None,
         wrong_state_layout: bool = False,
+        proj_factory: Optional[Callable[[int, int], nn.Module]] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -217,9 +226,28 @@ class KimiKDALinearAttention(nn.Module):
         projection_k_size = self.head_k_dim * self.num_k_heads
         projection_size = self.head_dim * self.num_heads
 
-        self.q_proj = nn.Linear(hidden_size, projection_k_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, projection_k_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, projection_size, bias=False)
+        # Factory for the five large bias-free projections (q/k/v, the
+        # full-rank gate, and o). Injected rather than imported so this mixer
+        # keeps no knowledge of any quantized-linear implementation -- the K3
+        # model module that owns the FP8 module also imports this file, so a
+        # direct import would be circular -- and so the parity tests can keep
+        # constructing it with plain nn.Linear.
+        #
+        # Only these five are routed through it. The state-path projections
+        # (f_a/f_b, b, the low-rank g_a/g_b, the short convolutions, dt) stay
+        # nn.Linear on purpose: b_proj outputs num_heads, which is not a
+        # multiple of 128 and so has no exact 128x128 block scale, and the
+        # rest are small and feed the accuracy-sensitive recurrent decay.
+        _proj = (
+            proj_factory
+            if proj_factory is not None
+            else (lambda in_f, out_f: nn.Linear(in_f, out_f, bias=False))
+        )
+        self._proj_factory_used = proj_factory is not None
+
+        self.q_proj = _proj(hidden_size, projection_k_size)
+        self.k_proj = _proj(hidden_size, projection_k_size)
+        self.v_proj = _proj(hidden_size, projection_size)
 
         self.q_conv1d = ShortConvolution(
             hidden_size=projection_k_size,
@@ -259,13 +287,13 @@ class KimiKDALinearAttention(nn.Module):
         self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
         if use_full_rank_gate:
-            self.g_proj = nn.Linear(hidden_size, projection_size, bias=False)
+            self.g_proj = _proj(hidden_size, projection_size)
         else:
             self.g_a_proj = nn.Linear(hidden_size, head_dim, bias=False)
             self.g_b_proj = nn.Linear(head_dim, projection_size, bias=False)
 
         self.o_norm = _MetaSafeFusedRMSNormGated(head_dim, eps=rms_norm_eps, activation="sigmoid")
-        self.o_proj = nn.Linear(projection_size, hidden_size, bias=False)
+        self.o_proj = _proj(projection_size, hidden_size)
 
         # Installed together by the FP8 weight loader (fused [q | k | v | g]
         # decode GEMM). Declared here so the decode path never sees a

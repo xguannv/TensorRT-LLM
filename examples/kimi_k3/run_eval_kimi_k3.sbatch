@@ -301,6 +301,34 @@ if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi
 
+# Forward the FP8 weight-read sub-switches into the container, but ONLY the
+# ones the submitter actually set. Exporting an unset switch as an empty string
+# is not equivalent: the model reads them with os.environ.get(ENV, <default>)
+# and tests '!= "0"', so "" is truthy and would silently override the default.
+# That matters for GATE_UP, whose default is layout-aware (on under attention
+# DP, off under TP) rather than a constant.
+#
+# Listed by FULL name rather than built from a common prefix: they do not share
+# one. KIMI_K3_FP8_ATTN_RESIDENT is a peer of the master switch, not a
+# KIMI_K3_FP8_WEIGHT_READ_* sub-switch, and a prefix loop would silently omit
+# it -- which is the exact failure this forwarding exists to prevent.
+K3_FP8_SWITCHES="
+KIMI_K3_FP8_WEIGHT_READ_KDA
+KIMI_K3_FP8_WEIGHT_READ_MLA
+KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
+KIMI_K3_FP8_WEIGHT_READ_GATE_UP
+KIMI_K3_FP8_ATTN_RESIDENT
+"
+K3_SUBSWITCH_EXPORTS=""
+for _n in $K3_FP8_SWITCHES; do
+    if [ -n "${!_n+set}" ]; then
+        K3_SUBSWITCH_EXPORTS+="export $_n='${!_n}'; "
+    fi
+done
+# Flattened to one line: this is interpolated into the double-quoted bash -c
+# body below, where the multi-line form would break the `for` statement.
+K3_FP8_SWITCH_NAMES=$(echo $K3_FP8_SWITCHES)
+
 srun --mpi=pmix \
     --container-image="$CONTAINER_IMAGE" \
     --container-mount-home \
@@ -359,6 +387,12 @@ srun --mpi=pmix \
         # actually re-running the same configuration twice.
         export KIMI_K3_FP8_WEIGHT_READ=\"${KIMI_K3_FP8_WEIGHT_READ:-0}\"
         echo \"[k3] KIMI_K3_FP8_WEIGHT_READ=\$KIMI_K3_FP8_WEIGHT_READ\"
+        # Per-region sub-switches (built by the submit shell above, so that only
+        # the ones actually set are exported), then echoed like the master.
+        $K3_SUBSWITCH_EXPORTS
+        for n in $K3_FP8_SWITCH_NAMES; do
+            echo \"[k3] \$n=\${!n:-(default)}\"
+        done
 
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;
