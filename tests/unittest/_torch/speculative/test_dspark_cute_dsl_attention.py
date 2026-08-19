@@ -258,7 +258,10 @@ def test_cute_dsl_dspark_attention_rejects_unsupported_shapes():
 
 
 @pytest.mark.parametrize("persist", (False, True))
-def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist):
+@pytest.mark.parametrize("explicit_validity", (False, True))
+def test_dspark_attention_forward_batched_matches_fallback(
+    monkeypatch, persist, explicit_validity
+):
     import tensorrt_llm._torch.models.dspark.attention as dspark_attention
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
         precompile_dspark_attention,
@@ -279,6 +282,7 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     start_pos = torch.tensor([5, 390], device=device, dtype=torch.long)
     slots = torch.tensor([1, 0], device=device, dtype=torch.long)
     valid_len = torch.tensor([6, 3], device=device, dtype=torch.long)
+    dispatch_valid_len = valid_len if explicit_validity else None
     kwargs = {
         "wq_a": scaled_randn(q_rank, hidden),
         "q_norm_w": torch.ones(q_rank, device=device, dtype=dtype),
@@ -344,17 +348,28 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
         )
         patch.setattr(dspark_attention, "cute_dsl_dspark_rmsnorm_rope", counted_rmsnorm_rope)
         actual = dspark_attention.dspark_attention_forward_batched(
-            x, main_x, start_pos, op_cache, slots, valid_len, **kwargs
+            x, main_x, start_pos, op_cache, slots, dispatch_valid_len, **kwargs
         )
 
-    # Main K/V and block K/V reuse their existing RMSNorm/RoPE launches for
-    # physical preparation; only q_a and per-head q use the generic op.
-    assert calls == {
-        "attention_prepared": 1,
-        "cache_write": 1,
-        "block_page": 1,
-        "rmsnorm_rope": 2,
-    }
+    if explicit_validity:
+        # Explicit validity can describe holes on a disaggregated generation
+        # worker and must retain the main/reference path.
+        assert calls == {
+            "attention_prepared": 0,
+            "cache_write": 0,
+            "block_page": 0,
+            "rmsnorm_rope": 5,
+        }
+    else:
+        # Legacy dense windows retain Rubin's prepared fast path. Main K/V and
+        # block K/V use their physical preparation kernels; q_a and q use the
+        # generic fused op.
+        assert calls == {
+            "attention_prepared": 1,
+            "cache_write": 1,
+            "block_page": 1,
+            "rmsnorm_rope": 2,
+        }
 
     with monkeypatch.context() as patch:
         patch.setattr(
@@ -373,7 +388,7 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
             lambda *args: False,
         )
         expected = dspark_attention.dspark_attention_forward_batched(
-            x, main_x, start_pos, fallback_cache, slots, valid_len, **kwargs
+            x, main_x, start_pos, fallback_cache, slots, dispatch_valid_len, **kwargs
         )
 
     torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)

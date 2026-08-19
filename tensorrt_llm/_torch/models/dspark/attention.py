@@ -524,13 +524,25 @@ def dspark_attention_forward_batched(
     inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
     block_rope_freqs = inverse_rope_freqs.reshape(-1, rd // 2, 2)
 
-    # The fused kernel requires explicit physical-window validity; None keeps
-    # the reference path.
+    # ``valid_len`` is more than an optimization hint: an explicit tensor means
+    # the rolling window can contain holes (notably on a disaggregated generation
+    # worker, which does not receive the context worker's DSpark window). Keep
+    # that contract on the main/reference path. Legacy callers without explicit
+    # validity have a dense suffix and can use Rubin's prepared kernels with the
+    # equivalent synthesized length.
+    has_explicit_validity = valid_len is not None
+    kernel_valid_len = (
+        valid_len
+        if has_explicit_validity
+        else torch.clamp(start_pos + 1, max=window_size)
+    )
+
+    # The prepared path is only valid for the legacy dense-window contract.
     use_prepared_attention = (
-        valid_len is not None
+        not has_explicit_validity
         and IS_CUTLASS_DSL_AVAILABLE
         and is_cute_dsl_dspark_attention_prepared_supported(
-            q, write_target, valid_len, attn_sink, inverse_rope_freqs
+            q, write_target, kernel_valid_len, attn_sink, inverse_rope_freqs
         )
         and is_fused_dspark_attention_preparation_supported(
             main_kv_input,
@@ -565,7 +577,7 @@ def dspark_attention_forward_batched(
             write_target,
             slots_i32,
             cache_seqs,
-            valid_len,
+            kernel_valid_len,
             attn_sink,
             inverse_rope_freqs,
             softmax_scale,
@@ -578,7 +590,7 @@ def dspark_attention_forward_batched(
         # Compatibility path for direct/int32 callers; production uses
         # preparation.
         if (
-            valid_len is not None
+            not has_explicit_validity
             and IS_CUTLASS_DSL_AVAILABLE
             and is_cute_dsl_dspark_attention_supported(
                 q,
@@ -587,7 +599,7 @@ def dspark_attention_forward_batched(
                 write_target,
                 slots,
                 start_pos,
-                valid_len,
+                kernel_valid_len,
                 attn_sink,
                 inverse_rope_freqs,
             )
@@ -599,7 +611,7 @@ def dspark_attention_forward_batched(
                 write_target,
                 slots,
                 start_pos,
-                valid_len,
+                kernel_valid_len,
                 attn_sink,
                 inverse_rope_freqs,
                 softmax_scale,
