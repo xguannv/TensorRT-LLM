@@ -211,7 +211,7 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "max_num_tokens": 4096,
         "kv_cache_config": {
             "enable_block_reuse": False,
-            "free_gpu_memory_fraction": 0.6,
+            "free_gpu_memory_fraction": 0.9 if enable_dspark else 0.6,
         },
         "enable_chunked_prefill": False,
         "disable_overlap_scheduler": True,
