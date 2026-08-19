@@ -1428,7 +1428,7 @@ class KimiK3MoERuntime(nn.Module):
                 f"{routed_quant_config.quant_algo}, which the TRTLLM "
                 "(trtllm-gen) MoE backend cannot serve: its SiTu activation "
                 "exists only for W4A8_MXFP4_MXFP8. Set moe_config.backend to "
-                "CUTLASS or MEGAMOE_CUTEDSL."
+                "CUTLASS, CUTEDSL or MEGAMOE_CUTEDSL."
             )
 
         if routed_moe_model_config.moe_backend == "CUTLASS":
@@ -1448,6 +1448,12 @@ class KimiK3MoERuntime(nn.Module):
                 swiglu_alpha=self.routed_situ_alpha,
                 swiglu_beta=self.routed_situ_beta,
             )
+        elif routed_moe_model_config.moe_backend == "CUTEDSL":
+            # The CuTe DSL FC1 epilogue folds the SiTU constants in at trace
+            # time, so unlike CUTLASS it needs no per-expert alpha/beta tensors
+            # -- CuteDslFusedMoE reads the two scalars off the pretrained
+            # config, the same way MegaMoECuteDsl does.
+            routed_moe_kwargs.update(activation_type=ActivationType.SiTu)
         elif routed_moe_model_config.moe_backend == "TRTLLM":
             routed_moe_kwargs.update(
                 trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
@@ -1476,6 +1482,23 @@ class KimiK3MoERuntime(nn.Module):
                 raise RuntimeError(
                     "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
                     f"MoE factory selected {type(self.routed_experts.backend).__name__}."
+                )
+        if routed_moe_model_config.moe_backend == "CUTEDSL":
+            from ..modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+
+            # Same guard, same reason as the MegaMoE ones below: create_moe
+            # silently falls back when a backend declines the config, and a
+            # request that quietly became CUTLASS would be measured as if it
+            # were CuteDSL.
+            #
+            # Exact type, not isinstance: CuteDslB12xFusedMoE subclasses
+            # CuteDslFusedMoE but is a different (SM120/121 FlashInfer-decode)
+            # backend that has no SiTu epilogue, so isinstance would wave it
+            # through.
+            if type(self.routed_experts.backend) is not CuteDslFusedMoE:
+                raise RuntimeError(
+                    "Kimi K3 explicitly requested CUTEDSL, but the MoE factory "
+                    f"selected {type(self.routed_experts.backend).__name__}."
                 )
         if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
             from ..modules.fused_moe.mega_moe import MegaMoECuteDsl

@@ -668,11 +668,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             if sm_version != 107:
                 return _reject(
                     MoERejectReason.SM_UNSUPPORTED,
-                    f"Unquantized CuteDslFusedMoE requires SM107, got SM{sm_version}")
+                    f"Unquantized CuteDslFusedMoE requires SM107, got SM{sm_version}"
+                )
             if not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
                 return _reject(
                     MoERejectReason.DEP_MISSING,
-                    "Unquantized CuteDslFusedMoE on SM107 requires CuTE DSL internal")
+                    "Unquantized CuteDslFusedMoE on SM107 requires CuTE DSL internal"
+                )
             return MoEEligibility.ok()
 
         # NVFP4 - SM in {100, 103, 107}
@@ -680,7 +682,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             if sm_version not in {100, 103, 107}:
                 return _reject(
                     MoERejectReason.SM_UNSUPPORTED,
-                    f"NVFP4 requires SM100, SM103, or SM107, got SM{sm_version}")
+                    f"NVFP4 requires SM100, SM103, or SM107, got SM{sm_version}"
+                )
             if sm_version == 107 and not IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
                 return _reject(
                     MoERejectReason.DEP_MISSING,
@@ -717,6 +720,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         init_load_balancer: bool = True,
         activation_type: ActivationType = ActivationType.Swiglu,
         override_quant_config: Optional[QuantConfig] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
 
         super().__init__(
@@ -737,6 +742,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             ignore_weights=True,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
+
+        # SiTU (Kimi K3) constants. Unlike CUTLASS -- whose SiTuAdaptor reads
+        # per-expert ``swiglu_alpha`` / ``swiglu_beta`` tensors -- the CuTe DSL
+        # epilogue folds them in as trace-time scalars, so they are resolved
+        # here as plain floats. ``None`` is inferred from the pretrained config,
+        # mirroring ``MegaMoECuteDsl._resolve_activation_config``.
+        self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(
+            model_config, situ_beta, situ_linear_beta)
 
         # Output-memset overlap is independent of MoE chunking, so ensure its
         # stream and events exist even if the parent creates no chunking event.
@@ -772,6 +785,59 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             self._ugpu_runtime = UgpuRuntime(self._ugpu_plan.num_partitions)
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+    def _resolve_situ_betas(
+        self,
+        model_config: ModelConfig,
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Resolve the SiTU constants for ``ActivationType.SiTu``.
+
+        Explicit arguments win; otherwise they are read from the pretrained
+        config (``activation_situ_beta`` / ``activation_situ_linear_beta``,
+        falling back to ``text_config`` for multimodal wrappers), the same
+        source ``MegaMoECuteDsl`` uses. Returns ``(None, None)`` for every
+        non-SiTU activation.
+        """
+        if self.activation_type != ActivationType.SiTu:
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError(
+                    "situ_beta / situ_linear_beta require "
+                    f"ActivationType.SiTu, got {self.activation_type.name}.")
+            return None, None
+
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        cfg_beta = getattr(pretrained_config, "activation_situ_beta", None)
+        cfg_lbeta = getattr(pretrained_config, "activation_situ_linear_beta",
+                            None)
+        text_config = getattr(pretrained_config, "text_config", None)
+        if cfg_beta is None and text_config is not None:
+            cfg_beta = getattr(text_config, "activation_situ_beta", None)
+        if cfg_lbeta is None and text_config is not None:
+            cfg_lbeta = getattr(text_config, "activation_situ_linear_beta",
+                                None)
+
+        situ_beta = cfg_beta if situ_beta is None else situ_beta
+        situ_linear_beta = (cfg_lbeta
+                            if situ_linear_beta is None else situ_linear_beta)
+        if situ_beta is None or situ_linear_beta is None:
+            raise ValueError(
+                "CuteDslFusedMoE SiTU requires activation_situ_beta and "
+                "activation_situ_linear_beta in the pretrained config, or "
+                "explicit situ_beta and situ_linear_beta arguments; got "
+                f"{situ_beta} and {situ_linear_beta}.")
+        if situ_beta <= 0 or situ_linear_beta <= 0:
+            raise ValueError(
+                "CuteDslFusedMoE SiTU beta parameters must be positive, got "
+                f"{situ_beta} and {situ_linear_beta}.")
+        if self.swiglu_limit_scalar != float("inf"):
+            # Matches MegaMoE (both backends) and DeepGEMM, which reject
+            # activation_clamp together with SiTU.
+            raise ValueError(
+                "CuteDslFusedMoE SiTU does not support a SwiGLU clamp; "
+                "drop swiglu_limit_scalar for SiTU checkpoints.")
+        return float(situ_beta), float(situ_linear_beta)
 
     def create_weights(self):
         if self._weights_created:
@@ -1048,9 +1114,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             gather_act_kwargs["output_tensor"] = None
             gather_act_kwargs["output_sf_tensor"] = None
         else:
-            gather_act_kwargs["activation_type"] = self.activation_type
             gather_act_kwargs["swiglu_limit_scalar"] = self.swiglu_limit_scalar
         gather_act_kwargs["activation_type"] = self.activation_type
+        if self.activation_type == ActivationType.SiTu:
+            gather_act_kwargs["situ_beta"] = self.situ_beta
+            gather_act_kwargs["situ_linear_beta"] = self.situ_linear_beta
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 

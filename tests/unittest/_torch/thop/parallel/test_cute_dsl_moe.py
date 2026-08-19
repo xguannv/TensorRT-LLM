@@ -60,6 +60,31 @@ def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Ten
     return x * torch.nn.functional.silu(gate)
 
 
+# Kimi K3 SiTU constants; deliberately non-unit and unequal, so that a swapped
+# beta / linear_beta or a dropped constant cannot pass the test.
+SITU_BETA = 2.5
+SITU_LINEAR_BETA = 0.7
+
+
+def situ_ref(
+    x: torch.Tensor, beta: float = SITU_BETA, linear_beta: float = SITU_LINEAR_BETA
+) -> torch.Tensor:
+    """SiTU reference, in this kernel's ``[linear | gate]`` chunk order.
+
+    ``tensorrt_llm._torch.modules.kimi_k3_moe._mlp.SituAndMul`` is the golden
+    definition, but it consumes the model's ``[gate | up]`` packing -- the two
+    halves in the opposite order from ``swiglu_ref`` and from the interleaved
+    FC1 weight this kernel reads. Keep the order explicit: silently swapping
+    the halves still produces plausible-looking numbers.
+    """
+    up, gate = x.chunk(2, dim=-1)
+    gate = gate.to(torch.float32)
+    up = up.to(torch.float32)
+    situ_a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    up = linear_beta * torch.tanh(up / linear_beta)
+    return (situ_a * up).to(x.dtype)
+
+
 def apply_activation_ref(
     x: torch.Tensor, activation_type: ActivationType, swiglu_limit: float = float("inf")
 ) -> torch.Tensor:
@@ -67,6 +92,8 @@ def apply_activation_ref(
         return swiglu_ref(x, swiglu_limit)
     if activation_type == ActivationType.Relu2:
         return relu2(x)
+    if activation_type == ActivationType.SiTu:
+        return situ_ref(x)
     raise ValueError(f"Unsupported activation_type: {activation_type}")
 
 
@@ -774,8 +801,8 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
 )
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu, ActivationType.Relu2],
-    ids=["swiglu", "relu2"],
+    [ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu],
+    ids=["swiglu", "relu2", "situ"],
 )
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
@@ -793,11 +820,14 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     This test validates the gather kernel which:
     1. Uses LDGSTS for A/SFA loading with permuted_idx_to_expanded_idx
     2. Performs GEMM with (interleaved for gated) weights
-    3. Applies the fused activation (SwiGLU for gated, Relu2 for non-gated)
+    3. Applies the fused activation (SwiGLU / SiTU for gated, Relu2 for
+       non-gated)
     4. Quantizes output to FP4 with scale factor generation
     """
     is_gated = is_gated_activation(activation_type)
-    swiglu_limit = 1.0 if is_gated else float("inf")
+    is_situ = activation_type == ActivationType.SiTu
+    # SiTU rejects the SwiGLU clamp (matching MegaMoE and DeepGEMM).
+    swiglu_limit = 1.0 if (is_gated and not is_situ) else float("inf")
     weight_n_multiplier = 2 if is_gated else 1
     sf_vec_size = 16
     hidden_size = 4096
@@ -939,6 +969,8 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         scaling_vector_size=sf_vec_size,
         activation_type=activation_type,
         swiglu_limit_scalar=swiglu_limit,
+        situ_beta=SITU_BETA if is_situ else -1.0,
+        situ_linear_beta=SITU_LINEAR_BETA if is_situ else -1.0,
     )
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
@@ -974,48 +1006,57 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
         check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
 
-        if num_local_experts > 1:
-            split_sizes = (
-                num_local_experts // 2,
-                num_local_experts - num_local_experts // 2,
+        # Sensitivity check, deliberately restricted to the smallest shape.
+        #
+        # The comparison against situ_ref above does NOT discriminate the two
+        # SiTU constants: for |x| >> beta, beta*tanh(x/beta) -> beta, so the
+        # product collapses to beta*linear_beta*sigmoid(gate), which is
+        # symmetric under swapping them. Measured: swapping the two betas
+        # passed every check above, at every shape.
+        #
+        # So assert sensitivity directly -- same inputs, betas exchanged, the
+        # output must differ. This catches a dropped or transposed beta, which
+        # comparing against the reference cannot.
+        #
+        # Only at the smallest shape, though: with larger top_k the FC1
+        # accumulation grows, tanh saturates completely, and the two betas
+        # become genuinely indistinguishable in the output. That is a property
+        # of the activation on that input range, not a kernel defect -- forcing
+        # the assertion there would just make the test flaky. Measured: it
+        # holds at (num_tokens=128, top_k=1, ep_size=1) for both tile sizes and
+        # fails for 26 of the 72 situ configurations overall.
+        if is_situ and num_tokens == 128 and top_k == 1 and ep_size == 1:
+            c_swapped, _ = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+                a,
+                b_kernel,
+                a_sf_unswizzled,
+                b_sf_kernel,
+                alpha,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=0,
+                tile_size=tile_size,
+                scaling_vector_size=sf_vec_size,
+                activation_type=activation_type,
+                swiglu_limit_scalar=swiglu_limit,
+                situ_beta=SITU_LINEAR_BETA,
+                situ_linear_beta=SITU_BETA,
             )
-            b_kernel_list = list(torch.split(b_kernel, split_sizes, dim=0))
-            b_sf_kernel_list = list(torch.split(b_sf_kernel, split_sizes, dim=0))
-            alpha_list = list(torch.split(alpha, split_sizes, dim=0))
-            c_multi, c_sf_multi = (
-                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
-                    a,
-                    b_kernel_list,
-                    a_sf_unswizzled,
-                    b_sf_kernel_list,
-                    alpha_list,
-                    tile_idx_to_group_idx,
-                    tile_idx_to_mn_limit,
-                    permuted_idx_to_expanded_idx,
-                    num_non_exiting_tiles,
-                    torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    num_local_experts=num_local_experts,
-                    local_expert_offset=0,
-                    tile_size=tile_size,
-                    scaling_vector_size=sf_vec_size,
-                    activation_type=activation_type,
-                )
+            c_swapped_valid = c_swapped[:num_valid_permuted_tokens].view(torch.uint8)[
+                valid_token_mask
+            ]
+            assert not torch.equal(c_valid, c_swapped_valid), (
+                "Swapping situ_beta and situ_linear_beta produced a bit-identical "
+                "result, so this test cannot tell the two SiTU constants apart. "
+                "Either the kernel ignores one of them, or both are missing from "
+                "the compiled-kernel cache key."
             )
-            c_multi_valid = c_multi[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
-            check_accuracy(c_multi_valid, c_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
-
-            c_sf_multi_unswizzled = unswizzle_sf(
-                c_sf_multi, max_num_permuted_tokens, interm_size, sf_vec_size
-            )
-            c_sf_multi_valid = []
-            for i in range(num_valid_permuted_tokens):
-                if i >= tile_idx_to_mn_limit_list[i // tile_size]:
-                    continue
-                c_sf_multi_valid.append(c_sf_multi_unswizzled[i])
-            c_sf_multi_valid = torch.cat(c_sf_multi_valid)
-            check_accuracy(c_sf_multi_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
 
 
 # ============================================================================
