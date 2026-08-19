@@ -114,7 +114,7 @@ SQUASH_COMMIT=$(git rev-parse HEAD)
 ```
 
 Use the actual PR title, number, and canonical URL. The `Pull-Request` trailer preserves a clickable,
-unambiguous source even after the squash commit is cherry-picked or moved to another remote. Perserve the original sign-off if possible, otherwise let
+unambiguous source even after the squash commit is cherry-picked or moved to another remote. Preserve the original sign-off if possible, otherwise let
 Git add the DCO sign-off through `-s`; never type it manually. Let all hooks finish. If hooks modify
 files, re-stage them and commit again.
 
@@ -1571,3 +1571,13 @@ Context: previous sync attempt retained on `backup/rubin-dsv4-k3-pre-redo-202608
 - Resolution: restore both `Build.groovy` Rubin dev-image constants to `20260627-upgraded`; retain the DSpark position-bootstrap code from `85ec068814` without its unrelated image reversal.
 - Evidence: the exported raw `20260724-upgraded` sqsh contains PyTorch `2.14.0a0+4fdf77b940.nvinternal.rubin` and FlashInfer 0.6.15, while the compiled image used by successful guards `440382`/`440383` contains PyTorch `2.13.0a0+8145d630e8.nvinternal.rubin` and FlashInfer 0.6.16. Jobs `440588` and `440778` loaded the 2.13-built worktree extensions under the raw 2.14 image: the source-level CUDA registration for `deepseek_v4_compute_sliding_block_tables` appeared as HIP at runtime and executor warmup failed before accuracy execution. Job `440778` reproduced this on l05 nodes, disproving the earlier node-class diagnosis, and was canceled during failed-rank teardown.
 - Status: source resolution applied; corrected image rebuild and static runtime-registration validation pending. No further Slurm accuracy job may be submitted until the rebuilt image reports PyTorch 2.13 and a CUDA kernel for `trtllm::deepseek_v4_compute_sliding_block_tables`.
+
+
+#### `tensorrt_llm/_torch/disaggregation/transceiver.py::KvCacheTransceiverV2._create_kv_slice` gen-init draft-tail accounting
+
+- Conflict/risk: fresh main commit `dff59cd5c7` populates placeholder `py_draft_tokens` before scheduling a one-model speculative `DISAGG_GENERATION_INIT` request. The generation receiver therefore allocates `prompt_len + draft_len + num_extra_kv_tokens`, while PR #17619 scratch-tail trimming still reconstructed the allocation as only `prompt_len + num_extra_kv_tokens`. When the omitted DSpark draft reserve crosses a 128-token page boundary but the four extra-KV tokens do not, an uninitialized receiver tail page survives and the subsequent SWA suffix trim drops one initialized prompt page. This interaction is exclusive to disaggregated generation with speculative decoding.
+- Function/symbol scope: `KvCacheTransceiverV2._create_kv_slice`, `get_draft_token_length`, and `TestCreateKvSliceTokenRange::test_dspark_gen_init_draft_reserve_is_removed_before_swa_trim`.
+- Human direction: not required - this is not an API choice; one internal accounting rule matches the scheduler and transfer contracts.
+- Resolution: include the live request draft length when reconstructing allocated receiver blocks, gated by `is_generation_only_request()` so a context sender that merely publishes draft tokens does not over-trim its prompt allocation. Remove the complete receiver-only tail before selecting the valid SWA prompt suffix. Keep `TokenRange.end == prompt_len`; draft and extra-KV slots remain untransferred.
+- Evidence: current scheduler, gen-init allocation, and transceiver call-order review; a focused 128-token boundary regression reproduces the omitted-page case. `git diff --check` and `py_compile` pass. OCI-AGA image validation job `517665` passed the focused regression in the supplied image with editable repo install (`1 passed`, exit code 0). Authoritative job `517765` reused job `516649` exactly, including `dsv4_ucx_plugin`, the supplied image, mounted editable repo, two-node four-GPU-per-node topology, NVFP4 checkpoint, and unchanged accuracy contract. It completed in 30:53 with GSM8K 96.475 versus reference 95.900 and threshold 92.697; both node-side pytest processes reported `1 passed` and Slurm exited 0. A preceding job, `517706`, omitted the UCX plugin and failed before serving, so it is not accuracy evidence.
+- Status: fixed and validated.
