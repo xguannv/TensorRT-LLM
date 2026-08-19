@@ -1264,6 +1264,204 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
+@pytest.mark.parametrize("tile_size", [128, 256])
+def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
+    """SiTU epilogue on the Rubin NVFP4 gather+grouped GEMM kernel.
+
+    Reduced grid vs the SwiGLU test: enough to compile both tile sizes and
+    catch a dropped / swapped beta. The Blackwell test documents why the
+    swap check is restricted to (128 tokens, top_k=1, ep=1).
+    """
+    num_tokens = 128
+    top_k = 1
+    ep_size = 1
+    sf_vec_size = 16
+    hidden_size = 4096
+    interm_size = 8192
+    num_experts = 256
+    num_local_experts = num_experts // ep_size
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    token_selected_experts[0] = 0
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    num_valid_permuted_tokens = total_num_padded_tokens.item()
+
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    b = torch.randint(
+        -5,
+        5,
+        (num_local_experts, interm_size * 2, hidden_size),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.bfloat16)
+
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a = a.view(torch.float4_e2m1fn_x2)
+    a_sf_unswizzled = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
+    b = b.view(torch.float4_e2m1fn_x2)
+    b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    alpha = a_global_sf * b_global_sf
+
+    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+        torch.float4_e2m1fn_x2
+    )
+    b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
+        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+    )
+    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+    b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
+        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
+    )
+
+    permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
+    tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
+
+    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
+    a_sf_gathered = torch.empty(
+        max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
+    )
+    for i in range(num_valid_permuted_tokens):
+        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+            continue
+        expanded_idx = permuted_idx_to_expanded_idx_list[i]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
+    a_gathered = a_gathered.to(a.device)
+    a_sf_gathered = a_sf_gathered.to(a.device)
+
+    a_sf_gathered_swizzled = swizzle_sf(
+        a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
+        max_num_permuted_tokens,
+        hidden_size,
+    )
+
+    c_ref = cute_dsl_nvfp4_grouped_gemm_ref(
+        a_gathered,
+        b,
+        a_sf_gathered_swizzled,
+        b_sf,
+        alpha,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        tile_size=tile_size,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=sf_vec_size,
+    )
+    c_ref = situ_ref(c_ref)
+    global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
+    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+
+    op_kwargs = dict(
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        output_tensor=None,
+        output_sf_tensor=None,
+        scaling_vector_size=sf_vec_size,
+        activation_type=ActivationType.SiTu,
+        situ_beta=SITU_BETA,
+        situ_linear_beta=SITU_LINEAR_BETA,
+    )
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+        a,
+        b_interleaved,
+        a_sf_unswizzled,
+        b_sf_interleaved,
+        alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+        **op_kwargs,
+    )
+
+    valid_token_mask = torch.zeros(num_valid_permuted_tokens, dtype=torch.bool, device="cuda")
+    for i in range(num_valid_permuted_tokens):
+        if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+            continue
+        valid_token_mask[i] = True
+
+    num_valid_tokens = valid_token_mask.sum().item()
+    if num_valid_tokens > 0:
+        c_valid = c[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
+        c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_token_mask]
+        check_accuracy(c_valid, c_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+
+        c_sf_unswizzled = unswizzle_sf(c_sf, max_num_permuted_tokens, interm_size, sf_vec_size)
+        c_sf_ref_unswizzled = unswizzle_sf(
+            c_sf_ref, max_num_permuted_tokens, interm_size, sf_vec_size
+        )
+
+        c_sf_valid = []
+        c_sf_ref_valid = []
+        for i in range(num_valid_permuted_tokens):
+            if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+                continue
+            c_sf_valid.append(c_sf_unswizzled[i])
+            c_sf_ref_valid.append(c_sf_ref_unswizzled[i])
+
+        c_sf_valid = torch.cat(c_sf_valid)
+        c_sf_ref_valid = torch.cat(c_sf_ref_valid)
+        check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+
+        c_swapped, _ = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+            a,
+            b_interleaved,
+            a_sf_unswizzled,
+            b_sf_interleaved,
+            alpha,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+            **{
+                **op_kwargs,
+                "situ_beta": SITU_LINEAR_BETA,
+                "situ_linear_beta": SITU_BETA,
+            },
+        )
+        swapped_valid = c_swapped[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
+        assert not torch.equal(c_valid, swapped_valid), (
+            "Swapping situ_beta and situ_linear_beta produced a bit-identical "
+            "output; the kernel is ignoring one of the SiTU constants."
+        )
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on SM 107 (Rubin) GPUs",
+)
 @pytest.mark.parametrize(
     "num_tokens, num_experts, top_k, hidden_size, interm_size, tile_size",
     [

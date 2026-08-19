@@ -40,6 +40,15 @@ while [[ $# -gt 0 ]]; do
             FEATURE_ARGS="$FEATURE_ARGS $1"
             shift
             ;;
+        --moe-backend)
+            [[ $# -ge 2 ]] || { echo "error: --moe-backend requires a value" >&2; usage >&2; exit 2; }
+            FEATURE_ARGS="$FEATURE_ARGS --moe-backend $2"
+            shift 2
+            ;;
+        --moe-backend=*)
+            FEATURE_ARGS="$FEATURE_ARGS --moe-backend ${1#*=}"
+            shift
+            ;;
         --model)
             [[ $# -ge 2 ]] || { echo "error: --model requires a value" >&2; usage >&2; exit 2; }
             MODEL=$2

@@ -1482,6 +1482,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             output_sf_tensor=fc1_out_sf,
             scaling_vector_size=self.scaling_vector_size,
             activation_type=self.activation_type,
+            situ_beta=self.situ_beta
+            if self.activation_type == ActivationType.SiTu else -1.0,
+            situ_linear_beta=self.situ_linear_beta
+            if self.activation_type == ActivationType.SiTu else -1.0,
         )
 
         fc1_out_sf_merged = fc1_out_sf
