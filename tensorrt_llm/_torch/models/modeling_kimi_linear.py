@@ -45,8 +45,7 @@ w1/w3 column-sharded and w2 row-sharded along the intermediate dim
 (``intermediate / moe_tp_size`` per rank; group-32 MXFP4 packed bytes and
 scales sliced consistently by the stock TRTLLM-Gen quant-method loaders).
 The split is EP-only unless the user sets ``moe_tensor_parallel_size`` /
-``moe_expert_parallel_size`` explicitly (or the ``TLLM_K3_MOE_TP_SIZE`` /
-``TLLM_K3_MOE_EP_SIZE`` env overrides). Routing is computed replicated; the
+``moe_expert_parallel_size`` explicitly. Routing is computed replicated; the
 routed partial sums — EP partials of whole experts, or TP partials over the
 intermediate shards — are all-reduced in the latent space (before
 ``routed_expert_norm`` / ``routed_expert_up_proj``, which are
@@ -145,14 +144,24 @@ Triton pass). Default: fused with fallback."""
 
 _FUSED_KDA_CONV_STATE_ENABLED = os.environ.get(KIMI_K3_FUSED_KDA_CONV_STATE_ENV, "1") == "1"
 
-# Routed-expert MoE TP/EP split overrides (read per model init, not import).
-# Highest precedence; either one may be set alone, the other is derived from
-# tp_size. Without them, an explicit moe_tensor_parallel_size /
-# moe_expert_parallel_size pair from the user config is honored, and the
+# Routed-expert MoE TP/EP split. An explicit moe_tensor_parallel_size /
+# moe_expert_parallel_size pair from the user config is honored; otherwise the
 # default stays EP-only (moe_ep == tp_size).
-_K3_MOE_TP_ENV = "TLLM_K3_MOE_TP_SIZE"
-_K3_MOE_EP_ENV = "TLLM_K3_MOE_EP_SIZE"
-
+#
+# Measured tradeoff for the TP override (16xGB200, TEP16, ISL 8192 / OSL
+# 1024, concurrency 1, one allocation with the EP-only baseline bracketing
+# the candidates): moe_tp 1 = 53.41 tok/s/user (TPOT 17.93 ms), moe_tp 4 =
+# 61.59 (+15.3%, TPOT 15.54), moe_tp 8 = 61.06 (+14.3%). EP-only is
+# balls-into-bins at decode -- top_k 16 over 16 EP ranks leaves the busiest
+# rank ~3 experts and ~6 ranks with none, and the routed AllReduce waits for
+# the busiest (per-layer routed gemm1 spans 4.1-27.4 us across the 93 layers
+# purely from that draw). Splitting the intermediate makes every rank's share
+# identical. 4 is the sweet spot: 8 leaves too little work per rank for the
+# TRTLLM-Gen 128-wide intermediate tile, and 16 is worse still (3072/16 = 192
+# is not 128-aligned, so the intermediate pads to 4096 and each rank stores
+# and reads 33% more expert weight than it computes on). The win is a
+# small-batch effect and fades as the batch grows (concurrency 4 measured
+# +4.4%, roughly the run-to-run spread), so it stays opt-in.
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -1597,27 +1606,15 @@ class KimiK3MoERuntime(nn.Module):
 
         Precedence:
 
-        1. ``TLLM_K3_MOE_TP_SIZE`` / ``TLLM_K3_MOE_EP_SIZE`` env overrides
-           (either alone; the other is derived from ``tp_size``).
-        2. Explicit ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size``
+        1. Explicit ``moe_tensor_parallel_size`` / ``moe_expert_parallel_size``
            from the user config. Detected via
            ``mapping.moe_tp_ep_user_specified`` so the auto-resolved mapping
            default (``moe_tp=tp_size, moe_ep=1``) is NOT mistaken for a TP
            request.
-        3. Default: EP-only (``moe_tp=1, moe_ep=tp_size``), the historical
+        2. Default: EP-only (``moe_tp=1, moe_ep=tp_size``), the historical
            K3 layout.
         """
         tp_size = mapping.tp_size
-        env_tp = os.environ.get(_K3_MOE_TP_ENV)
-        env_ep = os.environ.get(_K3_MOE_EP_ENV)
-        if env_tp is not None or env_ep is not None:
-            moe_tp = int(env_tp) if env_tp is not None else 0
-            moe_ep = int(env_ep) if env_ep is not None else 0
-            if moe_tp <= 0 and moe_ep > 0:
-                moe_tp = tp_size // moe_ep
-            elif moe_ep <= 0 and moe_tp > 0:
-                moe_ep = tp_size // moe_tp
-            return moe_tp, moe_ep
         if getattr(mapping, "moe_tp_ep_user_specified", False):
             return mapping.moe_tp_size, mapping.moe_ep_size
         return 1, tp_size
