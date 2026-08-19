@@ -4807,7 +4807,8 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             mega_fc1, mega_fc1_sf, mega_fc2, mega_fc2_sf = (
                 self._build_mega_format_buffers(
                     raw_w3_w1=_on_cuda(module.w3_w1_weight.data[lo:hi]),
-                    raw_w3_w1_sf=_on_cuda(module.w3_w1_weight_scale.data[lo:hi]),
+                    raw_w3_w1_sf=_on_cuda(
+                        module.w3_w1_weight_scale.data[lo:hi]),
                     raw_w2=_on_cuda(module.w2_weight.data[lo:hi]),
                     raw_w2_sf=_on_cuda(module.w2_weight_scale.data[lo:hi]),
                     num_slots=hi - lo,
