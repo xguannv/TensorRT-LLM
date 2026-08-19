@@ -1,0 +1,165 @@
+# Kimi K3 disaggregated serving at DEP8 (1 ctx + 1 gen, 2 nodes each).
+#
+# Derived from benchmark_kimi_k3_dep16.yaml. Only the parallelism, the memory
+# knobs that DEP8 forced, and the FP8 weight-read env are different; every
+# constraint the DEP16 config documents still applies (NIXL + PYTHON
+# transceiver, 1024 MB bounce, tokens_per_block 64, block reuse off, matched
+# ctx/gen DEP, ctx and gen inside ONE NVL72 domain).
+#
+# 🔴 Why DEP8 ctx is worth trying at all. disagg/README.md rules it "an open
+# (likely negative) question on GB300", on an estimate of ~273 GiB/rank for
+# weights alone against a 288 GiB card. That estimate predates FP8-resident
+# attention: aggregated DEP8 now measures **239.70 / 246.14 GiB/rank** and runs
+# GSM8K 96.5125 / GPQA-D 92.4242 (jobs 484973 / 485168). The premise the README
+# ruled on has changed, so the question is re-opened rather than contradicted.
+#
+# Requires, and will silently mis-run without:
+#   KIMI_K3_FP8_WEIGHT_READ=1     master switch
+#   KIMI_K3_FP8_ATTN_RESIDENT=1   construction-time FP8 KDA -- without it the
+#                                 BF16 weights are allocated at construction and
+#                                 DEP8 OOMs before reading a single weight
+# Both are passed through worker_env_var below.
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "batch"
+  account: "coreai_comparch_inferencex"
+  job_time: "02:00:00"
+  job_name: "k3-disagg-dep8"
+  extra_args: "--gpus-per-node=4"
+  numa_bind: true  # GB200/GB300 NVL72
+benchmark:
+  mode: "e2e"  # e2e | gen_only | gen_only_no_context
+  use_nv_sa_benchmark: false
+  multi_round: 1          # first bring-up: one round, not four
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: "16"
+  input_length: 8192
+  output_length: 1024
+  dataset_file: "/lustre/fsw/portfolios/coreai/users/xguan/dev/datasets/kimi_k3_8192_1024_128req_trtllm_custom.jsonl"
+  env_var:
+    TRTLLM_PATH_PREPEND: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/.venv-3.12/bin"
+    TRTLLM_PYTHONPATH_PREPEND: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM"
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  # Physical path on both sides of the colon: the venv console-script shebangs
+  # bake in the install-time path, so a symlinked /lustre/... mount gives
+  # "cannot execute" (exit 127).
+  container_mount: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM:/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM,/lustre:/lustre,/scratch:/scratch"
+  container_image: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/build_images/5d86e96249/trtllm-k3deps-c450.sqsh"
+  model_path: "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
+  trtllm_repo: ""
+  build_wheel: false
+  trtllm_wheel_path: ""
+  work_dir: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/disagg_dep8_out"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_ATTN_RESIDENT=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM"
+worker_config:
+  gen:
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    # Baseline first: the documented disagg settings, so a failure is
+    # attributable to DEP8 rather than to a scheduler change. The
+    # overlap-scheduler / CUDA-graph variants come after this runs.
+    disable_overlap_scheduler: true
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    # 8, not the DEP16 config's 8-for-SA reason: at DEP8 the V2 Mamba manager's
+    # minimum quota scales linearly with resident sequences, and aggregated
+    # DEP8 measured need=14.39 GiB at batch 32 versus a ~6-7 GiB quota. Batch 8
+    # puts the minimum near 3.8 GiB. SA is off for this first bring-up.
+    max_batch_size: 8
+    max_num_tokens: 256
+    max_seq_len: 9236
+    print_iter_log: true
+    # MegaMoE on the GENERATION side only. Measured on this cluster
+    # (xguan, 0730_megamoe_disagg_ociaga.md, DEP16): gen-only is the best
+    # disagg configuration -- throughput +8.59 %, median TPOT -10.76 %, median
+    # e2e -9.72 %, TTFT unchanged. Enabling it on ctx as well costs +29.45 %
+    # median TTFT and *lowers* the throughput gain to +6.99 %, because with all
+    # ranks prefilling at once the MoE path scales 6.87x for MegaMoE against
+    # 2.50x for the baseline (2.60 -> 17.98 ms per call). The decode win comes
+    # from the all-to-all being fused into the compute kernel: routed-expert
+    # path -47.5 %, 8 kernels down to 2.
+    #
+    # ⚠️ NO moe_config.max_num_tokens here. For MEGAMOE_* that key is the
+    # SymmBuffer capacity, not the CUTLASS per-call chunking bound, and setting
+    # it wrong is a silent over/under-provision. The ctx worker below pins it
+    # precisely because ctx stays on CUTLASS.
+    # MegaMoE on the GENERATION side only. Measured on this cluster
+    # (xguan, 0730_megamoe_disagg_ociaga.md, DEP16): gen-only is the best
+    # disagg configuration -- throughput +8.59 %, median TPOT -10.76 %, median
+    # e2e -9.72 %, TTFT unchanged. Enabling it on ctx as well costs +29.45 %
+    # median TTFT and *lowers* the throughput gain, because with all ranks
+    # prefilling at once the MoE path scales 6.87x for MegaMoE against 2.50x
+    # for the baseline. The decode win comes from the all-to-all being fused
+    # into the compute kernel: routed-expert path -47.5 %, 8 kernels down to 2.
+    #
+    # ⚠️ This did NOT fit at DEP8 before the staging fix. Attempt 489457 OOM'd
+    # inside setup_engine with 275.20 GiB free immediately beforehand, because
+    # MegaMoE lacked a finalize_streamed_expert override and its staged w3_w1
+    # halves -- a second copy of the routed-expert weights -- accumulated across
+    # the whole load. Survivable at EP16 (56 rank-local experts), not at EP8
+    # (112). Requires the fix that bounds that footprint.
+    #
+    # ⚠️ NO moe_config.max_num_tokens here. For MEGAMOE_* that key is the
+    # SymmBuffer capacity, not the CUTLASS per-call chunking bound, and setting
+    # it wrong is a silent over/under-provision. The ctx worker below pins it
+    # precisely because ctx stays on CUTLASS.
+    moe_config:
+      backend: MEGAMOE_CUTEDSL
+      use_low_precision_moe_combine: true
+    kv_cache_config:
+      enable_block_reuse: false   # mandatory for K3 (KDA state)
+      tokens_per_block: 64        # mandatory for K3 MLA kernels
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON  # mandatory: C++ path throws for K3
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
+  ctx:
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    disable_overlap_scheduler: true   # documented as mandatory for disagg ctx
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    print_iter_log: true
+    # Pinned to max_num_tokens rather than left to default. For CUTLASS this is
+    # a per-call chunking bound, and its profiling workspace scales with it and
+    # with the rank-local expert count (112 at EP8 versus 56 at EP16).
+    # Aggregated DEP8 died in "Can't allocate profile workspace for MoE GEMM
+    # profile" until this was cut from 131072 to 8192; the default here would
+    # be max_num_tokens * dp_size = 67584.
+    # ⚠️ Do NOT copy this to a MEGAMOE_* backend, where moe_config.max_num_tokens
+    # is the SymmBuffer capacity, not a chunking bound.
+    #
+    # ⚠️ backend MUST be set explicitly. Leaving it out resolves AUTO -> TRTLLM,
+    # and trtllm-gen cannot serve NVFP4 routed experts (its SiTu activation
+    # exists only for W4A8_MXFP4_MXFP8), so every ctx rank dies at construction.
+    # The first DEP8 disagg attempt (489452) did exactly that.
+    moe_config:
+      backend: CUTLASS
+      max_num_tokens: 8448
+      use_low_precision_moe_combine: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 64
+      free_gpu_memory_fraction: 0.25
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    trust_remote_code: true
