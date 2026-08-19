@@ -14,6 +14,8 @@ for constraints.
 | `gen_config_no_sa.yaml` | Generation-server options, no speculative decoding (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging). A suffix-automaton (SA) speculative-decoding variant lands together with K3 SA support. |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
+| `benchmark_kimi_k3_dep8.yaml` | Same harness at **DEP8** (2 nodes per worker), CUTLASS ctx + MegaMoE gen. Runs end-to-end; its baseline deliberately has graphs and overlap OFF, so **its throughput/TTFT are not performance numbers**. Accuracy through the proxy is not yet validated at DEP8 |
+| `benchmark_kimi_k3_dep8_gsm8k.yaml` | The same DEP8 deployment — `worker_config` is identical, verified key by key — plus an `accuracy:` block that runs **GSM8K through the proxy** with `lm_eval`. Use it to check that the served model *computes* correctly, not just that it responds. Its header records the harness-comparability settings that make the score comparable to `trtllm-eval gsm8k`, and the offline-dataset staging the client srun needs |
 
 ## K3 constraints baked into the configs
 
@@ -24,12 +26,22 @@ for constraints.
   K3's replicated KDA state and is rejected at peer registration — do
   not deviate. Hetero DEP with attention-DP on both sides is believed
   correct but unvalidated.
-- **Ctx sizing = DEP16**: DEP16 is the smallest verified fit
-  (~193 GiB weights/rank on GB300). A DEP8 ctx is estimated at
-  ~273 GiB/rank for weights alone (extrapolating the 1.5 TB checkpoint:
-  replicated share ~113 GiB + experts/8), leaving no activation headroom
-  on GB300 (288 GiB) and not fitting GB200 (186 GiB). Treat DEP8-ctx as
-  ruled out on GB200 and an open (likely negative) question on GB300.
+- **Ctx sizing**: **DEP8 works on GB300** as of 2026-08-16 — 1 ctx + 1 gen,
+  both DEP8, 16/16 requests end-to-end, both workers loading at
+  **239.70 / 245.05 GiB weights per rank**
+  (`benchmark_kimi_k3_dep8.yaml`). DEP16 remains the safer default and is
+  what the perf numbers below were measured on.
+  - This paragraph previously read that DEP8 ctx was "ruled out on GB200
+    and an open (likely negative) question on GB300", on an estimate of
+    ~273 GiB/rank for weights alone against a 288 GiB card. That estimate
+    predated **FP8-resident attention**, which keeps the replicated KDA
+    projections at FP8 on device instead of expanding them to BF16 and is
+    worth ~34 GiB/rank. DEP8 additionally needs
+    `KIMI_K3_FP8_ATTN_RESIDENT=1`, a `max_batch_size` low enough for the V2
+    Mamba minimum (which scales with resident sequences), and an explicit
+    `moe_config.max_num_tokens` on a CUTLASS worker.
+  - **GB200 (186 GiB) is still ruled out** — 239.70 GiB/rank does not fit
+    there, so the original conclusion stands for that part.
 - **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the
   C++ transceiver, which throws at construction for K3's
   `MixedMambaHybridCacheManager`.

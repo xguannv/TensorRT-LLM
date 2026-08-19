@@ -54,6 +54,13 @@ environment:
   trtllm_repo: ""
   build_wheel: false
   trtllm_wheel_path: ""
+  # Health-check budget for the proxy. The harness default is 1800 s and K3 at
+  # DEP8 does not reliably fit inside it: 489792 had both workers healthy at
+  # ~22 min, while 491105 -- same config, same cluster -- was still finishing
+  # ctx post-load init when 1800 s expired and the job was failed with
+  # "Server not healthy after 1800 seconds". Weights had loaded correctly
+  # (245.05 GiB/rank, the expected figure); only the deadline was wrong.
+  server_health_timeout: 5400
   work_dir: "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/disagg_dep8_out"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_ATTN_RESIDENT=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM/.venv-3.12/bin TRTLLM_PYTHONPATH_PREPEND=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/jonasl/GitRepos/TensorRT-LLM"

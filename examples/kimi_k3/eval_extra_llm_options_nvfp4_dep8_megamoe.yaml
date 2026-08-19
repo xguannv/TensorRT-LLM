@@ -1,0 +1,61 @@
+# Kimi K3 NVFP4 on DEP8 with the MegaMoE CuteDSL backend (2 nodes x 4 GPU).
+#
+# WHY THIS CONFIG EXISTS. DEP8 *disaggregated* with MegaMoE on the generation
+# worker measured GSM8K 95.64 and 95.68 on two runs (jobs 489792 / 491381) --
+# reproducible to within one question, but ~0.8-1.2 points below every
+# reference. Those references differ from it in more than one way at once, so
+# the deficit could not be attributed:
+#
+#   DEP8 aggregated, CUTLASS   96.47 (484973)  <- differs by MoE backend AND disagg
+#   DEP16 aggregated, MegaMoE  96.32 (479618)  <- differs by topology AND disagg
+#   DEP16 disagg, graphs on    96.89           <- differs by topology AND graphs
+#
+# This config is the missing cell: DEP8 + MegaMoE + aggregated. It splits the
+# two live hypotheses with one job.
+#
+#   score ~96.4  => the deficit is in the DISAGG path at DEP8
+#   score ~95.7  => the deficit is in the EP8 MEGAMOE path, and disagg is fine
+#
+# Derived from eval_extra_llm_options_nvfp4_dep8.yaml (the CUTLASS DEP8 config
+# that scored 96.47) with the MoE backend swapped and max_batch_size lowered.
+# Everything else is held fixed so the comparison against 484973 is
+# single-variable in the MoE backend.
+#
+# max_batch_size 8, not 32: at EP8 the V2 Mamba manager's minimum KV quota
+# scales with resident sequences, and aggregated DEP8 measured need=14.39 GiB
+# at batch 32 against a ~6-7 GiB quota. 8 is also what the DEP16 MegaMoE eval
+# config and the DEP8 disagg gen worker use, which keeps this comparable to
+# both.
+#
+# moe_config.max_num_tokens is deliberately ABSENT. For CUTLASS it is a
+# per-call chunking bound and the DEP8 CUTLASS config's 131072 is harmless; for
+# MEGAMOE_* the same key is the SymmBuffer capacity, further divided by ep_size
+# under attention-DP. Carrying it over would over-provision the generation
+# SymmBuffer ~32x and eat the KV cache.
+#
+# MegaMoE uses MNNVL symmetric memory, so both nodes must sit in ONE NVL72
+# domain: pin them with sbatch -w to a single nvl72dNNN rack or the rendezvous
+# fails with "invalid resource handle".
+#
+# Requires KIMI_K3_FP8_WEIGHT_READ=1 and KIMI_K3_FP8_ATTN_RESIDENT=1 in the
+# environment; without the construction-time FP8 KDA path DEP8 OOMs before
+# reading a single weight.
+tensor_parallel_size: 8
+enable_attention_dp: true
+moe_expert_parallel_size: 8
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: MEGAMOE_CUTEDSL
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64
