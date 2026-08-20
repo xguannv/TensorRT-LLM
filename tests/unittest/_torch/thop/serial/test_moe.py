@@ -67,9 +67,9 @@ def test_mxe4m3_mxe2m1_situ_runner_has_valid_configs(num_tokens):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
-    getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="The SiTu kernel supports SM100/SM103 and family-compatible SM107. "
+    "Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 8, 512])
 def test_e2m1_e2m1_situ_runner_has_valid_configs(num_tokens):
