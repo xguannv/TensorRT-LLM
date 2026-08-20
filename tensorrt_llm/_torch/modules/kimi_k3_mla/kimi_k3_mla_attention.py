@@ -58,9 +58,7 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     The default is TRTLLM-Gen on this branch; see
     ``_KIMI_K3_MLA_GEN_BACKEND_DEFAULT`` for why.
     """
-    backend = os.environ.get(
-        _KIMI_K3_MLA_GEN_BACKEND_ENV, _KIMI_K3_MLA_GEN_BACKEND_DEFAULT
-    )
+    backend = os.environ.get(_KIMI_K3_MLA_GEN_BACKEND_ENV, _KIMI_K3_MLA_GEN_BACKEND_DEFAULT)
     has_fp8_kv_cache = bool(
         quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
     )
@@ -262,8 +260,7 @@ class KimiK3MLAAttention(MLA):
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
-            flashinfer_mla_backend=_select_mla_generation_backend(
-                model_config.get_quant_config()),
+            flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
         )
         # K3 calls forward_impl() directly to insert its output gate before
         # the base row-parallel o_proj. The original executor metadata remains

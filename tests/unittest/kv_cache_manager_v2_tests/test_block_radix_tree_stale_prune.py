@@ -95,7 +95,7 @@ _LC_OTHER = LifeCycleId(1)
 
 class TestStaleTailPrune(unittest.TestCase):
     def _build_chain(self) -> "tuple[BlockRadixTree, object, Block, Block]":
-        """root -> first -> tip, two life cycles, tokens_per_block=2."""
+        """Root -> first -> tip, two life cycles, tokens_per_block=2."""
         tree = BlockRadixTree(cast(LifeCycleRegistry, _TwoLifeCycles()), tokens_per_block=2)
         root = tree.add_or_get_existing(ReuseScope())
         first = Block([TokenId(1), TokenId(2)], root)

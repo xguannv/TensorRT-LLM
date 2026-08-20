@@ -107,6 +107,7 @@ def test_cft_combine_disabled_for_low_precision(hidden_size):
     # returning False for everything.
     assert _use_cft_for_combine_payload(True, payload, use_low_precision=False)
 
+
 # ============================================================================
 # Constants
 # ============================================================================

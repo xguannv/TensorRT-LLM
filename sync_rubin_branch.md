@@ -1625,4 +1625,5 @@ Context: previous sync attempt retained on `backup/rubin-dsv4-k3-pre-redo-202608
 
 - Every resolved Python file was checked with `py_compile`; changed shell scripts were checked with `bash -n`; each cherry-pick passed `git diff --check` before completion.
 - Relevant pre-commit hooks pass after formatter output is staged. The repository-wide `validate-test-lists` hook still reports three unrelated pre-existing stale entries for `accuracy/test_llm_api_autodeploy.py::TestNemotronH` at `tests/integration/test_lists/waives.txt:291-293`.
-- Runtime/targeted-test validation and the final clean-tree audit are pending. No remote branch has been pushed.
+- The final 95-file sweep passed YAPF, Ruff, Ruff-format, baseline-gated Ruff, clang-format, codespell, `py_compile`, `bash -n`, and `git diff --check`. It also closed three replay-integration gaps found by lint: the missing `Tuple` import, the omitted CuTeDSL MLA workspace helpers, and the omitted `TRTLLMGenFusedMoE` scheduler import.
+- Targeted pytest was not run: the `tllm-dev` workflow requires an explicit GPU host and container, and neither was supplied. No remote branch has been pushed.

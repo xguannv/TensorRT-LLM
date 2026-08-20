@@ -591,7 +591,7 @@ class Block:
         # sequence. Mirrors Block::clearStaleBlocksAfterPageUnlink in
         # cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.cpp.
         while (
-(isinstance(curr, Block) and curr.get_page(lc_idx) is None)
+            (isinstance(curr, Block) and curr.get_page(lc_idx) is None)
             and all(page_ref is None for page_ref in curr.storage)
             and not curr.next
             and curr._prev() is not None

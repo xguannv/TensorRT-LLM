@@ -568,26 +568,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if not self.ugpu_enabled:
             return
 
-        num_ugpus = (
-            self.kv_cache_manager.num_ugpus
-            if self.kv_cache_manager is not None
-            else 2
-        )
-        if (
-            not self.is_cuda_graph
-            and (
-                self.ugpu_workspaces is None
-                or len(self.ugpu_workspaces) != num_ugpus
-            )
-        ):
+        num_ugpus = (self.kv_cache_manager.num_ugpus
+                     if self.kv_cache_manager is not None else 2)
+        if (not self.is_cuda_graph
+                and (self.ugpu_workspaces is None
+                     or len(self.ugpu_workspaces) != num_ugpus)):
             self.ugpu_workspaces = [
                 torch.empty(0, device="cuda", dtype=torch.int8)
                 for _ in range(num_ugpus)
             ]
-        if (
-            self.ugpu_cuda_graph_workspaces is None
-            or len(self.ugpu_cuda_graph_workspaces) != num_ugpus
-        ):
+        if (self.ugpu_cuda_graph_workspaces is None
+                or len(self.ugpu_cuda_graph_workspaces) != num_ugpus):
             self.ugpu_cuda_graph_workspaces = [
                 torch.empty(0, device="cuda", dtype=torch.int8)
                 for _ in range(num_ugpus)
@@ -601,24 +592,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
 
-        if (
-            not self.ugpu_enabled
-            or self.kv_cache_manager is None
-            or self.request_ids is None
-        ):
+        if (not self.ugpu_enabled or self.kv_cache_manager is None
+                or self.request_ids is None):
             return
 
         num_ugpus = self.kv_cache_manager.num_ugpus
-        sequence_lengths = self.seq_lens[: self.num_seqs].tolist()
+        sequence_lengths = self.seq_lens[:self.num_seqs].tolist()
 
         per_ugpu_ctx_reqs = [0] * num_ugpus
         per_ugpu_ctx_tokens = [0] * num_ugpus
         per_ugpu_gen_reqs = [0] * num_ugpus
         per_ugpu_gen_tokens = [0] * num_ugpus
 
-        def ugpu_from_splits(
-            splits: Optional[List[int]], local_req_idx: int
-        ) -> Optional[int]:
+        def ugpu_from_splits(splits: Optional[List[int]],
+                             local_req_idx: int) -> Optional[int]:
             if splits is None:
                 return None
             for ugpu_idx in range(len(splits) - 1):
@@ -628,7 +615,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         old_ctx_req_splits = self.ugpu_ctx_req_splits
         old_gen_req_splits = self.ugpu_gen_req_splits
-        for req_idx, request_id in enumerate(self.request_ids[: self.num_seqs]):
+        for req_idx, request_id in enumerate(self.request_ids[:self.num_seqs]):
             if req_idx < self.num_contexts:
                 ugpu_id = ugpu_from_splits(old_ctx_req_splits, req_idx)
                 if ugpu_id is None:
@@ -651,13 +638,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.ugpu_num_gen_tokens = per_ugpu_gen_tokens
 
         if self.host_request_types is not None:
-            self.host_request_types[: self.num_contexts].fill_(0)
-            self.host_request_types[self.num_contexts : self.num_seqs].fill_(1)
+            self.host_request_types[:self.num_contexts].fill_(0)
+            self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
         if self.kv_cache_block_offsets is not None:
             self.ugpu_kv_cache_block_offsets = self.build_ugpu_block_offsets(
-                self.kv_cache_block_offsets, "_ugpu_block_offsets_buf"
-            )
+                self.kv_cache_block_offsets, "_ugpu_block_offsets_buf")
 
         if self.draft_kv_cache_block_offsets is not None:
             self.draft_ugpu_kv_cache_block_offsets = self.build_ugpu_block_offsets(
@@ -674,11 +660,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.is_cuda_graph:
             for ugpu_idx in range(num_ugpus):
                 self._ugpu_host_total_kv_lens_buf[ugpu_idx][0] = (
-                    self.max_seq_len * per_ugpu_ctx_reqs[ugpu_idx]
-                )
+                    self.max_seq_len * per_ugpu_ctx_reqs[ugpu_idx])
                 self._ugpu_host_total_kv_lens_buf[ugpu_idx][1] = (
-                    self.max_seq_len * per_ugpu_gen_reqs[ugpu_idx]
-                )
+                    self.max_seq_len * per_ugpu_gen_reqs[ugpu_idx])
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative

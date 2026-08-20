@@ -122,11 +122,10 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     TORCH_CHECK(g.dim() == 4 && g.size(0) == 1 && g.size(1) == B && g.size(2) == HV && g.size(3) == kDimK,
         "g must have shape [1, B, HV, 128]");
     token_row_stride(g, "g");
-    TORCH_CHECK(beta.dim() == 3 && beta.size(0) == 1 && beta.size(1) == B && beta.size(2) == HV
-            && beta.stride(2) == 1,
+    TORCH_CHECK(beta.dim() == 3 && beta.size(0) == 1 && beta.size(1) == B && beta.size(2) == HV && beta.stride(2) == 1,
         "beta must have shape [1, B, HV] with a contiguous head axis");
-    TORCH_CHECK(onorm_g.dim() == 4 && onorm_g.size(0) == 1 && onorm_g.size(1) == B
-            && onorm_g.size(2) == HV && onorm_g.size(3) == kDimV,
+    TORCH_CHECK(onorm_g.dim() == 4 && onorm_g.size(0) == 1 && onorm_g.size(1) == B && onorm_g.size(2) == HV
+            && onorm_g.size(3) == kDimV,
         "onorm_g must have shape [1, B, HV, 128]");
     token_row_stride(onorm_g, "onorm_g");
     if (apply_onorm)
@@ -273,7 +272,8 @@ at::Tensor kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor 
     auto out = output.has_value() ? *output : at::empty({B, 1, HV, kDimV}, x_q.options());
     TORCH_CHECK(!(update_conv_cache && roll_conv_pool), "update_conv_cache and roll_conv_pool are mutually exclusive");
     validate_kda_decode_fusion_inputs(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
-        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm, update_conv_cache, roll_conv_pool);
+        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm,
+        update_conv_cache, roll_conv_pool);
     launch_selected_kernel(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
         dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm, update_conv_cache,
         roll_conv_pool, use_lower_bound, apply_beta_sigmoid, lower_bound, scale, onorm_eps);

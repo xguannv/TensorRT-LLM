@@ -48,13 +48,14 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
-from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, MxFp8QuantizedTensor
+from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
+from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
@@ -73,8 +74,10 @@ def _log_k3_fused_route_quant_gate(moe, can_quantize_before_dispatch: bool) -> N
     _K3_FUSED_ROUTE_QUANT_GATE_LOGGED = True
 
     if not can_quantize_before_dispatch:
-        reason = (f"{type(moe.comm).__name__} does not support post-quant "
-                  "dispatch, so quantization must happen after dispatch")
+        reason = (
+            f"{type(moe.comm).__name__} does not support post-quant "
+            "dispatch, so quantization must happen after dispatch"
+        )
     elif moe._using_load_balancer():
         reason = "expert load balancer (EPLB) is active"
     elif moe.apply_router_weight_on_input:
@@ -82,9 +85,8 @@ def _log_k3_fused_route_quant_gate(moe, can_quantize_before_dispatch: bool) -> N
     else:
         reason = "unknown (predicates re-evaluated as passing)"
 
-    logger.info(
-        "Kimi K3 fused route+MXFP8 quant NOT OFFERED by the scheduler: "
-        f"{reason}.")
+    logger.info(f"Kimi K3 fused route+MXFP8 quant NOT OFFERED by the scheduler: {reason}.")
+
 
 __all__ = [
     "MoEScheduler",
@@ -412,9 +414,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # One evaluation, two consumers: the fused route+quant gate below and
         # the quantize/dispatch ordering in Step 5. Computing it twice let the
         # two drift, which is what the (unreachable) assert used to guard.
-        post_quant_dispatch_ok = (
-            moe.comm is None or moe.comm.supports_post_quant_dispatch()
-        )
+        post_quant_dispatch_ok = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
         if requires_separated_routing:
             if (
@@ -426,8 +426,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 fused_result = moe.backend.try_fused_kimi_route_quant(x, router_logits)
             else:
                 fused_result = None
-                if (not _K3_FUSED_ROUTE_QUANT_GATE_LOGGED
-                        and isinstance(moe.backend, TRTLLMGenFusedMoE)):
+                if not _K3_FUSED_ROUTE_QUANT_GATE_LOGGED and isinstance(
+                    moe.backend, TRTLLMGenFusedMoE
+                ):
                     _log_k3_fused_route_quant_gate(moe, post_quant_dispatch_ok)
 
             if fused_result is None:

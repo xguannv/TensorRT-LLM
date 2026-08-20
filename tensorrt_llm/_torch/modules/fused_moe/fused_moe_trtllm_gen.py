@@ -16,7 +16,7 @@
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -716,12 +716,10 @@ class TRTLLMGenFusedMoE(MoE):
         # while everything before it is a dict lookup or an isinstance. Tests
         # that stub the SM probe must be able to reach the cheap rejections
         # without the probe running at all.
-        if (_K3_DISABLE_FUSED_ROUTE_QUANT
-                or isinstance(x, MxFp8QuantizedTensor)
+        if (_K3_DISABLE_FUSED_ROUTE_QUANT or isinstance(x, MxFp8QuantizedTensor)
                 or not self.has_w4a8_mxfp4_mxfp8
-                or not isinstance(self.op_backend, TRTLLMOpBackend)
-                or not isinstance(self.routing_method,
-                                  DeepSeekV3MoeRoutingMethod)
+                or not isinstance(self.op_backend, TRTLLMOpBackend) or
+                not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
                 or not 100 <= get_sm_version() < 110):
             if not TRTLLMGenFusedMoE._k3_route_quant_logged_off:
                 self._log_k3_route_quant_declined(x, router_logits)
@@ -788,11 +786,12 @@ class TRTLLMGenFusedMoE(MoE):
             checks = (
                 (not routing.is_fused, "routing_impl.is_fused is False"),
                 (routing.n_group != 1, f"n_group={routing.n_group} != 1"),
-                (routing.topk_group != 1,
-                 f"topk_group={routing.topk_group} != 1"),
+                (routing.topk_group
+                 != 1, f"topk_group={routing.topk_group} != 1"),
                 (routing.top_k != 16, f"top_k={routing.top_k} != 16"),
                 (router_logits.ndim != 2 or router_logits.shape[1] != 896,
-                 f"router_logits shape {tuple(router_logits.shape)} is not [M, 896]"),
+                 f"router_logits shape {tuple(router_logits.shape)} is not [M, 896]"
+                 ),
                 (router_logits.dtype != torch.float32,
                  f"router_logits dtype {router_logits.dtype} != float32"),
                 (not router_logits.is_contiguous(),
@@ -811,9 +810,8 @@ class TRTLLMGenFusedMoE(MoE):
             reason = next((msg for failed, msg in checks if failed),
                           "unknown (predicates re-evaluated as passing)")
 
-        logger.info(
-            f"Kimi K3 fused route+MXFP8 quant DISABLED: {reason}. "
-            "Falling back to separate routing + MXFP8 quantization.")
+        logger.info(f"Kimi K3 fused route+MXFP8 quant DISABLED: {reason}. "
+                    "Falling back to separate routing + MXFP8 quantization.")
 
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.

@@ -155,6 +155,7 @@ def _make_single_token_context_graph_batch(
                                              for request in context_requests)
     return graph_batch, promoted_context_request_ids
 
+
 def _ugpu_forkjoin_enabled(kv_cache_manager) -> bool:
     """Whether to drive fork-join attention for *kv_cache_manager*.
 
@@ -1900,8 +1901,9 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=self.original_max_draft_len)
 
         if self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens:
-            logger.info("Skipping autotuner warmup for an already completed token shape: %s",
-                        curr_max_num_tokens)
+            logger.info(
+                "Skipping autotuner warmup for an already completed token shape: %s",
+                curr_max_num_tokens)
             return
 
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
@@ -2466,7 +2468,8 @@ class PyTorchModelEngine(ModelEngine):
                     if cleared is not None:
                         logger.info(
                             "Cleared capture-only sampling override from "
-                            f"{cleared} cached CUDA graph spec metadata object(s).")
+                            f"{cleared} cached CUDA graph spec metadata object(s)."
+                        )
 
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
@@ -2943,9 +2946,8 @@ class PyTorchModelEngine(ModelEngine):
         requests = []
         if mixed_context_encoder_output_lens:
             context_request_ids = short_request_ids[:num_mixed_contexts]
-            context_ugpu_ids = (
-                short_ugpu_ids[:num_mixed_contexts]
-                if short_ugpu_ids is not None else None)
+            context_ugpu_ids = (short_ugpu_ids[:num_mixed_contexts]
+                                if short_ugpu_ids is not None else None)
             context_requests = kv_cache_manager.add_dummy_requests(
                 context_request_ids,
                 token_nums=[mixed_context_query_len] * num_mixed_contexts,
@@ -2964,9 +2966,8 @@ class PyTorchModelEngine(ModelEngine):
             generation_request_ids = short_request_ids[num_mixed_contexts:]
             generation_requests = []
             if generation_request_ids:
-                generation_ugpu_ids = (
-                    short_ugpu_ids[num_mixed_contexts:]
-                    if short_ugpu_ids is not None else None)
+                generation_ugpu_ids = (short_ugpu_ids[num_mixed_contexts:]
+                                       if short_ugpu_ids is not None else None)
                 generation_requests = kv_cache_manager.add_dummy_requests(
                     generation_request_ids,
                     token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM] *
@@ -3071,8 +3072,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
-            encoder_output_lens=[max_encoder_output_len] * num_long_requests
-            if is_enc_dec else None,
+            encoder_output_lens=[max_encoder_output_len] *
+            num_long_requests if is_enc_dec else None,
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
             **ugpu_kwargs(max_seq_len_ugpu_ids))
@@ -3088,8 +3089,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = 0
                 request.py_batch_idx = None
             result.context_requests_last_chunk = requests[:num_mixed_contexts]
-            result.generation_requests = (
-                max_seq_len_requests + requests[num_mixed_contexts:])
+            result.generation_requests = (max_seq_len_requests +
+                                          requests[num_mixed_contexts:])
         else:
             # Put longest requests first so each uGPU group starts with the
             # max-length dummy request after the stable uGPU sort.

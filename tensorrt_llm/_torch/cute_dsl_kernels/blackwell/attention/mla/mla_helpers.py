@@ -296,13 +296,12 @@ class MLAStaticTileScheduler:
         # cutlass-dsl build, so the old fixed 6/1/3/rest split mis-slices.
         rebuilt = []
         offset = 0
-        for field in (self.params, self.current_work_linear_idx,
-                      self.blk_coord, self.grid_shape):
+        for field in (self.params, self.current_work_linear_idx, self.blk_coord,
+                      self.grid_shape):
             width = len(cutlass.extract_mlir_values(field))
             rebuilt.append(
-                cutlass.new_from_mlir_values(field,
-                                             list(values[offset:offset +
-                                                         width])))
+                cutlass.new_from_mlir_values(
+                    field, list(values[offset:offset + width])))
             offset += width
         assert offset == len(values), (
             f"MLAStaticTileScheduler consumed {offset} of {len(values)} values")

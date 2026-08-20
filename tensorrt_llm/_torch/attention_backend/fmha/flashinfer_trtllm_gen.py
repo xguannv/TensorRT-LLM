@@ -231,6 +231,84 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
 
 
 @lru_cache(maxsize=128)
+def _get_cute_dsl_mla_workspace_size(
+    max_batch_size: int,
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    multi_processor_count: int,
+) -> int:
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import _get_split_kv_and_workspace_size
+
+    return max(
+        _get_split_kv_and_workspace_size(
+            batch_size,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            multi_processor_count,
+        )[1]
+        for batch_size in range(1, max_batch_size + 1)
+    )
+
+
+def _get_cute_dsl_mla_buffer_layout(
+    batch_size: int,
+    padded_num_pages: int,
+) -> Tuple[int, int, int]:
+    buffer_alignment_bytes = 32
+    page_table_bytes = batch_size * padded_num_pages * torch.int32.itemsize
+    sequence_lengths_offset = (
+        math.ceil(page_table_bytes / buffer_alignment_bytes) * buffer_alignment_bytes
+    )
+    kernel_workspace_offset = (
+        math.ceil(
+            (sequence_lengths_offset + batch_size * torch.int32.itemsize) / buffer_alignment_bytes
+        )
+        * buffer_alignment_bytes
+    )
+    return page_table_bytes, sequence_lengths_offset, kernel_workspace_offset
+
+
+def _prepare_cute_dsl_mla_buffers(
+    workspace: torch.Tensor,
+    block_tables: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    padded_num_pages: int,
+    skip_copy: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if block_tables.size(-1) > padded_num_pages:
+        raise RuntimeError("CuTeDSL MLA page table exceeds its pre-allocated shape.")
+    batch_size = block_tables.size(0)
+    if sequence_lengths.numel() < batch_size:
+        raise RuntimeError("CuTeDSL MLA sequence lengths are smaller than the batch size.")
+
+    page_table_bytes, sequence_lengths_offset, kernel_workspace_offset = (
+        _get_cute_dsl_mla_buffer_layout(batch_size, padded_num_pages)
+    )
+    workspace_bytes = workspace.view(torch.uint8).flatten()
+    page_table_storage = (
+        workspace_bytes[:page_table_bytes].view(torch.int32).view(batch_size, padded_num_pages)
+    )
+    if not skip_copy:
+        page_table_storage.zero_()
+        page_table_storage[:, : block_tables.size(-1)].copy_(block_tables[:, 0, :])
+
+    sequence_lengths_storage = workspace_bytes[
+        sequence_lengths_offset:kernel_workspace_offset
+    ].view(torch.int32)
+    aligned_sequence_lengths = sequence_lengths_storage[:batch_size]
+    if not skip_copy:
+        aligned_sequence_lengths.copy_(sequence_lengths.flatten()[:batch_size])
+
+    kernel_workspace_bytes = (workspace_bytes.numel() - kernel_workspace_offset) // 4 * 4
+    kernel_workspace = workspace_bytes[
+        kernel_workspace_offset : kernel_workspace_offset + kernel_workspace_bytes
+    ].view(-1, 4)
+    return kernel_workspace, page_table_storage, aligned_sequence_lengths
+
+
+@lru_cache(maxsize=128)
 def _get_context_workspace_layout(
     dtype: torch.dtype,
     batch_size: int,
