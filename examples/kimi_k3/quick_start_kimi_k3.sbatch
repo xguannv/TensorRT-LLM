@@ -105,6 +105,14 @@ srun --mpi=pmix \
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$TRITON_CACHE_DIR\"
 
+        # DeepGEMM JIT writes compiled artifacts through a temporary file +
+        # rename. Sharing one cache across ranks lets two compilers race that
+        # rename (444447: compiler.hpp:147 runtime != nullptr in
+        # fp8_swap_ab_gemm). Keep it node-local and per-rank, like GSM8K.
+        export DG_JIT_CACHE_DIR=/tmp/deep-gemm-rank\${SLURM_PROCID:-0}
+        mkdir -p \"\$DG_JIT_CACHE_DIR\"
+        echo \"[k3] DG_JIT_CACHE_DIR=\$DG_JIT_CACHE_DIR\"
+
         # Node-local flashinfer cache: the default (\$HOME) is shared NFS and
         # races across ranks during cubin download (stale file handles).
         export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-rank\${SLURM_PROCID:-0}
