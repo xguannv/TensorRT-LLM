@@ -1304,24 +1304,29 @@ class KimiK3MoERuntime(nn.Module):
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
         )
-        # trtllm-gen ships SiTu cubins for exactly one dtype combination
-        # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
-        # standalone SiTu activation kernel to fall back on, so a non-MXFP4
-        # routed-expert format cannot be served here. Fail with the fix rather
-        # than with a cubin lookup error deep inside the runner. Checked against
-        # the resolved backend, not the K3 architecture branch, because the
-        # generic FP8_BLOCK_SCALES fallback in ``resolve_moe_backend`` can also
-        # land on TRTLLM.
+        # trtllm-gen has fused SiTu FC1 cubins for two input formats and no
+        # standalone SiTu activation kernel, so anything else dies here rather
+        # than in a cubin lookup. Keep this set in sync with
+        # TRTLLMGenFusedMoE._SITU_SUPPORTED_QUANT_ALGOS.
+        #   NVFP4               group-16 Bmm_E2m1_E2m1E2m1_..._siTuGlu_*
+        #   W4A8_MXFP4_MXFP8    group-32 Bmm_MxE4m3_MxE2m1MxE4m3_..._siTuGlu_*
+        # Checked against the resolved backend, not the K3 architecture
+        # branch, because the generic FP8_BLOCK_SCALES fallback in
+        # ``resolve_moe_backend`` can also land on TRTLLM.
         if (
             routed_moe_model_config.moe_backend == "TRTLLM"
-            and routed_quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8
+            and routed_quant_config.quant_algo
+            not in {
+                QuantAlgo.NVFP4,
+                QuantAlgo.W4A8_MXFP4_MXFP8,
+            }
         ):
             raise ValueError(
                 f"Kimi K3 routed experts are quantized as "
                 f"{routed_quant_config.quant_algo}, which the TRTLLM "
-                "(trtllm-gen) MoE backend cannot serve: its SiTu activation "
-                "exists only for W4A8_MXFP4_MXFP8. Set moe_config.backend to "
-                "CUTLASS, CUTEDSL or MEGAMOE_CUTEDSL."
+                "(trtllm-gen) MoE backend cannot serve: fused SiTu cubins "
+                "exist only for NVFP4 and W4A8_MXFP4_MXFP8. Set "
+                "moe_config.backend to CUTLASS, CUTEDSL or MEGAMOE_CUTEDSL."
             )
 
         if routed_moe_model_config.moe_backend == "CUTLASS":

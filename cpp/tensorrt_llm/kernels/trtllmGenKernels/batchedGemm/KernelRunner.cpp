@@ -137,42 +137,39 @@ static inline bool skipQuirks(BatchedGemmConfig const& config, int gpuSM)
         && strstr(config.mFunctionName, "MxE4m3_MxE2m1MxE4m3") != nullptr
         && strstr(config.mFunctionName, "splitK") != nullptr;
 
-    // SM100f GEMM2 token tiles fault when launched through family compatibility on SM107. Keep the family-compatible
-    // fused GEMM1 variants, and allow the regenerated native SM107a SiTu cubins.
-    bool const incompatible_sm107_family_kernel
-        = gpuSM == 107 && config.mSm == ::batchedGemm::gemm::SmVersion::Sm100f && !options.mFusedAct;
+    // SM100f GEMM2 token tiles fault when launched through family compatibility on SM107.
+    // Keep fused GEMM1 (siTuGlu etc.) on sm100f. Native SM107a replacements exist for MXFP4
+    // FC2 (MxE2m1×MxE4m3); skip those sm100f unfused tiles so the regenerated cubins win.
+    // NVFP4 FC2 (E2m1×E2m1, fusedAct=0) from #17940 is sm100f-only — skipping it leaves
+    // tile-8 K3 init with "No kernel found". Allow that dtype through family compatibility.
+    bool const nvfp4UnfusedFc2 = options.mDtypeA == Dtype::E2m1 && options.mDtypeB == Dtype::E2m1;
+    bool const incompatible_sm107_family_kernel = gpuSM == 107 && config.mSm == ::batchedGemm::gemm::SmVersion::Sm100f
+        && !options.mFusedAct && !nvfp4UnfusedFc2;
 
     // The native SM107a BF16-output tile-8 dynamic-persistent variant can illegal-address while initializing
     // Kimi-K3 GEMM2 (for example B=56, MNK=16x3584x3072). Its static sibling is safe. Keep other persistent
     // variants because the native static catalog does not cover every requested tile.
-    auto const tileSize = options.mTransposeMmaOutput ? options.mTileN * options.mClusterDimY
-                                                      : options.mTileM * options.mClusterDimX;
+    auto const tileSize
+        = options.mTransposeMmaOutput ? options.mTileN * options.mClusterDimY : options.mTileM * options.mClusterDimX;
     bool const incompatible_sm107_bf16_tile8_dynamic_persistent = gpuSM == 107
-        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a
-        && options.mDtypeC == Dtype::Bfloat16
-        && tileSize == 8
+        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a && options.mDtypeC == Dtype::Bfloat16 && tileSize == 8
         && options.mTileScheduler == TileScheduler::Persistent;
 
     // Prefer the least aggressive native tile-64 GEMM2 variant on Rubin. The 256-K, 2x-unrolled variant
     // illegal-addresses for Kimi-K3's B=56, MNK=16x3584x3072 initialization problem.
     bool const incompatible_sm107_bf16_tile64_variant = gpuSM == 107
-        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a
-        && options.mDtypeC == Dtype::Bfloat16
-        && tileSize == 64
+        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a && options.mDtypeC == Dtype::Bfloat16 && tileSize == 64
         && (options.mMmaTileK != 128 || options.mUseUnrollLoop2xForMma);
 
     // For tile 16, use the single-CTA, non-unrolled static variant.
     bool const incompatible_sm107_bf16_tile16_variant = gpuSM == 107
-        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a
-        && options.mDtypeC == Dtype::Bfloat16
-        && tileSize == 16
+        && config.mSm == ::batchedGemm::gemm::SmVersion::Sm107a && options.mDtypeC == Dtype::Bfloat16 && tileSize == 16
         && (options.mClusterDimX != 1 || options.mUseUnrollLoop2xForMma
             || options.mTileScheduler != TileScheduler::Static);
 
     return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || corrupt_splitk_fc2 || corrupt_splitk_fc1
-        || incompatible_sm107_family_kernel
-        || incompatible_sm107_bf16_tile8_dynamic_persistent || incompatible_sm107_bf16_tile64_variant
-        || incompatible_sm107_bf16_tile16_variant;
+        || incompatible_sm107_family_kernel || incompatible_sm107_bf16_tile8_dynamic_persistent
+        || incompatible_sm107_bf16_tile64_variant || incompatible_sm107_bf16_tile16_variant;
 }
 
 void setProblemDimensions(BatchedGemmData& gemmData, bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
