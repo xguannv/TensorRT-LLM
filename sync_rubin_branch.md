@@ -1581,3 +1581,48 @@ Context: previous sync attempt retained on `backup/rubin-dsv4-k3-pre-redo-202608
 - Resolution: include the live request draft length when reconstructing allocated receiver blocks, gated by `is_generation_only_request()` so a context sender that merely publishes draft tokens does not over-trim its prompt allocation. Remove the complete receiver-only tail before selecting the valid SWA prompt suffix. Keep `TokenRange.end == prompt_len`; draft and extra-KV slots remain untransferred.
 - Evidence: current scheduler, gen-init allocation, and transceiver call-order review; a focused 128-token boundary regression reproduces the omitted-page case. `git diff --check` and `py_compile` pass. OCI-AGA image validation job `517665` passed the focused regression in the supplied image with editable repo install (`1 passed`, exit code 0). Authoritative job `517765` reused job `516649` exactly, including `dsv4_ucx_plugin`, the supplied image, mounted editable repo, two-node four-GPU-per-node topology, NVFP4 checkpoint, and unchanged accuracy contract. It completed in 30:53 with GSM8K 96.475 versus reference 95.900 and threshold 92.697; both node-side pytest processes reported `1 passed` and Slurm exited 0. A preceding job, `517706`, omitted the UCX plugin and failed before serving, so it is not accuracy evidence.
 - Status: fixed and validated.
+
+### K3 feature replay from `feat/rubin-k3-latest` (2026-08-20)
+
+#### Source inventory and replay boundary
+
+- Source remote/ref: GitLab `feat/rubin-k3-latest` at `e67bfc7dac1ccc95822f631d08324066f2fee55b`.
+- Exclusive lower boundary: `c61a248aed1a2b1d697b3b9dab47f72a2d3379cc` (not replayed).
+- Target: `codex/k3-features-after-c61-20260820`, created from `user/lizhiz/rubin-dsv4-k3-latest` at `75ae54c6`; backup ref `backup/rubin-dsv4-k3-before-k3-features-20260820` preserves that starting point.
+- Worktree: `~/workspace/tllm_k3/.worktrees/k3-features-after-c61-20260820`.
+- Inventory: 48 graph commits after the boundary: 37 non-merge candidates and 11 merge commits. The merge commits were deliberately dropped and their first-parent payloads were audited through the 37 candidates: `e71f49090c`, `9a823473b8`, `452fb6f77c`, `345c3aa7ed`, `cf0fe5f9dc`, `5cd34e938c`, `a32d4564dd`, `b2a6fd17c6`, `ef95d6fd2e`, `cf44b33ab3`, and `3c0b90f9d0`.
+
+#### Applied source commits
+
+- `6aa1a734` -> `77734dba99`; `c585d20e` -> `dbee3710e8`; `afa1035a` -> `6bce3d2a20`; `0ff1588a` -> `68e8bb5533`; `e54e341e` -> `62757752dd`.
+- `2463b0d` -> `f881c6ebaa`; `9b280b6` -> `19e595a0fd`; `e71c30d` -> `ddadc177f5`; `57bc18e` -> `19a707925c`; `ab7d326` -> `21dba7ee0b`.
+- `6e1ab573` -> `58741b5227`; `c6bfcd95` -> `875a1d911d`; `ad1c94d5` -> `174a5f9b79`; `d47257c8` -> `9df6b36df6`; `c82a94bf` -> `d4832c7b92`.
+- `6bd818ce` -> `68e8814a43`; `3a6cab1e` -> `619cda0c9e`; `9f958a49` -> `4c6193d324`; `fd18c75b` -> `ba4d6ed37d`; `fd63632d` -> `a13f8c9b8a`.
+- `b2f56ceb` -> `13aa78ab3c`; `072b0cd2` -> `6fce9c1429`; `3fe11a61` -> `af4a56c0a4`; `0c0179cb` -> `f0f9862652`; `b9e2e4b3` -> `0d16b74b67`.
+- `be8c2be8` -> `652a7f5309`; `6466e966` -> `31ca299182`; `3f0afebd` -> `a4532b296e`; `e67bfc7d` -> `94a7e2d3bc`.
+
+#### Intentionally skipped source commits
+
+- `adc79fa188` (`add Kimi K3 SiTU MegaMoE support`): the target already has the complete, newer Kimi architecture/MegaMoE implementation; later focused SiTU commits were replayed separately.
+- `0ded3d5140` (`Shard Kimi K3 dense and shared-expert MLPs with tensor parallelism`): obsolete against the target's newer loader and direct TP ownership.
+- `a8335949f9` (`sync auto host-tier quota across ranks`) and `4438f151cb` (`saving last N turns in per-conversation policy`): patch-equivalent changes are already present in the target.
+- `2b787ce9c0` (`Pin Kimi MegaMoE to upstream DeepGEMM`): the target already carries the same pin through newer dependency state.
+- `5d86e96249` (`partial rewind endpoints reusable via per-page token coverage`): the target already contains a newer implementation of the same KVCM-V2 contract.
+- `8170f22c55` (`CuteDSL FP8/FP16 MLA decode attention fmha lib`): the target already contains the newer CuTeDSL MLA implementation; the SM107 enablement was replayed separately.
+- `703862356d` (`disagg benchmark server health timeout configurable`): the target already contains the newer configurable-health-timeout behavior.
+
+#### Three-tree conflict resolutions
+
+- KDA/attention kernels (`2463b0d`, `9b280b6`): unioned source byte-movement and residual-RMSNorm fusion with target bounds checks, device-specific layouts, and current launch contracts.
+- Route quantization and PDL (`e71c30d`, `57bc18e`): retained the target route-dtype union and adapted source PDL behavior to the shared `situ.py` implementation.
+- MLA decode (`ab7d326`, `d47257c8`, `3a6cab1e`, `9f958a49`): preserved target workspace/counter-buffer/RoPE handling and split-loader APIs while applying the decode-performance, backend-default, no-padding, and SM107 behavior.
+- KVCM/ShortConv (`6e1ab573`, `ad1c94d5`, `6bd818ce`): kept the all-lifecycle stale-walk guard and target deletion of the obsolete packed-prefill test while applying identity-RoPE and D2H-copy fixes.
+- NVFP4 and resident FP8 (`fd18c75b`, `fd63632d`, `6466e966`): relocated source finalization into target `_load_expert_slices`/split-loader ownership, preserved target MegaMoE streaming safety, passed explicit resident-FP8 attention jobs, removed the old KDA FP8 read path, and retained the target deletion of its obsolete test.
+- MoE SiTU (`b9e2e4b3`, `3f0afebd`): preserved target `gather_act` naming, Relu2 support, precomputed-tactic and uGPU APIs; added SiTU beta validation, cache identity, SM107 epilogue, and beta propagation through both single- and two-partition paths.
+- Final lint commit (`e67bfc7d`): retained current-target formatted versions of conflicted files and applied the remaining clean quantization formatting hunk.
+
+#### Replay validation state
+
+- Every resolved Python file was checked with `py_compile`; changed shell scripts were checked with `bash -n`; each cherry-pick passed `git diff --check` before completion.
+- Relevant pre-commit hooks pass after formatter output is staged. The repository-wide `validate-test-lists` hook still reports three unrelated pre-existing stale entries for `accuracy/test_llm_api_autodeploy.py::TestNemotronH` at `tests/integration/test_lists/waives.txt:291-293`.
+- Runtime/targeted-test validation and the final clean-tree audit are pending. No remote branch has been pushed.
