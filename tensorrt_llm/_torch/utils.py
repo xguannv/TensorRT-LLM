@@ -62,14 +62,12 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
-# TRTLLM-Gen-local activation encoding, kept separate from the shared
-# ActivationType above ON PURPOSE: ActivationType mirrors the cutlass enum in
-# common.h and drives cutlass MoE kernels, whereas SiTu exists only in the
-# trtllm-gen batched-GEMM kernels. Adding SiTu to the shared ActivationType
-# would force a matching cutlass enum member that no cutlass kernel implements.
-# So SiTu stays here (TRTLLM-15177 item 1.2(a): decided keep-backend-local).
+# TRTLLM-Gen keeps a backend-local activation encoding separate from the
+# shared CUTLASS ActivationType above. SiTu is implemented by both backends,
+# but its enum value and runtime contract remain backend-specific.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
