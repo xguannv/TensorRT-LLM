@@ -4406,6 +4406,56 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(250000)
+@skip_pre_blackwell
+class TestKimiK3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_full_accuracy(self):
+        """Run the full 1,319-sample GSM8K gate on the proven DEP8 recipe."""
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                enable_attention_dp=True,
+                max_batch_size=32,
+                max_num_tokens=8192,
+                max_seq_len=8192,
+                trust_remote_code=True,
+                disable_overlap_scheduler=False,
+                enable_chunked_prefill=True,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                  max_batch_size=32),
+                moe_config=MoeConfig(
+                    backend="TRTLLM",
+                    max_num_tokens=131072,
+                    use_low_precision_moe_combine=True,
+                ),
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.35,
+                    tokens_per_block=64,
+                ),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=(llm.args.speculative_config.decoding_type
+                               if llm.args.speculative_config else None))
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(llm)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+
+
+@pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
 class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
