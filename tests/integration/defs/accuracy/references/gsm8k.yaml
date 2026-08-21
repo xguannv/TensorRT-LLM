@@ -286,7 +286,7 @@ moonshotai/Kimi-K3:
   # CUDA graphs, chunked prefill, and the NVFP4 checkpoint. The checked-in
   # K3 evaluation measured 96.5125 on all 1,319 samples; retain margin for
   # ordinary run-to-run variation.
-  - quant_algo: NVFP4
+  - quant_algo: MIXED_PRECISION
     accuracy: 96.0
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57

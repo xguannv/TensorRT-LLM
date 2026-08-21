@@ -3285,9 +3285,15 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
-        if isinstance(self.model, DecoderModelForCausalLM):
-            # Hybrid models may extend the default Mamba metadata contract.
-            self.attn_metadata.mamba_metadata_cls = self.model.mamba_metadata_cls
+        model_for_mamba_metadata = self.model
+        if not isinstance(model_for_mamba_metadata, DecoderModelForCausalLM):
+            model_for_mamba_metadata = getattr(model_for_mamba_metadata, "llm", None)
+        if isinstance(model_for_mamba_metadata, DecoderModelForCausalLM):
+            # Hybrid text backbones may extend the default Mamba metadata
+            # contract, including when wrapped by a multimodal model.
+            self.attn_metadata.mamba_metadata_cls = (
+                model_for_mamba_metadata.mamba_metadata_cls
+            )
 
         return self.attn_metadata
 
