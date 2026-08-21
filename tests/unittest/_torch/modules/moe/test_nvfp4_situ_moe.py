@@ -38,7 +38,7 @@ from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
 from tensorrt_llm._torch.modules.fused_moe.routing import RenormalizeMoeRoutingMethod
-from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import SituAndMul
+from tensorrt_llm._torch.modules.situ import SituAndMul
 from tensorrt_llm._torch.utils import ActivationType, ActType_TrtllmGen
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -188,8 +188,8 @@ def test_situ_backend_activation_overrides_generic_swiglu():
 def test_nvfp4_situ_runner_has_valid_configs(num_tokens):
     """The NVFP4 SiTU cubins must be reachable through tactic selection."""
     runner = torch.classes.trtllm.FP4BlockScaleMoERunner(int(ActType_TrtllmGen.SiTu))
-    # (topK, hiddenSize, intermediateSize, numLocalExperts, numTokens)
-    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens)
+    # (topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, useLamport)
+    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, True)
     assert tactics, f"no valid NVFP4 SiTU tactic for num_tokens={num_tokens}"
 
 

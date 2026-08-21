@@ -79,7 +79,7 @@ def test_e2m1_e2m1_situ_runner_has_valid_configs(num_tokens):
     tests/unittest/_torch/modules/moe/test_nvfp4_situ_moe.py.
     """
     runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
-    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens)
+    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, True)
     assert tactics, f"No valid NVFP4 SiTu tactic for num_tokens={num_tokens}"
 
 
