@@ -14,7 +14,7 @@ for constraints.
 | `gen_config_no_sa.yaml` | Generation-server options, no speculative decoding (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging). A suffix-automaton (SA) speculative-decoding variant lands together with K3 SA support. |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
-| `benchmark_kimi_k3_dep8.yaml` | Same harness at **DEP8** (2 nodes per worker), CUTLASS ctx + MegaMoE gen. Runs end-to-end; its baseline deliberately has graphs and overlap OFF, so **its throughput/TTFT are not performance numbers**. Accuracy through the proxy is not yet validated at DEP8 |
+| `benchmark_kimi_k3_dep8.yaml` | Same harness at **DEP8** (2 nodes per worker), using TRTLLM SiTU on ctx and gen. Validated end-to-end; graphs and overlap are OFF, so **its throughput/TTFT are not performance numbers**. Full GSM8K through the proxy measured 96.21. |
 | `benchmark_kimi_k3_dep8_gsm8k.yaml` | The same DEP8 deployment — `worker_config` is identical, verified key by key — plus an `accuracy:` block that runs **GSM8K through the proxy** with `lm_eval`. Use it to check that the served model *computes* correctly, not just that it responds. Its header records the harness-comparability settings that make the score comparable to `trtllm-eval gsm8k`, and the offline-dataset staging the client srun needs |
 
 ## K3 constraints baked into the configs
@@ -38,8 +38,8 @@ for constraints.
     projections at FP8 on device instead of expanding them to BF16 and is
     worth ~34 GiB/rank and is on by default. DEP8 additionally needs a
     `max_batch_size` low enough for the V2 Mamba minimum (which scales with
-    resident sequences), and an explicit `moe_config.max_num_tokens` on a
-    CUTLASS worker.
+    resident sequences), and an explicit `moe_config.max_num_tokens` on the
+    TRTLLM worker.
   - **GB200 (186 GiB) is still ruled out** — 239.70 GiB/rank does not fit
     there, so the original conclusion stands for that part.
 - **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the
