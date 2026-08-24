@@ -117,9 +117,14 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if spec_config._use_shared_kv_cache:
         return False
-    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
-    # model does not read the paged draft KV cache managed by attention metadata.
-    if spec_config.spec_dec_mode.is_dspark():
+    # The embedded DSpark draft owns a dedicated rolling-window cache in
+    # DSv4DSparkWorker and never reads the paged draft KV cache that attention
+    # metadata manages. A standalone DSpark drafter runs on DSparkWorker
+    # (DFlash lineage), which does read it, so it keeps the default -- hence a
+    # form check, not a mode check
+    # (see DSparkDecodingConfig.draft_is_embedded_in_target).
+    if (spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target):
         return False
     return spec_config._allow_separate_draft_kv_cache
 
@@ -2456,9 +2461,9 @@ class SpecWorkerBase(nn.Module, ABC):
 
         from ..attention_backend.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            draft_metadata = (attn_metadata if draft_kv_cache_manager is None
-                              else attn_metadata.get_draft_metadata(
-                                  draft_kv_cache_manager))
+            draft_metadata = (
+                attn_metadata if draft_kv_cache_manager is None else
+                attn_metadata.get_draft_metadata(draft_kv_cache_manager))
             yield draft_metadata
             return
 
@@ -2475,8 +2480,8 @@ class SpecWorkerBase(nn.Module, ABC):
             setattr(attn_metadata, name, value)
 
         using_separate_draft_cache = saved_state is not None
-        draft_manager_supports_ugpu_forkjoin = getattr(
-            draft_kv_cache_manager, "fork_join_attn", False)
+        draft_manager_supports_ugpu_forkjoin = getattr(draft_kv_cache_manager,
+                                                       "fork_join_attn", False)
 
         try:
             if attn_metadata.ugpu_enabled:
@@ -2491,9 +2496,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                 "uGPU fork-join is enabled for the draft KV "
                                 "cache, but draft_ugpu_kv_cache_block_offsets "
                                 "was not prepared.")
-                        patch_ugpu_metadata(
-                            "ugpu_kv_cache_block_offsets",
-                            draft_ugpu_block_offsets)
+                        patch_ugpu_metadata("ugpu_kv_cache_block_offsets",
+                                            draft_ugpu_block_offsets)
                     else:
                         patch_ugpu_metadata("ugpu_enabled", False)
             yield attn_metadata
