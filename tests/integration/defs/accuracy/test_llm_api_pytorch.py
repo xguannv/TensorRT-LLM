@@ -42,13 +42,11 @@ from tensorrt_llm.llmapi.llm_args import Nvfp4GemmConfig
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (check_device_contain, get_device_count,
-                        get_mpi_world_size, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_no_mxfp4_swizzle, skip_no_rubin,
-                        skip_post_blackwell, skip_post_hopper, skip_pre_ada,
-                        skip_pre_blackwell, skip_pre_hopper, skip_pre_rubin,
-                        skip_ray)
+from ..conftest import (
+    check_device_contain, get_device_count, get_mpi_world_size, llm_models_root,
+    parametrize_with_ids, skip_no_hopper, skip_no_mxfp4_swizzle, skip_no_rubin,
+    skip_post_blackwell, skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
+    skip_pre_hopper, skip_pre_rubin, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length)
@@ -4527,6 +4525,8 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  enable_chunked_prefill=False,
                  disable_overlap_scheduler=True,
                  custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
                  speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
@@ -4541,6 +4541,16 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
+            # The DeepGEMM sibling above gates on acceptance as well as on the
+            # score. Without it a drafter regression on the CuteDSL backend —
+            # the only one that serves the NVFP4 export — costs speed only, and
+            # the accuracy assert cannot see that.
+            acceptance_length = _compute_acceptance_length(llm)
+            print(f"[AL] test_gsm8k_dep8_megamoe_cutedsl "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_cutedsl",
+                acceptance_length)
 
 
 @pytest.mark.timeout(14400)
