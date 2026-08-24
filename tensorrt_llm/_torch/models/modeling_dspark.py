@@ -595,21 +595,16 @@ def dspark_attention_forward_batched(
     inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
     block_rope_freqs = inverse_rope_freqs.reshape(-1, rd // 2, 2)
 
-    # ``valid_len`` is more than an optimization hint: an explicit tensor means
-    # the rolling window can contain holes (notably on a disaggregated generation
-    # worker, which does not receive the context worker's DSpark window). Keep
-    # that contract on the main/reference path. Legacy callers without explicit
-    # validity have a dense suffix and can use Rubin's prepared kernels with the
-    # equivalent synthesized length.
-    has_explicit_validity = valid_len is not None
+    # The fused kernel consumes the number of initialized physical-window rows,
+    # including short suffixes on disaggregated generation workers. Legacy
+    # callers without explicit validity have a dense suffix, so synthesize the
+    # equivalent length from their absolute decode position.
     kernel_valid_len = (
-        valid_len if has_explicit_validity else torch.clamp(start_pos + 1, max=window_size)
+        valid_len if valid_len is not None else torch.clamp(start_pos + 1, max=window_size)
     )
 
-    # The prepared path is only valid for the legacy dense-window contract.
     use_prepared_attention = (
-        not has_explicit_validity
-        and IS_CUTLASS_DSL_AVAILABLE
+        IS_CUTLASS_DSL_AVAILABLE
         and is_cute_dsl_dspark_attention_prepared_supported(
             q, write_target, kernel_valid_len, attn_sink, inverse_rope_freqs
         )
@@ -659,8 +654,7 @@ def dspark_attention_forward_batched(
         # Compatibility path for direct/int32 callers; production uses
         # preparation.
         if (
-            not has_explicit_validity
-            and IS_CUTLASS_DSL_AVAILABLE
+            IS_CUTLASS_DSL_AVAILABLE
             and is_cute_dsl_dspark_attention_supported(
                 q,
                 main_kv_flat,

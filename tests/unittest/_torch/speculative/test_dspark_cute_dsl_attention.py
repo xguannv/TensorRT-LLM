@@ -262,7 +262,7 @@ def test_cute_dsl_dspark_attention_rejects_unsupported_shapes():
 def test_dspark_attention_forward_batched_matches_fallback(
     monkeypatch, persist, explicit_validity
 ):
-    import tensorrt_llm._torch.models.dspark.attention as dspark_attention
+    import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
         precompile_dspark_attention,
     )
@@ -351,25 +351,14 @@ def test_dspark_attention_forward_batched_matches_fallback(
             x, main_x, start_pos, op_cache, slots, dispatch_valid_len, **kwargs
         )
 
-    if explicit_validity:
-        # Explicit validity can describe holes on a disaggregated generation
-        # worker and must retain the main/reference path.
-        assert calls == {
-            "attention_prepared": 0,
-            "cache_write": 0,
-            "block_page": 0,
-            "rmsnorm_rope": 5,
-        }
-    else:
-        # Legacy dense windows retain Rubin's prepared fast path. Main K/V and
-        # block K/V use their physical preparation kernels; q_a and q use the
-        # generic fused op.
-        assert calls == {
-            "attention_prepared": 1,
-            "cache_write": 1,
-            "block_page": 1,
-            "rmsnorm_rope": 2,
-        }
+    # Both explicit physical-window validity (including the wrapped short
+    # suffix above) and legacy synthesized validity use the prepared path.
+    assert calls == {
+        "attention_prepared": 1,
+        "cache_write": 1,
+        "block_page": 1,
+        "rmsnorm_rope": 2,
+    }
 
     with monkeypatch.context() as patch:
         patch.setattr(

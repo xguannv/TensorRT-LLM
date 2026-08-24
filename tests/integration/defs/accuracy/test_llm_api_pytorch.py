@@ -4177,9 +4177,10 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
     disable_mtp = os.environ.get("DSV4_DIAG_DISABLE_MTP") == "1"
     mtp_nextn = int(os.environ.get("DSV4_DIAG_MTP_NEXTN", "1"))
     kwargs = dict(
-        tensor_parallel_size=4,
-        moe_expert_parallel_size=4,
-        moe_config=MoeConfig(backend="TRTLLM"),
+        tensor_parallel_size=8,
+        moe_expert_parallel_size=8,
+        # DeepSeek-V4-Pro routed experts use MegaMoE CuTe DSL on Rubin.
+        moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
         enable_attention_dp=not disable_attention_dp,
         max_seq_len=4096,
         max_batch_size=16,

@@ -204,7 +204,9 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "moe_expert_parallel_size": 4,
         "enable_attention_dp": True,
         "moe_config": {
-            "backend": "TRTLLM",
+            # DeepSeek-V4 routed experts are W4A8 MXFP4. Use the MegaMoE
+            # DeepGEMM path, which supports the Rubin SM107 deployment.
+            "backend": "MEGAMOE_DEEPGEMM",
         },
         "max_batch_size": 128,
         "max_seq_len": 4096,

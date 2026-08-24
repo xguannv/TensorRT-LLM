@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Submit the DSV4 branch guard tests through Slurm.
+"""Submit the DSV4 and Kimi K3 branch guard tests through Slurm.
 
 The runner deliberately keeps the Slurm allocation and container launch in this
 file so that the same command can be reviewed, reproduced, and run from a
@@ -127,6 +127,15 @@ SINGLE_NODE_SELECTORS = (
     "::TestDeepSeekV4Pro::test_gsm8k_full_accuracy",
 )
 
+K3_AGGREGATE_SELECTOR = (
+    "tests/integration/defs/accuracy/test_llm_api_pytorch.py"
+    "::TestKimiK3::test_gsm8k_full_accuracy"
+)
+K3_DISAGGREGATED_SELECTOR = (
+    "tests/integration/defs/test_kimi_k3_specdec.py"
+    "::test_kimi_k3_disagg_parity_selftest"
+)
+
 MULTI_NODE_TESTS: dict[str, int] = {
     "tests/integration/defs/accuracy/test_disaggregated_multinode.py"
     "::TestDeepSeekV4ProDSparkMultinode::test_gsm8k_1p1d_dep4": 2,
@@ -156,6 +165,26 @@ GUARD_JOBS = (
         gpus_per_node=4,
         use_pmix=True,
     ),
+    GuardJob(
+        name="k3-aggregate-gsm8k",
+        scope="multi-node",
+        selectors=(K3_AGGREGATE_SELECTOR,),
+        nodes=2,
+        ntasks=8,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=True,
+    ),
+    GuardJob(
+        name="k3-disaggregated-parity",
+        scope="single-node",
+        selectors=(K3_DISAGGREGATED_SELECTOR,),
+        nodes=1,
+        ntasks=1,
+        ntasks_per_node=1,
+        gpus_per_node=1,
+        use_pmix=False,
+    ),
     *(
         GuardJob(
             name=f"dsv4-multi-node-{test_name.rsplit('::', maxsplit=1)[-1]}",
@@ -178,7 +207,7 @@ def _default(value: str, environment_name: str) -> str:
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the DSV4 single-node and multi-node branch guards on Slurm."
+        description="Run the DSV4 and Kimi K3 branch guards on Slurm."
     )
     parser.add_argument(
         "--scope",
@@ -406,7 +435,7 @@ def _pytest_command(
     pytest_args.extend(args.pytest_arg)
     pytest_args.extend(str(args.repo_root / selector) for selector in job.selectors)
 
-    if job.scope == "single-node":
+    if job.use_pmix:
         return (
             [
                 str(args.repo_root / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch"),
