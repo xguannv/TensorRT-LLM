@@ -434,6 +434,18 @@ def _get_workspace_size(
     return max(context_size, generation_size)
 
 
+_SUPPORTED_MLA_BACKENDS = {"cute-dsl", "trtllm-gen"}
+
+
+def _get_mla_backend(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend not in _SUPPORTED_MLA_BACKENDS:
+        raise ValueError(
+            f"flashinfer_mla_backend must be one of {_SUPPORTED_MLA_BACKENDS}, got {backend!r}."
+        )
+    return backend
+
+
 class FlashInferTrtllmGenFmha(PhasedFmha):
     """
     An attention backend using pure trtllm-gen kernels from flashinfer.
@@ -493,6 +505,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
+        requested_mla_backend = _get_mla_backend(attn.flashinfer_mla_backend or "trtllm-gen")
+        if requested_mla_backend == "cute-dsl" and attn.is_mla_enable and attn.has_fp8_kv_cache:
+            raise ValueError(
+                "flashinfer_mla_backend='cute-dsl' does not support FP8 KV cache device scales; "
+                "use 'trtllm-gen' instead."
+            )
+        self._mla_backend = requested_mla_backend
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
 
