@@ -1564,11 +1564,11 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
-        supported_backends = {"TRTLLM", "MEGAMOE_DEEPGEMM"}
+        supported_backends = {"TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"}
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the TRTLLM and "
-                "MEGAMOE_DEEPGEMM backends; "
+                "MEGAMOE_DEEPGEMM and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:

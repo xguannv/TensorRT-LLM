@@ -4179,7 +4179,7 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
     kwargs = dict(
         tensor_parallel_size=8,
         moe_expert_parallel_size=8,
-        # DeepSeek-V4-Pro routed experts use MegaMoE CuTe DSL on Rubin.
+        # The NVFP4 aggregate checkpoint uses MegaMoE CuTe DSL on Rubin.
         moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
         enable_attention_dp=not disable_attention_dp,
         max_seq_len=4096,
@@ -4385,7 +4385,7 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
         system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
     )
 
-    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_full_accuracy(self):
         with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -4414,7 +4414,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_full_accuracy(self):
-        """Run the full 1,319-sample GSM8K gate on the proven DEP8 recipe."""
+        """Run the full 1,319-sample GSM8K gate on the DEP8 recipe."""
         with LLM(
                 self.MODEL_PATH,
                 tensor_parallel_size=8,
@@ -4435,7 +4435,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 ),
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
-                    free_gpu_memory_fraction=0.35,
+                    free_gpu_memory_fraction=0.25,
                     tokens_per_block=64,
                 ),
         ) as llm:
@@ -4452,7 +4452,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
-
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)

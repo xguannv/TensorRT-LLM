@@ -54,9 +54,12 @@ import shutil
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+import yaml
 
 _PYTEST_SUMMARY_RE = re.compile(
     r"(?P<summary>\d+\s+(?:passed|failed|skipped|xfailed|xpassed|error|errors|warnings|deselected)"
@@ -124,16 +127,19 @@ REPO_ROOT = _detect_trtllm_repo_root()
 
 SINGLE_NODE_SELECTORS = (
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py"
-    "::TestDeepSeekV4Pro::test_gsm8k_full_accuracy",
+    "::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_cutedsl",
 )
 
 K3_AGGREGATE_SELECTOR = (
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py"
     "::TestKimiK3::test_gsm8k_full_accuracy"
 )
-K3_DISAGGREGATED_SELECTOR = (
-    "tests/integration/defs/test_kimi_k3_specdec.py"
-    "::test_kimi_k3_disagg_parity_selftest"
+K3_CHECKPOINT_PATH = (
+    "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
+    "nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
+)
+K3_DISAGGREGATED_ACCURACY_CONFIG = (
+    "examples/kimi_k3/disagg/benchmark_kimi_k3_dep8_gsm8k.yaml"
 )
 
 MULTI_NODE_TESTS: dict[str, int] = {
@@ -152,15 +158,16 @@ class GuardJob:
     ntasks_per_node: int
     gpus_per_node: int
     use_pmix: bool
+    launcher: str = "pytest"
 
 
 GUARD_JOBS = (
     GuardJob(
-        name="dsv4-single-node",
-        scope="single-node",
+        name="dsv4-aggregate",
+        scope="multi-node",
         selectors=SINGLE_NODE_SELECTORS,
-        nodes=1,
-        ntasks=4,
+        nodes=2,
+        ntasks=8,
         ntasks_per_node=4,
         gpus_per_node=4,
         use_pmix=True,
@@ -176,14 +183,15 @@ GUARD_JOBS = (
         use_pmix=True,
     ),
     GuardJob(
-        name="k3-disaggregated-parity",
-        scope="single-node",
-        selectors=(K3_DISAGGREGATED_SELECTOR,),
-        nodes=1,
-        ntasks=1,
-        ntasks_per_node=1,
-        gpus_per_node=1,
+        name="k3-disaggregated-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=4,
+        ntasks=16,
+        ntasks_per_node=4,
+        gpus_per_node=4,
         use_pmix=False,
+        launcher="benchmark",
     ),
     *(
         GuardJob(
@@ -213,7 +221,13 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--scope",
         choices=("all", "single-node", "multi-node"),
         default="all",
-        help="Which Slurm guard job to submit (default: all).",
+        help="Which Slurm guard scope to submit (default: all).",
+    )
+    parser.add_argument(
+        "--job",
+        choices=tuple(job.name for job in GUARD_JOBS),
+        default=None,
+        help="Submit one named guard job instead of a whole scope.",
     )
     parser.add_argument(
         "--image",
@@ -331,7 +345,9 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _selected_jobs(scope: str) -> tuple[GuardJob, ...]:
+def _selected_jobs(scope: str, job_name: str | None = None) -> tuple[GuardJob, ...]:
+    if job_name is not None:
+        return tuple(job for job in GUARD_JOBS if job.name == job_name)
     if scope == "all":
         return GUARD_JOBS
     return tuple(job for job in GUARD_JOBS if job.scope == scope)
@@ -408,6 +424,16 @@ def _shell_env_lines(args: argparse.Namespace) -> list[str]:
 def _install_lines(args: argparse.Namespace) -> list[str]:
     if not args.install_from_repo:
         return []
+    cutedsl_uninstall = shlex.join(
+        [
+            "python3",
+            "-m",
+            "pip",
+            "uninstall",
+            "--yes",
+            "nvidia-cutlass-dsl",
+        ]
+    )
     command = shlex.join(
         [
             "python3",
@@ -420,10 +446,28 @@ def _install_lines(args: argparse.Namespace) -> list[str]:
             str(args.repo_root),
         ]
     )
-    install_shell = "; ".join([*_shell_env_lines(args), command])
+    install_shell = "; ".join([*_shell_env_lines(args), cutedsl_uninstall, command])
     return [
         f'flock "/tmp/trtllm_branch_guard_install_"$SLURM_JOB_ID".lock" '
         f"bash -lc {shlex.quote(install_shell)}",
+    ]
+
+
+def _model_setup_lines(args: argparse.Namespace, job: GuardJob) -> list[str]:
+    if job.name != "k3-aggregate-gsm8k":
+        return []
+
+    return [
+        f'k3_model_root={shlex.quote("/lustre/share/coreai_comparch_trtllm/lizhiz/branch_guard_k3_models")}/job_${{SLURM_JOB_ID}}',
+        f"k3_checkpoint={shlex.quote(K3_CHECKPOINT_PATH)}",
+        f"k3_dataset_root={shlex.quote(str(Path(args.model_root) / 'datasets'))}",
+        'test -d "$k3_checkpoint"',
+        'test -d "$k3_dataset_root"',
+        'mkdir -p "$k3_model_root"',
+        'ln -sfn "$k3_checkpoint" "$k3_model_root/Kimi-K3"',
+        'ln -sfn "$k3_dataset_root" "$k3_model_root/datasets"',
+        'export LLM_MODELS_ROOT="$k3_model_root"',
+        'export KIMI_K3_CKPT="$k3_model_root/Kimi-K3"',
     ]
 
 
@@ -473,9 +517,12 @@ def _pytest_command(
 
 
 def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
+    if job.launcher != "pytest":
+        raise ValueError(f"{job.name} is launched by its benchmark harness")
     command, workdir = _pytest_command(args, job)
     lines = ["set -eu", *_shell_env_lines(args)]
     lines.extend(_install_lines(args))
+    lines.extend(_model_setup_lines(args, job))
     lines.append(f"cd {shlex.quote(workdir)}")
     if job.scope == "multi-node":
         lines.append(
@@ -541,17 +588,93 @@ def _print_jobs(jobs: Sequence[GuardJob]) -> None:
         print(
             f"{job.name}: scope={job.scope}, nodes={job.nodes}, "
             f"tasks={job.ntasks} ({job.ntasks_per_node}/node), "
-            f"gpus/node={job.gpus_per_node}, mpi={mpi}"
+            f"gpus/node={job.gpus_per_node}, mpi={mpi}, launcher={job.launcher}"
         )
         print(f"  tests: {selectors}")
 
 
 def _job_id_from_output(output: str) -> str | None:
     for line in reversed(output.splitlines()):
-        job_id = line.strip().split(";", maxsplit=1)[0]
+        stripped = line.strip()
+        submitted = re.search(r"Submitted batch job (\d+)", stripped)
+        if submitted is not None:
+            return submitted.group(1)
+        job_id = stripped.split(";", maxsplit=1)[0]
         if job_id.isdigit():
             return job_id
     return None
+
+
+def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Path]:
+    source = args.repo_root / job.selectors[0]
+    config = deepcopy(yaml.safe_load(source.read_text()))
+    log_dir = args.log_dir / job.name
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    config["slurm"]["partition"] = args.partition
+    config["slurm"]["account"] = args.account
+    config["slurm"]["job_time"] = args.multi_node_time
+    config["slurm"]["job_name"] = job.name
+    # batch-xdr allocates one GPU per task for this guard; the example config
+    # uses --gpus-per-node, which this partition rejects as an invalid GRES.
+    config["slurm"]["extra_args"] = ""
+    config["environment"]["container_image"] = args.image
+    config["environment"]["model_path"] = K3_CHECKPOINT_PATH
+    config["environment"]["trtllm_repo"] = str(args.repo_root) if args.install_from_repo else ""
+    config["environment"]["build_wheel"] = False
+    config["environment"]["trtllm_wheel_path"] = ""
+    config["environment"].pop("work_dir", None)
+    config["environment"]["log_dir"] = str(log_dir)
+    config["environment"]["container_mount"] = (
+        f"{args.repo_root}:{args.repo_root}:rw,/lustre:/lustre,/scratch:/scratch")
+
+    # The branch guard is an accuracy run, not the optional synthetic serving
+    # benchmark.  Keeping the benchmark disabled also avoids requiring its
+    # unrelated 8K/1K JSONL dataset on the compute nodes.
+    config["benchmark"]["enable_benchmark"] = False
+    accuracy_env = config.setdefault("accuracy", {}).setdefault("env_var", {})
+    accuracy_env["HF_HOME"] = os.environ.get(
+        "HF_HOME", "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache")
+    accuracy_env["HF_HUB_OFFLINE"] = "1"
+    accuracy_env["HF_DATASETS_OFFLINE"] = "1"
+
+    # The example config names a developer checkout/venv.  The guard mounts
+    # this repository and installs it from source, so remove those stale
+    # path prepends while retaining the K3/NIXL environment settings.
+    for key in ("worker_env_var", "server_env_var", "ctx_worker_env_var",
+                "gen_worker_env_var"):
+        value = config["environment"].get(key, "")
+        config["environment"][key] = " ".join(
+            token for token in value.split()
+            if not token.startswith(("TRTLLM_PATH_PREPEND=",
+                                     "TRTLLM_PYTHONPATH_PREPEND=")))
+
+    runtime_config = args.log_dir / f"{job.name}-config-{int(time.time())}.yaml"
+    runtime_config.write_text(yaml.safe_dump(config, sort_keys=False))
+    return runtime_config, log_dir
+
+
+def _submit_benchmark_job(args: argparse.Namespace, job: GuardJob) -> tuple[str, str]:
+    runtime_config, log_dir = _benchmark_config(args, job)
+    submitter = args.repo_root / "examples/disaggregated/slurm/benchmark/submit.py"
+    command = [
+        sys.executable,
+        str(submitter),
+        "--config",
+        str(runtime_config),
+        "--log-dir",
+        str(log_dir),
+    ]
+    result = subprocess.run(
+        command, cwd=args.repo_root, check=False, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        raise RuntimeError(output.strip() or f"benchmark submitter exited {result.returncode}")
+    job_id = _job_id_from_output(output)
+    if job_id is None:
+        raise RuntimeError(f"benchmark submitter returned no Slurm job id:\n{output}")
+    print(output, end="" if output.endswith("\n") else "\n")
+    return job_id, output
 
 
 def _test_result_summaries(log_path: Path) -> list[str]:
@@ -600,7 +723,7 @@ def _job_log_paths(args: argparse.Namespace, job_id: str, started_at: float) -> 
     primary = args.log_dir / f"job-{job_id}.log"
     paths = [primary]
     role_names = ("ctx", "context", "gen", "generation", "disagg")
-    for path in args.log_dir.rglob("*.log"):
+    for path in (*args.log_dir.rglob("*.log"), *args.log_dir.rglob("*.out"), *args.log_dir.rglob("*.err")):
         if path in paths:
             continue
         try:
@@ -745,7 +868,7 @@ def _print_test_results(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    jobs = _selected_jobs(args.scope)
+    jobs = _selected_jobs(args.scope, args.job)
     if args.list:
         _print_jobs(jobs)
         return 0
@@ -761,8 +884,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     failures = 0
     for job in jobs:
-        command = _sbatch_command(args, job)
         print(f"\n[{job.name}]")
+        if job.launcher == "benchmark":
+            if args.dry_run:
+                runtime_config = args.repo_root / job.selectors[0]
+                submitter = args.repo_root / "examples/disaggregated/slurm/benchmark/submit.py"
+                print(shlex.join([sys.executable, str(submitter), "--config", str(runtime_config)]))
+                continue
+            started_at = time.time()
+            try:
+                job_id, sbatch_output = _submit_benchmark_job(args, job)
+            except RuntimeError as error:
+                failures += 1
+                print(f"[{job.name}] FAIL ({error})", file=sys.stderr)
+                if not args.continue_on_failure:
+                    break
+                continue
+            print(f"[{job.name}] SUBMITTED job {job_id}")
+            if args.no_wait:
+                continue
+            passed = _monitor_job(args, job, job_id, started_at)
+            if passed:
+                print(f"[{job.name}] PASS")
+                continue
+            failures += 1
+            print(f"[{job.name}] FAIL (benchmark job did not complete)", file=sys.stderr)
+            if not args.continue_on_failure:
+                break
+            continue
+
+        command = _sbatch_command(args, job)
         print(shlex.join(command))
         if args.dry_run:
             continue

@@ -17,6 +17,7 @@ import os
 import re
 import time
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Iterator, Optional
 
 import openai
@@ -28,7 +29,7 @@ from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer
 from tests.unittest.llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import skip_pre_blackwell
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import DuckLLM, MyThreadPoolExecutor, Result, run_accuracy_test
 
@@ -151,7 +152,12 @@ DISAGG_SERVER_PORT = 8000
 SERVER_START_TIMEOUT = 7200
 
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
-MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro-DSpark"
+
+
+MODEL_PATH = str(
+    Path(__file__).resolve().parents[4]
+    / "build_images/nvfp4_test_model_root/DeepSeek-V4-Pro-DSpark"
+)
 
 EXTRA_EVALUATOR_KWARGS = {
     "apply_chat_template": True,
@@ -183,7 +189,12 @@ def _worker_env() -> dict[str, str]:
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_"))
-        and key not in {"UCX_TLS", "UCX_NET_DEVICES"}
+        and key not in {
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "UCX_TLS",
+            "UCX_NET_DEVICES",
+        }
     }
     # Pyxis starts these worker processes as root; preserve the explicit
     # Open MPI container override for mpi4py dynamic worker spawn.
@@ -204,16 +215,16 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "moe_expert_parallel_size": 4,
         "enable_attention_dp": True,
         "moe_config": {
-            # DeepSeek-V4 routed experts are W4A8 MXFP4. Use the MegaMoE
-            # DeepGEMM path, which supports the Rubin SM107 deployment.
-            "backend": "MEGAMOE_DEEPGEMM",
+            # DeepSeek-V4 routed experts use NVFP4 in this test. Use the
+            # MegaMoE CuTe DSL path for the NVFP4 checkpoint.
+            "backend": "MEGAMOE_CUTEDSL",
         },
         "max_batch_size": 128,
         "max_seq_len": 4096,
         "max_num_tokens": 4096,
         "kv_cache_config": {
             "enable_block_reuse": False,
-            "free_gpu_memory_fraction": 0.9 if enable_dspark else 0.6,
+            "free_gpu_memory_fraction": 0.7,
         },
         "enable_chunked_prefill": False,
         "disable_overlap_scheduler": True,
