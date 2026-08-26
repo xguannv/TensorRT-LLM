@@ -34,13 +34,8 @@ def _require_cuda_fp32(name: str, tensor: torch.Tensor) -> None:
 
 
 def _as_token_rows(tensor: torch.Tensor) -> torch.Tensor:
-    """Hand a ``[1, B, heads, dim]`` decode input to the kernel as it lies.
-
-    The kernel walks these through a batch-row stride, so a column slice of a
-    fused in-projection needs no repacking — only the head and channel axes
-    have to be packed, which they already are for any such slice.
-    """
-    if tensor.stride(3) == 1 and tensor.stride(2) == tensor.shape[3]:
+    """Keep a decode input view when its head and channel axes are packed."""
+    if tensor.ndim == 4 and tensor.stride(3) == 1 and tensor.stride(2) == tensor.shape[3]:
         return tensor
     return tensor.contiguous()
 
@@ -97,19 +92,12 @@ def run_kda_decode_fusion_cuda(
     use_beta_sigmoid_in_kernel: bool = True,
     verbose: bool = False,
     update_conv_cache: bool = False,
-    roll_conv_pool: bool = False,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Run CUDA KDA decode fusion for the tuned decode shapes.
 
     ``ssm_state_indices=None`` selects the tuned batch-local static layout,
     while a tensor selects the indexed state-pool layout.
-
-    ``roll_conv_pool`` takes ``cs_q``/``cs_k``/``cs_v`` as the three section
-    views of one HF-layout ``[slots, 3 * dim, W]`` conv pool rather than a
-    batch-row-dense staged copy: the kernel reads each admitted request's
-    window straight out of the pool and stores it back rolled forward by this
-    token, so the step neither stages the window nor rolls the pool separately.
-    It needs ``ssm_state_indices`` to resolve slots.
     """
     for name, tensor in (
         ("x_q", x_q),
@@ -178,38 +166,21 @@ def run_kda_decode_fusion_cuda(
     for name, tensor in (("dt_bias", dt_bias), ("onorm_weight", onorm_weight)):
         _require_cuda_fp32(name, tensor)
 
-    if update_conv_cache and roll_conv_pool:
-        raise ValueError("update_conv_cache and roll_conv_pool are mutually exclusive")
-
     if update_conv_cache:
-        q_stride = H * 128
-        v_stride = HV * 128
+        if any(tensor.ndim != 3 for tensor in (cs_q, cs_k, cs_v)):
+            raise ValueError("update_conv_cache expects rank-3 conv-state pools")
+        projection_size = H * 128
+        conv_state_width = cs_q.shape[2]
+        min_slot_stride = 3 * projection_size * conv_state_width
         if not (
-            cs_q.stride(1) == 1
-            and cs_k.stride(1) == 1
-            and cs_v.stride(1) == 1
-            and cs_q.stride(2) == q_stride
-            and cs_k.stride(2) == q_stride
-            and cs_v.stride(2) == v_stride
+            cs_q.stride(0) == cs_k.stride(0) == cs_v.stride(0)
+            and cs_q.stride(0) >= min_slot_stride
+            and cs_q.stride(1) == cs_k.stride(1) == cs_v.stride(1) == conv_state_width
+            and cs_q.stride(2) == cs_k.stride(2) == cs_v.stride(2) == 1
         ):
             raise ValueError(
-                "update_conv_cache expects transposed conv-state layout: "
-                "shape [B, dim, 3], stride(1)=1, stride(2)=dim"
-            )
-
-    if roll_conv_pool:
-        if ssm_state_indices is None:
-            raise ValueError(
-                "roll_conv_pool addresses the conv pool by cache slot and needs ssm_state_indices"
-            )
-        width = cs_q.shape[-1]
-        if not all(
-            cs.stride(2) == 1 and cs.stride(1) == width and cs.shape[-1] == width
-            for cs in (cs_q, cs_k, cs_v)
-        ):
-            raise ValueError(
-                "roll_conv_pool expects [slots, dim, W] section views of one "
-                "HF-layout conv pool, each channel's window W contiguous columns"
+                "update_conv_cache expects section views of packed "
+                "[slots, 3 * dim, width] conv states"
             )
 
     if cu_seqlens is None:
@@ -221,11 +192,7 @@ def run_kda_decode_fusion_cuda(
             raise ValueError("cu_seqlens must have shape [B + 1]")
         cu_seqlens = cu_seqlens.contiguous()
 
-    keep_conv_layout = update_conv_cache or roll_conv_pool
     args = (
-        # The kernel reads the per-token inputs through a batch-row stride, so
-        # column slices of a fused in-projection go down as they are; only the
-        # head and channel axes have to be packed.
         _as_token_rows(x_q),
         _as_token_rows(x_k),
         _as_token_rows(x_v),
@@ -235,13 +202,13 @@ def run_kda_decode_fusion_cuda(
         bias_q.contiguous(),
         bias_k.contiguous(),
         bias_v.contiguous(),
-        cs_q if keep_conv_layout else cs_q.contiguous(),
-        cs_k if keep_conv_layout else cs_k.contiguous(),
-        cs_v if keep_conv_layout else cs_v.contiguous(),
+        cs_q if update_conv_cache else cs_q.contiguous(),
+        cs_k if update_conv_cache else cs_k.contiguous(),
+        cs_v if update_conv_cache else cs_v.contiguous(),
         A_log.contiguous(),
         _as_token_rows(g),
         dt_bias.contiguous(),
-        beta if beta.stride(-1) == 1 else beta.contiguous(),
+        beta if beta.ndim == 3 and beta.stride(2) == 1 else beta.contiguous(),
         _as_token_rows(onorm_g),
         onorm_weight.contiguous(),
         ssm_state_indices,
@@ -259,7 +226,6 @@ def run_kda_decode_fusion_cuda(
         lower_bound_value,
         float(scale),
         float(onorm_eps),
+        enable_pdl,
     )
-    return torch.ops.trtllm.kda_decode(
-        *args, *launch_args, output=out, roll_conv_pool=bool(roll_conv_pool)
-    )
+    return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)

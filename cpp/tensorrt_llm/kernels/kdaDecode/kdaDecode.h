@@ -42,30 +42,19 @@ constexpr bool shouldUseCompactHeads(int batchSize, int numHeads, int numValueHe
         && batchSize <= kCompactHeadsWorkThreshold / numHeads;
 }
 
-//! How the decode step's per-token inputs and conv-state pool are addressed.
+//! Batch-row strides for the decode step's per-token inputs.
 //!
-//! The row strides are the element distance between consecutive batch rows.
-//! Each is the packed value (``numHeads * 128``, or ``numHeads`` for beta)
-//! when the tensor was materialized for the kernel; passing the strides of a
-//! fused in-projection's output instead lets the kernel read its column
-//! slices where they already are, with no repacking pass.
+//! The head and channel axes remain packed. A separate row stride lets the
+//! kernel consume column views of fused projection outputs without first
+//! materializing each view as a contiguous tensor.
 struct KdaDecodeIoLayout
 {
-    int xQRowStride;
-    int xKRowStride;
-    int xVRowStride;
-    int gateRowStride;
-    int betaRowStride;
-    int outputNormGateRowStride;
-    //! Element distance between conv-pool slots. Only read when
-    //! ``rollConvPool`` is set.
-    int64_t convPoolSlotStride;
-    //! Take each request's conv window straight out of the layer's
-    //! ``[slots, sections * dim, W]`` pool (``W`` contiguous, addressed by
-    //! ``ssmStateIndices``) and store it back rolled forward by this token,
-    //! instead of reading a batch-row-dense staged copy. ``convStateQ/K/V``
-    //! then point at the pool's three section views.
-    bool rollConvPool;
+    int64_t xQRowStride;
+    int64_t xKRowStride;
+    int64_t xVRowStride;
+    int64_t gateRowStride;
+    int64_t betaRowStride;
+    int64_t outputNormGateRowStride;
 };
 
 //! Parameters for the fused, single-token KDA decode kernel.
@@ -94,6 +83,7 @@ struct KdaDecodeParams
     int const* cuSeqlens;
     float* state;
     int64_t stateSlotStride;
+    int64_t convStateSlotStride;
     void* output;
     int batchSize;
     int numHeads;
@@ -102,6 +92,7 @@ struct KdaDecodeParams
     bool updateConvCache;
     bool useLowerBound;
     bool applyBetaSigmoid;
+    bool enablePdl;
     float lowerBound;
     float scale;
     float outputNormEps;

@@ -21,7 +21,6 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.16.1
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.12.0a0.
 # The floor admits the NGC alpha builds (2.12.0a0+...); torch<2.12 pins triton==3.6.0,
 # which conflicts with the triton pin below.
