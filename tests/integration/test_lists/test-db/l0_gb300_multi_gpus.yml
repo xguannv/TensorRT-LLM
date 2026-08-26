@@ -51,6 +51,11 @@ l0_gb300_multi_gpus:
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
+  # KDA prefill scratch must stay bounded: _get_buffers is keyed on the
+  # unquantized per-iteration context token count, so a cache entry that
+  # outlives its LRU eviction strands ~1 GiB per distinct shape and OOMs a
+  # long context run ~40 min in. Memory-only assertions; no kernels.
+  - unittest/_torch/modules/kimi_kda/test_kda_buf_cache_bounded.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).

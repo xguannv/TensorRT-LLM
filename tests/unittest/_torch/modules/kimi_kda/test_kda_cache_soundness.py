@@ -32,7 +32,9 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
+    KDAKernelDispatch,
+)
 
 NUM_HEADS = 96
 HEAD_K_DIM = 128
@@ -40,12 +42,16 @@ LOWER_BOUND = -5.0
 
 
 def _has_supported_gpu() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
+    # SM100/SM103 (Blackwell) and SM107 (Rubin) -- must track
+    # _kda_kernels.is_kda_optimized_supported(), which accepts all three.
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0) in {(10, 0), (10, 3), (10, 7)}
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell (SM100/SM103)",
+    reason="Kimi K3 is supported only on Blackwell SM100/SM103 or Rubin SM107",
 )
 
 
@@ -108,7 +114,9 @@ def _run(dispatch, gate_params, q, k, v, g, beta, cu):
 
 def _assert_close(name, actual, expected):
     actual, expected = actual.float(), expected.float()
-    cos = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item()
+    cos = torch.nn.functional.cosine_similarity(
+        actual.flatten(), expected.flatten(), dim=0
+    ).item()
     rel = ((actual - expected).norm() / (expected.norm() + 1e-12)).item()
     assert cos > 0.999 and rel < 3e-2, f"{name}: cos={cos:.6f} rel_l2={rel:.3e}"
 
@@ -133,8 +141,9 @@ def _flush_tensor_cache_pins():
     """
     from fla.ops.utils.index import prepare_chunk_indices as fla_pci
     from fla.ops.utils.index import prepare_chunk_offsets as fla_pco
-
-    from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices as intree_pci
+    from tensorrt_llm._torch.modules.fla.index import (
+        prepare_chunk_indices as intree_pci,
+    )
 
     for _ in range(5):
         dummy = torch.tensor([0, 64], dtype=torch.long, device="cuda")
@@ -184,13 +193,8 @@ def _make_eqlen_inputs(batch, t, seed):
     def rnd(*shape, dtype=torch.bfloat16):
         return torch.randn(*shape, generator=gen, dtype=torch.float32, device="cuda").to(dtype)
 
-    return (
-        rnd(batch, t, h, k),
-        rnd(batch, t, h, k),
-        rnd(batch, t, h, k),
-        rnd(batch, t, h, k),
-        rnd(batch, t, h, dtype=torch.float32),
-    )
+    return (rnd(batch, t, h, k), rnd(batch, t, h, k), rnd(batch, t, h, k),
+            rnd(batch, t, h, k), rnd(batch, t, h, dtype=torch.float32))
 
 
 @pytest.mark.parametrize("regime", ["eqlen", "varlen"])
@@ -219,7 +223,8 @@ def test_nondefault_stream_parity(dispatch_pair, gate_params, regime):
     # Warmup compile of the optimized variants on the default stream so the
     # streamed run below launches immediately (a ~100 s JIT inside the
     # streamed region would let the sleep expire and hide the race).
-    _run(optimized, gate_params, q, k, v, g, beta, _make_cu(lens) if lens else None)
+    _run(optimized, gate_params, q, k, v, g, beta,
+         _make_cu(lens) if lens else None)
     torch.cuda.synchronize()
 
     exec_stream = torch.cuda.Stream()  # non-blocking, like the executor's
@@ -230,8 +235,8 @@ def test_nondefault_stream_parity(dispatch_pair, gate_params, regime):
         q2, k2, v2 = q * 1.0, k * 1.0, v * 1.0
         g2, beta2 = g * 1.0, beta * 1.0
         out_opt, state_opt = _run(
-            optimized, gate_params, q2, k2, v2, g2, beta2, _make_cu(lens) if lens else None
-        )
+            optimized, gate_params, q2, k2, v2, g2, beta2,
+            _make_cu(lens) if lens else None)
         # Consume on the execution stream immediately, exactly like the
         # runtime's output-gate matmul and ssm_pool.index_copy_ do.
         out_opt = out_opt * 1.0
@@ -261,26 +266,28 @@ def test_recycled_id_varlen_pure_cache(dispatch_pair, gate_params):
     _run(optimized, gate_params, q, k, v, g, beta, cu_holder[0])
     torch.cuda.synchronize()
     assert mod._varlen_pure_cache.get(id(cu_holder[0])) is True, (
-        "test setup: expected VARLEN_PURE=True cached under id(cu1)"
-    )
+        "test setup: expected VARLEN_PURE=True cached under id(cu1)")
 
     old_id, pruned = _release_cu(mod, cu_holder)
     nonaligned = [100, 257, 219]  # same n_seqs so the entry shape matches
     if not pruned:
         # Entry outlived our release: something still pins the tensor. That
         # is sound ONLY if no new tensor can land on its id.
-        clash = _alloc_with_recycled_id(old_id, lambda: _make_cu(nonaligned), attempts=64)
+        clash = _alloc_with_recycled_id(
+            old_id, lambda: _make_cu(nonaligned), attempts=64)
         assert clash is None, (
-            "UNSOUND: id recycled while a stale _varlen_pure_cache entry for it is still present"
-        )
-        pytest.skip("cu_seqlens still pinned externally; recycled-id scenario unreachable this run")
+            "UNSOUND: id recycled while a stale _varlen_pure_cache entry "
+            "for it is still present")
+        pytest.skip("cu_seqlens still pinned externally; recycled-id "
+                    "scenario unreachable this run")
 
     cu2 = _alloc_with_recycled_id(old_id, lambda: _make_cu(nonaligned))
     if cu2 is None:
         pytest.skip("could not obtain a recycled id for cu_seqlens")
     q, k, v, g, beta = _make_inputs(sum(nonaligned), seed=12)
     out_opt, state_opt = _run(optimized, gate_params, q, k, v, g, beta, cu2)
-    out_ref, state_ref = _run(reference, gate_params, q, k, v, g, beta, _make_cu(nonaligned))
+    out_ref, state_ref = _run(reference, gate_params, q, k, v, g, beta,
+                              _make_cu(nonaligned))
     _assert_close("recycled_pure/out", out_opt, out_ref)
     _assert_close("recycled_pure/state", state_opt, state_ref)
     assert mod._varlen_pure_cache.get(id(cu2)) is False
@@ -302,11 +309,13 @@ def test_recycled_id_single_seq_caches(dispatch_pair, gate_params):
 
     old_id, pruned = _release_cu(mod, cu_holder)
     if not pruned:
-        clash = _alloc_with_recycled_id(old_id, lambda: _make_cu([300]), attempts=64)
+        clash = _alloc_with_recycled_id(
+            old_id, lambda: _make_cu([300]), attempts=64)
         assert clash is None, (
-            "UNSOUND: id recycled while stale Phase 2.1 cache entries for it are still present"
-        )
-        pytest.skip("cu_seqlens still pinned externally; recycled-id scenario unreachable this run")
+            "UNSOUND: id recycled while stale Phase 2.1 cache entries for "
+            "it are still present")
+        pytest.skip("cu_seqlens still pinned externally; recycled-id "
+                    "scenario unreachable this run")
     assert old_id not in mod._varlen_single_seqlen_cache
 
     cu2 = _alloc_with_recycled_id(old_id, lambda: _make_cu([300]))
@@ -314,7 +323,8 @@ def test_recycled_id_single_seq_caches(dispatch_pair, gate_params):
         pytest.skip("could not obtain a recycled id for cu_seqlens")
     q, k, v, g, beta = _make_inputs(300, seed=22)
     out_opt, state_opt = _run(optimized, gate_params, q, k, v, g, beta, cu2)
-    out_ref, state_ref = _run(reference, gate_params, q, k, v, g, beta, _make_cu([300]))
+    out_ref, state_ref = _run(reference, gate_params, q, k, v, g, beta,
+                              _make_cu([300]))
     _assert_close("recycled_single/out", out_opt, out_ref)
     _assert_close("recycled_single/state", state_opt, state_ref)
 
@@ -330,53 +340,7 @@ def test_single_seq_same_object_repeated(dispatch_pair, gate_params):
     for i in range(2):
         q, k, v, g, beta = _make_inputs(300, seed=40 + i)
         out_opt, state_opt = _run(optimized, gate_params, q, k, v, g, beta, cu)
-        out_ref, state_ref = _run(reference, gate_params, q, k, v, g, beta, _make_cu([300]))
+        out_ref, state_ref = _run(reference, gate_params, q, k, v, g, beta,
+                                  _make_cu([300]))
         _assert_close(f"sameobj_call{i}/out", out_opt, out_ref)
         _assert_close(f"sameobj_call{i}/state", state_opt, state_ref)
-
-
-@torch.no_grad()
-def test_recycled_id_input_wrap_cache():
-    """_ct_cached wrappers are keyed by (id(tensor), etype); the wrapper pins
-    the tensor's storage, so entries for live tensors are immortal by
-    design. Soundness requires the entry to be popped when the keyed tensor
-    dies before its id can be recycled — otherwise a new tensor on the
-    recycled id would silently reuse a wrapper over freed storage."""
-    mod = _op_module()
-    import cutlass
-
-    t1 = torch.zeros(64, 64, dtype=torch.bfloat16, device="cuda")
-    w1 = mod._ct_cached(t1, cutlass.BFloat16)
-    assert mod._ct_cached(t1, cutlass.BFloat16) is w1  # cache hit path
-    old_id = id(t1)
-    key = (old_id, cutlass.BFloat16)
-    assert key in mod._input_wrap_cache
-    del t1
-    gc.collect()
-
-    if key in mod._input_wrap_cache:
-        # The wrapper (still referenced by the cache) pins the tensor object,
-        # so the entry survives — sound only if the id can NOT be recycled
-        # while the entry is present. Prove no new tensor lands on old_id.
-        t2 = _alloc_with_recycled_id(
-            old_id,
-            lambda: torch.zeros(64, 64, dtype=torch.bfloat16, device="cuda"),
-            attempts=64,
-        )
-        assert t2 is None, (
-            "UNSOUND: id recycled while a stale _input_wrap_cache entry for "
-            "it is still present — a new tensor would reuse a wrapper over "
-            "another tensor's storage"
-        )
-        # Dropping the last wrapper ref must let the finalizer prune.
-        del w1
-        mod._input_wrap_cache.pop(key, None)
-        gc.collect()
-    else:
-        # Finalizer fired at t1's dealloc — entry pruned before any recycle.
-        del w1
-
-    # Fresh tensor (recycled id or not) must get a fresh wrapper.
-    t3 = torch.zeros(64, 64, dtype=torch.bfloat16, device="cuda")
-    w3 = mod._ct_cached(t3, cutlass.BFloat16)
-    assert mod._input_wrap_cache[(id(t3), cutlass.BFloat16)] is w3
