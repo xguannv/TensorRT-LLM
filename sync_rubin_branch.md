@@ -1680,3 +1680,38 @@ Context: previous sync attempt retained on `backup/rubin-dsv4-k3-pre-redo-202608
   pre-commit hooks pass except `validate-test-lists`, which reports the same three unrelated,
   pre-existing stale `TestNemotronH` waiver entries at `waives.txt:291-293`.
 - Focused pytest could not run because the available Python environment has no `pytest` module.
+
+
+### Import GitHub PR #18185 onto `user/lizhiz/rubin-advance` (2026-08-25)
+
+#### PR boundary and production loader integration
+
+- Conflict/risk: PR #18185 is a six-commit linear series based at `6c5119411d`; its DeepSeek-V4
+  loader changes apply onto a Rubin model that has later MoE resolver, quantization, and SM107 work.
+- Human direction: not required - compatible union.
+- Resolution: squash all six non-merge commits as `6cf641d633`, retain Rubin's later model code,
+  and apply the PR's consumable-weight ownership, per-subtree consumption, and EPLB safetensor
+  page-out behavior without changing public APIs.
+- Evidence: the fetched PR head is `b91105d625`, the range contains six commits and zero merges,
+  and the staged production diff was compared with `ConsumableWeightsDict` plus the established
+  DeepSeek-V3 consumption pattern.
+- Status: applied, staged, and syntax/lint-validated.
+
+#### Performance waiver conflict
+
+- Conflict: the PR removes nine DeepSeek-V4 performance waivers, while Rubin has a substantially
+  newer waiver list and already lacks one of those nine entries.
+- Human direction: not required - exact intent is recoverable from the six source commits.
+- Resolution: preserve Rubin's complete waiver list and remove exactly the eight PR-targeted entries
+  still present. Keep unrelated Rubin waivers, including the two `con8` cases.
+- Evidence: all three index stages and the per-commit waiver diffs from `8dfd3c8bd1` and
+  `b91105d625` were compared directly; no unmerged paths remain.
+- Status: resolved, canonically sorted by the repository hook, and staged.
+
+#### Validation
+
+- Both changed Python files pass `py_compile`, Ruff, Ruff-format, and `git diff --cached --check`.
+  All other applicable hooks pass.
+- `validate-test-lists` reports only the same three pre-existing stale `TestNemotronH` entries, now
+  at `waives.txt:246-248`; the file-content hook also canonically relocated 23 existing Rubin waivers.
+- Focused DeepSeek-V4 loader tests could not run because the available Python has no `pytest` module.
