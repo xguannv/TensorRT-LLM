@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The KDA decode fast path's three conv-state tiers must agree.
 
-``KimiKDARuntime._forward_decode`` gets each request's short-convolution
+``KimiKDALinearAttention.forward_decode`` gets each request's short-convolution
 window to the kernel, and rolls the layer's pool forward by the generated
 token, in one of three ways:
 
@@ -27,8 +27,8 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.models import modeling_kimi_linear  # noqa: E402
-from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer  # noqa: E402
 
 HIDDEN_SIZE = 512
 NUM_HEADS = 4
@@ -66,16 +66,16 @@ def _skip_without_supported_gpu() -> None:
         pytest.skip("Kimi K3 is supported only on Blackwell (SM100/SM103)")
 
 
-def _make_runtime() -> KimiKDARuntime:
-    runtime = KimiKDARuntime(_Cfg(), layer_idx=0).to("cuda")
+def _make_runtime() -> KimiKDALinearAttention:
+    runtime = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
     # dt_bias is declared but not initialized (it expects a checkpoint), so
     # without this it holds whatever the caching allocator last left there —
     # large enough values overflow the decay to NaN, and every comparison
     # below then fails on NaN != NaN rather than on a real difference.
     # finalize_decode_weights snapshots it, so seed it first.
-    torch.nn.init.normal_(runtime.mixer.dt_bias, std=0.1)
+    torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     runtime.finalize_decode_weights()
-    if runtime._in_proj_weight is None:
+    if runtime._qkvg_proj_weight is None:
         pytest.skip("decode fast path unavailable for this build")
     return runtime
 
@@ -89,7 +89,7 @@ def _run_steps(runtime, tier, x, conv_pool, ssm_pool, slot_indices, monkeypatch)
     the staging tier in place and clearing the bound pass drops to ATen.
     """
     if tier != "kernel-roll":
-        monkeypatch.setattr(modeling_kimi_linear, "_FUSED_KDA_CONV_STATE_ENABLED", False)
+        monkeypatch.setattr(kimi_kda_mixer, "_FUSED_KDA_CONV_STATE_ENABLED", False)
     if tier == "aten":
         monkeypatch.setattr(runtime, "_fused_conv_state_step", None)
 
@@ -97,7 +97,7 @@ def _run_steps(runtime, tier, x, conv_pool, ssm_pool, slot_indices, monkeypatch)
     outputs = []
     for step in range(x.shape[1]):
         outputs.append(
-            runtime._forward_decode(
+            runtime.forward_decode(
                 x[:, step],
                 conv_pool,
                 ssm_pool,
