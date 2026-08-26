@@ -31,6 +31,7 @@ The public ``trtllm::kda_prefill`` operator returns only the KDA output and
 final recurrent state. Intermediate matrices remain private runner workspace.
 """
 
+import os
 import weakref
 from typing import Optional, Tuple
 
@@ -122,12 +123,43 @@ _varlen_pure_cache = {}
 # single-seq cu_seqlens.
 _varlen_single_seqlen_cache = {}
 
-# id(tensor) -> cute_wrapper. The wrappers themselves are stateless views
-# over the tensor's storage, so they remain valid as long as the tensor's
-# data pointer / shape / strides don't change. Callers that reuse the same
-# tensor objects across iterations (typical benchmark pattern) hit the
-# cache; per-call fresh tensors (the executor runtime pattern) rebuild.
-_input_wrap_cache = {}
+# ===== Caching rule for this module (read before adding a cache) =====
+#
+# A cute wrapper built by ``from_dlpack`` holds a STRONG reference to the
+# torch tensor it was built from. So a module-level dict that stores a
+# wrapper keeps that tensor -- and its GPU storage -- alive for the life of
+# the process. id()-keyed weakref pruning cannot save you here: the cache
+# entry is itself what keeps the key object alive, so the finalizer never
+# runs. Such an entry is immortal by construction.
+#
+# Therefore:
+#   * Never put a wrapper over a per-call activation in a module-level dict
+#     (see the note in _launch_k4_persistent).
+#   * Never put a wrapper over LRU-managed scratch in a module-level dict
+#     either -- it defeats the eviction. Store it next to the buffers whose
+#     lifetime it must share (see ``cute_wrappers`` in _get_buffers).
+#   * A wrapper over a private COPY the module intends to own forever is
+#     fine (see _get_dt_bias_ct / _get_k4_varlen_cu_co, which clone on
+#     purpose so the cached value never aliases the keyed object).
+#
+# Every shape-keyed dict below must also be LRU-bounded via _lru_put: T is
+# the packed context-token count of one iteration (attn_metadata
+# .num_ctx_tokens), which the scheduler does not quantize, so an unbounded
+# shape-keyed cache grows without limit under any real serving load.
+
+
+def _lru_put(cache, key, value, max_entries):
+    """Insert ``value`` into ``cache``, evicting in insertion order first."""
+    while len(cache) >= max_entries:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
+
+
+def _lru_touch(cache, key):
+    """Move ``key`` to the MRU end so hot shapes survive eviction."""
+    cache[key] = cache.pop(key)
+    return cache[key]
 
 
 def _prune_on_gc(cache, key, *keyobjs):
@@ -143,26 +175,6 @@ def _prune_on_gc(cache, key, *keyobjs):
     """
     for o in keyobjs:
         weakref.finalize(o, cache.pop, key, None)
-
-
-def _ct_cached(t, etype):
-    """`_ct(t, etype)` with id(t)-based cache. Returns the same cute wrapper
-    for repeated calls with the same tensor object, avoiding per-call
-    `from_dlpack` overhead (~5-10us each).
-
-    ONLY use for tensors with process-long lifetime (module params, the
-    module-level scratch from ``_get_buffers``): the cached wrapper pins the
-    tensor's storage, so the weakref pruning never fires for the keyed
-    object and a per-call activation would be pinned forever (~100MB/call
-    leak in the executor runtime). Per-call tensors must use plain ``_ct``.
-    """
-    key = (id(t), etype)
-    w = _input_wrap_cache.get(key)
-    if w is None:
-        w = _ct(t, etype)
-        _input_wrap_cache[key] = w
-        _prune_on_gc(_input_wrap_cache, key, t)
-    return w
 
 
 # Cache for dt_bias `.float().contiguous().view(H, K)` + cute wrapper.
@@ -272,42 +284,49 @@ def _get_side_stream(dev):
 
 # Buffer cache: avoid re-allocating ~67us of intermediate tensors per call.
 # Also caches cute.Tensor wrappers (saves ~7us each call from from_dlpack).
-# LRU-bounded: entries are keyed by (B, T, ...) shapes, and the runtime
-# executor calls with a different token count per prefill batch — an
-# unbounded dict would pin ~T*150KB of scratch per distinct shape forever.
+#
+# Sized in bytes, not in "entries": at K3's H=96, K=V=128 one entry owns
+# ~0.12 MiB per token, i.e. ~1 GiB at max_num_tokens=8192. This scratch is
+# allocated AFTER the KV pool has been sized from the warmup peak (warmup
+# compiles a single 257-token context), so every resident entry is memory
+# the KV-cache accounting never saw -- keep the cap small.
+#
+# A small cap costs almost nothing: T is the packed context-token count of
+# ONE iteration, shared by all 69 KDA layers, so a 1-entry cache already
+# hits 68/69 within a forward. Cross-iteration hits are incidental --
+# T = attn_metadata.num_ctx_tokens is not quantized by the scheduler
+# (only budget-trimmed chunks get rounded to a 64-multiple), so the shape
+# usually changes from one iteration to the next.
 _buf_cache = {}
-_BUF_CACHE_MAX_ENTRIES = 8
+_BUF_CACHE_MAX_ENTRIES = max(1, int(os.getenv("TLLM_KDA_BUF_CACHE_ENTRIES", "2")))
 
 # Padded-input scratch cache for the eqlen partial-chunk path. Keyed by
 # (B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T).
 # real_T is part of the key so the g sentinel tail [real_T:T_padded] = -1e3
-# is set once and reused across calls with the same shape. LRU-bounded like
-# _buf_cache: real_T varies per prefill batch, so an unbounded dict would pin
-# scratch for every distinct token count forever.
+# is set once and reused across calls with the same shape.
 _padded_input_cache = {}
-_PAD_CACHE_MAX_ENTRIES = 8
+_PADDED_INPUT_CACHE_MAX_ENTRIES = _BUF_CACHE_MAX_ENTRIES
 
 # Sentinel-padded g scratch for varlen single-seq Phase 2.1 path. Keyed by
 # (B, T_padded, H, K, dtype, device, real_T). The tail [real_T:T_padded] is
 # pre-set to -1e3 once at cache init; subsequent calls only overwrite the
 # valid prefix [0, real_T).
+#
+# real_T is the request's true prompt length, so the key space is as wide as
+# the prompt-length distribution -- one ~200 MiB buffer per distinct length
+# if left unbounded.
 _g_sentinel_cache = {}
+_G_SENTINEL_CACHE_MAX_ENTRIES = _BUF_CACHE_MAX_ENTRIES
 
 
 def _get_g_sentinel_buffer(B, T_padded, H, K, dtype_g, device, real_T):
     key = (B, T_padded, H, K, dtype_g, device.index if device.index is not None else 0, real_T)
-    e = _g_sentinel_cache.get(key)
-    if e is None:
-        e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
-        if real_T < T_padded:
-            e[:, real_T:] = -1000.0
-        while len(_g_sentinel_cache) >= _PAD_CACHE_MAX_ENTRIES:
-            _g_sentinel_cache.pop(next(iter(_g_sentinel_cache)))
-        _g_sentinel_cache[key] = e
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _g_sentinel_cache[key] = _g_sentinel_cache.pop(key)
-    return e
+    if key in _g_sentinel_cache:
+        return _lru_touch(_g_sentinel_cache, key)
+    e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
+    if real_T < T_padded:
+        e[:, real_T:] = -1000.0
+    return _lru_put(_g_sentinel_cache, key, e, _G_SENTINEL_CACHE_MAX_ENTRIES)
 
 
 def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T):
@@ -322,25 +341,19 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
         device.index if device.index is not None else 0,
         real_T,
     )
-    e = _padded_input_cache.get(key)
-    if e is None:
-        q_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        k_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        v_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
-        beta_pad = torch.zeros(B, T_padded, H, dtype=dtype_beta, device=device)
-        # g: zero in [0, real_T), sentinel -1e3 in [real_T, T_padded). Caller's
-        # data overwrites the prefix each call; the sentinel tail never moves.
-        g_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
-        if real_T < T_padded:
-            g_pad[:, real_T:] = -1000.0
-        e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
-        while len(_padded_input_cache) >= _PAD_CACHE_MAX_ENTRIES:
-            _padded_input_cache.pop(next(iter(_padded_input_cache)))
-        _padded_input_cache[key] = e
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _padded_input_cache[key] = _padded_input_cache.pop(key)
-    return e
+    if key in _padded_input_cache:
+        return _lru_touch(_padded_input_cache, key)
+    q_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    k_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    v_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_qkv, device=device)
+    beta_pad = torch.zeros(B, T_padded, H, dtype=dtype_beta, device=device)
+    # g: zero in [0, real_T), sentinel -1e3 in [real_T, T_padded). Caller's
+    # data overwrites the prefix each call; the sentinel tail never moves.
+    g_pad = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
+    if real_T < T_padded:
+        g_pad[:, real_T:] = -1000.0
+    e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
+    return _lru_put(_padded_input_cache, key, e, _PADDED_INPUT_CACHE_MAX_ENTRIES)
 
 
 def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=False):
@@ -411,6 +424,20 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         kg_ct = _wrap(KG_flat, bf16)
         o_ct = _wrap(O_token, bf16)
         gk_ct = _wrap(gk_flat, fp32)
+
+        # K123 consumes the un-flattened [B, T, H, *] views of the same
+        # scratch (K4 consumes the token-flat ones above), so it needs its
+        # own wrappers. They MUST be built here and stored in the cache
+        # entry: a wrapper holds a strong reference to its torch tensor, so
+        # parking these in a module-level dict makes the whole buffer set
+        # immortal and the LRU below frees nothing. See the caching rule at
+        # the top of this file.
+        k123_ks_ct = _ct(k_scaled, bf16)
+        k123_kg_ct = _ct(kg, bf16)
+        k123_qs_ct = _ct(q_scaled, bf16)
+        k123_gk_ct = _ct(gk_last_exp, fp32)
+        k123_aqk_ct = _ct(A_qk, bf16)
+        k123_akk_ct = _ct(A_kk, bf16)
         cu_eqlen_ct = from_dlpack(cu_eqlen, assumed_align=4).mark_layout_dynamic()
         cu_eqlen_ct.element_type = cutlass.Int32
         co_eqlen_ct = from_dlpack(co_eqlen, assumed_align=4).mark_layout_dynamic()
@@ -454,6 +481,12 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             akk_in_view=akk_in_view,
             akk_out_view=akk_out_view,
             s_ct=s_ct,
+            k123_ks_ct=k123_ks_ct,
+            k123_kg_ct=k123_kg_ct,
+            k123_qs_ct=k123_qs_ct,
+            k123_gk_ct=k123_gk_ct,
+            k123_aqk_ct=k123_aqk_ct,
+            k123_akk_ct=k123_akk_ct,
             side_stream=side_stream_cached,
             # Filled lazily on first launch — saves cache_key tuple build +
             # outer dict lookup on subsequent calls.
@@ -462,25 +495,28 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             _k4_fn=None,
         )
 
-        while len(_buf_cache) >= _BUF_CACHE_MAX_ENTRIES:
-            _buf_cache.pop(next(iter(_buf_cache)))
-        _buf_cache[key] = (
-            k_scaled,
-            kg,
-            q_scaled,
-            gk_last_exp,
-            A_qk,
-            A_kk,
-            O_flat,
-            S_out,
-            cu_eqlen,
-            co_eqlen,
-            cute_wrappers,
+        # Eviction is only real because nothing outside this tuple holds a
+        # reference to the buffers or their wrappers.
+        return _lru_put(
+            _buf_cache,
+            key,
+            (
+                k_scaled,
+                kg,
+                q_scaled,
+                gk_last_exp,
+                A_qk,
+                A_kk,
+                O_flat,
+                S_out,
+                cu_eqlen,
+                co_eqlen,
+                cute_wrappers,
+            ),
+            _BUF_CACHE_MAX_ENTRIES,
         )
-    else:
-        # LRU refresh so hot shapes survive eviction.
-        _buf_cache[key] = _buf_cache.pop(key)
-    return _buf_cache[key]
+    # LRU refresh so hot shapes survive eviction.
+    return _lru_touch(_buf_cache, key)
 
 
 def _launch_k4_persistent(
@@ -497,12 +533,6 @@ def _launch_k4_persistent(
     use_fast_sync=False,
 ):
     """Launch persistent K4 with cached CuTe wrappers.
-
-    Precondition: all sequence lengths in cu_seqlens must be > 0 (a
-    zero-length sequence deadlocks the kernel's chunk-loop barriers; see the
-    k4_persistent module docstring). Not validated here: cu_seqlens is on the
-    GPU and a host-side check would sync the hot path, and the prefill
-    runtime never emits zero-length sequences.
 
     No fast-launch (args-tuple) cache here: such a cache pins the per-call
     v/initial-state tensors via their cute wrappers (the wrapper holds the
@@ -525,7 +555,7 @@ def _launch_k4_persistent(
     gk_ct = cute_wrappers["gk_ct"]
 
     # v is a per-call activation — wrap fresh every call (never cache; see
-    # _ct_cached docstring).
+    # the caching rule at the top of this file).
     v_view = v_beta.reshape(-1, H, V_dim) if v_beta.dim() == 4 else v_beta
     v_ct = from_dlpack(v_view, assumed_align=16).mark_layout_dynamic()
     v_ct.element_type = bf16
@@ -701,20 +731,35 @@ def _launch_fused_k123_inv(
     # Inputs are guaranteed contiguous by upstream linear projections.
     # A_log is fp32 model param; .float() is no-op when dtype already matches.
     # q/k/g/beta/cu/ci are per-call activations: plain _ct, never cached
-    # (see _ct_cached docstring). The _get_buffers scratch below is
-    # module-persistent, so caching its wrappers is safe and worthwhile.
+    # (see the caching rule at the top of this file).
     q_ct = _ct(q, cutlass.BFloat16)
     k_ct = _ct(k, cutlass.BFloat16)
     g_ct = _ct(g, cutlass.BFloat16)
     alog_ct = _ct(A_log if A_log.dtype == torch.float32 else A_log.float(), cutlass.Float32)
     beta_ct = _ct(beta, cutlass.BFloat16)
 
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
-    kg_ct = _ct_cached(kg, cutlass.BFloat16)
-    qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
-    gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
-    aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_inv, cutlass.BFloat16)
+    # Scratch wrappers come from the buffer-cache entry that owns the scratch
+    # itself, so wrapper and buffer die together and evicting the entry
+    # actually returns the ~1 GiB it holds. Caching them in a module-level
+    # id()-keyed dict instead is what leaked one full buffer set per distinct
+    # prefill token count. CONTRACT: cute_wrappers must be the dict returned
+    # by the same _get_buffers call that produced k_scaled..A_kk_inv --
+    # _chunk_kda_fwd unpacks both from one return value. Direct low-level
+    # callers may omit it and pay ~10us per tensor to rebuild.
+    if cute_wrappers is not None:
+        ks_ct = cute_wrappers["k123_ks_ct"]
+        kg_ct = cute_wrappers["k123_kg_ct"]
+        qs_ct = cute_wrappers["k123_qs_ct"]
+        gk_ct = cute_wrappers["k123_gk_ct"]
+        aqk_ct = cute_wrappers["k123_aqk_ct"]
+        akk_ct = cute_wrappers["k123_akk_ct"]
+    else:
+        ks_ct = _ct(k_scaled, cutlass.BFloat16)
+        kg_ct = _ct(kg, cutlass.BFloat16)
+        qs_ct = _ct(q_scaled, cutlass.BFloat16)
+        gk_ct = _ct(gk_last_exp, cutlass.Float32)
+        aqk_ct = _ct(A_qk, cutlass.BFloat16)
+        akk_ct = _ct(A_kk_inv, cutlass.BFloat16)
 
     if is_varlen:
         cu_ct = _ct(cu_seqlens, _cute_int_type(cu_seqlens.dtype))
@@ -843,9 +888,8 @@ def _launch_fused_k1234(
     NC = T // _BT
     has_bias = dt_bias is not None
 
-    # B only changes the outer extent and launch grid. T, H, and K change
-    # compiled tensor layouts, so they must select distinct artifacts.
-    cache_key = (dev, has_bias, safe_gate, T, H, K)
+    # Dynamic shapes: cache only on mode flags, not B/NC/H
+    cache_key = (dev, has_bias, safe_gate)
 
     # Buffers
     BH = B * H
@@ -1246,12 +1290,6 @@ class KdaPrefillRunner:
             raise RuntimeError("Kimi K3 KDA prefill requires NVIDIA CUTLASS DSL")
         if chunk_size != 64:
             raise ValueError(f"Kimi K3 KDA prefill requires chunk_size=64, got {chunk_size}")
-        # Zero-token calls take the early return in _chunk_kda_fwd and
-        # never touch A_log; the runtime emits such batches (overlap
-        # scheduler + logprobs flows), so only require A_log when there
-        # is work to do.
-        if A_log is None and q.shape[1] != 0:
-            raise ValueError("Kimi K3 KDA prefill requires A_log")
 
         result = _chunk_kda_fwd(
             q=q,
