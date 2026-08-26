@@ -29,7 +29,7 @@ from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer
 from tests.unittest.llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 
-from ..conftest import skip_pre_blackwell
+from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import DuckLLM, MyThreadPoolExecutor, Result, run_accuracy_test
 
@@ -154,10 +154,7 @@ SERVER_START_TIMEOUT = 7200
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
 
 
-MODEL_PATH = str(
-    Path(__file__).resolve().parents[4]
-    / "build_images/nvfp4_test_model_root/DeepSeek-V4-Pro-DSpark"
-)
+MODEL_PATH = str(Path(llm_models_root()) / "DeepSeek-V4-Pro-DSpark")
 
 EXTRA_EVALUATOR_KWARGS = {
     "apply_chat_template": True,
@@ -189,7 +186,8 @@ def _worker_env() -> dict[str, str]:
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_"))
-        and key not in {
+        and key
+        not in {
             "MASTER_ADDR",
             "MASTER_PORT",
             "UCX_TLS",
@@ -219,12 +217,16 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
             # MegaMoE CuTe DSL path for the NVFP4 checkpoint.
             "backend": "MEGAMOE_CUTEDSL",
         },
-        "max_batch_size": 128,
+        # Keep the DEP4 worker envelope aligned with the aggregate guard. A
+        # batch-128 DSpark graph leaves too little headroom for the post-capture
+        # 4096-token warmup on rank 0.
+        "max_batch_size": 64,
+        "cuda_graph_config": {"max_batch_size": 64},
         "max_seq_len": 4096,
         "max_num_tokens": 4096,
         "kv_cache_config": {
             "enable_block_reuse": False,
-            "free_gpu_memory_fraction": 0.7,
+            "free_gpu_memory_fraction": 0.5,
         },
         "enable_chunked_prefill": False,
         "disable_overlap_scheduler": True,

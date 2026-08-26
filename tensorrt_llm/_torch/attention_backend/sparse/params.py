@@ -33,9 +33,14 @@ def get_indexer_mqa_logits_elem_budget() -> int:
     )
 
 
-def get_indexer_mqa_logits_workspace_bytes() -> int:
-    """Return the maximum transient bytes for one FP32 MQA-logits tile."""
-    return get_indexer_mqa_logits_elem_budget() * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
+def get_indexer_mqa_logits_workspace_bytes(
+    max_num_tokens: Optional[int] = None, max_seq_len: Optional[int] = None
+) -> int:
+    """Return the reachable maximum bytes for one FP32 MQA-logits tile."""
+    elem_budget = get_indexer_mqa_logits_elem_budget()
+    if max_num_tokens is not None and max_seq_len is not None:
+        elem_budget = min(elem_budget, max_num_tokens * max_seq_len)
+    return elem_budget * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
 
 
 class SparseParams:

@@ -4453,6 +4453,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
 
+
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)
 @skip_pre_blackwell
@@ -4506,19 +4507,26 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
                 acceptance_length)
 
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_dep8_megamoe_cutedsl(self):
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_megamoe_cutedsl(self):
+        # DEP4 doubles the per-rank model footprint relative to the DEP8
+        # baseline. Bound both serving and CUDA-graph batches to the size that
+        # fits the smaller memory envelope without a warmup OOM.
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
         spec_config = DSparkDecodingConfig(max_draft_len=5,
                                            speculative_model=self.MODEL_PATH)
+        task = GSM8K(self.MODEL_NAME)
+        evaluator = task.create_evaluator(GSM8K.NUM_SAMPLES,
+                                          self.EXTRA_EVALUATOR_KWARGS)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
-                 tensor_parallel_size=8,
-                 moe_expert_parallel_size=8,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
                  enable_attention_dp=True,
                  moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
-                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_batch_size=64,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=64),
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  kv_cache_config=kv_cache_config,
@@ -4528,7 +4536,6 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  max_stats_len=-1,
                  enable_iter_perf_stats=True,
                  speculative_config=spec_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
                 quant_algo=llm.args.quant_config.quant_algo,
@@ -4536,8 +4543,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
-                score = task.evaluate(
-                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+                score = task.evaluate(llm, prepared_evaluator=evaluator)
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
@@ -4546,10 +4552,10 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             # the only one that serves the NVFP4 export — costs speed only, and
             # the accuracy assert cannot see that.
             acceptance_length = _compute_acceptance_length(llm)
-            print(f"[AL] test_gsm8k_dep8_megamoe_cutedsl "
+            print(f"[AL] test_gsm8k_dep4_megamoe_cutedsl "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
-                "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_cutedsl",
+                "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
                 acceptance_length)
 
 

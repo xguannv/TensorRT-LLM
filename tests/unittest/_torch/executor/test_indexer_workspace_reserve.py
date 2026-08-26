@@ -28,6 +28,11 @@ def test_workspace_bytes_match_runtime_element_budget(monkeypatch):
     assert get_indexer_mqa_logits_workspace_bytes() == 4096
 
 
+def test_workspace_bytes_are_bounded_by_reachable_request_shape(monkeypatch):
+    monkeypatch.setenv("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", str(1 << 31))
+    assert get_indexer_mqa_logits_workspace_bytes(4096, 4096) == 64 * 1024 * 1024
+
+
 @pytest.mark.parametrize(
     "kv_cache_memory,workspace_memory,expected",
     [

@@ -24,9 +24,9 @@ TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
   min_al: 4.226345739772378
 # Not a copy of the DeepGEMM row above: that one is measured on the FP8 export,
 # this backend is the only one that serves the NVFP4 export, and the two differ
-# in both the MoE numerics and the checkpoint. Measured on 2x4 GB300 (job
-# 2771225) alongside a GSM8K strict-match score of 96.21.
-TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_cutedsl:
+# in both the MoE numerics and the checkpoint. The baseline was established
+# on the same NVFP4 export before moving the aggregate guard to one-node DEP4.
+TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl:
   ref_al: 4.433448078026391
   min_al: 4.211775674125072
 TestLlama3_1_8BInstruct::test_ngram:
