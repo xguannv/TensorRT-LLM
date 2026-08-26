@@ -1628,3 +1628,55 @@ Context: previous sync attempt retained on `backup/rubin-dsv4-k3-pre-redo-202608
 - Relevant pre-commit hooks pass after formatter output is staged. The repository-wide `validate-test-lists` hook still reports three unrelated pre-existing stale entries for `accuracy/test_llm_api_autodeploy.py::TestNemotronH` at `tests/integration/test_lists/waives.txt:291-293`.
 - The final 95-file sweep passed YAPF, Ruff, Ruff-format, baseline-gated Ruff, clang-format, codespell, `py_compile`, `bash -n`, and `git diff --check`. It also closed three replay-integration gaps found by lint: the missing `Tuple` import, the omitted CuTeDSL MLA workspace helpers, and the omitted `TRTLLMGenFusedMoE` scheduler import.
 - Targeted pytest was not run: the `tllm-dev` workflow requires an explicit GPU host and container, and neither was supplied. No remote branch has been pushed.
+
+
+### Import GitLab MR !10518 onto `user/lizhiz/rubin-advance` (2026-08-25)
+
+#### MR boundary and already-present commits
+
+- Conflict/risk: GitLab reports 13 linear commits from `ba828e3772` to `2d4a8dd759`, but the
+  target already contains the original commits corresponding to the MR's first three cherry-picks:
+  `7e8eb8f1a1`, `92d1a8f4fa`, and `70bf7e4fd1`.
+- Human direction: not required - patch-equivalent work must not be replayed.
+- Resolution: squash only the remaining MR range `fca53393d0..2d4a8dd759` and preserve the MR
+  title, number, author, URL, and a Git-generated DCO sign-off.
+- Evidence: the MR API reports base `ba828e3772`, head `2d4a8dd759`, 13 commits, and zero merges;
+  target history contains the three original source commits.
+- Status: replacement squash `ee56b092af` created; its resolved tree is staged and ready to commit.
+
+#### MegaMoE kernel bundle and `MegaMoECuteDsl` capability/SiTU contracts
+
+- Conflict: MR !10518 replaces the MegaMoE scheduling and epilogue implementation and narrows the
+  supported architectures to SM100/103/107. The target has a newer pure
+  `can_implement(MoEProblem, MoEDeployment)` resolver contract plus Kimi K3 SiTU activation, beta
+  validation, compiled-kernel cache identity, top-16 routing, and beta propagation.
+- Human direction: not required - compatible union.
+- Resolution: retain the target's structured capability API and frozen-environment dependency
+  checks, apply the MR's exact SM100/103/107 gate, and union the coherent MR scheduling/TMA-stage
+  implementation with every target SiTU constructor, epilogue, cache-key, and call-path field.
+- Evidence: `ba4d6ed37d` is the only target-only production commit touching the four conflicted
+  kernel/backend files; its complete patch was reviewed. All four resolved files pass `py_compile`;
+  the capability path contains no host SM probe, the runtime probe retains its required
+  `get_sm_version` import, and SiTU plus the MR TMA/accumulator controls are present end to end.
+- Status: applied, staged, and syntax-validated.
+
+#### MoE guide, microbenchmark rendezvous, and backend unit tests
+
+- Conflict: the MR documentation predates the target's resolver and current Marlin/CuteDSL matrix;
+  its benchmark helper removes CuteDSL process-group setup but also simplifies DeepGEMM rendezvous;
+  the unit-test conflict independently adds `ModuleType` versus the target's `Tuple` import.
+- Human direction: not required - compatible union.
+- Resolution: keep the current guide and update only MegaMoE's architecture/provider/kernel
+  description; retain current capability facts for unrelated backends. Stop benchmark-side process
+  group setup for the new CuteDSL provider, while retaining HashStore for one-rank DeepGEMM and MPI
+  rendezvous broadcast for multi-rank DeepGEMM. Import both `ModuleType` and `Tuple` in the tests.
+- Evidence: the MR-only diffs and current implementations were compared directly; the resolved
+  benchmark and unit-test modules pass `py_compile`.
+- Status: applied, staged, and syntax-validated.
+
+#### Validation
+
+- All staged Python files pass `py_compile`, `git diff --cached --check` passes, and all applicable
+  pre-commit hooks pass except `validate-test-lists`, which reports the same three unrelated,
+  pre-existing stale `TestNemotronH` waiver entries at `waives.txt:291-293`.
+- Focused pytest could not run because the available Python environment has no `pytest` module.

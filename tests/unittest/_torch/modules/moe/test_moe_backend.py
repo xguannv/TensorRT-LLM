@@ -19,7 +19,7 @@ import itertools
 import logging
 import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
 
@@ -562,6 +562,8 @@ def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(torch.cuda, "set_device", set_device)
 
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
     moe._maybe_init_torch_dist_under_mpi()
 
     set_device.assert_called_once_with(1)
@@ -877,22 +879,18 @@ def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     assert moe.tactic_autotune is False
 
 
-@pytest.mark.parametrize(
-    "sm_version, expected",
-    [
-        (90, False),
-        (100, True),
-        (103, True),
-        (107, True),
-        (109, True),
-        (110, False),
-        (120, False),
-    ],
+_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC = (
+    [256, 256, 256],
+    [2, 1, 1],
+    None,
+    ("grouped", 512),
+    "grid_stride",
+    "reuse_dispatch_warps",
+    True,
+    2,
+    4,
+    (1, 1),
 )
-def test_megamoe_cutedsl_sm100_family_gate(sm_version: int, expected: bool) -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op
-
-    assert cute_dsl_megamoe_custom_op._is_megamoe_supported_sm(sm_version) is expected
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
@@ -900,16 +898,62 @@ def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
-    assert len(decode) == len(prefill) == 36
+    assert len(decode) == 36
+    assert len(prefill) == 40
+    assert all(len(tactic) == 10 for tactic in decode + prefill)
     assert {t[-1] for t in decode} == {(1, 1)}
     assert {t[-1] for t in prefill} == {(2, 4)}
-    # The deterministic fallback stays inside the curated axes.
+
     for num_tokens in (64, 4096, 16384):
         megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
-    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
-    invalid_tactic[2] = 511
-    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+
+
+@pytest.mark.parametrize(
+    ("sm", "eligible"),
+    [(100, True), (103, True), (107, True), (101, False), (109, False)],
+)
+def test_megamoe_cutedsl_sm_support(
+    monkeypatch: pytest.MonkeyPatch, sm: int, eligible: bool
+) -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe import mega_moe_cute_dsl
+
+    monkeypatch.setattr(mega_moe_cute_dsl, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(
+        mega_moe_cute_dsl,
+        "is_megamoe_cute_dsl_runtime_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(cute_dsl_megamoe_custom_op, "IS_MEGAMOE_OP_AVAILABLE", True)
+
+    verdict, reason = MegaMoECuteDsl.can_implement(
+        QuantAlgo.NVFP4,
+        dtype_activation=torch.bfloat16,
+        hidden_size=256,
+        intermediate_size=256,
+    )
+
+    assert verdict is eligible
+    if not eligible:
+        assert "requires SM100, SM103, or SM107" in reason
+
+
+def test_megamoe_kernel_arch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels import mega_moe_nvfp4
+
+    sm100_kernel = object()
+    sm107_kernel = object()
+    module_name = f"{mega_moe_nvfp4.__name__}.megamoe_kernel"
+    fake_module = ModuleType(module_name)
+    fake_module.Sm100MegaMoEKernel = sm100_kernel
+    fake_module.Sm107MegaMoEKernel = sm107_kernel
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    assert mega_moe_nvfp4.import_kernel(100) is sm100_kernel
+    assert mega_moe_nvfp4.import_kernel(103) is sm100_kernel
+    assert mega_moe_nvfp4.import_kernel(107) is sm107_kernel
+    with pytest.raises(ValueError, match="supports SM100, SM103, or SM107"):
+        mega_moe_nvfp4.import_kernel(101)
 
 
 def run_backend_moe(
@@ -1408,6 +1452,24 @@ def test_moe_backend(
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
+    local_tma_selector = None
+    if (
+        backend_type == MoeBackendType.MEGAMOE_CUTEDSL
+        and dtype_activation == torch.bfloat16
+        and quant_algo == QuantAlgo.NVFP4
+        and seq_len == 8
+        and (num_experts, top_k, hidden_size, intermediate_size) == (8, 1, 512, 512)
+        and routing_method_cls is RenormalizeMoeRoutingMethod
+        and activation_type == ActivationType.Swiglu
+        and not swiglu_gptoss_style
+    ):
+        from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+        monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "0")
+        monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", "bf16")
+        local_tma_selector = MagicMock(return_value=_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC)
+        monkeypatch.setattr(megamoe_op, "default_megamoe_tactic", local_tma_selector)
+
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
     # Create mapping
@@ -1630,6 +1692,9 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+        if local_tma_selector is not None:
+            assert any(call.args[0] > 0 for call in local_tma_selector.call_args_list)
 
 
 # ============================================================================
