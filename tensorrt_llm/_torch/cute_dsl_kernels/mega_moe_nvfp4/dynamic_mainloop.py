@@ -221,9 +221,14 @@ def issue_dynamic_block_scaled_mma_tile(
 
     num_k_inner = mma_tiler_mnk[2] // _UMMA_K_NVFP4  # = 4 for NVFP4 K=256
 
-    compatible_to_old_nvvm = False
-    if hasattr(_nvvm_raw, "Tcgen05GroupKind"):
-        compatible_to_old_nvvm = True
+    # nvvm renamed Tcgen05GroupKind -> CTAGroupKind before it introduced
+    # Tcgen05MMABlockScale, so a build can carry neither -- cutlass-dsl 4.6.1,
+    # which requirements.txt pins, is exactly that. Probe the symbol each
+    # branch actually calls rather than using one as a proxy for the whole ABI,
+    # and resolve the CTA-group enum by whichever name exists.
+    _cta_group_kind = getattr(_nvvm_raw, "Tcgen05GroupKind", None) or getattr(
+        _nvvm_raw, "CTAGroupKind")
+    compatible_to_old_nvvm = not hasattr(_nvvm_raw, "Tcgen05MMABlockScale")
 
     # m / n inner indices both 0 for v1 (m_count = n_count = 1).
     m_inner = 0
@@ -275,8 +280,8 @@ def issue_dynamic_block_scaled_mma_tile(
                     "mma_kind":
                     _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
                     "cta_group":
-                    _nvvm_raw.Tcgen05GroupKind.CTA_2 if mma_tiler_mnk[0] == 256
-                    else _nvvm_raw.Tcgen05GroupKind.CTA_1,
+                    _cta_group_kind.CTA_2
+                    if mma_tiler_mnk[0] == 256 else _cta_group_kind.CTA_1,
                     "d":
                     operand_d_ptr,
                     "a":
