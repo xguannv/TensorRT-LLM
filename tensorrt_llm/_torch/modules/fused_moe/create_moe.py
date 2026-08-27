@@ -11,6 +11,7 @@ from ...utils import ActivationType, ActType_TrtllmGen, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -130,6 +131,7 @@ def create_moe_backend(
             CutlassFusedMoE,
             TRTLLMGenFusedMoE,
             CuteDslFusedMoE,
+            CuteDslFc12FusedMoE,
             DeepGemmFusedMoE,
             DenseGEMMFusedMoE,
             MegaMoEDeepGemm,
@@ -159,7 +161,7 @@ def create_moe_backend(
     if swiglu_limit_scalar is not None:
         assert moe_cls in [
             CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
+            MegaMoEDeepGemm, CuteDslFusedMoE, CuteDslFc12FusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
@@ -240,7 +242,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
-    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE, CuteDslFc12FusedMoE):
         # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
         # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
         return moe_cls(
@@ -466,7 +468,7 @@ def create_moe(
             f"{moe_cls.__name__}.")
 
     if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                   CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
+                   CuteDslB12xFusedMoE, CuteDslFc12FusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
                    MegaMoEDeepGemm, MegaMoECuteDsl, MarlinFusedMoE):
         return ConfigurableMoE(
             moe_cls=moe_cls,
