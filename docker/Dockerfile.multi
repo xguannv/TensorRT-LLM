@@ -1,22 +1,8 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=gitlab-master.nvidia.com:5005/dl/dgx/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=rubin-py3-devel
-ARG TRITON_BASE_TAG=26.05-py3
+ARG TRITON_BASE_TAG=26.04-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -44,6 +30,7 @@ FROM base AS devel
 #
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
+ENV PIP_EXTRA_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
 
 ARG CUDA_VER
 ARG CUDNN_VER
@@ -66,10 +53,14 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
+ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy wandb || true && \
+    # WAR: uninstall dependencies that has vulnerability or need upgrading.
+    apt remove python3-wheel && \
+    pip3 uninstall -y tornado black nbconvert pillow numpy || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
-    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
+    PIP_INDEX_URL=${GITHUB_MIRROR:+https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple} \
+    PIP_EXTRA_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple" \
     pip3 install -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
@@ -88,6 +79,8 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
+
+RUN pip3 uninstall -y nvidia-cutlass-dsl-libs-cu12
 
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
@@ -124,7 +117,7 @@ COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
-COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt constraints.txt LICENSE README.md ./
+COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
@@ -132,21 +125,25 @@ ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
-    fi && \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    GITHUB_MIRROR=$GITHUB_MIRROR \
+    PIP_INDEX_URL=${GITHUB_MIRROR:+https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple} \
+    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
-WORKDIR /app/tensorrt_llm
+ENV PIP_EXTRA_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    CUTE_DSL_LIBS=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so
+
 ARG GITHUB_MIRROR=""
+WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
-    if [ -n "$GITHUB_MIRROR" ]; then \
-      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
-    fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \
+    PIP_INDEX_URL=${GITHUB_MIRROR:+https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple} \
     pip install "${TRTLLM_WHEEL}[mx]"
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
@@ -175,6 +172,8 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
 
+RUN pip3 uninstall -y nvidia-cutlass-dsl-libs-cu12
+
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ARG TARGETARCH
@@ -185,9 +184,60 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
     bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
+FROM wheel AS tritonbuild
+
+WORKDIR /src/tensorrt_llm
+RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
+COPY ./triton_backend/ ./triton_backend/
+ARG TRITON_BASE_TAG
+RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
+
+
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm
 COPY ./triton_backend/all_models ./triton_backend/all_models
 COPY ./triton_backend/scripts ./triton_backend/scripts
 COPY ./triton_backend/tools ./triton_backend/tools
+COPY ./triton_backend/inflight_batcher_llm/scripts ./triton_backend/inflight_batcher_llm/scripts
+COPY ./triton_backend/inflight_batcher_llm/client ./triton_backend/inflight_batcher_llm/client
+COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm
+
+# Rubin bringup image: install flashinfer 0.6.18
+# All credentials are injected via BuildKit secrets and never stored in layers.
+FROM devel AS rubindevel
+
+# Allow MPI/PRTE to run as root inside the container (inherited by rubin-release
+# since it uses this image as DEVEL_IMAGE).
+ENV PIP_EXTRA_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    CUTE_DSL_LIBS=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so
+
+# ── Install flashinfer 0.6.18 internal ──
+RUN pip install \
+        "flashinfer_python==0.6.18+cf3c3a3e.nvinternal.rubin.0.8dev.devel.cu.64035134" \
+        --index-url https://gitlab-master.nvidia.com/api/v4/projects/179191/packages/pypi/simple \
+        --no-deps --force-reinstall
+
+# Rubin CI image: rubindevel + triton files + CI tooling (mirrors the
+# relationship between tritondevel and devel for the standard CI path).
+FROM rubindevel AS rubin-tritondevel
+
+ARG GITHUB_MIRROR=""
+COPY --from=triton /opt/tritonserver/backends/python /opt/tritonserver/backends/python
+COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
+COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
+COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
+COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
+
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_triton.sh && \
+    if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping mooncake installation"; \
+    else \
+        bash /opt/docker/common/install_mooncake.sh; \
+    fi && \
+    bash /opt/docker/common/install_ci.sh
