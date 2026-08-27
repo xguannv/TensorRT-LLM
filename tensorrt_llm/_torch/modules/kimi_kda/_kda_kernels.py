@@ -70,7 +70,7 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103, 107)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
