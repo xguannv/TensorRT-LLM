@@ -809,7 +809,6 @@ class PersistentDenseGemmKernel:
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * len(self.epilogue_warp_id),
-                32 * len(self.epilogue_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.num_c_stage, producer_group=c_producer_group

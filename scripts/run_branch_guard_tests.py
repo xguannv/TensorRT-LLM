@@ -140,8 +140,20 @@ DSV4_DSPARK_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
     "nvidia_deepseek-v4-pro-nvfp4-dspark/hf/hf-318bf60_orig"
 )
+OCI_AGA_K3_CHECKPOINT_PATH = (
+    "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/"
+    "nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
+)
+OCI_AGA_DSV4_DSPARK_CHECKPOINT_PATH = (
+    "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/"
+    "nvidia_deepseek-v4-pro-nvfp4-dspark/hf/hf-318bf60_orig"
+)
 BRANCH_GUARD_MODEL_ROOT = "/lustre/share/coreai_comparch_trtllm/lizhiz/branch_guard_models"
 K3_DISAGGREGATED_ACCURACY_CONFIG = "examples/kimi_k3/disagg/benchmark_kimi_k3_dep8_gsm8k.yaml"
+K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG = (
+    "tests/scripts/perf/disaggregated/"
+    "gb300_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL.yaml"
+)
 
 MULTI_NODE_TESTS: dict[str, int] = {
     "tests/integration/defs/accuracy/test_disaggregated_multinode.py"
@@ -202,6 +214,17 @@ GUARD_JOBS = (
         use_pmix=False,
         launcher="benchmark",
     ),
+    GuardJob(
+        name="k3-disaggregated-dep16-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=8,
+        ntasks=32,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark",
+    ),
     *(
         GuardJob(
             name=f"dsv4-multi-node-{test_name.rsplit('::', maxsplit=1)[-1]}",
@@ -222,6 +245,13 @@ GUARD_JOBS = (
 
 def _default(value: str, environment_name: str) -> str:
     return os.environ.get(environment_name, value)
+
+
+def _first_available_path(primary: str, *fallbacks: str) -> str:
+    for candidate in (primary, *fallbacks):
+        if Path(candidate).is_dir():
+            return candidate
+    return primary
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -259,6 +289,30 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         dest="model_root",
         default=os.environ.get("LLM_MODELS_ROOT", ""),
         help="LLM model root visible inside the container.",
+    )
+    parser.add_argument(
+        "--k3-checkpoint",
+        default=os.environ.get(
+            "KIMI_K3_CKPT",
+            _first_available_path(K3_CHECKPOINT_PATH, OCI_AGA_K3_CHECKPOINT_PATH),
+        ),
+        help="Kimi K3 checkpoint path (or set KIMI_K3_CKPT).",
+    )
+    parser.add_argument(
+        "--dsv4-dspark-checkpoint",
+        default=os.environ.get(
+            "DSV4_DSPARK_CKPT",
+            _first_available_path(
+                DSV4_DSPARK_CHECKPOINT_PATH,
+                OCI_AGA_DSV4_DSPARK_CHECKPOINT_PATH,
+            ),
+        ),
+        help="DeepSeek V4 Pro DSpark checkpoint path (or set DSV4_DSPARK_CKPT).",
+    )
+    parser.add_argument(
+        "--guard-model-root",
+        default=os.environ.get("TRTLLM_GUARD_MODEL_ROOT", BRANCH_GUARD_MODEL_ROOT),
+        help="Writable directory used to stage model and dataset symlinks.",
     )
     parser.add_argument(
         "--mounts",
@@ -375,6 +429,17 @@ def _validate_env_assignments(assignments: Sequence[str]) -> None:
 def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     args.repo_root = args.repo_root.expanduser().resolve()
     args.log_dir = args.log_dir.expanduser().resolve()
+    if args.image:
+        args.image = str(Path(args.image).expanduser().resolve())
+    if args.model_root:
+        args.model_root = str(Path(args.model_root).expanduser().resolve())
+    if args.k3_checkpoint:
+        args.k3_checkpoint = str(Path(args.k3_checkpoint).expanduser().resolve())
+    if args.dsv4_dspark_checkpoint:
+        args.dsv4_dspark_checkpoint = str(
+            Path(args.dsv4_dspark_checkpoint).expanduser().resolve()
+        )
+    args.guard_model_root = str(Path(args.guard_model_root).expanduser().resolve())
     if not _is_trtllm_repo_root(args.repo_root):
         raise ValueError(f"Not a TensorRT-LLM repository: {args.repo_root}")
 
@@ -392,6 +457,22 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
         raise ValueError(f"Container image does not exist: {args.image}")
     if args.model_root and not Path(args.model_root).is_dir() and not args.dry_run:
         raise ValueError(f"Model root does not exist: {args.model_root}")
+    if any(job.name.startswith("k3-") for job in jobs):
+        if not args.k3_checkpoint:
+            raise ValueError("Missing required Kimi K3 checkpoint: --k3-checkpoint")
+        if not Path(args.k3_checkpoint).is_dir() and not args.dry_run:
+            raise ValueError(f"Kimi K3 checkpoint does not exist: {args.k3_checkpoint}")
+    if any(job.model_name == "DeepSeek-V4-Pro-DSpark" for job in jobs):
+        if not args.dsv4_dspark_checkpoint:
+            raise ValueError(
+                "Missing required DeepSeek V4 Pro DSpark checkpoint: "
+                "--dsv4-dspark-checkpoint"
+            )
+        if not Path(args.dsv4_dspark_checkpoint).is_dir() and not args.dry_run:
+            raise ValueError(
+                "DeepSeek V4 Pro DSpark checkpoint does not exist: "
+                f"{args.dsv4_dspark_checkpoint}"
+            )
 
     _validate_env_assignments(args.env)
     for job in jobs:
@@ -446,18 +527,6 @@ def _install_lines(args: argparse.Namespace) -> list[str]:
                 ]
             )
         )
-    commands.append(
-        shlex.join(
-            [
-                "python3",
-                "-m",
-                "pip",
-                "uninstall",
-                "--yes",
-                "nvidia-cutlass-dsl",
-            ]
-        )
-    )
     install_shell = "; ".join(commands)
     return [
         f'flock "/tmp/trtllm_branch_guard_install_"$SLURM_JOB_ID".lock" '
@@ -469,9 +538,16 @@ def _model_setup_lines(args: argparse.Namespace, job: GuardJob) -> list[str]:
     if job.model_name is None or job.checkpoint_path is None:
         return []
 
+    if job.name.startswith("k3-"):
+        checkpoint_path = args.k3_checkpoint
+    elif job.model_name == "DeepSeek-V4-Pro-DSpark":
+        checkpoint_path = args.dsv4_dspark_checkpoint
+    else:
+        checkpoint_path = job.checkpoint_path
     lines = [
-        f"guard_model_root={shlex.quote(BRANCH_GUARD_MODEL_ROOT)}/{shlex.quote(job.name)}/job_${{SLURM_JOB_ID}}",
-        f"guard_checkpoint={shlex.quote(job.checkpoint_path)}",
+        f"guard_model_root={shlex.quote(args.guard_model_root)}/"
+        f"{shlex.quote(job.name)}/job_${{SLURM_JOB_ID}}",
+        f"guard_checkpoint={shlex.quote(checkpoint_path)}",
         f"guard_dataset_root={shlex.quote(str(Path(args.model_root) / 'datasets'))}",
         'test -d "$guard_checkpoint"',
         'test -d "$guard_dataset_root"',
@@ -591,6 +667,8 @@ def _sbatch_command(args: argparse.Namespace, job: GuardJob) -> list[str]:
         command.append(f"--qos={args.qos}")
     if args.constraint:
         command.append(f"--constraint={args.constraint}")
+    if args.partition != "batch-xdr":
+        command.append(f"--gpus-per-node={job.gpus_per_node}")
     command.extend(["--wrap", shlex.join(_srun_command(args, job))])
     return command
 
@@ -621,25 +699,9 @@ def _job_id_from_output(output: str) -> str | None:
 
 def _write_benchmark_slurm_script(repo_root: Path, log_dir: Path) -> Path:
     source = repo_root / "examples/disaggregated/slurm/benchmark/disaggr_torch.slurm"
-    output = log_dir / "disaggr_torch_branch_guard.slurm"
-    marker = "# Get node lists and replace the placeholder with the actual node names"
-    uninstall = """# Remove the image dependency after TensorRT-LLM installation.
-echo "Uninstalling nvidia-cutlass-dsl..."
-uninstall_log=${full_logdir}/3_uninstall_cutlass_dsl.log
-if ! srun --container-name=${container_name} \\
-        --container-mounts=${container_mount} --no-container-mount-home \\
-        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \\
-        bash -c "python3 -m pip uninstall --yes nvidia-cutlass-dsl" \\
-        &> "${uninstall_log}"; then
-    cleanup_on_failure "nvidia-cutlass-dsl uninstall failed. Check ${uninstall_log} for details"
-fi
-echo "nvidia-cutlass-dsl uninstall completed successfully"
-
-"""
+    output = log_dir.parent / f"{log_dir.name}-disaggr_torch_branch_guard.slurm"
     script = source.read_text()
-    if script.count(marker) != 1:
-        raise ValueError(f"Expected exactly one install-completion marker in {source}")
-    output.write_text(script.replace(marker, uninstall + marker))
+    output.write_text(script)
     output.chmod(source.stat().st_mode)
     return output
 
@@ -647,7 +709,8 @@ echo "nvidia-cutlass-dsl uninstall completed successfully"
 def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Path]:
     source = args.repo_root / job.selectors[0]
     config = deepcopy(yaml.safe_load(source.read_text()))
-    log_dir = args.log_dir / job.name
+    run_id = int(time.time())
+    log_dir = args.log_dir / job.name / f"run-{run_id}"
     log_dir.mkdir(parents=True, exist_ok=True)
     config["slurm"]["script_file"] = str(
         _write_benchmark_slurm_script(args.repo_root, log_dir)
@@ -657,29 +720,41 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     config["slurm"]["account"] = args.account
     config["slurm"]["job_time"] = args.multi_node_time
     config["slurm"]["job_name"] = job.name
-    # batch-xdr allocates one GPU per task for this guard; the example config
-    # uses --gpus-per-node, which this partition rejects as an invalid GRES.
-    config["slurm"]["extra_args"] = ""
+    # batch-xdr allocates one GPU per task and rejects a GPU GRES request.
+    # Other GPU partitions need the per-node request explicitly.
+    config["slurm"]["extra_args"] = (
+        "" if args.partition == "batch-xdr" else f"--gpus-per-node={job.gpus_per_node}"
+    )
     config["environment"]["container_image"] = args.image
-    config["environment"]["model_path"] = K3_CHECKPOINT_PATH
+    config["environment"]["model_path"] = args.k3_checkpoint
     config["environment"]["trtllm_repo"] = str(args.repo_root) if args.install_from_repo else ""
     config["environment"]["build_wheel"] = False
     config["environment"]["trtllm_wheel_path"] = ""
     config["environment"].pop("work_dir", None)
     config["environment"]["log_dir"] = str(log_dir)
-    # The Rubin compute nodes do not expose a host /scratch directory to
-    # Pyxis. All guard inputs, logs, and the checkout are on shared Lustre.
-    config["environment"]["container_mount"] = (
-        f"{args.repo_root}:{args.repo_root}:rw,/lustre:/lustre")
+    mounts = [f"{args.repo_root}:{args.repo_root}:rw"]
+    mounts.extend(mount for mount in args.mounts.split(",") if mount)
+    config["environment"]["container_mount"] = ",".join(dict.fromkeys(mounts))
 
     # The branch guard is an accuracy run, not the optional synthetic serving
     # benchmark.  Keeping the benchmark disabled also avoids requiring its
     # unrelated 8K/1K JSONL dataset on the compute nodes.
     config["benchmark"]["enable_benchmark"] = False
+    config.setdefault("accuracy", {})["enable_accuracy_test"] = True
+    if job.name == "k3-disaggregated-dep16-gsm8k":
+        # The normal SBSA GB300 image does not provide the MegaMoE DeepGEMM
+        # implementation selected by the performance recipe. Use K3's
+        # supported TRTLLM MoE backend for this correctness guard.
+        for role in ("ctx", "gen"):
+            config["worker_config"][role].setdefault("moe_config", {})[
+                "backend"
+            ] = "TRTLLM"
+        config["environment"]["server_health_timeout"] = 5400
     accuracy_env = config.setdefault("accuracy", {}).setdefault("env_var", {})
     accuracy_env["HF_HOME"] = os.environ.get(
         "HF_HOME", "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache"
     )
+    accuracy_env["LLM_MODELS_ROOT"] = args.model_root
     accuracy_env["HF_HUB_OFFLINE"] = "1"
     accuracy_env["HF_DATASETS_OFFLINE"] = "1"
 
@@ -694,7 +769,7 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
             if not token.startswith(("TRTLLM_PATH_PREPEND=", "TRTLLM_PYTHONPATH_PREPEND="))
         )
 
-    runtime_config = args.log_dir / f"{job.name}-config-{int(time.time())}.yaml"
+    runtime_config = args.log_dir / f"{job.name}-config-{run_id}.yaml"
     runtime_config.write_text(yaml.safe_dump(config, sort_keys=False))
     return runtime_config, log_dir
 

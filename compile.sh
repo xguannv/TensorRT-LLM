@@ -29,10 +29,6 @@ mkdir -p ${BUILD_DIR}
 
 rm ${REPO_DIR}/build/tensorrt_llm-*.whl || true
 
-REPLACE_CUTLASS_DSL="pip uninstall -y nvidia-cutlass-dsl && pip install 'nvidia-cutlass-dsl-internal==0.3.0+20260529043000.c907734' \
-  --force-reinstall --no-deps \
-  --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local/simple"
-
 NSYS_VERSION="2026.6.0.224-266038638214v0"
 NSYS_TARGET="${NSYS_VERSION%%-*}"
 NSYS_URL="http://nsys/dvs-nightlies/QuadDBringup/${NSYS_VERSION}/nsight-systems-cli-sbsa-DVS.tar.gz"
@@ -59,8 +55,7 @@ srun -A ${ACCOUNT} -p ${PARTITION} --job-name=${JOB_NAME} --container-image=${IM
     --container-workdir=${WORKDIR} \
     --container-save=${BUILD_DIR}/trtllm.sqsh \
     -N 1 --ntasks=1 --ntasks-per-node=1  -t 2:00:00 \
-    bash -c "pip install -r requirements-dev.txt && python scripts/build_wheel.py -G Ninja -a '107-real' $EXTRA_FLAGS $CLEAN  && pip install build/tensorrt_llm-*.whl && ${REPLACE_CUTLASS_DSL} && ${INSTALL_NSYS} " 
-
+    bash -c "python3 -m pip install --upgrade -r requirements-dev.txt && python scripts/build_wheel.py -G Ninja -a '107-real' $EXTRA_FLAGS $CLEAN  && pip install build/tensorrt_llm-*.whl && ${INSTALL_NSYS} "
 cp ${REPO_DIR}/build/tensorrt_llm-*.whl ${BUILD_DIR}/
 mkdir -p "${PUBLISH_DIR}"
 cp "${BUILD_DIR}/trtllm.sqsh" "${PUBLISH_DIR}/"
