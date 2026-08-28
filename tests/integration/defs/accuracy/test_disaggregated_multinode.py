@@ -201,6 +201,10 @@ def _worker_env() -> dict[str, str]:
             "OMPI_ALLOW_RUN_AS_ROOT": "1",
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
+            # Avoid auto-selecting the NVL72 RDMA VF, whose container-visible
+            # IPv6 address cannot be bound by UCX on this cluster.
+            "UCX_NET_DEVICES": "eth0",
+            "UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc",
         }
     )
     return env
