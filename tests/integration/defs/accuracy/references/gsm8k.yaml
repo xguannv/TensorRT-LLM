@@ -291,10 +291,20 @@ moonshotai/Kimi-K2.5:
     accuracy: 93.06
 moonshotai/Kimi-K3:
   # Full GSM8K DEP8 aggregate path: TP=8, EP=8, attention DP, TRTLLM-Gen MoE,
-  # CUDA graphs, chunked prefill, and the NVFP4 checkpoint. The checked-in
-  # K3 evaluation measured 96.5125 on all 1,319 samples; retain margin for
-  # ordinary run-to-run variation.
+  # CUDA graphs, chunked prefill. Two checkpoints land on this key and it
+  # cannot tell them apart -- both report MIXED_PRECISION because only the
+  # experts are 4-bit -- so record what each measured on all 1,319 samples:
+  # 96.5125 for the MXFP4 weights moonshotai/Kimi-K3 ships natively
+  # (LLM_MODELS_ROOT/Kimi-K3), 96.361 for the NVFP4 requant
+  # (Kimi-K3-NVFP4). The threshold keeps margin below both for ordinary
+  # run-to-run variation.
   - quant_algo: MIXED_PRECISION
+    accuracy: 96.0
+  # Same threshold as the non-speculative row above: speculative decoding is
+  # lossless, so DSpark must not move the score. Measured 97.0-97.5 on a
+  # 200-sample TEP8 subset while bringing up the drafter's paged KV path.
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: DSpark
     accuracy: 96.0
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57

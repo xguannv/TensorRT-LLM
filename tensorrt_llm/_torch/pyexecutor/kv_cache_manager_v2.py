@@ -2737,6 +2737,46 @@ class KVCacheManagerV2(BaseResourceManager):
             self._prepare_draft_resources(scheduled_batch)
             return
 
+    def _mirror_draft_kv_cache(self, req: LlmRequest):
+        """The draft manager's entry for ``req``, created on first sight.
+
+        Mirrors what the target manager does in ``_prepare_context_impl``:
+        create when missing rather than fail, passing ``is_dummy`` through. The
+        draft mirror never looks up block reuse (``tokens=None``) and never
+        commits, so this cannot share the target's implementation.
+
+        Reached from both the context and the generation loop, because not
+        every generation request passed through context on this worker:
+        attention DP injects its idle placeholder straight as a generation
+        request when a rank has no real work (ATTENTION_DP_DUMMY_REQUEST_ID,
+        see py_executor._adp_dummy_is_gen), and a disaggregated generation
+        worker receives prompt KV rather than prefilling it.
+
+        Returns None when the IndexMapper is saturated. The caller must treat
+        that as fatal: the request stays in the scheduled batch, so skipping it
+        only defers the failure to copy_batch_block_offsets(), which asserts in
+        C++ on the unmapped request ID. Slots are released early on a
+        context-only worker (release_index_slot), so saturation here means the
+        draft mirror is out of sync with the target, not merely busy.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is not None:
+            return kv_cache
+        ugpu_id = self._request_ugpu_id(req)
+        kv_cache = self._create_kv_cache(
+            req.py_request_id,
+            req.lora_task_id,
+            None,
+            cache_salt=req.cache_salt,
+            is_dummy=req.is_dummy,
+            ugpu_id=ugpu_id,
+        )
+        if kv_cache is None:
+            return None
+        assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
+        kv_cache.stop_committing()
+        return kv_cache
+
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
 
@@ -2747,26 +2787,12 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         with request_context(True, scheduled_batch):
             for req in scheduled_batch.context_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
-                    ugpu_id = self._request_ugpu_id(req)
-                    kv_cache = self._create_kv_cache(
-                        req.py_request_id,
-                        req.lora_task_id,
-                        None,
-                        cache_salt=req.cache_salt,
-                        is_dummy=req.is_dummy,
-                        ugpu_id=ugpu_id,
+                    raise RuntimeError(
+                        f"Draft KV cache mirror exhausted its IndexMapper on "
+                        f"context request {req.py_request_id}"
                     )
-                    if kv_cache is None:
-                        # Saturated IndexMapper (e.g. slots held by disagg
-                        # generation transfers in flight): skip mirroring this
-                        # request for now; it is retried next iteration once
-                        # slots free up, before the request runs any spec-dec
-                        # forward that needs the mirror.
-                        continue
-                    assert _get_kv_cache_ugpu_id(kv_cache) == ugpu_id
-                    kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
@@ -2785,10 +2811,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
             for req in scheduled_batch.generation_requests:
-                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     raise RuntimeError(
-                        f"Missing draft KV cache for generation request {req.py_request_id}"
+                        f"Draft KV cache mirror exhausted its IndexMapper on "
+                        f"generation request {req.py_request_id}"
                     )
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -3567,6 +3594,10 @@ class KVCacheManagerV2(BaseResourceManager):
         the KV cache blocks are still being transferred via NIXL/UCX.
         """
         kv_cache = self.kv_cache_map.get(request_id)
+        if self.is_draft and (kv_cache is None or request_id in self._early_freed_index_requests):
+            # The draft mirror only holds a slot for requests it actually
+            # mirrored, and the target may release the same request twice.
+            return
         if kv_cache is not None:
             for i in range(self.max_beam_width):
                 for pool_idx in range(self.num_pools):

@@ -1434,9 +1434,23 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
+        if self._speculative_config is None:
+            # No drafter at all, so there is nothing to give a manager to.
+            return False
+        is_external_drafter = (
+            self._speculative_config.spec_dec_mode.is_external_drafter())
+        if self._mapping.enable_attention_dp and not is_external_drafter:
             # Attention-DP uses the target KV cache manager for MTP draft layers
-            # so draft cache state follows the DP-sharded target requests.
+            # so draft cache state follows the DP-sharded target requests. That
+            # works only because MTP draft layers are target-shaped and can be
+            # appended to the target pool (get_pp_layers). An external drafter
+            # has its own architecture and layer count, so there is nothing to
+            # append and the bail would strand it on the private context arena
+            # -- dense in max_seq_len, and with KV heads unsharded under
+            # attention DP that is the allocation that OOMs at long ISL. Its
+            # own manager follows the DP sharding regardless: same mapping (so
+            # `tp_size = 1 if enable_attention_dp` applies to it too) and block
+            # tables copied per rank from attn_metadata.request_ids.
             logger.info(
                 "Attention DP does not support a separate draft KV cache "
                 "manager; MTP layers share the target manager.")

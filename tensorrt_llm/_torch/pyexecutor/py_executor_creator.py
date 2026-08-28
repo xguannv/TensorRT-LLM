@@ -521,10 +521,17 @@ def create_py_executor(
         if hasattr(spec_config, '_max_batch_size'):
             spec_config._max_batch_size = max_batch_size
 
-        # WAR for https://nvbugs/5807902
-        # Disable separate draft KV cache in disaggregated mode
-        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        if cache_transceiver_config is not None:
+        # WAR for https://nvbugs/5807902: Eagle3 crashes in disaggregated mode
+        # when the draft layers get their own KV cache manager (RMSNorm invalid
+        # argument). The root cause was never found and the bug closed
+        # will-not-fix, so the workaround stands -- but only for the mode it was
+        # reported on. It was originally a blanket disable, which also stranded
+        # external drafters on their private context arena; that arena is dense
+        # in max_seq_len and, with KV heads unsharded under attention DP, is
+        # what makes long-ISL disaggregated serving unservable.
+        is_eagle3 = (spec_config.spec_dec_mode.is_eagle3()
+                     or spec_config.spec_dec_mode.is_eagle3_one_model())
+        if cache_transceiver_config is not None and is_eagle3:
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla

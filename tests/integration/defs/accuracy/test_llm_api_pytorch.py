@@ -4411,6 +4411,10 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
 class TestKimiK3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K3"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+    # Standalone drafter: K3's DSpark draft is its own 5-layer Qwen3-shaped
+    # checkpoint, not weights inside the target (contrast DeepSeek-V4-Pro,
+    # whose speculative_model is the target path).
+    DSPARK_MODEL_PATH = f"{llm_models_root()}/Kimi-K3-DSpark"
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_full_accuracy(self):
@@ -4435,7 +4439,12 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 ),
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
-                    free_gpu_memory_fraction=0.25,
+                    # Attention DP replicates KV per rank, so 0.25 leaves
+                    # 4.64 GiB and clamp_max_seq_len_for_mem silently drops
+                    # max_seq_len 8192 -> 256. The server still starts; a
+                    # GSM8K-length prompt then overruns max_blocks_per_seq
+                    # mid-run as "base page indices is too short".
+                    free_gpu_memory_fraction=0.4,
                     tokens_per_block=64,
                 ),
         ) as llm:
@@ -4452,6 +4461,64 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_tep8_dspark(self):
+        """GSM8K plus an acceptance-length gate on the TEP8 DSpark recipe.
+
+        TEP, not the DEP8 recipe above: with attention DP off the drafter gets
+        its own KV cache pool, which is the path this covers. Accuracy alone
+        cannot detect a broken drafter -- speculative decoding is lossless, so
+        a drafter producing garbage scores the same and only runs slower --
+        hence the acceptance-length assertion.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.20,
+                                        tokens_per_block=64)
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model=self.DSPARK_MODEL_PATH,
+            attention_backend="TRTLLM")
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                enable_attention_dp=False,
+                max_batch_size=8,
+                max_num_tokens=4096,
+                max_seq_len=8192,
+                trust_remote_code=True,
+                # The drafter runs between target steps, and its hidden-state
+                # capture needs a whole-sequence prefill.
+                disable_overlap_scheduler=True,
+                enable_chunked_prefill=False,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+                moe_config=MoeConfig(
+                    max_num_tokens=33024,
+                    use_low_precision_moe_combine=True,
+                ),
+                kv_cache_config=kv_cache_config,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+                speculative_config=spec_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(llm)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+            acceptance_length = _compute_acceptance_length(llm)
+            print(f"[AL] test_gsm8k_tep8_dspark "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length("TestKimiK3::test_gsm8k_tep8_dspark",
+                                     acceptance_length)
 
 
 @pytest.mark.timeout(14400)
