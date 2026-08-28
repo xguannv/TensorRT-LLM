@@ -472,11 +472,19 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
 
     output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(a_fp8, b_fp8, a_sf,
                                                         b_sf)
+    inplace_output = torch.empty_like(output)
+    with autotune():
+        torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+            a_fp8, b_fp8, a_sf, b_sf, inplace_output)
+    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(a_fp8, b_fp8, a_sf, b_sf,
+                                                       inplace_output)
+
     expected = a @ b.t()
 
     diff = calc_diff(output, expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(inplace_output, expected, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(

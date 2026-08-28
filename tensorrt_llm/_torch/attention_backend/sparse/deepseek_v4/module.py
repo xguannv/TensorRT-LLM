@@ -14,10 +14,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
-from tensorrt_llm._torch.modules.mla import (
-    _cute_dsl_fp8_bmm_out,
-    _is_cute_dsl_fp8_bmm_available,
-)
+from tensorrt_llm._torch.modules.mla import _cute_dsl_fp8_bmm_out, _is_cute_dsl_fp8_bmm_available
 from tensorrt_llm._torch.modules.multi_stream_utils import (
     do_multi_stream,
     maybe_execute_in_parallel,
@@ -215,27 +212,48 @@ def _create_dsv4_epilogue_buffers(
     return fp8_o, output_sf
 
 
+def _uses_rubin_dsv4_o_b_proj_out(self) -> bool:
+    return (
+        get_sm_version() == 107
+        and self.o_b_proj.has_fp8_block_scales
+        and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+        and (self.o_b_proj.use_cute_dsl_blockscaling_mm or self.o_b_proj.disable_deep_gemm)
+    )
+
+
+def _rubin_dsv4_o_b_proj_out(
+    self,
+    o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    if isinstance(o_b_proj_input, tuple):
+        activation, activation_scale = o_b_proj_input
+    else:
+        activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+            o_b_proj_input
+        )
+    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+        activation,
+        self.o_b_proj.weight,
+        activation_scale,
+        self.o_b_proj.weight_scale,
+        output,
+    )
+
+
 def _rubin_dsv4_o_lora_quantized_input(
     self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-    if not (get_sm_version() == 107 and self.o_b_proj.has_fp8_block_scales):
+    if not _uses_rubin_dsv4_o_b_proj_out(self):
         return None
     num_tokens = attn_fp8.shape[1]
     flat_n = self.n_local_groups * self.o_lora_rank
     fp8_output = torch.empty(
         (num_tokens, flat_n), dtype=torch.float8_e4m3fn, device=attn_fp8.device
     )
-    fp8_batched = fp8_output.view(
-        num_tokens, self.n_local_groups, self.o_lora_rank
-    ).transpose(0, 1)
-    scale_numel = (
-        (num_tokens + 127) // 128
-        * 128
-        * (((flat_n + 31) // 32 + 3) // 4 * 4)
-    )
-    packed_scale = torch.empty(
-        (scale_numel,), dtype=torch.uint8, device=attn_fp8.device
-    )
+    fp8_batched = fp8_output.view(num_tokens, self.n_local_groups, self.o_lora_rank).transpose(0, 1)
+    scale_numel = (num_tokens + 127) // 128 * 128 * (((flat_n + 31) // 32 + 3) // 4 * 4)
+    packed_scale = torch.empty((scale_numel,), dtype=torch.uint8, device=attn_fp8.device)
     torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(
         attn_fp8,
         self.o_a_proj,
@@ -276,16 +294,50 @@ def _run_dsv4_o_lora_bmms(
     num_tokens: int,
     context_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
     generation_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
-) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+) -> None:
     active_inputs = [
-        item
-        for item in (context_o_lora_bmm_input, generation_o_lora_bmm_input)
-        if item is not None
+        item for item in (context_o_lora_bmm_input, generation_o_lora_bmm_input) if item is not None
     ]
+    if not active_inputs:
+        return
+
+    uses_direct_output = _uses_rubin_dsv4_o_b_proj_out(self)
+    projected_output = None
+    if uses_direct_output:
+        projected_output = o_lora_output.flatten(1)[:num_tokens]
+        if projected_output.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"DSv4 projected output width must be {self.hidden_size}, got "
+                f"{projected_output.shape[1]}"
+            )
+
+    def write_legacy_projected_output(
+        o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        legacy_projected_output = self.o_b_proj(o_b_proj_input)
+        output_view = o_lora_output.flatten(1)
+        output_view[: legacy_projected_output.shape[0], : self.hidden_size].copy_(
+            legacy_projected_output
+        )
+
     if len(active_inputs) == 1:
         quantized_input = _rubin_dsv4_o_lora_quantized_input(self, *active_inputs[0])
         if quantized_input is not None:
-            return quantized_input
+            if uses_direct_output:
+                assert projected_output is not None
+                _rubin_dsv4_o_b_proj_out(self, quantized_input, projected_output)
+            else:
+                write_legacy_projected_output(quantized_input)
+            return
+
+    if uses_direct_output:
+        o_lora_bmm_output = torch.empty(
+            [num_tokens, self.n_local_groups, self.o_lora_rank],
+            device=o_lora_output.device,
+            dtype=self.dtype,
+        )
+    else:
+        o_lora_bmm_output = o_lora_output
 
     def run_o_lora_bmm(
         o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
@@ -303,14 +355,18 @@ def _run_dsv4_o_lora_bmms(
     if context_o_lora_bmm_input is not None:
         run_o_lora_bmm(
             context_o_lora_bmm_input,
-            o_lora_output[:num_context_tokens],
+            o_lora_bmm_output[:num_context_tokens],
         )
     if generation_o_lora_bmm_input is not None:
         run_o_lora_bmm(
             generation_o_lora_bmm_input,
-            o_lora_output[num_context_tokens:num_tokens],
+            o_lora_bmm_output[num_context_tokens:num_tokens],
         )
-    return None
+    if uses_direct_output:
+        assert projected_output is not None
+        _rubin_dsv4_o_b_proj_out(self, o_lora_bmm_output.flatten(1), projected_output)
+    else:
+        write_legacy_projected_output(o_lora_bmm_output[:num_tokens].flatten(1))
 
 
 def prepare_sparse_attn_outputs(
@@ -323,12 +379,9 @@ def prepare_sparse_attn_outputs(
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
-        if get_sm_version() == 107:
-            # Rubin keeps its quantized O-LoRA projection in the standard output
-            # path. The FMHA epilogue was inherited from main and its SM107
-            # quantized-attention output is not numerically compatible.
-            return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
+            return False
+        if get_sm_version() == 107 and not _uses_rubin_dsv4_o_b_proj_out(self):
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):
             return False
@@ -350,9 +403,14 @@ def prepare_sparse_attn_outputs(
 
     if _should_use_dsv4_epilogue_fusion():
         num_tokens = hidden_states.shape[0]
+        output_shape = (
+            [num_tokens, 1, self.hidden_size]
+            if _uses_rubin_dsv4_o_b_proj_out(self)
+            else [num_tokens, self.n_local_groups, self.o_lora_rank]
+        )
         return [
             torch.empty(
-                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                output_shape,
                 device=hidden_states.device,
                 dtype=self.dtype,
             )
@@ -371,10 +429,11 @@ def project_sparse_attn_output(
     attn_output_tensor = attn_output[0]
     if isinstance(attn_output_tensor, tuple):
         return self.o_b_proj(attn_output_tensor)
-    # BCG/mixed-batch epilogue fusion runs o_a_proj at the end of attention,
-    # so this 3D tensor is O-LoRA output and only o_b_proj remains.
     if attn_output_tensor.ndim == 3:
-        return self.o_b_proj(attn_output_tensor.flatten(1))
+        output_view = attn_output_tensor.flatten(1)
+        if output_view.shape[1] == self.hidden_size:
+            return output_view
+        return output_view[:, : self.hidden_size]
 
     assert position_ids is not None
     num_tokens = attn_output_tensor.shape[0]
@@ -383,8 +442,7 @@ def project_sparse_attn_output(
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
     fused_inv_rope_fp8 = (
-        self.o_a_proj.dtype == torch.float8_e4m3fn
-        and _is_cute_dsl_fp8_bmm_available()
+        self.o_a_proj.dtype == torch.float8_e4m3fn and _is_cute_dsl_fp8_bmm_available()
     )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
@@ -576,9 +634,9 @@ def _dsv4_q_b_gemm_cu_q_seqlens(
     if attn_metadata.cu_q_seqlens is not None:
         return attn_metadata.cu_q_seqlens
     if attn_metadata.num_contexts > 0:
-        prep_ctx = getattr(attn_metadata, 'mla_prepare_ctx_cu_seqlens', None)
+        prep_ctx = getattr(attn_metadata, "mla_prepare_ctx_cu_seqlens", None)
         return prep_ctx() if prep_ctx is not None else None
-    generation_cu_seqlens = getattr(attn_metadata, 'cu_seq_lens_cuda', None)
+    generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
     if generation_cu_seqlens is None:
         return None
     return generation_cu_seqlens[: attn_metadata.num_generations + 1]
@@ -592,7 +650,7 @@ def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse FP8 q_b GEMM, per-head RMSNorm, RoPE, and output quantization."""
     assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
-    assert q.is_contiguous(), 'fused q_b GEMM needs a contiguous q_lora'
+    assert q.is_contiguous(), "fused q_b GEMM needs a contiguous q_lora"
     if getattr(self, "_quant_scale_qkv", None) is None:
         self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
     q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
@@ -1264,14 +1322,10 @@ def forward_sparse_attn(
 
     def _q_branch():
         self._fused_q_rope_applied = False
-        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
-            self, q, position_ids, attn_metadata
-        ):
+        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(self, q, position_ids, attn_metadata):
             assert position_ids is not None
             placeholder_q, quant_q_buffer, quant_scale_qkv = (
-                _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
-                    self, q, position_ids, attn_metadata
-                )
+                _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(self, q, position_ids, attn_metadata)
             )
             self._fused_quant_q_buffer = quant_q_buffer
             self._fused_q_pe = None
@@ -1426,9 +1480,9 @@ def forward_sparse_attn(
     if enable_dsv4_epilogue_fusion:
         assert context_o_lora_bmm_input is None or isinstance(context_o_lora_bmm_input, tuple)
         assert generation_o_lora_bmm_input is None or isinstance(generation_o_lora_bmm_input, tuple)
-        # The fused kernel output is group-first, which BCG cannot slice on
-        # dim 0. Write O-LoRA as token-first so replay can slice the bucket.
-        quantized_o_lora = _run_dsv4_o_lora_bmms(
+        # Keep the final projection inside the custom op and write it into the
+        # only mutable output buffer declared by the BCG contract.
+        _run_dsv4_o_lora_bmms(
             self,
             output,
             num_ctx_tokens,
@@ -1436,8 +1490,6 @@ def forward_sparse_attn(
             context_o_lora_bmm_input,
             generation_o_lora_bmm_input,
         )
-        if quantized_o_lora is not None:
-            attn_output[0] = quantized_o_lora
 
     # Both halves have consumed the fused-prologue state; clear it here rather than in
     # either half, so a mixed batch cannot have the context half hide the flag from the
