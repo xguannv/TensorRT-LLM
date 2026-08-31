@@ -455,7 +455,19 @@ def test_kimi_k3_moe_split_selection():
     assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["TRTLLM", "MEGAMOE_DEEPGEMM"])
+# The full admitted set, not a sample: this is the assertion that says which
+# backends Kimi K3 lets through, so it has to move whenever the allow-list does.
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "TRTLLM",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL",
+        "CUTEDSL",
+        "CUTLASS",
+        "CUTEDSL_FC12",
+    ],
+)
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -522,15 +534,20 @@ def test_kimi_k3_routed_config_logs_megamoe_capacity_override(monkeypatch):
 
 
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
+    # TRITON, not CUTLASS: this test has to name a backend that will never be
+    # admitted, or it breaks the moment one more backend is unlocked. It was
+    # written against CUTLASS and silently stopped testing anything when
+    # CUTLASS was admitted -- the raise disappeared and the ``match=`` string
+    # had drifted too.
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
-        moe_backend="CUTLASS",
+        moe_backend="TRITON",
     )
 
-    with pytest.raises(ValueError, match="SiTU routed experts only support"):
+    with pytest.raises(ValueError, match="SiTU routed experts support"):
         KimiK3MoERuntime._routed_moe_model_config(model_config)
 
-    assert model_config.moe_backend == "CUTLASS"
+    assert model_config.moe_backend == "TRITON"
 
 
 @pytest.mark.parametrize(
@@ -663,7 +680,15 @@ def _make_routed_moe(
             swiglu_alpha=torch.full((num_experts,), 4.0, dtype=torch.float32, device="cuda"),
             swiglu_beta=torch.full((num_experts,), 25.0, dtype=torch.float32, device="cuda"),
         )
-    else:
+    elif moe_backend == "CUTEDSL":
+        from tensorrt_llm._torch.utils import ActivationType
+
+        moe_kwargs.update(
+            activation_type=ActivationType.SiTu,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+    elif moe_backend in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"):
         moe_kwargs.update(
             activation="situ",
             situ_beta=4.0,

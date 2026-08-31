@@ -119,7 +119,6 @@ from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..utils import ActivationType, ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -1246,8 +1245,15 @@ class KimiK3MoERuntime(nn.Module):
         if not getattr(cfg, "latent_moe_use_norm", False):
             raise ValueError("Kimi K3 runtime expects latent_moe_use_norm=True")
 
-        situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
+        _cfg_beta = getattr(cfg, "activation_situ_beta", None)
+        # Keep 0.0 (invalid, rejected downstream) instead of swallowing it
+        # with ``or 1.0``. Shared-expert SituAndMul still keeps
+        # ``linear_beta is None`` as "up half stays linear".
+        situ_beta = float(_cfg_beta) if _cfg_beta is not None else 1.0
         situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
+        situ_linear_beta_moe = (
+            float(situ_linear_beta) if situ_linear_beta is not None else 1.0
+        )
         dtype = torch.bfloat16
 
         # Routing scores stay fp32; with attention-DP off the gate GEMM runs
@@ -1308,48 +1314,23 @@ class KimiK3MoERuntime(nn.Module):
                 f"{routed_quant_config.quant_algo}, which the TRTLLM "
                 "(trtllm-gen) MoE backend cannot serve: fused SiTu cubins "
                 "exist only for NVFP4 and W4A8_MXFP4_MXFP8. Set "
-                "moe_config.backend to CUTLASS, CUTEDSL or MEGAMOE_CUTEDSL."
+                "moe_config.backend to one of the other backends in "
+                "_routed_moe_model_config's supported_backends "
+                "(CUTLASS / CUTEDSL / CUTEDSL_FC12 / MEGAMOE_CUTEDSL for "
+                "NVFP4, MEGAMOE_DEEPGEMM for W4A8_MXFP4_MXFP8)."
             )
 
-        if routed_moe_model_config.moe_backend == "CUTLASS":
-            local_num_experts = self.num_experts // routed_moe_model_config.mapping.moe_ep_size
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.routed_situ_alpha = torch.full(
-                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
-            )
-            self.routed_situ_beta = torch.full(
-                (local_num_experts,),
-                float(situ_linear_beta if situ_linear_beta is not None else 1.0),
-                dtype=torch.float32,
-                device=device,
-            )
-            routed_moe_kwargs.update(
-                activation_type=ActivationType.SiTu,
-                swiglu_alpha=self.routed_situ_alpha,
-                swiglu_beta=self.routed_situ_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "CUTEDSL":
-            # The CuTe DSL FC1 epilogue folds the SiTU constants in at trace
-            # time, so unlike CUTLASS it needs no per-expert alpha/beta tensors
-            # -- CuteDslFusedMoE reads the two scalars off the pretrained
-            # config, the same way MegaMoECuteDsl does.
-            routed_moe_kwargs.update(activation_type=ActivationType.SiTu)
-        elif routed_moe_model_config.moe_backend == "TRTLLM":
-            routed_moe_kwargs.update(
-                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-                # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=float(situ_beta),
-                trtllm_gen_activation_beta=float(
-                    situ_linear_beta if situ_linear_beta is not None else 1.0
-                ),
-            )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            routed_moe_kwargs.update(
-                activation="situ",
-                situ_beta=float(situ_beta),
-                situ_linear_beta=float(situ_linear_beta if situ_linear_beta is not None else 1.0),
-            )
+        # SiTU is named once, in the canonical form. ``create_moe_backend``
+        # translates it into whichever signature the resolved backend wants --
+        # per-expert tensors for CUTLASS, a backend-local enum for TRTLLM-Gen,
+        # scalars for CuteDSL and MegaMoE. Keeping those dialects out of the
+        # model is the point: an unsupported backend is rejected there with a
+        # message naming the backend, not here.
+        routed_moe_kwargs.update(
+            activation="situ",
+            situ_beta=float(situ_beta),
+            situ_linear_beta=situ_linear_beta_moe,
+        )
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
@@ -1546,11 +1527,32 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
-        supported_backends = {"TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"}
+        # Every backend listed here must have a matching SiTU translation in
+        # ``create_moe_backend`` -- the model passes SiTU explicitly in the
+        # canonical form; no backend infers it from the checkpoint config, and
+        # no backend dialect appears in this file.
+        #
+        # CUTLASS is admitted together with SM107 in ``fused_moe_cutlass.py``'s
+        # NVFP4 ``sm_constraint`` -- ``resolve_moe_cls`` runs ``can_implement``
+        # even for an explicitly requested backend, so listing it here without
+        # that constraint would only trade this message for a less obvious
+        # "no MoE implementation can serve this layer".
+        #
+        # W4A8_MXFP4_MXFP8 still excludes SM107, so MXFP4 + CUTLASS remains
+        # unavailable on Rubin. That path has an L1 smoke on the k3-latest tree
+        # (job 450060) but no GSM8K, so it is left closed until measured.
+        supported_backends = {
+            "TRTLLM",
+            "MEGAMOE_DEEPGEMM",
+            "MEGAMOE_CUTEDSL",
+            "CUTEDSL",
+            "CUTLASS",
+            "CUTEDSL_FC12",
+        }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
-                "Kimi K3 SiTU routed experts only support the TRTLLM and "
-                "MEGAMOE_DEEPGEMM and MEGAMOE_CUTEDSL backends; "
+                "Kimi K3 SiTU routed experts support "
+                f"{', '.join(sorted(supported_backends))}; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
