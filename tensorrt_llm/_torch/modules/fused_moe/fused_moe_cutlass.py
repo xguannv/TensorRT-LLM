@@ -117,9 +117,17 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
+        # SM107 (Rubin) is served by the same SM100-family grouped-GEMM path.
+        # It was never listed here -- this entry is a new claim, not a restored
+        # one. The omission stayed invisible on branches whose resolution
+        # short-circuits an explicit CUTLASS request without calling
+        # can_implement; there Kimi-K3 NVFP4 ran anyway and scored GSM8K 96.2092
+        # (job 468774). Measured here, through resolve_moe_cls and this table:
+        # 96.6641 (job 470162, DEP16, 1319 questions, strict == flexible), with
+        # a passing quickstart first (job 470157).
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation

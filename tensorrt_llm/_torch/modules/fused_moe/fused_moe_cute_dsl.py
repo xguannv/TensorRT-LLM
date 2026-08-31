@@ -746,10 +746,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # SiTU (Kimi K3) constants. Unlike CUTLASS -- whose SiTuAdaptor reads
         # per-expert ``swiglu_alpha`` / ``swiglu_beta`` tensors -- the CuTe DSL
         # epilogue folds them in as trace-time scalars, so they are resolved
-        # here as plain floats. ``None`` is inferred from the pretrained config,
-        # mirroring ``MegaMoECuteDsl._resolve_activation_config``.
+        # here as plain floats. The model layer must pass both; this backend
+        # does not read pretrained_config.
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(
-            model_config, situ_beta, situ_linear_beta)
+            situ_beta, situ_linear_beta)
 
         # Output-memset overlap is independent of MoE chunking, so ensure its
         # stream and events exist even if the parent creates no chunking event.
@@ -788,17 +788,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
     def _resolve_situ_betas(
         self,
-        model_config: ModelConfig,
         situ_beta: Optional[float],
         situ_linear_beta: Optional[float],
     ) -> Tuple[Optional[float], Optional[float]]:
         """Resolve the SiTU constants for ``ActivationType.SiTu``.
 
-        Explicit arguments win; otherwise they are read from the pretrained
-        config (``activation_situ_beta`` / ``activation_situ_linear_beta``,
-        falling back to ``text_config`` for multimodal wrappers), the same
-        source ``MegaMoECuteDsl`` uses. Returns ``(None, None)`` for every
-        non-SiTU activation.
+        Both betas must be passed explicitly. Returns ``(None, None)`` for
+        every non-SiTU activation.
         """
         if self.activation_type != ActivationType.SiTu:
             if situ_beta is not None or situ_linear_beta is not None:
@@ -807,25 +803,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     f"ActivationType.SiTu, got {self.activation_type.name}.")
             return None, None
 
-        pretrained_config = getattr(model_config, "pretrained_config", None)
-        cfg_beta = getattr(pretrained_config, "activation_situ_beta", None)
-        cfg_lbeta = getattr(pretrained_config, "activation_situ_linear_beta",
-                            None)
-        text_config = getattr(pretrained_config, "text_config", None)
-        if cfg_beta is None and text_config is not None:
-            cfg_beta = getattr(text_config, "activation_situ_beta", None)
-        if cfg_lbeta is None and text_config is not None:
-            cfg_lbeta = getattr(text_config, "activation_situ_linear_beta",
-                                None)
-
-        situ_beta = cfg_beta if situ_beta is None else situ_beta
-        situ_linear_beta = (cfg_lbeta
-                            if situ_linear_beta is None else situ_linear_beta)
         if situ_beta is None or situ_linear_beta is None:
             raise ValueError(
-                "CuteDslFusedMoE SiTU requires activation_situ_beta and "
-                "activation_situ_linear_beta in the pretrained config, or "
-                "explicit situ_beta and situ_linear_beta arguments; got "
+                "CuteDslFusedMoE SiTU requires explicit situ_beta and "
+                "situ_linear_beta arguments; got "
                 f"{situ_beta} and {situ_linear_beta}.")
         if situ_beta <= 0 or situ_linear_beta <= 0:
             raise ValueError(
@@ -960,11 +941,24 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         """
         assert self.has_nvfp4
         assert weight_view is not None
+        # SiTu belongs here: everything below it already handles SiTu --
+        # ``run_moe_nvfp4_impl`` sets ``gather_act_kwargs["activation_type"]``
+        # and forwards ``situ_beta`` / ``situ_linear_beta``, and both act-fusion
+        # kernels (blackwell/... and rubin/...) implement the SiTU epilogue.
+        # This gate ran BEFORE that dispatch, so it rejected SiTu even though
+        # the path underneath supports it -- Kimi K3 NVFP4 on CUTEDSL died here
+        # (job 461412).
+        #
+        # ``self.activation_type`` may be a plain int, so do not format it with
+        # ``.name``: that turned the rejection itself into
+        # ``AttributeError: 'int' object has no attribute 'name'`` and hid which
+        # activation was actually refused.
         if self.activation_type not in (ActivationType.Swiglu,
-                                        ActivationType.Relu2):
+                                        ActivationType.Relu2,
+                                        ActivationType.SiTu):
             raise NotImplementedError(
-                "CuteDSL NVFP4 FC1 supports only SwiGLU and Relu2; "
-                f"got {self.activation_type.name}")
+                "CuteDSL NVFP4 FC1 supports only SwiGLU, Relu2 and SiTu; "
+                f"got {getattr(self.activation_type, 'name', self.activation_type)}")
         output_dtype = torch.bfloat16
 
         use_ugpu = self._ugpu_runtime is not None

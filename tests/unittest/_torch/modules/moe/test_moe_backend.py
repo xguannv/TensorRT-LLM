@@ -50,6 +50,8 @@ from tensorrt_llm._torch.modules.fused_moe import (
     RenormalizeMoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -83,7 +85,8 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
 )
 from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
-from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
+from tensorrt_llm._torch.utils import (ActivationType, ActType_TrtllmGen,
+                                       MxFp8QuantizedTensor, is_gated_activation)
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -727,69 +730,189 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
-def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
-    model_config = ModelConfig(
-        pretrained_config=SimpleNamespace(
-            text_config=SimpleNamespace(
-                activation_situ_beta=4.0,
-                activation_situ_linear_beta=25.0,
-            )
-        )
+def _megamoe_model_config(**kwargs) -> ModelConfig:
+    return ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+        **kwargs,
     )
 
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
 
-    assert activation == "situ"
-    assert situ_beta == 4.0
-    assert situ_linear_beta == 25.0
-
-
-def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
-    model_config = ModelConfig(pretrained_config=SimpleNamespace())
-
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
-
-    assert activation == "swiglu"
-    assert situ_beta is None
-    assert situ_linear_beta is None
-
-
-def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
-    create_moe_module = importlib.import_module("tensorrt_llm._torch.modules.fused_moe.create_moe")
-    configurable_moe = MagicMock(return_value=object())
-    monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
-    monkeypatch.setattr(
-        create_moe_module,
-        "resolve_moe_cls",
-        MagicMock(return_value=MegaMoEDeepGemm),
-    )
-
-    result = create_moe_module.create_moe(
-        routing_method=MagicMock(),
+def _make_megamoe_cutedsl(model_config: ModelConfig, **kwargs) -> MegaMoECuteDsl:
+    return MegaMoECuteDsl(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
         num_experts=8,
         hidden_size=512,
         intermediate_size=512,
         dtype=torch.bfloat16,
-        model_config=ModelConfig(),
+        model_config=model_config,
+        init_load_balancer=False,
+        **kwargs,
+    )
+
+
+def _create_megamoe_backend(**kwargs):
+    """Drive the real factory so the SiTU fan-out and its guards are exercised."""
+    return create_moe_backend(
+        moe_cls=MegaMoEDeepGemm,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=_megamoe_model_config(),
+        init_load_balancer=False,
+        **kwargs,
+    )
+
+
+def test_megamoe_uses_explicit_situ_args():
+    moe = _make_megamoe_cutedsl(
+        _megamoe_model_config(),
         activation="situ",
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
 
-    assert result is configurable_moe.return_value
-    assert configurable_moe.call_args.kwargs["activation"] == "situ"
-    assert configurable_moe.call_args.kwargs["situ_beta"] == 4.0
-    assert configurable_moe.call_args.kwargs["situ_linear_beta"] == 25.0
+    assert moe.activation == "situ"
+    assert moe.situ_beta == 4.0
+    assert moe.situ_linear_beta == 25.0
+
+
+def test_megamoe_defaults_to_swiglu_without_explicit_activation():
+    moe = _make_megamoe_cutedsl(_megamoe_model_config())
+
+    assert moe.activation == "swiglu"
+    assert moe.situ_beta is None
+    assert moe.situ_linear_beta is None
+
+
+def test_megamoe_does_not_infer_situ_from_pretrained_config():
+    # The checkpoint config carries the HF SiTU fields, but no backend may read
+    # them: SiTU only arrives through explicit constructor arguments.
+    pretrained_config = PretrainedConfig(
+        hidden_act="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+    moe = _make_megamoe_cutedsl(
+        _megamoe_model_config(pretrained_config=pretrained_config))
+
+    assert moe.activation == "swiglu"
+    assert moe.situ_beta is None
+    assert moe.situ_linear_beta is None
+
+
+def test_situ_requires_both_betas():
+    with pytest.raises(ValueError, match="requires explicit situ_beta"):
+        _create_megamoe_backend(activation="situ",
+                                situ_beta=4.0,
+                                situ_linear_beta=None)
+
+
+def test_situ_betas_must_be_positive():
+    with pytest.raises(ValueError, match="must be positive"):
+        _create_megamoe_backend(activation="situ",
+                                situ_beta=4.0,
+                                situ_linear_beta=-1.0)
+
+
+def test_situ_betas_without_situ_activation_are_rejected():
+    with pytest.raises(ValueError, match="require activation='situ'"):
+        _create_megamoe_backend(situ_beta=4.0, situ_linear_beta=25.0)
+
+
+def test_situ_fanout_builds_cutlass_per_expert_tensors():
+    """CUTLASS reads per-expert alpha/beta tensors; the fan-out must build them
+    with the gate-side constant in alpha and the linear-side one in beta, and
+    with one entry per expert on this rank. A swap stays fluent at runtime, so
+    assert the values rather than relying on generated text."""
+    num_experts = 8
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.CUTLASS.value,
+        skip_create_weights_in_init=True,
+    )
+    moe = create_moe_backend(
+        moe_cls=CutlassFusedMoE,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=num_experts,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=model_config,
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert moe.activation_type == ActivationType.SiTu
+    assert moe.swiglu_alpha.shape == (num_experts, )
+    assert moe.swiglu_beta.shape == (num_experts, )
+    assert torch.all(moe.swiglu_alpha == 4.0)
+    assert torch.all(moe.swiglu_beta == 25.0)
+
+
+def test_situ_fanout_gives_trtllm_gen_its_own_enum_and_scalars():
+    """TRTLLM-Gen takes a backend-local enum plus scalars; cubin alpha is the
+    gate-side constant and cubin beta the linear-side one.
+
+    Quantized because the backend only has fused SiTu cubins for NVFP4 and
+    W4A8_MXFP4_MXFP8 and rejects SiTu otherwise.
+    """
+    model_config = _megamoe_model_config()
+    model_config.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    moe = create_moe_backend(
+        moe_cls=TRTLLMGenFusedMoE,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=model_config,
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert moe.trtllm_gen_activation_type == ActType_TrtllmGen.SiTu
+    assert moe.trtllm_gen_activation_alpha == 4.0
+    assert moe.trtllm_gen_activation_beta == 25.0
+
+
+@pytest.mark.parametrize("moe_cls", [CuteDslFusedMoE, CuteDslFc12FusedMoE])
+def test_situ_fanout_gives_cutedsl_the_activation_type_enum(moe_cls):
+    """CuteDSL takes ActivationType.SiTu plus scalars, not the string.
+
+    CuteDslFc12FusedMoE is covered here rather than trusted by inheritance: it
+    is a subclass, but the fan-out dispatches on an explicit ``moe_cls in
+    (...)`` tuple, so a subclass that nobody added to that tuple falls through
+    to the ``else`` and raises instead of being served.
+    """
+    moe = create_moe_backend(
+        moe_cls=moe_cls,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=_megamoe_model_config(),
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert moe.activation_type == ActivationType.SiTu
+    assert moe.situ_beta == 4.0
+    assert moe.situ_linear_beta == 25.0
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
