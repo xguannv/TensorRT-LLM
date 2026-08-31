@@ -37,6 +37,8 @@ ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
+# Redeclare so rubin BASE_TAG is in scope for this stage
+ARG BASE_TAG
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -48,6 +50,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
+    BASE_TAG=${BASE_TAG} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --cuda_libs --polygraphy --mpi4py --pytorch
 
@@ -79,8 +82,6 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
-
-RUN pip3 uninstall -y nvidia-cutlass-dsl-libs-cu12
 
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
@@ -135,8 +136,7 @@ ENV PIP_EXTRA_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/nv-shared-py
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     PRTE_ALLOW_RUN_AS_ROOT=1 \
-    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-    CUTE_DSL_LIBS=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 ARG GITHUB_MIRROR=""
 WORKDIR /app/tensorrt_llm
@@ -171,8 +171,6 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
-
-RUN pip3 uninstall -y nvidia-cutlass-dsl-libs-cu12
 
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
@@ -213,8 +211,7 @@ ENV PIP_EXTRA_INDEX_URL=https://urm.nvidia.com/artifactory/api/pypi/nv-shared-py
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     PRTE_ALLOW_RUN_AS_ROOT=1 \
-    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-    CUTE_DSL_LIBS=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 # ── Install flashinfer 0.6.18 internal ──
 RUN pip install \

@@ -109,24 +109,29 @@ init_ubuntu() {
   # and ubuntu22.04 (currently not used) shouldn't be affected.
   pip3 config set global.break-system-packages true
   pip3 install pip wheel
-  pip3 install --upgrade cmake
-  # WAR: pin setuptools<80; setuptools>=80 breaks `python setup_library.py develop`
-  # used by cutlass. Use --ignore-installed to avoid failing on system setuptools
-  # that lack a RECORD file (installed via apt without pip metadata).
-  pip3 install --ignore-installed "setuptools<80"
-  # WAR: uninstall dependencies that has vulnerability or need upgrading.
-  # pip and wheel are already installed to /usr/local/ above, so removing
-  # the apt packages leaves pip3 functional.
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
-  # Remove previous TRT installation
-  if [[ $(apt list --installed | grep libnvinfer) ]]; then
-    apt-get remove --purge -y libnvinfer*
+  # Rubin devel keeps TensorRT from the dlfw base image.
+  if [[ "${SKIP_TRT_UNINSTALL:-0}" == "1" || "${BASE_TAG:-}" == *rubin* ]]; then
+    echo "Keeping TensorRT from the base image (SKIP_TRT_UNINSTALL=${SKIP_TRT_UNINSTALL:-0}, BASE_TAG=${BASE_TAG:-unset})"
+  else
+    # Remove previous TRT installation
+    if [[ $(apt list --installed | grep libnvinfer) ]]; then
+      apt-get remove --purge -y libnvinfer*
+    fi
+    if [[ $(apt list --installed | grep tensorrt) ]]; then
+      apt-get remove --purge -y tensorrt*
+    fi
+    pip3 uninstall -y tensorrt
   fi
-  if [[ $(apt list --installed | grep tensorrt) ]]; then
-    apt-get remove --purge -y tensorrt*
-  fi
-  pip3 uninstall -y tensorrt
+
+  # Install flashinfer for rubin, note that the below won't work because the ci account
+  # does not have permission to access the flashinfer repo.
+  #git clone -b feat_sm107 https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer.git --recursive
+  #cd flashinfer
+  #python3 -m pip install -v .
+  #cd ..
+  #rm -rf flashinfer
 }
 
 install_python_rockylinux() {
