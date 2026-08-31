@@ -279,8 +279,6 @@ class CuteDslMlaFmha(PhasedFmha):
         # TODO: Eliminate high host overhead of cutedsl mla to enable mix-batch.
         if (meta.num_contexts != 0 and attn.num_heads != 96) or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
-        if meta.helix_position_offsets is not None:
-            return False, "CuTe DSL MLA FMHA does not support Helix parallelism."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
         # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
@@ -297,6 +295,31 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
+        if meta.helix_position_offsets is not None:
+            if seq_len_q != 1 and not getattr(meta, "_helix_spec_tokens_valid",
+                                              False):
+                # Multi-token decode under helix needs the per-token bound /
+                # write-slot buffers of the speculative verify-group path.
+                return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
+            if seq_len_q != 1 and self._get_kernel_dtype(
+                    attn, q) == torch.float8_e4m3fn:
+                return False, (
+                    "CuTe DSL MLA FMHA helix verify groups require a bf16/fp16 "
+                    "KV cache (the fp8 kernel has no per-token bounds).")
+            softmax_stats = fwd.softmax_stats_tensor
+            if softmax_stats is None:
+                return False, "CuTe DSL MLA FMHA requires softmax_stats_tensor with Helix."
+            expected_stats_shape = (q.shape[0], attn.num_heads, 2)
+            if softmax_stats.shape != expected_stats_shape:
+                return False, (
+                    "CuTe DSL MLA FMHA requires Helix softmax stats with shape "
+                    f"{expected_stats_shape}, got {tuple(softmax_stats.shape)}."
+                )
+            if softmax_stats.dtype != torch.float32 or not softmax_stats.is_contiguous():
+                return False, (
+                    "CuTe DSL MLA FMHA requires contiguous float32 Helix softmax stats, "
+                    f"got dtype={softmax_stats.dtype}, contiguous={softmax_stats.is_contiguous()}."
+                )
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
@@ -490,6 +513,14 @@ class CuteDslMlaFmha(PhasedFmha):
             output_scale,
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
+            params.fwd.softmax_stats_tensor,
+            # Helix speculative verify groups: per-token rank-local bounds
+            # (filled by recompute_helix_spec_buffers). None on the
+            # single-token helix path and outside helix.
+            (meta.helix_kv_bounds[:num_tokens] if
+             (meta.helix_position_offsets is not None
+              and getattr(meta, "_helix_spec_tokens_valid", False)
+              and kernel_dtype != torch.float8_e4m3fn) else None),
         )
 
     def run_mla_generation(

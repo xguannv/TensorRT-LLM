@@ -773,6 +773,7 @@ class TestKVCachePlacement(unittest.TestCase):
             num_ugpus=2,
             num_extra_kv_tokens=0,
             _stream=stream,
+            _has_cp_helix=False,
         )
         stub._create_kv_cache = MagicMock(return_value=kv_cache)
         stub.pick_ugpu = KVCacheManagerV2.pick_ugpu.__get__(stub)
