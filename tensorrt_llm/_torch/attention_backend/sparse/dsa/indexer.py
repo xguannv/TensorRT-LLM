@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (
@@ -689,7 +691,33 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        # Opt-in self-sampling GVR top-K decode (CuTeDSL, env-gated:
+        # TRTLLM_GVR_SELF_SAMPLING=1). Same operator contract as the tiered
+        # heuristic path (per-request device kv_lens, raw prev-top-K hints,
+        # per-row MTP window, in-kernel n <= topK short path); tuning is
+        # frozen from indexer_max_seq_len at capture time, so the launch is
+        # CUDA-graph-replay safe. The TopK module's hardware-format gate
+        # falls through to the CUDA GVR path with a one-time warning;
+        # contract violations inside the engine raise.
+        self._use_self_sampling_topk = (
+            os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
+            and IS_CUTLASS_DSL_AVAILABLE
+            # Datacenter Blackwell and Rubin; consumer Blackwell (sm_120/121)
+            # lacks thread-block clusters.
+            and get_sm_version() in (100, 103, 107)
+            and sparse_params.index_topk in (512, 1024, 2048)
+            and self.compress_ratio in (1, 4)
+        )
         self.mtp_index_share = sparse_params.mtp_index_share
+
+        self.top_k: Optional[TopK] = None
+        if self._use_self_sampling_topk and self._enable_heuristic_topk:
+            self.top_k = TopK(
+                self.index_topk,
+                prefill_implementation=TopKImplementation.CUDA_RADIX,
+                decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+                compress_ratio=self.compress_ratio,
+            )
 
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
@@ -1811,7 +1839,23 @@ class Indexer(nn.Module):
                     if not metadata.use_cute_dsl_topk:
                         heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                if self.top_k is not None:
+                    scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
+                    assert scan_lengths is not None
+                    self.top_k(
+                        logits_decode,
+                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
+                        is_prefill=False,
+                        sequence_lengths=gen_kv_lens_cuda,
+                        scan_lengths=scan_lengths,
+                        next_n=next_n,
+                        max_seq_len=indexer_max_seq_len,
+                        gvr_ext_kwargs={
+                            "gvr_prior_indices": pre_idx,
+                            "gvr_row_order": metadata.kv_lens_row_reorder,
+                        },
+                    )
+                elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,
                         pre_idx,
