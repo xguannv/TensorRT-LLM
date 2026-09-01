@@ -4476,9 +4476,11 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                                         free_gpu_memory_fraction=0.20,
                                         tokens_per_block=64)
         spec_config = DSparkDecodingConfig(
+            attention_backend="TRTLLM",
+            block_size=7,
+            decoding_type="DSpark",
             max_draft_len=7,
-            speculative_model=self.DSPARK_MODEL_PATH,
-            attention_backend="TRTLLM")
+            speculative_model=self.DSPARK_MODEL_PATH)
         with LLM(
                 self.MODEL_PATH,
                 tensor_parallel_size=8,

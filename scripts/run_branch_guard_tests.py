@@ -133,8 +133,16 @@ SINGLE_NODE_SELECTORS = (
 K3_AGGREGATE_SELECTOR = (
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_full_accuracy"
 )
+K3_DSPARK_AGGREGATE_SELECTOR = (
+    "tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_tep8_dspark"
+)
 K3_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
+)
+K3_DSPARK_CHECKPOINT_PATH = "/lustre/fsw/coreai_comparch_infbench/alyuan//Kimi-K3-DSpark"
+FLASHINFER_CUBINS_REPOSITORY = (
+    "https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/"
+    "artifactory/sw-kernelinferencelibrary-generic-local/"
 )
 DSV4_DSPARK_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
@@ -150,6 +158,13 @@ OCI_AGA_DSV4_DSPARK_CHECKPOINT_PATH = (
 )
 BRANCH_GUARD_MODEL_ROOT = "/lustre/share/coreai_comparch_trtllm/lizhiz/branch_guard_models"
 K3_DISAGGREGATED_ACCURACY_CONFIG = "examples/kimi_k3/disagg/benchmark_kimi_k3_dep8_gsm8k.yaml"
+K3_DSPARK_SPECULATIVE_CONFIG: dict[str, str | int] = {
+    "attention_backend": "TRTLLM",
+    "block_size": 7,
+    "decoding_type": "DSpark",
+    "max_draft_len": 7,
+    "speculative_model": K3_DSPARK_CHECKPOINT_PATH,
+}
 K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG = (
     "tests/scripts/perf/disaggregated/"
     "gb300_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL.yaml"
@@ -175,6 +190,8 @@ class GuardJob:
     model_name: str | None = None
     checkpoint_path: str | None = None
     model_path_env: str | None = None
+    draft_model_name: str | None = None
+    speculative_config: dict[str, str | int] | None = None
 
 
 GUARD_JOBS = (
@@ -204,6 +221,20 @@ GUARD_JOBS = (
         model_path_env="KIMI_K3_CKPT",
     ),
     GuardJob(
+        name="k3-aggregate-dspark-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DSPARK_AGGREGATE_SELECTOR,),
+        nodes=2,
+        ntasks=8,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=True,
+        model_name="Kimi-K3",
+        checkpoint_path=K3_CHECKPOINT_PATH,
+        model_path_env="KIMI_K3_CKPT",
+        draft_model_name="Kimi-K3-DSpark",
+    ),
+    GuardJob(
         name="k3-disaggregated-gsm8k",
         scope="multi-node",
         selectors=(K3_DISAGGREGATED_ACCURACY_CONFIG,),
@@ -213,6 +244,18 @@ GUARD_JOBS = (
         gpus_per_node=4,
         use_pmix=False,
         launcher="benchmark",
+    ),
+    GuardJob(
+        name="k3-disaggregated-dspark-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=4,
+        ntasks=16,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark",
+        speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
     ),
     GuardJob(
         name="k3-disaggregated-dep16-gsm8k",
@@ -297,6 +340,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
             _first_available_path(K3_CHECKPOINT_PATH, OCI_AGA_K3_CHECKPOINT_PATH),
         ),
         help="Kimi K3 checkpoint path (or set KIMI_K3_CKPT).",
+    )
+    parser.add_argument(
+        "--k3-dspark-checkpoint",
+        default=os.environ.get("KIMI_K3_DSPARK_CKPT", K3_DSPARK_CHECKPOINT_PATH),
+        help="Kimi K3 DSpark checkpoint path (or set KIMI_K3_DSPARK_CKPT).",
     )
     parser.add_argument(
         "--dsv4-dspark-checkpoint",
@@ -426,6 +474,16 @@ def _validate_env_assignments(assignments: Sequence[str]) -> None:
             raise ValueError(f"Invalid --env assignment: {assignment!r}")
 
 
+def _requires_flashinfer_cubins(job: GuardJob) -> bool:
+    return (
+        job.model_name == "Kimi-K3"
+        and (
+            job.draft_model_name is not None
+            or job.speculative_config is not None
+        )
+    )
+
+
 def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     args.repo_root = args.repo_root.expanduser().resolve()
     args.log_dir = args.log_dir.expanduser().resolve()
@@ -435,6 +493,10 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
         args.model_root = str(Path(args.model_root).expanduser().resolve())
     if args.k3_checkpoint:
         args.k3_checkpoint = str(Path(args.k3_checkpoint).expanduser().resolve())
+    if args.k3_dspark_checkpoint:
+        args.k3_dspark_checkpoint = str(
+            Path(args.k3_dspark_checkpoint).expanduser().resolve()
+        )
     if args.dsv4_dspark_checkpoint:
         args.dsv4_dspark_checkpoint = str(
             Path(args.dsv4_dspark_checkpoint).expanduser().resolve()
@@ -453,6 +515,15 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     if missing and not args.dry_run:
         raise ValueError("Missing required Slurm inputs: " + ", ".join(missing))
 
+    if (
+        not args.dry_run
+        and any(_requires_flashinfer_cubins(job) for job in jobs)
+        and not os.environ.get("URM_TOKEN")
+    ):
+        raise ValueError(
+            "URM_TOKEN must be set in the environment before submitting a K3 DSpark test"
+        )
+
     if args.image and not Path(args.image).is_file() and not args.dry_run:
         raise ValueError(f"Container image does not exist: {args.image}")
     if args.model_root and not Path(args.model_root).is_dir() and not args.dry_run:
@@ -462,6 +533,20 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
             raise ValueError("Missing required Kimi K3 checkpoint: --k3-checkpoint")
         if not Path(args.k3_checkpoint).is_dir() and not args.dry_run:
             raise ValueError(f"Kimi K3 checkpoint does not exist: {args.k3_checkpoint}")
+    if any(
+        job.draft_model_name is not None or job.speculative_config is not None
+        for job in jobs
+    ):
+        if not args.k3_dspark_checkpoint:
+            raise ValueError(
+                "Missing required Kimi K3 DSpark checkpoint: "
+                "--k3-dspark-checkpoint"
+            )
+        if not args.dry_run and not Path(args.k3_dspark_checkpoint).is_dir():
+            raise ValueError(
+                "Kimi K3 DSpark checkpoint does not exist: "
+                f"{args.k3_dspark_checkpoint}"
+            )
     if any(job.model_name == "DeepSeek-V4-Pro-DSpark" for job in jobs):
         if not args.dsv4_dspark_checkpoint:
             raise ValueError(
@@ -489,7 +574,9 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
                 raise ValueError(f"Required Slurm command is not on PATH: {command}")
 
 
-def _shell_env_lines(args: argparse.Namespace) -> list[str]:
+def _shell_env_lines(
+    args: argparse.Namespace, include_flashinfer_repository: bool = False
+) -> list[str]:
     values = {
         "LLM_MODELS_ROOT": args.model_root,
         "HF_HOME": os.environ.get(
@@ -505,6 +592,14 @@ def _shell_env_lines(args: argparse.Namespace) -> list[str]:
         "PYTHONPATH": "",
     }
     lines = [f"export {key}={shlex.quote(value)}" for key, value in values.items()]
+    if include_flashinfer_repository:
+        lines.extend(
+            [
+                'test -n "${URM_TOKEN:-}"',
+                f"export URM_USER={shlex.quote(os.environ['USER'])}",
+                'export FLASHINFER_CUBINS_REPOSITORY="https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/artifactory/sw-kernelinferencelibrary-generic-local/"',
+            ]
+        )
     lines.append("unset TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES")
     lines.extend(f"export {assignment}" for assignment in args.env)
     return lines
@@ -556,6 +651,14 @@ def _model_setup_lines(args: argparse.Namespace, job: GuardJob) -> list[str]:
         'ln -sfn "$guard_dataset_root" "$guard_model_root/datasets"',
         'export LLM_MODELS_ROOT="$guard_model_root"',
     ]
+    if job.draft_model_name is not None:
+        lines.extend(
+            [
+                f"guard_draft_checkpoint={shlex.quote(args.k3_dspark_checkpoint)}",
+                'test -d "$guard_draft_checkpoint"',
+                f'ln -sfn "$guard_draft_checkpoint" "$guard_model_root/{job.draft_model_name}"',
+            ]
+        )
     if job.model_path_env is not None:
         lines.append(f'export {job.model_path_env}="$guard_model_root/{job.model_name}"')
     return lines
@@ -610,7 +713,11 @@ def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
     if job.launcher != "pytest":
         raise ValueError(f"{job.name} is launched by its benchmark harness")
     command, workdir = _pytest_command(args, job)
-    lines = ["set -eu", *_shell_env_lines(args)]
+    include_flashinfer_repository = _requires_flashinfer_cubins(job)
+    lines = [
+        "set -eu",
+        *_shell_env_lines(args, include_flashinfer_repository),
+    ]
     lines.extend(_install_lines(args))
     lines.extend(_model_setup_lines(args, job))
     lines.append(f"cd {shlex.quote(workdir)}")
@@ -741,6 +848,18 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     # unrelated 8K/1K JSONL dataset on the compute nodes.
     config["benchmark"]["enable_benchmark"] = False
     config.setdefault("accuracy", {})["enable_accuracy_test"] = True
+    if job.speculative_config is not None:
+        speculative_config = deepcopy(job.speculative_config)
+        speculative_config["speculative_model"] = args.k3_dspark_checkpoint
+        config["worker_config"]["gen"]["speculative_config"] = speculative_config
+    if _requires_flashinfer_cubins(job):
+        config["environment"]["worker_env_var"] = " ".join(
+            [
+                f"URM_USER={os.environ['USER']}",
+                "FLASHINFER_CUBINS_REPOSITORY=https://$URM_USER:$URM_TOKEN@urm.nvidia.com/artifactory/sw-kernelinferencelibrary-generic-local/",
+                config["environment"].get("worker_env_var", ""),
+            ]
+        ).strip()
     if job.name == "k3-disaggregated-dep16-gsm8k":
         # The normal SBSA GB300 image does not provide the MegaMoE DeepGEMM
         # implementation selected by the performance recipe. Use K3's

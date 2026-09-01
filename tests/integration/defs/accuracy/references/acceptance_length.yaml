@@ -38,11 +38,8 @@ TestLlama3_1_8BInstruct::test_suffix_automaton:
 TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
   ref_al: 3.243380267550134
   min_al: 3.0812112541726275
-# Populate on the first green run with TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1.
-# Left null on purpose: AL was measured at 5.33-5.53 during bring-up, but on a
-# 200-sample chat-template subset, not this harness's full 1,319-sample stock
-# workload -- and the workload moves acceptance, so copying that number across
-# would bake in a threshold nothing here has ever produced.
+# Baseline established on the full 1,319-sample stock workload after accuracy
+# passed for the K3 DSpark TEP8 configuration.
 TestKimiK3::test_gsm8k_tep8_dspark:
-  ref_al: null
-  min_al: null
+  ref_al: 4.356080931788769
+  min_al: 4.13827688519933

@@ -368,6 +368,23 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="TensorRT-LLM SquashFS image (or set TRTLLM_TEST_IMAGE).",
     )
     parser.add_argument(
+        "--legacy-block-reuse-policy",
+        action="store_true",
+        help="Keep the reference recipe block_reuse_policy field for legacy images.",
+    )
+    parser.add_argument(
+        "--nsys-prefill-window",
+        nargs=2,
+        type=int,
+        metavar=("START", "STOP"),
+        help="Capture only prefill iterations START through STOP with Nsys.",
+    )
+    parser.add_argument(
+        "--nsys-bin",
+        type=Path,
+        help="Nsys executable (or wrapper) passed to srtctl through SRTCTL_NSYS_BIN.",
+    )
+    parser.add_argument(
         "--benchmark-repo",
         type=Path,
         default=Path(os.environ.get("TRTLLM_PERF_BENCH_REPO", DEFAULT_BENCHMARK_REPO)),
@@ -528,6 +545,8 @@ def _prepare_recipe(
     image: Path,
     cache: Path,
     preset: PerfPreset,
+    legacy_block_reuse_policy: bool,
+    nsys_prefill_window: tuple[int, int] | None,
 ) -> None:
     _validate_reference_recipe(source, preset)
     recipe = _replace_one(
@@ -554,12 +573,25 @@ def _prepare_recipe(
         f"    AIPERF_DATASET_MMAP_CACHE_DIR: {cache}",
         "benchmark.env.AIPERF_DATASET_MMAP_CACHE_DIR",
     )
-    recipe = _replace_one(
-        recipe,
-        r"^(\s*)block_reuse_policy: (.+)$",
-        r"\1policy: \2",
-        "model.trtllm_config.prefill.kv_cache_config.block_reuse_config.policy",
-    )
+    if not legacy_block_reuse_policy:
+        recipe = _replace_one(
+            recipe,
+            r"^(\s*)block_reuse_policy: (.+)$",
+            r"\1policy: \2",
+            "model.trtllm_config.prefill.kv_cache_config.block_reuse_config.policy",
+        )
+    if nsys_prefill_window:
+        start_step, stop_step = nsys_prefill_window
+        if start_step <= 0 or stop_step < start_step:
+            raise ValueError("--nsys-prefill-window requires 0 < START <= STOP")
+        recipe += (
+            "\nprofiling:\n"
+            "  type: nsys\n"
+            "  prefill:\n"
+            f"    start_step: {start_step}\n"
+            f"    stop_step: {stop_step}\n"
+            "  decode: {}\n"
+        )
     _validate_reference_recipe(recipe, preset)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(recipe)
@@ -673,6 +705,8 @@ def _run_srtctl(
         command.append("--json")
     environment = os.environ.copy()
     environment["SRTSLURM_CONFIG"] = str(cluster_config)
+    if args.nsys_bin:
+        environment["SRTCTL_NSYS_BIN"] = str(args.nsys_bin)
     print("Running:", " ".join(command))
     result = subprocess.run(
         command,
@@ -920,7 +954,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         cluster_config = run_dir / "srtslurm-hecate.yaml"
         output_base = run_dir / "outputs"
 
-        _prepare_recipe(source_recipe, recipe, image, cache, preset)
+        _prepare_recipe(
+            source_recipe,
+            recipe,
+            image,
+            cache,
+            preset,
+            args.legacy_block_reuse_policy,
+            tuple(args.nsys_prefill_window) if args.nsys_prefill_window else None,
+        )
         _write_cluster_config(
             cluster_config,
             account=args.account,
