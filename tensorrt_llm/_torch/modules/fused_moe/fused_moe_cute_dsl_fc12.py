@@ -209,6 +209,20 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
              tile_tokens_dim=tile_size,
          )
 
+        # Zero moe_output for the scatter-add finalize via the sparse memset;
+        # faster than a full-buffer fc2_c.zero_() at large token counts.
+        torch.ops.trtllm.moe_output_memset_inplace(
+            input=moe_output,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_tokens_dim=tile_size,
+            top_k=effective_top_k,
+            ep_size=self.mapping.moe_ep_size,
+            enable_alltoall=enable_alltoall,
+        )
+
         # One fused op: gather + FC1 GEMM + SwiGLU + requant + FC2 GEMM +
         # finalize (scatter-add into moe_output = a2a combine workspace).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
