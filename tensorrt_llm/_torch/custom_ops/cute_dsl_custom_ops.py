@@ -12854,8 +12854,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fc2_scheduler_counter = torch.zeros(1,
                                                     dtype=torch.int32,
                                                     device=fc1_a.device)
-                # Finalize is scatter-ADD, so the output must start zeroed.
-                fc2_c.zero_()
 
                 fc1_a_ptr = make_ptr(cutlass.Float4E2M1FN, fc1_a.data_ptr(),
                                      cute.AddressSpace.gmem, assumed_align=32)
