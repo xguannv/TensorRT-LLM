@@ -40,6 +40,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams,
     RopeParams,
 )
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSABackendForwardArgs,
     DSACacheManager,
@@ -110,6 +113,25 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata.compress_ratios == [1, 4, 128]
     assert metadata._indexer_compress_ratio == 4
     assert metadata._tokens_per_block == 64
+
+
+def test_deepseek_v4_selfsampling_warmup_respects_heuristic_gate(monkeypatch):
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.enable_heuristic_topk = False
+    metadata.kv_cache_manager = Mock()
+    monkeypatch.setenv("TRTLLM_GVR_SELF_SAMPLING", "1")
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=107,
+        ),
+    ):
+        metadata.warmup_selfsampling_topk(next_n=6, batch_sizes=[32])
 
 
 def test_shared_topk_lifecycle():
