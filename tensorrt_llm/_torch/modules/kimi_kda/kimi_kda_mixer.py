@@ -25,9 +25,10 @@ import torch
 from fla.modules import ShortConvolution
 from torch import nn
 
+from tensorrt_llm.logger import logger
+
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
-from tensorrt_llm.logger import logger
 from ...modules.multi_stream_utils import maybe_execute_in_parallel
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
@@ -825,7 +826,7 @@ class KimiKDALinearAttention(nn.Module):
         )
 
     def _project_verify_inputs(
-        self, x: torch.Tensor, num_rows: int
+        self, x: torch.Tensor, num_rows: int, preserve_section_strides: bool = False
     ) -> Optional[
         tuple[
             torch.Tensor,
@@ -875,12 +876,20 @@ class KimiKDALinearAttention(nn.Module):
             forget_gate = self.f_b_proj(self.f_a_proj(x))
 
         d = self.proj_size
-        q_proj, k_proj, v_proj = (part.contiguous() for part in qkvg[..., : 3 * d].split(d, dim=-1))
+        q_proj, k_proj, v_proj = qkvg[..., : 3 * d].split(d, dim=-1)
         qkvg_split_sizes = self.qkvg_split_sizes
         has_onorm_gate = qkvg_weight is not None or (
             self.use_full_rank_gate and qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4
         )
-        onorm_g = qkvg[..., 3 * d : 4 * d].contiguous() if has_onorm_gate else None
+        onorm_g = qkvg[..., 3 * d : 4 * d] if has_onorm_gate else None
+        if not preserve_section_strides:
+            q_proj, k_proj, v_proj = (
+                q_proj.contiguous(),
+                k_proj.contiguous(),
+                v_proj.contiguous(),
+            )
+            if onorm_g is not None:
+                onorm_g = onorm_g.contiguous()
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
     def forward_verify_fused(
@@ -888,13 +897,11 @@ class KimiKDALinearAttention(nn.Module):
     ) -> torch.Tensor:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
-        Token layout: the kernel indexes each request's new tokens at
-        ``cu_seqlens[n] + num_accepted[n] + i``. The runtime packs the
-        ``num_steps`` new tokens per request contiguously, so we pass
-        ``cu_seqlens[n] = n * num_steps - num_accepted[n]`` — the shift
-        lands the kernel's reads/writes exactly on the packed rows. A
-        negative entry for request 0 is fine: ``bos`` is only ever used
-        additively with a token offset ``>= num_accepted``.
+        The runtime packs ``num_steps`` new rows contiguously per request.
+        The kernel derives those row offsets from the request index and
+        reads each request's pending accepted count directly from the
+        slot-indexed replay pool; no gathered pending vector or shifted
+        ``cu_seqlens`` tensor is materialized.
         """
         num_decodes = x2d.shape[0] // num_steps
         num_spec = num_steps - 1
@@ -903,7 +910,7 @@ class KimiKDALinearAttention(nn.Module):
         x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
         T_total = num_decodes * num_steps
 
-        projections = self._project_verify_inputs(x, T_total)
+        projections = self._project_verify_inputs(x, T_total, preserve_section_strides=True)
         if projections is None:
             q_proj = self.q_proj(x)
             k_proj = self.k_proj(x)
@@ -919,18 +926,27 @@ class KimiKDALinearAttention(nn.Module):
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
         g = forget_gate.view(1, T_total, H, K)
-        beta = beta_proj.contiguous().view(1, T_total, H)
+        beta = beta_proj.view(1, T_total, H)
+        if onorm_g is None:
+            raise RuntimeError(
+                "optimized KDA MTP verify requires the fused QKVG output-gate section"
+            )
+        if self._onorm_w_f32 is None:
+            raise RuntimeError(
+                "optimized KDA MTP verify requires finalized output-norm weights"
+            )
+        mxfp8_output = self._fp8_resident_projections
+        forward_prequantized = None
+        if mxfp8_output:
+            forward_prequantized = getattr(self.o_proj, "forward_prequantized", None)
+            if not callable(forward_prequantized):
+                raise RuntimeError(
+                    "FP8-resident KDA MTP verify requires o_proj.forward_prequantized"
+                )
+        onorm_g_view = onorm_g.view(1, T_total, H, self.head_dim)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
-
-        pending = layer_cache.prev_num_accepted_tokens[
-            slot_indices
-        ]  # accepted drafts of the previous round, per req
-        cu_seqlens = torch.arange(
-            0, (num_decodes + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
-        )
-        cu_seqlens[:num_decodes].sub_(pending)
 
         out = self._dispatch.mtp_verify(
             x_q=x_q,
@@ -953,14 +969,25 @@ class KimiKDALinearAttention(nn.Module):
             v_cache=layer_cache.kda_v_cache,
             beta_cache=layer_cache.kda_beta_cache,
             ssm_state_indices=slot_indices,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=None,
             num_spec=num_spec,
-            num_accepted_tokens=pending,
+            num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
+            packed_token_layout=True,
             lower_bound=lower_bound,
             scale=self.head_k_dim**-0.5,
+            onorm_g=onorm_g_view,
+            onorm_weight=self._onorm_w_f32,
+            onorm_eps=self.o_norm.eps,
+            fuse_output_norm=True,
+            mxfp8_output=mxfp8_output,
         )
-        o = out.view(num_decodes, num_steps, H, self.head_dim)
-        return self._output_gate_and_proj(x, o, onorm_g)
+        if mxfp8_output:
+            if not isinstance(out, tuple):
+                raise RuntimeError("MXFP8-output MTP KDA must return activation and scale")
+            return forward_prequantized(*out)
+        # The CuTe epilogue already applies gated RMSNorm. Keep the
+        # projection independent so it can retain its own GEMM schedule.
+        return self.o_proj(out.view(-1, self.proj_size))
 
     def _build_mtp_conv_weights(self) -> None:
         """Prebuild packed-prefill and fused-verify convolution weights.

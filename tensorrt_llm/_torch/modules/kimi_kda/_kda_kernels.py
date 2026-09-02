@@ -30,7 +30,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ..fla.index import prepare_chunk_indices
 from ...flashinfer_utils import get_env_enable_pdl
 from . import _kda_decode
 
@@ -407,10 +406,12 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def mtp_verify(self, **kwargs) -> torch.Tensor:
+    def mtp_verify(
+        self, *, mxfp8_output: bool = False, **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
-        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
+        Thin passthrough to the BF16 or MXFP8-output MTP op (see
         ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
@@ -421,8 +422,13 @@ class KDAKernelDispatch:
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        _load_mtp_module()  # registers trtllm::kda_mtp_decode
-        return torch.ops.trtllm.kda_mtp_decode(**kwargs)
+        _load_mtp_module()  # registers both BF16 and FP8 MTP ops
+        if mxfp8_output:
+            kwargs.pop("fuse_output_norm", None)
+            op = torch.ops.trtllm.kda_mtp_decode_fp8
+        else:
+            op = torch.ops.trtllm.kda_mtp_decode
+        return op(**kwargs)
 
     def can_use_indexed_prefill(
         self,

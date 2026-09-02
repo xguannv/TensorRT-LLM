@@ -866,6 +866,29 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         )
         return out.reshape(out_shape)
 
+    def forward_prequantized(
+        self,
+        activation: torch.Tensor,
+        activation_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project an activation that the fused KDA producer already quantized."""
+        if self.is_placeholder:
+            raise RuntimeError(
+                "Kimi K3 FP8 placeholder was never filled by the loader; "
+                "load_checkpoint_pair must run before forward."
+            )
+        if activation.dtype is not torch.float8_e4m3fn:
+            raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
+        out = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+            activation.reshape(-1, activation.shape[-1]),
+            activation_scale,
+            self.weight,
+            self.weight_scale,
+            output_dtype=torch.bfloat16,
+            disable_ue8m0_cast=True,
+        )
+        return out.reshape(activation.shape[:-1] + (self.out_features,))
+
 
 def _swap_linear_to_fp8_weight_read(
     parent: nn.Module,
