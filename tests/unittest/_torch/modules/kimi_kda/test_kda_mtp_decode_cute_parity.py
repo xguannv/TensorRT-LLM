@@ -34,7 +34,7 @@ state-TP4) and H=6 (TP16) are the production per-rank head counts outside
 the drop's benchmark-tuned set {2, 12, 32}; the vendored v_row hoist fix
 makes them compile, and this test validates them numerically.
 
-Requires: 1 GPU (sm100 for the CuTe kernel), fla-core, nvidia-cutlass-dsl,
+Requires: 1 GPU (sm100/sm103/sm107), fla-core, nvidia-cutlass-dsl,
 cuda-bindings. Skips cleanly otherwise.
 """
 
@@ -57,12 +57,12 @@ def _is_blackwell():
     if not torch.cuda.is_available():
         return False
     prop = torch.cuda.get_device_properties(0)
-    return prop.major * 10 + prop.minor in (100, 103)
+    return prop.major * 10 + prop.minor in (100, 103, 107)
 
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
-    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103"),
+    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103/sm107"),
     pytest.mark.skipif(not _HAVE_DEPS, reason=f"deps: {_DEP_ERR}"),
 ]
 
@@ -260,7 +260,14 @@ def cpu_reference(data):
     }
 
 
-def cute_run(data, zero_accepted_hint=False):
+def cute_run(
+    data,
+    zero_accepted_hint=False,
+    packed_token_layout=False,
+    out=None,
+    fuse_output_norm=False,
+    quantize_output=False,
+):
     """Run the in-tree op on cloned caches; return the drop-format dict."""
     import tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
 
@@ -276,7 +283,7 @@ def cute_run(data, zero_accepted_hint=False):
     qkg_cache = data["qkg_cache"].clone()
     v_cache = data["v_cache"].clone()
     beta_cache = data["beta_cache"].clone()
-    out = torch.ops.trtllm.kda_mtp_decode(
+    op_kwargs = dict(
         x_q=data["x_q"],
         x_k=data["x_k"],
         x_v=data["x_v"],
@@ -301,9 +308,25 @@ def cute_run(data, zero_accepted_hint=False):
         lower_bound=data["lower_bound"],
         scale=data["scale"],
         zero_accepted_hint=zero_accepted_hint,
+        packed_token_layout=packed_token_layout,
+        onorm_g=data.get("onorm_g"),
+        onorm_weight=data.get("onorm_weight"),
+        onorm_eps=data.get("onorm_eps", 1e-5),
+        fuse_output_norm=fuse_output_norm,
     )
+    output_scale = None
+    if quantize_output:
+        op_kwargs.pop("fuse_output_norm")
+        out, output_scale = torch.ops.trtllm.kda_mtp_decode_fp8(**op_kwargs)
+    elif out is None:
+        out = torch.ops.trtllm.kda_mtp_decode(**op_kwargs)
+    else:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import kda_mtp_decode_impl
+
+        out = kda_mtp_decode_impl(out=out, **op_kwargs)
     return {
         "out": out,
+        "output_scale": output_scale,
         # committed state back in K-first layout for CPU-golden comparison
         "recurrent_state": state.permute(0, 1, 3, 2).contiguous(),
         "state_v_first": state,
@@ -314,6 +337,58 @@ def cute_run(data, zero_accepted_hint=False):
         "cs_k": cs["cs_k"],
         "cs_v": cs["cs_v"],
     }
+
+
+def _pack_new_token_projection_views(data):
+    """Build production-like section views over compact fused GEMM outputs."""
+    B, H, K, M, source_T = (
+        data["B"],
+        data["H"],
+        data["K"],
+        data["M"],
+        data["T"],
+    )
+    accepted = data["num_accepted_tokens"].cpu()
+    rows = torch.cat(
+        [
+            torch.arange(n * source_T + int(accepted[n]), n * source_T + int(accepted[n]) + M + 1)
+            for n in range(B)
+        ]
+    ).cuda()
+    num_rows = B * (M + 1)
+    dim = H * K
+
+    # q/k/v are adjacent sections of [q | k | v | onorm_g]. Their token
+    # stride is therefore 4 * dim, not dim.
+    qkvg = torch.empty(1, num_rows, 4 * dim, dtype=torch.bfloat16, device="cuda")
+    qkvg[..., :dim].copy_(data["x_q"][0, rows].reshape(1, num_rows, dim))
+    qkvg[..., dim : 2 * dim].copy_(data["x_k"][0, rows].reshape(1, num_rows, dim))
+    qkvg[..., 2 * dim : 3 * dim].copy_(data["x_v"][0, rows].reshape(1, num_rows, dim))
+    qkvg[..., 3 * dim : 4 * dim].copy_(data["g"][0, rows].reshape(1, num_rows, dim))
+
+    # beta is the H-wide tail of the padded [f_a | beta] projection.
+    bfa_width = ((K + H + 7) // 8) * 8
+    bfa = torch.empty(1, num_rows, bfa_width, dtype=torch.bfloat16, device="cuda")
+    bfa[..., K : K + H].copy_(data["beta"][0, rows].reshape(1, num_rows, H))
+
+    packed = dict(data)
+    packed.update(
+        x_q=qkvg[..., :dim].view(1, num_rows, H, K),
+        x_k=qkvg[..., dim : 2 * dim].view(1, num_rows, H, K),
+        x_v=qkvg[..., 2 * dim : 3 * dim].view(1, num_rows, H, K),
+        onorm_g=qkvg[..., 3 * dim : 4 * dim].view(1, num_rows, H, K),
+        g=data["g"][:, rows].contiguous(),
+        beta=bfa[..., K : K + H],
+        cu_seqlens=None,
+        T=M + 1,
+        T_total=num_rows,
+    )
+    assert packed["x_q"].stride(1) == 4 * dim
+    assert packed["x_k"].stride(1) == 4 * dim
+    assert packed["x_v"].stride(1) == 4 * dim
+    assert packed["onorm_g"].stride(1) == 4 * dim
+    assert packed["beta"].stride(1) == bfa_width
+    return packed, rows
 
 
 def _fla_sequential_reference(data, num_accepted):
@@ -513,6 +588,134 @@ def test_round2_replay(B, H):
     _assert_close(
         "state2(cute vs fla)", cute2["state_v_first"], fla_committed2, atol=5e-3, rtol=5e-3
     )
+
+
+@pytest.mark.parametrize("B,H,num_spec", [(4, 6, 2), (2, 12, 7)])
+def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
+    """Compact row-strided projection views match the legacy shifted layout."""
+    data = make_conv_data(B=B, H=H, M=num_spec, seed=10)
+    request_accepted = torch.arange(B, dtype=torch.int32, device="cuda")
+    request_accepted[-1] = num_spec
+    data["num_accepted_tokens"] = request_accepted
+    packed, legacy_rows = _pack_new_token_projection_views(data)
+
+    # The production count is pool-level, while request rows may map to any
+    # state slot. Move every request's initial pools to a non-identity slot
+    # and scatter its accepted count to the same slot.
+    slots = torch.arange(B - 1, -1, -1, dtype=torch.int32, device="cuda")
+    packed["ssm_state_indices"] = slots
+    for name in (
+        "initial_state_kfirst",
+        "initial_state_cute",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        request_order = packed[name]
+        slot_order = torch.empty_like(request_order)
+        slot_order[slots.long()] = request_order
+        packed[name] = slot_order
+    pool_accepted = torch.zeros(B, dtype=torch.int32, device="cuda")
+    pool_accepted[slots.long()] = request_accepted
+    packed["num_accepted_tokens"] = pool_accepted
+
+    legacy = cute_run(data)
+    actual = cute_run(packed, packed_token_layout=True)
+    poison = torch.full(
+        (1, B * (num_spec + 1), H, data["V"]),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    poisoned = cute_run(packed, packed_token_layout=True, out=poison)
+    assert poisoned["out"].data_ptr() == poison.data_ptr()
+    assert torch.isfinite(poisoned["out"]).all()
+    _assert_close("poisoned packed out", poisoned["out"], actual["out"], atol=1e-5)
+    _assert_close(
+        "packed out",
+        actual["out"].reshape(-1, data["H"], data["V"]),
+        legacy["out"][0, legacy_rows],
+        atol=1e-5,
+    )
+
+    # Stage3a oracle: fuse only gated RMSNorm into the packed CuTe consumer.
+    # The raw recurrence output above is BF16, matching the explicit BF16
+    # round-trip boundary retained in the fused epilogue.
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+    fused_data = dict(packed)
+    fused_data["onorm_weight"] = torch.linspace(
+        0.75, 1.25, data["V"], dtype=torch.float32, device="cuda"
+    )
+    fused_data["onorm_eps"] = 1e-5
+    expected_norm = rms_norm_gated_token_major(
+        actual["out"].reshape(-1, data["V"]),
+        packed["onorm_g"].reshape(-1, data["H"], data["V"]),
+        fused_data["onorm_weight"],
+        fused_data["onorm_eps"],
+        gate_activation="sigmoid",
+    )
+    fused_norm = cute_run(
+        fused_data,
+        packed_token_layout=True,
+        fuse_output_norm=True,
+    )
+    assert torch.isfinite(fused_norm["out"]).all()
+    fused_norm_diff = (
+        fused_norm["out"].float().reshape_as(expected_norm) - expected_norm.float()
+    ).abs()
+    fused_norm_rel_l2 = (
+        fused_norm_diff.norm() / expected_norm.float().norm().clamp_min(1e-12)
+    ).item()
+    print(
+        f"  fused_norm B={B} H={H} M={num_spec}: "
+        f"max_abs={fused_norm_diff.max().item():.3e} rel_l2={fused_norm_rel_l2:.3e}"
+    )
+    _assert_close(
+        "fused gated RMSNorm",
+        fused_norm["out"].reshape(-1, data["V"]),
+        expected_norm,
+        atol=2e-2,
+        rtol=1e-2,
+    )
+    fused_fp8 = cute_run(
+        fused_data,
+        packed_token_layout=True,
+        quantize_output=True,
+    )
+    expected_rows = B * (num_spec + 1)
+    assert fused_fp8["out"].dtype is torch.float8_e4m3fn
+    assert fused_fp8["out"].shape == (expected_rows, H * data["V"])
+    assert torch.isfinite(fused_fp8["out"].float()).all()
+    assert fused_fp8["output_scale"].dtype is torch.int32
+    assert fused_fp8["output_scale"].shape == (expected_rows, (H + 3) // 4)
+    assert fused_fp8["output_scale"].stride() == (
+        1,
+        (expected_rows + 3) // 4 * 4,
+    )
+    expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        expected_norm.reshape(expected_rows, H * data["V"]),
+        False,
+    )
+    assert torch.equal(fused_fp8["out"], expected_fp8)
+    assert torch.equal(fused_fp8["output_scale"], expected_scale)
+    for name in (
+        "recurrent_state",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        _assert_close(
+            f"{name}(packed vs shifted)", actual[name][slots.long()], legacy[name], atol=1e-5
+        )
+        _assert_close(f"{name}(norm vs raw)", fused_norm[name], actual[name], atol=1e-5)
+        _assert_close(f"{name}(fp8 vs raw)", fused_fp8[name], actual[name], atol=1e-5)
 
 
 @pytest.mark.parametrize("B,H", [(32, 12)], ids=lambda v: str(v))

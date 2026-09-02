@@ -43,9 +43,9 @@ Productization deltas vs the drop's host wrapper (``reference.py``):
   syncs.
 * The compile cache is keyed purely by dtype/shape/stride layouts and
   constexpr flags — no ``id()`` or ``data_ptr`` keys.
-* Bias / output-norm / ``pad_slot_id`` arguments (unsupported by the
-  specialized kernel, previously validated-then-rejected) are dropped from
-  the signature.
+* Bias / ``pad_slot_id`` arguments (unsupported by the specialized kernel,
+  previously validated-then-rejected) are dropped from the signature. Gated
+  output norm and MXFP8 quantization are optional packed-layout epilogues.
 
 Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 ``HV == H``, TILE_V=64. ``num_spec`` is a compile-time constant per cache
@@ -96,7 +96,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         g: cute.Tensor,
         dt_bias: cute.Tensor,
         beta: cute.Tensor,
+        onorm_g: cute.Tensor,
+        onorm_weight: cute.Tensor,
         o: cute.Tensor,
+        output_scale: cute.Tensor,
         ht: cute.Tensor,
         qkg_cache: cute.Tensor,
         v_cache: cute.Tensor,
@@ -115,13 +118,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         TILE_V: cutlass.Constexpr[int],
         KERNEL_WIDTH: cutlass.Constexpr[int],
         lower_bound: cutlass.Constexpr[float],
+        onorm_eps: cutlass.Constexpr[float],
+        scale_leading_dim: cutlass.Constexpr[int],
         USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
         USE_SETMAXREG: cutlass.Constexpr[bool],
         USE_REGULAR_METADATA: cutlass.Constexpr[bool],
+        USE_PACKED_TOKEN_LAYOUT: cutlass.Constexpr[bool],
         USE_REG_Q_WEIGHTS: cutlass.Constexpr[bool],
         USE_ZERO_ACCEPTED: cutlass.Constexpr[bool],
         FUSE_PRECOMPUTE: cutlass.Constexpr[bool],
         RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
+        FUSE_OUTPUT_NORM: cutlass.Constexpr[bool],
+        QUANTIZE_OUTPUT: cutlass.Constexpr[bool],
         PROFILE_STAGES: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
@@ -145,7 +153,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             g,
             dt_bias,
             beta,
+            onorm_g,
+            onorm_weight,
             o,
+            output_scale,
             ht,
             qkg_cache,
             v_cache,
@@ -163,13 +174,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             NUM_SPEC,
             KERNEL_WIDTH,
             lower_bound,
+            onorm_eps,
+            scale_leading_dim,
             USE_FLAT_LAYOUT,
             USE_SETMAXREG,
             USE_REGULAR_METADATA,
+            USE_PACKED_TOKEN_LAYOUT,
             USE_REG_Q_WEIGHTS,
             USE_ZERO_ACCEPTED,
             FUSE_PRECOMPUTE,
             RUNTIME_PRECOMPUTE_FLAG,
+            FUSE_OUTPUT_NORM,
+            QUANTIZE_OUTPUT,
             stage_timing,
             PROFILE_STAGES,
         ).launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
@@ -198,6 +214,8 @@ def _require_stride_layout(
     cu_seqlens,
     num_accepted_tokens,
     out,
+    onorm_g,
+    onorm_weight,
     H,
     HV,
     K,
@@ -205,6 +223,9 @@ def _require_stride_layout(
     W,
     num_spec,
     T_total,
+    packed_token_layout,
+    fuse_output_norm,
+    quantize_output,
 ):
     if x_q.ndim != 4 or x_k.ndim != 4 or x_v.ndim != 4:
         raise ValueError("Expected x_q/x_k/x_v to have shape [1, T, H, D].")
@@ -216,8 +237,28 @@ def _require_stride_layout(
         raise ValueError(f"Expected g shape [1, {T_total}, {HV}, {K}].")
     if beta.ndim != 3 or beta.shape != (1, T_total, HV):
         raise ValueError(f"Expected beta shape [1, {T_total}, {HV}].")
-    if out.ndim != 4 or out.shape != (1, T_total, HV, V):
-        raise ValueError(f"Expected out shape [1, {T_total}, {HV}, {V}].")
+    if quantize_output:
+        if out.ndim != 2 or out.shape != (T_total, HV * V):
+            raise ValueError(f"Expected FP8 out shape [{T_total}, {HV * V}].")
+        if out.dtype is not torch.float8_e4m3fn:
+            raise TypeError("Expected FP8 out dtype torch.float8_e4m3fn.")
+    elif out.ndim != 4 or out.shape != (1, T_total, HV, V):
+        raise ValueError(f"Expected BF16 out shape [1, {T_total}, {HV}, {V}].")
+    if fuse_output_norm:
+        if not packed_token_layout:
+            raise ValueError("fuse_output_norm requires packed_token_layout=True.")
+        if onorm_g is None or onorm_weight is None:
+            raise ValueError("fuse_output_norm requires onorm_g and onorm_weight.")
+        if onorm_g.ndim != 4 or onorm_g.shape != (1, T_total, HV, V):
+            raise ValueError(f"Expected onorm_g shape [1, {T_total}, {HV}, {V}].")
+        if onorm_g.stride(-1) != 1 or onorm_g.stride(-2) != V:
+            raise ValueError("Expected onorm_g to have contiguous head/value blocks.")
+        if onorm_weight.ndim != 1 or onorm_weight.shape[0] != V:
+            raise ValueError(f"Expected onorm_weight shape [{V}].")
+        if onorm_weight.stride(0) != 1:
+            raise ValueError("Expected onorm_weight to be contiguous.")
+    if quantize_output and not fuse_output_norm:
+        raise ValueError("quantize_output requires fuse_output_norm=True.")
 
     last_dim_tensors = {
         "x_q": x_q,
@@ -225,12 +266,13 @@ def _require_stride_layout(
         "x_v": x_v,
         "g": g,
         "beta": beta,
-        "out": out,
         "recurrent_state": recurrent_state,
         "qkg_cache": qkg_cache,
         "v_cache": v_cache,
         "beta_cache": beta_cache,
     }
+    if not quantize_output:
+        last_dim_tensors["out"] = out
     for name, tensor in last_dim_tensors.items():
         if tensor.stride(-1) != 1:
             raise ValueError(f"Expected {name} to be contiguous in its last dimension.")
@@ -278,14 +320,25 @@ def _require_stride_layout(
     ):
         raise ValueError("Expected cache pool dimensions to cover recurrent_state rows.")
 
-    if ssm_state_indices.ndim != 1 or cu_seqlens.ndim != 1 or num_accepted_tokens.ndim != 1:
-        raise ValueError(
-            "Expected ssm_state_indices, cu_seqlens, and num_accepted_tokens to be 1D."
-        )
-    if cu_seqlens.shape[0] != ssm_state_indices.shape[0] + 1:
-        raise ValueError("Expected cu_seqlens length to be N + 1.")
-    if num_accepted_tokens.shape[0] != ssm_state_indices.shape[0]:
-        raise ValueError("Expected num_accepted_tokens length to match N.")
+    if ssm_state_indices.ndim != 1 or num_accepted_tokens.ndim != 1:
+        raise ValueError("Expected ssm_state_indices and num_accepted_tokens to be 1D.")
+    num_requests = ssm_state_indices.shape[0]
+    if packed_token_layout:
+        if cu_seqlens is not None:
+            raise ValueError("packed_token_layout derives row offsets; cu_seqlens must be None.")
+        if T_total != num_requests * (num_spec + 1):
+            raise ValueError(
+                "packed_token_layout expects exactly num_spec + 1 new-token rows per request."
+            )
+        if num_accepted_tokens.shape[0] < pool_size:
+            raise ValueError("Expected slot-indexed num_accepted_tokens to cover the state pool.")
+    else:
+        if cu_seqlens is None or cu_seqlens.ndim != 1:
+            raise ValueError("Expected cu_seqlens to be a 1D tensor.")
+        if cu_seqlens.shape[0] != num_requests + 1:
+            raise ValueError("Expected cu_seqlens length to be N + 1.")
+        if num_accepted_tokens.shape[0] != num_requests:
+            raise ValueError("Expected num_accepted_tokens length to match N.")
 
 
 def _fits_32bit_stride(tensor: torch.Tensor) -> bool:
@@ -404,7 +457,7 @@ def kda_mtp_decode_impl(
     v_cache: torch.Tensor,
     beta_cache: torch.Tensor,
     ssm_state_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
     num_spec: int,
     num_accepted_tokens: torch.Tensor,
     lower_bound: float,
@@ -412,13 +465,20 @@ def kda_mtp_decode_impl(
     out: Optional[torch.Tensor] = None,
     zero_accepted_hint: bool = False,
     regular_metadata_hint: bool = False,
-) -> torch.Tensor:
+    packed_token_layout: bool = False,
+    onorm_g: Optional[torch.Tensor] = None,
+    onorm_weight: Optional[torch.Tensor] = None,
+    onorm_eps: float = 1e-5,
+    fuse_output_norm: bool = False,
+    quantize_output: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
     Args (device tensors unless noted):
         x_q/x_k/x_v: post-projection, pre-conv token states
             ``[1, T_total, H, 128]`` bf16 — new tokens only, ``1 +
-            num_spec`` per request, packed per ``cu_seqlens``.
+            num_spec`` per request. Rows may be described by ``cu_seqlens``
+            or packed uniformly by request.
         w_q/w_k/w_v: conv weights ``[H*128, W]`` fp32, width-contiguous.
         cs_q/cs_k/cs_v: extended conv caches ``[pool, H*128, >= W-1+M]``
             fp32, dim-contiguous. Columns ``[0, W-1)`` are the committed
@@ -430,17 +490,28 @@ def kda_mtp_decode_impl(
             kernel). Committed in place.
         qkg_cache/v_cache/beta_cache: replay caches ``[pool, M, 3, H*K]`` /
             ``[pool, M, H*V]`` / ``[pool, M, H]`` fp32. Mutated.
-        ssm_state_indices / cu_seqlens / num_accepted_tokens: per-request
-            slot, token offsets ``[N+1]``, accepted-draft counts ``[N]``.
+        ssm_state_indices: per-request state-pool slots. On the legacy
+            metadata path, ``cu_seqlens`` supplies token offsets ``[N+1]``
+            and accepted counts are request-indexed ``[N]``. On the packed
+            path, ``cu_seqlens`` is absent and accepted counts are pool-level.
         zero_accepted_hint: caller asserts every ``num_accepted_tokens`` is
             zero (compiles the smaller-smem no-replay variant). Wrong hints
             produce wrong results — pass True only when statically known.
         regular_metadata_hint: caller asserts ``cu_seqlens`` is the uniform
             ``arange * (2*num_spec+1)`` pattern and ``ssm_state_indices``
             is ``arange(N)`` (benchmark identity layout).
+        packed_token_layout: input projections contain exactly ``1 +
+            num_spec`` rows per request. ``cu_seqlens`` must be ``None`` and
+            ``num_accepted_tokens`` is indexed by state-pool slot. The
+            kernel derives every new-token row from the request index.
+        fuse_output_norm: on the packed path, apply gated RMSNorm in the CuTe
+            epilogue using section-strided ``onorm_g`` and ``onorm_weight``.
+        quantize_output: return the normalized activation directly as MXFP8
+            E4M3 plus packed UE8M0 1x128 scales for a prequantized projection.
 
-    Returns the output ``[1, T_total, H, V]`` bf16 (rows for replayed
-    positions are zero; only new-token rows are written).
+    Returns either BF16 ``[1, T_total, H, V]`` or, with
+    ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
+    ``[T_total, ceil(H/4)]`` with stride ``(1, round_up(T_total, 4))``.
     """
     _, T_total, _, D = x_q.shape
     H = A_log.shape[0]
@@ -455,11 +526,43 @@ def kda_mtp_decode_impl(
     if scale is None:
         scale = K**-0.5
 
-    N = cu_seqlens.shape[0] - 1
-    if out is None:
-        out = torch.zeros(1, T_total, HV, V_dim, dtype=x_q.dtype, device=x_q.device)
+    if packed_token_layout and regular_metadata_hint:
+        raise ValueError("packed_token_layout and regular_metadata_hint are mutually exclusive.")
+    if packed_token_layout:
+        N = ssm_state_indices.shape[0]
+    elif cu_seqlens is None:
+        raise ValueError("cu_seqlens may be None only with packed_token_layout=True.")
+    else:
+        N = cu_seqlens.shape[0] - 1
+    if quantize_output:
+        if out is not None:
+            raise ValueError("quantize_output does not accept a caller-provided out tensor.")
+        out = torch.empty(
+            (T_total, HV * V_dim),
+            dtype=torch.float8_e4m3fn,
+            device=x_q.device,
+        )
+        scale_leading_dim = (T_total + 3) // 4 * 4
+        output_scale = torch.empty_strided(
+            (T_total, (HV + 3) // 4),
+            (1, scale_leading_dim),
+            dtype=torch.int32,
+            device=x_q.device,
+        )
+    elif out is None:
+        output_shape = (1, T_total, HV, V_dim)
+        if packed_token_layout:
+            # Packed outputs contain new-token rows only, and the kernel
+            # writes every head/value element. Avoid a redundant zero-fill.
+            out = torch.empty(output_shape, dtype=x_q.dtype, device=x_q.device)
+        else:
+            # Legacy layouts include replay-position holes that remain zero.
+            out = torch.zeros(output_shape, dtype=x_q.dtype, device=x_q.device)
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+    if not quantize_output:
+        output_scale = num_accepted_tokens
+        scale_leading_dim = 1
     # Mixed context/generation batches pass a view into the shared state-index
     # buffer.  An int32 view starting after one to three context rows is still
     # contiguous but may not satisfy the CuTe DLPack bridge's 16-byte pointer
@@ -490,6 +593,8 @@ def kda_mtp_decode_impl(
         cu_seqlens=cu_seqlens,
         num_accepted_tokens=num_accepted_tokens,
         out=out,
+        onorm_g=onorm_g,
+        onorm_weight=onorm_weight,
         H=H,
         HV=HV,
         K=K,
@@ -497,10 +602,20 @@ def kda_mtp_decode_impl(
         W=W,
         num_spec=num_spec,
         T_total=T_total,
+        packed_token_layout=packed_token_layout,
+        fuse_output_norm=fuse_output_norm,
+        quantize_output=quantize_output,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     precompute_control = _precompute_control_tensor(x_q.device, True)
+    # The packed variant proves at compile time that this tensor is never
+    # read. Reuse an existing metadata tensor as the CuTe placeholder.
+    cu_seqlens_arg = ssm_state_indices if cu_seqlens is None else cu_seqlens
+    # These tensors are compile-time dead in the raw-output variant. Reuse
+    # existing aligned arguments instead of allocating placeholders.
+    onorm_g_arg = onorm_g if onorm_g is not None else out
+    onorm_weight_arg = onorm_weight if onorm_weight is not None else A_log
 
     use_flat_layout, h0_arg, x_q_arg, x_k_arg, x_v_arg = _try_flatten_args(
         recurrent_state=recurrent_state,
@@ -562,17 +677,24 @@ def kda_mtp_decode_impl(
         _layout_key(g, dynamic_layout=True),
         _layout_key(dt_bias),
         _layout_key(beta, dynamic_layout=True),
+        _layout_key(onorm_g_arg, dynamic_layout=True),
+        _layout_key(onorm_weight_arg),
         _layout_key(out, dynamic_layout=True),
+        _layout_key(output_scale),
         _layout_key(qkg_cache),
         _layout_key(v_cache),
         _layout_key(beta_cache),
         _layout_key(ssm_state_indices, dynamic_layout=True),
-        _layout_key(cu_seqlens, dynamic_layout=True),
+        _layout_key(cu_seqlens_arg, dynamic_layout=True),
         _layout_key(num_accepted_tokens, dynamic_layout=True),
         use_setmaxreg,
         use_regular_metadata,
+        bool(packed_token_layout),
         use_reg_q_weights,
         use_zero_accepted,
+        float(onorm_eps),
+        bool(fuse_output_norm),
+        bool(quantize_output),
     )
 
     if key not in _compiled_cache:
@@ -580,7 +702,9 @@ def kda_mtp_decode_impl(
             f"kda_mtp_decode: compiling variant N={N} H={HV} T={T_total} "
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
-            f"static_shape={is_benchmark_static_shape}"
+            f"static_shape={is_benchmark_static_shape} "
+            f"fuse_output_norm={fuse_output_norm} "
+            f"quantize_output={quantize_output}"
         )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
@@ -598,14 +722,17 @@ def kda_mtp_decode_impl(
             _dlpack_arg(g),
             _from_dlpack_arg(dt_bias),
             _dlpack_arg(beta),
+            _dlpack_arg(onorm_g_arg),
+            _from_dlpack_arg(onorm_weight_arg),
             _dlpack_arg(out),
+            _from_dlpack_arg(output_scale),
             _from_dlpack_arg(h0_arg),
             _from_dlpack_arg(qkg_cache),
             _from_dlpack_arg(v_cache),
             _from_dlpack_arg(beta_cache),
             _dlpack_arg(stage_timing_arg),
             _dlpack_arg(ssm_state_indices),
-            _dlpack_arg(cu_seqlens),
+            _dlpack_arg(cu_seqlens_arg),
             _dlpack_arg(num_accepted_tokens),
             _from_dlpack_arg(precompute_control),
             scale=scale,
@@ -617,13 +744,18 @@ def kda_mtp_decode_impl(
             TILE_V=_TILE_V,
             KERNEL_WIDTH=W,
             lower_bound=lower_bound,
+            onorm_eps=float(onorm_eps),
+            scale_leading_dim=scale_leading_dim,
             USE_FLAT_LAYOUT=use_flat_layout,
             USE_SETMAXREG=use_setmaxreg,
             USE_REGULAR_METADATA=use_regular_metadata,
+            USE_PACKED_TOKEN_LAYOUT=bool(packed_token_layout),
             USE_REG_Q_WEIGHTS=use_reg_q_weights,
             USE_ZERO_ACCEPTED=use_zero_accepted,
             FUSE_PRECOMPUTE=True,
             RUNTIME_PRECOMPUTE_FLAG=False,
+            FUSE_OUTPUT_NORM=bool(fuse_output_norm),
+            QUANTIZE_OUTPUT=bool(quantize_output),
             PROFILE_STAGES=profile_stages,
             stream=stream,
         )
@@ -643,20 +775,25 @@ def kda_mtp_decode_impl(
         _dlpack_arg(g),
         _dlpack_arg(dt_bias),
         _dlpack_arg(beta),
+        _dlpack_arg(onorm_g_arg),
+        _dlpack_arg(onorm_weight_arg),
         _dlpack_arg(out),
+        _dlpack_arg(output_scale),
         _dlpack_arg(h0_arg),
         _dlpack_arg(qkg_cache),
         _dlpack_arg(v_cache),
         _dlpack_arg(beta_cache),
         _dlpack_arg(stage_timing_arg),
         _dlpack_arg(ssm_state_indices),
-        _dlpack_arg(cu_seqlens),
+        _dlpack_arg(cu_seqlens_arg),
         _dlpack_arg(num_accepted_tokens),
         _dlpack_arg(precompute_control),
         N,
         stream,
     )
 
+    if quantize_output:
+        return out, output_scale
     return out
 
 
@@ -694,13 +831,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
         num_spec: int,
         num_accepted_tokens: torch.Tensor,
         lower_bound: float,
         scale: Optional[float] = None,
         zero_accepted_hint: bool = False,
         regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+        fuse_output_norm: bool = False,
     ) -> torch.Tensor:
         """Fused KDA multi-token verify with in-place state commit."""
         return kda_mtp_decode_impl(
@@ -729,6 +871,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             scale=scale,
             zero_accepted_hint=zero_accepted_hint,
             regular_metadata_hint=regular_metadata_hint,
+            packed_token_layout=packed_token_layout,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=fuse_output_norm,
         )
 
     @kda_mtp_decode.register_fake
@@ -751,12 +898,170 @@ if IS_CUTLASS_DSL_AVAILABLE:
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
         num_spec: int,
         num_accepted_tokens: torch.Tensor,
         lower_bound: float,
         scale: Optional[float] = None,
         zero_accepted_hint: bool = False,
         regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+        fuse_output_norm: bool = False,
     ) -> torch.Tensor:
+        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm
         return x_q.new_empty(x_v.shape)
+
+    @torch.library.custom_op(
+        "trtllm::kda_mtp_decode_fp8",
+        mutates_args=(
+            "cs_q",
+            "cs_k",
+            "cs_v",
+            "recurrent_state",
+            "qkg_cache",
+            "v_cache",
+            "beta_cache",
+        ),
+        device_types="cuda",
+    )
+    def kda_mtp_decode_fp8(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        qkg_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: Optional[float] = None,
+        zero_accepted_hint: bool = False,
+        regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused KDA verify, gated RMSNorm, and 1x128 MXFP8 quantization."""
+        return kda_mtp_decode_impl(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            qkg_cache=qkg_cache,
+            v_cache=v_cache,
+            beta_cache=beta_cache,
+            ssm_state_indices=ssm_state_indices,
+            cu_seqlens=cu_seqlens,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            lower_bound=lower_bound,
+            scale=scale,
+            zero_accepted_hint=zero_accepted_hint,
+            regular_metadata_hint=regular_metadata_hint,
+            packed_token_layout=packed_token_layout,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=True,
+            quantize_output=True,
+        )
+
+    @kda_mtp_decode_fp8.register_fake
+    def _(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        qkg_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: Optional[float] = None,
+        zero_accepted_hint: bool = False,
+        regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del (
+            x_k,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            recurrent_state,
+            qkg_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            cu_seqlens,
+            num_spec,
+            num_accepted_tokens,
+            lower_bound,
+            scale,
+            zero_accepted_hint,
+            regular_metadata_hint,
+            packed_token_layout,
+            onorm_g,
+            onorm_weight,
+            onorm_eps,
+        )
+        rows = x_q.shape[1]
+        heads = x_v.shape[2]
+        scale_leading_dim = (rows + 3) // 4 * 4
+        output = x_q.new_empty((rows, heads * x_v.shape[3]), dtype=torch.float8_e4m3fn)
+        output_scale = torch.empty_strided(
+            (rows, (heads + 3) // 4),
+            (1, scale_leading_dim),
+            dtype=torch.int32,
+            device=x_q.device,
+        )
+        return output, output_scale

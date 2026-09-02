@@ -16,10 +16,10 @@
 
 Source-integrated from the ``KDA_decode_mtp`` kernel drop ("readable KDA
 conv-MTP"). Specialized for the benchmarked contract: conv enabled, no bias,
-no output norm, lower_bound gate, Q/K L2 norm, beta sigmoid, TILE_V=64,
-ILP=2, W=4, K == V == 128, HV == H.
+optional BF16 gated RMSNorm output, lower_bound gate, Q/K L2 norm, beta
+sigmoid, TILE_V=64, ILP=2, W=4, K == V == 128, HV == H.
 
-Per request ``n`` the kernel processes ``num_accepted_tokens[n] + 1 +
+Per request ``n`` the kernel processes an accepted count plus ``1 +
 NUM_SPEC`` steps: it first *replays* the accepted draft tokens from the
 ``qkg/v/beta`` caches (raw conv inputs from the extended tail columns of
 ``cs_q/cs_k/cs_v``), then processes the ``1 + NUM_SPEC`` new tokens. The
@@ -81,7 +81,10 @@ def kda_decode_mtp_kernel(
     g: cute.Tensor,
     dt_bias: cute.Tensor,
     beta: cute.Tensor,
+    onorm_g: cute.Tensor,
+    onorm_weight: cute.Tensor,
     o: cute.Tensor,
+    output_scale: cute.Tensor,
     ht: cute.Tensor,
     qkg_cache: cute.Tensor,
     v_cache: cute.Tensor,
@@ -99,13 +102,18 @@ def kda_decode_mtp_kernel(
     NUM_SPEC: cutlass.Constexpr[int],
     KERNEL_WIDTH: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
+    onorm_eps: cutlass.Constexpr[float],
+    scale_leading_dim: cutlass.Constexpr[int],
     USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
     USE_SETMAXREG: cutlass.Constexpr[bool],
     USE_REGULAR_METADATA: cutlass.Constexpr[bool],
+    USE_PACKED_TOKEN_LAYOUT: cutlass.Constexpr[bool],
     USE_REG_Q_WEIGHTS: cutlass.Constexpr[bool],
     USE_ZERO_ACCEPTED: cutlass.Constexpr[bool],
     FUSE_PRECOMPUTE: cutlass.Constexpr[bool],
     RUNTIME_PRECOMPUTE_FLAG: cutlass.Constexpr[bool],
+    FUSE_OUTPUT_NORM: cutlass.Constexpr[bool],
+    QUANTIZE_OUTPUT: cutlass.Constexpr[bool],
     stage_timing: cute.Tensor,
     PROFILE_STAGES: cutlass.Constexpr[bool],
 ):
@@ -132,6 +140,13 @@ def kda_decode_mtp_kernel(
         bos = i_n * (2 * NUM_SPEC + 1)
         eos = bos + (2 * NUM_SPEC + 1)
         slot = i_n
+    elif cutlass.const_expr(USE_PACKED_TOKEN_LAYOUT):
+        # Runtime verification packs exactly 1 + NUM_SPEC new rows per
+        # request. Accepted drafts live in slot-indexed replay pools and do
+        # not occupy rows in the projection outputs.
+        bos = cutlass.Int32(0)
+        eos = cutlass.Int32(0)
+        slot = ssm_state_indices[i_n]
     else:
         bos = cu_seqlens[i_n]
         eos = cu_seqlens[i_n + 1]
@@ -142,12 +157,21 @@ def kda_decode_mtp_kernel(
     if cutlass.const_expr(USE_ZERO_ACCEPTED):
         commit_len = 0
     else:
-        commit_len = num_accepted_tokens[i_n]
+        if cutlass.const_expr(USE_PACKED_TOKEN_LAYOUT):
+            commit_len = num_accepted_tokens[slot]
+        else:
+            commit_len = num_accepted_tokens[i_n]
         # Only NUM_SPEC drafts can be pending from the previous round. Clamp
         # so a malformed count cannot drive T_loop past the t_max-sized SMEM
         # buffers or the num_spec extents of the replay caches.
         if commit_len > NUM_SPEC:
             commit_len = cutlass.Int32(NUM_SPEC)
+    if cutlass.const_expr(USE_PACKED_TOKEN_LAYOUT):
+        # Existing body addresses every new row as bos + i_t, where i_t is
+        # offset by commit_len after replay. Shift bos so those accesses map
+        # to request-major packed rows without materialized cu_seqlens.
+        bos = i_n * (1 + NUM_SPEC) - commit_len
+        eos = bos + commit_len + 1 + NUM_SPEC
     if cutlass.const_expr(USE_ZERO_ACCEPTED):
         T_loop = 1 + NUM_SPEC
         t_max = 1 + NUM_SPEC
@@ -170,9 +194,9 @@ def kda_decode_mtp_kernel(
     sK = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
     sG = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((t_max,)), 16)
-    # Reserve the 8-float scratch region formerly used by the removed
-    # output-norm reduction. Nothing reads or writes this allocation; it only
-    # preserves the offsets and bank mapping of the shared-memory buffers below.
+    # Preserve the offsets and bank mapping of the shared-memory buffers from
+    # the source kernel. The fused norm below reduces within one warp and does
+    # not need this legacy CTA-reduction scratch.
     smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), 16)
     sVall = smem.allocate_tensor(cutlass.Float32, cute.make_layout((t_max * V,)), 16)
     sConvW = smem.allocate_tensor(
@@ -192,7 +216,7 @@ def kda_decode_mtp_kernel(
             cute.make_layout((KERNEL_WIDTH * vec_size,), stride=(1,)), cutlass.Float32
         )
     r_exp_A = cutlass.Float32(0.0)
-    if cutlass.const_expr(USE_REGULAR_METADATA) or eos > bos:
+    if cutlass.const_expr(USE_REGULAR_METADATA or USE_PACKED_TOKEN_LAYOUT) or eos > bos:
         if cutlass.const_expr(FUSE_PRECOMPUTE or RUNTIME_PRECOMPUTE_FLAG):
             if cutlass.const_expr(RUNTIME_PRECOMPUTE_FLAG):
                 run_precompute = precompute_control[0] != 0
@@ -749,11 +773,31 @@ def kda_decode_mtp_kernel(
                         v_row_a = warp_idx * NUM_V_ROWS + ra
                         v_row_b = warp_idx * NUM_V_ROWS + rb
                         if cutlass.const_expr(USE_ZERO_ACCEPTED):
-                            o[0, bos + i_t, i_hv, v_base + v_row_a] = cutlass.BFloat16(shq_a)
-                            o[0, bos + i_t, i_hv, v_base + v_row_b] = cutlass.BFloat16(shq_b)
+                            if cutlass.const_expr(FUSE_OUTPUT_NORM):
+                                # Match the old two-kernel dataflow exactly:
+                                # recurrent output first crosses a BF16
+                                # boundary, then RMSNorm reloads that value.
+                                sVall[i_t * V + v_base + v_row_a] = cutlass.Float32(
+                                    cutlass.BFloat16(shq_a)
+                                )
+                                sVall[i_t * V + v_base + v_row_b] = cutlass.Float32(
+                                    cutlass.BFloat16(shq_b)
+                                )
+                            else:
+                                o[0, bos + i_t, i_hv, v_base + v_row_a] = cutlass.BFloat16(shq_a)
+                                o[0, bos + i_t, i_hv, v_base + v_row_b] = cutlass.BFloat16(shq_b)
                         elif i_t >= commit_len:
-                            o[0, bos + i_t, i_hv, v_base + v_row_a] = cutlass.BFloat16(shq_a)
-                            o[0, bos + i_t, i_hv, v_base + v_row_b] = cutlass.BFloat16(shq_b)
+                            if cutlass.const_expr(FUSE_OUTPUT_NORM):
+                                new_token = i_t - commit_len
+                                sVall[new_token * V + v_base + v_row_a] = cutlass.Float32(
+                                    cutlass.BFloat16(shq_a)
+                                )
+                                sVall[new_token * V + v_base + v_row_b] = cutlass.Float32(
+                                    cutlass.BFloat16(shq_b)
+                                )
+                            else:
+                                o[0, bos + i_t, i_hv, v_base + v_row_a] = cutlass.BFloat16(shq_a)
+                                o[0, bos + i_t, i_hv, v_base + v_row_b] = cutlass.BFloat16(shq_b)
                 if i_t == commit_len:
                     for row in range(NUM_V_ROWS):
                         v_row = warp_idx * NUM_V_ROWS + row
@@ -767,6 +811,88 @@ def kda_decode_mtp_kernel(
                                     row * vec_size + i
                                 ]
                 i_t = i_t + 1
+        if cutlass.const_expr(FUSE_OUTPUT_NORM):
+            # All eight warps produced disjoint value rows above. One CTA
+            # barrier makes the BF16-rounded rows visible before assigning
+            # one complete token to each warp.
+            cute.arch.barrier()
+            token_idx = warp_idx
+            while token_idx < 1 + NUM_SPEC:
+                rms_partial = cutlass.Float32(0.0)
+                for i in range(V // 32):
+                    v_idx = i * 32 + in_warp_tid
+                    value = sVall[token_idx * V + v_idx]
+                    rms_partial += value * value
+                for offset in [16, 8, 4, 2, 1]:
+                    rms_partial += cute.arch.shuffle_sync_bfly(
+                        rms_partial, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                inv_rms = cute.math.rsqrt(
+                    rms_partial / cutlass.Float32(V) + cutlass.Float32(onorm_eps),
+                    fastmath=True,
+                )
+                output_row = i_n * (1 + NUM_SPEC) + token_idx
+                normalized_values = cute.make_rmem_tensor(
+                    cute.make_layout((V // 32,), stride=(1,)), cutlass.Float32
+                )
+                output_amax = cutlass.Float32(0.0)
+                for i in range(V // 32):
+                    v_idx = i * 32 + in_warp_tid
+                    value = sVall[token_idx * V + v_idx]
+                    gate = cutlass.Float32(onorm_g[0, output_row, i_hv, v_idx])
+                    sigmoid_gate = cutlass.Float32(1.0) / (
+                        cutlass.Float32(1.0) + cute.math.exp(-gate)
+                    )
+                    normalized = (
+                        value * inv_rms * cutlass.Float32(onorm_weight[v_idx]) * sigmoid_gate
+                    )
+                    if cutlass.const_expr(QUANTIZE_OUTPUT):
+                        # Preserve the old standalone RMSNorm's BF16 output
+                        # boundary in registers. The value goes straight to
+                        # MXFP8 below; it is never written to or reloaded from
+                        # HBM as BF16.
+                        normalized = cutlass.Float32(cutlass.BFloat16(normalized))
+                    normalized_values[i] = normalized
+                    output_abs = cute.arch.fmax(normalized, -normalized)
+                    output_amax = cute.arch.fmax(output_amax, output_abs)
+                if cutlass.const_expr(QUANTIZE_OUTPUT):
+                    output_amax = cute.arch.warp_reduction_max(output_amax)
+                    output_amax = cute.arch.fmax(output_amax, cutlass.Float32(1.0e-10))
+                    output_sf = (output_amax * cutlass.Float32(1.0 / 448.0)).to(
+                        cutlass.Float8E8M0FNU
+                    )
+                    quant_scale = cute.arch.rcp_approx(cutlass.Float32(output_sf))
+                    for i in range(V // 32):
+                        v_idx = i * 32 + in_warp_tid
+                        o[output_row, i_hv * V + v_idx] = cutlass.Float8E4M3FN(
+                            normalized_values[i] * quant_scale
+                        )
+                    if in_warp_tid == 0:
+                        scale_bytes = cute.make_tensor(
+                            cute.recast_ptr(
+                                output_scale.iterator,
+                                dtype=cutlass.Float8E8M0FNU,
+                            ),
+                            cute.make_layout(
+                                (output_scale.shape[1], scale_leading_dim, 4),
+                                stride=(scale_leading_dim * 4, 4, 1),
+                            ),
+                        )
+                        scale_bytes[i_hv // 4, output_row, i_hv % 4] = output_sf
+                        if i_hv == HV - 1:
+                            # The packed int32 ABI reserves four scale bytes
+                            # per group. Make tail bytes deterministic when H
+                            # is not divisible by four without a zero-fill
+                            # kernel or pre-initialized output tensor.
+                            for pad_head in range(HV, (HV + 3) // 4 * 4):
+                                scale_bytes[pad_head // 4, output_row, pad_head % 4] = (
+                                    cutlass.Float8E8M0FNU(0.0)
+                                )
+                else:
+                    for i in range(V // 32):
+                        v_idx = i * 32 + in_warp_tid
+                        o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(normalized_values[i])
+                token_idx = token_idx + NUM_THREADS // 32
         if cutlass.const_expr(PROFILE_STAGES):
             cute.arch.barrier()
             t_stage2 = read_globaltimer()

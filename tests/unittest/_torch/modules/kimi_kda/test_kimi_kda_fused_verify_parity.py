@@ -28,9 +28,8 @@ Simulates two chained speculative-verification rounds through
 Identical hidden states are fed to both worlds; the fused world additionally
 uses fused QKVG and [f_a|b] projections with multi-stream overlap. With mixed
 per-request acceptance between rounds, matching round-2 outputs proves the
-projection fusion and replay bookkeeping (shifted ``cu_seqlens`` layout,
-conv-window seeding, pending-count plumbing) reproduce the promoted-state
-semantics.
+projection fusion, packed row/slot bookkeeping, and in-kernel BF16 gated
+RMSNorm reproduce the promoted-state semantics.
 
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
@@ -60,12 +59,12 @@ def _is_blackwell():
     if not torch.cuda.is_available():
         return False
     prop = torch.cuda.get_device_properties(0)
-    return prop.major * 10 + prop.minor in (100, 103)
+    return prop.major * 10 + prop.minor in (100, 103, 107)
 
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
-    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103"),
+    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103/sm107"),
     pytest.mark.skipif(not _HAVE_DEPS, reason=f"deps: {_DEP_ERR}"),
 ]
 
@@ -241,6 +240,15 @@ def test_fused_vs_sequential_two_rounds():
     rt_fused.finalize_decode_weights()
     assert rt_fused._qkvg_proj_weight is not None
     assert rt_fused._bfa_proj_weight is not None
+    assert rt_fused._onorm_w_f32 is not None
+    mtp_calls = []
+    mtp_verify = rt_fused._dispatch.mtp_verify
+
+    def _capturing_mtp_verify(**kwargs):
+        mtp_calls.append(kwargs)
+        return mtp_verify(**kwargs)
+
+    rt_fused._dispatch.mtp_verify = _capturing_mtp_verify
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)
@@ -259,6 +267,15 @@ def test_fused_vs_sequential_two_rounds():
     ok = True
     # ---- Round 1 (no pending drafts) ----
     x1 = tokens()
+    projected = rt_fused._project_verify_inputs(
+        x1.view(B, T, -1), B * T, preserve_section_strides=True
+    )
+    q_view, k_view, v_view, _, beta_view, onorm_view = projected
+    for view in (q_view, k_view, v_view, onorm_view):
+        assert view.stride(-2) == 4 * rt_fused.proj_size
+        assert view.stride(-1) == 1
+    assert beta_view.stride(-2) == rt_fused._bfa_proj_weight.shape[0]
+    assert beta_view.stride(-1) == 1
     out1_seq = rt_seq.forward_verify_sequential(
         x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
     )
@@ -266,6 +283,10 @@ def test_fused_vs_sequential_two_rounds():
         out1_fused = rt_fused.forward_verify(
             x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
+    assert mtp_calls[-1]["fuse_output_norm"]
+    assert not mtp_calls[-1]["mxfp8_output"]
+    assert mtp_calls[-1]["onorm_g"].stride(-2) == K
+    assert mtp_calls[-1]["onorm_g"].stride(1) == 4 * rt_fused.proj_size
     print("round 1:")
     ok &= _rep("out", out1_fused, out1_seq)
 
@@ -283,6 +304,9 @@ def test_fused_vs_sequential_two_rounds():
         out2_fused = rt_fused.forward_verify(
             x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
+    assert len(mtp_calls) == 2
+    assert all(call["fuse_output_norm"] for call in mtp_calls)
+    assert all(not call["mxfp8_output"] for call in mtp_calls)
     print("round 2 (mixed replay):")
     ok &= _rep("out", out2_fused, out2_seq)
 
@@ -295,3 +319,29 @@ def test_fused_vs_sequential_two_rounds():
     ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
 
     assert ok
+
+
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    [
+        ("output_norm", "finalized output-norm weights"),
+        ("mxfp8_projection", "requires o_proj.forward_prequantized"),
+    ],
+)
+@torch.no_grad()
+def test_fused_verify_fails_fast_when_epilogue_is_incomplete(missing, message):
+    runtime = _make_runtime(seed=7)
+    runtime.finalize_decode_weights()
+    if missing == "output_norm":
+        runtime._onorm_w_f32 = None
+    else:
+        runtime._fp8_resident_projections = True
+
+    batch = 1
+    hidden = torch.zeros(batch * (M + 1), HIDDEN, dtype=torch.bfloat16, device="cuda")
+    conv_pool, ssm_pool = _make_pools(batch, seed=8)
+    layer_cache = _make_fused_layer_cache(batch, conv_pool)
+    slot_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(RuntimeError, match=message):
+        runtime.forward_verify_fused(hidden, M + 1, layer_cache, ssm_pool, slot_indices)
