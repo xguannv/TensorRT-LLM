@@ -280,6 +280,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if self._win_inited:
             return
         max_batch = spec_metadata.max_num_requests
+        draft_model.configure_generation_autotuner(max_batch)
+
         num_stages = draft_model.num_stages
         self._win = int(draft_model._attn_params["window_size"])
         head_dim = int(draft_model._attn_params["head_dim"])
@@ -331,12 +333,21 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if IS_CUTLASS_DSL_AVAILABLE:
             from ..custom_ops.dspark_attention_custom_op import precompile_dspark_attention
 
+            output_groups = None
+            stages = getattr(getattr(draft_model, "dspark_model", draft_model), "mtp_layers", ())
+            if (
+                stages
+                and "n_groups" in draft_model._attn_params
+                and all(stage._dspark_attn["use_fused_output_projection"] for stage in stages)
+            ):
+                output_groups = int(draft_model._attn_params["n_groups"])
             precompile_dspark_attention(
                 block_size,
                 int(draft_model._attn_params["n_heads"]),
                 self._kv_windows[:, 0],
                 float(draft_model._attn_params["softmax_scale"]),
                 eps=float(draft_model._attn_params["eps"]),
+                output_groups=output_groups,
             )
 
         # Publish the initialized state only after every required kernel has

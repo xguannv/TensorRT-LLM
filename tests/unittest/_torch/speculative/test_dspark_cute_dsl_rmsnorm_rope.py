@@ -36,6 +36,13 @@ def _make_inputs(
     return x, weight, freqs
 
 
+def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
+    storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
+    padded = storage[..., : x.shape[-1]]
+    padded.copy_(x)
+    return padded
+
+
 def _reference(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -168,12 +175,42 @@ def test_fused_dspark_rmsnorm_rope_matches_reference(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def test_fused_dspark_rmsnorm_rope_row_strided_matches_reference() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    x, weight, freqs = _make_inputs(2, 5, 512, 64, 1, seed=3)
+    x = _with_row_padding(x)
+    args = (1, 64, 1e-6, True, True, False)
+
+    assert not x.is_contiguous()
+    assert is_fused_dspark_rmsnorm_rope_supported(x, weight, freqs, 1, 64)
+    actual = cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
+    expected = _reference(x, weight, freqs, *args)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_fused_dspark_rmsnorm_rope_rejects_irregular_rows() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    x, weight, freqs = _make_inputs(2, 6, 512, 64, 1, seed=4)
+    x = _with_row_padding(x)[:, 1:]
+
+    assert x.stride(0) != x.stride(1) * x.shape[1]
+    assert not is_fused_dspark_rmsnorm_rope_supported(x, weight, freqs[:10], 1, 64)
+
+
 def test_fused_dspark_rmsnorm_rope_cuda_graph_replay():
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         cute_dsl_dspark_rmsnorm_rope,
     )
 
     x, weight, freqs = _make_inputs(2, 5, 512, 64, 24, seed=1)
+    x = _with_row_padding(x)
     args = (24, 64, 1e-6, False, True, False)
     cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args)
 
@@ -196,6 +233,8 @@ def test_fused_dspark_rmsnorm_rope_compiles_once_across_batches():
     _compile_fused_dspark_rmsnorm_rope.cache_clear()
     for batch in (1, 3):
         inputs = _make_inputs(batch, 5, 512, 64, 1, seed=batch)
+        if batch == 3:
+            inputs = (_with_row_padding(inputs[0]), *inputs[1:])
         cute_dsl_dspark_rmsnorm_rope(*inputs, 1, 64, 1e-6, True, True, False)
 
     cache_info = _compile_fused_dspark_rmsnorm_rope.cache_info()
