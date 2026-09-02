@@ -140,10 +140,6 @@ K3_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
 )
 K3_DSPARK_CHECKPOINT_PATH = "/lustre/fsw/coreai_comparch_infbench/alyuan//Kimi-K3-DSpark"
-FLASHINFER_CUBINS_REPOSITORY = (
-    "https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/"
-    "artifactory/sw-kernelinferencelibrary-generic-local/"
-)
 DSV4_DSPARK_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
     "nvidia_deepseek-v4-pro-nvfp4-dspark/hf/hf-318bf60_orig"
@@ -474,7 +470,7 @@ def _validate_env_assignments(assignments: Sequence[str]) -> None:
             raise ValueError(f"Invalid --env assignment: {assignment!r}")
 
 
-def _requires_flashinfer_cubins(job: GuardJob) -> bool:
+def _requires_flashinfer_python(job: GuardJob) -> bool:
     return (
         job.model_name == "Kimi-K3"
         and (
@@ -514,15 +510,6 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     missing = [name for name, value in required.items() if not value]
     if missing and not args.dry_run:
         raise ValueError("Missing required Slurm inputs: " + ", ".join(missing))
-
-    if (
-        not args.dry_run
-        and any(_requires_flashinfer_cubins(job) for job in jobs)
-        and not os.environ.get("URM_TOKEN")
-    ):
-        raise ValueError(
-            "URM_TOKEN must be set in the environment before submitting a K3 DSpark test"
-        )
 
     if args.image and not Path(args.image).is_file() and not args.dry_run:
         raise ValueError(f"Container image does not exist: {args.image}")
@@ -574,9 +561,7 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
                 raise ValueError(f"Required Slurm command is not on PATH: {command}")
 
 
-def _shell_env_lines(
-    args: argparse.Namespace, include_flashinfer_repository: bool = False
-) -> list[str]:
+def _shell_env_lines(args: argparse.Namespace) -> list[str]:
     values = {
         "LLM_MODELS_ROOT": args.model_root,
         "HF_HOME": os.environ.get(
@@ -592,21 +577,34 @@ def _shell_env_lines(
         "PYTHONPATH": "",
     }
     lines = [f"export {key}={shlex.quote(value)}" for key, value in values.items()]
-    if include_flashinfer_repository:
-        lines.extend(
-            [
-                'test -n "${URM_TOKEN:-}"',
-                f"export URM_USER={shlex.quote(os.environ['USER'])}",
-                'export FLASHINFER_CUBINS_REPOSITORY="https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/artifactory/sw-kernelinferencelibrary-generic-local/"',
-            ]
-        )
     lines.append("unset TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES")
     lines.extend(f"export {assignment}" for assignment in args.env)
     return lines
 
 
-def _install_lines(args: argparse.Namespace) -> list[str]:
+def _install_lines(
+    args: argparse.Namespace, install_flashinfer_python: bool = False
+) -> list[str]:
     commands = [*_shell_env_lines(args)]
+    if install_flashinfer_python:
+        commands.append(
+            shlex.join(
+                [
+                    "python3",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--isolated",
+                    "--break-system-packages",
+                    "--disable-pip-version-check",
+                    "--no-cache-dir",
+                    "--upgrade",
+                    "--index-url",
+                    "https://pypi.org/simple",
+                    "flashinfer-python[cu13]==0.6.16",
+                ]
+            )
+        )
     if args.install_from_repo:
         commands.append(
             shlex.join(
@@ -713,12 +711,13 @@ def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
     if job.launcher != "pytest":
         raise ValueError(f"{job.name} is launched by its benchmark harness")
     command, workdir = _pytest_command(args, job)
-    include_flashinfer_repository = _requires_flashinfer_cubins(job)
     lines = [
         "set -eu",
-        *_shell_env_lines(args, include_flashinfer_repository),
+        *_shell_env_lines(args),
     ]
-    lines.extend(_install_lines(args))
+    lines.extend(
+        _install_lines(args, install_flashinfer_python=_requires_flashinfer_python(job))
+    )
     lines.extend(_model_setup_lines(args, job))
     lines.append(f"cd {shlex.quote(workdir)}")
     if job.scope == "multi-node":
@@ -852,14 +851,6 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
         speculative_config = deepcopy(job.speculative_config)
         speculative_config["speculative_model"] = args.k3_dspark_checkpoint
         config["worker_config"]["gen"]["speculative_config"] = speculative_config
-    if _requires_flashinfer_cubins(job):
-        config["environment"]["worker_env_var"] = " ".join(
-            [
-                f"URM_USER={os.environ['USER']}",
-                "FLASHINFER_CUBINS_REPOSITORY=https://$URM_USER:$URM_TOKEN@urm.nvidia.com/artifactory/sw-kernelinferencelibrary-generic-local/",
-                config["environment"].get("worker_env_var", ""),
-            ]
-        ).strip()
     if job.name == "k3-disaggregated-dep16-gsm8k":
         # The normal SBSA GB300 image does not provide the MegaMoE DeepGEMM
         # implementation selected by the performance recipe. Use K3's
