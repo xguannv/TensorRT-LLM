@@ -22,6 +22,7 @@ draft and acceptance path is covered by the DSpark test in
 """
 
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -119,6 +120,7 @@ def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
             "softmax_scale": 1.0,
             "eps": 1e-6,
         },
+        configure_generation_autotuner=Mock(),
     )
 
 
@@ -144,6 +146,18 @@ def test_worker_lazy_init_window_buffers():
     buf_id = id(worker._kv_windows)
     worker._lazy_init(dm, meta)
     assert id(worker._kv_windows) == buf_id
+
+
+def test_worker_lazy_init_configures_generation_autotuner_once():
+    worker = _make_worker()
+    draft_model = _fake_draft_model()
+    draft_model.configure_generation_autotuner = Mock()
+    metadata = _make_metadata(max_num_requests=8)
+
+    worker._lazy_init(draft_model, metadata)
+    worker._lazy_init(draft_model, metadata)
+
+    draft_model.configure_generation_autotuner.assert_called_once_with(8)
 
 
 def test_worker_rejects_mismatched_block_size():
@@ -207,6 +221,9 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
 
         def __init__(self):
             self.written_positions = []
+
+        def configure_generation_autotuner(self, _max_batch):
+            pass
 
         def write_context_windows(self, hidden, positions, windows):
             self.written_positions.append(positions.clone())
@@ -397,6 +414,9 @@ class _RecordingDraftModel:
 
     def __init__(self):
         self.forward_calls = []
+
+    def configure_generation_autotuner(self, _max_batch):
+        pass
 
     def write_context_windows_batched(self, *args):
         pass

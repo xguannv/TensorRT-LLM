@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """GPU correctness tests for the DSpark CuteDSL attention op."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+)
+from tensorrt_llm._torch.models.modeling_dspark import (
     _rope_last_dims_batched,
     dspark_sparse_attn,
     get_dspark_topk_idxs_batched,
@@ -82,16 +84,19 @@ def _legacy_valid_len(start_pos):
     return (start_pos.long() + 1).clamp(max=128)
 
 
-def _reference(
-    q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, blk_freqs
-):
+def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
+    storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
+    padded = storage[..., : x.shape[-1]]
+    padded.copy_(x)
+    return padded
+
+
+def _reference(q, main_kv, block_kv, kv_cache, slots, start_pos, valid_len, sink, blk_freqs):
     cache = kv_cache.clone()
     window = cache.shape[1]
     cache[slots.long(), (start_pos % window).long()] = main_kv
     kv_full = torch.cat([cache[slots.long()], block_kv], dim=1)
-    topk = get_dspark_topk_idxs_batched(
-        window, q.shape[1], start_pos.long(), valid_len
-    )
+    topk = get_dspark_topk_idxs_batched(window, q.shape[1], start_pos.long(), valid_len)
     o = dspark_sparse_attn(q, kv_full, sink, topk, q.shape[-1] ** -0.5)
     return _rope_last_dims_batched(o, _ROPE_DIM, blk_freqs, inverse=True), cache
 
@@ -112,9 +117,7 @@ def _reference(
     ],
     ids=["full_window", "partial_window", "odd_batch", "wrapped_suffix"],
 )
-def test_cute_dsl_dspark_attention_matches_reference(
-    block, start_pos_values, valid_len_values
-):
+def test_cute_dsl_dspark_attention_matches_reference(block, start_pos_values, valid_len_values):
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
 
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
@@ -158,8 +161,10 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
     )
     batch, block, dim = block_kv.shape
     scale = dim**-0.5
-    main_x = main_kv.unsqueeze(1)
-    block_x = block_kv
+    main_x = _with_row_padding(main_kv.unsqueeze(1))
+    block_x = _with_row_padding(block_kv)
+    assert not main_x.is_contiguous()
+    assert not block_x.is_contiguous()
     weight = torch.ones(dim, device=q.device, dtype=q.dtype)
     main_freqs = torch.zeros(batch, _ROPE_DIM // 2, 2, device=q.device)
     block_freqs = torch.zeros(batch * block, _ROPE_DIM // 2, 2, device=q.device)
@@ -217,6 +222,107 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
     torch.testing.assert_close(
         block_page[:, block:], torch.zeros_like(block_page[:, block:]), rtol=0, atol=0
     )
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="The fused DSpark FP8 output projection is a Rubin specialization",
+)
+def test_cute_dsl_dspark_attention_prepared_fp8_matches_separate_quant_and_replays_graph():
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        cute_dsl_dspark_attention_prepared,
+        cute_dsl_dspark_attention_prepared_fp8,
+        precompile_dspark_attention,
+    )
+
+    groups = 16
+    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, inverse_rope_freqs = _make_inputs(
+        47, start_pos_values=[257, 390]
+    )
+    block = q.shape[1]
+    block_page = torch.zeros(q.shape[0], 8, q.shape[-1], device=q.device, dtype=q.dtype)
+    block_page[:, :block] = block_kv
+    kv_cache[slots.long(), (start_pos % kv_cache.shape[1]).long()] = main_kv
+    valid_len = torch.tensor([3, 5], device=q.device, dtype=torch.long)
+    scale = q.shape[-1] ** -0.5
+
+    precompile_dspark_attention(block, q.shape[2], kv_cache, scale, output_groups=groups)
+
+    def separate_quantize():
+        bf16 = cute_dsl_dspark_attention_prepared(
+            q,
+            block_page,
+            kv_cache,
+            slots,
+            start_pos,
+            valid_len,
+            sink,
+            inverse_rope_freqs,
+            scale,
+        )
+        rows = q.shape[0] * block
+        grouped = bf16.reshape(rows, groups, -1).permute(1, 0, 2).contiguous()
+        quant_blocks = grouped.view(groups, rows, -1, 128)
+        amax = quant_blocks.abs().amax(dim=-1).float().clamp_min(1e-10)
+        quant_scale = 448.0 / amax
+        quantized = (quant_blocks.float() * quant_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        scale_rows = (rows + 3) // 4 * 4
+        scales = torch.zeros(
+            groups,
+            quant_blocks.shape[2],
+            scale_rows,
+            device=q.device,
+            dtype=torch.float32,
+        )
+        scales[..., :rows] = (1.0 / quant_scale).transpose(1, 2)
+        return quantized.view_as(grouped), scales
+
+    def assert_quantized_close(actual_fp8, actual_scale, expected_fp8, expected_scale):
+        rows = q.shape[0] * block
+        torch.testing.assert_close(
+            actual_scale[..., :rows], expected_scale[..., :rows], rtol=1e-6, atol=0
+        )
+        actual = actual_fp8.float()
+        expected = expected_fp8.float()
+        mismatch_rate = torch.count_nonzero(actual != expected) / actual.numel()
+        assert mismatch_rate <= 1e-3
+        # CuTe and Torch can choose neighboring E4M3 values at a rounding tie.
+        torch.testing.assert_close(actual, expected, rtol=0.125, atol=0.015625)
+
+    actual_fp8, actual_scale = cute_dsl_dspark_attention_prepared_fp8(
+        q,
+        block_page,
+        kv_cache,
+        slots,
+        start_pos,
+        valid_len,
+        sink,
+        inverse_rope_freqs,
+        scale,
+        groups,
+    )
+    expected_fp8, expected_scale = separate_quantize()
+    assert_quantized_close(actual_fp8, actual_scale, expected_fp8, expected_scale)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_fp8, captured_scale = cute_dsl_dspark_attention_prepared_fp8(
+            q,
+            block_page,
+            kv_cache,
+            slots,
+            start_pos,
+            valid_len,
+            sink,
+            inverse_rope_freqs,
+            scale,
+            groups,
+        )
+    q.copy_(torch.randn_like(q))
+    valid_len.copy_(torch.tensor([7, 2], device=q.device))
+    graph.replay()
+    expected_fp8, expected_scale = separate_quantize()
+    assert_quantized_close(captured_fp8, captured_scale, expected_fp8, expected_scale)
 
 
 def test_cute_dsl_dspark_attention_rejects_unsupported_shapes():
@@ -313,6 +419,7 @@ def test_dspark_attention_forward_batched_matches_fallback(
         "block_page": 0,
         "rmsnorm_rope": 0,
     }
+    prepared_valid_lens = []
     op_attention = dspark_attention.cute_dsl_dspark_attention_prepared
     op_cache_write = dspark_attention.cute_dsl_dspark_rmsnorm_rope_cache_write
     op_block_page = dspark_attention.cute_dsl_dspark_rmsnorm_rope_block_page
@@ -320,6 +427,7 @@ def test_dspark_attention_forward_batched_matches_fallback(
 
     def counted_attention(*args):
         calls["attention_prepared"] += 1
+        prepared_valid_lens.append(args[5])
         return op_attention(*args)
 
     def counted_cache_write(*args):
@@ -542,3 +650,202 @@ def test_preparation_precompile_covers_dynamic_batches_without_runtime_jit():
 
     assert _compile_dspark_rmsnorm_rope_cache_write.cache_info().misses == 1
     assert _compile_dspark_rmsnorm_rope_block_page.cache_info().misses == 1
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The fused DSpark FP8 input producers require SM107 Rubin CuTe DSL",
+)
+def test_dspark_fp8_input_producers_match_reference_and_reuse_dynamic_m_compile():
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        _compile_dspark_concat_fp8_quant,
+        _compile_dspark_rmsnorm_fp8_quant,
+        cute_dsl_dspark_concat_fp8_quant,
+        cute_dsl_dspark_rmsnorm_fp8_quant,
+        precompile_dspark_fp8_input_fusions,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import _rmsnorm
+
+    torch.manual_seed(53)
+    hidden_dim = 1536
+    eps = 1e-6
+    weight = torch.randn(hidden_dim, device="cuda", dtype=torch.bfloat16)
+    _compile_dspark_concat_fp8_quant.cache_clear()
+    _compile_dspark_rmsnorm_fp8_quant.cache_clear()
+
+    def active_scales(scale: torch.Tensor, rows: int) -> torch.Tensor:
+        offsets = []
+        quant_blocks = hidden_dim // 128
+        for row in range(rows):
+            for quant_block in range(quant_blocks):
+                base = (
+                    (row // 128) * quant_blocks * 512
+                    + quant_block * 512
+                    + (row % 32) * 16
+                    + ((row % 128) // 32) * 4
+                )
+                offsets.extend(range(base, base + 4))
+        return scale[torch.tensor(offsets, device=scale.device, dtype=torch.long)]
+
+    missing = torch.randn(2, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="not precompiled"):
+        cute_dsl_dspark_concat_fp8_quant(missing[:1], missing[1:])
+    with pytest.raises(RuntimeError, match="not precompiled"):
+        cute_dsl_dspark_rmsnorm_fp8_quant(missing, weight, eps)
+
+    _compile_dspark_concat_fp8_quant.cache_clear()
+    _compile_dspark_rmsnorm_fp8_quant.cache_clear()
+    precompile_dspark_fp8_input_fusions(hidden_dim, hidden_dim, eps)
+    assert _compile_dspark_concat_fp8_quant.cache_info().misses == 1
+    assert _compile_dspark_rmsnorm_fp8_quant.cache_info().misses == 1
+
+    for first_rows, second_rows in ((1, 1), (3, 10), (64, 65)):
+        first_storage = torch.randn(
+            first_rows, hidden_dim + 128, device="cuda", dtype=torch.bfloat16
+        )
+        second_storage = torch.randn(
+            second_rows, hidden_dim + 256, device="cuda", dtype=torch.bfloat16
+        )
+        first = first_storage[:, :hidden_dim]
+        second = second_storage[:, :hidden_dim]
+        if first_rows > 1:
+            assert not first.is_contiguous()
+        if second_rows > 1:
+            assert not second.is_contiguous()
+
+        expected_input = torch.cat((first, second), dim=0)
+        expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+            expected_input
+        )
+        actual_fp8, actual_scale = cute_dsl_dspark_concat_fp8_quant(first, second)
+        torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            active_scales(actual_scale, first_rows + second_rows),
+            active_scales(expected_scale, first_rows + second_rows),
+            rtol=0,
+            atol=0,
+        )
+
+        norm_storage = torch.randn(
+            first_rows + second_rows,
+            hidden_dim + 128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        norm_input = norm_storage[:, :hidden_dim]
+        expected_norm = _rmsnorm(norm_input, weight, eps)
+        expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+            expected_norm
+        )
+        actual_fp8, actual_scale = cute_dsl_dspark_rmsnorm_fp8_quant(norm_input, weight, eps)
+        torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            active_scales(actual_scale, first_rows + second_rows),
+            active_scales(expected_scale, first_rows + second_rows),
+            rtol=0,
+            atol=0,
+        )
+
+    # Runtime row counts and row strides reuse the two initialization artifacts.
+    assert _compile_dspark_concat_fp8_quant.cache_info().misses == 1
+    assert _compile_dspark_rmsnorm_fp8_quant.cache_info().misses == 1
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE,
+    reason="The fused DSpark output projection requires SM107 Rubin CuTe DSL",
+)
+def test_dspark_fused_fp8_output_projection_matches_separate_and_reuses_cache():
+    from _torch.helpers import per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0
+
+    from tensorrt_llm._torch.autotuner import autotune
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLFp8RubinBmmQuantRunner,
+        CuteDSLMXFP8RubinLinear,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import _output_projection
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    torch.manual_seed(41)
+    batch, block, groups = 2, 6, 8
+    rank, group_dim, hidden = 128, 512, 128
+    rows, flat_n = batch * block, groups * rank
+    o = (
+        torch.randn(
+            batch,
+            block,
+            groups,
+            group_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / group_dim
+    )
+    o_a = torch.randn(groups, rank, group_dim, device="cuda", dtype=torch.bfloat16) / group_dim
+    o_a_fp8 = torch.empty_like(o_a, dtype=torch.float8_e4m3fn)
+    o_a_scale = torch.empty(
+        groups, rank // 128, group_dim // 128, device="cuda", dtype=torch.float32
+    )
+    for group in range(groups):
+        o_a_fp8[group], o_a_scale[group] = per_block_cast_to_fp8(o_a[group])
+
+    wo_b = torch.randn(hidden, flat_n, device="cuda", dtype=torch.bfloat16) / flat_n
+    wo_b_fp8, wo_b_scale = per_block_cast_to_fp8_e8m0(wo_b)
+    wo_b_scale = fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(
+        wo_b_scale, mn=hidden, k=flat_n
+    )
+
+    class OutputLinear:
+        has_fp8_block_scales = True
+        use_cute_dsl_blockscaling_mm = True
+        disable_deep_gemm = False
+        in_features = flat_n
+        weight = wo_b_fp8
+        weight_scale = wo_b_scale
+
+        def __call__(self, input):
+            if isinstance(input, tuple):
+                activation, scale = input
+            else:
+                activation, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+            return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                activation, self.weight, scale, self.weight_scale
+            )
+
+    output_linear = OutputLinear()
+    args = dict(
+        wo_a=None,
+        wo_b=output_linear,
+        n_groups=groups,
+        o_lora_rank=rank,
+        o_a_proj=o_a_fp8,
+        o_a_scale=o_a_scale,
+        o_a_dequant=None,
+        use_fused_output_projection=True,
+    )
+    with autotune(skip_dynamic_tuning_buckets=True):
+        actual = _output_projection(o, **args)
+    cache_sizes = (
+        len(CuteDSLFp8RubinBmmQuantRunner.kernel_cache),
+        len(CuteDSLMXFP8RubinLinear.kernel_cache),
+    )
+    replay = _output_projection(o, **args)
+    assert cache_sizes[0] > 0 and cache_sizes[1] > 0
+    assert cache_sizes == (
+        len(CuteDSLFp8RubinBmmQuantRunner.kernel_cache),
+        len(CuteDSLMXFP8RubinLinear.kernel_cache),
+    )
+    torch.testing.assert_close(replay, actual, rtol=0, atol=0)
+
+    grouped_o = o.reshape(rows, groups, group_dim)
+    grouped_o_fp8, grouped_o_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+        grouped_o
+    )
+    assert grouped_o_fp8.shape == (groups, rows, group_dim)
+    o_lora = torch.empty(groups, rows, rank, device="cuda", dtype=torch.bfloat16)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(
+        grouped_o_fp8, o_a_fp8, grouped_o_scale, o_a_scale, o_lora
+    )
+    expected = output_linear(o_lora.transpose(0, 1).reshape(rows, flat_n))
+    expected = expected.view(batch, block, hidden)
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)

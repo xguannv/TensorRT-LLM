@@ -72,9 +72,13 @@ Four parts live here:
    deployment form alone.
 
 The per-stage *backbone* forward (block attention whose K/V derive from
-``main_x``, + MoE + mHC) is brought up and numerically validated against the real
-fp8 weights separately; ``forward_embed`` (capture) and ``forward_head`` (block
-draft) are the reference-faithful, unit-validated I/O stages.
+``main_x``, + MoE + mHC) consumes the loaded block-scaled FP8 projections directly by
+default when attention projections are unsharded. Plain tensor parallelism
+automatically uses dequantized BF16 projections; set
+``TRTLLM_DSPARK_LINEAR_BACKEND=bf16`` before model construction to select the same
+fallback explicitly.
+``forward_embed`` (capture) and ``forward_head`` (block draft) below are the
+reference-faithful, unit-validated I/O stages.
 """
 
 import copy
@@ -82,7 +86,7 @@ import json
 import os
 import re
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -91,14 +95,14 @@ from torch import nn
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._utils import is_sm_100f
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..._utils import get_sm_version, is_sm_100f
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from ..distributed import AllReduceParams
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpeculativeDecodingMode
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, swizzle_sf, unswizzle_sf
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4WeightLoader,
@@ -117,14 +121,22 @@ from .modeling_speculative import (
 )
 from .modeling_utils import register_draft_model
 
+if IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+    from ..custom_ops.dspark_attention_custom_op import (
+        _run_cute_dsl_dspark_mxfp8_gemm_rubin_prevalidated,
+    )
+
 if IS_CUTLASS_DSL_AVAILABLE:
     from ..custom_ops.dspark_attention_custom_op import (
         cute_dsl_dspark_attention,
         cute_dsl_dspark_attention_prepared,
+        cute_dsl_dspark_attention_prepared_fp8,
         is_cute_dsl_dspark_attention_prepared_supported,
         is_cute_dsl_dspark_attention_supported,
     )
     from ..custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_concat_fp8_quant,
+        cute_dsl_dspark_rmsnorm_fp8_quant,
         cute_dsl_dspark_rmsnorm_rope,
         cute_dsl_dspark_rmsnorm_rope_block_page,
         cute_dsl_dspark_rmsnorm_rope_cache_write,
@@ -254,7 +266,7 @@ def get_dspark_topk_idxs_batched(
     window_size: int,
     block_size: int,
     start_pos: torch.Tensor,
-    valid_len: torch.Tensor | None = None,
+    valid_len: torch.Tensor,
 ) -> torch.Tensor:
     """Sync-free, fixed-size (CUDA-graph-safe) batched ``get_dspark_topk_idxs``.
 
@@ -265,16 +277,14 @@ def get_dspark_topk_idxs_batched(
     slots are excluded by :func:`dspark_sparse_attn` exactly as if they were
     absent while the shape remains CUDA-graph safe.
 
-    Every query attends to the actually written circular-window suffix, followed
-    by the current-block positions. Without ``valid_len`` this preserves the
-    legacy ``start_pos``-only behavior.
+    Every query attends to the actually written circular-window suffix,
+    followed by the current-block positions.
 
     Args:
         window_size: sliding-window length of the captured-context KV cache.
         block_size: number of draft positions per request.
         start_pos: ``[G]`` int tensor of per-request absolute decode positions.
-        valid_len: optional ``[G]`` count of actually written rolling-window
-            entries. When omitted, preserve the legacy ``start_pos`` mask.
+        valid_len: ``[G]`` count of actually written rolling-window entries.
 
     Returns:
         int32 tensor ``[G, block_size, window_size + block_size]``.
@@ -282,14 +292,11 @@ def get_dspark_topk_idxs_batched(
     device = start_pos.device
     g = start_pos.shape[0]
     ctx_cols = torch.arange(window_size, device=device)  # [win]
-    if valid_len is None:
-        valid = ctx_cols.unsqueeze(0) <= start_pos.unsqueeze(1)  # [G, win]
-    else:
-        # The valid entries are the contiguous logical suffix ending at
-        # start_pos, but their physical slots wrap modulo window_size.
-        valid_len = valid_len.clamp(min=0, max=window_size)
-        age = torch.remainder(start_pos.unsqueeze(1) - ctx_cols.unsqueeze(0), window_size)
-        valid = age < valid_len.unsqueeze(1)
+    # The valid entries are the contiguous logical suffix ending at start_pos,
+    # but their physical slots wrap modulo window_size.
+    valid_len = valid_len.clamp(min=0, max=window_size)
+    age = torch.remainder(start_pos.unsqueeze(1) - ctx_cols.unsqueeze(0), window_size)
+    valid = age < valid_len.unsqueeze(1)
     ctx_idx = torch.where(
         valid, ctx_cols.unsqueeze(0).expand(g, -1), torch.full_like(valid, -1, dtype=torch.long)
     )
@@ -416,19 +423,287 @@ def _rmsnorm_rope_batched(
     return t
 
 
+def _linear_projection(
+    x: torch.Tensor,
+    weight_or_projection: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Apply either a reference tensor weight or a loaded ``Linear`` module."""
+    if callable(weight_or_projection):
+        return weight_or_projection(x)
+    return F.linear(x, weight_or_projection)
+
+
+def _prequantized_fp8_projection(
+    x: tuple[torch.Tensor, torch.Tensor],
+    projection: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Run a bind-time-validated Rubin FP8 projection without Linear dispatch."""
+    activation, activation_scale = x
+    tuning_config = getattr(projection, "_dspark_generation_tuning_config", None)
+    return _run_cute_dsl_dspark_mxfp8_gemm_rubin_prevalidated(
+        activation,
+        projection.weight,
+        activation_scale,
+        projection.weight_scale,
+        materialize_launch=True,
+        tuning_config=tuning_config,
+    )
+
+
+def _can_use_fused_fp8_input_projection(
+    projection: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    in_features: int,
+) -> bool:
+    """Return whether a loaded Linear accepts Rubin R128c4 FP8 input."""
+    if (
+        get_sm_version() != 107
+        or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+        or not callable(projection)
+        or in_features % 128 != 0
+        or getattr(projection, "in_features", None) != in_features
+        or getattr(projection, "has_fp8_block_scales", False) is not True
+        or not (
+            getattr(projection, "use_cute_dsl_blockscaling_mm", False) is True
+            or getattr(projection, "disable_deep_gemm", False) is True
+        )
+        or getattr(projection, "bias", None) is not None
+        or getattr(projection, "lora", None) is not None
+        or getattr(projection, "_ugpu_weight_shards", None) is not None
+    ):
+        return False
+
+    weight = getattr(projection, "weight", None)
+    weight_scale = getattr(projection, "weight_scale", None)
+    return (
+        isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.ndim == 2
+        and weight.shape[1] == in_features
+        and weight.is_contiguous()
+        and isinstance(weight_scale, torch.Tensor)
+        and weight_scale.dtype == torch.uint8
+        and weight_scale.is_contiguous()
+    )
+
+
+def _can_use_fused_fp8_output_projection(
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    o_a_proj: torch.Tensor,
+    n_groups: int,
+    o_lora_rank: int,
+) -> bool:
+    """Return whether ``wo_b`` consumes the Rubin R128c4 FP8 layout."""
+    if (
+        get_sm_version() != 107
+        or not IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+        or not callable(wo_b)
+        or getattr(wo_b, "has_fp8_block_scales", False) is not True
+        or not (
+            getattr(wo_b, "use_cute_dsl_blockscaling_mm", False) is True
+            or getattr(wo_b, "disable_deep_gemm", False) is True
+        )
+    ):
+        return False
+
+    weight = getattr(wo_b, "weight", None)
+    weight_scale = getattr(wo_b, "weight_scale", None)
+    flat_n = n_groups * o_lora_rank
+    return (
+        o_a_proj.dtype == torch.float8_e4m3fn
+        and o_lora_rank % 128 == 0
+        and tuple(o_a_proj.shape[:2]) == (n_groups, o_lora_rank)
+        and getattr(wo_b, "in_features", None) == flat_n
+        and isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.float8_e4m3fn
+        and isinstance(weight_scale, torch.Tensor)
+        and weight_scale.dtype == torch.uint8
+    )
+
+
+def _qkv_projections(
+    x: torch.Tensor,
+    main_x: torch.Tensor,
+    *,
+    wq_a: Optional[torch.Tensor],
+    wkv: Optional[torch.Tensor],
+    q_norm_w: torch.Tensor,
+    qkv_proj: Optional[Callable[[torch.Tensor], torch.Tensor]],
+    use_fused_fp8_input: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project Q-latent and MQA K/V, fusing q_a+wkv when a module is supplied."""
+    if qkv_proj is None:
+        if wq_a is None or wkv is None:
+            raise ValueError("DSpark attention requires tensor weights or a fused qkv projection")
+        return F.linear(x, wq_a), F.linear(x, wkv), F.linear(main_x, wkv)
+
+    q_lora_rank = q_norm_w.shape[0]
+    # Group main and draft rows separately so the last-dimension Q/KV splits
+    # retain a constant row stride across batches. The views are metadata-only.
+    # Rubin folds their concatenation into the projection FP8 input producer;
+    # other paths keep the original concatenation.
+    main_rows = main_x.view(-1, main_x.shape[-1])
+    block_rows = x.view(-1, x.shape[-1])
+    if use_fused_fp8_input:
+        qkv_input = cute_dsl_dspark_concat_fp8_quant(main_rows, block_rows)
+    else:
+        qkv_input = torch.cat((main_rows, block_rows), dim=0)
+    qkv_rows = (
+        _prequantized_fp8_projection(qkv_input, qkv_proj)
+        if use_fused_fp8_input
+        else qkv_proj(qkv_input)
+    )
+    main_qkv, qkv = qkv_rows.split((main_rows.shape[0], block_rows.shape[0]), dim=0)
+    main_qkv = main_qkv.view(*main_x.shape[:-1], qkv_rows.shape[-1])
+    qkv = qkv.view(*x.shape[:-1], qkv_rows.shape[-1])
+    q_latent, kv = qkv.split((q_lora_rank, qkv.shape[-1] - q_lora_rank), dim=-1)
+    main_kv = main_qkv[..., q_lora_rank:]
+    return q_latent, kv, main_kv
+
+
+def _q_projection(
+    q_latent: torch.Tensor,
+    q_norm_w: torch.Tensor,
+    eps: float,
+    wq_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    use_fused_fp8_input: bool,
+    batched_freqs_cis: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply q-latent RMSNorm and q_b, optionally sharing one FP8 producer."""
+    if use_fused_fp8_input:
+        q_input = cute_dsl_dspark_rmsnorm_fp8_quant(q_latent, q_norm_w, eps)
+        q = _prequantized_fp8_projection(q_input, wq_b)
+        return q.view(*q_latent.shape[:-1], q.shape[-1])
+
+    if batched_freqs_cis is not None:
+        return _linear_projection(
+            _rmsnorm_rope_batched(q_latent, q_norm_w, eps, 0, batched_freqs_cis),
+            wq_b,
+        )
+    q = _rmsnorm(q_latent, q_norm_w, eps)
+    return _linear_projection(q, wq_b)
+
+
+def _output_projection(
+    o: torch.Tensor,
+    *,
+    wo_a: Optional[torch.Tensor],
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    n_groups: int,
+    o_lora_rank: int,
+    o_a_proj: Optional[torch.Tensor],
+    o_a_scale: Optional[torch.Tensor],
+    o_a_dequant: Optional[torch.Tensor],
+    use_fused_output_projection: Optional[bool] = None,
+) -> torch.Tensor:
+    """Apply the grouped o_a projection followed by o_b."""
+    batch, block = o.shape[:2]
+    if o_a_proj is None:
+        if wo_a is None:
+            raise ValueError("DSpark attention requires a tensor wo_a or a loaded FP8 o_a")
+        o = o.reshape(batch, block, n_groups, -1)
+        wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
+        o_lora = torch.einsum("bsgd,grd->bsgr", o, wo_a_v).flatten(2)
+        return _linear_projection(o_lora, wo_b)
+
+    if o_a_proj.dtype != torch.float8_e4m3fn:
+        grouped_o = o.reshape(batch * block, n_groups, -1).transpose(0, 1)
+        o_lora = torch.bmm(grouped_o, o_a_proj.transpose(1, 2))
+        o_lora = o_lora.transpose(0, 1).reshape(batch, block, n_groups * o_lora_rank)
+        return _linear_projection(o_lora, wo_b)
+
+    if o_a_scale is None:
+        raise ValueError("The DSpark FP8 o_a projection requires block scales")
+
+    grouped_o = o.reshape(batch * block, n_groups, -1)
+    if use_fused_output_projection is None:
+        use_fused_output_projection = _can_use_fused_fp8_output_projection(
+            wo_b, o_a_proj, n_groups, o_lora_rank
+        )
+    if use_fused_output_projection:
+        grouped_o_fp8, grouped_o_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+            grouped_o
+        )
+        return _fused_fp8_output_projection_from_quantized(
+            grouped_o_fp8,
+            grouped_o_scale,
+            batch=batch,
+            block=block,
+            wo_b=wo_b,
+            n_groups=n_groups,
+            o_lora_rank=o_lora_rank,
+            o_a_proj=o_a_proj,
+            o_a_scale=o_a_scale,
+        )
+
+    from ..modules.mla import fp8_block_scaling_bmm_out
+
+    o_lora = o.new_empty((n_groups, batch * block, o_lora_rank))
+    fp8_block_scaling_bmm_out(
+        grouped_o,
+        o_a_proj,
+        o_a_scale,
+        o_lora,
+        mat2_dequant=o_a_dequant,
+        use_cute_dsl_blockscaling_bmm=True,
+    )
+    o_lora = o_lora.transpose(0, 1).reshape(batch, block, n_groups * o_lora_rank)
+    return _linear_projection(o_lora, wo_b)
+
+
+def _fused_fp8_output_projection_from_quantized(
+    grouped_o_fp8: torch.Tensor,
+    grouped_o_scale: torch.Tensor,
+    *,
+    batch: int,
+    block: int,
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    n_groups: int,
+    o_lora_rank: int,
+    o_a_proj: torch.Tensor,
+    o_a_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Consume group-major FP8 attention output in the fused OA/OB path."""
+    rows = batch * block
+    flat_n = n_groups * o_lora_rank
+    fp8_output = grouped_o_fp8.new_empty((rows, flat_n))
+    fp8_batched = fp8_output.view(rows, n_groups, o_lora_rank).transpose(0, 1)
+    scale_m = (rows + 127) // 128 * 128
+    scale_k = ((flat_n + 31) // 32 + 3) // 4 * 4
+    packed_scale = torch.empty(
+        (scale_m * scale_k,),
+        dtype=torch.uint8,
+        device=grouped_o_fp8.device,
+    )
+    max_batch = getattr(wo_b, "_dspark_generation_max_batch", 0)
+    rows_per_request = getattr(wo_b, "_dspark_generation_rows_per_request", 0)
+    torch.ops.trtllm.cute_dsl_dspark_fp8_bmm_quantize_rubin_out(
+        grouped_o_fp8,
+        o_a_proj,
+        grouped_o_scale,
+        o_a_scale,
+        fp8_batched,
+        packed_scale,
+        True,
+        max_batch,
+        rows_per_request,
+    )
+    projected = _prequantized_fp8_projection((fp8_output, packed_scale), wo_b)
+    return projected.view(batch, block, projected.shape[-1])
+
+
 def dspark_attention_forward(
     x: torch.Tensor,
     main_x: torch.Tensor,
     start_pos: int,
     kv_cache: torch.Tensor,
     *,
-    wq_a: torch.Tensor,
+    wq_a: Optional[torch.Tensor],
     q_norm_w: torch.Tensor,
-    wq_b: torch.Tensor,
-    wkv: torch.Tensor,
+    wq_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    wkv: Optional[torch.Tensor],
     kv_norm_w: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
+    wo_a: Optional[torch.Tensor],
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
     attn_sink: torch.Tensor,
     n_heads: int,
     head_dim: int,
@@ -440,6 +715,13 @@ def dspark_attention_forward(
     softmax_scale: float,
     freqs_cis: torch.Tensor,
     persist: bool = False,
+    qkv_proj: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    o_a_proj: Optional[torch.Tensor] = None,
+    o_a_scale: Optional[torch.Tensor] = None,
+    o_a_dequant: Optional[torch.Tensor] = None,
+    use_fused_output_projection: Optional[bool] = None,
+    use_fused_qkv_input_projection: bool = False,
+    use_fused_q_input_projection: bool = False,
 ) -> torch.Tensor:
     """Captured-context DSpark draft attention (generation path, ``start_pos > 0``).
 
@@ -451,10 +733,9 @@ def dspark_attention_forward(
     block's own positions, attention-sink softmax, inverse-RoPE on the output, and a
     grouped low-rank O projection (``wo_a`` einsum + ``wo_b``).
 
-    Weights are plain tensors for ``F.linear`` (the caller supplies the loaded /
-    dequantized projection weights); ``wo_a`` is the raw grouped weight matrix
-    ``[n_groups * o_lora_rank, n_heads * head_dim // n_groups]``. ``kv_cache`` is
-    ``[b, window_size, head_dim]`` and is updated functionally (cloned).
+    The reference path accepts plain BF16 tensor weights. Production passes the
+    loaded FP8 ``Linear`` modules plus the native grouped o_a weight and scale, so
+    all five projections dispatch through block-scaled CuTe DSL kernels on Rubin.
 
     Returns:
         ``[b, block_size, dim]`` attention output (residual stream contribution).
@@ -465,20 +746,31 @@ def dspark_attention_forward(
     main_freqs = freqs_cis[start_pos : start_pos + 1]
     blk_freqs = freqs_cis[start_pos + 1 : start_pos + 1 + block]
 
+    q_latent, kv, main_kv = _qkv_projections(
+        x,
+        main_x,
+        wq_a=wq_a,
+        wkv=wkv,
+        q_norm_w=q_norm_w,
+        qkv_proj=qkv_proj,
+        use_fused_fp8_input=use_fused_qkv_input_projection,
+    )
+
     # Captured-context K/V from main_x (MQA, shared across heads).
-    main_kv = _rmsnorm(F.linear(main_x, wkv), kv_norm_w, eps)  # [b, 1, head_dim]
+    main_kv = _rmsnorm(main_kv, kv_norm_w, eps)  # [b, 1, head_dim]
     main_kv = _rope_last_dims(main_kv, rd, main_freqs)
 
     # Query: low-rank + per-head RMS + RoPE.
-    q = _rmsnorm(F.linear(x, wq_a), q_norm_w, eps)
-    q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [b, block, h, head_dim]
+    q = _q_projection(q_latent, q_norm_w, eps, wq_b, use_fused_q_input_projection).unflatten(
+        -1, (n_heads, head_dim)
+    )
     # Per-head RMS in the query dtype (matches the reference inline normalization,
     # which is NOT the fp32 RMSNorm path).
     q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
     q = _rope_last_dims(q, rd, blk_freqs)
 
     # Block K/V.
-    kv = _rmsnorm(F.linear(x, wkv), kv_norm_w, eps)  # [b, block, head_dim]
+    kv = _rmsnorm(kv, kv_norm_w, eps)  # [b, block, head_dim]
     kv = _rope_last_dims(kv, rd, blk_freqs)
 
     # Write the context K/V into the rolling window, then attend over
@@ -492,11 +784,17 @@ def dspark_attention_forward(
     o = dspark_sparse_attn(q, kv_full, attn_sink, topk, softmax_scale)  # [b, block, h, head_dim]
     o = _rope_last_dims(o, rd, blk_freqs, inverse=True)
 
-    # Grouped low-rank O projection.
-    o = o.reshape(b, block, n_groups, -1)
-    wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
-    o = torch.einsum("bsgd,grd->bsgr", o, wo_a_v)
-    return F.linear(o.flatten(2), wo_b)
+    return _output_projection(
+        o,
+        wo_a=wo_a,
+        wo_b=wo_b,
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+        o_a_proj=o_a_proj,
+        o_a_scale=o_a_scale,
+        o_a_dequant=o_a_dequant,
+        use_fused_output_projection=use_fused_output_projection,
+    )
 
 
 def dspark_attention_forward_batched(
@@ -505,15 +803,15 @@ def dspark_attention_forward_batched(
     start_pos: torch.Tensor,
     kv_cache: torch.Tensor,
     slots: torch.Tensor,
-    valid_len: torch.Tensor | None = None,
+    valid_len: torch.Tensor,
     *,
-    wq_a: torch.Tensor,
+    wq_a: Optional[torch.Tensor],
     q_norm_w: torch.Tensor,
-    wq_b: torch.Tensor,
-    wkv: torch.Tensor,
+    wq_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
+    wkv: Optional[torch.Tensor],
     kv_norm_w: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
+    wo_a: Optional[torch.Tensor],
+    wo_b: torch.Tensor | Callable[[torch.Tensor], torch.Tensor],
     attn_sink: torch.Tensor,
     n_heads: int,
     head_dim: int,
@@ -525,6 +823,13 @@ def dspark_attention_forward_batched(
     softmax_scale: float,
     freqs_cis: torch.Tensor,
     persist: bool = False,
+    qkv_proj: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    o_a_proj: Optional[torch.Tensor] = None,
+    o_a_scale: Optional[torch.Tensor] = None,
+    o_a_dequant: Optional[torch.Tensor] = None,
+    use_fused_output_projection: Optional[bool] = None,
+    use_fused_qkv_input_projection: bool = False,
+    use_fused_q_input_projection: bool = False,
 ) -> torch.Tensor:
     """Batched, CUDA-graph-safe captured-context DSpark draft attention.
 
@@ -550,9 +855,8 @@ def dspark_attention_forward_batched(
         kv_cache: ``[N, window_size, head_dim]`` rolling captured-context windows
             (``N`` rows indexed by ``slots``; ``N == G`` for single-shot callers).
         slots: ``[G]`` int tensor mapping each request to its ``kv_cache`` row.
-        valid_len: optional ``[G]`` count of actually written context entries;
-            masks holes left when absolute positions are bootstrapped without
-            receiving the corresponding DSpark rolling-window state.
+        valid_len: ``[G]`` count of actually written context entries; masks holes left when
+            absolute positions are bootstrapped without the corresponding rolling-window state.
         freqs_cis: ``[maxlen, rope_head_dim // 2]`` precomputed plain-RoPE table;
             must satisfy ``maxlen > start_pos.max() + block_size``.
 
@@ -570,13 +874,20 @@ def dspark_attention_forward_batched(
     blk_pos = start_pos.unsqueeze(1) + 1 + torch.arange(block, device=x.device)  # [G, block]
     blk_freqs = freqs_cis[blk_pos]  # [G, block, rd//2]
 
-    # Keep the two GEMM outputs live until dispatch: the production path lets
-    # their RMSNorm/RoPE kernels store directly into attention's physical inputs.
-    main_kv_input = F.linear(main_x, wkv)
+    q_latent, block_kv_input, main_kv_input = _qkv_projections(
+        x,
+        main_x,
+        wq_a=wq_a,
+        wkv=wkv,
+        q_norm_w=q_norm_w,
+        qkv_proj=qkv_proj,
+        use_fused_fp8_input=use_fused_qkv_input_projection,
+    )
 
     # Query: low-rank + per-head RMS + RoPE.
-    q = _rmsnorm_rope_batched(F.linear(x, wq_a), q_norm_w, eps, 0, blk_freqs)
-    q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [G, block, h, head_dim]
+    q = _q_projection(
+        q_latent, q_norm_w, eps, wq_b, use_fused_q_input_projection, blk_freqs
+    ).unflatten(-1, (n_heads, head_dim))
     q = _rmsnorm_rope_batched(
         q,
         kv_norm_w,
@@ -586,14 +897,16 @@ def dspark_attention_forward_batched(
         num_heads=n_heads,
         apply_weight=False,
     )
-    block_kv_input = F.linear(x, wkv)
-
     # ``persist=True`` writes through to the worker-owned rolling window;
     # single-shot callers keep the original functional clone behavior.
     write_target = kv_cache if persist else kv_cache.clone()
     main_rope_freqs = torch.view_as_real(main_freqs).reshape(-1, rd // 2, 2).contiguous()
     inverse_rope_freqs = torch.view_as_real(blk_freqs).contiguous()
     block_rope_freqs = inverse_rope_freqs.reshape(-1, rd // 2, 2)
+    if use_fused_output_projection is None:
+        use_fused_output_projection = o_a_proj is not None and _can_use_fused_fp8_output_projection(
+            wo_b, o_a_proj, n_groups, o_lora_rank
+        )
 
     # The fused kernel consumes the number of initialized physical-window rows,
     # including short suffixes on disaggregated generation workers. Legacy
@@ -635,6 +948,32 @@ def dspark_attention_forward_batched(
             block_rope_freqs,
             eps,
         )
+        if use_fused_output_projection:
+            if o_a_proj is None or o_a_scale is None:
+                raise ValueError("The fused DSpark FP8 output path requires o_a weights and scales")
+            grouped_o_fp8, grouped_o_scale = cute_dsl_dspark_attention_prepared_fp8(
+                q,
+                block_page,
+                write_target,
+                slots_i32,
+                cache_seqs,
+                kernel_valid_len,
+                attn_sink,
+                inverse_rope_freqs,
+                softmax_scale,
+                n_groups,
+            )
+            return _fused_fp8_output_projection_from_quantized(
+                grouped_o_fp8,
+                grouped_o_scale,
+                batch=g,
+                block=block,
+                wo_b=wo_b,
+                n_groups=n_groups,
+                o_lora_rank=o_lora_rank,
+                o_a_proj=o_a_proj,
+                o_a_scale=o_a_scale,
+            )
         o = cute_dsl_dspark_attention_prepared(
             q,
             block_page,
@@ -700,11 +1039,17 @@ def dspark_attention_forward_batched(
                 inverse_rope=True,
             )
 
-    # Grouped low-rank O projection.
-    o = o.reshape(g, block, n_groups, -1)
-    wo_a_v = wo_a.view(n_groups, o_lora_rank, -1)
-    o = torch.einsum("bsgd,grd->bsgr", o, wo_a_v)
-    return F.linear(o.flatten(2), wo_b)
+    return _output_projection(
+        o,
+        wo_a=wo_a,
+        wo_b=wo_b,
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+        o_a_proj=o_a_proj,
+        o_a_scale=o_a_scale,
+        o_a_dequant=o_a_dequant,
+        use_fused_output_projection=use_fused_output_projection,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -813,6 +1158,57 @@ def dspark_propose(
 # prefix; the main model's keys (``layers.*``, ``embed.weight``, ``head.weight``,
 # top-level ``norm.weight`` / ``hc_head_*``) are loaded by the target model.
 _DSPARK_MTP_RE = re.compile(r"^mtp\.(\d+)\.(.+)$")
+_DSPARK_LINEAR_BACKEND_ENV = "TRTLLM_DSPARK_LINEAR_BACKEND"
+
+
+def _use_dspark_bf16_linear(mapping) -> bool:
+    """Select BF16 for an explicit override or sharded attention projections."""
+    backend = os.environ.get(_DSPARK_LINEAR_BACKEND_ENV, "fp8").lower()
+    if backend not in ("fp8", "bf16"):
+        raise ValueError(f"{_DSPARK_LINEAR_BACKEND_ENV} must be 'fp8' or 'bf16', got {backend!r}")
+    return backend == "bf16" or (mapping.tp_size > 1 and not mapping.enable_attention_dp)
+
+
+def _stack_fp8_projection_output_rows(
+    projections: List[Linear], output_rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stack trailing output rows and rebuild their shared R128c4 scales."""
+    if output_rows <= 0 or output_rows % 128 != 0:
+        raise ValueError(
+            f"DSpark stacked FP8 output_rows must be a positive multiple of 128, got {output_rows}"
+        )
+
+    weights = []
+    linear_scales = []
+    for projection in projections:
+        weight = projection.weight
+        if (
+            weight.ndim != 2
+            or weight.shape[0] % 128 != 0
+            or weight.shape[1] % 128 != 0
+            or output_rows > weight.shape[0]
+        ):
+            raise ValueError(
+                "DSpark stacked FP8 projections require 2-D 128-aligned weights "
+                f"with at least {output_rows} rows, got shape {tuple(weight.shape)}"
+            )
+        linear_scale = unswizzle_sf(
+            projection.weight_scale,
+            weight.shape[0],
+            weight.shape[1],
+            scaling_vector_size=32,
+        )
+        weights.append(weight[-output_rows:])
+        linear_scales.append(linear_scale[-output_rows:])
+
+    stacked_weight = torch.cat(weights, dim=0).contiguous()
+    stacked_scale = swizzle_sf(
+        torch.cat(linear_scales, dim=0),
+        len(projections) * output_rows,
+        stacked_weight.shape[1],
+        scaling_vector_size=32,
+    )
+    return stacked_weight, stacked_scale
 
 
 def _active_moe_load_balancer():
@@ -972,15 +1368,6 @@ def remap_dspark_draft_keys(weights: Dict, num_stages: int) -> Dict:
     return out
 
 
-# The checkpoint stores
-# ``mtp.{s}.attn.wo_a`` as fp8_e4m3 + a UE8M0 128x128 block scale (verified), and
-# the reference (`inference/model.py`, ``self.wo_a`` is a bf16 ColumnParallelLinear
-# loaded from the fp8 ckpt) uses the DEQUANTIZED bf16 ``wo_a`` (== ``wo_a_fp8 *
-# scale`` ~ absmean 0.065). The bf16 captured-context path historically skipped
-# this dequant (raw fp8-cast-to-bf16, ~993x too large); the correct behavior is to
-# dequantize ``wo_a`` (cos 1.0 vs ``wo_a_fp8 * scale``). Always dequantize now.
-
-
 class DSv4DSparkBlock(DeepseekV4DecoderLayer):
     """One DSpark draft stage = a DeepSeek-V4 decoder block + DSpark extras.
 
@@ -1037,6 +1424,7 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
                 dtype=config.torch_dtype,
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             )
             self.main_norm = RMSNorm(
                 hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
@@ -1191,106 +1579,192 @@ class DSv4DSparkDraftModel(nn.Module):
             int(getattr(config, "max_position_embeddings", 163840)) + self.block_size + 2
         )
         self._freqs_table_cache: Dict = {}
+        self._context_wkv_fp8 = None
+        self._use_bf16_linear = _use_dspark_bf16_linear(model_config.mapping)
 
-    def post_load_weights(self) -> None:
-        """Run the one-shot post-load transforms for the draft's quant linears.
+    def post_load_weights(self, weights: Optional[Dict] = None) -> None:
+        """Transform draft linears and bind the selected attention backend."""
+        # DSparkForCausalLM.load_weights supplies the complete raw draft
+        # checkpoint before the generic zero-argument post-load walk. Only that
+        # explicit draft load owns these derived projections; a target-model
+        # reload does not reload the separate draft model.
+        if weights is None:
+            return
 
-        The fp8 UE8M0 linears we invoke as modules (``main_proj``, shared experts,
-        the heads) need ``resmooth_to_fp8_e8m0`` + ``transform_sf_into_required_layout``
-        before the first forward, or the kernel reads raw scales and emits NaNs.
-        ``Linear.transform_weights`` is idempotent; the routed-expert MoE packs
-        itself in its own ``load_weights``.
+        # The separately constructed draft config does not receive the target
+        # model's SM107 CuTe block-scaling default. Select the same backend for
+        # the draft attention linears before their one-time weight transform;
+        # otherwise they materialize DeepGEMM int32 scales and cannot consume
+        # the fused Rubin attention/projection layouts.
+        if not self._use_bf16_linear and get_sm_version() == 107:
+            for stage in self.mtp_layers:
+                for module in stage.self_attn.modules():
+                    if isinstance(module, Linear):
+                        module.use_cute_dsl_blockscaling_mm = True
 
-        The bf16 captured-context attention does NOT use the MLA module's forward —
-        it runs ``dspark_attention_forward`` on dequantized bf16 weights cached via
-        :meth:`cache_attn_weights_from_checkpoint` — so the MLA projection linears are
-        skipped here (they would otherwise be transformed into the deep_gemm layout we
-        don't consume).
-        """
         attn_linear_ids = set()
-        for stage in self.mtp_layers:
-            for m in stage.self_attn.modules():
-                if isinstance(m, Linear):
-                    attn_linear_ids.add(id(m))
+        if self._use_bf16_linear:
+            for stage in self.mtp_layers:
+                for module in stage.self_attn.modules():
+                    if isinstance(module, Linear):
+                        attn_linear_ids.add(id(module))
 
         for module in self.modules():
             if isinstance(module, Linear) and id(module) not in attn_linear_ids:
                 module.transform_weights()
+        if self._use_bf16_linear:
+            self._bind_bf16_attn_projections(weights)
+        else:
+            self._bind_attn_projections()
 
     @staticmethod
-    def _block_dequant(w_fp8: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
-        """DeepSeek ``block``×``block`` block-scale dequant → bf16: ``real = fp8 * scale``.
+    def _block_dequant(
+        weight_fp8: torch.Tensor, scale: torch.Tensor, block: int = 128
+    ) -> torch.Tensor:
+        """Dequantize a block-scaled FP8 checkpoint weight to BF16."""
+        weight = weight_fp8.float()
+        output_features, input_features = weight.shape
+        scale = scale.float()
+        scale = scale.repeat_interleave(block, 0)[:output_features]
+        scale = scale.repeat_interleave(block, 1)[:, :input_features]
+        return (weight * scale).to(torch.bfloat16)
 
-        ``scale`` (possibly UE8M0) is broadcast over each ``block``×``block`` tile.
-        Pure-torch (matches the golden-validated reference dequant), robust to the
-        e8m0 scale dtype.
-        """
-        wf = w_fp8.float()
-        out, inn = wf.shape
-        s = scale.float()
-        s_full = s.repeat_interleave(block, 0)[:out].repeat_interleave(block, 1)[:, :inn]
-        return (wf * s_full).to(torch.bfloat16)
+    def _bind_bf16_attn_projections(self, weights: Dict) -> None:
+        """Bind all five captured-context attention projections as BF16 tensors."""
+        for stage_id, stage in enumerate(self.mtp_layers):
+            prefix = f"mtp.{stage_id}.attn."
+            device = stage.input_layernorm.weight.device
 
-    def _cache_attn_weights(self, src: Dict) -> None:
-        """Populate each stage's ``_dspark_attn`` from a dict of raw ``mtp.{s}.attn.*``
-        tensors (source-agnostic core shared by the two public entry points).
-
-        The captured-context attention runs the validated ``dspark_attention_forward``
-        free function on reference-layout bf16 weights dequantized here. Sourcing the
-        separate ``wq_a``/``wkv`` (plain 128×128 block scale) sidesteps the TRT-LLM
-        ``MLA`` module's fused + interleaved fp8 storage (``kv_a_proj_with_mqa`` fuses
-        ``q_a``+``kv`` and stores the scale interleaved). This mirrors the
-        golden-validated dequant exactly.
-        """
-        for s, stage in enumerate(self.mtp_layers):
-            pref = f"mtp.{s}.attn."
-            dev = stage.input_layernorm.weight.device
-
-            def deq(name: str, fp8: bool) -> torch.Tensor:
-                w = src[f"{pref}{name}.weight"].to(dev)
-                if fp8:
-                    return self._block_dequant(w, src[f"{pref}{name}.scale"].to(dev))
-                return w.to(torch.bfloat16)
+            def dequant(name: str) -> torch.Tensor:
+                weight = weights[f"{prefix}{name}.weight"].to(device)
+                scale = weights[f"{prefix}{name}.scale"].to(device)
+                return self._block_dequant(weight, scale)
 
             stage._dspark_attn = dict(
-                wq_a=deq("wq_a", True),
-                q_norm_w=src[f"{pref}q_norm.weight"].to(dev).to(torch.bfloat16),
-                wq_b=deq("wq_b", True),
-                wkv=deq("wkv", True),
-                kv_norm_w=src[f"{pref}kv_norm.weight"].to(dev).to(torch.bfloat16),
-                # wo_a IS fp8+scale in the checkpoint (verified); always dequant.
-                wo_a=deq("wo_a", True),
-                wo_b=deq("wo_b", True),
-                attn_sink=src[f"{pref}attn_sink"].to(dev).float(),
+                wq_a=dequant("wq_a"),
+                q_norm_w=weights[f"{prefix}q_norm.weight"].to(device=device, dtype=torch.bfloat16),
+                wq_b=dequant("wq_b"),
+                wkv=dequant("wkv"),
+                kv_norm_w=weights[f"{prefix}kv_norm.weight"].to(
+                    device=device, dtype=torch.bfloat16
+                ),
+                wo_a=dequant("wo_a"),
+                wo_b=dequant("wo_b"),
+                attn_sink=weights[f"{prefix}attn_sink"].to(device=device, dtype=torch.float32),
+                qkv_proj=None,
+                o_a_proj=None,
+                o_a_scale=None,
+                o_a_dequant=None,
+                use_fused_output_projection=False,
+                use_fused_qkv_input_projection=False,
+                use_fused_q_input_projection=False,
             )
+        self._context_wkv_fp8 = None
 
-    def cache_attn_weights_from_checkpoint(self, ckpt_dir: str, weight_map: Dict[str, str]) -> None:
-        """Populate ``_dspark_attn`` by reading the ``mtp.{s}.attn.*`` tensors from the
-        checkpoint shards on disk, then dequantizing via :meth:`_cache_attn_weights`.
+    def _bind_attn_projections(self) -> None:
+        """Bind loaded MLA modules to the DSpark attention functional path.
 
-        TODO(step 3): source these from the loaded ``MLA`` modules instead, once the
-        fused/interleaved fp8 scale layout is decoded, to drop the checkpoint I/O.
+        DeepSeek-V4 loads q_a+wkv as one block-scaled FP8 ``Linear`` and keeps
+        o_a as a grouped FP8 weight. Reusing those objects avoids a second BF16
+        copy of every attention projection and preserves the Rubin CuTe DSL
+        weight/scale layouts produced by ``Linear.transform_weights``.
         """
-        from safetensors import safe_open
+        expected_heads = self._attn_params["n_heads"]
+        expected_groups = self._attn_params["n_groups"]
+        head_dim = self._attn_params["head_dim"]
+        for stage in self.mtp_layers:
+            attn = stage.self_attn
+            if attn.num_heads_tp != expected_heads or attn.n_local_groups != expected_groups:
+                raise ValueError(
+                    "DSpark FP8 attention requires unsharded attention projections; "
+                    f"got {attn.num_heads_tp} heads and {attn.n_local_groups} groups, "
+                    f"expected {expected_heads} heads and {expected_groups} groups. "
+                    "Enable attention DP (or use TP=1)."
+                )
+            qkv_in_features = attn.kv_a_proj_with_mqa.in_features
+            q_lora_rank = attn.q_a_layernorm.weight.shape[0]
+            use_fused_qkv_input_projection = _can_use_fused_fp8_input_projection(
+                attn.kv_a_proj_with_mqa, qkv_in_features
+            )
+            use_fused_q_input_projection = _can_use_fused_fp8_input_projection(
+                attn.q_b_proj, q_lora_rank
+            )
+            if use_fused_qkv_input_projection or use_fused_q_input_projection:
+                from ..custom_ops.dspark_rmsnorm_rope_custom_op import (
+                    precompile_dspark_fp8_input_fusions,
+                )
 
-        prefixes = tuple(f"mtp.{s}.attn." for s in range(len(self.mtp_layers)))
-        shards: Dict[str, list] = {}
-        for k in weight_map:
-            if k.startswith(prefixes):
-                shards.setdefault(weight_map[k], []).append(k)
-        raw: Dict[str, torch.Tensor] = {}
-        for shard, ks in shards.items():
-            with safe_open(os.path.join(ckpt_dir, shard), framework="pt", device="cpu") as f:
-                for k in ks:
-                    raw[k] = f.get_tensor(k)
-        self._cache_attn_weights(raw)
+                precompile_dspark_fp8_input_fusions(
+                    qkv_in_features if use_fused_qkv_input_projection else None,
+                    q_lora_rank if use_fused_q_input_projection else None,
+                    self._attn_params["eps"],
+                )
+            stage._dspark_attn = dict(
+                wq_a=None,
+                q_norm_w=attn.q_a_layernorm.weight,
+                wq_b=attn.q_b_proj,
+                wkv=None,
+                kv_norm_w=attn.kv_a_layernorm.weight,
+                wo_a=None,
+                wo_b=attn.o_b_proj,
+                attn_sink=attn.mqa.attn_sink,
+                qkv_proj=attn.kv_a_proj_with_mqa,
+                o_a_proj=attn.o_a_proj,
+                o_a_scale=attn.o_a_proj_scale,
+                o_a_dequant=attn.o_a_proj_dequant,
+                use_fused_output_projection=_can_use_fused_fp8_output_projection(
+                    attn.o_b_proj,
+                    attn.o_a_proj,
+                    attn.n_local_groups,
+                    attn.o_a_proj.shape[1],
+                ),
+                use_fused_qkv_input_projection=use_fused_qkv_input_projection,
+                use_fused_q_input_projection=use_fused_q_input_projection,
+            )
+        # Generation consumes q_a+wkv, while context-window seeding needs only
+        # the trailing wkv rows. Stack the three transformed WKV weights once so
+        # CTX runs one N=(stages*head_dim) GEMM instead of three small-N GEMMs.
+        # Scale layout conversion and the weight copy never enter serving.
+        self._context_wkv_fp8 = (
+            _stack_fp8_projection_output_rows(
+                [stage.self_attn.kv_a_proj_with_mqa for stage in self.mtp_layers],
+                head_dim,
+            )
+            if self.mtp_layers
+            and all(
+                stage._dspark_attn["use_fused_qkv_input_projection"] for stage in self.mtp_layers
+            )
+            else None
+        )
 
-    def cache_attn_weights_from_state_dict(self, weights: Dict) -> None:
-        """Populate ``_dspark_attn`` from an already-loaded in-memory ``weights`` dict
-        (no extra disk I/O); used on the one-engine load path
-        (``DSv4DSparkForCausalLM.load_weights``). Delegates to :meth:`_cache_attn_weights`.
-        """
-        self._cache_attn_weights(weights)
+    def configure_generation_autotuner(self, max_batch: int) -> None:
+        """Give DSpark projection runners the worker's real generation capacity."""
+        if self._use_bf16_linear:
+            return
+        if max_batch < 1:
+            raise ValueError(f"DSpark max_batch must be positive, got {max_batch}")
+
+        from ..custom_ops.dspark_attention_custom_op import (
+            _get_dspark_generation_mxfp8_tuning_config,
+        )
+
+        projection_rows = (
+            ("qkv_proj", self.block_size + 1),
+            ("wq_b", self.block_size),
+            ("wo_b", self.block_size),
+        )
+        for stage in self.mtp_layers:
+            for name, rows_per_request in projection_rows:
+                projection = stage._dspark_attn[name]
+                projection._dspark_generation_tuning_config = (
+                    _get_dspark_generation_mxfp8_tuning_config(
+                        rows_per_request,
+                        max_batch,
+                    )
+                )
+                if name == "wo_b":
+                    projection._dspark_generation_max_batch = max_batch
+                    projection._dspark_generation_rows_per_request = rows_per_request
 
     def _dspark_freqs_table(self, device: torch.device) -> torch.Tensor:
         """Return the fixed-size plain-RoPE table cached for ``device``."""
@@ -1452,6 +1926,19 @@ class DSv4DSparkDraftModel(nn.Module):
                 changed = True
         return new_qcd if changed else None
 
+    def _project_context_wkv(self, main_x: torch.Tensor) -> Optional[torch.Tensor]:
+        """Quantize once and project every stage's WKV with one stacked GEMM."""
+        if self._context_wkv_fp8 is None:
+            return None
+        rows = main_x.reshape(-1, main_x.shape[-1])
+        input_fp8, input_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(rows)
+        weight, weight_scale = self._context_wkv_fp8
+        output = torch.ops.trtllm.cute_dsl_dspark_context_wkv_gemm_rubin(
+            input_fp8, weight, input_scale, weight_scale
+        )
+        head_dim = self._attn_params["head_dim"]
+        return output.view(*main_x.shape[:-1], len(self.mtp_layers), head_dim)
+
     @torch.inference_mode()
     def write_context_windows(
         self,
@@ -1488,6 +1975,7 @@ class DSv4DSparkDraftModel(nn.Module):
         if M == 0:
             return
         win = int(self._attn_params["window_size"])
+        head_dim = int(self._attn_params["head_dim"])
         rd = int(self._attn_params["rope_head_dim"])
         eps = float(self._attn_params["eps"])
         positions = positions.to(main_hidden.device).long()
@@ -1497,9 +1985,19 @@ class DSv4DSparkDraftModel(nn.Module):
         freqs = self._dspark_freqs_table(main_x.device)[positions]
         slots = positions % win  # [M]
         mx = main_x.unsqueeze(0)  # [1, M, hidden] for the per-position RoPE layout
+        projected_wkv = self._project_context_wkv(mx)
         for s, stage in enumerate(self.mtp_layers):
             a = stage._dspark_attn
-            kv = _rmsnorm(F.linear(mx, a["wkv"]), a["kv_norm_w"], eps)  # [1, M, head_dim]
+            kv = (
+                projected_wkv[..., s, :]
+                if projected_wkv is not None
+                else (
+                    a["qkv_proj"](mx)[..., -head_dim:]
+                    if a["qkv_proj"] is not None
+                    else F.linear(mx, a["wkv"])
+                )
+            )
+            kv = _rmsnorm(kv, a["kv_norm_w"], eps)  # [1, M, head_dim]
             kv = _rope_last_dims(kv, rd, freqs)  # [1, M, head_dim]
             stage_windows[s, slots] = kv[0].to(stage_windows.dtype)
 
@@ -1536,6 +2034,7 @@ class DSv4DSparkDraftModel(nn.Module):
         if G == 0 or M == 0:
             return
         win = int(self._attn_params["window_size"])
+        head_dim = int(self._attn_params["head_dim"])
         rd = int(self._attn_params["rope_head_dim"])
         eps = float(self._attn_params["eps"])
         positions = positions.long()
@@ -1546,9 +2045,19 @@ class DSv4DSparkDraftModel(nn.Module):
         mask3 = mask.unsqueeze(-1)  # [G, M, 1]
         stage0 = self.mtp_layers[0]
         main_x = stage0.main_norm(stage0.main_proj(main_hidden))  # [G, M, hidden]
+        projected_wkv = self._project_context_wkv(main_x)
         for s, stage in enumerate(self.mtp_layers):
             a = stage._dspark_attn
-            kv = _rmsnorm(F.linear(main_x, a["wkv"]), a["kv_norm_w"], eps)  # [G, M, head_dim]
+            kv = (
+                projected_wkv[..., s, :]
+                if projected_wkv is not None
+                else (
+                    a["qkv_proj"](main_x)[..., -head_dim:]
+                    if a["qkv_proj"] is not None
+                    else F.linear(main_x, a["wkv"])
+                )
+            )
+            kv = _rmsnorm(kv, a["kv_norm_w"], eps)  # [G, M, head_dim]
             kv = _rope_last_dims_batched(kv, rd, freqs)  # [G, M, head_dim]
             win_s = kv_windows[:, s]  # [N, win, head_dim] view onto the base buffer
             # Read-modify-write so masked-out (g, m) entries keep their current
@@ -1635,6 +2144,10 @@ class DSv4DSparkDraftModel(nn.Module):
         if slots is not None:
             # Batched, CUDA-graph-safe path (start_pos is a [G] tensor; window is
             # written/read through ``slots``).
+            if valid_len is None:
+                raise ValueError(
+                    "DSpark batched attention requires valid_len for each rolling window"
+                )
             attn = dspark_attention_forward_batched(
                 layer_input,
                 main_x,
@@ -1745,8 +2258,7 @@ class DSv4DSparkDraftModel(nn.Module):
         assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
-                "DSpark attention weights not cached; call "
-                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
+                "DSpark attention projections are not bound; call post_load_weights() after loading."
             )
         x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids)
         main_x = main_x.unsqueeze(1)  # [T, 1, hidden] for the MQA K/V projection
@@ -1783,7 +2295,7 @@ class DSv4DSparkDraftModel(nn.Module):
         *,
         kv_windows: torch.Tensor,
         slots: torch.Tensor,
-        valid_len: Optional[torch.Tensor] = None,
+        valid_len: torch.Tensor,
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
@@ -1814,8 +2326,7 @@ class DSv4DSparkDraftModel(nn.Module):
         """
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
-                "DSpark attention weights not cached; call "
-                "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
+                "DSpark attention projections are not bound; call post_load_weights() after loading."
             )
         x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids)
         main_x = main_x.unsqueeze(1)  # [G, 1, hidden] for the MQA K/V projection
@@ -1928,8 +2439,8 @@ class DSv4DSparkForCausalLM(nn.Module):
     (:meth:`load_weights_from_target_model`). The draft weights live in the SAME
     checkpoint under ``mtp.*``; :meth:`load_weights` remaps them
     (``remap_dspark_draft_keys``), loads via ``DeepseekV4WeightLoader``, runs the
-    fp8 ``post_load_weights`` transforms, and caches the bf16 captured-context
-    attention weights from the in-memory state dict.
+    selected post-load transforms, and binds the captured-context path to the
+    selected attention projection backend.
     """
 
     def __init__(self, draft_config, aux_stream_dict=None, num_stages=None, block_size=None):
@@ -1970,6 +2481,10 @@ class DSv4DSparkForCausalLM(nn.Module):
         """Empty-batch MoE barrier lockstep (delegates to the draft model)."""
         return self.dspark_model.run_moe_lockstep_noop(all_rank_num_tokens, device)
 
+    def configure_generation_autotuner(self, max_batch):
+        """Delegate generation autotuner capacity to the DSpark model."""
+        self.dspark_model.configure_generation_autotuner(max_batch)
+
     def write_context_windows(self, main_hidden, positions, stage_windows):
         """Seed / back-fill the rolling KV windows (delegates to the draft model)."""
         return self.dspark_model.write_context_windows(main_hidden, positions, stage_windows)
@@ -1992,11 +2507,11 @@ class DSv4DSparkForCausalLM(nn.Module):
             f"[DSpark] loading {len(remapped)} draft params across {self.num_stages} stages"
         )
         DeepseekV4WeightLoader(self.dspark_model).load_weights(remapped)
-        self.dspark_model.post_load_weights()
-        # bf16 captured-context attention path: dequantize the raw mtp.{s}.attn.*
-        # tensors for ``dspark_attention_forward``.
-        self.dspark_model.cache_attn_weights_from_state_dict(weights)
-        logger.info("[DSpark] draft weight load complete")
+        self.dspark_model.post_load_weights(weights)
+        logger.info(
+            f"[DSpark] draft weight load complete "
+            f"(linear_backend={'bf16' if self.dspark_model._use_bf16_linear else 'fp8'})"
+        )
 
     def load_weights_from_target_model(self, target_model):
         """Share the target's embed_tokens / lm_head (DSpark has neither)."""

@@ -9494,6 +9494,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tactic,
             ) -> None:
                 """Run FP8 block-scaled BMM with TRT-LLM tensor layouts."""
+                launch_plan_key = None
+                launch_plan_cache = getattr(self, "_tvm_ffi_launch_plans", None)
+                if self.use_tvm_ffi and launch_plan_cache is not None:
+                    a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs[:4]
+                    batch_size, m, k = a_tensor.shape
+                    n = b_tensor.shape[1]
+                    launch_plan_key = (
+                        tactic,
+                        batch_size,
+                        m,
+                        n,
+                        k,
+                        a_sf_tensor.numel(),
+                        b_sf_tensor.numel(),
+                    )
+                    if self.fp8_quantize_1x128:
+                        c_tensor, scale_tensor = inputs[4:]
+                        launch_plan_key += (
+                            c_tensor.numel(),
+                            scale_tensor.numel(),
+                        )
+                    compiled_gemm = launch_plan_cache.get(launch_plan_key)
+                    if compiled_gemm is not None:
+                        self._forward_tvm_ffi_prepared(inputs, compiled_gemm)
+                        return
+
                 if isinstance(tactic, tuple):
                     (use_2cta_instrs, mma_tiler, mma_inst_shape,
                      cluster_shape_mn) = tactic
@@ -9535,8 +9561,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             "Fused FP8 BMM output requires E4M3 output and a "
                             "flat contiguous uint8 R128c4 scale tensor with "
                             f"{expected_scale_numel} elements.")
-                    scale_cute = cute.runtime.from_dlpack(
-                        scale_tensor).mark_layout_dynamic(leading_dim=0)
+                    if not self.use_tvm_ffi:
+                        scale_cute = cute.runtime.from_dlpack(
+                            scale_tensor).mark_layout_dynamic(leading_dim=0)
 
                 if not self.use_tvm_ffi:
                     a_ptr = make_ptr(
@@ -9604,6 +9631,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         )
                         c_cute_tensor = cute.runtime.from_dlpack(
                             c_tmp).mark_layout_dynamic(leading_dim=1)
+                        if self.fp8_quantize_1x128:
+                            scale_cute = cute.runtime.from_dlpack(
+                                scale_tensor).mark_layout_dynamic(leading_dim=0)
                         stream = cute.runtime.make_fake_stream(
                             use_tvm_ffi_env_stream=True)
 
@@ -9664,6 +9694,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     compiled_gemm = self.__class__.kernel_cache[cache_key]
 
+                if self.use_tvm_ffi and launch_plan_cache is not None:
+                    launch_plan_cache[launch_plan_key] = compiled_gemm
                 if self.use_tvm_ffi:
                     runtime_args = (
                         m,
@@ -10187,6 +10219,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 Returns:
                     torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
                 """
+                launch_plan_key = None
+                launch_plan_cache = getattr(self, "_tvm_ffi_launch_plans", None)
+                if self.use_tvm_ffi and launch_plan_cache is not None:
+                    a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs[:4]
+                    m, k = a_tensor.shape
+                    n = b_tensor.shape[0]
+                    output_tensor = inputs[5] if len(inputs) == 6 else None
+                    partition_id = kwargs.get("partition_id", -1)
+                    output_width = (output_tensor.shape[1]
+                                    if output_tensor is not None else 0)
+                    launch_plan_key = (
+                        tactic,
+                        m,
+                        n,
+                        k,
+                        a_sf_tensor.numel(),
+                        b_sf_tensor.numel(),
+                        output_width,
+                        partition_id,
+                    )
+                    launch_plan = launch_plan_cache.get(launch_plan_key)
+                    if launch_plan is not None:
+                        return self._forward_tvm_ffi_prepared(
+                            inputs,
+                            launch_plan,
+                            bias=bias,
+                            **kwargs,
+                        )
+
                 sf_vec_size = self.sf_vec_size
 
                 if (isinstance(tactic, tuple) and len(tactic) > 0
@@ -10342,26 +10403,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
                 b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
-                a_ptr = self.make_cute_dsl_global_pointer(
-                    a_tensor, self.a_dtype, self.ab_assumed_align)
-                b_ptr = self.make_cute_dsl_global_pointer(
-                    b_tensor, self.b_dtype, self.ab_assumed_align)
-                a_sf_ptr = self.make_cute_dsl_global_pointer(
-                    a_sf_tensor, self.sf_dtype, self.sf_assumed_align)
-                b_sf_ptr = self.make_cute_dsl_global_pointer(
-                    b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
-                c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
-
-                # get stream
-                torch_stream = torch.cuda.current_stream()
-                stream = cuda.CUstream(torch_stream.cuda_stream)
+                if not self.use_tvm_ffi:
+                    a_ptr = self.make_cute_dsl_global_pointer(
+                        a_tensor, self.a_dtype, self.ab_assumed_align)
+                    b_ptr = self.make_cute_dsl_global_pointer(
+                        b_tensor, self.b_dtype, self.ab_assumed_align)
+                    a_sf_ptr = self.make_cute_dsl_global_pointer(
+                        a_sf_tensor, self.sf_dtype, self.sf_assumed_align)
+                    b_sf_ptr = self.make_cute_dsl_global_pointer(
+                        b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
+                    c_ptr = self.make_cute_dsl_global_pointer(
+                        c_tensor, cutlass.BFloat16, 16)
+                    alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream)
 
                 # c_ld is the C leading dimension. uGPU writes into a half-width
                 # view of a full-width output buffer, so both ROW_MAJOR and
                 # COL_MAJOR layouts need the full output width as their stride.
                 c_ld_key = output_tensor.shape[1] if ugpu_half_gemm else 0
-                c_ld_val = cutlass.Int64(c_ld_key)
+                if not self.use_tvm_ffi:
+                    c_ld_val = cutlass.Int64(c_ld_key)
 
                 if swap_ab:
                     kernel_m = n
@@ -10373,10 +10435,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_a_sf_tensor = b_sf_tensor
                     kernel_b_tensor = a_tensor
                     kernel_b_sf_tensor = a_sf_tensor
-                    kernel_a_ptr = b_ptr
-                    kernel_a_sf_ptr = b_sf_ptr
-                    kernel_b_ptr = a_ptr
-                    kernel_b_sf_ptr = a_sf_ptr
+                    if not self.use_tvm_ffi:
+                        kernel_a_ptr = b_ptr
+                        kernel_a_sf_ptr = b_sf_ptr
+                        kernel_b_ptr = a_ptr
+                        kernel_b_sf_ptr = a_sf_ptr
                 else:
                     kernel_m = m
                     kernel_n = n
@@ -10387,10 +10450,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_a_sf_tensor = a_sf_tensor
                     kernel_b_tensor = b_tensor
                     kernel_b_sf_tensor = b_sf_tensor
-                    kernel_a_ptr = a_ptr
-                    kernel_a_sf_ptr = a_sf_ptr
-                    kernel_b_ptr = b_ptr
-                    kernel_b_sf_ptr = b_sf_ptr
+                    if not self.use_tvm_ffi:
+                        kernel_a_ptr = a_ptr
+                        kernel_a_sf_ptr = a_sf_ptr
+                        kernel_b_ptr = b_ptr
+                        kernel_b_sf_ptr = b_sf_ptr
 
                 # The wrapper entry points declare m/n/k, all scale-tile
                 # counts (sf_m/sf_n/sf_k) and c_ld as dynamic cutlass.Int64
@@ -10418,11 +10482,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              raster_order, scheduler_mode, ugpu_half_gemm,
                              self.use_tvm_ffi, max_active_preferred_clusters,
                              max_active_clusters)
-                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
-
-                # get stream
-                torch_stream = torch.cuda.current_stream()
-                stream = cuda.CUstream(torch_stream.cuda_stream)
 
                 if cache_key not in self.__class__.kernel_cache:
                     if self.use_tvm_ffi:
@@ -10438,6 +10497,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             c_tensor, cutlass.BFloat16, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
                             alpha_tensor)
+                        c_ld_val = cutlass.Int64(c_ld_key)
                         # make faked stream
                         stream = cute.runtime.make_fake_stream(
                             use_tvm_ffi_env_stream=True)
@@ -10538,6 +10598,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         c_ld_key,
                     ]
                     compiled_gemm(*launch_args)
+                    if launch_plan_cache is not None:
+                        launch_plan_cache[launch_plan_key] = (compiled_gemm,
+                                                              swap_ab)
                 else:
                     launch_args = [
                         kernel_m,
@@ -10681,8 +10744,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
 
             alpha = torch.ones((), dtype=torch.float32, device=input.device)
-            runner = CuteDSLMXFP8RubinLinear(output_dtype=output_dtype,
-                                             use_tvm_ffi=use_tvm_ffi)
+            runner = CuteDSLMXFP8RubinLinear(
+                output_dtype=output_dtype,
+                use_tvm_ffi=use_tvm_ffi,
+            )
             inputs = [input, weight, input_scale, weight_scale, alpha]
             _, best_tactic = AutoTuner.get().choose_one(
                 "trtllm::cute_dsl_mxfp8_gemm_rubin",
