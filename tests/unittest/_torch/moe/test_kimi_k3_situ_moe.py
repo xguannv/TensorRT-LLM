@@ -620,6 +620,33 @@ def test_kimi_k3_moe_auto_backend_defaults_to_trtllm(architecture):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "moe_backend",
+    ["CUTLASS", "CUTEDSL", "TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"],
+)
+def test_kimi_k3_detects_a_silent_backend_substitution(moe_backend):
+    """Every admitted backend must be caught if the factory swaps it out.
+
+    ``create_moe`` falls back to CutlassFusedMoE whenever the requested impl
+    declines, leaving one WARNING line behind. Before this was table-driven
+    only the two MegaMoE names were checked, so a TRTLLM or CUTEDSL request
+    that quietly became CUTLASS would be benchmarked as if it had not.
+
+    ``CutlassFusedMoE`` is the fallback target and the base class of
+    ``CuteDslFusedMoE``, so the CUTLASS row also pins that the comparison is
+    by exact type -- an isinstance check would call CuteDSL a valid CUTLASS.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _k3_backend_matches
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+
+    substitute = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    assert _k3_backend_matches(moe_backend, substitute) is (moe_backend == "CUTLASS")
+
+    # A name this guard has nothing to say about must not raise, and must be
+    # distinguishable from "checked and wrong".
+    assert _k3_backend_matches("VANILLA", substitute) is None
+
+
 def test_kimi_k3_trtllm_situ_admits_every_backend_supported_quant():
     """The model must not narrow what the backend says it can serve.
 

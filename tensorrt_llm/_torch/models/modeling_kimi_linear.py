@@ -1046,6 +1046,38 @@ _K3_EXPERT_CKPT_SPECS = {
 }
 
 
+def _k3_backend_matches(moe_backend: str, backend) -> Optional[bool]:
+    """Did an explicit K3 ``moe_backend`` actually get the impl it named?
+
+    Returns ``None`` for a name with nothing to check. Imports lazily and per
+    name so that asking for CUTLASS does not drag in the MegaMoE CuteDSL
+    kernel package.
+
+    CUTLASS is compared by exact type, not ``isinstance``: it is the fallback
+    target AND the base class of CuteDslFusedMoE and DeepGemmFusedMoE, so a
+    subclass check would call a substitution into one of those a match.
+    """
+    if moe_backend == "MEGAMOE_DEEPGEMM":
+        from ..moe.fused_moe.mega_moe import MegaMoEDeepGemm
+
+        return isinstance(backend, MegaMoEDeepGemm)
+    if moe_backend == "MEGAMOE_CUTEDSL":
+        from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
+
+        return isinstance(backend, MegaMoECuteDsl)
+    if moe_backend == "CUTEDSL":
+        from ..moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+
+        return isinstance(backend, CuteDslFusedMoE)
+    if moe_backend == "TRTLLM":
+        return isinstance(backend, TRTLLMGenFusedMoE)
+    if moe_backend == "CUTLASS":
+        from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+
+        return type(backend) is CutlassFusedMoE
+    return None
+
+
 def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
     spec = _K3_EXPERT_CKPT_SPECS.get(quant_algo)
     if spec is None:
@@ -1139,28 +1171,24 @@ class KimiK3MoERuntime(nn.Module):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            from ..moe.fused_moe.mega_moe import MegaMoEDeepGemm
-
-            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
-            from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
-
-            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
-            # create_moe silently falls back when a backend declines the
-            # config, and for MegaMoE the decline is easy to trigger (it is
-            # EP-only and has its own token/top-k limits), so an explicit
-            # request that quietly became CUTLASS would be measured as if it
-            # were MegaMoE.
-            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
+        # create_moe silently falls back when a backend declines the config:
+        # BACKEND_FAMILY maps each name to one impl and appends
+        # FALLBACK_IMPL (CutlassFusedMoE), so a decline leaves nothing but one
+        # WARNING line and a run that looks healthy. With five SiTU-capable
+        # backends admitted, an unnoticed substitution does not merely lose
+        # performance -- it makes a backend comparison measure CUTLASS twice.
+        #
+        # Checked for every backend, not just the MegaMoE pair that used to be
+        # guarded here: the decline is easiest to trigger for MegaMoE (EP-only,
+        # own token/top-k limits), but TRTLLM and CUTEDSL both have SM and
+        # quant gates of their own, and they were the two silent ones.
+        if _k3_backend_matches(routed_moe_model_config.moe_backend,
+                               self.routed_experts.backend) is False:
+            raise RuntimeError(
+                f"Kimi K3 explicitly requested "
+                f"{routed_moe_model_config.moe_backend}, but the MoE factory "
+                f"selected {type(self.routed_experts.backend).__name__}. "
+                "Look for 'cannot serve this layer' in the log for the reason.")
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
