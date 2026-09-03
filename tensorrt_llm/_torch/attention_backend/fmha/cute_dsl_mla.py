@@ -36,11 +36,45 @@ if TYPE_CHECKING:
         TrtllmAttentionMetadata,
     )
 
-_LOG2_E = math.log2(math.e)
-
 
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
+
+    @staticmethod
+    def _get_fp8_scales(
+        q: torch.Tensor,
+        fwd: AttentionForwardArgs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        softmax_scale = fwd.mla_bmm1_scale
+        output_scale = fwd.mla_bmm2_scale
+        if softmax_scale is None or output_scale is None:
+            raise RuntimeError(
+                "CuTe DSL FP8 MLA decode requires mla_bmm1_scale and mla_bmm2_scale device tensors."
+            )
+        for name, scale in (
+            ("mla_bmm1_scale", softmax_scale),
+            ("mla_bmm2_scale", output_scale),
+        ):
+            if scale.dtype != torch.float32 or scale.numel() < 1:
+                raise RuntimeError(f"{name} must contain at least one float32 value.")
+            if scale.device != q.device:
+                raise RuntimeError(f"{name} must be on {q.device}, got {scale.device}.")
+        return softmax_scale, output_scale
+
+    @staticmethod
+    def _is_fp8_cute_dsl_selected(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+        num_tokens: int,
+        kernel_dtype: Optional[torch.dtype],
+    ) -> bool:
+        if kernel_dtype != torch.float8_e4m3fn:
+            return False
+        backend = attn.flashinfer_mla_backend
+        policy = attn.mla_backend_policy
+        if policy is not None:
+            backend = policy(backend, meta, num_tokens)
+        return backend == "cute-dsl"
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -296,16 +330,15 @@ class CuteDslMlaFmha(PhasedFmha):
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
-            if seq_len_q != 1 and not getattr(meta, "_helix_spec_tokens_valid",
-                                              False):
+            if seq_len_q != 1 and not getattr(meta, "_helix_spec_tokens_valid", False):
                 # Multi-token decode under helix needs the per-token bound /
                 # write-slot buffers of the speculative verify-group path.
                 return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
-            if seq_len_q != 1 and self._get_kernel_dtype(
-                    attn, q) == torch.float8_e4m3fn:
+            if seq_len_q != 1 and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn:
                 return False, (
                     "CuTe DSL MLA FMHA helix verify groups require a bf16/fp16 "
-                    "KV cache (the fp8 kernel has no per-token bounds).")
+                    "KV cache (the fp8 kernel has no per-token bounds)."
+                )
             softmax_stats = fwd.softmax_stats_tensor
             if softmax_stats is None:
                 return False, "CuTe DSL MLA FMHA requires softmax_stats_tensor with Helix."
@@ -320,25 +353,28 @@ class CuteDslMlaFmha(PhasedFmha):
                     "CuTe DSL MLA FMHA requires contiguous float32 Helix softmax stats, "
                     f"got dtype={softmax_stats.dtype}, contiguous={softmax_stats.is_contiguous()}."
                 )
+        kernel_dtype = self._get_kernel_dtype(attn, q)
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # Perf gate (NOT a correctness limit).
-        favorable, reason = self._is_perf_favorable(
-            attn.num_heads,
-            None if AutoTuner.get().is_tuning_mode else batch_size,
-            seq_len_q,
-            self._get_kernel_dtype(attn, q),
-        )
-        if not favorable:
-            return False, reason
+        # Perf gate (NOT a correctness limit). An explicit CuTe-DSL choice
+        # uses this native wrapper as the FP8 correctness path because the
+        # FlashInfer public CuTe-DSL wrapper cannot consume device scales.
+        if not self._is_fp8_cute_dsl_selected(attn, meta, q.shape[0], kernel_dtype):
+            favorable, reason = self._is_perf_favorable(
+                attn.num_heads,
+                None if AutoTuner.get().is_tuning_mode else batch_size,
+                seq_len_q,
+                kernel_dtype,
+            )
+            if not favorable:
+                return False, reason
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
         if fwd.output is None:
             return False, "output is required."
 
         # The kernel type is the input dtype
-        kernel_dtype = self._get_kernel_dtype(attn, q)
         if kernel_dtype is None:
             return (
                 False,
@@ -477,18 +513,7 @@ class CuteDslMlaFmha(PhasedFmha):
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
-            cached = getattr(self, "_cute_dsl_fp8_scale", None)
-            if cached is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "CuTe DSL MLA FMHA: fp8 decode scale was not cached for "
-                        f"layer {attn.layer_idx} before CUDA graph capture."
-                    )
-                softmax_scale = float(params.fwd.mla_bmm1_scale[1].item()) / _LOG2_E
-                output_scale = float(params.fwd.mla_bmm2_scale[0].item())
-                self._cute_dsl_fp8_scale = (softmax_scale, output_scale)
-            else:
-                softmax_scale, output_scale = cached
+            softmax_scale, output_scale = self._get_fp8_scales(q, params.fwd)
 
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
@@ -517,10 +542,15 @@ class CuteDslMlaFmha(PhasedFmha):
             # Helix speculative verify groups: per-token rank-local bounds
             # (filled by recompute_helix_spec_buffers). None on the
             # single-token helix path and outside helix.
-            (meta.helix_kv_bounds[:num_tokens] if
-             (meta.helix_position_offsets is not None
-              and getattr(meta, "_helix_spec_tokens_valid", False)
-              and kernel_dtype != torch.float8_e4m3fn) else None),
+            (
+                meta.helix_kv_bounds[:num_tokens]
+                if (
+                    meta.helix_position_offsets is not None
+                    and getattr(meta, "_helix_spec_tokens_valid", False)
+                    and kernel_dtype != torch.float8_e4m3fn
+                )
+                else None
+            ),
         )
 
     def run_mla_generation(

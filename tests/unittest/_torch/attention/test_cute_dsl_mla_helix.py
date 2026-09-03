@@ -93,21 +93,34 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(input_dtype: torch.dtype) -
         num_heads, seq_len_q, latent_dim, batch_size, cutlass.Float32
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+    inputs = [
+        q_latent,
+        q_rope,
+        c_latent,
+        c_rope,
+        page_table,
+        cache_seqs,
+        output,
+        workspace,
+        softmax_stats,
+        None,
+    ]
+    scale_kwargs = {
+        "softmax_scale": softmax_scale,
+        "output_scale": 1.0,
+    }
+    if input_dtype == torch.float8_e4m3fn:
+        inputs.extend(
+            [
+                torch.tensor([softmax_scale], device=device),
+                torch.tensor([1.0], device=device),
+            ]
+        )
+        scale_kwargs = {}
     runner.forward(
-        [
-            q_latent,
-            q_rope,
-            c_latent,
-            c_rope,
-            page_table,
-            cache_seqs,
-            output,
-            workspace,
-            softmax_stats,
-        ],
+        inputs,
         tactic=((128, 128), (128, 256), 4, False),
-        softmax_scale=softmax_scale,
-        output_scale=1.0,
+        **scale_kwargs,
     )
 
     # The existing Helix sanitizer makes a rank with no local pages the identity
