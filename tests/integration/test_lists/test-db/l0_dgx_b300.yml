@@ -141,5 +141,4 @@ l0_dgx_b300:
   # Kimi K3 needs 8 GPUs and B300-class memory: at TP8 the weights alone are
   # 192-202 GiB/GPU, past what a 184 GiB B200 can hold before any KV cache.
   - accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_full_accuracy TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_full_accuracy_fp8_kv TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_tep8_dspark TIMEOUT (60)

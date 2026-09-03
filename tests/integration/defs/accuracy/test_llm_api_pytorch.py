@@ -4416,8 +4416,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # whose speculative_model is the target path).
     DSPARK_MODEL_PATH = f"{llm_models_root()}/Kimi-K3-DSpark"
 
-    def _run_gsm8k_full_accuracy(self, kv_cache_dtype: str) -> None:
-        """Run the full GSM8K gate with the requested KV-cache dtype."""
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_full_accuracy(self):
+        """Run the full DEP8 GSM8K gate with an FP8 KV cache."""
         with LLM(
                 self.MODEL_PATH,
                 tensor_parallel_size=8,
@@ -4437,7 +4438,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                     use_low_precision_moe_combine=True,
                 ),
                 kv_cache_config=KvCacheConfig(
-                    dtype=kv_cache_dtype,
+                    dtype="fp8",
                     enable_block_reuse=False,
                     # Attention DP replicates KV per rank, so 0.25 leaves
                     # 4.64 GiB and clamp_max_seq_len_for_mem silently drops
@@ -4448,8 +4449,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                     tokens_per_block=64,
                 ),
         ) as llm:
-            if kv_cache_dtype == "fp8":
-                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = GSM8K(self.MODEL_NAME)
             acc_params = task.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
@@ -4463,16 +4463,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
-
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_full_accuracy(self):
-        """Run the full 1,319-sample GSM8K gate on the DEP8 recipe."""
-        self._run_gsm8k_full_accuracy("auto")
-
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_full_accuracy_fp8_kv(self):
-        """Run the full DEP8 GSM8K gate with an explicitly FP8 KV cache."""
-        self._run_gsm8k_full_accuracy("fp8")
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_tep8_dspark(self):
