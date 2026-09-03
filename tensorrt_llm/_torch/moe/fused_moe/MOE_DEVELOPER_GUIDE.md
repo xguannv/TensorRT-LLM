@@ -390,6 +390,38 @@ the base `w3_w1_weight_shape[:2]` default (wrong for transposed layouts).
 Widening the set without that distinction converts a selection-time
 rejection into a weight-loading crash.
 
+#### SiTU (Kimi K3)
+
+SiTU is a second activation axis, and unlike gpt-oss SwiGLU it is **named once
+by the model and translated in one place**. A model passes
+`activation="situ"` plus `situ_beta` and `situ_linear_beta` to `create_moe`;
+`create_moe_backend` converts that into whatever the resolved backend's
+constructor wants:
+
+| Backend | Dialect it receives |
+| --- | --- |
+| `CutlassFusedMoE` / `MarlinFusedMoE` | `ActivationType.SiTu` + per-expert `swiglu_alpha` / `swiglu_beta` tensors (`SiTuAdaptor` reads tensors), sized with `_compute_ep_partition` |
+| `TRTLLMGenFusedMoE` | `trtllm_gen_activation_type=ActType_TrtllmGen.SiTu` + two scalars; `activation_type` stays `Swiglu`, which is the FC1 *geometry*, not the elementwise function. Only the algos in `_SITU_SUPPORTED_QUANT_ALGOS` have a fused `..._siTuGlu_*` cubin |
+| `CuteDslFusedMoE` | `ActivationType.SiTu` + two scalars; the FC1 epilogue folds them at trace time, so they are part of the compiled-kernel cache key |
+| `MegaMoEDeepGemm` / `MegaMoECuteDsl` | the `activation` string plus the two scalars, unchanged |
+
+Anything else is rejected there, by class name.
+
+Two rules that are load-bearing rather than stylistic:
+
+- **SiTU is never inferred from `pretrained_config`.** Both MegaMoE backends
+  used to select it whenever `activation_situ_beta` was present. Because
+  `resolve_moe_impl` substitutes a declining backend for `FALLBACK_IMPL`
+  silently, inference made "ran SwiGLU instead" the *default* outcome of a
+  substitution rather than an error.
+- **`CuteDslB12xFusedMoE` is deliberately absent.** It subclasses
+  `CutlassFusedMoE` and forwards `**kwargs` into an `__init__` with no
+  `situ_beta`, and it is SM120/121 NVFP4 decode-only.
+
+A model that requests a backend by name should also check it got it —
+`resolve_moe_impl`'s fallback leaves only a WARNING behind. See
+`_k3_backend_matches` in `modeling_kimi_linear.py`.
+
 Three things make this easy to get wrong in either direction. First, the SM
 asymmetry: `ModelConfig.get_mxfp4_quant_algo` maps a gpt-oss checkpoint to
 `W4A16_MXFP4` below SM100 and to the `W4A8_MXFP4_*` pair at SM100+, so a gate
