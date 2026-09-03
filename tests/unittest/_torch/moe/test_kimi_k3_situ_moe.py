@@ -339,7 +339,22 @@ def test_fused_forward_launches_situ_kernel(fmt):
     env["TLLM_BATCHED_GEMM_PRINT_NAME"] = "1"
     env["TLLM_LOG_LEVEL"] = "INFO"
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    unittest_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
+    # ``tests/unittest`` has to be importable for this module's own
+    # ``from _torch.moe.kimi_k3_ref_moe...`` imports to work in the subprocess.
+    #
+    # Found by walking up rather than by a fixed number of ``..``: the
+    # ``_torch/moe`` reorg (#17952) moved this file one level shallower, and the
+    # previous three-level walk silently started landing on ``tests/`` instead.
+    # Nothing failed, because the walk's result is appended to an inherited
+    # PYTHONPATH that already contains ``tests/unittest`` under CI -- so the
+    # breakage only surfaces when someone runs pytest with their own PYTHONPATH.
+    # A depth-independent search cannot be broken by the next move.
+    unittest_root = this_dir
+    while os.path.basename(unittest_root) != "unittest":
+        parent = os.path.dirname(unittest_root)
+        if parent == unittest_root:
+            raise RuntimeError(f"no 'unittest' ancestor above {this_dir}")
+        unittest_root = parent
     env["PYTHONPATH"] = os.pathsep.join([this_dir, unittest_root, env.get("PYTHONPATH", "")])
     result = subprocess.run(
         [sys.executable, "-c", _LAUNCH_EVIDENCE_SCRIPTS[fmt]],
