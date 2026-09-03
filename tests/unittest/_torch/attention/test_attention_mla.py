@@ -1,6 +1,7 @@
 import math
 import random
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -15,6 +16,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -385,6 +387,103 @@ accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),
     torch.float8_e4m3fn: (4e-1, 4e-2),
 }
+
+
+def test_fp8_mla_scales_remain_tensors() -> None:
+    q = torch.empty(1)
+    bmm1_scale = torch.tensor([0.25, 0.25 * 1.442695], dtype=torch.float32)
+    bmm2_scale = torch.tensor([4.0], dtype=torch.float32)
+
+    actual_bmm1_scale, actual_bmm2_scale = CuteDslMlaFmha._get_fp8_scales(
+        q,
+        SimpleNamespace(
+            mla_bmm1_scale=bmm1_scale,
+            mla_bmm2_scale=bmm2_scale,
+        ),
+    )
+
+    assert actual_bmm1_scale is bmm1_scale
+    assert actual_bmm2_scale is bmm2_scale
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "num_generations", "num_tokens"),
+    [
+        (0, 4, 4),
+        (1, 3, 4),
+        (0, 4, 8),
+    ],
+    ids=["generation-only", "mixed-batch", "speculative-multi-token"],
+)
+def test_fp8_cute_dsl_dispatch_without_fallback_policy(
+    num_contexts: int,
+    num_generations: int,
+    num_tokens: int,
+) -> None:
+    """FP8 keeps the required CuTe-DSL backend for every batch shape."""
+    metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_generations=num_generations,
+    )
+    attn = SimpleNamespace(
+        flashinfer_mla_backend="cute-dsl",
+        mla_backend_policy=None,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._mla_backend = "cute-dsl"
+    fmha._attn_ref = lambda: attn
+
+    assert fmha._get_effective_mla_backend(metadata, num_tokens) == "cute-dsl"
+    assert CuteDslMlaFmha._is_fp8_cute_dsl_selected(
+        attn,
+        metadata,
+        num_tokens=num_tokens,
+        kernel_dtype=torch.float8_e4m3fn,
+    )
+
+
+def test_fp8_cute_dsl_respects_per_batch_backend_policy() -> None:
+    metadata = SimpleNamespace(num_contexts=0, num_generations=1)
+    attn = SimpleNamespace(
+        flashinfer_mla_backend="cute-dsl",
+        mla_backend_policy=lambda _backend, _metadata, _num_tokens: "trtllm-gen",
+    )
+
+    assert not CuteDslMlaFmha._is_fp8_cute_dsl_selected(
+        attn,
+        metadata,
+        num_tokens=2,
+        kernel_dtype=torch.float8_e4m3fn,
+    )
+
+
+def test_fp8_h96_decode_does_not_bypass_backend_selection() -> None:
+    favorable, reason = CuteDslMlaFmha._is_perf_favorable(
+        num_heads=96,
+        batch_size=1,
+        seq_len_q=1,
+        kernel_dtype=torch.float8_e4m3fn,
+    )
+
+    assert not favorable
+    assert "not a perf win" in reason
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_AVAILABLE,
+    reason="nvidia-cutlass-dsl is not installed",
+)
+def test_fp8_mla_custom_op_accepts_tensor_scales() -> None:
+    # Import registers the CuTe DSL custom ops when the package is available.
+    import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
+
+    schema = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell.default._schema
+    argument_types = {
+        argument.name: str(argument.type) for argument in schema.arguments
+    }
+
+    assert argument_types["softmax_scale"] == "Tensor"
+    assert argument_types["output_scale"] == "Tensor"
 
 
 @pytest.mark.parametrize(

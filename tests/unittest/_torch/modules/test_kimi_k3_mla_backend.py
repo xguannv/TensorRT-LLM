@@ -48,7 +48,7 @@ def test_select_kimi_k3_mla_generation_backend(
 
 
 @pytest.mark.parametrize("configured_backend", ["cute-dsl", "trtllm-gen"])
-def test_select_kimi_k3_mla_generation_backend_uses_cute_dsl_for_fp8_kv_cache(
+def test_select_kimi_k3_mla_generation_backend_requires_cute_dsl_for_fp8_kv_cache(
     monkeypatch: pytest.MonkeyPatch,
     configured_backend: str,
 ) -> None:

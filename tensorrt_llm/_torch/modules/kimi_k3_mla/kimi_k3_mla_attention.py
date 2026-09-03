@@ -52,11 +52,12 @@ _KIMI_K3_MLA_GEN_BACKEND_DEFAULT = "trtllm-gen"
 def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     """Select K3's absorbed-generation MLA backend.
 
-    FP8 KV cache uses the native CuTe-DSL wrapper, which accepts its device
-    scales. Other KV-cache dtypes keep the existing configured/default
-    backend selection unchanged.
+    FP8 KV cache requires the native CuTe-DSL wrapper, which accepts its
+    device scales; TRTLLM-Gen does not support K3's 96 query heads. Other
+    KV-cache dtypes keep the existing configured/default backend selection
+    unchanged.
 
-    The default is TRTLLM-Gen on this branch; see
+    The non-FP8 default is TRTLLM-Gen on this branch; see
     ``_KIMI_K3_MLA_GEN_BACKEND_DEFAULT`` for why.
     """
     backend = os.environ.get(_KIMI_K3_MLA_GEN_BACKEND_ENV, _KIMI_K3_MLA_GEN_BACKEND_DEFAULT)
@@ -65,7 +66,7 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     )
     if has_fp8_kv_cache and backend != "cute-dsl":
         logger.info(
-            "Kimi K3 MLA: FP8 KV cache uses the CuTe-DSL MLA "
+            "Kimi K3 MLA: FP8 KV cache requires the CuTe-DSL MLA "
             f"generation backend; overriding '{backend}' -> 'cute-dsl'."
         )
         return "cute-dsl"
@@ -77,20 +78,18 @@ def _kimi_k3_mla_decode_backend_policy(
     metadata,
     num_tokens: int,
 ) -> str:
-    """Per-batch MLA decode backend selection for Kimi K3.
+    """Per-batch MLA decode backend selection for Kimi K3 with non-FP8 KV.
 
     Installed as ``mla_backend_policy`` on K3's generation attention backend
-    (see :class:`KimiK3MLAAttention`); the general attention code applies no
-    such policy on its own.
+    only when the KV cache is not FP8 (see :class:`KimiK3MLAAttention`). The
+    general attention code applies no such policy on its own.
 
     CuTe-DSL reuses one staged page table across MLA layers for a
     generation-only, one-token-per-request batch. A mixed context/generation
     batch cannot use that reuse key, so selecting CuTe-DSL would repeat the
-    staging copies in every MLA layer and regress time to first token. K3's
-    128 padded query heads also restrict the CuTe-DSL kernel to one query
-    token per request. Keep the requested CuTe-DSL fast path for plain decode
-    and use TRTLLM-Gen for mixed batches and speculative multi-token
-    verification.
+    staging copies in every MLA layer and regress time to first token. Keep
+    the requested CuTe-DSL fast path for plain decode and use TRTLLM-Gen for
+    mixed batches and speculative multi-token verification.
     """
     is_single_token_generation = num_tokens == metadata.num_generations
     if requested_backend == "cute-dsl" and (
@@ -238,6 +237,10 @@ class KimiK3MLAAttention(MLA):
         model_config: ModelConfig,
         mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
+        quant_config = model_config.get_quant_config()
+        has_fp8_kv_cache = bool(
+            quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
+        )
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
             max_position_embeddings=max_position_embeddings,
@@ -263,7 +266,7 @@ class KimiK3MLAAttention(MLA):
             reduce_output=False,
             fuse_qkv_a_proj=False,
             rms_norm_eps=rms_norm_eps,
-            flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
+            flashinfer_mla_backend=_select_mla_generation_backend(quant_config),
         )
         # K3 calls forward_impl() directly to insert its output gate before
         # the base row-parallel o_proj. The original executor metadata remains
@@ -298,9 +301,14 @@ class KimiK3MLAAttention(MLA):
         _install_identity_rope_table(self.mha)
         _install_identity_rope_table(self.mqa)
         # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
-        # only it needs K3's per-batch fallback policy; mha keeps the
-        # default trtllm-gen selection.
-        self.mqa.mla_backend_policy = _kimi_k3_mla_decode_backend_policy
+        # only it needs K3's per-batch fallback policy. FP8 KV must keep its
+        # required CuTe-DSL backend because TRTLLM-Gen does not support K3's
+        # 96 query heads, so leave the policy unset and preserve the static
+        # backend for every batch composition. Use the config-derived flag:
+        # TrtllmAttention has not populated has_fp8_kv_cache yet when weight
+        # creation is deferred under MetaInitMode.
+        if not has_fp8_kv_cache:
+            self.mqa.mla_backend_policy = _kimi_k3_mla_decode_backend_policy
         self.rotary_emb = None
         self.apply_rotary_emb = False
 
