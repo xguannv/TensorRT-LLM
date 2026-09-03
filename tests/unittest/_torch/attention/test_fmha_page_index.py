@@ -26,6 +26,7 @@ class _AttentionStub:
         self.is_mla_enable = is_mla_enable
         self.has_fp8_kv_cache = has_fp8_kv_cache
         self.flashinfer_mla_backend = flashinfer_mla_backend
+        self.mla_backend_policy = None
         self.kv_lora_rank = 512 if is_mla_enable else None
         self.head_dim = 576
         self.v_head_dim = 512 if is_mla_enable else None
@@ -117,15 +118,29 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
         )
 
 
-def test_flashinfer_cute_dsl_mla_backend_rejects_fp8_kv_cache() -> None:
+def test_flashinfer_cute_dsl_mla_backend_accepts_fp8_kv_cache() -> None:
     attn = _AttentionStub(
         is_mla_enable=True,
         has_fp8_kv_cache=True,
         flashinfer_mla_backend="cute-dsl",
     )
 
-    with pytest.raises(ValueError, match="does not support FP8 KV cache"):
-        FlashInferTrtllmGenFmha(attn)
+    fmha = FlashInferTrtllmGenFmha(attn)
+
+    assert fmha._mla_backend == "cute-dsl"
+    assert fmha._get_effective_mla_backend(SimpleNamespace(), 1) == "cute-dsl"
+
+
+def test_flashinfer_trtllm_gen_mla_backend_accepts_fp8_kv_cache() -> None:
+    attn = _AttentionStub(
+        is_mla_enable=True,
+        has_fp8_kv_cache=True,
+        flashinfer_mla_backend="trtllm-gen",
+    )
+
+    fmha = FlashInferTrtllmGenFmha(attn)
+
+    assert fmha._mla_backend == "trtllm-gen"
 
 
 def _cute_dsl_mla_helix_support(

@@ -52,9 +52,9 @@ _KIMI_K3_MLA_GEN_BACKEND_DEFAULT = "trtllm-gen"
 def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     """Select K3's absorbed-generation MLA backend.
 
-    K3 was tuned with the FlashInfer CuTe-DSL backend for BF16 KV cache.
-    FP8 KV cache carries device scales that CuTe-DSL does not support, so
-    retain the TRTLLM-Gen fallback used by the pre-refactor implementation.
+    FP8 KV cache uses the native CuTe-DSL wrapper, which accepts its device
+    scales. Other KV-cache dtypes keep the existing configured/default
+    backend selection unchanged.
 
     The default is TRTLLM-Gen on this branch; see
     ``_KIMI_K3_MLA_GEN_BACKEND_DEFAULT`` for why.
@@ -63,12 +63,12 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     has_fp8_kv_cache = bool(
         quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
     )
-    if has_fp8_kv_cache and backend != "trtllm-gen":
+    if has_fp8_kv_cache and backend != "cute-dsl":
         logger.info(
-            "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
-            f"generation backend; overriding '{backend}' -> 'trtllm-gen'."
+            "Kimi K3 MLA: FP8 KV cache uses the CuTe-DSL MLA "
+            f"generation backend; overriding '{backend}' -> 'cute-dsl'."
         )
-        return "trtllm-gen"
+        return "cute-dsl"
     return backend
 
 

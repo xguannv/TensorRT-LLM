@@ -300,6 +300,10 @@ moonshotai/Kimi-K3:
   # run-to-run variation.
   - quant_algo: MIXED_PRECISION
     accuracy: 96.0
+  # FP8 KV uses the same full DEP8 gate and must preserve the BF16-KV score.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 96.0
   # Same threshold as the non-speculative row above: speculative decoding is
   # lossless, so DSpark must not move the score. Measured 97.0-97.5 on a
   # 200-sample TEP8 subset while bringing up the drafter's paged KV path.

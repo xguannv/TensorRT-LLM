@@ -506,11 +506,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
         requested_mla_backend = _get_mla_backend(attn.flashinfer_mla_backend or "trtllm-gen")
-        if requested_mla_backend == "cute-dsl" and attn.is_mla_enable and attn.has_fp8_kv_cache:
-            raise ValueError(
-                "flashinfer_mla_backend='cute-dsl' does not support FP8 KV cache device scales; "
-                "use 'trtllm-gen' instead."
-            )
         self._mla_backend = requested_mla_backend
         # Read once so the hot path is not sensitive to later environment changes.
         self._enable_pdl = get_env_enable_pdl()
@@ -696,6 +691,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         fwd: AttentionForwardArgs,
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
+        if (
+            is_mla_enable
+            and attn.has_fp8_kv_cache
+            and self._get_effective_mla_backend(meta, q.size(0)) == "cute-dsl"
+        ):
+            return (
+                False,
+                "FP8 CuTe-DSL MLA is handled by the native cute_dsl_mla FMHA library.",
+            )
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
