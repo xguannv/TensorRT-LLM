@@ -20,7 +20,7 @@ combine) from
 ``tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
-``tensorrt_llm/_torch/custom_ops/cute_dsl_megamoe_custom_op.py``. This
+``tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py``. This
 file only owns:
 
   * capability gating (``can_implement``)

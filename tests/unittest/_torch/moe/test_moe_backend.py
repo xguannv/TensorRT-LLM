@@ -999,7 +999,7 @@ def test_megamoe_cutedsl_tactic_autotune_defaults_off(
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
