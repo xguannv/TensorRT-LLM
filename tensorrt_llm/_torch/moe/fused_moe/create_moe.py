@@ -96,9 +96,12 @@ def create_moe_backend(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
-        activation: Optional MegaMoE DeepGEMM activation name
-        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
-        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
+        activation: Canonical elementwise activation name. ``'situ'`` is
+            translated per backend by ``create_moe_backend``; MegaMoE also
+            accepts ``'swiglu'``.
+        situ_beta: SiTU gate-side constant. Requires ``activation='situ'``.
+        situ_linear_beta: SiTU linear-side constant. Requires
+            ``activation='situ'``.
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
@@ -495,9 +498,12 @@ def create_moe(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
-        activation: Optional MegaMoE DeepGEMM activation name
-        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
-        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
+        activation: Canonical elementwise activation name. ``'situ'`` is
+            translated per backend by ``create_moe_backend``; MegaMoE also
+            accepts ``'swiglu'``.
+        situ_beta: SiTU gate-side constant. Requires ``activation='situ'``.
+        situ_linear_beta: SiTU linear-side constant. Requires
+            ``activation='situ'``.
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
