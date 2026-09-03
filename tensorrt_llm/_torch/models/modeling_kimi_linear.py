@@ -117,7 +117,7 @@ from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..moe.fused_moe import ConfigurableMoE, create_moe
+from ..moe.fused_moe import ConfigurableMoE, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.interface import _compute_ep_partition
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..utils import ActivationType, ActType_TrtllmGen
@@ -1121,25 +1121,9 @@ class KimiK3MoERuntime(nn.Module):
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
         )
-        # trtllm-gen ships SiTu cubins for exactly one dtype combination
-        # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
-        # standalone SiTu activation kernel to fall back on, so a non-MXFP4
-        # routed-expert format cannot be served here. Fail with the fix rather
-        # than with a cubin lookup error deep inside the runner. Checked against
-        # the resolved backend, not the K3 architecture branch, because the
-        # generic FP8_BLOCK_SCALES fallback in ``resolve_moe_backend`` can also
-        # land on TRTLLM.
-        if (
-            routed_moe_model_config.moe_backend == "TRTLLM"
-            and routed_quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8
-        ):
-            raise ValueError(
-                f"Kimi K3 routed experts are quantized as "
-                f"{routed_quant_config.quant_algo}, which the TRTLLM "
-                "(trtllm-gen) MoE backend cannot serve: its SiTu activation "
-                "exists only for W4A8_MXFP4_MXFP8. Set moe_config.backend to "
-                "CUTLASS or MEGAMOE_CUTEDSL."
-            )
+        self._check_trtllm_situ_quant(
+            routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
+        )
 
         if routed_moe_model_config.moe_backend == "CUTLASS":
             # Size the per-expert SiTU constants with the same ceil/floor
@@ -1346,6 +1330,44 @@ class KimiK3MoERuntime(nn.Module):
             _K3_DEFAULT_ROUTED_QUANT_ALGO,
         )
         return QuantConfig(quant_algo=_K3_DEFAULT_ROUTED_QUANT_ALGO)
+
+    @staticmethod
+    def _check_trtllm_situ_quant(moe_backend: str, quant_algo: Optional[QuantAlgo]) -> None:
+        """Reject a routed-expert format trtllm-gen has no fused SiTu cubin for.
+
+        trtllm-gen has fused SiTu FC1 cubins for two input formats and no
+        standalone SiTu activation kernel, so anything else has to die here
+        rather than in a cubin lookup deep inside the runner. Checked against
+        the resolved backend, not the K3 architecture branch, because the
+        generic FP8_BLOCK_SCALES fallback in ``resolve_moe_backend`` can also
+        land on TRTLLM.
+
+        The admitted set is read off the backend rather than restated here,
+        because restating it is what broke. This guard was written in #17865
+        when MXFP4 was the only fused SiTu drop; #17940 then added the NVFP4
+        (group-16 ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``) cubins and updated
+        ``TRTLLMGenFusedMoE``'s set without touching this copy. For the week
+        in between, an NVFP4 K3 checkpoint could not start at all -- and not
+        only when TRTLLM was asked for by name, because
+        ``ModelConfig.resolve_moe_backend`` sends every K3 architecture to
+        TRTLLM, so the default AUTO configuration hit this raise too. The unit
+        tests did not catch it: they call ``create_moe`` directly and never
+        reach this guard, so the kernel path stayed green while the model path
+        was closed.
+
+        A staticmethod, not an inline block, so that the invariant is
+        reachable from a test without constructing the whole runtime.
+        """
+        situ_supported = TRTLLMGenFusedMoE.situ_supported_quant_algos()
+        if moe_backend != "TRTLLM" or quant_algo in situ_supported:
+            return
+        supported = ", ".join(sorted(algo.name for algo in situ_supported))
+        raise ValueError(
+            f"Kimi K3 routed experts are quantized as {quant_algo}, which the "
+            "TRTLLM (trtllm-gen) MoE backend cannot serve: fused SiTu cubins "
+            f"exist only for {supported}. Set moe_config.backend to CUTLASS "
+            "or MEGAMOE_CUTEDSL."
+        )
 
     @staticmethod
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
