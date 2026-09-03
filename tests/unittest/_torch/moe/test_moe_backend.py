@@ -894,6 +894,92 @@ def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
     assert configurable_moe.call_args.kwargs["situ_linear_beta"] == 25.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUTLASS row allocates on CUDA")
+@pytest.mark.parametrize("dialect", ["cutlass", "trtllm", "cutedsl", "megamoe"])
+def test_create_moe_backend_translates_situ_per_backend(monkeypatch, dialect):
+    """One SiTU spelling in, four dialects out.
+
+    The model names SiTU once (``activation='situ'`` + both betas) and
+    ``create_moe_backend`` is the only place that knows what each backend
+    calls it. Getting a row wrong is silent in the worst way: the backend
+    constructs, runs, and computes SwiGLU.
+
+    Each class is monkeypatched in the create_moe namespace and passed back in
+    as ``moe_cls`` so the branch dispatch -- which compares against those
+    module-level names -- selects the intended row.
+    """
+    import tensorrt_llm._torch.moe.fused_moe.create_moe as create_moe_module
+    from tensorrt_llm._torch.utils import ActivationType, ActType_TrtllmGen
+
+    name = {
+        "cutlass": "CutlassFusedMoE",
+        "trtllm": "TRTLLMGenFusedMoE",
+        "cutedsl": "CuteDslFusedMoE",
+        "megamoe": "MegaMoECuteDsl",
+    }[dialect]
+    fake_cls = MagicMock(name=name)
+    monkeypatch.setattr(create_moe_module, name, fake_cls)
+
+    create_moe_module.create_moe_backend(
+        moe_cls=fake_cls,
+        routing_method=MagicMock(),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=ModelConfig(),
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    kwargs = fake_cls.call_args.kwargs
+
+    if dialect == "cutlass":
+        # Per-expert tensors under the gpt-oss names; SiTuAdaptor reads tensors.
+        assert kwargs["activation_type"] == ActivationType.SiTu
+        assert torch.equal(kwargs["swiglu_alpha"], torch.full((8,), 4.0, device="cuda"))
+        assert torch.equal(kwargs["swiglu_beta"], torch.full((8,), 25.0, device="cuda"))
+    elif dialect == "trtllm":
+        # activation_type stays the FC1 geometry, not the elementwise function.
+        assert kwargs["trtllm_gen_activation_type"] == ActType_TrtllmGen.SiTu
+        assert kwargs["trtllm_gen_activation_alpha"] == 4.0
+        assert kwargs["trtllm_gen_activation_beta"] == 25.0
+        assert kwargs["activation_type"] == ActivationType.Swiglu
+    elif dialect == "cutedsl":
+        # Scalars: the CuTe DSL epilogue folds them in at trace time.
+        assert kwargs["activation_type"] == ActivationType.SiTu
+        assert kwargs["situ_beta"] == 4.0
+        assert kwargs["situ_linear_beta"] == 25.0
+    else:
+        # MegaMoE already speaks this dialect; nothing is translated.
+        assert kwargs["activation"] == "situ"
+        assert kwargs["situ_beta"] == 4.0
+        assert kwargs["situ_linear_beta"] == 25.0
+        assert kwargs["activation_type"] == ActivationType.Swiglu
+
+
+def test_create_moe_backend_rejects_situ_on_a_backend_without_wiring(monkeypatch):
+    """A backend with no SiTU row must be named, not silently defaulted."""
+    import tensorrt_llm._torch.moe.fused_moe.create_moe as create_moe_module
+
+    fake_cls = MagicMock(name="TritonFusedMoE")
+    monkeypatch.setattr(create_moe_module, "TritonFusedMoE", fake_cls)
+
+    with pytest.raises(ValueError, match="activation='situ' is not supported"):
+        create_moe_module.create_moe_backend(
+            moe_cls=fake_cls,
+            routing_method=MagicMock(),
+            num_experts=8,
+            hidden_size=512,
+            intermediate_size=512,
+            dtype=torch.bfloat16,
+            model_config=ModelConfig(),
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+
+
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
     routing_method = RenormalizeMoeRoutingMethod(top_k=1)
     model_config = ModelConfig(
