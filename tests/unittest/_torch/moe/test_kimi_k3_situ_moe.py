@@ -1147,8 +1147,9 @@ def _load_nvfp4_bank_for(moe, bank, moe_backend):
     CUTLASS goes through K3's per-expert streaming adapter -- the path the real
     checkpoint loader takes, and the one the buffer-equality tests above pin.
     TRTLLM-Gen's NVFP4 quant method does not override
-    ``prepare_streaming_expert_load``, so it takes the stock whole-checkpoint
-    path instead; the loader is not what these tests are about, the kernel is.
+    ``prepare_streaming_expert_load``, and CUTEDSL is only here to exercise its
+    own FC1 epilogue, so both take the stock whole-checkpoint path instead; the
+    loader is not what these tests are about, the kernel is.
     """
     if moe_backend == "CUTLASS":
         backend = _stream_nvfp4_bank(moe, bank)
@@ -1422,6 +1423,7 @@ def _quantize_expert_to_nvfp4(w1, w2, w3, input_scale):
     [
         pytest.param("CUTLASS", 1.0, id="CUTLASS-static_1.0"),
         pytest.param("TRTLLM", 1.0, id="TRTLLM-static_1.0"),
+        pytest.param("CUTEDSL", 1.0, id="CUTEDSL-static_1.0"),
         # derived_act_scale is a CUTLASS-path finding (see the reason below),
         # so it stays pinned to CUTLASS rather than becoming a strict xfail the
         # TRTLLM-Gen path would have to reproduce.
@@ -1539,7 +1541,7 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
