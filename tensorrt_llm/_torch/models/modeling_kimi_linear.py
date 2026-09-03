@@ -1189,6 +1189,17 @@ class KimiK3MoERuntime(nn.Module):
                 f"{routed_moe_model_config.moe_backend}, but the MoE factory "
                 f"selected {type(self.routed_experts.backend).__name__}. "
                 "Look for 'cannot serve this layer' in the log for the reason.")
+        # Say which impl actually won, once per process. The guard above only
+        # proves a substitution did NOT happen; a run still has no positive
+        # record of what it exercised, and the quickstart prints no MoE config
+        # at all -- so "which backend did this number come from" had to be
+        # inferred from the absence of an error.
+        logger.info_once(
+            f"Kimi K3 routed MoE: requested "
+            f"{routed_moe_model_config.moe_backend}, running "
+            f"{type(self.routed_experts.backend).__name__}",
+            key="kimi_k3_routed_moe_backend",
+        )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
