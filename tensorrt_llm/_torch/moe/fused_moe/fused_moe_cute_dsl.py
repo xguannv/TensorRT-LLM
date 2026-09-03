@@ -453,6 +453,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -472,6 +474,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
 
+        # SiTU (Kimi K3) constants. Unlike CUTLASS -- whose SiTuAdaptor reads
+        # per-expert ``swiglu_alpha`` / ``swiglu_beta`` tensors -- the CuTe DSL
+        # epilogue folds them in as trace-time scalars, so they are resolved
+        # here as plain floats. The model layer must pass both; this backend
+        # does not read pretrained_config.
+        self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(
+            situ_beta, situ_linear_beta)
+
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
         if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
@@ -482,6 +492,40 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+
+    def _resolve_situ_betas(
+        self,
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Resolve the SiTU constants for ``ActivationType.SiTu``.
+
+        Both betas must be passed explicitly. Returns ``(None, None)`` for
+        every non-SiTU activation.
+        """
+        if self.activation_type != ActivationType.SiTu:
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError(
+                    "situ_beta / situ_linear_beta require "
+                    f"ActivationType.SiTu, got {self.activation_type.name}.")
+            return None, None
+
+        if situ_beta is None or situ_linear_beta is None:
+            raise ValueError(
+                "CuteDslFusedMoE SiTU requires explicit situ_beta and "
+                "situ_linear_beta arguments; got "
+                f"{situ_beta} and {situ_linear_beta}.")
+        if situ_beta <= 0 or situ_linear_beta <= 0:
+            raise ValueError(
+                "CuteDslFusedMoE SiTU beta parameters must be positive, got "
+                f"{situ_beta} and {situ_linear_beta}.")
+        if self.swiglu_limit_scalar != float("inf"):
+            # Matches MegaMoE (both backends) and DeepGEMM, which reject
+            # activation_clamp together with SiTU.
+            raise ValueError(
+                "CuteDslFusedMoE SiTU does not support a SwiGLU clamp; "
+                "drop swiglu_limit_scalar for SiTU checkpoints.")
+        return float(situ_beta), float(situ_linear_beta)
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
@@ -666,6 +710,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             tile_size=tile_size,
             activation_type=self.activation_type,
             swiglu_limit_scalar=self.swiglu_limit_scalar,
+            # -1.0 is the "unset" sentinel; the op schema needs a concrete
+            # float, and SiTU betas are required positive.
+            situ_beta=self.situ_beta
+            if self.activation_type == ActivationType.SiTu else -1.0,
+            situ_linear_beta=self.situ_linear_beta
+            if self.activation_type == ActivationType.SiTu else -1.0,
         )
 
         if self.use_fused_finalize:

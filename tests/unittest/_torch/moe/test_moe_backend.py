@@ -846,41 +846,24 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
-def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
-    model_config = ModelConfig(
-        pretrained_config=SimpleNamespace(
-            text_config=SimpleNamespace(
-                activation_situ_beta=4.0,
-                activation_situ_linear_beta=25.0,
-            )
-        )
-    )
+def test_megamoe_never_infers_situ_from_pretrained_config():
+    """SiTU is passed in, never read off the checkpoint.
 
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
+    MegaMoE used to select SiTU whenever ``activation_situ_beta`` was present
+    in the pretrained config. That made "ran the wrong activation" the DEFAULT
+    outcome of a backend substitution: the MoE factory silently falls back
+    (TRTLLM -> CUTLASS, see FALLBACK_IMPL), and the substitute would then read
+    a config that may or may not carry the key. Requiring the caller to say
+    ``activation='situ'`` turns that same situation into a raise.
 
-    assert activation == "situ"
-    assert situ_beta == 4.0
-    assert situ_linear_beta == 25.0
-
-
-def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
-    model_config = ModelConfig(pretrained_config=SimpleNamespace())
-
-    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
-        model_config,
-        activation=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-    )
-
-    assert activation == "swiglu"
-    assert situ_beta is None
-    assert situ_linear_beta is None
+    Asserted against the classes rather than a constructed module because
+    construction needs a process group; what changed is the contract, and the
+    contract is "no attribute named for the inference path exists".
+    """
+    for cls in (MegaMoEDeepGemm, MegaMoECuteDsl):
+        assert not hasattr(cls, "_resolve_activation_config"), (
+            f"{cls.__name__} still has the pretrained-config inference path; "
+            "SiTU must come from create_moe_backend's explicit hand-off.")
 
 
 def test_create_moe_forwards_megamoe_activation_options(monkeypatch):

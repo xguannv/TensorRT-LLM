@@ -512,15 +512,12 @@ class MegaMoECuteDsl(MoEImplBase):
             raise ValueError(
                 f"MegaMoECuteDsl only supports ActivationType.Swiglu (got {activation_type})."
             )
-        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
-            model_config,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
-        self.activation = activation
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
+        # SiTU arrives already validated and translated by
+        # ``create_moe_backend``; never inferred from pretrained_config.
+        self.activation = (activation or "swiglu").lower()
+        self.situ_beta = None if situ_beta is None else float(situ_beta)
+        self.situ_linear_beta = (None if situ_linear_beta is None else
+                                 float(situ_linear_beta))
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # topk-score application point. v2 default is the deepgemm graph
@@ -638,52 +635,6 @@ class MegaMoECuteDsl(MoEImplBase):
     # ------------------------------------------------------------------
     # Topology
     # ------------------------------------------------------------------
-    @staticmethod
-    def _resolve_activation_config(
-        model_config,
-        *,
-        activation: Optional[str],
-        situ_beta: Optional[float],
-        situ_linear_beta: Optional[float],
-    ):
-        """Resolve the elementwise activation and its SiTU constants.
-
-        ``activation=None`` infers SiTU from ``activation_situ_beta`` in the
-        pretrained config (Kimi K3 sets it) and otherwise selects SwiGLU. Kept
-        byte-for-byte equivalent to ``MegaMoEDeepGemm._resolve_activation_config``
-        so the two MegaMoE backends cannot disagree about the same checkpoint.
-        """
-        pretrained_config = getattr(model_config, "pretrained_config", None)
-        text_config = getattr(pretrained_config, "text_config", None)
-        cfg_beta = getattr(pretrained_config, "activation_situ_beta", None)
-        cfg_lbeta = getattr(pretrained_config, "activation_situ_linear_beta", None)
-        if cfg_beta is None:
-            cfg_beta = getattr(text_config, "activation_situ_beta", None)
-        if cfg_lbeta is None:
-            cfg_lbeta = getattr(text_config, "activation_situ_linear_beta", None)
-        if activation is None:
-            activation = "situ" if cfg_beta is not None else "swiglu"
-        activation = activation.lower()
-        if activation not in ("swiglu", "situ"):
-            raise ValueError(
-                f"MegaMoECuteDsl activation must be 'swiglu' or 'situ'; got {activation!r}."
-            )
-        if activation == "swiglu":
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU beta parameters require activation='situ'.")
-            return activation, None, None
-        situ_beta = cfg_beta if situ_beta is None else situ_beta
-        situ_linear_beta = cfg_lbeta if situ_linear_beta is None else situ_linear_beta
-        if situ_beta is None or situ_linear_beta is None:
-            raise ValueError(
-                "MegaMoECuteDsl SiTU requires activation_situ_beta and "
-                "activation_situ_linear_beta in the pretrained config, or explicit "
-                "situ_beta and situ_linear_beta arguments."
-            )
-        if situ_beta <= 0 or situ_linear_beta <= 0:
-            raise ValueError("MegaMoECuteDsl SiTU beta parameters must be positive.")
-        return activation, float(situ_beta), float(situ_linear_beta)
-
     @staticmethod
     def _resolve_gate_up_clamp(
         swiglu_limit: Optional[torch.Tensor],

@@ -20,7 +20,7 @@ from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
-from .interface import MoE, MoEWeightLoadingMode
+from .interface import MoE, MoEWeightLoadingMode, _compute_ep_partition
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE, MoEImplClass,
@@ -145,6 +145,79 @@ def create_moe_backend(
             f"{', '.join(cls.__name__ for cls in supported_load_balancer_backends)}."
         )
 
+    # ---- SiTU hand-off ---------------------------------------------------
+    # SiTU is a model property, so a model names it once -- activation='situ'
+    # plus both constants -- and this is the single place that translates that
+    # into each backend's own constructor signature. The backends spell the
+    # same two numbers three different ways: CUTLASS wants per-expert tensors
+    # under the gpt-oss ``swiglu_alpha`` / ``swiglu_beta`` names, TRTLLM-Gen
+    # wants its own enum plus scalars, CuteDSL wants ActivationType.SiTu with
+    # scalars, and MegaMoE keeps the gated-FC1 geometry in ``activation_type``
+    # while naming the elementwise function in ``activation``. Translating in
+    # the model layer instead would put backend dialects -- and a CUDA
+    # allocation shaped by moe_ep_size -- into every model that uses SiTU.
+    if activation is not None and activation.lower() == "situ":
+        if situ_beta is None or situ_linear_beta is None:
+            raise ValueError(
+                "activation='situ' requires explicit situ_beta and "
+                "situ_linear_beta.")
+        if situ_beta <= 0 or situ_linear_beta <= 0:
+            raise ValueError(
+                "situ_beta and situ_linear_beta must be positive; got "
+                f"{situ_beta} and {situ_linear_beta}.")
+        situ_beta = float(situ_beta)
+        situ_linear_beta = float(situ_linear_beta)
+
+        if moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
+            # SiTuAdaptor reads per-expert alpha/beta tensors, so the constants
+            # are broadcast over this rank's expert shard. Sized with
+            # _compute_ep_partition rather than num_experts // ep_size: the
+            # plain division is one short on the first num_experts % ep_size
+            # ranks and trips the "swiglu_alpha must have num_experts_on_rank
+            # elements" check in moeOp.cpp.
+            local_num_experts, _, _ = _compute_ep_partition(
+                num_experts, model_config.mapping.moe_ep_size,
+                model_config.mapping.moe_ep_rank)
+            device = torch.device("cuda", torch.cuda.current_device())
+            swiglu_alpha = torch.full((local_num_experts, ),
+                                      situ_beta,
+                                      dtype=torch.float32,
+                                      device=device)
+            swiglu_beta = torch.full((local_num_experts, ),
+                                     situ_linear_beta,
+                                     dtype=torch.float32,
+                                     device=device)
+            activation_type = ActivationType.SiTu
+            activation = situ_beta = situ_linear_beta = None
+        elif moe_cls is CuteDslFusedMoE:
+            # The CuTe DSL FC1 epilogue folds the constants in at trace time,
+            # so they stay scalars and need no per-expert tensors.
+            #
+            # CuteDslB12xFusedMoE is deliberately NOT here. It subclasses
+            # CutlassFusedMoE and forwards **kwargs straight into that
+            # __init__, which has no situ_beta, so admitting it would raise
+            # TypeError rather than run. It is also SM120/121 NVFP4
+            # decode-only, i.e. never a Kimi K3 candidate.
+            activation_type = ActivationType.SiTu
+            activation = None
+        elif moe_cls is TRTLLMGenFusedMoE:
+            # Cubin alpha is the gate-side constant, cubin beta the
+            # linear-side one. activation_type stays the FC1 geometry.
+            trtllm_gen_activation_type = ActType_TrtllmGen.SiTu
+            trtllm_gen_activation_alpha = situ_beta
+            trtllm_gen_activation_beta = situ_linear_beta
+            activation = situ_beta = situ_linear_beta = None
+        elif moe_cls in (MegaMoEDeepGemm, MegaMoECuteDsl):
+            # Already the MegaMoE dialect; activation_type stays Swiglu, which
+            # is the gated FC1 geometry rather than the elementwise function.
+            pass
+        else:
+            raise ValueError(
+                f"activation='situ' is not supported by {moe_cls.__name__}.")
+    elif situ_beta is not None or situ_linear_beta is not None:
+        raise ValueError(
+            "situ_beta / situ_linear_beta require activation='situ'.")
+
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
                            ], f"bias not supported in {moe_cls.__name__}."
@@ -195,19 +268,26 @@ def create_moe_backend(
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
         )
 
-    if any(value is not None
-           for value in (activation, situ_beta,
-                         situ_linear_beta)) and moe_cls is not MegaMoEDeepGemm:
-        raise ValueError("MegaMoE DeepGEMM activation options require "
-                         f"MegaMoEDeepGemm, got {moe_cls.__name__}")
-
     if any(value is not None for value in (trtllm_gen_activation_type,
                                            trtllm_gen_activation_alpha,
                                            trtllm_gen_activation_beta)):
         raise ValueError(
             "TRTLLM-Gen backend-local activation options are only supported "
             f"by TRTLLMGenFusedMoE, got {moe_cls.__name__}")
-    elif moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
+
+    if activation is not None and moe_cls not in (MegaMoEDeepGemm,
+                                                  MegaMoECuteDsl):
+        raise ValueError(
+            "activation= is only supported by MegaMoEDeepGemm and "
+            f"MegaMoECuteDsl, got {moe_cls.__name__}")
+    if (situ_beta is not None
+            or situ_linear_beta is not None) and moe_cls not in (
+                MegaMoEDeepGemm, MegaMoECuteDsl, CuteDslFusedMoE):
+        raise ValueError(
+            "situ_beta / situ_linear_beta are only supported by MegaMoE and "
+            f"CuteDslFusedMoE, got {moe_cls.__name__}")
+
+    if moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
         # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
         # also subclass CutlassFusedMoE but have narrower constructors, so
         # they take their own branches below.
@@ -267,6 +347,12 @@ def create_moe_backend(
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            # Only CuteDslFusedMoE has the SiTU constructor arguments; b12x
+            # forwards **kwargs into CutlassFusedMoE.__init__, which does not.
+            **({
+                "situ_beta": situ_beta,
+                "situ_linear_beta": situ_linear_beta,
+            } if moe_cls is CuteDslFusedMoE else {}),
         )
     elif moe_cls == DeepGemmFusedMoE:
         return moe_cls(
@@ -339,6 +425,9 @@ def create_moe_backend(
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         if moe_cls is MegaMoECuteDsl:
             # ``_resolve_gate_up_clamp`` accepts tensor or scalar; fall back
@@ -347,12 +436,11 @@ def create_moe_backend(
                                               if swiglu_limit is not None else
                                               swiglu_limit_scalar)
         else:
-            megamoe_kwargs.update(
-                swiglu_limit_scalar=swiglu_limit_scalar,
-                activation=activation,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
+            # activation / situ_beta / situ_linear_beta are already in the
+            # shared megamoe_kwargs above: both MegaMoE backends take SiTU
+            # explicitly now, not DeepGEMM alone. Only the DeepGEMM-specific
+            # entry is added here.
+            megamoe_kwargs.update(swiglu_limit_scalar=swiglu_limit_scalar)
         return moe_cls(**megamoe_kwargs)
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
@@ -461,13 +549,11 @@ def create_moe(
         routing=routing_method,
         layer_idx=layer_idx,
     )
-    if (any(value is not None
-            for value in (activation, situ_beta, situ_linear_beta))
-            and moe_cls is not MegaMoEDeepGemm):
-        raise ValueError(
-            "MegaMoE DeepGEMM activation options require "
-            "MegaMoEDeepGemm without backend fallback, but resolved "
-            f"{moe_cls.__name__}.")
+    # Ownership of activation / situ_* is decided by the two guards in
+    # create_moe_backend, which now accept every SiTU-capable backend rather
+    # than MegaMoEDeepGemm alone. A redundant `moe_cls is not MegaMoEDeepGemm`
+    # test used to sit here as well and would have rejected MegaMoECuteDsl,
+    # CuteDslFusedMoE, CutlassFusedMoE and TRTLLMGenFusedMoE outright.
     if (any(value is not None for value in (trtllm_gen_activation_type,
                                             trtllm_gen_activation_alpha,
                                             trtllm_gen_activation_beta))

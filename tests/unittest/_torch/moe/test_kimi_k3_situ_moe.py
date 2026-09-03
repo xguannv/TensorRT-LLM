@@ -594,7 +594,7 @@ def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
         moe_backend="TRITON",
     )
 
-    with pytest.raises(ValueError, match="SiTU routed experts only support"):
+    with pytest.raises(ValueError, match="SiTU routed experts support"):
         KimiK3MoERuntime._routed_moe_model_config(model_config)
 
     assert model_config.moe_backend == "TRITON"

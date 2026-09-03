@@ -118,9 +118,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, TRTLLMGenFusedMoE, create_moe
-from ..moe.fused_moe.interface import _compute_ep_partition
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-from ..utils import ActivationType, ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -1125,55 +1123,17 @@ class KimiK3MoERuntime(nn.Module):
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
         )
 
-        if routed_moe_model_config.moe_backend == "CUTLASS":
-            # Size the per-expert SiTU constants with the same ceil/floor
-            # partition the MoE backend uses for ``expert_size_per_partition``.
-            # A plain ``num_experts // ep_size`` is one element short on the
-            # first ``num_experts % ep_size`` ranks, which trips the
-            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
-            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
-            # mismatch is latent there but real for any uneven split.
-            local_num_experts, _, _ = _compute_ep_partition(
-                self.num_experts,
-                routed_moe_model_config.mapping.moe_ep_size,
-                routed_moe_model_config.mapping.moe_ep_rank,
-            )
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.routed_situ_alpha = torch.full(
-                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
-            )
-            self.routed_situ_beta = torch.full(
-                (local_num_experts,),
-                situ_linear_beta,
-                dtype=torch.float32,
-                device=device,
-            )
-            routed_moe_kwargs.update(
-                activation_type=ActivationType.SiTu,
-                swiglu_alpha=self.routed_situ_alpha,
-                swiglu_beta=self.routed_situ_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "TRTLLM":
-            routed_moe_kwargs.update(
-                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-                # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=situ_beta,
-                trtllm_gen_activation_beta=situ_linear_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            routed_moe_kwargs.update(
-                activation="situ",
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
-        # SiTU from the pretrained config in ``_resolve_activation_config``
-        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
-        # present), and ``create_moe`` currently rejects the explicit
-        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
-        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
-        # Unifying that plumbing is tracked in TRTLLM-15649.
+        # SiTU is named once, in the canonical form. ``create_moe_backend``
+        # translates it into whichever signature the resolved backend wants --
+        # per-expert tensors for CUTLASS, a backend-local enum for TRTLLM-Gen,
+        # scalars for CuteDSL and MegaMoE. Keeping those dialects out of the
+        # model is the point: an unsupported backend is rejected there with a
+        # message naming the backend, not here. (TRTLLM-15649.)
+        routed_moe_kwargs.update(
+            activation="situ",
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
@@ -1373,16 +1333,24 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
+        # Every backend listed here must have a matching SiTU translation in
+        # ``create_moe_backend`` -- the model passes SiTU explicitly in the
+        # canonical form; no backend infers it from the checkpoint config, and
+        # no backend dialect appears in this file.
+        #
+        # CUTEDSL_FC12 is in the equivalent set on the Rubin branch but not
+        # here: it is SM107-only and has no upstream implementation.
         supported_backends = {
             "CUTLASS",
+            "CUTEDSL",
             "TRTLLM",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
-                "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "Kimi K3 SiTU routed experts support "
+                f"{', '.join(sorted(supported_backends))}; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
