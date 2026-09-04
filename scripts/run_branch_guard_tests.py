@@ -470,16 +470,6 @@ def _validate_env_assignments(assignments: Sequence[str]) -> None:
             raise ValueError(f"Invalid --env assignment: {assignment!r}")
 
 
-def _requires_flashinfer_python(job: GuardJob) -> bool:
-    return (
-        job.model_name == "Kimi-K3"
-        and (
-            job.draft_model_name is not None
-            or job.speculative_config is not None
-        )
-    )
-
-
 def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     args.repo_root = args.repo_root.expanduser().resolve()
     args.log_dir = args.log_dir.expanduser().resolve()
@@ -582,29 +572,8 @@ def _shell_env_lines(args: argparse.Namespace) -> list[str]:
     return lines
 
 
-def _install_lines(
-    args: argparse.Namespace, install_flashinfer_python: bool = False
-) -> list[str]:
+def _install_lines(args: argparse.Namespace) -> list[str]:
     commands = [*_shell_env_lines(args)]
-    if install_flashinfer_python:
-        commands.append(
-            shlex.join(
-                [
-                    "python3",
-                    "-m",
-                    "pip",
-                    "install",
-                    "--isolated",
-                    "--break-system-packages",
-                    "--disable-pip-version-check",
-                    "--no-cache-dir",
-                    "--upgrade",
-                    "--index-url",
-                    "https://pypi.org/simple",
-                    "flashinfer-python[cu13]==0.6.16",
-                ]
-            )
-        )
     if args.install_from_repo:
         commands.append(
             shlex.join(
@@ -715,9 +684,7 @@ def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
         "set -eu",
         *_shell_env_lines(args),
     ]
-    lines.extend(
-        _install_lines(args, install_flashinfer_python=_requires_flashinfer_python(job))
-    )
+    lines.extend(_install_lines(args))
     lines.extend(_model_setup_lines(args, job))
     lines.append(f"cd {shlex.quote(workdir)}")
     if job.scope == "multi-node":
