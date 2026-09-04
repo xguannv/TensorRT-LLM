@@ -735,21 +735,16 @@ def kda_decode_mtp_kernel(
                                 output_scale.iterator,
                                 dtype=cutlass.Float8E8M0FNU,
                             ),
-                            cute.make_layout(
-                                (output_scale.shape[1], scale_leading_dim, 4),
-                                stride=(scale_leading_dim * 4, 4, 1),
-                            ),
+                            cute.make_layout(output_scale.shape),
                         )
-                        scale_bytes[i_hv // 4, output_row, i_hv % 4] = output_sf
-                        if i_hv == HV - 1:
-                            # The packed int32 ABI reserves four scale bytes
-                            # per group. Make tail bytes deterministic when H
-                            # is not divisible by four without a zero-fill
-                            # kernel or pre-initialized output tensor.
-                            for pad_head in range(HV, (HV + 3) // 4 * 4):
-                                scale_bytes[pad_head // 4, output_row, pad_head % 4] = (
-                                    cutlass.Float8E8M0FNU(0.0)
-                                )
+                        scale_offset = (
+                            (output_row // 128) * HV * 512
+                            + i_hv * 512
+                            + (output_row % 32) * 16
+                            + ((output_row % 128) // 32) * 4
+                        )
+                        for replica in cutlass.range_constexpr(4):
+                            scale_bytes[scale_offset + replica] = output_sf
                 else:
                     for i in range(V // 32):
                         v_idx = i * 32 + in_warp_tid

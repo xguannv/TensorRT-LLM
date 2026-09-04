@@ -696,18 +696,28 @@ def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
     assert fused_fp8["out"].dtype is torch.float8_e4m3fn
     assert fused_fp8["out"].shape == (expected_rows, H * data["V"])
     assert torch.isfinite(fused_fp8["out"].float()).all()
-    assert fused_fp8["output_scale"].dtype is torch.int32
-    assert fused_fp8["output_scale"].shape == (expected_rows, (H + 3) // 4)
-    assert fused_fp8["output_scale"].stride() == (
-        1,
-        (expected_rows + 3) // 4 * 4,
+    assert fused_fp8["output_scale"].dtype is torch.uint8
+    assert fused_fp8["output_scale"].shape == (
+        (expected_rows + 127) // 128 * 128 * H * 4,
     )
     expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
         expected_norm.reshape(expected_rows, H * data["V"]),
-        False,
     )
     assert torch.equal(fused_fp8["out"], expected_fp8)
-    assert torch.equal(fused_fp8["output_scale"], expected_scale)
+    rows = torch.arange(expected_rows, device="cuda", dtype=torch.int64).view(-1, 1)
+    scale_columns = torch.arange(H * 4, device="cuda", dtype=torch.int64).view(1, -1)
+    offsets = (
+        (
+            (rows // 128 * H + scale_columns // 4) * 32
+            + rows % 32
+        )
+        * 4
+        + (rows % 128) // 32
+    ) * 4 + scale_columns % 4
+    assert torch.equal(
+        fused_fp8["output_scale"][offsets.flatten()],
+        expected_scale[offsets.flatten()],
+    )
     for name in (
         "recurrent_state",
         "qkg_cache",

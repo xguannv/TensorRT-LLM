@@ -139,7 +139,14 @@ K3_DSPARK_AGGREGATE_SELECTOR = (
 K3_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
 )
-K3_DSPARK_CHECKPOINT_PATH = "/lustre/fsw/coreai_comparch_infbench/alyuan//Kimi-K3-DSpark"
+K3_DSPARK_CHECKPOINT_PATH = (
+    "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
+    "radixark_kimi-k3-dspark/hf/hf-3c5bac3_orig"
+)
+FLASHINFER_CUBINS_REPOSITORY = (
+    "https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/"
+    "artifactory/sw-kernelinferencelibrary-generic-local/"
+)
 DSV4_DSPARK_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
     "nvidia_deepseek-v4-pro-nvfp4-dspark/hf/hf-318bf60_orig"
@@ -243,6 +250,18 @@ GUARD_JOBS = (
     ),
     GuardJob(
         name="k3-disaggregated-dspark-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=4,
+        ntasks=16,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark",
+        speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
+    ),
+    GuardJob(
+        name="k3-disaggregated-dspark-helix-cp8-gsm8k",
         scope="multi-node",
         selectors=(K3_DISAGGREGATED_ACCURACY_CONFIG,),
         nodes=4,
@@ -470,6 +489,13 @@ def _validate_env_assignments(assignments: Sequence[str]) -> None:
             raise ValueError(f"Invalid --env assignment: {assignment!r}")
 
 
+def _requires_flashinfer_cubins(job: GuardJob) -> bool:
+    return (
+        (job.model_name == "Kimi-K3" and job.draft_model_name is not None)
+        or job.speculative_config is not None
+    )
+
+
 def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     args.repo_root = args.repo_root.expanduser().resolve()
     args.log_dir = args.log_dir.expanduser().resolve()
@@ -500,6 +526,15 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     missing = [name for name, value in required.items() if not value]
     if missing and not args.dry_run:
         raise ValueError("Missing required Slurm inputs: " + ", ".join(missing))
+
+    if (
+        not args.dry_run
+        and any(_requires_flashinfer_cubins(job) for job in jobs)
+        and not os.environ.get("URM_TOKEN")
+    ):
+        raise ValueError(
+            "URM_TOKEN must be set before submitting a K3 D-Spark test"
+        )
 
     if args.image and not Path(args.image).is_file() and not args.dry_run:
         raise ValueError(f"Container image does not exist: {args.image}")
@@ -551,7 +586,9 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
                 raise ValueError(f"Required Slurm command is not on PATH: {command}")
 
 
-def _shell_env_lines(args: argparse.Namespace) -> list[str]:
+def _shell_env_lines(
+    args: argparse.Namespace, include_flashinfer_repository: bool = False
+) -> list[str]:
     values = {
         "LLM_MODELS_ROOT": args.model_root,
         "HF_HOME": os.environ.get(
@@ -567,6 +604,14 @@ def _shell_env_lines(args: argparse.Namespace) -> list[str]:
         "PYTHONPATH": "",
     }
     lines = [f"export {key}={shlex.quote(value)}" for key, value in values.items()]
+    if include_flashinfer_repository:
+        lines.extend(
+            [
+                "test -n \"${URM_TOKEN:-}\"",
+                "export URM_USER=\"${USER}\"",
+                f"export FLASHINFER_CUBINS_REPOSITORY=\"{FLASHINFER_CUBINS_REPOSITORY}\"",
+            ]
+        )
     lines.append("unset TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES")
     lines.extend(f"export {assignment}" for assignment in args.env)
     return lines
@@ -680,9 +725,10 @@ def _container_shell(args: argparse.Namespace, job: GuardJob) -> str:
     if job.launcher != "pytest":
         raise ValueError(f"{job.name} is launched by its benchmark harness")
     command, workdir = _pytest_command(args, job)
+    include_flashinfer_repository = _requires_flashinfer_cubins(job)
     lines = [
         "set -eu",
-        *_shell_env_lines(args),
+        *_shell_env_lines(args, include_flashinfer_repository),
     ]
     lines.extend(_install_lines(args))
     lines.extend(_model_setup_lines(args, job))
@@ -818,6 +864,38 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
         speculative_config = deepcopy(job.speculative_config)
         speculative_config["speculative_model"] = args.k3_dspark_checkpoint
         config["worker_config"]["gen"]["speculative_config"] = speculative_config
+    if _requires_flashinfer_cubins(job):
+        flashinfer_repository = FLASHINFER_CUBINS_REPOSITORY.replace(
+            "${URM_USER}", os.environ["USER"]
+        )
+        config["environment"]["worker_env_var"] = " ".join(
+            [
+                f"URM_USER={os.environ['USER']}",
+                f"FLASHINFER_CUBINS_REPOSITORY={flashinfer_repository}",
+                config["environment"].get("worker_env_var", ""),
+            ]
+        ).strip()
+    if job.name in {
+        "k3-disaggregated-dspark-gsm8k",
+        "k3-disaggregated-dspark-helix-cp8-gsm8k",
+    }:
+        for role in ("ctx", "gen"):
+            config["worker_config"][role]["kv_cache_config"]["dtype"] = "fp8"
+    if job.name == "k3-disaggregated-dspark-helix-cp8-gsm8k":
+        gen_config = config["worker_config"]["gen"]
+        gen_config.update(
+            {
+                "tensor_parallel_size": 1,
+                "enable_attention_dp": False,
+                "context_parallel_size": 8,
+                "cp_config": {
+                    "cp_type": "HELIX",
+                    "tokens_per_block": 64,
+                },
+                "max_batch_size": 16,
+                "max_num_tokens": 256,
+            }
+        )
     if job.name == "k3-disaggregated-dep16-gsm8k":
         # The normal SBSA GB300 image does not provide the MegaMoE DeepGEMM
         # implementation selected by the performance recipe. Use K3's

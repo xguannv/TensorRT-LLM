@@ -520,7 +520,7 @@ def kda_mtp_decode_impl(
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
-    ``[T_total, ceil(H/4)]`` with stride ``(1, round_up(T_total, 4))``.
+    in the flat uint8 R128c4 layout consumed by the CuTe MXFP8 GEMM.
     """
     _, T_total, _, D = x_q.shape
     H = A_log.shape[0]
@@ -551,11 +551,10 @@ def kda_mtp_decode_impl(
             dtype=torch.float8_e4m3fn,
             device=x_q.device,
         )
-        scale_leading_dim = (T_total + 3) // 4 * 4
-        output_scale = torch.empty_strided(
-            (T_total, (HV + 3) // 4),
-            (1, scale_leading_dim),
-            dtype=torch.int32,
+        scale_leading_dim = (T_total + 127) // 128 * 128
+        output_scale = torch.empty(
+            (scale_leading_dim * HV * 4,),
+            dtype=torch.uint8,
             device=x_q.device,
         )
     elif out is None:
@@ -1067,12 +1066,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         rows = x_q.shape[1]
         heads = x_v.shape[2]
-        scale_leading_dim = (rows + 3) // 4 * 4
+        scale_leading_dim = (rows + 127) // 128 * 128
         output = x_q.new_empty((rows, heads * x_v.shape[3]), dtype=torch.float8_e4m3fn)
-        output_scale = torch.empty_strided(
-            (rows, (heads + 3) // 4),
-            (1, scale_leading_dim),
-            dtype=torch.int32,
+        output_scale = torch.empty(
+            (scale_leading_dim * heads * 4,),
+            dtype=torch.uint8,
             device=x_q.device,
         )
         return output, output_scale

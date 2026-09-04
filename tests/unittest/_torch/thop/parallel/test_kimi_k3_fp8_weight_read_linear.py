@@ -77,6 +77,21 @@ def test_forward_matches_bf16(m, out_features, in_features):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @RUBIN
+def test_forward_prequantized_matches_bf16():
+    """D-Spark's fused KDA output must use the same CuTe scale ABI."""
+    w, mod = _make(512, 1024, seed=9)
+    x = torch.randn((16, 1024), device="cuda", dtype=torch.bfloat16)
+    activation, activation_scale = (
+        torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x)
+    )
+
+    out = mod.forward_prequantized(activation, activation_scale)
+
+    _check(out, _ref(x, w), "prequantized")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
 def test_forward_uses_specialized_quant():
     """Every call must use the specialized quantizer and fine-M runner."""
     _, mod = _make(512, 1024, seed=8)

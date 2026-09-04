@@ -1190,13 +1190,15 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             )
         if activation.dtype is not torch.float8_e4m3fn:
             raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
-        out = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+        if activation_scale.dtype is not torch.uint8:
+            raise TypeError("prequantized Kimi K3 activation scale must be uint8 R128c4")
+        out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
             activation.reshape(-1, activation.shape[-1]),
-            activation_scale,
             self.weight,
+            activation_scale,
             self.weight_scale,
             output_dtype=torch.bfloat16,
-            disable_ue8m0_cast=True,
+            fine_grained_m=True,
         )
         return out.reshape(activation.shape[:-1] + (self.out_features,))
 
