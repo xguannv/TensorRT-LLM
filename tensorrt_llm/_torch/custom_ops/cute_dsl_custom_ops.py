@@ -9048,11 +9048,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kv_bounds: Optional[torch.Tensor] = None,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103/SM107).
+
+        kv_bounds: helix speculative verify groups -- per-token rank-local
+        attention bounds of shape (B * seq_len_q,), int32.
         """
-        if kv_bounds is not None:
-            raise ValueError(
-                "trtllm::cute_dsl_mla_decode_fp8_blackwell does not support "
-                "helix per-token kv_bounds (bf16/fp16 kernel only).")
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
                 f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100, "
