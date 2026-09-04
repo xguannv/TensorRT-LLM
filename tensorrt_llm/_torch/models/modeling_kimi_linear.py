@@ -332,23 +332,271 @@ def _is_mla_layer(cfg, layer_idx: int) -> bool:
 
 
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
-"""Set to ``0`` to disable the in-tree fused Torch op
-``trtllm::attn_res_fwd`` (Blackwell only). Default: fused with fallback."""
+"""Set to ``0`` to run attention-residual as the exact fp32 reference.
+
+Two states, not three: either the fused ops are used -- selection and the
+trailing RMSNorm together, and the residual add too where the call site has one
+-- or nothing is fused and ``_apply_attn_res`` computes the reference in fp32.
+
+There used to be a middle state, ``KIMI_K3_FUSED_ATTN_RES_NORM=0``, which kept
+``trtllm::attn_res_fwd`` and ran the RMSNorm as a separate PyTorch module. It
+existed to A/B the norm fusion when that fusion was new; that question is
+answered and the fusion is the default. It is removed rather than kept, because
+by now it was actively misleading: the persistent op instantiates
+``HAS_OUTPUT_NORM=true`` only, so under the ``split`` and ``persistent``
+topologies setting it to 0 did not give "persistent without the fused norm", it
+silently fell all the way back to ``per_token``.
+
+When this is ``0``, ``KIMI_K3_ATTN_RES_TOPOLOGY`` and
+``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` have no effect: no fused op is reached, so
+there is no topology to pick and no ceiling to compare against."""
 
 _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
-KIMI_K3_FUSED_ATTN_RES_NORM_ENV = "KIMI_K3_FUSED_ATTN_RES_NORM"
-"""Set to ``0`` to keep the trailing RMSNorm out of the attention-residual
-kernel, i.e. ``trtllm::attn_res_fwd`` followed by the production RMSNorm
-module.
+KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
+"""Largest per-rank token count the fused epilogue is taken for.
 
-This is the *only* knob that isolates the norm-fusing ops
-(``attn_res_rmsnorm_fwd`` / ``attn_res_add_rmsnorm_fwd``) from the
-attention-residual selection itself. ``KIMI_K3_FUSED_ATTN_RES=0`` disables
-both and falls all the way back to the exact fp32 reference, so it cannot be
-used to A/B the norm fusion against the unfused-norm path."""
+Under attention-DP this is a concurrency ceiling divided by the DP degree: at
+DEP16, 32 tokens per rank is concurrency 512, and the production max_batch_size
+is 32 anyway. The default is the top of the measured range rather than a limit
+of the kernel, which will launch for any token count -- past 32 there is simply
+no measurement, and the split-K variant is already spilling into a second wave
+there (256 CTAs against 212 SMs), so the trend is not safe to extrapolate.
 
-_FUSED_ATTN_RES_NORM_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_NORM_ENV, "1") == "1"
+The default follows KIMI_K3_ATTN_RES_TOPOLOGY rather than being a constant: 1
+when the port is off, which is the pre-existing decode-only gate, and 32 when
+it is on. Setting this explicitly overrides both.
+
+Exposed as an environment variable so an A/B can hold the tree, the .so and the
+image fixed and vary only this. Read at import, so CUDA-graph capture and replay
+cannot disagree about it.
+"""
+
+
+def _read_fused_attn_res_max_tokens() -> int:
+    """Resolved after the topology, because its default follows it.
+
+    With the port off -- the default -- the ceiling is 1, which is exactly the
+    pre-existing gate: the fused epilogue is taken at the single-token decode
+    shape and nowhere else. Enabling the port raises it to 32, the top of the
+    measured range.
+
+    Tying the two together is the point. A ceiling of 32 under a topology of
+    per_token would leave the shapes in 1 < M <= 32 quietly using the fused
+    add+RMSNorm ops while the feature reads as disabled, so "off" would not mean
+    "unchanged" -- and those shapes are the ones the end-to-end evidence covers
+    least: the two 8k1k ABBAs that measured exactly this change sit inside a
+    12-26% within-arm spread and neither show a gain nor rule out a regression.
+    """
+    default = "1" if _ATTN_RES_TOPOLOGY == "per_token" else "32"
+    raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, default)
+    try:
+        value = int(raw)
+    except ValueError:
+        # Failing loudly matters more than usual here: a mistyped A/B arm that
+        # silently fell back to the default would measure the candidate twice
+        # and report no difference.
+        raise ValueError(
+            f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be a positive integer, got {raw!r}"
+        ) from None
+    if value < 1:
+        raise ValueError(
+            f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be >= 1, got {value}"
+        )
+    return value
+
+
+
+KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
+"""Which fused attention-residual kernel topology to use.
+
+Two implementations of the same fusion now exist, and they are good at opposite
+ends of the token count:
+
+  ``per_token``   one CTA (N<=4) or one 8-CTA cluster (N>=5) per token. Wins
+                  when tokens are scarce enough that the machine is not full.
+  ``persistent``  one CTA per SM looping over tokens, so the score projection is
+                  loaded once per CTA rather than once per token.
+
+Measured on both architectures (`notes/experiments/kimi_k3/0902_vllm_persistent_fusion`),
+`persistent` wins everywhere except small token counts at N>=5:
+
+  Rubin  SM107, 212 SM   per_token wins at (N=5,T<=8) and (N=9,T<=8), 4 of 21
+  GB300  SM103, 152 SM   per_token wins at (N=9,T<=8), 2 of 21
+
+At T=8192 `persistent` beats the unfused three-kernel path by 17-43% while
+`per_token` loses by 46-468%, so the prefill case is not close.
+
+A third value, ``split``, routes by token count instead of picking one kernel
+for the whole run: at or below ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens the
+per-token kernels, above it the persistent one. That is the policy the two
+measurements above imply, and it is the only mode in which both fused paths are
+reachable in a single process.
+
+``split`` is deliberately one threshold and not a tuned table. The threshold is
+the production ``max_batch_size``, which makes it the prefill/decode boundary
+rather than a fitted constant: at most ``max_batch_size`` tokens can be in
+flight one-per-request, so anything above it is several tokens of one sequence.
+That is a fact about the deployment, not about a particular SM count, so it does
+not need re-measuring per machine.
+
+Resisting the alternative on purpose: the kernel sweep does show a crossover
+that moves with N, and following it leads to a per-(N, token-count) lookup
+table. SGLang has one -- ``_TMA_BEST_CONFIG`` in
+``python/sglang/kernels/ops/kimi_k3/attn_res.py``, eight entries plus a
+``num_tokens < 128`` special case -- and it went through a two-kernel selector
+before deleting it. A table has to be re-measured whenever the SM count, the
+candidate-count distribution, or the tile constants move, and nothing tells you
+when it has gone stale. One number tied to a deployment parameter does not.
+
+The default is ``per_token``, i.e. off: the ported kernel is not used at any
+shape, and the behaviour is what shipped before this branch. Enabling it is
+``KIMI_K3_ATTN_RES_TOPOLOGY=1``, which resolves to ``split`` -- the persistent
+kernel above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens, the per-token
+kernels at or below. In deployment terms that is persistent for prefill and
+per-token for decode.
+
+Off by default because the port is not uniformly safe, and the reason is not in
+this kernel. It is measured as no-regression on NVFP4 and as a 2.98x
+context-phase regression on W4A8_MXFP4_MXFP8, and the difference is downstream:
+the ported kernel's output agrees with the old one to row_rel_max 3.087e-03,
+which flips 8.7% of top-16 expert selections with no bias at all (one EP16
+rank's share moves from 6.36% to 6.36% against a balanced 6.25%), while the
+TRTLLM-gen MoE on that checkpoint turns the same perturbation into a 86.7x rank
+skew. Swapping only the MoE implementation removes the regression entirely
+(MEGAMOE_DEEPGEMM: ctx_step 1224.4 ms against TRTLLM-gen's 4557.9 ms and the
+per_token baseline's 1528.2 ms). A default that is free on one checkpoint and
+3x slower on another is not a default, however well documented.
+
+Enabling it selects ``split`` rather than ``persistent`` because that is the
+strictly smaller change. Below the threshold it is byte-for-byte the previous
+behaviour, so the only shapes that move are the ones the persistent kernel
+exists for. And the end-to-end evidence is an OSL=1 workload, which is
+prefill-dominated -- precisely the regime where ``split`` and ``persistent``
+agree. ``persistent`` would additionally change decode, which that measurement
+does not cover.
+
+The raw numbers behind that. Four-phase ABBA, one binary, the arms one
+environment variable apart, 8-node DEP16 disaggregated, ISL 8192 OSL 1:
+
+    checkpoint                   per_token   persistent
+    moonshotai_kimi-k3           1528.2 ms    4557.9 ms   ctx_step, 2.98x
+    nvidia_kimi-k3-nvfp4        19831.1 ms   19799.2 ms   TTFT,    0.998x
+
+The cost is not in this kernel: 544 ms against the old kernel's 480 ms over
+identical 4650 instances. It is in the MoE, and it is an imbalance rather than
+a slowdown -- inside the persistent arm gemm1 costs 48412 ms on rank 0 against
+559 ms on rank 1 (2024 and 1840 instances), an 86.7x skew where per_token has
+1.63x (6255 ms against 3838 ms), while rank 1 idles 78 s in the all-to-all.
+
+The regression is in prefill, so ``split`` reaches it exactly as ``persistent``
+does: neither is safe on that checkpoint *while the MoE backend is TRTLLM-gen*.
+``moe_config.backend=MEGAMOE_DEEPGEMM`` is, and beats the pre-port baseline.
+NVFP4 is unaffected either way.
+
+What the NVFP4 ABBA does and does not support: TTFT -0.161% and throughput
++0.201% for ``persistent``, with the four values not interleaving, but |delta|
+at 0.96x the within-arm spread. That is enough to say "no regression" and not
+enough to claim a speedup. The decode side (8k1k) is unmeasured on NVFP4 --
+which is an argument for ``split`` rather than against it, since ``split``
+leaves decode on the previously shipped path.
+
+The row-error outlier previously recorded here as unexplained -- ~5e-1 against
+~4e-3, at (N=7) and (N=8) with an addend -- was the shared-workspace race fixed
+in the kernel: ws_stats barriered the writes before the reads and nothing
+ordered those reads before the next chunk's writes. It is gone, and the sweep
+is now bit-identical across repeats rather than merely close.
+
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+_ATTN_RES_TOPOLOGIES = ("per_token", "persistent", "split")
+
+# Turning the port on should not require knowing which of the three topologies
+# is the right one. "1" is the policy this branch measured -- persistent at
+# prefill, per-token at decode -- so enabling the feature and choosing the
+# policy are the same action, through one variable rather than two.
+_ATTN_RES_TOPOLOGY_ON = ("1", "on", "true")
+
+
+def _read_attn_res_topology() -> str:
+    """Default off. The persistent kernel is opt-in on this branch.
+
+    ``per_token`` is what shipped before the port, so the default changes no
+    behaviour for anyone who does not ask for it. That is deliberate rather
+    than timid: the port is measured as no-regression on NVFP4 (four-phase
+    ABBA, TTFT -0.161% against a within-arm spread of 0.168%), but it is
+    measured as a 2.98x context-phase regression on W4A8_MXFP4_MXFP8, and the
+    cause of that lives downstream in the TRTLLM-gen MoE rather than in this
+    kernel -- see the module docstring above. A default that is safe on one
+    checkpoint and 3x slower on another is not a default.
+
+    Enabling it is ``=1``, which resolves to ``split``. The two named
+    topologies stay available for measurement: ``persistent`` uses the ported
+    kernel at every shape, ``per_token`` at none.
+    """
+    raw = os.environ.get(KIMI_K3_ATTN_RES_TOPOLOGY_ENV, "per_token")
+    if raw.lower() in _ATTN_RES_TOPOLOGY_ON:
+        return "split"
+    if raw not in _ATTN_RES_TOPOLOGIES:
+        # Loudly, for the same reason as the token ceiling: a mistyped A/B arm
+        # that silently fell back to the default would measure one side twice.
+        raise ValueError(
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be one of "
+            f"{_ATTN_RES_TOPOLOGIES} or one of {_ATTN_RES_TOPOLOGY_ON} "
+            f"(which means 'split'), got {raw!r}"
+        )
+    return raw
+
+
+_ATTN_RES_TOPOLOGY = _read_attn_res_topology()
+_FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
+
+
+def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
+    """Shape gate for the persistent kernel.
+
+    Note what is absent: a token ceiling. The persistent grid is sized by the SM
+    count, not by the token count, so prefill is the case it exists for.
+    """
+    del M  # deliberately unused; see above
+    return H == 7168 and 2 <= N <= 9
+
+
+def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
+    """Pick between the two fused kernels for this call site.
+
+    ``split`` routes by token count, which is the only thing this layer can see
+    and, as it happens, the thing that should decide. "Prefill" and "decode" are
+    not available here and would be the wrong question anyway: chunked prefill
+    produces intermediate token counts, a single forward can mix context and
+    generation requests, and whether the two phases even run in separate
+    processes is a deployment choice. A token-count threshold covers all three
+    cases with one rule.
+
+    One comparison against one constant, on purpose. The constant is the
+    existing ``_FUSED_ATTN_RES_MAX_TOKENS``, i.e. the production
+    ``max_batch_size``: at most that many tokens can be in flight one per
+    request, so above it the batch is several tokens of one sequence. Today the
+    gate means "above this, give up and run unfused"; under ``split`` it means
+    "above this, switch topology".
+
+    Note the two gates here are different kinds of thing.
+    ``_persistent_attn_res_applicable`` is a capability gate -- the kernel is
+    only instantiated for those shapes, so it tracks the code and never needs
+    re-measuring. The token count is the only performance decision, and it stays
+    a single number rather than a per-(N, tokens) table; see the module constant
+    for why that trade is made deliberately.
+
+    Shapes the persistent kernel does not implement (N outside [2, 9], H other
+    than 7168) fall through to the caller's existing gate and land on the
+    unfused path, exactly as they do today.
+    """
+    if not _persistent_attn_res_applicable(M, H, N):
+        return False
+    if _ATTN_RES_TOPOLOGY == "persistent":
+        return True
+    return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
 
 
 def _apply_attn_res_fused(
@@ -428,10 +676,52 @@ def _apply_attn_res_rmsnorm_fused(
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
     N = K + 1
-    # The fused topology is beneficial for the production decode shape only.
-    # Keep prefill on attn_res_fwd + the production RMSNorm, which exposes
-    # independent work across tokens and was 41-108% faster in GB300 tests.
-    if M != 1 or H != 7168 or (N > 9 and N != 12):
+    # Measured on Rubin (SM107) over M in {1, 2, 4, 8, 16, 32} x N in {2, 5, 9,
+    # 12}: the fused kernel beat the unfused add + attn_res_fwd + RMSNorm path by
+    # 33-53% in every cell, because at these sizes all three kernels are bound by
+    # their fixed per-launch cost rather than by bandwidth or occupancy, and
+    # collapsing three into one removes two of those costs regardless of M. See
+    # notes/run_records/kimi_k3/0901_attn_res_multi_token.md.
+    #
+    # The ceiling is the largest token count measured, which is also the
+    # production max_batch_size. Prefill stays on the unfused path on a
+    # measured negative result, recorded on GB300 at T=8192:
+    #
+    #   Folding the trailing RMSNorm into the PERSISTENT attn_res grid was
+    #   41-108% slower than attn_res_fwd + FlashInfer RMSNorm. The added
+    #   RMSNorm cost 150-159 us, 4.1-4.35x the standalone kernel, because the
+    #   persistent grid runs one CTA per SM and loops over tokens, so a
+    #   CTA-wide reduction inside that loop serializes across tokens.
+    #   FlashInfer instead exposes an independent CTA per token.
+    #
+    # (branch xguan/kimi_k3_attn_res_fusion @ 7293523d99, run record
+    # kimi_k3_attn_res_fusion_kernel_opt/20260730_185026 on ociaga.)
+    #
+    # That result is about the persistent topology, and this gate selects the
+    # single-CTA / split-K kernels instead -- which put one CTA (or one
+    # cluster) on each token, i.e. the same shape the note credits FlashInfer
+    # with. Whether those hold up at prefill is a separate question that has
+    # not been measured; the ceiling stays at the top of the measured range
+    # until it is.
+    if _use_persistent_attn_res(M, H, N):
+        try:
+            persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
+        except (AttributeError, RuntimeError):
+            return None
+        _, output = persistent_op(
+            prefix_sum.reshape(M, 1, H).contiguous(),
+            None,
+            block_residual.reshape(K, M, 1, H).contiguous(),
+            proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+            norm.weight.to(torch.bfloat16).contiguous(),
+            output_norm.weight.to(torch.bfloat16).contiguous(),
+            float(norm.eps),
+            _rms_norm_eps(output_norm),
+        )
+        _note_attn_res_fusion("attn_res+norm/persistent", True, M, H, N)
+        return output.reshape(M, H)
+
+    if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
     try:
@@ -481,7 +771,26 @@ def _apply_attn_res_add_rmsnorm_fused(
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
     N = K + 1
-    if M != 1 or H != 7168 or (N > 9 and N != 12):
+    # Same measured window as _apply_attn_res_rmsnorm_fused above.
+    if _use_persistent_attn_res(M, H, N):
+        try:
+            persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
+        except (AttributeError, RuntimeError):
+            return None
+        updated_prefix_sum, output = persistent_op(
+            prefix_sum.reshape(M, 1, H).contiguous(),
+            addend.reshape(M, 1, H).contiguous(),
+            block_residual.reshape(K, M, 1, H).contiguous(),
+            proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+            norm.weight.to(torch.bfloat16).contiguous(),
+            output_norm.weight.to(torch.bfloat16).contiguous(),
+            float(norm.eps),
+            _rms_norm_eps(output_norm),
+        )
+        _note_attn_res_fusion("add+attn_res+norm/persistent", True, M, H, N)
+        return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
+
+    if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
     try:
@@ -541,7 +850,7 @@ def _apply_attn_res_and_rmsnorm(
     output_norm: nn.Module,
 ) -> torch.Tensor:
     """Apply attention-residual selection and the next RMSNorm."""
-    if _FUSED_ATTN_RES_ENABLED and _FUSED_ATTN_RES_NORM_ENABLED:
+    if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
         if fused is not None:
             return fused
@@ -557,7 +866,7 @@ def _apply_attn_res_add_and_rmsnorm(
     output_norm: nn.Module,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm."""
-    if _FUSED_ATTN_RES_ENABLED and _FUSED_ATTN_RES_NORM_ENABLED:
+    if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
             prefix_sum, addend, block_residual, proj, norm, output_norm
         )
@@ -2051,7 +2360,7 @@ class KimiLinearModel(DecoderModel):
 
         logger.info_once(
             f"Kimi K3 attention-residual kernels: fused={_FUSED_ATTN_RES_ENABLED}, "
-            f"fused_norm={_FUSED_ATTN_RES_NORM_ENABLED}",
+            f"topology={_ATTN_RES_TOPOLOGY}, max_tokens={_FUSED_ATTN_RES_MAX_TOKENS}",
             key="kimi_k3_attn_res_fusion",
         )
 

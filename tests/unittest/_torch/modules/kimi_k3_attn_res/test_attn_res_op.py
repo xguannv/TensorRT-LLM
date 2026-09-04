@@ -115,7 +115,16 @@ def _make_snapshot_test_layer(layer_idx: int) -> kimi_modeling.KimiLinearDecoder
     layer.input_layernorm = nn.Identity()
     layer.post_attention_layernorm = nn.Identity()
     layer.is_kda = True
-    layer.self_attn = _AddConstant(1.0)
+    # Bound under both names, deliberately. The fixture builds the layer with
+    # __new__, so it has to supply whatever the code under test reaches for, and
+    # the two consumers disagree: the current forward calls self.linear_attn
+    # (renamed when the KDA runtime moved into the mixer), while
+    # _legacy_decoder_layer_forward below is a frozen copy of the older forward
+    # and still calls self.self_attn. Same module either way, so the comparison
+    # stays honest; updating the frozen copy instead would defeat its purpose.
+    attention = _AddConstant(1.0)
+    layer.linear_attn = attention
+    layer.self_attn = attention
     layer.is_moe = False
     layer.mlp = _AddConstant(2.0)
     layer._mlp_allreduce = None

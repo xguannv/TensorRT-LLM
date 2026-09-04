@@ -57,6 +57,10 @@ l0_gb300_multi_gpus:
   # long context run ~40 min in. Memory-only assertions; no kernels.
   - unittest/_torch/modules/kimi_kda/test_kda_buf_cache_bounded.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  # Fused attn-res epilogue (selection + trailing RMSNorm, optionally the
+  # preceding residual add) against the unfused reference, across the token
+  # counts the fused path is taken for.
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/modules/moe/test_moe_backend.py -k "kimi_k3_shape"

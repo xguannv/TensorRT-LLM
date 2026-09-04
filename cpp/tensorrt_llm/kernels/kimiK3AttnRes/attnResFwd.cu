@@ -207,7 +207,7 @@ constexpr int CHUNK_DEPTH = 2;
 constexpr int BLK = 288;                   // 1 producer warp + 8 consumer warps
 constexpr int CONSUMER_THREADS = BLK - 32; // 256
 constexpr int CONSUMER_WARPS = CONSUMER_THREADS / 32;
-constexpr int CONSUMER_GROUPS = 2;         // two 128-thread consumer groups
+constexpr int CONSUMER_GROUPS = 2; // two 128-thread consumer groups
 constexpr int CONSUMER_THREADS_PER_GROUP = CONSUMER_THREADS / CONSUMER_GROUPS;
 constexpr int TMEM_Q_COLS_PER_GROUP = 32;
 constexpr int TMEM_Q_COLS_TOTAL = 2 * TMEM_Q_COLS_PER_GROUP;
@@ -295,7 +295,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
     }
     __syncthreads();
 
-    const uint32_t my_v_tmem = (comp_tid >= 0) ? (plan.tmem_base + group * TMEM_V_COLS_PER_GROUP) : 0;
+    uint32_t const my_v_tmem = (comp_tid >= 0) ? (plan.tmem_base + group * TMEM_V_COLS_PER_GROUP) : 0;
 
     float q_cache[ACC_PER_THREAD];
     if (comp_tid >= 0)
@@ -401,12 +401,12 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                             if (si == SLICES_PER_GROUP - 1)
                             {
                                 int h_base = 6 * K_TILE + group * (K_TILE / 2) + ct_in_group * 4;
-                                const float* qv = &q_cache[si * VEC];
+                                float const* qv = &q_cache[si * VEC];
 #pragma unroll
                                 for (int n = 0; n < AN; n++)
                                 {
                                     int slot = slot_of(gci, n);
-                                    int2 vp = *reinterpret_cast<const int2*>(buf_ptr(slot) + h_base);
+                                    int2 vp = *reinterpret_cast<int2 const*>(buf_ptr(slot) + h_base);
                                     __nv_bfloat162* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
                                     float2 f[2] = {__bfloat1622float2(v2[0]), __bfloat1622float2(v2[1])};
                                     if constexpr (FULL_N12)
@@ -429,13 +429,13 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                         int dt = si * CONSUMER_GROUPS + group;
                         if (dt >= NHT)
                             continue;
-                        const float* qv = &q_cache[si * VEC];
+                        float const* qv = &q_cache[si * VEC];
 
 #pragma unroll
                         for (int n = 0; n < AN; n++)
                         {
                             int slot = slot_of(gci, n);
-                            int4 vp = *reinterpret_cast<const int4*>(buf_ptr(slot) + dt * K_TILE + k_local);
+                            int4 vp = *reinterpret_cast<int4 const*>(buf_ptr(slot) + dt * K_TILE + k_local);
                             __nv_bfloat162* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
                             float2 f[4] = {__bfloat1622float2(v2[0]), __bfloat1622float2(v2[1]),
                                 __bfloat1622float2(v2[2]), __bfloat1622float2(v2[3])};
@@ -851,7 +851,7 @@ __global__ void __launch_bounds__(BLK, 1)
     }
     __syncthreads();
 
-    const uint32_t my_tmem = (comp_tid >= 0) ? (plan.tmem_base + ((comp_wid >= 4) ? TMEM_Q_COLS_PER_GROUP : 0)) : 0;
+    uint32_t const my_tmem = (comp_tid >= 0) ? (plan.tmem_base + ((comp_wid >= 4) ? TMEM_Q_COLS_PER_GROUP : 0)) : 0;
 
     if (comp_tid >= 0)
     {
@@ -1027,7 +1027,7 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
     bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
     bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
     bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
-    float* __restrict__ logits_out, float rms_eps, float output_rms_eps)
+    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     if constexpr (ENABLE_PDL)
@@ -1042,6 +1042,40 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
     constexpr float LOG2_E = 1.4426950408889634f;
     static_assert(H % THREADS == 0);
     static_assert(N >= 1 && N <= 4);
+
+    // One CTA owns one whole token. Nothing in this kernel is reduced across
+    // tokens -- the score, the softmax and the output RMSNorm are all per-row --
+    // so the token index is simply the grid dimension and adding it costs no
+    // extra registers or instantiations. Rebasing the pointers here keeps every
+    // access site below identical to the single-token version.
+    //
+    // Layouts: layer_res / output / the add and its materialized result are
+    // [num_tokens, H]; block_res is [N-1, num_tokens, H], so its candidate
+    // stride picks up num_tokens (applied at the load below). The optional
+    // per-candidate diagnostics are the odd one out -- attn_res_fwd allocates
+    // them as [N, T, B] with B == 1, so there the token stride is 1 and the
+    // candidate stride is num_tokens.
+    int const token = blockIdx.x;
+    block_res += (size_t) token * H;
+    layer_res += (size_t) token * H;
+    output += (size_t) token * H;
+    if constexpr (FUSE_LAYER_ADD)
+    {
+        layer_res_add += (size_t) token * H;
+        updated_layer_res += (size_t) token * H;
+    }
+    if (rsigma_out != nullptr)
+    {
+        rsigma_out += token;
+    }
+    if (probs_out != nullptr)
+    {
+        probs_out += token;
+    }
+    if (logits_out != nullptr)
+    {
+        logits_out += token;
+    }
 
     __shared__ float2 warp_stats[WARPS * N];
     __shared__ float weights[N];
@@ -1062,7 +1096,9 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
 #pragma unroll
         for (int n = 0; n < N; n++)
         {
-            bf16_t const* row = n < N - 1 ? block_res + (size_t) n * H : layer_res;
+            // block_res is [N-1, num_tokens, H] and was already advanced to this
+            // token, so stepping a candidate skips a whole token plane.
+            bf16_t const* row = n < N - 1 ? block_res + (size_t) n * num_tokens * H : layer_res;
             bf16_t packed_v = row[h];
             if constexpr (FUSE_LAYER_ADD)
             {
@@ -1179,11 +1215,11 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
         {
             weights[n] *= inv_denominator;
             if (rsigma_out)
-                rsigma_out[n] = local_rsigma[n];
+                rsigma_out[(size_t) n * num_tokens] = local_rsigma[n];
             if (logits_out)
-                logits_out[n] = local_logits[n];
+                logits_out[(size_t) n * num_tokens] = local_logits[n];
             if (probs_out)
-                probs_out[n] = weights[n];
+                probs_out[(size_t) n * num_tokens] = weights[n];
         }
     }
     __syncthreads();
@@ -1280,13 +1316,13 @@ template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false>
 static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* layer_residual,
     bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
     bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
-    float* logits, float rms_eps, float output_rms_eps, cudaStream_t stream)
+    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream)
 {
     if (tensorrt_llm::common::getEnvEnablePDL())
     {
         auto kernel = &attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>;
         cudaLaunchConfig_t config{};
-        config.gridDim = dim3(1);
+        config.gridDim = dim3(num_tokens);
         config.blockDim = dim3(256);
         config.stream = stream;
         cudaLaunchAttribute attribute{};
@@ -1295,23 +1331,25 @@ static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* lay
         config.attrs = &attribute;
         config.numAttrs = 1;
         cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
-            output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps);
+            output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps,
+            num_tokens);
     }
     else
     {
         attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>
-            <<<1, 256, 0, stream>>>(block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
-                output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps);
+            <<<num_tokens, 256, 0, stream>>>(block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
+                output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps,
+                num_tokens);
     }
 }
 
 template <int N>
 static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t const* res_weight,
-    bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps,
+    bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps, int num_tokens,
     cudaStream_t stream)
 {
     launch_s1_single_cta<N, false, false>(block_residual, layer_residual, nullptr, res_weight, rms_weight, nullptr,
-        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, stream);
+        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, num_tokens, stream);
 }
 
 // Single-token split-K specialization.  The complete grid is one CTA cluster:
@@ -1323,7 +1361,7 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
     bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
     bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
     bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
-    float* __restrict__ logits_out, float rms_eps, float output_rms_eps)
+    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     if constexpr (ENABLE_PDL)
@@ -1352,6 +1390,34 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
     int const group = cluster.block_rank();
     int const h_begin = group * K_PER_CTA;
 
+    // One cluster of GROUPS CTAs owns one whole token. The grid is launched as
+    // num_tokens * GROUPS with clusterDim == GROUPS, so clusters are contiguous
+    // and block_rank() above still yields this CTA's H slice unchanged -- the
+    // DSM exchange stays inside a single token by construction. Only the token
+    // origin has to be derived and folded into the base pointers; see the
+    // single-CTA kernel for the layouts.
+    int const token = blockIdx.x / GROUPS;
+    block_res += (size_t) token * H;
+    layer_res += (size_t) token * H;
+    output += (size_t) token * H;
+    if constexpr (FUSE_LAYER_ADD)
+    {
+        layer_res_add += (size_t) token * H;
+        updated_layer_res += (size_t) token * H;
+    }
+    if (rsigma_out != nullptr)
+    {
+        rsigma_out += token;
+    }
+    if (probs_out != nullptr)
+    {
+        probs_out += token;
+    }
+    if (logits_out != nullptr)
+    {
+        logits_out += token;
+    }
+
     float sq[N] = {};
     float dot[N] = {};
 #pragma unroll
@@ -1362,7 +1428,9 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
 #pragma unroll
         for (int n = 0; n < N; n++)
         {
-            bf16_t const* row = n < N - 1 ? block_res + (size_t) n * H : layer_res;
+            // block_res is [N-1, num_tokens, H] and was already advanced to this
+            // token, so stepping a candidate skips a whole token plane.
+            bf16_t const* row = n < N - 1 ? block_res + (size_t) n * num_tokens * H : layer_res;
             bf16_t packed_v = row[h];
             if constexpr (FUSE_LAYER_ADD)
             {
@@ -1466,11 +1534,11 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
             if (group == 0)
             {
                 if (rsigma_out)
-                    rsigma_out[n] = local_rsigma[n];
+                    rsigma_out[(size_t) n * num_tokens] = local_rsigma[n];
                 if (logits_out)
-                    logits_out[n] = local_logits[n];
+                    logits_out[(size_t) n * num_tokens] = local_logits[n];
                 if (probs_out)
-                    probs_out[n] = weights[n];
+                    probs_out[(size_t) n * num_tokens] = weights[n];
             }
         }
     }
@@ -1565,7 +1633,7 @@ template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LA
 static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual,
     bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
     bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
-    float* logits, float rms_eps, float output_rms_eps, cudaStream_t stream)
+    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream)
 {
     constexpr int K_PER_CTA = 7168 / GROUPS;
     constexpr int WARPS = 8;
@@ -1591,9 +1659,11 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
     void* args[] = {const_cast<bf16_t**>(&block_residual), const_cast<bf16_t**>(&layer_residual),
         const_cast<bf16_t**>(&layer_residual_add), const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight),
         const_cast<bf16_t**>(&output_rms_weight), &updated_layer_residual, &output, &rsigma, &probs, &logits, &rms_eps,
-        &output_rms_eps};
+        &output_rms_eps, &num_tokens};
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(GROUPS);
+    // One cluster per token. clusterDim stays GROUPS, so clusters are contiguous
+    // spans of the grid and each token's DSM exchange stays within its own.
+    config.gridDim = dim3(num_tokens * GROUPS);
     config.blockDim = dim3(256);
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
@@ -1614,11 +1684,11 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
 
 template <int N, int GROUPS = 8>
 static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t const* res_weight,
-    bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps,
+    bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps, int num_tokens,
     cudaStream_t stream)
 {
     launch_s1_splitk<N, GROUPS, false, false>(block_residual, layer_residual, nullptr, res_weight, rms_weight, nullptr,
-        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, stream);
+        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, num_tokens, stream);
 }
 
 template <int H, int TB_TILE>
@@ -1723,28 +1793,28 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     {
         if (T == 1 && N == 1)
         {
-            launch_s1_single_cta<1>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_single_cta<1>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
+                logits, rms_eps, T, stream);
         }
         else if (T == 1 && N == 2)
         {
-            launch_s1_single_cta<2>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_single_cta<2>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
+                logits, rms_eps, T, stream);
         }
         else if (T == 1 && N == 4)
         {
-            launch_s1_single_cta<4>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_single_cta<4>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
+                logits, rms_eps, T, stream);
         }
         else if (T == 1 && N == 8)
         {
-            launch_s1_splitk<8, 8>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_splitk<8, 8>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
+                logits, rms_eps, T, stream);
         }
         else if (T == 1 && N == 12)
         {
-            launch_s1_splitk<12, 8>(
-                block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps, stream);
+            launch_s1_splitk<12, 8>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
+                logits, rms_eps, T, stream);
         }
         else if (N == 12 && T == 1024)
         {
@@ -1803,13 +1873,13 @@ static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
     {
         launch_s1_single_cta<N, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
             params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
-            nullptr, nullptr, params.rmsEps, params.outputRmsEps, stream);
+            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream);
     }
     else
     {
         launch_s1_splitk<N, 8, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
             params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
-            nullptr, nullptr, params.rmsEps, params.outputRmsEps, stream);
+            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream);
     }
 }
 
@@ -1827,8 +1897,19 @@ static void invokeAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
     case 7: launchAttnResDecodeRmsNorm<7, FUSE_LAYER_ADD>(params, stream); break;
     case 8: launchAttnResDecodeRmsNorm<8, FUSE_LAYER_ADD>(params, stream); break;
     case 9: launchAttnResDecodeRmsNorm<9, FUSE_LAYER_ADD>(params, stream); break;
+    case 10: launchAttnResDecodeRmsNorm<10, FUSE_LAYER_ADD>(params, stream); break;
+    case 11: launchAttnResDecodeRmsNorm<11, FUSE_LAYER_ADD>(params, stream); break;
     case 12: launchAttnResDecodeRmsNorm<12, FUSE_LAYER_ADD>(params, stream); break;
-    default: break;
+    // Previously `default: break;`, which launched nothing and returned success:
+    // the output buffer kept whatever it already held and the failure surfaced,
+    // if at all, as wrong numbers far downstream. N is bounded by the bank size
+    // (ceil(num_layers / attn_res_block_size) + 1), so an unhandled value means
+    // a configuration this kernel was never instantiated for.
+    default:
+        TLLM_CHECK_WITH_INFO(false,
+            "Kimi K3 attn-res fused epilogue has no instantiation for numCandidates=%d (supported: 1-12)",
+            params.numCandidates);
+        break;
     }
 }
 

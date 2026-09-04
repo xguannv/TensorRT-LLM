@@ -149,6 +149,16 @@ def _fused_add(
     )
 
 
+def _above_ceiling_tokens() -> int:
+    """One more token than the fused epilogue will take.
+
+    Read from the module rather than hardcoded: the ceiling is configurable via
+    KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS, and a literal here would silently stop
+    testing the fallback branch the moment someone raised it.
+    """
+    return modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS + 1
+
+
 def _similarity(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -176,7 +186,19 @@ def _similarity(
         (1, 6),  # N=7 CTA-cluster decode
         (1, 7),  # N=8 CTA-cluster decode
         (1, 8),  # N=9 CTA-cluster decode
+        (1, 9),  # N=10 CTA-cluster decode
+        (1, 10),  # N=11 CTA-cluster decode
         (1, 11),  # N=12 CTA-cluster decode
+        # Multi-token: one CTA per token below, one cluster per token above.
+        # A wrong token offset reads another row's candidates, which the
+        # reference comparison catches; a wrong candidate stride reads the
+        # wrong snapshot plane, which it also catches.
+        (2, 3),  # N=4 single-CTA, smallest multi-token grid
+        (16, 3),  # N=4 single-CTA, DEP16 concurrency 256
+        (32, 3),  # N=4 single-CTA, production max_batch_size
+        (2, 8),  # N=9 split-K, smallest multi-token cluster grid
+        (16, 8),  # N=9 split-K, DEP16 concurrency 256
+        (32, 8),  # N=9 split-K, 256 CTAs over 212 SMs
     ],
 )
 @torch.no_grad()
@@ -195,11 +217,34 @@ def test_attn_res_rmsnorm_matches_unfused(
     assert relative_l2 < 5e-3
 
 
+@pytest.mark.skip(
+    reason="A failing TORCH_CHECK in this op aborts the process in the Rubin K3 "
+    "container instead of raising: the C++ unwinder resolves __gxx_personality_v0 "
+    "to the incompatible copy exported by libcurand.so.11, so __cxa_throw ends in "
+    "abort(). Reproduced with checks this branch never touched (a 2-D "
+    "layer_residual trips the original dim() check and aborts identically), so it "
+    "predates this work and is not specific to the shape being rejected. Any "
+    "negative test of these ops is unrunnable here until the container is fixed; "
+    "drop this marker once it is."
+)
 @torch.no_grad()
-def test_attn_res_rmsnorm_op_rejects_multi_token() -> None:
-    inputs = _make_inputs(num_tokens=2, num_snapshots=3)
-    with pytest.raises(RuntimeError, match="only production decode shape"):
-        _fused(*inputs)
+def test_attn_res_rmsnorm_op_rejects_unsupported_hidden_size() -> None:
+    """H is still pinned even though T no longer is.
+
+    The kernel derives its per-thread register tiling from H as a compile-time
+    constant, so an unsupported hidden size has no instantiation; T became a
+    grid dimension and is therefore free.
+    """
+    layer, block, res_w, rms_w, out_w = _make_inputs(num_tokens=1, num_snapshots=3)
+    narrow = 4096
+    with pytest.raises(RuntimeError, match="requires B=1 and H=7168"):
+        _fused(
+            layer[..., :narrow].contiguous(),
+            block[..., :narrow].contiguous(),
+            res_w[:narrow].contiguous(),
+            rms_w[:narrow].contiguous(),
+            out_w[:narrow].contiguous(),
+        )
 
 
 @torch.no_grad()
@@ -353,14 +398,16 @@ def test_model_helper_dispatches_fused_attn_res_add_rmsnorm(
 
 
 @torch.no_grad()
-def test_model_helper_rejects_multi_token_fused_add() -> None:
+def test_model_helper_rejects_fused_add_above_token_ceiling() -> None:
+    """One token past the ceiling must still fall back. Multi-token itself is
+    supported now; only the measured ceiling is enforced."""
     (
         layer_residual,
         block_residual,
         res_weight,
         score_rms_weight,
         output_rms_weight,
-    ) = _make_inputs(num_tokens=64, num_snapshots=5)
+    ) = _make_inputs(num_tokens=_above_ceiling_tokens(), num_snapshots=5)
     layer_residual_add = (torch.randn_like(layer_residual) * 0.05).contiguous()
     projection = nn.Linear(
         HIDDEN_SIZE,
@@ -402,6 +449,8 @@ def test_model_helper_rejects_multi_token_fused_add() -> None:
     ("num_tokens", "num_snapshots"),
     [
         (1, 3),
+        (16, 3),  # DEP16 concurrency 256
+        (32, 3),  # production max_batch_size, top of the measured window
     ],
 )
 @torch.no_grad()
@@ -473,14 +522,15 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
 
 
 @torch.no_grad()
-def test_model_helper_keeps_multi_token_rmsnorm_split() -> None:
+def test_model_helper_keeps_rmsnorm_split_above_token_ceiling() -> None:
+    """Same ceiling as the fused-add case: above it the split path stays."""
     (
         layer_residual,
         block_residual,
         res_weight,
         score_rms_weight,
         output_rms_weight,
-    ) = _make_inputs(num_tokens=64, num_snapshots=5)
+    ) = _make_inputs(num_tokens=_above_ceiling_tokens(), num_snapshots=5)
     projection = nn.Linear(
         HIDDEN_SIZE,
         1,
