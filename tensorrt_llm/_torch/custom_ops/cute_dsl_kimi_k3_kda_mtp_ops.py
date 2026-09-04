@@ -48,9 +48,10 @@ Productization deltas vs the drop's host wrapper (``reference.py``):
   output norm and MXFP8 quantization are optional packed-layout epilogues.
 
 Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
-``HV == H``, TILE_V=64. ``num_spec`` is a compile-time constant per cache
-allocation. Benchmark-tuned fast variants exist for ``N in (32, 128), H in
-(2, 12, 32), num_spec == 2``; other shapes compile the general variant.
+``HV == H``, one V pass (TILE_V=128, 512 threads). ``num_spec`` is a
+compile-time constant per cache allocation; every shape compiles the same
+kernel structure (the drop's benchmark-only setmaxreg / register-weight
+specializations were retired with the latency restructuring).
 """
 
 from math import gcd
@@ -76,7 +77,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
-_TILE_V = 64
+# One V pass: the kernel runs 16 warps x 8 rows over the full 128-row state.
+_TILE_V = 128
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -439,20 +441,6 @@ def _try_flatten_args(
     return True, h0, x_q_flat, x_k_flat, x_v_flat
 
 
-def _is_benchmark_static_shape(
-    N: int, H: int, HV: int, K: int, V: int, W: int, num_spec: int
-) -> bool:
-    return (
-        K == 128
-        and V == 128
-        and W == 4
-        and num_spec == 2
-        and H == HV
-        and N in (32, 128)
-        and H in (2, 12, 32)
-    )
-
-
 # Layout-and-constexpr-keyed compile cache. Request count and packed-token
 # length are dynamic; batches sharing the same kernel variant reuse one
 # artifact even when their launch grid and token-buffer extents differ.
@@ -642,9 +630,11 @@ def kda_mtp_decode_impl(
         V=V_dim,
     )
     pool_size = h0_arg.shape[0]
-    is_benchmark_static_shape = _is_benchmark_static_shape(N, H, HV, K, V_dim, W, num_spec)
-    use_setmaxreg = is_benchmark_static_shape
-    use_reg_q_weights = is_benchmark_static_shape
+    # The restructured kernel keeps the conv weights in smem and prefetches
+    # the recurrent state before precompute; the drop's setmaxreg and
+    # register-weight specializations no longer apply to any shape.
+    use_setmaxreg = False
+    use_reg_q_weights = False
     use_regular_metadata = bool(regular_metadata_hint)
     # The kernel's USE_ZERO_ACCEPTED fast path unrolls exactly
     # 1 + NUM_SPEC == 3 new tokens, so it is only valid for num_spec == 2.
@@ -717,7 +707,6 @@ def kda_mtp_decode_impl(
             f"kda_mtp_decode: compiling variant N={N} H={HV} T={T_total} "
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
-            f"static_shape={is_benchmark_static_shape} "
             f"fuse_output_norm={fuse_output_norm} "
             f"quantize_output={quantize_output}"
         )

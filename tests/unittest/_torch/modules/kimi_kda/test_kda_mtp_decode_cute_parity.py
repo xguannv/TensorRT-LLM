@@ -405,7 +405,7 @@ def _fla_sequential_reference(data, num_accepted):
     from fla.ops.kda import fused_recurrent_kda
 
     B, H, K, V, W = data["B"], data["H"], data["K"], data["V"], data["W"]
-    T = data["T"]
+    M, T = data["M"], data["T"]
     dim = H * K
     dev = data["x_q"].device
     out = torch.zeros(1, B * T, H, V, dtype=torch.float32, device=dev)
@@ -541,11 +541,16 @@ def test_round1_zero_accepted(B, H):
     )
 
 
-@pytest.mark.parametrize("B,H", [(128, 2), (32, 12), (32, 6)], ids=lambda v: str(v))
-def test_round2_replay(B, H):
+@pytest.mark.parametrize(
+    "B,H,M",
+    [(128, 2, 2), (32, 12, 2), (32, 6, 2), (2, 12, 7), (16, 12, 7)],
+    ids=lambda v: str(v),
+)
+def test_round2_replay(B, H, M):
     """Replay round: mixed num_accepted per request, chained from a CPU-
     golden round 1. Validates the kernel's cache-replay state math (the
-    path the drop's own self-check never exercised)."""
+    path the drop's own self-check never exercised). ``M=7`` covers the
+    production MTP7 verify (T_loop up to 15) at the TEP8 shape."""
     data = make_conv_data(B, H, M=M, seed=7)
     T = data["T"]
 
