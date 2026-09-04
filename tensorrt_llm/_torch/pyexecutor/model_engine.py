@@ -1739,16 +1739,9 @@ class PyTorchModelEngine(ModelEngine):
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
-        model_type = getattr(self.model.model_config.pretrained_config,
-                             "model_type", None)
-        if can_run_general_warmup and model_type in ("kimi_k3", "kimi_linear"):
-            # Kimi's one-token context takes the NT < 4 FLA fallback and does
-            # not compile the optimized single-sequence K123 variant. A
-            # non-aligned five-chunk context enters the pure K123 path.
-            _KIMI_KDA_PREFILL_WARMUP_TOKENS = 257
-            logger.info("Adding Kimi KDA pure-prefill warmup with "
-                        f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
-            warmup_requests_configs.append((_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
+        # Kimi K3 / Kimi Linear are warmed by ``_run_mamba_hybrid_warmup``, not
+        # here: they always run on a ``MambaHybridCacheManager``, so
+        # ``can_run_general_warmup`` is False and the configs above never run.
 
         if (not self.is_draft_model and self.guided_decoder is None
                 and can_run_general_warmup):
@@ -1889,8 +1882,9 @@ class PyTorchModelEngine(ModelEngine):
         This method runs two extra forward passes to compile those variants
         during warmup:
 
-        1. ``least_requests=False`` — splits ``curr_max_num_tokens`` into many
-           short sequences, forcing the multi-seq path of
+        1. ``least_requests=False``, chunk-ragged — splits
+           ``curr_max_num_tokens`` into many short sequences, forcing the
+           multi-seq path of
            ``cu_seqlens_to_chunk_indices_offsets_triton`` and its
            ``_cu_seqlens_triton_kernel``.
         2. ``least_requests=False`` inside
@@ -1942,10 +1936,18 @@ class PyTorchModelEngine(ModelEngine):
         logger.info(
             "Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
 
-        # (num_tokens, num_gen_requests, least_requests, force_initstates)
+        # A model whose prefill kernel specializes on chunk alignment declares
+        # it on its Mamba metadata class; the two passes then cover both
+        # variants, for free since alignment is independent of HAS_INITSTATES.
+        metadata_cls = getattr(self.model, "mamba_metadata_cls", None) or getattr(
+            getattr(self.model, "llm", None), "mamba_metadata_cls", None)
+        chunk_alignment = getattr(metadata_cls, "prefill_chunk_alignment", None)
+
+        # (num_tokens, num_gen_requests, least_requests, force_initstates,
+        #  chunk_aligned)
         mamba_warmup_shapes = [
-            (capped_num_tokens, 0, False, False),
-            (capped_num_tokens, 0, False, True),
+            (capped_num_tokens, 0, False, False, False),
+            (capped_num_tokens, 0, False, True, True),
         ]
 
         autotuner_enabled = self.llm_args.enable_autotuner
@@ -1954,8 +1956,8 @@ class PyTorchModelEngine(ModelEngine):
                         if autotuner_enabled else contextlib.nullcontext())
 
         with self.no_cuda_graph(), autotune_ctx:
-            for (num_tokens_i, num_gen_requests_i, least_req_i,
-                 force_init_i) in mamba_warmup_shapes:
+            for (num_tokens_i, num_gen_requests_i, least_req_i, force_init_i,
+                 chunk_aligned_i) in mamba_warmup_shapes:
                 init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
                             if force_init_i else contextlib.nullcontext())
                 try:
@@ -1964,7 +1966,9 @@ class PyTorchModelEngine(ModelEngine):
                             resource_manager,
                             num_tokens_i,
                             num_gen_requests_i,
-                            least_requests=least_req_i)
+                            least_requests=least_req_i,
+                            chunk_alignment=chunk_alignment,
+                            chunk_aligned=chunk_aligned_i)
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
                             if batch is None and self.mapping.tp_size <= 1:
@@ -2635,13 +2639,43 @@ class PyTorchModelEngine(ModelEngine):
             )
             return 0
 
+    @staticmethod
+    def _apply_chunk_alignment(ctx_token_nums: List[int], alignment: int,
+                               aligned: bool) -> Optional[List[int]]:
+        """Rewrite warmup context lengths onto one side of ``alignment``.
+
+        Returns lengths that are all multiples of ``alignment`` (``aligned``) or
+        that include at least one non-multiple, or None if that would leave the
+        batch empty. Only shrinks or drops sequences.
+        """
+        if aligned:
+            floored = [n - n % alignment for n in ctx_token_nums]
+            kept = [n for n in floored if n > 0]
+            return kept or None
+        if any(n % alignment != 0 for n in ctx_token_nums):
+            return list(ctx_token_nums)
+        # Every length is a multiple; one token off the last breaks it.
+        if ctx_token_nums[-1] <= 1:
+            return None
+        return ctx_token_nums[:-1] + [ctx_token_nums[-1] - 1]
+
     def _create_warmup_request(
             self,
             resource_manager: ResourceManager,
             num_tokens: int,
             num_gen_requests: int,
-            least_requests: bool = True) -> Optional[ScheduledRequests]:
-        """Creates a generic dummy ScheduledRequests object for warmup."""
+            least_requests: bool = True,
+            chunk_alignment: Optional[int] = None,
+            chunk_aligned: bool = False
+    ) -> Optional[ScheduledRequests]:
+        """Creates a generic dummy ScheduledRequests object for warmup.
+
+        ``chunk_alignment``, when set, rewrites the context lengths onto one
+        side of it, so a kernel specializing on chunk alignment can be primed
+        for both variants instead of whichever one the split happens to hit.
+        Only shrinks or drops sequences, so the block estimate below stays a
+        safe over-estimate.
+        """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -2733,6 +2767,20 @@ class PyTorchModelEngine(ModelEngine):
             ctx_token_nums = [max_seq_len] * num_full_seqs
             if num_left_over_tokens > 0:
                 ctx_token_nums.append(num_left_over_tokens)
+
+            if chunk_alignment:
+                adjusted = self._apply_chunk_alignment(ctx_token_nums,
+                                                       chunk_alignment,
+                                                       chunk_aligned)
+                if adjusted is None:
+                    logger.debug(
+                        f"Warmup batch of {ctx_token_nums} cannot be made "
+                        f"{'aligned' if chunk_aligned else 'ragged'} modulo "
+                        f"{chunk_alignment}; that variant will compile on the "
+                        f"first request needing it.")
+                else:
+                    ctx_token_nums = adjusted
+                    num_ctx_requests = len(ctx_token_nums)
 
             ctx_requests = kv_cache_manager.add_dummy_requests(
                 list(range(num_ctx_requests)),
