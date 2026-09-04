@@ -105,6 +105,10 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  # Fused attn-res epilogue (selection + trailing RMSNorm, optionally the
+  # preceding residual add) against the unfused reference, across the token
+  # counts the fused path is taken for.
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
