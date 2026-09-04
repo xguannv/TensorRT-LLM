@@ -103,7 +103,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -180,11 +180,11 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # loss can be attributed if a precision question ever points here; GSM8K
 # parity with it on is what licenses the default.
 #
-# Requires SM100+ (the DeepGEMM ``fp8_swap_ab_gemm`` kernel is Blackwell-only);
-# on any other SM the weights stay BF16. The routed experts and the dense
-# layer-0 MLP are never converted. The fused shared-expert ``gate_up_proj`` is
-# included only under attention DP — under TP the BF16 GEMM overlaps on the
-# aux stream and the FP8 quantize+GEMM would serialize onto the critical path.
+# Requires SM107 with CuTe DSL internal; on any other GPU the weights stay
+# BF16. The routed experts and dense layer-0 MLP are never converted. The fused
+# shared-expert ``gate_up_proj`` is included only under attention DP — under TP
+# the BF16 GEMM overlaps on the aux stream and FP8 quantize+GEMM would serialize
+# onto the critical path.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 
 # FP8-RESIDENT attention (Phase 3a) — default ON, set
@@ -202,9 +202,9 @@ _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 # allocates BF16 and converts afterwards is too late, however cheap its steady
 # state.
 #
-# Gated on the checkpoint's stored format, not on the flag alone: it requires
-# attention actually be stored FP8_PB_WO, and SM100+ for the GEMM. Letting one
-# switch mean different things on different checkpoints is the
+# Gated on the checkpoint's stored format, not on the flag alone: attention must
+# be stored FP8_PB_WO and the rank must have SM107 with CuTe DSL internal.
+# Letting one switch mean different things on different checkpoints is the
 # implicit-ambiguity class of bug that has cost this bring-up repeatedly. So on
 # ``moonshotai/Kimi-K3`` (BF16 attention) this is inert and attention stays
 # BF16 regardless of the flag — that checkpoint has no FP8 attention path.
@@ -595,22 +595,39 @@ def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _rubin_mxfp8_is_available() -> bool:
+    """Whether this rank can run the SM107 native block-scaled MXFP8 GEMM.
+
+    Same predicate ``FP8BlockScalesLinearMethod`` uses for the generic
+    FP8-block-scale ``Linear``. Recomputed rather than cached: the SM version
+    cannot change within a run, so weight preparation and forward always agree.
+    """
+    from ..cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+
+    return get_sm_version() == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free linear replacement that reads its weight at FP8.
 
     The BF16 weight ``[out, in]`` is quantized once (at load) to
-    ``float8_e4m3fn`` with 128x128 block scales, then served through the
-    DeepGEMM ``fp8_swap_ab_gemm`` kernel — the same FP8 block-scale GEMM the
-    quantized DeepSeek block-scale path uses. The activation stays BF16 and is
-    quantized inside the kernel, so only the weight's storage/read precision
-    changes. Halving the weight bytes cuts the dominant HBM read that bounds
-    K3's memory-bound decode step. Both ``out`` and ``in`` are multiples of
-    128 for every projection this is applied to, so the block scales cover the
-    weight exactly.
+    ``float8_e4m3fn`` with 128x128 block scales, then served through an FP8
+    block-scale GEMM. On Rubin the CuTe DSL kernel uses native 2xFP8 MMA and a
+    K32 R128c4 UE8M0 scale layout. Halving the weight bytes cuts the dominant
+    HBM read that bounds K3's memory-bound decode step. Both ``out`` and ``in``
+    are multiples of 128 for every projection this is applied to, so the block
+    scales cover the weight exactly.
+
+    The activation is quantized directly into the GEMM's scale layout by the
+    specialized CuTe quantizer. The CuTe wrapper caches its scalar alpha so
+    forward does not launch a fill kernel during CUDA graph capture.
     """
 
     def __init__(
-        self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, out_features: int
+        self,
+        weight_fp8: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_features: int,
     ) -> None:
         super().__init__()
         self.in_features = weight_fp8.shape[1]
@@ -632,8 +649,27 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         return False
 
     @staticmethod
+    def _pack_scales(
+        weight_fp8: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert a K128 block scale to the CuTe K32 R128c4 layout."""
+        from ...quantization.utils.fp8_utils import (
+            resmooth_to_fp8_e8m0,
+            transform_k128_scales_to_cutedsl_mxfp8_layout,
+        )
+
+        weight_fp8, k128_scale = resmooth_to_fp8_e8m0(
+            weight_fp8.contiguous(), weight_scale.contiguous().float()
+        )
+        mn, k = weight_fp8.shape[0], weight_fp8.shape[1]
+
+        weight_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(k128_scale, mn=mn, k=k)
+        return weight_fp8, weight_scale
+
+    @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """BF16 ``[out, in]`` weight -> (FP8 weight, deep_gemm-ready scale).
+        """BF16 ``[out, in]`` weight -> FP8 weight and CuTe-ready scale.
 
         Both dims must be multiples of 128. Because the 128x128 block scale is
         computed per block, concatenating several such weights along ``out``
@@ -641,67 +677,29 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         separately (no block crosses a 128-aligned boundary), so a fused
         weight's row slices equal the individually quantized weights.
         """
-        # Lazy imports: only pulled in on the FP8 path.
+        # Lazy import: only pulled in on the FP8 path.
         from ...deep_gemm.utils.math import per_block_cast_to_fp8
-        from ...quantization.utils.fp8_utils import (
-            resmooth_to_fp8_e8m0,
-            transform_sf_into_required_layout,
-        )
 
-        # 128x128 block-scale FP8 weight, then the exact SM100 deep_gemm scale
-        # preparation the shipping FP8-block-scale Linear uses: resmooth to
-        # UE8M0 and pack the scale into deep_gemm's TMA-aligned MN-major
-        # layout. fp8_swap_ab_gemm runs with disable_ue8m0_cast=True, so it
-        # consumes this pre-formatted scale directly (a plain FP32 block scale
-        # would be misread and produce garbage).
         weight_fp8, weight_scale = per_block_cast_to_fp8(weight, use_ue8m0=False)
-        weight_fp8, weight_scale = resmooth_to_fp8_e8m0(
-            weight_fp8.contiguous(), weight_scale.contiguous().float()
-        )
-        weight_scale = transform_sf_into_required_layout(
-            weight_scale,
-            mn=weight_fp8.shape[0],
-            k=weight_fp8.shape[1],
-            recipe=(1, 128, 128),
-            is_sfa=False,
-        )
-        return weight_fp8, weight_scale
+        return _Fp8BlockScaleWeightReadLinear._pack_scales(weight_fp8, weight_scale)
 
     @staticmethod
     def prepare_checkpoint_scale(
         weight_fp8: torch.Tensor, weight_scale: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Checkpoint FP8 + FP32 128x128 block scale -> deep_gemm-ready pair.
+        """Checkpoint FP8 + FP32 K128 scale -> FP8 and CuTe-ready scale.
 
         This is ``quantize_weight`` without its first step. A checkpoint that
         already stores FP8_PB_WO weights (``nvidia/Kimi-K3-NVFP4``) supplies
         exactly what ``per_block_cast_to_fp8`` would have produced, so the only
-        work left is the scale bridge: resmooth to UE8M0 and pack into
-        deep_gemm's TMA-aligned MN-major layout, because ``fp8_swap_ab_gemm``
-        runs with ``disable_ue8m0_cast=True`` and would misread a plain FP32
-        block scale.
+        work left is the scale bridge -- see ``_pack_scales``.
 
         Taking this route instead of dequantizing to BF16 and re-quantizing
         avoids a lossy round trip: the re-quantization recomputes each block's
         scale from the dequantized values, which need not reproduce the
         scale the checkpoint was written with.
         """
-        from ...quantization.utils.fp8_utils import (
-            resmooth_to_fp8_e8m0,
-            transform_sf_into_required_layout,
-        )
-
-        weight_fp8, weight_scale = resmooth_to_fp8_e8m0(
-            weight_fp8.contiguous(), weight_scale.contiguous().float()
-        )
-        weight_scale = transform_sf_into_required_layout(
-            weight_scale,
-            mn=weight_fp8.shape[0],
-            k=weight_fp8.shape[1],
-            recipe=(1, 128, 128),
-            is_sfa=False,
-        )
-        return weight_fp8, weight_scale
+        return _Fp8BlockScaleWeightReadLinear._pack_scales(weight_fp8, weight_scale)
 
     @classmethod
     def from_linear(cls, linear: nn.Linear | TrtllmLinear) -> "_Fp8BlockScaleWeightReadLinear":
@@ -741,7 +739,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # in_features off the weight, and numel() == 0 still marks it unfilled.
         return cls(
             torch.empty(0, in_features, dtype=torch.float8_e4m3fn),
-            torch.empty(0, 0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.uint8),
             out_features,
         )
 
@@ -764,7 +762,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         )
         self.fill_prepared(filled.weight, filled.weight_scale)
 
-    def fill_prepared(self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor) -> None:
+    def fill_prepared(
+        self,
+        weight_fp8: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> None:
         """Fill a placeholder from an ALREADY-prepared FP8 weight + scale.
 
         The single fill path, so the filled-twice guard cannot be bypassed.
@@ -772,11 +774,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         pairs; the KDA fused path uses it directly to install a *view* of the
         fused weight (its own storage would defeat the point of fusing).
 
-        ``weight_scale`` must already be in the deep_gemm layout -- i.e. come
-        from ``prepare_checkpoint_scale`` or ``quantize_weight``. A raw FP32
-        checkpoint block scale is consumed silently by ``fp8_swap_ab_gemm``
-        (it runs with disable_ue8m0_cast=True) and produces garbage, not an
-        error.
+        ``weight_scale`` must already be in the CuTe K32 R128c4 layout from
+        ``prepare_checkpoint_scale`` or ``quantize_weight``.
         """
         if not self.is_placeholder:
             raise RuntimeError(
@@ -812,9 +811,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         for the block-scale rows.
 
         The layout transform is applied ONCE to the assembled scale rather
-        than per part: ``transform_sf_into_required_layout`` packs against the
-        full ``mn``, so transforming the pieces and stacking afterwards would
-        not produce the same bytes.
+        than per part: the R128c4 interleave packs against the full ``mn``, so
+        transforming the pieces and stacking afterwards would not produce the
+        same bytes.
         """
         weights = [w for w, _ in pairs]
         scales = [s for _, s in pairs]
@@ -848,21 +847,24 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         if lora_params:
             raise NotImplementedError("Kimi K3 FP8 weight read does not support LoRA.")
         if self.is_placeholder:
-            # An unfilled placeholder would otherwise reach fp8_swap_ab_gemm
-            # with empty operands. Fail here instead: this whole path has a
-            # habit of turning wrong weights into plausible-looking numbers
-            # rather than errors.
+            # Fail before the empty operands reach the GEMM: this whole path
+            # has a habit of turning wrong weights into plausible-looking
+            # numbers rather than errors.
             raise RuntimeError(
                 "Kimi K3 FP8 placeholder was never filled by the loader; "
                 "load_checkpoint_pair must run before forward."
             )
         out_shape = x.shape[:-1] + (self.out_features,)
-        out = torch.ops.trtllm.fp8_swap_ab_gemm(
-            x.reshape(-1, x.shape[-1]),
+        x_flat = x.reshape(-1, x.shape[-1])
+
+        act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
+        out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            act_fp8,
             self.weight,
+            act_scale,
             self.weight_scale,
-            output_dtype=x.dtype,
-            disable_ue8m0_cast=True,
+            output_dtype=torch.bfloat16,
+            fine_grained_m=True,
         )
         return out.reshape(out_shape)
 
@@ -1659,7 +1661,7 @@ class KimiK3MoERuntime(nn.Module):
             # (A/B escape hatch). When the FP8 weight-read conversion has
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
-            # is already a single fused GEMM (fp8_swap_ab_gemm).
+            # is already a quantize + native 2xFP8 GEMM path.
             routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             y = self.routed_experts(
                 routed_in,
@@ -1795,13 +1797,12 @@ class KimiLinearDecoderLayer(nn.Module):
 
         if self.is_kda:
             # Default on, but only when the checkpoint actually stores these
-            # projections as FP8_PB_WO (see the env definition). SM100+ is
-            # required because the FP8 module's GEMM is Blackwell-only; the
-            # warning for an explicitly-set-but-unsupported flag is emitted
-            # once, by the model, rather than per layer.
+            # projections as FP8_PB_WO (see the env definition). SM107 with
+            # CuTe DSL internal is required; the explicit-flag warning is
+            # emitted once by the model rather than once per layer.
             fp8_resident = (
                 os.environ.get(_KIMI_K3_FP8_ATTN_RESIDENT_ENV, "1") != "0"
-                and is_sm_100f()
+                and _rubin_mxfp8_is_available()
                 and _k3_attn_stored_fp8_block_scaled(model_config, layer_idx)
             )
             proj_factory = None
@@ -2022,11 +2023,11 @@ class KimiLinearModel(DecoderModel):
         # only worth a warning when it was asked for explicitly. Emitted here,
         # once, rather than per layer.
         _resident_env = os.environ.get(_KIMI_K3_FP8_ATTN_RESIDENT_ENV)
-        if _resident_env is not None and _resident_env != "0" and not is_sm_100f():
+        if _resident_env is not None and _resident_env != "0" and not _rubin_mxfp8_is_available():
             logger.warning(
                 f"Kimi K3: {_KIMI_K3_FP8_ATTN_RESIDENT_ENV} is set but the FP8 "
-                "block-scale attention read requires SM100 (DeepGEMM "
-                "fp8_swap_ab_gemm is Blackwell-only); keeping attention BF16."
+                "block-scale attention read requires SM107 with CuTe DSL "
+                "internal; keeping attention BF16."
             )
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
@@ -2182,10 +2183,8 @@ def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights):
     scale = _materialize(weights[scale_key]).float()
     # The checkpoint stores the block scale 4-D as
     # [ceil(N/128), 1, ceil(K/128), 1]. Normalize here, once, so every
-    # consumer sees the plain 2-D [n_blocks_m, n_blocks_k] that both the
-    # dequantization below and deep_gemm's transform_sf_into_required_layout
-    # expect -- the latter asserts on rank and gave an unhelpful
-    # ``assert sf.dim() == ...`` when handed the raw 4-D tensor.
+    # consumer sees the plain 2-D [n_blocks_m, n_blocks_k] expected by both
+    # the dequantization below and the CuTe scale preparation.
     if scale.dim() == 4:
         scale = scale.reshape(scale.shape[0], scale.shape[2])
     return src, scale
@@ -2607,7 +2606,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         )
         # Read here rather than at the conversion site because load_param runs
         # first. See _K3_CKPT_FP8_ATTR for why the pairs are load-bearing.
-        stash_ckpt_fp8 = is_sm_100f()
+        stash_ckpt_fp8 = _rubin_mxfp8_is_available()
 
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
@@ -2652,8 +2651,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 return
             src = _materialize(weights[name_map[name]])
             # Keep the checkpoint's FP8 pair for the MLA conversion at the end
-            # of this method. Gated on SM100 like that conversion, so the pairs
-            # are not retained for a run that will never use them.
+            # of this method. Gated like that conversion, so the pairs are not
+            # retained for a run that will never use them.
             ckpt_fp8_pair = (
                 _checkpoint_fp8_pair(name_map[name], src, weights) if stash_ckpt_fp8 else None
             )
@@ -3078,17 +3077,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
         # Online FP8 block-scale cast for the replicated MoE-layer MLPs —
         # default on, off with KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0 (see the env
-        # definition near the top of this file). Blackwell-only, because the
-        # DeepGEMM fp8_swap_ab_gemm kernel is.
+        # definition near the top of this file). Requires the Rubin CuTe DSL
+        # MXFP8 kernel.
         if os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "1") == "0":
             logger.info(
                 f"Kimi K3: {_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV}=0 — keeping the "
                 f"MoE-layer MLP projections in BF16"
             )
-        elif not is_sm_100f():
+        elif not _rubin_mxfp8_is_available():
             logger.info(
-                "Kimi K3: the MoE-layer MLP FP8 block-scale read requires SM100 "
-                "(DeepGEMM fp8_swap_ab_gemm is Blackwell-only); keeping them BF16"
+                "Kimi K3: the MoE-layer MLP FP8 block-scale read requires SM107 "
+                "with CuTe DSL internal; keeping them BF16"
             )
         else:
             n_fp8 = _convert_moe_mlps_to_fp8_weight_read(
@@ -3102,7 +3101,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "
                 f"(shared-expert + latent) at FP8 block-scale"
             )
-        if is_sm_100f():
+        if _rubin_mxfp8_is_available():
             # The MLA q_a/q_b/o and output-gate projections are the remaining
             # replicated attention weight read. Unlike KDA these have no
             # FP8-resident path, so without this conversion they stay BF16 --

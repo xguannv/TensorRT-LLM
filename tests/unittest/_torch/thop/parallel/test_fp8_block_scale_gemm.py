@@ -15,6 +15,7 @@
 import os
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
 from utils.util import getSMVersion, isSM100Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
@@ -470,21 +472,60 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
         output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
             a_fp8, b_fp8, a_sf, b_sf)
 
-    output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(a_fp8, b_fp8, a_sf,
-                                                        b_sf)
     inplace_output = torch.empty_like(output)
     with autotune():
         torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
             a_fp8, b_fp8, a_sf, b_sf, inplace_output)
-    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(a_fp8, b_fp8, a_sf, b_sf,
-                                                       inplace_output)
 
     expected = a @ b.t()
+    alpha = cute_dsl_custom_ops._get_mxfp8_gemm_alpha(a.device)
+    seen_alphas = []
+    real_get_alpha = cute_dsl_custom_ops._get_mxfp8_gemm_alpha
+
+    def _get_alpha_spy(device):
+        cached = real_get_alpha(device)
+        seen_alphas.append(cached)
+        return cached
+
+    with mock.patch.object(
+        cute_dsl_custom_ops,
+        "_get_mxfp8_gemm_alpha",
+        side_effect=_get_alpha_spy,
+    ), mock.patch.object(
+        torch,
+        "ones",
+        side_effect=AssertionError("unexpected per-call fill"),
+    ):
+        output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            a_fp8, b_fp8, a_sf, b_sf)
+        torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+            a_fp8, b_fp8, a_sf, b_sf, inplace_output)
+
+    assert len(seen_alphas) == 2
+    assert all(seen is alpha for seen in seen_alphas)
+    assert {seen.data_ptr() for seen in seen_alphas} == {alpha.data_ptr()}
 
     diff = calc_diff(output, expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(inplace_output, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
+    """A capture cannot perform the per-device cache's one-time allocation."""
+    device = torch.device("cuda", 31415)
+    assert device not in cute_dsl_custom_ops._MXFP8_GEMM_ALPHA_CACHE
+
+    with mock.patch.object(
+        torch.cuda, "device"
+    ) as device_guard, mock.patch.object(
+        torch.cuda, "is_current_stream_capturing", return_value=True
+    ):
+        with pytest.raises(RuntimeError, match="run one eager GEMM warmup first"):
+            cute_dsl_custom_ops._get_mxfp8_gemm_alpha(device)
+
+    device_guard.assert_called_once_with(device)
+    assert device not in cute_dsl_custom_ops._MXFP8_GEMM_ALPHA_CACHE
 
 
 @pytest.mark.skipif(
