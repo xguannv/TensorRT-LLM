@@ -4659,8 +4659,8 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     # -----------------------------------------------------------------
     # MegaMoE-format weight builders
     # -----------------------------------------------------------------
-    @staticmethod
-    def _build_mega_sf(raw_sf: torch.Tensor, *, num_slots: int,
+    @classmethod
+    def _build_mega_sf(cls, raw_sf: torch.Tensor, *, num_slots: int,
                        gate_up_interleave_intermediate: Optional[int],
                        n_pairs: Optional[int], expand_intermediate: int,
                        flat_size: int) -> torch.Tensor:
@@ -4672,15 +4672,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         along the last axis to ``flat_size`` so the registered Parameter
         shape matches.
         """
-        from ...cute_dsl_kernels.mega_moe_nvfp4 import (
-            stack_byte_reinterpretable_tensors, to_blocked)
-
         device = raw_sf.device
         # Multi-node EPLB can leave this rank with zero shared-load
         # experts (``len(local_shared_load_expert_ids) == 0``), making
-        # the per-slot SF list empty. ``stack_byte_reinterpretable_tensors``
-        # rejects an empty input, so short-circuit to the registered
-        # flat shape.
+        # the per-slot SF list empty, so short-circuit to the registered shape.
         if num_slots == 0:
             return torch.empty((0, flat_size), dtype=torch.uint8, device=device)
         sf_cols = raw_sf.shape[-1]  # int32 units
@@ -4696,9 +4691,24 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         per_slot: List[torch.Tensor] = []
         for slot_idx in range(num_slots):
             sf_fp8 = raw_sf[slot_idx].view(torch.float8_e4m3fn)
-            per_slot.append(to_blocked(sf_fp8).view(torch.uint8))
-        stacked = stack_byte_reinterpretable_tensors(per_slot,
-                                                     dim=0).contiguous()
+            rows, cols = sf_fp8.shape
+            padded_rows = cls._round_up_int(rows, 128)
+            padded_cols = cls._round_up_int(cols, 4)
+            padded = sf_fp8
+            if (rows, cols) != (padded_rows, padded_cols):
+                padded = torch.zeros((padded_rows, padded_cols),
+                                     dtype=sf_fp8.dtype,
+                                     device=sf_fp8.device)
+                padded[:rows, :cols] = sf_fp8
+            row_blocks = padded_rows // 128
+            col_blocks = padded_cols // 4
+            blocks = padded.view(row_blocks, 128, col_blocks,
+                                 4).permute(0, 2, 1, 3)
+            blocked = blocks.reshape(-1, 4, 32,
+                                     4).transpose(1, 2).reshape(-1, 32,
+                                                                16).flatten()
+            per_slot.append(blocked.view(torch.uint8))
+        stacked = torch.stack(per_slot, dim=0).contiguous()
         if stacked.shape[-1] == flat_size:
             return stacked
         # Pad zero on the tail so the output shape matches the

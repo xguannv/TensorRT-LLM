@@ -17,7 +17,7 @@
 ConfigurableMoE-compatible MoE backend wrapping the ported
 architecture-specific MegaMoE kernel (fused dispatch + FC1 + activation + FC2 +
 combine) from
-``tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4``. The kernel is
+``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
 ``tensorrt_llm/_torch/custom_ops/cute_dsl_megamoe_custom_op.py``. This
@@ -226,20 +226,17 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             return False, reason
 
     try:
-        # mega_moe_cute_dsl.py lives at
-        # tensorrt_llm/_torch/modules/fused_moe/mega_moe/mega_moe_cute_dsl.py;
-        # four dots take us back to tensorrt_llm._torch where
-        # cute_dsl_kernels.mega_moe_nvfp4 is registered.
-        from ....cute_dsl_kernels.mega_moe_nvfp4 import (  # noqa: F401
-            Nvfp4BlockSize,
-            SfPaddingBlock,
-            to_blocked,
+        from ....cute_dsl_kernels.cutedsl_megamoe import (  # noqa: F401
+            BlackwellInferenceMegaMoE,
+            RubinInferenceGenphaseMegaMoE,
+            RubinInferenceLocalMegaMoE,
+            RubinInferenceMegaMoE,
         )
     except ImportError as e:
         reason = (
             f"Ported MegaMoE NVFP4 kernel package failed to import: "
             f"{e!r}. Verify tensorrt_llm/_torch/cute_dsl_kernels/"
-            f"mega_moe_nvfp4 is in the install tree."
+            f"cutedsl_megamoe is in the install tree."
         )
         _RUNTIME_PROBE_CACHE[sm_version] = reason
         return False, reason
@@ -346,7 +343,7 @@ class _MegaMoeBuffers:
     combine_output: torch.Tensor  # (max_T, top_k, hidden) bf16
     shared_workspace: torch.Tensor  # (shared_ws_bytes,) uint8
     peer_offsets: List[int]  # length == world_size; [0] for single-rank
-    topk_idx_local: torch.Tensor  # (max_T, top_k) int64, always-local
+    topk_idx_local: torch.Tensor  # (max_T, top_k) int32 on SM107, otherwise int64
 
 
 # ---------------------------------------------------------------------------
@@ -545,8 +542,7 @@ class MegaMoECuteDsl(MoE):
         # ``create_moe_backend``; never inferred from pretrained_config.
         self.activation = (activation or "swiglu").lower()
         self.situ_beta = None if situ_beta is None else float(situ_beta)
-        self.situ_linear_beta = (None if situ_linear_beta is None else
-                                 float(situ_linear_beta))
+        self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # topk-score application point. v2 default is the deepgemm graph
@@ -555,6 +551,7 @@ class MegaMoECuteDsl(MoE):
         # backend constant until the transformers route is GPU-validated and
         # promoted to MoeConfig.
         self.apply_topk_in_fc1 = True
+        self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
         # Cross-rank combine wire format is selected with
         # MEGAMOE_COMBINE_FORMAT (default bf16). It MUST be rank-identical:
@@ -609,6 +606,7 @@ class MegaMoECuteDsl(MoE):
         # Per-bucket symmetric providers (bucket -> MegaMoeSymmMemProvider);
         # filled in ``create_weights`` on the multi-rank EP path.
         self._symm_providers = {}
+        self._genphase_direct_input_buckets: set[int] = set()
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
@@ -700,15 +698,20 @@ class MegaMoECuteDsl(MoE):
     def _resolve_maxt_buckets(max_num_tokens: int) -> List[int]:
         """Resolve the adaptive ``max_tokens_per_rank`` bucket ladder.
 
-        MUST be a pure function of ``max_num_tokens`` so every EP rank derives
-        the identical ladder (divergence breaks the cross-rank NVLink barrier):
-        {256, 1024, 4096} rungs below the per-rank cap plus the cap itself.
+        Every EP rank derives the same architecture-specific ladder (divergence
+        breaks the cross-rank NVLink barrier). Rubin adds generation-phase
+        rungs through 1024; Blackwell keeps the existing 256/1024/4096 ladder.
         Kept small -- each rung multiplies the compile/capture/memory surface.
         """
         full = int(max_num_tokens)
         if full <= 0:
             full = 4096
-        cand = {b for b in (256, 1024, 4096) if b < full}
+        rungs = (
+            (32, 64, 128, 192, 256, 384, 512, 1024, 4096)
+            if get_sm_version() == 107
+            else (256, 1024, 4096)
+        )
+        cand = {b for b in rungs if b < full}
         cand.add(full)
         return sorted(cand)
 
@@ -965,6 +968,13 @@ class MegaMoECuteDsl(MoE):
         """
         return self._symm_providers.get(self._maxt_buckets[-1])
 
+    def _use_in_kernel_fc2_reduce(self, max_tokens_per_rank: int) -> bool:
+        if get_sm_version() != 107 or self.combine_format != "bf16":
+            return False
+        from ....custom_ops.cute_dsl_megamoe_custom_op import _sm107_use_in_kernel_fc2_reduce
+
+        return _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank)
+
     def _alloc_symm_provider(self):
         """Build-time symmetric provider allocation. See ``create_weights``.
 
@@ -977,7 +987,7 @@ class MegaMoECuteDsl(MoE):
         """
         from ....custom_ops.cute_dsl_megamoe_custom_op import (
             get_megamoe_symm_provider,
-            query_megamoe_shared_workspace_bytes,
+            query_megamoe_kernel_properties,
         )
 
         if self._ep_pg is None:
@@ -990,7 +1000,10 @@ class MegaMoECuteDsl(MoE):
         full_T = self._maxt_buckets[-1]
         self._profiling_scratch_provider_ref = None
         for max_T in self._maxt_buckets:
-            shared_workspace_bytes = query_megamoe_shared_workspace_bytes(
+            (
+                shared_workspace_bytes,
+                supports_direct_inputs,
+            ) = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
                 num_experts_per_rank=int(self.expert_size_per_partition),
@@ -1000,9 +1013,15 @@ class MegaMoECuteDsl(MoE):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
-                in_kernel_fc2_reduce=False,
+                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                gate_up_clamp=self.gate_up_clamp,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
+            if supports_direct_inputs:
+                self._genphase_direct_input_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -1174,11 +1193,10 @@ class MegaMoECuteDsl(MoE):
     ) -> torch.Tensor:
         """Run the fused MegaMoE CuteDSL kernel on pre-quantized inputs.
 
-        Casts ``token_selected_experts`` to ``int64`` (the scheduler keeps
-        ``int32`` for the EPLB stats kernel; the MegaMoE kernel reads
-        ``topk_idx`` as Int64) and delegates the staging + kernel launch
-        to :meth:`_run_moe`, which returns the reduced ``(T, hidden)``
-        output.
+        Keeps the scheduler's ``int32`` token-selected experts on SM107 and
+        delegates the staging + kernel launch to :meth:`_run_moe`, which
+        returns the reduced ``(T, hidden)`` output. Other architectures keep
+        the existing ``int64`` kernel ABI.
         """
         del workspace  # The symmetric buffer is this backend's own workspace.
         x = ctx.x
@@ -1217,13 +1235,13 @@ class MegaMoECuteDsl(MoE):
         top_k = int(token_selected_experts.shape[-1])
         device = x.device
 
-        topk_idx_i64 = token_selected_experts.to(torch.int64).contiguous()
+        topk_idx = token_selected_experts.to(self._topk_idx_dtype).contiguous()
         topk_weights_f32 = token_final_scales.to(torch.float32).contiguous()
 
         return self._run_moe(
             x=x,
             x_sf=x_sf,
-            topk_idx=topk_idx_i64,
+            topk_idx=topk_idx,
             topk_weights=topk_weights_f32,
             weight_view=weight_view,
             num_tokens=num_tokens,
@@ -1263,7 +1281,12 @@ class MegaMoECuteDsl(MoE):
         # ``topk_idx`` defaults to -1 so dispatch_prep skips padded tail
         # rows (``if expert_id >= Int32(0):`` in dispatch_kernel.py).
         staging = {
-            "topk_idx": torch.full((max_T, top_k), -1, dtype=torch.int64, device=device),
+            "topk_idx": torch.full(
+                (max_T, top_k),
+                -1,
+                dtype=self._topk_idx_dtype,
+                device=device,
+            ),
         }
         if self.ep_size == 1:
             sf_bytes_per_row = megamoe_activation_sf_bytes_per_row(hidden)
@@ -1289,11 +1312,9 @@ class MegaMoECuteDsl(MoE):
             )
             # Shared-workspace probe lives behind ``IS_MEGAMOE_OP_AVAILABLE``
             # in cute_dsl_megamoe_custom_op so the import stays lazy.
-            from ....custom_ops.cute_dsl_megamoe_custom_op import (
-                query_megamoe_shared_workspace_bytes,
-            )
+            from ....custom_ops.cute_dsl_megamoe_custom_op import query_megamoe_kernel_properties
 
-            shared_bytes = query_megamoe_shared_workspace_bytes(
+            shared_bytes, supports_direct_inputs = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
                 num_experts_per_rank=int(self.expert_size_per_partition),
@@ -1303,9 +1324,15 @@ class MegaMoECuteDsl(MoE):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
-                in_kernel_fc2_reduce=False,
+                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                gate_up_clamp=self.gate_up_clamp,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
+            if supports_direct_inputs:
+                self._genphase_direct_input_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
@@ -1387,6 +1414,7 @@ class MegaMoECuteDsl(MoE):
         topk_weights: torch.Tensor,
         num_tokens: int,
         top_k: int,
+        stage_activation: bool,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
         pre-allocated buffers and refresh the padded tail.
@@ -1417,8 +1445,9 @@ class MegaMoECuteDsl(MoE):
             bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
         if num_tokens > 0:
             bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
-            bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
-            bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+            if stage_activation:
+                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
+                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
             bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
         if num_tokens < max_T:
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
@@ -1487,6 +1516,10 @@ class MegaMoECuteDsl(MoE):
                     return provider.get_regions()
 
                 scratch_factory = _deferred_scratch_factory
+        in_kernel_fc2_reduce = self._use_in_kernel_fc2_reduce(launch_max_T)
+        if in_kernel_fc2_reduce and num_tokens > 0:
+            combine_output[:num_tokens].zero_()
+
         set_active_megamoe_profiling_scratch(
             scratch_provider.get_regions()
             if (scratch_provider is not None and world_size > 1)
@@ -1524,9 +1557,7 @@ class MegaMoECuteDsl(MoE):
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
-                # Keep the deterministic standalone TopkReduce until form-B
-                # has dedicated GPU correctness and performance coverage.
-                in_kernel_fc2_reduce=False,
+                in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
@@ -1594,6 +1625,16 @@ class MegaMoECuteDsl(MoE):
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
         )
+        use_direct_inputs = (
+            self.ep_size > 1
+            and not self.tactic_autotune
+            and num_tokens == launch_max_T
+            and launch_max_T in self._genphase_direct_input_buckets
+            and x.shape == bufs.activation.shape
+            and x_sf.shape == bufs.activation_sf.shape
+            and x.is_contiguous()
+            and x_sf.is_contiguous()
+        )
         self._stage_inputs(
             bufs=bufs,
             x=x,
@@ -1602,10 +1643,11 @@ class MegaMoECuteDsl(MoE):
             topk_weights=topk_weights,
             num_tokens=num_tokens,
             top_k=top_k,
+            stage_activation=not use_direct_inputs,
         )
         return self._launch_megamoe_kernel(
-            activation=bufs.activation,
-            activation_sf=bufs.activation_sf,
+            activation=x if use_direct_inputs else bufs.activation,
+            activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
             topk_idx=bufs.topk_idx_local,
             topk_weights=bufs.topk_weights[:, :top_k],
             weight_view=weight_view,

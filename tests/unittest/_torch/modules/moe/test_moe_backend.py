@@ -14,12 +14,11 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
-import importlib
 import itertools
 import logging
 import os
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
 
@@ -85,8 +84,12 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
 )
 from tensorrt_llm._torch.ugpu.policy import UgpuPolicy
 from tensorrt_llm._torch.ugpu_utils import is_ugpu_enabled
-from tensorrt_llm._torch.utils import (ActivationType, ActType_TrtllmGen,
-                                       MxFp8QuantizedTensor, is_gated_activation)
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    ActType_TrtllmGen,
+    MxFp8QuantizedTensor,
+    is_gated_activation,
+)
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -797,8 +800,7 @@ def test_megamoe_does_not_infer_situ_from_pretrained_config():
         activation_situ_beta=4.0,
         activation_situ_linear_beta=25.0,
     )
-    moe = _make_megamoe_cutedsl(
-        _megamoe_model_config(pretrained_config=pretrained_config))
+    moe = _make_megamoe_cutedsl(_megamoe_model_config(pretrained_config=pretrained_config))
 
     assert moe.activation == "swiglu"
     assert moe.situ_beta is None
@@ -807,16 +809,12 @@ def test_megamoe_does_not_infer_situ_from_pretrained_config():
 
 def test_situ_requires_both_betas():
     with pytest.raises(ValueError, match="requires explicit situ_beta"):
-        _create_megamoe_backend(activation="situ",
-                                situ_beta=4.0,
-                                situ_linear_beta=None)
+        _create_megamoe_backend(activation="situ", situ_beta=4.0, situ_linear_beta=None)
 
 
 def test_situ_betas_must_be_positive():
     with pytest.raises(ValueError, match="must be positive"):
-        _create_megamoe_backend(activation="situ",
-                                situ_beta=4.0,
-                                situ_linear_beta=-1.0)
+        _create_megamoe_backend(activation="situ", situ_beta=4.0, situ_linear_beta=-1.0)
 
 
 def test_situ_betas_without_situ_activation_are_rejected():
@@ -851,8 +849,8 @@ def test_situ_fanout_builds_cutlass_per_expert_tensors():
     )
 
     assert moe.activation_type == ActivationType.SiTu
-    assert moe.swiglu_alpha.shape == (num_experts, )
-    assert moe.swiglu_beta.shape == (num_experts, )
+    assert moe.swiglu_alpha.shape == (num_experts,)
+    assert moe.swiglu_beta.shape == (num_experts,)
     assert torch.all(moe.swiglu_alpha == 4.0)
     assert torch.all(moe.swiglu_beta == 25.0)
 
@@ -996,7 +994,7 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
 def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Standard serving must not pay for the 36-tactic sweep by default.
+    # Standard serving must not pay for the curated tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
@@ -1061,24 +1059,6 @@ def test_megamoe_cutedsl_sm_support(
         assert "requires SM100, SM103, or SM107" in reason
 
 
-def test_megamoe_kernel_arch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tensorrt_llm._torch.cute_dsl_kernels import mega_moe_nvfp4
-
-    sm100_kernel = object()
-    sm107_kernel = object()
-    module_name = f"{mega_moe_nvfp4.__name__}.megamoe_kernel"
-    fake_module = ModuleType(module_name)
-    fake_module.Sm100MegaMoEKernel = sm100_kernel
-    fake_module.Sm107MegaMoEKernel = sm107_kernel
-    monkeypatch.setitem(sys.modules, module_name, fake_module)
-
-    assert mega_moe_nvfp4.import_kernel(100) is sm100_kernel
-    assert mega_moe_nvfp4.import_kernel(103) is sm100_kernel
-    assert mega_moe_nvfp4.import_kernel(107) is sm107_kernel
-    with pytest.raises(ValueError, match="supports SM100, SM103, or SM107"):
-        mega_moe_nvfp4.import_kernel(101)
-
-
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,
@@ -1098,7 +1078,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
-    - MegaMoE backends: token_selected_experts=int64, output_dtype
+    - MegaMoE backends: backend-specific token_selected_experts, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -1131,7 +1111,12 @@ def run_backend_moe(
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         workspace = backend.get_workspace(m_max, 128)
     elif backend_type in _MEGAMOE_BACKEND_TYPES:
-        args["token_selected_experts"] = token_selected_experts.to(torch.int64)
+        topk_dtype = (
+            torch.int32
+            if backend_type == MoeBackendType.MEGAMOE_CUTEDSL and get_sm_version() == 107
+            else torch.int64
+        )
+        args["token_selected_experts"] = token_selected_experts.to(topk_dtype)
         args["output_dtype"] = dtype
 
     # Mirror what each scheduler hands the backend: ExternalCommMoEScheduler
