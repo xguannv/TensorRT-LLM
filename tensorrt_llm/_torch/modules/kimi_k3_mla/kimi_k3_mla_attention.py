@@ -22,6 +22,7 @@ from ....models.modeling_utils import QuantConfig
 from ...attention_backend import AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
+from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
 from ..mla import MLA
 
@@ -235,6 +236,7 @@ class KimiK3MLAAttention(MLA):
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
         model_config: ModelConfig,
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         quant_config = model_config.get_quant_config()
@@ -262,6 +264,7 @@ class KimiK3MLAAttention(MLA):
             dtype=dtype,
             dense_bias=False,
             config=model_config,
+            aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
             reduce_output=False,
             fuse_qkv_a_proj=False,
