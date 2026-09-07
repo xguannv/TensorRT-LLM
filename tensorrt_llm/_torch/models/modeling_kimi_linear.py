@@ -48,16 +48,16 @@ The split is EP-only unless the user sets ``moe_tensor_parallel_size`` /
 ``moe_expert_parallel_size`` explicitly. Routing is computed replicated; the
 routed partial sums — EP partials of whole experts, or TP partials over the
 intermediate shards — are all-reduced in the latent space (before
-``routed_expert_norm`` / ``routed_expert_up_proj``, which are
-nonlinear/linear layers applied to the full sum). When attention DP is off,
-the shared experts use standard MLP TP over the model TP group: gate/up are
-column-sharded and down is row-sharded. Direct MoE-TP combines the shared
-hidden-width partial and routed latent partial into one all-reduce after the
-two streams join, then splits them before the routed norm/up projection.
-Communication-backed routed paths keep the shared ``GatedMLP`` reduction,
-because their routed result is already combined. Under attention DP the
-shared experts stay replicated. ``lm_head`` uses the stock ``LMHead``
-(vocab-sharded + gather), so logits are identical on all ranks.
+``routed_expert_norm`` / ``routed_expert_up_proj``, which are nonlinear/linear
+layers applied to the full sum). When attention DP is off, the shared experts
+use standard MLP TP over the model TP group: gate/up are column-sharded and down
+is row-sharded. The shared down projection reduces on the auxiliary stream
+while the routed expert chain runs on the main stream. After the streams join,
+the routed latent partial is reduced before its norm/up projection.
+Fused-communication routed backends already return a complete routed result and
+need no outer reduction. Under attention DP the shared experts stay replicated.
+``lm_head`` uses the stock ``LMHead`` (vocab-sharded + gather), so logits are
+identical on all ranks.
 
 Speculative decoding: SA (suffix automaton, one-engine, draft-weight-free);
 the KDA/MLA runtimes implement multi-token verification with deferred
@@ -111,6 +111,7 @@ from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
+from ..modules.fused_moe.interface import MoESchedulerKind
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -400,11 +401,8 @@ def _read_fused_attn_res_max_tokens() -> int:
             f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be a positive integer, got {raw!r}"
         ) from None
     if value < 1:
-        raise ValueError(
-            f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be >= 1, got {value}"
-        )
+        raise ValueError(f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be >= 1, got {value}")
     return value
-
 
 
 KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
@@ -1589,9 +1587,7 @@ class KimiK3MoERuntime(nn.Module):
         # ``linear_beta is None`` as "up half stays linear".
         situ_beta = float(_cfg_beta) if _cfg_beta is not None else 1.0
         situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
-        situ_linear_beta_moe = (
-            float(situ_linear_beta) if situ_linear_beta is not None else 1.0
-        )
+        situ_linear_beta_moe = float(situ_linear_beta) if situ_linear_beta is not None else 1.0
         dtype = torch.bfloat16
 
         # Routing scores stay fp32; with attention-DP off the gate GEMM runs
@@ -1621,8 +1617,8 @@ class KimiK3MoERuntime(nn.Module):
             hidden_size=self.moe_hidden_size,
             intermediate_size=cfg.moe_intermediate_size,
             dtype=dtype,
-            # Kimi owns the latent reduction so direct MoE-TP can combine it
-            # with the shared-expert partial in one collective below.
+            # Kimi owns the latent reduction so it can order that collective
+            # after the shared expert's auxiliary-stream reduction.
             reduce_results=False,
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
@@ -1756,15 +1752,18 @@ class KimiK3MoERuntime(nn.Module):
         #
         # Otherwise GatedMLP owns the row-parallel reduction, which runs on
         # the auxiliary stream used for the shared-expert branch.
-        # Direct MoE-TP leaves both branches partial for one combined all-reduce.
+        # Fused-communication routed backends already return the cross-rank
+        # combined result and need no outer routed all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
-        routed_all_reduce = self.routed_experts.all_reduce
-        if use_shared_tp and routed_all_reduce is None:
+        self._reduce_routed_output = (
+            use_shared_tp
+            and self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
+        )
+        if self._reduce_routed_output and self.routed_experts.all_reduce is None:
             raise RuntimeError(
                 "Kimi K3 direct MoE tensor parallelism requires the "
                 "ConfigurableMoE all-reduce even when reduce_results=False."
             )
-        self._use_combined_all_reduce = use_shared_tp
         self.shared_experts = GatedMLP(
             hidden_size=cfg.hidden_size,
             intermediate_size=shared_intermediate,
@@ -1777,7 +1776,7 @@ class KimiK3MoERuntime(nn.Module):
             dtype=dtype,
             config=shared_model_config,
             overridden_tp_size=1 if attention_dp else None,
-            reduce_output=False,
+            reduce_output=use_shared_tp,
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
@@ -1960,7 +1959,7 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
-        moe_all_reduce = self.routed_experts.all_reduce if self._use_combined_all_reduce else None
+        moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1979,7 +1978,7 @@ class KimiK3MoERuntime(nn.Module):
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
-            if self._use_combined_all_reduce:
+            if self._reduce_routed_output:
                 return y
             # Communication-backed paths return a complete routed result.
             y = self.routed_expert_norm(y)
@@ -1988,8 +1987,10 @@ class KimiK3MoERuntime(nn.Module):
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
         # only under CUDA graphs; otherwise both branches run in order on the
-        # default stream. Direct MoE-TP leaves both branches as partial sums
-        # until the streams join, then reduces them with one collective.
+        # default stream. The shared GatedMLP includes its output all-reduce on
+        # the auxiliary stream. The join below must precede the routed
+        # all-reduce: concurrent collectives on different streams can corrupt
+        # SYMM_MEM all-reduce state.
         routed_out, shared_out = maybe_execute_in_parallel(
             _routed_output,
             lambda: self.shared_experts(identity),
@@ -1998,16 +1999,9 @@ class KimiK3MoERuntime(nn.Module):
             self.aux_stream,
             disable_on_compile=True,
         )
-        if self._use_combined_all_reduce:
-            combined = moe_all_reduce(torch.cat((shared_out, routed_out), dim=-1))
-            shared_out, routed_latent = torch.split(
-                combined,
-                (self.hidden_size, self.moe_hidden_size),
-                dim=-1,
-            )
-            # The column split is a strided view; FlashInfer RMSNorm expects
-            # a dense last dimension.
-            routed_latent = self.routed_expert_norm(routed_latent.contiguous())
+        if self._reduce_routed_output:
+            routed_latent = moe_all_reduce(routed_out)
+            routed_latent = self.routed_expert_norm(routed_latent)
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
 
@@ -2645,14 +2639,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # py_decoding_iter - 1) is stale once any draft token was
             # accepted -> silently wrong RoPE positions and KV slots. Reject
             # the trip wires until that loop is helix-group aware.
-            if (spec_config.acceptance_rate_window_size is not None
-                    or spec_config.acceptance_rate_threshold is not None):
+            if (
+                spec_config.acceptance_rate_window_size is not None
+                or spec_config.acceptance_rate_threshold is not None
+            ):
                 raise ValueError(
                     "Kimi K3 helix does not support the speculation "
                     "acceptance-rate gate (acceptance_rate_window_size / "
                     "acceptance_rate_threshold): dynamically disabling "
                     "speculation mid-flight leaves helix requests on a "
-                    "single-token position formula.")
+                    "single-token position formula."
+                )
             # DSparkDecodingConfig resolves this from the drafter checkpoint's
             # weight index; the embedded flavour also carries a
             # speculative_model path, so the flag is the only reliable probe.
