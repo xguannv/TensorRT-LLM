@@ -129,15 +129,11 @@ class KimiKDALinearAttention(nn.Module):
         self.num_k_heads = self.num_heads
         projection_size = self.num_heads * self.head_dim
         self.proj_size = projection_size
-        self._fp8_resident_projections = (
-            fp8_resident_projections and self._kda_tp_size == 1
-        )
+        self._fp8_resident_projections = fp8_resident_projections and self._kda_tp_size == 1
         if not self._fp8_resident_projections:
             proj_factory = None
         projection_factory = proj_factory or (
-            lambda in_features, out_features: nn.Linear(
-                in_features, out_features, bias=False
-            )
+            lambda in_features, out_features: nn.Linear(in_features, out_features, bias=False)
         )
 
         # Keep the logical projections separate for checkpoint-compatible
@@ -951,10 +947,13 @@ class KimiKDALinearAttention(nn.Module):
                 "optimized KDA MTP verify requires the fused QKVG output-gate section"
             )
         if self._onorm_w_f32 is None:
-            raise RuntimeError(
-                "optimized KDA MTP verify requires finalized output-norm weights"
-            )
-        mxfp8_output = self._fp8_resident_projections
+            raise RuntimeError("optimized KDA MTP verify requires finalized output-norm weights")
+        # The fused epilogue emits the Rubin CuTe scale layout. SM100/103
+        # keep the output BF16 and let the resident-weight DeepGEMM projection
+        # quantize it, while SM107 can pass the prequantized pair through.
+        mxfp8_output = self._fp8_resident_projections and bool(
+            getattr(self.o_proj, "supports_prequantized_input", False)
+        )
         forward_prequantized = None
         if mxfp8_output:
             forward_prequantized = getattr(self.o_proj, "forward_prequantized", None)

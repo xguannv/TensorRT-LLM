@@ -103,7 +103,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import get_sm_version
+from ..._utils import get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -182,11 +182,11 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # loss can be attributed if a precision question ever points here; GSM8K
 # parity with it on is what licenses the default.
 #
-# Requires SM107 with CuTe DSL internal; on any other GPU the weights stay
-# BF16. The routed experts and dense layer-0 MLP are never converted. The fused
-# shared-expert ``gate_up_proj`` is included only under attention DP — under TP
-# the BF16 GEMM overlaps on the aux stream and FP8 quantize+GEMM would serialize
-# onto the critical path.
+# Requires datacenter Blackwell. SM100/103 use DeepGEMM, while SM107 uses the
+# native CuTe DSL MXFP8 kernel when available. The routed experts and dense
+# layer-0 MLP are never converted. The fused shared-expert ``gate_up_proj`` is
+# included only under attention DP — under TP the BF16 GEMM overlaps on the aux
+# stream and FP8 quantize+GEMM would serialize onto the critical path.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 
 # FP8-RESIDENT attention (Phase 3a) — default ON, set
@@ -205,8 +205,8 @@ _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 # state.
 #
 # Gated on the checkpoint's stored format, not on the flag alone: attention must
-# be stored FP8_PB_WO and the rank must have SM107 with CuTe DSL internal.
-# Letting one switch mean different things on different checkpoints is the
+# be stored FP8_PB_WO and the rank must be datacenter Blackwell. Letting one
+# switch mean different things on different checkpoints is the
 # implicit-ambiguity class of bug that has cost this bring-up repeatedly. So on
 # ``moonshotai/Kimi-K3`` (BF16 attention) this is inert and attention stays
 # BF16 regardless of the flag — that checkpoint has no FP8 attention path.
@@ -903,6 +903,11 @@ def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _fp8_weight_read_is_available() -> bool:
+    """Whether this rank can keep K3's eligible weights resident in FP8."""
+    return is_sm_100f()
+
+
 def _rubin_mxfp8_is_available() -> bool:
     """Whether this rank can run the SM107 native block-scaled MXFP8 GEMM.
 
@@ -920,14 +925,15 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
 
     The BF16 weight ``[out, in]`` is quantized once (at load) to
     ``float8_e4m3fn`` with 128x128 block scales, then served through an FP8
-    block-scale GEMM. On Rubin the CuTe DSL kernel uses native 2xFP8 MMA and a
-    K32 R128c4 UE8M0 scale layout. Halving the weight bytes cuts the dominant
-    HBM read that bounds K3's memory-bound decode step. Both ``out`` and ``in``
-    are multiples of 128 for every projection this is applied to, so the block
-    scales cover the weight exactly.
+    block-scale GEMM. SM100/103 use DeepGEMM; on Rubin the CuTe DSL kernel uses
+    native 2xFP8 MMA and a K32 R128c4 UE8M0 scale layout. Halving the weight
+    bytes cuts the dominant HBM read that bounds K3's memory-bound decode step.
+    Both ``out`` and ``in`` are multiples of 128 for every projection this is
+    applied to, so the block scales cover the weight exactly.
 
-    The activation is quantized directly into the GEMM's scale layout by the
-    specialized CuTe quantizer. The CuTe wrapper caches its scalar alpha so
+    On Rubin, the activation is quantized directly into the GEMM's scale layout
+    by the specialized CuTe quantizer. SM100/103 use DeepGEMM's internal
+    activation quantization. The CuTe wrapper caches its scalar alpha so Rubin
     forward does not launch a fill kernel during CUDA graph capture.
     """
 
@@ -956,28 +962,45 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         """Match the ``Linear`` interface consumed by ``GatedMLP``."""
         return False
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        """Whether the KDA fused producer emits this GEMM's scale layout."""
+        return _rubin_mxfp8_is_available()
+
     @staticmethod
     def _pack_scales(
         weight_fp8: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert a K128 block scale to the CuTe K32 R128c4 layout."""
-        from ...quantization.utils.fp8_utils import (
-            resmooth_to_fp8_e8m0,
-            transform_k128_scales_to_cutedsl_mxfp8_layout,
-        )
+        """Convert a K128 block scale to the active GEMM's required layout."""
+        from ...quantization.utils.fp8_utils import resmooth_to_fp8_e8m0
 
         weight_fp8, k128_scale = resmooth_to_fp8_e8m0(
             weight_fp8.contiguous(), weight_scale.contiguous().float()
         )
         mn, k = weight_fp8.shape[0], weight_fp8.shape[1]
 
-        weight_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(k128_scale, mn=mn, k=k)
+        if _rubin_mxfp8_is_available():
+            from ...quantization.utils.fp8_utils import (
+                transform_k128_scales_to_cutedsl_mxfp8_layout,
+            )
+
+            weight_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(k128_scale, mn=mn, k=k)
+        else:
+            from ...quantization.utils.fp8_utils import transform_sf_into_required_layout
+
+            weight_scale = transform_sf_into_required_layout(
+                k128_scale,
+                mn=mn,
+                k=k,
+                recipe=(1, 128, 128),
+                is_sfa=False,
+            )
         return weight_fp8, weight_scale
 
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """BF16 ``[out, in]`` weight -> FP8 weight and CuTe-ready scale.
+        """BF16 ``[out, in]`` weight -> FP8 weight and backend-ready scale.
 
         Both dims must be multiples of 128. Because the 128x128 block scale is
         computed per block, concatenating several such weights along ``out``
@@ -995,7 +1018,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     def prepare_checkpoint_scale(
         weight_fp8: torch.Tensor, weight_scale: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Checkpoint FP8 + FP32 K128 scale -> FP8 and CuTe-ready scale.
+        """Checkpoint FP8 + FP32 K128 scale -> FP8 and backend-ready scale.
 
         This is ``quantize_weight`` without its first step. A checkpoint that
         already stores FP8_PB_WO weights (``nvidia/Kimi-K3-NVFP4``) supplies
@@ -1082,7 +1105,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         pairs; the KDA fused path uses it directly to install a *view* of the
         fused weight (its own storage would defeat the point of fusing).
 
-        ``weight_scale`` must already be in the CuTe K32 R128c4 layout from
+        ``weight_scale`` must already be in the active GEMM's layout from
         ``prepare_checkpoint_scale`` or ``quantize_weight``.
         """
         if not self.is_placeholder:
@@ -1119,7 +1142,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         for the block-scale rows.
 
         The layout transform is applied ONCE to the assembled scale rather
-        than per part: the R128c4 interleave packs against the full ``mn``, so
+        than per part: both backend layouts pack against the full ``mn``, so
         transforming the pieces and stacking afterwards would not produce the
         same bytes.
         """
@@ -1165,15 +1188,24 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         out_shape = x.shape[:-1] + (self.out_features,)
         x_flat = x.reshape(-1, x.shape[-1])
 
-        act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
-        out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-            act_fp8,
-            self.weight,
-            act_scale,
-            self.weight_scale,
-            output_dtype=torch.bfloat16,
-            fine_grained_m=True,
-        )
+        if _rubin_mxfp8_is_available():
+            act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
+            out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                act_fp8,
+                self.weight,
+                act_scale,
+                self.weight_scale,
+                output_dtype=torch.bfloat16,
+                fine_grained_m=True,
+            )
+        else:
+            out = torch.ops.trtllm.fp8_swap_ab_gemm(
+                x_flat,
+                self.weight,
+                self.weight_scale,
+                output_dtype=x.dtype,
+                disable_ue8m0_cast=True,
+            )
         return out.reshape(out_shape)
 
     def forward_prequantized(
@@ -1189,6 +1221,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             )
         if activation.dtype is not torch.float8_e4m3fn:
             raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
+        if not self.supports_prequantized_input:
+            raise RuntimeError("prequantized Kimi K3 activation requires the Rubin CuTe GEMM")
         if activation_scale.dtype is not torch.uint8:
             raise TypeError("prequantized Kimi K3 activation scale must be uint8 R128c4")
         out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
@@ -2106,12 +2140,12 @@ class KimiLinearDecoderLayer(nn.Module):
 
         if self.is_kda:
             # Default on, but only when the checkpoint actually stores these
-            # projections as FP8_PB_WO (see the env definition). SM107 with
-            # CuTe DSL internal is required; the explicit-flag warning is
-            # emitted once by the model rather than once per layer.
+            # projections as FP8_PB_WO (see the env definition). Datacenter
+            # Blackwell is required; the explicit-flag warning is emitted once
+            # by the model rather than once per layer.
             fp8_resident = (
                 os.environ.get(_KIMI_K3_FP8_ATTN_RESIDENT_ENV, "1") != "0"
-                and _rubin_mxfp8_is_available()
+                and _fp8_weight_read_is_available()
                 and _k3_attn_stored_fp8_block_scaled(model_config, layer_idx)
             )
             proj_factory = None
@@ -2338,11 +2372,15 @@ class KimiLinearModel(DecoderModel):
         # only worth a warning when it was asked for explicitly. Emitted here,
         # once, rather than per layer.
         _resident_env = os.environ.get(_KIMI_K3_FP8_ATTN_RESIDENT_ENV)
-        if _resident_env is not None and _resident_env != "0" and not _rubin_mxfp8_is_available():
+        if (
+            _resident_env is not None
+            and _resident_env != "0"
+            and not _fp8_weight_read_is_available()
+        ):
             logger.warning(
                 f"Kimi K3: {_KIMI_K3_FP8_ATTN_RESIDENT_ENV} is set but the FP8 "
-                "block-scale attention read requires SM107 with CuTe DSL "
-                "internal; keeping attention BF16."
+                "block-scale attention read requires datacenter Blackwell; "
+                "keeping attention BF16."
             )
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
@@ -2924,7 +2962,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         )
         # Read here rather than at the conversion site because load_param runs
         # first. See _K3_CKPT_FP8_ATTR for why the pairs are load-bearing.
-        stash_ckpt_fp8 = _rubin_mxfp8_is_available()
+        stash_ckpt_fp8 = _fp8_weight_read_is_available()
 
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
@@ -3395,17 +3433,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
         # Online FP8 block-scale cast for the replicated MoE-layer MLPs —
         # default on, off with KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0 (see the env
-        # definition near the top of this file). Requires the Rubin CuTe DSL
-        # MXFP8 kernel.
+        # definition near the top of this file). Requires datacenter Blackwell.
         if os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "1") == "0":
             logger.info(
                 f"Kimi K3: {_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV}=0 — keeping the "
                 f"MoE-layer MLP projections in BF16"
             )
-        elif not _rubin_mxfp8_is_available():
+        elif not _fp8_weight_read_is_available():
             logger.info(
-                "Kimi K3: the MoE-layer MLP FP8 block-scale read requires SM107 "
-                "with CuTe DSL internal; keeping them BF16"
+                "Kimi K3: the MoE-layer MLP FP8 block-scale read requires "
+                "datacenter Blackwell; keeping them BF16"
             )
         else:
             n_fp8 = _convert_moe_mlps_to_fp8_weight_read(
@@ -3419,7 +3456,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "
                 f"(shared-expert + latent) at FP8 block-scale"
             )
-        if _rubin_mxfp8_is_available():
+        if _fp8_weight_read_is_available():
             # The MLA q_a/q_b/o and output-gate projections are the remaining
             # replicated attention weight read. Unlike KDA these have no
             # FP8-resident path, so without this conversion they stay BF16 --
