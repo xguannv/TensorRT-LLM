@@ -139,9 +139,15 @@ class CutlassFusedMoE(MoEImplBase):
             "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103, 120, 121}
+        # NVFP4: SM in {100, 103, 107, 120, 121}
+        # SM107 (Rubin) runs the same grouped GEMMs as the rest of the SM100
+        # family: ``cutlass_kernels/CMakeLists.txt`` gives 107 both
+        # COMPILE_BLACKWELL_TMA_GEMMS and COMPILE_BLACKWELL_TMA_GROUPED_GEMMS,
+        # so the kernels this table gates on are built for it. The entry was
+        # missing rather than deliberately withheld -- 107 was simply never
+        # added when the family grew.
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103, 120, 121}),
+            "sm_constraint": ("in", {100, 103, 107, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation

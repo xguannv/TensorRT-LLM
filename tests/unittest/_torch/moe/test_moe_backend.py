@@ -2537,6 +2537,53 @@ def test_nvfp4_fc1_row_alignment_gate(
         assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
 
 
+def _nvfp4_deployment_at_sm(sm: int) -> MoEDeployment:
+    return MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=sm),
+    )
+
+
+@pytest.mark.parametrize(
+    "sm,admitted",
+    [
+        (100, True),
+        (103, True),
+        # SM107 (Rubin) is in the SM100 family and gets the same grouped-GEMM
+        # kernels: cutlass_kernels/CMakeLists.txt hands 100/103/107 both
+        # COMPILE_BLACKWELL_TMA_GEMMS and COMPILE_BLACKWELL_TMA_GROUPED_GEMMS.
+        # The table said {100, 103, 120, 121}, so an NVFP4 MoE layer on Rubin
+        # was turned down for a capability the build actually ships.
+        (107, True),
+        (120, True),
+        (121, True),
+        # Not in the family: these must still be refused, otherwise the entry
+        # stops being a constraint at all.
+        (90, False),
+        (89, False),
+    ],
+    ids=["sm100", "sm103", "sm107_rubin", "sm120", "sm121", "sm90", "sm89"],
+)
+def test_cutlass_nvfp4_admits_the_whole_sm100_family(sm, admitted):
+    """The NVFP4 SM set must track the archs the kernels are compiled for.
+
+    Asserted per-arch rather than by comparing against a copy of the set: a
+    second copy is the failure mode this is guarding against, not a test.
+    """
+    verdict = CutlassFusedMoE.can_implement(
+        _nvfp4_problem(2048, "Swiglu"), _nvfp4_deployment_at_sm(sm)
+    )
+    if admitted:
+        assert verdict.reject_reason is not MoERejectReason.SM_UNSUPPORTED, verdict.detail
+    else:
+        assert not verdict.eligible
+        assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
+
+
 def test_unresolvable_layer_error_carries_rejection_details():
     """describe() prints reason codes only, so impl_class_for has to add the
     details -- without them a shape rejection reaches the operator as a bare
