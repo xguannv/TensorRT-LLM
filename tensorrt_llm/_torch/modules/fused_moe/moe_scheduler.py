@@ -1024,9 +1024,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 )
             ep_rank = moe.mapping.moe_ep_rank
         else:
-            real_local = (
-                int(all_rank_num_tokens[0]) if all_rank_num_tokens else int(x.shape[0])
-            )
+            real_local = int(all_rank_num_tokens[0]) if all_rank_num_tokens else int(x.shape[0])
             real_all_rank_num_tokens = [real_local]
             ep_rank = 0
         real_local = real_all_rank_num_tokens[ep_rank]
@@ -1198,8 +1196,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
         # ----- routing -----
-        # int32 matches the EPLB stats kernel contract used by the external-comm
-        # path; the fused-comm backend casts to int64 internally.
+        # int32 matches the EPLB stats kernel contract; fused-comm backends
+        # normalize it to their kernel ABI internally when needed.
         if num_tokens > 0:
             token_selected_experts, token_final_scales = moe.routing_method.apply(
                 router_logits_chunk_real, input_ids_chunk_real
