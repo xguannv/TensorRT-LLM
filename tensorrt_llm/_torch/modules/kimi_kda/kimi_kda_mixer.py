@@ -129,9 +129,11 @@ class KimiKDALinearAttention(nn.Module):
         self.num_k_heads = self.num_heads
         projection_size = self.num_heads * self.head_dim
         self.proj_size = projection_size
-        self._fp8_resident_projections = fp8_resident_projections and self._kda_tp_size == 1
-        if not self._fp8_resident_projections:
-            proj_factory = None
+        # True when Q/K/V/G/O retain the checkpoint's FP8_PB_WO weights and
+        # 128x128 block scales at runtime. ``proj_factory`` creates empty FP8
+        # placeholders, which the loader fills directly without BF16 storage.
+        # Under TP, it shards Q/K/V/G rows and O columns with their scales.
+        self._fp8_resident_projections = fp8_resident_projections
         projection_factory = proj_factory or (
             lambda in_features, out_features: nn.Linear(in_features, out_features, bias=False)
         )

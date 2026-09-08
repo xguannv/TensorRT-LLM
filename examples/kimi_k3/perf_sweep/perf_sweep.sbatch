@@ -55,11 +55,11 @@ done
 
 # Per-mode batch shape and the tuned env. MAX_BATCH_SIZE is PER-RANK for
 # dep16 (attention DP), GLOBAL for the TEP modes.
-# The FP8 read of the replicated MoE-layer MLPs is on by default now
-# (KIMI_K3_FP8_WEIGHT_READ_MOE_MLP), and so is FP8-resident attention on a
-# checkpoint that stores it (KIMI_K3_FP8_ATTN_RESIDENT), so no mode has to opt
-# in. The per-slice overrides these recipes were tuned with (KDA, GATE_UP) no
-# longer exist; see the tep16 note below for what they used to buy.
+# The FP8 read of the replicated MoE-layer MLPs is on by default
+# (KIMI_K3_FP8_WEIGHT_READ_MOE_MLP). KDA attention follows the checkpoint
+# datatype directly, so no mode has to opt in. The per-slice overrides these
+# recipes were tuned with (KDA, GATE_UP) no longer exist; see the tep16 note
+# below for what they used to buy.
 #   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; the in-cubin
 #       top-k tier register-spills at decode batch 5-64 (33 us/layer).
 case "$MODE" in

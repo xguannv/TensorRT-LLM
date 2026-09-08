@@ -37,9 +37,9 @@
 # domain: pin them with sbatch -w to a single nvl72dNNN rack or the rendezvous
 # fails with "invalid resource handle".
 #
-# Requires the construction-time FP8 KDA path (KIMI_K3_FP8_ATTN_RESIDENT, on
-# by default); with KIMI_K3_FP8_ATTN_RESIDENT=0 DEP8 OOMs before reading a
-# single weight.
+# Requires the construction-time FP8 KDA path selected from the checkpoint's
+# FP8 datatype; allocating those weights as BF16 would OOM DEP8 before reading
+# a single weight.
 tensor_parallel_size: 8
 enable_attention_dp: true
 moe_expert_parallel_size: 8
