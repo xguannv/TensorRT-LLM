@@ -497,6 +497,43 @@ def _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank: int) -> bool:
     return bucket is not None and bucket in _SM107_IN_KERNEL_FC2_REDUCE_BUCKETS
 
 
+def _megamoe_problem_key(
+    *,
+    sm_version: int,
+    world_size: int,
+    num_topk: int,
+    num_experts_per_rank: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    expand_intermediate_size_per_partition: int,
+    max_tokens_per_rank: int,
+    output_dtype: torch.dtype,
+    apply_topk_in_fc1: bool,
+    gate_up_clamp: Optional[float],
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+    in_kernel_fc2_reduce: bool,
+    combine_format: str,
+) -> Tuple:
+    return (
+        int(sm_version),
+        int(world_size),
+        int(num_topk),
+        int(num_experts_per_rank),
+        int(hidden_size),
+        int(intermediate_size_per_partition),
+        int(expand_intermediate_size_per_partition),
+        int(max_tokens_per_rank),
+        str(output_dtype),
+        bool(apply_topk_in_fc1),
+        None if gate_up_clamp is None else float(gate_up_clamp),
+        None if situ_beta is None else float(situ_beta),
+        None if situ_linear_beta is None else float(situ_linear_beta),
+        bool(in_kernel_fc2_reduce),
+        str(combine_format),
+    )
+
+
 def _default_megamoe_tactic_for_problem(
     *,
     sm_version: int,
@@ -518,6 +555,47 @@ def _default_megamoe_tactic_for_problem(
     if shape_tuned_tactic is not None:
         return shape_tuned_tactic
     return default_megamoe_tactic(num_tokens)
+
+
+def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> Tuple:
+    return _default_megamoe_tactic_for_problem(
+        sm_version=problem_key[0],
+        max_tokens_per_rank=problem_key[7],
+        num_tokens=num_tokens,
+        in_kernel_fc2_reduce=problem_key[13],
+        combine_format=problem_key[14],
+        shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
+    )
+
+
+def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
+    """Return the heuristic tactic followed by shape-safe fallbacks."""
+    candidates = [tactic]
+    schedule_policy = _unpack_tactic(tactic)[3]
+    if schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None:
+        auto_hint_tactic = list(tactic)
+        auto_hint_tactic[3] = ("phase_interleave", None)
+        candidates.append(tuple(auto_hint_tactic))
+    if _MEGAMOE_NONBULK_STANDALONE_TACTIC not in candidates:
+        candidates.append(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    return tuple(candidates)
+
+
+def _resolve_megamoe_kernel_tactic(
+    tactic: Tuple, *, allow_fallback: bool, build: Any
+) -> Tuple[Any, Tuple]:
+    """Build ``tactic``, retrying safe defaults only for heuristic selection."""
+    candidates = _megamoe_default_tactic_candidates(tactic) if allow_fallback else (tactic,)
+    last_error = None
+    for candidate in candidates:
+        try:
+            return build(candidate), candidate
+        except ValueError as exc:
+            last_error = exc
+            logger.debug(f"[MegaMoE] rejected tactic {candidate!r}: {type(exc).__name__}: {exc}")
+    if last_error is None:
+        raise RuntimeError("MegaMoE default tactic resolution had no candidates")
+    raise last_error
 
 
 # group_hint saturates ~512; omission (-> ~74) is worst.
@@ -1614,85 +1692,111 @@ if IS_MEGAMOE_OP_AVAILABLE:
         """Probe workspace size and direct-input support of the default kernel."""
 
         sm_version = get_sm_version()
-        if tactic is None:
-            tactic = _default_megamoe_tactic_for_problem(
+        use_default_tactic = tactic is None
+        if use_default_tactic:
+            problem_key = _megamoe_problem_key(
                 sm_version=sm_version,
+                world_size=world_size,
+                num_topk=num_topk,
+                num_experts_per_rank=num_experts_per_rank,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                expand_intermediate_size_per_partition=expand_intermediate_size_per_partition,
                 max_tokens_per_rank=max_tokens_per_rank,
-                num_tokens=max_tokens_per_rank,
+                output_dtype=torch.bfloat16,
+                apply_topk_in_fc1=apply_topk_in_fc1,
+                gate_up_clamp=gate_up_clamp,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
                 in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 combine_format=combine_format,
             )
-        validate_megamoe_tactic(tactic, sm_version=sm_version)
-        (
-            mma_tiler,
-            cluster_shape,
-            fallback_cluster_shape,
-            schedule_policy,
-            work_id_mode,
-            token_back_mode,
-            use_bulk_fc2_store,
-            fc2_tma_stages,
-            flag_batch,
-            epi_flag_batch,
-        ) = _unpack_tactic(tactic)
-        mma_tiler = tuple(mma_tiler)
-        (
-            launch_cluster_count,
-            preferred_cluster_count,
-            fallback_cluster_count,
-            _,
-        ) = _launch_cluster_configuration(
-            cluster_shape,
-            fallback_cluster_shape,
-            sm_version,
-        )
-        schedule_hint = schedule_policy[1]
-        common = dict(
-            mma_tiler_mnk=mma_tiler,
-            cluster_shape_mnk=tuple(cluster_shape),
-            use_2cta_instrs=bool(mma_tiler[0] == 256),
-            group_hint=512 if schedule_hint is None else int(schedule_hint),
-            token_padding_block=64,
-            sf_padding_block=_SF_PADDING_BLOCK,
-            load_balance_mode=("atomic_counter" if work_id_mode == "atomic_counter" else "static"),
-            fallback_cluster_shape_mn=(
-                None if fallback_cluster_shape is None else tuple(fallback_cluster_shape[:2])
-            ),
-            schedule_policy=tuple(schedule_policy),
-            work_id_mode=str(work_id_mode),
-            launch_cluster_count=launch_cluster_count,
-            preferred_cluster_count=preferred_cluster_count,
-            fallback_cluster_count=fallback_cluster_count,
-            fc2_tma_stages=fc2_tma_stages,
-            static_expert_shape=(
-                num_experts_per_rank,
-                expand_intermediate_size_per_partition,
-                hidden_size,
-            ),
-            world_size=int(world_size),
-            num_topk=int(num_topk),
-            max_tokens_per_rank=int(max_tokens_per_rank),
-            hidden=int(hidden_size),
-            fc2_output_dtype=cutlass.BFloat16,
-            in_kernel_fc2_reduce=bool(in_kernel_fc2_reduce),
-            token_back_mode=str(token_back_mode),
-            non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
-            flag_batch=int(flag_batch),
-            epi_flag_batch=tuple(epi_flag_batch),
-            apply_topk_in_fc1=bool(apply_topk_in_fc1),
-            gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
-            situ_beta=(None if situ_beta is None else float(situ_beta)),
-            situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
-            **_LOCKED_KERNEL_KWARGS,
+            tactic = _default_megamoe_tactic_for_key(
+                problem_key,
+                num_tokens=max_tokens_per_rank,
+            )
+
+        def build(candidate: Tuple):
+            validate_megamoe_tactic(candidate, sm_version=sm_version)
+            (
+                mma_tiler,
+                cluster_shape,
+                fallback_cluster_shape,
+                schedule_policy,
+                work_id_mode,
+                token_back_mode,
+                use_bulk_fc2_store,
+                fc2_tma_stages,
+                flag_batch,
+                epi_flag_batch,
+            ) = _unpack_tactic(candidate)
+            mma_tiler = tuple(mma_tiler)
+            (
+                launch_cluster_count,
+                preferred_cluster_count,
+                fallback_cluster_count,
+                _,
+            ) = _launch_cluster_configuration(
+                cluster_shape,
+                fallback_cluster_shape,
+                sm_version,
+            )
+            schedule_hint = schedule_policy[1]
+            common = dict(
+                mma_tiler_mnk=mma_tiler,
+                cluster_shape_mnk=tuple(cluster_shape),
+                use_2cta_instrs=bool(mma_tiler[0] == 256),
+                group_hint=512 if schedule_hint is None else int(schedule_hint),
+                token_padding_block=64,
+                sf_padding_block=_SF_PADDING_BLOCK,
+                load_balance_mode=(
+                    "atomic_counter" if work_id_mode == "atomic_counter" else "static"
+                ),
+                fallback_cluster_shape_mn=(
+                    None if fallback_cluster_shape is None else tuple(fallback_cluster_shape[:2])
+                ),
+                schedule_policy=tuple(schedule_policy),
+                work_id_mode=str(work_id_mode),
+                launch_cluster_count=launch_cluster_count,
+                preferred_cluster_count=preferred_cluster_count,
+                fallback_cluster_count=fallback_cluster_count,
+                fc2_tma_stages=fc2_tma_stages,
+                static_expert_shape=(
+                    num_experts_per_rank,
+                    expand_intermediate_size_per_partition,
+                    hidden_size,
+                ),
+                world_size=int(world_size),
+                num_topk=int(num_topk),
+                max_tokens_per_rank=int(max_tokens_per_rank),
+                hidden=int(hidden_size),
+                fc2_output_dtype=cutlass.BFloat16,
+                in_kernel_fc2_reduce=bool(in_kernel_fc2_reduce),
+                token_back_mode=str(token_back_mode),
+                non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
+                flag_batch=int(flag_batch),
+                epi_flag_batch=tuple(epi_flag_batch),
+                apply_topk_in_fc1=bool(apply_topk_in_fc1),
+                gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
+                situ_beta=(None if situ_beta is None else float(situ_beta)),
+                situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
+                **_LOCKED_KERNEL_KWARGS,
+            )
+            probe, _ = _construct_megamoe_kernel(
+                sm_version=sm_version,
+                common=common,
+                combine_format=combine_format,
+            )
+            return probe
+
+        probe, _ = _resolve_megamoe_kernel_tactic(
+            tactic,
+            allow_fallback=use_default_tactic,
+            build=build,
         )
         # The probe MUST build the SAME kernel that runs (same combine_format):
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
-        probe, _ = _construct_megamoe_kernel(
-            sm_version=sm_version,
-            common=common,
-            combine_format=combine_format,
-        )
         _, shared_bytes = probe.get_workspace_sizes()
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
 
@@ -1796,22 +1900,24 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # SAME tactic and MERGE merges timings by cache key across ranks,
             # so the key MUST be rank-identical. world_size stays so
             # single-rank and multi-rank never share entries.
-            return (
-                self.sm_version,
-                self.world_size,
-                self.num_topk,
-                self.num_experts_per_rank,
-                self.hidden_size,
-                self.intermediate_size_per_partition,
-                self.expand_intermediate_size_per_partition,
-                self.max_tokens_per_rank,
-                str(self.output_dtype),
-                self.apply_topk_in_fc1,
-                self.gate_up_clamp,
-                self.situ_beta,
-                self.situ_linear_beta,
-                self.in_kernel_fc2_reduce,
-                self.combine_format,
+            return _megamoe_problem_key(
+                sm_version=self.sm_version,
+                world_size=self.world_size,
+                num_topk=self.num_topk,
+                num_experts_per_rank=self.num_experts_per_rank,
+                hidden_size=self.hidden_size,
+                intermediate_size_per_partition=self.intermediate_size_per_partition,
+                expand_intermediate_size_per_partition=(
+                    self.expand_intermediate_size_per_partition
+                ),
+                max_tokens_per_rank=self.max_tokens_per_rank,
+                output_dtype=self.output_dtype,
+                apply_topk_in_fc1=self.apply_topk_in_fc1,
+                gate_up_clamp=self.gate_up_clamp,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+                in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
+                combine_format=self.combine_format,
             )
 
         def get_valid_tactics(
@@ -1983,7 +2089,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             return config
 
-        def _build_kernel(self, tactic: Tuple):
+        def _build_kernel_once(self, tactic: Tuple):
+            validate_megamoe_tactic(tactic, sm_version=self.sm_version)
             (
                 mma_tiler,
                 cluster_shape,
@@ -2109,22 +2216,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
             **kwargs,
         ) -> None:
             del kwargs
-            if tactic == -1 or tactic is None:
+            use_default_tactic = tactic == -1 or tactic is None
+            if use_default_tactic:
                 num_tokens = int(inputs[0].shape[0])
-                tactic_t = _default_megamoe_tactic_for_problem(
-                    sm_version=self.sm_version,
-                    max_tokens_per_rank=self.max_tokens_per_rank,
+                tactic_t = _default_megamoe_tactic_for_key(
+                    self.unique_id(),
                     num_tokens=num_tokens,
-                    in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
-                    combine_format=self.combine_format,
-                    shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id()),
                 )
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:
                 tactic_t = tactic
-            validate_megamoe_tactic(tactic_t, sm_version=self.sm_version)
-
             (
                 activation,
                 activation_sf,
@@ -2155,7 +2257,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 f"peer_offsets length {len(peer_offsets)} != world_size {self.world_size}"
             )
 
-            kernel = self._build_kernel(tactic_t)
+            kernel, tactic_t = _resolve_megamoe_kernel_tactic(
+                tactic_t,
+                allow_fallback=use_default_tactic,
+                build=self._build_kernel_once,
+            )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
             # so its live rows MUST start at 0; the CALLER zeros [:num_tokens]
