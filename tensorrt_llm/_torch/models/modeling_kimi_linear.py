@@ -600,6 +600,10 @@ def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
     return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
 
 
+# Token limit of trtllm::attn_res_fwd (cpp/tensorrt_llm/thop/attnResOp.cpp).
+_ATTN_RES_OP_MAX_TOKENS = 16384
+
+
 def _apply_attn_res_fused(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
 ) -> Optional[torch.Tensor]:
@@ -619,22 +623,36 @@ def _apply_attn_res_fused(
         return None
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
-    if K + 1 > 12 or M > 16384 or not (4096 <= H <= 8192 and H % 1024 == 0):
+    if K + 1 > 12 or not (4096 <= H <= 8192 and H % 1024 == 0):
         return None
     try:
         attn_res_op = torch.ops.trtllm.attn_res_fwd
     except (AttributeError, RuntimeError):
         return None
-    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
-    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output, _rsigma, _probs, _logits = attn_res_op(
-        layer_kernel,
-        block_kernel,
-        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
-        norm.weight.to(torch.bfloat16).contiguous(),
-        float(norm.eps),
-    )
-    return output.reshape(M, H)
+    proj_w = proj.weight.reshape(-1).to(torch.bfloat16).contiguous()
+    norm_w = norm.weight.to(torch.bfloat16).contiguous()
+
+    def run(prefix, block):
+        t = prefix.shape[0]
+        output, _rsigma, _probs, _logits = attn_res_op(
+            prefix.reshape(t, 1, H).contiguous(),
+            block.reshape(K, t, 1, H).contiguous(),
+            proj_w,
+            norm_w,
+            float(norm.eps),
+        )
+        return output.reshape(t, H)
+
+    if M <= _ATTN_RES_OP_MAX_TOKENS:
+        return run(prefix_sum, block_residual)
+    # The op takes at most _ATTN_RES_OP_MAX_TOKENS tokens per call and is
+    # per-token, so longer prefill chunks run in slices; the fp32 reference
+    # below would otherwise cost seconds per iteration at 24k+ tokens.
+    out = torch.empty_like(prefix_sum)
+    for lo in range(0, M, _ATTN_RES_OP_MAX_TOKENS):
+        hi = min(M, lo + _ATTN_RES_OP_MAX_TOKENS)
+        out[lo:hi] = run(prefix_sum[lo:hi], block_residual[:, lo:hi])
+    return out
 
 
 def _rms_norm_eps(norm: nn.Module) -> float:
@@ -831,6 +849,15 @@ def _apply_attn_res(
         fused = _apply_attn_res_fused(prefix_sum, block_residual, proj, norm)
         if fused is not None:
             return fused
+        # The fp32 reference below is orders of magnitude slower at prefill
+        # sizes; say so once per shape rather than fall back silently.
+        _note_attn_res_fusion(
+            "attn_res",
+            False,
+            prefix_sum.shape[0],
+            prefix_sum.shape[1],
+            int(block_residual.shape[0]) + 1,
+        )
     block_residual_hf = block_residual.transpose(0, 1)
     v = torch.cat((block_residual_hf, prefix_sum.unsqueeze(1)), dim=1)
     v_float = v.float()
