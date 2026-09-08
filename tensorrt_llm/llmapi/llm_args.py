@@ -3880,6 +3880,18 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=True,
+        description=
+        "Snapshot the Mamba recurrent state where a request's content "
+        "diverges from the prefix cache, so that later requests sharing the "
+        "same prefix can reuse up to the fork instead of being truncated to "
+        "an earlier snapshot. If no periodic or additional snapshot point "
+        "applies to the prompt, the prompt end is snapshotted as a fallback. "
+        "Requires KV cache manager V2.")
+
 
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
@@ -4279,6 +4291,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.mamba_state_config additional snapshot "
                 "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        if (state_config.enable_branch_snapshot
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config.enable_branch_snapshot "
+                "requires kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')
