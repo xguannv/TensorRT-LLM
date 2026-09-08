@@ -189,29 +189,6 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # stream and FP8 quantize+GEMM would serialize onto the critical path.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 
-# FP8-RESIDENT attention (Phase 3a) — default ON, set
-# KIMI_K3_FP8_ATTN_RESIDENT=0 to keep the KDA projections BF16.
-#
-# Builds the KDA q/k/v/g/o projections as empty FP8 placeholders at
-# CONSTRUCTION time, so their BF16 storage never exists, and lets the loader
-# fill them from the checkpoint's own FP8 + 128x128 block scale. Nothing is
-# re-quantized on this path: the checkpoint's bytes are carried through
-# untouched.
-#
-# Only the construction-time form can fix DEP8, whose OOM happened during
-# module construction with 274 of 276 GiB gone to parameters before a single
-# weight had been read (no "Lazily opened" line in the log). Anything that
-# allocates BF16 and converts afterwards is too late, however cheap its steady
-# state.
-#
-# Gated on the checkpoint's stored format, not on the flag alone: attention must
-# be stored FP8_PB_WO and the rank must be datacenter Blackwell. Letting one
-# switch mean different things on different checkpoints is the
-# implicit-ambiguity class of bug that has cost this bring-up repeatedly. So on
-# ``moonshotai/Kimi-K3`` (BF16 attention) this is inert and attention stays
-# BF16 regardless of the flag — that checkpoint has no FP8 attention path.
-_KIMI_K3_FP8_ATTN_RESIDENT_ENV = "KIMI_K3_FP8_ATTN_RESIDENT"
-
 
 class KimiK3MoEGate(nn.Module):
     """Kimi K3 gate weights and routing method for ``ConfigurableMoE``."""
@@ -1336,11 +1313,12 @@ def _k3_kda_fp8_resident_jobs(model: nn.Module, prefix: str):
                 yield layer_idx, mixer, attr, key
 
 
-def _fill_kda_fp8_resident_projections(jobs, pair_of) -> int:
+def _fill_kda_fp8_resident_projections(jobs, weights) -> int:
     """Fill construction-time FP8 placeholders from the checkpoint's FP8 pairs.
 
-    ``jobs`` is the output of ``_k3_kda_fp8_resident_jobs``; ``pair_of(key)``
-    returns that checkpoint key's ``(fp8_weight, fp32_block_scale)``.
+    Under KDA TP, q/k/v/g weights are row-sharded and o is column-sharded.
+    Their 128x128 block scales follow the same split in scale coordinates,
+    matching MLA's ``Linear.load_shard(..., scale_span=128)`` policy.
 
     Produces one fused ``qkvg_proj`` that is the sole storage, with q/k/v/g
     rebuilt as views of their slice, **without ever materializing BF16**:
@@ -1360,7 +1338,7 @@ def _fill_kda_fp8_resident_projections(jobs, pair_of) -> int:
         # on its own.
         group = [a for a in ("q_proj", "k_proj", "v_proj", "g_proj") if a in attrs]
         if group:
-            pairs = [pair_of(attrs[a]) for a in group]
+            pairs = [_k3_kda_checkpoint_fp8_pair(mixer, a, attrs[a], weights) for a in group]
             fused = _Fp8BlockScaleWeightReadLinear.fuse_checkpoint_fp8(pairs)
             mixer.qkvg_proj = fused
             mixer.qkvg_split_sizes = [getattr(mixer, a).out_features for a in group]
@@ -1380,7 +1358,7 @@ def _fill_kda_fp8_resident_projections(jobs, pair_of) -> int:
                 filled += 1
 
         if "o_proj" in attrs:
-            w_fp8, w_scale = pair_of(attrs["o_proj"])
+            w_fp8, w_scale = _k3_kda_checkpoint_fp8_pair(mixer, "o_proj", attrs["o_proj"], weights)
             getattr(mixer, "o_proj").load_checkpoint_pair([(w_fp8, w_scale)])
             filled += 1
 
@@ -1465,17 +1443,13 @@ _K3_KDA_FP8_RESIDENT_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "g_proj", "o_p
 def _k3_attn_stored_fp8_block_scaled(model_config: "ModelConfig", layer_idx: int) -> bool:
     """Does the checkpoint store this layer's KDA projections as FP8_PB_WO?
 
-    Dispatch for FP8-resident attention keys on the checkpoint's stored format
-    rather than on the runtime flag alone, so one switch cannot mean different
-    things on different checkpoints. ``moonshotai/Kimi-K3`` stores attention as
-    plain BF16 and declares no per-layer attention entry at all, so it answers
-    False here and keeps today's behavior.
+    FP8 residency follows the checkpoint's stored format. ``moonshotai/Kimi-K3``
+    stores attention as plain BF16 and declares no per-layer attention entry,
+    so it answers False and keeps the BF16 path.
 
     Requires ALL five projections to be declared. A partial declaration is
-    treated as "not eligible" rather than converting the subset: a half-FP8
-    layer would still allocate BF16 for the rest and so would not buy the
-    construction-time headroom this exists for, while making the failure
-    harder to see.
+    rejected rather than silently dequantized: the runtime cannot preserve a
+    partially FP8 layer without allocating BF16 for the undeclared projections.
 
     ⚠️ Matches ``FP8_BLOCK_SCALES``, **not** the ``FP8_PB_WO`` spelling the
     checkpoint uses. ``canonicalize_quant_algo`` (Blocker #0) rewrites the
@@ -1496,15 +1470,11 @@ def _k3_attn_stored_fp8_block_scaled(model_config: "ModelConfig", layer_idx: int
         if n_declared == len(algos):
             return True
         if n_declared:
-            logger.warning(
-                "Kimi K3 layer %d: only %d of %d KDA projections are declared "
-                "FP8 block-scaled under prefix %r; not building them FP8-resident.",
-                layer_idx,
-                n_declared,
-                len(algos),
-                prefix,
+            raise ValueError(
+                f"Kimi K3 layer {layer_idx}: only {n_declared} of {len(algos)} "
+                f"KDA projections are declared FP8 block-scaled under prefix "
+                f"{prefix!r}; partial FP8 residency is unsupported."
             )
-            return False
     return False
 
 
@@ -2139,15 +2109,16 @@ class KimiLinearDecoderLayer(nn.Module):
             raise ValueError(f"Kimi K3 layer {layer_idx} must be exactly one of KDA/MLA")
 
         if self.is_kda:
-            # Default on, but only when the checkpoint actually stores these
-            # projections as FP8_PB_WO (see the env definition). Datacenter
-            # Blackwell is required; the explicit-flag warning is emitted once
-            # by the model rather than once per layer.
-            fp8_resident = (
-                os.environ.get(_KIMI_K3_FP8_ATTN_RESIDENT_ENV, "1") != "0"
-                and _fp8_weight_read_is_available()
-                and _k3_attn_stored_fp8_block_scaled(model_config, layer_idx)
-            )
+            # Preserve the checkpoint's KDA projection datatype. FP8_PB_WO
+            # weights use FP8 placeholders so no BF16 storage or
+            # dequantize/re-quantize round trip exists.
+            fp8_resident = _k3_attn_stored_fp8_block_scaled(model_config, layer_idx)
+            if fp8_resident and not _fp8_weight_read_is_available():
+                raise NotImplementedError(
+                    "Kimi K3 FP8-resident KDA projections require datacenter "
+                    "Blackwell; refusing to dequantize checkpoint FP8 weights "
+                    "to BF16."
+                )
             proj_factory = None
             if fp8_resident:
 
@@ -2368,21 +2339,6 @@ class KimiLinearModel(DecoderModel):
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
-        # FP8-resident attention is on by default, so an unmet requirement is
-        # only worth a warning when it was asked for explicitly. Emitted here,
-        # once, rather than per layer.
-        _resident_env = os.environ.get(_KIMI_K3_FP8_ATTN_RESIDENT_ENV)
-        if (
-            _resident_env is not None
-            and _resident_env != "0"
-            and not _fp8_weight_read_is_available()
-        ):
-            logger.warning(
-                f"Kimi K3: {_KIMI_K3_FP8_ATTN_RESIDENT_ENV} is set but the FP8 "
-                "block-scale attention read requires datacenter Blackwell; "
-                "keeping attention BF16."
-            )
-
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
@@ -2518,13 +2474,44 @@ def _fp8_block_scale_key(weight_key: str) -> str:
     return weight_key + _FP8_BLOCK_SCALE_SUFFIX
 
 
-def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights):
+def _value_shape(value) -> Tuple[int, ...]:
+    """Return a tensor or lazy safetensors slice shape without materializing it."""
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape)
+    get_shape = getattr(value, "get_shape", None)
+    if get_shape is None:
+        raise ValueError(f"unsupported weight type: {type(value)}")
+    return tuple(get_shape())
+
+
+def _materialize(value, indices=None) -> torch.Tensor:
+    """Materialize all or part of a tensor or lazy safetensors slice."""
+    if indices is not None:
+        return value[indices]
+    if isinstance(value, torch.Tensor):
+        return value
+    # ``[:]`` is invalid for the scalar NVFP4 weight_scale_2/input_scale
+    # entries. This matches ``_ReopenSafeTensorSlice._tensor``.
+    if len(_value_shape(value)) == 0:
+        return value[()]
+    return value[:]
+
+
+def _checkpoint_fp8_pair(
+    ckpt_key: str,
+    src,
+    weights,
+    *,
+    weight_slice=None,
+    scale_slice=None,
+):
     """``(fp8 weight, fp32 128x128 block scale)`` if this tensor is FP8_PB_WO.
 
     ``None`` for an ordinary (BF16) checkpoint tensor. Raises when an FP8
     tensor has no companion scale rather than letting the caller fall through
     to a cast that would silently drop it.
     """
+    src = _materialize(src, weight_slice)
     if src.dtype != torch.float8_e4m3fn:
         return None
     scale_key = _fp8_block_scale_key(ckpt_key)
@@ -2540,7 +2527,77 @@ def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights):
     # the dequantization below and the CuTe scale preparation.
     if scale.dim() == 4:
         scale = scale.reshape(scale.shape[0], scale.shape[2])
+    if scale_slice is not None:
+        scale = scale[scale_slice]
     return src, scale
+
+
+def _k3_kda_checkpoint_fp8_pair(mixer, attr: str, ckpt_key: str, weights):
+    """Load this rank's KDA FP8 weight and matching block-scale shard."""
+    module = getattr(mixer, attr)
+    tp_size = mixer._kda_tp_size
+    tp_rank = mixer._kda_tp_rank
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"Kimi K3 KDA TP rank {tp_rank} is invalid for TP size {tp_size}.")
+
+    # Q/K/V/G produce head shards (column parallel); O consumes them (row
+    # parallel). Its block-scale grid uses the same split axis divided by 128.
+    split_dim = 1 if attr == "o_proj" else 0
+    local_shape = (module.out_features, module.in_features)
+    if any(dim % _FP8_BLOCK for dim in local_shape):
+        raise ValueError(
+            f"Kimi K3 {attr} rank-local FP8 shape {local_shape} is not "
+            f"{_FP8_BLOCK}x{_FP8_BLOCK} block-aligned."
+        )
+
+    full_shape = list(local_shape)
+    full_shape[split_dim] *= tp_size
+    stored_shape = _value_shape(weights[ckpt_key])
+    if stored_shape != tuple(full_shape):
+        raise ValueError(
+            f"Kimi K3 {ckpt_key} shape {stored_shape} does not match the "
+            f"expected TP{tp_size} shape {tuple(full_shape)} for local "
+            f"{attr} shape {local_shape}."
+        )
+
+    weight_slice = scale_slice = None
+    if tp_size > 1:
+        shard_width = local_shape[split_dim]
+        start = tp_rank * shard_width
+        end = start + shard_width
+        if start % _FP8_BLOCK or end % _FP8_BLOCK:
+            raise ValueError(
+                f"Kimi K3 {attr} TP shard [{start}:{end}] is not aligned to "
+                f"the FP8 block size {_FP8_BLOCK}."
+            )
+        weight_indices = [slice(dim) for dim in stored_shape]
+        weight_indices[split_dim] = slice(start, end)
+        weight_slice = tuple(weight_indices)
+        scale_indices = [slice(None), slice(None)]
+        scale_indices[split_dim] = slice(start // _FP8_BLOCK, end // _FP8_BLOCK)
+        scale_slice = tuple(scale_indices)
+
+    pair = _checkpoint_fp8_pair(
+        ckpt_key,
+        weights[ckpt_key],
+        weights,
+        weight_slice=weight_slice,
+        scale_slice=scale_slice,
+    )
+    if pair is None:
+        raise ValueError(
+            f"Kimi K3: {ckpt_key} was built FP8-resident but the checkpoint "
+            f"does not store it as FP8_PB_WO."
+        )
+    weight, scale = pair
+    expected_scale_shape = tuple(dim // _FP8_BLOCK for dim in local_shape)
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"Kimi K3 {_fp8_block_scale_key(ckpt_key)} shard shape "
+            f"{tuple(scale.shape)} does not match {attr} FP8 block grid "
+            f"{expected_scale_shape}."
+        )
+    return weight, scale
 
 
 def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> torch.Tensor:
@@ -2554,14 +2611,15 @@ def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> t
     the scale left behind as an unreferenced checkpoint key. The model then
     loads clean and generates nonsense.
 
-    Still needed with FP8-resident attention on by default, because that path
-    only takes over the KDA projections. MLA's ``q_a``/``q_b``/``o`` load as
-    BF16 parameters through this function -- the load-time conversion that
-    re-quantizes them runs afterwards and consumes ``linear.weight``, so they
-    have to be materialized first -- and ``kv_b_proj`` is consumed directly by
-    ``_kv_b_absorb_split`` (never through its ``forward``), so it has no FP8
-    path at all and stays BF16 for good. Dequantizing here keeps both on the
-    same BF16 tensors the MXFP4 checkpoint would have supplied.
+    Still needed when checkpoint metadata selects FP8-resident KDA, because
+    that path only takes over the KDA projections. MLA's
+    ``q_a``/``q_b``/``o`` load as BF16 parameters through this function -- the
+    load-time conversion that re-quantizes them runs afterwards and consumes
+    ``linear.weight``, so they have to be materialized first -- and
+    ``kv_b_proj`` is consumed directly by ``_kv_b_absorb_split`` (never through
+    its ``forward``), so it has no FP8 path at all and stays BF16 for good.
+    Dequantizing here keeps both on the same BF16 tensors the MXFP4 checkpoint
+    would have supplied.
     """
     pair = _checkpoint_fp8_pair(ckpt_key, src, weights)
     if pair is None:
@@ -2577,19 +2635,6 @@ def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> t
             f"{tuple(expanded.shape)} but {ckpt_key} is {tuple(out.shape)}."
         )
     return (out * expanded[: out.shape[0], : out.shape[1]]).to(torch.bfloat16)
-
-
-def _materialize(value) -> torch.Tensor:
-    """Materialize a (possibly lazy safetensors slice) weight value."""
-    if isinstance(value, torch.Tensor):
-        return value
-    # ``[:]`` is how a lazy slice is realized, but it is invalid on a 0-dim
-    # entry — and the NVFP4 checkpoint stores weight_scale_2 / input_scale as
-    # scalars. Same fix as ``_ReopenSafeTensorSlice._tensor``.
-    get_shape = getattr(value, "get_shape", None)
-    if get_shape is not None and len(get_shape()) == 0:
-        return value[()]
-    return value[:]
 
 
 @register_auto_model("KimiLinearForCausalLM")
@@ -3248,22 +3293,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # streaming, while their (small) source tensors are still cheap to
         # reach; their checkpoint keys were validated with the rest.
         if fp8_attn_jobs:
-
-            def _pair_of(ckpt_key: str):
-                pair = _checkpoint_fp8_pair(ckpt_key, _materialize(weights[ckpt_key]), weights)
-                if pair is None:
-                    # _checkpoint_fp8_pair returns None for a non-FP8 source.
-                    # Construction already decided this layer is FP8-resident
-                    # from the checkpoint's own quant config, so a BF16 tensor
-                    # here means the two disagree -- fail rather than fall back
-                    # to a path that cannot allocate the BF16 it would need.
-                    raise ValueError(
-                        f"Kimi K3: {ckpt_key} was built FP8-resident but the checkpoint "
-                        f"does not store it as FP8_PB_WO."
-                    )
-                return pair
-
-            n_resident = _fill_kda_fp8_resident_projections(fp8_attn_jobs, _pair_of)
+            n_resident = _fill_kda_fp8_resident_projections(fp8_attn_jobs, weights)
             logger.info(
                 f"Kimi K3: filled {n_resident} FP8-resident KDA projections "
                 f"from the checkpoint (no BF16 storage was allocated for them)"

@@ -5,10 +5,9 @@
 # DEP8 does not fit. The parameters alone exceed a 288 GB GB300 at EP8: the
 # per-rank footprint is NOT checkpoint_bytes / 8, because enable_attention_dp
 # replicates every non-routed weight on every rank. This estimate predates
-# FP8-resident attention (KIMI_K3_FP8_ATTN_RESIDENT, now on by default), which
-# keeps the checkpoint's FP8 KDA projections at FP8 on device instead of
-# expanding them to BF16. Halving the routed-expert share is what buys the
-# headroom back.
+# FP8-resident attention now follows the checkpoint datatype, keeping its FP8
+# KDA projections at FP8 on device instead of expanding them to BF16. Halving
+# the routed-expert share is what buys the headroom back.
 #
 # max_batch_size is 8, not the template's 32. The V2 Mamba cache reserves a
 # full recurrent-state slot per resident sequence (69 KDA layers, fp32 state,

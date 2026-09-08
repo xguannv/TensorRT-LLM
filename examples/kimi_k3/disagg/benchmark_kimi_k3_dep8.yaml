@@ -13,9 +13,9 @@
 # GSM8K 96.5125 / GPQA-D 92.4242 (jobs 484973 / 485168). The premise the README
 # ruled on has changed, so the question is re-opened rather than contradicted.
 #
-# Requires the construction-time FP8 KDA path (KIMI_K3_FP8_ATTN_RESIDENT, on by
-# default). Setting it to 0 allocates the BF16 weights at construction and DEP8
-# OOMs before reading a single weight.
+# Requires the construction-time FP8 KDA path selected from the checkpoint's
+# FP8 datatype. Allocating those weights as BF16 would OOM DEP8 before reading
+# a single weight.
 slurm:
   script_file: "disaggr_torch.slurm"
   partition: "batch"

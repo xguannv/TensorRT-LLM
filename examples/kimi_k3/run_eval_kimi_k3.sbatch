@@ -301,18 +301,11 @@ if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi
 
-# Forward the FP8 precision switches into the container, but ONLY the ones the
-# submitter actually set. Exporting an unset switch as an empty string is not
-# equivalent: the model reads them with os.environ.get(ENV, <default>) and
-# tests '!= "0"', so "" is truthy and would silently override the default.
-#
-# Both default ON, so the usual reason to set either is to turn it OFF for an
-# A/B. Listed by FULL name rather than built from a common prefix: they do not
-# share one, and a prefix loop would silently omit KIMI_K3_FP8_ATTN_RESIDENT --
-# which is the exact failure this forwarding exists to prevent.
+# Forward the K3 online FP8 MLP-cast switch only when the submitter set it.
+# Exporting an unset switch as an empty string would override its default-on
+# behavior.
 K3_FP8_SWITCHES="
 KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
-KIMI_K3_FP8_ATTN_RESIDENT
 "
 K3_SUBSWITCH_EXPORTS=""
 for _n in $K3_FP8_SWITCHES; do

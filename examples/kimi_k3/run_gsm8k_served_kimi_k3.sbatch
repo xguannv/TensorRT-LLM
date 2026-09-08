@@ -169,14 +169,10 @@ MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro,$WORK_DIR:$WORK_DIR:rw,$CACHE_DIR:$CACHE
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk 'NR == 1')
 
-# Forward only the K3 precision switches the submitter actually set. Exporting
-# an unset switch as "" is NOT equivalent: the model reads them with
-# os.environ.get(ENV, <default>) and tests '!= "0"', so "" is truthy and would
-# override the default. Both default ON, so the usual reason to set either is
-# to turn it OFF for an A/B. Same construction as run_gsm8k_kimi_k3.
+# Forward the K3 online FP8 MLP-cast switch only when the submitter set it.
+# Exporting an unset switch as "" would override its default-on behavior.
 K3_FP8_SWITCHES="
 KIMI_K3_FP8_WEIGHT_READ_MOE_MLP
-KIMI_K3_FP8_ATTN_RESIDENT
 "
 K3_SUBSWITCH_EXPORTS=""
 for _n in $K3_FP8_SWITCHES; do
