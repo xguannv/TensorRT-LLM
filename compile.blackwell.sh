@@ -13,7 +13,7 @@ MOUNT="/lustre:/lustre,${REPO_DIR}:/code/tensorrt_llm"
 WORKDIR="/code/tensorrt_llm"
 
 source "${REPO_DIR}/jenkins/current_image_tags.properties"
-IMAGE=${LLM_SBSA_DOCKER_IMAGE}
+IMAGE=${TRTLLM_TEST_IMAGE:-${LLM_SBSA_DOCKER_IMAGE}}
 
 HASH=$(git -C "${REPO_DIR}" rev-parse --short HEAD)
 BUILD_DIR="${REPO_DIR}/build_images/${HASH}-blackwell"
@@ -31,6 +31,6 @@ srun -A "${ACCOUNT}" -p "${PARTITION}" --job-name="${JOB_NAME}" --container-imag
     --container-workdir="${WORKDIR}" \
     --container-save="${BUILD_DIR}/trtllm.sqsh" \
     -N 1 --ntasks=1 --ntasks-per-node=1 -t 2:00:00 \
-    bash -c "python3 -m pip install --upgrade -r requirements-dev.txt && python scripts/build_wheel.py -G Ninja -a '103-real' ${CLEAN} && pip install build/tensorrt_llm-*.whl"
+    bash -c "python3 -m pip install --upgrade -r requirements-dev.txt && python3 -m pip install --no-deps --force-reinstall 'flashinfer-python==0.6.16' 'nvidia-cutlass-dsl[cu13]==4.7.1' && python scripts/build_wheel.py -G Ninja -a '103-real' ${CLEAN} && pip install build/tensorrt_llm-*.whl"
 
 cp "${REPO_DIR}"/build/tensorrt_llm-*.whl "${BUILD_DIR}/"
