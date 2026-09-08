@@ -45,7 +45,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
@@ -2105,9 +2105,6 @@ def _(
     return input.new_empty((M, N), dtype=output_dtype)
 
 
-# deep_gemm_gen_tuning_buckets is imported from ..utils
-
-
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
 
@@ -2178,7 +2175,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # every process startup.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
     )
 
@@ -2228,7 +2225,7 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
 
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
@@ -2371,12 +2368,17 @@ def _(
     return input.new_empty((input.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The runner is used to trigger deepgemm jit during autotune.
+# The runner is used to trigger deepgemm jit during autotune. Only Hopper has
+# work to do: on SM100 this GEMM dispatches to TrtllmGenGemmRunner's prebuilt
+# cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
+    # Without exclude_from_cache, a warm disk cache short-circuits tuning and
+    # the JIT warmup never runs.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         tune_max_num_tokens=4096,
+        exclude_from_cache=True,
     )
 
     def get_valid_tactics(
