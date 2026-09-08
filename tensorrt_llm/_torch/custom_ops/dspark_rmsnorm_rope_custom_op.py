@@ -68,6 +68,7 @@ def is_fused_dspark_rmsnorm_rope_supported(
     freqs: torch.Tensor,
     num_heads: int,
     rope_dim: int,
+    norm_dim: int | None = None,
 ) -> bool:
     """Return whether tensors satisfy the production fused-op contract."""
     if _get_dspark_arch_str() is None or not all(t.is_cuda for t in (x, weight, freqs)):
@@ -78,9 +79,14 @@ def is_fused_dspark_rmsnorm_rope_supported(
         return False
     if x.ndim < 2 or x.shape[-1] % 32 != 0:
         return False
-    if weight.shape != (x.shape[-1],):
-        return False
     if rope_dim < 0 or rope_dim > x.shape[-1] or rope_dim % 2 != 0:
+        return False
+    # norm_dim defaults to the whole row; the only other supported value is the
+    # nope prefix, where the weight spans just that prefix.
+    effective_norm_dim = x.shape[-1] if norm_dim is None else norm_dim
+    if effective_norm_dim not in (x.shape[-1], x.shape[-1] - rope_dim):
+        return False
+    if effective_norm_dim % 32 != 0 or weight.shape != (effective_norm_dim,):
         return False
     if (x.shape[-1] - rope_dim) % 32 != 0 or (rope_dim // 2) % 32 != 0:
         return False
@@ -171,6 +177,7 @@ def _compile_fused_dspark_rmsnorm_rope(
     apply_weight: bool,
     apply_rmsnorm: bool,
     inverse_rope: bool,
+    norm_dim: int,
 ):
     rows = cute.sym_int()
     freq_rows = cute.sym_int()
@@ -180,7 +187,7 @@ def _compile_fused_dspark_rmsnorm_rope(
         stride=(cute.sym_int64(), 1),
     )
     weight_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (hidden_dim,), stride_order=(0,)
+        cutlass.BFloat16, (norm_dim,), stride_order=(0,)
     )
     freqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
@@ -199,6 +206,7 @@ def _compile_fused_dspark_rmsnorm_rope(
         apply_weight,
         apply_rmsnorm,
         inverse_rope,
+        norm_dim=norm_dim,
     )
     return cute.compile(
         kernel,
@@ -528,9 +536,10 @@ def cute_dsl_dspark_rmsnorm_rope(
     apply_weight: bool,
     apply_rmsnorm: bool,
     inverse_rope: bool,
+    norm_dim: int | None = None,
 ) -> torch.Tensor:
     """Apply fused RMSNorm and adjacent-pair RoPE to regular BF16 rows."""
-    if not is_fused_dspark_rmsnorm_rope_supported(x, weight, freqs, num_heads, rope_dim):
+    if not is_fused_dspark_rmsnorm_rope_supported(x, weight, freqs, num_heads, rope_dim, norm_dim):
         raise ValueError(
             "cute_dsl_dspark_rmsnorm_rope requires regular row-strided BF16 tensors on "
             "an SM100, SM103, or SM107 GPU with a valid FP32 frequency view; "
@@ -548,6 +557,7 @@ def cute_dsl_dspark_rmsnorm_rope(
         apply_weight,
         apply_rmsnorm,
         inverse_rope,
+        x.shape[-1] if norm_dim is None else norm_dim,
     )
     compiled(x_flat, weight, freqs, output)
     return output.view(original_shape)
@@ -564,6 +574,7 @@ def _(
     apply_weight: bool,
     apply_rmsnorm: bool,
     inverse_rope: bool,
+    norm_dim: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 

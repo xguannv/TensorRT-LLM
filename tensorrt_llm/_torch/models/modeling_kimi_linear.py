@@ -310,6 +310,44 @@ def _is_mla_layer(cfg, layer_idx: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+KIMI_K3_AUX_ATTN_RES_STREAM_ENV = "KIMI_K3_AUX_ATTN_RES_STREAM"
+"""Which residual-stream value the DFlash/DSpark hidden-state tap captures.
+
+``1`` (default) captures the pre-norm attn_res mixture -- the value the next
+consumer actually reads. ``0`` captures the raw running prefix sum instead.
+
+Both conventions exist in the wild and a drafter distilled against one scores
+lower on the other with nothing raised, so this is a property of the DRAFTER
+checkpoint, not a performance knob. SGLang (and therefore RadixArk/Kimi-K3-DSpark)
+uses the mixture: ``kimi_k3.py _dspark_capture_stream`` -> ``attn_residual.py
+aggregate_stream``. vLLM implements both and defaults to the prefix
+(``VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0``, ``models/kimi_k3/nvidia/model.py
+_capture_aux_hidden_stream``), which is what a TorchSpec-distilled drafter may
+have been trained against. Measured cost of getting it wrong on K3 + RadixArk:
+AR 71.4% -> 66.9%.
+
+Per-checkpoint measurements on K3, GSM8K AL, n=200, TEP8:
+
+===================  ==================  ============  ======
+drafter              stream (default 1)  prefix (0)    delta
+===================  ==================  ============  ======
+RadixArk (GQA)       71.8%               --            --
+Inferact (MLA)       65.7%               66.6%         +0.9pt
+===================  ==================  ============  ======
+
+So the default is right for RadixArk. For Inferact the prefix convention
+matches its vLLM/TorchSpec lineage and measures better, but +0.9pt at n=200 is
+inside this harness's noise band (it treats RadixArk's own 71-73% spread as
+noise), so this is a direction, not a settled requirement -- unlike the 4.5pt
+RadixArk case above, which was unambiguous. Both Inferact acc_len values (5.60
+and 5.66) sit on its model card's 5.64, so neither convention is grossly wrong
+for it.
+
+Deriving this from checkpoint metadata is not possible today: neither published
+drafter's config records which capture convention it was distilled against."""
+
+_AUX_ATTN_RES_STREAM_ENABLED = os.environ.get(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, "1") == "1"
+
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 """Set to ``0`` to run attention-residual as the exact fp32 reference.
 
@@ -2247,8 +2285,18 @@ class KimiLinearDecoderLayer(nn.Module):
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
 
+        if capture is not None and not _AUX_ATTN_RES_STREAM_ENABLED:
+            # prefix_only wants the incoming running prefix, which is already in
+            # hand -- no pre-norm intermediate is needed, so the tap is a plain
+            # read and this layer keeps the fused attn_res+RMSNorm path like the
+            # other 88. ``prefix_sum`` already has the previous layer's MLP
+            # output folded in, i.e. the quantity vLLM builds as
+            # ``prefix_sum + pending_mlp_out`` on its deferred-add path.
+            capture[0].maybe_capture_hidden_states(capture[1], prefix_sum, None)
+            capture = None
+
         if capture is not None:
-            # The DSpark tap needs the PRE-norm mixture (SGLang's
+            # The mixture tap needs the PRE-norm value (SGLang's
             # aggregate_stream is a "softmax mixture, no output norm"), which
             # the fused attn-res+RMSNorm kernel below does not expose. Split
             # the two steps on captured layers only — 5 of 93 — and leave the
@@ -2363,6 +2411,15 @@ class KimiLinearModel(DecoderModel):
             f"topology={_ATTN_RES_TOPOLOGY}, max_tokens={_FUSED_ATTN_RES_MAX_TOKENS}",
             key="kimi_k3_attn_res_fusion",
         )
+        # Which convention the drafter tap is on is not recoverable from the
+        # served output -- a mismatch only lowers acceptance -- so state it once
+        # at construction rather than leaving it to be inferred from an AL.
+        logger.info_once(
+            "Kimi K3 aux hidden capture: mode="
+            f"{'attn_res_stream' if _AUX_ATTN_RES_STREAM_ENABLED else 'prefix_only'} "
+            f"({KIMI_K3_AUX_ATTN_RES_STREAM_ENV}={int(_AUX_ATTN_RES_STREAM_ENABLED)})",
+            key="kimi_k3_aux_capture_mode",
+        )
 
     def forward(
         self,
@@ -2431,7 +2488,7 @@ class KimiLinearModel(DecoderModel):
                         self.output_attn_res_proj,
                         self.output_attn_res_norm,
                     )
-                    if num_snapshots > 0
+                    if num_snapshots > 0 and _AUX_ATTN_RES_STREAM_ENABLED
                     else hidden_states
                 )
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
