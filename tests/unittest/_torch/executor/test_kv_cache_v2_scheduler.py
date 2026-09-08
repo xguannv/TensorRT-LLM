@@ -2857,3 +2857,32 @@ class TestEqualCostChunking:
         self._make(env, max_num_tokens=1024).schedule_request([req], set())
         # affordable = 204_800 // 10_100 = 20 < unit -> floored to one unit
         assert req.context_chunk_size == 64
+
+    def test_per_chunk_depth_term_scales_with_prefix(self):
+        """TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS: every chunk also costs R * kv_depth and the
+        budget grows by R * kv_depth_threshold, so a request at the threshold still gets
+        a full chunk, a deep request pays a bigger fixed share than a shallow one, and a
+        zero-depth backfill pays nothing extra."""
+        env = dict(self.ENV, TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS="500")
+        at_threshold = self._deep_req(0, kv_start=64_000)
+        self._make(env).schedule_request([at_threshold], set())
+        assert at_threshold.context_chunk_size == 8192
+
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(env).schedule_request([deep, shallow], set())
+        assert ids(out.context_requests) == [0, 1]
+        # B = 204000 * 8192 + 500 * 64000 = 1_703_168_000
+        # deep: (B - 500 * 500_000) // 640_000 = 2270 -> 64-aligned 2240
+        assert deep.context_chunk_size == 2240
+        # leftover 1_703_168_000 - (640_000 * 2240 + 250_000_000) = 19_568_000; depth term
+        # at kv 0 is 0 -> 19_568_000 // 140_000 = 139 -> 128
+        assert shallow.context_chunk_size == 128
+
+        # A depth term the leftover cannot pay skips the backfill instead of over-committing.
+        env = dict(self.ENV, TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS="1000")
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(env).schedule_request([deep, shallow], set())
+        # B = 204000 * 8192 + 1000 * 64000 = 1_735_168_000; deep: (B - 500_000_000) // 640_000 = 1929 -> 1920
+        assert deep.context_chunk_size == 1920
+        # leftover 1_735_168_000 - (640_000 * 1920 + 500_000_000) = 6_368_000 // 140_000 = 45 -> below one 64-unit -> skipped
+        assert ids(out.context_requests) == [0]

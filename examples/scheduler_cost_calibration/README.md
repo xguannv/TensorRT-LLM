@@ -33,3 +33,22 @@ scheduler) from the iteration logs of an ordinary run:
 
 Re-fit after changing the model, attention kernels, precision, or GPU
 (`kv_cost_offset` moves) or the workload mix (`kv_depth_threshold` moves).
+
+## Per-chunk depth term
+
+The two knobs above price a chunk as `(kv_cost_offset + kv_depth) * n`, so
+every cost scales with the chunk's token count `n`. Chunked prefill also
+re-reads and re-projects the request's cached prefix on every chunk, which
+scales with the depth and not with `n`. One optional term (default 0 = off)
+charges that in the same budget:
+
+- `TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS=R` — each chunk also costs
+  `R * kv_depth`, i.e. like `R` extra tokens at the request's depth. `R` is the
+  per-chunk prefix cost per cached token divided by the attention cost per
+  token*kv, a model x kernel x GPU property like `kv_cost_offset`.
+
+The budget grows by `R * kv_depth_threshold` so a single request at the
+threshold still fits a full chunk. `fit_context_cost.py` does not fit this
+term (it attributes the lockstep iteration time to a single request, which
+folds the per-chunk work into `kv_cost_offset`); per-rank attention timing is
+needed to separate them.
