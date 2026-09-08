@@ -145,9 +145,9 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/modules/moe/test_moe_backend.py::test_import_deep_gemm_rejects_pre_situ_mega_moe_api
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_streaming_reload_resets_slot_claims
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_does_not_infer_situ_from_pretrained_config
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_defaults_to_swiglu_without_explicit_activation
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_uses_explicit_situ_args
   - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/modules/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   # ------------- MoE: test_single_gpu (by backend) ---------------
