@@ -413,7 +413,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--multi-node-time",
-        default="04:00:00",
+        default="00:50:00",
         help="Time limit for the multi-node job.",
     )
     parser.add_argument("--qos", default=os.environ.get("TRTLLM_SLURM_QOS", ""))

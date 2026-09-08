@@ -68,10 +68,8 @@ slurm:
   script_file: "disaggr_torch.slurm"
   partition: "batch"
   account: "coreai_comparch_inferencex"
-  # 4 h (the `batch` partition maximum): weight load is tens of minutes per
-  # worker before the first token, and 1319 GSM8K questions decode with CUDA
-  # graphs and the overlap scheduler both off.
-  job_time: "04:00:00"
+  # Branch-guard default wall-time budget.
+  job_time: "00:50:00"
   job_name: "k3-disagg-dep8-gsm8k"
   extra_args: "--gpus-per-node=4"
   numa_bind: true  # GB200/GB300 NVL72
@@ -190,7 +188,7 @@ worker_config:
     # and is validated through the disaggregated proxy on a 4x4 allocation.
     # max_num_tokens is a chunking ceiling, not a resident token allocation.
     moe_config:
-      backend: TRTLLM
+      backend: CUTEDSL
       max_num_tokens: 131072
       use_low_precision_moe_combine: true
     kv_cache_config:
@@ -218,7 +216,7 @@ worker_config:
     # Match the aggregate DEP8 TRTLLM SiTU configuration on the context side.
     # max_num_tokens is a chunking ceiling, not a resident token allocation.
     moe_config:
-      backend: TRTLLM
+      backend: CUTEDSL
       max_num_tokens: 131072
       use_low_precision_moe_combine: true
     kv_cache_config:

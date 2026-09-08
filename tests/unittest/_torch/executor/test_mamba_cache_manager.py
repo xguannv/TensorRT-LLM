@@ -2554,9 +2554,19 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
         lora_task_id=None,
         input_tokens=list(range(127)),
         expected_prompt_length=127,
+        ugpu_id=None,
     )
 
     assert result is kv_cache
+    create_kv_cache.assert_called_once_with(
+        123,
+        None,
+        list(range(127)),
+        cache_salt=None,
+        is_dummy=False,
+        expected_prompt_length=127,
+        ugpu_id=None,
+    )
     assert log_debug.call_count == expected_log_count
     assert get_num_reusable_tokens_before_hybrid_pruning.call_count == expected_log_count
     assert get_num_reusable_tokens_before_pruning.call_count == expected_log_count
