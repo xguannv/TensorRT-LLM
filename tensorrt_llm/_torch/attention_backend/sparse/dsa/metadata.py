@@ -29,7 +29,7 @@ from .indexer import (
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
 )
-from .params import DSAMetadataParams
+from .params import DSAMetadataParams, use_self_sampling_gvr
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -108,6 +108,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # Temporal-GVR prior state: allocated only when the two-level dispatch
+    # selects the temporal engine (the self-sampling engine keeps no
+    # cross-step state).
+    needs_gvr_prior: bool = field(default=False, init=False)
+    gvr_prior_indices: Optional[torch.Tensor] = field(default=None, init=False)
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -177,6 +182,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
             tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
         self._tokens_per_block = tpb
+        # Mirror the indexer's two-level GVR decision. The representative
+        # compress ratio matches every live indexer: the DeepSeek-V4 backend
+        # only builds indexers on cr=4 layers and plain DSA uses cr=1.
+        self.use_self_sampling_topk = use_self_sampling_gvr(
+            enable_heuristic_topk=self.enable_gvr_topk,
+            use_self_sampling_topk=sparse_metadata_params.use_self_sampling_topk,
+            index_topk=self.num_sparse_topk,
+            compress_ratio=self._indexer_compress_ratio,
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            sm_version=get_sm_version(),
+        )
+        self.needs_gvr_prior = (
+            self.enable_gvr_topk
+            and IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() in (100, 103)
+            and not self.use_self_sampling_topk
+        )
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
@@ -291,18 +313,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         warmed keys are the ones dispatch actually looks up. Batches outside
         this set still compile lazily on first touch. The helper enumerates
         one representative row per distinct engine compile key, so large
-        batch lists warm in bounded time and memory. No-op unless the opt-in
-        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        batch lists warm in bounded time and memory. No-op unless the
+        two-level dispatch (enable_heuristic_topk + use_self_sampling_topk)
+        selects the self-sampling engine.
         """
-        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
-            return
-        # same hardware gates as the dispatch flag (indexer __init__): never
-        # compile these kernels on unsupported stacks during warmup
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103, 107):
+        # same two-level dispatch and hardware gates as the indexer __init__:
+        # never compile these kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
             return
         if not self.enable_heuristic_topk or self.kv_cache_manager is None:
             return
-        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not self.use_self_sampling_topk:
+            return
+        top_k = self.sparse_mla_topk
         if not top_k or int(top_k) not in (512, 1024, 2048):
             return
         cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
@@ -479,11 +502,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def _compute_kv_lens_row_reorder(self):
         """Prepare longest-job-first row order for GVR top-k."""
         next_n = 1 + self.max_draft_tokens
-        if (
-            self.enable_heuristic_topk
-            and self.use_cute_dsl_topk
-            and self.num_generations * next_n >= 2 * self.num_sms
-        ):
+        if self.needs_gvr_prior and self.num_generations * next_n >= 2 * self.num_sms:
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
             order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
             self.kv_lens_row_reorder_buffer[: self.num_generations].copy_(order)
@@ -782,51 +801,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        # Per-layer persistent buffers for heuristic TopK pre_idx.
-        # Indexed by [local_layer_idx, generation_position, :].
-        # The graph captures reads/writes on these stable-address buffers;
-        # each replay's write becomes the next replay's read (feedback loop).
-        self.enable_heuristic_topk = (
-            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
-        if self.enable_heuristic_topk:
-            num_local_layers = self.kv_cache_manager.num_local_layers
-            self.heuristic_prev_topk = self.get_empty(
+        if self.needs_gvr_prior:
+            self.gvr_prior_indices = self.get_empty(
                 self.cuda_graph_buffers,
                 (num_local_layers, self.max_num_sequences, self.num_sparse_topk),
                 cache_name="heuristic_prev_topk",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            # Zero-initialize so the first decode step's pre_idx (kernel
-            # adds +1 offset) points to index 1 — a valid but benign candidate.
-            # Without this, uninitialized memory produces random hint indices.
-            self.heuristic_prev_topk.zero_()
-            # The C++ top-k path needs a stable scratch address.
-            if not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
-            # GVR row order also needs a stable address for CUDA graphs.
-            if self.use_cute_dsl_topk:
-                self.kv_lens_row_reorder_buffer = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (self.max_num_sequences,),
-                    cache_name="kv_lens_row_reorder_buffer",
-                    dtype=torch.int32,
-                    capture_graph=capture_graph,
-                )
-
-        # Persistent scratch for the Radix-split-work indexer path. Re-created
-        # in update_spec_dec_param when max_draft_tokens changes so it stays
-        # large enough for the MTP generation-row count.
-        self._create_radix_aux_buffers(capture_graph=capture_graph)
-
+            self.gvr_prior_indices.zero_()
+            self.kv_lens_row_reorder_buffer = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences,),
+                cache_name="kv_lens_row_reorder_buffer",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 

@@ -7307,6 +7307,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_batch_size: Required with ``counters``; ignored
                 otherwise. Power of 2 in ``[64, 1024]``, must match
                 the value passed to LB prepare.
+
+        Of the optional hint tensors the kernel WRITES ``xstate`` (the
+        closed-loop publish); it cannot be declared in ``mutates_args``:
+        torch.library raises IndexError when a declared-mutable Optional
+        arg is None at call time (re-verified on the pinned torch), and
+        most calls pass no hints. Under torch.compile/functionalization
+        the undeclared write is invisible, so the hint path is eager /
+        CUDA-graph only. The ``use_gvr_emission`` sparse-attention config
+        field gates the emission-assisted wiring that feeds these tensors
+        (opt-in; temporal-hint path only).
         """
         if not is_sm_100f():
             raise ValueError(
