@@ -260,17 +260,27 @@ class KVCacheV2Scheduler(RequestScheduler):
         # TODO(perf): promote to a config field, calibrate kv_cost_offset online.
         kv_cost_offset = int(os.environ.get("TLLM_V2_CTX_COST_KV_OFFSET", "0"))
         kv_depth_threshold = int(os.environ.get("TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD", "0"))
+        # Optional per-chunk depth term (default 0 = off), paid before a chunk's
+        # tokens: every chunk also costs R * kv_depth, the prefix re-read that does
+        # not shrink with the chunk size. The budget grows by R * kv_depth_threshold
+        # so a single request at the threshold still fits a full chunk.
+        per_chunk_depth_tokens = int(os.environ.get("TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS", "0"))
         self._cost_chunking_enabled = (
             kv_cost_offset > 0 and kv_depth_threshold > 0
             and max_num_tokens is not None and self.chunking_enabled
         )
         self._kv_cost_offset = kv_cost_offset
+        self._ctx_per_chunk_depth_tokens = float(max(0, per_chunk_depth_tokens))
         self._ctx_cost_budget: Optional[float] = None
         if self._cost_chunking_enabled:
-            self._ctx_cost_budget = float((kv_cost_offset + kv_depth_threshold) * max_num_tokens)
+            self._ctx_cost_budget = (
+                float((kv_cost_offset + kv_depth_threshold) * max_num_tokens)
+                + self._ctx_per_chunk_depth_tokens * kv_depth_threshold
+            )
             logger.info(
                 f"KVCacheV2Scheduler: equal-cost context chunking ON, "
                 f"kv_cost_offset={kv_cost_offset}, kv_depth_threshold={kv_depth_threshold}, "
+                f"per_chunk_depth_tokens={per_chunk_depth_tokens}, "
                 f"cost_budget={self._ctx_cost_budget:.4e} token*kv"
             )
 
@@ -500,6 +510,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     # i.e. the same value the cost cap priced this chunk at.
                     budget.commit_ctx_cost(
                         float(self._kv_cost_offset + req.context_current_position) * tokens
+                        + self._ctx_per_chunk_depth_tokens * req.context_current_position
                     )
 
         # Deadlock detection: if generation requests exist but none were
@@ -711,7 +722,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # above already advanced it past the reused prefix / prior chunks.
         if self._cost_chunking_enabled:
             cost_rate = self._kv_cost_offset + req.context_current_position
-            affordable = int(budget.remaining_ctx_cost // cost_rate)
+            # The per-chunk depth term is paid before any token of this chunk.
+            remaining_cost = (
+                budget.remaining_ctx_cost
+                - self._ctx_per_chunk_depth_tokens * req.context_current_position
+            )
+            affordable = int(remaining_cost // cost_rate) if remaining_cost > 0 else 0
             if affordable < self.chunk_unit_size and budget.ctx_cost == 0.0:
                 # Head-of-line floor: a bounded budget overshoot beats
                 # starving a deep request forever.
