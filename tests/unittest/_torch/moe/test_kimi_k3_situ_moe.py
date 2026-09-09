@@ -1027,27 +1027,21 @@ nvfp4_moe_supported = pytest.mark.skipif(
 )
 
 
-def _nvfp4_situ_backend_params():
-    """The FP4 backends that serve SiTU, each with its own reason to be here.
+#: The FP4 backends that serve SiTU. CUTEDSL additionally needs the CuTe DSL
+#: wheel, which is checked inside the test rather than in a ``skipif``:
+#: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
+#: directory to ``sys.path``, and this repository fails the whole pytest
+#: session when a test file does that at collection time.
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
 
-    CUTEDSL carries its own skip rather than sharing ``nvfp4_moe_supported``:
-    it needs the CuTe DSL wheel at import time and a JIT compile at run time,
-    neither of which the SM check covers, and on SM107 it dispatches to a
-    second kernel file entirely.
-    """
+
+def _skip_if_backend_unavailable(moe_backend):
+    if moe_backend != "CUTEDSL":
+        return
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
-    return [
-        "CUTLASS",
-        "TRTLLM",
-        pytest.param(
-            "CUTEDSL",
-            marks=pytest.mark.skipif(
-                not IS_CUTLASS_DSL_AVAILABLE,
-                reason="CuteDSL MoE requires the CuTe DSL wheel",
-            ),
-        ),
-    ]
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
 
 
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
@@ -1551,7 +1545,7 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize("moe_backend", _nvfp4_situ_backend_params())
+@pytest.mark.parametrize("moe_backend", _NVFP4_SITU_BACKENDS)
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
@@ -1579,6 +1573,7 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
     """
+    _skip_if_backend_unavailable(moe_backend)
     num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
     gate = _make_test_gate(num_experts=num_experts)
 
