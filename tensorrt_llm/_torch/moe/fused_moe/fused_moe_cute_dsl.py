@@ -609,9 +609,8 @@ class CuteDslFusedMoE(MoEImplBase):
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({
-            ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu
-        }),
+        kinds=frozenset(
+            {ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
     )
@@ -713,6 +712,19 @@ class CuteDslFusedMoE(MoEImplBase):
             return _reject(
                 MoERejectReason.EPLB_UNSUPPORTED,
                 "locality domain MoE cannot follow EPLB expert migration")
+
+        # The locality-domain half-GEMM op has no SiTU parameters: it splits
+        # FC1 across two partitions and its wrapper forwards only
+        # ``activation_type``. Reaching it with SiTU would build a kernel with
+        # no soft-caps and die in the kernel constructor, several layers below
+        # the decision that caused it. Turn it down here, where the rejection
+        # trail names both the activation and the policy.
+        if (p.activation == "SiTu" and d.locality_domain_requested
+                and d.env.has_dep(MoEDep.LOCALITY_DOMAIN)):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CuteDslFusedMoE SiTU has no locality-domain FC1; disable "
+                "locality_domain_policy for this layer or pick another backend")
 
         # SM107 has no unfused FC2: NVFP4 has no plain grouped GEMM there, and
         # the BF16 op always fuses finalize.
