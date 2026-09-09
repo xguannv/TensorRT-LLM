@@ -1126,12 +1126,20 @@ class KimiK3MoERuntime(nn.Module):
                 gate_softcap=situ_beta,
                 linear_softcap=situ_linear_beta,
             ),
-            # A MegaMoE request that silently degraded to CUTLASS would be
-            # benchmarked as if it were MegaMoE, and the decline is easy to
-            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # A request that silently degraded to CUTLASS would be benchmarked
+            # as if it were the backend that was asked for, and the decline is
+            # easy to trigger: MegaMoE has its own token / top-k limits and is
+            # EP-only, and CuteDSL declines on activation shape, SM version and
+            # the CuTe DSL dependency. Measured 2026-09-08: a CUTEDSL request
+            # was turned down on every one of the 92 MoE layers, on all 16
+            # ranks, and still produced correct text and a zero exit -- the
+            # only trace was a warning line per layer. Fail in the resolver
             # instead, which reports the rejection trail.
+            #
+            # CUTLASS is absent on purpose: it is the fallback target, so
+            # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
