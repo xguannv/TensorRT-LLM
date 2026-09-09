@@ -164,6 +164,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = sparse_metadata_params.enable_indexer_skip
+        self.enable_heuristic_topk = (
+            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
+        )
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
@@ -186,7 +189,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # compress ratio matches every live indexer: the DeepSeek-V4 backend
         # only builds indexers on cr=4 layers and plain DSA uses cr=1.
         self.use_self_sampling_topk = use_self_sampling_gvr(
-            enable_heuristic_topk=self.enable_gvr_topk,
+            enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=sparse_metadata_params.use_self_sampling_topk,
             index_topk=self.num_sparse_topk,
             compress_ratio=self._indexer_compress_ratio,
@@ -194,7 +197,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             sm_version=get_sm_version(),
         )
         self.needs_gvr_prior = (
-            self.enable_gvr_topk
+            self.enable_heuristic_topk
             and IS_CUTLASS_DSL_AVAILABLE
             and get_sm_version() in (100, 103)
             and not self.use_self_sampling_topk
@@ -802,6 +805,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
         if self.needs_gvr_prior:
+            num_local_layers = self.kv_cache_manager.num_local_layers
             self.gvr_prior_indices = self.get_empty(
                 self.cuda_graph_buffers,
                 (num_local_layers, self.max_num_sequences, self.num_sparse_topk),
