@@ -728,10 +728,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 - self._ctx_per_chunk_depth_tokens * req.context_current_position
             )
             affordable = int(remaining_cost // cost_rate) if remaining_cost > 0 else 0
-            if affordable < self.chunk_unit_size and budget.ctx_cost == 0.0:
-                # Head-of-line floor: a bounded budget overshoot beats
-                # starving a deep request forever.
-                affordable = self.chunk_unit_size
+            # Head-of-line floor: the first request of an iteration gets at least a
+            # quarter of the token budget. Unit-sized chunks that each re-read the
+            # whole prefix cost more than a bounded budget overshoot.
+            hol_floor = max(self.chunk_unit_size, (self.max_num_tokens or 0) // 4)
+            if affordable < hol_floor and budget.ctx_cost == 0.0:
+                affordable = hol_floor
             chunk_size = min(chunk_size, affordable)
 
         # Round down to chunk_unit_size boundary only when not hitting the end
