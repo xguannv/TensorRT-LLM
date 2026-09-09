@@ -1223,6 +1223,72 @@ def test_mla_rope_table_follows_runtime_max_seq_len():
         assert advertised[key] == served[key]
 
 
+@pytest.mark.parametrize(
+    "max_ctx,checkpoint_block_size,max_draft_len",
+    [
+        (8205, None, 7),  # the shipped recipe: no block_size, fallback K+1 = 8
+        (8205, 7, 7),  # a checkpoint declaring a window NARROWER than the verify group
+        (4104, 16, 3),  # ... and one declaring a WIDER window
+        (1026, 2, 1),
+    ],
+)
+def test_dflash_position_ceiling_covers_both_index_paths(
+    max_ctx, checkpoint_block_size, max_draft_len
+):
+    """The published ceiling must exceed every index the forward can produce.
+
+    Two independent position sets read the same table, and they do not have the
+    same reach: the block decode runs to ctx_len + block_size - 1 while the
+    context path runs to ctx_len + max_draft_len. Sizing for either one alone is
+    short whenever the other is wider, which is why the ceiling takes a max.
+
+    max_ctx here is the RUNTIME value (attn_metadata.max_seq_len, what ctx_len
+    is clamped to), not model_config.max_seq_len -- 8205 is the measured value
+    for a configured 8192 with max_draft_len 7.
+    """
+    from tensorrt_llm._torch.speculative.dflash import dflash_position_ceiling
+
+    block_size = checkpoint_block_size or (max_draft_len + 1)
+    ceiling = dflash_position_ceiling(max_ctx, block_size, max_draft_len)
+
+    # dflash.py: query_position_ids = clamp(ctx_len + num_accepted) + j
+    worst_block = max_ctx + block_size - 1
+    # dflash.py: ctx_position_ids = ctx_len + [0, max_draft_len]
+    worst_ctx = max_ctx + max_draft_len
+
+    assert ceiling > worst_block, (
+        f"ceiling {ceiling} does not cover block decode index {worst_block} "
+        f"(max_ctx {max_ctx}, block_size {block_size})"
+    )
+    assert ceiling > worst_ctx, (
+        f"ceiling {ceiling} does not cover context index {worst_ctx} "
+        f"(max_ctx {max_ctx}, max_draft_len {max_draft_len})"
+    )
+    # and no more than one position of slack, so it cannot quietly grow
+    assert ceiling == max(worst_block, worst_ctx) + 1
+
+
+@needs_cuda
+def test_mla_rope_table_prefers_the_runtime_ceiling_over_the_config_cap():
+    """A worker-published ceiling replaces the config-derived cap outright.
+
+    Not max() of the two: with max_seq_len unset the config cap is the
+    checkpoint's advertised max_position_embeddings (1,048,576 for K3), and
+    taking the larger would rebuild exactly the ~256 MiB table the cap exists to
+    avoid. Exercises the real _mla_freqs_cis, so it also pins that the table is
+    still lazy enough to see an attribute set after construction.
+    """
+    drafter = _build_mla_drafter(_tiny_mla_weights())
+    # construction-time cap: the plain config value, no lookahead baked in
+    assert drafter._mla_rope_params["max_positions"] == _tiny_mla_config().max_position_embeddings
+
+    drafter._runtime_position_ceiling = 8213
+    table = drafter._mla_freqs_cis(torch.device("cuda"))
+    assert table.shape[0] == 8213, (
+        f"table has {table.shape[0]} positions, expected the published ceiling 8213"
+    )
+
+
 @needs_cuda
 def test_mla_drafter_rejects_a_checkpoint_missing_backbone_weights():
     """Only lm_head may be absent; a truncated backbone must not load quietly.
@@ -1280,7 +1346,16 @@ def test_mla_drafter_rejects_a_partial_fused_component_set():
     weights = _tiny_mla_weights()
     drafter = _build_mla_drafter(weights)
 
-    victim = next(k for k in weights if k.endswith("self_attn.kv_b_proj.weight"))
+    # gate_proj/up_proj, NOT an unfused module: the checkpoint stores them
+    # separately and the module tree names them once as mlp.gate_up_proj, so
+    # dropping one is the only way to reach the fused branch of _supplied.
+    # (kv_b_proj would exercise the plain _has path and duplicate the
+    # missing-backbone test above.)
+    victim = next(k for k in weights if k.endswith("mlp.gate_proj.weight"))
+    assert any(k.endswith("mlp.up_proj.weight") for k in weights), (
+        "the surviving half of the fused pair must be present, or this is not "
+        "testing the fused branch"
+    )
     truncated = {k: v for k, v in weights.items() if k != victim}
 
     with pytest.raises(ValueError, match="WEIGHTS_SHARED_WITH_TARGET"):
