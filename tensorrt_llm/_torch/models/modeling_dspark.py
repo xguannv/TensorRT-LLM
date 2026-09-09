@@ -1494,11 +1494,11 @@ def _runtime_position_cap(model_config, pretrained_config, slack: int = 0) -> in
     return int(runtime or getattr(pretrained_config, "max_position_embeddings", 163840)) + slack
 
 
-# NOTE on slack: a draft ModelConfig's max_seq_len already carries the draft
-# reserve (external_drafter_config_kwargs adds max_total_draft_tokens + 1, the
-# same quantity kv_cache_manager_v2 reserves), so callers do not add their own.
-# The DSv4 site keeps a small slack only because it also indexes two positions
-# past the block for its bonus token.
+# NOTE on slack: this is a construction-time cap only. A drafter driven by
+# DFlashWorker gets its real bound at runtime from dflash_position_ceiling
+# (published as _runtime_position_ceiling), because the engine raises
+# max_seq_len past model_config's value and never writes it back. The DSv4 site
+# keeps its own slack because it is not driven by that worker.
 
 
 class DSv4DSparkDraftModel(nn.Module):
@@ -3218,6 +3218,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._head_dim = attn0.kv_cache_head_dim
         self._kv_factor = 1
 
+        # No slack: the lookahead lives in dflash_position_ceiling, which the
+        # worker publishes as _runtime_position_ceiling before any forward and
+        # _mla_freqs_cis builds the table from. This config-derived cap is only
+        # the fallback for direct construction, where no worker runs and the
+        # positions asked for are whatever the caller passes.
         rope = _resolve_dspark_mla_rope_params(cfg, draft_config)
         self._mla_rope_params = rope
         self._mla_workspace = None
@@ -3372,9 +3377,25 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         return merged.to(query.dtype)
 
     def _mla_freqs_cis(self, device):
-        """Adjacent-pair YaRN table, cached. See build_dspark_mla_yarn_freqs_cis."""
+        """Adjacent-pair YaRN table, cached. See build_dspark_mla_yarn_freqs_cis.
+
+        Sized from the ceiling the worker publishes once it knows the runtime
+        one (_runtime_position_ceiling, set in DFlashDrafter._lazy_init_ctx_buffers
+        before any forward), because that is the value ctx_len is clamped to and
+        it is strictly above model_config.max_seq_len whenever spec decoding is
+        on. The config-derived cap is the fallback for direct construction in
+        tests, where no worker runs.
+        """
         if self._mla_freqs is None:
-            rope = self._mla_rope_params
+            rope = dict(self._mla_rope_params)
+            runtime_cap = getattr(self, "_runtime_position_ceiling", None)
+            if runtime_cap is not None:
+                # Outright, not max(): the published ceiling is already
+                # min(runtime, max_position_embeddings) + lookahead, so it is
+                # both sufficient and the only thing that keeps the table small
+                # when max_seq_len is unset and the config cap is the
+                # checkpoint's advertised 1,048,576.
+                rope["max_positions"] = int(runtime_cap)
             self._mla_freqs = build_dspark_mla_yarn_freqs_cis(
                 dim=self.qk_rope_head_dim,
                 base=rope["theta"],

@@ -1464,27 +1464,18 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
-        # The drafter sizes position tables from this. Without it the field
-        # stays None and the tables fall back to the checkpoint's advertised
+        # Bounds the drafter's position tables. Without it the field stays
+        # None and they fall back to the checkpoint's advertised
         # max_position_embeddings -- 1,048,576 for K3, a ~256 MiB complex64
         # table per rank for a context the runtime bounds far below that.
         #
-        # Carry the draft reserve here rather than letting the drafter guess a
-        # slack from its own block_size: a request may run to the KV manager's
-        # per-sequence capacity and the block decode then indexes the position
-        # table at ctx_len + num_accepted + j.
-        #
-        # This is a LOWER BOUND on that capacity, not a copy of it. The manager
-        # uses max_seq_len + num_extra_kv_tokens + _kv_reserve_draft_tokens + 1
-        # (kv_cache_manager_v2.py max_seq_capacity); num_extra_kv_tokens is not
-        # reachable from here, and _kv_reserve_draft_tokens equals
-        # max_total_draft_tokens except under a dynamic tree, where it is
-        # larger. Both omissions make the table shorter than the ceiling, so
-        # revisit this if either becomes non-zero for a drafter that indexes
-        # the table at its own max position.
-        max_seq_len=(model_config.max_seq_len +
-                     getattr(spec_config, "max_total_draft_tokens", 0) +
-                     1 if model_config.max_seq_len is not None else None),
+        # The user's value, NOT the engine's. py_executor_creator raises
+        # model_engine_max_seq_len past this and never writes it back, so a
+        # drafter that indexes absolute positions must read the raised value at
+        # runtime (DFlashDrafter publishes it as _runtime_position_ceiling)
+        # rather than have this line predict it -- reproducing that arithmetic
+        # here is what let the two drift apart in the first place.
+        max_seq_len=model_config.max_seq_len,
     )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).

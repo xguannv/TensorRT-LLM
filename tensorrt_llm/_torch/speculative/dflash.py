@@ -62,6 +62,24 @@ def dflash_draft_slot_ids(
     return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
 
 
+def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
+    """Positions a drafter that indexes absolute positions must be able to encode.
+
+    The forward reads two position sets past the accumulated context, both
+    starting from a ctx_len clamped to ``max_ctx``:
+
+      * block decode  ``ctx_len + num_accepted + j``, ``j in [0, block_size)``
+      * context KV    ``ctx_len + [0, max_draft_len]``
+
+    so the largest index is ``max_ctx + max(block_size, max_draft_len + 1) - 1``
+    and a table needs one entry more than that. Derived from the runtime
+    ``max_ctx`` rather than from model_config: py_executor_creator raises the
+    engine's max_seq_len past the configured value and never writes it back, so
+    any config-derived reconstruction drifts from what ctx_len is clamped to.
+    """
+    return int(max_ctx) + max(int(block_size), int(max_draft_len) + 1)
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -552,6 +570,16 @@ class DFlashWorker(SpecWorkerBase):
         hd = draft_model._head_dim
         kv_factor = getattr(draft_model, "_kv_factor", 2)
         capacity = self._max_ctx + self._resolved_block_size
+        # The one number a drafter that builds an absolute-position table needs,
+        # published from the only place that knows it: _max_ctx comes from
+        # attn_metadata.max_seq_len, the engine's value, which
+        # py_executor_creator raises past model_config.max_seq_len and never
+        # writes back. Tables are built lazily on first forward and this runs
+        # before any of them, so a drafter may read it in place of its
+        # config-derived cap.
+        draft_model._runtime_position_ceiling = dflash_position_ceiling(
+            self._max_ctx, self._resolved_block_size, self.max_draft_len
+        )
         # TRTLLM needs pages because its kernels are paged; a drafter can also
         # ask for them on its own (the MLA one does, to get its footprint under
         # free_gpu_memory_fraction) while still reading them eagerly.
@@ -1228,11 +1256,13 @@ class DFlashWorker(SpecWorkerBase):
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
-            query_position_ids = (
-                ctx_len_gen.unsqueeze(1)
-                + gen_num_accepted.long().unsqueeze(1)
-                + j_block.unsqueeze(0)
-            )
+            # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
+            # tokens are folded in (see the update below), so the running length
+            # used here has to be clamped on its own -- otherwise a request that
+            # already sits at the ceiling indexes num_accepted positions past
+            # any position the sequence can legitimately reach.
+            ctx_len_now = (ctx_len_gen + gen_num_accepted.long()).clamp_(max=self._max_ctx)
+            query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
             # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
