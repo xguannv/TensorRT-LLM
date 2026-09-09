@@ -12803,6 +12803,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             IDX_FC2_ALPHA = 12
             IDX_FC2_C = 13
             IDX_FC2_ROUTING = 14
+            # expanded_idx_to_permuted_idx (dim0 = num_tokens); consumed only by
+            # the in-op output memset. Appended after the FC2 tensors so the
+            # existing 0..14 positions (and their constraints) stay put.
+            IDX_EXPANDED_IDX = 15
 
             def inputs_pre_hook(self,
                                 inputs: List[torch.Tensor]
@@ -12822,8 +12826,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 new_fc2_c = fc2_c.new_empty((num_tokens, fc2_c.size(1)))
                 new_routing = fc2_routing.new_empty(
                     (num_tokens, fc2_routing.size(1)))
+                # Resize expanded_idx to the regenerated token count so the
+                # unpacked forward sees a consistent 16-tensor list. Its
+                # contents are unused during tuning (the in-op memset falls back
+                # to an index-free full zero while AutoTuner.is_tuning_mode, so
+                # the uninitialised index values are never dereferenced).
+                expanded_idx = inputs[self.IDX_EXPANDED_IDX]
+                new_expanded = expanded_idx.new_empty(
+                    (num_tokens, expanded_idx.size(1)))
                 return (*fc1_prefix, fc2_b, fc2_sfb, fc2_alpha, new_fc2_c,
-                        new_routing)
+                        new_routing, new_expanded)
 
         class Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
                 TunableRunner):
@@ -12850,7 +12862,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     local_expert_offset: int,
                     tile_size: int,
                     scaling_vector_size: int = 16,
-                    swiglu_limit: float = float("inf")):
+                    swiglu_limit: float = float("inf"),
+                    ep_size: int = 1,
+                    enable_alltoall: bool = False):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -12859,15 +12873,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size = tile_size
                 self.scaling_vector_size = scaling_vector_size
                 self.swiglu_limit = swiglu_limit
+                # Used only by the in-op output memset (moved here so the memset
+                # is the fused kernel's immediate stream predecessor).
+                self.ep_size = ep_size
+                self.enable_alltoall = enable_alltoall
                 if (sm_version := get_sm_version()) != 107:
                     raise ValueError(
                         f"{self.__class__.kernel_class.__name__} supports SM 107 "
                         f"(Rubin) only, but got SM {sm_version}")
                 # v1 fused kernel only supports the 128-wide routing tile.
-                if self.tile_size != 128:
+                if self.tile_size not in (128, 256):
                     raise ValueError(
-                        f"{self.__class__.kernel_class.__name__} v1 supports "
-                        f"tile_size 128 only, but got {self.tile_size}")
+                        f"{self.__class__.kernel_class.__name__} supports "
+                        f"tile_size 128 (1-CTA) or 256 (2-CTA) only, but got "
+                        f"{self.tile_size}")
 
             def unique_id(self):
                 return (
@@ -12877,6 +12896,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.local_expert_offset,
                     self.tile_size,
                     self.scaling_vector_size,
+                    self.swiglu_limit,
                 )
 
             def get_valid_tactics(
@@ -12897,18 +12917,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # Fixed K for FP4: mma_tiler_k=256, mma_inst_k=128.
                 mma_tiler_k = 256
                 mma_inst_k = 128
-                # v1 GEN-phase geometry: 1-CTA, no B-reuse, cluster (1,1).
-                # mma_tiler_m == mma_inst_m == tile_size (128).
-                mma_m_candidates = [(128, 128)]
+                # Mirror the CuteDSL grouped-GEMM runners: the MMA M-tile equals
+                # the routing tile_size and the cluster M = tile_size // 128, so
+                # tile_size=128 -> 1-CTA cluster (1,1), tile_size=256 -> 2-CTA
+                # cluster (2,1). moe_sort tiles the tokens by tile_size, so the
+                # kernel's M-tile always matches the routing tile. mma_n is free
+                # {128, 256}.
+                mma_tiler_m = self.tile_size
+                mma_inst_m = self.tile_size
+                cluster_shape_mn = (self.tile_size // 128, 1)
                 mma_n_candidates = [128, 256]
-                cluster_shape_mn_candidates = [(1, 1)]
 
                 valid_tactics = []
-                for (mma_tiler_m, mma_inst_m), mma_n, cluster_shape_mn in (
-                        itertools.product(mma_m_candidates, mma_n_candidates,
-                                          cluster_shape_mn_candidates)):
-                    if mma_tiler_m != self.tile_size:
-                        continue
+                for mma_n in mma_n_candidates:
+                    # No "cluster CTAs > tiles" guard here (unlike the Sm100
+                    # runners): this kernel's per-CTA M-tile is 128, so one
+                    # 256-row logical tile is exactly one (2,1) cluster and a
+                    # single-tile problem is valid for 2-CTA.
                     # The fused N-tile must divide both FC1 and FC2 output N.
                     if fc1_n % mma_n != 0 or fc2_n % mma_n != 0:
                         continue
@@ -12961,6 +12986,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
+                            # fc2_c/fc2_routing_scales dim0 = num_tokens (follows M bucket like inputs 0/2)
+                            ConstraintSpec(13, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(14, 0, helper.infer_shape_num_tokens),
+                            # expanded_idx_to_permuted_idx dim0 = num_tokens too
+                            ConstraintSpec(15, 0, helper.infer_shape_num_tokens),
                         ),
                         inputs_pre_hook=helper.inputs_pre_hook,
                     )
@@ -12974,7 +13004,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                  tile_idx_to_group_idx, tile_idx_to_mn_limit,
                  permuted_idx_to_expanded_idx, num_non_exiting_tiles,
                  fc1_norm_const, fc2_b, fc2_sfb, fc2_alpha, fc2_c,
-                 fc2_routing_scales) = inputs
+                 fc2_routing_scales, expanded_idx_to_permuted_idx) = inputs
 
                 assert fc1_a.dtype == torch.float4_e2m1fn_x2
                 assert fc1_b.dtype == torch.float4_e2m1fn_x2
@@ -13004,9 +13034,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if isinstance(tactic, tuple):
                     mma_tiler, mma_inst_shape, cluster_shape_mn = tactic
                 else:
+                    # Fallback geometry must satisfy the kernel validator
+                    # (is_valid_mma_tiler_and_cluster_shape): inst_m ==
+                    # tile_m and cluster_m == inst_m // 128. Mirrors
+                    # _get_sm107_nvfp4_default_mma_config used by the sibling
+                    # runners; the old fixed cluster (1,1) was illegal for
+                    # tile_size=256 (a 2-CTA MMA in a 1-CTA cluster).
+                    mma_inst_m = min(self.tile_size, 256)
                     mma_tiler = (self.tile_size, 128, 256)
-                    mma_inst_shape = (self.tile_size, 128, 128)
-                    cluster_shape_mn = (1, 1)
+                    mma_inst_shape = (mma_inst_m, 128, 128)
+                    cluster_shape_mn = (mma_inst_m // 128, 1)
+                # The MMA M-tile and cluster M must match the routing tile this
+                # runner was built for; a mismatch (e.g. a tactic captured under
+                # another tile_size) would index routing metadata wrongly and
+                # can read uninitialised permuted-index padding.
+                assert (mma_tiler[0] == self.tile_size
+                        and cluster_shape_mn[0] == self.tile_size // 128), (
+                            f"FC12 tactic/tile mismatch: mma_tiler={mma_tiler} "
+                            f"mma_inst_shape={mma_inst_shape} "
+                            f"cluster_shape_mn={cluster_shape_mn} "
+                            f"tile_size={self.tile_size}")
 
                 # FC1 intermediate output (kept on-chip by the kernel; passed as
                 # a scratch tensor) + its dynamic block scale.
@@ -13027,6 +13074,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fc2_scheduler_counter = torch.zeros(1,
                                                     dtype=torch.int32,
                                                     device=fc1_a.device)
+
+                # Zero the scatter-add output right before the fused kernel so
+                # the memset becomes the kernel's immediate stream predecessor
+                # (PDL prologue can then overlap a longer predecessor than the
+                # 1-int counter). The zeroing must run on every launch: autotune()
+                # keeps is_tuning_mode set for its whole context, including the
+                # final real launch, so gating the memset on it would leave real
+                # outputs unzeroed. While tuning, the profiling inputs carry an
+                # uninitialised expanded_idx (see Fc12FusedInputsHelper
+                # .inputs_pre_hook), so use an index-free full zero there instead
+                # of the sparse, index-driven memset; it is semantically equivalent
+                # (a superset of the rows the finalize scatter-adds into) and still
+                # charges a memset to the profiled time.
+                if AutoTuner.get().is_tuning_mode:
+                    fc2_c.zero_()
+                else:
+                    torch.ops.trtllm.moe_output_memset_inplace(
+                        input=fc2_c,
+                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles=num_non_exiting_tiles,
+                        tile_tokens_dim=self.tile_size,
+                        top_k=self.top_k,
+                        ep_size=self.ep_size,
+                        enable_alltoall=self.enable_alltoall,
+                    )
 
                 fc1_a_ptr = make_ptr(cutlass.Float4E2M1FN, fc1_a.data_ptr(),
                                      cute.AddressSpace.gmem, assumed_align=32)
@@ -13093,7 +13167,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 top_k_cx = self.top_k
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
-                             cluster_shape_mn, max_active_clusters)
+                             cluster_shape_mn, max_active_clusters,
+                             self.swiglu_limit)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         self.scaling_vector_size,
@@ -13102,7 +13177,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cluster_shape_mn,
                         True,  # vectorized_f32
                         topk=self.top_k,
-                        use_pdl=False,
+                        use_pdl=True,
                         swiglu_limit=self.swiglu_limit,
                         scheduler="l2_atomic",
                     )
@@ -13312,6 +13387,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             scaling_vector_size: int,
             swiglu_limit: float,
             precomputed_tactic: Optional[str],
+            expanded_idx_to_permuted_idx: torch.Tensor,
+            ep_size: int,
+            enable_alltoall: bool,
             tuner_key: str,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
@@ -13323,15 +13401,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size,
                 scaling_vector_size,
                 swiglu_limit=swiglu_limit,
+                ep_size=ep_size,
+                enable_alltoall=enable_alltoall,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
-            # GatherGroupedGemmInputsHelper; FC2 tensors 10..14).
+            # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
+            # feeds the in-op output memset).
             inputs = [
                 input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
                 tile_idx_to_group_idx, tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
                 fc2_weight, fc2_weight_scale, fc2_alpha, output,
-                token_final_scales
+                token_final_scales, expanded_idx_to_permuted_idx
             ]
             if precomputed_tactic is None:
                 _, best_tactic = tuner.choose_one(
@@ -13353,8 +13434,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, Tensor global_sf, "
             "Tensor fc2_weight, Tensor fc2_weight_scale, Tensor fc2_alpha, "
             "Tensor(a13!) output, Tensor token_final_scales, "
+            "Tensor expanded_idx_to_permuted_idx, "
             "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
             "SymInt local_expert_offset, SymInt tile_size, float swiglu_limit, "
+            "SymInt ep_size, bool enable_alltoall, "
             "SymInt scaling_vector_size=16, "
             "str? precomputed_tactic=None) -> ()",
             device_types="cuda")
@@ -13374,12 +13457,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             fc2_alpha: torch.Tensor,
             output: torch.Tensor,
             token_final_scales: torch.Tensor,
+            expanded_idx_to_permuted_idx: torch.Tensor,
             num_experts: int,
             top_k: int,
             num_local_experts: int,
             local_expert_offset: int,
             tile_size: int,
             swiglu_limit: float,
+            ep_size: int,
+            enable_alltoall: bool,
             scaling_vector_size: int = 16,
             precomputed_tactic: Optional[str] = None,
         ) -> None:
@@ -13393,6 +13479,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 token_final_scales, num_experts, top_k, num_local_experts,
                 local_expert_offset, tile_size, scaling_vector_size,
                 swiglu_limit, precomputed_tactic,
+                expanded_idx_to_permuted_idx, ep_size, enable_alltoall,
                 "trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
 
         @torch.library.register_fake(
@@ -13413,12 +13500,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             fc2_alpha: torch.Tensor,
             output: torch.Tensor,
             token_final_scales: torch.Tensor,
+            expanded_idx_to_permuted_idx: torch.Tensor,
             num_experts: int,
             top_k: int,
             num_local_experts: int,
             local_expert_offset: int,
             tile_size: int,
             swiglu_limit: float,
+            ep_size: int,
+            enable_alltoall: bool,
             scaling_vector_size: int = 16,
             precomputed_tactic: Optional[str] = None,
         ) -> None:

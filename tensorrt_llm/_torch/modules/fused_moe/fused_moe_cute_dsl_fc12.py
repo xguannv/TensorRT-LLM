@@ -58,15 +58,17 @@ from .interface import _reject
 class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
     """Outer autotune runner for the fused FC12 backend.
 
-    Identical to the parent except the routing-tile candidate set: the v1
-    fused kernel only supports the 128-wide tile, so restrict ``_tile_sizes``
-    to ``[128]`` (the parent offers 128/256/512, which would make the inner
-    fused runner assert on 256/512 during autotuning).
+    Identical to the parent except the routing-tile candidate set: the fused
+    kernel supports the 128-wide tile (1-CTA) and the 256-wide tile (2-CTA,
+    cluster (2,1)), so restrict ``_tile_sizes`` to ``[128, 256]`` (the parent
+    also offers 512, which the fused v1 kernel does not support). The inner
+    fused runner derives mma_tiler_m == tile_size and cluster M == tile_size //
+    128 from the selected tile, mirroring the CuteDSL grouped-GEMM runners.
     """
 
     @staticmethod
     def _tile_sizes():
-        return [128]
+        return [128, 256]
 
 
 class CuteDslFc12FusedMoE(CuteDslFusedMoE):
@@ -209,25 +211,15 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
              tile_tokens_dim=tile_size,
          )
 
-        # Zero moe_output for the scatter-add finalize via the sparse memset;
-        # faster than a full-buffer fc2_c.zero_() at large token counts.
-        torch.ops.trtllm.moe_output_memset_inplace(
-            input=moe_output,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_tokens_dim=tile_size,
-            top_k=effective_top_k,
-            ep_size=self.mapping.moe_ep_size,
-            enable_alltoall=enable_alltoall,
-        )
-
         # One fused op: gather + FC1 GEMM + SwiGLU + requant + FC2 GEMM +
         # finalize (scatter-add into moe_output = a2a combine workspace).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
         # scales (the kernel takes split alphas). The three atomic counters are
-        # allocated + memset inside the op runner.
+        # allocated + memset inside the op runner. The moe_output zeroing memset
+        # is issued inside the op too (right before the fused kernel, so it is
+        # the kernel's immediate stream predecessor and the PDL prologue can
+        # overlap it); expanded_idx_to_permuted_idx / ep_size / enable_alltoall
+        # are passed through for that memset.
         torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
             input=x.view(torch.float4_e2m1fn_x2),
             fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -244,12 +236,15 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             fc2_alpha=weight_view.fc2_global_scale,
             output=moe_output,
             token_final_scales=token_final_scales,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             num_experts=self.num_slots,
             top_k=effective_top_k,
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
-            scaling_vector_size=16,
             swiglu_limit=self.swiglu_limit_scalar,
+            ep_size=self.mapping.moe_ep_size,
+            enable_alltoall=enable_alltoall,
+            scaling_vector_size=16,
         )
         return moe_output
