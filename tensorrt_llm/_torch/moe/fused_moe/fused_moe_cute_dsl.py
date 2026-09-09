@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -609,10 +609,29 @@ class CuteDslFusedMoE(MoEImplBase):
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2}),
+        kinds=frozenset({
+            ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu
+        }),
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
     )
+
+    def resolve_activation_support(self) -> MoEActivationSupport:
+        """Declare the alpha/beta pair only for the kind that actually uses it.
+
+        The act-fusion kernels take the two SiTU soft-caps by value and fold
+        them at trace time, so their shape is ``UNIFORM_SCALAR``. Declaring
+        that on the class attribute instead would apply it to every kind, and
+        this backend's SwiGLU epilogue is a bare ``up * silu(gate)`` with no
+        constants -- a caller-supplied SwiGLU alpha/beta would then be accepted
+        here and silently dropped, which is exactly the failure
+        ``ActivationParamShape.UNSUPPORTED`` exists to raise on.
+        """
+        support = type(self).activation_support
+        if ActivationType(self.activation.kind) is ActivationType.SiTu:
+            return replace(support,
+                           alpha_beta=ActivationParamShape.UNIFORM_SCALAR)
+        return support
 
     def _has_moe_output_memset_aux_stream(self) -> bool:
         event_dict = getattr(self, 'event_dict', None)
