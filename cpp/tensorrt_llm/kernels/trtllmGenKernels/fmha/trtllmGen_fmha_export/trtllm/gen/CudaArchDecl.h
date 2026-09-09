@@ -41,13 +41,13 @@ enum class CudaArch {
   Sm100f,
   // Blackwell Ultra
   Sm103a,
-// {$nv-internal-release begin}
 #ifdef TLLM_RUBIN_FEATURES
-  // Rubin
+// {$nv-internal-release begin}
   Sm105a,
+  // {$nv-internal-release end}
+  // SM107
   Sm107a,
 #endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,24 +56,33 @@ inline bool isArchHopper(CudaArch cudaArch) {
   return cudaArch == CudaArch::Sm90a;
 }
 
-// {$nv-internal-release begin}
 #ifdef TLLM_RUBIN_FEATURES
 inline bool isArchRubin(CudaArch cudaArch) {
   // Note: when compiling with a Blackwell target compatible with Rubin such as 100f,
   // no Rubin-specific features shall be used.
-  return cudaArch == CudaArch::Sm105a || cudaArch == CudaArch::Sm107a;
+  // {$nv-internal-release begin}
+  if (cudaArch == CudaArch::Sm105a) {
+    return true;
+  }
+  // {$nv-internal-release end}
+  if (cudaArch == CudaArch::Sm107a) {
+    return true;
+  }
+  return false;
 }
 #endif // TLLM_RUBIN_FEATURES
-// {$nv-internal-release end}
 
 inline bool isArchBlackwell(CudaArch cudaArch) {
-// {$nv-internal-release begin}
 #ifdef TLLM_RUBIN_FEATURES
-  if (isArchRubin(cudaArch)) {
+// {$nv-internal-release begin}
+  if (cudaArch == CudaArch::Sm105a) {
+    return true;
+  }
+  // {$nv-internal-release end}
+  if (cudaArch == CudaArch::Sm107a) {
     return true;
   }
 #endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
   return cudaArch == CudaArch::Sm100a || cudaArch == CudaArch::Sm100f ||
          cudaArch == CudaArch::Sm103a;
 }
@@ -94,14 +103,14 @@ inline std::string cudaArchToString(CudaArch cudaArch, bool isFull = true) {
     return isFull ? "100f" : "100";
   case CudaArch::Sm103a:
     return isFull ? "103a" : "103";
-// {$nv-internal-release begin}
 #ifdef TLLM_RUBIN_FEATURES
+// {$nv-internal-release begin}
   case CudaArch::Sm105a:
     return isFull ? "105a" : "105";
+  // {$nv-internal-release end}
   case CudaArch::Sm107a:
     return isFull ? "107a" : "107";
 #endif // TLLM_RUBIN_FEATURES
-  // {$nv-internal-release end}
   default:
     assert(false);
     return "";
@@ -119,14 +128,14 @@ inline CudaArch stringToCudaArch(std::string const& str) {
     return CudaArch::Sm100f;
   } else if (str == "103a") {
     return CudaArch::Sm103a;
-// {$nv-internal-release begin}
 #ifdef TLLM_RUBIN_FEATURES
+// {$nv-internal-release begin}
   } else if (str == "105a") {
     return CudaArch::Sm105a;
+  // {$nv-internal-release end}
   } else if (str == "107a") {
     return CudaArch::Sm107a;
 #endif // TLLM_RUBIN_FEATURES
-    // {$nv-internal-release end}
   } else {
     assert(false);
     return CudaArch::Sm100a;

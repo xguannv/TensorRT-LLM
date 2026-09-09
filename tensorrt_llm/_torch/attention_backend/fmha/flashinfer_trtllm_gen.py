@@ -622,6 +622,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        num_heads: int,
+        mla_backend: str,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -657,6 +659,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # FlashInfer's TRTLLM-Gen MLA decode entry point rejects H=96 before
+        # dispatch. Decline only that wrapper path so FMHA selection can fall
+        # through to the legacy TRTLLM attention op, whose TRTLLM-Gen
+        # autotuner supports H=96 through a Q16 kernel.
+        if mla_backend == "trtllm-gen" and num_heads == 96:
+            return (
+                False,
+                "[Generation][MLA] FlashInfer TRTLLM-GEN backend is disabled "
+                "for num_heads=96; use the legacy TRTLLM fallback.",
             )
 
         return True, ""
@@ -834,6 +847,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    num_heads=attn.num_heads,
+                    mla_backend=self._get_effective_mla_backend(meta, q.size(0)),
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )

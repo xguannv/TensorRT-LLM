@@ -1346,6 +1346,15 @@ inline __device__ cutlass::Array<float, 2> sigmoid2_base2(cutlass::Array<float, 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ cutlass::Array<float, 2> tanh2(cutlass::Array<float, 2> x) {
+  cutlass::Array<float, 2> result;
+  result[0] = tanhf(x[0]);
+  result[1] = tanhf(x[1]);
+  return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Returns the largest power-of-2 less than or equal to the absolute value of the input.
 __forceinline__ __device__ float trunc_abs_float_to_pow2(float val) {
   // Mask out sign and mantissa bits, only retain exponent.
