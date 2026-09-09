@@ -89,7 +89,7 @@ SITU_BETA_DISABLED = -1.0
 
 def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
     """Map the op-boundary sentinel back to ``None`` for the kernel."""
-    return None if situ_beta is None or situ_beta < 0 else situ_beta
+    return None if situ_beta is None or situ_beta <= 0 else float(situ_beta)
 
 
 def _get_cute_dsl_swap_ab_candidates(
@@ -11459,30 +11459,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt num_local_experts, SymInt local_expert_offset, "
             "SymInt tile_size, Tensor(a!) output_tensor, "
             "Tensor(b!) output_sf_tensor, SymInt scaling_vector_size=16, "
-            f"SymInt activation_type={int(ActivationType.Swiglu)}) -> ()",
+            f"SymInt activation_type={int(ActivationType.Swiglu)}, "
+            f"float situ_beta={SITU_BETA_DISABLED}, "
+            f"float situ_linear_beta={SITU_BETA_DISABLED}) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
-                input: torch.Tensor,
-                weight_0: torch.Tensor,
-                weight_1: torch.Tensor,
-                input_scale: torch.Tensor,
-                weight_scale_0: torch.Tensor,
-                weight_scale_1: torch.Tensor,
-                alpha: torch.Tensor,
-                tile_idx_to_group_idx: torch.Tensor,
-                tile_idx_to_mn_limit: torch.Tensor,
-                permuted_idx_to_expanded_idx: torch.Tensor,
-                num_non_exiting_tiles: torch.Tensor,
-                global_sf: torch.Tensor,
-                num_experts: int,
-                top_k: int,
-                num_local_experts: int,
-                local_expert_offset: int,
-                tile_size: int,
-                output_tensor: torch.Tensor,
-                output_sf_tensor: torch.Tensor,
-                scaling_vector_size: int = 16,
-                activation_type: int = int(ActivationType.Swiglu),
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale_0: torch.Tensor,
+            weight_scale_1: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: torch.Tensor,
+            output_sf_tensor: torch.Tensor,
+            scaling_vector_size: int = 16,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: float = SITU_BETA_DISABLED,
+            situ_linear_beta: float = SITU_BETA_DISABLED,
         ) -> None:
             """Tune and launch both Rubin locality domain NVFP4 MoE FC1 partitions.
 
@@ -11524,6 +11528,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tile_size,
                     scaling_vector_size,
                     activation_type=ActivationType(activation_type),
+                    situ_beta=_canonicalize_situ_beta(situ_beta),
+                    situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
                 ))
             inputs = [
                 input,
@@ -11587,27 +11593,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin"
         )
         def _(
-                input: torch.Tensor,
-                weight_0: torch.Tensor,
-                weight_1: torch.Tensor,
-                input_scale: torch.Tensor,
-                weight_scale_0: torch.Tensor,
-                weight_scale_1: torch.Tensor,
-                alpha: torch.Tensor,
-                tile_idx_to_group_idx: torch.Tensor,
-                tile_idx_to_mn_limit: torch.Tensor,
-                permuted_idx_to_expanded_idx: torch.Tensor,
-                num_non_exiting_tiles: torch.Tensor,
-                global_sf: torch.Tensor,
-                num_experts: int,
-                top_k: int,
-                num_local_experts: int,
-                local_expert_offset: int,
-                tile_size: int,
-                output_tensor: torch.Tensor,
-                output_sf_tensor: torch.Tensor,
-                scaling_vector_size: int = 16,
-                activation_type: int = int(ActivationType.Swiglu),
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale_0: torch.Tensor,
+            weight_scale_1: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: torch.Tensor,
+            output_sf_tensor: torch.Tensor,
+            scaling_vector_size: int = 16,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: float = SITU_BETA_DISABLED,
+            situ_linear_beta: float = SITU_BETA_DISABLED,
         ) -> None:
             return None
 

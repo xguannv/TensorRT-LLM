@@ -25,7 +25,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...custom_ops.cute_dsl_custom_ops import (SITU_BETA_DISABLED,
+                                               GroupedGemmInputsHelper)
 from ...cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ...locality_domain.autotune import \
@@ -713,19 +714,6 @@ class CuteDslFusedMoE(MoEImplBase):
                 MoERejectReason.EPLB_UNSUPPORTED,
                 "locality domain MoE cannot follow EPLB expert migration")
 
-        # The locality-domain half-GEMM op has no SiTU parameters: it splits
-        # FC1 across two partitions and its wrapper forwards only
-        # ``activation_type``. Reaching it with SiTU would build a kernel with
-        # no soft-caps and die in the kernel constructor, several layers below
-        # the decision that caused it. Turn it down here, where the rejection
-        # trail names both the activation and the policy.
-        if (p.activation == "SiTu" and d.locality_domain_requested
-                and d.env.has_dep(MoEDep.LOCALITY_DOMAIN)):
-            return _reject(
-                MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "CuteDslFusedMoE SiTU has no locality-domain FC1; disable "
-                "locality_domain_policy for this layer or pick another backend")
-
         # SM107 has no unfused FC2: NVFP4 has no plain grouped GEMM there, and
         # the BF16 op always fuses finalize.
         if sm_version == 107 and not d.fused_finalize_enabled:
@@ -986,18 +974,20 @@ class CuteDslFusedMoE(MoEImplBase):
         assert self.has_nvfp4
         assert weight_view is not None
         if self.activation_type not in (ActivationType.Swiglu,
-                                        ActivationType.Relu2):
+                                        ActivationType.Relu2,
+                                        ActivationType.SiTu):
             raise NotImplementedError(
-                "CuteDSL NVFP4 FC1 supports only SwiGLU and Relu2; "
+                "CuteDSL NVFP4 FC1 supports only SwiGLU, Relu2 and SiTU; "
                 f"got {self.activation_type.name}")
         output_dtype = torch.bfloat16
 
         use_locality_domain = self._locality_domain_runtime is not None
         if use_locality_domain:
-            if self.activation_type != ActivationType.Swiglu:
+            if self.activation_type not in (ActivationType.Swiglu,
+                                            ActivationType.SiTu):
                 raise NotImplementedError(
-                    "Rubin locality domain NVFP4 MoE currently supports SwiGLU only"
-                )
+                    "Rubin locality domain NVFP4 MoE supports SwiGLU and SiTU "
+                    f"only; got {self.activation_type.name}")
 
         if moe_output is None:
             moe_output = torch.empty(
@@ -1144,6 +1134,15 @@ class CuteDslFusedMoE(MoEImplBase):
             gather_act_kwargs["activation_type"] = self.activation_type
             gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
         gather_act_kwargs["activation_type"] = self.activation_type
+        # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
+        # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
+        # a uniform scalar by the shape this backend declares. Only forwarded
+        # for SiTU so every other activation keeps hitting the op's sentinel
+        # default -- passing them unconditionally would make the op signature
+        # lie about which kinds have soft-caps.
+        if self.activation_type == ActivationType.SiTu:
+            gather_act_kwargs["situ_beta"] = self.act_alpha
+            gather_act_kwargs["situ_linear_beta"] = self.act_beta
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
@@ -1512,6 +1511,14 @@ class CuteDslFusedMoE(MoEImplBase):
             output_sf_tensor=fc1_out_sf,
             scaling_vector_size=self.scaling_vector_size,
             activation_type=self.activation_type,
+            # Always passed here, unlike the non-locality-domain call above:
+            # this op is invoked positionally-compatible from a prepare step
+            # before graph capture, so the sentinel keeps one signature for
+            # both SiTU and non-SiTU layers.
+            situ_beta=(self.act_alpha if self.activation_type
+                       == ActivationType.SiTu else SITU_BETA_DISABLED),
+            situ_linear_beta=(self.act_beta if self.activation_type
+                              == ActivationType.SiTu else SITU_BETA_DISABLED),
         )
 
         fc1_out_sf_merged = fc1_out_sf
