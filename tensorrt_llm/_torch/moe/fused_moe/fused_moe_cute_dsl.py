@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -609,29 +609,24 @@ class CuteDslFusedMoE(MoEImplBase):
     # cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py.
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
+    # alpha/beta are declared on the class, not narrowed per instance: MoE
+    # resolution reads the class attribute (there is no instance yet when a
+    # candidate is judged), and ``moe_resolution._activation_rejection`` states
+    # the invariant -- an instance may narrow a shape, never admit one its
+    # class refuses. Declaring UNSUPPORTED here and widening per instance made
+    # every K3 layer resolve away to CUTLASS with
+    # "CuteDslFusedMoE kernels take no activation alpha".
+    #
+    # Safe for the other two kinds because neither supplies the pair:
+    # ``SwigluActivation.constants()`` fills only ``limit`` and Relu2 fills
+    # nothing. ``SwigluBias`` is the kind that does, and it is not in ``kinds``.
     activation_support = MoEActivationSupport(
         kinds=frozenset(
             {ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
     )
-
-    def resolve_activation_support(self) -> MoEActivationSupport:
-        """Declare the alpha/beta pair only for the kind that actually uses it.
-
-        The act-fusion kernels take the two SiTU soft-caps by value and fold
-        them at trace time, so their shape is ``UNIFORM_SCALAR``. Declaring
-        that on the class attribute instead would apply it to every kind, and
-        this backend's SwiGLU epilogue is a bare ``up * silu(gate)`` with no
-        constants -- a caller-supplied SwiGLU alpha/beta would then be accepted
-        here and silently dropped, which is exactly the failure
-        ``ActivationParamShape.UNSUPPORTED`` exists to raise on.
-        """
-        support = type(self).activation_support
-        if ActivationType(self.activation.kind) is ActivationType.SiTu:
-            return replace(support,
-                           alpha_beta=ActivationParamShape.UNIFORM_SCALAR)
-        return support
 
     def _has_moe_output_memset_aux_stream(self) -> bool:
         event_dict = getattr(self, 'event_dict', None)
