@@ -182,10 +182,13 @@ inline __device__ void qmul4E4m3E2m1E4m3(__nv_fp8x4_storage_t& res,
                : "=r"(res)
                : "r"(a), "r"(b));
 }
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Fused replacement for two qmul4E4m3E2m1E4m3 calls, for architectures without qmul4.
+// {$nv-internal-release begin}
+// Fused replacement for two qmul4E4m3E2m1E4m3 calls for architectures without qmul4.
+// {$nv-internal-release end}
 //   src0, src1: 4 unpacked E2M1 values each (in nibbles 0, 2, 4, 6).
 //   sf:         4 packed E4M3 SFs, shared by both src0 and src1.
 //   dst0, dst1: 4 E4M3 output values each.
@@ -239,7 +242,8 @@ inline __device__ void convertUnpackedE2m1ToE4m3x2(uint32_t& dst0,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Fused replacement for two qmul4E4m3E2m1E4m3Bx calls, for architectures without qmul4.
+// Fused dequant-multiply for two registers with a broadcast SF byte (portable public-PTX path).
+// The fused single-instruction dequant is not exposed in public PTX, so this path is used publicly.
 //   src0, src1: 4 unpacked E2M1 values each (in nibbles 0, 2, 4, 6).
 //   sf0, sf1:   4 packed E4M3 SFs each; byte at byteIdx is selected for both.
 //   dst0, dst1: 4 E4M3 output values each.
@@ -292,7 +296,6 @@ inline __device__ void convertUnpackedE2m1ToE4m3x2Bx(uint32_t& dst0,
   asm volatile("prmt.b32 %0, %1, %2, 0x6420;" : "=r"(dst0) : "r"(resLo), "r"(resHi));
   asm volatile("prmt.b32 %0, %1, %2, 0x7531;" : "=r"(dst1) : "r"(resLo), "r"(resHi));
 }
-// {$nv-internal-release end}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ cute::uint128_t e2m1ToFp16(uint32_t src) {
@@ -396,6 +399,7 @@ inline __device__ uint32_t qmul4E4m3E2m1E4m3Higher4Elts(uint32_t src, cutlass::f
 #endif
   return res;
 }
+// {$nv-internal-release end}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -408,8 +412,10 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
   // The array to hold the 16 FP8 results.
   uint32_t dst[4];
 
-  // Only Blackwell has the qmul4 instruction.
-#if !(__CUDA_ARCH_SPECIFIC__ == 1000 || __CUDA_ARCH_SPECIFIC__ == 1030)
+  // The public release uses the portable cvt-based path unconditionally; the fused
+  // single-instruction dequant fast path is internal / not exposed in public PTX.
+#if defined(TLLM_PUBLIC_RELEASE) ||                                                                \
+  !(__CUDA_ARCH_SPECIFIC__ == 1000 || __CUDA_ARCH_SPECIFIC__ == 1030)
   // Convert SF from e4m3 to fp16x2 by packing the byte twice, then converting.
   uint16_t sfPacked = uint16_t(sf.storage) * 256u + uint16_t(sf.storage);
   uint32_t sfFp16x2;
@@ -443,6 +449,7 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
                  : "r"(srcWords[ii]), "r"(sfFp16x2));
   }
 #else
+  // {$nv-internal-release begin}
   // Cast the src into uint32_t array of 2 elements.
   uint32_t(&e2m1x8Array)[2] = reinterpret_cast<uint32_t(&)[2]>(srcX16);
 
@@ -451,11 +458,11 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
   dst[1] = qmul4E4m3E2m1E4m3Higher4Elts(e2m1x8Array[0], sf);
   dst[2] = qmul4E4m3E2m1E4m3Lower4Elts(e2m1x8Array[1], sf);
   dst[3] = qmul4E4m3E2m1E4m3Higher4Elts(e2m1x8Array[1], sf);
+  // {$nv-internal-release end}
 #endif
 
   return reinterpret_cast<cute::uint128_t&>(dst);
 }
-// {$nv-internal-release end}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,

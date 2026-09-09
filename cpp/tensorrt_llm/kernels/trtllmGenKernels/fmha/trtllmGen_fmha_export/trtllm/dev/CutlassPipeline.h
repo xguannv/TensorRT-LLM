@@ -25,15 +25,11 @@
 #include "CutlassSm90TileScheduler.h"
 #include "CutlassSm100TileScheduler.h"
 
-#ifdef TLLM_PUBLIC_RELEASE                  // {$nv-internal-release}
-#ifdef TLLM_RUBIN_FEATURES                  // {$nv-internal-release}
-#include <cuda_ptx/cuda_ptx_public_rubin.h> // {$nv-internal-release}
-#else                                       // {$nv-internal-release}
+#ifdef TLLM_PUBLIC_RELEASE               // {$nv-internal-release}
 #include <cuda_ptx/cuda_ptx.h>
-#endif                                  // {$nv-internal-release}
-#else                                   // {$nv-internal-release}
-#include <cuda_ptx/cuda_ptx_internal.h> // {$nv-internal-release}
-#endif                                  // {$nv-internal-release}
+#else                                    // {$nv-internal-release}
+#include <cuda_ptx/cuda_ptx_internal.h>  // {$nv-internal-release}
+#endif                                   // {$nv-internal-release}
 
 #include "Utils.h"
 
@@ -1973,11 +1969,11 @@ template <uint32_t Stages_> struct PipelineNonBlockingState {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
-// PipelineLamport class.
+// PipelineFineGrained class.
 // *************************************************************************************************
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Stages_, bool UseUmma_> class PipelineLamport {
+template <int Stages_, bool UseUmma_> class PipelineFineGrained {
 public:
   // Number of stages in pipeline.
   static constexpr uint32_t Stages = Stages_;
@@ -1988,15 +1984,15 @@ public:
   using PipelineState = cutlass::PipelineState<Stages>;
 
   template <typename InitBarriers = cute::true_type>
-  __device__ PipelineLamport(uint64_t* conditionalBarrierPtr,
-                             uint64_t* emptyBarrierPtr,
-                             uint64_t* primaryBarrierPtr,
-                             int32_t consumerArrivalCount,
-                             int32_t producerArrivalCount,
-                             int32_t transactionBytes,
-                             int32_t warpId,
-                             int32_t barInitWarpId,
-                             InitBarriers = {})
+  __device__ PipelineFineGrained(uint64_t* conditionalBarrierPtr,
+                                 uint64_t* emptyBarrierPtr,
+                                 uint64_t* primaryBarrierPtr,
+                                 int32_t consumerArrivalCount,
+                                 int32_t producerArrivalCount,
+                                 int32_t transactionBytes,
+                                 int32_t warpId,
+                                 int32_t barInitWarpId,
+                                 InitBarriers = {})
     : mConditionalBarrierPtr(conditionalBarrierPtr)
     , mEmptyBarrierPtr(emptyBarrierPtr)
     , mPrimaryBarrierPtr(primaryBarrierPtr)
@@ -2024,7 +2020,7 @@ public:
   //
   //////////////////////////////////////////////////////////////////////////////////////////////////
   // Performs an arrive and expect TX on the given stage. For normal TMA pipelines this is fused
-  // with producer-acquire, but Lamport pipelines need this decoupled
+  // with producer-acquire, but FineGrained pipelines need this decoupled
   inline __device__ void producer_arrive(int32_t const index) {
     cuda_ptx::mbarrier_arrive_expect_tx(cuda_ptx::sem_release_t{},
                                         cuda_ptx::scope_cta_t{},
@@ -2033,7 +2029,7 @@ public:
                                         mTransactionBytes);
   }
 
-  // Producer commit. For emulated lamport syncs, this will need to explicitly arrive on the
+  // Producer commit. For emulated fineGrained syncs, this will need to explicitly arrive on the
   // conditional barrier, but will be a no-op with hardware support
   inline __device__ void producer_commit(int32_t const index) {
     cuda_ptx::mbarrier_arrive(&mConditionalBarrierPtr[index]);
@@ -2149,11 +2145,11 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
-// PipelinePayloadLamport class.
+// PipelineFineGrainedMbarv1 class.
 // *************************************************************************************************
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Stages_, bool UseUmma_> class PipelinePayloadLamport {
+template <int Stages_, bool UseUmma_> class PipelineFineGrainedMbarv1 {
 public:
   // Number of stages in pipeline.
   static constexpr uint32_t Stages = Stages_;
@@ -2165,14 +2161,14 @@ public:
 
   // The ctor.
   template <typename InitBarriers = cute::true_type>
-  __device__ PipelinePayloadLamport(uint64_t* fullBarrierPtr,
-                                    uint64_t* emptyBarrierPtr,
-                                    int32_t consumerArrivalCount,
-                                    int32_t producerArrivalCount,
-                                    int32_t transactionBytes,
-                                    int32_t warpId,
-                                    int32_t barInitWarpId,
-                                    InitBarriers = {})
+  __device__ PipelineFineGrainedMbarv1(uint64_t* fullBarrierPtr,
+                                       uint64_t* emptyBarrierPtr,
+                                       int32_t consumerArrivalCount,
+                                       int32_t producerArrivalCount,
+                                       int32_t transactionBytes,
+                                       int32_t warpId,
+                                       int32_t barInitWarpId,
+                                       InitBarriers = {})
     : mFullBarrierPtr(fullBarrierPtr)
     , mEmptyBarrierPtr(emptyBarrierPtr)
     , mTransactionBytes(transactionBytes)
@@ -2198,7 +2194,7 @@ public:
   //
   //////////////////////////////////////////////////////////////////////////////////////////////////
   // Performs an arrive and expect TX on the given stage. For normal TMA pipelines this is fused
-  // with producer-acquire, but Lamport pipelines need this decoupled
+  // with producer-acquire, but FineGrained pipelines need this decoupled
   inline __device__ void producer_arrive(int32_t const index) {
     cuda_ptx::mbarrier_arrive_expect_tx(cuda_ptx::sem_release_t{},
                                         cuda_ptx::scope_cta_t{},
@@ -2261,7 +2257,7 @@ public:
                                                   uint32_t const phase,
                                                   int32_t* smemPtr,
                                                   cutlass::Array<bool, 2>& result) {
-    // Unused when using Payload64 barriers.
+    // Unused when using mbarriers V1.
     (void)smemPtr;
     auto barrier = &mFullBarrierPtr[index];
 
@@ -2356,9 +2352,9 @@ public:
   }
 
 private:
-  // Full Payload64 barriers are used to signal that:
-  // 1. The producer has loaded the data into the stage, through payload barrier primary phase
-  // 2. The loaded data is valid, through payload barrier conditional phase
+  // Full mbarriers V1 are used to signal that:
+  // 1. The producer has loaded the data into the stage, through mbarrier primary phase
+  // 2. The loaded data is valid, through mbarrier conditional phase
   uint64_t* mFullBarrierPtr{nullptr};
   // Empty Trans64  barriers are used to signal the producer that the consumer is finished with a
   // stage. The consumer threads will arrive on this barrier, and the producer threads will

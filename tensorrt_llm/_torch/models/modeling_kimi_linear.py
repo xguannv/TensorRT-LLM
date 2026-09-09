@@ -2864,10 +2864,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   explicit opt-in (routes to CppMambaHybridCacheManager with
         #   per-block KDA state snapshots); the default stays on the
         #   Mixed manager, which SA speculative decoding requires.
-        # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
-        #   rejects the MLA (576, 512) generation kernel (marked slower) and
-        #   the fallback C++ path requires num_heads % 64 == 0, which K3's
-        #   96 query heads violate.
+        # - tokens_per_block=64 remains the validated K3 page size. When the
+        #   effective MLA backend is trtllm-gen, H=96 is declined by the
+        #   FlashInfer wrapper and served by the legacy TRTLLM-Gen fallback.
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,

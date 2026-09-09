@@ -90,7 +90,9 @@ def _kimi_k3_mla_decode_backend_policy(
     batch cannot use that reuse key, so selecting CuTe-DSL would repeat the
     staging copies in every MLA layer and regress time to first token. Keep
     the requested CuTe-DSL fast path for plain decode and use TRTLLM-Gen for
-    mixed batches and speculative multi-token verification.
+    mixed batches and speculative multi-token verification. For H=96, the
+    FlashInfer wrapper declines that effective TRTLLM-Gen backend so FMHA
+    selection can continue to the legacy TRTLLM-Gen path.
     """
     is_single_token_generation = num_tokens == metadata.num_generations
     if requested_backend == "cute-dsl" and (
