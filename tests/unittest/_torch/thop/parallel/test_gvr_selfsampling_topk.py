@@ -1021,3 +1021,167 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
         ref_v = torch.topk(row, k).values.sort().values
         got = row[out[r].long()].sort().values
         assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
+
+
+@pytest.mark.parametrize("n_valid", [3072, 4096], ids=["n3072", "n4096"])
+def test_selfsampling_topk_high_anchor_hint_completeness(n_valid):
+    """Anchor-only hints whose gathered values all sit ABOVE the true k-th
+    value (an argmax anchor over the all-zero cold-start buffer, with a high
+    row head) bracket the sampling band so it contains fewer than top_k
+    entries. The classify histogram then never reaches k and the crossing
+    scan pins its bin-0 fallback as a fake crossing; the register-family
+    whole-bin emit must escape to the key-space ranking instead of
+    stopping at the histogram total (regression: rows exited with
+    out[tot:k) unwritten -- a prefix-only write). Deterministic worst case:
+    row[0] = second-max, so the bracket holds exactly two entries. The
+    cells pin the vulnerable reg variant (hint-driven bracket + no-clamp
+    classify: BRL variants clamp out-of-bracket values into bin 0 and
+    cannot under-count, so batch/shape are chosen to compile BRL off)."""
+    top_k = 512
+    bs = 256
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    v2 = torch.topk(logits, 2, dim=1).values[:, 1]
+    logits[:, 0] = v2  # row head = second-max: bracket = [second-max, max]
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device=_DEV)
+    pre_idx[:, 0] = logits.argmax(dim=1).to(torch.int32)
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((bs,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, pre_idx, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots (prefix-only emit)"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def test_selfsampling_topk_neginf_tail_completeness():
+    """The DEG bracket arm folds the row tail element (the last n % 4
+    columns live outside the float4 register batch) into the bracket
+    without the > -inf guard the vector loop has: a single in-window -inf
+    there drags the bracket low edge to -inf, every classify product
+    becomes NaN, the histogram total is zero, and the row exited having
+    written nothing (regression: hint-independent zero-write rows). The
+    escape such rows now take must also not double-count the tail element
+    when the tie class is the -inf key itself (regression: duplicate
+    indices from the -inf fill lanes of the last partial float4) -- odd
+    rows keep fewer than top_k finite entries to exercise that lane
+    bound."""
+    top_k = 1024
+    bs, npad, n_valid = 256, 4096, 4093  # n_valid % 4 = 1: one tail column
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, n_valid:] = 3e38  # poison past the window
+    logits[:, n_valid - 1] = float("-inf")  # in-window -inf in the tail column
+    logits[1::2, 500:n_valid] = float("-inf")  # odd rows: n_finite < top_k
+    masked = logits.clone()
+    masked[:, n_valid:] = float("-inf")
+    ref_vals, _ = torch.topk(masked, top_k, dim=1)
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device=_DEV)
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((bs,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, pre_idx, kv, indices, max_seq_len=npad)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots (zero-write rows)"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+@pytest.mark.parametrize("pos", [1000, 3000], ids=["in_window", "out_of_window"])
+def test_selfsampling_topk_posinf_completeness(pos):
+    """A +inf in the register-family fold window drives the bracket max to
+    +inf, so the bracket width GMAX-Tv=+inf and SC=rcp(+inf)=0 fold every
+    value into bin 0; the whole-bin emit then drops the +inf from the top-k
+    (regression, DKG issue #58). The infinite-width bracket must be rejected
+    by the collapse guard and take the key-space escape, where fkey(+inf) is
+    the maximum key. Both an in-window and an out-of-window +inf are pinned;
+    N=4096 k=1024 keeps the register 'reg' family (not the streaming tiers,
+    which never collapse this way)."""
+    top_k = 1024
+    n_valid = 4096
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((1, n_valid), generator=gen, dtype=torch.float32, device=_DEV) * 2.0
+    logits[0, pos] = float("inf")
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((1, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((1,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, None, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isinf(logits[0][indices[0].long()]).any(), "+inf dropped from the top-k"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def test_selfsampling_topk_posinf_regclus_completeness() -> None:
+    """A collapsed reg_clus bracket must use its whole-row key-space
+    fallback instead of emitting from the lossy float-space histogram."""
+    batch_size, n_valid, top_k = 4, 32768, 1024
+    assert ss_host.route(batch_size, n_valid, n_valid, top_k)["kernel"] == "reg_clus"
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((batch_size, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, 1000] = float("inf")
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((batch_size, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((batch_size,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, None, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isposinf(logits.gather(1, indices.long())).any(dim=1).all()
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width() -> None:
+    """Logits narrower than k + 1 with kv lengths beyond k: the launch
+    envelope must be the physical row width, so every row takes the in-kernel
+    short path (identity + -1 tail) instead of reading k + 1 elements across
+    the row stride (DKG issue #60, item 1)."""
+    rows, n, k = 2, 256, 512
+    lg = torch.randn(rows, n, dtype=torch.float32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    lc = ss_host._varlen_launcher(rows, n, k, n, 1, 1, hf=True)
+    if lc[0] != "main":  # main derives the envelope from npad in-kernel
+        env = lc[2] if not isinstance(lc[2], tuple) else lc[2][0]
+        assert env == n, (lc[0], env)
+    want = torch.full((rows, k), -1, dtype=torch.int32, device=_DEV)
+    want[:, :n] = torch.arange(n, dtype=torch.int32, device=_DEV)
+    for kv_len in (100000, n):  # kv far beyond the row width, and exactly the row width
+        kv = torch.full((rows,), kv_len, dtype=torch.int32, device=_DEV)
+        out.fill_(-7)
+        ss_host.run_varlen(lg, None, kv, out, max_seq_len=n)
+        torch.cuda.synchronize()
+        assert torch.equal(out, want), kv_len
+
+
+def test_selfsampling_warmup_incremental_rows_populate_exact_launchers() -> None:
+    """A later warmup_varlen call whose new row count falls inside an already
+    warmed engine band must still create that row count's launcher entry, so a
+    CUDA-graph capture at it finds its key (DKG issue #60, item 2)."""
+    k, msl, cr, nn = 512, 8192, 1, 1
+    npad = (msl + 63) // 64 * 64
+    ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(64,), hint_free=True)
+    key63 = (63, npad, k, min(msl, npad), nn, cr, True)
+    ss_host._VARLEN_CACHE.pop(key63, None)  # independent of earlier tests in this process
+    ss_host.warmup_varlen(
+        k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(63, 64), hint_free=True
+    )
+    assert key63 in ss_host._VARLEN_CACHE
+    lg = torch.randn(63, npad, dtype=torch.float32, device=_DEV)
+    kv = torch.full((63,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(63, k, dtype=torch.int32, device=_DEV)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg[:, :msl], None, kv, out, max_seq_len=msl)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = torch.topk(lg[:, :msl], k, dim=1).values.sort(dim=1).values
+    got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(ref, got)
+
+
+def test_validate_run_ws_requires_16_byte_alignment() -> None:
+    """The workspace fake declares 16-byte alignment; the host check matches
+    it so an 8-but-not-16-byte workspace fails here instead of at DSL
+    conversion (DKG issue #60, item 3)."""
+    logits = torch.zeros(1, 64, dtype=torch.float32, device=_DEV)
+    base = torch.zeros(ss_host.WS_BYTES // 4 + 4, dtype=torch.int32, device=_DEV)
+    ss_host.validate_run_ws(base[4:], logits)  # +16 B
+    with pytest.raises(RuntimeError, match="16-byte"):
+        ss_host.validate_run_ws(base[2:], logits)  # +8 B

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -167,6 +166,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = sparse_metadata_params.enable_indexer_skip
+        self.enable_gvr_topk = (
+            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
+        )
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
@@ -274,7 +276,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         and plain (no cute_dsl_topk) decode uses the C++ op. Called once from
         ``ModelEngine.warmup``.
         """
-        if not self.use_cute_dsl_topk or self.enable_heuristic_topk:
+        if not self.use_cute_dsl_topk or self.enable_gvr_topk:
             return
         if self.kv_cache_manager is None:
             return
@@ -323,9 +325,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         # same two-level dispatch and hardware gates as the indexer __init__:
         # never compile these kernels on unsupported stacks during warmup
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103, 107):
             return
-        if not self.enable_heuristic_topk or self.kv_cache_manager is None:
+        if not self.enable_gvr_topk or self.kv_cache_manager is None:
             return
         if not self.use_self_sampling_topk:
             return
@@ -374,7 +376,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
-                hint_free=os.environ.get("TRTLLM_GVR_V2_HINTED", "0") != "1",
+                hint_free=True,
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines
@@ -838,6 +840,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
         if self.needs_gvr_prior:
+            num_local_layers = self.kv_cache_manager.num_local_layers
             self.gvr_prior_indices = self.get_empty(
                 self.cuda_graph_buffers,
                 (num_local_layers, self.max_num_sequences, self.num_sparse_topk),
@@ -966,16 +969,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
-            # Resize heuristic scratch buffer for new max_draft_tokens.
-            if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
             # The Radix-split-work scratch (radix_aux_*) is sized the same way
             # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
             # unconditionally, so it must be resized here too -- otherwise the
