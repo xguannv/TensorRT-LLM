@@ -61,6 +61,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -243,6 +244,64 @@ def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
     assert params.num_mamba_layers == 2
     assert params.dtype is torch.bfloat16
     assert params.mamba_ssm_cache_dtype is torch.float32
+
+
+def test_kimi_kda_cache_params_honor_explicit_bf16_state() -> None:
+    config = _kimi_model_config().pretrained_config
+    quant_config = SimpleNamespace(mamba_ssm_cache_dtype=torch.bfloat16)
+
+    params = extract_mamba_kv_cache_params(config, quant_config=quant_config)
+
+    assert params.mamba_ssm_cache_dtype is torch.bfloat16
+
+
+def test_kimi_kda_cache_params_reject_fp16_state() -> None:
+    config = _kimi_model_config().pretrained_config
+    quant_config = SimpleNamespace(mamba_ssm_cache_dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="float32 .* or bfloat16"):
+        extract_mamba_kv_cache_params(config, quant_config=quant_config)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [("auto", torch.float32), ("float32", torch.float32), ("bfloat16", torch.bfloat16)],
+)
+def test_kimi_kda_state_dtype_auto_defaults_to_fp32(requested, expected) -> None:
+    """The "auto" default keeps the fp32 HF-reference state; bf16 is an explicit opt-in."""
+    model_config = _kimi_model_config()
+    model_config.quant_config = SimpleNamespace()
+    model_config.torch_dtype = torch.bfloat16
+
+    validate_and_set_mamba_ssm_cache_dtype(model_config, requested)
+
+    assert model_config.quant_config.mamba_ssm_cache_dtype is expected
+
+
+def test_kimi_kda_state_dtype_rejects_fp16() -> None:
+    model_config = _kimi_model_config()
+    model_config.quant_config = SimpleNamespace()
+    model_config.torch_dtype = torch.bfloat16
+
+    with pytest.raises(ValueError, match="float32 .* or bfloat16"):
+        validate_and_set_mamba_ssm_cache_dtype(model_config, "float16")
+
+
+def test_kimi_kda_state_dtype_rejects_stochastic_rounding_on_bf16() -> None:
+    """The KDA kernels round to nearest: stochastic rounding cannot pair with a
+    bf16 pool. An fp32 pool has nothing to round, so the flag is accepted (and
+    unused) there as it is for the other hybrids."""
+    model_config = _kimi_model_config()
+    model_config.quant_config = SimpleNamespace()
+    model_config.torch_dtype = torch.bfloat16
+
+    with pytest.raises(ValueError, match="stochastic_rounding"):
+        validate_and_set_mamba_ssm_cache_dtype(
+            model_config, "bfloat16", mamba_ssm_stochastic_rounding=True
+        )
+
+    validate_and_set_mamba_ssm_cache_dtype(model_config, "auto", mamba_ssm_stochastic_rounding=True)
+    assert model_config.quant_config.mamba_ssm_cache_dtype is torch.float32
 
 
 def _kimi_model_config() -> SimpleNamespace:
@@ -3780,9 +3839,9 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
-        assert layer_cache.kda_conv_q.dtype is torch.float32
+        assert layer_cache.kda_conv_q.dtype is torch.bfloat16
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_kg_cache.shape == (cache_size, 2, 2, 48)
         assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
         assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
         assert layer_cache.kda_beta_cache.stride(-2) == 8
@@ -3794,7 +3853,7 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
                         % _KDA_BETA_CACHE_ALIGNMENT_BYTES
                         == 0
                     )
-        assert layer_cache.kda_qkg_cache.dtype is torch.float32
+        assert layer_cache.kda_kg_cache.dtype is torch.float32
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             mgr.prev_num_accepted_tokens.data_ptr()
         )
@@ -3919,7 +3978,7 @@ def test_v2_kda_replay_relocates_live_slot_history():
             "kda_conv_q",
             "kda_conv_k",
             "kda_conv_v",
-            "kda_qkg_cache",
+            "kda_kg_cache",
             "kda_v_cache",
             "kda_beta_cache",
         )
@@ -3978,7 +4037,7 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr.kda_conv_q = torch.full((2, 4, 2, 6), 7.0)
     mgr.kda_conv_k = torch.full((2, 4, 2, 6), 7.0)
     mgr.kda_conv_v = torch.full((2, 4, 2, 6), 7.0)
-    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
+    mgr.kda_kg_cache = torch.full((2, 4, 2, 2, 2), 7.0)
     mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
 
@@ -3996,7 +4055,7 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
                     conv_state[slot, start : start + 2, :],
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_kg_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
             assert mgr.prev_num_accepted_tokens[slot] == 0

@@ -103,15 +103,16 @@ def make_conv_data(B, H, K=128, V=128, M=2, W=4, lower_bound=-5.0, scale=None, s
     A_log = torch.randn(H, dtype=torch.float32, device=device)
     dt_bias = torch.randn(dim, dtype=torch.float32, device=device)
     # dim-contiguous extended conv caches: allocate [B, S, dim], transpose.
-    cs_q = torch.randn(B, S, dim, dtype=torch.float32, device=device).transpose(1, 2)
-    cs_k = torch.randn(B, S, dim, dtype=torch.float32, device=device).transpose(1, 2)
-    cs_v = torch.randn(B, S, dim, dtype=torch.float32, device=device).transpose(1, 2)
+    # raw conv inputs are cached in bf16 like the projections that produce them
+    cs_q = torch.randn(B, S, dim, dtype=torch.bfloat16, device=device).transpose(1, 2)
+    cs_k = torch.randn(B, S, dim, dtype=torch.bfloat16, device=device).transpose(1, 2)
+    cs_v = torch.randn(B, S, dim, dtype=torch.bfloat16, device=device).transpose(1, 2)
     initial_state_kfirst = torch.randn(B, H, K, V, dtype=torch.float32, device=device)
     initial_state_cute = initial_state_kfirst.permute(0, 1, 3, 2).contiguous()
     cu_seqlens = torch.arange(0, B * T + 1, T, dtype=torch.int32, device=device)
     ssm_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     num_accepted_tokens = torch.zeros(B, dtype=torch.int32, device=device)
-    qkg_cache = torch.zeros(B, M, 3, dim, dtype=torch.float32, device=device)
+    kg_cache = torch.zeros(B, M, 2, dim, dtype=torch.float32, device=device)
     v_cache = torch.zeros(B, M, H * V, dtype=torch.float32, device=device)
     beta_cache = torch.zeros(B, M, H, dtype=torch.float32, device=device)
     return {
@@ -130,7 +131,7 @@ def make_conv_data(B, H, K=128, V=128, M=2, W=4, lower_bound=-5.0, scale=None, s
         "cs_v": cs_v,
         "initial_state_kfirst": initial_state_kfirst,
         "initial_state_cute": initial_state_cute,
-        "qkg_cache": qkg_cache,
+        "kg_cache": kg_cache,
         "v_cache": v_cache,
         "beta_cache": beta_cache,
         "cu_seqlens": cu_seqlens,
@@ -168,7 +169,7 @@ def cpu_reference(data):
     cs_q = data["cs_q"].float().cpu().clone()
     cs_k = data["cs_k"].float().cpu().clone()
     cs_v = data["cs_v"].float().cpu().clone()
-    qkg_cache = data["qkg_cache"].float().cpu().clone()
+    kg_cache = data["kg_cache"].float().cpu().clone()
     v_cache = data["v_cache"].float().cpu().clone()
     beta_cache = data["beta_cache"].float().cpu().clone()
     ht = data["initial_state_kfirst"].float().cpu().clone()
@@ -189,9 +190,10 @@ def cpu_reference(data):
             h_state = ht[slot, h].clone()
             for i_t in range(T_loop):
                 if i_t < commit_len:
-                    q_t = qkg_cache[slot, i_t, 0, hk : hk + K]
-                    k_t = qkg_cache[slot, i_t, 1, hk : hk + K]
-                    gk_t = qkg_cache[slot, i_t, 2, hk : hk + K]
+                    # replayed drafts produce no output; their q is not cached
+                    q_t = torch.zeros(K, dtype=torch.float32)
+                    k_t = kg_cache[slot, i_t, 0, hk : hk + K]
+                    gk_t = kg_cache[slot, i_t, 1, hk : hk + K]
                     v_t = v_cache[slot, i_t, hv : hv + V]
                     beta_t = beta_cache[slot, i_t, h]
                     xq_raw = cs_q[slot, hk : hk + K, W - 1 + i_t]
@@ -239,9 +241,8 @@ def cpu_reference(data):
                     cs_v[slot, hv : hv + V, : W - 1] = hist_v
                 if i_t > commit_len:
                     cache_pos = i_t - commit_len - 1
-                    qkg_cache[slot, cache_pos, 0, hk : hk + K] = q_t
-                    qkg_cache[slot, cache_pos, 1, hk : hk + K] = k_t
-                    qkg_cache[slot, cache_pos, 2, hk : hk + K] = gk_t
+                    kg_cache[slot, cache_pos, 0, hk : hk + K] = k_t
+                    kg_cache[slot, cache_pos, 1, hk : hk + K] = gk_t
                     v_cache[slot, cache_pos, hv : hv + V] = v_t
                     beta_cache[slot, cache_pos, h] = beta_t
                     cs_q[slot, hk : hk + K, W - 1 + cache_pos] = xq_raw
@@ -251,7 +252,7 @@ def cpu_reference(data):
     return {
         "out": out,
         "recurrent_state": ht_commit,
-        "qkg_cache": qkg_cache,
+        "kg_cache": kg_cache,
         "v_cache": v_cache,
         "beta_cache": beta_cache,
         "cs_q": cs_q,
@@ -268,11 +269,17 @@ def cute_run(
     fuse_output_norm=False,
     quantize_output=False,
     beta_cache_override=None,
+    state_override=None,
 ):
-    """Run the op, optionally substituting a pre-populated beta-cache view."""
+    """Run the op, optionally substituting a pre-populated beta-cache view or a
+    caller-allocated recurrent-state tensor (e.g. a strided slice of a larger cache)."""
     import tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
 
-    state = data["initial_state_cute"].clone()
+    if state_override is None:
+        state = data["initial_state_cute"].clone()
+    else:
+        state = state_override
+        state.copy_(data["initial_state_cute"])
     cs = {}
     for name in ("cs_q", "cs_k", "cs_v"):
         src = data[name]
@@ -281,7 +288,7 @@ def cute_run(
         ).transpose(1, 2)
         dst.copy_(src)
         cs[name] = dst
-    qkg_cache = data["qkg_cache"].clone()
+    kg_cache = data["kg_cache"].clone()
     v_cache = data["v_cache"].clone()
     beta_cache = data["beta_cache"].clone() if beta_cache_override is None else beta_cache_override
     op_kwargs = dict(
@@ -299,7 +306,7 @@ def cute_run(
         A_log=data["A_log"],
         dt_bias=data["dt_bias"],
         recurrent_state=state,
-        qkg_cache=qkg_cache,
+        kg_cache=kg_cache,
         v_cache=v_cache,
         beta_cache=beta_cache,
         ssm_state_indices=data["ssm_state_indices"],
@@ -331,7 +338,7 @@ def cute_run(
         # committed state back in K-first layout for CPU-golden comparison
         "recurrent_state": state.permute(0, 1, 3, 2).contiguous(),
         "state_v_first": state,
-        "qkg_cache": qkg_cache,
+        "kg_cache": kg_cache,
         "v_cache": v_cache,
         "beta_cache": beta_cache,
         "cs_q": cs["cs_q"],
@@ -431,7 +438,7 @@ def _fla_sequential_reference(data, num_accepted):
                 xk = data["cs_k"][n, :, W - 1 + i_t].float()
                 xv = data["cs_v"][n, :, W - 1 + i_t].float()
                 tok = None
-                g_t = data["qkg_cache"][n, i_t, 2].float()
+                g_t = data["kg_cache"][n, i_t, 1].float()
                 beta_t = data["beta_cache"][n, i_t].float()
                 replay = True
             else:
@@ -453,7 +460,7 @@ def _fla_sequential_reference(data, num_accepted):
             if replay:
                 # Replayed tokens use the cached post-processed k/g/v/beta
                 # exactly as the kernel does (delta rule applied directly).
-                k_t = data["qkg_cache"][n, i_t, 1].float().view(H, K)
+                k_t = data["kg_cache"][n, i_t, 0].float().view(H, K)
                 gk_t = g_t.view(H, K)
                 v_t = data["v_cache"][n, i_t].float().view(H, V)
                 st = state[0]
@@ -525,7 +532,7 @@ def test_round1_zero_accepted(B, H):
     _assert_close(
         "state(cute vs cpu)", cute_out["recurrent_state"], cpu["recurrent_state"], atol=1e-4
     )
-    for name in ("qkg_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
+    for name in ("kg_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
         _assert_close(f"{name}(cute vs cpu)", cute_out[name], cpu[name], atol=2e-2)
 
     # Kernel vs the FLA sequential path (the in-tree fused verify math).
@@ -560,7 +567,7 @@ def test_round2_replay(B, H, M):
 
     # Round 2 inputs: fresh tokens, caches/state/conv from round 1.
     data2 = make_conv_data(B, H, M=M, seed=8)
-    for name in ("qkg_cache", "v_cache", "beta_cache"):
+    for name in ("kg_cache", "v_cache", "beta_cache"):
         data2[name] = r1[name].cuda().contiguous()
     for name in ("cs_q", "cs_k", "cs_v"):
         # Preserve the contract's dim-contiguous (transposed) layout.
@@ -596,6 +603,91 @@ def test_round2_replay(B, H, M):
     )
 
 
+@pytest.mark.parametrize("B,H,M", [(2, 12, 7), (16, 12, 7)], ids=lambda v: str(v))
+def test_round2_replay_strided_state_cache(B, H, M):
+    """Replay round with the recurrent state living in a strided slice of a larger buffer
+    (slot stride 3 * H * V * K), like the runtime's per-layer view of the SSM cache. Covers the
+    kernel's own global-memory views (TMA state load/store), which only a non-contiguous state
+    exercises; ``B=2`` runs the cluster-pair form, ``B=16`` the single-CTA form."""
+    data = make_conv_data(B, H, M=M, seed=7)
+    T = data["T"]
+    r1 = cpu_reference(data)
+    data2 = make_conv_data(B, H, M=M, seed=8)
+    for name in ("kg_cache", "v_cache", "beta_cache"):
+        data2[name] = r1[name].cuda().contiguous()
+    for name in ("cs_q", "cs_k", "cs_v"):
+        src = r1[name].cuda()
+        dst = torch.empty(
+            src.shape[0], src.shape[2], src.shape[1], dtype=src.dtype, device=src.device
+        ).transpose(1, 2)
+        dst.copy_(src)
+        data2[name] = dst
+    data2["initial_state_kfirst"] = r1["recurrent_state"].cuda().contiguous()
+    data2["initial_state_cute"] = r1["recurrent_state"].cuda().permute(0, 1, 3, 2).contiguous()
+    accept = torch.arange(B, dtype=torch.int32) % (M + 1)
+    data2["num_accepted_tokens"] = accept.cuda()
+
+    state_shape = tuple(data2["initial_state_cute"].shape)  # (B, H, V, K)
+    big = torch.zeros((B, 3) + state_shape[1:], dtype=torch.float32, device="cuda")
+    strided_state = big[:, 1]
+    assert not strided_state.is_contiguous()
+
+    cpu2 = {k: v.cuda() for k, v in cpu_reference(data2).items()}
+    cute2 = cute_run(data2, state_override=strided_state)
+
+    rows = torch.cat(
+        [torch.arange(n * T + int(accept[n]), n * T + int(accept[n]) + 1 + M) for n in range(B)]
+    ).cuda()
+    _assert_close("out2(cute vs cpu)", cute2["out"][0, rows], cpu2["out"][0, rows], atol=2e-2)
+    _assert_close(
+        "state2(cute vs cpu)", cute2["recurrent_state"], cpu2["recurrent_state"], atol=1e-4
+    )
+    # the neighbouring slices of the buffer must be untouched
+    assert torch.count_nonzero(big[:, 0]) == 0 and torch.count_nonzero(big[:, 2]) == 0
+
+
+@pytest.mark.parametrize("B,H,M", [(2, 12, 7), (16, 12, 7)], ids=lambda v: str(v))
+def test_round2_replay_bf16_state(B, H, M):
+    """Replay round with a bf16 recurrent-state pool: the kernel reads the bf16 state (exact in
+    tf32) and rounds the committed state to nearest bf16. The CPU golden starts from the same
+    bf16-rounded state; its fp32 result is compared against the kernel's bf16 output with a
+    half-ulp (2^-9) bf16 tolerance. ``B=2`` runs the cluster-pair form, ``B=16`` the single-CTA form."""
+    data = make_conv_data(B, H, M=M, seed=7)
+    T = data["T"]
+    r1 = cpu_reference(data)
+    data2 = make_conv_data(B, H, M=M, seed=8)
+    for name in ("kg_cache", "v_cache", "beta_cache"):
+        data2[name] = r1[name].cuda().contiguous()
+    for name in ("cs_q", "cs_k", "cs_v"):
+        src = r1[name].cuda()
+        dst = torch.empty(
+            src.shape[0], src.shape[2], src.shape[1], dtype=src.dtype, device=src.device
+        ).transpose(1, 2)
+        dst.copy_(src)
+        data2[name] = dst
+    state_bf16 = r1["recurrent_state"].cuda().permute(0, 1, 3, 2).to(torch.bfloat16).contiguous()
+    data2["initial_state_cute"] = state_bf16
+    data2["initial_state_kfirst"] = state_bf16.permute(0, 1, 3, 2).float().contiguous()
+    accept = torch.arange(B, dtype=torch.int32) % (M + 1)
+    data2["num_accepted_tokens"] = accept.cuda()
+
+    cpu2 = {k: v.cuda() for k, v in cpu_reference(data2).items()}
+    cute2 = cute_run(data2)
+    assert cute2["state_v_first"].dtype == torch.bfloat16
+
+    rows = torch.cat(
+        [torch.arange(n * T + int(accept[n]), n * T + int(accept[n]) + 1 + M) for n in range(B)]
+    ).cuda()
+    _assert_close("out2(cute vs cpu)", cute2["out"][0, rows], cpu2["out"][0, rows], atol=2e-2)
+    _assert_close(
+        "state2(cute bf16 vs cpu fp32)",
+        cute2["recurrent_state"].float(),
+        cpu2["recurrent_state"],
+        atol=2e-3,
+        rtol=4e-3,
+    )
+
+
 @pytest.mark.parametrize("B,H,num_spec", [(4, 6, 2), (2, 12, 7)])
 def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
     """Compact row-strided projection views match the legacy shifted layout."""
@@ -613,7 +705,7 @@ def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
     for name in (
         "initial_state_kfirst",
         "initial_state_cute",
-        "qkg_cache",
+        "kg_cache",
         "v_cache",
         "beta_cache",
         "cs_q",
@@ -697,9 +789,7 @@ def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
     assert fused_fp8["out"].shape == (expected_rows, H * data["V"])
     assert torch.isfinite(fused_fp8["out"].float()).all()
     assert fused_fp8["output_scale"].dtype is torch.uint8
-    assert fused_fp8["output_scale"].shape == (
-        (expected_rows + 127) // 128 * 128 * H * 4,
-    )
+    assert fused_fp8["output_scale"].shape == ((expected_rows + 127) // 128 * 128 * H * 4,)
     expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
         expected_norm.reshape(expected_rows, H * data["V"]),
     )
@@ -707,12 +797,7 @@ def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
     rows = torch.arange(expected_rows, device="cuda", dtype=torch.int64).view(-1, 1)
     scale_columns = torch.arange(H * 4, device="cuda", dtype=torch.int64).view(1, -1)
     offsets = (
-        (
-            (rows // 128 * H + scale_columns // 4) * 32
-            + rows % 32
-        )
-        * 4
-        + (rows % 128) // 32
+        ((rows // 128 * H + scale_columns // 4) * 32 + rows % 32) * 4 + (rows % 128) // 32
     ) * 4 + scale_columns % 4
     assert torch.equal(
         fused_fp8["output_scale"][offsets.flatten()],
@@ -720,7 +805,7 @@ def test_packed_projection_views_match_shifted_metadata_replay(B, H, num_spec):
     )
     for name in (
         "recurrent_state",
-        "qkg_cache",
+        "kg_cache",
         "v_cache",
         "beta_cache",
         "cs_q",
@@ -743,7 +828,7 @@ def test_zero_accepted_hint_variant(B, H):
     for name in (
         "out",
         "recurrent_state",
-        "qkg_cache",
+        "kg_cache",
         "v_cache",
         "beta_cache",
         "cs_q",
@@ -772,7 +857,7 @@ def test_misaligned_state_indices_after_aligned_warmup():
     for name in (
         "out",
         "recurrent_state",
-        "qkg_cache",
+        "kg_cache",
         "v_cache",
         "beta_cache",
         "cs_q",
@@ -803,7 +888,7 @@ def test_misaligned_scalar_metadata_after_aligned_warmup(field):
     for name in (
         "out",
         "recurrent_state",
-        "qkg_cache",
+        "kg_cache",
         "v_cache",
         "beta_cache",
         "cs_q",
@@ -897,7 +982,7 @@ def test_beta_cache_sibling_layer_after_aligned_warmup(
     for name in (
         "out",
         "recurrent_state",
-        "qkg_cache",
+        "kg_cache",
         "v_cache",
         "beta_cache",
         "cs_q",

@@ -17,7 +17,7 @@
 Wraps the source-integrated ``kda_decode_mtp_kernel`` (see
 ``cute_dsl_kernels/blackwell/kimi_k3_kda/kda_mtp_decode.py``) as the
 ``trtllm::kda_mtp_decode`` operator. One launch fuses, per generation
-request: replay of previously-accepted draft tokens from the ``qkg/v/beta``
+request: replay of previously-accepted draft tokens from the ``kg/v/beta``
 caches, causal conv + SiLU, Q/K L2 norm, beta sigmoid, lower-bound gate, and
 the KDA delta-rule recurrence over the ``1 + num_spec`` new tokens. The
 recurrent state and base conv windows are committed **in place** after the
@@ -67,10 +67,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    import cutlass.utils.blackwell_helpers as sm100_utils
+    from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
     from cutlass.cute.runtime import from_dlpack
 
     from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
         NUM_THREADS,
+        SPLIT_MAX_TILES,
+        T_PAD,
         TILE_K,
         kda_decode_mtp_kernel,
     )
@@ -104,7 +108,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         o: cute.Tensor,
         output_scale: cute.Tensor,
         ht: cute.Tensor,
-        qkg_cache: cute.Tensor,
+        kg_cache: cute.Tensor,
         v_cache: cute.Tensor,
         beta_cache: cute.Tensor,
         stage_timing: cute.Tensor,
@@ -134,6 +138,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         FUSE_OUTPUT_NORM: cutlass.Constexpr[bool],
         QUANTIZE_OUTPUT: cutlass.Constexpr[bool],
         PROFILE_STAGES: cutlass.Constexpr[bool],
+        SPLIT_V: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(USE_ZERO_ACCEPTED):
@@ -141,7 +146,149 @@ if IS_CUTLASS_DSL_AVAILABLE:
         else:
             t_max = 2 * NUM_SPEC + 1
         smem_qk_layout = cute.make_layout((t_max, K), stride=(K, 1))
-        kda_decode_mtp_kernel(
+        # GEMM1: M = V rows of the state (TMEM), N = 3 * T_PAD operand rows, tf32.
+        tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (V, 3 * T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1 = sm100_utils.make_smem_layout_b(
+            tiled_mma1, (V, 3 * T_PAD, K), cutlass.Float32, 1
+        )
+        # GEMM1b: the S0_lo sweep only needs K~hi (N = T_PAD) -> a third of the N=48 work.
+        tiled_mma1k = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1k = sm100_utils.make_smem_layout_b(
+            tiled_mma1k, (V, T_PAD, K), cutlass.Float32, 1
+        )
+        # TMA bulk store of the committed state: (V, K, tiles) view of ht, one 128B-swizzled
+        # (V/SPLIT_V x 32 fp32 | 64 bf16) box per 128 B-wide column slab. The view takes ht's own strides (the
+        # per-layer state cache is a strided slice of a larger buffer); the tile mode is the pool
+        # index (flat layout) or the (head, slot) pair.
+        if cutlass.const_expr(cute.rank(ht.shape) == 3):
+            mT_vkl = cute.make_tensor(
+                ht.iterator,
+                cute.make_layout(
+                    (V, K, ht.shape[0]),
+                    stride=(ht.layout.stride[1], ht.layout.stride[2], ht.layout.stride[0]),
+                ),
+            )
+        else:
+            mT_vkl = cute.make_tensor(
+                ht.iterator,
+                cute.make_layout(
+                    (V, K, (ht.shape[1], ht.shape[0])),
+                    stride=(
+                        ht.layout.stride[2],
+                        ht.layout.stride[3],
+                        (ht.layout.stride[1], ht.layout.stride[0]),
+                    ),
+                ),
+            )
+        # 128 B swizzled box rows: 32 fp32 or 64 bf16 state columns per box
+        box_cols = 128 // (h0.element_type.width // 8)
+        box_atom = sm100_utils.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, h0.element_type
+        )
+        box_layout = cute.tile_to_shape(box_atom, (V, box_cols), order=(0, 1))
+        # committed-state store: each CTA writes its V/SPLIT_V rows through (V/SPLIT_V x box_cols) boxes
+        box_layout_t = cute.tile_to_shape(box_atom, (V // SPLIT_V, box_cols), order=(0, 1))
+        tma_atom_t, mT_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(), mT_vkl, box_layout_t, (V // SPLIT_V, box_cols)
+        )
+        # TMA bulk load of the initial state S0 into the same box layout (issued at kernel start).
+        if cutlass.const_expr(cute.rank(h0.shape) == 3):
+            mS_vkl = cute.make_tensor(
+                h0.iterator,
+                cute.make_layout(
+                    (V, K, h0.shape[0]),
+                    stride=(h0.layout.stride[1], h0.layout.stride[2], h0.layout.stride[0]),
+                ),
+            )
+        else:
+            mS_vkl = cute.make_tensor(
+                h0.iterator,
+                cute.make_layout(
+                    (V, K, (h0.shape[1], h0.shape[0])),
+                    stride=(
+                        h0.layout.stride[2],
+                        h0.layout.stride[3],
+                        (h0.layout.stride[1], h0.layout.stride[0]),
+                    ),
+                ),
+            )
+        tma_atom_l, mS_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), mS_vkl, box_layout, (V, box_cols)
+        )
+        # GEMM2: (V x T_PAD) x (T_PAD x K), both operands in smem, tf32; issued as two N = K/2
+        # column halves so the state store can start on half 0.
+        tiled_mma2h = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (V, K // 2),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_b2h = sm100_utils.make_smem_layout_b(
+            tiled_mma2h, (V, K // 2, T_PAD), cutlass.Float32, 1
+        )
+        smem_layout_a2 = sm100_utils.make_smem_layout_a(
+            tiled_mma2h, (V, K // 2, T_PAD), cutlass.Float32, 1
+        )
+        # GEMM2 half 0 also carries the output-combination GEMM: N = T_PAD (Bcoef) + K/2 (Kbar rows 0..63).
+        tiled_mma2q = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD + K // 2),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_b2q = sm100_utils.make_smem_layout_b(
+            tiled_mma2q, (V, T_PAD + K // 2, T_PAD), cutlass.Float32, 1
+        )
+        # GEMM3: T x T coupling matrices, A3 = [Kf; Qf] padded to 64 rows, B3 = Kb (16 rows).
+        tiled_mma3 = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (4 * T_PAD, T_PAD),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_a3 = sm100_utils.make_smem_layout_a(
+            tiled_mma3, (4 * T_PAD, T_PAD, K), cutlass.Float32, 1
+        )
+        smem_layout_b3 = sm100_utils.make_smem_layout_b(
+            tiled_mma3, (4 * T_PAD, T_PAD, K), cutlass.Float32, 1
+        )
+        # Output combination D4[v, t] = sum_s V'[s, v] Bcoef[t, s]: computed as the first 16 columns
+        # of GEMM2 half 0; this tiled MMA only provides the accumulator layout of those columns.
+        tiled_mma4 = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD),
+            tcgen05.OperandSource.SMEM,
+        )
+        launched = kda_decode_mtp_kernel(
             h0,
             x_q,
             x_k,
@@ -161,7 +308,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             o,
             output_scale,
             ht,
-            qkg_cache,
+            kg_cache,
             v_cache,
             beta_cache,
             smem_qk_layout,
@@ -191,7 +338,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
             QUANTIZE_OUTPUT,
             stage_timing,
             PROFILE_STAGES,
-        ).launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
+            tiled_mma1,
+            tiled_mma3,
+            tiled_mma1k,
+            smem_layout_b1,
+            smem_layout_a2,
+            smem_layout_a3,
+            smem_layout_b3,
+            smem_layout_b1k,
+            tiled_mma4,
+            tma_atom_t,
+            mT_tma,
+            box_layout,
+            tma_atom_l,
+            mS_tma,
+            tiled_mma2h,
+            smem_layout_b2h,
+            box_layout_t,
+            tiled_mma2q,
+            smem_layout_b2q,
+            SPLIT_V,
+        )
+        if cutlass.const_expr(SPLIT_V == 2):
+            # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
+            launched.launch(
+                grid=(HV, N, 2), block=[NUM_THREADS, 1, 1], cluster=(1, 1, 2), stream=stream
+            )
+        else:
+            launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
 
 
 def _require_stride_layout(
@@ -210,7 +384,7 @@ def _require_stride_layout(
     A_log,
     dt_bias,
     recurrent_state,
-    qkg_cache,
+    kg_cache,
     v_cache,
     beta_cache,
     ssm_state_indices,
@@ -270,7 +444,7 @@ def _require_stride_layout(
         "g": g,
         "beta": beta,
         "recurrent_state": recurrent_state,
-        "qkg_cache": qkg_cache,
+        "kg_cache": kg_cache,
         "v_cache": v_cache,
         "beta_cache": beta_cache,
     }
@@ -310,14 +484,16 @@ def _require_stride_layout(
         raise ValueError(
             f"Expected recurrent_state shape [pool, {HV}, {V}, {K}] (V-first pool layout)."
         )
-    if qkg_cache.ndim != 4 or qkg_cache.shape[1:] != (num_spec, 3, H * K):
-        raise ValueError(f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")
+    if recurrent_state.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"recurrent_state must be fp32 or bf16, got {recurrent_state.dtype}")
+    if kg_cache.ndim != 4 or kg_cache.shape[1:] != (num_spec, 2, H * K):
+        raise ValueError(f"Expected kg_cache shape [pool, {num_spec}, 2, {H * K}].")
     if v_cache.ndim != 3 or v_cache.shape[1:] != (num_spec, HV * V):
         raise ValueError(f"Expected v_cache shape [pool, {num_spec}, {HV * V}].")
     if beta_cache.ndim != 3 or beta_cache.shape[1:] != (num_spec, HV):
         raise ValueError(f"Expected beta_cache shape [pool, {num_spec}, {HV}].")
     if (
-        qkg_cache.shape[0] < pool_size
+        kg_cache.shape[0] < pool_size
         or v_cache.shape[0] < pool_size
         or beta_cache.shape[0] < pool_size
     ):
@@ -462,7 +638,7 @@ def kda_mtp_decode_impl(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     recurrent_state: torch.Tensor,
-    qkg_cache: torch.Tensor,
+    kg_cache: torch.Tensor,
     v_cache: torch.Tensor,
     beta_cache: torch.Tensor,
     ssm_state_indices: torch.Tensor,
@@ -494,10 +670,10 @@ def kda_mtp_decode_impl(
             window; tail columns hold raw pending-draft inputs. Mutated.
         g, beta: raw gate ``[1, T, H, 128]`` and beta ``[1, T, H]`` bf16.
         A_log, dt_bias: fp32 ``[H]`` / ``[H*128]``.
-        recurrent_state: pool ``[pool, H, V, K]`` fp32, **V-first** layout
+        recurrent_state: pool ``[pool, H, V, K]`` fp32 or bf16, **V-first** layout
             (matches the executor ssm pool and the single-token decode
             kernel). Committed in place.
-        qkg_cache/v_cache/beta_cache: replay caches ``[pool, M, 3, H*K]`` /
+        kg_cache/v_cache/beta_cache: replay caches ``[pool, M, 2, H*K]`` /
             ``[pool, M, H*V]`` / ``[pool, M, H]`` fp32. Mutated.
         ssm_state_indices: per-request state-pool slots. On the legacy
             metadata path, ``cu_seqlens`` supplies token offsets ``[N+1]``
@@ -586,7 +762,7 @@ def kda_mtp_decode_impl(
         A_log=A_log,
         dt_bias=dt_bias,
         recurrent_state=recurrent_state,
-        qkg_cache=qkg_cache,
+        kg_cache=kg_cache,
         v_cache=v_cache,
         beta_cache=beta_cache,
         ssm_state_indices=ssm_state_indices,
@@ -655,6 +831,8 @@ def kda_mtp_decode_impl(
     stage_timing_arg = out
     beta_cache_assumed_align = _beta_cache_assumed_align(beta_cache)
     output_scale_assumed_align = 16 if quantize_output else 4
+    # Two CTAs per (head, request) while they fit in one wave (see SPLIT_MAX_TILES).
+    split_v = 2 if HV * N <= SPLIT_MAX_TILES else 1
 
     key = (
         x_q.dtype,
@@ -685,7 +863,7 @@ def kda_mtp_decode_impl(
         _layout_key(onorm_weight_arg),
         _layout_key(out, dynamic_layout=True, assumed_align=16),
         _layout_key(output_scale, assumed_align=output_scale_assumed_align),
-        _layout_key(qkg_cache),
+        _layout_key(kg_cache),
         _layout_key(v_cache),
         _layout_key(beta_cache, assumed_align=beta_cache_assumed_align),
         _layout_key(ssm_state_indices, dynamic_layout=True, assumed_align=4),
@@ -699,6 +877,7 @@ def kda_mtp_decode_impl(
         float(onorm_eps),
         bool(fuse_output_norm),
         bool(quantize_output),
+        split_v,
     )
 
     if key not in _compiled_cache:
@@ -707,7 +886,7 @@ def kda_mtp_decode_impl(
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
             f"fuse_output_norm={fuse_output_norm} "
-            f"quantize_output={quantize_output}"
+            f"quantize_output={quantize_output} split_v={split_v}"
         )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
@@ -730,7 +909,7 @@ def kda_mtp_decode_impl(
             _dlpack_arg(out, assumed_align=16),
             _from_dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
             _from_dlpack_arg(h0_arg),
-            _from_dlpack_arg(qkg_cache),
+            _from_dlpack_arg(kg_cache),
             _from_dlpack_arg(v_cache),
             _from_dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
             _dlpack_arg(stage_timing_arg, assumed_align=16),
@@ -760,11 +939,12 @@ def kda_mtp_decode_impl(
             FUSE_OUTPUT_NORM=bool(fuse_output_norm),
             QUANTIZE_OUTPUT=bool(quantize_output),
             PROFILE_STAGES=profile_stages,
+            SPLIT_V=split_v,
             stream=stream,
         )
 
     # Runtime alignment policy:
-    # - 16 B: model inputs/outputs, parameters, recurrent/conv/qkg/v pools,
+    # - 16 B: model inputs/outputs, parameters, recurrent/conv/kg/v pools,
     #   output-norm tensors, and the persistent control scalar.
     # - beta_cache: derived from its actual per-layer physical span and dtype.
     # - 4 B: int32 scheduler metadata, which may be an element-offset view.
@@ -790,7 +970,7 @@ def kda_mtp_decode_impl(
         _dlpack_arg(out, assumed_align=16),
         _dlpack_arg(output_scale, assumed_align=output_scale_assumed_align),
         _dlpack_arg(h0_arg, assumed_align=16),
-        _dlpack_arg(qkg_cache, assumed_align=16),
+        _dlpack_arg(kg_cache, assumed_align=16),
         _dlpack_arg(v_cache, assumed_align=16),
         _dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
         _dlpack_arg(stage_timing_arg, assumed_align=16),
@@ -816,7 +996,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "cs_k",
             "cs_v",
             "recurrent_state",
-            "qkg_cache",
+            "kg_cache",
             "v_cache",
             "beta_cache",
         ),
@@ -837,7 +1017,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        qkg_cache: torch.Tensor,
+        kg_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -870,7 +1050,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             A_log=A_log,
             dt_bias=dt_bias,
             recurrent_state=recurrent_state,
-            qkg_cache=qkg_cache,
+            kg_cache=kg_cache,
             v_cache=v_cache,
             beta_cache=beta_cache,
             ssm_state_indices=ssm_state_indices,
@@ -904,7 +1084,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        qkg_cache: torch.Tensor,
+        kg_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -931,7 +1111,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "cs_k",
             "cs_v",
             "recurrent_state",
-            "qkg_cache",
+            "kg_cache",
             "v_cache",
             "beta_cache",
         ),
@@ -952,7 +1132,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        qkg_cache: torch.Tensor,
+        kg_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -984,7 +1164,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             A_log=A_log,
             dt_bias=dt_bias,
             recurrent_state=recurrent_state,
-            qkg_cache=qkg_cache,
+            kg_cache=kg_cache,
             v_cache=v_cache,
             beta_cache=beta_cache,
             ssm_state_indices=ssm_state_indices,
@@ -1019,7 +1199,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         recurrent_state: torch.Tensor,
-        qkg_cache: torch.Tensor,
+        kg_cache: torch.Tensor,
         v_cache: torch.Tensor,
         beta_cache: torch.Tensor,
         ssm_state_indices: torch.Tensor,
@@ -1048,7 +1228,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             A_log,
             dt_bias,
             recurrent_state,
-            qkg_cache,
+            kg_cache,
             v_cache,
             beta_cache,
             ssm_state_indices,
