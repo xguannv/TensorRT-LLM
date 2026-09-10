@@ -680,11 +680,11 @@ def _make_routed_moe(
             swiglu_alpha=torch.full((num_experts,), 4.0, dtype=torch.float32, device="cuda"),
             swiglu_beta=torch.full((num_experts,), 25.0, dtype=torch.float32, device="cuda"),
         )
-    elif moe_backend == "CUTEDSL":
-        from tensorrt_llm._torch.utils import ActivationType
-
+    elif moe_backend in ("CUTEDSL", "CUTEDSL_FC12"):
+        # Canonical form, same as KimiK3MoERuntime: create_moe_backend
+        # translates activation='situ' into ActivationType.SiTu + scalars.
         moe_kwargs.update(
-            activation_type=ActivationType.SiTu,
+            activation="situ",
             situ_beta=4.0,
             situ_linear_beta=25.0,
         )
@@ -951,14 +951,14 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
     return bank
 
 
-def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS):
+def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     return _make_routed_moe(
         _TP_INTERMEDIATE,
         gate,
         num_experts=num_experts,
-        moe_backend="CUTLASS",
+        moe_backend=moe_backend,
         routed_quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=_NVFP4_GROUP_SIZE),
     )
 
@@ -1377,7 +1377,20 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-def test_nvfp4_kernel_actually_applies_situ():
+@pytest.mark.parametrize(
+    "moe_backend",
+    [
+        "CUTLASS",
+        pytest.param(
+            "CUTEDSL_FC12",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available() or get_sm_version() != 107,
+                reason="CUTEDSL_FC12 fused kernel is Rubin (SM107) only",
+            ),
+        ),
+    ],
+)
+def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
     BF16 + SiTU already matches the golden reference, so the activation, the
@@ -1391,6 +1404,11 @@ def test_nvfp4_kernel_actually_applies_situ():
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
     """
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_fc12 import (
+        CuteDslFc12FusedMoE,
+    )
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+
     num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
     gate = _make_test_gate(num_experts=num_experts)
 
@@ -1411,7 +1429,12 @@ def test_nvfp4_kernel_actually_applies_situ():
     ]
     bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
 
-    moe = _make_nvfp4_moe(gate, num_experts=num_experts)
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend=moe_backend)
+    expected_cls = CuteDslFc12FusedMoE if moe_backend == "CUTEDSL_FC12" else CutlassFusedMoE
+    assert type(moe.backend) is expected_cls, (
+        f"requested {moe_backend} but factory selected "
+        f"{type(moe.backend).__name__}"
+    )
     _stream_nvfp4_bank(moe, bank)
     moe.backend._weights_transformed = False
     moe.post_load_weights()

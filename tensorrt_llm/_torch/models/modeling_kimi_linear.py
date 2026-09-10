@@ -1740,6 +1740,19 @@ class KimiK3MoERuntime(nn.Module):
                     "Kimi K3 explicitly requested CUTEDSL, but the MoE factory "
                     f"selected {type(self.routed_experts.backend).__name__}."
                 )
+        if routed_moe_model_config.moe_backend == "CUTEDSL_FC12":
+            from ..modules.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
+
+            # Same reason as CUTEDSL: CUTEDSL_FC12 is not in
+            # NO_FALLBACK_BACKENDS, so a declined config becomes CUTLASS and
+            # would be measured as the fused kernel. Exact type: the class
+            # subclasses CuteDslFusedMoE.
+            if type(self.routed_experts.backend) is not CuteDslFc12FusedMoE:
+                raise RuntimeError(
+                    "Kimi K3 explicitly requested CUTEDSL_FC12, but the MoE "
+                    "factory selected "
+                    f"{type(self.routed_experts.backend).__name__}."
+                )
         if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
             from ..modules.fused_moe.mega_moe import MegaMoECuteDsl
 

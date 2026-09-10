@@ -185,7 +185,8 @@ def create_moe_backend(
                          CuteDslFc12FusedMoE):
             # The CuTe DSL FC1 epilogue folds the constants in at trace time,
             # so they stay scalars and need no per-expert tensors.
-            # CuteDslFc12FusedMoE inherits the parent's SiTU-capable __init__.
+            # CuteDslFc12FusedMoE inherits the parent's SiTU-capable __init__
+            # and forwards the scalars into the fused kernel cache key.
             activation_type = ActivationType.SiTu
             activation = None
         elif moe_cls is TRTLLMGenFusedMoE:
