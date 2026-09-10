@@ -186,6 +186,9 @@ class Role:
     # _build_base_config, so allocation, free, slot reuse, and prefix reuse
     # share the lifecycle of the main K/V buffers for the same layer.
     INDEX_KEY = DataRole("index_key")
+    MLA_V_SCALE = DataRole("mla_v_scale")
+    MLA_V_PACKED = DataRole("mla_v_packed")
+    MLA_HP_TAIL = DataRole("mla_hp_tail")
     ALL = DataRole("all")
 
 
@@ -1552,6 +1555,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return layer_sizes, attention_windows
 
+    def _get_generation_request_capacity(self) -> int:
+        """Return the resident generation requests used for SWA sizing."""
+        return self.max_batch_size
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
@@ -1581,7 +1588,7 @@ class KVCacheManagerV2(BaseResourceManager):
         ) = _estimate_swa_cache_size(
             layer_sizes, attention_windows, self.tokens_per_block, context=False, scratch=False
         )
-        size_per_batch = self.max_batch_size * generation_swa_size_per_request
+        size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
             return 0
         context_size_per_token = full_attn_size_per_token + context_swa_size_per_token
@@ -1632,7 +1639,7 @@ class KVCacheManagerV2(BaseResourceManager):
         generation_quota = (
             max_tokens * full_attn_size_per_token
             + generation_tokens * generation_swa_size_per_token
-            + self.max_batch_size * generation_swa_size_per_request
+            + self._get_generation_request_capacity() * generation_swa_size_per_request
         )
         context_extra_quota = context_tokens * context_swa_size_per_token
         return int(generation_quota + context_extra_quota)
@@ -1932,7 +1939,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
             if typical_seq_len is not None:
                 # Model one context request and enough generation requests to fill
-                # max_batch_size without over-provisioning windowed cache pools.
+                # the resident request capacity without over-provisioning windowed
+                # cache pools.
+                generation_request_capacity = self._get_generation_request_capacity()
                 context_capacity = (
                     self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
                 ) + self.num_extra_kv_tokens
@@ -1945,11 +1954,11 @@ class KVCacheManagerV2(BaseResourceManager):
                             history_length=generation_history_length,
                         )
                     ]
-                    * (self.max_batch_size - 1)
+                    * (generation_request_capacity - 1)
                 )
 
                 # CUDA graph generation warmup uses one request at max_seq_len and
-                # enough minimal decode requests to fill max_batch_size.
+                # enough minimal decode requests to fill the resident capacity.
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
@@ -1960,10 +1969,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
-                        * (self.max_batch_size - 1)
+                        * (generation_request_capacity - 1)
                     )
                 )
-
                 # General and chunked-prefill warmup uses one fresh context request
                 # at the per-iteration token budget.
                 if self.max_num_tokens is not None:
@@ -1978,17 +1986,14 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
 
-        buffer_type = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            buffer_type.append(Role.VALUE)
         if kv_cache_config.dtype == "nvfp4":
             for layer_idx, hd in enumerate(self.head_dim_per_layer):
+                buffer_roles = self._get_buffer_roles_for_layer(layer_idx)
+                if Role.KEY_BLOCK_SCALE not in buffer_roles:
+                    continue
                 assert hd % 2 == 0, (
                     f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
                 )
-            buffer_type.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
         # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
         # per-layer BufferConfig entries — for example a sparse index-K
@@ -2003,16 +2008,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         layer_configs: List[AttentionLayerConfig] = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
+            buffer_roles = self._get_buffer_roles_for_layer(layer_id)
             buffers = [
                 BufferConfig(
                     role=role,
                     size=self.get_layer_bytes_per_token(local_layer_idx=layer_id, data_role=role)
                     * tokens_per_block,
                 )
-                for role in buffer_type
+                for role in buffer_roles
             ]
             for extra in extra_buffers_per_layer.get(int(layer_id), ()):
-                assert extra.role not in buffer_type, (
+                assert extra.role not in buffer_roles, (
                     f"extra buffer role {extra.role!r} for layer "
                     f"{int(layer_id)} duplicates a standard K/V/scale role"
                 )
@@ -2050,6 +2056,18 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
+        """Return the standard cache roles allocated for one local layer."""
+        del local_layer_idx
+        buffer_roles = [Role.KEY]
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            buffer_roles.append(Role.VALUE)
+        if self.dtype == DataType.NVFP4:
+            buffer_roles.append(Role.KEY_BLOCK_SCALE)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                buffer_roles.append(Role.VALUE_BLOCK_SCALE)
+        return buffer_roles
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
@@ -2104,6 +2122,15 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
+    def get_disagg_transfer_roles(self) -> Optional[frozenset[DataRole]]:
+        """Return the native roles included in disaggregated transfer.
+
+        ``None`` preserves the default policy and transfers every registered
+        role. Specialized managers may omit deterministic derived roles that
+        are rebuilt on the receiver after canonical cache data arrives.
+        """
+        return None
+
     @property
     def blocks_in_primary_pool(self) -> int:
         """
@@ -2126,7 +2153,7 @@ class KVCacheManagerV2(BaseResourceManager):
         assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
 
         element_per_container = 1
-        dtype = self.dtype
+        dtype = self.get_kv_cache_dtype(layer_idx)
         if dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
@@ -2156,6 +2183,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 shape,
             )
         )
+
+    def get_kv_cache_dtype(self, layer_idx: Optional[int] = None) -> DataType:
+        """Return the storage dtype for a layer, or the manager default."""
+        del layer_idx
+        return self.dtype
 
     def get_index_k_buffer(
         self,
@@ -3971,6 +4003,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 yield buffer
             pool_handled.add(pool_id)
 
+    @torch.inference_mode()
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False
         has_invalid_values = torch.tensor(
@@ -3978,14 +4011,16 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         for buffer in self._iter_cache_buffers_for_invalid_check():
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i : i + 256]
-                try:
-                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
+            if torch.is_floating_point(buffer) or torch.is_complex(buffer):
+                # Process page-major physical views in bounded chunks. Packed
+                # integer cache data cannot contain NaN or Inf.
+                for i in range(0, buffer.shape[0], 256):
+                    buffer_slice = buffer[i : i + 256]
+                    try:
+                        has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
+                        has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
+                    except NotImplementedError:
+                        some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
         torch.cuda.synchronize()

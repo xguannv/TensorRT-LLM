@@ -376,6 +376,8 @@ class PeerRegistrar:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
+            self_window_size=getattr(self_lg, "sliding_window_size", None),
+            peer_window_size=getattr(peer_lg, "sliding_window_size", None),
         )
 
         self._kv_map_cache[cache_key] = mapper

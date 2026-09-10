@@ -45,10 +45,6 @@ from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
-
-# Shared with the KV budget estimator so allocator and budgeting can never
-# diverge on the sharding rule (config_utils is import-cycle-free).
-from .config_utils import mamba_effective_tp_size as _mamba_effective_tp_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
                                                       BatchDesc, BufferConfig,
@@ -58,6 +54,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       SsmLayerConfig,
                                                       TokenIdExt, _KVCache)
+
+# Shared with the KV budget estimator so allocator and budgeting can never
+# diverge on the sharding rule (config_utils is import-cycle-free).
+from .config_utils import mamba_effective_tp_size as _mamba_effective_tp_size
 
 GB = 1 << 30
 
@@ -96,9 +96,8 @@ def _allocate_kda_beta_cache(
     logical_num_heads = shape[-1]
     heads_per_alignment = (_KDA_BETA_CACHE_ALIGNMENT_BYTES //
                            torch.float32.itemsize)
-    padded_num_heads = (
-        (logical_num_heads + heads_per_alignment - 1) // heads_per_alignment
-    ) * heads_per_alignment
+    padded_num_heads = ((logical_num_heads + heads_per_alignment - 1) //
+                        heads_per_alignment) * heads_per_alignment
     # CuTe requires every nested cache view to be 16-byte aligned. Keep the
     # logical head count while padding the physical stride (six fp32 heads are
     # 24 bytes, so an unpadded row makes alternating views only 8-byte aligned).
@@ -2045,6 +2044,8 @@ def _estimate_mamba_hybrid_cache_cost(
     cap_partial_attention_snapshots: bool,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
+    attention_slope_override: Optional[int] = None,
+    attention_page_bytes_override: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
     spec_config = kwargs.get("spec_config")
@@ -2056,12 +2057,14 @@ def _estimate_mamba_hybrid_cache_cost(
             is_draft=is_draft,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
         ))
-    attention_slope = (KVCacheManager.get_cache_size_per_token(
-        model_config,
-        mapping,
-        num_layers=local_attention_layers,
-        **kwargs,
-    ) if local_attention_layers > 0 else 0)
+    attention_slope = attention_slope_override
+    if attention_slope is None:
+        attention_slope = (KVCacheManager.get_cache_size_per_token(
+            model_config,
+            mapping,
+            num_layers=local_attention_layers,
+            **kwargs,
+        ) if local_attention_layers > 0 else 0)
     state_bytes_per_rank = (local_mamba_layers *
                             params.get_states_bytes_per_layer(mapping))
     max_resident_sequences = max_batch_size * mapping.pp_size
@@ -2090,7 +2093,8 @@ def _estimate_mamba_hybrid_cache_cost(
         partial_attention_slots = (max_resident_sequences *
                                    unaligned_fixed_rules)
     intercept = (fixed_state_slots * state_bytes_per_rank +
-                 partial_attention_slots * attention_block_bytes)
+                 partial_attention_slots *
+                 (attention_block_bytes + attention_page_bytes_override))
 
     if interval is None:
         regular_slope = 0
@@ -3061,6 +3065,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 # SSM reuse is valid only at explicit snapshot boundaries.
                 kv_cache_config.block_reuse_config = block_reuse_config.model_copy(
                     update={"policy": BlockReusePolicy.PER_REQUEST.value})
+        self._attention_cache_layout_policy = None
+        pretrained_config = kwargs.get("pretrained_config")
+        if (dtype == DataType.NVFP4 and kv_cache_type == CacheTypeCpp.SELFKONLY
+                and getattr(pretrained_config, "kv_lora_rank", None) is not None
+                and getattr(pretrained_config, "qk_rope_head_dim",
+                            None) is not None):
+            from tensorrt_llm._torch.attention_backend.fp4_mla.cache_manager import \
+                Fp4MlaV2CacheLayoutPolicy
+
+            kv_cache_config = Fp4MlaV2CacheLayoutPolicy.configure_manager(
+                self,
+                kv_cache_config,
+                kv_cache_type,
+                dtype=dtype,
+                tokens_per_block=tokens_per_block,
+                head_dim=head_dim,
+                pretrained_config=pretrained_config,
+                spec_config=spec_config,
+                is_disagg=kwargs.get("is_disagg", False),
+            )
         self.kv_cache_config = kv_cache_config
 
         super().__init__(
@@ -3081,6 +3105,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             num_reserved_index_slots=self._num_reserved_dummy_slots,
             **kwargs,
         )
+
+        if self._attention_cache_layout_policy is not None:
+            self._attention_cache_layout_policy.finalize_manager(self)
 
         self.mamba_layer_offsets = {
             layer_id: offset
@@ -3391,7 +3418,40 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         spec_config = kwargs.get("spec_config")
         num_reserved_dummy_slots = (_get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size) + int(mapping.enable_attention_dp))
-        return _estimate_mamba_hybrid_cache_cost(
+        attention_slope_override = None
+        attention_intercept = 0
+        attention_page_bytes_override = 0
+        config = model_config.pretrained_config
+        quant_config = model_config.quant_config
+        if (getattr(config, "kv_lora_rank", None) is not None
+                and quant_config is not None
+                and quant_config.quant_mode.has_fp4_kv_cache()):
+            from tensorrt_llm._torch.attention_backend.fp4_mla.cache_manager import \
+                Fp4MlaKVCacheManagerV2
+
+            _, _, local_attention_layers = _get_local_mamba_cache_layout(
+                model_config,
+                mapping,
+                spec_config=spec_config,
+                is_draft=kwargs.get("is_draft", False),
+                use_separate_draft_kv_cache=kwargs.get(
+                    "use_separate_draft_kv_cache", False),
+            )
+            attention_slope_override, attention_intercept = (
+                Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
+                    model_config,
+                    mapping,
+                    num_layers=local_attention_layers,
+                    tokens_per_block=tokens_per_block,
+                    max_batch_size=max_batch_size,
+                    spec_config=spec_config,
+                ))
+            max_resident_sequences = max_batch_size * mapping.pp_size
+            if max_resident_sequences > 0:
+                attention_page_bytes_override = (attention_intercept //
+                                                 max_resident_sequences)
+
+        slope, intercept = _estimate_mamba_hybrid_cache_cost(
             model_config,
             mapping,
             max_batch_size=max_batch_size,
@@ -3401,8 +3461,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             num_reserved_dummy_slots=num_reserved_dummy_slots,
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
+            attention_slope_override=attention_slope_override,
+            attention_page_bytes_override=attention_page_bytes_override,
             **kwargs,
         )
+        return slope, intercept + attention_intercept
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
@@ -3410,6 +3473,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         layer_id = int(self.impl.layer_grouping[pool_id][0])
+        if layer_id >= self.num_local_layers:
+            if (getattr(self, "_attention_cache_layout_policy",
+                        None) is not None
+                    and LayerId(layer_id) in self._hp_manager_layer_ids):
+                return Role.MLA_HP_TAIL, None
+            raise ValueError(f"Unknown hybrid V2 virtual layer {layer_id}.")
         if self._is_local_mamba_layer(layer_id):
             return MambaRole.SSM_STATE, None
         return super()._get_pool_roles(pool_id)
@@ -3605,7 +3674,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     for _ in range(ssm_floor_slots)
                 ]),
             ]
-        return replace(
+        result = replace(
             config,
             layers=layers,
             typical_step=typical_step,
@@ -3615,6 +3684,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # attempted, while the runtime config still needs the invariant.
             commit_min_snapshot=True,
         )
+        layout_policy = getattr(self, "_attention_cache_layout_policy", None)
+        if layout_policy is not None:
+            result = layout_policy._build_cache_config(self, result)
+        return result
 
     def _get_state_buffer(self, local_layer_idx: int, role, dtype: torch.dtype,
                           state_shape: List[int]) -> torch.Tensor:
@@ -3715,6 +3788,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     def _attention_cache_bytes_per_token(self) -> int:
+        layout_policy = getattr(self, "_attention_cache_layout_policy", None)
+        if layout_policy is not None:
+            return layout_policy.get_cache_bytes_per_token(self)
         # Mamba layers have zero KV heads, so the generic calculation naturally
         # returns only bytes owned by local attention layers.
         return super().get_cache_bytes_per_token()
@@ -3735,6 +3811,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert len(self.kv_cache_map) == 0, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
+        if getattr(self, "_attention_cache_layout_policy", None) is not None:
+            return self.blocks_in_primary_pool
         attention_pages = []
         ssm_pages = []
         for local_layer_idx in range(self.num_local_layers):
@@ -3754,6 +3832,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @property
     def blocks_in_primary_pool(self) -> int:
+        layout_policy = getattr(self, "_attention_cache_layout_policy", None)
+        if layout_policy is not None:
+            return layout_policy.blocks_in_primary_pool.fget(self)
         for local_layer_idx in range(self.num_local_layers):
             if self._is_local_mamba_layer(local_layer_idx):
                 continue
@@ -3770,13 +3851,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return super().get_buffers(layer_idx, kv_layout)
 
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
-        for global_layer_id, local_layer_id in self.layer_offsets.items():
-            if self._is_local_mamba_layer(local_layer_id):
-                continue
-            # A layer group is a lifecycle, not a physical memory pool.
-            # Differently sized attention buffers can share one lifecycle,
-            # so scan every attention layer in this diagnostic path.
-            yield KVCacheManagerV2.get_buffers(self, global_layer_id)
+        layout_policy = getattr(self, "_attention_cache_layout_policy", None)
+        if layout_policy is not None:
+            yield from self._iter_fp4_mla_physical_pool_views()
+        else:
+            for global_layer_id, local_layer_id in self.layer_offsets.items():
+                if self._is_local_mamba_layer(local_layer_id):
+                    continue
+                # A layer group is a lifecycle, not a physical memory pool.
+                # Differently sized attention buffers can share one lifecycle,
+                # so scan every attention layer in this diagnostic path.
+                yield KVCacheManagerV2.get_buffers(self, global_layer_id)
 
         yield from self.all_ssm_states
         yield from self.all_conv_states

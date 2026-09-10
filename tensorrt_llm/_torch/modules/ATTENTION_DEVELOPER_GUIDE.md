@@ -207,6 +207,9 @@ The core contract is:
   - `support_mla()`
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
+- `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
+  chunked prefill limits that workspace to the current KV chunk (default
+  `True`)
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -222,10 +225,15 @@ maximum is under-reserved and can OOM mid-forward. If a backend stages such a
 buffer, declare its per-token cost via
 `runtime_workspace_bytes_per_token(model_config, mapping)` (default `0`): the
 estimator reserves it from the KV budget and the scheduler caps the driving sum.
-Keep the declared cost identical to the runtime allocation's (single source of
-truth). The one instance today is the fp8 context-MLA K/V dequant workspace,
-sized by summed attended KV length (`total_kv_len`) — which KV-cache reuse
-decouples from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+Keep the declared cost identical to the runtime allocation's when possible, or
+use a documented conservative upper bound. The current instances are the fp8
+context-MLA K/V dequant workspace and
+the NVFP4 DSA and DeepSeek-V4 context gather workspaces. They are sized by
+summed attended KV length (`total_kv_len`), which cached prefixes can decouple
+from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
+so it also returns `False` from
+`runtime_workspace_is_chunked_prefill_bounded`.
 
 ### 2.4 Capability reference
 
@@ -301,22 +309,24 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+libraries. `Fp4MlaFmha` owns FP4 MLA context and decode dispatch,
+`CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
 the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
-or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
-path. Each FMHA library exposes `is_available()` for module/static environment
-checks and `is_supported()` for per-forward request checks.
+`fp4_mla,cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use
+`TLLM_FMHA_LIBS=fallback` or `TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force
+the fallback path. Each FMHA library exposes `is_available()` for module/static
+environment checks and `is_supported()` for per-forward request checks.
 
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
+- `fmha/fp4_mla.py` implements FP4 MLA context and no-dequant decode.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.

@@ -444,15 +444,26 @@ class AsyncTransferManager:
         def __init__(self, block_id: Optional[int]):
             self.block_id = block_id
             self.counter = 0
+            self.transceiver_pending = False
 
-        def start_transfer(self):
+        def start_transfer(self, is_transceiver: bool = False):
+            if is_transceiver:
+                if self.transceiver_pending:
+                    raise RuntimeError(
+                        "KV cache transceiver transfer was started more than once"
+                    )
+                self.transceiver_pending = True
             self.counter += 1
 
-        def end_transfer(self) -> bool:
+        def end_transfer(self, is_transceiver: bool = False) -> bool:
             """
             Returns:
                 bool: True if there are no more transfers for this request
             """
+            if is_transceiver:
+                if not self.transceiver_pending:
+                    return False
+                self.transceiver_pending = False
             self.counter -= 1
             return self.counter == 0
 
@@ -475,7 +486,7 @@ class AsyncTransferManager:
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
 
-    def start_transfer(self, request: LlmRequest):
+    def start_transfer(self, request: LlmRequest, is_transceiver: bool = False):
         """
         Called when a Cache transceiver or connector transfer is started.
         1. Increment the counter for the request.
@@ -489,10 +500,10 @@ class AsyncTransferManager:
             for resource_mgr_type in (
                     ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER):
-                if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
-                        resource_mgr_type] is not None:
-                    self.resource_manager.resource_managers[
-                        resource_mgr_type].free_resources(request)
+                resource_mgr = self.resource_manager.resource_managers.get(
+                    resource_mgr_type)
+                if resource_mgr is not None:
+                    resource_mgr.free_resources(request)
 
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
@@ -506,9 +517,12 @@ class AsyncTransferManager:
             self._request_transfer_metadata[
                 req_id] = self.RequestTransferMetadata(block_id)
 
-        self._request_transfer_metadata[req_id].start_transfer()
+        self._request_transfer_metadata[req_id].start_transfer(
+            is_transceiver=is_transceiver)
 
-    def end_transfer(self, request: LlmRequest) -> bool:
+    def end_transfer(self,
+                     request: LlmRequest,
+                     is_transceiver: bool = False) -> bool:
         """
         Called after a send of KV cache is complete.
         1. Decrements counter for request.
@@ -526,7 +540,7 @@ class AsyncTransferManager:
             )
             return False
 
-        if transfer_metadata.end_transfer():
+        if transfer_metadata.end_transfer(is_transceiver=is_transceiver):
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
@@ -1227,14 +1241,17 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
-    def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+    def _end_transfer_and_maybe_terminate(self,
+                                          request: LlmRequest,
+                                          is_transceiver: bool = False):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
         if self.kv_cache_transceiver and request in self.active_requests:
             if transfer_failed:
                 # End only the transfer that just became terminal. Keep the
                 # request active so the synchronized error path can emit an
                 # error response after every async transfer releases ownership.
-                self.async_transfer_manager.end_transfer(request)
+                self.async_transfer_manager.end_transfer(
+                    request, is_transceiver=is_transceiver)
                 return
             # Fast-transfer: KV transfer completed in the same iteration
             # before _handle_responses could run. Create the response now
@@ -1253,14 +1270,16 @@ class PyExecutor:
                 # participate.
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
-            if self.async_transfer_manager.end_transfer(request):
+            if self.async_transfer_manager.end_transfer(
+                    request, is_transceiver=is_transceiver):
                 self.active_requests.remove(request)
                 if response:
                     self._pending_response_terminations.append(request)
                 else:
                     self._terminate_request(request)
             return
-        if self.async_transfer_manager.end_transfer(request):
+        if self.async_transfer_manager.end_transfer(
+                request, is_transceiver=is_transceiver):
             if transfer_failed:
                 return
             # Skip if the PP=1 early path already terminated this request;
@@ -3663,6 +3682,13 @@ class PyExecutor:
             self.active_requests.remove(dummy_request)
             return
 
+        if not getattr(dummy_request, "py_adp_dummy_resources_prepared", True):
+            # A context dummy defers all allocation to the normal context
+            # prepare path. If scheduling rejects it before that point, there
+            # are no partial resources to release.
+            self.active_requests.remove(dummy_request)
+            return
+
         # Before prepare_resources(), only the KV and speculative managers have
         # allocated anything for the dummy. Do not run the full teardown path:
         # other resource managers may require a prior prepare call.
@@ -5708,8 +5734,10 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
-    def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
-                                    total_num_active_requests: int) -> None:
+    def _fetch_and_enqueue_requests(self,
+                                    waiting_queue: WaitingQueue,
+                                    total_num_active_requests: int,
+                                    force_nonblocking: bool = False) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
         # Block new requests while control requests are pending
         if len(self.control_requests) != 0:
@@ -5721,7 +5749,7 @@ class PyExecutor:
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
         idle = (total_num_active_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown)
+                and not self.is_shutdown and not force_nonblocking)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -5928,14 +5956,21 @@ class PyExecutor:
                 s.num_active_requests for s in all_rank_states
             ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
+            force_nonblocking = any(state.has_inflight_transfer
+                                    for state in all_rank_states)
         else:
             total_num_active_requests = len(active_requests)
             all_ranks_num_active_requests = None
             all_rank_states = None
+            force_nonblocking = (
+                self.async_transfer_manager.has_any_inflight_requests())
 
         # 2. Fetch and enqueue to waiting queue
-        self._fetch_and_enqueue_requests(waiting_queue,
-                                         total_num_active_requests)
+        self._fetch_and_enqueue_requests(
+            waiting_queue,
+            total_num_active_requests,
+            force_nonblocking=force_nonblocking,
+        )
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
@@ -6306,13 +6341,13 @@ class PyExecutor:
     def _get_ctx_mla_kv_len_cap(self):
         """Cap on the summed context attended-KV length (total_kv_len) per forward step, cached.
 
-        The KV-cache estimator is the single decision point: it reserves the fp8 context-MLA workspace only
-        when KV-cache reuse can grow it past the profiled floor, and carries the exact token cap that reserve
+        The KV-cache estimator is the single decision point: it reserves context-MLA workspace only when
+        cached tokens can grow it past the profiled floor, and carries the exact token cap that reserve
         covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, budget/(k+w))`). The scheduler
         reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
-        A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
-        or estimation skipped -- means no admission cap is applied. A carried 0 is a real cap (a budget so
+        A carried value of None -- no affected MLA workspace or no reservation needed -- means no admission
+        cap is applied. A carried 0 is a real cap (a budget so
         tight the reserve covers under one token), not "no cap", so it must not be collapsed into None.
         """
         cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
@@ -6329,7 +6364,7 @@ class PyExecutor:
         return self._ctx_mla_kv_len_cap
 
     def _warn_if_ctx_mla_kv_len_cap_degenerate(self) -> None:
-        """Surface an fp8 context-MLA admission cap too tight to batch context requests on.
+        """Surface a context-MLA admission cap too tight to batch context requests on.
 
         `_cap_context_by_total_kv_len` logs its deferrals at debug level, so a deployment whose budget
         lands here sees context throughput collapse with nothing in the log at default level. Called from
@@ -6357,7 +6392,7 @@ class PyExecutor:
         else:
             return
         logger.warning(
-            f"fp8 context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
+            f"context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
             f"{consequence}. Prefill batching is degraded, not incorrect -- generation is unaffected "
             "and requests still complete. The cap is the workspace reserve the KV-cache estimator "
             "could afford divided by its per-token cost, so the KV cache memory budget is the binding "
@@ -6380,8 +6415,9 @@ class PyExecutor:
         return min(attended, ctx_req.orig_prompt_len)
 
     def _cap_context_by_total_kv_len(self, context_requests):
-        """Trim scheduled context requests so their summed attended KV length stays within the fp8
-        context-MLA workspace reservation (KV-cache reuse can push total_kv_len far past `max_num_tokens`).
+        """Trim context requests to the summed attended-KV workspace reservation.
+
+        Cached prefixes can push total_kv_len far past `max_num_tokens`.
         The first request is always kept: it attends at most `max_seq_len` and at most its pool, both covered
         by the cap, so one request always fits and forward progress is guaranteed. Deferred requests stay
         active and retry next iteration, mirroring `_waiting_requests`.
@@ -6395,7 +6431,7 @@ class PyExecutor:
             if i > 0 and cumulative > cap:
                 logger.debug(
                     f"Deferring {len(context_requests) - i} context request(s): summed attended "
-                    f"KV length {cumulative} would exceed the fp8 context-MLA workspace cap {cap}."
+                    f"KV length {cumulative} would exceed the context-MLA workspace cap {cap}."
                 )
                 return context_requests[:i]
         return context_requests
@@ -6449,8 +6485,8 @@ class PyExecutor:
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
 
-        # Cap summed context attended-KV length so the fp8 context-MLA attention workspace stays within the
-        # headroom the estimator reserved for it (no-op for non-fp8-MLA models).
+        # Cap summed context attended-KV length so the context-MLA attention workspace stays within the
+        # headroom the estimator reserved for it (a no-op for unaffected models).
         scheduled_context_requests = self._cap_context_by_total_kv_len(
             scheduled_context_requests)
 
@@ -7084,14 +7120,19 @@ class PyExecutor:
         has_ctx = False
         has_gen = False
         for candidate in candidates:
-            req = (candidate.request
-                   if isinstance(candidate, RequestQueueItem) else candidate)
-            rt = getattr(req, "llm_request_type", None)
-            request_type = getattr(req, "request_type", None)
-            if (rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+            if isinstance(candidate, RequestQueueItem):
+                request = candidate.request
+            else:
+                request = candidate
+            if request is None:
+                continue
+            llm_request_type = getattr(request, "llm_request_type", None)
+            request_type = getattr(request, "request_type", None)
+            if (llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
                     or request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY):
                 has_ctx = True
-            elif (rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+            elif (llm_request_type
+                  == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
                   or request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY):
                 has_gen = True
         # Prefer the CTX role when both types are present this iteration so the
@@ -7166,6 +7207,11 @@ class PyExecutor:
             # minimum to two tokens in the KV manager and capacity check.
             token_nums = [1]
 
+        # GEN dummies bypass context initialization and need resources now.
+        # CTX dummies remain first context chunks, so normal prepare_resources
+        # must be their sole allocator; preallocating here would add ID 0 twice.
+        prepare_dummy_resources = self._adp_dummy_is_gen
+
         if not self._has_adp_dummy_kv_capacity(token_nums):
             logger.warning_once(
                 "Unable to fit the complete attention-DP dummy KV allocation; "
@@ -7179,7 +7225,7 @@ class PyExecutor:
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
+                prepare_resource=prepare_dummy_resources,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
             # KVCacheManagerV2 returns None when its IndexMapper or KV pages
@@ -7194,9 +7240,11 @@ class PyExecutor:
                 return
             llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
+            llm_request.py_adp_dummy_resources_prepared = (
+                prepare_dummy_resources)
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None:
+            if (prepare_dummy_resources and spec_resource_manager is not None):
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             self.active_requests.append(llm_request)
             return
@@ -7213,7 +7261,7 @@ class PyExecutor:
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
+                prepare_resource=prepare_dummy_resources,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
         except OutOfPagesError:
@@ -7224,9 +7272,11 @@ class PyExecutor:
             return
 
         dummy_request = dummy_requests[0]
+        dummy_request.py_adp_dummy_resources_prepared = (
+            prepare_dummy_resources)
         spec_resource_manager = self.resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        if spec_resource_manager is not None:
+        if prepare_dummy_resources and spec_resource_manager is not None:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
@@ -7640,8 +7690,19 @@ class PyExecutor:
                             mgr.release_index_slot(req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                    self.async_transfer_manager.start_transfer(
+                        req, is_transceiver=True)
+                    try:
+                        self.kv_cache_transceiver.respond_and_send_async(req)
+                    except Exception:
+                        # Synchronous setup failures leave no live transceiver
+                        # session, so balance the pending marker immediately.
+                        # Once NIXL owns the source addresses, the Python
+                        # transceiver retains the session and reports the
+                        # terminal status through normal polling instead.
+                        self.async_transfer_manager.end_transfer(
+                            req, is_transceiver=True)
+                        raise
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
@@ -7707,6 +7768,7 @@ class PyExecutor:
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
+        user_canceled_req_ids = set(self.canceled_req_ids)
 
         for request_id in completed_req_ids:
 
@@ -7717,7 +7779,20 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
 
-            self._end_transfer_and_maybe_terminate(request)
+            # A cancelled TxSession is reported through the legacy
+            # ``finished_requests`` list once every rank has left NIXL.  Keep
+            # the public cancellation semantics and never turn either a local
+            # or remote cancellation into a successful context response.
+            external_request_id = (request.py_request_id if not request.is_child
+                                   else request.parent_request_id)
+            if external_request_id in user_canceled_req_ids:
+                request.finish_by_reason(FinishReason.CANCELLED)
+                request.decoding_iter = request.py_decoding_iter
+            elif getattr(request, "py_disagg_transfer_cancelled",
+                         False) is True:
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+            self._end_transfer_and_maybe_terminate(request, is_transceiver=True)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
@@ -7745,7 +7820,8 @@ class PyExecutor:
                 # cancelled is immediately released from the async manager.
                 request.py_kv_transfer_start_time = None
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-                self._end_transfer_and_maybe_terminate(request)
+                self._end_transfer_and_maybe_terminate(request,
+                                                       is_transceiver=True)
 
         self._check_cache_transfer_errors("context requests")
 

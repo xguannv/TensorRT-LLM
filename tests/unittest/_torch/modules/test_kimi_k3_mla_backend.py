@@ -6,13 +6,59 @@ from typing import Optional
 
 import pytest
 
+from tensorrt_llm._torch.attention_backend.fmha.cute_dsl_mla import CuteDslMlaFmha
+from tensorrt_llm._torch.kimi_k3_cache_policy import (
+    KIMI_K3_BF16_KV_LAYERS_ENV,
+    get_kimi_k3_bf16_kv_layer_ids,
+)
 from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import (
     _KIMI_K3_MLA_GEN_BACKEND_DEFAULT,
     _KIMI_K3_MLA_GEN_BACKEND_ENV,
     _kimi_k3_mla_decode_backend_policy,
     _select_mla_generation_backend,
 )
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+
+def _kimi_k3_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        linear_attn_config={"full_attn_layers": [2, 4]},
+    )
+
+
+def test_kimi_k3_bf16_kv_fallback_parses_zero_based_mla_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "1, 3")
+
+    assert get_kimi_k3_bf16_kv_layer_ids(_kimi_k3_config()) == frozenset({1, 3})
+
+
+@pytest.mark.parametrize("value", ["0", "4", "three", "1,"])
+def test_kimi_k3_bf16_kv_fallback_rejects_invalid_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, value)
+
+    with pytest.raises(ValueError, match=KIMI_K3_BF16_KV_LAYERS_ENV):
+        get_kimi_k3_bf16_kv_layer_ids(_kimi_k3_config())
+
+
+def test_kimi_k3_bf16_kv_fallback_ignores_other_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "1")
+    config = SimpleNamespace(
+        model_type="deepseek_v3",
+        num_hidden_layers=4,
+        linear_attn_config={"full_attn_layers": [2, 4]},
+    )
+
+    assert get_kimi_k3_bf16_kv_layer_ids(config) == frozenset()
 
 
 def test_kimi_k3_mla_generation_backend_default_is_trtllm_gen() -> None:
@@ -94,3 +140,33 @@ def test_kimi_k3_mla_decode_backend_policy_falls_back_for_mixed_batches(
         )
         == expected_backend
     )
+
+
+def test_cute_dsl_mla_mixed_batch_supports_bf16_layer_in_nvfp4_manager() -> None:
+    manager = SimpleNamespace(
+        dtype=DataType.NVFP4,
+        layer_offsets={91: 91},
+        get_kv_cache_dtype=lambda layer_idx: DataType.BF16,
+    )
+    attn = SimpleNamespace(layer_idx=91, num_heads=12)
+    metadata = SimpleNamespace(num_contexts=9, kv_cache_manager=manager)
+
+    assert CuteDslMlaFmha._supports_mixed_batch(attn, metadata)
+
+    manager.get_kv_cache_dtype = lambda layer_idx: DataType.NVFP4
+    assert not CuteDslMlaFmha._supports_mixed_batch(attn, metadata)
+
+    metadata.kv_cache_manager = SimpleNamespace(
+        dtype=DataType.BF16,
+        layer_offsets={91: 91},
+        get_kv_cache_dtype=lambda layer_idx: DataType.BF16,
+    )
+    assert not CuteDslMlaFmha._supports_mixed_batch(attn, metadata)
+
+    metadata.num_contexts = 0
+    assert CuteDslMlaFmha._supports_mixed_batch(attn, metadata)
+
+    metadata.num_contexts = 9
+    metadata.kv_cache_manager = None
+    attn.num_heads = 96
+    assert not CuteDslMlaFmha._supports_mixed_batch(attn, metadata)

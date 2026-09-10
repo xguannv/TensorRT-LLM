@@ -140,6 +140,33 @@ def get_kv_cache_manager_cls(
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
+    quant_config = model_config.quant_config
+    if (is_mla(config) and quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()):
+        if sparse_attn_algorithm == "dsa":
+            # NVFP4 DSA owns a distinct V2 layout: latent KV data and block
+            # scales live alongside the indexer cache, without dense FP4
+            # MLA's HP ring or V-scale side pools.
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
+        if sparse_attn_algorithm == "deepseek_v4":
+            # DeepSeek-V4 keeps SWA in FP8 and quantizes only the long-lived
+            # COMPRESS cache to NVFP4 in its dedicated multi-pool manager.
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
+        if sparse_attn_config is not None:
+            raise NotImplementedError(
+                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
+                f"support sparse attention algorithm {sparse_attn_algorithm!r}."
+            )
+        if (is_hybrid_linear(config)
+                and model_config.get_num_mamba_layers() > 0):
+            return MambaHybridCacheManagerV2
+
+        from ..attention_backend.fp4_mla.cache_manager import \
+            Fp4MlaKVCacheManagerV2
+
+        return Fp4MlaKVCacheManagerV2
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid routes.
@@ -384,16 +411,29 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
             model_config, mapping)
 
 
-def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
-                                         max_num_tokens, max_seq_len,
-                                         enable_chunked_prefill):
-    """Max summed attended-KV length (tokens) per forward step the fp8 context-MLA workspace is reserved
-    -- and the scheduler admits -- for, or ``None`` when no reservation is needed.
+def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
+    """Whether chunked prefill bounds the selected backend's runtime workspace."""
+    from ..attention_backend.utils import get_attention_backend
 
-    Returns ``None`` unless KV-cache reuse can grow the workspace past the floor the profiling forward
-    measures: with block reuse off the summed attended KV is bounded by ``max_num_tokens`` (already
-    profiled), and with chunked prefill each attention launch is independently bounded by its chunk buffer.
-    In both cases reserving would only double-count and needlessly shrink the KV pool, so no cap is returned.
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(
+            model_config)
+
+
+def get_mla_context_workspace_kv_len_cap(
+        kv_cache_config,
+        max_batch_size,
+        max_num_tokens,
+        max_seq_len,
+        enable_chunked_prefill,
+        workspace_is_chunked_prefill_bounded=True):
+    """Max summed attended-KV length covered by the context-MLA workspace reserve.
+
+    KV-cache reuse can grow this workspace beyond the fresh-prefill profiling
+    floor. Chunked prefill normally prevents that by staging one bounded KV
+    chunk per launch. An implementation that consumes the complete attended
+    prefix sets ``workspace_is_chunked_prefill_bounded=False`` and receives the
+    same reservation and scheduler admission protection as cache reuse.
 
     Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
@@ -401,7 +441,10 @@ def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
     reserves less workspace (freeing KV pool) and lets the scheduler defer over-cap requests; it is floored
     at ``max_seq_len`` (one request must always fit) and capped at the worst case.
     """
-    if not kv_cache_config.enable_block_reuse or enable_chunked_prefill:
+    workspace_can_exceed_profile = (
+        kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
+            enable_chunked_prefill and not workspace_is_chunked_prefill_bounded)
+    if not workspace_can_exceed_profile:
         return None
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
     override = kv_cache_config.fp8_context_mla_kv_len_cap
@@ -715,6 +758,13 @@ class KvCacheCreator:
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
                         "provide a compatible fallback. Use max_beam_width=1 "
                         "and disable the KV connector.")
+                quant_config = model_config.quant_config
+                if (is_mla(config) and quant_config is not None
+                        and quant_config.quant_mode.has_fp4_kv_cache()):
+                    raise NotImplementedError(
+                        "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
+                        f"not yet supported with {incompat_str}. Disable these "
+                        "features to run FP4 MLA.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -1334,13 +1384,11 @@ class KvCacheCreator:
                     f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
                 )
 
-        # Reserve headroom for the attention workspace the selected backend declares (today: fp8
-        # context-MLA), which the profiling forward under-measures (fresh-prefill dummies never exercise
-        # KV reuse). This is only needed when KV-cache reuse can push summed attended KV past the profiled
-        # floor: get_mla_context_workspace_kv_len_cap returns None (no reservation) with reuse off -- the
-        # workspace is then bounded by max_num_tokens -- or with chunked prefill -- each attention launch is
-        # then bounded by its chunk buffer -- since reserving in those cases would double-count and
-        # needlessly shrink the KV pool (up to ~37% for Kimi-K2 attention-DP). When it does apply,
+        # Reserve headroom for attention workspace the selected backend declares and the profiling forward
+        # under-measures. KV-cache reuse can push summed attended KV past the profiled floor. Chunked prefill
+        # usually bounds each attention launch by its chunk buffer, except for implementations such as the
+        # NVFP4 DSA context gather that consume the complete attended prefix. The backend declares that
+        # distinction through runtime_workspace_is_chunked_prefill_bounded. When a reserve applies,
         # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
         # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
         # so a memory-constrained node shares the budget at a common token count instead of starving the
@@ -1350,9 +1398,15 @@ class KvCacheCreator:
         # overstates). No cap or w == 0 -> no-op.
         w_bytes_per_token = get_attention_workspace_bytes_per_token(
             self._model_engine.model.model_config, self._mapping)
+        workspace_is_chunked_prefill_bounded = True
+        if w_bytes_per_token > 0:
+            workspace_is_chunked_prefill_bounded = (
+                get_attention_workspace_is_chunked_prefill_bounded(
+                    self._model_engine.model.model_config))
         kv_len_cap = get_mla_context_workspace_kv_len_cap(
             self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
-            self._max_seq_len, self._llm_args.enable_chunked_prefill)
+            self._max_seq_len, self._llm_args.enable_chunked_prefill,
+            workspace_is_chunked_prefill_bounded)
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
@@ -1363,7 +1417,7 @@ class KvCacheCreator:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(
-                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the fp8 context-MLA attention "
+                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the context-MLA attention "
                     f"workspace (w={w_bytes_per_token} B/token, admitting up to "
                     f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
                     f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
@@ -2545,6 +2599,9 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=max_beam_width,
+            pretrained_config=config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             **kimi_extra_kwargs,
