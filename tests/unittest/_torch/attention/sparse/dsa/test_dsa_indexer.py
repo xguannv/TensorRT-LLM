@@ -58,15 +58,8 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa import backend as dsa_backend
-from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
-    _resolve_fp8_ds_mla_head_dim,
-)
-from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
-    transform_local_topk_and_prepare_pool_view_grouped,
-)
-from tensorrt_llm._torch.attention.backends.sparse.dsa.params import use_self_sampling_gvr
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.sparse.dsa.params import use_self_sampling_gvr
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
@@ -101,6 +94,10 @@ def has_deep_gemm():
 
 
 def test_fp8_ds_mla_layout_resolves_shared_inline_scale_module():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
+        _resolve_fp8_ds_mla_head_dim,
+    )
+
     enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
         KvCacheConfig(dtype="fp8_ds_mla"),
         tokens_per_block=64,
@@ -113,6 +110,10 @@ def test_fp8_ds_mla_layout_resolves_shared_inline_scale_module():
 
 
 def test_fp8_ds_mla_layout_treats_binding_config_as_auto():
+    from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
+        _resolve_fp8_ds_mla_head_dim,
+    )
+
     enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
         BindingKvCacheConfig(),
         tokens_per_block=64,
@@ -157,14 +158,14 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
 
     with (
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
         ),
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
             True,
         ),
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.get_sm_version",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
             return_value=100,
         ),
     ):
@@ -235,7 +236,7 @@ def test_use_gvr_emission_defaults_off():
 
 def test_deepseek_v4_selfsampling_warmup_respects_heuristic_gate(monkeypatch):
     metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
-    metadata.enable_heuristic_topk = False
+    metadata.enable_gvr_topk = False
     metadata.kv_cache_manager = Mock()
     monkeypatch.setenv("TRTLLM_GVR_SELF_SAMPLING", "1")
 
@@ -249,18 +250,12 @@ def test_deepseek_v4_selfsampling_warmup_respects_heuristic_gate(monkeypatch):
             return_value=107,
         ),
     ):
-        DSAtrtllmAttentionMetadata.warmup_cute_dsl_radix_topk(metadata, next_n)
-
-    if should_warmup:
-        cute_dsl_radix.assert_called_once_with(
-            top_k=384,
-            num_cols=32768,
-            next_n=next_n,
-            dtype=torch.float32,
-            num_sms=148,
-        )
-    else:
-        cute_dsl_radix.assert_not_called()
+        with patch(
+            "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k."
+            "gvr_topk_decode_self_sampling_host.warmup_varlen"
+        ) as warmup:
+            metadata.warmup_selfsampling_topk(next_n=4)
+    warmup.assert_not_called()
 
 
 def test_kv_lens_row_reorder_threshold():
@@ -365,13 +360,7 @@ def test_gvr_prior_writeback_uses_aux_stream():
         cache_manager.shutdown()
 
 
-def test_shared_topk_lifecycle(monkeypatch):
-    # This test exercises the shared-topk buffer read/write lifecycle, not the
-    # cross-layer group-remap fan-out (covered by the test_group_remap_* tests).
-    # Keep the remap on the per-layer path so it flows through the patched
-    # transform below.
-    monkeypatch.setattr(dsa_backend, "_GROUP_REMAP", False)
-
+def test_shared_topk_lifecycle():
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=1,
         index_head_dim=8,
@@ -515,11 +504,11 @@ def test_indexer_configures_one_top_k_module(
 
     with (
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
             True,
         ),
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
             return_value=100,
         ),
     ):
@@ -565,11 +554,11 @@ def test_indexer_two_level_gvr_dispatch(
 
     with (
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
             True,
         ),
         patch(
-            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
             return_value=100,
         ),
     ):
@@ -607,7 +596,7 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
     )
 
     with patch(
-        "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
         return_value=100,
     ):
         indexer = create_indexer(sparse_config)
@@ -4198,55 +4187,3 @@ def test_topk_indices_buffer_cuda_graph():
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
-
-
-def test_kv_lens_row_reorder_threshold():
-    """_compute_kv_lens_row_reorder engages iff num_generations * next_n >= 2 * num_sms,
-    and produces a descending argsort of gen_kv_lens when active."""
-    num_sms = 16  # small synthetic value; threshold = 2 * 16 = 32 rows
-    next_n = 2  # max_draft_tokens=1 → next_n = 1 + 1 = 2
-
-    def make_mock(num_generations, kv_lens_list):
-        kv_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
-        buf = torch.zeros(64, dtype=torch.int32, device="cuda")
-        ns = SimpleNamespace(
-            enable_heuristic_topk=True,
-            use_cute_dsl_topk=True,
-            num_generations=num_generations,
-            num_sms=num_sms,
-            max_draft_tokens=next_n - 1,
-            num_contexts=0,
-            num_seqs=num_generations,
-            kv_lens_cuda=kv_cuda,
-            kv_lens_row_reorder_buffer=buf,
-            kv_lens_row_reorder=None,
-        )
-        ns._compute_kv_lens_row_reorder = (
-            lambda: DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(ns)
-        )
-        return ns
-
-    # Fixed unsorted sequence for deterministic sort verification (len == num_sms)
-    kv_vals = [4, 1, 8, 2, 16, 3, 12, 6, 7, 9, 5, 11, 13, 10, 14, 15]
-
-    # Below threshold: 1 * 2 = 2 < 32 → None
-    md_below = make_mock(1, [1000])
-    md_below._compute_kv_lens_row_reorder()
-    assert md_below.kv_lens_row_reorder is None
-
-    # At threshold: num_sms * 2 = 32 → engages, verify descending argsort
-    md_at = make_mock(num_sms, kv_vals)
-    md_at._compute_kv_lens_row_reorder()
-    assert md_at.kv_lens_row_reorder is not None
-    reorder = md_at.kv_lens_row_reorder.cpu().tolist()
-    assert [kv_vals[i] for i in reorder] == sorted(kv_vals, reverse=True), (
-        "order_row must be a descending argsort of gen_kv_lens"
-    )
-
-    # Above threshold: (num_sms + 1) * 2 = 34 > 32 → also engages with correct sort
-    kv_vals2 = kv_vals + [100]
-    md_above = make_mock(num_sms + 1, kv_vals2)
-    md_above._compute_kv_lens_row_reorder()
-    assert md_above.kv_lens_row_reorder is not None
-    reorder2 = md_above.kv_lens_row_reorder.cpu().tolist()
-    assert [kv_vals2[i] for i in reorder2] == sorted(kv_vals2, reverse=True)

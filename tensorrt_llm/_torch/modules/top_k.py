@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from enum import Enum
 
 import torch
@@ -299,23 +298,21 @@ class TopK(nn.Module):
                 logger.info_once(
                     "self-sampling GVR top-K engaged "
                     f"(K={self.top_k}, cr={self.compress_ratio}, "
-                    f"next_n={next_n}, "
-                    f"{'hinted' if self._gvr_v2_hinted else 'hint-free'}).",
+                    f"next_n={next_n}, hint-free).",
                     key="selfsampling_topk_engaged",
                 )
                 # Self-sampling GVR varlen engine:
                 # one launch for the batch; per-row n from device kv_lens,
                 # capture-stable tuning from the max-seq-len engine constant
-                # (no host reads — CUDA-graph safe). Hint-free by default
-                # (pre_idx=None: the kernel brackets from the current row);
-                # TRTLLM_GVR_V2_HINTED=1 restores raw prev-step hint
-                # consumption (offset-free contract). The module receives
+                # (no host reads — CUDA-graph safe). Self-sampling is hint-free
+                # (pre_idx=None: the kernel brackets from the current row).
+                # The module receives
                 # max_seq_len in COMPRESSED index space; run_varlen's
                 # max_seq_len is in kv-token space like sequence_lengths —
                 # multiply back.
                 selfsampling_topk_run_varlen(
                     scores,
-                    gvr_prior_indices if self._gvr_v2_hinted else None,
+                    None,
                     sequence_lengths,
                     output_indices,
                     next_n=next_n,
@@ -385,7 +382,9 @@ class TopK(nn.Module):
         Args:
             output_indices: Int32 prefill selections with shape
                 ``[num_prefill_rows, top_k]``.
-            request_lengths: Per-request prefill row counts.
+            request_lengths: Per-request prefill row counts on
+                ``output_indices.device``; a host tensor here makes the row
+                gather a synchronous host-to-device copy.
             gvr_prior_indices: Int32 caller-owned state on
                 ``output_indices.device`` with shape ``[capacity, top_k]``.
                 The slice starting at ``request_offset`` is updated in place.
