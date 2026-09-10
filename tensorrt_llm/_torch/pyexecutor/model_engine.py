@@ -1939,8 +1939,9 @@ class PyTorchModelEngine(ModelEngine):
         # A model whose prefill kernel specializes on chunk alignment declares
         # it on its Mamba metadata class; the two passes then cover both
         # variants, for free since alignment is independent of HAS_INITSTATES.
-        metadata_cls = getattr(self.model, "mamba_metadata_cls", None) or getattr(
-            getattr(self.model, "llm", None), "mamba_metadata_cls", None)
+        metadata_cls = getattr(
+            self.model, "mamba_metadata_cls", None) or getattr(
+                getattr(self.model, "llm", None), "mamba_metadata_cls", None)
         chunk_alignment = getattr(metadata_cls, "prefill_chunk_alignment", None)
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates,
@@ -2666,8 +2667,7 @@ class PyTorchModelEngine(ModelEngine):
             num_gen_requests: int,
             least_requests: bool = True,
             chunk_alignment: Optional[int] = None,
-            chunk_aligned: bool = False
-    ) -> Optional[ScheduledRequests]:
+            chunk_aligned: bool = False) -> Optional[ScheduledRequests]:
         """Creates a generic dummy ScheduledRequests object for warmup.
 
         ``chunk_alignment``, when set, rewrites the context lengths onto one
@@ -5247,6 +5247,7 @@ class PyTorchModelEngine(ModelEngine):
         sequence_lengths = []  # per sequence
         prompt_lengths = []  # per sequence
         request_ids = []  # per request
+        seq_slots = []  # per request (stable seq_slot from SeqSlotManager)
         gather_ids = []
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
@@ -5365,6 +5366,8 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in _ctx_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
@@ -5645,6 +5648,10 @@ class PyTorchModelEngine(ModelEngine):
                     padding_gen_slots.append(request.py_seq_slot)
                 request.py_needs_onehot_draft_probs = False  # consume once
             request_ids.append(request.py_request_id)
+            # CUDA-graph padding dummies have no SeqSlotManager slot; keep
+            # them distinguishable from real request slots.
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else -1)
             request_accepted_path[
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
@@ -5766,6 +5773,8 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             draft_lens.append(0)
             # Only the length and the last (original_max_draft_len+1) tokens are
             # needed here; get_num_tokens is O(1) and get_tokens_range copies only
@@ -5890,6 +5899,10 @@ class PyTorchModelEngine(ModelEngine):
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
+                # -1 marks CUDA-graph padding dummies with no SeqSlotManager
+                # slot.
+                seq_slots.append(request.py_seq_slot if request.
+                                 py_seq_slot is not None else -1)
                 is_promoted_context = (request.py_request_id
                                        in promoted_context_request_ids)
                 if is_promoted_context:
@@ -6878,6 +6891,7 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = []
         prompt_lengths = []
         request_ids = []
+        seq_slots = []
         gather_ids = []
         position_ids = []
         # for star attention, we need customized block ids
@@ -6885,6 +6899,8 @@ class PyTorchModelEngine(ModelEngine):
         num_cached_tokens_per_seq = []
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             prompt_lengths.append(request.py_prompt_len)
 
             ctx_iter = request.ctx_iters
@@ -6996,6 +7012,8 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in generation_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             prompt_lengths.append(request.py_prompt_len)
 
             input_token_id = request.get_token(0, request.get_num_tokens(0) - 1)
@@ -7702,6 +7720,14 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        if not self._disable_overlap_scheduler:
+            # Do not refill reusable host staging while the previous
+            # iteration's asynchronous H2D copies still consume it.  This
+            # event precedes the model forward, so its synchronization retains
+            # GPU forward overlap while protecting every forward entry,
+            # including speculative/draft paths.
+            self.wait_for_input_copy()
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(

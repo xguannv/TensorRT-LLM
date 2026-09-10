@@ -628,6 +628,35 @@ def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():
     assert idx_starts == {0: 256}
 
 
+def test_v2_builder_filters_derived_roles_and_uses_manager_layer_ids():
+    """A specialized manager can rebuild derived roles after transfer."""
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.MLA_V_PACKED): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=128, size=128
+        ),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.MLA_V_PACKED): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=384, size=128
+        ),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD},
+        slot_bytes_list=(512,),
+    )
+    manager.get_disagg_transfer_roles = lambda: frozenset({Role.KEY})
+    manager.get_disagg_global_layer_ids = lambda _group_id: [20, 21]
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert [layer.global_layer_id for layer in layer_group.local_layers] == [20, 21]
+    assert len(layer_group.pool_views) == 1
+    view = layer_group.pool_views[0]
+    assert view.pool_role == frozenset({"key"})
+    assert get_layer_byte_ranges(view) == ({0: 0, 1: 256}, 128)
+
+
 def test_v2_builder_validates_role_mapper_declaration():
     from types import SimpleNamespace
 

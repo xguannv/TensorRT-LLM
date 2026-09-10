@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Attention Data Parallelism (ADP) abstractions.
 
@@ -99,6 +102,7 @@ class RankState:
     rank: int
     num_active_requests: int = 0
     num_active_tokens: int = 0
+    has_inflight_transfer: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
@@ -112,6 +116,7 @@ class RankState:
             self.rank,
             self.num_active_requests,
             self.num_active_tokens,
+            self.has_inflight_transfer,
             *self.iter_stats.serialize(),
         ]
 
@@ -119,9 +124,16 @@ class RankState:
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_prefix_field_count = 3
+        legacy_prefix_field_count = 3
+        rank_state_prefix_field_count = 4
+        iter_stats_field_count = len(fields(RankIterStatsPayload))
+        # Accept the previous full payload shape so rolling unit fixtures and
+        # persisted diagnostics remain readable. Runtime ranks always run the
+        # same binary and emit the new shape below.
+        if len(values) == legacy_prefix_field_count + iter_stats_field_count:
+            values.insert(legacy_prefix_field_count, 0)
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
-        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
+        max_field_count = rank_state_prefix_field_count + iter_stats_field_count
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > max_field_count:
@@ -140,6 +152,7 @@ class RankState:
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
+            has_inflight_transfer=rank_values[3],
             iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
         )
 
@@ -163,8 +176,21 @@ class ADPRouter(ABC):
 
     needs_prefix_matches: bool = False
 
-    def __init__(self, dist: Distributed):
+    def __init__(
+        self,
+        dist: Distributed,
+        kv_cache_manager=None,
+        async_transfer_manager=None,
+    ):
         self.dist = dist
+        self.kv_cache_manager = kv_cache_manager
+        self.async_transfer_manager = async_transfer_manager
+
+    def _has_inflight_transfer(self) -> int:
+        return int(
+            self.async_transfer_manager is not None
+            and self.async_transfer_manager.has_any_inflight_requests()
+        )
 
     @classmethod
     def create(
@@ -181,8 +207,7 @@ class ADPRouter(ABC):
             kv_cache_manager: KV cache manager instance (may be None).
             attention_dp_config: AttentionDpConfig instance (may be None).
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
-                KVCacheAwareADPRouter to account for KV-transfer-in-progress
-                requests in per-rank load.  Ignored by DefaultADPRouter.
+                the routers to account for KV-transfer-in-progress requests.
 
         Returns:
             A KVCacheAwareADPRouter if config requests it and the
@@ -221,7 +246,11 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist)
+        return DefaultADPRouter(
+            dist=dist,
+            kv_cache_manager=kv_cache_manager,
+            async_transfer_manager=async_transfer_manager,
+        )
 
     @abstractmethod
     def create_rank_state(
@@ -365,6 +394,7 @@ class DefaultADPRouter(ADPRouter):
             rank=self.dist.tp_rank,
             num_active_requests=len(active_requests),
             num_active_tokens=num_active_tokens,
+            has_inflight_transfer=self._has_inflight_transfer(),
         )
 
     def route_requests(
@@ -514,7 +544,11 @@ class KVCacheAwareADPRouter(ADPRouter):
         async_transfer_manager=None,
         account_for_in_transfer: bool = False,
     ):
-        super().__init__(dist)
+        super().__init__(
+            dist,
+            kv_cache_manager=kv_cache_manager,
+            async_transfer_manager=async_transfer_manager,
+        )
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
         self.match_rate_threshold = match_rate_threshold
@@ -564,6 +598,7 @@ class KVCacheAwareADPRouter(ADPRouter):
             rank=self.dist.tp_rank,
             num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
+            has_inflight_transfer=self._has_inflight_transfer(),
         )
 
     def gather_prefix_matches(

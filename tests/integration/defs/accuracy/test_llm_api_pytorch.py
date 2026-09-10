@@ -43,14 +43,15 @@ from tensorrt_llm.llmapi.llm_args import Nvfp4GemmConfig
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
+                            JsonModeEval, LlmapiAccuracyTestHarness,
+                            LongBenchV1, LongBenchV2, assert_acceptance_length)
+
+from ..conftest import (  # isort: skip
     check_device_contain, get_device_count, get_mpi_world_size, llm_models_root,
     parametrize_with_ids, skip_no_hopper, skip_no_mxfp4_swizzle, skip_no_rubin,
     skip_post_blackwell, skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
     skip_pre_hopper, skip_pre_rubin, skip_ray)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2, assert_acceptance_length)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -1783,6 +1784,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  attn_backend="TRTLLM",
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_no_rubin
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_nvfp4_mla_gsm8k(self):
+        kv_cache_config = KvCacheConfig(dtype="nvfp4",
+                                        free_gpu_memory_fraction=0.75)
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                attn_backend="TRTLLM",
+                kv_cache_config=kv_cache_config,
+                max_num_tokens=8192,
+                max_batch_size=1350,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -4262,6 +4280,24 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_kv(self):
+        kv_cache_config = KvCacheConfig(dtype="nvfp4",
+                                        free_gpu_memory_fraction=0.5)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 enable_attention_dp=True,
+                 enable_chunked_prefill=True,
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=512,
+                 kv_cache_config=kv_cache_config) as llm:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -8734,6 +8770,43 @@ class TestGLM52(LlmapiAccuracyTestHarness):
                  **pytorch_config) as llm:
             assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4_nvfp4kv(self, tp_size, ep_size):
+        """Exercise GLM-5.2 NVFP4 KV cache prefill and decode paths."""
+        model_name = "zai-org/GLM-5.2"
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(
+            dtype="nvfp4",
+            free_gpu_memory_fraction=0.7,
+            use_kv_cache_manager_v2=True,
+        )
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                max_seq_len=8192,
+                max_num_tokens=512,
+                **pytorch_config,
+        ) as llm:
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(model_name)
             task.evaluate(llm)
 

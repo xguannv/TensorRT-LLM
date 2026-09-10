@@ -517,6 +517,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
         kv_cache_manager = meta.kv_cache_manager
         if kv_cache_manager is not None:
+            get_num_blocks = getattr(kv_cache_manager, "get_kv_cache_num_blocks", None)
+            layer_idx = getattr(getattr(self, "attn", None), "layer_idx", None)
+            if callable(get_num_blocks) and layer_idx is not None:
+                return int(get_num_blocks(layer_idx))
             get_page_index_upper_bound = getattr(
                 getattr(kv_cache_manager, "impl", None), "get_page_index_upper_bound", None
             )
@@ -604,9 +608,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     @staticmethod
     def _get_kv_cache_dtype(
         meta: "TrtllmAttentionMetadata",
+        layer_idx: Optional[int] = None,
     ) -> Optional[DataType]:
         kv_cache_manager = meta.kv_cache_manager
         if kv_cache_manager is not None:
+            get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+            if callable(get_kv_cache_dtype) and layer_idx is not None:
+                return get_kv_cache_dtype(layer_idx)
             return kv_cache_manager.dtype
         return None
 
@@ -771,7 +779,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if q_dtype not in self.SUPPORTED_INPUT_DTYPES:
             return False, f"input dtype {q_dtype}. Supported: FP16, BF16, FP8 (E4M3)."
 
-        kv_cache_dtype = self._get_kv_cache_dtype(meta)
+        kv_cache_dtype = self._get_kv_cache_dtype(meta, self.attn.layer_idx)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
         if meta.is_cross:

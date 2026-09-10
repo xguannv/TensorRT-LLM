@@ -109,6 +109,7 @@ from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams
+from ..kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV, get_kimi_k3_bf16_kv_layer_ids
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.fused_moe.interface import MoESchedulerKind
@@ -2195,19 +2196,32 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             # Forward only the KV-cache quantization to the MLA attention
-            # backends (enables FP8 KV cache). The attention projection
+            # backends. The attention projection
             # weights themselves stay BF16 — the model-level weight-quant
             # algo must not leak into the attention backend's weight paths.
-            mla_quant_config = None
             kv_quant_algo = (
                 model_config.quant_config.kv_cache_quant_algo
                 if model_config.quant_config is not None
                 else None
             )
-            if kv_quant_algo is not None:
-                mla_quant_config = QuantConfig(kv_cache_quant_algo=kv_quant_algo)
+            bf16_kv_layer_ids = get_kimi_k3_bf16_kv_layer_ids(cfg)
+            if layer_idx in bf16_kv_layer_ids:
+                if kv_quant_algo != QuantAlgo.NVFP4:
+                    raise ValueError(
+                        f"{KIMI_K3_BF16_KV_LAYERS_ENV} requires the model-wide "
+                        "KV cache dtype to be NVFP4."
+                    )
+                kv_quant_algo = None
+                logger.info_once(
+                    f"Kimi K3 MLA layers using BF16 KV-cache fallback: {sorted(bf16_kv_layer_ids)}.",
+                    key="kimi_k3_bf16_kv_fallback_layers",
+                )
             mla_model_config = copy.copy(model_config)
-            mla_model_config.quant_config = mla_quant_config or QuantConfig()
+            mla_model_config.quant_config = (
+                QuantConfig(kv_cache_quant_algo=kv_quant_algo)
+                if kv_quant_algo is not None
+                else QuantConfig()
+            )
             self.self_attn = KimiMLARuntime(
                 cfg,
                 layer_idx,

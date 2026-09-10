@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .phased import FmhaParams, PhasedFmha
@@ -139,6 +140,25 @@ class CuteDslMlaFmha(PhasedFmha):
         return None
 
     @staticmethod
+    def _supports_mixed_batch(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+    ) -> bool:
+        if meta.num_contexts == 0:
+            return True
+
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is None or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4:
+            return False
+        layer_offsets = getattr(kv_cache_manager, "layer_offsets", {})
+        get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+        return (
+            callable(get_kv_cache_dtype)
+            and attn.layer_idx in layer_offsets
+            and get_kv_cache_dtype(attn.layer_idx) == DataType.BF16
+        )
+
+    @staticmethod
     def _to_cutlass_dtype(dtype: torch.dtype):
         """Map a torch dtype to the cutlass dtype the kernel expects, or None
         if the kernel has no counterpart for it."""
@@ -240,6 +260,15 @@ class CuteDslMlaFmha(PhasedFmha):
             metadata,
             forward_args,
         )
+        if supported and metadata.num_contexts > 0 and self.attn.num_heads != 96:
+            logger.info_once(
+                "CuTe DSL MLA FMHA selected for an NVFP4-manager BF16 fallback "
+                f"layer in a mixed batch: layer={self.attn.layer_idx}, "
+                f"num_contexts={metadata.num_contexts}, "
+                f"num_generations={metadata.num_generations}, "
+                f"q_shape={tuple(q.shape)}.",
+                key=f"cute_dsl_mla_mixed_bf16_layer:{self.attn.layer_idx}",
+            )
         if not supported:
             logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
         return supported
@@ -308,9 +337,12 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
-        # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # Keep the general mixed-batch performance gate, except when an
+        # NVFP4 manager exposes this layer through its BF16 fallback pool.
+        # TRTLLM-Gen cannot consume that combination with 128-token pages,
+        # while the CuTeDSL path below already slices all generation inputs
+        # and page tables past meta.num_contexts.
+        if meta.num_generations <= 0 or not self._supports_mixed_batch(attn, meta):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."

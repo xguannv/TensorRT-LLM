@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 
 
 class _AttentionStub:
@@ -54,6 +55,23 @@ def test_flashinfer_preserves_legacy_pool_scaling() -> None:
         num_local_layers=36,
     )
     assert _get_total_num_blocks(manager, kv_factor=2) == 1024 * 36 * 2
+
+
+def test_flashinfer_uses_layer_specific_v2_pool_properties() -> None:
+    manager = SimpleNamespace(
+        dtype=DataType.NVFP4,
+        impl=SimpleNamespace(get_page_index_upper_bound=lambda *_: 99),
+        get_kv_cache_num_blocks=lambda layer_idx: 1234 + layer_idx,
+        get_kv_cache_dtype=lambda layer_idx: (DataType.BF16 if layer_idx == 7 else DataType.NVFP4),
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha.attn = SimpleNamespace(layer_idx=7)
+
+    assert fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=manager)) == 1241
+    assert (
+        fmha._get_kv_cache_dtype(SimpleNamespace(kv_cache_manager=manager), layer_idx=7)
+        == DataType.BF16
+    )
 
 
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:

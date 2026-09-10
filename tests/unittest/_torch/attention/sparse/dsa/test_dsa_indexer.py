@@ -34,6 +34,8 @@ import torch
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention_backend.fmha.fp4_mla import Fp4MlaFmha
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -69,6 +71,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import _uses_fp4_mla_attention
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -85,6 +88,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.quantization.utils import fp8_utils
 
 
@@ -714,6 +718,34 @@ def test_transform_local_topk_uses_v2_page_mapping():
 
     torch.testing.assert_close(actual, expected_indices)
     convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_dsa_selects_sparse_v2_cache_and_fallback_fmha():
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        ),
+        sparse_attention_config=sparse_config,
+        quant_config=SimpleNamespace(
+            quant_mode=QuantMode.NVFP4_KV_CACHE,
+        ),
+        attn_backend="TRTLLM",
+    )
+    kv_cache_config = KvCacheConfig(
+        dtype="nvfp4",
+        use_kv_cache_manager_v2=True,
+    )
+
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is DSACacheManagerV2
+    assert not _uses_fp4_mla_attention(model_config, kv_cache_config)
+
+    dsa_attention = object.__new__(DSATrtllmAttention)
+    assert not dsa_attention.uses_fp4_mla_attention
+    assert not Fp4MlaFmha.is_available(dsa_attention)
+    assert FallbackFmha(dsa_attention).is_supported(None, None, None, None, None)
 
 
 def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():

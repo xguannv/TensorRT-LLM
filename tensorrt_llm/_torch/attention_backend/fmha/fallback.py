@@ -64,12 +64,15 @@ class FallbackFmha(Fmha):
         # new KV entries are the trailing slots of one rank's kv_len. Running
         # it would be silently wrong, so reject — with no remaining FMHA
         # library, dispatch raises loudly instead.
-        if (metadata.helix_position_offsets is not None
-                and getattr(metadata, "_helix_spec_tokens_valid", False)
-                and metadata.num_generations > 0
-                and q.shape[0] > metadata.num_seqs):
+        if (
+            metadata.helix_position_offsets is not None
+            and getattr(metadata, "_helix_spec_tokens_valid", False)
+            and metadata.num_generations > 0
+            and q.shape[0] > metadata.num_seqs
+        ):
             return False
-        return True
+        attn = self.attn
+        return not attn.uses_fp4_mla_attention
 
     def forward(
         self,
