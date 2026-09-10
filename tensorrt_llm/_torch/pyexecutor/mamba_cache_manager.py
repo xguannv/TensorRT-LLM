@@ -415,9 +415,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         kda_conv_k: torch.Tensor | None = None
         kda_conv_v: torch.Tensor | None = None
         # Post-processed per-draft quantities for replay:
-        # [layers, slots, num_spec, 3, H*K] (q/k/gate), [.., num_spec, H*V],
+        # [layers, slots, num_spec, 2, H*K] (k/gate), [.., num_spec, H*V],
         # [.., num_spec, H] — all fp32.
-        kda_qkg_cache: torch.Tensor | None = None
+        kda_kg_cache: torch.Tensor | None = None
         kda_v_cache: torch.Tensor | None = None
         kda_beta_cache: torch.Tensor | None = None
 
@@ -599,11 +599,13 @@ class PythonMambaCacheManager(BaseResourceManager):
                 extended_s = w_kernel - 1 + M
 
                 def _dim_contiguous_conv_cache():
+                    # raw bf16 projection inputs: bf16 is exact and halves
+                    # the per-draft replay traffic of the verify kernel
                     return torch.zeros(num_local_layers,
                                        max_batch_size,
                                        extended_s,
                                        section_dim,
-                                       dtype=torch.float32,
+                                       dtype=torch.bfloat16,
                                        device=device).transpose(-1, -2)
 
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
@@ -611,10 +613,10 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['kda_conv_q'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_k'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_v'] = _dim_contiguous_conv_cache()
-                spec_kwargs['kda_qkg_cache'] = torch.zeros(num_local_layers,
+                spec_kwargs['kda_kg_cache'] = torch.zeros(num_local_layers,
                                                            max_batch_size,
                                                            M,
-                                                           3,
+                                                           2,
                                                            section_dim,
                                                            dtype=torch.float32,
                                                            device=device)
@@ -628,7 +630,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                     (num_local_layers, max_batch_size, M, nheads), device)
                 ssm_spec_cache = [
                     spec_kwargs['kda_conv_q'], spec_kwargs['kda_conv_k'],
-                    spec_kwargs['kda_conv_v'], spec_kwargs['kda_qkg_cache'],
+                    spec_kwargs['kda_conv_v'], spec_kwargs['kda_kg_cache'],
                     spec_kwargs['kda_v_cache'], spec_kwargs['kda_beta_cache']
                 ]
                 spec_path_label = "kda-replay"
@@ -857,7 +859,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 device=cache.device)
             seeded[:, :, :, :committed] = section.to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
-        for buf in (self.mamba_cache.kda_qkg_cache,
+        for buf in (self.mamba_cache.kda_kg_cache,
                     self.mamba_cache.kda_v_cache,
                     self.mamba_cache.kda_beta_cache):
             buf.index_fill_(1, idx, 0)
@@ -1082,7 +1084,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 kda_conv_q=_drop(self.mamba_cache.kda_conv_q),
                 kda_conv_k=_drop(self.mamba_cache.kda_conv_k),
                 kda_conv_v=_drop(self.mamba_cache.kda_conv_v),
-                kda_qkg_cache=_drop(self.mamba_cache.kda_qkg_cache),
+                kda_kg_cache=_drop(self.mamba_cache.kda_kg_cache),
                 kda_v_cache=_drop(self.mamba_cache.kda_v_cache),
                 kda_beta_cache=_drop(self.mamba_cache.kda_beta_cache),
             )
@@ -4203,7 +4205,7 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         self.kda_conv_q = None
         self.kda_conv_k = None
         self.kda_conv_v = None
-        self.kda_qkg_cache = None
+        self.kda_kg_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
 
@@ -4228,12 +4230,14 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         extended_window = committed_window + num_spec
 
         def allocate_dim_contiguous_conv_cache() -> torch.Tensor:
+            # raw bf16 projection inputs: bf16 is exact and halves the
+            # per-draft replay traffic of the verify kernel
             return torch.zeros(
                 self.local_num_mamba_layers,
                 cache_size,
                 extended_window,
                 section_dim,
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device=device,
             ).transpose(-1, -2)
 
@@ -4243,11 +4247,11 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         self.kda_conv_q = allocate_dim_contiguous_conv_cache()
         self.kda_conv_k = allocate_dim_contiguous_conv_cache()
         self.kda_conv_v = allocate_dim_contiguous_conv_cache()
-        self.kda_qkg_cache = torch.zeros(
+        self.kda_kg_cache = torch.zeros(
             self.local_num_mamba_layers,
             cache_size,
             num_spec,
-            3,
+            2,
             section_dim,
             dtype=torch.float32,
             device=device,
@@ -4313,7 +4317,7 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
             self.kda_conv_q,
             self.kda_conv_k,
             self.kda_conv_v,
-            self.kda_qkg_cache,
+            self.kda_kg_cache,
             self.kda_v_cache,
             self.kda_beta_cache,
         )
@@ -4419,7 +4423,7 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
                 replay_layer[:, :, :committed_window].index_copy_(
                     0, state_indices, section.to(replay_layer.dtype))
 
-        for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
+        for replay_buffer in (self.kda_kg_cache, self.kda_v_cache,
                               self.kda_beta_cache):
             replay_buffer.index_fill_(1, state_indices, 0)
         self.prev_num_accepted_tokens[state_indices] = 0
@@ -4437,7 +4441,7 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
             "kda_conv_q": self.kda_conv_q[layer_offset],
             "kda_conv_k": self.kda_conv_k[layer_offset],
             "kda_conv_v": self.kda_conv_v[layer_offset],
-            "kda_qkg_cache": self.kda_qkg_cache[layer_offset],
+            "kda_kg_cache": self.kda_kg_cache[layer_offset],
             "kda_v_cache": self.kda_v_cache[layer_offset],
             "kda_beta_cache": self.kda_beta_cache[layer_offset],
         }
@@ -4536,7 +4540,7 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         self.kda_conv_q = None
         self.kda_conv_k = None
         self.kda_conv_v = None
-        self.kda_qkg_cache = None
+        self.kda_kg_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
         super().shutdown()

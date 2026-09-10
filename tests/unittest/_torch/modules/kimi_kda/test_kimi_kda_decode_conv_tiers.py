@@ -51,7 +51,7 @@ class _Cfg:
 class _LayerCache:
     """Only what the plain-decode path reads; no fused-verify replay caches."""
 
-    kda_qkg_cache = None
+    kda_kg_cache = None
 
 
 class _MambaMetadata:
