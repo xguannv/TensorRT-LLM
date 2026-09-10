@@ -14,30 +14,18 @@
 # limitations under the License.
 """CuteDslFc12FusedMoE: FC1+FC2-fused CuteDSL NVFP4 MoE backend for Rubin (SM107).
 
-SKELETON STATE
---------------
-This is a thin subclass of :class:`CuteDslFusedMoE` that currently REUSES the
-existing CuteDSL FC1/FC2 ops and kernels, so the backend is fully functional and
-end-to-end testable today (it behaves like ``CuteDslFusedMoE`` but is a distinct,
-separately selectable backend ``"CUTEDSL_FC12"``).
+Drives ``cute_dsl_nvfp4_fc12_fused_rubin``: one persistent kernel does gather +
+FC1 GEMM + gated epilogue + requant + FC2 GEMM + finalize. The epilogue is a
+trace-time specialization of SwiGLU or SiTU (Kimi K3); Relu2 is not gated and
+is not supported. uGPU is not enabled for this backend.
 
-When the colleague's fused FC12 kernel (FC1+FC2 fused into one persistent kernel)
-is delivered, only the marked swap points need changing -- everything else
-(``quantize_input``, ``run_moe``, weight lifecycle, EPLB) is inherited from
-:class:`CuteDslFusedMoE`:
+``quantize_input``, ``run_moe``, the weight lifecycle, capabilities, and EPLB
+are inherited from :class:`CuteDslFusedMoE`. The SiTU constants live on the
+parent (``situ_beta`` / ``situ_linear_beta``) and are forwarded into the fused
+op; they are part of the compiled-kernel cache key.
 
-  1. ``run_moe_nvfp4_impl``  -- replace the parent's FC1+FC2 two-op sequence with
-     the single fused op ``cute_dsl_nvfp4_fc12_fused_rubin``.
-  2. ``_get_quant_method``   -- override ONLY if the fused kernel's weight/scale
-     layout differs from ``NVFP4CuteDslFusedMoEMethod`` (then also re-evaluate
-     ``eplb_support_status`` for the new method).
-
-uGPU is intentionally NOT wired up for this backend: benchmarks currently run
-without the uGPU feature, so FC12 is a non-uGPU backend for now. It does not
-override ``_run_moe_nvfp4_ugpu`` and the ``plan_moe`` gate in ``ugpu/policy.py``
-does not enable uGPU for ``CUTEDSL_FC12``. uGPU can be added back later if needed.
-
-See ``CuteDslFc12FusedMoE-integration-plan.txt`` for the full plan.
+See ``CuteDslFc12FusedMoE-integration-plan.txt`` for the original integration
+plan.
 """
 
 from typing import Optional
@@ -48,6 +36,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import AutoTuner
 from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+from ...utils import ActivationType
 from .fused_moe_cute_dsl import (CuteDslFusedMoE, CuteDslFusedMoENvfp4Runner,
                                  NvFp4WeightView)
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
@@ -74,11 +63,8 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
 class CuteDslFc12FusedMoE(CuteDslFusedMoE):
     """FC1+FC2-fused CuteDSL NVFP4 MoE backend (Rubin/SM107).
 
-    Currently a functional skeleton that reuses ``CuteDslFusedMoE``'s ops and
-    kernels; the FC12 fused kernel is swapped in at the marked point once
-    delivered. ``scheduler_kind`` (EXTERNAL_COMM), ``quantize_input``,
-    ``run_moe``, the weight lifecycle, capabilities, and EPLB are inherited
-    unchanged. uGPU is not enabled for this backend (benchmarks run without it).
+    SwiGLU and SiTU share the gated FC1 geometry; the fused kernel specializes
+    the epilogue at trace time. uGPU is not enabled for this backend.
     """
 
     @classmethod
@@ -98,6 +84,12 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
                 MoERejectReason.DTYPE_UNSUPPORTED,
                 "CuteDslFc12FusedMoE only supports bfloat16 activation, "
                 f"got {p.dtype_act}")
+
+        if p.activation_type not in (ActivationType.Swiglu, ActivationType.SiTu):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CuteDslFc12FusedMoE supports only SwiGLU and SiTU, "
+                f"got {p.activation_type.name}")
 
         if p.swiglu_gptoss_style:
             return _reject(
@@ -168,7 +160,13 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             local_expert_offset=weight_view.slot_start,
             enable_finalize_fusion=self.use_fused_finalize,
             enable_alltoall=enable_alltoall,
-            workload_identity=None,
+            # Inner kernel_cache already keys on these; the outer AutoTuner
+            # unique_id must too, or SwiGLU/SiTU share a tile-size tactic.
+            workload_identity=(
+                int(self.activation_type),
+                self.situ_beta,
+                self.situ_linear_beta,
+            ),
         )
         inputs = [
             x, token_selected_experts, token_final_scales, x_sf, moe_output,
@@ -211,8 +209,8 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
              tile_tokens_dim=tile_size,
          )
 
-        # One fused op: gather + FC1 GEMM + SwiGLU + requant + FC2 GEMM +
-        # finalize (scatter-add into moe_output = a2a combine workspace).
+        # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
+        # + FC2 GEMM + finalize (scatter-add into moe_output).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
         # scales (the kernel takes split alphas). The three atomic counters are
         # allocated + memset inside the op runner. The moe_output zeroing memset
@@ -220,6 +218,7 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
         # the kernel's immediate stream predecessor and the PDL prologue can
         # overlap it); expanded_idx_to_permuted_idx / ep_size / enable_alltoall
         # are passed through for that memset.
+        situ = ActivationType(self.activation_type) == ActivationType.SiTu
         torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
             input=x.view(torch.float4_e2m1fn_x2),
             fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -246,5 +245,8 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             ep_size=self.mapping.moe_ep_size,
             enable_alltoall=enable_alltoall,
             scaling_vector_size=16,
+            activation_type=int(self.activation_type),
+            situ_beta=self.situ_beta if situ else -1.0,
+            situ_linear_beta=self.situ_linear_beta if situ else -1.0,
         )
         return moe_output

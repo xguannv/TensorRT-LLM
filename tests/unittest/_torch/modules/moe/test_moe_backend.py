@@ -50,7 +50,10 @@ from tensorrt_llm._torch.modules.fused_moe import (
 )
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_fc12 import (
+    CuteDslFc12FusedMoE,
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -911,6 +914,62 @@ def test_situ_fanout_gives_cutedsl_the_activation_type_enum(moe_cls):
     assert moe.activation_type == ActivationType.SiTu
     assert moe.situ_beta == 4.0
     assert moe.situ_linear_beta == 25.0
+
+
+def test_situ_fanout_rejects_swiglu_clamp_on_cutedsl_fc12():
+    """SiTU and a SwiGLU clamp are mutually exclusive on CuteDSL, including FC12."""
+    with pytest.raises(ValueError, match="does not support a SwiGLU clamp"):
+        create_moe_backend(
+            moe_cls=CuteDslFc12FusedMoE,
+            routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+            num_experts=8,
+            hidden_size=512,
+            intermediate_size=512,
+            dtype=torch.bfloat16,
+            reduce_results=True,
+            model_config=_megamoe_model_config(),
+            init_load_balancer=False,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            swiglu_limit_scalar=7.0,
+        )
+
+
+def test_cutedsl_fc12_relu2_degrades_to_cutlass():
+    """Relu2 is not gated; fused FC12 would otherwise compile as SwiGLU."""
+    cfg = ModelConfig(
+        moe_backend="CUTEDSL_FC12",
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+    )
+    report = resolve_moe_impl(cfg, activation_type=ActivationType.Relu2)
+    assert impl_class_for(report) is CutlassFusedMoE
+    assert report.degraded
+    assert report.degraded_from.reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+def test_cutedsl_fc12_outer_runner_unique_id_includes_situ():
+    """Outer AutoTuner key must not share a tile-size tactic across activations."""
+
+    def _forward(*args, **kwargs):
+        raise AssertionError("not launched")
+
+    common = dict(
+        forward_impl=_forward,
+        num_experts=8,
+        top_k=2,
+        num_local_experts=8,
+        local_expert_offset=0,
+    )
+    swiglu = CuteDslFc12FusedMoENvfp4Runner(
+        **common,
+        workload_identity=(int(ActivationType.Swiglu), None, None),
+    )
+    situ = CuteDslFc12FusedMoENvfp4Runner(
+        **common,
+        workload_identity=(int(ActivationType.SiTu), 4.0, 25.0),
+    )
+    assert swiglu.unique_id() != situ.unique_id()
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
