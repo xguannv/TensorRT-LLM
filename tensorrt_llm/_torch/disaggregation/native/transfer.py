@@ -2829,25 +2829,61 @@ class RxSession(RxSessionBase):
                 return
             try:
                 if status == AgentResult.SUCCESS:
+                    from .bounce import scatter_write_result
+
+                    on_done = None
                     if is_last_slice:
                         task.last_slice_count += 1
                         if task.last_slice_count == task.expected_transfers:
-                            task.complete()
-                            # Transfer end for perf/time-sync: only meaningful once every slice has
-                            # landed. Plain attribute write (atomic under the GIL); on_done must stay
-                            # lock-free, and consumers only read it after wait_complete succeeds.
-                            if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
-                                self.transfer_end_time = (
-                                    tensorrt_llm.bindings.global_steady_clock_now()
+                            request_id = self.request_id
+
+                            def on_done(
+                                success,
+                                task=task,
+                                peer_rank=peer_rank,
+                                sender_slice_id=sender_slice_id,
+                                request_id=request_id,
+                            ):
+                                if not success:
+                                    task.fail(
+                                        RuntimeError(
+                                            f"KV bounce scatter failed for request {request_id} "
+                                            f"slice={sender_slice_id}"
+                                        )
+                                    )
+                                    return
+                                if task.status == TaskStatus.ERROR:
+                                    return
+                                task.complete()
+                                # Transfer end for perf/time-sync is valid only
+                                # after the bounce data has landed in the real KV pool.
+                                if all(
+                                    t.status == TaskStatus.TRANSFERRED
+                                    for t in self._kv_tasks
+                                ):
+                                    self.transfer_end_time = (
+                                        tensorrt_llm.bindings.global_steady_clock_now()
+                                    )
+                                logger.debug(
+                                    f"KV transfer complete for request {request_id} "
+                                    f"slice={sender_slice_id}"
                                 )
-                            logger.debug(
-                                f"KV transfer complete for request {self.request_id} "
-                                f"slice={sender_slice_id}"
-                            )
-                            if task._perf_timer is not None:
-                                task._perf_timer.record_task_end(peer_rank)
-                            ri = self._receiver._registrar.self_rank_info
-                            task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+                                if task._perf_timer is not None:
+                                    task._perf_timer.record_task_end(peer_rank)
+                                ri = self._receiver._registrar.self_rank_info
+                                task.print_perf_info(
+                                    peer_rank, ri.instance_name, ri.instance_rank
+                                )
+
+                    scatter_write_result(
+                        self._receiver._bounce,
+                        (self.disagg_request_id, task.slice_id),
+                        peer_rank,
+                        dst_ptrs,
+                        sizes,
+                        src_base,
+                        on_done,
+                    )
                 elif status == AgentResult.FAILED:
                     detail = (
                         f"KV transfer failed for request {self.request_id} slice={sender_slice_id} "
