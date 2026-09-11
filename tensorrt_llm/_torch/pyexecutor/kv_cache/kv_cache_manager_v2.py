@@ -1916,6 +1916,50 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def _format_kv_cache_pool_group_sizes(self) -> list[str]:
+        """Describe how many slots each pool group was given.
+
+        ``get_kv_cache_stats`` reports one aggregate number per worker,
+        summing ``total`` and ``available`` across every pool group. That
+        aggregate cannot express "one pool group is full while the others are
+        empty", which is the state a heterogeneous-attention model lands in:
+        pool groups whose per-request cost does not scale with sequence length
+        stay small, so they reach their ceiling while the token-scaled groups
+        beside them are barely used, and the aggregate still reads low.
+
+        The per-group slot count makes that state visible, and comparing a
+        group's slot count against ``max_batch_size`` makes it actionable: a
+        group holding roughly one slot per declared request has no headroom
+        for the per-request slot count to vary, which windowed life cycles do
+        as their window slides across block boundaries.
+
+        Emitted once at construction; this is a description of the layout, not
+        a per-iteration statistic.
+        """
+        try:
+            stats = self._get_storage_statistics(GPU_LEVEL)
+        except (AttributeError, RuntimeError) as exc:
+            # A manager that cannot describe its own layout must still start:
+            # this is a debugging aid, not a correctness dependency.
+            logger.debug(f"KV cache pool group sizes unavailable: {exc}")
+            return []
+
+        entries = []
+        for pool_group_id, stat in enumerate(stats):
+            # One size per pool in the group, under either of the two names the
+            # backends use for it: the C++ binding exposes `slot_sizes`, the
+            # Python implementation `slot_size`. Both are lists.
+            slot_sizes = getattr(stat, "slot_sizes", None)
+            if slot_sizes is None:
+                slot_sizes = stat.slot_size
+            entries.append(
+                f"pool_group_id={pool_group_id}, "
+                f"num_slots={stat.total}, "
+                f"slot_size={list(slot_sizes)}, "
+                f"bytes={stat.total * sum(slot_sizes)}"
+            )
+        return entries
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -1929,6 +1973,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
         for entry in entries:
+            logger.info(entry)
+
+        # Sizes ride along with the mapping so a log that identifies the pool
+        # groups always says how big they are.
+        for entry in self._format_kv_cache_pool_group_sizes():
             logger.info(entry)
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
