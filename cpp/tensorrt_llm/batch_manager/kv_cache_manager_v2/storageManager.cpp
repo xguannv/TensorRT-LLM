@@ -30,10 +30,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
@@ -1725,6 +1727,27 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
 // computeSlotsFromConstraints
 // ---------------------------------------------------------------------------
 
+namespace
+{
+//! Whether constraint floors budget for a batch that stays resident. Set
+//! TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR=0 to restore sizing from the instantaneous demand
+//! of the declared constraint batch: slightly fewer slots for windowed pool groups, at the cost of
+//! not being able to keep a full max_batch_size of them resident. Read per call rather than cached,
+//! since sizing happens once and A/B comparisons need to flip it.
+bool sustainWindowedFloor()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR");
+    return value == nullptr || std::string_view(value) == "1";
+}
+} // namespace
+
+int StorageManager::windowedWorstCaseBlocks(AttnLifeCycle const& lc, int tokensPerBlock) const
+{
+    int window = *lc.windowSize;
+    // Handle oscillation of slot count required by SWA while the window slides.
+    return lc.numSinkBlocks + (window + tokensPerBlock - 2) / tokensPerBlock + 1;
+}
+
 TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
     int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
@@ -1733,20 +1756,13 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std
     // for the utilization gate checked by KvCache::resume.
     TypedVec<LifeCycleId, SlotCount> maxSlots(numLifeCycles(), 0);
 
-    auto swaFloorBlocks = [tokensPerBlock](AttnLifeCycle const& lc) -> int
-    {
-        int window = *lc.windowSize;
-        // Handle oscillation of slot count required by SWA while the window slides.
-        return lc.numSinkBlocks + (window + tokensPerBlock - 2) / tokensPerBlock + 1;
-    };
-
     // Full-attention lifecycles share the largest SWA floor: all attention
     // lifecycles see the same seq_len, so this is a valid lower bound.
     int floorNumBlocks = 1;
     for (auto const& [lcId, attn] : mLifeCycles.attentionLifeCycles())
     {
         if (attn->windowSize.has_value())
-            floorNumBlocks = std::max(floorNumBlocks, swaFloorBlocks(*attn));
+            floorNumBlocks = std::max(floorNumBlocks, windowedWorstCaseBlocks(*attn, tokensPerBlock));
     }
     for (auto const& [lcIdx, lc] : mLifeCycles)
     {
@@ -1758,7 +1774,7 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std
         }
         else if (attn->windowSize.has_value())
         {
-            maxSlots[lcIdx] = swaFloorBlocks(*attn);
+            maxSlots[lcIdx] = windowedWorstCaseBlocks(*attn, tokensPerBlock);
         }
         else
         {
@@ -1767,6 +1783,10 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std
     }
     for (auto const& batch : constraints)
     {
+        // Instantaneous demand, deliberately: with no typical batch and no explicit ratio, the
+        // constraints stand in for one, and a ratio has to describe what the pool groups are
+        // actually used for. The feasibility floor derived from the same constraints lives in
+        // computePoolGroupMinSlotsFromConstraints.
         auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (LifeCycleId lifeCycle{0}; lifeCycle < slots.size(); ++lifeCycle)
         {
@@ -1789,9 +1809,12 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupMinSlotsFrom
         maxSlots[getPoolGroupIndex(kHotLevel, lifeCycle)] += lifeCycleFloors[lifeCycle];
     }
 
+    // A floor has to hold for as long as the batch is resident, so every request is charged its
+    // worst case rather than its demand at the history length the constraint descriptor names.
+    bool const sustainWindowed = sustainWindowedFloor();
     for (auto const& batch : constraints)
     {
-        auto const slots = computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+        auto const slots = computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, sustainWindowed);
         for (PoolGroupIndex poolGroup{0}; poolGroup < slots.size(); ++poolGroup)
         {
             auto const scaledSlots = static_cast<SlotCount>(
@@ -1806,8 +1829,8 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupMinSlotsFrom
 // computeSlotsForBatch
 // ---------------------------------------------------------------------------
 
-TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
-    BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
+TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock,
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, bool sustainWindowed) const
 {
     TypedVec<LifeCycleId, SlotCount> numSlots(numLifeCycles(), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
@@ -1839,18 +1862,29 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
             int nonStale = totalBlocks - stale.length();
             int nonStaleSys = sysBlocks - intersect(stale, sysRange).length();
             int uniqueNonStale = std::max(0, nonStale - nonStaleSys);
+            int contribution = 0;
             if (swaScratchReuse.has_value())
             {
                 auto scratch = computeScratchRange(
                     lc, kv.historyLength, kv.capacity, tokensPerBlock, swaScratchReuse->maxRewindLen);
                 int numScratch = scratch.length();
                 // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
-                numSlots[lcIdx] += (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
+                contribution = (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
             }
             else
             {
-                numSlots[lcIdx] += uniqueNonStale;
+                contribution = uniqueNonStale;
             }
+            auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+            if (sustainWindowed && attn != nullptr && attn->windowSize.has_value())
+            {
+                // Raise only: a request whose history has not yet passed its window has no stale
+                // blocks and holds its whole capacity, which is more than the window will ever span.
+                // Treating the window span as a ceiling would cut such a request down to a fraction
+                // of what it demands right now.
+                contribution = std::max(contribution, windowedWorstCaseBlocks(*attn, tokensPerBlock));
+            }
+            numSlots[lcIdx] += contribution;
         }
     }
     return numSlots;
@@ -1860,10 +1894,10 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
 // computePoolGroupSlotsForBatch
 // ---------------------------------------------------------------------------
 
-TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupSlotsForBatch(
-    BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupSlotsForBatch(BatchDesc const& batch,
+    int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, bool sustainWindowed) const
 {
-    auto const slotsByLifeCycle = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+    auto const slotsByLifeCycle = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, sustainWindowed);
     TypedVec<PoolGroupIndex, SlotCount> numSlots(numPoolGroups(kHotLevel), 0);
     for (LifeCycleId lifeCycle{0}; lifeCycle < slotsByLifeCycle.size(); ++lifeCycle)
     {

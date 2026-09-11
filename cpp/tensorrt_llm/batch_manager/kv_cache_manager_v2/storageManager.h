@@ -317,11 +317,22 @@ private:
     using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;
 
     // Minimum per-pool-group slot counts to support a BatchDesc.
-    TypedVec<PoolGroupIndex, SlotCount> computePoolGroupSlotsForBatch(
-        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+    TypedVec<PoolGroupIndex, SlotCount> computePoolGroupSlotsForBatch(BatchDesc const& batch, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, bool sustainWindowed = false) const;
 
-    TypedVec<LifeCycleId, SlotCount> computeSlotsForBatch(
-        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+    // Blocks one request can hold at the worst point of its window slide. A windowed life cycle's live
+    // block count oscillates by one as the window crosses a block boundary, so a request that stays
+    // resident passes through this count even when its demand right now is lower.
+    int windowedWorstCaseBlocks(AttnLifeCycle const& lc, int tokensPerBlock) const;
+
+    // `sustainWindowed` asks what it takes to *keep* the batch resident rather than to represent it at
+    // one instant. The batch a constraint describes is not always the batch that has to run: the
+    // CUDA-graph generation warmup declares one long request plus maxBatchSize - 1 requests of a few
+    // tokens each, standing in for full ones. Each is charged what a resident request costs a windowed
+    // life cycle -- the blocks its window spans -- rather than its declared capacity. This only ever
+    // raises a contribution; the window span is the cost of staying resident, not a ceiling.
+    TypedVec<LifeCycleId, SlotCount> computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, bool sustainWindowed = false) const;
 
     // Constraint floors apply only to the hot level. Lifecycle demands remain available only as ratio weights.
     TypedVec<PoolGroupIndex, SlotCount> computePoolGroupMinSlotsFromConstraints(

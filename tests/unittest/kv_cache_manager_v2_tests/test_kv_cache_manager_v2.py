@@ -3673,8 +3673,15 @@ class TestInitRatioConfig(unittest.TestCase):
             tuple(stat_slot_sizes(stat)): stat.total
             for stat in _introspection.storage_statistics(manager)
         }
-        self.assertEqual(slots_by_size[(grain - 1,)], 2)
-        self.assertEqual(slots_by_size[(grain,)], 3)
+        # The windowed group holds 3 slots, not 2: its window is one block wide,
+        # so it spans two blocks whenever it straddles a boundary, and the
+        # constraint floor scales that by max_util_for_resume (0.97) to leave
+        # both usable under the resume gate. At 2 slots the gate would admit
+        # only one, which cannot sustain a single straddling request. The
+        # windowed group takes that extra grain from the non-windowed one; the
+        # total is still the 5 grains of quota.
+        self.assertEqual(slots_by_size[(grain - 1,)], 3)
+        self.assertEqual(slots_by_size[(grain,)], 2)
         manager.shutdown()
 
     @parameterized.expand([(0,), (64,), (50,), (256,)])
