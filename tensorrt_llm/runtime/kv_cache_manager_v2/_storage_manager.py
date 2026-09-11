@@ -181,6 +181,18 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
 
+def sustain_windowed_floor() -> bool:
+    """Whether constraint floors budget for a batch that stays resident.
+
+    Set ``TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR=0`` to restore sizing
+    from the instantaneous demand of the declared constraint batch. That reserves
+    slightly fewer slots for windowed pool groups, at the cost of not being able
+    to keep a full ``max_batch_size`` of them resident. Read per call rather than
+    cached, since sizing happens once and A/B comparisons need to flip it.
+    """
+    return os.environ.get("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR", "1") == "1"
+
+
 class StorageManager:
     __slots__ = (
         "_life_cycles",
@@ -926,23 +938,26 @@ class StorageManager:
             raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
         max_slots = filled_list(0, self.num_life_cycles)
 
-        def swa_floor_blocks(lc: AttnLifeCycle) -> int:
-            window = unwrap_optional(lc.window_size)
-            return lc.num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
-
         floor_num_blocks = 1
         for _, lc in self.life_cycles.attention_life_cycles():
             if lc.window_size is not None:
-                floor_num_blocks = max(floor_num_blocks, swa_floor_blocks(lc))
+                floor_num_blocks = max(
+                    floor_num_blocks, self._windowed_worst_case_blocks(lc, tokens_per_block)
+                )
         for life_cycle, lc in self.life_cycles.items():
             if not isinstance(lc, AttnLifeCycle):
                 max_slots[life_cycle] = 1
             elif lc.window_size is not None:
-                max_slots[life_cycle] = swa_floor_blocks(lc)
+                max_slots[life_cycle] = self._windowed_worst_case_blocks(lc, tokens_per_block)
             else:
                 max_slots[life_cycle] = floor_num_blocks
 
         for batch in constraints:
+            # Instantaneous demand, deliberately: with no typical batch and no
+            # explicit ratio, the constraints stand in for one, and a ratio has
+            # to describe what the pool groups are actually used for. The
+            # feasibility floor derived from the same constraints lives in
+            # `_compute_pool_group_min_slots_from_constraints`.
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for life_cycle in typed_range(self.num_life_cycles):
                 scaled_slots = math.ceil(slots[life_cycle] / max_util_for_resume)
@@ -970,22 +985,53 @@ class StorageManager:
         for life_cycle in typed_range(self.num_life_cycles):
             max_slots[self.get_pool_group_index(life_cycle)] += life_cycle_floors[life_cycle]
 
+        # A floor has to hold for as long as the batch is resident, so every
+        # request is charged its worst case rather than its demand at the
+        # history length the constraint descriptor happens to name.
+        sustain_windowed = sustain_windowed_floor()
         for batch in constraints:
             slots = self._compute_pool_group_slots_for_batch(
-                batch, tokens_per_block, swa_scratch_reuse
+                batch, tokens_per_block, swa_scratch_reuse, sustain_windowed=sustain_windowed
             )
             for pg_idx in typed_range(self.num_pool_groups):
                 scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
                 max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 
+    def _windowed_worst_case_blocks(self, lc: AttnLifeCycle, tokens_per_block: int) -> int:
+        """Blocks one request can hold at the worst point of its window slide.
+
+        A windowed life cycle's live block count oscillates by one as the
+        window crosses a block boundary, so a request that stays resident
+        passes through this count even when its demand right now is lower.
+        """
+        window = unwrap_optional(lc.window_size)
+        return lc.num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
+
     def _compute_slots_for_batch(
         self,
         batch: BatchDesc,
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
+        sustain_windowed: bool = False,
     ) -> TypedIndexList[LifeCycleId, int]:
-        """Compute the minimum number of slots per lifecycle to support a BatchDesc."""
+        """Compute the minimum number of slots per lifecycle to support a BatchDesc.
+
+        ``sustain_windowed`` asks what it takes to *keep* the batch resident
+        rather than to represent it at one instant. It matters only for windowed
+        life cycles, and only because the batch a constraint describes is not
+        always the batch that has to run: the executor's CUDA-graph generation
+        warmup declares one long request plus ``max_batch_size - 1`` requests of
+        a few tokens each, and those short requests stand in for full ones. Each
+        is therefore charged what a resident request costs a windowed life cycle
+        -- the blocks its window spans at the worst point of its slide -- rather
+        than the single block its declared capacity happens to hold.
+
+        This only ever raises a request's contribution. A request whose history
+        has not yet reached its window has nothing stale and holds every block
+        of its capacity, which exceeds the window span; the window span is the
+        cost of staying resident, not a ceiling on what a request can hold.
+        """
         num_slots = filled_list(0, self.num_life_cycles)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
         sys_blocks = batch.system_prompt_length // tokens_per_block
@@ -1024,11 +1070,21 @@ class StorageManager:
                     # overlap with shared sys blocks (which are history).
                     num_scratch = len(scratch)
                     frac_max = self._slot_util_frac_max[lc_idx]
-                    num_slots[lc_idx] += (unique_non_stale - num_scratch) + math.ceil(
+                    contribution = (unique_non_stale - num_scratch) + math.ceil(
                         num_scratch * frac_max
                     )
                 else:
-                    num_slots[lc_idx] += unique_non_stale
+                    contribution = unique_non_stale
+                if sustain_windowed and lc.window_size is not None:
+                    # Raise only: a request whose history has not yet passed its
+                    # window has no stale blocks and holds its whole capacity,
+                    # which is more than the window will ever span. Treating the
+                    # window span as a ceiling would cut such a request down to
+                    # a fraction of what it demands right now.
+                    contribution = max(
+                        contribution, self._windowed_worst_case_blocks(lc, tokens_per_block)
+                    )
+                num_slots[lc_idx] += contribution
         return num_slots
 
     def _compute_pool_group_slots_for_batch(
@@ -1036,9 +1092,12 @@ class StorageManager:
         batch: BatchDesc,
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
+        sustain_windowed: bool = False,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum number of slots per hot pool group."""
-        life_cycle_slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+        life_cycle_slots = self._compute_slots_for_batch(
+            batch, tokens_per_block, swa_scratch_reuse, sustain_windowed=sustain_windowed
+        )
         num_slots = filled_list(0, self.num_pool_groups)
         for life_cycle in typed_range(self.num_life_cycles):
             num_slots[self.get_pool_group_index(life_cycle)] += life_cycle_slots[life_cycle]
