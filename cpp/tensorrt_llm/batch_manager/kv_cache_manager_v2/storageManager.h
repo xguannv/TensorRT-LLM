@@ -371,6 +371,15 @@ private:
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
+    // Shrink constraint floors until they fit within the configured quota. The quota is a budget the
+    // caller chose, so allocating past it trades a shortfall that can be measured for an
+    // out-of-memory failure somewhere else that cannot. Floors derive from maxBatchSize, which bounds
+    // concurrency rather than promising it, so holding fewer requests resident is a legitimate
+    // degradation -- but only if it is announced.
+    TypedVec<PoolGroupIndex, SlotCount> fitMinSlotsToQuota(
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, size_t quota) const;
+
     // Internal helpers.
     // Register the slot descriptors for the next cache level and derive its slot-size table.
     // This is the only mutator of mSlotDescLists/mSlotSizes, so the two cannot go out of sync.

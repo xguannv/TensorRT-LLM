@@ -181,6 +181,21 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
 
+# Each pass shrinks at least one floor or stops; granularity rounding is the only
+# reason more than two are ever needed.
+_MAX_QUOTA_CLAMP_PASSES = 8
+
+
+def clamp_floors_to_quota() -> bool:
+    """Whether the configured KV quota is a hard ceiling on constraint floors.
+
+    Set ``TLLM_KV_CACHE_MANAGER_V2_CLAMP_FLOORS_TO_QUOTA=0`` to restore the
+    previous behaviour, where a level was sized at ``max(floors, quota)`` and so
+    could allocate past the quota the caller asked for.
+    """
+    return os.environ.get("TLLM_KV_CACHE_MANAGER_V2_CLAMP_FLOORS_TO_QUOTA", "1") == "1"
+
+
 def sustain_windowed_floor() -> bool:
     """Whether constraint floors budget for a batch that stays resident.
 
@@ -1154,13 +1169,61 @@ class StorageManager:
         """
         granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
         min_slots = self._min_slots_for_level(level)
-        quota = max(
-            self._min_quota_for_level(slot_size_lists, granularity, min_slots),
-            round_up(tier_config.quota, granularity),
-        )
+        quota = round_up(tier_config.quota, granularity)
+        if clamp_floors_to_quota():
+            min_slots = self._fit_min_slots_to_quota(slot_size_lists, granularity, min_slots, quota)
+        else:
+            # Previous behaviour: grow the level past the configured budget
+            # rather than admit the floors do not fit.
+            quota = max(self._min_quota_for_level(slot_size_lists, granularity, min_slots), quota)
         return CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio, granularity, min_slots
         )
+
+    def _fit_min_slots_to_quota(
+        self,
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        granularity: int,
+        min_slots: TypedIndexList[PoolGroupIndex, int],
+        quota: int,
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Shrink constraint floors until they fit within the configured quota.
+
+        The quota is a budget the caller chose, so allocating past it trades a
+        shortfall that can be measured for an out-of-memory failure somewhere
+        else that cannot. Floors derive from ``max_batch_size``, which bounds
+        concurrency rather than promising it, so serving fewer requests than
+        declared is a legitimate degradation -- but only if it is announced,
+        which is what separates this from the under-admission it replaces.
+
+        Scaling is iterative because each pool's bytes are rounded up to the
+        allocation granularity, so the byte cost does not shrink in proportion
+        to the slot count.
+        """
+        fitted = min_slots
+        required = self._min_quota_for_level(slot_size_lists, granularity, fitted)
+        if required <= quota:
+            return fitted
+        original = required
+        # Each pass strictly decreases at least one floor or stops, so this
+        # terminates well inside the bound.
+        for _ in range(_MAX_QUOTA_CLAMP_PASSES):
+            scale = quota / required
+            shrunk = typed_map(fitted, lambda ms: max(1, int(ms * scale)))
+            if shrunk == fitted:
+                break
+            fitted = shrunk
+            required = self._min_quota_for_level(slot_size_lists, granularity, fitted)
+            if required <= quota:
+                break
+        warnings.warn(
+            f"KV cache constraint floors need {original} bytes but the configured quota is "
+            f"{quota} bytes; floors were reduced from {list(min_slots)} to {list(fitted)} slots "
+            f"per pool group. The declared batch cannot be held resident -- lower "
+            f"max_batch_size or raise the KV cache quota to serve it in full.",
+            stacklevel=2,
+        )
+        return fitted
 
     def constrain_pool_group_ratio(
         self,

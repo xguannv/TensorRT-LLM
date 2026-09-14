@@ -1720,6 +1720,19 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
 
 namespace
 {
+//! Each pass shrinks at least one floor or stops; granularity rounding is the only reason more than
+//! two are ever needed.
+constexpr int kMaxQuotaClampPasses = 8;
+
+//! Whether the configured KV quota is a hard ceiling on constraint floors. Set
+//! TLLM_KV_CACHE_MANAGER_V2_CLAMP_FLOORS_TO_QUOTA=0 to restore the previous behaviour, where a level
+//! was sized at max(floors, quota) and so could allocate past the quota the caller asked for.
+bool clampFloorsToQuota()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_CLAMP_FLOORS_TO_QUOTA");
+    return value == nullptr || std::string_view(value) == "1";
+}
+
 //! Whether constraint floors budget for a batch that stays resident. Set
 //! TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR=0 to restore sizing from the instantaneous demand
 //! of the declared constraint batch: slightly fewer slots for windowed pool groups, at the cost of
@@ -1942,8 +1955,61 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     size_t quota = cacheTierQuota(tierConfig);
     size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
                                                     : CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
+    quota = roundUp(quota, granularity);
+    if (clampFloorsToQuota())
+    {
+        auto const fitted = fitMinSlotsToQuota(slotSizeLists, granularity, minSlots, quota);
+        return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, fitted);
+    }
+    // Previous behaviour: grow the level past the configured budget rather than admit the floors
+    // do not fit.
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), quota);
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+}
+
+// ---------------------------------------------------------------------------
+// fitMinSlotsToQuota
+// ---------------------------------------------------------------------------
+
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::fitMinSlotsToQuota(
+    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, size_t quota) const
+{
+    auto fitted = minSlots;
+    size_t required = minQuotaForLevel(slotSizeLists, granularity, fitted);
+    if (required <= quota)
+    {
+        return fitted;
+    }
+    size_t const original = required;
+    // Scaling is iterative because each pool's bytes are rounded up to the allocation granularity,
+    // so the byte cost does not shrink in proportion to the slot count.
+    for (int pass = 0; pass < kMaxQuotaClampPasses; ++pass)
+    {
+        double const scale = static_cast<double>(quota) / static_cast<double>(required);
+        auto shrunk = fitted;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < shrunk.size(); ++pgIdx)
+        {
+            auto const scaled = static_cast<SlotCount>(static_cast<double>(shrunk[pgIdx]) * scale);
+            shrunk[pgIdx] = std::max(static_cast<SlotCount>(1), scaled);
+        }
+        if (shrunk == fitted)
+        {
+            break;
+        }
+        fitted = shrunk;
+        required = minQuotaForLevel(slotSizeLists, granularity, fitted);
+        if (required <= quota)
+        {
+            break;
+        }
+    }
+    TLLM_LOG_WARNING(
+        "KV cache constraint floors need %zu bytes but the configured quota is %zu bytes; floors were reduced. "
+        "The declared batch cannot be held resident -- lower max_batch_size or raise the KV cache quota to "
+        "serve it in full.",
+        original, quota);
+    return fitted;
 }
 
 // ---------------------------------------------------------------------------
