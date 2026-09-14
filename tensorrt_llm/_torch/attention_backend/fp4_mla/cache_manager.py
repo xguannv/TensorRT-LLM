@@ -137,7 +137,9 @@ class Fp4MlaV2CacheLayoutPolicy:
                 f"{manager.mla_v_scale_head_dim} and {head_dim}."
             )
 
-        manager._bf16_mla_global_layer_ids = get_kimi_k3_bf16_kv_layer_ids(pretrained_config)
+        manager._bf16_mla_global_layer_ids = get_kimi_k3_bf16_kv_layer_ids(
+            pretrained_config, nvfp4_enabled=True
+        )
         if manager._bf16_mla_global_layer_ids:
             logger.info(
                 "Kimi K3 MLA layers using BF16 KV-cache fallback: "
@@ -958,7 +960,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         local_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        bf16_layer_ids = get_kimi_k3_bf16_kv_layer_ids(config)
+        bf16_layer_ids = get_kimi_k3_bf16_kv_layer_ids(config, nvfp4_enabled=True)
         if bf16_layer_ids:
             local_global_layers = set(mapping.pp_layers(int(config.num_hidden_layers)))
             num_bf16_layers = len(bf16_layer_ids & local_global_layers)

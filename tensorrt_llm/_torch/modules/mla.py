@@ -1848,11 +1848,7 @@ class MLA(nn.Module):
             )
 
             fp4_mla = isinstance(self.mqa, TrtllmAttention) and self.mqa.uses_fp4_mla_attention
-            if fp4_mla and (
-                self.k_b_proj_trans.dtype != torch.bfloat16
-                or latent_cache is None
-                or self.mapping.has_cp_helix()
-            ):
+            if fp4_mla and (self.k_b_proj_trans.dtype != torch.bfloat16 or latent_cache is None):
                 raise RuntimeError(
                     "FP4 MLA generation requires fused BF16 Q "
                     "quantization, RoPE, and cache update on the TRT-LLM "

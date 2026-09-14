@@ -29,6 +29,53 @@ def _kimi_k3_config() -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize(
+    "configured_layers, nvfp4_enabled, expected",
+    [
+        (None, True, {3, 7}),
+        (None, False, set()),
+        ("", True, set()),
+        ("  ", True, set()),
+        ("1", True, {1}),
+        ("1", False, {1}),
+    ],
+)
+@pytest.mark.parametrize("nested_text_config", [False, True])
+def test_kimi_k3_bf16_kv_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_layers: Optional[str],
+    nvfp4_enabled: bool,
+    expected: set[int],
+    nested_text_config: bool,
+) -> None:
+    if configured_layers is None:
+        monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, configured_layers)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=9,
+        linear_attn_config={"full_attn_layers": [8, 2, 4]},
+    )
+    if nested_text_config:
+        config = SimpleNamespace(text_config=config)
+
+    assert get_kimi_k3_bf16_kv_layer_ids(config, nvfp4_enabled=nvfp4_enabled) == expected
+
+
+@pytest.mark.parametrize("full_attn_layers, expected", [([], set()), ([2], {1}), ([2, 4], {1, 3})])
+def test_kimi_k3_bf16_kv_default_with_fewer_mla_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    full_attn_layers: list[int],
+    expected: set[int],
+) -> None:
+    monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    config = _kimi_k3_config()
+    config.linear_attn_config["full_attn_layers"] = full_attn_layers
+
+    assert get_kimi_k3_bf16_kv_layer_ids(config, nvfp4_enabled=True) == expected
+
+
 def test_kimi_k3_bf16_kv_fallback_parses_zero_based_mla_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -48,17 +95,22 @@ def test_kimi_k3_bf16_kv_fallback_rejects_invalid_layers(
         get_kimi_k3_bf16_kv_layer_ids(_kimi_k3_config())
 
 
+@pytest.mark.parametrize("configured_layers", [None, "1"])
 def test_kimi_k3_bf16_kv_fallback_ignores_other_models(
     monkeypatch: pytest.MonkeyPatch,
+    configured_layers: Optional[str],
 ) -> None:
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "1")
+    if configured_layers is None:
+        monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, configured_layers)
     config = SimpleNamespace(
         model_type="deepseek_v3",
         num_hidden_layers=4,
         linear_attn_config={"full_attn_layers": [2, 4]},
     )
 
-    assert get_kimi_k3_bf16_kv_layer_ids(config) == frozenset()
+    assert get_kimi_k3_bf16_kv_layer_ids(config, nvfp4_enabled=True) == frozenset()
 
 
 def test_kimi_k3_mla_generation_backend_default_is_trtllm_gen() -> None:

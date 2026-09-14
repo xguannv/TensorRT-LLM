@@ -120,6 +120,20 @@ class Fp4MlaFmha(PhasedFmha):
         if attention_input_type == AttentionInputType.generation_only:
             if k is not None or v is not None:
                 raise RuntimeError("FP4 MLA generation expects a fused query input.")
+            if metadata.helix_position_offsets is not None:
+                softmax_stats = forward_args.softmax_stats_tensor
+                expected_shape = (metadata.num_tokens, self.attn.num_heads, 2)
+                if softmax_stats is None:
+                    raise RuntimeError("FP4 MLA Helix requires softmax_stats_tensor.")
+                if (
+                    softmax_stats.shape != expected_shape
+                    or softmax_stats.dtype != torch.float32
+                    or not softmax_stats.is_contiguous()
+                ):
+                    raise ValueError(
+                        "FP4 MLA Helix requires contiguous float32 softmax stats "
+                        f"with shape {expected_shape}."
+                    )
             return
         raise NotImplementedError("FP4 MLA requires a context-only or generation-only call.")
 
@@ -378,6 +392,7 @@ class Fp4MlaFmha(PhasedFmha):
                 prequantized_q=prequantized_q,
                 prequantized_q_sf=prequantized_q_sf,
                 q_batch_capacity=q_batch_capacity,
+                softmax_stats_tensor=forward_args.softmax_stats_tensor,
             )
         finally:
             metadata._fp4_mla_prequantized_q = None
