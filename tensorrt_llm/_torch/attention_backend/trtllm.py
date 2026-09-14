@@ -3586,6 +3586,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 "FP4 MLA generation requires fused BF16 RoPE/cache update "
                 "with an FP32 rotary table.")
 
+        helix_position_offsets = metadata.helix_position_offsets
+        helix_is_inactive_rank = metadata.helix_is_inactive_rank
+        if helix_position_offsets is not None:
+            if helix_is_inactive_rank is None:
+                raise RuntimeError(
+                    "FP4 MLA Helix requires inactive-rank metadata.")
+
         metadata._fp4_mla_generation_cache_scattered = False
         hp_pool_updated = scatter_fp4_mla_kv_cache(
             metadata,
@@ -3599,6 +3606,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q_pe=q_pe,
             q_rope_out=fused_q[..., self.kv_lora_rank:],
             q_quant_input=fused_q,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=helix_is_inactive_rank,
         )
         if not hp_pool_updated:
             raise RuntimeError(

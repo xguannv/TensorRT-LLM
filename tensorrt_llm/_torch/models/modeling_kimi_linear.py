@@ -2217,7 +2217,9 @@ class KimiLinearDecoderLayer(nn.Module):
                 if model_config.quant_config is not None
                 else None
             )
-            bf16_kv_layer_ids = get_kimi_k3_bf16_kv_layer_ids(cfg)
+            bf16_kv_layer_ids = get_kimi_k3_bf16_kv_layer_ids(
+                cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4
+            )
             if layer_idx in bf16_kv_layer_ids:
                 if kv_quant_algo != QuantAlgo.NVFP4:
                     raise ValueError(
