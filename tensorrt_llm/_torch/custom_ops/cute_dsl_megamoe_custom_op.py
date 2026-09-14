@@ -492,9 +492,13 @@ def _sm107_tactic_bucket(max_tokens_per_rank: int) -> Optional[int]:
     return None
 
 
-def _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank: int) -> bool:
+def _sm107_use_in_kernel_fc2_reduce(
+    max_tokens_per_rank: int, apply_topk_in_fc1: bool = True
+) -> bool:
     bucket = _sm107_tactic_bucket(max_tokens_per_rank)
-    return bucket is not None and bucket in _SM107_IN_KERNEL_FC2_REDUCE_BUCKETS
+    return (
+        apply_topk_in_fc1 and bucket is not None and bucket in _SM107_IN_KERNEL_FC2_REDUCE_BUCKETS
+    )
 
 
 def _megamoe_problem_key(
@@ -539,6 +543,7 @@ def _default_megamoe_tactic_for_problem(
     sm_version: int,
     max_tokens_per_rank: int,
     num_tokens: int,
+    apply_topk_in_fc1: bool,
     in_kernel_fc2_reduce: bool,
     combine_format: str,
     shape_tuned_tactic: Optional[Tuple] = None,
@@ -547,7 +552,10 @@ def _default_megamoe_tactic_for_problem(
         return _MEGAMOE_NONBULK_STANDALONE_TACTIC
     bucket = _sm107_tactic_bucket(max_tokens_per_rank) if sm_version == 107 else None
     if bucket is not None:
-        if in_kernel_fc2_reduce != (bucket in _SM107_IN_KERNEL_FC2_REDUCE_BUCKETS):
+        expected_in_kernel_fc2_reduce = _sm107_use_in_kernel_fc2_reduce(
+            max_tokens_per_rank, apply_topk_in_fc1
+        )
+        if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
             return _MEGAMOE_NONBULK_STANDALONE_TACTIC
         return _SM107_GENPHASE_TACTICS[bucket]
     if in_kernel_fc2_reduce:
@@ -562,6 +570,7 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         sm_version=problem_key[0],
         max_tokens_per_rank=problem_key[7],
         num_tokens=num_tokens,
+        apply_topk_in_fc1=problem_key[9],
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
         shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
@@ -1822,7 +1831,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         and validates each against the kernel-side constraints.
         """
 
-        # Module-scope compile cache shared by every runner instance.
+        # Keep metadata with its successful compiled kernel; failed traces are not cached.
         kernel_cache: dict = {}
 
         def __init__(
@@ -1944,6 +1953,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 sm_version=self.sm_version,
                 max_tokens_per_rank=self.max_tokens_per_rank,
                 num_tokens=num_tokens,
+                apply_topk_in_fc1=self.apply_topk_in_fc1,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
             )
@@ -2091,6 +2101,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         def _build_kernel_once(self, tactic: Tuple):
             validate_megamoe_tactic(tactic, sm_version=self.sm_version)
+            cached = self.__class__.kernel_cache.get(self._tactic_cache_key(tactic))
+            if cached is not None:
+                return cached[1]
             (
                 mma_tiler,
                 cluster_shape,
@@ -2438,10 +2451,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 ),
             )
             cache_key = self._tactic_cache_key(tactic_t)
-            compiled = self.__class__.kernel_cache.get(cache_key)
-            if compiled is None:
+            cached = self.__class__.kernel_cache.get(cache_key)
+            if cached is None:
                 compiled = cute.compile(kernel, **runtime_kwargs)
-                self.__class__.kernel_cache[cache_key] = compiled
+                self.__class__.kernel_cache[cache_key] = (compiled, kernel)
+            else:
+                compiled = cached[0]
             compiled(**runtime_kwargs)
             return combine_output
 

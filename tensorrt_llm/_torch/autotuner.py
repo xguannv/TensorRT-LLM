@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import ast
 import contextlib
 import copy
@@ -1246,6 +1249,8 @@ class AutoTuner:
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
+        self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
+                                   **kwargs)
 
         # If failed profiling tactics occurs, log the error.
         if new_tuning_failure_occurred:
@@ -1279,14 +1284,17 @@ class AutoTuner:
     ) -> None:
         """Run every cached winner once so JIT runners compile during warmup.
 
-        A tuning-mode cache hit means the winners were selected by an earlier
-        process (persistent cache), so this process has never run them.
-        Runners that compile per tactic (class-level ``kernel_cache``) would
-        otherwise compile lazily at the first serving iteration that reaches
-        each (weight family, M bucket). Disable with
+        Cached winners may come from a previous process or another rank's
+        profiling shard, so this process may not have run them. Runners with
+        a class-level ``kernel_cache`` would otherwise compile lazily during
+        serving. Disable with
         ``TLLM_AUTOTUNER_PRIME_CACHED_TACTICS=0``.
         """
         if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+            return
+        # Cache hits need not agree across ranks. Collective runners must
+        # not allocate profiling scratch or launch outside lockstep profiling.
+        if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
             return
         jit_classes = {
             type(r)
@@ -1318,7 +1326,6 @@ class AutoTuner:
                    str(tactic))
             if key in primed:
                 continue
-            primed.add(key)
             tensors = self._prepare_input_tensors(p, inputs)
             if tuning_config.inputs_pre_hook is not None:
                 tensors = tuning_config.inputs_pre_hook(tensors)
@@ -1332,6 +1339,7 @@ class AutoTuner:
                                do_preparation=True,
                                **kwargs)
                     runner(tensors, tactic=tactic, **kwargs)
+                primed.add(key)
                 n_launch += 1
             except Exception as e:
                 n_fail += 1

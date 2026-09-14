@@ -29,7 +29,7 @@ file only owns:
     ``validate_configurable_moe``)
   * EP process group resolution
   * BF16 -> NVFP4 activation quantization (``quantize_input``)
-  * ``run_moe`` boundary: stage activation + topk into the kernel ABI,
+  * ``run_moe`` boundary: prepare activation + topk for the kernel ABI,
     build the ``MegaMoECuteDslWeightView`` from the quant method, call
     ``torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell`` (a historical
     name; the op dispatches by active SM), return the ``(T, hidden)`` output
@@ -550,12 +550,10 @@ class MegaMoECuteDsl(MoE):
         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # topk-score application point. v2 default is the deepgemm graph
-        # (apply_topk_in_fc1=True): the fused kernel folds the topk score into
-        # the SwiGLU output before the fc1-out NVFP4 quant. Kept as an internal
-        # backend constant until the transformers route is GPU-validated and
-        # promoted to MoeConfig.
-        self.apply_topk_in_fc1 = True
+        # Preserve V4's pre-quantization routing weights; other models apply them after FC2.
+        self.apply_topk_in_fc1 = "DeepseekV4ForCausalLM" in (
+            getattr(model_config.pretrained_config, "architectures", None) or ()
+        )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
         # Cross-rank combine wire format is selected with
@@ -978,7 +976,7 @@ class MegaMoECuteDsl(MoE):
             return False
         from ....custom_ops.cute_dsl_megamoe_custom_op import _sm107_use_in_kernel_fc2_reduce
 
-        return _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank)
+        return _sm107_use_in_kernel_fc2_reduce(max_tokens_per_rank, self.apply_topk_in_fc1)
 
     def _alloc_symm_provider(self):
         """Build-time symmetric provider allocation. See ``create_weights``.
@@ -1679,7 +1677,9 @@ class MegaMoECuteDsl(MoE):
         ``set_adaptive_launch_tokens``), capped at ``max_num_tokens``. Live
         tokens fill the first ``num_tokens`` rows and the tail is masked via
         ``topk_idx == -1`` (skipped by dispatch_kernel) and zero
-        ``topk_weights`` (combine stale-data guard).
+        ``topk_weights`` (combine stale-data guard). An exact-size genphase
+        bucket can consume the caller's inputs directly because it has no
+        padded tail and only reads its routing inputs locally.
 
         ``FusedCommMoEScheduler`` invariant 7 forces every EP rank to
         cross the NVLink barrier even with zero local tokens; only
@@ -1703,7 +1703,12 @@ class MegaMoECuteDsl(MoE):
         if num_tokens == 0 and self.ep_size == 1:
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
-        if self.ep_size > 1 and _MEGAMOE_PRIME_LADDER and AutoTuner.get().is_tuning_mode:
+        if (
+            self.ep_size > 1
+            and not self.tactic_autotune
+            and _MEGAMOE_PRIME_LADDER
+            and AutoTuner.get().is_tuning_mode
+        ):
             self._prime_ladder(
                 live_T=launch_max_T,
                 weight_view=weight_view,
@@ -1730,21 +1735,37 @@ class MegaMoECuteDsl(MoE):
             and x.is_contiguous()
             and x_sf.is_contiguous()
         )
-        self._stage_inputs(
-            bufs=bufs,
-            x=x,
-            x_sf=x_sf,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            num_tokens=num_tokens,
-            top_k=top_k,
-            stage_activation=not use_direct_inputs,
+        use_direct_routing_inputs = (
+            use_direct_inputs
+            and topk_idx.shape == (launch_max_T, top_k)
+            and topk_weights.shape == (launch_max_T, top_k)
+            and topk_idx.dtype == self._topk_idx_dtype
+            and topk_weights.dtype == torch.float32
+            and topk_idx.device == device
+            and topk_weights.device == device
+            and topk_idx.is_contiguous()
+            and topk_weights.is_contiguous()
+            and topk_idx.data_ptr() % 16 == 0
+            and topk_weights.data_ptr() % 16 == 0
         )
+        if not use_direct_routing_inputs:
+            self._stage_inputs(
+                bufs=bufs,
+                x=x,
+                x_sf=x_sf,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                stage_activation=not use_direct_inputs,
+            )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,
             activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
-            topk_idx=bufs.topk_idx_local,
-            topk_weights=bufs.topk_weights[:, :top_k],
+            topk_idx=topk_idx if use_direct_routing_inputs else bufs.topk_idx_local,
+            topk_weights=(
+                topk_weights if use_direct_routing_inputs else bufs.topk_weights[:, :top_k]
+            ),
             weight_view=weight_view,
             combine_output=bufs.combine_output,
             shared_workspace=bufs.shared_workspace,
