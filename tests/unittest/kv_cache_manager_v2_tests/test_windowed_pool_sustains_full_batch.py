@@ -63,7 +63,13 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
 _HAS_V2 = find_spec("kv_cache_manager_v2") is not None
 
 TOKENS_PER_BLOCK = 32
-WINDOW = 32
+# A window exactly one block wide is the DeepSeek-V4 compressor shape, and it is
+# also a blind spot: there `max(demand, worst_case)` and `demand + 1` are the
+# same number, so a test that only uses it cannot tell the two sizing rules
+# apart. NARROW_WINDOW keeps the reported shape; WIDE_WINDOW separates them.
+NARROW_WINDOW = 32
+WIDE_WINDOW = 4 * TOKENS_PER_BLOCK
+WINDOW = NARROW_WINDOW
 MAX_UTIL_FOR_RESUME = 0.95
 MAX_SEQ_LEN = 2048
 # `1 + max_draft_len + num_extra_kv_tokens` in the executor: a few tokens, well
@@ -85,6 +91,11 @@ def _pinned_quota(max_batch_size: int) -> int:
     return ((8 * max_batch_size) + 128) << 20
 
 
+def _worst_case_blocks(window: int) -> int:
+    """What `_windowed_worst_case_blocks` computes, for predicting each mode."""
+    return (window + TOKENS_PER_BLOCK - 2) // TOKENS_PER_BLOCK + 1
+
+
 def _warmup_constraint_batch(max_batch_size: int) -> "BatchDesc":
     """The batch the executor declares for CUDA-graph generation warmup."""
     return BatchDesc(
@@ -93,7 +104,9 @@ def _warmup_constraint_batch(max_batch_size: int) -> "BatchDesc":
     )
 
 
-def _make_config(max_batch_size: int, gpu_quota: int) -> "KVCacheManagerConfig":
+def _make_config(
+    max_batch_size: int, gpu_quota: int, window: int = NARROW_WINDOW
+) -> "KVCacheManagerConfig":
     """One windowed life cycle and one token-scaled one, in separate pool groups.
 
     The buffer sizes differ so the two cannot coalesce, and they are comparable
@@ -108,7 +121,7 @@ def _make_config(max_batch_size: int, gpu_quota: int) -> "KVCacheManagerConfig":
             AttentionLayerConfig(
                 layer_id=LayerId(0),
                 buffers=[BufferConfig(role=Role.KEY, size=(1 << 20) + 1)],
-                sliding_window_size=WINDOW,
+                sliding_window_size=window,
                 num_sink_tokens=0,
             ),
             AttentionLayerConfig(
@@ -129,17 +142,20 @@ def _make_config(max_batch_size: int, gpu_quota: int) -> "KVCacheManagerConfig":
 
 
 SUSTAIN_ENV = "TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR"
+MODE_OFF = "off"
+MODE_SLIDE = "slide"
+MODE_WORST = "worst"
 
 
 @contextmanager
-def _sustain_windowed_floor(enabled: bool):
+def _floor_mode(mode: str):
     """Select the sizing rule for the manager constructed inside the block.
 
     The rule is read once, while sizing, so scoping the variable to construction
-    is enough -- and keeps the two arms comparable within a single process.
+    is enough -- and keeps the arms comparable within a single process.
     """
     previous = os.environ.get(SUSTAIN_ENV)
-    os.environ[SUSTAIN_ENV] = "1" if enabled else "0"
+    os.environ[SUSTAIN_ENV] = mode
     try:
         yield
     finally:
@@ -153,13 +169,17 @@ class _Batch:
     """Drive `max_batch_size` long-lived requests through the resume gate."""
 
     def __init__(
-        self, max_batch_size: int, gpu_quota: int | None = None, sustain: bool = True
+        self,
+        max_batch_size: int,
+        gpu_quota: int | None = None,
+        mode: str = MODE_SLIDE,
+        window: int = NARROW_WINDOW,
     ) -> None:
         gpu_quota = _pinned_quota(max_batch_size) if gpu_quota is None else gpu_quota
         init_cuda_once()
         self.max_batch_size = max_batch_size
-        with _sustain_windowed_floor(sustain):
-            self.manager = KVCacheManager(_make_config(max_batch_size, gpu_quota))
+        with _floor_mode(mode):
+            self.manager = KVCacheManager(_make_config(max_batch_size, gpu_quota, window))
         self._stream_holder = CachedCudaStream()
         self.caches: list = []
 
@@ -258,7 +278,7 @@ class TestWindowedPoolSustainsFullBatch(unittest.TestCase):
                 finally:
                     sustained.close()
 
-                batch = _Batch(max_batch_size, sustain=False)
+                batch = _Batch(max_batch_size, mode=MODE_OFF)
                 try:
                     # Compared against the other arm rather than against a
                     # closed form, so pool granularity rounding cannot make this
@@ -267,6 +287,32 @@ class TestWindowedPoolSustainsFullBatch(unittest.TestCase):
                     self.assertLess(batch.admit(), max_batch_size)
                 finally:
                     batch.close()
+
+    def test_wide_window_separates_the_two_sizing_rules(self) -> None:
+        """The three modes must be three different floors, or this suite is blind.
+
+        With a window one block wide -- the shape this bug was reported against
+        -- `max(demand, worst_case)` and `demand + 1` agree exactly, because the
+        worst case *is* demand plus one. Every other test here would pass under
+        either rule. A window several blocks wide pulls them apart, and pinning
+        that here means a future change cannot quietly collapse the two again.
+        """
+        max_batch_size = 16
+        slots = {}
+        for mode in (MODE_OFF, MODE_SLIDE, MODE_WORST):
+            batch = _Batch(max_batch_size, mode=mode, window=WIDE_WINDOW)
+            try:
+                slots[mode] = min(batch.pool_slots())
+            finally:
+                batch.close()
+
+        self.assertLess(slots[MODE_OFF], slots[MODE_SLIDE], slots)
+        self.assertLess(slots[MODE_SLIDE], slots[MODE_WORST], slots)
+        # `worst` charges a whole window of residency, so it scales with the
+        # window while `slide` does not. That gap is the entire question.
+        self.assertGreater(
+            slots[MODE_WORST] / slots[MODE_SLIDE], 1.5, f"{slots} at window={WIDE_WINDOW}"
+        )
 
 
 if __name__ == "__main__":

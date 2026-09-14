@@ -1733,15 +1733,28 @@ bool clampFloorsToQuota()
     return value == nullptr || std::string_view(value) == "1";
 }
 
-//! Whether constraint floors budget for a batch that stays resident. Set
-//! TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR=0 to restore sizing from the instantaneous demand
-//! of the declared constraint batch: slightly fewer slots for windowed pool groups, at the cost of
-//! not being able to keep a full max_batch_size of them resident. Read per call rather than cached,
+//! How much a constraint floor charges each windowed request, from
+//! TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR. `off` (`0`) charges the descriptor's
+//! instantaneous demand; `slide` adds the one block a window takes on when it straddles a block
+//! boundary; `worst` (`1`) charges a whole window of residency. Read per call rather than cached,
 //! since sizing happens once and A/B comparisons need to flip it.
-bool sustainWindowedFloor()
+FloorMode windowedFloorMode()
 {
     char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR");
-    return value == nullptr || std::string_view(value) == "1";
+    if (value == nullptr)
+    {
+        return FloorMode::kSlide;
+    }
+    std::string_view const mode{value};
+    if (mode == "off" || mode == "0")
+    {
+        return FloorMode::kOff;
+    }
+    if (mode == "worst" || mode == "1")
+    {
+        return FloorMode::kWorst;
+    }
+    return FloorMode::kSlide;
 }
 } // namespace
 
@@ -1813,12 +1826,12 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupMinSlotsFrom
         maxSlots[getPoolGroupIndex(kHotLevel, lifeCycle)] += lifeCycleFloors[lifeCycle];
     }
 
-    // A floor has to hold for as long as the batch is resident, so every request is charged its
-    // worst case rather than its demand at the history length the constraint descriptor names.
-    bool const sustainWindowed = sustainWindowedFloor();
+    // A floor has to hold for as long as the batch is resident, so a windowed request is charged
+    // more than its demand at the history length the constraint descriptor names.
+    FloorMode const floorMode = windowedFloorMode();
     for (auto const& batch : constraints)
     {
-        auto const slots = computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, sustainWindowed);
+        auto const slots = computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, floorMode);
         for (PoolGroupIndex poolGroup{0}; poolGroup < slots.size(); ++poolGroup)
         {
             auto const scaledSlots = static_cast<SlotCount>(
@@ -1834,7 +1847,7 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupMinSlotsFrom
 // ---------------------------------------------------------------------------
 
 TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock,
-    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, bool sustainWindowed) const
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, FloorMode floorMode) const
 {
     TypedVec<LifeCycleId, SlotCount> numSlots(numLifeCycles(), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
@@ -1880,13 +1893,20 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(BatchDesc 
                 contribution = uniqueNonStale;
             }
             auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-            if (sustainWindowed && attn != nullptr && attn->windowSize.has_value())
+            if (attn != nullptr && attn->windowSize.has_value() && floorMode != FloorMode::kOff)
             {
-                // Raise only: a request whose history has not yet passed its window has no stale
-                // blocks and holds its whole capacity, which is more than the window will ever span.
-                // Treating the window span as a ceiling would cut such a request down to a fraction
-                // of what it demands right now.
-                contribution = std::max(contribution, windowedWorstCaseBlocks(*attn, tokensPerBlock));
+                int const windowSpanBlocks = windowedWorstCaseBlocks(*attn, tokensPerBlock);
+                if (floorMode == FloorMode::kSlide)
+                {
+                    // One block for the straddle, but never past what the window can span: a request
+                    // already above that count is not window-limited yet -- it still holds its whole
+                    // capacity -- so it has no slide to absorb.
+                    contribution = std::max(contribution, std::min(contribution + 1, windowSpanBlocks));
+                }
+                else
+                {
+                    contribution = std::max(contribution, windowSpanBlocks);
+                }
             }
             numSlots[lcIdx] += contribution;
         }
@@ -1899,9 +1919,9 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(BatchDesc 
 // ---------------------------------------------------------------------------
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupSlotsForBatch(BatchDesc const& batch,
-    int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, bool sustainWindowed) const
+    int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, FloorMode floorMode) const
 {
-    auto const slotsByLifeCycle = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, sustainWindowed);
+    auto const slotsByLifeCycle = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, floorMode);
     TypedVec<PoolGroupIndex, SlotCount> numSlots(numPoolGroups(kHotLevel), 0);
     for (LifeCycleId lifeCycle{0}; lifeCycle < slotsByLifeCycle.size(); ++lifeCycle)
     {

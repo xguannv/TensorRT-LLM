@@ -196,16 +196,36 @@ def clamp_floors_to_quota() -> bool:
     return os.environ.get("TLLM_KV_CACHE_MANAGER_V2_CLAMP_FLOORS_TO_QUOTA", "1") == "1"
 
 
-def sustain_windowed_floor() -> bool:
-    """Whether constraint floors budget for a batch that stays resident.
+# How a constraint floor charges a windowed life cycle per request.
+FLOOR_MODE_OFF = "off"  # its demand at the history the descriptor names
+FLOOR_MODE_SLIDE = "slide"  # that demand plus the one block of window slide
+FLOOR_MODE_WORST = "worst"  # a whole window of residency
+_FLOOR_MODE_ALIASES = {"0": FLOOR_MODE_OFF, "1": FLOOR_MODE_WORST}
 
-    Set ``TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR=0`` to restore sizing
-    from the instantaneous demand of the declared constraint batch. That reserves
-    slightly fewer slots for windowed pool groups, at the cost of not being able
-    to keep a full ``max_batch_size`` of them resident. Read per call rather than
-    cached, since sizing happens once and A/B comparisons need to flip it.
+
+def windowed_floor_mode() -> str:
+    """How much a constraint floor charges each windowed request.
+
+    ``TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR`` selects between:
+
+    ``off``
+        The descriptor's instantaneous demand. The CUDA-graph warmup batch
+        names ``max_batch_size - 1`` requests of a few tokens, so a windowed
+        life cycle is charged one block each and the floor lands just above
+        ``max_batch_size`` -- too low to hold that batch once the requests are
+        real and their windows straddle block boundaries.
+    ``slide``
+        One block more, covering exactly that straddle.
+    ``worst``
+        Everything the window can ever span. Correct for a request that has
+        filled its window, but for a wide window it charges placeholder
+        requests a residency they never reach.
+
+    Read per call rather than cached: sizing happens once, and A/B comparisons
+    need to flip it.
     """
-    return os.environ.get("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR", "1") == "1"
+    raw = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR", FLOOR_MODE_SLIDE)
+    return _FLOOR_MODE_ALIASES.get(raw, raw)
 
 
 class StorageManager:
@@ -1000,13 +1020,13 @@ class StorageManager:
         for life_cycle in typed_range(self.num_life_cycles):
             max_slots[self.get_pool_group_index(life_cycle)] += life_cycle_floors[life_cycle]
 
-        # A floor has to hold for as long as the batch is resident, so every
-        # request is charged its worst case rather than its demand at the
-        # history length the constraint descriptor happens to name.
-        sustain_windowed = sustain_windowed_floor()
+        # A floor has to hold for as long as the batch is resident, so a windowed
+        # request is charged more than its demand at the history length the
+        # constraint descriptor happens to name.
+        floor_mode = windowed_floor_mode()
         for batch in constraints:
             slots = self._compute_pool_group_slots_for_batch(
-                batch, tokens_per_block, swa_scratch_reuse, sustain_windowed=sustain_windowed
+                batch, tokens_per_block, swa_scratch_reuse, floor_mode=floor_mode
             )
             for pg_idx in typed_range(self.num_pool_groups):
                 scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
@@ -1028,24 +1048,27 @@ class StorageManager:
         batch: BatchDesc,
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
-        sustain_windowed: bool = False,
+        floor_mode: str = FLOOR_MODE_OFF,
     ) -> TypedIndexList[LifeCycleId, int]:
         """Compute the minimum number of slots per lifecycle to support a BatchDesc.
 
-        ``sustain_windowed`` asks what it takes to *keep* the batch resident
+        ``floor_mode`` asks what it takes to *keep* the batch resident
         rather than to represent it at one instant. It matters only for windowed
         life cycles, and only because the batch a constraint describes is not
         always the batch that has to run: the executor's CUDA-graph generation
         warmup declares one long request plus ``max_batch_size - 1`` requests of
-        a few tokens each, and those short requests stand in for full ones. Each
-        is therefore charged what a resident request costs a windowed life cycle
-        -- the blocks its window spans at the worst point of its slide -- rather
-        than the single block its declared capacity happens to hold.
+        a few tokens each, and those short requests stand in for full ones.
 
-        This only ever raises a request's contribution. A request whose history
-        has not yet reached its window has nothing stale and holds every block
-        of its capacity, which exceeds the window span; the window span is the
-        cost of staying resident, not a ceiling on what a request can hold.
+        ``FLOOR_MODE_SLIDE`` adds the one block a windowed life cycle takes on
+        when its window straddles a block boundary -- the shortfall actually
+        observed in the field. ``FLOOR_MODE_WORST`` instead charges a whole
+        window of residency, which is what a request costs once it has filled
+        its window but far more than a placeholder ever reaches.
+
+        Both only ever raise a contribution. A request whose history has not yet
+        reached its window has nothing stale and holds every block of its
+        capacity, which can exceed the window span; the window span is a cost of
+        staying resident, not a ceiling on what a request can hold.
         """
         num_slots = filled_list(0, self.num_life_cycles)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
@@ -1090,15 +1113,17 @@ class StorageManager:
                     )
                 else:
                     contribution = unique_non_stale
-                if sustain_windowed and lc.window_size is not None:
-                    # Raise only: a request whose history has not yet passed its
-                    # window has no stale blocks and holds its whole capacity,
-                    # which is more than the window will ever span. Treating the
-                    # window span as a ceiling would cut such a request down to
-                    # a fraction of what it demands right now.
-                    contribution = max(
-                        contribution, self._windowed_worst_case_blocks(lc, tokens_per_block)
-                    )
+                if lc.window_size is not None and floor_mode != FLOOR_MODE_OFF:
+                    worst_case = self._windowed_worst_case_blocks(lc, tokens_per_block)
+                    if floor_mode == FLOOR_MODE_SLIDE:
+                        # One block for the straddle, but never past what the
+                        # window can span: a request already above that count is
+                        # not window-limited yet -- it still holds its whole
+                        # capacity -- so it has no slide to absorb, and charging
+                        # it one more block is unjustified.
+                        contribution = max(contribution, min(contribution + 1, worst_case))
+                    else:
+                        contribution = max(contribution, worst_case)
                 num_slots[lc_idx] += contribution
         return num_slots
 
@@ -1107,11 +1132,11 @@ class StorageManager:
         batch: BatchDesc,
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
-        sustain_windowed: bool = False,
+        floor_mode: str = FLOOR_MODE_OFF,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum number of slots per hot pool group."""
         life_cycle_slots = self._compute_slots_for_batch(
-            batch, tokens_per_block, swa_scratch_reuse, sustain_windowed=sustain_windowed
+            batch, tokens_per_block, swa_scratch_reuse, floor_mode=floor_mode
         )
         num_slots = filled_list(0, self.num_pool_groups)
         for life_cycle in typed_range(self.num_life_cycles):
