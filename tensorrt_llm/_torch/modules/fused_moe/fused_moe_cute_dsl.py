@@ -286,7 +286,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  enable_alltoall: bool = False,
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
-                 workload_identity: Optional[Tuple] = None):
+                 workload_identity: Optional[Tuple] = None,
+                 prime_inner_tactics: bool = False):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -299,7 +300,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
         self.scaling_vector_size = scaling_vector_size
+        # Extra terms that distinguish two otherwise identically-shaped
+        # workloads (uGPU topology, activation type, ...). Cache key only --
+        # it must not imply anything about ``forward_impl``'s signature.
         self.workload_identity = workload_identity
+        # uGPU only: ``forward_impl`` nests its own AutoTuner calls and accepts
+        # ``overlap_moe_output_memset``. Single-op backends must leave this off.
+        self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self):
         identity = (
@@ -360,7 +367,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 tactic: Optional[int],
                 do_preparation: bool = False) -> torch.Tensor:
         if do_preparation:
-            if self.workload_identity is not None:
+            if self.prime_inner_tactics:
                 # Inner FC tuning cannot run from inside the CUDA graph used to
                 # profile an outer tile. Prime every tile's FC1/FC2 cache for
                 # this optimization profile before outer profiling starts.
@@ -463,7 +470,8 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
                  local_expert_offset: int,
                  enable_alltoall: bool = False,
                  output_dtype: torch.dtype = torch.bfloat16,
-                 workload_identity: Optional[Tuple] = None):
+                 workload_identity: Optional[Tuple] = None,
+                 prime_inner_tactics: bool = False):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -472,7 +480,9 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.enable_alltoall = enable_alltoall
         self.output_dtype = output_dtype
+        # See CuteDslFusedMoENvfp4Runner: cache key only, and uGPU-only.
         self.workload_identity = workload_identity
+        self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self):
         identity = (
@@ -527,7 +537,7 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
                 tactic: Optional[int],
                 do_preparation: bool = False) -> torch.Tensor:
         if do_preparation:
-            if self.workload_identity is not None:
+            if self.prime_inner_tactics:
                 # See the NVFP4 runner: nested FC tuning must complete before
                 # the outer tile is profiled under CUDA graph capture.
                 for tile_size in self._tile_sizes():
@@ -1024,6 +1034,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             enable_finalize_fusion=self.use_fused_finalize,
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
+            prime_inner_tactics=use_ugpu,
         )
 
         _, best_tactic = tuner.choose_one(
@@ -1242,6 +1253,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             enable_alltoall=enable_alltoall,
             output_dtype=output_dtype,
             workload_identity=workload_identity,
+            prime_inner_tactics=use_ugpu,
         )
 
         inputs = [x, token_selected_experts, token_final_scales, moe_output]

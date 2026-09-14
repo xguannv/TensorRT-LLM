@@ -971,6 +971,20 @@ def test_cutedsl_fc12_outer_runner_unique_id_includes_situ():
     )
     assert swiglu.unique_id() != situ.unique_id()
 
+    # The side effect this change actually shipped, asserted next to the change
+    # that caused it. Giving FC12 a non-None workload_identity used to open the
+    # uGPU inner-tactic priming branch, which calls forward_impl with
+    # overlap_moe_output_memset -- a kwarg the fused single-op impl has no
+    # parameter for. _forward raises if reached, so this is red on the pre-fix
+    # code, and it needs no GPU because the failure is at kwarg binding.
+    # getattr: on the pre-fix code this attribute is absent, and asserting it
+    # directly would fail here with AttributeError -- red, but for the wrong
+    # reason, and without ever reaching the priming call that reproduces the
+    # actual TypeError.
+    assert getattr(situ, "prime_inner_tactics", False) is False
+    inputs = [torch.empty(0) for _ in range(5)]
+    assert situ(inputs, tactic=-1, do_preparation=True) is inputs[4]
+
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
     routing_method = RenormalizeMoeRoutingMethod(top_k=1)
