@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import enum
 import itertools
 import json
@@ -1628,21 +1631,26 @@ class JitGemmRunner(GemmRunner):
         return super().forward(inputs, tactic=tactic, **kwargs)
 
 
-def test_prime_cached_tactics_on_cache_hit(monkeypatch):
-    """A tuning-mode cache hit must run every cached winner once, so runners
-    that JIT-compile per tactic do so during warmup instead of serving."""
+@pytest.mark.parametrize("strategy", [
+    DistributedTuningStrategy.PARALLEL,
+    DistributedTuningStrategy.MERGE,
+])
+def test_prime_cached_tactics_on_cache_hit(monkeypatch, strategy):
+    """Prime local cached winners without starting collective profiling."""
     w = torch.randn(64, 128)
     x = torch.randn(3, 64)
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        DynamicTensorSpec(input_idx=0,
-                          dim_idx=0,
-                          gen_tuning_buckets=(3, 4, 5),
-                          map_to_tuning_buckets=lambda x: x),
-        DynamicTensorSpec(input_idx=1,
-                          dim_idx=1,
-                          gen_tuning_buckets=(64, 128, 256, 512),
-                          map_to_tuning_buckets=lambda x: x),
-    ), )
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(input_idx=0,
+                              dim_idx=0,
+                              gen_tuning_buckets=(3, 4, 5),
+                              map_to_tuning_buckets=lambda x: x),
+            DynamicTensorSpec(input_idx=1,
+                              dim_idx=1,
+                              gen_tuning_buckets=(64, 128, 256, 512),
+                              map_to_tuning_buckets=lambda x: x),
+        ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
     op = "test_prime_cached_tactics"
     tuner = AutoTuner.get()
     tuner.clear_cache()
@@ -1657,19 +1665,28 @@ def test_prime_cached_tactics_on_cache_hit(monkeypatch):
     assert winners
 
     # A fresh process: the persistent cache is loaded, nothing compiled yet.
+    tuning_config.distributed_tuning_strategy = strategy
     tuner.profiling_cache.clear()
     tuner._primed_cached_tactics = set()
     JitGemmRunner.kernel_cache.clear()
     JitGemmRunner.calls.clear()
+    if strategy == DistributedTuningStrategy.MERGE:
+
+        def unexpected_prepare(*args, **kwargs):
+            pytest.fail(
+                "A collective cache hit must not prepare profiling inputs")
+
+        monkeypatch.setattr(tuner, "_prepare_input_tensors", unexpected_prepare)
     with autotune(cache_path=cache_path):
         tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
-    assert set(JitGemmRunner.kernel_cache) == winners
-    assert len(JitGemmRunner.calls) == len(winners)
+    expected = winners if strategy != DistributedTuningStrategy.MERGE else set()
+    assert set(JitGemmRunner.kernel_cache) == expected
+    assert len(JitGemmRunner.calls) == len(expected)
 
     # Already primed in this process: no further launches.
     with autotune(cache_path=cache_path):
         tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
-    assert len(JitGemmRunner.calls) == len(winners)
+    assert len(JitGemmRunner.calls) == len(expected)
 
     # Opt-out knob.
     monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "0")
@@ -1678,3 +1695,97 @@ def test_prime_cached_tactics_on_cache_hit(monkeypatch):
     with autotune(cache_path=cache_path):
         tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
     assert JitGemmRunner.calls == []
+
+
+def test_prime_cached_tactics_after_parallel_cache_merge(monkeypatch):
+    """Prime winners selected by another rank after a cold profile."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    x = torch.randn(20, 64)
+    w = torch.randn(64, 128)
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            input_idx=0,
+            dim_idx=0,
+            gen_tuning_buckets=(3, 20),
+            map_to_tuning_buckets=lambda value: value,
+        ), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+    )
+    op = "test_prime_cached_tactics_after_parallel_cache_merge"
+    tuner = AutoTuner.get()
+    runner = JitGemmRunner()
+    tuner.clear_cache()
+    tuner._primed_cached_tactics = set()
+    JitGemmRunner.kernel_cache.clear()
+    JitGemmRunner.calls.clear()
+
+    def merge_remote_winners(strategy, custom_op):
+        assert strategy == DistributedTuningStrategy.PARALLEL
+        for m, tactic in ((3, 0), (20, 1)):
+            cache_key = tuner.profiling_cache.get_cache_key(
+                custom_op,
+                runner,
+                ((m, 64), (64, 128)),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            tuner.profiling_cache[cache_key] = (0, tactic, 0.5)
+
+    monkeypatch.setattr(tuner, "is_tuning_mode", True)
+    # Isolate the cold post-merge path; distributed lockstep is covered separately.
+    monkeypatch.setattr(tuner, "_should_current_rank_tune", lambda _: False)
+    monkeypatch.setattr(tuner, "cache_pp_recv", lambda: None)
+    monkeypatch.setattr(tuner, "_maybe_sync_cache_data", merge_remote_winners)
+
+    selected_runner, tactic = tuner.choose_one(op, [runner], tuning_config,
+                                               [x, w])
+
+    assert selected_runner is runner
+    assert tactic == 1
+    assert set(JitGemmRunner.kernel_cache) == {0, 1}
+    assert JitGemmRunner.calls == [((3, 64), 0), ((20, 64), 1)]
+
+
+def test_failed_cached_tactic_prime_is_retried(monkeypatch):
+    """Do not memoize a cached winner until its prime launch succeeds."""
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1")
+    x = torch.randn(3, 64)
+    w = torch.randn(64, 128)
+    tuning_config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    op = "test_failed_cached_tactic_prime_is_retried"
+    tuner = AutoTuner.get()
+    runner = JitGemmRunner()
+    tuner.clear_cache()
+    tuner._primed_cached_tactics = set()
+    JitGemmRunner.kernel_cache.clear()
+    JitGemmRunner.calls.clear()
+    profile = tuner._optimization_profiles(tuning_config, [x, w])[0]
+    cache_key = tuner.profiling_cache.get_cache_key(
+        op,
+        runner,
+        profile.get_opt_shapes(),
+        tuning_config,
+        apply_map_to_tuning_buckets=False,
+    )
+    tuner.profiling_cache[cache_key] = (0, 0, 1.0)
+
+    original_forward = runner.forward
+    attempts = 0
+
+    def fail_once(self, inputs, *, tactic=-1, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected prime failure")
+        return original_forward(inputs, tactic=tactic, **kwargs)
+
+    # Keep the runner's attribute-based cache identity unchanged.
+    monkeypatch.setattr(JitGemmRunner, "forward", fail_once)
+
+    tuner._prime_cached_tactics(op, [runner], tuning_config, [x, w])
+    tuner._prime_cached_tactics(op, [runner], tuning_config, [x, w])
+
+    assert attempts == 2
+    assert set(JitGemmRunner.kernel_cache) == {0}
+    assert JitGemmRunner.calls == [((3, 64), 0)]
