@@ -1467,6 +1467,86 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     )
 
 
+@nvfp4_moe_supported
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 107,
+    reason="CUTEDSL_FC12 fused kernel is Rubin (SM107) only",
+)
+def test_cutedsl_fc12_survives_autotune_warmup():
+    """Drive FC12 through a cold AutoTuner warmup -- the one path nothing covered.
+
+    ``do_preparation`` only ever runs from inside ``AutoTuner.choose_one``'s
+    profiling path. Every other FC12 test calls ``moe.forward`` outside any
+    ``autotune()`` context, so ``choose_one`` takes its ``not
+    self.is_tuning_mode`` early return and that branch is dead. That is how a
+    priming call carrying a kwarg ``CuteDslFc12FusedMoE.run_moe_nvfp4_impl``
+    does not accept shipped green: it raised TypeError on rank N at executor
+    init, and no unit test had ever entered warmup.
+
+    ``clear_cache()`` is load-bearing, not hygiene. In tuning mode a cache
+    *hit* also returns early ("cache hit ... to avoid redundant profiling"), so
+    a warm on-disk tactic cache hides this exactly as well as no autotune does
+    -- which is why the failure looked environment-dependent.
+    """
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+
+    custom_op = "CuteDslFc12FusedMoE::run_moe_nvfp4"
+
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(91)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.randn(hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+
+    router_logits = gate.compute_logits(x)
+
+    autotuner = AutoTuner.get()
+    autotuner.clear_cache()
+    # The singleton outlives the test; without this the positive control below
+    # could be satisfied by a previous test's profiling counts.
+    autotuner.reset_statistics()
+    autotuner.warmup = 0  # default 2; this test is about reaching the path
+    autotuner.repeat = 1  # default 10
+    autotuner.stream_delay_micro_secs = 10
+
+    # No cache_path: a shared on-disk cache would turn a cold miss into a hit
+    # and silently skip the branch under test.
+    with torch.inference_mode(), autotune():
+        tuned = moe.forward(x, router_logits, all_rank_num_tokens=None)
+
+    assert tuned.shape == x.shape
+    assert torch.isfinite(tuned.float()).all()
+
+    # Positive control. Without this the test passes just as happily when
+    # autotune profiles nothing at all -- an instrument that cannot fire is
+    # not a passing test, it is an absent one.
+    profiled = autotuner.stats.tuned_op_profiled_configs.get(custom_op, 0)
+    assert profiled > 0, (
+        f"{custom_op} was never profiled, so the do_preparation branch this "
+        f"test exists to cover did not run; the assertions above are vacuous"
+    )
+    assert not autotuner.stats.failed_profiling_count.get(custom_op, set())
+
+
 def test_fp8_block_scaled_dequantization():
     """FP8_PB_WO attention weights must be dequantized, never reinterpreted.
 
