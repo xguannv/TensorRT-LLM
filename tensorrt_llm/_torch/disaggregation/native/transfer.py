@@ -1130,6 +1130,24 @@ class Sender(SenderBase):
         return max(0, block_ids.size - (beam_width - 1))
 
     @staticmethod
+    def _helix_windowed_block_ids(
+        src_block_ids: np.ndarray,
+        total_blocks: int,
+        beam_width: int,
+        cp_rank: int,
+        cp_size: int,
+    ) -> np.ndarray:
+        """Select the blocks of a windowed (suffix) list owned by one Helix rank.
+
+        The list covers global ordinals ``[total_blocks - k, total_blocks)``;
+        rank ``cp_rank`` owns every ordinal congruent to it modulo ``cp_size``.
+        """
+        k = Sender._beam0_block_count(src_block_ids, total_blocks, beam_width)
+        first_ordinal = total_blocks - k
+        keep = [i for i in range(k) if (first_ordinal + i) % cp_size == cp_rank]
+        return src_block_ids[keep]
+
+    @staticmethod
     def _trim_receiver_window_head(
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
@@ -1195,15 +1213,24 @@ class Sender(SenderBase):
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
-            if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
-                # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                # (same protocol as partition_context_for_helix). The strided
-                # subset has exactly the receiver's block count, so the
-                # suffix alignment below degenerates to identity; block
-                # reuse is rejected under helix.
-                src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
+            if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
+                # Helix: the receiver owns global blocks [cp_rank::cp_size]
+                # (same protocol as partition_context_for_helix); block reuse
+                # is rejected under helix. Windowed lists are a suffix of the
+                # global ordinals, so route them by ordinal, not by position.
+                if window_size is None:
+                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
+                else:
+                    slice_end = token_range.end if token_range is not None else 0
+                    src_block_ids = Sender._helix_windowed_block_ids(
+                        src_block_ids,
+                        total_blocks=(slice_end + tpb - 1) // tpb,
+                        beam_width=task._beam_width,
+                        cp_rank=peer_ri.cp_rank,
+                        cp_size=peer_ri.cp_size,
+                    )
 
             # Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
             # _create_kv_slice, so dst must not exceed src. A smaller dst
