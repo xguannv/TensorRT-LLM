@@ -307,6 +307,7 @@ def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
     # Do not reuse instances copied from the FP4 attention; the caller binds
     # this FP8 view explicitly to TRTLLM's regular FMHA implementation.
     fp8_attn.fmha_libs = []
+    fp8_attn._fp4_mla_fmha = None
     fp8_attn.local_layer_idx = 0
     # This branch resolves local cache layers through layer_idx. The
     # disposable cache has exactly one layer, so bind the copied view to it.

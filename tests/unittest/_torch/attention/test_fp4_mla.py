@@ -433,6 +433,133 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update(
         )
 
 
+def test_k3_fp8_split_k_context_selection_is_shape_gated(monkeypatch) -> None:
+    import sys
+    from types import ModuleType
+    from unittest.mock import Mock
+
+    import tensorrt_llm._torch.attention_backend.fmha.fp4_mla as fp4_mla_fmha_module
+
+    class FakeAttention:
+        is_mla_enable = True
+        kv_lora_rank = 512
+        qk_nope_head_dim = 128
+        qk_rope_head_dim = 64
+        v_head_dim = 128
+        num_heads = 96
+        num_kv_heads = 96
+
+    attn = FakeAttention()
+    fmha = Fp4MlaFmha(attn)
+    custom_op_module_name = "tensorrt_llm._torch.custom_ops.cute_dsl_k3_context_custom_ops"
+    custom_op_module = ModuleType(custom_op_module_name)
+    custom_op_module.IS_K3_CONTEXT_FMHA_AVAILABLE = True
+    custom_op_module.K3_CONTEXT_FMHA_IMPORT_ERROR = None
+    monkeypatch.setitem(sys.modules, custom_op_module_name, custom_op_module)
+    monkeypatch.setattr(fp4_mla_fmha_module, "get_sm_version", lambda: 107)
+    debug_once = Mock()
+    monkeypatch.setattr(fp4_mla_fmha_module.logger, "debug_once", debug_once)
+
+    assert fmha.supports_k3_fp8_split_k_context()
+    debug_once.assert_not_called()
+
+    attn.num_heads = attn.num_kv_heads = 6
+    assert not fmha.supports_k3_fp8_split_k_context()
+    assert "96 Q/KV heads per rank" in debug_once.call_args.args[0]
+    assert "got 6/6" in debug_once.call_args.args[0]
+    key = debug_once.call_args.kwargs["key"]
+    assert not fmha.supports_k3_fp8_split_k_context()
+    assert debug_once.call_args.kwargs["key"] == key
+
+    attn.num_heads = attn.num_kv_heads = 96
+    monkeypatch.setattr(fp4_mla_fmha_module, "get_sm_version", lambda: 103)
+    assert not fmha.supports_k3_fp8_split_k_context()
+    assert "requires SM107, got SM103" in debug_once.call_args.args[0]
+
+    monkeypatch.setattr(fp4_mla_fmha_module, "get_sm_version", lambda: 107)
+    attn.qk_nope_head_dim = 64
+    assert not fmha.supports_k3_fp8_split_k_context()
+    assert "requires head dimensions" in debug_once.call_args.args[0]
+    attn.qk_nope_head_dim = 128
+    custom_op_module.IS_K3_CONTEXT_FMHA_AVAILABLE = False
+    assert not fmha.supports_k3_fp8_split_k_context()
+    assert "lacks split-K epilogue merge support" in debug_once.call_args.args[0]
+    custom_op_module.K3_CONTEXT_FMHA_IMPORT_ERROR = ImportError("missing CuTe runtime")
+    assert not fmha.supports_k3_fp8_split_k_context()
+    assert "import failed" in debug_once.call_args.args[0]
+    assert "missing CuTe runtime" in debug_once.call_args.args[0]
+
+
+def test_k3_fp8_split_k_context_caches_fmha_instance(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    import tensorrt_llm._torch.attention_backend.trtllm as trtllm_module
+
+    class FakeAttention:
+        uses_fp4_mla_attention = True
+        is_mla_enable = True
+        kv_lora_rank = 512
+        v_head_dim = 128
+        head_dim = 128
+        create_fmha_libs = trtllm_module.TrtllmAttention.create_fmha_libs
+        supports_k3_fp8_split_k_context = (
+            trtllm_module.TrtllmAttention.supports_k3_fp8_split_k_context
+        )
+        forward_k3_fp8_split_k_context_partition = (
+            trtllm_module.TrtllmAttention.forward_k3_fp8_split_k_context_partition
+        )
+
+    class FakeFallback:
+        @classmethod
+        def is_available(cls, attn):
+            return True
+
+        def __init__(self, attn):
+            pass
+
+    monkeypatch.setattr(
+        trtllm_module, "get_enabled_fmha_lib_classes", lambda: [Fp4MlaFmha, FakeFallback]
+    )
+    supports = Mock(return_value=True)
+    forward = Mock()
+    monkeypatch.setattr(Fp4MlaFmha, "supports_k3_fp8_split_k_context", supports)
+    monkeypatch.setattr(Fp4MlaFmha, "forward_k3_fp8_split_k_context_partition", forward)
+    attn = FakeAttention()
+    attn.fmha_libs = []
+    assert attn.supports_k3_fp8_split_k_context()
+    first = attn._fp4_mla_fmha
+    assert first is attn.fmha_libs[0]
+
+    class NoIteration(list):
+        def __iter__(self):
+            raise AssertionError("FMHA selection must reuse the cached instance")
+
+    attn.fmha_libs = NoIteration(attn.fmha_libs)
+    args = (None,) * 9
+    kwargs = dict(max_q_len=256, max_kv_len=256, is_causal=False)
+    assert attn.supports_k3_fp8_split_k_context()
+    attn.forward_k3_fp8_split_k_context_partition(*args, **kwargs)
+    forward.assert_called_once_with(*args, **kwargs)
+
+    attn.create_fmha_libs()
+    assert attn._fp4_mla_fmha is not first
+    assert attn._fp4_mla_fmha is attn.fmha_libs[0]
+    from tensorrt_llm._torch.attention_backend.fp4_mla.fp4_mla_context import (
+        _build_fp8_mla_context_attn,
+    )
+
+    fp8_attn = _build_fp8_mla_context_attn(attn)
+    assert fp8_attn._fp4_mla_fmha is None
+    assert fp8_attn.fmha_libs == []
+    assert attn._fp4_mla_fmha is not None
+    attn.uses_fp4_mla_attention = False
+    attn.create_fmha_libs()
+    assert attn._fp4_mla_fmha is None
+    assert not attn.supports_k3_fp8_split_k_context()
+    with pytest.raises(RuntimeError, match="unavailable for chunked prefill"):
+        attn.forward_k3_fp8_split_k_context_partition(*args, **kwargs)
+
+
 def test_fp8_mla_context_partition_metadata_separates_q_and_kv_lengths() -> None:
     prompt_lens_cuda = torch.tensor([32, 48, 1], dtype=torch.int32)
     prompt_lens_cpu = prompt_lens_cuda.clone()
