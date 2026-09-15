@@ -327,6 +327,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Remove scratch before trimming stale prompt blocks; otherwise a
                 # boundary-crossing allocation can displace initialized prompt KV.
                 scratch_blocks = max(0, allocated_blocks - total_blocks)
+                if scratch_blocks > 0 and getattr(self._kv_cache_manager, "_has_cp_helix", False):
+                    # Helix ledgers expose one windowed page per
+                    # tokens_per_block * cp_size tokens, so the per-page scratch
+                    # arithmetic above would empty a one-entry HP-tail list.
+                    scratch_blocks = 0
                 if scratch_blocks > 0:
                     if req.py_beam_width != 1:
                         raise ValueError("speculative scratch blocks require beam_width == 1")
