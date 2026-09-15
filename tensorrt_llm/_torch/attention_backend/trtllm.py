@@ -2452,6 +2452,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self.fmha_libs: List[Fmha] = []
+        self._fp4_mla_fmha: Optional[Fp4MlaFmha] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -2781,9 +2782,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def create_fmha_libs(self) -> None:
         self.fmha_libs = []
+        self._fp4_mla_fmha = None
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(self):
-                self.fmha_libs.append(fmha_cls(self))
+                fmha = fmha_cls(self)
+                self.fmha_libs.append(fmha)
+                if isinstance(fmha, Fp4MlaFmha):
+                    self._fp4_mla_fmha = fmha
 
     def forward(
         self,
@@ -3340,6 +3345,50 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )
         raise RuntimeError(
             "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
+
+    def supports_k3_fp8_split_k_context(self) -> bool:
+        if not self.fmha_libs:
+            self.create_fmha_libs()
+        return (self._fp4_mla_fmha is not None
+                and self._fp4_mla_fmha.supports_k3_fp8_split_k_context())
+
+    def forward_k3_fp8_split_k_context_partition(
+        self,
+        q: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        merge_op: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        *,
+        max_q_len: int,
+        max_kv_len: int,
+        is_causal: bool,
+    ) -> None:
+        if not self.fmha_libs:
+            self.create_fmha_libs()
+        if self._fp4_mla_fmha is not None:
+            self._fp4_mla_fmha.forward_k3_fp8_split_k_context_partition(
+                q,
+                k_nope,
+                k_pe,
+                v,
+                output,
+                softmax_stats,
+                merge_op,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                is_causal=is_causal,
+            )
+            return
+        raise RuntimeError(
+            "Rubin K3 FP8 split-K context FMHA is unavailable for chunked prefill."
+        )
 
     def mla_rope_append_paged_kv_assign_q(
         self,
