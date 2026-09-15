@@ -193,6 +193,30 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
 
+# How a constraint floor charges a windowed life cycle per request.
+FLOOR_MODE_OFF = "off"  # its demand at the history the descriptor names
+FLOOR_MODE_WORST = "worst"  # a whole window of residency
+_FLOOR_MODE_ALIASES = {"0": FLOOR_MODE_OFF, "1": FLOOR_MODE_WORST}
+
+
+def windowed_floor_mode() -> str:
+    """How much a constraint floor charges each windowed request.
+
+    ``worst`` (default) charges the residency a windowed request actually has;
+    ``off`` is the pre-fix sizing, kept so a deployment the new floor costs too
+    much can get its old behaviour back without a rebuild. Keep in sync with
+    storageManager.cpp::windowedFloorMode.
+
+    A third rule that charged only the straddle block was measured and dropped:
+    it admits fewer requests than ``worst`` at every phase of the window slide,
+    and on a shape where windowed layers dominate it is bit-identical to ``off``
+    because its floor never binds -- so it was neither the correct rule nor a
+    cheaper one, and shipping a selectable wrong rule only invites selecting it.
+    """
+    raw = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR", FLOOR_MODE_WORST)
+    return _FLOOR_MODE_ALIASES.get(raw, raw)
+
+
 class StorageManager:
     __slots__ = (
         "_life_cycles",
@@ -1111,20 +1135,39 @@ class StorageManager:
                 max_slots[pg_idx] += swa_floor_blocks(lc)
             else:
                 max_slots[pg_idx] += floor_num_blocks
+        # A floor has to hold for as long as the batch is resident, so a windowed
+        # request is charged more than its demand at the history length the
+        # constraint descriptor happens to name. `ratio_from_batch` shares this
+        # helper and must NOT get the same treatment.
+        floor_mode = windowed_floor_mode()
         for batch in constraints:
-            slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
+            slots = self._compute_slots_for_batch(
+                batch, tokens_per_block, swa_scratch_reuse, floor_mode=floor_mode
+            )
             for pg_idx in typed_range(self.num_pool_groups):
                 scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
                 max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
+
+    def _windowed_worst_case_blocks(self, lc: AttnLifeCycle, tokens_per_block: int) -> int:
+        """Blocks one request can hold at the worst point of its window slide."""
+        window = unwrap_optional(lc.window_size)
+        # Handle oscillation of slot count required by SWA while the window slides.
+        return lc.num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
 
     def _compute_slots_for_batch(
         self,
         batch: BatchDesc,
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
+        floor_mode: str = FLOOR_MODE_OFF,
     ) -> TypedIndexList[PoolGroupIndex, int]:
-        """Compute the minimum number of slots per pool group to support a BatchDesc."""
+        """Compute the minimum number of slots per pool group to support a BatchDesc.
+
+        ``floor_mode`` is set only on the constraint-floor path. The ratio path
+        must keep the instantaneous demand, because there the proportion between
+        pool groups is exactly what the numbers mean.
+        """
         num_slots = filled_list(0, self.num_pool_groups)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
         sys_blocks = batch.system_prompt_length // tokens_per_block
@@ -1164,11 +1207,16 @@ class StorageManager:
                     # overlap with shared sys blocks (which are history).
                     num_scratch = len(scratch)
                     frac_max = self._slot_util_frac_max[lc_idx]
-                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(
+                    contribution = (unique_non_stale - num_scratch) + math.ceil(
                         num_scratch * frac_max
                     )
                 else:
-                    num_slots[pg_idx] += unique_non_stale
+                    contribution = unique_non_stale
+                if lc.window_size is not None and floor_mode != FLOOR_MODE_OFF:
+                    contribution = max(
+                        contribution, self._windowed_worst_case_blocks(lc, tokens_per_block)
+                    )
+                num_slots[pg_idx] += contribution
         return num_slots
 
     def _slots_to_bytes(
@@ -1202,12 +1250,23 @@ class StorageManager:
         """Compute slot counts for a cache level from its tier config and ratio.
 
         Applies min_slots constraints (always at least 1 per life cycle).
+
+        Sizing at the floors is deliberate -- a declared constraint batch has to
+        stay resumable -- but it allocates past the configured budget, so say so.
         """
         granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
-        quota = max(
-            self._min_quota_for_level(slot_size_lists, granularity),
-            round_up(tier_config.quota, granularity),
-        )
+        configured = round_up(tier_config.quota, granularity)
+        min_quota = self._min_quota_for_level(slot_size_lists, granularity)
+        if min_quota > configured:
+            warnings.warn(
+                f"KV cache constraint floors need {min_quota} bytes at cache tier "
+                f"{tier_config.tier}, more than the configured quota of {configured} bytes. "
+                f"The level is sized at {min_quota} bytes so the declared batch stays "
+                f"resumable, which is {min_quota / configured:.2f}x the configured budget. "
+                f"Lower max_batch_size or raise the KV cache quota if that is not acceptable.",
+                stacklevel=2,
+            )
+        quota = max(min_quota, configured)
         return CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio, granularity, self._min_slots
         )

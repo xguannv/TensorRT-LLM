@@ -1688,6 +1688,44 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def _format_kv_cache_pool_group_sizes(self) -> list[str]:
+        """Describe how many slots each pool group actually got.
+
+        The aggregate KV utilization reported per iteration cannot answer
+        "which pool group is the binding constraint", because it sums every
+        pool group: a run can sit at 13% aggregate while one small pool group
+        is at its admission ceiling and refusing to activate requests. The
+        per-group slot count is what makes that case legible, and comparing it
+        against ``max_batch_size`` is what makes it actionable -- a pool group
+        sized at roughly one slot per declared request has no room for the
+        per-request slot count to vary, which windowed life cycles do as their
+        window slides across block boundaries.
+
+        Read through ``_introspection`` so the numbers are the same under
+        either the Python or the C++ backend.
+        """
+        try:
+            stats = _introspection.storage_statistics(self.impl, GPU_LEVEL)
+        except (AttributeError, RuntimeError) as exc:
+            # Introspection is a debugging aid, never a correctness
+            # dependency: a manager that cannot report its own layout must
+            # still start.
+            logger.debug(f"KV cache pool group sizes unavailable: {exc}")
+            return []
+
+        entries = []
+        for pool_group_id, stat in enumerate(stats):
+            slot_sizes = getattr(stat, "slot_sizes", None)
+            if slot_sizes is None:
+                slot_sizes = [stat.slot_size]
+            entries.append(
+                f"pool_group_id={pool_group_id}, "
+                f"num_slots={stat.total}, "
+                f"slot_size={list(slot_sizes)}, "
+                f"bytes={stat.total * sum(slot_sizes)}"
+            )
+        return entries
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -1701,6 +1739,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
         for entry in entries:
+            logger.info(entry)
+
+        for entry in self._format_kv_cache_pool_group_sizes():
             logger.info(entry)
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
