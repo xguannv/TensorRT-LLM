@@ -3324,11 +3324,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
+        for request in requests:
+            self._align_fp4_mla_snapshot_points(request)
         if (not self.enable_block_reuse or not self.kv_cache_config.
                 mamba_state_config.enable_branch_snapshot):
             return
         for request in requests:
             self._apply_branch_snapshot_point(request)
+
+    def _align_fp4_mla_snapshot_points(self, request: LlmRequest) -> None:
+        if self.dtype != DataType.NVFP4:
+            return
+        # NVFP4 KV is quantized in 16-token tiles, so FP4 context resumes only
+        # on a full cache block (partial-block reuse is disabled). Capture the
+        # recurrent state at that boundary; rounding only the reused length
+        # would restore a later token's state.
+        request.expect_snapshot_points = sorted({
+            point // self.tokens_per_block * self.tokens_per_block
+            for point in request.expect_snapshot_points
+            if point >= self.tokens_per_block
+        })
 
     def _apply_branch_snapshot_point(self, request: LlmRequest) -> None:
         points = set(request.expect_snapshot_points)
@@ -3342,6 +3357,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if point is not None and point > request.context_current_position:
             points.add(point)
         request.expect_snapshot_points = sorted(points)
+        self._align_fp4_mla_snapshot_points(request)
 
     def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
         """Log recurrent-cache movement; this is KDA state for Kimi K3."""
@@ -4095,8 +4111,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             has_pending_snapshot = any(
                 point > request.context_current_position
                 for point in request.expect_snapshot_points)
-            should_resize = (not should_block_reuse or
-                             (not is_all_reusable and not has_pending_snapshot))
+            # NVFP4: the BF16 HP-tail ring is positioned by the history
+            # length, so it needs the completed chunk's watermark even while a
+            # later recurrent-state snapshot is still pending.
+            should_resize = (self.dtype == DataType.NVFP4
+                             or not should_block_reuse
+                             or (not is_all_reusable and not has_pending_snapshot))
             should_commit = (is_all_reusable or is_snapshot_boundary
                              or request.context_remaining_length == 0)
 
