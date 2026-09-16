@@ -1660,8 +1660,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
                         )
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.uses_external_draft_model:
@@ -1674,8 +1672,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
@@ -1683,12 +1679,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         model_config.spec_config.speculative_model,
                         **external_drafter_config_kwargs(
                             model_config, spec_config))
-                    self.draft_config.quant_config.kv_cache_quant_algo = \
-                        model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
+
+                # KV dtype is a property of the POOL, so the draft inherits the
+                # target's only when it reads the target's pool. A draft with
+                # its own pool takes it from spec_config.kv_cache_dtype.
+                if (self.draft_config is not None
+                        and not self.use_separate_draft_kv_cache):
+                    self.draft_config.quant_config.kv_cache_quant_algo = \
+                        model_config.quant_config.kv_cache_quant_algo
 
                 self.draft_model = get_draft_model(model_config,
                                                    self.draft_config,

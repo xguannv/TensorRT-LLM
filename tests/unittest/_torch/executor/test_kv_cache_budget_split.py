@@ -118,9 +118,14 @@ class TestSplitGpuBudgetForDraft:
         creator._max_seq_len = 16384
         creator._max_batch_size = 1
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        # Mock's predicates are all truthy, so the helix branch would scale the
+        # draft slope by a Mock cp_size.
+        creator._mapping.has_cp_helix.return_value = False
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
-        creator._speculative_config = SimpleNamespace(spec_dec_mode=mode)
+        creator._speculative_config = SimpleNamespace(
+            spec_dec_mode=mode, kv_cache_dtype="auto", kv_cache_tokens_per_block=64
+        )
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
@@ -165,8 +170,9 @@ class TestSplitGpuBudgetForDraft:
         c._enable_kv_cache_stats = Mock(return_value=False)
         c._fp8_ctx_mla_kv_len_cap = None
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
-        c._speculative_config = Mock()
+        c._speculative_config = Mock(kv_cache_dtype="auto", kv_cache_tokens_per_block=64)
         c._speculative_config.spec_dec_mode.is_external_drafter.return_value = True
+        c._llm_args = Mock(enable_ugpu=False)
 
         draft_pretrained_config = SimpleNamespace(
             num_hidden_layers=2,
@@ -501,12 +507,10 @@ class TestGpuSplitChargesFixedCost:
 class TestExternalDrafterKvDtype:
     """The draft budget must be charged at the dtype the draft pool is ALLOCATED in.
 
-    ``kv_cache_config.dtype: fp8`` stamps the target's fp8 KV algo onto an
-    external drafter's ModelConfig, but the drafter keeps a bf16 pool (dflash
-    rejects an fp8 pool and falls back to a max_seq_len-dense private arena).
-    The allocation path dropped the inherited algo; the cost path did not, so
-    the split charged 2880 B/token for a pool costing 5760, handed the draft
-    manager half the tokens the target got, and the GEN worker died in
+    The target's ``kv_cache_config.dtype: fp8`` describes the TARGET pool. When
+    it reached the draft cost but not the draft allocation, the split charged
+    2880 B/token for a pool costing 5760, handed the draft manager half the
+    tokens the target got, and the GEN worker died in
     ``_prepare_draft_resources`` at ~50% target utilization -- fatal to every
     rank, because the capacity scheduler admits on the target pool alone.
     """
@@ -536,14 +540,14 @@ class TestExternalDrafterKvDtype:
 
         target_model_config = SimpleNamespace(is_encoder_decoder=False)
         draft_model_config = DraftModelConfig()
-        seen_draft_model_configs = []
+        seen_draft_calls = []
 
         class ProbeKVCacheManager(KVCacheManagerV2):
             @staticmethod
             def get_cache_size_per_token(model_config, *args, **kwargs):
                 if model_config is target_model_config:
                     return 0
-                seen_draft_model_configs.append(model_config)
+                seen_draft_calls.append((model_config, kwargs))
                 return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
 
         c = object.__new__(KvCacheCreator)
@@ -562,6 +566,8 @@ class TestExternalDrafterKvDtype:
         c._speculative_config = SimpleNamespace(
             spec_dec_mode=SpeculativeDecodingMode.DSPARK,
             max_draft_len=4,
+            kv_cache_dtype="auto",
+            kv_cache_tokens_per_block=32,
         )
         c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
         c._draft_model_engine = None
@@ -575,59 +581,48 @@ class TestExternalDrafterKvDtype:
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
             return_value=ProbeKVCacheManager,
         )
-        return c, draft_model_config, seen_draft_model_configs
+        return c, draft_model_config, seen_draft_calls
 
-    def test_inherited_fp8_kv_algo_is_dropped_from_the_draft_cost(self, mocker):
+    def test_target_fp8_kv_cache_config_does_not_reach_the_draft_cost(self, mocker):
         from tensorrt_llm.models.modeling_utils import QuantConfig
-        from tensorrt_llm.quantization.mode import QuantAlgo
 
-        # What the args-level kv_cache_config.dtype sync puts on the drafter.
-        inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
-        assert inherited.quant_mode.has_fp8_kv_cache()
-        c, draft_model_config, seen = self._creator(mocker, inherited)
+        # A bf16 drafter under a target running kv_cache_config.dtype="fp8".
+        bf16_drafter = QuantConfig()
+        assert not bf16_drafter.quant_mode.has_fp8_kv_cache()
+        c, draft_model_config, seen = self._creator(mocker, bf16_drafter)
 
         cost = c._get_kv_size_per_token()
 
-        # The draft pool is bf16, so the split must charge bf16 bytes/token.
         assert cost.slope == self.BF16_SLOPE, (
             f"draft charged {cost.slope} B/token; the bf16 pool costs "
             f"{self.BF16_SLOPE}. Charging {self.FP8_SLOPE} gives the draft "
             f"manager half the tokens the target gets."
         )
         assert len(seen) == 1
-        assert not seen[0].quant_config.quant_mode.has_fp8_kv_cache()
-        # Both cached_property caches must be invalidated, or the
-        # draft_kv_config.dtype guard in the allocation path silently no-ops.
-        assert not seen[0].quant_config.layer_quant_mode.has_fp8_kv_cache()
-        # The drafter's own ModelConfig must not be mutated in place.
-        assert draft_model_config.quant_config is inherited
-        assert inherited.quant_mode.has_fp8_kv_cache()
+        # The cost reads the drafter's OWN config, unmodified.
+        assert seen[0][0] is draft_model_config
+        assert seen[0][0].quant_config is bf16_drafter
 
-    def test_cost_and_allocation_paths_agree(self, mocker):
-        """Both call sites must resolve the draft config through one helper."""
+    def test_draft_cost_follows_the_drafter_quant_config(self, mocker):
+        """An fp8-KV drafter is charged fp8 bytes, whatever the target uses."""
         from tensorrt_llm.models.modeling_utils import QuantConfig
         from tensorrt_llm.quantization.mode import QuantAlgo
 
         c, _, seen = self._creator(mocker, QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8))
+
+        assert c._get_kv_size_per_token().slope == self.FP8_SLOPE
+        assert len(seen) == 1
+
+    def test_cost_and_allocation_use_the_same_page_size(self, mocker):
+        """The split must charge the page size the draft pool is built with.
+
+        The target's is rewritten in place by its attention backend, so the two
+        diverge silently whenever a backend forces its own tokens_per_block.
+        """
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        c, _, seen = self._creator(mocker, QuantConfig())
         c._get_kv_size_per_token()
 
-        allocation_config = c._get_draft_kv_model_config()
-        assert (
-            seen[0].quant_config.quant_mode.has_fp8_kv_cache()
-            == allocation_config.quant_config.quant_mode.has_fp8_kv_cache()
-        )
-
-    def test_non_external_drafter_is_untouched(self, mocker):
-        """MTP/Eagle3 share the target's layout, so nothing is neutralized."""
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-        from tensorrt_llm.quantization.mode import QuantAlgo
-
-        inherited = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
-        c, draft_model_config, _ = self._creator(mocker, inherited)
-        # 换一个真实的非外部模式,而不是去改谓词返回值 —— 真实枚举上
-        # `.is_external_drafter.return_value = False` 会抛
-        # AttributeError: 'method' object has no attribute 'return_value'。
-        # MTP_EAGLE 与 target 共享 KV 布局,正是本用例断言"不该被改动"的场景。
-        c._speculative_config.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
-
-        assert c._get_draft_kv_model_config() is draft_model_config
+        assert seen[0][1]["tokens_per_block"] == c._get_draft_tokens_per_block()
+        assert c._get_draft_tokens_per_block() != c._tokens_per_block
