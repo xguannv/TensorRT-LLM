@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -51,6 +52,10 @@ from .interface import AlltoallMethodType, _reject
 from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CuteDslFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
+
+# Kill switch for CuteDslFusedMoE.quantize_input_async (fork the NVFP4 input
+# quantization onto the MoE aux stream so it overlaps top-k + moe_sort).
+ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
 
 
 def _unwrap_ugpu_runner(runner: TunableRunner) -> TunableRunner:
@@ -778,6 +783,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+        # Async input quantization (see quantize_input_async / _join_pending_x_ready).
+        self._x_quant_event = torch.cuda.Event()
+        self._pending_x_ready_event: Optional[torch.cuda.Event] = None
 
         self.scaling_vector_size = 16
         self.quant_config = override_quant_config if override_quant_config is not None else self.quant_config
@@ -934,6 +942,47 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             x_sf = x_sf.view(x_row, scale_cols)
         return x, x_sf
 
+    def quantize_input_async(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.cuda.Event]]:
+        """Quantize ``x`` on the MoE aux stream so it overlaps top-k and ``moe_sort``.
+
+        At small decode batches the three per-layer prologue kernels (top-k,
+        input quantization, routing/permutation) are all latency-bound and
+        serialize on the main stream (~25 us/layer for 8 tokens on GB300).
+        Quantization only depends on ``x``, so the scheduler forks it here
+        before routing; the consumer joins via the returned event right before
+        the first kernel that reads ``x``/``x_sf`` (``run_moe_nvfp4_impl``,
+        after ``moe_sort``). Falls back to the synchronous ``quantize_input``
+        (event ``None``) when disabled, not NVFP4, already quantized, or no aux
+        stream is available.
+        """
+        if (not ASYNC_INPUT_QUANT or not self.has_nvfp4
+                or isinstance(x, Fp4QuantizedTensor)
+                or not self._has_moe_output_memset_aux_stream()):
+            x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
+            return x_q, x_sf, None
+        main_stream = torch.cuda.current_stream()
+        aux_stream = self.aux_stream_dict[AuxStreamType.MoeOutputMemset]
+        self.event_dict[EventType.Main].record()
+        x.record_stream(aux_stream)
+        with torch.cuda.stream(aux_stream):
+            self.event_dict[EventType.Main].wait()
+            x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
+            self._x_quant_event.record()
+        x_q.record_stream(main_stream)
+        if x_sf is not None:
+            x_sf.record_stream(main_stream)
+        return x_q, x_sf, self._x_quant_event
+
+    def _join_pending_x_ready(self) -> None:
+        """Wait for the async input quantization (once per forward)."""
+        event = getattr(self, "_pending_x_ready_event", None)
+        if event is not None:
+            event.wait()
+            self._pending_x_ready_event = None
+
     def run_moe_nvfp4(
         self,
         x: torch.Tensor,
@@ -943,6 +992,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
         weight_view: Optional[NvFp4WeightView] = None,
+        x_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """NVFP4 MoE computation.
 
@@ -953,6 +1003,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         Args:
             weight_view: Bundled weight tensors. Must not be None.
+            x_ready_event: Set when ``x``/``x_sf`` come from
+                ``quantize_input_async``; joined inside ``run_moe_nvfp4_impl``
+                right before the FC1 gather GEMM (the uGPU path joins here).
         """
         assert self.has_nvfp4
         assert weight_view is not None
@@ -999,6 +1052,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             return moe_output
 
         effective_top_k = token_selected_experts.size(-1)
+
+        if use_ugpu:
+            # No overlap on the uGPU path yet: join before dispatching.
+            if x_ready_event is not None:
+                x_ready_event.wait()
+            self._pending_x_ready_event = None
+        else:
+            self._pending_x_ready_event = x_ready_event
 
         if use_ugpu:
             forward_impl = self._run_moe_nvfp4_ugpu
@@ -1130,6 +1191,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             gather_act_kwargs["situ_beta"] = self.situ_beta
             gather_act_kwargs["situ_linear_beta"] = self.situ_linear_beta
 
+        # Join the async input quantization (quantize_input_async): x/x_sf were
+        # produced on the aux stream and are first read here, after moe_sort
+        # ran on the main stream in parallel with the quantization.
+        self._join_pending_x_ready()
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
         if self.use_fused_finalize:
@@ -1791,6 +1856,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 moe_output=moe_output,
                 enable_alltoall=enable_alltoall,
                 weight_view=weight_view,
+                x_ready_event=ctx.x_ready_event,
             )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
