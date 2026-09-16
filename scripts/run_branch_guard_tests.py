@@ -143,6 +143,10 @@ K3_DSPARK_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
     "radixark_kimi-k3-dspark/hf/hf-3c5bac3_orig"
 )
+K3_HELIX_DSPARK_CHECKPOINT_PATH = (
+    "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
+    "inferact_kimi-k3-dspark/hf/hf-cf6b824_orig"
+)
 FLASHINFER_CUBINS_REPOSITORY = (
     "https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/"
     "artifactory/sw-kernelinferencelibrary-generic-local/"
@@ -194,6 +198,7 @@ class GuardJob:
     checkpoint_path: str | None = None
     model_path_env: str | None = None
     draft_model_name: str | None = None
+    draft_checkpoint_path: str | None = None
     speculative_config: dict[str, str | int] | None = None
 
 
@@ -271,6 +276,7 @@ GUARD_JOBS = (
         use_pmix=False,
         launcher="benchmark",
         speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
+        draft_checkpoint_path=K3_HELIX_DSPARK_CHECKPOINT_PATH,
     ),
     GuardJob(
         name="k3-disaggregated-dep16-gsm8k",
@@ -666,7 +672,7 @@ def _model_setup_lines(args: argparse.Namespace, job: GuardJob) -> list[str]:
     if job.draft_model_name is not None:
         lines.extend(
             [
-                f"guard_draft_checkpoint={shlex.quote(args.k3_dspark_checkpoint)}",
+                f"guard_draft_checkpoint={shlex.quote(job.draft_checkpoint_path or args.k3_dspark_checkpoint)}",
                 'test -d "$guard_draft_checkpoint"',
                 f'ln -sfn "$guard_draft_checkpoint" "$guard_model_root/{job.draft_model_name}"',
             ]
@@ -820,6 +826,21 @@ def _write_benchmark_slurm_script(repo_root: Path, log_dir: Path) -> Path:
     source = repo_root / "examples/disaggregated/slurm/benchmark/disaggr_torch.slurm"
     output = log_dir.parent / f"{log_dir.name}-disaggr_torch_branch_guard.slurm"
     script = source.read_text()
+    install_command = "pip install -e .[devel]"
+    if script.count(install_command) != 1:
+        raise RuntimeError(
+            "Unable to locate the TensorRT-LLM editable-install command "
+            "in the benchmark Slurm script."
+        )
+    script = script.replace(
+        install_command,
+        (
+            f"{install_command} && python3 -m pip install "
+            "flashinfer_python==0.6.18+cf3c3a3e.nvinternal.rubin.0.8dev.devel.cu.64035134 "
+            "--index-url https://gitlab-master.nvidia.com/api/v4/projects/179191/packages/pypi/simple "
+            "--no-deps --force-reinstall --break-system-packages"
+        ),
+    )
     output.write_text(script)
     output.chmod(source.stat().st_mode)
     return output
@@ -862,7 +883,9 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     config.setdefault("accuracy", {})["enable_accuracy_test"] = True
     if job.speculative_config is not None:
         speculative_config = deepcopy(job.speculative_config)
-        speculative_config["speculative_model"] = args.k3_dspark_checkpoint
+        speculative_config["speculative_model"] = (
+            job.draft_checkpoint_path or args.k3_dspark_checkpoint
+        )
         config["worker_config"]["gen"]["speculative_config"] = speculative_config
     if _requires_flashinfer_cubins(job):
         flashinfer_repository = FLASHINFER_CUBINS_REPOSITORY.replace(

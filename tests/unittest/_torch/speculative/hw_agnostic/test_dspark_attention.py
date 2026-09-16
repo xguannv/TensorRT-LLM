@@ -982,7 +982,7 @@ def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
         )
 
     batched_hidden = torch.arange(2 * 2 * hidden, dtype=torch.float32).view(2, 2, hidden)
-    batched_positions = torch.tensor([[1, 2], [3, 4]])
+    batched_positions = torch.tensor([[1, 32], [3, 4]])
     request_slots = torch.tensor([0, 1])
     mask = torch.tensor([[True, False], [True, True]])
     kv_windows = torch.zeros(2, num_stages, window, head_dim)
