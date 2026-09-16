@@ -783,6 +783,7 @@ class KvCacheCreator:
                                 model_config,
                                 kv_cache_config: Optional[KvCacheConfig] = None,
                                 mapping=None,
+                                tokens_per_block: Optional[int] = None,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -790,7 +791,8 @@ class KvCacheCreator:
             manager_cls.get_cache_size_per_token(
                 model_config,
                 mapping if mapping is not None else self._mapping,
-                tokens_per_block=self._tokens_per_block,
+                tokens_per_block=(tokens_per_block if tokens_per_block
+                                  is not None else self._tokens_per_block),
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
                 kv_cache_config=kv_cache_config,
@@ -855,12 +857,13 @@ class KvCacheCreator:
             # (e.g. EAGLE3: config says 1, runtime uses 4).
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
-            # _get_draft_kv_model_config(), not _get_effective_draft_config():
-            # the cost charged here must be the cost of the pool that
-            # _create_one_model_draft_kv_cache_manager actually allocates.
-            effective_draft_config = self._get_draft_kv_model_config()
+            # Same config and page size _create_one_model_draft_kv_cache_manager
+            # allocates with: charging one dtype and allocating another gives
+            # the draft pool half the tokens and a fatal mid-run resize failure.
+            effective_draft_config = self._get_effective_draft_config()
             draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
                 kv_cache_config, self._max_seq_len)
+            draft_tokens_per_block = self._get_draft_tokens_per_block()
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
@@ -873,7 +876,8 @@ class KvCacheCreator:
                     draft_kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
-                    mapping=draft_mapping)
+                    mapping=draft_mapping,
+                    tokens_per_block=draft_tokens_per_block)
                 total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
                                    intercept=draft_cost.intercept)
             elif self._mapping.is_last_pp_rank():
@@ -883,6 +887,7 @@ class KvCacheCreator:
                     effective_draft_config,
                     draft_kv_cache_config,
                     mapping=draft_mapping,
+                    tokens_per_block=draft_tokens_per_block,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
                 total += CacheCost(slope=draft_cost.slope * helix_cp_scale,
@@ -1624,50 +1629,14 @@ class KvCacheCreator:
         # layers as well.
         return self._model_engine.model.model_config
 
-    def _get_draft_kv_model_config(self) -> ModelConfig:
-        """The draft ModelConfig describing the KV pool as it is ALLOCATED.
+    def _get_draft_tokens_per_block(self) -> int:
+        """Page size of the separate draft KV pool.
 
-        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8
-        KV algo onto every loaded model, including an external drafter. The
-        drafter stores and reads its pool in its weights dtype (DFlash
-        validates a bf16 pool and otherwise falls back to the max_seq_len-dense
-        private arena, which OOMs at long context), so the pool dtype must
-        follow the drafter, not the target.
-
-        Every consumer that reasons about draft KV bytes must go through here.
-        Construction and the target/draft budget split reading different dtypes
-        is not cosmetic: the split then charges the draft fp8 bytes for a pool
-        allocated bf16, so the draft manager receives exactly HALF the tokens
-        the target gets. Because the capacity scheduler admits on the target
-        pool alone, the draft pool cannot backpressure -- it can only raise
-        "Draft KV cache context resize failed" out of
-        ``KVCacheManagerV2._prepare_draft_resources``, which is fatal to every
-        rank, as soon as resident context passes ~50% of target utilization.
+        NOT self._tokens_per_block: the target's attention backend rewrites
+        kv_cache_config.tokens_per_block in place (FP4 MLA and FlashMLA both
+        force their own), which would then pick the drafter's page size.
         """
-        effective_draft_config = self._get_effective_draft_config()
-        if not self._speculative_config.spec_dec_mode.is_external_drafter():
-            return effective_draft_config
-        quant_config = getattr(effective_draft_config, "quant_config", None)
-        if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            return effective_draft_config
-        logger.info(
-            "External drafter KV pool keeps the drafter dtype; dropping "
-            "the fp8 KV quant algo inherited from the target.")
-        neutral_quant = copy.copy(quant_config)
-        neutral_quant.kv_cache_quant_algo = None
-        # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
-        # and the copy carries the already-computed caches, so BOTH must be
-        # dropped for the mutation to take. Leaving layer_quant_mode stale
-        # silently no-ops the `draft_kv_config.dtype -> "auto"` guard in
-        # _create_one_model_draft_kv_cache_manager, which reads it.
-        neutral_quant.__dict__.pop("quant_mode", None)
-        neutral_quant.__dict__.pop("layer_quant_mode", None)
-        effective_draft_config = copy.copy(effective_draft_config)
-        effective_draft_config._frozen = False
-        effective_draft_config.quant_config = neutral_quant
-        effective_draft_config._frozen = True
-        return effective_draft_config
+        return self._speculative_config.kv_cache_tokens_per_block
 
     def _get_num_draft_layers(self) -> int:
         """Return the actual number of draft KV cache layers.
@@ -1723,12 +1692,7 @@ class KvCacheCreator:
         num_draft_layers = self._get_num_draft_layers()
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
 
-        # Get the effective draft config (explicit draft_config if available,
-        # otherwise fall back to target model config for MTP), with the
-        # target's inherited fp8 KV algo dropped for an external drafter. The
-        # budget split in _get_kv_size_per_token resolves it through the SAME
-        # helper, so the bytes/token it charges match the pool allocated here.
-        effective_draft_config = self._get_draft_kv_model_config()
+        effective_draft_config = self._get_effective_draft_config()
 
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
@@ -1749,21 +1713,10 @@ class KvCacheCreator:
                 f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
                 "pool group.")
             draft_kv_config.pool_ratio = [1.0]
-        draft_quant = effective_draft_config.quant_config
-        draft_has_fp8_kv = bool(
-            draft_quant is not None
-            and draft_quant.layer_quant_mode.has_fp8_kv_cache())
-        if draft_kv_config.dtype == "fp8" and not draft_has_fp8_kv:
-            # kv_cache_config.dtype describes the TARGET pool. An external
-            # drafter without fp8-KV quantization stores and reads its pool in
-            # its own dtype (DFlash validates the pool as bf16 and otherwise
-            # falls back to the max_seq_len-dense private arena, which OOMs at
-            # long context). Resolve the draft pool from the drafter's quant
-            # config instead.
-            logger.info(
-                "Separate one-model draft KV cache keeps the drafter dtype "
-                "(kv_cache_config.dtype=fp8 applies to the target pool only).")
-            draft_kv_config.dtype = "auto"
+        # Never kv_cache_config.dtype: that describes the TARGET pool, and
+        # charging the draft budget at one dtype while allocating its pool at
+        # another gives the draft pool half the tokens the target gets.
+        draft_kv_config.dtype = self._speculative_config.kv_cache_dtype
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -1789,12 +1742,20 @@ class KvCacheCreator:
         draft_mapping = self._mapping
         if draft_mapping.has_cp_helix():
             draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
+        draft_tokens_per_block = self._get_draft_tokens_per_block()
+        if draft_tokens_per_block != self._tokens_per_block:
+            # Logged because nothing fails when the two differ: only the draft
+            # pool's block count, block-table width and fragmentation change.
+            logger.info(
+                f"Separate draft KV cache page size {draft_tokens_per_block} "
+                f"(target pool uses {self._tokens_per_block}); set "
+                f"speculative_config.kv_cache_tokens_per_block to change it.")
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
-            tokens_per_block=self._tokens_per_block,
+            tokens_per_block=draft_tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,

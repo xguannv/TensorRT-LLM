@@ -1802,6 +1802,22 @@ class DecodingBaseConfig(StrictBaseModel):
         "dynamic tree, each draft layer may generate more than one draft token. In this case, "
         "max_total_draft_tokens >= max_draft_len.")
 
+    kv_cache_dtype: str = Field(
+        default="auto",
+        description=
+        "Data type of the DRAFT model's own KV pool. 'auto' keeps the drafter "
+        "checkpoint's quantization metadata. Not inherited from "
+        "kv_cache_config.dtype, which describes the target pool. Ignored by a "
+        "draft that shares the target's pool.")
+
+    kv_cache_tokens_per_block: int = Field(
+        default=32,
+        description="Page size of the DRAFT model's own KV pool. Same default as "
+        "KvCacheConfig.tokens_per_block but independent of it: the target's "
+        "value is rewritten in place by its attention backend (FP4 MLA and "
+        "FlashMLA force their own). Ignored by a draft that shares the "
+        "target's pool.")
+
     speculative_model: Optional[Union[str, Path]] = Field(
         default=None,
         validation_alias=AliasChoices("speculative_model",
