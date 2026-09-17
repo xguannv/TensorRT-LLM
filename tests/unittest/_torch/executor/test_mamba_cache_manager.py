@@ -326,13 +326,19 @@ def _kimi_model_config() -> SimpleNamespace:
     return SimpleNamespace(
         pretrained_config=config,
         quant_config=None,
+        mapping=None,
+        spec_config=None,
         sparse_attention_config=None,
         get_num_mamba_layers=lambda: 2,
     )
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+@pytest.mark.parametrize("use_v2", [False, True])
 def test_kimi_fp4_mla_routes_to_v2_policy_manager(
     monkeypatch: pytest.MonkeyPatch,
+    is_disagg: bool,
+    use_v2: bool,
 ) -> None:
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
@@ -346,16 +352,21 @@ def test_kimi_fp4_mla_routes_to_v2_policy_manager(
         KvCacheConfig(
             dtype="nvfp4",
             tokens_per_block=128,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=use_v2,
+        ),
+        is_disagg=is_disagg,
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="PYTHON"
         ),
     )
 
-    assert manager_cls is MambaHybridCacheManagerV2
+    assert manager_cls is KDAHybridCacheManagerV2
 
 
 def _capture_kimi_v2_manager_ctor(
     monkeypatch: pytest.MonkeyPatch,
     spec_config=None,
+    kv_dtype: str = "auto",
 ) -> tuple[tuple, dict]:
     """Route a Kimi config through _create_kv_cache_manager with an explicit
     V2 manager and capture the constructor arguments."""
@@ -367,7 +378,17 @@ def _capture_kimi_v2_manager_ctor(
             captured["kwargs"] = kwargs
 
     model_config = _kimi_model_config()
-    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    tokens_per_block = 128 if kv_dtype == "nvfp4" else 64
+    kv_cache_config = KvCacheConfig(
+        dtype=kv_dtype, tokens_per_block=tokens_per_block, use_kv_cache_manager_v2=True
+    )
+    if kv_dtype == "nvfp4":
+        model_config.quant_config = SimpleNamespace(
+            quant_mode=SimpleNamespace(
+                has_fp4_kv_cache=lambda: True, has_fp8_kv_cache=lambda: False
+            ),
+            mamba_ssm_cache_dtype=torch.float32,
+        )
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
@@ -378,7 +399,7 @@ def _capture_kimi_v2_manager_ctor(
         kv_cache_manager_cls=RecordingV2Manager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         kv_cache_config=kv_cache_config,
-        tokens_per_block=64,
+        tokens_per_block=tokens_per_block,
         max_seq_len=2048,
         max_batch_size=4,
         spec_config=spec_config,
@@ -418,8 +439,10 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert "kda_replay_num_spec" not in kwargs
 
 
+@pytest.mark.parametrize("kv_dtype", ["auto", "nvfp4"])
 def test_kimi_explicit_v2_manager_enables_kda_replay(
     monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: str,
 ) -> None:
     spec_config = MTPDecodingConfig(max_draft_len=3)
     monkeypatch.setattr(
@@ -427,8 +450,11 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
         lambda: True,
     )
 
-    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
+    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config, kv_dtype)
 
+    if kv_dtype == "nvfp4":
+        assert kwargs["dtype"] == DataType.NVFP4
+        assert kwargs["tokens_per_block"] == 128
     assert kwargs["kda_replay_num_spec"] == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
 
@@ -1817,12 +1843,14 @@ def _base_attention_layer_configs(num_layers):
     ]
 
 
+@pytest.mark.parametrize("manager_cls", [MambaHybridCacheManagerV2, KDAHybridCacheManagerV2])
 def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     monkeypatch: pytest.MonkeyPatch,
+    manager_cls: type[MambaHybridCacheManagerV2],
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr = object.__new__(manager_cls)
     mgr.pp_layers = [0, 1, 2, 3]
     mgr._mamba_layer_mask = [True, False, True, False]
     mgr.num_local_layers = 4
@@ -1861,7 +1889,7 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
         initial_pool_ratio=[1.0],
     )
 
-    config = MambaHybridCacheManagerV2._build_cache_config(mgr, base_config)
+    config = mgr._build_cache_config(base_config)
 
     assert isinstance(config.layers[0], SsmLayerConfig)
     assert isinstance(config.layers[1], AttentionLayerConfig)
