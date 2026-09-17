@@ -130,6 +130,7 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
         weight_view: Optional[NvFp4WeightView] = None,
+        x_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
         assert weight_view is not None
@@ -149,6 +150,11 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
         # require at least one output row).
         if token_selected_experts.size(0) == 0:
             return moe_output
+
+        # Deferred join for ``quantize_input_async`` (see the parent class):
+        # the fused kernel is the first consumer of ``x``/``x_sf``, so
+        # ``run_moe_nvfp4_impl`` joins right after ``moe_sort``.
+        self._pending_x_ready_event = x_ready_event
 
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
@@ -208,6 +214,12 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
              local_num_experts=esp,
              tile_tokens_dim=tile_size,
          )
+
+        # Join the async input quantization (``quantize_input_async``): the
+        # fused op below is the first consumer of ``x``/``x_sf``; ``moe_sort``
+        # above only reads routing tensors, so it overlaps the aux-stream
+        # quantization.
+        self._join_pending_x_ready()
 
         # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
         # + FC2 GEMM + finalize (scatter-add into moe_output).
