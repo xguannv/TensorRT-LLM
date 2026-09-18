@@ -614,12 +614,12 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['kda_conv_k'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_v'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_kg_cache'] = torch.zeros(num_local_layers,
-                                                           max_batch_size,
-                                                           M,
-                                                           2,
-                                                           section_dim,
-                                                           dtype=torch.float32,
-                                                           device=device)
+                                                          max_batch_size,
+                                                          M,
+                                                          2,
+                                                          section_dim,
+                                                          dtype=torch.float32,
+                                                          device=device)
                 spec_kwargs['kda_v_cache'] = torch.zeros(num_local_layers,
                                                          max_batch_size,
                                                          M,
@@ -859,8 +859,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 device=cache.device)
             seeded[:, :, :, :committed] = section.to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
-        for buf in (self.mamba_cache.kda_kg_cache,
-                    self.mamba_cache.kda_v_cache,
+        for buf in (self.mamba_cache.kda_kg_cache, self.mamba_cache.kda_v_cache,
                     self.mamba_cache.kda_beta_cache):
             buf.index_fill_(1, idx, 0)
         self.mamba_cache.prev_num_accepted_tokens[idx] = 0
@@ -2879,6 +2878,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # Recurrent-state snapshots use a specialized commit/history protocol, so
+    # keep main-like reuse endpoints and the existing unpaired draft path.
+    _supports_reuse_match_backoff = False
 
     def __init__(
         self,
@@ -3283,6 +3285,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
+            # A fresh lookup can record a point before resume() fails. On the
+            # next attempt, reapply that point against the cache's authoritative
+            # reuse depth: the request cursor is not rewound until preparation
+            # succeeds and may still describe a deeper, abandoned attempt.
+            if req.py_request_id in self._branch_snapshot_points:
+                self._apply_branch_snapshot_point(
+                    req, context_current_position=kv_cache.num_committed_tokens)
             return
 
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
@@ -3309,7 +3318,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._skip_branch_snapshot("aligned_to_zero")
             return
         # Reuse already reached the fork, so a snapshot there exists.
-        if point <= req.context_current_position:
+        if point <= reused:
             self._skip_branch_snapshot("already_reused")
             return
         # A branch point at or beyond the prompt end cannot improve sibling
@@ -3319,7 +3328,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         self._branch_snapshot_points[req.py_request_id] = point
-        self._apply_branch_snapshot_point(req)
+        self._apply_branch_snapshot_point(req, context_current_position=reused)
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
@@ -3345,7 +3354,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if point >= self.tokens_per_block
         })
 
-    def _apply_branch_snapshot_point(self, request: LlmRequest) -> None:
+    def _apply_branch_snapshot_point(
+        self,
+        request: LlmRequest,
+        context_current_position: Optional[int] = None,
+    ) -> None:
+        # prompt_len is unioned in unconditionally: try_commit_blocks derives
+        # commit_limit from max(snapshot_points), so a lone branch point below
+        # the prompt end would silently stop commits there and lose the
+        # prompt-end snapshot. It also makes the flag usable on its own.
         points = set(request.expect_snapshot_points)
         # Keep the flag usable without any configured snapshot placement. If a
         # placement is configured, preserve it: adding prompt_len can replace a
@@ -3354,7 +3371,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if not points:
             points.add(request.prompt_len)
         point = self._branch_snapshot_points.get(request.py_request_id)
-        if point is not None and point > request.context_current_position:
+        current_position = (request.context_current_position
+                            if context_current_position is None else
+                            context_current_position)
+        if point is not None and point > current_position:
             points.add(point)
         request.expect_snapshot_points = sorted(points)
         self._align_fp4_mla_snapshot_points(request)
@@ -4115,8 +4135,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # length, so it needs the completed chunk's watermark even while a
             # later recurrent-state snapshot is still pending.
             should_resize = (self.dtype == DataType.NVFP4
-                             or not should_block_reuse
-                             or (not is_all_reusable and not has_pending_snapshot))
+                             or not should_block_reuse or
+                             (not is_all_reusable and not has_pending_snapshot))
             should_commit = (is_all_reusable or is_snapshot_boundary
                              or request.context_remaining_length == 0)
 
