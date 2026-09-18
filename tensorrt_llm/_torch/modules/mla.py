@@ -15,6 +15,7 @@
 
 import functools
 import math
+import os
 import weakref
 from typing import Dict, Optional, cast
 
@@ -166,6 +167,11 @@ def mla_custom_op_inplace(
 
 
 maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
+
+
+def _mla_kv_strided_enabled() -> bool:
+    """TRTLLM_MLA_KV_STRIDED=0 falls back to the wide GEMM + cat KV expansion."""
+    return os.environ.get("TRTLLM_MLA_KV_STRIDED", "1") != "0"
 
 
 def _is_cute_dsl_fp8_bmm_available(sm_version: Optional[int] = None) -> bool:
@@ -1253,6 +1259,83 @@ class MLA(nn.Module):
 
         return attn_output
 
+    def _expand_kv_to_k_v(
+        self,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """kv_b_proj + RoPE concat -> (k [T, H*qk_head_dim], v [T, H*v_head_dim]).
+
+        Strided path: the per-head bmm writes k_nope straight into the nope slot of
+        the [T, H, qk_head_dim] buffer, so the [T, H, 192] cat never runs and only
+        the 64-wide rope slot is broadcast-stored. forward_context_default already
+        used this pattern; this extends it to the chunked-prefill loop, where the
+        cat costs 1.124 ms per 32768-token KV chunk against 0.432 ms for the GEMM
+        feeding it (GB300, 96 heads).
+
+        TRTLLM_MLA_KV_STRIDED=0 forces the cat path so both can be A/B'd in one
+        build.
+        """
+        num_tokens = compressed_kv.shape[0]
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+
+        strided = _mla_kv_strided_enabled() and self._use_kvbproj_strided_out()
+        if not getattr(MLA, "_kv_expand_path_logged", False):
+            MLA._kv_expand_path_logged = True
+            logger.info(
+                f"MLA KV expansion: {'strided bmm (no cat)' if strided else 'wide GEMM + cat'} "
+                f"[TRTLLM_MLA_KV_STRIDED={os.environ.get('TRTLLM_MLA_KV_STRIDED', '1')}, "
+                f"eligible={self._use_kvbproj_strided_out()}]"
+            )
+        if strided:
+            weight_k, weight_v = self._get_kvbproj_head_weights()
+            # stride-0 batch broadcast: no per-head copy of the latent.
+            compressed_kv_batched = compressed_kv.unsqueeze(0).expand(
+                self.num_heads_tp,
+                num_tokens,
+                self.kv_lora_rank,
+            )
+            k = compressed_kv.new_empty(num_tokens, self.num_heads_tp, self.qk_head_dim)
+            # v must be a slice of a full-width [T, nope_cols + v_cols] buffer, not
+            # its own contiguous [T, v_cols]: the attention op inherits v's row
+            # stride, and a 12288-wide stride where it expects 24576 reads out of
+            # bounds ("cudaMemset ... an illegal memory access" inside
+            # thop.attention). forward_context_default allocates it this way for
+            # the same reason.
+            nope_cols = self.num_heads_tp * self.qk_nope_head_dim
+            v_cols = self.num_heads_tp * self.v_head_dim
+            kv_buffer = compressed_kv.new_empty(num_tokens, nope_cols + v_cols)
+            v = kv_buffer[:, nope_cols:]
+            torch.ops.trtllm.bmm_out(
+                compressed_kv_batched,
+                weight_k.transpose(1, 2),
+                k[..., : self.qk_nope_head_dim].transpose(0, 1),
+            )
+            torch.ops.trtllm.bmm_out(
+                compressed_kv_batched,
+                weight_v.transpose(1, 2),
+                v.unflatten(-1, (self.num_heads_tp, self.v_head_dim)).transpose(0, 1),
+            )
+            k[..., self.qk_nope_head_dim :] = k_pe
+            return k.view(num_tokens, -1), v
+
+        kv = self.kv_b_proj(compressed_kv)
+        k_nope, v = kv.split(
+            [
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim,
+            ],
+            -1,
+        )
+        k = maybe_compiled_cat(
+            (
+                k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
+                k_pe.expand(-1, self.num_heads_tp, -1),
+            ),
+            dim=-1,
+        )
+        return k.view(num_tokens, -1), v
+
     def forward_context_with_chunked_prefill_fp4(
         self,
         q: torch.Tensor,
@@ -1560,29 +1643,12 @@ class MLA(nn.Module):
                 out_dtype=q.dtype,
             )
 
-            # up proj to uncompressed kv
-            # [tokens, 2, h, kv_dim], without rope_dim
-            chunked_kv = self.kv_b_proj(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split(
-                [
-                    self.num_heads_tp * self.qk_nope_head_dim,
-                    self.num_heads_tp * self.v_head_dim,
-                ],
-                -1,
-            )
-
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-            )
-            chunked_k = chunked_k.view(-1, self.num_heads_tp * self.qk_head_dim)
+            # up proj to uncompressed kv, RoPE slot filled in place (no [T,H,192] cat)
+            chunked_k, chunked_v = self._expand_kv_to_k_v(chunked_compressed_kv, chunked_k_pe)
 
             # release pytorch activation memory
             chunked_compressed_kv = None
             chunked_k_pe = None
-            chunked_kv = None
-            chunked_k_nope = None
 
             # copy chunked_seq_len to replace kv_lens_runtime
             attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
@@ -1619,24 +1685,11 @@ class MLA(nn.Module):
             )
 
         # deal with the uncached kv
-        kv = self.kv_b_proj(compressed_kv)
         _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
             [self.kv_lora_rank, self.qk_rope_head_dim], -1
         )
         # final round of attention
-
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
-        )
-
-        k_nope = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1)
-        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
+        k, v = self._expand_kv_to_k_v(compressed_kv, k_pe)
 
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
