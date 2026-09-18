@@ -3391,23 +3391,8 @@ class TestInitRatioConfig(unittest.TestCase):
             tuple(stat_slot_sizes(stat)): stat.total
             for stat in _introspection.storage_statistics(manager)
         }
-        # The pair swapped when the windowed constraint floor started charging a
-        # resident request the block its window takes on as it crosses a block
-        # boundary. This config declares a constraint, so what is observed here
-        # is max(ratio share, floor), and the floor now dominates for the
-        # windowed group: its per-request demand goes 1 -> 2, and
-        # ceil(1 / 0.97) = 2 becomes ceil(2 / 0.97) = 3. Under a fixed quota the
-        # full-attention group beside it gives one slot up, 3 -> 2.
-        #
-        # The ratio arithmetic this test is named for is unchanged; only which
-        # of the two terms wins has moved. Measured identically on upstream main
-        # and on rubin-advance, whose StorageManager has a different shape, and
-        # identically on the C++ and Python backends.
-        #
-        # NOTE: this is an existing upstream contract being re-baselined, not a
-        # test added with the fix. It wants owner review.
-        self.assertEqual(slots_by_size[(grain - 1,)], 3)
-        self.assertEqual(slots_by_size[(grain,)], 2)
+        self.assertEqual(slots_by_size[(grain - 1,)], 2)
+        self.assertEqual(slots_by_size[(grain,)], 3)
         manager.shutdown()
 
     @parameterized.expand([(0,), (64,), (50,), (256,)])
