@@ -85,6 +85,7 @@ import json
 import math
 import os
 import threading
+import weakref
 from contextlib import ExitStack
 from typing import (
     TYPE_CHECKING,
@@ -118,6 +119,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
+from ..modules.linear import TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
@@ -164,30 +166,14 @@ _KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
 _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
     ".self_attn.mixer.k_b_proj_trans",
     ".self_attn.mixer.v_b_proj",
+    ".self_attn.mixer.k_b_proj_trans_scale",
+    ".self_attn.mixer.v_b_proj_scale",
+    ".self_attn.mixer.k_b_proj_trans_dequant",
+    ".self_attn.mixer.v_b_proj_dequant",
 )
 
-# Online FP8 block-scale cast for the replicated MoE-layer MLPs — default ON,
-# set KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0 to keep them BF16.
-#
-# Targets the shared-expert MLP (gate/up/down) and the latent up/down
-# projection of every MoE layer. Under attention data-parallelism each rank
-# re-reads these dense replicated weights in full on every decode step, so
-# decode is bound by that HBM read and the FP8 (e4m3, 128x128 block-scale)
-# copy roughly halves those bytes. It is also a DEP8 *prerequisite*, not a
-# tuning knob: without it job 484926 died in forward with 15 MiB free.
-#
-# Unlike the attention projections, this one is genuinely a cast: these
-# tensors are BF16 in nvidia/Kimi-K3-NVFP4 (every FP8 tensor in that
-# checkpoint lives under ``self_attn``), so the FP8 copy is quantized online
-# here and is LOSSY relative to the checkpoint. The off-switch exists so that
-# loss can be attributed if a precision question ever points here; GSM8K
-# parity with it on is what licenses the default.
-#
-# Requires datacenter Blackwell. SM100/103 use DeepGEMM, while SM107 uses the
-# native CuTe DSL MXFP8 kernel when available. The routed experts and dense
-# layer-0 MLP are never converted. The fused shared-expert ``gate_up_proj`` is
-# included only under attention DP — under TP the BF16 GEMM overlaps on the aux
-# stream and FP8 quantize+GEMM would serialize onto the critical path.
+# BF16 shared/latent MLP weights are optionally quantized once after loading.
+# Checkpoint-native attention FP8 is independent of this lossy conversion.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 
 
@@ -915,13 +901,8 @@ def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# FP8 block-scale weight read for the replicated MoE-layer MLP projections.
+# FP8 block-scale weight read for attention and replicated MoE-layer MLP projections.
 # ---------------------------------------------------------------------------
-
-
-def _fp8_weight_read_is_available() -> bool:
-    """Whether this rank can keep K3's eligible weights resident in FP8."""
-    return is_sm_100f()
 
 
 def _rubin_mxfp8_is_available() -> bool:
@@ -937,15 +918,11 @@ def _rubin_mxfp8_is_available() -> bool:
 
 
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
-    """Bias-free linear replacement that reads its weight at FP8.
+    """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
-    The BF16 weight ``[out, in]`` is quantized once (at load) to
-    ``float8_e4m3fn`` with 128x128 block scales, then served through an FP8
-    block-scale GEMM. SM100/103 use DeepGEMM; on Rubin the CuTe DSL kernel uses
-    native 2xFP8 MMA and a K32 R128c4 UE8M0 scale layout. Halving the weight
-    bytes cuts the dominant HBM read that bounds K3's memory-bound decode step.
-    Both ``out`` and ``in`` are multiples of 128 for every projection this is
-    applied to, so the block scales cover the weight exactly.
+    Attention loads checkpoint E4M3 codes and 128x128 scales directly. The optional
+    MLP path quantizes BF16 weights once at load. Both prepare UE8M0 scales
+    for DeepGEMM and quantize BF16 activations inside the GEMM.
 
     On Rubin, the activation is quantized directly into the GEMM's scale layout
     by the specialized CuTe quantizer. SM100/103 use DeepGEMM's internal
@@ -962,6 +939,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         super().__init__()
         self.in_features = weight_fp8.shape[1]
         self.out_features = out_features
+        self._weights_transformed = True
+        self._fused_projection = None
         # Buffers (not parameters): these are the module's weights post-load;
         # there is nothing further to load into them and they must not be
         # touched by any later autocast/dtype move.
@@ -1051,137 +1030,31 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     @classmethod
     def from_linear(cls, linear: nn.Linear | TrtllmLinear) -> "_Fp8BlockScaleWeightReadLinear":
         assert linear.bias is None, "FP8 weight read expects a bias-free Linear"
-        # If the checkpoint stored this projection as FP8_PB_WO, the loader kept
-        # the original pair on the parameter. Use it: re-deriving the block
-        # scale from the dequantized BF16 does NOT reproduce the checkpoint's
-        # bytes (16-19% differ -- see _K3_CKPT_FP8_ATTR). Only the MoE-layer
-        # MLPs, which are BF16 on disk, legitimately fall through to
-        # quantize_weight.
-        ckpt_pair = getattr(linear.weight, _K3_CKPT_FP8_ATTR, None)
-        if ckpt_pair is not None:
-            return cls.from_checkpoint_fp8(ckpt_pair[0], ckpt_pair[1], linear.out_features)
+        if isinstance(linear, TrtllmLinear) and linear.has_fp8_block_scales:
+            result = cls(linear.weight.detach(), linear.weight_scale.detach(), linear.out_features)
+            result.quant_config = linear.quant_config
+            result.tp_size, result.tp_rank = linear.tp_size, linear.tp_rank
+            result._weights_transformed = False
+            return result
         weight_fp8, weight_scale = cls.quantize_weight(linear.weight.data)
         return cls(weight_fp8, weight_scale, linear.out_features)
 
-    @classmethod
-    def empty_placeholder(
-        cls, out_features: int, in_features: int
-    ) -> "_Fp8BlockScaleWeightReadLinear":
-        """A module that occupies (almost) nothing until the loader fills it.
-
-        This is the contract construction-time FP8 dispatch has to satisfy:
-        build one of these instead of an ``nn.Linear`` and the BF16 weight is
-        never allocated at all. That matters because the DEP8 failure was an
-        OOM during module CONSTRUCTION, before a single weight had been read,
-        so any scheme that allocates BF16 and converts afterwards cannot fix
-        it however cheap the steady state ends up.
-
-        Same shape of trick MegaMoE uses for its raw NVFP4 params -- and with
-        the same hazard, learned there: anything that indexes these before the
-        loader has filled them sees an empty tensor. ``load_checkpoint_pair``
-        is the only way to populate them, and ``forward`` refuses to run while
-        they are still empty rather than producing garbage.
-        """
-        # Shaped [0, in_features] rather than a flat empty: __init__ reads
-        # in_features off the weight, and numel() == 0 still marks it unfilled.
-        return cls(
-            torch.empty(0, in_features, dtype=torch.float8_e4m3fn),
-            torch.empty(0, dtype=torch.uint8),
-            out_features,
-        )
-
-    @property
-    def is_placeholder(self) -> bool:
-        return self.weight.numel() == 0
-
-    def load_checkpoint_pair(self, pairs) -> None:
-        """Fill a placeholder from one or more checkpoint FP8_PB_WO pairs.
-
-        Several pairs fuse along ``out`` (KDA's q/k/v/g); one is the plain
-        case. Rejects a second fill so a double-load is loud rather than
-        silently keeping whichever arrived last.
-        """
-        pairs = list(pairs)
-        filled = (
-            self.fuse_checkpoint_fp8(pairs)
-            if len(pairs) > 1
-            else self.from_checkpoint_fp8(pairs[0][0], pairs[0][1], self.out_features)
-        )
-        self.fill_prepared(filled.weight, filled.weight_scale)
-
-    def fill_prepared(
-        self,
-        weight_fp8: torch.Tensor,
-        weight_scale: torch.Tensor,
-    ) -> None:
-        """Fill a placeholder from an ALREADY-prepared FP8 weight + scale.
-
-        The single fill path, so the filled-twice guard cannot be bypassed.
-        ``load_checkpoint_pair`` delegates here after converting checkpoint
-        pairs; the KDA fused path uses it directly to install a *view* of the
-        fused weight (its own storage would defeat the point of fusing).
-
-        ``weight_scale`` must already be in the active GEMM's layout from
-        ``prepare_checkpoint_scale`` or ``quantize_weight``.
-        """
-        if not self.is_placeholder:
-            raise RuntimeError(
-                "Kimi K3 FP8 placeholder was filled twice; the second load would silently win."
+    def transform_weights(self) -> None:
+        if not self._weights_transformed:
+            self.weight, self.weight_scale = self.prepare_checkpoint_scale(
+                self.weight, self.weight_scale
             )
-        if weight_fp8.shape[0] != self.out_features:
-            raise ValueError(
-                f"Kimi K3 FP8 placeholder expects out_features="
-                f"{self.out_features}, checkpoint gives {weight_fp8.shape[0]}."
-            )
-        if weight_fp8.dtype is not torch.float8_e4m3fn:
-            raise ValueError(
-                f"Kimi K3 FP8 placeholder expects a float8_e4m3fn weight, got {weight_fp8.dtype}."
-            )
-        self.register_buffer("weight", weight_fp8, persistent=False)
-        self.register_buffer("weight_scale", weight_scale, persistent=False)
-        self.in_features = weight_fp8.shape[1]
+            if self._fused_projection is not None:
+                owner_ref, start = self._fused_projection
+                owner = owner_ref()
+                if owner is None:
+                    raise RuntimeError("KDA fused FP8 projection was released before its views")
+                owner.transform_weights()
+                self.weight = owner.weight[start : start + self.out_features]
+            self._weights_transformed = True
 
-    @classmethod
-    def fuse_checkpoint_fp8(cls, pairs) -> "_Fp8BlockScaleWeightReadLinear":
-        """Fuse per-projection checkpoint FP8_PB_WO pairs along ``out``.
-
-        ``pairs`` is an ordered sequence of ``(weight_fp8, fp32 block scale)``
-        sharing one input dim -- e.g. KDA's q/k/v/g.
-
-        This exists so a fused projection can be built WITHOUT ever
-        materializing the BF16 concatenation the current path goes through,
-        which is what makes constructing attention as FP8 possible at all.
-        It is sound for the reason ``quantize_weight`` documents: with every
-        ``out`` a multiple of 128 no 128x128 block crosses a boundary, so the
-        fused quantization is per-block identical to the individual ones --
-        hence the fused FP8 rows ARE the individual FP8 rows, and likewise
-        for the block-scale rows.
-
-        The layout transform is applied ONCE to the assembled scale rather
-        than per part: both backend layouts pack against the full ``mn``, so
-        transforming the pieces and stacking afterwards would not produce the
-        same bytes.
-        """
-        weights = [w for w, _ in pairs]
-        scales = [s for _, s in pairs]
-        if any(w.shape[0] % _FP8_BLOCK for w in weights):
-            raise ValueError(
-                "Kimi K3 fused FP8 read requires every out dim to be a "
-                f"multiple of {_FP8_BLOCK}; got "
-                f"{[tuple(w.shape) for w in weights]}."
-            )
-        fused_weight = torch.cat(weights, dim=0)
-        fused_scale = torch.cat(scales, dim=0)
-        prepared, scale = cls.prepare_checkpoint_scale(fused_weight, fused_scale)
-        return cls(prepared, scale, fused_weight.shape[0])
-
-    @classmethod
-    def from_checkpoint_fp8(
-        cls, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, out_features: int
-    ) -> "_Fp8BlockScaleWeightReadLinear":
-        """Build directly from a checkpoint's FP8_PB_WO pair, no BF16 detour."""
-        prepared, scale = cls.prepare_checkpoint_scale(weight_fp8, weight_scale)
-        return cls(prepared, scale, out_features)
+    def post_load_weights(self) -> None:
+        self.transform_weights()
 
     def forward(
         self,
@@ -1193,14 +1066,6 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     ) -> torch.Tensor:
         if lora_params:
             raise NotImplementedError("Kimi K3 FP8 weight read does not support LoRA.")
-        if self.is_placeholder:
-            # Fail before the empty operands reach the GEMM: this whole path
-            # has a habit of turning wrong weights into plausible-looking
-            # numbers rather than errors.
-            raise RuntimeError(
-                "Kimi K3 FP8 placeholder was never filled by the loader; "
-                "load_checkpoint_pair must run before forward."
-            )
         out_shape = x.shape[:-1] + (self.out_features,)
         x_flat = x.reshape(-1, x.shape[-1])
 
@@ -1230,11 +1095,6 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         activation_scale: torch.Tensor,
     ) -> torch.Tensor:
         """Project an activation that the fused KDA producer already quantized."""
-        if self.is_placeholder:
-            raise RuntimeError(
-                "Kimi K3 FP8 placeholder was never filled by the loader; "
-                "load_checkpoint_pair must run before forward."
-            )
         if activation.dtype is not torch.float8_e4m3fn:
             raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
         if not self.supports_prequantized_input:
@@ -1261,10 +1121,9 @@ def _swap_linear_to_fp8_weight_read(
     plain linear of one of ``linear_types``; return the number of modules
     converted (0 or 1), so callers can accumulate a conversion count.
 
-    Frees the original BF16 weight storage immediately: the loader holds a
-    transient name->Parameter map that keeps it alive until load returns, so
-    without this the FP8 copy is purely additive and fragments the pool the
-    FP8 GEMM autotuner and KV-cache init need.
+    Transfer checkpoint FP8 storage or release the original BF16 storage
+    after conversion. The loader's transient parameter map must not retain
+    an unused BF16 copy until loading completes.
     """
     child = getattr(parent, attr, None)
     if not isinstance(child, linear_types):
@@ -1281,11 +1140,9 @@ def _convert_moe_mlps_to_fp8_weight_read(
 
     Targets the shared-expert MLP (gate/up/down) and the latent up/down
     projection on every MoE layer — the bias-free BF16 projections that
-    attention data-parallelism re-reads in full each decode step. The routed
-    experts and the dense layer-0 MLP are left in BF16. Attention is handled
-    elsewhere: KDA is built FP8-resident at construction time, and MLA goes
-    through ``_convert_mla_projections_to_fp8_weight_read``.
-    Returns the number of projections converted.
+    attention data-parallelism re-reads in full each decode step. Attention
+    follows checkpoint quantization separately. Routed experts and the dense
+    layer-0 MLP are not converted. Returns the number of projections converted.
     """
     count = 0
 
@@ -1324,140 +1181,6 @@ def _convert_moe_mlps_to_fp8_weight_read(
     return count
 
 
-def _k3_kda_fp8_resident_jobs(model: nn.Module, prefix: str):
-    """Yield ``(layer_idx, mixer, attr, ckpt_key)`` per FP8-resident projection.
-
-    🔴 Single source of truth, and that is the point. These projections hold
-    BUFFERS, not Parameters, so they never appear in ``named_parameters()`` and
-    are therefore absent from ``name_map`` and ``expected_keys``. Worse, the
-    unexpected-key check cannot catch the omission either: ``surprising``
-    already filters out everything under ``{prefix}model.layers.``. A projection
-    that was never loaded would be **silent** in both directions.
-
-    So ``checkpoint_name_plan`` extends ``expected_keys`` from this generator
-    and ``load_weights`` drives the fills from it. One walk, both uses: a
-    projection cannot be validated-but-unloaded or loaded-but-unvalidated.
-    """
-    for layer_idx, layer in enumerate(model.layers):
-        if not getattr(layer, "is_kda", False):
-            continue
-        mixer = getattr(layer, "linear_attn", None)
-        if mixer is None or not getattr(mixer, "_fp8_resident_projections", False):
-            continue
-        for attr in _K3_KDA_FP8_RESIDENT_PROJECTIONS:
-            mod = getattr(mixer, attr, None)
-            # g_proj is absent in the low-rank-gate config.
-            if isinstance(mod, _Fp8BlockScaleWeightReadLinear):
-                key = f"{prefix}model.layers.{layer_idx}.self_attn.{attr}.weight"
-                yield layer_idx, mixer, attr, key
-
-
-def _fill_kda_fp8_resident_projections(jobs, weights) -> int:
-    """Fill construction-time FP8 placeholders from the checkpoint's FP8 pairs.
-
-    Under KDA TP, q/k/v/g weights are row-sharded and o is column-sharded.
-    Their 128x128 block scales follow the same split in scale coordinates,
-    matching MLA's ``Linear.load_shard(..., scale_span=128)`` policy.
-
-    Produces one fused ``qkvg_proj`` that is the sole storage, with q/k/v/g
-    rebuilt as views of their slice, **without ever materializing BF16**:
-    ``fuse_checkpoint_fp8`` concatenates the checkpoint FP8 directly and
-    transforms the assembled scale once.
-
-    Returns the number of projections filled.
-    """
-    by_layer = {}
-    for layer_idx, mixer, attr, key in jobs:
-        by_layer.setdefault(layer_idx, (mixer, {}))[1][attr] = key
-
-    filled = 0
-    for layer_idx, (mixer, attrs) in sorted(by_layer.items()):
-        # The projections that read the same normed hidden, in the fused
-        # order. o_proj reads the decode-kernel output instead and is filled
-        # on its own.
-        group = [a for a in ("q_proj", "k_proj", "v_proj", "g_proj") if a in attrs]
-        if group:
-            pairs = [_k3_kda_checkpoint_fp8_pair(mixer, a, attrs[a], weights) for a in group]
-            fused = _Fp8BlockScaleWeightReadLinear.fuse_checkpoint_fp8(pairs)
-            mixer.qkvg_proj = fused
-            mixer.qkvg_split_sizes = [getattr(mixer, a).out_features for a in group]
-
-            offset = 0
-            for a, (w_fp8, w_scale) in zip(group, pairs):
-                mod = getattr(mixer, a)
-                n = mod.out_features
-                # Own block scale, but a VIEW of the fused weight: the fused
-                # tensor stays the only storage. Scale must be prepared, not
-                # raw -- see fill_prepared.
-                _, own_scale = _Fp8BlockScaleWeightReadLinear.prepare_checkpoint_scale(
-                    w_fp8, w_scale
-                )
-                mod.fill_prepared(fused.weight[offset : offset + n], own_scale)
-                offset += n
-                filled += 1
-
-        if "o_proj" in attrs:
-            w_fp8, w_scale = _k3_kda_checkpoint_fp8_pair(mixer, "o_proj", attrs["o_proj"], weights)
-            getattr(mixer, "o_proj").load_checkpoint_pair([(w_fp8, w_scale)])
-            filled += 1
-
-    return filled
-
-
-def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
-    """Swap the MLA q_a/q_b/o and output-gate projections to an FP8 weight read.
-
-    Targets the large bias-free BF16 projections of every MLA (full-attention)
-    layer that are read only through their ``forward`` — ``q_a_proj``,
-    ``q_b_proj``, ``o_proj`` and, when the output gate is enabled, ``g_proj``,
-    each ``[out, in]`` with both dims a multiple of 128 — replicated attention
-    weights re-read in full by every rank each decode step under attention
-    data-parallelism. Two MLA projections are left in BF16 on purpose:
-    ``kv_a_proj_with_mqa`` outputs ``kv_lora_rank + qk_rope_head_dim`` (576, not
-    a multiple of 128), and ``kv_b_proj`` supplies ``k_b_proj_trans`` and
-    ``v_b_proj`` directly (the absorbed generation path never calls its
-    ``forward``), with no FP8 dequant path. Returns the number of projections
-    converted.
-
-    Kept when the rest of the load-time FP8 weight read was retired, because
-    the reason that retirement rested on does not apply here. KDA went away
-    because the FP8-resident path *replaces* it -- q/k/v/g/o are built FP8 at
-    construction time and never allocate BF16 at all. MLA has no such
-    replacement: ``_k3_attn_stored_fp8_block_scaled`` only ever makes KDA
-    resident, so deleting this would simply leave these 96 projections in BF16
-    and cost ~2.4 GiB/rank of KV cache at DEP8 (measured: 7.57 -> 5.16 GiB).
-
-    Nor is the BF16 round trip here lossy, which is the other thing that made
-    the KDA path worth removing. ``from_linear`` re-derives the block scale
-    from the dequantized weight, and
-    ``test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree`` asserts
-    BITWISE that this lands on the checkpoint's own FP8 bytes:
-    ``per_block_cast_to_fp8`` recovers the same block maximum and therefore the
-    same codes. That test exists because the opposite was once assumed.
-    """
-    count = 0
-
-    for layer in model.layers:
-        # MLA layers are the non-KDA layers (each layer is exactly one of the
-        # two); their projections live on the KimiK3MLAAttention mixer.
-        if getattr(layer, "is_kda", False):
-            continue
-        mixer = getattr(getattr(layer, "self_attn", None), "mixer", None)
-        if mixer is None:
-            continue
-        # g_proj exists only when the MLA output gate is enabled; a missing
-        # attr is a safe no-op.
-        for attr in ("q_a_proj", "q_b_proj", "o_proj", "g_proj"):
-            count += _swap_linear_to_fp8_weight_read(
-                mixer, attr, linear_types=(nn.Linear, TrtllmLinear)
-            )
-
-    if count:
-        gc.collect()
-        torch.cuda.empty_cache()
-    return count
-
-
 # ---------------------------------------------------------------------------
 # Latent MoE block using the unified ConfigurableMoE stack.
 # ---------------------------------------------------------------------------
@@ -1468,54 +1191,6 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
 # without needing the MiniMax-M3-style prefix normalization in ``ModelConfig``.
 _K3_ROUTED_EXPERT_KEY_PREFIXES = ("language_model.model.", "model.", "")
 _K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
-
-# The KDA projections eligible to stay FP8 on device. Deliberately only the
-# five whose ``out`` and ``in`` are both multiples of 128, so every 128x128
-# block scale is whole: b_proj outputs num_heads, and f_a/f_b, g_a/g_b, the
-# short convolutions and dt are small and feed the accuracy-sensitive
-# recurrent decay. Verified against nvidia/Kimi-K3-NVFP4, which declares
-# exactly these (plus b_proj/f_a_proj/f_b_proj, which we leave BF16) as
-# FP8_PB_WO under all three key spellings.
-_K3_KDA_FP8_RESIDENT_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
-
-
-def _k3_attn_stored_fp8_block_scaled(model_config: "ModelConfig", layer_idx: int) -> bool:
-    """Does the checkpoint store this layer's KDA projections as FP8_PB_WO?
-
-    FP8 residency follows the checkpoint's stored format. ``moonshotai/Kimi-K3``
-    stores attention as plain BF16 and declares no per-layer attention entry,
-    so it answers False and keeps the BF16 path.
-
-    Requires ALL five projections to be declared. A partial declaration is
-    rejected rather than silently dequantized: the runtime cannot preserve a
-    partially FP8 layer without allocating BF16 for the undeclared projections.
-
-    ⚠️ Matches ``FP8_BLOCK_SCALES``, **not** the ``FP8_PB_WO`` spelling the
-    checkpoint uses. ``canonicalize_quant_algo`` (Blocker #0) rewrites the
-    alias on the way in -- same on-disk layout as the DeepSeek block recipe --
-    so ``quant_config_dict`` only ever holds the canonical name. There is no
-    ``QuantAlgo.FP8_PB_WO`` to compare against.
-    """
-    per_layer = getattr(model_config, "quant_config_dict", None)
-    if not per_layer:
-        return False
-    for prefix in _K3_ROUTED_EXPERT_KEY_PREFIXES:
-        base = f"{prefix}layers.{layer_idx}.self_attn."
-        algos = [
-            getattr(per_layer.get(base + p), "quant_algo", None)
-            for p in _K3_KDA_FP8_RESIDENT_PROJECTIONS
-        ]
-        n_declared = sum(a == QuantAlgo.FP8_BLOCK_SCALES for a in algos)
-        if n_declared == len(algos):
-            return True
-        if n_declared:
-            raise ValueError(
-                f"Kimi K3 layer {layer_idx}: only {n_declared} of {len(algos)} "
-                f"KDA projections are declared FP8 block-scaled under prefix "
-                f"{prefix!r}; partial FP8 residency is unsupported."
-            )
-    return False
-
 
 # Routed-expert quantization used when the checkpoint declares nothing per
 # layer. The original ``moonshotai/Kimi-K3`` ships a compressed-tensors
@@ -2092,6 +1767,49 @@ class KimiK3MoERuntime(nn.Module):
         return routed_out + shared_out
 
 
+def _helix_cp_v_b_shard(
+    v_weight: torch.Tensor, *, num_heads_tp_cp: int, cp_rank: int
+) -> torch.Tensor:
+    """Select the CP rank's head chunk from a TP-local KV-B tensor."""
+    start = cp_rank * num_heads_tp_cp
+    return v_weight[start : start + num_heads_tp_cp]
+
+
+def resolve_attention_quant_config(
+    config: ModelConfig | None, layer_idx: int, projection: str
+) -> QuantConfig:
+    """Resolve a checkpoint projection, including mixed-precision exclusions."""
+    if config is None:
+        return QuantConfig()
+    global_config = config.quant_config or QuantConfig()
+    names = [
+        f"{prefix}layers.{layer_idx}.self_attn.{projection}"
+        for prefix in ("language_model.model.", "model.", "")
+    ]
+    if any(global_config.is_module_excluded_from_quantization(name) for name in names):
+        return QuantConfig(kv_cache_quant_algo=global_config.kv_cache_quant_algo)
+    declarations = config.quant_config_dict or {}
+    matches = [declarations[name] for name in names if name in declarations]
+    if matches:
+        selected = matches[0]
+        if any(match.quant_algo != selected.quant_algo for match in matches[1:]):
+            raise ValueError(f"Conflicting Kimi K3 quantization aliases for {names[0]}")
+    elif global_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+        selected = QuantConfig()
+    else:
+        selected = global_config
+    if selected.quant_algo not in (None, QuantAlgo.FP8_BLOCK_SCALES):
+        raise ValueError(
+            f"Kimi K3 attention projection {names[0]} has unsupported checkpoint "
+            f"quantization {selected.quant_algo}"
+        )
+    if selected.quant_algo == QuantAlgo.FP8_BLOCK_SCALES and selected.group_size not in (None, 128):
+        raise ValueError(f"Kimi K3 attention requires 128x128 FP8 blocks for {names[0]}")
+    result = copy.copy(selected)
+    result.kv_cache_quant_algo = global_config.kv_cache_quant_algo
+    return result
+
+
 # ---------------------------------------------------------------------------
 # KDA runtime (pool-backed prefill / decode via the FLA kernels).
 # ---------------------------------------------------------------------------
@@ -2136,6 +1854,42 @@ class KimiMLARuntime(nn.Module):
             if reduce_output
             else None
         )
+        attention_config = copy.copy(model_config)
+        attention_config._frozen = False
+        attention_config.quant_config_dict = {
+            name: resolve_attention_quant_config(model_config, layer_idx, name)
+            for name in (
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+                "q_b_proj",
+                "kv_b_proj",
+                "g_proj",
+                "o_proj",
+            )
+        }
+        kv_quant_algo = (
+            model_config.quant_config.kv_cache_quant_algo
+            if model_config.quant_config is not None
+            else None
+        )
+        bf16_kv_layer_ids = get_kimi_k3_bf16_kv_layer_ids(
+            cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4
+        )
+        if layer_idx in bf16_kv_layer_ids:
+            if kv_quant_algo != QuantAlgo.NVFP4:
+                raise ValueError(
+                    f"{KIMI_K3_BF16_KV_LAYERS_ENV} requires the model-wide "
+                    "KV cache dtype to be NVFP4."
+                )
+            kv_quant_algo = None
+            logger.info_once(
+                f"Kimi K3 MLA layers using BF16 KV-cache fallback: {sorted(bf16_kv_layer_ids)}.",
+                key="kimi_k3_bf16_kv_fallback_layers",
+            )
+        attention_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_quant_algo)
+        for projection_config in attention_config.quant_config_dict.values():
+            projection_config.kv_cache_quant_algo = kv_quant_algo
+        attention_config._frozen = model_config._frozen
         self.mixer = KimiK3MLAAttention(
             hidden_size=cfg.hidden_size,
             num_heads=cfg.num_attention_heads,
@@ -2149,7 +1903,7 @@ class KimiMLARuntime(nn.Module):
             layer_idx=layer_idx,
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
-            model_config=model_config,
+            model_config=attention_config,
             aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
         )
@@ -2189,67 +1943,27 @@ class KimiLinearDecoderLayer(nn.Module):
             raise ValueError(f"Kimi K3 layer {layer_idx} must be exactly one of KDA/MLA")
 
         if self.is_kda:
-            # Preserve the checkpoint's KDA projection datatype. FP8_PB_WO
-            # weights use FP8 placeholders so no BF16 storage or
-            # dequantize/re-quantize round trip exists.
-            fp8_resident = _k3_attn_stored_fp8_block_scaled(model_config, layer_idx)
-            if fp8_resident and not _fp8_weight_read_is_available():
-                raise NotImplementedError(
-                    "Kimi K3 FP8-resident KDA projections require datacenter "
-                    "Blackwell; refusing to dequantize checkpoint FP8 weights "
-                    "to BF16."
-                )
-            proj_factory = None
-            if fp8_resident:
-
-                def proj_factory(in_features: int, out_features: int) -> nn.Module:
-                    return _Fp8BlockScaleWeightReadLinear.empty_placeholder(
-                        out_features, in_features
-                    )
-
+            projection_names = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
+            attention_config = copy.copy(model_config)
+            attention_config._frozen = False
+            attention_config.quant_config_dict = {
+                name: resolve_attention_quant_config(model_config, layer_idx, name)
+                for name in projection_names
+            }
+            attention_config._frozen = model_config._frozen
             self.linear_attn = KimiKDALinearAttention(
                 cfg,
                 layer_idx,
                 mapping=model_config.mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                fp8_resident_projections=fp8_resident,
-                proj_factory=proj_factory,
+                model_config=attention_config,
             )
         else:
-            # Forward only the KV-cache quantization to the MLA attention
-            # backends. The attention projection
-            # weights themselves stay BF16 — the model-level weight-quant
-            # algo must not leak into the attention backend's weight paths.
-            kv_quant_algo = (
-                model_config.quant_config.kv_cache_quant_algo
-                if model_config.quant_config is not None
-                else None
-            )
-            bf16_kv_layer_ids = get_kimi_k3_bf16_kv_layer_ids(
-                cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4
-            )
-            if layer_idx in bf16_kv_layer_ids:
-                if kv_quant_algo != QuantAlgo.NVFP4:
-                    raise ValueError(
-                        f"{KIMI_K3_BF16_KV_LAYERS_ENV} requires the model-wide "
-                        "KV cache dtype to be NVFP4."
-                    )
-                kv_quant_algo = None
-                logger.info_once(
-                    f"Kimi K3 MLA layers using BF16 KV-cache fallback: {sorted(bf16_kv_layer_ids)}.",
-                    key="kimi_k3_bf16_kv_fallback_layers",
-                )
-            mla_model_config = copy.copy(model_config)
-            mla_model_config.quant_config = (
-                QuantConfig(kv_cache_quant_algo=kv_quant_algo)
-                if kv_quant_algo is not None
-                else QuantConfig()
-            )
             self.self_attn = KimiMLARuntime(
                 cfg,
                 layer_idx,
-                model_config=mla_model_config,
+                model_config=model_config,
                 aux_stream_dict=aux_stream_dict,
                 # CP original stashed by _setup_helix_mappings; None outside helix.
                 mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
@@ -2566,22 +2280,6 @@ class KimiLinearModel(DecoderModel):
 
 _FP8_BLOCK_SCALE_SUFFIX = "_scale"
 _FP8_BLOCK = 128
-# Set on a Parameter by the loader when the checkpoint stored that projection as
-# FP8_PB_WO, so the MLA conversion can reuse the checkpoint's own bytes instead
-# of re-deriving them from the dequantized BF16.
-#
-# 🔴 This is NOT an optimization, it is a correctness requirement. Measured on
-# nvidia/Kimi-K3-NVFP4 (examples/kimi_k3/check_fp8_roundtrip_identity.py, job 514653): for
-# all 10 MLA projections sampled, dequantize->requantize differs from the
-# checkpoint's stored FP8 in 16-19% of bytes. The checkpoint was quantized by
-# ModelOpt, which does not agree bit-for-bit with `per_block_cast_to_fp8`.
-#
-# ⚠️ test_bf16_roundtrip_is_identity_so_both_fp8_routes_agree does NOT license
-# dropping this. It builds its "checkpoint" pair *with* per_block_cast_to_fp8,
-# so it only proves that function is idempotent -- not that the checkpoint
-# agrees with it. Deleting this stash on the strength of that test silently
-# changed the MLA weights once already.
-_K3_CKPT_FP8_ATTR = "_k3_ckpt_fp8_pair"
 
 
 def _fp8_block_scale_key(weight_key: str) -> str:
@@ -2629,9 +2327,11 @@ def _checkpoint_fp8_pair(
     if src.dtype != torch.float8_e4m3fn:
         return None
     scale_key = _fp8_block_scale_key(ckpt_key)
+    if scale_key not in weights and scale_key + "_inv" in weights:
+        scale_key += "_inv"
     if scale_key not in weights:
         raise KeyError(
-            f"Kimi K3: {ckpt_key} is FP8 E4M3 but has no {scale_key}; refusing "
+            f"Kimi K3: {ckpt_key} is FP8 E4M3 but has no {scale_key} or {scale_key}_inv; refusing "
             "to load it as if it were unquantized."
         )
     scale = _materialize(weights[scale_key]).float()
@@ -2646,94 +2346,12 @@ def _checkpoint_fp8_pair(
     return src, scale
 
 
-def _k3_kda_checkpoint_fp8_pair(mixer, attr: str, ckpt_key: str, weights):
-    """Load this rank's KDA FP8 weight and matching block-scale shard."""
-    module = getattr(mixer, attr)
-    tp_size = mixer._kda_tp_size
-    tp_rank = mixer._kda_tp_rank
-    if not 0 <= tp_rank < tp_size:
-        raise ValueError(f"Kimi K3 KDA TP rank {tp_rank} is invalid for TP size {tp_size}.")
-
-    # Q/K/V/G produce head shards (column parallel); O consumes them (row
-    # parallel). Its block-scale grid uses the same split axis divided by 128.
-    split_dim = 1 if attr == "o_proj" else 0
-    local_shape = (module.out_features, module.in_features)
-    if any(dim % _FP8_BLOCK for dim in local_shape):
-        raise ValueError(
-            f"Kimi K3 {attr} rank-local FP8 shape {local_shape} is not "
-            f"{_FP8_BLOCK}x{_FP8_BLOCK} block-aligned."
-        )
-
-    full_shape = list(local_shape)
-    full_shape[split_dim] *= tp_size
-    stored_shape = _value_shape(weights[ckpt_key])
-    if stored_shape != tuple(full_shape):
-        raise ValueError(
-            f"Kimi K3 {ckpt_key} shape {stored_shape} does not match the "
-            f"expected TP{tp_size} shape {tuple(full_shape)} for local "
-            f"{attr} shape {local_shape}."
-        )
-
-    weight_slice = scale_slice = None
-    if tp_size > 1:
-        shard_width = local_shape[split_dim]
-        start = tp_rank * shard_width
-        end = start + shard_width
-        if start % _FP8_BLOCK or end % _FP8_BLOCK:
-            raise ValueError(
-                f"Kimi K3 {attr} TP shard [{start}:{end}] is not aligned to "
-                f"the FP8 block size {_FP8_BLOCK}."
-            )
-        weight_indices = [slice(dim) for dim in stored_shape]
-        weight_indices[split_dim] = slice(start, end)
-        weight_slice = tuple(weight_indices)
-        scale_indices = [slice(None), slice(None)]
-        scale_indices[split_dim] = slice(start // _FP8_BLOCK, end // _FP8_BLOCK)
-        scale_slice = tuple(scale_indices)
-
-    pair = _checkpoint_fp8_pair(
-        ckpt_key,
-        weights[ckpt_key],
-        weights,
-        weight_slice=weight_slice,
-        scale_slice=scale_slice,
-    )
-    if pair is None:
-        raise ValueError(
-            f"Kimi K3: {ckpt_key} was built FP8-resident but the checkpoint "
-            f"does not store it as FP8_PB_WO."
-        )
-    weight, scale = pair
-    expected_scale_shape = tuple(dim // _FP8_BLOCK for dim in local_shape)
-    if tuple(scale.shape) != expected_scale_shape:
-        raise ValueError(
-            f"Kimi K3 {_fp8_block_scale_key(ckpt_key)} shard shape "
-            f"{tuple(scale.shape)} does not match {attr} FP8 block grid "
-            f"{expected_scale_shape}."
-        )
-    return weight, scale
-
-
 def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> torch.Tensor:
-    """Undo FP8_PB_WO block quantization, returning a BF16-compatible tensor.
+    """Apply checkpoint scales for projections explicitly configured as BF16.
 
-    ``nvidia/Kimi-K3-NVFP4`` stores the attention projections as FP8 E4M3
-    weights plus a per-128x128-block FP32 scale, where ``moonshotai/Kimi-K3``
-    stores plain BF16. **The two are the same shape**, so nothing downstream
-    can tell them apart: the shape check passes and ``src.to(param.dtype)``
-    happily reinterprets quantized values as if they were the real ones, with
-    the scale left behind as an unreferenced checkpoint key. The model then
-    loads clean and generates nonsense.
-
-    Still needed when checkpoint metadata selects FP8-resident KDA, because
-    that path only takes over the KDA projections. MLA's
-    ``q_a``/``q_b``/``o`` load as BF16 parameters through this function -- the
-    load-time conversion that re-quantizes them runs afterwards and consumes
-    ``linear.weight``, so they have to be materialized first -- and
-    ``kv_b_proj`` is consumed directly by ``_kv_b_absorb_split`` (never through
-    its ``forward``), so it has no FP8 path at all and stays BF16 for good.
-    Dequantizing here keeps both on the same BF16 tensors the MXFP4 checkpoint
-    would have supplied.
+    Checkpoint-native FP8 attention bypasses this loader. This handles an
+    excluded projection or another unquantized trunk parameter whose source
+    tensor is quantized; casting the codes alone would discard its scales.
     """
     pair = _checkpoint_fp8_pair(ckpt_key, src, weights)
     if pair is None:
@@ -2763,6 +2381,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     mamba_metadata_cls = KimiK3MambaMetadata
 
     def __init__(self, model_config: ModelConfig):
+        mlp_fp8 = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "0")
+        if mlp_fp8 not in ("0", "1"):
+            raise ValueError(
+                f"{_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV} must be 0 or 1; got {mlp_fp8!r}"
+            )
+        self._fp8_weight_read_moe_mlp = mlp_fp8 == "1"
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
         spec_config = getattr(model_config, "spec_config", None)
@@ -2956,6 +2580,200 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     # correspondingly longer load).
     # ------------------------------------------------------------------
 
+    def _attention_fp8_linears(self) -> list[tuple[str, TrtllmLinear, nn.Module]]:
+        """Collect checkpoint-backed FP8 attention projections for weight loading.
+
+        The loader uses this list to enumerate required weight/scale keys, exclude
+        these parameters from ordinary trunk loading, and load FP8 codes and scales
+        together. Derived QKVG fusion is excluded because it is built after loading.
+
+        Returns:
+            Tuples of runtime module path, linear, and owning attention module.
+        """
+        projections = []
+        for index, layer in enumerate(self.model.layers):
+            if layer.is_kda:
+                attention = layer.linear_attn
+                scope = f"model.layers.{index}.linear_attn"
+            else:
+                attention = layer.self_attn.mixer
+                scope = f"model.layers.{index}.self_attn.mixer"
+            for attr, module in attention.named_children():
+                if attr == "qkvg_proj":
+                    # Decode fusion is derived from separately loaded checkpoint projections.
+                    continue
+                if isinstance(module, TrtllmLinear) and module.has_fp8_block_scales:
+                    projections.append((f"{scope}.{attr}", module, attention))
+        return projections
+
+    def _load_attention_fp8(self, weights: Dict[str, torch.Tensor], prefix: str) -> int:
+        """Load checkpoint FP8 codes/scales without a BF16 projection intermediate."""
+        projections = self._attention_fp8_linears()
+        for name, linear, attention in projections:
+            # Both attention implementations use self_attn keys in the checkpoint.
+            key = (
+                prefix
+                + name.replace(".linear_attn.", ".self_attn.").replace(
+                    ".self_attn.mixer.", ".self_attn."
+                )
+                + ".weight"
+            )
+            attr = name.rsplit(".", 1)[1]
+            if attr == "kv_a_proj_with_mqa" and attention.fuse_qkv_a_proj:
+                # The runtime fuses Q-A/KV-A, but the checkpoint stores them separately.
+                # Construction checks that the fusion boundary aligns with FP8 blocks.
+                q_key = key.replace("kv_a_proj_with_mqa.weight", "q_a_proj.weight")
+                pairs = []
+                for part_key, rows in (
+                    (q_key, attention.q_lora_rank),
+                    (key, attention.kv_lora_rank + attention.qk_rope_head_dim),
+                ):
+                    part = _materialize(weights[part_key])
+                    pair = _checkpoint_fp8_pair(part_key, part, weights)
+                    if pair is None:
+                        raise ValueError(
+                            f"{part_key}: quant config declares FP8 but tensor is not E4M3"
+                        )
+                    codes, scales = pair
+                    expected = (rows, attention.hidden_size)
+                    if tuple(codes.shape) != expected:
+                        raise ValueError(
+                            f"{part_key}: checkpoint shape {tuple(codes.shape)} != {expected}"
+                        )
+                    if tuple(scales.shape) != tuple(math.ceil(d / _FP8_BLOCK) for d in expected):
+                        raise ValueError(f"{part_key}: scale shape does not cover {expected}")
+                    pairs.append(pair)
+                linear.load_weights(
+                    [
+                        {
+                            "weight": torch.cat([pair[0] for pair in pairs], dim=0),
+                            "weight_scale": torch.cat([pair[1] for pair in pairs], dim=0),
+                        }
+                    ]
+                )
+                continue
+            source = weights[key]
+            shape = (
+                tuple(source.shape)
+                if isinstance(source, torch.Tensor)
+                else tuple(source.get_shape())
+            )
+            local_shape = (linear.out_features, linear.in_features)
+            scale_slice = None
+            if isinstance(attention, KimiKDALinearAttention):
+                # KDA linears already have rank-local dimensions. Slice the lazy source
+                # before materializing it, and apply the same shard to its block scales.
+                split_dim = 1 if attr == "o_proj" else 0
+                tp_size = attention._kda_tp_size
+                tp_rank = attention._kda_tp_rank
+                expected_shape = list(local_shape)
+                expected_shape[split_dim] *= tp_size
+                if shape != tuple(expected_shape):
+                    raise ValueError(f"{key}: checkpoint shape {shape} != {tuple(expected_shape)}")
+                if tp_size > 1:
+                    width = local_shape[split_dim]
+                    start, end = tp_rank * width, (tp_rank + 1) * width
+                    if start % _FP8_BLOCK or end % _FP8_BLOCK:
+                        raise ValueError(f"{key}: TP slice [{start}:{end}] is not block-aligned")
+                    indices = [slice(None), slice(None)]
+                    indices[split_dim] = slice(start, end)
+                    source = source[tuple(indices)]
+                    scale_indices = [slice(None), slice(None)]
+                    scale_indices[split_dim] = slice(
+                        start // _FP8_BLOCK, math.ceil(end / _FP8_BLOCK)
+                    )
+                    scale_slice = tuple(scale_indices)
+            pair = _checkpoint_fp8_pair(key, _materialize(source), weights)
+            if pair is None:
+                raise ValueError(
+                    f"{key}: quant config declares FP8 but checkpoint tensor is not E4M3"
+                )
+            weight, scale = pair
+            full_scale_shape = tuple(math.ceil(dim / _FP8_BLOCK) for dim in shape)
+            if tuple(scale.shape) != full_scale_shape:
+                raise ValueError(f"{key}: scale shape {tuple(scale.shape)} != {full_scale_shape}")
+            if scale_slice is not None:
+                scale = scale[scale_slice]
+            if isinstance(attention, KimiKDALinearAttention):
+                if tuple(scale.shape) != tuple(math.ceil(dim / _FP8_BLOCK) for dim in local_shape):
+                    raise ValueError(f"{key}: scale shard does not cover local shape {local_shape}")
+                linear.load_weights([{"weight": weight, "weight_scale": scale}])
+            elif attr == "kv_b_proj":
+                # KV-B also supplies decode absorption weights; reorder codes and scales
+                # together and retain raw FP8 copies for the absorption kernels.
+                self._load_mla_fp8_kv_b(attention, weight, scale)
+            else:
+                # Other MLA projections delegate TP sharding to the common Linear loader.
+                expected_shape = list(local_shape)
+                if linear.tp_mode is not None:
+                    split_dim = 0 if linear.tp_mode == TensorParallelMode.COLUMN else 1
+                    expected_shape[split_dim] *= linear.tp_size
+                if shape != tuple(expected_shape):
+                    raise ValueError(f"{key}: checkpoint shape {shape} != {tuple(expected_shape)}")
+                linear.load_weights([{"weight": weight, "weight_scale": scale}])
+        return len(projections)
+
+    @staticmethod
+    def _load_mla_fp8_kv_b(attention: nn.Module, weight: torch.Tensor, scale: torch.Tensor) -> None:
+        """Reorder checkpoint KV-B heads and their scale grid together."""
+        linear = attention.kv_b_proj
+        h, n, v, k = (
+            attention.num_heads_tp,
+            attention.qk_nope_head_dim,
+            attention.v_head_dim,
+            attention.kv_lora_rank,
+        )
+        if any(dim % _FP8_BLOCK for dim in (n, v, k)):
+            raise ValueError(
+                "Kimi MLA FP8 absorption requires block-aligned head and latent dimensions"
+            )
+        expected_shape = (h * linear.tp_size * (n + v), k)
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(f"Kimi MLA KV-B shape {tuple(weight.shape)} != {expected_shape}")
+        device = linear.weight.device
+        local = linear.load_shard(weight, device=device).reshape(h, n + v, k)
+        local_scale = linear.load_shard(scale, scale_span=_FP8_BLOCK, device=device).reshape(
+            h, (n + v) // _FP8_BLOCK, k // _FP8_BLOCK
+        )
+        key_weight, value_weight = local.split((n, v), dim=1)
+        key_scale, value_scale = local_scale.split((n // _FP8_BLOCK, v // _FP8_BLOCK), dim=1)
+        linear.weight.data.copy_(
+            torch.cat((key_weight.reshape(h * n, k), value_weight.reshape(h * v, k)))
+        )
+        linear.weight_scale.data.copy_(
+            torch.cat((key_scale.flatten(0, 1), value_scale.flatten(0, 1)))
+        )
+        attention.k_b_proj_trans.data.copy_(key_weight.transpose(1, 2))
+        attention.k_b_proj_trans_scale.data.copy_(key_scale.transpose(1, 2))
+        value_weight = _helix_cp_v_b_shard(
+            value_weight,
+            num_heads_tp_cp=attention.num_heads_tp_cp,
+            cp_rank=attention.mapping.cp_rank,
+        )
+        value_scale = _helix_cp_v_b_shard(
+            value_scale,
+            num_heads_tp_cp=attention.num_heads_tp_cp,
+            cp_rank=attention.mapping.cp_rank,
+        )
+        # Absorption must keep raw checkpoint codes independent of Linear's
+        # backend-specific weight transformations.
+        attention.v_b_proj = nn.Parameter(value_weight.clone().contiguous(), requires_grad=False)
+        attention.v_b_proj_scale.data.copy_(value_scale)
+        for target, codes, scales in (
+            (
+                attention.k_b_proj_trans_dequant,
+                key_weight.transpose(1, 2),
+                key_scale.transpose(1, 2),
+            ),
+            (attention.v_b_proj_dequant, value_weight, value_scale),
+        ):
+            if target is not None:
+                expanded = scales.repeat_interleave(_FP8_BLOCK, -2).repeat_interleave(
+                    _FP8_BLOCK, -1
+                )
+                target.data.copy_((codes.float() * expanded).to(target.dtype))
+        linear.process_weights_after_loading()
+
     def _trunk_parameters(self) -> Dict[str, torch.nn.Parameter]:
         """Named parameters of the trunk only. Spec-dec draft modules
         (e.g. the DFlash drafter attached by SpecDecOneEngineForCausalLM)
@@ -2963,15 +2781,18 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         ModelLoader.load_draft_weights, not in the target checkpoint. MLA
         K/V absorb Parameters are derived by the KV-B loader and are likewise
         excluded from checkpoint jobs."""
+        fp8_prefixes = tuple(name + "." for name, _, _ in self._attention_fp8_linears())
         return {
             name: param
             for name, param in self.named_parameters()
             if not name.startswith("draft_model.")
+            and not name.startswith(fp8_prefixes)
+            and ".linear_attn.qkvg_proj." not in name
             and not name.endswith(_KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES)
         }
 
     def checkpoint_name_plan(self, prefix: str):
-        """Return ``(name_map, expected_keys, expert_jobs, fp8_attn_jobs)``.
+        """Return ``(name_map, expected_keys, expert_jobs)``.
 
         ``name_map`` maps every model parameter name to its checkpoint key
         (for fused ``gate_up_proj`` parameters the mapped key is virtual;
@@ -3021,25 +2842,35 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     for kind in kinds:
                         expected_keys.add(f"{base}.{expert_idx}.{w}.{kind}")
             expert_jobs.append((layer_idx, moe, base))
-
-        # FP8-resident attention projections. These hold buffers, so they are
-        # absent from ``params`` above; registering their checkpoint keys here
-        # is what keeps the strict missing-key check covering them. Built from
-        # the same generator ``load_weights`` fills from -- see its docstring
-        # for why anything else would fail silently.
-        fp8_attn_jobs = list(_k3_kda_fp8_resident_jobs(self.model, prefix))
-        for _layer_idx, _mixer, _attr, ckpt_key in fp8_attn_jobs:
-            expected_keys.add(ckpt_key)
-        return name_map, expected_keys, expert_jobs, fp8_attn_jobs
+        for name, _, _ in self._attention_fp8_linears():
+            key = (
+                prefix
+                + name.replace(".linear_attn.", ".self_attn.").replace(
+                    ".self_attn.mixer.", ".self_attn."
+                )
+                + ".weight"
+            )
+            expected_keys.update((key, _fp8_block_scale_key(key)))
+        for index, layer in enumerate(self.model.layers):
+            if getattr(layer, "is_kda", True):
+                continue
+            attention = layer.self_attn.mixer
+            if getattr(attention, "fuse_qkv_a_proj", False):
+                key = f"{prefix}model.layers.{index}.self_attn.q_a_proj.weight"
+                expected_keys.add(key)
+                if attention.kv_a_proj_with_mqa.has_fp8_block_scales:
+                    expected_keys.add(_fp8_block_scale_key(key))
+        return name_map, expected_keys, expert_jobs
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
         params = self._trunk_parameters()
-        name_map, expected_keys, expert_jobs, fp8_attn_jobs = self.checkpoint_name_plan(prefix)
+        name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
         self._validate_checkpoint_keys(weights, expected_keys, prefix)
         num_params = self._load_trunk_params(weights, params, name_map)
-        self._load_expert_slices(weights, expert_jobs, fp8_attn_jobs)
+        num_params += self._load_attention_fp8(weights, prefix)
+        self._load_expert_slices(weights, expert_jobs)
         self._finalize_weight_load(num_params, len(expert_jobs))
         device = next(self.parameters()).device
         if device.type == "cuda":
@@ -3059,7 +2890,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             for k in ckpt_keys
             if not (k.startswith("vision_tower.") or k.startswith("mm_projector."))
         }
-        missing = sorted(expected_keys - ckpt_keys)
+        missing = sorted(
+            key
+            for key in expected_keys - ckpt_keys
+            if not (key.endswith(".weight_scale") and key + "_inv" in ckpt_keys)
+        )
         if missing:
             raise KeyError(
                 f"Kimi K3 load_weights: {len(missing)} expected checkpoint "
@@ -3098,6 +2933,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             if not getattr(layer, "is_kda", True)
         ]
         mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
+        mla_fused_a_mixers = {
+            id(mixer.kv_a_proj_with_mqa.weight): mixer
+            for mixer in mla_mixers
+            if getattr(mixer, "fuse_qkv_a_proj", False)
+        }
         mla_head_shard_linears = {}
         for mixer in mla_mixers:
             mla_head_shard_linears[id(mixer.q_b_proj.weight)] = mixer.q_b_proj
@@ -3118,10 +2958,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             if self._repurposed_tp_mapping is not None
             else self.model_config.mapping.tp_rank
         )
-        # Read here rather than at the conversion site because load_param runs
-        # first. See _K3_CKPT_FP8_ATTR for why the pairs are load-bearing.
-        stash_ckpt_fp8 = _fp8_weight_read_is_available()
-
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
         kda_tp_size, kda_tp_rank = 1, 0
@@ -3164,13 +3000,21 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 param.data[inter:].copy_(up.to(param.dtype))
                 return
             src = _materialize(weights[name_map[name]])
-            # Keep the checkpoint's FP8 pair for the MLA conversion at the end
-            # of this method. Gated like that conversion, so the pairs are not
-            # retained for a run that will never use them.
-            ckpt_fp8_pair = (
-                _checkpoint_fp8_pair(name_map[name], src, weights) if stash_ckpt_fp8 else None
-            )
             src = _dequantize_fp8_block_scaled(name_map[name], src, weights)
+            fused_a = mla_fused_a_mixers.get(id(param))
+            if fused_a is not None:
+                q_key = name_map[name].replace("kv_a_proj_with_mqa.weight", "q_a_proj.weight")
+                q_weight = _dequantize_fp8_block_scaled(
+                    q_key, _materialize(weights[q_key]), weights
+                )
+                if q_weight.shape != (fused_a.q_lora_rank, fused_a.hidden_size) or src.shape != (
+                    fused_a.kv_lora_rank + fused_a.qk_rope_head_dim,
+                    fused_a.hidden_size,
+                ):
+                    raise ValueError(
+                        f"{name}: checkpoint Q-A/KV-A shapes do not match MLA dimensions"
+                    )
+                src = torch.cat((q_weight, src), dim=0)
             if name == "lm_head.weight":
                 # LMHead is vocab-sharded (TP column) + gathered; its
                 # load_weights shards the full checkpoint tensor.
@@ -3194,13 +3038,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     ).to(param.dtype)
                 )
                 mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
-                # Helix: v_b_proj holds this rank's 1/cp post-all-to-all
-                # head chunk; kv_b/k_b_proj_trans keep every tp-local head.
-                h_cp = mla_mixer.num_heads_tp_cp
-                if h_cp != h:
-                    lo = mla_mixer.mapping.cp_rank * h_cp
-                    v_weight = v_weight[lo : lo + h_cp]
-                mla_mixer.v_b_proj.data.copy_(v_weight)
+                # Share the loaded BF16 V rows with context GEMM instead of keeping a
+                # separate copy. Wrap the view to retain v_b_proj's parameter registration.
+                v_weight = _helix_cp_v_b_shard(
+                    param[h * n :].view(h, v, kv),
+                    num_heads_tp_cp=mla_mixer.num_heads_tp_cp,
+                    cp_rank=mla_mixer.mapping.cp_rank,
+                )
+                mla_mixer.v_b_proj = nn.Parameter(v_weight, requires_grad=False)
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
                 # The checkpoint pads A_log from [num_heads] to [head_dim]
@@ -3289,12 +3134,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     f"{tuple(param.shape)}"
                 )
             param.data.copy_(src.to(param.dtype))
-            # Only on this path: the branches above shard or pad, and the
-            # conversion consumes linear.weight in its module-local shape, so a
-            # full-size pair would not match. Under enable_attention_dp the
-            # attention projections are replicated, which is exactly this path.
-            if ckpt_fp8_pair is not None and ckpt_fp8_pair[0].shape == param.shape:
-                setattr(param, _K3_CKPT_FP8_ATTR, ckpt_fp8_pair)
 
         param_jobs = [(name, params[name]) for name in name_map]
         run_concurrently(load_param, param_jobs, num_workers=8)
@@ -3308,7 +3147,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         self,
         weights: Dict[str, torch.Tensor],
         expert_jobs: List[Tuple[int, KimiK3MoERuntime, str]],
-        fp8_attn_jobs: list[tuple],
     ) -> None:
         """Load FP8-resident attention projections and rank-local expert slices."""
         device = next(self.parameters()).device
@@ -3399,18 +3237,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     expert_idx,
                     lambda key: _materialize(weights[key]),
                 )
-
-        # ---- FP8-resident attention projections ----
-        # Not part of param_jobs: these are buffers, so the parameter-driven
-        # loader above cannot see them. Filled serially and before the expert
-        # streaming, while their (small) source tensors are still cheap to
-        # reach; their checkpoint keys were validated with the rest.
-        if fp8_attn_jobs:
-            n_resident = _fill_kda_fp8_resident_projections(fp8_attn_jobs, weights)
-            logger.info(
-                f"Kimi K3: filled {n_resident} FP8-resident KDA projections "
-                f"from the checkpoint (no BF16 storage was allocated for them)"
-            )
 
         # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the
@@ -3544,66 +3370,29 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             backend._weights_transformed = False
 
     def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
-        """Finalize KDA decode state and FP8 storage after all weights are loaded."""
-
-        # Build the KDA fused projection views and decode kernel constants.
-        # This must run after every KDA parameter is loaded and sharded, and
-        # after the FP8-resident fills above — those supply the fused FP8
-        # ``qkvg_proj``, so the FP8 finalizer only has to fuse the two small
-        # BF16 projections ([f_a | b]) and precompute the kernel constants.
-        num_kda_fused = 0
-        num_kda_fp8_fused = 0
+        """Finalize checkpoint-loaded attention and optional BF16 MLP conversion."""
         for layer in self.model.layers:
-            if not getattr(layer, "is_kda", False):
-                continue
-            attn = layer.linear_attn
-            if getattr(attn, "_fp8_resident_projections", False):
-                attn.finalize_decode_weights_fp8()
-                num_kda_fp8_fused += int(attn._bfa_proj_weight is not None)
+            if getattr(layer, "is_kda", False):
+                attention = layer.linear_attn
+                attention.finalize_decode_weights()
+                attention._build_mtp_conv_weights()
             else:
-                attn.finalize_decode_weights()
-                num_kda_fused += int(
-                    attn._qkvg_proj_weight is not None and attn._bfa_proj_weight is not None
-                )
-            # Verify constants must exist before any CUDA graph capture, for both
-            # resident-FP8 and BF16 KDA layers.
-            attn._build_mtp_conv_weights()
+                attention = layer.self_attn.mixer
+            for name, linear in attention.named_children():
+                if isinstance(linear, TrtllmLinear) and linear.has_fp8_block_scales:
+                    _swap_linear_to_fp8_weight_read(attention, name, (TrtllmLinear,))
+            fused = getattr(attention, "qkvg_proj", None)
+            if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
+                offset = 0
+                for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
+                    projection = getattr(attention, name)
+                    projection._fused_projection = (weakref.ref(fused), offset)
+                    offset += projection.out_features
         logger.info(
-            f"Kimi K3: loaded {num_params} parameters and the expert "
-            f"slices of {num_moe_layers} MoE layers; fused prefill/decode/verify "
-            f"projections on {num_kda_fused} BF16 and {num_kda_fp8_fused} FP8 KDA layers"
+            f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
-
-        # Online FP8 block-scale cast for the replicated MoE-layer MLPs —
-        # default on, off with KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0 (see the env
-        # definition near the top of this file). Requires datacenter Blackwell.
-        if os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "1") == "0":
-            logger.info(
-                f"Kimi K3: {_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV}=0 — keeping the "
-                f"MoE-layer MLP projections in BF16"
+        if self._fp8_weight_read_moe_mlp and is_sm_100f():
+            converted = _convert_moe_mlps_to_fp8_weight_read(
+                self.model, include_fused_gate_up=self.model_config.mapping.enable_attention_dp
             )
-        elif not _fp8_weight_read_is_available():
-            logger.info(
-                "Kimi K3: the MoE-layer MLP FP8 block-scale read requires "
-                "datacenter Blackwell; keeping them BF16"
-            )
-        else:
-            n_fp8 = _convert_moe_mlps_to_fp8_weight_read(
-                self.model,
-                # Only worth it when attention DP makes every rank re-read the
-                # fused weight per step; under TP the BF16 GEMM overlaps on the
-                # aux stream (see the conversion helper's comment).
-                include_fused_gate_up=self.model_config.mapping.enable_attention_dp,
-            )
-            logger.info(
-                f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "
-                f"(shared-expert + latent) at FP8 block-scale"
-            )
-        if _fp8_weight_read_is_available():
-            # The MLA q_a/q_b/o and output-gate projections are the remaining
-            # replicated attention weight read. Unlike KDA these have no
-            # FP8-resident path, so without this conversion they stay BF16 --
-            # worth ~2.4 GiB/rank of KV cache at DEP8. No env: the switch was
-            # the reviewable part, the conversion is not.
-            n_mla = _convert_mla_projections_to_fp8_weight_read(self.model)
-            logger.info(f"Kimi K3: reading {n_mla} MLA q_a/q_b/o/g projections at FP8 block-scale")
+            logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")

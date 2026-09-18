@@ -81,9 +81,7 @@ def test_forward_prequantized_matches_bf16():
     """D-Spark's fused KDA output must use the same CuTe scale ABI."""
     w, mod = _make(512, 1024, seed=9)
     x = torch.randn((16, 1024), device="cuda", dtype=torch.bfloat16)
-    activation, activation_scale = (
-        torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x)
-    )
+    activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x)
 
     out = mod.forward_prequantized(activation, activation_scale)
 
@@ -139,22 +137,29 @@ def test_single_cute_scale_is_built_on_rubin():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @RUBIN
-def test_placeholder_load_carries_cute_scale():
-    """A loader-filled placeholder must receive the CuTe scale layout."""
-    in_features, parts = 1024, [512, 512]
-    torch.random.manual_seed(6)
-    pairs = []
-    for p in parts:
-        wp = torch.randn((p, in_features), device="cuda", dtype=torch.bfloat16) / in_features**0.5
-        q, s = per_block_cast_to_fp8(wp)
-        pairs.append((q, s.float()))
+def test_checkpoint_loading_carries_cute_scale():
+    """Checkpoint-backed projections prepare CuTe scales and preserve their output."""
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantAlgo
 
-    mod = K3Fp8Linear.empty_placeholder(sum(parts), in_features)
-    mod.load_checkpoint_pair(pairs)
-    assert not mod.is_placeholder
-    assert mod.weight_scale.numel() > 0
+    torch.random.manual_seed(6)
+    weight = torch.randn((1024, 1024), device="cuda", dtype=torch.bfloat16) / 32
+    codes, scales = per_block_cast_to_fp8(weight)
+    with torch.device("cuda"):
+        linear = Linear(
+            1024,
+            1024,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        )
+    linear.load_weights([{"weight": codes, "weight_scale": scales.float()}])
+    mod = K3Fp8Linear.from_linear(linear)
+    mod.post_load_weights()
     assert mod.weight_scale.dtype is torch.uint8
-    assert not hasattr(mod, "gemm_alpha")
+    x = torch.randn((16, 1024), device="cuda", dtype=torch.bfloat16)
+    _check(mod(x), _ref(x, weight), "checkpoint")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -166,14 +171,6 @@ def test_weight_preparation_returns_only_cute_pair():
 
     q, s = per_block_cast_to_fp8(w)
     assert len(K3Fp8Linear.prepare_checkpoint_scale(q, s.float())) == 2
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_unfilled_placeholder_raises():
-    mod = K3Fp8Linear.empty_placeholder(256, 256)
-    x = torch.randn((2, 256), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="never filled"):
-        mod(x)
 
 
 def test_kimi_k3_fine_m_tuning_uses_hybrid_buckets():
@@ -192,7 +189,53 @@ def test_kimi_k3_fine_m_tuning_uses_hybrid_buckets():
     )
     assert tuple(
         _kimi_k3_mxfp8_tuning_bucket(m)
-        for m in (1, 3, 5, 8, 9, 15, 16, 17, 31, 32, 64, 65, 79, 80, 128,
-                  129, 191, 192, 193, 255, 256, 511, 512)
-    ) == (1, 2, 4, 8, 8, 8, 16, 16, 16, 32, 64, 80, 80, 80, 128, 144,
-          192, 192, 256, 256, 256, 512, 512)
+        for m in (
+            1,
+            3,
+            5,
+            8,
+            9,
+            15,
+            16,
+            17,
+            31,
+            32,
+            64,
+            65,
+            79,
+            80,
+            128,
+            129,
+            191,
+            192,
+            193,
+            255,
+            256,
+            511,
+            512,
+        )
+    ) == (
+        1,
+        2,
+        4,
+        8,
+        8,
+        8,
+        16,
+        16,
+        16,
+        32,
+        64,
+        80,
+        80,
+        80,
+        128,
+        144,
+        192,
+        192,
+        256,
+        256,
+        256,
+        512,
+        512,
+    )

@@ -262,6 +262,8 @@ The job writes progress and results to `kimi-k3-eval-<job-id>.log` in the submis
 
 The expected average accuracy is approximately 96.47. Small differences (roughly ±0.5 points) are possible with different checkpoint or dependency revisions.
 
+Attention projection datatypes follow the checkpoint quantization configuration. Shared/latent MLP projections remain BF16 by default; set `KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1` to opt into their lossy FP8 conversion.
+
 ## Benchmarking Performance
 
 ### Run the End-to-End Performance Sweep
