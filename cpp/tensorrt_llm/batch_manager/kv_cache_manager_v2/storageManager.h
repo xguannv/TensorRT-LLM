@@ -44,13 +44,6 @@ using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
 using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
 
-//! How a constraint floor charges a windowed life cycle per request.
-enum class FloorMode
-{
-    kOff,  //!< its demand at the history the descriptor names
-    kWorst, //!< a whole window of residency
-};
-
 // ---------------------------------------------------------------------------
 // StorageStatistics — per-pool-group slot counts.
 // ---------------------------------------------------------------------------
@@ -270,14 +263,9 @@ public:
     friend class KvCacheIntrospection;
 
 private:
-    // Blocks one request can hold at the worst point of its window slide.
-    int windowedWorstCaseBlocks(AttnLifeCycle const& lc, int tokensPerBlock) const;
-
-    // Minimum per-pool-group slot counts to support a BatchDesc. `floorMode` is set only on the
-    // constraint-floor path; ratioFromBatch shares this helper and must keep instantaneous demand,
-    // because there the proportion between pool groups is exactly what the numbers mean.
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock,
-        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, FloorMode floorMode = FloorMode::kOff) const;
+    // Minimum per-pool-group slot counts to support a BatchDesc.
+    TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(
+        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
 
     // Constraint-based partitioning helpers.
     TypedVec<PoolGroupIndex, SlotCount> computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,

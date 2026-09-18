@@ -1713,15 +1713,31 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.debug(f"KV cache pool group sizes unavailable: {exc}")
             return []
 
+        def flat_sizes(value) -> list[int]:
+            """Per-pool byte sizes, whatever shape the backend reported them in.
+
+            `slot_size` is a scalar under one backend and a list under another,
+            and wrapping a list in another list made `sum()` raise
+            ``TypeError: unsupported operand type(s) for +: 'int' and 'list'``
+            -- which is how a debugging aid took the startup log line with it.
+            """
+            if isinstance(value, int):
+                return [value]
+            sizes: list[int] = []
+            for item in value:
+                sizes.extend(flat_sizes(item))
+            return sizes
+
         entries = []
         for pool_group_id, stat in enumerate(stats):
-            slot_sizes = getattr(stat, "slot_sizes", None)
-            if slot_sizes is None:
-                slot_sizes = [stat.slot_size]
+            reported = getattr(stat, "slot_sizes", None)
+            if reported is None:
+                reported = stat.slot_size
+            slot_sizes = flat_sizes(reported)
             entries.append(
                 f"pool_group_id={pool_group_id}, "
                 f"num_slots={stat.total}, "
-                f"slot_size={list(slot_sizes)}, "
+                f"slot_size={slot_sizes}, "
                 f"bytes={stat.total * sum(slot_sizes)}"
             )
         return entries

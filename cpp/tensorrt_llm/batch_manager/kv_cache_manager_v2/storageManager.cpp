@@ -28,11 +28,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <numeric>
 #include <set>
 #include <string>
-#include <string_view>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -1117,36 +1115,6 @@ TypedVec<PoolGroupIndex, float> StorageManager::ratioFromBatch(BatchDesc const& 
 // computeMinSlotsFromConstraints
 // ---------------------------------------------------------------------------
 
-namespace
-{
-//! How much a constraint floor charges each windowed request, from
-//! TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR. `worst` (`1`, the default) charges the
-//! residency a windowed request actually has; `off` (`0`) is the pre-fix sizing, kept so a
-//! deployment the new floor costs too much can get its old behaviour back without a rebuild.
-//! Keep in sync with _storage_manager.py::windowed_floor_mode.
-FloorMode windowedFloorMode()
-{
-    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_SUSTAIN_WINDOWED_FLOOR");
-    if (value == nullptr)
-    {
-        return FloorMode::kWorst;
-    }
-    std::string_view const mode{value};
-    if (mode == "off" || mode == "0")
-    {
-        return FloorMode::kOff;
-    }
-    return FloorMode::kWorst;
-}
-} // namespace
-
-int StorageManager::windowedWorstCaseBlocks(AttnLifeCycle const& lc, int tokensPerBlock) const
-{
-    int window = *lc.windowSize;
-    // Handle oscillation of slot count required by SWA while the window slides.
-    return lc.numSinkBlocks + (window + tokensPerBlock - 2) / tokensPerBlock + 1;
-}
-
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstraints(
     std::vector<BatchDesc> const& constraints, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
@@ -1189,12 +1157,9 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
             maxSlots[pgIdx] += floorNumBlocks;
         }
     }
-    // A floor has to hold for as long as the batch is resident. ratioFromBatch shares this helper
-    // and must NOT get the same treatment.
-    FloorMode const floorMode = windowedFloorMode();
     for (auto const& batch : constraints)
     {
-        auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse, floorMode);
+        auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (PoolGroupIndex pgIdx{0}; pgIdx < slots.size(); ++pgIdx)
         {
             auto const scaledSlots = static_cast<SlotCount>(
@@ -1209,8 +1174,8 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
 // computeSlotsForBatch
 // ---------------------------------------------------------------------------
 
-TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock,
-    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, FloorMode floorMode) const
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotsForBatch(
+    BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     TypedVec<PoolGroupIndex, SlotCount> numSlots(numPoolGroups(), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
@@ -1243,25 +1208,18 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotsForBatch(BatchDe
             int nonStale = totalBlocks - stale.length();
             int nonStaleSys = sysBlocks - intersect(stale, sysRange).length();
             int uniqueNonStale = std::max(0, nonStale - nonStaleSys);
-            int contribution = 0;
             if (swaScratchReuse.has_value())
             {
                 auto scratch = computeScratchRange(
                     lc, kv.historyLength, kv.capacity, tokensPerBlock, swaScratchReuse->maxRewindLen);
                 int numScratch = scratch.length();
                 // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
-                contribution = (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
+                numSlots[pgIdx] += (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
             }
             else
             {
-                contribution = uniqueNonStale;
+                numSlots[pgIdx] += uniqueNonStale;
             }
-            auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-            if (attn != nullptr && attn->windowSize.has_value() && floorMode != FloorMode::kOff)
-            {
-                contribution = std::max(contribution, windowedWorstCaseBlocks(*attn, tokensPerBlock));
-            }
-            numSlots[pgIdx] += contribution;
         }
     }
     return numSlots;
@@ -1294,22 +1252,9 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     CacheTier tier = cacheTierOf(tierConfig);
-    size_t granularity = CacheLevelManager::cacheTierGranularity(tier, cacheTierQuota(tierConfig));
-    size_t const configured = roundUp(cacheTierQuota(tierConfig), granularity);
-    size_t const minQuota = minQuotaForLevel(slotSizeLists, granularity);
-    // Sizing at the floors is deliberate -- a declared constraint batch has to stay resumable --
-    // but it allocates past the configured budget, so say so rather than leaving it to surface as
-    // an out-of-memory failure elsewhere.
-    if (minQuota > configured)
-    {
-        TLLM_LOG_WARNING(
-            "KV cache constraint floors need %zu bytes at cache tier %d, %.2fx the configured quota of %zu; the "
-            "level is sized at the floors so the declared batch stays resumable. Lower max_batch_size or raise "
-            "the KV cache quota if that is not acceptable.",
-            minQuota, static_cast<int>(tier), static_cast<double>(minQuota) / static_cast<double>(configured),
-            configured);
-    }
-    size_t const quota = std::max(minQuota, configured);
+    size_t quota = cacheTierQuota(tierConfig);
+    size_t granularity = CacheLevelManager::cacheTierGranularity(tier, quota);
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity), roundUp(quota, granularity));
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, mMinSlots);
 }
 
