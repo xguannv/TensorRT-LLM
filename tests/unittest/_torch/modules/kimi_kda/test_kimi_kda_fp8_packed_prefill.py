@@ -6,16 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    _Fp8BlockScaleWeightReadLinear,
-    _fill_kda_fp8_resident_projections,
-    _k3_kda_fp8_resident_jobs,
-)
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 class _Cfg:
@@ -30,19 +28,6 @@ class _Cfg:
     }
 
 
-class _Layer(nn.Module):
-    def __init__(self, attention: KimiKDALinearAttention) -> None:
-        super().__init__()
-        self.is_kda = True
-        self.linear_attn = attention
-
-
-class _Model(nn.Module):
-    def __init__(self, attention: KimiKDALinearAttention) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList([_Layer(attention)])
-
-
 def _has_supported_gpu() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
 
@@ -54,38 +39,24 @@ pytestmark = pytest.mark.skipif(
 
 
 def _make_attention() -> KimiKDALinearAttention:
-    """A KDA attention module whose q/k/v/g/o are FP8-resident and filled.
-
-    Mirrors production: the projections are built as empty FP8 placeholders at
-    construction time and filled from checkpoint FP8 + block-scale pairs, which
-    here are cast from random BF16 rather than read off disk.
-    """
-    from tensorrt_llm.deep_gemm.utils.math import per_block_cast_to_fp8
-
-    def proj_factory(in_features: int, out_features: int) -> nn.Module:
-        return _Fp8BlockScaleWeightReadLinear.empty_placeholder(out_features, in_features)
-
+    config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES))
     attention = KimiKDALinearAttention(
         _Cfg(),
         layer_idx=0,
-        fp8_resident_projections=True,
-        proj_factory=proj_factory,
+        model_config=config,
     ).to("cuda")
-    jobs = list(_k3_kda_fp8_resident_jobs(_Model(attention), prefix=""))
-    assert len(jobs) == 5, f"expected 5 FP8-resident projections, got {[j[2] for j in jobs]}"
-
-    key_to_attr = {key: attr for _layer_idx, _mixer, attr, key in jobs}
-
-    def _pair_of(key: str):
-        mod = getattr(attention, key_to_attr[key])
-        weight = (
-            torch.randn(mod.out_features, mod.weight.shape[1], device="cuda", dtype=torch.bfloat16)
-            * 0.05
-        )
-        fp8, scale = per_block_cast_to_fp8(weight, use_ue8m0=False)
-        return fp8, scale.float()
-
-    assert _fill_kda_fp8_resident_projections(jobs, _pair_of) == 5
+    for module in attention.children():
+        if isinstance(module, Linear):
+            # Checkpoint-native codes and scales, independent of any BF16 quantizer.
+            codes = torch.randint(-64, 65, module.weight.shape, device="cuda").to(
+                torch.float8_e4m3fn
+            )
+            scales = torch.full(module.weight_scale.shape, 0.001, device="cuda")
+            module.load_weights([{"weight": codes, "weight_scale": scales}])
+    attention.finalize_decode_weights()
+    for module in attention.modules():
+        if isinstance(module, Linear):
+            module.post_load_weights()
     return attention
 
 
