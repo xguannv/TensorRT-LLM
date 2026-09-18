@@ -162,6 +162,10 @@ def get_kv_cache_manager_cls(
             )
         if (is_hybrid_linear(config)
                 and model_config.get_num_mamba_layers() > 0):
+            # Preserve KDA replay caches for fused verification. The KDA
+            # subclass inherits the hybrid manager's FP4 MLA layout.
+            if is_kimi_linear(config):
+                return KDAHybridCacheManagerV2
             return MambaHybridCacheManagerV2
 
         from ..attention_backend.fp4_mla.cache_manager import \
