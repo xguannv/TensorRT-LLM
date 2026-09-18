@@ -47,8 +47,9 @@ from ..attention_backend.sparse.params import \
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
-                           get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
+                           get_num_spec_layers, get_spec_decoder,
+                           should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
@@ -597,6 +598,10 @@ def _derive_draft_max_attention_window(
 
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
+
+    # Paired-reuse protocol flag. ``build_managers`` resolves it once and hands
+    # it to both constructors; the managers must not re-derive it.
+    _joint_kv_cache_reuse = False
 
     def __init__(
         self,
@@ -1553,6 +1558,7 @@ class KvCacheCreator:
             enable_ugpu=self._llm_args.enable_ugpu,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
 
         if not self._skip_est:
@@ -1611,6 +1617,25 @@ class KvCacheCreator:
                 "manager; MTP layers share the target manager.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _joint_reuse_supported(self) -> bool:
+        """Span half of the pairing decision; ``build_managers`` ANDs it with
+        ``has_separate_one_model_draft``. ``False`` = leave the run unpaired.
+        """
+        if not self._is_kv_cache_manager_v2:
+            return False
+        lookahead = draft_prompt_lookahead(self._speculative_config)
+        if lookahead is None:
+            return False
+        if lookahead > 0 and not getattr(self._kv_cache_manager_cls,
+                                         "_supports_reuse_match_backoff",
+                                         False):
+            # The opt-out is about backing the match off by `lookahead` tokens,
+            # which a specialized commit/history protocol (recurrent snapshots,
+            # DSA) cannot express. A zero span asks for no backoff at all, so
+            # every backoff-sized path stays a no-op and the pairing is safe.
+            return False
+        return True
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1775,6 +1800,7 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
             enable_ugpu=self._llm_args.enable_ugpu,
+            joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2182,12 +2208,21 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
+        has_separate_one_model_draft = (
+            self._draft_model_engine is None
+            and self._should_create_separate_draft_kv_cache())
+        # One term per axis: a draft pool exists to pair with, block reuse is on,
+        # and the span is known. Anything outside keeps its unpaired path.
+        self._joint_kv_cache_reuse = (has_separate_one_model_draft and
+                                      self_kv_cache_config.enable_block_reuse
+                                      and self._joint_reuse_supported())
+
         # Split combined KV cache budgets before creating managers. Skip during
         # estimation — estimation uses max_tokens-based logic and must not
         # mutate the config.
         has_draft = (
             self._draft_model_engine is not None  # two-model
-            or self._should_create_separate_draft_kv_cache())  # one-model
+            or has_separate_one_model_draft)  # one-model
         draft_kv_cache_config = None
         if not estimating_kv_cache and has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
@@ -2374,7 +2409,8 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        is_disagg: bool = False,
+        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2506,6 +2542,7 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_ugpu"] = enable_ugpu
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

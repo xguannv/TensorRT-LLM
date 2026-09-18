@@ -277,6 +277,11 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_last_page_len = None
         self._ctx_page_size = 32
         self._ctx_pages_per_slot = 0
+        # True only when the drafter reads the draft KV cache manager's pool
+        # AND that manager joins the target's reuse protocol, which is what
+        # makes a reused prefix's drafter K/V still addressable. Set in
+        # _lazy_init_ctx_buffers; read by _store_prefill_context.
+        self._ctx_reuse_addressable = False
         self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
@@ -653,6 +658,12 @@ class DFlashWorker(SpecWorkerBase):
                 # instead of max_batch x max_seq_len. That also means the
                 # estimation pass's small probe pool is enough.
                 self._ctx_kv_buf = pool
+                # Only a manager that publishes and matches its own blocks can
+                # hand back a reused prefix's drafter K/V; the private arena and
+                # an unpaired draft pool both start every request at 0.
+                self._ctx_reuse_addressable = bool(
+                    getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
+                )
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )
@@ -667,10 +678,25 @@ class DFlashWorker(SpecWorkerBase):
             )
         self._ctx_buf_inited = True
 
+        if not self._ctx_reuse_addressable and getattr(
+            draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False
+        ):
+            # Every fallback above (shape mismatch, stride mismatch, pool layer
+            # count) logs its own reason and then costs only memory -- except
+            # this one, where the scheduler goes on matching prefixes the
+            # drafter can no longer read. Silent, and it looks exactly like the
+            # unpaired build in every metric but acceptance length.
+            logger.warning(
+                "DFlash: the draft KV cache manager joins block reuse but the drafter "
+                "fell back to a private ctx arena, so a reused prefix's drafter K/V "
+                "stays unreachable and acceptance length drops as if unpaired."
+            )
+
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
-            f"dflash_attention_backend={self._dflash_attention_backend}"
+            f"dflash_attention_backend={self._dflash_attention_backend}, "
+            f"reuse_addressable={self._ctx_reuse_addressable}"
         )
 
     def _ctx_paged_index_args(self):
@@ -848,6 +874,27 @@ class DFlashWorker(SpecWorkerBase):
 
             slot = self._req_to_slot[req_id]
             cur = int(self._ctx_len[slot].item())
+            if cur == 0 and first_pos > 0 and self._ctx_reuse_addressable:
+                # Block reuse let the target skip [0, first_pos), so only the
+                # tail reaches the capture buffer. Those drafter K/V entries
+                # are not lost: precompute_context_kv is a per-token function
+                # of (projected target hidden at p, RoPE position p), so an
+                # identical token prefix produced identical entries on the turn
+                # that did compute it, and the paired draft pool matched the
+                # very blocks holding them into this request's block table.
+                # Index from the absolute position so the tail lands after them
+                # instead of overwriting the prefix from 0.
+                covered = int(self._ctx_block_counts[i].item()) * self._ctx_page_size
+                if first_pos + slen > covered:
+                    # Placeholder entries past a request's allocation decode to
+                    # block 0, so an under-covering table writes into whatever
+                    # request owns it. Refuse rather than corrupt a neighbour.
+                    raise RuntimeError(
+                        f"DFlash: request {req_id} reuses {first_pos} target prefix tokens "
+                        f"but its draft block table covers only {covered}; the draft pool "
+                        f"did not match the same prefix as the target."
+                    )
+                cur = first_pos
             if cur + slen > self._max_ctx:
                 # Truncating here keeps the OLDEST tokens and drops the newest —
                 # the arena is append-only, not a sliding window — so the drafter

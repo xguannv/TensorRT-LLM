@@ -129,6 +129,39 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     return spec_config._allow_separate_draft_kv_cache
 
 
+def draft_prompt_lookahead(spec_config) -> Optional[int]:
+    """Prompt tokens past position ``i`` that a one-model draft consumes at ``i``:
+    Eagle reads the shift-by-1 input ids, vanilla MTP chains ``D`` layers.
+
+    Read by the context-chunk tail token (``_prepare_context_input_ids``) and by a
+    separate draft pool's ``reuse_match_backoff``. ``None`` = span not established.
+    """
+    if spec_config is None:
+        return None
+    spec_mode = spec_config.spec_dec_mode
+    if not spec_mode.use_one_engine():
+        # Two-model drafting runs the draft as its own engine over its own
+        # request view, so nothing here is shifted against the target prompt.
+        return None
+    if spec_mode.is_pard():
+        # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
+        # its draft state at i is a function of tokens [0, i] like the target's.
+        return 0
+    if spec_mode.is_dflash() or spec_mode.is_dspark():
+        # precompute_context_kv(projected_hidden, positions) writes the drafter's
+        # OWN post-norm post-RoPE K/V, one entry per context token, and the
+        # target hidden at i already depends on exactly tokens [0, i]. Same
+        # dependency face as the target's own KV, so raw-prompt keys describe it
+        # and no chunk-tail lookahead token is needed. The paged pool then makes
+        # a matched prefix addressable again (dflash.py _store_prefill_context).
+        return 0
+    # A shift-by-1 (Eagle) or D-chained (vanilla MTP) span additionally needs the
+    # context-chunk lookahead token, whose plumbing this branch does not carry;
+    # keying those modes without it would attach draft KV a chunked prefill never
+    # produced. DraftTargetOneModel's span is unvalidated upstream.
+    return None
+
+
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
                                            draft_kv_cache_manager):
     """
@@ -370,6 +403,10 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_eagle_one_model(self):
+        """Whether MTP-Eagle or EAGLE3 uses the unified one-model worker."""
+        return self.is_mtp_eagle_one_model() or self.is_eagle3_one_model()
 
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
@@ -2458,7 +2495,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                    accepted_tokens, num_contexts):
         """
         Prepare context input IDs for draft model forward.
-        Shifts input IDs left by 1 and places the first accepted token at gather positions.
+        Shifts input IDs left by 1 (``draft_prompt_lookahead == 1``), leaving one
+        hole per request at the chunk's last position.
 
         Args:
             input_ids: Original input IDs tensor
