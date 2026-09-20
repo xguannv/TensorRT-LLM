@@ -299,6 +299,12 @@ class KimiKDALinearAttention(nn.Module):
             ):
                 self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
                 self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
+                # Scale grids are prepared by now, so this is the point the
+                # fusion comment defers the aliasing to. Without it the four
+                # source projections keep their own storage alongside the
+                # fused copy, which is pure duplication: the BF16 path avoids
+                # it by repointing in _merge_projection_weights.
+                self._alias_projections_into_fused(qkvg_modules, self.qkvg_proj)
             self._bfa_proj_weight = self._merge_projection_weights(
                 (self.f_a_proj, self.b_proj), pad_rows_to=8
             )
@@ -336,6 +342,27 @@ class KimiKDALinearAttention(nn.Module):
         # DeepGEMM resmooths codes in place. The model loader aliases the
         # projection views only after each scale grid has been prepared.
         return fused
+
+    @staticmethod
+    def _alias_projections_into_fused(modules: tuple[Linear, ...], fused: Linear) -> None:
+        """Repoint FP8 source projections at row views of the fused buffers.
+
+        Mirrors what _merge_projection_weights does for the BF16 path. The
+        fused Linear is built by copying each source's codes and scales, so
+        until the sources are repointed both copies stay resident and the
+        weights are held twice.
+        """
+        offset = 0
+        scale_offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            module.weight.data = fused.weight.data[offset : offset + rows]
+            offset += rows
+            scale_rows = module.weight_scale.shape[0]
+            module.weight_scale.data = fused.weight_scale.data[
+                scale_offset : scale_offset + scale_rows
+            ]
+            scale_offset += scale_rows
 
     @staticmethod
     def _merge_projection_weights(
