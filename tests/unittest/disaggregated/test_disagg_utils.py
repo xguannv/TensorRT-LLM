@@ -120,6 +120,8 @@ def test_extract_disagg_cfg(sample_yaml_config):
         4,
         "disagg_coordinator_url":
         "http://coordinator:7999",
+        "coordinator_bind_host":
+        "0.0.0.0",
     })
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
@@ -127,6 +129,29 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.gen_tokids_ctxbytes is True
     assert config.num_workers == 4
     assert config.disagg_coordinator_url == "http://coordinator:7999"
+    assert config.coordinator_bind_host == "0.0.0.0"
+    assert config.effective_coordinator_bind_host == "0.0.0.0"
+    assert all("coordinator_bind_host" not in server.other_args
+               for server in config.server_configs)
+
+
+def test_coordinator_bind_host_defaults_to_public_hostname():
+    config = extract_disagg_cfg(**get_yaml_config())
+
+    assert config.coordinator_bind_host is None
+    assert config.effective_coordinator_bind_host == "test_host"
+
+
+def test_coordinator_bind_host_survives_yaml_parser(tmp_path):
+    yaml_config = get_yaml_config()
+    yaml_config["coordinator_bind_host"] = "0.0.0.0"
+    yaml_file = tmp_path / "coordinator_bind_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(yaml_config, f)
+
+    config = parse_disagg_config_file(yaml_file)
+    assert config.coordinator_bind_host == "0.0.0.0"
+    assert config.effective_coordinator_bind_host == "0.0.0.0"
 
 
 def test_extract_disagg_metrics_controls():

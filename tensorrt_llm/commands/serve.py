@@ -2112,6 +2112,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    coordinator_bind_host = disagg_cfg.effective_coordinator_bind_host
     coord_port = int(
         os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
                        public_port - 1))
@@ -2151,13 +2152,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         _client_factory,
         metadata_config=metadata_server_cfg,
         server_start_timeout_secs=server_start_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(uds={coord_uds}) (fleet on public port {public_port})")
+    logger.info(
+        f"Coordinator serving on {coordinator_bind_host}:{coord_port} "
+        f"(uds={coord_uds}) (fleet on {public_host}:{public_port})")
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
             CoordinatorServer(coordinator)(
-                public_host,
+                coordinator_bind_host,
                 coord_port,
                 uds=coord_uds,
                 keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
