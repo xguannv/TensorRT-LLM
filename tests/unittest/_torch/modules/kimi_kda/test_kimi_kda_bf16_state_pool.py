@@ -125,7 +125,10 @@ def test_bf16_pool_decode_matches_fp32_pool():
 
 @torch.no_grad()
 def test_decode_fallback_returns_core_shape():
-    runtime = _make_runtime()
+    if not torch.cuda.is_available():
+        pytest.skip("the KDA decode fallback needs a CUDA device")
+    runtime = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
+    torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     batch, slots = 2, 4
     dim = NUM_HEADS * HEAD_DIM
     slot_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
