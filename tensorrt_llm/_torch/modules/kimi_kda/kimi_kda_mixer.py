@@ -1008,7 +1008,7 @@ class KimiKDALinearAttention(nn.Module):
         # so drafted batches always take the verify path.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
-        return out.squeeze(1)
+        return self._store_core(out, output)
 
     def forward_verify(
         self,

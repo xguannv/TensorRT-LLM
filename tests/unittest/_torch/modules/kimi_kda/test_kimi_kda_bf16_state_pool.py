@@ -123,6 +123,28 @@ def test_bf16_pool_decode_matches_fp32_pool():
     torch.testing.assert_close(ssm_bf16[untouched], initial[untouched], rtol=0, atol=0)
 
 
+@torch.no_grad()
+def test_decode_fallback_returns_core_shape():
+    runtime = _make_runtime()
+    batch, slots = 2, 4
+    dim = NUM_HEADS * HEAD_DIM
+    slot_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    hidden = torch.randn(batch, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    conv_pool = torch.zeros(slots, 3 * dim, CONV_WIDTH - 1, dtype=torch.bfloat16, device="cuda")
+    ssm_pool = torch.zeros(slots, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda")
+
+    core = runtime.forward_decode_fallback(
+        hidden,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        _LayerCache(),
+        ssm_state_indices=slot_indices,
+    )
+
+    assert core.shape == (batch, NUM_HEADS, HEAD_DIM)
+
+
 def _prefill_metadata(
     sequence_lengths, use_initial_states, has_initial_states, cu_seqlens, slot_indices
 ):
