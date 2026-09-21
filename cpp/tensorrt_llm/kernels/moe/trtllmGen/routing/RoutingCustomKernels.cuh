@@ -2067,6 +2067,17 @@ bool prefersSmallTokenKernel(RoutingPreprocessType preprocessType, RoutingPostpr
         && numTokens <= getSmallTokenKernelMaxNumTokens(dispatchedMaxExperts) && !coopWinsSingleToken;
 }
 
+bool coopLaunchDisabled()
+{
+    // Read once into a function-static, so the variable must be set before the first call.
+    static bool const disabled = []
+    {
+        char const* env = std::getenv("TRTLLM_K3LL_ROUTING_DISABLE_COOP_LAUNCH");
+        return env != nullptr && env[0] == '1';
+    }();
+    return disabled;
+}
+
 void run(Data const& data, void* stream)
 {
     TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
@@ -2171,7 +2182,8 @@ void run(Data const& data, void* stream)
 
         launchHistogramScoresKernel(data, maxNumBlocks, numThreadsHist, stream);
 
-        bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
+        bool const canUseCoop = !coopLaunchDisabled() && (smMajor >= 9) && (data.mNumExperts <= 1024)
+            && (data.mPtrPermutedIdxSize != nullptr);
         bool useCoop = false;
         int numBlocksCoop = 0;
 
