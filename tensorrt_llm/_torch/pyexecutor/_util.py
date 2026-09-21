@@ -806,6 +806,7 @@ class KvCacheCreator:
                 max_batch_size=self._max_batch_size,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
+                is_disagg=self._is_disagg,
                 **extra_kwargs))
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:

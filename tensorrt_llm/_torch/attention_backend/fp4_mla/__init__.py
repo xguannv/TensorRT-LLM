@@ -1491,7 +1491,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     sf_cache: torch.Tensor,
-    v_sf: torch.Tensor,
+    v_sf: Optional[torch.Tensor],
     global_scale: torch.Tensor,
     rotary_cos_sin: Optional[torch.Tensor],
     q_context: Optional[torch.Tensor],
@@ -1610,8 +1610,8 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         metadata.paged_kv_indices.shape[0],
         metadata.paged_kv_indptr.shape[0],
         metadata.batch_indices.shape[0],
-        v_sf.shape[1],
-        v_sf.shape[0],
+        v_sf.shape[1] if v_sf is not None else kv_cache.shape[0],
+        v_sf.shape[0] if v_sf is not None else hp_pool.shape[1],
         num_contexts,
         num_hp_pages,
         token_offset,
@@ -1628,8 +1628,8 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         q_context_view.stride(0),
         q_context_view.stride(1) if apply_q_rope else 0,
         q_context_view.stride(2) if apply_q_rope else 0,
-        v_sf.stride(0),
-        v_sf.stride(1),
+        v_sf.stride(0) if v_sf is not None else 0,
+        v_sf.stride(1) if v_sf is not None else 0,
         v_packed_s0,
         v_packed_s1,
         pool_s0,
@@ -1653,6 +1653,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         POOL_HEAD_D=pool_head_dim,
         STORE_HP_TAIL=store_hp_tail,
         WRITE_V_PACKED=write_v_packed,
+        STORE_V_SCALE=v_sf is not None,
     )
     return store_hp_tail
 
@@ -2180,6 +2181,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
                 POOL_HEAD_D=hp_head_dim,
                 STORE_HP_TAIL=True,
                 WRITE_V_PACKED=write_v_packed,
+                STORE_V_SCALE=True,
             )
             q1_prefix_blocks = FP4_MLA_Q_PREFIX_DIM // FP4_MLA_Q1_PREFIX_BLOCK_DIM
             for q1_kv_blocks, q1_prefix_blocks_per_program in q1_variants:
@@ -2452,7 +2454,12 @@ def scatter_fp4_mla_kv_cache(
 
     if phase not in ("context", "generation"):
         raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
-    if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
+    context_only_cache = getattr(
+        metadata.kv_cache_manager, "fp4_mla_context_only_cache", False
+    )
+    if context_only_cache and phase != "context":
+        raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
+    if not context_only_cache and getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -2473,7 +2480,10 @@ def scatter_fp4_mla_kv_cache(
         )
 
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    v_sf = (
+        None if context_only_cache
+        else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    )
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 
@@ -2522,7 +2532,7 @@ def scatter_fp4_mla_kv_cache(
     v_packed_base = None
     v_page_offset = 0
     direct_v_packed_write = False
-    if cutedsl_backend and not fused_v_transpose:
+    if cutedsl_backend and not fused_v_transpose and not context_only_cache:
         persistent_v_packed = _get_cutedsl_persistent_v_packed_cache(
             metadata,
             local_layer,
@@ -2647,7 +2657,8 @@ def scatter_fp4_mla_kv_cache(
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
     cutedsl_repack_max_touched_pages = 1
-    if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write:
+    if (cutedsl_backend and not fused_v_transpose and not direct_v_packed_write
+            and not context_only_cache):
         if phase == "context":
             num_contexts = metadata.num_contexts
             cutedsl_v_pack_page_ids = metadata.paged_kv_indices[: metadata.num_context_blocks]
@@ -2682,6 +2693,8 @@ def scatter_fp4_mla_kv_cache(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
+    if context_only_cache:
+        return hp_pool_updated
     _maybe_update_triton_v_packed_cache(
         metadata,
         layer_idx,
