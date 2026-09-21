@@ -2678,6 +2678,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        if num_gen_requests and getattr(kv_cache_manager,
+                                        "fp4_mla_context_only_cache", False):
+            return None
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
 
@@ -2842,6 +2845,8 @@ class PyTorchModelEngine(ModelEngine):
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        if getattr(kv_cache_manager, "fp4_mla_context_only_cache", False):
+            return None
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(

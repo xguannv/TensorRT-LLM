@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import contextlib
@@ -602,6 +605,17 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+
+    if isinstance(server_role, str):
+        server_role = ServerRole[server_role.upper()]
+    # MPI workers may predate this launcher process. Send the role through
+    # worker_main's explicit overrides instead of relying on env inheritance.
+    # Clear inherited CTX roles for generation and unspecified-role servers.
+    llm_args["env_overrides"] = {
+        **(llm_args.get("env_overrides") or {}),
+        "TRTLLM_DISAGG_ROLE":
+        (server_role.name.lower() if server_role is not None else ""),
+    }
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
@@ -2412,10 +2426,10 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
-    # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
-    role_map = {"ctx": "context", "gen": "generation"}
-    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
-        server_cfg.type, "")
+    server_role = {
+        "ctx": ServerRole.CONTEXT,
+        "gen": ServerRole.GENERATION
+    }[server_cfg.type]
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
@@ -2434,6 +2448,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
                   llm_args=llm_args,
+                  server_role=server_role,
                   **launch_kwargs)
 
 

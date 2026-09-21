@@ -3483,6 +3483,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     tokens_per_block=tokens_per_block,
                     max_batch_size=max_batch_size,
                     spec_config=spec_config,
+                    is_disagg=kwargs.get("is_disagg", False),
                 ))
             max_resident_sequences = max_batch_size * mapping.pp_size
             if max_resident_sequences > 0:

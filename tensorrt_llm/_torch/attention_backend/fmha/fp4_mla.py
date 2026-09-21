@@ -109,7 +109,10 @@ class Fp4MlaFmha(PhasedFmha):
             raise RuntimeError("FP4 MLA requires a SELF-K-only KV cache.")
         if metadata.high_precision_kv_pool is None:
             raise RuntimeError("FP4 MLA requires the high-precision KV pool.")
-        if metadata.fp4_mla_v_scale_pool is None:
+        if metadata.fp4_mla_v_scale_pool is None and not (
+            forward_args.attention_input_type == AttentionInputType.context_only
+            and getattr(kv_cache_manager, "fp4_mla_context_only_cache", False)
+        ):
             raise RuntimeError("FP4 MLA requires the V-scale pool.")
         if metadata.beam_width != 1:
             raise NotImplementedError("FP4 MLA does not support beam search.")
