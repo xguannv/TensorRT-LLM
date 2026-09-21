@@ -446,6 +446,12 @@ class CuteDslMlaFmha(PhasedFmha):
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
         cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        if cache_seqs_base.data_ptr() % 16 != 0:
+            # Mixed context/generation batches can expose an aligned buffer
+            # through an int32 slice whose storage offset is not 16-byte aligned.
+            # CuTe DSL requires the runtime pointer to preserve the alignment
+            # assumed when compiling the kernel.
+            cache_seqs_base = cache_seqs_base.clone()
         page_table = page_table_layer[meta.num_contexts :].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
