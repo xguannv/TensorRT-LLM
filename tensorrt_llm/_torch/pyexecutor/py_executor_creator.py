@@ -15,8 +15,9 @@ import torch
 from strenum import StrEnum
 
 import tensorrt_llm
+from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, global_mpi_rank
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -564,14 +565,12 @@ def create_py_executor(
     # about dwdp_size/dwdp_rank, so inject them here (before anything reads
     # mapping.dwdp_enabled / moe_ep_rank).
     #
-    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
-    # in disaggregated serving each context worker is its own TP=1 instance
-    # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
-    # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
-    # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
+    # dwdp_rank comes from dwdp_global_rank() (MPI rank, or TRTLLM_DWDP_RANK
+    # under plain trtllm-serve), never mapping.rank: disagg context workers
+    # are TP=1 with mapping.rank=0 and would all self-import as DWDP rank 0.
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
         dwdp_size = llm_args.dwdp_config.dwdp_size
-        dwdp_rank = global_mpi_rank() % dwdp_size
+        dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
             "dwdp_rank": dwdp_rank
