@@ -1915,12 +1915,18 @@ class MLA(nn.Module):
             )
 
             fp4_mla = isinstance(self.mqa, TrtllmAttention) and self.mqa.uses_fp4_mla_attention
-            if fp4_mla and (self.k_b_proj_trans.dtype != torch.bfloat16 or latent_cache is None):
+            if fp4_mla and latent_cache is None:
                 raise RuntimeError(
-                    "FP4 MLA generation requires fused BF16 Q "
-                    "quantization, RoPE, and cache update on the TRT-LLM "
-                    "backend."
+                    "FP4 MLA generation requires fused Q quantization, RoPE, "
+                    "and cache update on the TRT-LLM backend, which needs a "
+                    "latent cache to append into."
                 )
+            # The absorption weight dtype is deliberately not constrained here.
+            # It follows kv_b_proj: an FP8 block-scaled checkpoint yields
+            # float8_e4m3fn, anything else the module dtype. Both have a BMM
+            # below that writes q_nope into the same fused_q slice, and an
+            # unsupported dtype is rejected there. Requiring bfloat16 at this
+            # point rejected every FP8-attention Kimi K3 checkpoint outright.
             fuse_fp4_q_quant = fp4_mla
             fp4_rope_kwargs = {"fuse_fp4_q_quant": True} if fuse_fp4_q_quant else {}
 

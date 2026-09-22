@@ -125,6 +125,30 @@ def _detect_trtllm_repo_root() -> Path:
 
 REPO_ROOT = _detect_trtllm_repo_root()
 
+
+def _first_available_path(primary: str, *fallbacks: str) -> str:
+    for candidate in (primary, *fallbacks):
+        if Path(candidate).is_dir():
+            return candidate
+    return primary
+
+
+def _path_for_this_cluster(primary: str, *fallbacks: tuple[str, str]) -> str:
+    """Pick a path by which cluster we are on, given ``(marker, path)`` pairs.
+
+    ``_first_available_path`` probes the leaf, which is correct for a read-only
+    checkpoint that must already be present. It is wrong for a directory the
+    guard creates on demand -- a writable staging root or an HF cache -- and
+    wrong for a container mount string, which is not a local path at all. In
+    both of those cases probing the leaf would fall through to another
+    cluster's value and then fail at mkdir or at container start.
+    """
+    for marker, candidate in fallbacks:
+        if Path(marker).is_dir():
+            return candidate
+    return primary
+
+
 SINGLE_NODE_SELECTORS = (
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py"
     "::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
@@ -133,6 +157,9 @@ SINGLE_NODE_SELECTORS = (
 K3_AGGREGATE_SELECTOR = (
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_full_accuracy"
 )
+K3_NVFP4_KV_AGGREGATE_SELECTOR = (
+    "tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_nvfp4_kv"
+)
 K3_DSPARK_AGGREGATE_SELECTOR = (
     "tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestKimiK3::test_gsm8k_tep8_dspark"
 )
@@ -140,12 +167,15 @@ K3_CHECKPOINT_PATH = (
     "/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
 )
 K3_DSPARK_CHECKPOINT_PATH = (
-    "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
-    "radixark_kimi-k3-dspark/hf/hf-3c5bac3_orig"
+    "/lustre/share/coreai_dlalgo_ci/artifacts/model/radixark_kimi-k3-dspark/hf/hf-3c5bac3_orig"
 )
-K3_HELIX_DSPARK_CHECKPOINT_PATH = (
-    "/lustre/share/coreai_dlalgo_ci/artifacts/model/"
-    "inferact_kimi-k3-dspark/hf/hf-cf6b824_orig"
+# Resolved here rather than behind a flag: this one is baked into a GuardJob as
+# draft_checkpoint_path, which takes precedence over --k3-dspark-checkpoint, so
+# there is no command-line way to correct it on a cluster where it is absent.
+K3_HELIX_DSPARK_CHECKPOINT_PATH = _first_available_path(
+    "/lustre/share/coreai_dlalgo_ci/artifacts/model/inferact_kimi-k3-dspark/hf/hf-cf6b824_orig",
+    "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/"
+    "inferact_kimi-k3-dspark/hf/hf-cf6b824_orig",
 )
 FLASHINFER_CUBINS_REPOSITORY = (
     "https://${URM_USER}:${URM_TOKEN}@urm.nvidia.com/"
@@ -163,7 +193,28 @@ OCI_AGA_DSV4_DSPARK_CHECKPOINT_PATH = (
     "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/"
     "nvidia_deepseek-v4-pro-nvfp4-dspark/hf/hf-318bf60_orig"
 )
+OCI_AGA_K3_DSPARK_CHECKPOINT_PATH = (
+    "/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/"
+    "radixark_kimi-k3-dspark/hf/hf-3c5bac3_orig"
+)
 BRANCH_GUARD_MODEL_ROOT = "/lustre/share/coreai_comparch_trtllm/lizhiz/branch_guard_models"
+OCI_AGA_BRANCH_GUARD_MODEL_ROOT = (
+    "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/lizhiz/"
+    "branch_guard_models"
+)
+HF_CACHE = "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache"
+OCI_AGA_HF_CACHE = (
+    "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/lizhiz/hf_cache"
+)
+CONTAINER_MOUNTS = "/lustre:/lustre"
+OCI_AGA_CONTAINER_MOUNTS = "/scratch:/scratch"
+
+# Directories that exist on exactly one cluster, used to choose between the
+# path sets above. Deliberately NOT "/lustre": on oci-jhb /lustre is a symlink
+# to /scratch, so /lustre and /lustre/fsw exist there too and discriminate
+# nothing. /lustre/share and /scratch/fsw/portfolios do.
+HECATE_MARKER = "/lustre/share"
+OCI_AGA_MARKER = "/scratch/fsw/portfolios"
 K3_DISAGGREGATED_ACCURACY_CONFIG = "examples/kimi_k3/disagg/benchmark_kimi_k3_dep8_gsm8k.yaml"
 K3_DSPARK_SPECULATIVE_CONFIG: dict[str, str | int] = {
     "attention_backend": "TRTLLM",
@@ -221,6 +272,23 @@ GUARD_JOBS = (
         selectors=(K3_AGGREGATE_SELECTOR,),
         nodes=2,
         ntasks=8,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=True,
+        model_name="Kimi-K3",
+        checkpoint_path=K3_CHECKPOINT_PATH,
+        model_path_env="KIMI_K3_CKPT",
+    ),
+    GuardJob(
+        # Smallest gate that reaches FP4 MLA generation: the checkpoint
+        # declares kv_cache_quant_algo null, so only an explicit nvfp4 KV
+        # cache selects that path, and the disaggregated perf presets that
+        # otherwise cover it need six nodes.
+        name="k3-aggregate-nvfp4-kv-gsm8k",
+        scope="multi-node",
+        selectors=(K3_NVFP4_KV_AGGREGATE_SELECTOR,),
+        nodes=4,
+        ntasks=16,
         ntasks_per_node=4,
         gpus_per_node=4,
         use_pmix=True,
@@ -311,13 +379,6 @@ def _default(value: str, environment_name: str) -> str:
     return os.environ.get(environment_name, value)
 
 
-def _first_available_path(primary: str, *fallbacks: str) -> str:
-    for candidate in (primary, *fallbacks):
-        if Path(candidate).is_dir():
-            return candidate
-    return primary
-
-
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the DSV4 and Kimi K3 branch guards on Slurm.")
     parser.add_argument(
@@ -364,7 +425,13 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--k3-dspark-checkpoint",
-        default=os.environ.get("KIMI_K3_DSPARK_CKPT", K3_DSPARK_CHECKPOINT_PATH),
+        default=os.environ.get(
+            "KIMI_K3_DSPARK_CKPT",
+            _first_available_path(
+                K3_DSPARK_CHECKPOINT_PATH,
+                OCI_AGA_K3_DSPARK_CHECKPOINT_PATH,
+            ),
+        ),
         help="Kimi K3 DSpark checkpoint path (or set KIMI_K3_DSPARK_CKPT).",
     )
     parser.add_argument(
@@ -380,16 +447,28 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--guard-model-root",
-        default=os.environ.get("TRTLLM_GUARD_MODEL_ROOT", BRANCH_GUARD_MODEL_ROOT),
+        default=os.environ.get(
+            "TRTLLM_GUARD_MODEL_ROOT",
+            _path_for_this_cluster(
+                BRANCH_GUARD_MODEL_ROOT,
+                (OCI_AGA_MARKER, OCI_AGA_BRANCH_GUARD_MODEL_ROOT),
+            ),
+        ),
         help="Writable directory used to stage model and dataset symlinks.",
     )
     parser.add_argument(
         "--mounts",
         default=_default(
-            "/lustre:/lustre",
+            _path_for_this_cluster(
+                CONTAINER_MOUNTS,
+                (OCI_AGA_MARKER, OCI_AGA_CONTAINER_MOUNTS),
+            ),
             "TRTLLM_CONTAINER_MOUNTS",
         ),
-        help="Pyxis container mounts (default: /lustre:/lustre).",
+        help=(
+            "Pyxis container mounts (default: /lustre:/lustre on hecate, "
+            "/scratch:/scratch on oci-jhb, where the lustre mount is /scratch/fsw)."
+        ),
     )
     parser.add_argument(
         "--repo-root",
@@ -497,9 +576,8 @@ def _validate_env_assignments(assignments: Sequence[str]) -> None:
 
 def _requires_flashinfer_cubins(job: GuardJob) -> bool:
     return (
-        (job.model_name == "Kimi-K3" and job.draft_model_name is not None)
-        or job.speculative_config is not None
-    )
+        job.model_name == "Kimi-K3" and job.draft_model_name is not None
+    ) or job.speculative_config is not None
 
 
 def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
@@ -512,13 +590,9 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
     if args.k3_checkpoint:
         args.k3_checkpoint = str(Path(args.k3_checkpoint).expanduser().resolve())
     if args.k3_dspark_checkpoint:
-        args.k3_dspark_checkpoint = str(
-            Path(args.k3_dspark_checkpoint).expanduser().resolve()
-        )
+        args.k3_dspark_checkpoint = str(Path(args.k3_dspark_checkpoint).expanduser().resolve())
     if args.dsv4_dspark_checkpoint:
-        args.dsv4_dspark_checkpoint = str(
-            Path(args.dsv4_dspark_checkpoint).expanduser().resolve()
-        )
+        args.dsv4_dspark_checkpoint = str(Path(args.dsv4_dspark_checkpoint).expanduser().resolve())
     args.guard_model_root = str(Path(args.guard_model_root).expanduser().resolve())
     if not _is_trtllm_repo_root(args.repo_root):
         raise ValueError(f"Not a TensorRT-LLM repository: {args.repo_root}")
@@ -538,9 +612,7 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
         and any(_requires_flashinfer_cubins(job) for job in jobs)
         and not os.environ.get("URM_TOKEN")
     ):
-        raise ValueError(
-            "URM_TOKEN must be set before submitting a K3 D-Spark test"
-        )
+        raise ValueError("URM_TOKEN must be set before submitting a K3 D-Spark test")
 
     if args.image and not Path(args.image).is_file() and not args.dry_run:
         raise ValueError(f"Container image does not exist: {args.image}")
@@ -551,30 +623,21 @@ def _validate_args(args: argparse.Namespace, jobs: Sequence[GuardJob]) -> None:
             raise ValueError("Missing required Kimi K3 checkpoint: --k3-checkpoint")
         if not Path(args.k3_checkpoint).is_dir() and not args.dry_run:
             raise ValueError(f"Kimi K3 checkpoint does not exist: {args.k3_checkpoint}")
-    if any(
-        job.draft_model_name is not None or job.speculative_config is not None
-        for job in jobs
-    ):
+    if any(job.draft_model_name is not None or job.speculative_config is not None for job in jobs):
         if not args.k3_dspark_checkpoint:
-            raise ValueError(
-                "Missing required Kimi K3 DSpark checkpoint: "
-                "--k3-dspark-checkpoint"
-            )
+            raise ValueError("Missing required Kimi K3 DSpark checkpoint: --k3-dspark-checkpoint")
         if not args.dry_run and not Path(args.k3_dspark_checkpoint).is_dir():
             raise ValueError(
-                "Kimi K3 DSpark checkpoint does not exist: "
-                f"{args.k3_dspark_checkpoint}"
+                f"Kimi K3 DSpark checkpoint does not exist: {args.k3_dspark_checkpoint}"
             )
     if any(job.model_name == "DeepSeek-V4-Pro-DSpark" for job in jobs):
         if not args.dsv4_dspark_checkpoint:
             raise ValueError(
-                "Missing required DeepSeek V4 Pro DSpark checkpoint: "
-                "--dsv4-dspark-checkpoint"
+                "Missing required DeepSeek V4 Pro DSpark checkpoint: --dsv4-dspark-checkpoint"
             )
         if not Path(args.dsv4_dspark_checkpoint).is_dir() and not args.dry_run:
             raise ValueError(
-                "DeepSeek V4 Pro DSpark checkpoint does not exist: "
-                f"{args.dsv4_dspark_checkpoint}"
+                f"DeepSeek V4 Pro DSpark checkpoint does not exist: {args.dsv4_dspark_checkpoint}"
             )
 
     _validate_env_assignments(args.env)
@@ -599,7 +662,7 @@ def _shell_env_lines(
         "LLM_MODELS_ROOT": args.model_root,
         "HF_HOME": os.environ.get(
             "HF_HOME",
-            "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache",
+            _path_for_this_cluster(HF_CACHE, (OCI_AGA_MARKER, OCI_AGA_HF_CACHE)),
         ),
         "TLLM_LOG_LEVEL": "INFO",
         "OMPI_ALLOW_RUN_AS_ROOT": "1",
@@ -613,9 +676,9 @@ def _shell_env_lines(
     if include_flashinfer_repository:
         lines.extend(
             [
-                "test -n \"${URM_TOKEN:-}\"",
-                "export URM_USER=\"${USER}\"",
-                f"export FLASHINFER_CUBINS_REPOSITORY=\"{FLASHINFER_CUBINS_REPOSITORY}\"",
+                'test -n "${URM_TOKEN:-}"',
+                'export URM_USER="${USER}"',
+                f'export FLASHINFER_CUBINS_REPOSITORY="{FLASHINFER_CUBINS_REPOSITORY}"',
             ]
         )
     lines.append("unset TRTLLM_MOE_A2A_DISABLE_CFT_COUNTED_WRITES")
@@ -641,9 +704,15 @@ def _install_lines(args: argparse.Namespace) -> list[str]:
             )
         )
     install_shell = "; ".join(commands)
+    # The lock must sit on shared storage, not /tmp. enroot mounts /tmp as a
+    # per-node tmpfs, so a /tmp lock only serialises the ranks within one node
+    # while every node still runs "pip install -e" against the same shared
+    # checkout at once. Concurrent editable installs then clobber each other's
+    # build metadata in the repo and the losers die with "is not a valid
+    # editable requirement" and a working directory that no longer exists.
+    lock_path = f"{args.repo_root}/.branch_guard_install_$SLURM_JOB_ID.lock"
     return [
-        f'flock "/tmp/trtllm_branch_guard_install_"$SLURM_JOB_ID".lock" '
-        f"bash -lc {shlex.quote(install_shell)}",
+        f'flock "{lock_path}" bash -lc {shlex.quote(install_shell)}',
     ]
 
 
@@ -852,9 +921,7 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     run_id = int(time.time())
     log_dir = args.log_dir / job.name / f"run-{run_id}"
     log_dir.mkdir(parents=True, exist_ok=True)
-    config["slurm"]["script_file"] = str(
-        _write_benchmark_slurm_script(args.repo_root, log_dir)
-    )
+    config["slurm"]["script_file"] = str(_write_benchmark_slurm_script(args.repo_root, log_dir))
 
     config["slurm"]["partition"] = args.partition
     config["slurm"]["account"] = args.account
@@ -924,13 +991,11 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
         # implementation selected by the performance recipe. Use K3's
         # supported TRTLLM MoE backend for this correctness guard.
         for role in ("ctx", "gen"):
-            config["worker_config"][role].setdefault("moe_config", {})[
-                "backend"
-            ] = "TRTLLM"
+            config["worker_config"][role].setdefault("moe_config", {})["backend"] = "TRTLLM"
         config["environment"]["server_health_timeout"] = 5400
     accuracy_env = config.setdefault("accuracy", {}).setdefault("env_var", {})
     accuracy_env["HF_HOME"] = os.environ.get(
-        "HF_HOME", "/lustre/fsw/coreai_comparch_trtllm/lizhiz/hf_cache"
+        "HF_HOME", _path_for_this_cluster(HF_CACHE, (OCI_AGA_MARKER, OCI_AGA_HF_CACHE))
     )
     accuracy_env["LLM_MODELS_ROOT"] = args.model_root
     accuracy_env["HF_HUB_OFFLINE"] = "1"

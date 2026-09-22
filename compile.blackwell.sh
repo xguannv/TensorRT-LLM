@@ -9,8 +9,30 @@ CLEAN=${2:---clean}
 
 ACCOUNT=${ACCOUNT:-coreai_comparch_inferencex}
 REPO_DIR=$(readlink -f "$PWD")
-MOUNT="/lustre:/lustre,${REPO_DIR}:/code/tensorrt_llm"
-WORKDIR="/code/tensorrt_llm"
+
+# Mount layout is cluster-specific. hecate keeps everything under /lustre and
+# the build has historically mounted the whole filesystem in. oci-jhb has no
+# /lustre/share at all -- there /lustre is a symlink to /scratch and the real
+# lustre mount is /scratch/fsw -- so "/lustre:/lustre" resolves to a target the
+# base image does not have. enroot then auto-creates the missing target as a
+# directory the submitting user cannot traverse, and that single directory makes
+# --container-save abort with "find: Permission denied / pyxis: failed to export
+# container", leaving a successful build with no image (measured on hecate
+# 2026-09-18, see compile.sh). /workspace exists in the base image, and the build
+# itself needs nothing but the repo: every path in the container command below is
+# relative to WORKDIR.
+#
+# The /lustre/share probe is the same marker scripts/run_branch_guard_perf_k3.py
+# uses to tell the two clusters apart; see _detect_cluster() there.
+if [[ -d /lustre/share ]]; then
+    MOUNT="/lustre:/lustre,${REPO_DIR}:/code/tensorrt_llm"
+    WORKDIR="/code/tensorrt_llm"
+else
+    MOUNT="${REPO_DIR}:/workspace"
+    WORKDIR="/workspace"
+fi
+MOUNT=${TRTLLM_BUILD_MOUNT:-${MOUNT}}
+WORKDIR=${TRTLLM_BUILD_WORKDIR:-${WORKDIR}}
 
 source "${REPO_DIR}/jenkins/current_image_tags.properties"
 IMAGE=${TRTLLM_TEST_IMAGE:-${LLM_SBSA_DOCKER_IMAGE}}

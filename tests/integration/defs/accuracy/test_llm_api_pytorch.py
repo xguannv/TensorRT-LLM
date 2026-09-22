@@ -4501,6 +4501,59 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
 
+    @pytest.mark.skip_less_mpi_world_size(16)
+    def test_gsm8k_nvfp4_kv(self):
+        """GSM8K on an NVFP4 KV cache, which is what selects FP4 MLA.
+
+        The checkpoint declares kv_cache_quant_algo null, so every other K3
+        gate here runs FP8 or auto KV and never reaches the FP4 MLA
+        generation path. That gap let an FP8-attention checkpoint break the
+        path unnoticed: absorption weights follow kv_b_proj, so they load as
+        float8_e4m3fn, and the generation path rejected anything but
+        bfloat16 before reaching the FP8 BMM that handles them.
+        """
+        with LLM(
+                self.MODEL_PATH,
+                # tp16, matching the dep16 context worker of the disaggregated
+                # NVFP4 recipe. tp8 runs out of memory building the model.
+                tensor_parallel_size=16,
+                moe_expert_parallel_size=16,
+                enable_attention_dp=True,
+                max_batch_size=8,
+                max_num_tokens=8192,
+                max_seq_len=8192,
+                trust_remote_code=True,
+                disable_overlap_scheduler=False,
+                enable_chunked_prefill=True,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                  max_batch_size=8),
+                moe_config=MoeConfig(
+                    backend="TRTLLM",
+                    max_num_tokens=131072,
+                    use_low_precision_moe_combine=True,
+                ),
+                kv_cache_config=KvCacheConfig(
+                    dtype="nvfp4",
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.4,
+                    tokens_per_block=64,
+                ),
+        ) as llm:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=(llm.args.speculative_config.decoding_type
+                               if llm.args.speculative_config else None))
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(llm)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_tep8_dspark(self):
         """GSM8K plus an acceptance-length gate on the TEP8 DSpark recipe.

@@ -54,6 +54,11 @@ FP4_MLA_CUTEDSL_MUFU16_ENV = "TRTLLM_FP4_MLA_CUTEDSL_MUFU16"
 FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV = "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE"
 _FP4_MLA_CUTEDSL_BACKEND = "cutedsl"
 _FP4_MLA_K_RESIDUAL_BACKENDS = ("triton", _FP4_MLA_CUTEDSL_BACKEND)
+# Architectures on which the K-residual Triton path can run the fused Q-quant
+# cache update. SM107 is not listed because it selects CuTeDSL instead, which
+# carries its own check at launch; SM103 (Blackwell-Ultra, GB300) is the part
+# this was first exercised on.
+_FP4_MLA_TRITON_Q_QUANT_FUSION_SMS = (103,)
 _FP4_MLA_Q1_KV_BLOCKS_SMALL_BATCH = 4
 _FP4_MLA_Q1_KV_BLOCKS_MEDIUM_BATCH = 16
 _FP4_MLA_Q1_KV_BLOCKS_LARGE_BATCH = 32
@@ -98,6 +103,24 @@ def _fp4_mla_attention_backend() -> str:
     if backend:
         return backend.lower()
     return _FP4_MLA_CUTEDSL_BACKEND if get_sm_version() == 107 else "triton"
+
+
+def _q_quant_fusion_supported() -> bool:
+    """Whether the selected backend can fuse Q quantization on this GPU.
+
+    The backend selector already encodes the architecture: SM107 gets CuTeDSL,
+    everything else gets the Triton K-residual path, and the CuTeDSL launch
+    re-checks SM107 for itself. Gating this predicate on SM107 as well ruled
+    out the Triton path on architectures that select it, which is not a
+    no-op: ``uses_fp4_mla_attention`` carries no SM check, so on GB300
+    (SM103) it stayed true while this returned false, and the caller treats
+    that disagreement as a hard error ("FP4 MLA fused Q quantization
+    eligibility changed before launch") rather than a fallback.
+    """
+    backend = _fp4_mla_attention_backend()
+    if backend == _FP4_MLA_CUTEDSL_BACKEND:
+        return get_sm_version() == 107
+    return get_sm_version() in _FP4_MLA_TRITON_Q_QUANT_FUSION_SMS
 
 
 def _cutedsl_backend_available() -> bool:
@@ -954,7 +977,7 @@ def can_fuse_fp4_mla_q_quant(
     num_gen = metadata.num_seqs - metadata.num_contexts
     return bool(
         _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
-        and get_sm_version() == 107
+        and _q_quant_fusion_supported()
         and num_gen > 0
         and getattr(metadata, "kv_cache_manager", None) is not None
         and q.shape[0] > 0
