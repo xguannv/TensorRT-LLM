@@ -5,6 +5,7 @@ import ast
 import functools
 import itertools
 import math
+import os
 from dataclasses import replace
 from typing import ClassVar, List, Optional, Tuple, Type
 
@@ -19,6 +20,7 @@ from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
+from ..cute_dsl_kernels import sm_reserve
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_INTERNAL_AVAILABLE)
 from ..ugpu.autotune import tune_ugpu_concurrent
@@ -38,6 +40,36 @@ try:
     from cuda.bindings import driver as cuda
 except ImportError:
     from cuda import cuda
+
+# TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic|static pins the Rubin dense
+# block-scaled GEMM autotuner to one persistent tile scheduler (unset: both).
+# ``clc_dynamic`` also drops the mixed-cluster kernel (static scheduler only);
+# use it when another kernel holds SMs, where a static grid runs a second wave.
+_DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
+_dense_gemm_scheduler_announced = set()
+
+
+def _dense_gemm_scheduler_override() -> Optional[str]:
+    """Scheduler pinned by the env var, read at use time; None if unset."""
+    value = os.environ.get(_DENSE_GEMM_SCHEDULER_ENV,
+                           "").strip().lower() or None
+    if value not in (None, "static", "clc_dynamic"):
+        raise ValueError(f"{_DENSE_GEMM_SCHEDULER_ENV} must be 'static' or "
+                         f"'clc_dynamic', got {value!r}")
+    if value is not None and value not in _dense_gemm_scheduler_announced:
+        _dense_gemm_scheduler_announced.add(value)
+        excluded = " (mixed-cluster kernel excluded)" if value == "clc_dynamic" else ""
+        logger.info(
+            f"[cute_dsl_custom_ops] {_DENSE_GEMM_SCHEDULER_ENV}={value}: Rubin dense "
+            f"GEMM tactics limited to that scheduler{excluded}")
+    return value
+
+
+def _dense_gemm_scheduler_modes(default: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Scheduler candidates after the env override."""
+    override = _dense_gemm_scheduler_override()
+    return (override, ) if override else default
+
 
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
@@ -550,15 +582,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     @functools.cache
-    def _get_full_device_max_active_clusters(device_id: int,
-                                             cluster_size: int) -> int:
-        """Return the cached full-device occupancy for a cluster shape."""
+    def _get_full_device_max_active_clusters(device_id: int, cluster_size: int,
+                                             reserved_sms: int) -> int:
+        """Return the cached full-device occupancy for a cluster shape.
+
+        ``reserved_sms`` (``TRTLLM_CUTEDSL_SM_RESERVE``, applied inside
+        ``HardwareInfo.get_max_active_clusters``) is part of the key so a
+        reserve set after the first query is not hidden by the cache.
+        """
         hardware_info = cutlass.utils.HardwareInfo(device_id=device_id)
         return hardware_info.get_max_active_clusters(cluster_size)
 
     def get_max_activate_clusters(cluster_size):
         max_active = _get_full_device_max_active_clusters(
-            torch.cuda.current_device(), cluster_size)
+            torch.cuda.current_device(), cluster_size, sm_reserve())
         if get_current_ugpu() is not None:
             node_local = node_local_max_active_clusters(max_active)
             max_active = node_local if node_local is not None else max(
@@ -10015,6 +10052,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_inst_shape_k: ClassVar[int]
             allow_unswapped_small_m_fallback: ClassVar[bool]
             raster_order_candidates: ClassVar[Tuple[str, ...]] = ("m", )
+            # Narrowed at use time by TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER, see
+            # _dense_gemm_scheduler_modes().
             scheduler_mode_candidates: ClassVar[Tuple[str,
                                                       ...]] = ("static",
                                                                "clc_dynamic")
@@ -10035,17 +10074,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_tvm_ffi = use_tvm_ffi
 
             def unique_id(self):
-                return (self.output_dtype, self.to_userbuffers,
+                # The scheduler pin narrows the tactic space, so it is part of
+                # the autotuner cache key: a cache file written without the pin
+                # must not hand a static or mixed-cluster tactic to a pinned
+                # run (or the reverse).  Unpinned runs keep the old key.
+                base = (self.output_dtype, self.to_userbuffers,
                         self.use_tvm_ffi)
+                override = _dense_gemm_scheduler_override()
+                return base if override is None else base + (override, )
 
             def __hash__(self):
-                return hash(
-                    (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi))
+                return hash(self.unique_id())
 
             def __eq__(self, other):
                 if not isinstance(other, self.__class__):
                     return False
-                return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi
+                return self.unique_id() == other.unique_id()
 
             def get_valid_tactics(
                 self,
@@ -10099,6 +10143,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m, output_aligned)
                 mixed_swap_ab_candidates = _get_cute_dsl_swap_ab_candidates(
                     m, output_aligned, include_alternative=True)
+                if _dense_gemm_scheduler_override() == "clc_dynamic":
+                    # The mixed-cluster kernel only has a static scheduler.
+                    mixed_swap_ab_candidates = []
                 if not base_swap_ab_candidates:
                     logger.debug(
                         f"CuteDSL: No valid C layout for M={m}, N={n}. "
@@ -10179,7 +10226,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             mma_inst_shape,
                             cluster_shape_mn,
                     ):
-                        for scheduler_mode in self.scheduler_mode_candidates:
+                        for scheduler_mode in _dense_gemm_scheduler_modes(
+                                self.scheduler_mode_candidates):
                             if (scheduler_mode == "clc_dynamic"
                                     and raster_order == "n"
                                     and not _clc_raster_n_has_launchable_grid(
@@ -10262,8 +10310,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         return False
                     if not isinstance(tactic[5], bool):
                         return False
-                    if (len(tactic) >= 7 and tactic[6]
-                            not in self.scheduler_mode_candidates):
+                    if (len(tactic) >= 7
+                            and tactic[6] not in _dense_gemm_scheduler_modes(
+                                self.scheduler_mode_candidates)):
                         return False
                     return (len(tactic) < 8
                             or tactic[7] in self.raster_order_candidates)
