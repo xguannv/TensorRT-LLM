@@ -9,8 +9,24 @@ CLEAN=${2:-""}
 
 ACCOUNT=${ACCOUNT:-coreai_comparch_aarwlt}
 REPO_DIR=`readlink -f $PWD`
-MOUNT="/lustre:/lustre,${REPO_DIR}:/code/tensorrt_llm"
-WORKDIR="/code/tensorrt_llm"
+# Mount targets MUST already exist in the base image. enroot auto-creates a
+# missing mount target (x-create=dir) as a directory the submitting user cannot
+# traverse, and that single directory makes --container-save abort with
+#   find: '<rootfs>/<target>': Permission denied
+#   pyxis: failed to export container ...
+# leaving a successful build with no image. /workspace exists in the Rubin base
+# image; /code and /lustre do not. Measured on hecate 2026-09-18: targets
+# /lustre + /code/tensorrt_llm fail, no mounts succeeds, /workspace succeeds.
+# The build itself needs only the repo -- every path in the container command is
+# relative to WORKDIR, and PUBLISH_ROOT is used host-side after srun returns.
+# Migrating an existing checkout to this WORKDIR needs one clean build. Both
+# build artefacts under ${REPO_DIR} record absolute in-container paths:
+#   .venv-3.12   venv shebangs -> "conan: not found", exit 127
+#   cpp/build    CMakeCache.txt -> "current CMakeCache.txt directory ... is
+#                different than the directory /code/tensorrt_llm/cpp/build"
+# Run once with --clean (or delete both) after changing WORKDIR.
+MOUNT="${REPO_DIR}:/workspace"
+WORKDIR="/workspace"
 
 source ${REPO_DIR}/jenkins/current_image_tags.properties
 IMAGE=${LLM_SBSA_RUBIN_DOCKER_IMAGE}
