@@ -86,6 +86,19 @@ _EARLY_FAILURE_RE = re.compile(
     r"(?:ctx|context|gen|generation|disagg|disaggregated)",
     re.IGNORECASE,
 )
+# Lines that label themselves INFO or DEBUG cannot be the failure, whatever
+# they happen to contain. On job 557546 the scanner's first hit was
+# "[TRT-LLM] [I] [_torch][RANK 2] Fallback to regular model init: Traceback
+# (most recent call last):" -- an expected fast-init fallback, matched only
+# because the pattern accepts a bare "Traceback (most recent call last)". In
+# wait mode that would have cancelled the job 6m17s before the real cause (an
+# OOM) was written, and then reported the fallback as the failure: the wrong
+# diagnosis, with the right one destroyed. 16 further benign matches preceded
+# the genuine one. WARNING is deliberately not suppressed -- NCCL WARN is in
+# the pattern on purpose.
+_BENIGN_SEVERITY_RE = re.compile(
+    r"\[TRT-LLM\] \[[ID]\]|\b(?:INFO|DEBUG)\b",
+)
 _ROLE_RE = re.compile(
     r"\b(?:ctx|context|gen|generation|disagg|disaggregated)\b",
     re.IGNORECASE,
@@ -215,6 +228,9 @@ OCI_AGA_CONTAINER_MOUNTS = "/scratch:/scratch"
 # nothing. /lustre/share and /scratch/fsw/portfolios do.
 HECATE_MARKER = "/lustre/share"
 OCI_AGA_MARKER = "/scratch/fsw/portfolios"
+# lm-eval --seed, "python,numpy,torch,fewshot". The fewshot field is what the
+# K3 reference numbers were measured with; its lm-eval default of 1234 is not.
+_LM_EVAL_SEED = "0,1234,1234,0"
 K3_DISAGGREGATED_ACCURACY_CONFIG = "examples/kimi_k3/disagg/benchmark_kimi_k3_dep8_gsm8k.yaml"
 K3_DSPARK_SPECULATIVE_CONFIG: dict[str, str | int] = {
     "attention_backend": "TRTLLM",
@@ -356,6 +372,25 @@ GUARD_JOBS = (
         gpus_per_node=4,
         use_pmix=False,
         launcher="benchmark",
+    ),
+    # DSpark on the EP16 topology. The EP8 DSpark job above cannot be made to
+    # fit on GB300: it OOMs during model creation, before KV-cache sizing, at
+    # 252.59 GB/rank of weights alone, so no free_gpu_memory_fraction helps.
+    # Expert-parallel width is the only measured lever -- EP16 holds 56 experts
+    # per rank per layer against EP8's 112 and was measured at 163.44 GB/rank
+    # on the same cluster -- so this is the variant that actually exercises
+    # DSpark there.
+    GuardJob(
+        name="k3-disaggregated-dspark-dep16-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=8,
+        ntasks=32,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark",
+        speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
     ),
     *(
         GuardJob(
@@ -948,12 +983,44 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     # unrelated 8K/1K JSONL dataset on the compute nodes.
     config["benchmark"]["enable_benchmark"] = False
     config.setdefault("accuracy", {})["enable_accuracy_test"] = True
+    # lm-eval's --seed is "python,numpy,torch,fewshot" and its fewshot default
+    # is 1234, which selects different 5-shot exemplars than every K3 reference
+    # number was measured with. benchmark_kimi_k3_dep8_gsm8k.yaml pins
+    # "0,1234,1234,0" and records the cost of not doing so: fewshot seed 0 gave
+    # 96.36 / 96.40 / 96.47 against seed 1234's 95.07 / 95.68 / 95.68 / 95.68,
+    # i.e. about 0.8 points, with the questions identical and all 1319 prompts
+    # different. Job 559983 ran a perf recipe, whose accuracy block is disabled
+    # boilerplate carrying no seed, and scored 95.83 -- squarely in the
+    # wrong-seed band and not comparable to any anchor.
+    #
+    # Enabling the accuracy test therefore has to carry the seed with it. A
+    # perf recipe will never supply one, and nothing in the output says the
+    # number is incomparable, so leaving this to the recipe is a trap that
+    # reads as a model regression.
+    for task_config in config["accuracy"].setdefault("tasks", {}).values():
+        task_config.setdefault("extra_kwargs", {}).setdefault("seed", _LM_EVAL_SEED)
     if job.speculative_config is not None:
         speculative_config = deepcopy(job.speculative_config)
         speculative_config["speculative_model"] = (
             job.draft_checkpoint_path or args.k3_dspark_checkpoint
         )
         config["worker_config"]["gen"]["speculative_config"] = speculative_config
+    # #19179 flipped KIMI_K3_FP8_WEIGHT_READ_MOE_MLP from on to off, so the
+    # replicated shared-expert and latent MLP projections stay BF16 unless
+    # something asks for FP8. They are not TP-sharded, so that is twice the
+    # bytes on every rank. The perf guard has set this deliberately since
+    # 76e0ef7212; this guard never did, which is the inconsistency being fixed
+    # here.
+    #
+    # It does not fix the GB300 accuracy-preset OOM, which was measured as a
+    # ~68 GiB transient during model creation, dominated by raw BF16 expert
+    # staging -- nothing this variable touches.
+    config["environment"]["worker_env_var"] = " ".join(
+        [
+            "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1",
+            config["environment"].get("worker_env_var", ""),
+        ]
+    ).strip()
     if _requires_flashinfer_cubins(job):
         flashinfer_repository = FLASHINFER_CUBINS_REPOSITORY.replace(
             "${URM_USER}", os.environ["USER"]
@@ -968,6 +1035,7 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     if job.name in {
         "k3-disaggregated-dspark-gsm8k",
         "k3-disaggregated-dspark-helix-cp8-gsm8k",
+        "k3-disaggregated-dspark-dep16-gsm8k",
     }:
         for role in ("ctx", "gen"):
             config["worker_config"][role]["kv_cache_config"]["dtype"] = "fp8"
@@ -986,7 +1054,10 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
                 "max_num_tokens": 256,
             }
         )
-    if job.name == "k3-disaggregated-dep16-gsm8k":
+    if job.name in {
+        "k3-disaggregated-dep16-gsm8k",
+        "k3-disaggregated-dspark-dep16-gsm8k",
+    }:
         # The normal SBSA GB300 image does not provide the MegaMoE DeepGEMM
         # implementation selected by the performance recipe. Use K3's
         # supported TRTLLM MoE backend for this correctness guard.
@@ -1120,6 +1191,8 @@ def _read_new_log(path: Path, offset: int) -> tuple[int, list[str]]:
 
 
 def _failure_context(line: str) -> str | None:
+    if _BENIGN_SEVERITY_RE.search(line) is not None:
+        return None
     if _EARLY_FAILURE_RE.search(line) is None:
         return None
     role_map = {
@@ -1168,6 +1241,29 @@ def _slurm_job_state(job_id: str) -> str | None:
     return None
 
 
+def _slurm_batch_step_completed(job_id: str) -> bool:
+    """Whether the job's batch script ran to completion.
+
+    The allocation's own state is not a verdict. The benchmark harness tears
+    its allocation down once the workload finishes, so a clean run ends
+    CANCELLED -- both a successful reference run and our own runs do. Grading
+    on ``state == "COMPLETED"`` reports those as failures. The batch step is
+    the thing that actually ran the work, and it records COMPLETED whatever
+    happens to the allocation afterwards.
+    """
+    result = subprocess.run(
+        ["sacct", "-n", "-P", "-j", f"{job_id}.batch", "--format=State"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        state = line.strip().split("|", 1)[0].split("+", 1)[0]
+        if state:
+            return state == "COMPLETED"
+    return False
+
+
 def _cancel_slurm_job(job_id: str) -> None:
     result = subprocess.run(
         ["scancel", job_id],
@@ -1198,7 +1294,7 @@ def _monitor_job(args: argparse.Namespace, job: GuardJob, job_id: str, started_a
             if failure is not None:
                 print(f"[{job.name}] FAILURE: {failure}", file=sys.stderr)
                 return False
-            if state != "COMPLETED":
+            if state != "COMPLETED" and not _slurm_batch_step_completed(job_id):
                 print(f"[{job.name}] Slurm terminal state: {state}", file=sys.stderr)
                 return False
             return True
