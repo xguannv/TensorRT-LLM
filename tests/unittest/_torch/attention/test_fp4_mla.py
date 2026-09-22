@@ -365,8 +365,10 @@ def test_fp4_mla_rope_generation_forwards_helix_cache_ownership(
     assert metadata._fp4_mla_generation_cache_scattered
 
 
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("has_latent_cache", [True, False])
 def test_mla_fp4_helix_generation_reaches_fused_cache_update(
-    monkeypatch,
+    monkeypatch, weight_dtype, has_latent_cache
 ) -> None:
     num_tokens, num_heads = 2, 2
     qk_nope_head_dim, qk_rope_head_dim = 2, 2
@@ -396,8 +398,11 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update(
             num_heads,
             kv_lora_rank,
             qk_nope_head_dim,
-            dtype=torch.bfloat16,
+            dtype=weight_dtype,
         ),
+        k_b_proj_trans_scale=None,
+        k_b_proj_trans_dequant=None,
+        use_cute_dsl_blockscaling_bmm=False,
         apply_rotary_emb=False,
         aux_stream=None,
         ln_events=[None, None],
@@ -412,7 +417,16 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update(
 
     monkeypatch.setattr(mla_module, "TrtllmAttention", FakeFp4Attention)
 
-    with pytest.raises(ReachedFusedCacheUpdate):
+    monkeypatch.setattr(mla_module, "fp8_block_scaling_bmm_out", lambda *args: None)
+    error = ReachedFusedCacheUpdate if has_latent_cache else RuntimeError
+    match = None if has_latent_cache else "needs a latent cache"
+    latent_cache = (
+        torch.empty(num_tokens, kv_lora_rank + qk_rope_head_dim, dtype=torch.bfloat16)
+        if has_latent_cache
+        else None
+    )
+
+    with pytest.raises(error, match=match):
         MLA.forward_absorption_generation(
             mla,
             torch.empty(
@@ -425,11 +439,7 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update(
             attn_metadata=metadata,
             output=torch.empty(0),
             position_ids=torch.arange(num_tokens),
-            latent_cache=torch.empty(
-                num_tokens,
-                kv_lora_rank + qk_rope_head_dim,
-                dtype=torch.bfloat16,
-            ),
+            latent_cache=latent_cache,
         )
 
 
@@ -463,13 +473,21 @@ def test_k3_fp8_split_k_context_selection_is_shape_gated(monkeypatch) -> None:
     assert fmha.supports_k3_fp8_split_k_context()
     debug_once.assert_not_called()
 
-    attn.num_heads = attn.num_kv_heads = 6
+    for heads in (48, 24, 12, 6, 3):
+        attn.num_heads = attn.num_kv_heads = heads
+        assert fmha.supports_k3_fp8_split_k_context()
+    debug_once.assert_not_called()
+
+    attn.num_heads, attn.num_kv_heads = 12, 6
     assert not fmha.supports_k3_fp8_split_k_context()
-    assert "96 Q/KV heads per rank" in debug_once.call_args.args[0]
-    assert "got 6/6" in debug_once.call_args.args[0]
+    assert "matching positive Q/KV head counts" in debug_once.call_args.args[0]
+    assert "got 12/6" in debug_once.call_args.args[0]
     key = debug_once.call_args.kwargs["key"]
     assert not fmha.supports_k3_fp8_split_k_context()
     assert debug_once.call_args.kwargs["key"] == key
+
+    attn.num_heads = attn.num_kv_heads = 0
+    assert not fmha.supports_k3_fp8_split_k_context()
 
     attn.num_heads = attn.num_kv_heads = 96
     monkeypatch.setattr(fp4_mla_fmha_module, "get_sm_version", lambda: 103)
@@ -2542,3 +2560,199 @@ def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     assert torch.equal(actual, expected)
     assert torch.all(actual[_V_REPACK_HEAD_DIM : 2 * _V_REPACK_HEAD_DIM] == sentinel)
     assert torch.all(actual[3 * _V_REPACK_HEAD_DIM : 4 * _V_REPACK_HEAD_DIM] == sentinel)
+
+
+@pytest.mark.skipif(_is_cutedsl_unavailable(), reason="MXFP8 CTX gather requires Rubin CuTe DSL")
+@pytest.mark.parametrize(
+    "lengths, offsets, global_scale, large_page_stride",
+    [
+        ([97, 32], [0, 127], 32.0, False),
+        ([13, 0, 117], [127, 1, 255], 128.0, False),
+        ([128], [0], 1.0, False),
+        ([128], [0], 1.0, True),
+    ],
+)
+def test_fp4_mla_context_mxfp8_gather(
+    lengths, offsets, global_scale, large_page_stride, monkeypatch
+):
+    """Validate the reader; direct cache bytes do not test scatter or reuse lifecycle.
+
+    Power-of-two global scales make division exact, so the independent PyTorch
+    reference is bitwise comparable despite compiler FFMA contraction. Arbitrary
+    scales require a reference that preserves the original PTX expression.
+    """
+    seq_lens = [length + offset for length, offset in zip(lengths, offsets)]
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=65536,
+        max_seq_len=max(seq_lens),
+        max_batch_size=len(lengths),
+        enable_block_reuse=True,
+    )
+    try:
+        assert manager.enable_block_reuse
+        manager.add_dummy_requests(list(range(len(lengths))), seq_lens)
+        assert all(index in manager.kv_cache_map for index in range(len(lengths)))
+        metadata = _build_multi_seq_metadata(manager, seq_lens=seq_lens, page_size=128)
+        metadata._fp4_mla_kv_global_scale.fill_(global_scale)
+        kv, sf = manager.get_fp4_mla_cache_buffers(0)
+        if large_page_stride:
+            # Exercise both cache and SF scalar reads beyond signed 32-bit
+            # offsets without filling the unused gap between two pages.
+            kv = torch.empty_strided(
+                (2, *kv.shape[1:]),
+                ((1 << 31) + kv.stride(0), *kv.stride()[1:]),
+                dtype=kv.dtype,
+                device=kv.device,
+            )
+            sf = torch.empty_strided(
+                (2, *sf.shape[1:]),
+                ((1 << 31) + sf.stride(0), *sf.stride()[1:]),
+                dtype=sf.dtype,
+                device=sf.device,
+            )
+            monkeypatch.setattr(manager, "get_fp4_mla_cache_buffers", lambda _: (kv, sf))
+        torch.manual_seed(107)
+        kv.random_(0, 256)
+        sf.view(torch.uint8).copy_(
+            torch.randint(1, 127, sf.shape, dtype=torch.uint8, device="cuda")
+        )
+        # Native allocation remains active, but use nonidentity physical pages.
+        metadata._paged_kv_indices.copy_(kv.shape[0] - 1 - metadata._paged_kv_indices)
+        if large_page_stride:
+            metadata._paged_kv_indices.fill_(1)
+            assert kv.stride(0) >= 1 << 31 and sf.stride(0) >= 1 << 31
+        row_ids, physical_ids = [], []
+        for batch, (length, offset) in enumerate(zip(lengths, offsets)):
+            positions = torch.arange(offset, offset + length, device="cuda")
+            row_ids.append(positions % 128)
+            physical_ids.append(
+                metadata._paged_kv_indices[
+                    batch * metadata.fp4_mla_page_table_stride + positions // 128
+                ].long()
+            )
+        rows, physical = torch.cat(row_ids), torch.cat(physical_ids)
+        page, row = int(physical[0]), int(rows[0])
+        kv[page, 0, row, 0, :256] = 0  # Floor scale, including signed-zero inputs elsewhere.
+        kv[page, 0, row, 0, 256] = 0x22
+        kv[page, 0, row, 0, 288] = 0xAA
+        sf_bytes = sf[page].view(torch.uint8).flatten()
+        for col in (32, 36):
+            sf_bytes[_swizzled_sf_offset(row, col, 40)] = 56
+        # Saturation and near cancellation test rounding after adding the residual.
+        kv[page, 0, row, 0, 264] = 0xF7
+        kv[page, 0, row, 0, 296] = 0
+        sf_bytes[_swizzled_sf_offset(row, 33, 40)] = 126
+        kv[page, 0, row, 0, 272] = 0x55
+        kv[page, 0, row, 0, 304] = 0xDD
+        sf_bytes[_swizzled_sf_offset(row, 34, 40)] = 56
+        sf_bytes[_swizzled_sf_offset(row, 38, 40)] = 55
+
+        packed = kv[physical, 0, rows, 0, :320]
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(-1, 640).long()
+        lut = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            device="cuda",
+        )
+        sf_indices = _swizzled_sf_offset(rows[:, None], torch.arange(40, device="cuda"), 40)
+        sf_values = sf.view(torch.float8_e4m3fn).reshape(sf.shape[0], -1).float()
+        scales = sf_values[physical[:, None], sf_indices].repeat_interleave(16, dim=1)
+        # Keep FP32 division per term; a reciprocal multiply changes rounding.
+        values = lut[codes] * scales / metadata._fp4_mla_kv_global_scale
+        dense = values[:, :512].to(torch.bfloat16).contiguous()
+        rope = (values[:, 512:576] + values[:, 576:]).to(torch.bfloat16).contiguous()
+        expected_a, expected_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(dense)
+        expected_pe, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            rope, torch.ones(1, device="cuda")
+        )
+
+        cu = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64, device="cuda"
+        )
+        chunk_offsets = torch.tensor(offsets, dtype=torch.int64, device="cuda")
+        # Capacity exceeds active contexts; sentinels must never be dereferenced.
+        metadata._paged_kv_indices = torch.cat(
+            (
+                metadata._paged_kv_indices,
+                torch.full(
+                    (3 * metadata.fp4_mla_page_table_stride,), -1, dtype=torch.int32, device="cuda"
+                ),
+            )
+        )
+        cu = torch.cat((cu, torch.full((3,), -1, dtype=torch.int64, device="cuda")))
+        chunk_offsets = torch.cat(
+            (chunk_offsets, torch.full((3,), -1, dtype=torch.int64, device="cuda"))
+        )
+        (actual_a, actual_sf), actual_pe = load_fp4_mla_chunked_kv_cache(
+            metadata,
+            0,
+            num_ctx_cached_tokens=sum(lengths),
+            cu_chunked_seq_len=cu,
+            chunked_global_offset=chunk_offsets,
+            chunked_max_seq_len=max(lengths),
+            out_dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            output_format="mxfp8",
+        )
+        for expected, actual in (
+            (expected_a, actual_a),
+            (expected_sf, actual_sf),
+            (expected_pe, actual_pe),
+        ):
+            # Includes every padded SF byte, not just rows consumed by the GEMM.
+            assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))
+    finally:
+        torch.cuda.synchronize()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("bias_kind", ["missing", "none", "present"])
+def test_mla_strided_context_projection_optional_bias(monkeypatch, bias_kind):
+    projection = SimpleNamespace(weight=torch.empty(16, 512, dtype=torch.bfloat16))
+    if bias_kind != "missing":
+        projection.bias = None if bias_kind == "none" else torch.zeros(16)
+    module = SimpleNamespace(
+        kv_b_proj=projection,
+        num_heads_tp=1,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        kv_lora_rank=512,
+    )
+    monkeypatch.setattr(mla_module, "is_sm_100f", lambda: True)
+    assert MLA._use_kvbproj_strided_out(module) == (bias_kind != "present")
+
+
+@pytest.mark.parametrize("output_format", ["dense", "mxfp8"])
+@pytest.mark.parametrize("qk_rope_head_dim", [32, 128])
+def test_fp4_mla_context_gather_rejects_unsupported_rope_dim(output_format, qk_rope_head_dim):
+    # Reject the shape before accessing metadata or allocating CUDA output.
+    with pytest.raises(ValueError, match="qk_rope_head_dim=64"):
+        load_fp4_mla_chunked_kv_cache(
+            None,
+            0,
+            num_ctx_cached_tokens=1,
+            cu_chunked_seq_len=None,
+            chunked_global_offset=None,
+            chunked_max_seq_len=1,
+            out_dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=qk_rope_head_dim,
+            output_format=output_format,
+        )
