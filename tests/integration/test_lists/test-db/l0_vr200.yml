@@ -14,6 +14,7 @@ l0_vr200:
       backend: pytorch
       compute_capability: "10.7"
   tests:
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_fc1_prologue_wait_preserves_exhaustion
   # ------------- PyTorch tests ---------------
   # One test per KPI model, newest model generations first. NVFP4 preferred as
   # the primary Rubin precision.
