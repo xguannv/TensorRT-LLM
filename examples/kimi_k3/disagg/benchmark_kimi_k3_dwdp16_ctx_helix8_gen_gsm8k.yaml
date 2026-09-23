@@ -1,0 +1,250 @@
+# Kimi K3 NVFP4 disaggregated serving -- DWDP16 context + HELIX8 generation,
+# GSM8K ACCURACY through the proxy.
+#
+# This is the accuracy guard for the "DWDP ctx-only" recipe v2 that was tuned
+# and measured on hecate (R200 / SM107) and handed over in
+# /lustre/share/coreai_comparch_trtllm/laliao/k3_dwdp_handoff_20260920/README.md.
+# The worker configuration below is a transcription of that bundle's
+# best_run_622869 ctx_config.yaml / gen_config.yaml -- i.e. of the exact pair
+# that scored GSM8K strict-match 0.9613 in job 623214 -- with only the
+# perf-telemetry and multi-turn-serving knobs removed (see the notes inline).
+# Reference band from the handoff: DWDP16 v2 0.9613, DWDP16 v1 0.9613,
+# DEP16 with the same helix gen 0.9644, historical baseline range 0.948-0.964.
+#
+# WHY this job exists. The DWDP context path is a completely different weight
+# residency and MoE execution story from every other K3 guard: each context
+# worker is TP1/EP1 and holds only 56 of the experts, fetching the rest over
+# the MNNVL fabric with an SM gather kernel one layer ahead of the compute.
+# Nothing about that is exercised by the DEP8/DEP16 guards, and it is the part
+# most likely to be broken by an unrelated MoE, CuTeDSL or routing change --
+# silently, because a gather that returns stale expert weights still produces
+# fluent text. GSM8K strict-match is the cheapest signal that says otherwise.
+# The generation side is HELIX8 because that is what the measured recipe pairs
+# with DWDP context, and because the ctx->gen NVFP4 KV transfer into a helix
+# ring is itself a numerical surface no aggregated test covers.
+#
+# LAUNCH PATH. This config is submitted through
+# examples/disaggregated/slurm/benchmark/submit_dwdp.py (not submit.py): DWDP
+# needs all 16 context workers in one launch so they can find each other. That
+# launcher puts context and generation ranks in a single MPI world and starts
+# them with `trtllm-serve disaggregated_mpi_worker`, so DWDP's group rendezvous
+# resolves through the MPI communicator and dwdp_global_rank() falls back to
+# the MPI rank (tensorrt_llm/_torch/modules/dwdp/rendezvous.py). The four
+# TRTLLM_DWDP_RANK / _MASTER_ADDR / _MASTER_PORT / _RENDEZVOUS_TIMEOUT_S
+# variables the handoff harness generates per worker are therefore NOT set
+# here: they exist to select the TCPStore rendezvous when each context worker
+# is an independent `trtllm-serve` with a size-1 MPI world, which is how the
+# handoff harness -- not this launcher -- starts them. Setting only some of
+# them would be worse than setting none: store_rendezvous_enabled() requires
+# both RANK and MASTER_ADDR, and RANK cannot be made per-rank through the
+# single `--export` string the launcher emits per srun.
+#
+# TOPOLOGY. 16 context workers x TP1 (4 nodes) + 1 generation worker x CP8
+# (2 nodes) = 24 GPUs on 6 nodes, which requires hardware.compact_packing:
+# without it the "one whole node per worker" default asks for 16 + 2 nodes.
+# Expert-parallel width, not free_gpu_memory_fraction, is what makes K3 fit on
+# a 278.54 GiB R200: EP8 needs 277-278 GiB/rank and OOMs in
+# kimi_kda_mixer.py::_fuse_checkpoint_projections during model creation,
+# BEFORE the KV cache is sized. DWDP16 holds the same 56 experts per rank that
+# EP16 does (163.44 GB/rank measured), which is why it fits.
+slurm:
+  script_file: "disaggr_torch_dwdp.slurm"
+  partition: "batch"
+  account: "coreai_comparch_inferencex"
+  # 16 context workers loading K3 NVFP4 take ~25 min before the proxy is
+  # healthy; lm_eval on 1319 questions adds ~10 min at num_concurrent 32.
+  job_time: "02:00:00"
+  job_name: "k3-disagg-dwdp16-ctx-helix8-gen-gsm8k"
+  extra_args: "--gpus-per-node=4"
+  numa_bind: true
+benchmark:
+  # The branch guard disables the serving benchmark and runs only the accuracy
+  # block; these keys are still read by the launcher for log-directory naming
+  # and for the e2e UCX warmup count.
+  mode: "e2e"
+  use_nv_sa_benchmark: false
+  multi_round: 1
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: "32"
+  input_length: 8192
+  output_length: 1024
+  dataset_file: ""
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 16
+  num_gen_servers: 1
+  # Mandatory here: 16 TP1 context workers share 4 nodes rather than owning one
+  # node each. 16 context GPUs is a multiple of gpus_per_node, so the launcher
+  # still takes its block-distribution path (14-15% faster per context GPU than
+  # the arbitrary-distribution fallback) and generation starts on a fresh node.
+  compact_packing: true
+environment:
+  container_mount: "/lustre:/lustre"
+  container_image: "<set by the branch guard>"
+  model_path: "/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_kimi-k3-nvfp4/hf/hf-1ec10fa_orig"
+  trtllm_repo: ""
+  build_wheel: false
+  trtllm_wheel_path: ""
+  # 16 context workers each load the full K3 checkpoint and then rendezvous
+  # before the first gather; the harness default of 1800 s does not cover that.
+  server_health_timeout: 5400
+  worker_env_var: >-
+    TLLM_LOG_LEVEL=INFO
+    TRTLLM_SERVER_DISABLE_GC=1
+    TRTLLM_WORKER_DISABLE_GC=1
+    ENROOT_ALLOW_DEV=yes
+    NCCL_GRAPH_MIXING_SUPPORT=0
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    HF_HUB_TRUST_REMOTE_CODE=1
+    TLLM_KIMI_K3_BF16_KV_LAYERS=91,92
+    KIMI_K3_ATTN_RES_TOPOLOGY=1
+    KIMI_K3_MLA_MAX_POSITIONS=1048576
+    TRTLLM_MOE_A2A_FORCE_CFT=0
+  # DWDP recipe v2, context side only (handoff README section 2a).
+  #   TRTLLM_DWDP_PREFETCH_GATHER=1 is the master switch: the SM fabric gather
+  #     replaces the copy engine. Without it the whole recipe is inert and the
+  #     job silently measures the copy-engine path instead.
+  #   TRTLLM_DWDP_GATHER_KERNEL=tma opts into the TMA ring kernel; unset gives
+  #     the 30x1024 register kernel. Both are bit-identical gathers, so this is
+  #     a performance selection that the accuracy guard carries only so that
+  #     the kernel the recipe actually ships is the one under test.
+  #   TLLM_ROUTING_DISABLE_COOP_LAUNCH=1 is MR !10701's switch and is context
+  #     side ONLY. It takes trtllm-gen MoE routing off the grid-cooperative
+  #     kernel, which needs 204 co-resident SMs that the 30 resident gather
+  #     blocks deny; that is what lets moe_config.max_num_tokens be 16384 and a
+  #     16k prefill step run as ONE MoE chunk. It has no business on the
+  #     generation side, where there is no gather and no 16k step.
+  #   TLLM_AUTOTUNER_MULTIPROCESS=0 keeps autotuning in the worker process,
+  #     because the DWDP fabric mappings belong to that process.
+  # Deliberately NOT set: TRTLLM_CUTEDSL_SM_RESERVE and
+  # TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER (fabric_gather.apply_compute_side_defaults
+  # sets both automatically once the gather is on -- setting them by hand was
+  # measured equivalent), TRTLLM_DWDP_GATHER_BLOCKS/_THREADS/_CLUSTER (defaults;
+  # a manual THREADS=128 under TMA actually defeats the automatic SM reserve),
+  # TRTLLM_DWDP_GATHER_LIB (the op is in libth_common.so now), and
+  # TLLM_AUTOTUNER_CACHE_PATH (startup time only, and a cache written for a
+  # different MoE chunk size or scheduler pin is not reusable).
+  ctx_worker_env_var: >-
+    TRTLLM_DWDP_PREFETCH_GATHER=1
+    TRTLLM_DWDP_GATHER_KERNEL=tma
+    TLLM_ROUTING_DISABLE_COOP_LAUNCH=1
+    TLLM_AUTOTUNER_MULTIPROCESS=0
+  gen_worker_env_var: "TLLM_K3_MLA_GEN_BACKEND=cute-dsl"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+accuracy:
+  enable_accuracy_test: true
+  tasks:
+    gsm8k:
+      model: "local-completions"
+      # num_concurrent 32 = the generation worker's max_batch_size, i.e. exactly
+      # what it can hold in flight; more only queues in the proxy. max_gen_toks
+      # and max_length mirror trtllm-eval's GSM8K defaults so the number stays
+      # comparable to the aggregated K3 anchors, and they match the handoff's
+      # own lm_eval arguments (num_concurrent=32,max_gen_toks=256,max_length=4096).
+      model_args_extra: "num_concurrent=32,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"
+      extra_kwargs:
+        trust_remote_code: true
+        # The few-shot seed. lm-eval's --seed is "python,numpy,torch,fewshot"
+        # and its fewshot default of 1234 selects different 5-shot exemplars
+        # than every K3 reference number was measured with -- worth ~0.8 GSM8K
+        # points here. The branch guard injects this for every accuracy job;
+        # it is repeated in the file so the config is correct on its own.
+        seed: "0,1234,1234,0"
+  env_var:
+    HF_HUB_OFFLINE: "1"
+    HF_DATASETS_OFFLINE: "1"
+worker_config:
+  ctx:
+    # TP1 / EP1 with DWDP: the worker owns 56 experts per layer and gathers the
+    # rest from its 15 peers. attention DP is on because each worker is its own
+    # attention instance.
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    dwdp_config:
+      dwdp_size: 16
+      num_groups: 1
+      num_experts_per_worker: 56
+      num_prefetch_experts: 56
+      # Off in the measured recipe: the contention optimisation targets the
+      # copy-engine prefetch, not the SM gather.
+      contention_opt: false
+    disable_overlap_scheduler: true   # mandatory for a disaggregated context
+    enable_chunked_prefill: true
+    cuda_graph_config: null
+    max_batch_size: 16
+    # 16384 with moe_config.max_num_tokens 16384 is the v2 recipe: one MoE chunk
+    # per prefill step instead of two 8192 chunks. It only works together with
+    # TLLM_ROUTING_DISABLE_COOP_LAUNCH=1 above.
+    max_num_tokens: 16384
+    max_seq_len: 996672
+    print_iter_log: true
+    moe_config:
+      backend: CUTEDSL
+      max_num_tokens: 16384
+      use_low_precision_moe_combine: true
+    kv_cache_config:
+      dtype: nvfp4
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+      free_gpu_memory_fraction: 0.75
+      pool_ratio: [0.205, 0.02, 0.635, 0.14]
+      enable_block_reuse: true
+      block_reuse_config:
+        policy: per_conversation
+        max_num_turns: 5
+      host_cache_size: 171798691840
+      mamba_ssm_cache_dtype: bfloat16
+      mamba_state_config:
+        additional_snapshot_offsets_from_end: [0]
+    attention_dp_config:
+      kv_cache_routing_conversation_affinity: true
+      kv_cache_routing_new_conv_placement: least_queued
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON   # mandatory: the C++ path throws for K3
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+    trust_remote_code: true
+  gen:
+    # HELIX8: one generation worker, TP1 x CP8, attention DP off. tokens_per_block
+    # is 128 on both sides here -- the context side writes NVFP4 KV at 128 and the
+    # helix ring reads it back, so the two must agree.
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    context_parallel_size: 8
+    enable_attention_dp: false
+    cp_config:
+      cp_type: HELIX
+      tokens_per_block: 128
+      use_nccl_for_alltoall: true
+      fifo_version: 2
+    max_batch_size: 32
+    max_num_tokens: 256
+    max_seq_len: 997376
+    print_iter_log: true
+    cuda_graph_config:
+      batch_sizes: [1, 2, 4, 8, 16, 32]
+      enable_padding: true
+    moe_config:
+      backend: TRTLLM
+      max_num_tokens: 33024
+      use_low_precision_moe_combine: true
+    kv_cache_config:
+      dtype: nvfp4
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+      free_gpu_memory_fraction: 0.6
+      enable_block_reuse: false
+      enable_partial_reuse: false
+      host_cache_size: 0
+      mamba_ssm_cache_dtype: bfloat16
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+    trust_remote_code: true

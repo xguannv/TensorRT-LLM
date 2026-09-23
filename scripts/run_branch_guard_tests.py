@@ -243,6 +243,21 @@ K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG = (
     "tests/scripts/perf/disaggregated/"
     "gb300_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL.yaml"
 )
+K3_DWDP_HELIX_DISAGGREGATED_ACCURACY_CONFIG = (
+    "examples/kimi_k3/disagg/benchmark_kimi_k3_dwdp16_ctx_helix8_gen_gsm8k.yaml"
+)
+# Same DSpark draft model and decoding type as K3_DSPARK_SPECULATIVE_CONFIG, at
+# the draft length the helix generation worker was actually characterised at.
+# The shared constant carries 7, which is the EP16 accuracy job's value; the
+# pinned helix perf reference speculates 5. Running the helix worker at 7 would
+# report a GSM8K number for a draft length nothing measured, so both the draft
+# length and the block size that has to match it are overridden here rather
+# than by editing the shared dict, which three other jobs still read as 7.
+K3_DWDP_HELIX_SPECULATIVE_CONFIG: dict[str, str | int] = {
+    **K3_DSPARK_SPECULATIVE_CONFIG,
+    "block_size": 5,
+    "max_draft_len": 5,
+}
 
 MULTI_NODE_TESTS: dict[str, int] = {
     "tests/integration/defs/accuracy/test_disaggregated_multinode.py"
@@ -391,6 +406,69 @@ GUARD_JOBS = (
         use_pmix=False,
         launcher="benchmark",
         speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
+    ),
+    # Helix generation against an EP16 context. The existing helix job pairs
+    # helix with the EP8 context config, which does not fit on GB300 -- it
+    # OOMs in model creation before the KV cache is sized, so no
+    # free_gpu_memory_fraction reaches it. Both halves here are separately
+    # measured on GB300: the EP16 context selector served at 163.44 GB/rank
+    # with zero OOMs (job 560333), and the generation side is the same
+    # TP1 x CP8 helix shape the EP8 helix job already uses.
+    #
+    # Generation keeps moe_expert_parallel_size 8 because CP8 x TP1 is eight
+    # ranks. That is 112 experts per rank per layer, the same width the EP8
+    # *context* config OOMs at -- but the two are not the same claim. What was
+    # measured to fail is that context path, with attention DP on and a 16k
+    # prefill step; a helix generation worker at max_num_tokens 256 was
+    # measured to run at this width (handoff job 623214, GSM8K 0.9613).
+    GuardJob(
+        name="k3-disaggregated-dspark-helix-cp8-dep16-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=6,
+        ntasks=24,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark",
+        speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
+        draft_checkpoint_path=K3_HELIX_DSPARK_CHECKPOINT_PATH,
+    ),
+    # DWDP context + HELIX generation. The only guard that reaches the DWDP
+    # weight path: 16 TP1/EP1 context workers that each hold 56 experts per
+    # layer and gather the rest over the MNNVL fabric one layer ahead of the
+    # compute. A gather that returns stale or mis-indexed experts still emits
+    # fluent text, so an accuracy task is the cheapest detector; GSM8K
+    # strict-match on the handoff recipe is 0.9613 (DEP16 with the same helix
+    # generation scores 0.9644).
+    #
+    # 6 nodes / 24 GPUs: 16 context GPUs (4 nodes, compact-packed) + CP8
+    # generation (2 nodes). EP8 is not an option on R200 -- it needs
+    # 277-278 GiB/rank against a 278.54 GiB card and OOMs during model
+    # creation, before the KV cache is sized, so no free_gpu_memory_fraction
+    # rescues it. DWDP16 holds the same 56 experts per rank that EP16 does.
+    #
+    # launcher="benchmark-dwdp" selects submit_dwdp.py: DWDP needs all 16
+    # context workers in one launch, which submit.py's one-srun-per-worker
+    # model cannot express.
+    GuardJob(
+        name="k3-disaggregated-dwdp-ctx-helix-gen-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DWDP_HELIX_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=6,
+        ntasks=24,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark-dwdp",
+        # Speculation on, so this job is comparable to the EP16-context helix
+        # guard: that one speculates, and without this the DWDP number would
+        # differ from it by both the context strategy and the presence of
+        # speculation, isolating neither. draft_checkpoint_path is the helix
+        # DSpark checkpoint (a different checkpoint from the default), matching
+        # what the other helix generation guards use.
+        speculative_config=K3_DWDP_HELIX_SPECULATIVE_CONFIG,
+        draft_checkpoint_path=K3_HELIX_DSPARK_CHECKPOINT_PATH,
     ),
     *(
         GuardJob(
@@ -926,9 +1004,29 @@ def _job_id_from_output(output: str) -> str | None:
     return None
 
 
-def _write_benchmark_slurm_script(repo_root: Path, log_dir: Path) -> Path:
-    source = repo_root / "examples/disaggregated/slurm/benchmark/disaggr_torch.slurm"
-    output = log_dir.parent / f"{log_dir.name}-disaggr_torch_branch_guard.slurm"
+# Which disaggregated launcher a benchmark-style job is submitted through, as
+# (submitter, Slurm template). "benchmark-dwdp" exists because DWDP's context
+# workers form one group that has to rendezvous before the first expert
+# gather, so they must all come up inside a single launch; submit.py starts
+# one independent srun per worker and cannot express that.
+_BENCHMARK_LAUNCHERS: dict[str, tuple[str, str]] = {
+    "benchmark": ("submit.py", "disaggr_torch.slurm"),
+    "benchmark-dwdp": ("submit_dwdp.py", "disaggr_torch_dwdp.slurm"),
+}
+
+
+def _is_benchmark_job(job: GuardJob) -> bool:
+    return job.launcher in _BENCHMARK_LAUNCHERS
+
+
+def _benchmark_submitter(args: argparse.Namespace, job: GuardJob) -> Path:
+    submitter, _ = _BENCHMARK_LAUNCHERS[job.launcher]
+    return args.repo_root / "examples/disaggregated/slurm/benchmark" / submitter
+
+
+def _write_benchmark_slurm_script(repo_root: Path, log_dir: Path, template: str) -> Path:
+    source = repo_root / "examples/disaggregated/slurm/benchmark" / template
+    output = log_dir.parent / f"{log_dir.name}-{Path(template).stem}_branch_guard.slurm"
     script = source.read_text()
     install_command = "pip install -e .[devel]"
     if script.count(install_command) != 1:
@@ -956,7 +1054,10 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     run_id = int(time.time())
     log_dir = args.log_dir / job.name / f"run-{run_id}"
     log_dir.mkdir(parents=True, exist_ok=True)
-    config["slurm"]["script_file"] = str(_write_benchmark_slurm_script(args.repo_root, log_dir))
+    _, slurm_template = _BENCHMARK_LAUNCHERS[job.launcher]
+    config["slurm"]["script_file"] = str(
+        _write_benchmark_slurm_script(args.repo_root, log_dir, slurm_template)
+    )
 
     config["slurm"]["partition"] = args.partition
     config["slurm"]["account"] = args.account
@@ -1044,6 +1145,7 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
         gen_config.update(
             {
                 "tensor_parallel_size": 1,
+                "moe_expert_parallel_size": 8,
                 "enable_attention_dp": False,
                 "context_parallel_size": 8,
                 "cp_config": {
@@ -1064,6 +1166,90 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
         for role in ("ctx", "gen"):
             config["worker_config"][role].setdefault("moe_config", {})["backend"] = "TRTLLM"
         config["environment"]["server_health_timeout"] = 5400
+    if job.name == "k3-disaggregated-dspark-helix-cp8-dep16-gsm8k":
+        # Transcribed field-by-field from the pinned perf reference config of
+        # k3-genonly-helix8-c16-mtp5 (job 605293), so this accuracy run and
+        # that performance run exercise the same code. The point is the FP4
+        # MLA path: the perf preset reaches it, and until this job matched it
+        # the two guards were grading different backends on the same branch.
+        #
+        # Everything below differs from what this job carried before, and each
+        # difference is the perf config's value, not a preference:
+        #   KV dtype   fp8 -> nvfp4        (FP4 MLA needs the NVFP4 KV layout)
+        #   tokens/blk 64  -> 128          (ctx writes it, the helix ring reads
+        #                                   it back, so the two must agree)
+        #   MoE        TRTLLM -> CUTEDSL / CUTEDSL_FC12
+        #   draft len  7   -> 5, block_size 7 -> 5
+        #   gen mnt    256 -> 96
+        ctx_config = config["worker_config"]["ctx"]
+        ctx_config.update({"max_batch_size": 64, "max_num_tokens": 8192})
+        ctx_config.setdefault("moe_config", {})["backend"] = "CUTEDSL"
+        ctx_config["kv_cache_config"].update(
+            {
+                "dtype": "nvfp4",
+                "tokens_per_block": 128,
+                "free_gpu_memory_fraction": 0.8,
+                "mamba_ssm_cache_dtype": "float32",
+            }
+        )
+        gen_config = config["worker_config"]["gen"]
+        gen_config.update(
+            {
+                "tensor_parallel_size": 1,
+                "moe_expert_parallel_size": 8,
+                "enable_attention_dp": False,
+                "context_parallel_size": 8,
+                "cp_config": {
+                    "cp_type": "HELIX",
+                    "tokens_per_block": 128,
+                    "use_nccl_for_alltoall": False,
+                    "fifo_version": 2,
+                },
+                "max_batch_size": 16,
+                "max_num_tokens": 96,
+            }
+        )
+        gen_config.setdefault("moe_config", {})["backend"] = "CUTEDSL_FC12"
+        gen_config["kv_cache_config"].update(
+            {
+                "dtype": "nvfp4",
+                "tokens_per_block": 128,
+                "free_gpu_memory_fraction": 0.8,
+                "mamba_ssm_cache_dtype": "float32",
+            }
+        )
+        # The perf reference speculates 5 tokens, not the 7 the EP16 DSpark
+        # accuracy job uses. Leaving 7 here would mean the accuracy number
+        # came from a different draft length than the measured point.
+        gen_config["speculative_config"].update({"max_draft_len": 5, "block_size": 5})
+        config["environment"]["server_health_timeout"] = 5400
+
+        # Correctness fix, independent of any throughput question: the DEP16
+        # base config this job inherits sets no kv_transfer_timeout_ms at all,
+        # so CacheTransceiverConfig falls back to its 60_000 ms default. Every
+        # other checked-in config for a HELIX generation worker pins an explicit
+        # long deadline instead -- benchmark_kimi_k3_dwdp16_ctx_helix8_gen_gsm8k.yaml
+        # uses 600_000 on both sides -- precisely because a narrow HELIX
+        # generator makes a prefilled context wait far longer for a generation
+        # slot than a DEP16 one does. Silently inheriting the default is the
+        # defect; it is not a deliberate 60 s budget.
+        #
+        # A TxSession starts its clock when the context finishes prefill, not
+        # when the transfer starts, so the deadline covers the queueing wait.
+        # Runs 631779/632196/632392 each tripped it on every pending send with
+        # elapsed in a 60_014..61_002 ms band -- a deadline artifact, not a
+        # transport fault (zero nixl_status errors on the sender; the only
+        # failure path is "session already in CANCELLED state; sending FAILED to
+        # receiver" once the receiver finally arrives). One hour is chosen to
+        # put the deadline well outside the range of any plausible queueing
+        # wait, so that it cannot mask a slow generator: if this job is slow,
+        # it should now be slow and finish rather than deadlock and report
+        # nothing.
+        for role in ("ctx", "gen"):
+            config["worker_config"][role].setdefault("cache_transceiver_config", {})[
+                "kv_transfer_timeout_ms"
+            ] = 3600000
+
     accuracy_env = config.setdefault("accuracy", {}).setdefault("env_var", {})
     accuracy_env["HF_HOME"] = os.environ.get(
         "HF_HOME", _path_for_this_cluster(HF_CACHE, (OCI_AGA_MARKER, OCI_AGA_HF_CACHE))
@@ -1090,7 +1276,7 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
 
 def _submit_benchmark_job(args: argparse.Namespace, job: GuardJob) -> tuple[str, str]:
     runtime_config, log_dir = _benchmark_config(args, job)
-    submitter = args.repo_root / "examples/disaggregated/slurm/benchmark/submit.py"
+    submitter = _benchmark_submitter(args, job)
     command = [
         sys.executable,
         str(submitter),
@@ -1349,10 +1535,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures = 0
     for job in jobs:
         print(f"\n[{job.name}]")
-        if job.launcher == "benchmark":
+        if _is_benchmark_job(job):
             if args.dry_run:
                 runtime_config = args.repo_root / job.selectors[0]
-                submitter = args.repo_root / "examples/disaggregated/slurm/benchmark/submit.py"
+                submitter = _benchmark_submitter(args, job)
                 print(shlex.join([sys.executable, str(submitter), "--config", str(runtime_config)]))
                 continue
             started_at = time.time()
