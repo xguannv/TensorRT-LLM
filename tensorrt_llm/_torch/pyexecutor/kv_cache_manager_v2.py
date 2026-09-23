@@ -2766,7 +2766,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return True
         if kv_cache.history_length > pre_cap:
             self.free_resources(req)
-            req.set_prepopulated_prompt_len(0, self.tokens_per_block)
+            # The setter asserts prepopulated < promptLen; a Helix CP rank that
+            # holds none of the prompt has promptLen 0 and nothing to reset.
+            if req.prompt_len > 0 and req.prepopulated_prompt_len > 0:
+                req.set_prepopulated_prompt_len(0, self.tokens_per_block)
             # setPrepopulatedPromptLen only moves forward, so rewind the same
             # fields LlmRequest::pause() resets for a recompute pause.
             req.context_current_position = 0
