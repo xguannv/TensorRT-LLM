@@ -66,12 +66,38 @@ NSYS_CACHE="${PUBLISH_ROOT}/nsys/nsight-systems-cli-sbsa-DVS-${NSYS_VERSION}.tar
 
 INSTALL_NSYS="echo 'skip nsys'"
 
+# nvidia-cutlass-dsl and nvidia-cutlass-dsl-internal are different DISTRIBUTION
+# names, so pip will never uninstall one while installing the other -- they are
+# not a replacement pair. requirements.txt names only the internal build, but
+# the Rubin base image ships the old one preinstalled, so without this both end
+# up in site-packages and .pth ordering decides which owns the top-level
+# `cutlass` name.
+#
+# Measured, not assumed: an install log that pulls
+# nvidia-cutlass-dsl-internal-0.3.0+20260803235612.d88cc85 contains no cutlass
+# uninstall of any kind -- the only "Attempting uninstall" entries in a branch
+# guard install are tensorrt_llm and flashinfer_python. It happens to resolve to
+# the internal build today, but nothing guarantees that ordering; a different
+# base image, pip, or install order could flip it, and the failure mode is the
+# original one: find_spec("ctm") False and an AttributeError on cfence inside
+# the FP4 MLA CuTeDSL decode kernels.
+#
+# Dropping the constraints.txt floor only stops pip RE-RESOLVING the old
+# package. It cannot remove one that is already installed in the image, which
+# is why this has to happen here as well.
+#
+# Build time is the right place: once per image rather than once per run, and
+# it makes the image itself coherent instead of relying on a runtime overlay
+# winning a path race. `|| true` so a base image that never shipped the package
+# does not fail the build.
+DROP_STALE_CUTLASS="python3 -m pip uninstall -y nvidia-cutlass-dsl || true"
+
 srun -A ${ACCOUNT} -p ${PARTITION} --job-name=${JOB_NAME} --container-image=${IMAGE} \
     --container-mounts=${MOUNT} \
     --container-workdir=${WORKDIR} \
     --container-save=${BUILD_DIR}/trtllm.sqsh \
     -N 1 --ntasks=1 --ntasks-per-node=1  -t 2:00:00 \
-    bash -c "python3 -m pip install --upgrade -r requirements-dev.txt && python scripts/build_wheel.py -G Ninja -a '107-real' $EXTRA_FLAGS $CLEAN  && pip install build/tensorrt_llm-*.whl && ${INSTALL_NSYS} "
+    bash -c "${DROP_STALE_CUTLASS} && python3 -m pip install --upgrade -r requirements-dev.txt && python scripts/build_wheel.py -G Ninja -a '107-real' $EXTRA_FLAGS $CLEAN  && pip install build/tensorrt_llm-*.whl && ${INSTALL_NSYS} "
 cp ${REPO_DIR}/build/tensorrt_llm-*.whl ${BUILD_DIR}/
 mkdir -p "${PUBLISH_DIR}"
 cp "${BUILD_DIR}/trtllm.sqsh" "${PUBLISH_DIR}/"

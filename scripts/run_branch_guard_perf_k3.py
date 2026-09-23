@@ -26,7 +26,7 @@ workdir, topology, workload shape, reference metrics, and gate policy. The
 reference ``trtllm_config.yaml`` is SHA-256 checked before use, so edits under
 the shared reference tree cannot silently move the baseline.
 
-Two presets exist, one per measured reference run:
+Each preset pins one measured reference run:
 
 * ``k3-genonly-helix8-c16-mtp5`` - GEN-only, helix8 / concurrency 16 / MTP5.
   Reference: job 605293 (``.../k3-nsys-fp4-vs-fp8/fp4-job605293-mr10675fix``),
@@ -35,6 +35,13 @@ Two presets exist, one per measured reference run:
 * ``k3-ctxonly-dep16-c96`` - CTX-only, dep16 / concurrency 96.
   Reference: job 586472 (``.../k3-ctx-baseline-job586472``), the 7.66 req/s
   baseline. Results are read from AIPerf's ``profile_export_aiperf.csv``.
+* ``k3-ctxonly-dwdp16-c128`` - CTX-only with DWDP16 expert prefetch: 16 x TP1
+  context servers plus one helix8 decode worker, concurrency 128.
+  Reference: job 624450 (``.../k3_dwdp_ima_20260922/624450_oldimg_PASS_control``),
+  the one PASSING control in taizhongw's DWDP illegal-memory-access archive.
+  EVALUATION-ONLY -- the bench revision pinned here has no DWDP launcher, so
+  this preset grades result directories and cannot submit. See its
+  ``single_string`` comment for what would have to land first.
 
 Reference metrics are per cluster, not per preset. The same config on R200
 (hecate) and on GB300 (oci-jhb) produces different absolute numbers, so each
@@ -533,6 +540,15 @@ GENONLY_GB300_REFERENCE_DIR = Path(
     "/bm_kimi-k3-nvfp4-genonly-turnbatch-sol-996608-512-ratio1"
     "-dd78bbce-mr26-mr35-20260913-GB300"
 )
+# The DWDP CTX-only reference is the PASSING control of taizhongw's 2026-09-22
+# archive, not one of its illegal-memory-access reproductions. That archive's
+# README is explicit that 626177 / 626311 / 628753 / 629318 all die in MR!10698's
+# CuTeDSL ``gather_mxfp8`` with CUDA_ERROR_ILLEGAL_ADDRESS (700), so a reference
+# taken from any of them would be a reference for a broken state. 624450 is the
+# only run in the archive that produced numbers at all.
+DWDP_CTXONLY_REFERENCE_DIR = (
+    K3_REFERENCE_ROOT / "k3_dwdp_ima_20260922" / "624450_oldimg_PASS_control"
+)
 CTXONLY_FP8_REFERENCE_DIR = Path(
     "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_aarwlt/users/taizhongw"
     "/bench-trtllm-disagg/kimi-k3-nvfp4-agent"
@@ -1018,6 +1034,168 @@ K3_PRESETS: dict[str, K3Preset] = {
             overrides=(),
             worker_env=_REFERENCE_WORKER_ENV,
         ),
+        K3Preset(
+            name="k3-ctxonly-dwdp16-c128",
+            description=(
+                "Kimi-K3 NVFP4 CTX-only with DWDP16 expert prefetch, 16 x TP1 "
+                "context servers + helix8 gen, concurrency 128 (job 624450, the "
+                "PASSING control of the 2026-09-22 DWDP IMA archive). "
+                "EVALUATION-ONLY: the pinned bench revision has no DWDP launcher."
+            ),
+            mode=CTX_ONLY,
+            reference_dir=DWDP_CTXONLY_REFERENCE_DIR,
+            reference_config_sha256=(
+                "c98961a8a46ac64a713c7731019b89321d3f66fccea9536378b5127183a4bcee"
+            ),
+            # Pinned for identity, not for submission. The ctx-only agent config
+            # is the nearest analogue at K3_BENCH_REVISION and it is emphatically
+            # NOT what produced job 624450: no config at that revision can
+            # express a DWDP topology at all.
+            source_config=K3_AGENT_CONFIG_DIR / "agentx_disagg_ctxonly_ctxswept_rubin.yaml",
+            source_revision=K3_BENCH_REVISION,
+            source_sha256="cb2f379ec27a942669a1d7d2d2c6923fdb2c2322aa671ec7c4ca80a53c215153",
+            # Not submittable, and unlike k3-ctxonly-dep16-c96 this is not a
+            # gpu_memory_fraction mismatch that a different row would fix: the
+            # bench revision pinned here has no DWDP path whatsoever. Checked at
+            # 0c7dcd10fa and against every other ref present in that clone --
+            # `git ls-files | grep -i dwdp` is empty, the inner
+            # trtllm-disagg-benchmark/submit.py contains zero occurrences of
+            # "dwdp", gen_worker_config.py cannot emit a dwdp_config block, and
+            # `git log --all -S dwdp` finds only an unrelated Qwen3.5 patch file.
+            #
+            # The topology itself is expressible -- ctx_num is field 0 of a
+            # ctx_configs row, so "16 TP1 context servers" is just
+            # [16, 1, 1, ...]. What is missing is dwdp_config, which the worker
+            # config generator has no code to emit, and the per-instance
+            # TRTLLM_DWDP_RANK / _MASTER_ADDR that the 16 independent size-1
+            # srun tasks need in order to find each other through MR!10640's
+            # TCPStore rendezvous.
+            #
+            # A DWDP-capable perf harness does exist -- job 624450 ran under one
+            # -- but at the time of writing only as an uncommitted working-tree
+            # modification in a developer checkout. _read_pinned_file
+            # authenticates its inputs with `git show <revision>:<path>`, which
+            # cannot reach a working-tree-only change, and no source_sha256
+            # could authenticate it. Making this preset submittable means
+            # landing DWDP support on a bench-trtllm-disagg commit first, then
+            # bumping K3_BENCH_REVISION and filling in the row here.
+            single_string=None,
+            sweep_key="ctx_configs",
+            generator_config=Path("kimi-k3-nvfp4-agent/gen_worker_config.py"),
+            generator_sha256=("3c7d08a94dfc7e112ee1e52e1fb4fb0df8f1e9651e80dd9818a64301d642c9c3"),
+            # Inert while single_string is None. Recorded as the operating point
+            # a submittable version has to reproduce, read out of job 624450's own
+            # ctx_config.yaml / gen_config.yaml / env_vars.json rather than copied
+            # from a neighbouring preset. Two entries differ from every other K3
+            # preset and the difference is the point:
+            #
+            #  * The CTX cost triple is 0/0/0, not the tuned 35000/250000/3000
+            #    that k3-ctxonly-dep16-c96 pins. The control's ctx_worker_env_var
+            #    sets TLLM_V2_CTX_COST_KV_OFFSET, _KV_DEPTH_THRESHOLD and
+            #    _PER_CHUNK_DEPTH_TOKENS all to 0, i.e. the cost model is off.
+            #    DWDP16 runs 16 independent tp1 context servers behind a
+            #    conversation router, so the depth-aware chunk costing that earns
+            #    26% of request throughput on one tp16 server is not what
+            #    schedules this point. Copying 35000/250000/3000 in here would
+            #    have measured a scheduler the reference never ran.
+            #  * The GEN MoE backend is TRTLLM, not the CUTEDSL_FC12 the generator
+            #    defaults to on R200, because the control's gen_config.yaml says
+            #    moe_config.backend: TRTLLM.
+            generator_env=(
+                ("K3_MAMBA_SSM_DTYPE", "bfloat16"),
+                ("K3_CTX_MOE_BACKEND", "CUTEDSL"),
+                ("K3_GEN_MOE_BACKEND", "TRTLLM"),
+                ("K3_CTX_COST_KV_OFFSET", "0"),
+                ("K3_CTX_COST_KV_DEPTH_THRESHOLD", "0"),
+                ("K3_CTX_COST_PER_CHUNK_DEPTH_TOKENS", "0"),
+            ),
+            # The same 6-node / 24-GPU envelope as the other R200 presets, packed
+            # differently: 16 ctx GPUs as 16 tp1 servers 4-to-a-node, plus one
+            # helix8 decode worker on 2 nodes. Job 624450's server_config.yaml
+            # lists 16 context URLs across hecate0241-0244 and one gen URL.
+            ctx_nodes=4,
+            gen_nodes=2,
+            gpus_per_node=4,
+            ctx_gpus=16,
+            gen_gpus=8,
+            benchmark_concurrency=128,
+            input_length=996608,
+            output_length=2,
+            references=(
+                ClusterReference(
+                    cluster=HECATE,
+                    provenance=(
+                        "R200 / hecate. Job 624450, measured 2026-09-21, the "
+                        "PASSING control of taizhongw's k3_dwdp_ima_20260922 "
+                        "archive. Every number below was read from that run's own "
+                        "concurrency_128/profile_export_aiperf.csv, not from the "
+                        "archive README. Image "
+                        "/lustre/share/coreai_comparch_trtllm/lizhiz/rubin_k3/"
+                        "923d189d87/trtllm.sqsh -- the OLD image -- plus a "
+                        "PYTHONPATH overlay onto laliao's cutedsl-runtime and "
+                        "tekit-k3-dwdp-10683-kvgather-smreserve-clc trees, and an "
+                        "external gather kernel loaded through "
+                        "TRTLLM_DWDP_GATHER_LIB. 41458 requests, 0 errors, "
+                        "3619.82 s. Cross-check: 11.39 req/s is what the archive "
+                        "README quotes, and 1970926.13 x (1 - 0.9516) / 16 ctx "
+                        "GPUs = 5962 uncached tok/s per ctx GPU against the "
+                        "README's 5998, so the CSV and the prose describe the "
+                        "same run."
+                    ),
+                    benchmark_duration_seconds=3619.82,
+                    gates=(
+                        Gate("request_throughput", 11.39, minimum=True, ratio=0.95),
+                        Gate("input_token_throughput", 1970926.13, minimum=True, ratio=0.95),
+                        Gate("p50_ttft_ms", 12343.63, minimum=False, ratio=1.10),
+                        Gate("p90_ttft_ms", 45111.47, minimum=False, ratio=1.10),
+                        # 95.16 is "Overall Usage Prompt Cache Read %", which is
+                        # what _parse_ctx_only_metrics reads. The same CSV also
+                        # carries "Theoretical Prefix Cache Hit %" at 97.55;
+                        # taking that one instead failed this gate on the FP8
+                        # preset for a run whose cache behaviour was unchanged.
+                        Gate("prompt_cache_read_pct", 95.16, minimum=True, ratio=0.98),
+                    ),
+                    caveat=(
+                        "This reference did not run the branch, and the point it "
+                        "measures is known to be broken on current code. Three "
+                        "things follow. (1) The run took its Python from a "
+                        "PYTHONPATH overlay onto two of laliao's trees; PYTHONPATH "
+                        "precedes site-packages, so it would shadow anything "
+                        "--wheel or --trtllm-repo installed, and reproducing this "
+                        "operating point on the branch means dropping the overlay. "
+                        "(2) Its DWDP gather came from an external .so named by "
+                        "TRTLLM_DWDP_GATHER_LIB, whereas the in-tree path selects "
+                        "the registered trtllm::dwdp_fabric_gather op and "
+                        "TRTLLM_DWDP_GATHER_KERNEL; those are different kernels, "
+                        "so these numbers gate the DWDP operating point rather "
+                        "than the in-tree gather implementation. (3) The archive "
+                        "exists because this exact configuration raises "
+                        "CUDA_ERROR_ILLEGAL_ADDRESS (700) on the ToT image "
+                        "(rubin-advance 6a457e391e + MR!10696/!10697/!10698), in "
+                        "MR!10698's CuTeDSL gather_mxfp8 at "
+                        "cute_dsl_kernels/rubin/fp4_mla_context_gather.py:336, "
+                        "reached from forward_context_with_chunked_prefill_fp4. "
+                        "Four reproductions; the stale-autotune-cache and "
+                        "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP hypotheses are both "
+                        "already ruled out, by 626311 and 628753 respectively. "
+                        "Until that is fixed, a submission at this point is "
+                        "expected to die in warmup around step 53/512 rather than "
+                        "produce a number. Finally, the CTX cost model is disabled "
+                        "here (0/0/0) while every other K3 preset pins "
+                        "35000/250000/3000, so these numbers are not comparable to "
+                        "k3-ctxonly-dep16-c96 even though both are CTX-only at "
+                        "ISL 996608."
+                    ),
+                ),
+            ),
+            overrides=(),
+            # Job 624450 ran the old image, whose modeling_kimi_linear.py still
+            # defaulted KIMI_K3_FP8_WEIGHT_READ_MOE_MLP to "1" -- the archive
+            # README confirms it by recording 628753 as the run that set it to
+            # "0" on purpose. #19179 flipped that default, so the guard has to
+            # set it back for a branch run to match this baseline.
+            worker_env=_REFERENCE_WORKER_ENV,
+        ),
     )
 }
 DEFAULT_K3_PRESET = "k3-genonly-helix8-c16-mtp5"
@@ -1269,6 +1447,40 @@ def _assert_branch_build_used(result_dir: Path) -> None:
             )
 
 
+def _verify_reference_config(result_dir: Path, preset: K3Preset) -> None:
+    """Authenticate the pinned reference workdir before grading against it.
+
+    ``reference_config_sha256`` was recorded on every preset from the start but
+    never read back, so the pin documented a baseline without protecting it --
+    an edit under the shared reference tree would have moved the denominator
+    silently, which is the one thing pinning a digest is for.
+
+    Two deliberate narrowings. It runs only when the directory being graded IS
+    the preset's own reference, because a fresh result directory has no
+    reference config to authenticate and the digest would be meaningless there.
+    And it runs only when the preset actually carries a digest: the three GB300
+    presets pin the empty string, and minting digests for them is a separate
+    change that needs their own reference trees checked first.
+    """
+    if not preset.reference_config_sha256:
+        return
+    try:
+        if result_dir.resolve() != preset.reference_dir.resolve():
+            return
+    except OSError:
+        return
+    config = preset.reference_config
+    if not config.is_file():
+        raise ValueError(f"Pinned reference config is missing: {config}")
+    digest = _sha256_bytes(config.read_bytes())
+    if digest != preset.reference_config_sha256:
+        raise ValueError(
+            f"Pinned reference config {config} hashes to {digest}, expected "
+            f"{preset.reference_config_sha256}. The baseline this preset grades "
+            f"against has moved under it; re-measure rather than re-pin."
+        )
+
+
 def _print_run_header(result_dir: Path, preset: K3Preset, cluster: Cluster) -> None:
     print(f"Preset:  {preset.name} - {preset.description}")
     print(f"Mode:    {preset.mode}")
@@ -1296,6 +1508,7 @@ def _establish_reference(result_dir: Path, preset: K3Preset, cluster: Cluster) -
     same preset: which metrics matter and which way is "worse" are properties
     of the workload, not of the hardware. Only the numbers are new.
     """
+    _verify_reference_config(result_dir, preset)
     _assert_branch_build_used(result_dir)
     metrics = _parse_metrics(result_dir, preset)
 
@@ -1353,6 +1566,7 @@ def _render_reference_block(metrics: PerfMetrics, preset: K3Preset, cluster: Clu
 
 def _check_result(result_dir: Path, preset: K3Preset, cluster: Cluster) -> bool:
     """Print measured values beside references and derived pass/fail limits."""
+    _verify_reference_config(result_dir, preset)
     _assert_branch_build_used(result_dir)
     reference = preset.reference_for(cluster.name)
     metrics = _parse_metrics(result_dir, preset)
@@ -1566,6 +1780,27 @@ def _override_gen_gpu_memory_fraction(config: str, fraction: float) -> str:
     return updated
 
 
+def _override_job_time(config: str, job_time: str) -> str:
+    """Rewrite slurm.job_time in the prepared source config.
+
+    Applied to the in-memory copy after the reference config's SHA-256 has been
+    verified, exactly like the two gpu_memory_fraction overrides, so the pinned
+    file on the shared reference tree is never touched and the pin still means
+    what it says.
+
+    This moves only the Slurm wall limit, not the workload, so unlike a memory
+    fraction it does not move the measured point away from the reference. What
+    it can do is truncate a run that needed the original limit -- and a job
+    killed at the wall yields no result rather than a wrong one, so that
+    failure is loud rather than silent.
+    """
+    pattern = re.compile(r"^([ \t]*job_time: ).*$", re.MULTILINE)
+    updated, count = pattern.subn(rf"\g<1>{job_time}", config, count=1)
+    if count != 1:
+        raise ValueError("Expected exactly one slurm.job_time to override")
+    return updated
+
+
 def _write_server_config(
     output: Path,
     preset: K3Preset,
@@ -1632,6 +1867,8 @@ def _prepare_inputs(
     wheel: Path | None,
     ctx_gpu_memory_fraction: float | None = None,
     gen_gpu_memory_fraction: float | None = None,
+    job_time: str | None = None,
+    trtllm_repo: Path | None = None,
 ) -> Path:
     """Stage the config and its generator in the layout the harness expects.
 
@@ -1680,7 +1917,22 @@ def _prepare_inputs(
         config = _override_ctx_gpu_memory_fraction(config, ctx_gpu_memory_fraction)
     if gen_gpu_memory_fraction is not None:
         config = _override_gen_gpu_memory_fraction(config, gen_gpu_memory_fraction)
-    if wheel is not None:
+    if job_time is not None:
+        config = _override_job_time(config, job_time)
+    if trtllm_repo is not None:
+        # Editable install straight from the checkout. The harness supports
+        # this (submit.py forwards --trtllm-repo, and submit_ctx_only.py gates
+        # on `trtllm_repo or trtllm_wheel_path`); the guard simply never used
+        # it. It is the only way a Python-level change reaches a perf run
+        # without a rebuild, which matters when iterating on one.
+        #
+        # It replaces the wheel rather than joining it: the harness would
+        # otherwise have to pick, and a run whose Python came from one source
+        # and whose binaries came from another is not attributable to either.
+        # Only the Python layer is replaced -- the C++/CUDA objects still come
+        # from the image, so the checkout must already carry built artifacts.
+        config += f"\ntrtllm_install:\n  trtllm_repo: {trtllm_repo}\n"
+    elif wheel is not None:
         # Install the branch wheel over the base image instead of shipping a
         # whole saved container. pyxis --container-save cannot export an image
         # that has bind mounts on this cluster (the enroot export cannot
@@ -1888,6 +2140,23 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--trtllm-repo",
+        type=Path,
+        help=(
+            "Install TensorRT-LLM editable from this checkout instead of a "
+            "wheel. Replaces --wheel. Python layer only: the checkout must "
+            "already contain built artifacts, and the C++/CUDA objects still "
+            "come from the image."
+        ),
+    )
+    parser.add_argument(
+        "--job-time",
+        help=(
+            "Override the Slurm wall limit from the pinned source config "
+            "(HH:MM:SS). Moves only the time limit, not the measured point."
+        ),
+    )
+    parser.add_argument(
         "--ctx-gpu-memory-fraction",
         type=float,
         help=(
@@ -2046,6 +2315,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             wheel,
             ctx_gpu_memory_fraction,
             gen_gpu_memory_fraction,
+            args.job_time,
+            args.trtllm_repo,
         )
         server_config = _write_server_config(
             work_dir / "server-branchguard.config",
