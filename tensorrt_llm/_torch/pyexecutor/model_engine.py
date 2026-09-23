@@ -5642,6 +5642,12 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        # Token-row spans (half-open, in the batch's token layout) whose input
+        # ids are intentionally not appended to the host ``input_ids`` list:
+        # CUDA-graph and attention-DP padding requests (see the skips below).
+        # Collected here so they can be zero-filled after the host and device
+        # copies, which only cover real requests' rows.
+        unwritten_input_id_rows = []
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
@@ -5702,6 +5708,15 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
+                if (request.is_attention_dp_dummy
+                        or request.is_cuda_graph_dummy):
+                    # This request appended token rows but no input ids. Every
+                    # request appends exactly one position per token row, in
+                    # batch order, so the rows it owns are exactly the
+                    # position_ids slice it just extended.
+                    unwritten_input_id_rows.append(
+                        (len(position_ids) - (1 + num_draft_tokens),
+                         len(position_ids)))
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens)
                 request.cached_tokens = past_seen_token_num
@@ -6069,6 +6084,12 @@ class PyTorchModelEngine(ModelEngine):
                 append_cross_attention_state(request,
                                              project_encoder_output=False,
                                              repeat=beam_width)
+                if request.is_cuda_graph_dummy:
+                    # Same as the extend loop: beam_width token rows were
+                    # appended for this request, but its input ids were
+                    # deliberately skipped above.
+                    unwritten_input_id_rows.append(
+                        (len(position_ids) - beam_width, len(position_ids)))
                 # Do not add a gen_request_seq_slot for CUDA graph dummy requests
                 # to prevent access errors due to None values
                 if not request.is_cuda_graph_dummy:
@@ -6312,6 +6333,23 @@ class PyTorchModelEngine(ModelEngine):
             # when writing key/values to the KV cache.
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
+
+        if unwritten_input_id_rows:
+            # The host copy above covers input_ids_cuda[:num_tokens] and the
+            # device copies cover the previous-batch rows; the padding
+            # requests' rows are covered by neither, so without this fill the
+            # embedding gathers whatever self.input_ids_cuda (torch.empty)
+            # happens to hold. A stale value above the vocabulary size trips
+            # the vectorized_gather index assertion inside index_select.
+            rows = sorted(unwritten_input_id_rows)
+            merged_begin, merged_end = rows[0]
+            for row_begin, row_end in rows[1:]:
+                if row_begin == merged_end:
+                    merged_end = row_end
+                    continue
+                self.input_ids_cuda[merged_begin:merged_end].fill_(0)
+                merged_begin, merged_end = row_begin, row_end
+            self.input_ids_cuda[merged_begin:merged_end].fill_(0)
 
         position_ids = self._apply_position_id_offset(position_ids)
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
