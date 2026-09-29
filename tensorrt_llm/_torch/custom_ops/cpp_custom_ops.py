@@ -289,6 +289,26 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_router_latent_gemm_op")
+    def _(input: torch.Tensor, gate_weight: torch.Tensor,
+          down_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        for tensor in (input, gate_weight, down_weight):
+            torch._check(tensor.is_cuda and tensor.device == input.device)
+            torch._check(tensor.dim() == 2 and tensor.dtype == torch.bfloat16)
+            torch._check(tensor.is_contiguous())
+            torch._check(tensor.stride(0) == 7168)
+            torch._check(tensor.stride(1) == 1)
+            torch._check(tensor.storage_offset() % 8 == 0)
+        torch._check(input.shape[0] >= 1)
+        torch._check(input.shape[0] <= 16)
+        torch._check(input.shape[1] == 7168)
+        torch._check(gate_weight.shape[0] == 896)
+        torch._check(gate_weight.shape[1] == 7168)
+        torch._check(down_weight.shape[0] == 3584)
+        torch._check(down_weight.shape[1] == 7168)
+        return (input.new_empty((input.shape[0], 896), dtype=torch.float32),
+                input.new_empty((input.shape[0], 3584), dtype=torch.bfloat16))
+
     @torch.library.register_fake("trtllm::fp4_gemm")
     def _(
         mat1: torch.Tensor,
@@ -1246,7 +1266,11 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::alltoall_helix_native")
-    def _(partial_o, softmax_stats, workspace, cp_rank, cp_size,
+    def _(partial_o,
+          softmax_stats,
+          workspace,
+          cp_rank,
+          cp_size,
           zero_kv_mask=None):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
