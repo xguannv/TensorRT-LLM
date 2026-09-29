@@ -1711,6 +1711,7 @@ class _StubADPExecutor:
         self.inflight_req_ids = Mock()
         self._terminate_request = Mock()
         self._is_kv_manager_v2 = True
+        self.enable_joint_kv_cache_reuse = False
         self._terminate_attention_dp_dummy_requests = types.MethodType(
             PyExecutor._terminate_attention_dp_dummy_requests, self
         )
@@ -2209,6 +2210,100 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     assert spec_resource_manager.add_dummy_requests.call_count == 2
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+
+
+@pytest.mark.parametrize("allocated", [False, True])
+@pytest.mark.parametrize("joint_kv_reuse", [False, True])
+@pytest.mark.parametrize("can_queue", [False, True])
+def test_adp_context_dummy_scheduler_kv_rollback(allocated, joint_kv_reuse, can_queue):
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    stub = _StubADPExecutor()
+    stub.enable_joint_kv_cache_reuse = joint_kv_reuse
+    dummy = _make_adp_request(
+        LlmRequestState.CONTEXT_INIT,
+        request_id=ATTENTION_DP_DUMMY_REQUEST_ID,
+        is_dummy_request=True,
+    )
+    dummy.is_attention_dp_dummy = True
+    dummy.py_adp_dummy_resources_prepared = False
+    stub.active_requests = [dummy]
+    stub._pending_adp_dummy_request = dummy
+    spec_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_manager
+
+    # Model the interval after V2 scheduling and before prepare_resources():
+    # context KV may exist, but no sequence slot or speculative state does.
+    managers = [stub.kv_cache_manager]
+    if joint_kv_reuse:
+        stub.draft_kv_cache_manager = Mock()
+        managers.append(stub.draft_kv_cache_manager)
+    caches = []
+    for manager in managers:
+        cache = Mock()
+        caches.append(cache)
+        manager.conversation_manager = None
+        manager.kv_cache_map = {dummy.py_request_id: cache} if allocated else {}
+        manager._allocated_draft_lens = {}
+        manager._pending_overlap_slack = {}
+        manager._early_freed_index_requests = set()
+        manager.free_resources.side_effect = types.MethodType(
+            KVCacheManagerV2.free_resources, manager
+        )
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
+
+    assert stub._pending_adp_dummy_request is None
+    assert stub.active_requests == ([dummy] if can_queue else [])
+    stub._terminate_request.assert_not_called()
+    spec_manager.free_resources.assert_not_called()
+    for manager, cache in zip(managers, caches):
+        if can_queue:
+            manager.free_resources.assert_not_called()
+            assert (dummy.py_request_id in manager.kv_cache_map) == allocated
+        else:
+            manager.free_resources.assert_called_once_with(dummy)
+            assert dummy.py_request_id not in manager.kv_cache_map
+        if allocated and not can_queue:
+            cache.close.assert_called_once_with()
+            manager.index_mapper.remove_sequence.assert_called_once_with(dummy.py_request_id)
+        else:
+            cache.close.assert_not_called()
+            manager.index_mapper.remove_sequence.assert_not_called()
+
+    if not can_queue:
+        # The next empty scheduled batch must be able to allocate ID 0 again.
+        original_add_dummy = stub.kv_cache_manager.add_dummy_requests.side_effect
+
+        def allocate_retry(**kwargs):
+            request_id = kwargs["request_ids"][0]
+            assert request_id not in stub.kv_cache_manager.kv_cache_map
+            stub.kv_cache_manager.kv_cache_map[request_id] = Mock()
+            return original_add_dummy(**kwargs)
+
+        stub.kv_cache_manager.add_dummy_requests.side_effect = allocate_retry
+        stub.active_requests = [_make_adp_request(_STATE_GENERATION_IN_PROGRESS)]
+        scheduled_batch = ScheduledRequests()
+        _run_pad_empty(stub, scheduled_batch)
+        assert scheduled_batch.batch_size == 1
+        assert scheduled_batch.generation_requests[0].py_request_id == dummy.py_request_id
+
+
+def test_adp_context_dummy_v1_rollback_before_prepare():
+    stub = _StubADPExecutor()
+    stub._is_kv_manager_v2 = False
+    dummy = _make_adp_request(LlmRequestState.CONTEXT_INIT, is_dummy_request=True)
+    dummy.py_adp_dummy_resources_prepared = False
+    stub.active_requests = [dummy]
+    stub._pending_adp_dummy_request = dummy
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+
+    assert stub.active_requests == []
+    assert stub._pending_adp_dummy_request is None
+    stub.kv_cache_manager.free_resources.assert_not_called()
+    stub.resource_manager.get_resource_manager.assert_not_called()
+    stub._terminate_request.assert_not_called()
 
 
 def test_adp_dummy_rollback_only_frees_pending_candidate():
