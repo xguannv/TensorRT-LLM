@@ -3692,9 +3692,14 @@ class PyExecutor:
             return
 
         if not getattr(dummy_request, "py_adp_dummy_resources_prepared", True):
-            # A context dummy defers all allocation to the normal context
-            # prepare path. If scheduling rejects it before that point, there
-            # are no partial resources to release.
+            # V2 schedules context KV before prepare_resources(), so a context
+            # dummy can own a cache even though eager preparation was skipped.
+            # Release that cache before retrying with the fixed dummy ID. V1
+            # and the speculative manager have not allocated resources yet.
+            if self._is_kv_manager_v2:
+                self.kv_cache_manager.free_resources(dummy_request)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.free_resources(dummy_request)
             self.active_requests.remove(dummy_request)
             return
 
@@ -7207,8 +7212,11 @@ class PyExecutor:
             token_nums = [1]
 
         # GEN dummies bypass context initialization and need resources now.
-        # CTX dummies remain first context chunks, so normal prepare_resources
-        # must be their sole allocator; preallocating here would add ID 0 twice.
+        # CTX dummies remain first context chunks and are allocated by the
+        # normal context path (the V2 scheduler during scheduling, V1
+        # prepare_resources); preallocating here would add ID 0 twice. A CTX
+        # dummy may therefore own V2 KV before prepare_resources(), which
+        # _finalize_adp_dummy_allocation must release on rollback.
         prepare_dummy_resources = self._adp_dummy_is_gen
 
         if not self._has_adp_dummy_kv_capacity(token_nums):
