@@ -310,6 +310,9 @@ def kda_decode_mtp_kernel(
         bos = cu_seqlens[i_n]
         eos = cu_seqlens[i_n + 1]
         slot = ssm_state_indices[i_n]
+    # V2 state views may place many layer pages between adjacent slots. Widen
+    # the slot before indexing: slot * state stride can exceed INT32_MAX.
+    slot = Int64(slot)
     h0_idx = slot * HV + i_hv
     hk_off = i_h * K
     hv_off = i_hv * V
