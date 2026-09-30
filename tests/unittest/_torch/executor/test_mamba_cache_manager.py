@@ -3869,7 +3869,8 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_q.dtype is torch.bfloat16
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_kg_cache.shape == (cache_size, 2, 2, 48)
+        assert layer_cache.kda_k_cache.shape == (cache_size, 2, 48)
+        assert layer_cache.kda_g_cache.shape == (cache_size, 2, 48)
         assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
         assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
         assert layer_cache.kda_beta_cache.stride(-2) == 8
@@ -3881,7 +3882,10 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
                         % _KDA_BETA_CACHE_ALIGNMENT_BYTES
                         == 0
                     )
-        assert layer_cache.kda_kg_cache.dtype is torch.float32
+        assert layer_cache.kda_k_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_g_cache.dtype is torch.float32
+        assert layer_cache.kda_v_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_beta_cache.dtype is torch.bfloat16
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             mgr.prev_num_accepted_tokens.data_ptr()
         )
@@ -4006,7 +4010,8 @@ def test_v2_kda_replay_relocates_live_slot_history():
             "kda_conv_q",
             "kda_conv_k",
             "kda_conv_v",
-            "kda_kg_cache",
+            "kda_k_cache",
+            "kda_g_cache",
             "kda_v_cache",
             "kda_beta_cache",
         )
@@ -4065,7 +4070,8 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr.kda_conv_q = torch.full((2, 4, 2, 6), 7.0)
     mgr.kda_conv_k = torch.full((2, 4, 2, 6), 7.0)
     mgr.kda_conv_v = torch.full((2, 4, 2, 6), 7.0)
-    mgr.kda_kg_cache = torch.full((2, 4, 2, 2, 2), 7.0)
+    mgr.kda_k_cache = torch.full((2, 4, 2, 2), 7.0)
+    mgr.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
 
@@ -4083,7 +4089,8 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
                     conv_state[slot, start : start + 2, :],
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(mgr.kda_kg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_g_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
             assert mgr.prev_num_accepted_tokens[slot] == 0

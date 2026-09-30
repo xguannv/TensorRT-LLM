@@ -448,7 +448,7 @@ class KimiKDALinearAttention(nn.Module):
 
     def _has_kda_replay_caches(self, layer_cache) -> bool:
         """True when the manager allocated the fused-verify replay caches."""
-        return getattr(layer_cache, "kda_kg_cache", None) is not None
+        return getattr(layer_cache, "kda_k_cache", None) is not None
 
     def _sync_kda_replay_conv_window(self, layer_cache, slot_indices, conv_pool) -> None:
         """Seed replay conv caches from the live committed conv pool.
@@ -1092,7 +1092,8 @@ class KimiKDALinearAttention(nn.Module):
             A_log=self.A_log.detach(),
             dt_bias=self.dt_bias.detach(),
             recurrent_state=ssm_pool,
-            kg_cache=layer_cache.kda_kg_cache,
+            k_cache=layer_cache.kda_k_cache,
+            g_cache=layer_cache.kda_g_cache,
             v_cache=layer_cache.kda_v_cache,
             beta_cache=layer_cache.kda_beta_cache,
             ssm_state_indices=slot_indices,

@@ -27,8 +27,10 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
-from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda import (
+    KimiKDALinearAttention,  # noqa: E402
+    kimi_kda_mixer,  # noqa: E402
+)
 
 HIDDEN_SIZE = 512
 NUM_HEADS = 4
@@ -51,7 +53,7 @@ class _Cfg:
 class _LayerCache:
     """Only what the plain-decode path reads; no fused-verify replay caches."""
 
-    kda_kg_cache = None
+    kda_k_cache = None
 
 
 class _MambaMetadata:

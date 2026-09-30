@@ -160,9 +160,10 @@ def _make_fused_layer_cache(B, conv_pool):
         kda_conv_q=_conv_cache(0),
         kda_conv_k=_conv_cache(1),
         kda_conv_v=_conv_cache(2),
-        kda_kg_cache=torch.zeros(B, M, 2, d, device="cuda", dtype=torch.float32),
-        kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
-        kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
+        kda_k_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.bfloat16),
+        kda_g_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
+        kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.bfloat16),
+        kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.bfloat16),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
         intermediate_conv_window=None,
         intermediate_ssm=None,
@@ -172,7 +173,7 @@ def _make_fused_layer_cache(B, conv_pool):
 def _make_seq_layer_cache(B):
     d = H * K
     return SimpleNamespace(
-        kda_kg_cache=None,
+        kda_k_cache=None,
         intermediate_conv_window=torch.zeros(
             B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
