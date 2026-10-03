@@ -3576,8 +3576,12 @@ class PyTorchModelEngine(ModelEngine):
         # The disaggregated attention-DP overlap path opts into larger metadata
         # buffers. Passing None preserves the established max_num_requests
         # fallback for other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_disagg_adp_overlap_headroom else None)
+        # Size slot-indexed spec buffers (e.g. rejection-sampling draft_probs)
+        # by the same pool that sizes the SeqSlotManager
+        # (py_executor_creator passes model_engine.max_num_seq_slots), so every
+        # py_seq_slot has a row. With max_num_requests only, DSpark + rejection
+        # sampling on disaggregated attention-DP gen indexed past the buffer.
+        num_seq_slots = self.max_num_seq_slots
         if no_cache:
             return get_spec_metadata(
                 spec_config,
