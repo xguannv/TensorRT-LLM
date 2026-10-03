@@ -210,6 +210,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.fold_sq_ratio = (
             BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
                 num_heads, seq_len_q, mma_qk_tiler_mn[0]))
+        # fold_rows: rows of the folded head dimension, i.e. the (q_tok, head)
+        # pairs one M tile holds. With an integer fold it is num_heads * F.
+        # When that still leaves the M tile partly empty but the flattened
+        # [seq_len_q][num_heads] rows split evenly into full M tiles (e.g.
+        # H=96, S_q=4 -> 384 rows = 3 x 128), fold "flat" instead: every M tile
+        # is a contiguous run of 128 (q_tok, head) rows, which removes the
+        # padded MMA rows and one KV pass per request. Row r of folded tile c
+        # is global row c * fold_rows + r, i.e. q_tok = (c * fold_rows + r) //
+        # num_heads, head = (c * fold_rows + r) % num_heads; the per-row math
+        # is unchanged. TRTLLM_MLA_FLAT_FOLD=0 disables it.
+        self.fold_rows = num_heads * self.fold_sq_ratio
+        if (fold_sq and self.fold_rows < mma_qk_tiler_mn[0]
+                and (num_heads * seq_len_q) % mma_qk_tiler_mn[0] == 0
+                and os.environ.get("TRTLLM_MLA_FLAT_FOLD", "1") != "0"):
+            self.fold_rows = mma_qk_tiler_mn[0]
+        self.flat_fold = self.fold_rows != num_heads * self.fold_sq_ratio
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -479,7 +495,56 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Tensor layout: [H, D, S_q, B] -> [H*F, D, S_q/F, B]; relies on
         # stride_S == stride_H * H (always true for contiguous [B, S_q, H, D]
         # tensors after the host-side permute).
-        if cutlass.const_expr(self.fold_sq):
+        if cutlass.const_expr(self.fold_sq and self.flat_fold):
+            # Flat fold: [H, D, S_q, B] -> [rows, D, H * S_q / rows, B].
+            # Same stride requirement as the integer fold (stride_S == H *
+            # stride_H), so the folded rows have the uniform stride stride_H.
+            rows = self.fold_rows
+            chunks = self.num_heads * self.seq_len_q // rows
+
+            def _fold_sq_4d(t):
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (rows, t.shape[1], chunks, t.shape[3]),
+                        stride=(
+                            t.stride[0],
+                            t.stride[1],
+                            t.stride[0] * rows,
+                            t.stride[3],
+                        ),
+                    ),
+                )
+
+            q_latent = _fold_sq_4d(q_latent)
+            q_rope = _fold_sq_4d(q_rope)
+            o = _fold_sq_4d(o)
+            lse = cute.make_tensor(
+                lse.iterator,
+                cute.make_layout(
+                    (rows, chunks, lse.shape[2]),
+                    stride=(lse.stride[0], lse.stride[0] * rows, lse.stride[2]),
+                ),
+            )
+            if cutlass.const_expr(self.emit_softmax_stats):
+                softmax_stats = cute.make_tensor(
+                    softmax_stats.iterator,
+                    cute.make_layout(
+                        (
+                            rows,
+                            chunks,
+                            softmax_stats.shape[2],
+                            softmax_stats.shape[3],
+                        ),
+                        stride=(
+                            softmax_stats.stride[0],
+                            softmax_stats.stride[0] * rows,
+                            softmax_stats.stride[2],
+                            softmax_stats.stride[3],
+                        ),
+                    ),
+                )
+        elif cutlass.const_expr(self.fold_sq):
             F = self.fold_sq_ratio
 
             def _fold_sq_4d(t):
@@ -1610,8 +1675,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     # (H*F, S_q/F, B): true token = chunk * F + row // H.
                     if cutlass.const_expr(kv_bounds is not None):
                         if cutlass.const_expr(self.fold_sq):
-                            q_tok = (blk_coord[1] * self.fold_sq_ratio +
-                                     blk_coord[0] // self.num_heads)
+                            q_tok = (blk_coord[1] * self.fold_rows +
+                                     blk_coord[0]) // self.num_heads
                         else:
                             q_tok = blk_coord[1]
                         has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q +
@@ -2783,10 +2848,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
                     if cutlass.const_expr(self.fold_sq):
-                        q_tok = (
-                            common_params.blk_coord[1] * self.fold_sq_ratio +
-                            (tTR_tS[i][0] + common_params.blk_coord[0] *
-                             cta_m_rows) // self.num_heads)
+                        # == chunk * F + row // H for an integer fold
+                        q_tok = (common_params.blk_coord[1] * self.fold_rows +
+                                 tTR_tS[i][0] + common_params.blk_coord[0] *
+                                 cta_m_rows) // self.num_heads
                     else:
                         q_tok = common_params.blk_coord[1]
                     if cutlass.const_expr(common_params.kv_bounds is not None):
@@ -2839,10 +2904,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     if cutlass.const_expr(self.fold_sq):
-                        q_tok = (
-                            common_params.blk_coord[1] * self.fold_sq_ratio +
-                            (tTR_tS[i][0] + common_params.blk_coord[0] *
-                             cta_m_rows) // self.num_heads)
+                        # == chunk * F + row // H for an integer fold
+                        q_tok = (common_params.blk_coord[1] * self.fold_rows +
+                                 tTR_tS[i][0] + common_params.blk_coord[0] *
+                                 cta_m_rows) // self.num_heads
                     else:
                         q_tok = common_params.blk_coord[1]
                     if cutlass.const_expr(common_params.kv_bounds is not None):
