@@ -59,6 +59,7 @@
 #include <c10/util/SmallVector.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -2225,7 +2226,17 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     // Threshold to switch between one-shot and two-shot allreduce kernel.
     // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    // TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES overrides it (read once); it must match the Python side
+    // (tensorrt_llm/_torch/distributed/ops.py), which sizes the Lamport workspace with the same rule.
+    static size_t const kOneShotSizeThreshold = []()
+    {
+        size_t threshold = 64 * 1024 * 8 * 2;
+        if (char const* env = std::getenv("TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES"))
+        {
+            threshold = static_cast<size_t>(std::stoull(env));
+        }
+        return threshold;
+    }();
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {

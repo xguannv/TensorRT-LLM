@@ -30,7 +30,11 @@ from tensorrt_llm.mapping import Mapping
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
-_MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+# One-shot vs two-shot switch of the MNNVL all-reduce, in bytes of
+# num_tokens * hidden_dim * group_size * elem_size. Must match the C++ rule in
+# cpp/tensorrt_llm/thop/allreduceOp.cpp, which reads the same env override.
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = int(
+    os.environ.get("TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES", 64 * 1024 * 8 * 2))
 
 _thread_local = threading.local()
 
