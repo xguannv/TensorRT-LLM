@@ -614,6 +614,7 @@ class ConfigurableMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -627,6 +628,9 @@ class ConfigurableMoE(MoE):
         4. Advances the EPLB ``repeat_idx``.
 
         DP-padding handling and chunking live in the scheduler.
+
+        ``input_ready_event``: ``x`` is written on another stream; the join is
+        deferred to the first kernel that reads ``x``, so routing overlaps it.
         """
         input_ids = kwargs.get("input_ids")
 
@@ -651,6 +655,7 @@ class ConfigurableMoE(MoE):
             use_dp_padding=use_dp_padding,
             input_ids=input_ids,
             lora_params=lora_params,
+            input_ready_event=input_ready_event,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
