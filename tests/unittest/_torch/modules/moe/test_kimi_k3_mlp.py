@@ -417,6 +417,9 @@ def test_kimi_k3_shared_allreduce_ordering(
     runtime.moe_shared_event = _Event("shared_done", parallel)
     midpoint_event = _Event("midpoint", overlap) if defer else None
     runtime.moe_routed_event = midpoint_event
+    runtime.latent_down_stream = None
+    runtime.moe_latent_fork_event = None
+    runtime.moe_latent_ready_event = None
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
