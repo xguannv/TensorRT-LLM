@@ -192,6 +192,56 @@ def test_fused_kda_post_conv_matches_reference(sequence_length: int) -> None:
     assert torch.equal(actual_v, expected_v)
 
 
+@pytest.mark.parametrize("sequence_length", [1, 63, 65, 193])
+@pytest.mark.parametrize("beta_layout", ["contiguous", "fused_projection"])
+@torch.no_grad()
+def test_fused_kda_post_conv_prepad_matches_separate_padding(
+    sequence_length: int, beta_layout: str
+) -> None:
+    """The producer writes the same Q/K/V/beta prefix and exact zero tail as F.pad."""
+    torch.manual_seed(1)
+    heads, head_dim = 6, 128
+    packed = torch.randn(3 * heads * head_dim, sequence_length, device="cuda", dtype=torch.bfloat16)
+    if beta_layout == "fused_projection":
+        projection = torch.randn(
+            1, sequence_length, head_dim + heads, device="cuda", dtype=torch.bfloat16
+        )
+        beta = projection[..., head_dim:]
+        assert beta.stride(-2) > heads
+    else:
+        beta = torch.randn(1, sequence_length, heads, device="cuda", dtype=torch.bfloat16)
+
+    padded_tokens = ((sequence_length + 63) // 64) * 64
+    baseline_qkv = fused_kda_post_conv(packed, heads, head_dim)
+    actual = fused_kda_post_conv(packed, heads, head_dim, padded_tokens=padded_tokens, beta=beta)
+    expected = tuple(
+        torch.nn.functional.pad(value, (0, 0, 0, 0, 0, padded_tokens - sequence_length))
+        for value in baseline_qkv
+    ) + (torch.nn.functional.pad(beta.float(), (0, 0, 0, padded_tokens - sequence_length)),)
+
+    for name, got, want in zip(("q", "k", "v", "beta"), actual, expected, strict=True):
+        context = f"sequence_length={sequence_length} beta_layout={beta_layout} tensor={name}"
+        assert got.shape == want.shape and got.is_contiguous(), context
+        got_bits = got.view(torch.int16 if got.element_size() == 2 else torch.int32)
+        want_bits = want.view(torch.int16 if want.element_size() == 2 else torch.int32)
+        assert torch.equal(got_bits, want_bits), context
+
+
+@pytest.mark.parametrize("invalid", ["shape", "head_stride", "device"])
+def test_fused_kda_post_conv_rejects_invalid_beta(invalid: str) -> None:
+    """Reject inputs that would silently copy beta or read from another device."""
+    packed = torch.empty(3 * 6 * 128, 65, device="cuda", dtype=torch.bfloat16)
+    beta = torch.empty(1, 65, 6, device="cuda", dtype=torch.bfloat16)
+    if invalid == "shape":
+        beta = beta[:, :-1]
+    elif invalid == "head_stride":
+        beta = torch.empty(1, 65, 12, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    else:
+        beta = beta.cpu()
+    with pytest.raises(ValueError, match="beta must be"):
+        fused_kda_post_conv(packed, 6, 128, padded_tokens=128, beta=beta)
+
+
 @torch.no_grad()
 def test_packed_gdn_convolution_matches_three_fla_convolutions() -> None:
     """The reused GDN kernel preserves KDA convolution and cache semantics."""

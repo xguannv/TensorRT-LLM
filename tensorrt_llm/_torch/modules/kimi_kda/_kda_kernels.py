@@ -69,26 +69,38 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103, 107)
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "num_out_tokens", "beta_row_stride"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
     k_out_ptr,
     v_out_ptr,
+    beta_ptr,
+    beta_out_ptr,
     num_tokens,
+    num_out_tokens,
+    beta_row_stride,
     l2_norm_eps,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
-    """Normalize and transpose channel-major packed Q/K/V in one launch."""
+    """Normalize and transpose channel-major packed Q/K/V in one launch.
+
+    Rows in ``[num_tokens, num_out_tokens)`` are written as exact zeros, so
+    the outputs are already zero-padded for the KDA prefill op. When
+    ``HAS_BETA``, beta is cast to fp32 and zero-padded the same way.
+    """
     token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     head_idx = tl.program_id(1)
     dim_offsets = tl.arange(0, BLOCK_DIM)
     token_mask = token_offsets < num_tokens
+    out_token_mask = token_offsets < num_out_tokens
     dim_mask = dim_offsets < HEAD_DIM
     mask = token_mask[:, None] & dim_mask[None, :]
+    out_mask = out_token_mask[:, None] & dim_mask[None, :]
 
     feature_offsets = head_idx * HEAD_DIM + dim_offsets
     projection_size = NUM_HEADS * HEAD_DIM
@@ -101,9 +113,10 @@ def _fused_kda_post_conv_kernel(
         token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
     )
 
+    # Masked-off rows load 0 and normalize to exactly +0 (0 / sqrt(eps)).
     q = tl.load(packed_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
     q /= tl.sqrt(tl.sum(q * q, axis=1) + l2_norm_eps)[:, None]
-    tl.store(q_out_ptr + output_offsets, q, mask=mask)
+    tl.store(q_out_ptr + output_offsets, q, mask=out_mask)
 
     k = tl.load(
         packed_ptr + section_stride + source_offsets,
@@ -111,14 +124,21 @@ def _fused_kda_post_conv_kernel(
         other=0.0,
     ).to(tl.float32)
     k /= tl.sqrt(tl.sum(k * k, axis=1) + l2_norm_eps)[:, None]
-    tl.store(k_out_ptr + output_offsets, k, mask=mask)
+    tl.store(k_out_ptr + output_offsets, k, mask=out_mask)
 
     v = tl.load(
         packed_ptr + 2 * section_stride + source_offsets,
         mask=mask,
         other=0.0,
     )
-    tl.store(v_out_ptr + output_offsets, v, mask=mask)
+    tl.store(v_out_ptr + output_offsets, v, mask=out_mask)
+
+    if HAS_BETA:
+        token_i64 = token_offsets.to(tl.int64)
+        beta = tl.load(
+            beta_ptr + token_i64 * beta_row_stride + head_idx, mask=token_mask, other=0.0
+        ).to(tl.float32)
+        tl.store(beta_out_ptr + token_i64 * NUM_HEADS + head_idx, beta, mask=out_token_mask)
 
 
 def fused_kda_post_conv(
@@ -126,12 +146,20 @@ def fused_kda_post_conv(
     num_heads: int,
     head_dim: int,
     l2_norm_eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    padded_tokens: Optional[int] = None,
+    beta: Optional[torch.Tensor] = None,
+):
     """Convert packed channel-major convolution output to KDA Q/K/V.
 
     ``packed`` has shape ``[3 * num_heads * head_dim, tokens]``. The
-    returned tensors are contiguous ``[1, tokens, num_heads, head_dim]``;
-    Q and K are L2-normalized along the head dimension.
+    returned tensors are contiguous ``[1, out_tokens, num_heads, head_dim]``;
+    Q and K are L2-normalized along the head dimension. ``out_tokens`` is
+    ``padded_tokens`` when given (rows past ``tokens`` are exact zeros),
+    else ``tokens``.
+
+    If ``beta`` (``[..., tokens, num_heads]`` with unit head stride) is
+    given, a fourth output holds it cast to fp32 and zero-padded to
+    ``[1, out_tokens, num_heads]``.
     """
     projection_size = num_heads * head_dim
     if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
@@ -143,31 +171,56 @@ def fused_kda_post_conv(
         raise ValueError("Packed KDA post-conv requires a contiguous tensor")
 
     num_tokens = packed.shape[1]
-    output_shape = (1, num_tokens, num_heads, head_dim)
+    out_tokens = num_tokens if padded_tokens is None else padded_tokens
+    if out_tokens < num_tokens:
+        raise ValueError(f"padded_tokens={out_tokens} is smaller than tokens={num_tokens}")
+    output_shape = (1, out_tokens, num_heads, head_dim)
     q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
     k_out = torch.empty_like(q_out)
     v_out = torch.empty_like(q_out)
-    if num_tokens == 0:
-        return q_out, k_out, v_out
+    beta_out = None
+    beta_2d = None
+    if beta is not None:
+        if beta.ndim == 2 and beta.shape == (num_tokens, num_heads):
+            beta_2d = beta
+        elif beta.ndim == 3 and beta.shape == (1, num_tokens, num_heads):
+            beta_2d = beta[0]
+        if beta_2d is None or beta_2d.stride(-1) != 1 or beta_2d.device != packed.device:
+            raise ValueError(
+                f"beta must be [tokens={num_tokens}, heads={num_heads}] or "
+                f"[1, tokens={num_tokens}, heads={num_heads}] on {packed.device} "
+                f"with unit head stride, got shape {tuple(beta.shape)}, "
+                f"stride {beta.stride()}, device {beta.device}"
+            )
+        beta_out = torch.empty(
+            (1, out_tokens, num_heads), dtype=torch.float32, device=packed.device
+        )
+    if out_tokens == 0:
+        return (q_out, k_out, v_out) if beta is None else (q_out, k_out, v_out, beta_out)
 
     block_tokens = 16
     block_dim = triton.next_power_of_2(head_dim)
-    grid = (triton.cdiv(num_tokens, block_tokens), num_heads)
+    grid = (triton.cdiv(out_tokens, block_tokens), num_heads)
     _fused_kda_post_conv_kernel[grid](
         packed,
         q_out,
         k_out,
         v_out,
+        beta_2d if beta_2d is not None else q_out,
+        beta_out if beta_out is not None else q_out,
         num_tokens,
+        out_tokens,
+        beta_2d.stride(0) if beta_2d is not None else 0,
         l2_norm_eps,
         num_heads,
         head_dim,
         block_tokens,
         block_dim,
+        beta is not None,
         num_warps=8,
         num_stages=3,
     )
-    return q_out, k_out, v_out
+    return (q_out, k_out, v_out) if beta is None else (q_out, k_out, v_out, beta_out)
 
 
 @triton.jit
@@ -535,7 +588,28 @@ class KDAKernelDispatch:
             import torch.nn.functional as F
 
             real_T = q.shape[1]
-            if cu_seqlens is not None:
+            if (
+                cu_seqlens is not None
+                and single_sequence_length is not None
+                and q.shape[1] != single_sequence_length
+            ):
+                # Caller already produced chunk-padded inputs (zero tails);
+                # only the output needs trimming back to the real length.
+                real_T = single_sequence_length
+                padded_T = q.shape[1]
+                if (
+                    cu_seqlens.shape[0] != 2
+                    or padded_T % chunk_size != 0
+                    or not 0 < padded_T - real_T < chunk_size
+                    or any(t.shape[1] != padded_T for t in (k, v, beta))
+                    or g.shape[1] not in (real_T, padded_T)
+                ):
+                    raise ValueError(
+                        "Pre-padded KDA prefill inputs must be one sequence padded to the "
+                        f"next {chunk_size}-token boundary (real_T={real_T}, "
+                        f"q/k/v/g/beta lengths={[t.shape[1] for t in (q, k, v, g, beta)]})."
+                    )
+            elif cu_seqlens is not None:
                 # The op's varlen single-seq path (Phase 2.1) expects the
                 # caller to zero-pad the packed tensors to a chunk multiple
                 # (FLA convention) while cu_seqlens keeps the real length;

@@ -41,6 +41,8 @@ from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ._kda_kernels import KDAKernelDispatch, copy_kda_replay_conv_window, fused_kda_post_conv
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
+# Prototype A/B switch: produce chunk-padded Q/K/V/beta in the post-conv kernel.
+_KDA_PREPAD_PREFILL = os.environ.get("TLLM_KDA_PREPAD_PREFILL", "0") == "1"
 # Heuristic ported from SGLang's Blackwell cutoff:
 # https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
 # It has not been tuned for TensorRT-LLM; benchmark and retune it for TRT-LLM's
@@ -587,21 +589,48 @@ class KimiKDALinearAttention(nn.Module):
             activation="silu",
         )
 
+        # A single unaligned sequence on the optimized path needs its inputs
+        # zero-padded to a chunk multiple. Produce Q/K/V/beta at that length
+        # directly instead of padding copies; g needs no pad because the op
+        # rebuilds g's sentinel tail from the real prefix.
+        num_tokens = x2d.shape[0]
+        chunk = 64
+        padded_tokens = None
+        if (
+            _KDA_PREPAD_PREFILL
+            and use_indexed_state
+            and num_prefills == 1
+            and single_sequence_length is not None
+            and single_sequence_length == num_tokens
+            and num_tokens % chunk != 0
+        ):
+            padded_tokens = num_tokens + chunk - num_tokens % chunk
+
         if self._bfa_proj_weight is not None:
             bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
             f_a = bfa[..., : self.head_dim]
-            beta = bfa[..., self.head_dim : self.head_dim + self.num_heads].float()
+            beta = bfa[..., self.head_dim : self.head_dim + self.num_heads]
             g = self.f_b_proj(f_a)
         else:
             g = self.f_b_proj(self.f_a_proj(x))
-            beta = self.b_proj(x).float()
+            beta = self.b_proj(x)
         g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
 
-        q, k, v = fused_kda_post_conv(
-            packed_conv,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-        )
+        if padded_tokens is not None and beta.stride(-1) == 1:
+            q, k, v, beta = fused_kda_post_conv(
+                packed_conv,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                padded_tokens=padded_tokens,
+                beta=beta,
+            )
+        else:
+            beta = beta.float()
+            q, k, v = fused_kda_post_conv(
+                packed_conv,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+            )
 
         # The optimized kernel reads and writes the V-first pool directly;
         # the FLA core exchanges batch-dense recurrent states.

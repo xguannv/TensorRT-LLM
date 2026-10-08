@@ -50,6 +50,8 @@ l0_gb300_multi_gpus:
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (30)
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_prepad_mixer_ab.py
+  - unittest/_torch/modules/kimi_kda/test_kda_prefill_prepad_routing.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   # KDA prefill scratch must stay bounded: _get_buffers is keyed on the
   # unquantized per-iteration context token count, so a cache entry that
