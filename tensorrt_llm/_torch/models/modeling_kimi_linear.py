@@ -127,6 +127,8 @@ from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
+_K3_FUSE_MOE_RESIDUAL = os.environ.get("TRTLLM_K3_FUSE_MOE_RESIDUAL", "0") == "1"
+
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
@@ -1786,7 +1788,13 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
-    def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens=None,
+        *,
+        residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         projected_input = None
@@ -1885,6 +1893,10 @@ class KimiK3MoERuntime(nn.Module):
                 ),
             )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        if residual is not None:
+            from ..modules.kimi_k3_moe_residual import _fused_moe_residual_add
+
+            return _fused_moe_residual_add(routed_out, shared_out, residual)
         return routed_out + shared_out
 
 
@@ -2245,6 +2257,13 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
             )
+        if self.is_moe and _K3_FUSE_MOE_RESIDUAL and not torch.compiler.is_compiling():
+            prefix_sum = self.block_sparse_moe(
+                hidden_states,
+                getattr(attn_metadata, "all_rank_num_tokens", None),
+                residual=prefix_sum,
+            )
+            return prefix_sum, num_snapshots
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
                 hidden_states, getattr(attn_metadata, "all_rank_num_tokens", None)
