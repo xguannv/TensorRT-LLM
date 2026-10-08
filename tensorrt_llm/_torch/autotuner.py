@@ -25,7 +25,8 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, global_mpi_size,
+                                 nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -1600,6 +1601,15 @@ class AutoTuner:
             logger.warning_once(
                 "[Autotuner] Multiprocess tactic profiling is disabled for distributed tuning.",
                 key=("autotuner", "warning_multiprocess_distributed"),
+            )
+            return False
+
+        # A spawned worker re-runs MPI_Init (on `import tensorrt_llm`) with the
+        # parent's launcher environment, which blocks inside a multi-rank job.
+        if global_mpi_size() > 1:
+            logger.warning_once(
+                "[Autotuner] Multiprocess tactic profiling is disabled in a multi-rank MPI job.",
+                key=("autotuner", "warning_multiprocess_mpi"),
             )
             return False
 
