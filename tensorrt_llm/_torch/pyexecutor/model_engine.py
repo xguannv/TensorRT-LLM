@@ -1421,9 +1421,13 @@ class PyTorchModelEngine(ModelEngine):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Helix CP is decode-only and runs into issues with the
-        # autotuner warmup's context requests.
-        if not is_enc_dec and not self.mapping.has_cp_helix():
+        # Helix CP is decode-only, so it tunes on generation requests.
+        if not is_enc_dec and self.mapping.has_cp_helix():
+            self._run_autotuner_warmup(resource_manager, generation_only=True)
+            log_mem_snapshot("warmup/after_autotuner")
+            gc.collect()
+            torch.cuda.empty_cache()
+        elif not is_enc_dec:
             self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1785,17 +1789,29 @@ class PyTorchModelEngine(ModelEngine):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager):
-        """Runs forward passes to populate the autotuner cache."""
+    def _run_autotuner_warmup(self,
+                              resource_manager: ResourceManager,
+                              generation_only: bool = False):
+        """Runs forward passes to populate the autotuner cache.
+
+        ``generation_only`` tunes on one batch of ``max_batch_size`` generation
+        requests instead of a context batch, for Helix CP GENs.
+        """
         if not self.llm_args.enable_autotuner:
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self.original_max_draft_len)
+        if generation_only:
+            tokens_per_gen_request = 1 + self.max_total_draft_tokens
+            num_gen_requests = min(
+                self.batch_size, self.max_num_tokens // tokens_per_gen_request)
+            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        else:
+            token_num_upper_bound = min(
+                self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
+            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num_upper_bound,
+                max_num_draft_tokens=self.original_max_draft_len)
 
         if self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens:
             logger.info(
@@ -1806,9 +1822,12 @@ class PyTorchModelEngine(ModelEngine):
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
 
-        warmup_configs = [(curr_max_num_tokens, 0)]
-        if (not self.is_draft_model and self.guided_decoder is None
-                and not self.mapping.has_pp()):
+        if generation_only:
+            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
+        else:
+            warmup_configs = [(curr_max_num_tokens, 0)]
+        if (not generation_only and not self.is_draft_model
+                and self.guided_decoder is None and not self.mapping.has_pp()):
             # Add generation request to warmup the autotuner cache.
             warmup_configs.append((1 + self.max_total_draft_tokens, 1))
 
