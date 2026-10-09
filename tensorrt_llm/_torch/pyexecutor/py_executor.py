@@ -7150,7 +7150,8 @@ class PyExecutor:
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """Pad an idle attention-DP rank with a role-matched dummy request."""
-        if not self.enable_attention_dp:
+        if not self.enable_attention_dp or self.dist.tp_size <= 1:
+            # A single-rank attention-DP group has no peer to keep in step.
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -7200,6 +7201,13 @@ class PyExecutor:
                            and num_active_request == 0)
         if not needs_dummy:
             return
+
+        if (self._adp_dummy_is_gen
+                and getattr(self.kv_cache_manager, "fp4_mla_context_only_cache",
+                            False) is True):
+            # A context-only FP4 MLA cache has no generation V cache, so a
+            # generation dummy fails in attention; pad with a context dummy.
+            self._adp_dummy_is_gen = False
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
         token_nums = None
@@ -7320,6 +7328,20 @@ class PyExecutor:
         if scheduled_batch is None or scheduled_batch.batch_size != 0:
             return
         if not self.active_requests or self.expected_num_active_requests <= 0:
+            return
+        # With a single attention-DP rank `_can_queue` reduces to this rank's
+        # own batch, so an empty batch vetoes no peer and needs no padding.
+        if self.dist.tp_size <= 1:
+            return
+        # A context-only FP4 MLA cache has no generation V cache, so the
+        # generation dummy used below would fail in attention; let the empty
+        # batch skip this iteration instead.
+        if getattr(self.kv_cache_manager, "fp4_mla_context_only_cache",
+                   False) is True:
+            logger.warning_once(
+                "attention-DP rank scheduled an empty batch on a context-only "
+                "FP4 MLA cache; skipping generation-dummy padding",
+                key="attention_dp_empty_batch_ctx_only_cache")
             return
         # Unlike the pre-schedule path, this one pads a rank that already holds
         # active requests, so it must respect the cap that
