@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,6 +48,17 @@ static __device__ __forceinline__ uint64_t __as_ptr_gmem(void const* __ptr)
 __device__ __forceinline__ void fence_release_sys()
 {
     asm volatile("fence.release.sys;" : : : "memory");
+}
+
+// Orders this thread's earlier generic-proxy shared-memory accesses before its later
+// async-proxy (cp.async.bulk) accesses. A bulk copy that reads or overwrites shared memory
+// written with ordinary stores needs this fence in every writing thread, followed by a
+// barrier with the thread that issues the copy.
+__device__ __forceinline__ void fence_proxy_async_shared_cta()
+{
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
+    asm volatile("fence.proxy.async.shared::cta;" : : : "memory");
+#endif
 }
 
 // ============================================================================

@@ -476,7 +476,10 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             fifoEntry128ByteIndexBase += singleProtoTransfer128ByteCount;
 
             // ensure that we can over-write shmem in next iteration
-            // (it must be fully read by all threads when doing S2G above)
+            // (it must be fully read by all threads when doing S2G above).
+            // The next iteration refills shmem with a bulk copy, which must
+            // also be ordered after the sanitize and protoPack stores above.
+            fence_proxy_async_shared_cta();
             __syncwarp();
         }
         if (fifoEntry128ByteIndexBase > 0)
@@ -540,6 +543,12 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
             LL128Proto::protoUnpack(
                 shmem, tail, singlePacked128ByteCount, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
+
+            // protoUnpack restores the u64 under each line's flag with ordinary
+            // stores, and the bulk store below reads shared memory through the
+            // async proxy: without this fence it can still read the flag value.
+            fence_proxy_async_shared_cta();
+            __syncwarp();
 
             // note: fields are already unpacked in shared memory
             s2gAllFields<ALLOW_VARIABLE_FIELD1, USE_BULK_FIELD1>(params.recvFields, dataIndex, shmem, laneId);
