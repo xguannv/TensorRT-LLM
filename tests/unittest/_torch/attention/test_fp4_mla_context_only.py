@@ -22,7 +22,7 @@ def test_layout_and_estimate_follow_worker_role(monkeypatch, role, is_disagg, fu
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     monkeypatch.setenv("TRTLLM_FP4_MLA_ATTENTION_BACKEND", "cutedsl")
     monkeypatch.setenv("TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE", str(int(fused)))
-    monkeypatch.delenv("TLLM_KIMI_K3_BF16_KV_LAYERS", raising=False)
+    monkeypatch.delenv("TLLM_KIMI_K3_FP8_KV_LAYERS", raising=False)
     if legacy_flag is None:
         monkeypatch.delenv("TRTLLM_FP4_MLA_CONTEXT_ONLY_CACHE", raising=False)
     else:

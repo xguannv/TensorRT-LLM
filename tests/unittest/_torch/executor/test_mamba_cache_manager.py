@@ -21,7 +21,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MapperKind,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -1849,7 +1849,7 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     manager_cls: type[MambaHybridCacheManagerV2],
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     mgr = object.__new__(manager_cls)
     mgr.pp_layers = [0, 1, 2, 3]
     mgr._mamba_layer_mask = [True, False, True, False]
@@ -1915,11 +1915,11 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     assert mgr.get_disagg_global_layer_ids(2) == [3, 7]
 
 
-def test_v2_hybrid_composes_bf16_fallback_with_fp4_mla_and_ssm_layers(
+def test_v2_hybrid_composes_fp8_fallback_with_fp4_mla_and_ssm_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.pp_layers = [0, 1, 2, 3]
     mgr.layer_offsets = {layer: layer for layer in mgr.pp_layers}
@@ -1973,31 +1973,31 @@ def test_v2_hybrid_composes_bf16_fallback_with_fp4_mla_and_ssm_layers(
     config = MambaHybridCacheManagerV2._build_cache_config(mgr, base_config)
 
     assert mgr._cache_manager_layer_ids == [LayerId(1)]
-    assert mgr._bf16_mla_manager_layer_ids == [LayerId(3)]
+    assert mgr._fp8_mla_manager_layer_ids == [LayerId(3)]
     assert mgr._hp_manager_layer_ids == [LayerId(4)]
     assert mgr._get_buffer_roles_for_layer(1) == [Role.KEY, Role.KEY_BLOCK_SCALE]
     assert mgr._get_buffer_roles_for_layer(3) == [Role.KEY]
     assert [buffer.role for buffer in config.layers[3].buffers] == [Role.KEY]
     assert config.layers[3].buffers[0].size == (
-        96 * torch.bfloat16.itemsize * FP4_MLA_TOKENS_PER_BLOCK
+        96 * torch.float8_e4m3fn.itemsize * FP4_MLA_TOKENS_PER_BLOCK
     )
     assert config.layers[3].sliding_window_size > mgr.max_seq_len
     assert mgr.get_kv_cache_dtype(1) == DataType.NVFP4
-    assert mgr.get_kv_cache_dtype(3) == DataType.BF16
+    assert mgr.get_kv_cache_dtype(3) == DataType.FP8
 
-    bf16_pool = torch.empty(
+    fp8_pool = torch.empty(
         (8, 1, FP4_MLA_TOKENS_PER_BLOCK, 1, 96),
-        dtype=torch.bfloat16,
+        dtype=torch.float8_e4m3fn,
     )
 
     def role_view(layer_id, role, dtype, page_shape):
-        assert (layer_id, role, dtype) == (LayerId(3), Role.KEY, torch.bfloat16)
+        assert (layer_id, role, dtype) == (LayerId(3), Role.KEY, torch.float8_e4m3fn)
         assert page_shape == (1, FP4_MLA_TOKENS_PER_BLOCK, 1, 96)
-        return bf16_pool
+        return fp8_pool
 
     mgr._role_view = role_view
     assert mgr.get_buffers(0) is None
-    assert mgr.get_buffers(3) is bf16_pool
+    assert mgr.get_buffers(3) is fp8_pool
     mgr.impl = SimpleNamespace(layer_grouping=[[0, 2], [1], [3], [4]])
     assert mgr.get_disagg_global_layer_ids(1) == [2]
     assert mgr.get_disagg_global_layer_ids(2) == [6]
@@ -2016,13 +2016,14 @@ def test_fp4_mla_invalid_scan_builds_page_major_physical_pool_views() -> None:
         _fp4_mla_compact_to_local=[1],
         _cache_manager_layer_ids=[LayerId(1)],
         _hp_manager_layer_ids=[LayerId(2)],
-        _bf16_mla_manager_layer_ids=[],
+        _fp8_mla_manager_layer_ids=[],
         _storage_head_dim=lambda local_layer: 32,
         _role_pool_base_view=role_pool_base_view,
         get_mla_v_scale_pool_base=lambda: torch.empty((3, 32), dtype=torch.uint8),
         kv_factor=1,
         tokens_per_block=16,
         mla_v_head_dim=16,
+        fp4_mla_context_only_cache=False,
         _fp4_mla_hp_pool_size=1,
         head_dim_per_layer=[0, 32],
     )

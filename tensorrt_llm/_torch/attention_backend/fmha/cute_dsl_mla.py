@@ -155,7 +155,7 @@ class CuteDslMlaFmha(PhasedFmha):
         return (
             callable(get_kv_cache_dtype)
             and attn.layer_idx in layer_offsets
-            and get_kv_cache_dtype(attn.layer_idx) == DataType.BF16
+            and get_kv_cache_dtype(attn.layer_idx) in (DataType.BF16, DataType.FP8)
         )
 
     @staticmethod
@@ -262,12 +262,12 @@ class CuteDslMlaFmha(PhasedFmha):
         )
         if supported and metadata.num_contexts > 0 and self.attn.num_heads != 96:
             logger.info_once(
-                "CuTe DSL MLA FMHA selected for an NVFP4-manager BF16 fallback "
+                "CuTe DSL MLA FMHA selected for an NVFP4-manager fallback "
                 f"layer in a mixed batch: layer={self.attn.layer_idx}, "
                 f"num_contexts={metadata.num_contexts}, "
                 f"num_generations={metadata.num_generations}, "
                 f"q_shape={tuple(q.shape)}.",
-                key=f"cute_dsl_mla_mixed_bf16_layer:{self.attn.layer_idx}",
+                key=f"cute_dsl_mla_mixed_fallback_layer:{self.attn.layer_idx}",
             )
         if not supported:
             logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
@@ -338,7 +338,7 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Keep the general mixed-batch performance gate, except when an
-        # NVFP4 manager exposes this layer through its BF16 fallback pool.
+        # NVFP4 manager exposes this layer through its BF16 or FP8 fallback pool.
         # TRTLLM-Gen cannot consume that combination with 128-token pages,
         # while the CuTeDSL path below already slices all generation inputs
         # and page tables past meta.num_contexts.

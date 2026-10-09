@@ -110,7 +110,7 @@ from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
-from ..kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV, get_kimi_k3_bf16_kv_layer_ids
+from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.fused_moe.interface import MoESchedulerKind
@@ -1966,19 +1966,19 @@ class KimiMLARuntime(nn.Module):
             if model_config.quant_config is not None
             else None
         )
-        bf16_kv_layer_ids = get_kimi_k3_bf16_kv_layer_ids(
+        fp8_kv_layer_ids = get_kimi_k3_fp8_kv_layer_ids(
             cfg, nvfp4_enabled=kv_quant_algo == QuantAlgo.NVFP4
         )
-        if layer_idx in bf16_kv_layer_ids:
+        if layer_idx in fp8_kv_layer_ids:
             if kv_quant_algo != QuantAlgo.NVFP4:
                 raise ValueError(
-                    f"{KIMI_K3_BF16_KV_LAYERS_ENV} requires the model-wide "
+                    f"{KIMI_K3_FP8_KV_LAYERS_ENV} requires the model-wide "
                     "KV cache dtype to be NVFP4."
                 )
-            kv_quant_algo = None
+            kv_quant_algo = QuantAlgo.FP8
             logger.info_once(
-                f"Kimi K3 MLA layers using BF16 KV-cache fallback: {sorted(bf16_kv_layer_ids)}.",
-                key="kimi_k3_bf16_kv_fallback_layers",
+                f"Kimi K3 MLA layers using FP8 KV-cache fallback: {sorted(fp8_kv_layer_ids)}.",
+                key="kimi_k3_fp8_kv_fallback_layers",
             )
         attention_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_quant_algo)
         for projection_config in attention_config.quant_config_dict.values():
