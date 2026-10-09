@@ -8398,8 +8398,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _MMA_TILE_M = 128
         _MAX_SPLIT_KV = 32
         # CTA waves the split targets: with one wave, the longest request of a
-        # skewed decode batch sets the kernel time.
-        _SPLIT_KV_WAVES = 8
+        # skewed decode batch sets the kernel time. TRTLLM_MLA_SPLIT_KV_WAVES
+        # overrides it (read at import, so capture and replay agree).
+        _SPLIT_KV_WAVES = float(os.environ.get("TRTLLM_MLA_SPLIT_KV_WAVES", "8"))
 
         def __init__(
             self,
