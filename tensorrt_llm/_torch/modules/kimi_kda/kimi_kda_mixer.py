@@ -55,12 +55,17 @@ _KDA_BF16_LOWM_GEMV = os.environ.get("TRTLLM_K3_BF16_LOWM_GEMV", "0") == "1"
 
 
 def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x @ weight.T`` on the low-M BF16 GEMV when enabled and applicable."""
-    if _KDA_BF16_LOWM_GEMV and not torch.compiler.is_compiling():
+    """``x @ weight.T`` on the low-M BF16 GEMV when enabled and applicable.
+
+    Leading dimensions of ``x`` are flattened into the GEMV's rows.
+    """
+    if _KDA_BF16_LOWM_GEMV and not torch.compiler.is_compiling() and x.is_contiguous():
         from ...cute_dsl_kernels.blackwell import k3_fused_router
 
-        if k3_fused_router.can_use_k3_bf16_lowm_gemv(x, weight):
-            return torch.ops.trtllm.k3_bf16_lowm_gemv(x, weight)
+        x2d = x.reshape(-1, x.shape[-1])
+        if k3_fused_router.can_use_k3_bf16_lowm_gemv(x2d, weight):
+            out = torch.ops.trtllm.k3_bf16_lowm_gemv(x2d, weight)
+            return out.view(*x.shape[:-1], weight.shape[0])
     return torch.nn.functional.linear(x, weight)
 
 
@@ -1048,7 +1053,7 @@ class KimiKDALinearAttention(nn.Module):
                 bfa = _lowm_gemv_or_linear(x, bfa_weight)
                 f_a = bfa[..., : self.head_dim]
                 beta = bfa[..., self.head_dim : self.head_dim + self.num_heads]
-                if _KDA_BF16_LOWM_GEMV and f_a.dim() == 2:
+                if _KDA_BF16_LOWM_GEMV:
                     return beta, _lowm_gemv_or_linear(f_a.contiguous(), self.f_b_proj.weight)
                 return beta, self.f_b_proj(f_a)
 
