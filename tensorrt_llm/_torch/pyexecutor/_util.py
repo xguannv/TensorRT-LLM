@@ -1942,6 +1942,23 @@ class KvCacheCreator:
             return target_kv_cache_config, draft_kv_cache_config
         target_budget, draft_budget = shares
 
+        # The proportional split assumes the draft pool holds as many tokens as
+        # the target pool. A disaggregated generation worker never runs the
+        # prompt forward, so an external drafter there only stores the tokens
+        # generated on this worker; TLLM_DRAFT_KV_GPU_BUDGET_GIB caps the
+        # draft's GPU share and hands the rest to the target pool.
+        draft_cap_gib = os.environ.get("TLLM_DRAFT_KV_GPU_BUDGET_GIB")
+        if draft_cap_gib and budget_attr == "max_gpu_total_bytes":
+            draft_cap = draft_kv.intercept + int(float(draft_cap_gib) * GB)
+            if draft_cap < draft_budget:
+                logger.info(
+                    f"Capping the draft KV cache GPU budget at "
+                    f"{draft_cap / GB:.2f} GiB (TLLM_DRAFT_KV_GPU_BUDGET_GIB="
+                    f"{draft_cap_gib}); the proportional share was "
+                    f"{draft_budget / GB:.2f} GiB.")
+                draft_budget = draft_cap
+                target_budget = total_budget - draft_budget
+
         logger.info(
             f"Splitting KV cache {budget_attr}: total={total_budget / GB:.2f} GiB, "
             f"target={target_budget / GB:.2f} GiB ({target_kv}), "
