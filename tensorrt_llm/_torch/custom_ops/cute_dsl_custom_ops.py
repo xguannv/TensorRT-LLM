@@ -8401,6 +8401,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # skewed decode batch sets the kernel time. TRTLLM_MLA_SPLIT_KV_WAVES
         # overrides it (read at import, so capture and replay agree).
         _SPLIT_KV_WAVES = float(os.environ.get("TRTLLM_MLA_SPLIT_KV_WAVES", "8"))
+        # FP8 kernel: persistent clusters that split the batch's KV work evenly
+        # (tactic split_kv == 0, see BALANCED_SPLIT_TACTIC) instead of a
+        # per-batch-bucket uniform split_kv. TRTLLM_MLA_BALANCED_SPLIT=0 keeps
+        # the uniform split (read at import, so capture and replay agree).
+        _BALANCED_SPLIT = os.environ.get("TRTLLM_MLA_BALANCED_SPLIT",
+                                         "1") != "0"
+        # split_kv value of a balanced-split tactic
+        BALANCED_SPLIT_TACTIC = 0
 
         def __init__(
             self,
@@ -8603,8 +8611,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             lse_size = cls.get_lse_workspace_size(H, seq_len_q, max_batch_size)
             split_kv_offset = pad_up(lse_offset + lse_size,
                                      cls._WORKSPACE_ALIGN)
-            split_kv_size = cls.get_max_split_kv_workspace_size(
-                H, seq_len_q, D, max_batch_size, acc_dtype)
+            # The FP8 kernel's balanced split shares the split-KV region.
+            split_kv_size = max(
+                cls.get_max_split_kv_workspace_size(H, seq_len_q, D,
+                                                    max_batch_size, acc_dtype),
+                BlackwellMultiHeadLatentAttentionForwardFP8.
+                get_balanced_workspace_size(
+                    H, seq_len_q, D,
+                    cls._get_max_active_blocks() // cls._CLUSTER_SHAPE_MNK[0],
+                    acc_dtype, cls._MMA_TILE_M))
             workspace_size = split_kv_offset + pad_up(split_kv_size,
                                                       cls._WORKSPACE_ALIGN)
             return (lse_offset, lse_size, split_kv_offset, split_kv_size,
@@ -8688,6 +8703,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 batch_size, self.get_folded_seq_len_q(h, seq_len_q),
                 max_active_blocks)
             persistent_candidates = self.get_is_persistent_candidates()
+            if self._uses_balanced_split(batch_size):
+                # A balanced split ignores split_kv; can_implement checks the
+                # tiling with split_kv = 1.
+                balanced = []
+                for mma_qk_tiler_mn, mma_pv_tiler_mn in candidate_tiler_tactics:
+                    if self.kernel_class.can_implement(
+                            batch_size, seq_len_q, self.page_size, h,
+                            latent_dim, rope_dim, self.in_dtype, out_dtype,
+                            cutlass.Float32, cutlass.Float32, mma_qk_tiler_mn,
+                            mma_pv_tiler_mn, 1, True, self._IS_VAR_SEQ,
+                            self._IS_VAR_SPLIT_KV, self.page_size):
+                        balanced.append((mma_qk_tiler_mn, mma_pv_tiler_mn,
+                                         self.BALANCED_SPLIT_TACTIC, True))
+                return balanced
 
             valid = []
             for (mma_qk_tiler_mn,
@@ -8853,6 +8882,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             return cache[key]
 
+        def _uses_balanced_split(self, batch_size: int) -> bool:
+            """Whether the FP8 kernel runs this batch with a balanced split."""
+            return (self._BALANCED_SPLIT and self.kernel_class
+                    is BlackwellMultiHeadLatentAttentionForwardFP8
+                    and batch_size <= self.kernel_class.BALANCED_MAX_REQUESTS)
+
         def default_tactic(
             self,
             batch_size: int,
@@ -8868,6 +8903,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             split-KV workspace is sized for."""
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
+            if self._uses_balanced_split(batch_size):
+                return (mma_qk_tiler_mn, mma_pv_tiler_mn,
+                        self.BALANCED_SPLIT_TACTIC, True)
             max_active_blocks = self._get_max_active_blocks()
             bucketed_batch_size = last_positive_power_of_2(batch_size)
             split_kv = self.get_default_split_kv(
@@ -9007,13 +9045,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Kernel split-KV intermediates start AFTER the reserved LSE region.
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
-            # The workspace fits each batch bucket's split; a batch between two
-            # buckets shrinks its split to fit instead of JIT-compiling a variant.
             rows_per_request = self._split_kv_rows_per_request()
-            fitting_split_kv = self.get_fitting_split_kv(
-                batch_size, max_batch_size)
-            use_workspace = split_kv > 1 and fitting_split_kv >= 1
-            split_kv = max(1, min(split_kv, fitting_split_kv))
+            balanced_split = split_kv == self.BALANCED_SPLIT_TACTIC
+            if balanced_split and not self._uses_balanced_split(batch_size):
+                # e.g. a batch past the balanced split's request limit
+                balanced_split = False
+                _, _, split_kv, is_persistent = self.default_tactic(batch_size)
+            if balanced_split:
+                use_workspace = True
+                is_persistent = True
+                split_kv = 1
+            else:
+                # The workspace fits each batch bucket's split; a batch between
+                # two buckets shrinks its split to fit instead of JIT-compiling
+                # a variant.
+                fitting_split_kv = self.get_fitting_split_kv(
+                    batch_size, max_batch_size)
+                use_workspace = split_kv > 1 and fitting_split_kv >= 1
+                split_kv = max(1, min(split_kv, fitting_split_kv))
 
             if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
                 # Profiling rebuilds cache_seqs at bucketed sizes but input 9
@@ -9044,6 +9093,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
                 kv_bounds is not None,
                 rows_per_request,
+                balanced_split,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -9064,6 +9114,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
                            and seq_len_q > 1)
 
+                kernel_kwargs = {}
+                if balanced_split:
+                    kernel_kwargs["balanced_split"] = True
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
@@ -9079,6 +9132,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_len_q=seq_len_q,
                     fold_sq=fold_sq,
                     emit_softmax_stats=self.emit_softmax_stats,
+                    **kernel_kwargs,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,

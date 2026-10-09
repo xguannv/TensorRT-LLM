@@ -316,6 +316,296 @@ def create_mla_static_tile_scheduler(
     return MLAStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
 
 
+class MLABalancedWorkTileInfo:
+    """One work segment of ``MLABalancedTileScheduler``.
+
+    ``blk_coord`` is ``(cta_in_cluster, chunk, request, partial_slot)``; the
+    segment covers K tiles ``[k_index, k_index + k_count)`` of that
+    (request, chunk) M tile. ``is_partial`` (Int32 0/1) is set when the segment
+    does not cover the whole M tile, i.e. its result is a split-KV partial.
+    """
+
+    def __init__(self, blk_coord, is_valid, k_index, k_count, is_partial):
+        self.blk_coord = blk_coord
+        self.is_valid = cutlass.Boolean(is_valid)
+        self.k_index = k_index
+        self.k_count = k_count
+        self.is_partial = is_partial
+
+    def __extract_mlir_values__(self):
+        values = cutlass.extract_mlir_values(self.blk_coord)
+        values += cutlass.extract_mlir_values(self.is_valid)
+        values += cutlass.extract_mlir_values(self.k_index)
+        values += cutlass.extract_mlir_values(self.k_count)
+        values += cutlass.extract_mlir_values(self.is_partial)
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        n = len(values) - 4
+        return MLABalancedWorkTileInfo(
+            cutlass.new_from_mlir_values(self.blk_coord, values[:n]),
+            cutlass.new_from_mlir_values(self.is_valid, [values[n]]),
+            cutlass.new_from_mlir_values(self.k_index, [values[n + 1]]),
+            cutlass.new_from_mlir_values(self.k_count, [values[n + 2]]),
+            cutlass.new_from_mlir_values(self.is_partial, [values[n + 3]]),
+        )
+
+    @property
+    def is_valid_tile(self) -> cutlass.Boolean:
+        return self.is_valid
+
+    @property
+    def tile_idx(self) -> cute.Coord:
+        return self.blk_coord
+
+
+class MLABalancedTileScheduler:
+    """Persistent 2-CTA clusters that split the KV work of a decode batch evenly.
+
+    Work unit: one K tile of one (request, chunk) M tile. Every chunk of a
+    request reads the same KV, so the work of one chunk is the sequence of all
+    requests' K tiles, ``V = sum_b ceil(K_b / k_tile)`` units long, and the
+    batch holds ``U = C * V`` units for ``C`` chunks. Each of the ``G``
+    clusters gets ``W = max(ceil(U / G), min_units)`` units:
+
+    * ``n = G // C`` lanes per chunk: lane ``l`` of chunk ``c`` (cluster
+      ``l * C + c``) runs positions ``[l * W, (l + 1) * W)`` of chunk ``c``'s
+      sequence. Lane ``l`` of every chunk works on the same requests at the
+      same time, so the C M tiles of a request share its KV through L2.
+    * ``s = G - n * C`` spare clusters split the leftover positions
+      ``[n * W, V)`` of all chunks, concatenated chunk by chunk.
+
+    A cluster's positions are cut at M-tile (request) boundaries into
+    segments. A segment that covers only part of its M tile is a split-KV
+    partial: it goes to a workspace slot (lanes own 2 slots, spares
+    ``slots_per_spare``) and a reduction combines the partials of the tile.
+
+    The schedule lives in shared memory, written once per CTA by
+    ``build_mla_balanced_schedule``: ``table[b]`` is the number of units of
+    requests ``< b`` per chunk (``table[num_requests] = V``) and ``params``
+    holds ``(num_requests, n * W, V - n * W, range begin, range end)`` of
+    this cluster. Only the position ``q`` and the partial count are carried
+    in registers.
+    """
+
+    NUM_PARAMS = 5
+
+    def __init__(
+        self,
+        table: cute.Tensor,
+        params: cute.Tensor,
+        num_clusters: int,
+        num_chunks: int,
+        slots_per_spare: int,
+        q: cutlass.Int32,
+        n_partial: cutlass.Int32,
+    ):
+        self.table = table
+        self.params = params
+        # binary-search depth covering every request index the table holds
+        self.search_depth = (cute.size(table.layout) - 2).bit_length()
+        self.num_clusters = num_clusters
+        self.num_chunks = num_chunks
+        self.num_lanes = (num_clusters // num_chunks) * num_chunks
+        self.slots_per_spare = slots_per_spare
+        self.q = q
+        self.n_partial = n_partial
+
+    @staticmethod
+    def num_slots(num_clusters: int, num_chunks: int,
+                  slots_per_spare: int) -> int:
+        """Partial slots of all clusters (2 per lane, ``slots_per_spare`` per spare)."""
+        lanes = (num_clusters // num_chunks) * num_chunks
+        return 2 * lanes + (num_clusters - lanes) * slots_per_spare
+
+    @staticmethod
+    def default_slots_per_spare(num_chunks: int) -> int:
+        """Upper bound of a spare cluster's partial segments: its range start
+        and end plus one leftover start per chunk."""
+        return num_chunks + 2
+
+    def __extract_mlir_values__(self):
+        values = cutlass.extract_mlir_values(self.q)
+        values += cutlass.extract_mlir_values(self.n_partial)
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        return MLABalancedTileScheduler(
+            self.table,
+            self.params,
+            self.num_clusters,
+            self.num_chunks,
+            self.slots_per_spare,
+            cutlass.new_from_mlir_values(self.q, [values[0]]),
+            cutlass.new_from_mlir_values(self.n_partial, [values[1]]),
+        )
+
+    @staticmethod
+    def _cluster_idx():
+        return cute.arch.block_idx()[0] // 2
+
+    def _param(self, i: int):
+        # Shared-memory loads are per-thread values to the compiler; the
+        # schedule is the same for every lane, so mark it warp-uniform.
+        return cute.arch.make_warp_uniform(self.params[i])
+
+    @cute.jit
+    def _segment(self):
+        """(request, chunk, k_index, k_count, is_partial) of the segment at q.
+
+        Every lane computes the same values (a fixed-depth search over the
+        prefix table, results marked warp-uniform).
+        """
+        cluster_idx = self._cluster_idx()
+        c = cluster_idx % self.num_chunks
+        p = self.q
+        p_end = self._param(4)
+        if cutlass.const_expr(self.num_lanes < self.num_clusters):
+            if cluster_idx >= self.num_lanes:
+                # spare: q runs over the chunks' leftovers, Lw positions each
+                n_w = self._param(1)
+                l_w = self._param(2)
+                lw = cutlass.max(l_w, 1)
+                c = self.q // lw
+                p = n_w + (self.q - c * lw)
+                p_end = n_w + cutlass.min(l_w, p_end - c * lw)
+        # largest b < num_requests with table[b] <= p (table[0] = 0 <= p);
+        # requests without KV have no units
+        num_requests = self._param(0)
+        lo = cutlass.Int32(0)
+        for k in cutlass.range_constexpr(self.search_depth):
+            cand = lo + (1 << (self.search_depth - 1 - k))
+            if cand < num_requests:
+                if self.table[cand] <= p:
+                    lo = cand
+        lo = cute.arch.make_warp_uniform(lo)
+        tile_begin = cute.arch.make_warp_uniform(self.table[lo])
+        tile_end = cute.arch.make_warp_uniform(self.table[lo + 1])
+        k_count = cutlass.min(tile_end, p_end) - p
+        is_partial = cutlass.Int32(0)
+        if p > tile_begin or p + k_count < tile_end:
+            is_partial = cutlass.Int32(1)
+        return lo, c, p - tile_begin, k_count, is_partial
+
+    @cute.jit
+    def owned_slots(self):
+        """(first slot, slot count) of this cluster's partial slots."""
+        cluster_idx = self._cluster_idx()
+        base = cluster_idx * 2
+        count = cutlass.Int32(2)
+        if cutlass.const_expr(self.num_lanes < self.num_clusters):
+            if cluster_idx >= self.num_lanes:
+                base = (self.num_lanes * 2 +
+                        (cluster_idx - self.num_lanes) * self.slots_per_spare)
+                count = cutlass.Int32(self.slots_per_spare)
+        return base, count
+
+    def _slot(self):
+        base, _ = self.owned_slots()
+        return base + self.n_partial
+
+    def get_current_work(self, *, loc=None, ip=None) -> MLABalancedWorkTileInfo:
+        b, c, k_index, k_count, is_partial = self._segment()
+        return MLABalancedWorkTileInfo(
+            (cute.arch.block_idx()[0] % 2, c, b, self._slot()),
+            self.q < self._param(4),
+            k_index,
+            k_count,
+            is_partial,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        _, _, _, k_count, is_partial = self._segment()
+        self.q += k_count
+        self.n_partial += is_partial
+
+
+@cute.jit
+def build_mla_balanced_schedule(
+    cache_seqs: cute.Tensor,
+    table: cute.Tensor,
+    params: cute.Tensor,
+    k_tile: cutlass.Constexpr,
+    max_requests: cutlass.Constexpr,
+    num_clusters: cutlass.Constexpr,
+    num_chunks: cutlass.Constexpr,
+    min_units: cutlass.Constexpr,
+):
+    """One warp writes the shared-memory schedule of its CTA's cluster.
+
+    ``table[b]`` is the number of K tiles (``ceil(K / k_tile)``) of requests
+    ``< b``. Lane l loads requests l, l + 32, ... up front (indices clamped to
+    the batch, so the loads are unconditional), then each group of 32
+    requests is prefix-summed with warp shuffles. ``min_units``
+    lower-bounds the units per cluster so a small batch with short KV is not
+    cut into segments shorter than their fixed cost.
+    """
+    lane = cute.arch.lane_idx()
+    num_requests = cache_seqs.shape[0]
+    groups = max_requests // 32
+    kv = cute.make_rmem_tensor(cute.make_layout(groups), cutlass.Int32)
+    for i in cutlass.range_constexpr(groups):
+        kv[i] = cache_seqs[cutlass.min(i * 32 + lane, num_requests - 1)]
+    carry = cutlass.Int32(0)
+    for i in cutlass.range_constexpr(groups):
+        if i * 32 < num_requests:
+            b = i * 32 + lane
+            tiles = cutlass.Int32(0)
+            if b < num_requests:
+                tiles = (cutlass.max(kv[i], 0) + (k_tile - 1)) // k_tile
+            incl = tiles
+            for d in cutlass.range_constexpr(5):
+                up = cute.arch.shuffle_sync_up(incl, offset=1 << d)
+                if lane >= (1 << d):
+                    incl = incl + up
+            if b < num_requests:
+                table[b + 1] = carry + incl
+            carry = carry + cute.arch.shuffle_sync(incl, 31)
+    if lane == 0:
+        table[0] = 0
+        G = num_clusters
+        C = num_chunks
+        n = G // C
+        s = G - n * C
+        cluster_idx = cute.arch.block_idx()[0] // 2
+        V = carry
+        W = cutlass.max((V * C + (G - 1)) // G, min_units)
+        nW = cutlass.min(W * n, V)
+        Lw = V - nW
+        qa = cutlass.min(cluster_idx // C * W, V)
+        qb = cutlass.min((cluster_idx // C + 1) * W, V)
+        if cutlass.const_expr(s > 0):
+            if cluster_idx >= n * C:
+                spare = cluster_idx - n * C
+                s_tot = Lw * C
+                Ws = (s_tot + (s - 1)) // s
+                qa = cutlass.min(spare * Ws, s_tot)
+                qb = cutlass.min((spare + 1) * Ws, s_tot)
+        params[0] = num_requests
+        params[1] = nW
+        params[2] = Lw
+        params[3] = qa
+        params[4] = qb
+
+
+def create_mla_balanced_tile_scheduler(
+    table: cute.Tensor,
+    params: cute.Tensor,
+    num_clusters: int,
+    num_chunks: int,
+    slots_per_spare: int,
+) -> MLABalancedTileScheduler:
+    """Scheduler over the shared-memory schedule written by
+    ``build_mla_balanced_schedule``."""
+    return MLABalancedTileScheduler(table, params, num_clusters, num_chunks,
+                                    slots_per_spare,
+                                    cute.arch.make_warp_uniform(params[3]),
+                                    cutlass.Int32(0))
+
+
 LOG2_E = 1.4426950408889634074
 # avoid register indexing on array.
 MAX_SPLITS = 256

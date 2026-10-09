@@ -48,8 +48,10 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
-                          MLAStaticTileSchedulerParams, ceil_div,
+from .mla_helpers import (LOG2_E, MAX_SPLITS, MLABalancedTileScheduler,
+                          MLAStaticTileScheduler, MLAStaticTileSchedulerParams,
+                          build_mla_balanced_schedule, ceil_div,
+                          create_mla_balanced_tile_scheduler,
                           create_mla_static_tile_scheduler,
                           create_mla_static_tile_scheduler_params)
 
@@ -126,6 +128,13 @@ Constraints for this example:
 
 class BlackwellMultiHeadLatentAttentionForwardFP8:
 
+    # Balanced split (balanced_split=True): largest batch the smem prefix table
+    # holds, the fewest K tiles a cluster is given, and the M-tile rows one
+    # reduction CTA combines.
+    BALANCED_MAX_REQUESTS = 1024
+    BALANCED_MIN_UNITS = 4
+    BALANCED_REDUCTION_ROWS = 4
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -142,6 +151,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         seq_len_q: int = 1,
         fold_sq: bool = False,
         emit_softmax_stats: bool = False,
+        balanced_split: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -179,6 +189,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
             stores into the attention epilogue.
         :type emit_softmax_stats: bool
+        :param balanced_split: Run ``max_active_clusters`` persistent clusters
+            that split the batch's KV work evenly (``MLABalancedTileScheduler``)
+            instead of one (or ``split_kv``) cluster per M tile. M tiles cut
+            across clusters are combined by ``balanced_reduction_kernel``; the
+            ``split_kv`` argument is ignored and the workspace holds the
+            partial slots (``get_balanced_workspace_size``).
+        :type balanced_split: bool
         """
 
         self.latent_dim = 512
@@ -189,7 +206,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
-        self.is_persistent = is_persistent
+        self.balanced_split = balanced_split
+        self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
@@ -232,6 +250,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.flat_fold = self.fold_rows != num_heads * self.fold_sq_ratio
         self.flat_fold_padded = (self.flat_fold and
                                  (num_heads * seq_len_q) % self.fold_rows != 0)
+        # M tiles per request (the chunk mode of the folded Q / O views).
+        self.num_m_chunks = self.fold_chunks if fold_sq else seq_len_q
+        # Balanced split: one persistent cluster per active cluster slot.
+        self.balanced_num_clusters = max_active_clusters
+        self.balanced_slots_per_spare = (
+            MLABalancedTileScheduler.default_slots_per_spare(self.num_m_chunks))
+        self.balanced_num_slots = MLABalancedTileScheduler.num_slots(
+            max_active_clusters, self.num_m_chunks,
+            self.balanced_slots_per_spare)
+        self.balanced_min_units = self.BALANCED_MIN_UNITS
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -280,8 +308,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # register settings
         self.softmax_reg_num = 192
-        self.correction_reg_num = 256
-        self.other_reg_num = 48
+        self.correction_reg_num = 248
+        self.other_reg_num = 64
         # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
@@ -306,11 +334,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         self.load_q_stage = 1
-        self.load_k_stage = 3
+        self.load_k_stage = 2
         self.load_v_stage = 2
-        self.mma_s_stage = 2
-        self.p_mma_stage = 2
-        self.p_cor_stage = 2
+        # The MMA warp issues Q*K^T of K tile j + mma_lookahead before P*V of
+        # tile j, so the softmax and the O rescale of tile j overlap two
+        # Q*K^T/P*V pairs of tensor work; S, P and the correction metadata
+        # need one buffer per tile in flight.
+        self.mma_lookahead = 2
+        self.mma_s_stage = self.mma_lookahead + 1
+        self.p_mma_stage = self.mma_lookahead + 1
+        self.p_cor_stage = self.mma_lookahead + 1
         self.mma_o_stage = 2
 
         self.tmem_o_offset = self.mma_s_stage * self.mma_qk_tiler[
@@ -638,15 +671,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ws_rows, ws_chunks = self.fold_rows, self.fold_chunks
         else:
             ws_rows, ws_chunks = q_latent.shape[0], q_latent.shape[2]
-        acc_o, acc_lse = self.initialize_workspace(
-            ws_rows,
-            q_latent.shape[1],
-            ws_chunks,
-            q_latent.shape[3],
-            split_kv,
-            self.acc_dtype,
-            workspace,
-        )
+        part_desc = None
+        if cutlass.const_expr(self.balanced_split):
+            acc_o, acc_lse, part_desc = self.initialize_balanced_workspace(
+                ws_rows, q_latent.shape[1], self.acc_dtype, workspace)
+        else:
+            acc_o, acc_lse = self.initialize_workspace(
+                ws_rows,
+                q_latent.shape[1],
+                ws_chunks,
+                q_latent.shape[3],
+                split_kv,
+                self.acc_dtype,
+                workspace,
+            )
 
         c_latent_tranpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
         c_latent_transpose = cute.make_tensor(c_latent.iterator,
@@ -876,6 +914,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.max_active_clusters,
             self.is_persistent,
         )
+        if cutlass.const_expr(self.balanced_split):
+            grid = (self.cluster_shape_mnk[0] * self.balanced_num_clusters, 1,
+                    1)
 
         @cute.struct
         class SplitKVKernelSharedStorage:
@@ -933,6 +974,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             epilogue_smem_exchange: cute.struct.MemRange[
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp]
 
+            # Balanced split: per-request K-tile prefix table and the
+            # cluster's schedule parameters
+            tile_table: cute.struct.MemRange[cutlass.Int32,
+                                             self.BALANCED_MAX_REQUESTS +
+                                             1 if self.balanced_split else 1]
+            sched_params: cute.struct.MemRange[
+                cutlass.Int32, MLABalancedTileScheduler.NUM_PARAMS]
+
             # Tmem dealloc cluster barrier
             tmem_dealloc_mbar_ptr: cutlass.Int64
 
@@ -958,6 +1007,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 (lse, softmax_stats),
                 acc_o,
                 acc_lse,
+                part_desc,
                 split_kv,
                 cache_seqs,
                 kv_bounds,
@@ -996,6 +1046,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 lse,
                 acc_o,
                 acc_lse,
+                part_desc,
                 split_kv,
                 cache_seqs,
                 kv_bounds,
@@ -1023,7 +1074,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             stream=stream,
             min_blocks_per_mp=1,
         )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(self.balanced_split):
+            red_lse = lse
+            if cutlass.const_expr(self.emit_softmax_stats):
+                red_lse = (lse, softmax_stats)
+            # (row groups, partial slots + requests): a slot's CTAs combine
+            # the M tile whose first partial it holds; the per-request CTAs
+            # write the empty result of requests without KV.
+            self.balanced_reduction_kernel(
+                o,
+                red_lse,
+                acc_o,
+                acc_lse,
+                part_desc,
+                cache_seqs,
+                kv_bounds,
+            ).launch(
+                grid=(
+                    cute.ceil_div(ws_rows, self.BALANCED_REDUCTION_ROWS),
+                    self.balanced_num_slots +
+                    cute.ceil_div(q_latent.shape[3], self.num_compute_warps),
+                    1,
+                ),
+                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
+                smem=(self.balanced_num_slots + 1) * 4,
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
+        elif cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.emit_softmax_stats):
                 reduction_kernel = self.reduction_kernel(
                     o,
@@ -1119,6 +1197,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mLSE,
         mAccO: Optional[cute.Tensor],
         mAccLSE: Optional[cute.Tensor],
+        mDesc: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         kv_bounds: Optional[cute.Tensor],
@@ -1184,6 +1263,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type mAccO: cute.Tensor
         :param mAccLSE: Intermediate accumulator log-sum-exp tensor
         :type mAccLSE: cute.Tensor
+        :param mDesc: Balanced split: (M tile, first K tile) of each partial
+            slot, -1 for an unused slot
+        :type mDesc: cute.Tensor
         :param split_kv: The split_kv parameter
         :type split_kv: cutlass.Int32
         :param cache_seqs: The variable sequence length tensor
@@ -1321,6 +1403,28 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
+        # Balanced split: the cluster's schedule, in shared memory.
+        tile_table = None
+        if cutlass.const_expr(self.balanced_split):
+            tile_table = (
+                storage.tile_table.get_tensor(
+                    cute.make_layout(self.BALANCED_MAX_REQUESTS + 1)),
+                storage.sched_params.get_tensor(
+                    cute.make_layout(MLABalancedTileScheduler.NUM_PARAMS)),
+            )
+            if warp_idx == self.empty_warp_ids[0]:
+                build_mla_balanced_schedule(
+                    cache_seqs,
+                    tile_table[0],
+                    tile_table[1],
+                    self.mma_qk_tiler[1],
+                    self.BALANCED_MAX_REQUESTS,
+                    self.balanced_num_clusters,
+                    self.num_m_chunks,
+                    self.balanced_min_units,
+                )
+            cute.arch.barrier()
+
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1334,17 +1438,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Producer, self.load_q_stage)
             load_k_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_k_stage)
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = self._make_tile_scheduler(tile_sched_params,
+                                                   tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv,
-                    cache_seqs,
-                    block_split_kvs,
-                    blk_coord,
-                )
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs)
                 if k_tile_count > 0:
                     # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
@@ -1389,17 +1489,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
             load_v_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_v_stage)
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = self._make_tile_scheduler(tile_sched_params,
+                                                   tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv,
-                    cache_seqs,
-                    block_split_kvs,
-                    blk_coord,
-                )
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs)
                 if k_tile_count > 0:
                     # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
@@ -1448,13 +1544,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Consumer, self.p_mma_stage)
             mma_o_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_o_stage)
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = self._make_tile_scheduler(tile_sched_params,
+                                                   tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord)
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs)
                 if k_tile_count > 0:
                     mma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -1528,13 +1624,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = self._make_tile_scheduler(tile_sched_params,
+                                                   tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord)
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs)
                 if k_tile_count > 0:
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
@@ -1586,13 +1682,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = self._make_tile_scheduler(tile_sched_params,
+                                                   tile_table, cache_seqs)
+            if cutlass.const_expr(self.balanced_split):
+                # Mark this cluster's partial slots unused; the epilogue of
+                # each partial segment fills in its slot.
+                if is_leader_cta:
+                    if tidx % (self.num_compute_warps *
+                               self.threads_per_warp) == 0:
+                        slot_base, slot_count = tile_sched.owned_slots()
+                        for i in range(slot_count):
+                            mDesc[slot_base + i, 0] = -1
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord)
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs)
                 if k_tile_count > 0:
                     # H bounds the stored rows of this tile; with a padded
                     # flat fold the rows from H on are M-tile padding.
@@ -1616,6 +1721,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tiled_mma_pv=tiled_mma_pv,
                         p_cor_pipeline=p_cor_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
+                        is_partial=self._work_is_partial(work_tile),
+                        is_leader_cta=is_leader_cta,
+                        mDesc=mDesc,
+                        k_index=k_index,
                     )
                     if cutlass.const_expr(self.emit_softmax_stats):
                         compute_epilogue_params = SimpleNamespace(
@@ -1783,6 +1892,208 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
         return
 
+    @cute.kernel
+    def balanced_reduction_kernel(
+        self,
+        mO: cute.Tensor,
+        mLSE,
+        mAccO: cute.Tensor,
+        mAccLSE: cute.Tensor,
+        mDesc: cute.Tensor,
+        cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor] = None,
+    ):
+        """Combine the partials of the M tiles a balanced split cut across
+        clusters, and write the empty result of requests without KV.
+
+        Grid ``(row groups, partial slots + requests / 4)``, 4 warps per CTA:
+
+        * ``y < num_slots``: if slot ``y`` holds the first K tile of its M
+          tile, combine every slot of that tile (LSE-weighted, as
+          ``reduction_kernel``) into O, LSE and the softmax stats; each warp
+          combines ``BALANCED_REDUCTION_ROWS / 4`` rows, loading them together.
+        * ``y >= num_slots``: warp w checks request ``4 * (y - num_slots) + w``;
+          if it has no KV, it stores what ``reduction_kernel`` stores for such a
+          request (O = 0, LSE = +inf, stats (-inf, 0)).
+
+        :param mO: Output tensor (folded view)
+        :param mLSE: LSE tensor (folded view), or ``(lse, softmax_stats)``
+        :param mAccO: Partial O slots, (rows, slots, D, 1, 1)
+        :param mAccLSE: Partial LSE slots, (rows, slots, 1, 1)
+        :param mDesc: (M tile, first K tile) of each slot, -1 when unused
+        :param cache_seqs: Per-request KV lengths
+        :param kv_bounds: Optional per-token KV bounds (Helix verify groups)
+        """
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats):
+            mLSE, mSoftmaxStats = mLSE
+
+        row_group, y, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        num_slots = self.balanced_num_slots
+        num_chunks = self.num_m_chunks
+        rows = mAccO.shape[0]
+        rpw = self.BALANCED_REDUCTION_ROWS // self.num_compute_warps
+        vec = self.latent_dim // self.threads_per_warp
+        row0 = row_group * self.BALANCED_REDUCTION_ROWS + warp_idx * rpw
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate((num_slots + 1) * 4, 16)
+        # [0]: number of slots of the M tile, [1:]: the slots
+        tile_slots = cute.make_tensor(
+            cute.recast_ptr(storage, dtype=cutlass.Int32),
+            cute.make_layout(num_slots + 1))
+
+        if y < num_slots:
+            tile = mDesc[y, 0]
+            if tile >= 0 and mDesc[y, 1] == 0:
+                if warp_idx == 0:
+                    groups = ceil_div(num_slots, self.threads_per_warp)
+                    # all descriptor loads first (clamped, unconditional)
+                    rTile = cute.make_rmem_tensor(cute.make_layout(groups),
+                                                  cutlass.Int32)
+                    for g in cutlass.range_constexpr(groups):
+                        rTile[g] = mDesc[
+                            cutlass.min(g * self.threads_per_warp +
+                                        lane, num_slots - 1), 0]
+                    count = cutlass.Int32(0)
+                    for g in cutlass.range_constexpr(groups):
+                        q = g * self.threads_per_warp + lane
+                        match = False
+                        if q < num_slots:
+                            match = rTile[g] == tile
+                        ballot = cute.arch.vote_ballot_sync(match)
+                        if match:
+                            below = cute.arch.popc(
+                                ballot & cutlass.Int32(cute.arch.lanemask_lt()))
+                            tile_slots[1 + count + below] = q
+                        count = count + cute.arch.popc(ballot)
+                    if lane == 0:
+                        tile_slots[0] = count
+                pipeline.sync(barrier_id=4)
+                n_parts = tile_slots[0]
+                b = tile // num_chunks
+                c = tile % num_chunks
+                # rows past the M tile read row rows - 1 and are not stored
+                rr = cute.make_rmem_tensor(cute.make_layout(rpw), cutlass.Int32)
+                for i in cutlass.range_constexpr(rpw):
+                    rr[i] = cutlass.min(row0 + i, rows - 1)
+                # global LSE of each row: lanes take the partials (first the
+                # max, then the sum of the partials' LSEs, both lane-parallel)
+                rLSE = cute.make_rmem_tensor(cute.make_layout(rpw),
+                                             self.lse_dtype)
+                lse_max = cute.make_rmem_tensor(cute.make_layout(rpw),
+                                                self.lse_dtype)
+                sum_lse = cute.make_rmem_tensor(cute.make_layout(rpw),
+                                                self.lse_dtype)
+                rLSE.fill(-self.lse_dtype.inf)
+                if lane < n_parts:
+                    q = tile_slots[1 + lane]
+                    for i in cutlass.range_constexpr(rpw):
+                        rLSE[i] = mAccLSE[rr[i], q, 0, 0]
+                for i in cutlass.range_constexpr(rpw):
+                    lse_max[i] = rLSE[i]
+                for j0 in range(self.threads_per_warp, n_parts,
+                                self.threads_per_warp):
+                    if j0 + lane < n_parts:
+                        q = tile_slots[1 + j0 + lane]
+                        for i in cutlass.range_constexpr(rpw):
+                            lse_max[i] = cute.arch.fmax(lse_max[i],
+                                                        mAccLSE[rr[i], q, 0, 0])
+                for i in cutlass.range_constexpr(rpw):
+                    m = cute.arch.warp_reduction_max(lse_max[i])
+                    lse_max[i] = m if m != -self.lse_dtype.inf else 0.0
+                    sum_lse[i] = cute.math.exp2(rLSE[i] - lse_max[i],
+                                                fastmath=True)
+                for j0 in range(self.threads_per_warp, n_parts,
+                                self.threads_per_warp):
+                    if j0 + lane < n_parts:
+                        q = tile_slots[1 + j0 + lane]
+                        for i in cutlass.range_constexpr(rpw):
+                            sum_lse[i] += cute.math.exp2(
+                                mAccLSE[rr[i], q, 0, 0] - lse_max[i],
+                                fastmath=True)
+                for i in cutlass.range_constexpr(rpw):
+                    sm = cute.arch.warp_reduction_sum(sum_lse[i])
+                    sum_lse[i] = (lse_max[i] + cute.math.log2(sm, fastmath=True)
+                                  if not sm == self.lse_dtype(0.0) or sm != sm
+                                  else self.lse_dtype.inf)
+                # O: the rows' partials are loaded together, partial by partial
+                rAcc = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
+                                             self.acc_dtype)
+                rAcc.fill(0.0)
+                rPart = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
+                                              self.acc_dtype)
+                for j in range(n_parts):
+                    q = tile_slots[1 + j]
+                    for i in cutlass.range_constexpr(rpw):
+                        cute.autovec_copy(
+                            cute.local_tile(mAccO[rr[i], q, None, 0, 0],
+                                            (vec, ), (lane, )), rPart[None, i])
+                    for i in cutlass.range_constexpr(rpw):
+                        scale = cute.math.exp2(mAccLSE[rr[i], q, 0, 0] -
+                                               sum_lse[i],
+                                               fastmath=True)
+                        for e in cutlass.range_constexpr(vec):
+                            rAcc[e, i] += rPart[e, i] * scale
+                for i in cutlass.range_constexpr(rpw):
+                    if row0 + i < rows and self._is_stored_row(row0 + i, c):
+                        self._store_reduced_row(mO, mLSE, mSoftmaxStats,
+                                                cache_seqs, kv_bounds,
+                                                rAcc[None, i], sum_lse[i],
+                                                row0 + i, c, b, lane)
+        else:
+            b = (y - num_slots) * self.num_compute_warps + warp_idx
+            if b < cache_seqs.shape[0]:
+                if cache_seqs[b] <= 0:
+                    rZero = cute.make_rmem_tensor(cute.make_layout(vec),
+                                                  self.acc_dtype)
+                    rZero.fill(0.0)
+                    for c in cutlass.range_constexpr(num_chunks):
+                        for i in range(self.BALANCED_REDUCTION_ROWS):
+                            r = row_group * self.BALANCED_REDUCTION_ROWS + i
+                            if r < rows and self._is_stored_row(r, c):
+                                self._store_reduced_row(mO, mLSE, mSoftmaxStats,
+                                                        cache_seqs, kv_bounds,
+                                                        rZero,
+                                                        self.lse_dtype.inf, r,
+                                                        c, b, lane)
+
+    def _is_stored_row(self, r, c):
+        """Whether row r of chunk c is a real (q_tok, head) row."""
+        if cutlass.const_expr(self.flat_fold_padded):
+            return c * self.fold_rows + r < self.num_heads * self.seq_len_q
+        return True
+
+    @cute.jit
+    def _store_reduced_row(self, mO, mLSE, mSoftmaxStats, cache_seqs, kv_bounds,
+                           rAcc, global_lse, r, c, b, lane):
+        """One warp stores a combined row: O (``vec`` values per lane), LSE
+        and, for Helix, the softmax stats (as ``reduction_kernel``)."""
+        vec = self.latent_dim // self.threads_per_warp
+        rO = cute.make_rmem_tensor(cute.make_layout(vec), self.o_dtype)
+        rO.store(rAcc.load().to(self.o_dtype))
+        gO = cute.local_tile(mO[r, None, c, b], (vec, ), (lane, ))
+        cute.autovec_copy(rO, gO)
+        if lane == 0:
+            mLSE[r, c, b] = global_lse
+            if cutlass.const_expr(self.emit_softmax_stats):
+                if cutlass.const_expr(kv_bounds is not None):
+                    if cutlass.const_expr(self.fold_sq):
+                        q_tok = (c * self.fold_rows + r) // self.num_heads
+                    else:
+                        q_tok = c
+                    has_local_kv = kv_bounds[b * self.seq_len_q + q_tok] > 0
+                else:
+                    has_local_kv = cache_seqs[b] > 0
+                if has_local_kv:
+                    mSoftmaxStats[r, c, b, 0] = global_lse / LOG2_E
+                    mSoftmaxStats[r, c, b, 1] = 1.0
+                else:
+                    mSoftmaxStats[r, c, b, 0] = -self.lse_dtype.inf
+                    mSoftmaxStats[r, c, b, 1] = 0.0
+
     @staticmethod
     def get_split_kv(B: int, S: int, K: int, mma_qk_tiler_mn: tuple,
                      max_active_blocks: int) -> int:
@@ -1825,6 +2136,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
         max_split_kv = 32
         return min(blocks_per_batch, max_split_kv)
+
+    def _make_tile_scheduler(self, tile_sched_params, tile_table, cache_seqs):
+        """Work scheduler of this CTA: balanced split or (persistent) static."""
+        if cutlass.const_expr(self.balanced_split):
+            return create_mla_balanced_tile_scheduler(
+                tile_table[0],
+                tile_table[1],
+                self.balanced_num_clusters,
+                self.num_m_chunks,
+                self.balanced_slots_per_spare,
+            )
+        return create_mla_static_tile_scheduler(tile_sched_params,
+                                                cute.arch.block_idx(),
+                                                cute.arch.grid_dim())
+
+    def _work_k_range(self, work_tile, split_kv, cache_seqs, block_split_kvs):
+        """(k_index, k_tile_count, local split_kv) of a work tile."""
+        if cutlass.const_expr(self.balanced_split):
+            return work_tile.k_index, work_tile.k_count, cutlass.Int32(1)
+        return self.get_k_tile_count(split_kv, cache_seqs, block_split_kvs,
+                                     work_tile.tile_idx)
+
+    def _work_is_partial(self, work_tile):
+        """Balanced split: whether the work tile is a partial of its M tile."""
+        if cutlass.const_expr(self.balanced_split):
+            return work_tile.is_partial
+        return None
 
     @cute.jit
     def get_k_tile_count(
@@ -2331,6 +2669,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 wait_q=True,
             )
             k_tile_count -= 1
+            # Q*K^T runs mma_lookahead K tiles ahead of P*V.
+            pending_pv = cutlass.Int32(1)
+            for _ in cutlass.range_constexpr(self.mma_lookahead - 1):
+                if k_tile_count > 0:
+                    (
+                        tiled_mma_qk,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        mma_s_producer_state,
+                    ) = self.mma_qk(
+                        common_params,
+                        qk_params,
+                        tiled_mma_qk,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        mma_s_producer_state,
+                        wait_q=False,
+                    )
+                    k_tile_count -= 1
+                    pending_pv += 1
 
             while k_tile_count > 0:
                 (
@@ -2364,19 +2722,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # release q consumer states
             load_q_pipeline.consumer_release(load_q_release_state)
             load_q_release_state.advance()
-            (
-                tiled_mma_pv,
-                load_v_consumer_state,
-                p_mma_consumer_state,
-                mma_o_producer_state,
-            ) = self.mma_pv(
-                common_params,
-                pv_params,
-                tiled_mma_pv,
-                load_v_consumer_state,
-                p_mma_consumer_state,
-                mma_o_producer_state,
-            )
+            while pending_pv > 0:
+                (
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                ) = self.mma_pv(
+                    common_params,
+                    pv_params,
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                )
+                pending_pv -= 1
 
         return (
             tiled_mma_qk,
@@ -3044,6 +3404,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # softmax
         fma_b = softmax_params.softmax_scale_log2
         fma_c = (0.0 - row_max_new) * softmax_params.softmax_scale_log2
+        if cutlass.const_expr(self.flat_fold_padded):
+            # M-tile padding rows (never stored): P = 0, so with their
+            # zero-filled Q both GEMMs multiply zeros there (less power).
+            pad_row = (common_params.blk_coord[1] * self.fold_rows +
+                       tTR_tS[0][0] + common_params.blk_coord[0] * cta_m_rows)
+            if pad_row >= self.num_heads * self.seq_len_q:
+                fma_c = -self.acc_dtype.inf
 
         for i in cutlass.range(cute.size(tTR_rAcc),
                                vectorize=True,
@@ -3142,9 +3509,36 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
 
     @cute.jit
+    def _o_gmem_tile(self, common_params: SimpleNamespace, iter_n: int,
+                     target: cutlass.Constexpr):
+        """(64-row x N) CTA tile of the O target and its coordinates."""
+        cta_pv_tiler_mn = (
+            self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
+            self.mma_pv_tiler[1],
+        )
+        blk_coord = common_params.blk_coord
+        if cutlass.const_expr(target == "final"):
+            mTarget = common_params.mO
+            coord = (blk_coord[0], iter_n, blk_coord[1], blk_coord[2])
+        elif cutlass.const_expr(target == "split"):
+            mTarget = common_params.mAccO[None, blk_coord[3], None, None, None]
+            coord = (blk_coord[0], iter_n, blk_coord[1], blk_coord[2])
+        else:
+            # balanced partial slot: (rows, D, 1, 1)
+            mTarget = common_params.mAccO[None, blk_coord[3], None, None, None]
+            coord = (blk_coord[0], iter_n, 0, 0)
+        gO = cute.local_tile(mTarget, cta_pv_tiler_mn, coord)
+        cO = cute.local_tile(cute.make_identity_tensor(mTarget.shape),
+                             cta_pv_tiler_mn, coord)
+        return gO, cO
+
+    @cute.jit
     def _tmem_load_partition(
-        self, common_params: SimpleNamespace, tiled_mma_pv: cute.TiledMma,
-        iter_n: int
+        self,
+        common_params: SimpleNamespace,
+        tiled_mma_pv: cute.TiledMma,
+        iter_n: int,
+        target: cutlass.Constexpr = None,
     ) -> tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma,
                cute.TiledMma]:
         """Tensor memory load partition for rescale and epilogue.
@@ -3155,9 +3549,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type tiled_mma_pv: cute.TiledMma
         :param iter_n: The iteration number
         :type iter_n: int
+        :param target: O destination partitioned for the store ("final",
+            "split" or "slot"); None picks "split" with a split-KV workspace
+            and "final" otherwise.
 
-        :return: The tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
+        :return: The tmem load tiled copy, the TMEM accumulator view, its
+            per-thread partition, the per-thread destination partition and its
+            coordinates, and the register fragment
         """
 
         tOtO_shape = tiled_mma_pv.partition_shape_C(
@@ -3184,60 +3582,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             common_params.tidx %
             (self.num_compute_warps * self.threads_per_warp))
 
-        cta_pv_tiler = (
-            self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
-            self.mma_pv_tiler[1],
-            self.mma_pv_tiler[2],
-        )
-        # Flatten divide and partition global tensors for O
-        cta_pv_tiler_mn = cute.select(cta_pv_tiler, mode=[0, 1])
-
-        gO = None
-        if cutlass.const_expr(common_params.mAccO is not None):
-            gO = cute.local_tile(
-                common_params.mAccO[None, common_params.blk_coord[3], None,
-                                    None, None],
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
-            cO = cute.local_tile(
-                cute.make_identity_tensor(
-                    common_params.mAccO[None, common_params.blk_coord[3], None,
-                                        None, None].shape),
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
+        if cutlass.const_expr(target is None):
+            gO, cO = self._o_gmem_tile(
+                common_params, iter_n,
+                "final" if common_params.mAccO is None else "split")
         else:
-            gO = cute.local_tile(
-                common_params.mO,
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
-            cO = cute.local_tile(
-                cute.make_identity_tensor(common_params.mO.shape),
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
+            gO, cO = self._o_gmem_tile(common_params, iter_n, target)
         tTR_tAcc = tmem_load_thr_copy.partition_S(tAcc)
         tTR_gO = tmem_load_thr_copy.partition_D(gO)
         tTR_cO = tmem_load_thr_copy.partition_D(cO)
@@ -3270,7 +3620,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                      self.threads_per_warp)
         # load correction factor
         _, tAcc, _, _, _, _ = self._tmem_load_partition(
-            common_params, common_params.tiled_mma_pv, 0)
+            common_params, common_params.tiled_mma_pv, 0, "final")
         corr_layout = cute.make_layout(
             (tAcc.shape[0], (4, tAcc.shape[1][1]), self.p_cor_stage),
             stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
@@ -3333,7 +3683,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                     self._tmem_load_partition(common_params,
                                               common_params.tiled_mma_pv,
-                                              iter_n))
+                                              iter_n, "final"))
 
                 # tmem store tiled copy
                 tmem_store_atom = cute.make_copy_atom(
@@ -3358,6 +3708,70 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_o_consumer_state.advance()
 
         return mma_o_consumer_state
+
+    @cute.jit
+    def _store_o_and_lse(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        iter_n: int,
+        tTR_rAcc: cute.Tensor,
+        lse: cutlass.Float32,
+        target: cutlass.Constexpr,
+    ):
+        """Store one normalized O column block and (once) the rows' LSE."""
+        tidx = common_params.tidx % (self.num_compute_warps *
+                                     self.threads_per_warp)
+        _, _, _, tTR_gO, tTR_cO, _ = self._tmem_load_partition(
+            common_params, common_params.tiled_mma_pv, iter_n, target)
+        if cutlass.const_expr(target == "final"):
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+        else:
+            tR2G_rO_src = tTR_rAcc
+        if cute.elem_less(tTR_cO[0][0], common_params.H):
+            cute.autovec_copy(
+                tR2G_rO_src,
+                tTR_gO,
+                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+            )
+
+        blk_coord = common_params.blk_coord
+        if cutlass.const_expr(target == "final"):
+            mLSE = epilogue_params.mLSE
+            lse_coord = (blk_coord[0], blk_coord[1], blk_coord[2])
+        elif cutlass.const_expr(target == "split"):
+            mLSE = epilogue_params.mAccLSE[None, blk_coord[3], None, None]
+            lse_coord = (blk_coord[0], blk_coord[1], blk_coord[2])
+        else:
+            mLSE = epilogue_params.mAccLSE[None, blk_coord[3], None, None]
+            lse_coord = (blk_coord[0], 0, 0)
+        cta_rows = self.mma_pv_tiler[0] // self.cluster_shape_mnk[0]
+        gLSE = cute.local_tile(mLSE, (cta_rows, 1, 1), lse_coord, (1, 1, 1))
+        cLSE = cute.local_tile(cute.make_identity_tensor(mLSE.shape),
+                               (cta_rows, 1, 1), lse_coord, (1, 1, 1))
+        # Warps (0, 1) and (2, 3) hold the same rows; (0, 1) store them.
+        # (Tensors written under a runtime `if` are bound to locals first.)
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats and target == "final"):
+            mSoftmaxStats = epilogue_params.mSoftmaxStats
+        if cutlass.const_expr(self.warps_in_n == 2 and iter_n == 0):
+            if tidx < cta_rows and cute.elem_less(cLSE[tidx][0],
+                                                  common_params.H):
+                gLSE[tidx] = lse
+                if cutlass.const_expr(mSoftmaxStats is not None):
+                    head_idx = cLSE[tidx][0]
+                    mSoftmaxStats[head_idx, blk_coord[1], blk_coord[2],
+                                  0] = lse / LOG2_E
+                    mSoftmaxStats[head_idx, blk_coord[1], blk_coord[2], 1] = 1.0
+        if cutlass.const_expr(target == "slot" and iter_n == 0):
+            # Describe the partial for the reduction: (M tile, first K tile).
+            mDesc = common_params.mDesc
+            k_index = common_params.k_index
+            if common_params.is_leader_cta and tidx == 0:
+                mDesc[blk_coord[3],
+                      0] = (blk_coord[2] * self.num_m_chunks + blk_coord[1])
+                mDesc[blk_coord[3], 1] = k_index
 
     @cute.jit
     def epilogue(
@@ -3395,16 +3809,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # (64, 2)
             row_sum = (row_sum + common_params.smem_exchange[
                 (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)])
-        # mma_o pipeline consumer wait
+        lse = (cute.math.log2(row_sum, fastmath=True) +
+               epilogue_params.softmax_scale_log2 * row_max)
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
             # tmem load tiled copy and partition results.
             tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                 self._tmem_load_partition(common_params,
-                                          common_params.tiled_mma_pv, iter_n))
+                                          common_params.tiled_mma_pv, iter_n,
+                                          "final"))
 
-            # load o
+            # load o, then hand its TMEM columns back to the MMA warp
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+            cute.arch.fence_view_async_tmem_load()
+            common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
+            mma_o_consumer_state.advance()
 
             # apply output scale and normalize by row_sum
             for i in cutlass.range(cute.size(tTR_rAcc),
@@ -3413,99 +3832,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 tTR_rAcc[i] = (tTR_rAcc[i] * epilogue_params.output_scale *
                                cute.arch.rcp_approx(row_sum))
 
-            # store o to global memory
-            tR2G_rO_src = None
-            tR2G_rO_dst = tTR_gO
+            # O goes to the final O, a uniform split-KV slice of the
+            # workspace, or (balanced split, M tile cut across clusters) the
+            # segment's partial slot.
             if cutlass.const_expr(common_params.mAccO is None):
-                tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-                # using final output dtype for o
-                tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+                self._store_o_and_lse(common_params, epilogue_params, iter_n,
+                                      tTR_rAcc, lse, "final")
+            elif cutlass.const_expr(self.balanced_split):
+                if common_params.is_partial != 0:
+                    self._store_o_and_lse(common_params, epilogue_params,
+                                          iter_n, tTR_rAcc, lse, "slot")
+                else:
+                    self._store_o_and_lse(common_params, epilogue_params,
+                                          iter_n, tTR_rAcc, lse, "final")
             else:
-                # using accumulate dtype for o
-                tR2G_rO_src = tTR_rAcc
-
-            if cute.elem_less(tTR_cO[0][0], common_params.H):
-                cute.autovec_copy(
-                    tR2G_rO_src,
-                    tR2G_rO_dst,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.
-                    NO_ALLOCATE,
-                )
-
-            # store the lse to global memory
-            cta_pv_tiler = (
-                self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
-                self.mma_pv_tiler[1],
-                self.mma_pv_tiler[2],
-            )
-            gLSE = None
-            cLSE = None
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                gLSE = cute.local_tile(
-                    epilogue_params.mLSE,
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-
-            else:
-                gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[None, common_params.blk_coord[3],
-                                            None, None],
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(
-                        epilogue_params.mAccLSE[None,
-                                                common_params.blk_coord[3],
-                                                None, None].shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-            lse = (cute.math.log2(row_sum, fastmath=True) +
-                   epilogue_params.softmax_scale_log2 * row_max)
-            if cutlass.const_expr(self.warps_in_n == 2):
-                if cute.elem_less(cLSE[tidx][0], common_params.H):
-                    gLSE[tidx] = lse
-                    if cutlass.const_expr(self.emit_softmax_stats
-                                          and epilogue_params.mAccLSE is None
-                                          and iter_n == 0):
-                        head_idx = cLSE[tidx][0]
-                        epilogue_params.mSoftmaxStats[
-                            head_idx, common_params.blk_coord[1],
-                            common_params.blk_coord[2], 0] = lse / LOG2_E
-                        epilogue_params.mSoftmaxStats[
-                            head_idx, common_params.blk_coord[1],
-                            common_params.blk_coord[2], 1] = 1.0
-
-            cute.arch.fence_view_async_tmem_load()
-            common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
-            mma_o_consumer_state.advance()
+                self._store_o_and_lse(common_params, epilogue_params, iter_n,
+                                      tTR_rAcc, lse, "split")
 
         return mma_o_consumer_state
 
@@ -3772,6 +4114,65 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if split_kv == 1:
             return 0
         return B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
+
+    @staticmethod
+    def get_balanced_workspace_size(
+        num_heads: int,
+        seq_len_q: int,
+        D: int,
+        max_active_clusters: int,
+        acc_dtype: Type[cutlass.Numeric],
+        m_tile: int = 128,
+    ) -> int:
+        """Workspace bytes of a balanced split: per partial slot an M tile of
+        O and LSE in ``acc_dtype``, plus the slot descriptors."""
+        cls = BlackwellMultiHeadLatentAttentionForwardFP8
+        if num_heads < m_tile and seq_len_q > 1:
+            rows, chunks = cls.get_fold_layout(num_heads, seq_len_q, m_tile)
+        else:
+            rows, chunks = num_heads, seq_len_q
+        slots = MLABalancedTileScheduler.num_slots(
+            max_active_clusters, chunks,
+            MLABalancedTileScheduler.default_slots_per_spare(chunks))
+        return rows * slots * (D + 1) * acc_dtype.width // 8 + slots * 2 * 4
+
+    @cute.jit
+    def initialize_balanced_workspace(
+        self,
+        H: cutlass.Int32,
+        D: cutlass.Int32,
+        acc_dtype: Type[cutlass.Numeric],
+        workspace: cute.Tensor,
+    ) -> tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
+        """Views of the balanced-split workspace: partial O (H, slots, D, 1,
+        1), partial LSE (H, slots, 1, 1) and slot descriptors (slots, 2)."""
+        slots = self.balanced_num_slots
+        align = 256 // self.q_dtype.width
+        acc_o_layout = cute.make_layout(
+            (H, slots, D, 1, 1),
+            stride=(cute.assume(D, align), cute.assume(H * D, align), 1, 0, 0),
+        )
+        acc_o = cute.make_tensor(
+            cute.recast_ptr(workspace.iterator, dtype=acc_dtype), acc_o_layout)
+        acc_lse_layout = cute.make_layout((H, slots, 1, 1), stride=(1, H, 0, 0))
+        acc_lse = cute.make_tensor(
+            cute.recast_ptr(
+                workspace.iterator + cute.cosize(acc_o_layout) *
+                (acc_dtype.width // 8),
+                dtype=acc_dtype,
+            ),
+            acc_lse_layout,
+        )
+        desc = cute.make_tensor(
+            cute.recast_ptr(
+                workspace.iterator +
+                (cute.cosize(acc_o_layout) + cute.cosize(acc_lse_layout)) *
+                (acc_dtype.width // 8),
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout((slots, 2), stride=(2, 1)),
+        )
+        return acc_o, acc_lse, desc
 
     @cute.jit
     def initialize_workspace(

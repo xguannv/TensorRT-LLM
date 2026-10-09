@@ -261,9 +261,12 @@ def _padded_inputs(lens, S, H, helix, seed):
     return x
 
 
-def _run_guarded(x, H, S, split_kv, flat_fold, monkeypatch):
+def _run_guarded(x, H, S, split_kv, flat_fold, monkeypatch, persistent=False):
     """Run the runner with NaN-filled outputs plus one request's worth of
-    guard rows behind O and the softmax stats; returns (o, lse, stats)."""
+    guard rows behind O and the softmax stats; returns (o, lse, stats).
+
+    Requests without KV are skipped by the finiteness checks: the uniform
+    split leaves them unstored with split_kv == 1."""
     flag = "1" if flat_fold else "0"
     monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", flag)
     monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", _KERNEL_CACHES[flag])
@@ -294,20 +297,21 @@ def _run_guarded(x, H, S, split_kv, flat_fold, monkeypatch):
         stats_buf = torch.full((B * S + S, H, 2), float("nan"), dtype=torch.float32, device="cuda")
         inputs[8] = stats_buf[: B * S]
         inputs[9] = x["kv_bounds"]
-    runner.forward(inputs, ((128, 128), (128, 256), split_kv, False))
+    runner.forward(inputs, ((128, 128), (128, 256), split_kv, persistent))
     torch.cuda.synchronize()
 
     # Nothing is stored past the last request, and every real row is stored.
+    has_kv = torch.tensor([L > 0 for L in x["lens"]], device="cuda")
     assert torch.isnan(o_buf[n_o:].float()).all()
-    assert torch.isfinite(o.float()).all()
+    assert torch.isfinite(o[has_kv].float()).all()
     lse_all = ws[lse_off : lse_off + lse_size].view(torch.float32).view(_MAX_BATCH, S, H)
     assert torch.isnan(lse_all[B:]).all()
-    assert torch.isfinite(lse_all[:B]).all()
+    assert torch.isfinite(lse_all[:B][has_kv]).all()
     stats = None
     if helix:
         assert torch.isnan(stats_buf[B * S :]).all()
         stats = stats_buf[: B * S].clone()
-        assert not torch.isnan(stats).any()
+        assert not torch.isnan(stats.view(B, S, H, 2)[has_kv]).any()
     return o.clone(), lse_all[:B].clone(), stats
 
 
@@ -409,3 +413,123 @@ def test_k3_short_mtp_keeps_the_unfolded_tiling(S, monkeypatch):
     gold, _ = _reference_bounded(x, S, 96)
     err = (new_o.float() - gold).abs().max().item()
     assert err <= 0.05 * gold.abs().max().item(), err
+
+
+# Balanced split (tactic split_kv == BALANCED_SPLIT_TACTIC): persistent
+# clusters, each given an equal share of the batch's K tiles.
+
+
+def _balanced_split_tiles(lens, num_chunks, num_clusters, min_units, k_tile=128):
+    """(request, chunk) M tiles the balanced split cuts across clusters, by
+    the partition of MLABalancedTileScheduler."""
+    kt = [max(0, math.ceil(L / k_tile)) for L in lens]
+    prefix = [0]
+    for t in kt:
+        prefix.append(prefix[-1] + t)
+    G, C, V = num_clusters, num_chunks, prefix[-1]
+    W = max(math.ceil(V * C / G), min_units)
+    n = G // C
+    s = G - n * C
+    nW = min(W * n, V)
+    Lw = V - nW
+    ranges = []  # (chunk, first position, end position) in the chunk's units
+    for g in range(G):
+        if g < n * C:
+            lane = g // C
+            ranges.append((g % C, min(lane * W, V), min((lane + 1) * W, V)))
+            continue
+        s_tot = Lw * C
+        Ws = math.ceil(s_tot / s)
+        q, qb = min((g - n * C) * Ws, s_tot), min((g - n * C + 1) * Ws, s_tot)
+        while q < qb:
+            c = q // Lw
+            p = nW + q - c * Lw
+            p_end = nW + min(Lw, qb - c * Lw)
+            ranges.append((c, p, p_end))
+            q += p_end - p
+    split = set()
+    for c, p, p_end in ranges:
+        while p < p_end:
+            b = max(i for i in range(len(lens)) if prefix[i] <= p)
+            end = min(prefix[b + 1], p_end)
+            if p > prefix[b] or end < prefix[b + 1]:
+                split.add((b, c))
+            p = end
+    return split
+
+
+_BALANCED_LENS = {
+    "mixed8": _LENS["mixed8"],
+    "k3": _LENS["k3"],
+    "single": _LENS["single"],
+    # skewed per-rank KV of a Helix batch, with requests that hold no KV here
+    "skew": [600, 0, 61000, 2048, 9000, 0, 130, 15000, 7300, 64],
+}
+
+
+@pytest.mark.parametrize("lens_name", list(_BALANCED_LENS))
+@pytest.mark.parametrize(
+    "H,S,helix",
+    [(96, 7, True), (96, 7, False), (96, 6, False), (96, 8, True), (48, 3, False), (128, 1, False)],
+)
+def test_balanced_split_matches_uniform_split(H, S, helix, lens_name, monkeypatch):
+    """M tiles the balanced split keeps whole are bitwise identical to the
+    uniform split_kv = 1 kernel; M tiles it cuts across clusters match it to
+    split-KV rounding and the fp32 reference; requests without KV get the
+    empty result (O = 0, LSE = +inf, stats (-inf, 0))."""
+    lens = _BALANCED_LENS[lens_name]
+    x = _padded_inputs(lens, S, H, helix=helix, seed=13)
+    ref_o, ref_lse, ref_stats = _run_guarded(x, H, S, 1, True, monkeypatch)
+    new_o, new_lse, new_stats = _run_guarded(
+        x,
+        H,
+        S,
+        CuteDSLNVMlaDecodeBlackwellRunner.BALANCED_SPLIT_TACTIC,
+        True,
+        monkeypatch,
+        persistent=True,
+    )
+
+    if H < 128 and S > 1:
+        rows, chunks = BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout(H, S, 128)
+    else:
+        rows, chunks = H, S
+    split = _balanced_split_tiles(
+        lens,
+        chunks,
+        CuteDSLNVMlaDecodeBlackwellRunner._get_max_active_blocks() // 2,
+        BlackwellMultiHeadLatentAttentionForwardFP8.BALANCED_MIN_UNITS,
+    )
+    gold, valid = _reference_bounded(x, S, H)
+    tol = 0.05 * gold.abs().max().item()
+    flat = lambda t: t.reshape(len(lens), S * H, *t.shape[3:])  # noqa: E731
+    new_rows, ref_rows, gold_rows = flat(new_o), flat(ref_o), flat(gold)
+    new_lse_rows, ref_lse_rows = flat(new_lse), flat(ref_lse)
+    if helix:
+        new_st = new_stats.view(len(lens), S * H, 2)
+        ref_st = ref_stats.view(len(lens), S * H, 2)
+    for b, L in enumerate(lens):
+        if L <= 0:
+            assert (new_o[b] == 0).all()
+            assert torch.isinf(new_lse[b]).all() and (new_lse[b] > 0).all()
+            if helix:
+                st = new_stats.view(len(lens), S, H, 2)[b]
+                assert torch.isinf(st[..., 0]).all() and (st[..., 1] == 0).all()
+            continue
+        for c in range(chunks):
+            r = slice(c * rows, min((c + 1) * rows, S * H))
+            if (b, c) not in split:
+                assert torch.equal(new_rows[b, r], ref_rows[b, r]), (b, c)
+                assert torch.equal(new_lse_rows[b, r], ref_lse_rows[b, r]), (b, c)
+                if helix:
+                    assert torch.equal(new_st[b, r], ref_st[b, r]), (b, c)
+            else:
+                # Each part requantizes P to fp8 against its own running max,
+                # so a cut tile differs from the uncut one at fp8-P noise.
+                d = (new_rows[b, r].float() - ref_rows[b, r].float()).abs().max().item()
+                assert d <= tol, (b, c, d)
+                dl = (new_lse_rows[b, r] - ref_lse_rows[b, r]).abs().max().item()
+                assert dl <= 1e-4, (b, c, dl)
+        v = valid[b].to("cuda").repeat_interleave(H)
+        err = (new_rows[b].float() - gold_rows[b])[v].abs().max().item() if v.any() else 0.0
+        assert err <= tol, (b, err)
