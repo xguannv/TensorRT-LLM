@@ -1922,9 +1922,11 @@ class KimiK3MoERuntime(nn.Module):
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
-            router_logits = self._fused_route(hidden_states)
-            if router_logits is None:
-                router_logits = self.gate.compute_logits(hidden_states)
+            # With the fused router, routing runs inside the routed branch below, so the
+            # shared experts fork before it instead of waiting for the router.
+            router_logits = (
+                None if _K3_FUSED_ROUTER != "0" else self.gate.compute_logits(hidden_states)
+            )
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
@@ -1934,6 +1936,11 @@ class KimiK3MoERuntime(nn.Module):
         )
 
         def _routed_output():
+            logits = router_logits
+            if logits is None:
+                logits = self._fused_route(hidden_states)
+                if logits is None:
+                    logits = self.gate.compute_logits(hidden_states)
             moe_kwargs = {}
             if projected_input is not None:
                 routed_in = projected_input
@@ -1944,7 +1951,7 @@ class KimiK3MoERuntime(nn.Module):
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             y = self.routed_experts(
                 routed_in,
-                router_logits,
+                logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 **moe_kwargs,
             )
