@@ -1133,15 +1133,22 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
 
-        tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            local_expert_offset=slot_start,
-            local_num_experts=esp,
-            tile_tokens_dim=tile_size,
-        )
+        # A fused router may attach this rank's moe_sort outputs to the ids.
+        presorted = getattr(token_selected_experts, "_k3_presorted", None)
+        if presorted is not None and presorted[0] == (slot_start, esp,
+                                                      tile_size):
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = presorted[
+                1]
+        else:
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                local_expert_offset=slot_start,
+                local_num_experts=esp,
+                tile_tokens_dim=tile_size,
+            )
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
         if self.use_fused_finalize and has_aux_streams:

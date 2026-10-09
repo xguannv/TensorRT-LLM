@@ -138,6 +138,12 @@ _K3_FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
 # BF16 V weight on each rank.
 _K3_HELIX_V_UP_BEFORE_A2A = os.environ.get("TRTLLM_HELIX_V_UP_BEFORE_A2A", "0") == "1"
 
+# Small decode batches route with one fused CuTe launch: router GEMV + noaux_tc top-16
+# ("topk"), plus the CuteDSL MoE's moe_sort metadata of this rank ("sort").
+_K3_FUSED_ROUTER = os.environ.get("TRTLLM_K3_FUSED_ROUTER", "0")
+if _K3_FUSED_ROUTER not in ("0", "topk", "sort"):
+    raise ValueError(f"TRTLLM_K3_FUSED_ROUTER must be 0, topk or sort, got {_K3_FUSED_ROUTER!r}")
+
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
@@ -248,7 +254,7 @@ class KimiK3MoEGate(nn.Module):
             raise ValueError(
                 "Kimi K3 ConfigurableMoE routing requires top-k weight renormalization."
             )
-        return DeepSeekV3MoeRoutingMethod(
+        return _KimiK3RoutingMethod(
             top_k=self.top_k,
             n_group=self.num_expert_group,
             topk_group=self.topk_group,
@@ -256,6 +262,27 @@ class KimiK3MoEGate(nn.Module):
             callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
             is_fused=True,
         )
+
+
+class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
+    """DeepSeek-V3 routing that can hand out top-k results computed ahead of time.
+
+    ``KimiK3MoERuntime`` stores the fused router's ``(topk_ids, topk_weights)`` in
+    ``precomputed`` right before calling the routed experts; the next ``apply``
+    returns and clears them instead of routing ``logits`` again.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.precomputed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def apply(
+        self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.precomputed is not None:
+            result, self.precomputed = self.precomputed, None
+            return result
+        return super().apply(logits, input_ids)
 
 
 class KimiK3RMSNorm(nn.Module):
@@ -1603,6 +1630,56 @@ class KimiK3MoERuntime(nn.Module):
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
 
+    def _fused_route(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """Route with the fused CuTe router when enabled and applicable.
+
+        Hands the top-k to the routed experts' routing method and, in ``sort``
+        mode, attaches this rank's ``moe_sort`` outputs to the top-k ids (read by
+        the CuteDSL backend). Returns the FP32 router logits, or ``None`` when
+        the caller must route the regular way.
+        """
+        if _K3_FUSED_ROUTER == "0" or torch.compiler.is_compiling():
+            return None
+        routing = self.routed_experts.routing_method
+        backend = self.routed_experts.backend
+        if not isinstance(routing, _KimiK3RoutingMethod) or self.routed_experts.use_dp:
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_fused_router
+
+        bias = self.gate.e_score_correction_bias
+        if not k3_fused_router.can_use_k3_fused_router(hidden_states, self.gate.weight, bias):
+            return None
+        if torch.cuda.is_current_stream_capturing() and not k3_fused_router.workspace_ready(
+            hidden_states.device
+        ):
+            return None
+        scale = float(self.gate.routed_scaling_factor)
+        slot_start = getattr(backend, "slot_start", None)
+        num_local = getattr(backend, "expert_size_per_partition", None)
+        if (
+            _K3_FUSED_ROUTER == "sort"
+            and slot_start is not None
+            and num_local is not None
+            and getattr(backend, "num_slots", None) == self.gate.num_experts
+        ):
+            (topk_ids, topk_weights, *sort_outputs, logits) = torch.ops.trtllm.k3_fused_router_sort(
+                hidden_states,
+                self.gate.weight,
+                bias,
+                scale,
+                slot_start,
+                num_local,
+                128,
+                True,
+            )
+            topk_ids._k3_presorted = ((slot_start, num_local, 128), tuple(sort_outputs))
+        else:
+            topk_ids, topk_weights, logits = torch.ops.trtllm.k3_fused_router_topk(
+                hidden_states, self.gate.weight, bias, scale, True
+            )
+        routing.precomputed = (topk_ids, topk_weights)
+        return logits
+
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
@@ -1845,7 +1922,9 @@ class KimiK3MoERuntime(nn.Module):
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
-            router_logits = self.gate.compute_logits(hidden_states)
+            router_logits = self._fused_route(hidden_states)
+            if router_logits is None:
+                router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
