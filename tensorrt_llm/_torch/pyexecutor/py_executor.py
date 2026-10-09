@@ -647,6 +647,13 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        # Disaggregated generation: start KV receives for newly admitted
+        # requests after the in-flight step finished instead of blocking the
+        # host on it while scheduling (overlap scheduler only).
+        self._defer_disagg_gen_recv = (os.environ.get(
+            "TRTLLM_DEFER_DISAGG_GEN_RECV", "0") == "1"
+                                       and not disable_overlap_scheduler)
+        self._deferred_disagg_recv_reqs: List[LlmRequest] = []
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
@@ -5410,6 +5417,9 @@ class PyExecutor:
                 # participate in the tp_gather collective even when
                 # should_process_previous_batch differs between ranks.
                 self._flush_pending_transfer_responses()
+                self._start_deferred_disagg_recv(
+                    previous_step_synced=self.previous_batch is not None
+                    and should_process_previous_batch)
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -7434,8 +7444,30 @@ class PyExecutor:
                 kv_cache_manager.publish_connector_scheduler_output(
                     disagg_gen_init_to_prepare)
 
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            # Trigger KV cache exchange for new disagg_gen_init_requests. With
+            # a decode step in flight, slots just freed by requests in that
+            # step may be reused here, so the receive waits until the step is
+            # known to be complete (see _start_deferred_disagg_recv).
+            if self._defer_disagg_gen_recv and self.previous_batch is not None:
+                self._deferred_disagg_recv_reqs.extend(
+                    fitting_disagg_gen_init_requests)
+            else:
+                self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+
+    def _start_deferred_disagg_recv(self, previous_step_synced: bool) -> None:
+        """Start the KV receives deferred by _prepare_disagg_gen_init.
+
+        Called on every rank once per overlap iteration after the previous
+        batch's results were awaited, i.e. after the decode step that could
+        still touch reused slots has finished.
+        """
+        if not self._deferred_disagg_recv_reqs:
+            return
+        if not previous_step_synced and self.previous_batch is not None:
+            torch.cuda.current_stream().synchronize()
+        requests = self._deferred_disagg_recv_reqs
+        self._deferred_disagg_recv_reqs = []
+        self._recv_disagg_gen_cache(requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):

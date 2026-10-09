@@ -1782,6 +1782,131 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         self.update_mamba_states(attn_metadata, num_accepted, state_indices)
 
 
+# With TRTLLM_DEFER_DISAGG_GEN_RECV=1 the executor starts KV receives only
+# after the in-flight decode step finished, so replay-slot index tensors no
+# longer need the blocking copy that used to provide that ordering.
+_ASYNC_REPLAY_SLOT_INDICES = os.environ.get("TRTLLM_DEFER_DISAGG_GEN_RECV",
+                                            "0") == "1"
+
+
+def _index_tensor_async(values, device: torch.device) -> torch.Tensor:
+    """int64 device tensor of ``values``, without a host sync when enabled.
+
+    ``torch.tensor(values, device=...)`` copies from pageable memory and waits
+    for the stream, i.e. for the decode step in flight; a pinned staging tensor
+    with a non-blocking copy is ordered on the stream instead.
+    """
+    if not _ASYNC_REPLAY_SLOT_INDICES:
+        return torch.tensor(values, dtype=torch.long, device=device)
+    host = torch.tensor(values, dtype=torch.long, pin_memory=prefer_pinned())
+    return host.to(device, non_blocking=True)
+
+
+# Disaggregated generation seeds the KDA replay conv caches of newly
+# transferred requests with one launch per conv section across all layers
+# instead of a per-layer loop of small copies.
+_KDA_BATCHED_REPLAY_SEED = os.environ.get("TRTLLM_KDA_BATCHED_REPLAY_SEED",
+                                          "1") == "1"
+
+_TORCH_TO_TL_DTYPE = {
+    torch.float32: tl.float32,
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+}
+
+
+@triton.jit
+def _seed_kda_replay_conv_kernel(
+    conv_ptrs,
+    slot_idx_ptr,
+    out_ptr,
+    conv_slot_stride,
+    conv_channel_stride,
+    conv_window_stride,
+    channel_offset,
+    out_layer_stride,
+    out_slot_stride,
+    out_dim_stride,
+    out_window_stride,
+    section_dim,
+    CONV_DTYPE: tl.constexpr,
+    COMMITTED: tl.constexpr,
+    EXTENDED: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Copy one section of the committed conv window of one slot in one layer
+    into the replay conv cache and zero its draft tail."""
+    layer = tl.program_id(0)
+    slot = tl.load(slot_idx_ptr + tl.program_id(1)).to(tl.int64)
+    d = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+    w = tl.arange(0, BLOCK_W)
+    d_mask = d < section_dim
+    base = tl.load(conv_ptrs + layer).to(tl.pointer_type(CONV_DTYPE))
+    src = (base + slot * conv_slot_stride +
+           (channel_offset + d)[:, None] * conv_channel_stride +
+           w[None, :] * conv_window_stride)
+    values = tl.load(src,
+                     mask=d_mask[:, None] & (w[None, :] < COMMITTED),
+                     other=0.0)
+    dst = (out_ptr + layer.to(tl.int64) * out_layer_stride +
+           slot * out_slot_stride + d[:, None] * out_dim_stride +
+           w[None, :] * out_window_stride)
+    tl.store(dst,
+             values.to(out_ptr.dtype.element_ty),
+             mask=d_mask[:, None] & (w[None, :] < EXTENDED))
+
+
+def _seed_kda_replay_conv_batched(
+    conv_states: List[torch.Tensor],
+    conv_ptrs: torch.Tensor,
+    state_indices: torch.Tensor,
+    replay_buffers: Tuple[torch.Tensor, ...],
+    section_offsets: List[int],
+    committed_window: int,
+) -> bool:
+    """Seed every layer's replay conv caches with one launch per section.
+
+    ``conv_states`` are the per-layer ``[slots, conv_dim, W - 1]`` views and
+    ``conv_ptrs`` their base addresses; ``replay_buffers`` are the
+    ``[L, slots, D, W - 1 + num_spec]`` caches. Returns False (nothing done)
+    when the layers do not share one layout.
+    """
+    reference = conv_states[0]
+    if reference.dtype not in _TORCH_TO_TL_DTYPE or any(
+            state.stride() != reference.stride()
+            or state.dtype != reference.dtype for state in conv_states):
+        return False
+    num_layers = len(conv_states)
+    extended = replay_buffers[0].shape[-1]
+    block_w = triton.next_power_of_2(extended)
+    block_d = 128
+    for section, out in enumerate(replay_buffers):
+        section_dim = section_offsets[section + 1] - section_offsets[section]
+        grid = (num_layers, state_indices.numel(),
+                triton.cdiv(section_dim, block_d))
+        _seed_kda_replay_conv_kernel[grid](
+            conv_ptrs,
+            state_indices,
+            out,
+            reference.stride(0),
+            reference.stride(1),
+            reference.stride(2),
+            section_offsets[section],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            section_dim,
+            CONV_DTYPE=_TORCH_TO_TL_DTYPE[reference.dtype],
+            COMMITTED=committed_window,
+            EXTENDED=extended,
+            BLOCK_D=block_d,
+            BLOCK_W=block_w,
+        )
+    return True
+
+
 @triton.jit
 def _promote_mamba_state_kernel(
     src_ptr,
@@ -4351,9 +4476,14 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         if (not self._use_kda_replay_update
                 or self.prev_num_accepted_tokens is None):
             return
-        slots = torch.as_tensor(slots,
-                                dtype=torch.long,
-                                device=self.prev_num_accepted_tokens.device)
+        if isinstance(slots, torch.Tensor):
+            slots = slots.to(device=self.prev_num_accepted_tokens.device,
+                             dtype=torch.long)
+        elif slots:
+            slots = _index_tensor_async(slots,
+                                        self.prev_num_accepted_tokens.device)
+        else:
+            return
         if slots.numel() > 0:
             self.prev_num_accepted_tokens[slots] = 0
 
@@ -4369,12 +4499,9 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
             return
 
         device = self.prev_num_accepted_tokens.device
-        source_slots = torch.tensor([old for old, _ in moves],
-                                    dtype=torch.long,
-                                    device=device)
-        destination_slots = torch.tensor([new for _, new in moves],
-                                         dtype=torch.long,
-                                         device=device)
+        source_slots = _index_tensor_async([old for old, _ in moves], device)
+        destination_slots = _index_tensor_async([new for _, new in moves],
+                                                device)
         replay_buffers = (
             self.kda_conv_q,
             self.kda_conv_k,
@@ -4466,9 +4593,7 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
             return
 
         device = self.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(sorted(set(slots)),
-                                     dtype=torch.long,
-                                     device=device)
+        state_indices = _index_tensor_async(sorted(set(slots)), device)
         committed_window = self.conv_state_shape[1]
         section_offsets = [0]
         for section_dim in self.conv_section_dims:
@@ -4476,7 +4601,18 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
 
         replay_conv_buffers = (self.kda_conv_q, self.kda_conv_k,
                                self.kda_conv_v)
-        for layer_offset, conv_state in enumerate(self.all_conv_states):
+        seeded = False
+        if _KDA_BATCHED_REPLAY_SEED:
+            if getattr(self, "_kda_seed_conv_ptrs", None) is None:
+                self._kda_seed_conv_ptrs = torch.tensor(
+                    [state.data_ptr() for state in self.all_conv_states],
+                    dtype=torch.int64,
+                    device=device)
+            seeded = _seed_kda_replay_conv_batched(
+                self.all_conv_states, self._kda_seed_conv_ptrs, state_indices,
+                replay_conv_buffers, section_offsets, committed_window)
+        for layer_offset, conv_state in enumerate(
+            [] if seeded else self.all_conv_states):
             selected_conv = conv_state.index_select(0, state_indices)
             for section_idx, replay_buffer in enumerate(replay_conv_buffers):
                 replay_layer = replay_buffer[layer_offset]
