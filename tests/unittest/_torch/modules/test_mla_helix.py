@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import pickle
 import sys
 import weakref
@@ -94,6 +95,8 @@ class Scenario:
     # a lot of precision and we're using bf16 here.
     atol: float = 1e-1
     rtol: float = 5e-2
+    # Apply the V up-projection of all heads before the CP all-to-all.
+    helix_v_up: bool = False
 
     @property
     def max_position_embeddings(self) -> int:
@@ -358,9 +361,12 @@ def _run_mla_distributed(
         dtype=scenario.dtype,
         config=config,
     ).cuda()
+    full_v_b_proj = weights["v_b_proj"]
     copy_weights_for_cp(weights, "o_proj.weight", 1, rank, world_size)
     copy_weights_for_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
+    if scenario.helix_v_up:
+        mla.helix_v_b_proj_full = full_v_b_proj.to(device="cuda", dtype=scenario.dtype)
 
     # Set up KVCacheManager and attn_metadata for distributed.
     kv_cache_manager, attn_metadata = setup_kv_and_metadata(
@@ -572,8 +578,80 @@ def test_mla_helix_distributed(
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @skip_pre_blackwell
+@pytest.mark.parametrize(
+    "scenario",
+    [dataclasses.replace(s, helix_v_up=True) for s in test_scenarios],
+    ids=lambda x: f"scenario: {x}",
+)
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v2"])
+def test_mla_helix_v_up_before_alltoall(scenario: Scenario, comms_medium: str):
+    run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
 def test_mla_helix_fifo_v2_unaligned_softmax_stats():
     # Six heads over CP2 produce three local heads and a 24-byte softmax-stats
     # row, exercising the float2 fallback used by Kimi K3 over CP32.
     scenario = Scenario(num_heads=6, num_kv_heads=6, batch=1, ctx_len=64)
     run_helix_test(_full_test_multi_gpu, scenario, "fifo_v2")
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_tokens", [1, 37, 224])
+def test_helix_v_up_commutes_with_combine(num_tokens: int):
+    """Projecting V before the CP exchange equals projecting the combined latent.
+
+    Emulates the fifo_v2 exchange of ``cp_size`` ranks on one GPU and runs the
+    real combine kernel on both the latent partials (current path, then the
+    rank's V shard) and the V-projected partials (``_helix_project_v_partials``).
+    """
+    torch.manual_seed(0)
+    cp_size, num_heads, kv_lora_rank, v_head_dim = 4, 16, 512, 128
+    heads_per_rank = num_heads // cp_size
+    v_full = torch.randn(num_heads, v_head_dim, kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+    v_full = v_full / kv_lora_rank**0.5
+    mla_like = type("MlaLike", (), {})()
+    mla_like.num_heads_tp = num_heads
+    mla_like.kv_lora_rank = kv_lora_rank
+    mla_like.v_head_dim = v_head_dim
+    mla_like.helix_v_b_proj_full = v_full
+
+    # Partial outputs and (max, sum) softmax stats of every CP rank for all heads.
+    partials = [
+        torch.randn(num_tokens, num_heads * kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+        for _ in range(cp_size)
+    ]
+    stats = []
+    for _ in range(cp_size):
+        s = torch.empty(num_tokens, num_heads, 2, device="cuda", dtype=torch.float32)
+        s[..., 0].uniform_(-2.0, 2.0)
+        s[..., 1].uniform_(0.5, 4.0)
+        stats.append(s)
+    projected = [MLA._helix_project_v_partials(mla_like, p) for p in partials]
+
+    def gather(per_rank, rank, value_dim):
+        # What rank ``rank`` holds after the exchange: its head chunk from every rank.
+        chunks = [
+            t.view(num_tokens, cp_size, heads_per_rank * value_dim)[:, rank] for t in per_rank
+        ]
+        return torch.stack(chunks, dim=1).view(num_tokens, cp_size, heads_per_rank, value_dim)
+
+    for rank in range(cp_size):
+        gathered_stats = torch.stack(
+            [s.view(num_tokens, cp_size, heads_per_rank * 2)[:, rank] for s in stats], dim=1
+        ).view(num_tokens, cp_size, heads_per_rank, 2)
+        latent = torch.ops.trtllm.helix_post_process_native(
+            gather(partials, rank, kv_lora_rank).contiguous(), gathered_stats.contiguous(), 1.0, 1
+        ).view(num_tokens, heads_per_rank, kv_lora_rank)
+        v_shard = v_full[rank * heads_per_rank : (rank + 1) * heads_per_rank]
+        reference = torch.empty(
+            num_tokens, heads_per_rank, v_head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        torch.ops.trtllm.bmm_out(
+            latent.transpose(0, 1), v_shard.transpose(1, 2), reference.transpose(0, 1)
+        )
+        result = torch.ops.trtllm.helix_post_process_native(
+            gather(projected, rank, v_head_dim).contiguous(), gathered_stats.contiguous(), 1.0, 1
+        ).view(num_tokens, heads_per_rank, v_head_dim)
+        torch.testing.assert_close(result.float(), reference.float(), rtol=2e-2, atol=2e-2)
