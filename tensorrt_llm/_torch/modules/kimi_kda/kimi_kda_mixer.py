@@ -49,6 +49,19 @@ _KDA_PREPAD_PREFILL = os.environ.get("TLLM_KDA_PREPAD_PREFILL", "0") == "1"
 # projection kernels. Verify intentionally counts B * num_steps because those
 # flattened token rows form the projection GEMMs' M dimension.
 _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
+# Decode verify runs the [f_a | b] and f_b projections (<= 64 rows) on the CuTe low-M
+# BF16 GEMV instead of cuBLAS split-K.
+_KDA_BF16_LOWM_GEMV = os.environ.get("TRTLLM_K3_BF16_LOWM_GEMV", "0") == "1"
+
+
+def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` on the low-M BF16 GEMV when enabled and applicable."""
+    if _KDA_BF16_LOWM_GEMV and not torch.compiler.is_compiling():
+        from ...cute_dsl_kernels.blackwell import k3_fused_router
+
+        if k3_fused_router.can_use_k3_bf16_lowm_gemv(x, weight):
+            return torch.ops.trtllm.k3_bf16_lowm_gemv(x, weight)
+    return torch.nn.functional.linear(x, weight)
 
 
 def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
@@ -1032,9 +1045,11 @@ class KimiKDALinearAttention(nn.Module):
         if bfa_weight is not None:
 
             def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
-                bfa = torch.nn.functional.linear(x, bfa_weight)
+                bfa = _lowm_gemv_or_linear(x, bfa_weight)
                 f_a = bfa[..., : self.head_dim]
                 beta = bfa[..., self.head_dim : self.head_dim + self.num_heads]
+                if _KDA_BF16_LOWM_GEMV and f_a.dim() == 2:
+                    return beta, _lowm_gemv_or_linear(f_a.contiguous(), self.f_b_proj.weight)
                 return beta, self.f_b_proj(f_a)
 
             projection_aux_stream = (
