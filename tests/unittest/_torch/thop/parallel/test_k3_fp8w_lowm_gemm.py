@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 
 # (N, K): Kimi-K3 Helix decode projections plus small shapes with K % 512 != 0.
 SHAPES = [(3072, 7168), (7168, 768), (384, 1280), (256, 640)]
-MS = [1, 7, 8, 14, 28, 32, 56, 64]
+MS = [1, 7, 8, 14, 28, 32, 56, 64, 65, 112, 128, 168, 224, 256]
 
 
 def _kernel_module():
@@ -149,9 +149,47 @@ def test_split_k_tactics(m, split_k):
     assert _rel_err(out, ref) < 5e-3
 
 
-def test_cuda_graph_capture():
+@pytest.mark.parametrize("split_k", [1, 2, 3, 5])
+@pytest.mark.parametrize(
+    "m, mma_n", [(40, 64), (65, 96), (128, 128), (150, 160), (170, 192), (200, 224), (250, 256)]
+)
+def test_mid_m_tactics(m, mma_n, split_k):
+    """Quantization kernel + TMA-fed GEMM, including split-K reduce-scatter."""
     mod = _kernel_module()
-    n, k, m = 7168, 768, 14
+    n, k = 384, 1280
+    w_fp8, scale = _make_weight(n, k, seed=13)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
+    x = _make_activation(m, k, seed=9)
+    ref = _mxfp8_emulated_reference(x, w_fp8, scale)
+    base = mod.K3MidMTactic(mma_n=mma_n, split_k=split_k, a_stages=1, b_stages=2)
+    tactic = mod.dataclasses.replace(base, a_stages=mod.max_mid_a_stages(n, k, base))
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_k3_fp8w_lowm_gemm(x, w, packed, out, tactic=tactic)
+    torch.cuda.synchronize()
+    assert _rel_err(out, ref) < 5e-3
+
+
+def test_low_m_cutover_dispatch(monkeypatch):
+    """Shapes with a lower low-M cut-over run M above it on the mid-M path."""
+    mod = _kernel_module()
+    n, k, m = 384, 1280, 40
+    monkeypatch.setitem(mod._LOW_M_CUTOVER, (n, k), 32)
+    assert mod.low_m_max_for(n, k) == 32
+    w_fp8, scale = _make_weight(n, k, seed=17)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
+    x = _make_activation(m, k, seed=5)
+    out = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, w, packed)
+    mid = torch.empty_like(out)
+    mod.run_k3_fp8w_lowm_gemm(x, w, packed, mid, tactic=mod.default_mid_tactic(m, n, k))
+    torch.cuda.synchronize()
+    assert torch.equal(out, mid)
+    assert _rel_err(out, _mxfp8_emulated_reference(x, w_fp8, scale)) < 5e-3
+
+
+@pytest.mark.parametrize("m", [14, 200])
+def test_cuda_graph_capture(m):
+    mod = _kernel_module()
+    n, k = 7168, 768
     w_fp8, scale = _make_weight(n, k, seed=7)
     w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
     x = _make_activation(m, k, seed=1)
@@ -178,17 +216,26 @@ def test_rejects_unsupported_inputs():
     w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
     with pytest.raises(ValueError):
         torch.ops.trtllm.k3_fp8w_lowm_gemm(
-            torch.zeros((65, k), device="cuda", dtype=torch.bfloat16), w, packed
+            torch.zeros((mod.MAX_M + 1, k), device="cuda", dtype=torch.bfloat16), w, packed
         )
+    assert not mod.can_run(
+        torch.zeros((mod.MAX_M + 1, k), device="cuda", dtype=torch.bfloat16), w, packed
+    )
+    gate = mod.max_m_for(n, k)
+    assert mod.LOW_M_MAX <= gate <= mod.MAX_M
+    assert mod.can_run(torch.zeros((gate, k), device="cuda", dtype=torch.bfloat16), w, packed)
+    assert not mod.can_run(
+        torch.zeros((gate + 1, k), device="cuda", dtype=torch.bfloat16), w, packed
+    )
     with pytest.raises(ValueError):
         torch.ops.trtllm.k3_fp8w_lowm_gemm(
             torch.zeros((4, k), device="cuda", dtype=torch.bfloat16), w, packed.contiguous()
         )
 
 
-@pytest.mark.parametrize("m", [1, 28, 64, 65])
+@pytest.mark.parametrize("m", [1, 28, 64, 65, 224, 225, 256, 257])
 def test_weight_read_linear_dispatch(m, monkeypatch):
-    """``_Fp8BlockScaleWeightReadLinear`` runs the low-M kernel for M <= 64 when enabled."""
+    """``_Fp8BlockScaleWeightReadLinear`` runs this kernel for M <= max_m_for(N, K)."""
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
 
     torch.manual_seed(0)
@@ -204,7 +251,7 @@ def test_weight_read_linear_dispatch(m, monkeypatch):
     monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
     out = linear(x)
 
-    if m <= _kernel_module().MAX_M:
+    if m <= _kernel_module().max_m_for(n, k):
         direct = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, linear.weight, linear.weight_scale)
         torch.testing.assert_close(out, direct, rtol=0, atol=0)
     else:

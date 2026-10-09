@@ -61,8 +61,9 @@ from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
 from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
 
 
-# SM100/SM103 FP8 block-scale linears with at most 64 rows run the CuTe low-M FP8-weight
-# GEMM (activation quantization fused into the GEMM) instead of DeepGEMM swap-AB.
+# SM100/SM103 FP8 block-scale linears with few rows (per-shape limit, see
+# k3_fp8w_lowm_gemm.can_run) run the CuTe low-M FP8-weight GEMM instead of DeepGEMM
+# swap-AB.
 _FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
 
 

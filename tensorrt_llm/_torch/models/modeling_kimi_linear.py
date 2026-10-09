@@ -129,8 +129,8 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 _K3_FUSE_MOE_RESIDUAL = os.environ.get("TRTLLM_K3_FUSE_MOE_RESIDUAL", "0") == "1"
 
-# SM100/SM103 FP8 weight-read projections with at most 64 rows run the CuTe low-M GEMM
-# (activation quantization fused into the GEMM) instead of DeepGEMM swap-AB.
+# SM100/SM103 FP8 weight-read projections with few rows (per-shape limit, see
+# k3_fp8w_lowm_gemm.can_run) run the CuTe low-M GEMM instead of DeepGEMM swap-AB.
 _K3_FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
 
 # Helix MLA generation applies the V up-projection of all heads before the CP
