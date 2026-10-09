@@ -8470,6 +8470,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_heads, seq_len_q, cls._MMA_TILE_M)
 
         @classmethod
+        def get_split_kv_rows_per_request(cls, num_heads: int,
+                                          seq_len_q: int) -> int:
+            """Split-KV workspace rows one request takes per split in the FP8
+            kernel: num_heads * seq_len_q, plus the padding rows of the last M
+            tile when the kernel runs a padded flat (q_tok, head) fold."""
+            if num_heads >= cls._MMA_TILE_M or seq_len_q <= 1:
+                return num_heads * seq_len_q
+            rows, chunks = BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout(
+                num_heads, seq_len_q, cls._MMA_TILE_M)
+            return rows * chunks
+
+        @classmethod
         def get_default_split_kv(cls, B: int, S: int,
                                  max_active_blocks: int) -> int:
             """~_SPLIT_KV_WAVES waves of (2, B * S, split_kv) CTAs, as a power of
@@ -8519,6 +8531,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return rows
 
         @classmethod
+        def get_max_split_kv_acc_rows(cls, H: int, S: int,
+                                      max_batch_size: int) -> int:
+            """``get_max_split_kv_rows`` in workspace rows: the largest
+            B * split_kv * get_split_kv_rows_per_request(H, s) over the same
+            (batch bucket, s <= S) grid. Equals get_max_split_kv_rows * H
+            unless some s <= S runs a padded flat fold."""
+            rows_per_request = tuple(
+                cls.get_split_kv_rows_per_request(H, s)
+                for s in range(1, S + 1))
+            return cls._max_split_kv_acc_rows(H, S, max_batch_size,
+                                              cls._get_max_active_blocks(),
+                                              rows_per_request)
+
+        @classmethod
+        @functools.cache
+        def _max_split_kv_acc_rows(cls, H: int, S: int, max_batch_size: int,
+                                   max_active_blocks: int,
+                                   rows_per_request: Tuple[int, ...]) -> int:
+            rows = 0
+            for s in range(1, S + 1):
+                folded_s = cls.get_folded_seq_len_q(H, s)
+                bucket = 1
+                while bucket <= max(1, max_batch_size):
+                    split_kv = cls.get_default_split_kv(bucket, folded_s,
+                                                        max_active_blocks)
+                    if split_kv > 1:
+                        rows = max(rows,
+                                   bucket * split_kv * rows_per_request[s - 1])
+                    bucket *= 2
+            return rows
+
+        @classmethod
         def get_max_split_kv_workspace_size(
             cls,
             H: int,
@@ -8541,7 +8585,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # A later capture with a bigger workspace would resize it, so the
             # bound covers every batch size up-front; ``forward`` lowers
             # split_kv for a batch between two buckets instead."""
-            return (cls.get_max_split_kv_rows(H, S, max_batch_size) * H *
+            return (cls.get_max_split_kv_acc_rows(H, S, max_batch_size) *
                     (D + 1) * acc_dtype.width // 8)
 
         @classmethod
@@ -8587,6 +8631,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Padded bytes for the max-batch LSE and split-KV regions."""
             return cls.get_workspace_layout(H, seq_len_q, D, max_batch_size,
                                             acc_dtype)[4]
+
+        def _split_kv_rows_per_request(self) -> int:
+            """Split-KV workspace rows one request of this runner's kernel takes
+            per split (the FP16 kernel has no padded flat fold)."""
+            if self.kernel_class is BlackwellMultiHeadLatentAttentionForwardFP8:
+                return self.get_split_kv_rows_per_request(
+                    self.num_heads, self.seq_len_q)
+            return self.num_heads * self.seq_len_q
+
+        def get_fitting_split_kv(self, batch_size: int,
+                                 max_batch_size: int) -> int:
+            """Largest split_kv whose intermediates for ``batch_size`` requests
+            fit the split-KV workspace sized for ``max_batch_size``."""
+            rows_per_request = self._split_kv_rows_per_request()
+            if rows_per_request == self.num_heads * self.seq_len_q:
+                split_kv_rows = self.get_max_split_kv_rows(
+                    self.num_heads, self.seq_len_q,
+                    max_batch_size) * self.num_heads
+            else:
+                split_kv_rows = self.get_max_split_kv_acc_rows(
+                    self.num_heads, self.seq_len_q, max_batch_size)
+            return split_kv_rows // (batch_size * rows_per_request)
 
         def get_valid_tactics(
             self,
@@ -8942,9 +9008,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                               split_kv_size]
             # The workspace fits each batch bucket's split; a batch between two
             # buckets shrinks its split to fit instead of JIT-compiling a variant.
-            split_kv_rows = split_kv_size // (self.num_heads * (d_latent + 1) *
-                                              cutlass.Float32.width // 8)
-            fitting_split_kv = split_kv_rows // (batch_size * seq_len_q)
+            rows_per_request = self._split_kv_rows_per_request()
+            fitting_split_kv = self.get_fitting_split_kv(
+                batch_size, max_batch_size)
             use_workspace = split_kv > 1 and fitting_split_kv >= 1
             split_kv = max(1, min(split_kv, fitting_split_kv))
 
@@ -8976,6 +9042,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_workspace,
                 is_persistent,
                 kv_bounds is not None,
+                rows_per_request,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop

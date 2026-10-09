@@ -211,21 +211,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
                 num_heads, seq_len_q, mma_qk_tiler_mn[0]))
         # fold_rows: rows of the folded head dimension, i.e. the (q_tok, head)
-        # pairs one M tile holds. With an integer fold it is num_heads * F.
-        # When that still leaves the M tile partly empty but the flattened
-        # [seq_len_q][num_heads] rows split evenly into full M tiles (e.g.
-        # H=96, S_q=4 -> 384 rows = 3 x 128), fold "flat" instead: every M tile
-        # is a contiguous run of 128 (q_tok, head) rows, which removes the
-        # padded MMA rows and one KV pass per request. Row r of folded tile c
-        # is global row c * fold_rows + r, i.e. q_tok = (c * fold_rows + r) //
-        # num_heads, head = (c * fold_rows + r) % num_heads; the per-row math
-        # is unchanged. TRTLLM_MLA_FLAT_FOLD=0 disables it.
-        self.fold_rows = num_heads * self.fold_sq_ratio
-        if (fold_sq and self.fold_rows < mma_qk_tiler_mn[0]
-                and (num_heads * seq_len_q) % mma_qk_tiler_mn[0] == 0
-                and os.environ.get("TRTLLM_MLA_FLAT_FOLD", "1") != "0"):
-            self.fold_rows = mma_qk_tiler_mn[0]
+        # pairs one M tile holds; fold_chunks: M tiles per request. With an
+        # integer fold they are num_heads * F and seq_len_q / F. When that
+        # leaves the M tile partly empty, fold "flat" instead (see
+        # get_fold_layout): every M tile is a contiguous run of 128 (q_tok,
+        # head) rows. Row r of folded tile c is global row c * fold_rows + r,
+        # i.e. q_tok = (c * fold_rows + r) // num_heads, head = (c * fold_rows
+        # + r) % num_heads; the per-row math is unchanged.
+        # flat_fold_padded: num_heads * seq_len_q is not a multiple of the M
+        # tile, so the last tile of a request ends in padding rows (global row
+        # >= num_heads * seq_len_q). Their Q is TMA zero-fill and their
+        # output, LSE and softmax stats are never stored.
+        if fold_sq:
+            self.fold_rows, self.fold_chunks = (
+                BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout(
+                    num_heads, seq_len_q, mma_qk_tiler_mn[0]))
+        else:
+            self.fold_rows = num_heads * self.fold_sq_ratio
+            self.fold_chunks = seq_len_q // self.fold_sq_ratio
         self.flat_fold = self.fold_rows != num_heads * self.fold_sq_ratio
+        self.flat_fold_padded = (self.flat_fold and
+                                 (num_heads * seq_len_q) % self.fold_rows != 0)
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -496,11 +502,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # stride_S == stride_H * H (always true for contiguous [B, S_q, H, D]
         # tensors after the host-side permute).
         if cutlass.const_expr(self.fold_sq and self.flat_fold):
-            # Flat fold: [H, D, S_q, B] -> [rows, D, H * S_q / rows, B].
+            # Flat fold: [H, D, S_q, B] -> [rows, D, ceil(H * S_q / rows), B].
             # Same stride requirement as the integer fold (stride_S == H *
             # stride_H), so the folded rows have the uniform stride stride_H.
             rows = self.fold_rows
-            chunks = self.num_heads * self.seq_len_q // rows
+            chunks = self.fold_chunks
 
             def _fold_sq_4d(t):
                 return cute.make_tensor(
@@ -516,8 +522,38 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                 )
 
-            q_latent = _fold_sq_4d(q_latent)
-            q_rope = _fold_sq_4d(q_rope)
+            if cutlass.const_expr(self.flat_fold_padded):
+                # In the chunked view the padded rows of the last tile would
+                # alias the next request's Q (or run past the tensor), so Q
+                # keeps one row mode of the H * S_q real rows per request:
+                # [H*S_q, D, 1, B]. Tile c is M tile c of that mode, and TMA
+                # zero-fills its rows past H * S_q. O, LSE and the softmax
+                # stats use the chunked view with the padded rows masked off
+                # at the stores.
+                def _flat_rows_4d(t):
+                    return cute.make_tensor(
+                        t.iterator,
+                        cute.make_layout(
+                            (
+                                self.num_heads * self.seq_len_q,
+                                t.shape[1],
+                                1,
+                                t.shape[3],
+                            ),
+                            stride=(
+                                t.stride[0],
+                                t.stride[1],
+                                t.stride[2],
+                                t.stride[3],
+                            ),
+                        ),
+                    )
+
+                q_latent = _flat_rows_4d(q_latent)
+                q_rope = _flat_rows_4d(q_rope)
+            else:
+                q_latent = _fold_sq_4d(q_latent)
+                q_rope = _fold_sq_4d(q_rope)
             o = _fold_sq_4d(o)
             lse = cute.make_tensor(
                 lse.iterator,
@@ -596,10 +632,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                 )
 
+        # Split-KV intermediates follow the (rows, chunks) tiling of O; with a
+        # padded flat fold that is not the Q TMA view.
+        if cutlass.const_expr(self.flat_fold_padded):
+            ws_rows, ws_chunks = self.fold_rows, self.fold_chunks
+        else:
+            ws_rows, ws_chunks = q_latent.shape[0], q_latent.shape[2]
         acc_o, acc_lse = self.initialize_workspace(
-            q_latent.shape[0],
+            ws_rows,
             q_latent.shape[1],
-            q_latent.shape[2],
+            ws_chunks,
             q_latent.shape[3],
             split_kv,
             self.acc_dtype,
@@ -1003,8 +1045,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cache_seqs,
                     block_split_kvs,
                 )
+            # One CTA per (row, chunk, batch); a padded flat fold launches only
+            # the H * S_q real rows of each request (see reduction_kernel).
+            if cutlass.const_expr(self.flat_fold_padded):
+                reduction_grid = (self.num_heads * self.seq_len_q, 1,
+                                  q_latent.shape[3])
+            else:
+                reduction_grid = (q_latent.shape[0], q_latent.shape[2],
+                                  q_latent.shape[3])
             reduction_kernel.launch(
-                grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
+                grid=reduction_grid,
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
                 stream=stream,
@@ -1544,6 +1594,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
                     split_kv, cache_seqs, block_split_kvs, blk_coord)
                 if k_tile_count > 0:
+                    # H bounds the stored rows of this tile; with a padded
+                    # flat fold the rows from H on are M-tile padding.
+                    if cutlass.const_expr(self.flat_fold_padded):
+                        stored_rows = (self.num_heads * self.seq_len_q -
+                                       blk_coord[1] * self.fold_rows)
+                    else:
+                        stored_rows = mQL.shape[0]
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
                         split_kv=split_kv,
@@ -1553,7 +1610,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         L=mCL.shape[1],
-                        H=mQL.shape[0],
+                        H=stored_rows,
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
                         tiled_mma_pv=tiled_mma_pv,
@@ -1623,7 +1680,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        blk_coord = (bidx, bidy, bidz)
+        if cutlass.const_expr(self.flat_fold_padded):
+            # Grid (H * S_q, 1, B): blockIdx.x is the global (q_tok, head) row,
+            # so no CTA lands on an M-tile padding row.
+            blk_coord = (bidx % self.fold_rows, bidx // self.fold_rows, bidz)
+        else:
+            blk_coord = (bidx, bidy, bidz)
         local_split_kv = (block_split_kvs[blk_coord[2]]
                           if self.is_var_split_kv else split_kv)
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]],
@@ -1898,15 +1960,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tSgKR,
         )
 
-        tQLgQL = tQLgQL_mkl[None, None, None, common_params.blk_coord[1],
-                            common_params.blk_coord[2]]
-        tQRgQR = tQRgQR_mkl[None, None, None, common_params.blk_coord[1],
-                            common_params.blk_coord[2]]
+        if cutlass.const_expr(self.flat_fold_padded):
+            # Q view [H*S_q, D, 1, B]: chunk c is M tile c of the row mode.
+            tQLgQL = tQLgQL_mkl[None, None, None, 0, common_params.blk_coord[2]]
+            tQRgQR = tQRgQR_mkl[None, None, None, 0, common_params.blk_coord[2]]
+            q_m_tile = common_params.blk_coord[1]
+        else:
+            tQLgQL = tQLgQL_mkl[None, None, None, common_params.blk_coord[1],
+                                common_params.blk_coord[2]]
+            tQRgQR = tQRgQR_mkl[None, None, None, common_params.blk_coord[1],
+                                common_params.blk_coord[2]]
+            q_m_tile = 0
 
         # set extra params
         common_params.mPT = mPT
         qk_params.tQLgQL = tQLgQL
         qk_params.tQRgQR = tQRgQR
+        qk_params.q_m_tile = q_m_tile
         qk_params.tCLgCL = tCLgCL
         qk_params.tKRgKR = tKRgKR
         qk_params.tQsQ = tQsQ
@@ -2048,7 +2118,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 # load q latent
                 cute.copy(
                     qk_params.tma_atom_q_latent,
-                    qk_params.tQLgQL[None, 0, i],
+                    qk_params.tQLgQL[None, qk_params.q_m_tile, i],
                     qk_params.tQsQ[None, (i, 0)],
                     tma_bar_ptr=tma_bar_ptr,
                 )
@@ -2056,7 +2126,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 # load q rope
                 cute.copy(
                     qk_params.tma_atom_q_rope,
-                    qk_params.tQRgQR[None, 0, i],
+                    qk_params.tQRgQR[None, qk_params.q_m_tile, i],
                     qk_params.tQsQ_rope[None, i],
                     tma_bar_ptr=tma_bar_ptr,
                 )
@@ -2865,6 +2935,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             common_params.blk_coord[2] * self.seq_len_q +
                             q_tok_c]
                     else:
+                        if cutlass.const_expr(self.flat_fold_padded):
+                            # Padding rows past H * S_q derive q_tok >= S_q;
+                            # clamp so they never see columns >= K.
+                            q_tok = (q_tok if cute.elem_less(
+                                q_tok, self.seq_len_q) else self.seq_len_q - 1)
                         k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
@@ -2921,6 +2996,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             common_params.blk_coord[2] * self.seq_len_q +
                             q_tok_c]
                     else:
+                        if cutlass.const_expr(self.flat_fold_padded):
+                            # Padding rows past H * S_q derive q_tok >= S_q;
+                            # clamp so they never see columns >= K.
+                            q_tok = (q_tok if cute.elem_less(
+                                q_tok, self.seq_len_q) else self.seq_len_q - 1)
                         k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
@@ -3639,6 +3719,30 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         return 1
 
     @staticmethod
+    def get_fold_layout(num_heads: int, seq_len_q: int,
+                        m_tile: int) -> Tuple[int, int]:
+        """(rows per M tile, M tiles per request) of the fold_sq=True tiling.
+
+        The integer fold F (``compute_fold_sq_ratio``) gives num_heads * F rows
+        in seq_len_q / F tiles. When that leaves the M tile partly empty and
+        the flattened [seq_len_q][num_heads] rows fit in fewer full tiles, fold
+        them flat instead: ceil(num_heads * seq_len_q / m_tile) tiles of
+        m_tile contiguous (q_tok, head) rows, the last one ending in padding
+        rows when num_heads * seq_len_q is not a multiple of m_tile (e.g. Kimi
+        K3's H=96: S_q=4 -> 3 full tiles instead of 4, S_q=7 -> 6 tiles, the
+        last holding 32 rows, instead of 7). Every tile reads the request's
+        KV once. TRTLLM_MLA_FLAT_FOLD=0 keeps the integer fold.
+        """
+        fold = BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
+            num_heads, seq_len_q, m_tile)
+        rows, chunks = num_heads * fold, seq_len_q // fold
+        if rows < m_tile and os.environ.get("TRTLLM_MLA_FLAT_FOLD", "1") != "0":
+            flat_chunks = ceil_div(num_heads * seq_len_q, m_tile)
+            if flat_chunks < chunks:
+                return m_tile, flat_chunks
+        return rows, chunks
+
+    @staticmethod
     def get_workspace_size(
         H: int,
         S: int,
@@ -4126,15 +4230,18 @@ def run(
     def create_workspace(num_heads, seq_len_q, latent_dim, batch_size, split_kv,
                          acc_dtype):
         # When folding S_q into heads, the kernel allocates the per-split
-        # workspace using the effective (folded) dims [H*F, S_q/F]. Mirror that
-        # here so the host-allocated workspace matches. get_workspace_size
-        # uses H*S directly, so H*F * (S_q/F) == H*S_q -> identical size; this
-        # is kept explicit for clarity / parity with the integration layer.
+        # workspace using the effective (folded) dims [rows, tiles] of
+        # get_fold_layout. Mirror that here so the host-allocated workspace
+        # matches: rows * tiles == H * S_q, except for a padded flat fold,
+        # whose last tile also holds padding rows.
         fold_ratio = (
             BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
                 num_heads, seq_len_q, mma_qk_tiler_mn[0]))
-        num_heads_eff = num_heads * fold_ratio
-        seq_len_q_eff = seq_len_q // fold_ratio
+        num_heads_eff, seq_len_q_eff = num_heads, seq_len_q
+        if fold_ratio > 1:
+            num_heads_eff, seq_len_q_eff = (
+                BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout(
+                    num_heads, seq_len_q, mma_qk_tiler_mn[0]))
         workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
             num_heads_eff,
             seq_len_q_eff,

@@ -21,6 +21,11 @@ used to run S_q = 4 tiles of 96 valid rows per request. The flat fold packs the
 output must be BITWISE identical to the unfolded kernel (TRTLLM_MLA_FLAT_FOLD=0)
 at any split_kv, and agree with an fp32 reference of the MTP-causal attention.
 
+When H * S_q is not a multiple of 128 (K3 with MTP6: S_q = 7, 672 rows) the flat
+fold pads the last M tile (6 tiles instead of 7). The padded rows must never be
+stored: the output, LSE and Helix softmax stats past each request stay untouched
+and the valid rows stay bitwise identical to the unfolded kernel.
+
 Requires 1 SM100/SM103 GPU and nvidia-cutlass-dsl.
 """
 
@@ -172,4 +177,235 @@ def test_flat_fold_is_bitwise_identical(H, S, split_kv, monkeypatch):
     assert torch.equal(new, ref)
     gold = _reference(x, lens, S, H)
     err = (new.float() - gold).abs().max().item()
+    assert err <= 0.05 * gold.abs().max().item(), err
+
+
+@pytest.mark.parametrize("flat_fold", [True, False])
+def test_fold_layout(flat_fold, monkeypatch):
+    monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", "1" if flat_fold else "0")
+    layout = BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout
+    # (rows per M tile, M tiles per request) for K3's 96 heads
+    expected = {
+        2: (96, 2),
+        3: (96, 3),
+        4: (128, 3),
+        5: (128, 4),
+        6: (128, 5),
+        7: (128, 6),
+        8: (128, 6),
+    }
+    for S, flat in expected.items():
+        assert layout(96, S, 128) == (flat if flat_fold else (96, S)), S
+    # integer folds that fill the tile are unchanged; a partial one goes flat
+    assert layout(32, 4, 128) == (128, 1)
+    assert layout(48, 3, 128) == ((128, 2) if flat_fold else (48, 3))
+    assert layout(16, 3, 128) == (48, 1)
+
+    rows = CuteDSLNVMlaDecodeBlackwellRunner.get_split_kv_rows_per_request
+    assert rows(96, 7) == (768 if flat_fold else 672)
+    torch.zeros(1, device="cuda")  # HardwareInfo needs a current CUDA context
+    assert rows(96, 4) == 384 and rows(128, 2) == 256 and rows(96, 1) == 96
+    # the split-KV workspace bound grows only by the padding rows
+    acc = CuteDSLNVMlaDecodeBlackwellRunner.get_max_split_kv_acc_rows
+    old = CuteDSLNVMlaDecodeBlackwellRunner.get_max_split_kv_rows
+    assert acc(96, 4, 128) == old(96, 4, 128) * 96
+    assert acc(96, 7, 128) >= old(96, 7, 128) * 96
+
+
+def test_k3_mtp6_takes_the_padded_flat_fold(monkeypatch):
+    monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", "1")
+    k = BlackwellMultiHeadLatentAttentionForwardFP8(
+        cutlass.Float32,
+        cutlass.Float32,
+        (128, 128),
+        (128, 256),
+        76,
+        PAGE,
+        0.0,
+        False,
+        True,
+        False,
+        num_heads=96,
+        seq_len_q=7,
+        fold_sq=True,
+    )
+    assert (k.fold_rows, k.fold_chunks) == (128, 6)
+    assert k.flat_fold and k.flat_fold_padded
+
+
+# Compiled kernels per TRTLLM_MLA_FLAT_FOLD value, shared across the tests below
+# (the runner's cache key does not see the environment variable).
+_KERNEL_CACHES = {"0": {}, "1": {}}
+_MAX_BATCH = 64
+
+
+def _padded_inputs(lens, S, H, helix, seed):
+    torch.manual_seed(seed)
+    x = _make_inputs(lens, S, H, seed=seed)
+    B = len(lens)
+    x["lens"] = lens
+    if helix:
+        # Per-token rank-local bounds of a speculative verify group: the rank
+        # holds K local entries, of which the group's S_q tokens own at most
+        # S_q, so each token sees between K - S_q and K of them (none at all
+        # for a request whose K <= S_q).
+        bounds = []
+        for L in lens:
+            for _ in range(S):
+                bounds.append(int(torch.randint(max(0, L - S), L + 1, (1,)).item()))
+        bounds[0] = lens[0] - S
+        bounds[-S] = 0
+        bounds[-1] = lens[-1]
+        x["kv_bounds"] = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+        x["stats_shape"] = (B * S, H, 2)
+    return x
+
+
+def _run_guarded(x, H, S, split_kv, flat_fold, monkeypatch):
+    """Run the runner with NaN-filled outputs plus one request's worth of
+    guard rows behind O and the softmax stats; returns (o, lse, stats)."""
+    flag = "1" if flat_fold else "0"
+    monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", flag)
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", _KERNEL_CACHES[flag])
+    B = len(x["lens"])
+    helix = "kv_bounds" in x
+    runner = CuteDSLNVMlaDecodeBlackwellRunner(
+        in_dtype=cutlass.Float8E4M3FN,
+        num_heads=H,
+        seq_len_q=S,
+        page_size=PAGE,
+        max_batch_size=_MAX_BATCH,
+        emit_softmax_stats=helix,
+    )
+    n_o = B * S * H * D
+    o_buf = torch.full((n_o + S * H * D,), float("nan"), dtype=torch.bfloat16, device="cuda")
+    o = o_buf[:n_o].view(B, S, H, D)
+    lse_off, lse_size, _, _, ws_size = runner.get_workspace_layout(
+        H, S, D, _MAX_BATCH, cutlass.Float32
+    )
+    ws = torch.full(
+        (ws_size,), 0xFF, dtype=torch.uint8, device="cuda"
+    )  # 0xFFFFFFFF is a float32 NaN
+    inputs = list(x["inputs"])
+    inputs[6] = o.permute(2, 3, 1, 0)
+    inputs[7] = ws
+    stats_buf = None
+    if helix:
+        stats_buf = torch.full((B * S + S, H, 2), float("nan"), dtype=torch.float32, device="cuda")
+        inputs[8] = stats_buf[: B * S]
+        inputs[9] = x["kv_bounds"]
+    runner.forward(inputs, ((128, 128), (128, 256), split_kv, False))
+    torch.cuda.synchronize()
+
+    # Nothing is stored past the last request, and every real row is stored.
+    assert torch.isnan(o_buf[n_o:].float()).all()
+    assert torch.isfinite(o.float()).all()
+    lse_all = ws[lse_off : lse_off + lse_size].view(torch.float32).view(_MAX_BATCH, S, H)
+    assert torch.isnan(lse_all[B:]).all()
+    assert torch.isfinite(lse_all[:B]).all()
+    stats = None
+    if helix:
+        assert torch.isnan(stats_buf[B * S :]).all()
+        stats = stats_buf[: B * S].clone()
+        assert not torch.isnan(stats).any()
+    return o.clone(), lse_all[:B].clone(), stats
+
+
+def _reference_bounded(x, S, H):
+    """fp32 reference; bound[b][s] is the number of KV entries token s sees."""
+    q = x["q"].float()
+    kv = x["kv_pages"].float()
+    lens = x["lens"]
+    out = torch.zeros(len(lens), S, H, D, dtype=torch.float32, device="cuda")
+    valid = torch.zeros(len(lens), S, dtype=torch.bool)
+    scale = 1.0 / math.sqrt(192)
+    for b, L in enumerate(lens):
+        pages = x["pt"][b, : math.ceil(L / PAGE)].long()
+        c = kv[pages].reshape(-1, D + R)[:L]
+        for s in range(S):
+            if "kv_bounds" in x:
+                bound = int(x["kv_bounds"][b * S + s].item())
+            else:
+                bound = L - (S - 1) + s
+            if bound <= 0:
+                continue
+            logits = (q[b, s] @ c[:bound].T) * scale  # [H, bound]
+            out[b, s] = torch.softmax(logits, dim=-1) @ c[:bound, :D]
+            valid[b, s] = True
+    return out, valid
+
+
+def _effective_split(H, S, B, split_kv, monkeypatch):
+    """Requested split, capped like forward() caps it, for both foldings, so
+    the folded and unfolded runs use the same split."""
+    torch.zeros(1, device="cuda")  # HardwareInfo needs a current CUDA context
+    fits = []
+    for flag in ("0", "1"):
+        monkeypatch.setenv("TRTLLM_MLA_FLAT_FOLD", flag)
+        runner = CuteDSLNVMlaDecodeBlackwellRunner(
+            in_dtype=cutlass.Float8E4M3FN,
+            num_heads=H,
+            seq_len_q=S,
+            page_size=PAGE,
+            max_batch_size=_MAX_BATCH,
+        )
+        fits.append(runner.get_fitting_split_kv(B, _MAX_BATCH))
+    return max(1, min([split_kv] + fits))
+
+
+_LENS = {
+    # mixed lengths incl. one KV tile, page and tile boundaries, < 2 tiles
+    "mixed8": [3000, 70, 1500, 8191, 64, 513, 2048, 4500],
+    # K3 Helix CP16 per-rank KV (7.3k / 10k) and a request barely past S_q
+    "k3": [7300, 10000, 9],
+    # one request: the last tile's padding rows would run past every tensor
+    "single": [7300],
+}
+
+
+@pytest.mark.parametrize("lens_name", list(_LENS))
+@pytest.mark.parametrize("split_kv", [1, 2, 4, 8])
+@pytest.mark.parametrize("H,S", [(96, 7), (96, 6), (96, 5), (48, 3)])
+def test_padded_flat_fold_is_bitwise_identical(H, S, split_kv, lens_name, monkeypatch):
+    lens = _LENS[lens_name]
+    split_kv = _effective_split(H, S, len(lens), split_kv, monkeypatch)
+    x = _padded_inputs(lens, S, H, helix=False, seed=11)
+    ref_o, ref_lse, _ = _run_guarded(x, H, S, split_kv, flat_fold=False, monkeypatch=monkeypatch)
+    new_o, new_lse, _ = _run_guarded(x, H, S, split_kv, flat_fold=True, monkeypatch=monkeypatch)
+    assert torch.equal(new_o, ref_o)
+    assert torch.equal(new_lse, ref_lse)
+    gold, _ = _reference_bounded(x, S, H)
+    err = (new_o.float() - gold).abs().max().item()
+    assert err <= 0.05 * gold.abs().max().item(), err
+
+
+@pytest.mark.parametrize("split_kv", [1, 4])
+@pytest.mark.parametrize("H,S", [(96, 7), (96, 5), (48, 3)])
+def test_padded_flat_fold_helix_bounds_and_stats(H, S, split_kv, monkeypatch):
+    lens = _LENS["k3"] + [700, 3000, S]
+    split_kv = _effective_split(H, S, len(lens), split_kv, monkeypatch)
+    x = _padded_inputs(lens, S, H, helix=True, seed=5)
+    ref_o, ref_lse, ref_stats = _run_guarded(
+        x, H, S, split_kv, flat_fold=False, monkeypatch=monkeypatch
+    )
+    new_o, new_lse, new_stats = _run_guarded(
+        x, H, S, split_kv, flat_fold=True, monkeypatch=monkeypatch
+    )
+    assert torch.equal(new_o, ref_o)
+    assert torch.equal(new_lse, ref_lse)
+    assert torch.equal(new_stats, ref_stats)
+    gold, valid = _reference_bounded(x, S, H)
+    v = valid.to("cuda")
+    err = (new_o.float() - gold).abs()[v].max().item()
+    assert err <= 0.05 * gold.abs().max().item(), err
+
+
+@pytest.mark.parametrize("S", [2, 3])
+def test_k3_short_mtp_keeps_the_unfolded_tiling(S, monkeypatch):
+    # 96 * S rows need S M tiles either way, so the tiling stays per token.
+    lens = _LENS["mixed8"]
+    x = _padded_inputs(lens, S, 96, helix=False, seed=3)
+    new_o, _, _ = _run_guarded(x, 96, S, 2, flat_fold=True, monkeypatch=monkeypatch)
+    gold, _ = _reference_bounded(x, S, 96)
+    err = (new_o.float() - gold).abs().max().item()
     assert err <= 0.05 * gold.abs().max().item(), err
