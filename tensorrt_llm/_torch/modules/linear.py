@@ -61,6 +61,18 @@ from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
 from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
 
 
+# SM100/SM103 FP8 block-scale linears with at most 64 rows run the CuTe low-M FP8-weight
+# GEMM (activation quantization fused into the GEMM) instead of DeepGEMM swap-AB.
+_FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
+
+
+def _fp8w_lowm_gemm_can_run(input: torch.Tensor, weight: torch.Tensor,
+                            weight_scale: torch.Tensor) -> bool:
+    """Whether ``trtllm::k3_fp8w_lowm_gemm`` serves this GEMM (registers the op)."""
+    from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+    return k3_fp8w_lowm_gemm.can_run(input, weight, weight_scale)
+
+
 def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
     """Fast pre-filter: check the global enable flag and M upper bound only."""
     if not LOW_M_GEMM_ACTIVE:
@@ -1353,12 +1365,17 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
         elif is_sm_100f() and not module.disable_deep_gemm:
-            output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                input,
-                module.weight,
-                module.weight_scale,
-                disable_ue8m0_cast=True,
-            )
+            if _FP8W_LOWM_GEMM and _fp8w_lowm_gemm_can_run(
+                    input, module.weight, module.weight_scale):
+                output = torch.ops.trtllm.k3_fp8w_lowm_gemm(
+                    input, module.weight, module.weight_scale)
+            else:
+                output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                    input,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
         else:
             if sm_version == 120:
                 act_input_fp8, act_input_sf = per_token_quant_and_transform(

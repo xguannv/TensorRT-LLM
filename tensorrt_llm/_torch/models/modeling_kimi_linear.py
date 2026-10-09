@@ -129,6 +129,10 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 _K3_FUSE_MOE_RESIDUAL = os.environ.get("TRTLLM_K3_FUSE_MOE_RESIDUAL", "0") == "1"
 
+# SM100/SM103 FP8 weight-read projections with at most 64 rows run the CuTe low-M GEMM
+# (activation quantization fused into the GEMM) instead of DeepGEMM swap-AB.
+_K3_FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
+
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
@@ -946,6 +950,15 @@ def _rubin_mxfp8_is_available() -> bool:
     return get_sm_version() == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 
 
+def _k3_lowm_gemm_can_run(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> bool:
+    """Whether ``trtllm::k3_fp8w_lowm_gemm`` serves this projection (registers the op)."""
+    from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+    return k3_fp8w_lowm_gemm.can_run(x, weight, weight_scale)
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
@@ -1108,6 +1121,12 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 output_dtype=torch.bfloat16,
                 fine_grained_m=True,
             )
+        elif (
+            _K3_FP8W_LOWM_GEMM
+            and x.dtype == torch.bfloat16
+            and _k3_lowm_gemm_can_run(x_flat, self.weight, self.weight_scale)
+        ):
+            out = torch.ops.trtllm.k3_fp8w_lowm_gemm(x_flat, self.weight, self.weight_scale)
         else:
             out = torch.ops.trtllm.fp8_swap_ab_gemm(
                 x_flat,
