@@ -21,10 +21,11 @@ FP32 accumulation order differs from the reference GEMM, so:
 * top-k ids and weights must be bit-identical to ``noaux_tc_op`` applied to the kernel's own
   logits;
 * the ``moe_sort`` outputs must be bit-identical to a token-ordered sort of the kernel's own
-  ids. ``moe_sort`` itself produces exactly that order up to 12 tokens (single-CTA kernels);
-  above that its cluster kernel orders the rows of a tile by shared-memory atomics (it is not
-  deterministic from run to run), so there only the tile metadata must match exactly and the
-  rows of each tile must be the same set.
+  ids (experts with more than 128 tokens span several tiles). ``moe_sort`` itself produces
+  exactly that order up to 12 tokens (single-CTA kernels); above that its cluster kernel orders
+  the rows of a tile by shared-memory atomics (it is not deterministic from run to run), so
+  there only the tile metadata must match exactly and the rows of each tile must be the same
+  set.
 """
 
 import pytest
@@ -39,9 +40,19 @@ NUM_EXPERTS = 896
 HIDDEN = 7168
 TOP_K = 16
 TILE = 128
-MS = [1, 7, 14, 17, 28, 33, 56, 64]
-# (local_expert_offset, local_num_experts): EP16 ranks, TP8xEP2 ranks, no EP.
-LAYOUTS = [(0, 56), (7 * 56, 56), (15 * 56, 56), (0, 448), (448, 448), (0, 896)]
+# M <= 64 runs the mma.sync GEMM path, larger M the tcgen05 one.
+MS = [1, 7, 14, 17, 28, 33, 56, 64, 65, 112, 128, 168, 224, 256]
+# (local_expert_offset, local_num_experts): EP16 ranks, TP4xEP4 ranks, TP8xEP2 ranks, no EP.
+LAYOUTS = [
+    (0, 56),
+    (7 * 56, 56),
+    (15 * 56, 56),
+    (0, 224),
+    (3 * 224, 224),
+    (0, 448),
+    (448, 448),
+    (0, 896),
+]
 
 
 def _kernel_module():
@@ -76,7 +87,7 @@ def _assert_bit_equal(actual, expected, what):
 
 def _check_topk(k3, h, w, bias, scale=1.0):
     ids, vals, logits = torch.ops.trtllm.k3_fused_router_topk(h, w, bias, scale, True)
-    exact = h.float() @ w.float().t()
+    exact = (h.double() @ w.double().t()).float()
     torch.testing.assert_close(logits, exact, rtol=0, atol=5e-5)
     ref_gemm = torch.ops.trtllm.dsv3_router_gemm_op(h, w.t(), bias=None, out_dtype=torch.float32)
     torch.testing.assert_close(logits, ref_gemm, rtol=0, atol=1e-4)
@@ -213,29 +224,34 @@ def test_sort_matches_moe_sort(m, layout):
     _check_sort(k3, h, w, bias, *layout)
 
 
-@pytest.mark.parametrize("m", [4, 12])
+@pytest.mark.parametrize("m", [4, 12, 129, 200, 256])
 def test_sort_concentrated_routing(m):
-    """Every token routed to the same few experts (bias dominates the score)."""
+    """Every token routed to the same 16 experts (bias dominates the score); above 128 tokens
+    each of them spans two tiles, the second one partial."""
     k3 = _kernel_module()
     h, w, bias = _inputs(m, seed=400 + m)
     bias = torch.zeros_like(bias)
     bias[100:116] = 10.0
-    _check_sort(k3, h, w, bias, 56, 56)
+    outs = _check_sort(k3, h, w, bias, 56, 56)
+    # Experts 100..111 of the 16 favored ones are local to [56, 112).
+    assert int(outs[7]) == 12 * ((m + TILE - 1) // TILE)
+    _check_sort(k3, h, w, bias, 0, 224)
     _check_sort(k3, h, w, bias, 0, 448)
 
 
 def test_cuda_graph_replay():
     """Replays must reproduce eager results (the kernel re-arms its persistent workspace)."""
     k3 = _kernel_module()
-    m = 28
-    h, w, bias = _inputs(m, seed=500)
+    m, m_big = 28, 200
+    h, w, bias = _inputs(m_big, seed=500)
     w2 = (w.float() * -0.5).to(torch.bfloat16)
-    static_h = h.clone()
+    static_big = h.clone()
+    static_h = static_big[:m]
 
     def run():
         a = torch.ops.trtllm.k3_fused_router_sort(static_h, w, bias, 1.0, 0, 56, TILE, True)
-        b = torch.ops.trtllm.k3_fused_router_topk(static_h, w2, bias, 1.0, False)
-        c = torch.ops.trtllm.k3_fused_router_sort(static_h, w2, bias, 1.0, 448, 448, TILE, False)
+        b = torch.ops.trtllm.k3_fused_router_topk(static_big, w2, bias, 1.0, False)
+        c = torch.ops.trtllm.k3_fused_router_sort(static_big, w2, bias, 1.0, 448, 448, TILE, False)
         return a, b, c
 
     stream = torch.cuda.Stream()
@@ -247,8 +263,8 @@ def test_cuda_graph_replay():
     with torch.cuda.graph(graph):
         captured = run()
     for step in range(4):
-        new_h, _, _ = _inputs(m, seed=600 + step)
-        static_h.copy_(new_h)
+        new_h, _, _ = _inputs(m_big, seed=600 + step)
+        static_big.copy_(new_h)
         graph.replay()
         torch.cuda.synchronize()
         eager = run()
@@ -260,7 +276,8 @@ def test_cuda_graph_replay():
         _assert_bit_equal(captured[0][4], eager[0][4], "replay expanded_idx_to_permuted_idx")
         _assert_bit_equal(captured[2][4], eager[2][4], "replay expanded_idx_to_permuted_idx")
 
-    # Between launches the arrival counter is zero and every handoff slot holds the sentinel.
+    # Between launches the arrival counter is zero and every hand-off slot (expert ids and both
+    # paths' partial logits) holds the sentinel again.
     for counter, slots in k3._WORKSPACES.values():
         assert int(counter[0]) == 0
         assert bool((slots == -1).all())
@@ -268,7 +285,7 @@ def test_cuda_graph_replay():
 
 def test_rejects_unsupported_inputs():
     k3 = _kernel_module()
-    h, w, bias = _inputs(65, seed=1)
+    h, w, bias = _inputs(257, seed=1)
     assert not k3.can_use_k3_fused_router(h, w, bias)
     with pytest.raises(ValueError):
         torch.ops.trtllm.k3_fused_router_topk(h, w, bias, 1.0, False)

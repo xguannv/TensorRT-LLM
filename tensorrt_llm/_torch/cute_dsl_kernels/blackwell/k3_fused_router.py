@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Kimi-K3 MoE routing for small decode batches (SM100/SM103).
+"""Fused Kimi-K3 MoE routing for decode batches (SM100/SM103).
 
 One launch replaces ``dsv3_router_gemm_op`` -> ``noaux_tc_op`` (-> ``moe_sort``):
 
@@ -10,39 +10,45 @@ One launch replaces ``dsv3_router_gemm_op`` -> ``noaux_tc_op`` (-> ``moe_sort``)
   ``noaux_tc_op`` applied to the same logits (selection, order and weights);
 * optionally the six ``moe_sort`` outputs of one expert-parallel rank.
 
-Design (``1 <= M <= 64``):
+Design (``1 <= M <= 256``):
 
-* GEMM. The grid has ``8 * S`` CTAs (``S = num_SMs // 8``, one CTA per SM). CTA ``(g, s)``
-  owns 112 experts (seven MMA warps x 16 rows) and the ``s``-th slice of K in 64-wide chunks.
-  One thread TMA-loads the CTA's whole weight slice (<= 7 x 14 KB, 128B-swizzled) before
-  ``griddepcontrol.wait``, so the weight stream can overlap the previous kernel, then the
-  matching activation chunks. Warps run ``mma.sync`` m16n8k16 (experts on the MMA M side,
-  tokens on N) and store FP32 partial logits into sentinel-initialized slots
-  ``[S, 64, 896]`` of a persistent workspace.
-* Roles. When its operands have landed, each CTA takes a ticket from an arrival counter. The
-  last ``T = M`` CTAs become top-k workers; all others exit after storing their partials.
-  A worker waits on at most ``T - 1`` CTAs that have not arrived yet, and every CTA that
-  arrived earlier has exited or is a worker, so progress needs only ``T + 1`` co-resident
-  CTAs (no grid-wide co-residency assumption). The last CTA to arrive resets the counter.
-* Top-k. Worker ``w`` polls the ``S`` partial slots of token ``w`` until none holds the
-  sentinel (the data is the signal: no fences or flags on the critical path), sums them in
-  split order and forms ``noaux_tc_op``'s packed 64-bit keys (order-preserving score bits,
-  then ``65535 - expert``). Each warp sorts its 112 keys with register bitonic networks into
-  its top 16; the global top 16 is then placed by a rank merge (binary searches over the
-  eight sorted lists). Keys are unique, so this is exactly ``noaux_tc_op``'s selection.
-  The weights use FP32 division, which equals the reference's FP64 expression whenever the
-  scale is 1 and the sum is >= 2^-12, and the FP64 expression otherwise.
+* GEMM, ``M <= 64``. The grid has ``8 * S`` CTAs (``S = num_SMs // 8``, one CTA per SM).
+  CTA ``(g, s)`` owns 112 experts (seven MMA warps x 16 rows) and the ``s``-th slice of K in
+  64-wide chunks. One thread TMA-loads the CTA's whole weight slice (<= 7 x 14 KB,
+  128B-swizzled) before ``griddepcontrol.wait``, so the weight stream can overlap the previous
+  kernel, then the matching activation chunks. Warps run ``mma.sync`` m16n8k16 (experts on the
+  MMA M side, tokens on N).
+* GEMM, ``64 < M <= 256``. ``7 * S`` CTAs (``S = num_SMs // 7``) of 128 experts each run
+  ``tcgen05`` UMMA (M = 128 experts, N = padded tokens, accumulator in tensor memory) over
+  32-wide K chunks: the weight is again prefetched whole before ``griddepcontrol.wait``, the
+  activation chunks stream through a TMA ring, and four warps copy the accumulator out.
+* Either way the FP32 partial logits go into sentinel-initialized slots ``[S, 256, 896]`` of a
+  persistent workspace.
+* Roles. When its GEMM is done, each CTA takes a ticket from an arrival counter. The last
+  ``T = min(M, CTAs - 1)`` CTAs become top-k workers (token ``t`` goes to worker ``t % T``);
+  all others exit after storing their partials. A worker waits on at most ``T - 1`` CTAs that
+  have not arrived yet, and every CTA that arrived earlier has exited or is a worker, so
+  progress needs only ``T + 1`` co-resident CTAs (no grid-wide co-residency assumption). The
+  last CTA to arrive resets the counter.
+* Top-k. A worker polls the ``S`` partial slots of its token until none holds the sentinel
+  (the data is the signal: no fences or flags on the critical path), sums them in split order
+  and forms ``noaux_tc_op``'s packed 64-bit keys (order-preserving score bits, then ``65535 -
+  expert``). Each warp sorts its 112 keys with register bitonic networks into its top 16; the
+  global top 16 is then placed by a rank merge (binary searches over the eight sorted lists).
+  Keys are unique, so this is exactly ``noaux_tc_op``'s selection. The weights use FP32
+  division, which equals the reference's FP64 expression whenever the scale is 1 and the sum
+  is >= 2^-12, and the FP64 expression otherwise.
 * Sort (optional). Workers also publish their expert ids into sentinel slots; worker 0 polls
-  them and builds ``moe_sort``'s metadata: one 128-row tile per active local expert (``M <=
-  64`` tokens never fill more), tiles in local-expert order, rows in ascending token order
-  (what ``moe_sort``'s single-CTA kernels produce; its cluster kernel orders rows by atomics).
+  them and builds ``moe_sort``'s metadata from per-expert token bitmasks: ``ceil(count / 128)``
+  tiles per active local expert in local-expert order, rows in ascending token order (what
+  ``moe_sort``'s single-CTA kernels produce; its cluster kernel orders rows by atomics).
 * Re-arm. Consumers refill the slots they read with the sentinel (TMA bulk copies from a
   shared-memory sentinel block), so every launch leaves the workspace as it found it and a
   captured CUDA graph can be replayed. Launches sharing a workspace must not overlap, which
   stream order guarantees.
 
-The module also provides :func:`k3_bf16_lowm_gemv`, the GEMM phase as a standalone
-``M <= 64`` BF16 GEMV with a deterministic last-arriver split-K reduction.
+The module also provides :func:`k3_bf16_lowm_gemv`, the ``M <= 64`` GEMM phase as a standalone
+BF16 GEMV with a deterministic last-arriver split-K reduction.
 """
 
 from __future__ import annotations
@@ -54,10 +60,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -67,8 +74,12 @@ NUM_EXPERTS = 896
 HIDDEN_SIZE = 7168
 #: Experts selected per token.
 TOP_K = 16
-#: Largest token count served.
-MAX_M = 64
+#: Largest token count served by the router.
+MAX_M = 256
+#: Largest token count of the ``mma.sync`` GEMM path; larger M use ``tcgen05`` UMMA.
+SMALL_M = 64
+#: Expert-id hand-off slots (sentinel-armed), first in the workspace.
+_IDS_SLOT_BYTES = MAX_M * TOP_K * 4
 
 _K_CHUNK = 64
 _NUM_K_CHUNKS = HIDDEN_SIZE // _K_CHUNK
@@ -77,6 +88,13 @@ _EXPERTS_PER_CTA = NUM_EXPERTS // _EXPERT_GROUPS
 _M_TILES = _EXPERTS_PER_CTA // 16
 _THREADS = 256
 _W_CHUNK_BYTES = _EXPERTS_PER_CTA * _K_CHUNK * 2
+# Large-M (tcgen05) GEMM: 7 CTAs of 128 experts (UMMA M) per K slice, 32-wide K chunks.
+_UMMA_GROUPS = 7
+_UMMA_ROWS = NUM_EXPERTS // _UMMA_GROUPS
+_UMMA_K_CHUNK = 32
+_UMMA_NUM_K_CHUNKS = HIDDEN_SIZE // _UMMA_K_CHUNK
+_UMMA_A_CHUNK_BYTES = _UMMA_ROWS * _UMMA_K_CHUNK * 2
+_SMEM_CAPACITY = utils.get_smem_capacity_in_bytes("sm_100")
 #: L2 eviction hint for the streamed weight (CacheHintSm90::EVICT_FIRST).
 _EVICT_FIRST = 0x12F0000000000000
 #: ``1e-20`` as a PTX double literal (the renormalization epsilon of ``noaux_tc_op``).
@@ -88,12 +106,14 @@ _ROW_BYTES = NUM_EXPERTS * 4
 _SMEM_SIG = 0  # fp32 [896] sigmoid scores
 _SMEM_CAND = _SMEM_SIG + NUM_EXPERTS * 4  # u64 [8][16] per-warp sorted top 16
 _SMEM_TOP = _SMEM_CAND + _EXPERT_GROUPS * TOP_K * 8  # u64 [16] final top 16
-_SMEM_MASK_LO = 0  # sort: u32 [896] token mask (tokens 0-31) per local expert
-_SMEM_MASK_HI = _SMEM_MASK_LO + NUM_EXPERTS * 4  # sort: tokens 32-63
-_SMEM_TILE_BASE = _SMEM_MASK_HI + NUM_EXPERTS * 4  # sort: first row of each expert's tile
-_SMEM_WARP_TOT = _SMEM_TILE_BASE + NUM_EXPERTS * 4  # sort: per-warp active-expert counts
-_SMEM_SENTINEL = 12288  # 4 KB of sentinel bytes, the source of the re-arm bulk copies
+_SMEM_MASK = 0  # sort: u32 [MAX_M / 32][896] token bitmask word per local expert
+# sort: i32 [MAX_M / 32][896] first permuted row of the tokens of each mask word
+_SMEM_WORD_BASE = _SMEM_MASK + (MAX_M // 32) * NUM_EXPERTS * 4
+_SMEM_WARP_TOT = _SMEM_WORD_BASE + (MAX_M // 32) * NUM_EXPERTS * 4  # sort: per-warp tile counts
+_SMEM_SENTINEL = 65536  # 4 KB of sentinel bytes, the source of the re-arm bulk copies
 _SENTINEL_BYTES = 4096
+#: Shared-memory scratch the tail phases need from the GEMM's weight ring.
+_SCRATCH_BYTES = _SMEM_SENTINEL + _SENTINEL_BYTES
 
 # Shared-memory cache of the scalar kernel parameters (slot order).
 (
@@ -120,21 +140,22 @@ _NUM_PARAMS = 16
 assert _EXPERTS_PER_CTA % 4 == 0 and _EXPERTS_PER_CTA // 4 <= 32
 assert _EXPERT_GROUPS == _THREADS // 32 and _M_TILES < _THREADS // 32
 assert _SMEM_TOP + TOP_K * 8 <= _SMEM_SENTINEL and _SMEM_WARP_TOT + 64 <= _SMEM_SENTINEL
-assert _SENTINEL_BYTES >= max(_ROW_BYTES, MAX_M * TOP_K * 4)
+assert _SENTINEL_BYTES >= _ROW_BYTES and (MAX_M * TOP_K * 4) % _SENTINEL_BYTES == 0
 
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def workspace_partials_bytes(num_splits: int) -> int:
-    """Bytes of the partial-logit slots ``fp32 [S, 64, 896]`` at the start of the workspace."""
-    return num_splits * MAX_M * _ROW_BYTES
+def _slot_bytes(num_splits: int, rows: int) -> int:
+    return num_splits * rows * _ROW_BYTES
 
 
-def workspace_bytes(num_splits: int) -> int:
-    """Workspace: partial-logit slots, then ``int32 [64 * 16]`` expert-id slots."""
-    return workspace_partials_bytes(num_splits) + MAX_M * TOP_K * 4
+def workspace_bytes(small_splits: int, umma_splits: int) -> int:
+    """Hand-off workspace: ``int32 [256 * 16]`` expert-id slots, the ``M <= 64`` path's
+    ``fp32 [S, 64, 896]`` partial-logit slots, then the large-M path's ``fp32 [S, 256, 896]``
+    ones (all sentinel-armed)."""
+    return _IDS_SLOT_BYTES + _slot_bytes(small_splits, SMALL_M) + _slot_bytes(umma_splits, MAX_M)
 
 
 # ---------------------------------------------------------------------------
@@ -876,20 +897,25 @@ def _popc(value, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _bits_below(t, *, loc=None, ip=None):
-    """``(1 << t) - 1`` for ``0 <= t <= 32`` (32-bit)."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [_iv(t, loc=loc, ip=ip)],
-            "{\n.reg .b32 one;\n.reg .pred p;\nmov.b32 one, 1;\nshl.b32 one, one, $1;\n"
-            "sub.u32 $0, one, 1;\n"
-            "setp.ge.u32 p, $1, 32;\n@p mov.b32 $0, 0xffffffff;\n}",
-            "=r,r",
-            loc=loc,
-            ip=ip,
-        )
+def _tmem_ld16(taddr, *, loc=None, ip=None):
+    """16 consecutive FP32 accumulator columns of this thread's TMEM lane."""
+    regs = ", ".join(f"${i}" for i in range(16))
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 16),
+        [_iv(taddr, loc=loc, ip=ip)],
+        "tcgen05.fence::after_thread_sync;\n"
+        f"tcgen05.ld.sync.aligned.32x32b.x16.b32 {{{regs}}}, [$16];\n"
+        "tcgen05.wait::ld.sync.aligned;",
+        ",".join(["=f"] * 16) + ",r",
+        loc=loc,
+        ip=ip,
     )
+    return _unpack(res, T.f32(), Float32, 16, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _tmem_fence_before_sync(*, loc=None, ip=None):
+    _asm(None, [], "tcgen05.fence::before_thread_sync;", "", loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -928,7 +954,371 @@ def _st_global_bf16(addr, value, *, loc=None, ip=None):
 # ---------------------------------------------------------------------------
 
 
-class K3FusedRouterKernel:
+class _RouterTail:
+    """Arrival, top-k worker and ``moe_sort`` phases shared by both GEMM paths.
+
+    Subclasses set ``num_splits``, ``num_ctas``, ``max_m`` (token capacity of the path),
+    ``with_sort`` and ``use_pdl`` and call :meth:`route` once the CTA's partial logits are
+    stored and its ticket is in shared memory.
+    """
+
+    def _init_tail(
+        self,
+        num_splits: int,
+        num_ctas: int,
+        max_m: int,
+        with_sort: bool,
+        ids_scratch_offset: int,
+    ):
+        self.num_splits = num_splits
+        self.num_ctas = num_ctas
+        #: Token rows per K split in this path's partial-logit slots.
+        self.slot_rows = max_m
+        self.max_m = max_m
+        self.with_sort = with_sort
+        self.mask_words = max_m // 32
+        self.max_tiles_per_expert = _ceil_div(max_m, 128)
+        self.ids_scratch_offset = ids_scratch_offset
+
+    @cute.jit
+    def route(
+        self,
+        smem: Int32,
+        params: Int32,
+        ticket_addr: Int32,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        m: Int32,
+    ):
+        """The last ``T = min(M, CTAs - 1)`` CTAs to arrive are top-k workers (tokens dealt
+        round-robin); worker 0 then also builds the ``moe_sort`` metadata."""
+        ticket = _lds_b32(ticket_addr)
+        num_workers = m
+        if num_workers > self.num_ctas - 1:
+            num_workers = Int32(self.num_ctas - 1)
+        first_worker = self.num_ctas - num_workers
+        if ticket >= first_worker:
+            worker = ticket - first_worker
+            ws_addr = _lds_b64(params + _P_WS * 8)
+            self.topk_worker(
+                smem,
+                tidx,
+                warp,
+                lane,
+                worker,
+                num_workers,
+                m,
+                _lds_b64(params + _P_BIAS * 8),
+                ws_addr,
+                _lds_b64(params + _P_IDS * 8),
+                _lds_b64(params + _P_VALS * 8),
+                _lds_b64(params + _P_LOGITS * 8),
+                Int32(_lds_b64(params + _P_WRITE_LOGITS * 8)),
+                _lds_b64(params + _P_SCALE * 8),
+            )
+            if cutlass.const_expr(self.with_sort):
+                if worker == 0:
+                    self.sort_tokens(
+                        smem,
+                        tidx,
+                        warp,
+                        lane,
+                        m,
+                        ws_addr + self.ids_scratch_offset,
+                        _lds_b64(params + _P_E2P * 8),
+                        _lds_b64(params + _P_P2E * 8),
+                        _lds_b64(params + _P_TILE_EXPERT * 8),
+                        _lds_b64(params + _P_TILE_LIMIT * 8),
+                        _lds_b64(params + _P_TOTAL * 8),
+                        _lds_b64(params + _P_NUM_TILES * 8),
+                        Int32(_lds_b64(params + _P_LOCAL_OFFSET * 8)),
+                        Int32(_lds_b64(params + _P_LOCAL_NUM * 8)),
+                    )
+            if tidx == _THREADS - 32:
+                # The bulk copies read the sentinel block; it must outlive them.
+                _bulk_commit_and_wait_read()
+
+    @cute.jit
+    def topk_worker(
+        self,
+        smem: Int32,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        worker: Int32,
+        num_workers: Int32,
+        m: Int32,
+        bias_addr: Int64,
+        ws_addr: Int64,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        logits_addr: Int64,
+        write_logits: Int32,
+        scale_bits: Int64,
+    ):
+        """Top-16 of the tokens ``worker, worker + num_workers, ...``.
+
+        Warp ``w`` owns experts ``[112 w, 112 w + 112)``; lane ``l < 28`` polls the ``S``
+        partial logits of experts ``112 w + 4 l + {0..3}`` until no slot holds the sentinel,
+        sums them in split order and keeps the packed keys in registers. Each warp sorts its
+        keys in 16-key groups (4 lanes x 4 slots) and merges them into its top 16 with bitonic
+        networks; a rank merge over the eight sorted lists then places the global top 16. Keys
+        are unique, so this selects exactly what ``noaux_tc_op``'s arg-max rounds select, in
+        the same order. The consumed slots are re-armed with bulk copies.
+        """
+        S = self.num_splits
+        stride = self.slot_rows * _ROW_BYTES
+        lanes_used = _EXPERTS_PER_CTA // 4
+        loader = lane < lanes_used
+        e_lane = lane
+        if not loader:
+            e_lane = Int32(lanes_used - 1)
+        e4 = warp * _EXPERTS_PER_CTA + e_lane * 4
+        bias = _ld_nc_v4_f32(bias_addr + Int64(e4 * 4))
+        parts = cute.make_rmem_tensor((S * 4,), Float32)
+        _sts_v4_sentinel(smem + _SMEM_SENTINEL + tidx * 16)
+        _fence_proxy_async_shared()
+        # Consumed slots are re-armed right after level 1 when only top-k is computed (the
+        # copies then finish with the kernel). With the sort, they are re-armed after the
+        # output: their traffic would otherwise slow the sort, which runs last (measured on
+        # GB300; a full TMA queue also stalls the issuing warp and every barrier behind it).
+        rearm_early = not self.with_sort
+
+        # Workers get several tokens only when M exceeds the worker count (large-M path); there
+        # each token's first polling round is issued ahead, during the previous token.
+        prefetch = self.slot_rows > SMALL_M
+        if cutlass.const_expr(prefetch):
+            if loader:
+                self.load_rows(parts, ws_addr + Int64((worker * NUM_EXPERTS + e4) * 4), stride)
+        for token in cutlass.range(worker, m, num_workers, unroll=1):
+            # Poll the S partial rows (all loads in flight at once) until every slot is set.
+            row0 = ws_addr + Int64((token * NUM_EXPERTS + e4) * 4)
+            ready = Int32(1)
+            if loader:
+                ready = Int32(0)
+                if cutlass.const_expr(prefetch):
+                    ready = Int32(1)
+                    for sp in cutlass.range_constexpr(S):
+                        ready = ready & _all_valid4(*(parts[4 * sp + i] for i in range(4)))
+            while ready == 0:
+                ready = Int32(1)
+                for sp in cutlass.range_constexpr(S):
+                    v = _ld_relaxed_v4_f32(row0 + Int64(sp * stride))
+                    for i in cutlass.range_constexpr(4):
+                        parts[4 * sp + i] = v[i]
+                    ready = ready & _all_valid4(*v)
+            # Logits = sum of the S partials in split order; sigmoid; packed keys.
+            logit = [parts[i] for i in range(4)]
+            for sp in cutlass.range_constexpr(1, S):
+                for i in cutlass.range_constexpr(4):
+                    logit[i] = logit[i] + parts[4 * sp + i]
+            sig = [
+                cute.math.tanh(logit[i] * Float32(0.5)) * Float32(0.5) + Float32(0.5)
+                for i in range(4)
+            ]
+            keys = [_keep_key(_make_key(sig[i] + bias[i], e4 + i), loader) for i in range(4)]
+            if cutlass.const_expr(prefetch):
+                # The next token's rows: their latency hides behind this token's top-k.
+                if loader and token + num_workers < m:
+                    self.load_rows(parts, row0 + Int64(num_workers * _ROW_BYTES), stride)
+            if loader:
+                _sts_v4_f32(smem + _SMEM_SIG + e4 * 4, *sig)
+                if write_logits != 0:
+                    _st_global_v4_f32(logits_addr + Int64((token * NUM_EXPERTS + e4) * 4), *logit)
+
+            # Per-warp top 16 (group 0 = lanes 0-3 holds it, element lane * 4 + slot).
+            keys = _top16_of_groups(_sort16(keys, lane), lane)
+            if lane < 4:
+                for i in cutlass.range_constexpr(4):
+                    _sts_b64(smem + _SMEM_CAND + (warp * TOP_K + lane * 4 + i) * 8, keys[i])
+            cute.arch.barrier()
+            if cutlass.const_expr(rearm_early):
+                # Every thread has read its partial slots.
+                self.rearm_row(smem, tidx, ws_addr, stride, token)
+
+            # Rank merge of the eight sorted lists: candidate c's global rank is the number of
+            # larger keys in every list (binary searches); the 16 lanes with rank < 16 place
+            # their keys, then lane k of warp 0 takes the k-th largest.
+            if warp < _EXPERT_GROUPS * TOP_K // 32:
+                cand = _lds_b64(smem + _SMEM_CAND + (warp * 32 + lane) * 8)
+                rank = _count_greater_sorted(smem + _SMEM_CAND, cand)
+                if rank < TOP_K:
+                    _sts_b64(smem + _SMEM_TOP + rank * 8, cand)
+            cute.arch.barrier()
+            if warp == 0:
+                mine = _lds_b64_if(lane, TOP_K, smem + _SMEM_TOP + lane * 8)
+                expert = Int32(0)
+                score = Float32(0.0)
+                if lane < TOP_K:
+                    expert = _key_expert(mine)
+                    score = _lds_f32(smem + _SMEM_SIG + expert * 4)
+                total = _warp_sum_f32(score)
+                # Exact FP32 fast path of the FP64 expression (FP64 is slow on SM103): for a
+                # unit scale and total >= 2^-12, ``double(total) + 1e-20 == double(total)``
+                # and rounding the double quotient to FP32 equals FP32 division.
+                weight = Float32(0.0)
+                if _unit_scale_fast_path(scale_bits, total) != 0:
+                    weight = _div_rn_f32(score, total)
+                else:
+                    weight = _renormalize(score, total, scale_bits)
+                if lane < TOP_K:
+                    out = (token * TOP_K + lane) * 4
+                    _st_global_b32(ids_addr + Int64(out), expert)
+                    _st_global_f32(vals_addr + Int64(out), weight)
+                    if cutlass.const_expr(self.with_sort):
+                        _st_relaxed_b32(ws_addr + self.ids_scratch_offset + Int64(out), expert)
+            cute.arch.barrier()
+            if cutlass.const_expr(not rearm_early):
+                self.rearm_row(smem, tidx, ws_addr, stride, token)
+
+    @cute.jit
+    def load_rows(self, parts: cute.Tensor, row0: Int64, stride: int):
+        """Issue the loads of one token's ``S`` partial rows (4 experts) into ``parts``."""
+        for sp in cutlass.range_constexpr(self.num_splits):
+            v = _ld_relaxed_v4_f32(row0 + Int64(sp * stride))
+            for i in cutlass.range_constexpr(4):
+                parts[4 * sp + i] = v[i]
+
+    @cute.jit
+    def rearm_row(self, smem: Int32, tidx: Int32, ws_addr: Int64, stride: int, token: Int32):
+        """Refill a token's ``S`` consumed partial rows with the sentinel (TMA bulk copies)."""
+        if tidx == _THREADS - 32:
+            for sp in cutlass.range_constexpr(self.num_splits):
+                _bulk_s2g(
+                    ws_addr + Int64(sp * stride + token * _ROW_BYTES),
+                    smem + _SMEM_SENTINEL,
+                    _ROW_BYTES,
+                )
+
+    @cute.jit
+    def sort_tokens(
+        self,
+        smem: Int32,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        m: Int32,
+        scratch_addr: Int64,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_offset: Int32,
+        local_num: Int32,
+    ):
+        """``moe_sort`` metadata of the local experts.
+
+        A bitmask of the selecting tokens is built per local expert in shared memory. Experts
+        get ``ceil(count / 128)`` tiles in local-expert order, rows follow the token order,
+        and each tile's ``mn_limit`` is ``min(end of tile, first row of expert + count)``.
+        """
+        words = self.mask_words
+        for i in cutlass.range_constexpr(_ceil_div(NUM_EXPERTS, _THREADS)):
+            e = tidx + i * _THREADS
+            if e < local_num:
+                for w in cutlass.range_constexpr(words):
+                    _sts_b32(smem + _SMEM_MASK + (w * NUM_EXPERTS + e) * 4, 0)
+        cute.arch.barrier()
+
+        n_entries = m * TOP_K
+        per_thread = self.max_m * TOP_K // _THREADS
+        # Poll the published expert ids (-1 = not yet written).
+        ids = cute.make_rmem_tensor((per_thread,), Int32)
+        ready = Int32(0)
+        while ready == 0:
+            ready = Int32(1)
+            for q in cutlass.range_constexpr(per_thread):
+                idx = tidx + q * _THREADS
+                e = Int32(0)
+                if idx < n_entries:
+                    e = _ld_relaxed_b32(scratch_addr + Int64(idx * 4))
+                ids[q] = e
+                ready = ready & (1 - _is_neg(e))
+        local_idx = []
+        for q in cutlass.range_constexpr(per_thread):
+            idx = tidx + q * _THREADS
+            jl = Int32(-1)
+            if idx < n_entries:
+                jl = ids[q] - local_offset
+                token = idx >> 4
+                if jl >= 0 and jl < local_num:
+                    word = smem + _SMEM_MASK + ((token >> 5) * NUM_EXPERTS + jl) * 4
+                    _red_shared_or(word, Int32(1) << (token & 31))
+            local_idx.append(jl)
+        cute.arch.barrier()
+        # Thread t owns local experts 4t..4t+3; exclusive scan of their tile counts.
+        e0 = tidx * 4
+        word_counts = []
+        counts = [Int32(0)] * 4
+        for w in cutlass.range_constexpr(words):
+            v = _lds_v4_b32(smem + _SMEM_MASK + (w * NUM_EXPERTS + e0) * 4)
+            word_counts.append([_popc(v[i]) for i in range(4)])
+            counts = [counts[i] + word_counts[w][i] for i in range(4)]
+        counts = [counts[i] & _below_mask(e0 + i, local_num) for i in range(4)]
+        tiles = [(counts[i] + 127) >> 7 for i in range(4)]
+        thread_tiles = tiles[0] + tiles[1] + tiles[2] + tiles[3]
+        inclusive = _warp_inclusive_sum(thread_tiles)
+        if lane == 31:
+            _sts_b32(smem + _SMEM_WARP_TOT + warp * 4, inclusive)
+        cute.arch.barrier()
+        tile = inclusive - thread_tiles
+        num_tiles = Int32(0)
+        for w in cutlass.range_constexpr(_THREADS // 32):
+            cnt_w = _lds_b32(smem + _SMEM_WARP_TOT + w * 4)
+            if w < warp:
+                tile = tile + cnt_w
+            num_tiles = num_tiles + cnt_w
+        for i in cutlass.range_constexpr(4):
+            if tiles[i] != 0:
+                # First permuted row of each mask word's tokens: tile start + earlier words.
+                row = tile * 128
+                for w in cutlass.range_constexpr(words):
+                    _sts_b32(smem + _SMEM_WORD_BASE + (w * NUM_EXPERTS + e0 + i) * 4, row)
+                    row = row + word_counts[w][i]
+                for j in cutlass.range_constexpr(self.max_tiles_per_expert):
+                    if j < tiles[i]:
+                        limit = tile * 128 + counts[i]
+                        if limit > (tile + j + 1) * 128:
+                            limit = (tile + j + 1) * 128
+                        _st_global_b32(tile_expert_addr + Int64((tile + j) * 4), e0 + i)
+                        _st_global_b32(tile_limit_addr + Int64((tile + j) * 4), limit)
+            tile = tile + tiles[i]
+        if tidx == 0:
+            _st_global_b32(total_addr, num_tiles * 128)
+            _st_global_b32(num_tiles_addr, num_tiles)
+        cute.arch.barrier()
+
+        for q in cutlass.range_constexpr(per_thread):
+            idx = tidx + q * _THREADS
+            jl = local_idx[q]
+            if idx < n_entries:
+                perm = Int32(-1)
+                if jl >= 0 and jl < local_num:
+                    token = idx >> 4
+                    slot = ((token >> 5) * NUM_EXPERTS + jl) * 4
+                    word = _lds_b32(smem + _SMEM_MASK + slot)
+                    perm = _lds_b32(smem + _SMEM_WORD_BASE + slot) + _popc(
+                        word & ((Int32(1) << (token & 31)) - 1)
+                    )
+                    _st_global_b32(p2e_addr + Int64(perm * 4), idx)
+                _st_global_b32(e2p_addr + Int64(idx * 4), perm)
+        if tidx == _THREADS - 32:
+            # Re-arm the expert-id slots for the next launch (last: a full TMA queue would
+            # stall this warp and every barrier behind it).
+            n_bytes = n_entries * 4
+            for piece in cutlass.range_constexpr(self.max_m * TOP_K * 4 // _SENTINEL_BYTES):
+                off = piece * _SENTINEL_BYTES
+                if off < n_bytes:
+                    size = n_bytes - off
+                    if size > _SENTINEL_BYTES:
+                        size = Int32(_SENTINEL_BYTES)
+                    _bulk_s2g(scratch_addr + Int64(off), smem + _SMEM_SENTINEL, size)
+
+
+class K3FusedRouterKernel(_RouterTail):
     """Router GEMM + sigmoid/bias top-16 (+ ``moe_sort`` metadata) in one launch.
 
     Args:
@@ -938,21 +1328,22 @@ class K3FusedRouterKernel:
         use_pdl: Launch with programmatic dependent launch.
     """
 
-    def __init__(self, n_tiles: int, num_splits: int, with_sort: bool, use_pdl: bool):
-        if not 1 <= n_tiles <= MAX_M // 8:
-            raise ValueError(f"n_tiles={n_tiles} must be in [1, {MAX_M // 8}]")
+    def __init__(
+        self, n_tiles: int, num_splits: int, with_sort: bool, use_pdl: bool, ids_scratch_offset: int
+    ):
+        if not 1 <= n_tiles <= SMALL_M // 8:
+            raise ValueError(f"n_tiles={n_tiles} must be in [1, {SMALL_M // 8}]")
         if not 1 <= num_splits <= _NUM_K_CHUNKS:
             raise ValueError(f"num_splits={num_splits} must be in [1, {_NUM_K_CHUNKS}]")
+        self._init_tail(
+            num_splits, _EXPERT_GROUPS * num_splits, SMALL_M, with_sort, ids_scratch_offset
+        )
         self.n_tiles = n_tiles
         self.m_pad = 8 * n_tiles
-        self.num_splits = num_splits
-        self.num_ctas = _EXPERT_GROUPS * num_splits
         self.max_chunks = _ceil_div(_NUM_K_CHUNKS, num_splits)
-        self.with_sort = with_sort
         self.use_pdl = use_pdl
         self.h_chunk_bytes = self.m_pad * _K_CHUNK * 2
-        self.ids_scratch_offset = workspace_partials_bytes(num_splits)
-        if self.max_chunks * _W_CHUNK_BYTES < _SMEM_SENTINEL + _SENTINEL_BYTES:
+        if self.max_chunks * _W_CHUNK_BYTES < _SCRATCH_BYTES:
             raise ValueError(f"num_splits={num_splits} leaves too little shared memory")
 
     @cute.jit
@@ -1208,57 +1599,7 @@ class K3FusedRouterKernel:
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
         cute.arch.barrier()
-        ticket = _lds_b32(ticket_addr)
-        num_workers = m
-        if num_workers > self.num_ctas:
-            num_workers = Int32(self.num_ctas)
-        first_worker = self.num_ctas - num_workers
-        if ticket >= first_worker:
-            worker = ticket - first_worker
-            bias_addr = _lds_b64(params + _P_BIAS * 8)
-            ws_addr = _lds_b64(params + _P_WS * 8)
-            ids_addr = _lds_b64(params + _P_IDS * 8)
-            vals_addr = _lds_b64(params + _P_VALS * 8)
-            logits_addr = _lds_b64(params + _P_LOGITS * 8)
-            write_logits = Int32(_lds_b64(params + _P_WRITE_LOGITS * 8))
-            scale_bits = _lds_b64(params + _P_SCALE * 8)
-            self.topk_worker(
-                storage,
-                tidx,
-                warp,
-                lane,
-                worker,
-                num_workers,
-                m,
-                bias_addr,
-                ws_addr,
-                ids_addr,
-                vals_addr,
-                logits_addr,
-                write_logits,
-                scale_bits,
-            )
-            if cutlass.const_expr(self.with_sort):
-                if worker == 0:
-                    self.sort_tokens(
-                        storage,
-                        tidx,
-                        warp,
-                        lane,
-                        m,
-                        ws_addr + self.ids_scratch_offset,
-                        _lds_b64(params + _P_E2P * 8),
-                        _lds_b64(params + _P_P2E * 8),
-                        _lds_b64(params + _P_TILE_EXPERT * 8),
-                        _lds_b64(params + _P_TILE_LIMIT * 8),
-                        _lds_b64(params + _P_TOTAL * 8),
-                        _lds_b64(params + _P_NUM_TILES * 8),
-                        Int32(_lds_b64(params + _P_LOCAL_OFFSET * 8)),
-                        Int32(_lds_b64(params + _P_LOCAL_NUM * 8)),
-                    )
-            if tidx == _THREADS - 32:
-                # The bulk copies read the sentinel block; it must outlive them.
-                _bulk_commit_and_wait_read()
+        self.route(storage.sW.data_ptr().toint(), params, ticket_addr, tidx, warp, lane, m)
 
     @cute.jit
     def mma_and_store(
@@ -1313,7 +1654,7 @@ class K3FusedRouterKernel:
         # Partial logits: ws[split, token, expert]; d0/d1 at (row lane/4, cols 2(lane%4)+{0,1}),
         # d2/d3 eight rows below.
         expert = group * _EXPERTS_PER_CTA + warp * 16 + (lane >> 2)
-        split_base = split * MAX_M
+        split_base = split * self.slot_rows
         for nt in cutlass.range_constexpr(n_tiles):
             for i in cutlass.range_constexpr(4):
                 token = nt * 8 + 2 * (lane & 3) + (i & 1)
@@ -1321,134 +1662,64 @@ class K3FusedRouterKernel:
                     off = ((split_base + token) * NUM_EXPERTS + expert + (i >> 1) * 8) * 4
                     _st_relaxed_f32(ws_addr + Int64(off), acc[4 * nt + i])
 
+
+class K3FusedRouterUmmaKernel(_RouterTail):
+    """``64 < M <= 256``: the GEMM phase on ``tcgen05`` UMMA, the rest shared with the small path.
+
+    CTA ``(g, s)`` owns experts ``[128 g, 128 g + 128)`` (the UMMA M side; tokens are N) and the
+    ``s``-th slice of K in 32-wide chunks. Warp 0 TMA-loads all of the CTA's weight chunks before
+    ``griddepcontrol.wait`` and then streams activation chunks through a ring; warp 1 allocates
+    tensor memory and issues the UMMAs; warp 2 takes the arrival ticket; warps 4-7 copy the
+    accumulator (one expert row per thread) into the partial-logit slots.
+
+    Args:
+        n_pad: Padded token count (UMMA N), a multiple of 16 in ``(64, 256]``.
+        num_splits: K splits ``S``; the grid is ``7 * S`` CTAs.
+        with_sort: Also produce the ``moe_sort`` outputs.
+        use_pdl: Launch with programmatic dependent launch.
+    """
+
+    def __init__(
+        self, n_pad: int, num_splits: int, with_sort: bool, use_pdl: bool, ids_scratch_offset: int
+    ):
+        if n_pad % 16 or not SMALL_M < n_pad <= MAX_M:
+            raise ValueError(f"n_pad={n_pad} must be a multiple of 16 in ({SMALL_M}, {MAX_M}]")
+        if not 1 <= num_splits <= _UMMA_NUM_K_CHUNKS:
+            raise ValueError(f"num_splits={num_splits} must be in [1, {_UMMA_NUM_K_CHUNKS}]")
+        num_ctas = _UMMA_GROUPS * num_splits
+        self._init_tail(
+            num_splits,
+            num_ctas,
+            MAX_M,
+            with_sort,
+            ids_scratch_offset,
+        )
+        self.n_pad = n_pad
+        self.use_pdl = use_pdl
+        self.max_chunks = _ceil_div(_UMMA_NUM_K_CHUNKS, num_splits)
+        self.b_chunk_bytes = n_pad * _UMMA_K_CHUNK * 2
+        self.tmem_cols = max(32, 1 << (n_pad - 1).bit_length())
+        a_bytes = self.max_chunks * _UMMA_A_CHUNK_BYTES
+        if a_bytes < _SCRATCH_BYTES:
+            raise ValueError(f"num_splits={num_splits} leaves too little shared memory")
+        budget = _SMEM_CAPACITY - a_bytes - 4096  # barriers, parameters, alignment
+        self.b_stages = min(self.max_chunks, budget // self.b_chunk_bytes)
+        if self.b_stages < 2:
+            raise ValueError(f"num_splits={num_splits} leaves no room for the activation ring")
+        self.mma_tiler = (_UMMA_ROWS, n_pad, _UMMA_K_CHUNK)
+
     @cute.jit
-    def topk_worker(
+    def __call__(
         self,
-        storage,
-        tidx: Int32,
-        warp: Int32,
-        lane: Int32,
-        worker: Int32,
-        num_workers: Int32,
+        w_ptr: cute.Pointer,
+        h_ptr: cute.Pointer,
         m: Int32,
         bias_addr: Int64,
         ws_addr: Int64,
+        counter_addr: Int64,
         ids_addr: Int64,
         vals_addr: Int64,
         logits_addr: Int64,
-        write_logits: Int32,
-        scale_bits: Int64,
-    ):
-        """Top-16 of the tokens ``worker, worker + num_workers, ...``.
-
-        Warp ``w`` owns experts ``[112 w, 112 w + 112)``; lane ``l < 28`` polls the ``S``
-        partial logits of experts ``112 w + 4 l + {0..3}`` until no slot holds the sentinel,
-        sums them in split order and keeps the packed keys in registers. Each warp sorts its
-        keys in 16-key groups (4 lanes x 4 slots) and merges them into its top 16 with bitonic
-        networks; a rank merge over the eight sorted lists then places the global top 16. Keys
-        are unique, so this selects exactly what ``noaux_tc_op``'s arg-max rounds select, in
-        the same order. The consumed slots are re-armed with bulk copies.
-        """
-        S = self.num_splits
-        smem = storage.sW.data_ptr().toint()
-        lanes_used = _EXPERTS_PER_CTA // 4
-        loader = lane < lanes_used
-        e_lane = lane
-        if not loader:
-            e_lane = Int32(lanes_used - 1)
-        e4 = warp * _EXPERTS_PER_CTA + e_lane * 4
-        bias = _ld_nc_v4_f32(bias_addr + Int64(e4 * 4))
-        parts = cute.make_rmem_tensor((S * 4,), Float32)
-        _sts_v4_sentinel(smem + _SMEM_SENTINEL + tidx * 16)
-        _fence_proxy_async_shared()
-        rearm_thread = tidx == _THREADS - 32
-
-        for token in cutlass.range(worker, m, num_workers, unroll=1):
-            # Poll the S partial rows (all loads in flight at once) until every slot is set.
-            row0 = ws_addr + Int64((token * NUM_EXPERTS + e4) * 4)
-            ready = Int32(1)
-            if loader:
-                ready = Int32(0)
-            while ready == 0:
-                ready = Int32(1)
-                for s in cutlass.range_constexpr(S):
-                    v = _ld_relaxed_v4_f32(row0 + Int64(s * MAX_M * _ROW_BYTES))
-                    for i in cutlass.range_constexpr(4):
-                        parts[4 * s + i] = v[i]
-                    ready = ready & _all_valid4(*v)
-            # Logits = sum of the S partials in split order; sigmoid; packed keys.
-            logit = [parts[i] for i in range(4)]
-            for s in cutlass.range_constexpr(1, S):
-                for i in cutlass.range_constexpr(4):
-                    logit[i] = logit[i] + parts[4 * s + i]
-            sig = [
-                cute.math.tanh(logit[i] * Float32(0.5)) * Float32(0.5) + Float32(0.5)
-                for i in range(4)
-            ]
-            keys = [_keep_key(_make_key(sig[i] + bias[i], e4 + i), loader) for i in range(4)]
-            if loader:
-                _sts_v4_f32(smem + _SMEM_SIG + e4 * 4, *sig)
-                if write_logits != 0:
-                    _st_global_v4_f32(logits_addr + Int64((token * NUM_EXPERTS + e4) * 4), *logit)
-
-            # Per-warp top 16 (group 0 = lanes 0-3 holds it, element lane * 4 + slot).
-            keys = _top16_of_groups(_sort16(keys, lane), lane)
-            if lane < 4:
-                for i in cutlass.range_constexpr(4):
-                    _sts_b64(smem + _SMEM_CAND + (warp * TOP_K + lane * 4 + i) * 8, keys[i])
-            cute.arch.barrier()
-            # Every thread has read its partial slots: re-arm the token's S rows for the next
-            # launch with bulk copies (the TMA unit, not the warps' load/store queues).
-            if rearm_thread:
-                for s in cutlass.range_constexpr(S):
-                    _bulk_s2g(
-                        ws_addr + Int64(((s * MAX_M + token) * NUM_EXPERTS) * 4),
-                        smem + _SMEM_SENTINEL,
-                        _ROW_BYTES,
-                    )
-
-            # Rank merge of the eight sorted lists: candidate c's global rank is the number of
-            # larger keys in every list (binary searches); the 16 lanes with rank < 16 place
-            # their keys, then lane k of warp 0 takes the k-th largest.
-            if warp < _EXPERT_GROUPS * TOP_K // 32:
-                cand = _lds_b64(smem + _SMEM_CAND + (warp * 32 + lane) * 8)
-                rank = _count_greater_sorted(smem + _SMEM_CAND, cand)
-                if rank < TOP_K:
-                    _sts_b64(smem + _SMEM_TOP + rank * 8, cand)
-            cute.arch.barrier()
-            if warp == 0:
-                mine = _lds_b64_if(lane, TOP_K, smem + _SMEM_TOP + lane * 8)
-                expert = Int32(0)
-                score = Float32(0.0)
-                if lane < TOP_K:
-                    expert = _key_expert(mine)
-                    score = _lds_f32(smem + _SMEM_SIG + expert * 4)
-                total = _warp_sum_f32(score)
-                # Exact FP32 fast path of the FP64 expression (FP64 is slow on SM103): for a
-                # unit scale and total >= 2^-12, ``double(total) + 1e-20 == double(total)``
-                # and rounding the double quotient to FP32 equals FP32 division.
-                weight = Float32(0.0)
-                if _unit_scale_fast_path(scale_bits, total) != 0:
-                    weight = _div_rn_f32(score, total)
-                else:
-                    weight = _renormalize(score, total, scale_bits)
-                if lane < TOP_K:
-                    out = (token * TOP_K + lane) * 4
-                    _st_global_b32(ids_addr + Int64(out), expert)
-                    _st_global_f32(vals_addr + Int64(out), weight)
-                    if cutlass.const_expr(self.with_sort):
-                        _st_relaxed_b32(ws_addr + self.ids_scratch_offset + Int64(out), expert)
-            cute.arch.barrier()
-
-    @cute.jit
-    def sort_tokens(
-        self,
-        storage,
-        tidx: Int32,
-        warp: Int32,
-        lane: Int32,
-        m: Int32,
-        scratch_addr: Int64,
         e2p_addr: Int64,
         p2e_addr: Int64,
         tile_expert_addr: Int64,
@@ -1457,105 +1728,331 @@ class K3FusedRouterKernel:
         num_tiles_addr: Int64,
         local_offset: Int32,
         local_num: Int32,
+        write_logits: Int32,
+        scale_bits: Int64,
+        stream: cuda.CUstream,
     ):
-        """``moe_sort`` metadata for ``M <= 64``: one 128-row tile per active local expert.
+        mW = cute.make_tensor(
+            w_ptr,
+            cute.make_layout(
+                (NUM_EXPERTS, HIDDEN_SIZE, 1), stride=(HIDDEN_SIZE, 1, NUM_EXPERTS * HIDDEN_SIZE)
+            ),
+        )
+        mH = cute.make_tensor(
+            h_ptr, cute.make_layout((m, HIDDEN_SIZE, 1), stride=(HIDDEN_SIZE, 1, m * HIDDEN_SIZE))
+        )
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            cutlass.BFloat16,
+            cutlass.BFloat16,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            self.mma_tiler[:2],
+        )
+        a_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma, self.mma_tiler, cutlass.BFloat16, self.max_chunks
+        )
+        b_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma, self.mma_tiler, cutlass.BFloat16, self.b_stages
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma.thr_id.shape,)
+        )
+        tma_atom_a, tma_a = cute.nvgpu.make_tiled_tma_atom_A(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mW,
+            cute.slice_(a_layout, (None, None, None, 0)),
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_b, tma_b = cute.nvgpu.make_tiled_tma_atom_B(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mH,
+            cute.slice_(b_layout, (None, None, None, 0)),
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
 
-        Per local expert a 64-bit token mask is built in shared memory; tiles follow the
-        local expert order and the rows of a tile follow the token order.
-        """
-        smem = storage.sW.data_ptr().toint()
-        experts_per_thread = _ceil_div(NUM_EXPERTS, _THREADS)
-        for i in cutlass.range_constexpr(experts_per_thread):
-            e = tidx + i * _THREADS
-            if e < local_num:
-                _sts_b32(smem + _SMEM_MASK_LO + e * 4, 0)
-                _sts_b32(smem + _SMEM_MASK_HI + e * 4, 0)
-        cute.arch.barrier()
+        @cute.struct
+        class SharedStorage:
+            a_full: cute.struct.MemRange[cutlass.Int64, self.max_chunks]
+            b_full: cute.struct.MemRange[cutlass.Int64, self.b_stages]
+            b_empty: cute.struct.MemRange[cutlass.Int64, self.b_stages]
+            acc_full: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_ready: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_free: cute.struct.MemRange[cutlass.Int64, 1]
+            tmem_holding: cute.struct.MemRange[cutlass.Int32, 1]
+            ticket: cute.struct.MemRange[cutlass.Int32, 1]
+            params: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, _NUM_PARAMS], 16]
+            sA: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(a_layout.outer)], 1024
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(b_layout.outer)], 1024
+            ]
 
-        n_entries = m * TOP_K
-        per_thread = MAX_M * TOP_K // _THREADS
-        # Poll the published expert ids (-1 = not yet written), then reset the slots.
-        ids = cute.make_rmem_tensor((per_thread,), Int32)
-        ready = Int32(0)
-        while ready == 0:
-            ready = Int32(1)
-            for q in cutlass.range_constexpr(per_thread):
-                idx = tidx + q * _THREADS
-                e = Int32(0)
-                if idx < n_entries:
-                    e = _ld_relaxed_b32(scratch_addr + Int64(idx * 4))
-                ids[q] = e
-                ready = ready & (1 - _is_neg(e))
-        local_idx = []
-        for q in cutlass.range_constexpr(per_thread):
-            idx = tidx + q * _THREADS
-            jl = Int32(-1)
-            if idx < n_entries:
-                jl = ids[q] - local_offset
-                token = idx >> 4
-                if jl >= 0 and jl < local_num:
-                    mask_off = _SMEM_MASK_LO + (token >> 5) * (_SMEM_MASK_HI - _SMEM_MASK_LO)
-                    _red_shared_or(smem + mask_off + jl * 4, Int32(1) << (token & 31))
-            local_idx.append(jl)
-        cute.arch.barrier()
-        if tidx == _THREADS - 32:
-            # All ids are read: re-arm the expert-id slots for the next launch.
-            _bulk_s2g(scratch_addr, smem + _SMEM_SENTINEL, n_entries * 4)
+        self.shared_storage = SharedStorage
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_a,
+            tma_atom_b,
+            tma_b,
+            a_layout,
+            b_layout,
+            m,
+            bias_addr,
+            ws_addr,
+            counter_addr,
+            ids_addr,
+            vals_addr,
+            logits_addr,
+            e2p_addr,
+            p2e_addr,
+            tile_expert_addr,
+            tile_limit_addr,
+            total_addr,
+            num_tiles_addr,
+            local_offset,
+            local_num,
+            write_logits,
+            scale_bits,
+        ).launch(
+            grid=(self.num_ctas, 1, 1),
+            block=(_THREADS, 1, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            min_blocks_per_mp=1,
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
 
-        # Thread t owns local experts 4t..4t+3; exclusive scan of active experts -> tiles.
-        e0 = tidx * 4
-        lo4 = _lds_v4_b32(smem + _SMEM_MASK_LO + e0 * 4)
-        hi4 = _lds_v4_b32(smem + _SMEM_MASK_HI + e0 * 4)
-        active = []
-        count = Int32(0)
-        for i in cutlass.range_constexpr(4):
-            a = _nonzero((lo4[i] | hi4[i]) & _below_mask(e0 + i, local_num))
-            active.append(a)
-            count = count + a
-        inclusive = _warp_inclusive_sum(count)
-        if lane == 31:
-            _sts_b32(smem + _SMEM_WARP_TOT + warp * 4, inclusive)
-        cute.arch.barrier()
-        tile = inclusive - count
-        num_tiles = Int32(0)
-        for w in cutlass.range_constexpr(_THREADS // 32):
-            cnt_w = _lds_b32(smem + _SMEM_WARP_TOT + w * 4)
-            if w < warp:
-                tile = tile + cnt_w
-            num_tiles = num_tiles + cnt_w
-        for i in cutlass.range_constexpr(4):
-            if active[i] != 0:
-                rows = _popc(lo4[i]) + _popc(hi4[i])
-                _sts_b32(smem + _SMEM_TILE_BASE + (e0 + i) * 4, tile * 128)
-                _st_global_b32(tile_expert_addr + Int64(tile * 4), e0 + i)
-                _st_global_b32(tile_limit_addr + Int64(tile * 4), tile * 128 + rows)
-            tile = tile + active[i]
-        if tidx == 0:
-            _st_global_b32(total_addr, num_tiles * 128)
-            _st_global_b32(num_tiles_addr, num_tiles)
-        cute.arch.barrier()
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB: cute.Tensor,
+        a_layout: cute.ComposedLayout,
+        b_layout: cute.ComposedLayout,
+        m: Int32,
+        bias_addr: Int64,
+        ws_addr: Int64,
+        counter_addr: Int64,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        logits_addr: Int64,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_offset: Int32,
+        local_num: Int32,
+        write_logits: Int32,
+        scale_bits: Int64,
+    ):
+        S = self.num_splits
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        group = bidx % _UMMA_GROUPS
+        split = bidx // _UMMA_GROUPS
+        base_chunks = _UMMA_NUM_K_CHUNKS // S
+        rem_chunks = _UMMA_NUM_K_CHUNKS % S
+        chunk_count = Int32(base_chunks)
+        chunk_start = split * base_chunks
+        if cutlass.const_expr(rem_chunks > 0):
+            if split < rem_chunks:
+                chunk_count = chunk_count + 1
+                chunk_start = chunk_start + split
+            else:
+                chunk_start = chunk_start + rem_chunks
 
-        for q in cutlass.range_constexpr(per_thread):
-            idx = tidx + q * _THREADS
-            jl = local_idx[q]
-            if idx < n_entries:
-                perm = Int32(-1)
-                if jl >= 0 and jl < local_num:
-                    token = idx >> 4
-                    lo = _lds_b32(smem + _SMEM_MASK_LO + jl * 4)
-                    hi = _lds_b32(smem + _SMEM_MASK_HI + jl * 4)
-                    rank = _popc(lo & _bits_below(token))
-                    if token >= 32:
-                        rank = _popc(lo) + _popc(hi & _bits_below(token - 32))
-                    perm = _lds_b32(smem + _SMEM_TILE_BASE + jl * 4) + rank
-                    _st_global_b32(p2e_addr + Int64(perm * 4), idx)
-                _st_global_b32(e2p_addr + Int64(idx * 4), perm)
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        a_full = storage.a_full.data_ptr()
+        b_full = storage.b_full.data_ptr()
+        b_empty = storage.b_empty.data_ptr()
+        acc_full = storage.acc_full.data_ptr()
+        tmem_ready = storage.tmem_ready.data_ptr()
+        tmem_free = storage.tmem_free.data_ptr()
+        tmem_holding = storage.tmem_holding.data_ptr()
+        params = storage.params.data_ptr().toint()
+        if warp == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(self.max_chunks):
+                    cute.arch.mbarrier_init(a_full + i, 1)
+                for i in cutlass.range_constexpr(self.b_stages):
+                    cute.arch.mbarrier_init(b_full + i, 1)
+                    cute.arch.mbarrier_init(b_empty + i, 1)
+                cute.arch.mbarrier_init(acc_full, 1)
+                cute.arch.mbarrier_init(tmem_ready, 1)
+                cute.arch.mbarrier_init(tmem_free, 4)
+        elif warp == 3:
+            if lane == 0:
+                cached = (
+                    Int64(m),
+                    bias_addr,
+                    ws_addr,
+                    ids_addr,
+                    vals_addr,
+                    logits_addr,
+                    Int64(write_logits),
+                    scale_bits,
+                    e2p_addr,
+                    p2e_addr,
+                    tile_expert_addr,
+                    tile_limit_addr,
+                    total_addr,
+                    num_tiles_addr,
+                    Int64(local_offset),
+                    Int64(local_num),
+                )
+                for i in cutlass.range_constexpr(_NUM_PARAMS):
+                    _sts_b64(params + i * 8, cached[i])
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+        m = Int32(_lds_b64(params + _P_M * 8))
+        ticket_addr = storage.ticket.data_ptr().toint()
+
+        if warp == 0:
+            # Weight first (independent of the previous grid), then the activation ring.
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+            sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+            sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
+            gA = cute.local_tile(
+                mA, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            )
+            gB = cute.local_tile(
+                mB, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+            thr_mma = tiled_mma.get_slice(0)
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(thr_mma.partition_A(gA), 0, 3),
+            )
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(thr_mma.partition_B(gB), 0, 3),
+            )
+            for c in cutlass.range(chunk_count, unroll=1):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(a_full + c, _UMMA_A_CHUNK_BYTES)
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, group, chunk_start + c, 0)],
+                    tAsA[(None, c)],
+                    tma_bar_ptr=a_full + c,
+                    cache_policy=Int64(_EVICT_FIRST),
+                )
+            # Dependents may launch only once this CTA holds its tensor memory: a dependent CTA
+            # that took the columns first and then waited on this grid would deadlock it.
+            cute.arch.mbarrier_wait(tmem_ready, 0)
+            if cutlass.const_expr(self.use_pdl):
+                _griddepcontrol_launch_dependents()
+                _griddepcontrol_wait()
+            for c in cutlass.range(chunk_count, unroll=1):
+                stage = c % self.b_stages
+                if c >= self.b_stages:
+                    cute.arch.mbarrier_wait(b_empty + stage, ((c // self.b_stages) & 1) ^ 1)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(b_full + stage, self.b_chunk_bytes)
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, 0, chunk_start + c, 0)],
+                    tBsB[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+        elif warp == 1:
+            cute.arch.alloc_tmem(self.tmem_cols, tmem_holding)
+            cute.arch.relinquish_tmem_alloc_permit()
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(tmem_ready)
+            acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                cutlass.Float32, alignment=16, ptr_to_buffer_holding_addr=tmem_holding
+            )
+            acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+            tCtAcc = cute.make_tensor(acc_tmem_ptr, tiled_mma.make_fragment_C(acc_shape).layout)
+            sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+            sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
+            tCrA = tiled_mma.make_fragment_A(sA)
+            tCrB = tiled_mma.make_fragment_B(sB)
+            num_kphases = cute.size(tCrA, mode=[2])
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for c in cutlass.range(chunk_count, unroll=1):
+                stage = c % self.b_stages
+                cute.arch.mbarrier_wait(a_full + c, 0)
+                cute.arch.mbarrier_wait(b_full + stage, (c // self.b_stages) & 1)
+                for kp in cutlass.range_constexpr(num_kphases):
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[(None, None, kp, c)],
+                        tCrB[(None, None, kp, stage)],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                with cute.arch.elect_one():
+                    tcgen05.commit(b_empty + stage)
+            with cute.arch.elect_one():
+                tcgen05.commit(acc_full)
+            cute.arch.mbarrier_wait(tmem_free, 0)
+            cute.arch.dealloc_tmem(acc_tmem_ptr, self.tmem_cols)
+        elif warp == 2:
+            # Arrival once the accumulator is final (see the small path).
+            cute.arch.mbarrier_wait(acc_full, 0)
+            if lane == 0:
+                arrived = _atom_add_relaxed_gpu(counter_addr, 1)
+                if arrived == self.num_ctas - 1:
+                    _st_relaxed_gpu(counter_addr, 0)
+                _sts_b32(ticket_addr, arrived)
+        elif warp >= 4:
+            # TMEM lane = expert row: warp 4 + i reads lanes [32 i, 32 i + 32).
+            cute.arch.mbarrier_wait(tmem_ready, 0)
+            tmem_base = _lds_b32(tmem_holding.toint())
+            if cutlass.const_expr(self.use_pdl):
+                _griddepcontrol_wait()
+            row = tidx - 128
+            row_addr = _lds_b64(params + _P_WS * 8) + Int64(
+                ((split * self.slot_rows) * NUM_EXPERTS + group * _UMMA_ROWS + row) * 4
+            )
+            lane_base = tmem_base + (((warp - 4) * 32) << 16)
+            cute.arch.mbarrier_wait(acc_full, 0)
+            for j in cutlass.range_constexpr(self.n_pad // 16):
+                v = _tmem_ld16(lane_base + j * 16)
+                for i in cutlass.range_constexpr(16):
+                    token = j * 16 + i
+                    if token < m:
+                        _st_relaxed_f32(row_addr + Int64(token * _ROW_BYTES), v[i])
+            _tmem_fence_before_sync()
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(tmem_free)
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_wait()
+        cute.arch.barrier()
+        self.route(storage.sA.data_ptr().toint(), params, ticket_addr, tidx, warp, lane, m)
 
 
 # ---------------------------------------------------------------------------
 # Standalone low-M BF16 GEMV (the router's GEMM phase, generalized)
 # ---------------------------------------------------------------------------
 
+#: Largest token count of the standalone GEMV.
+GEMV_MAX_M = 64
 _GEMV_ROWS = 16
 _GEMV_WARPS = 4
 _GEMV_THREADS = 32 * _GEMV_WARPS
@@ -1587,8 +2084,8 @@ class K3LowMGemvKernel:
     ):
         if n % 8 or k % 128:
             raise ValueError(f"N={n} must be a multiple of 8 and K={k} a multiple of 128")
-        if not 1 <= n_tiles <= MAX_M // 8:
-            raise ValueError(f"n_tiles={n_tiles} must be in [1, {MAX_M // 8}]")
+        if not 1 <= n_tiles <= GEMV_MAX_M // 8:
+            raise ValueError(f"n_tiles={n_tiles} must be in [1, {GEMV_MAX_M // 8}]")
         self.n = n
         self.k = k
         self.n_tiles = n_tiles
@@ -1872,51 +2369,82 @@ def _is_supported_device(device_index: int) -> bool:
 
 
 def num_splits_for(num_sms: int) -> int:
-    """K splits so that the ``8 * S`` CTAs fill the GPU with one CTA per SM."""
+    """K splits of the ``M <= 64`` path: ``8 * S`` CTAs fill the GPU, one CTA per SM."""
     return max(1, min(num_sms // _EXPERT_GROUPS, _NUM_K_CHUNKS))
 
 
-@functools.cache
-def _compiled_kernel(n_tiles: int, num_splits: int, with_sort: bool, use_pdl: bool):
-    kernel = K3FusedRouterKernel(n_tiles, num_splits, with_sort, use_pdl)
+def umma_num_splits_for(num_sms: int) -> int:
+    """K splits of the ``M > 64`` path: ``7 * S`` CTAs, one per SM."""
+    return max(1, min(num_sms // _UMMA_GROUPS, _UMMA_NUM_K_CHUNKS))
+
+
+def _compile_args(m: int):
     dummy = 1 << 20
-    w_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
-    h_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
     addr = Int64(dummy)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(
-        kernel,
-        w_ptr,
-        h_ptr,
-        Int32(8 * n_tiles),
+    return (
+        make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16),
+        Int32(m),
         *([addr] * 12),
         Int32(0),
         Int32(NUM_EXPERTS),
         Int32(0),
         Int64(0),
-        stream,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
 
 
-_WORKSPACES: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+def _workspace_offsets(num_sms: int) -> tuple[int, int]:
+    """Byte offsets of the two paths' partial-logit slots in the workspace."""
+    small = _IDS_SLOT_BYTES
+    return small, small + _slot_bytes(num_splits_for(num_sms), SMALL_M)
 
 
-def _workspace(device: torch.device, num_splits: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Persistent per-device state: ``(arrival counter, handoff slots)``.
+@functools.cache
+def _compiled_kernel(n_tiles: int, num_sms: int, with_sort: bool, use_pdl: bool):
+    offset = _workspace_offsets(num_sms)[0]
+    kernel = K3FusedRouterKernel(n_tiles, num_splits_for(num_sms), with_sort, use_pdl, -offset)
+    return cute.compile(kernel, *_compile_args(8 * n_tiles))
 
-    The counter is zero and every slot holds the sentinel (all ones) between launches; each
-    launch restores that state, so a captured graph can be replayed. Launches on one device
-    must not overlap (they share this state); stream order provides that.
+
+@functools.cache
+def _compiled_umma_kernel(n_pad: int, num_sms: int, with_sort: bool, use_pdl: bool):
+    offset = _workspace_offsets(num_sms)[1]
+    kernel = K3FusedRouterUmmaKernel(
+        n_pad, umma_num_splits_for(num_sms), with_sort, use_pdl, -offset
+    )
+    return cute.compile(kernel, *_compile_args(n_pad))
+
+
+def _compiled_router(m: int, num_sms: int, with_sort: bool, use_pdl: bool):
+    """``(compiled kernel, byte offset of its partial-logit slots in the workspace)``."""
+    if m <= SMALL_M:
+        compiled = _compiled_kernel(_ceil_div(m, 8), num_sms, with_sort, use_pdl)
+        return compiled, _workspace_offsets(num_sms)[0]
+    compiled = _compiled_umma_kernel(16 * _ceil_div(m, 16), num_sms, with_sort, use_pdl)
+    return compiled, _workspace_offsets(num_sms)[1]
+
+
+_WORKSPACES: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _workspace(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Persistent per-device state: ``(arrival state, hand-off slots)``.
+
+    Both GEMM paths share it. Between launches the arrival counter is zero and the
+    hand-off slots hold the sentinel (all ones); each launch restores that state, so a
+    captured graph can be replayed. Launches on one device must not overlap (they share this state); stream
+    order provides that.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
-    state = _WORKSPACES.get((index, num_splits))
+    state = _WORKSPACES.get(index)
     if state is None:
+        num_sms = _num_sms(index)
+        size = workspace_bytes(num_splits_for(num_sms), umma_num_splits_for(num_sms))
         counter = torch.zeros(32, dtype=torch.int32, device=device)
-        slots = torch.full(
-            (workspace_bytes(num_splits) // 4,), -1, dtype=torch.int32, device=device
-        )
+        slots = torch.full((size // 4,), -1, dtype=torch.int32, device=device)
         state = (counter, slots)
-        _WORKSPACES[(index, num_splits)] = state
+        _WORKSPACES[index] = state
     return state
 
 
@@ -1927,7 +2455,7 @@ def workspace_ready(device: torch.device) -> bool:
     the graph's private pool), so callers that may be capturing check this first.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
-    return any(key[0] == index for key in _WORKSPACES)
+    return index in _WORKSPACES
 
 
 def sort_buffer_sizes(num_tokens: int, local_num_experts: int, tile_tokens_dim: int = 128):
@@ -1996,7 +2524,7 @@ def run_k3_fused_router(
     """Launch the fused router on the current stream (inputs are not re-validated).
 
     Args:
-        hidden_states: ``bf16 [M, 7168]``, ``1 <= M <= 64``.
+        hidden_states: ``bf16 [M, 7168]``, ``1 <= M <= 256``.
         weight: Router weight ``bf16 [896, 7168]`` (``nn.Linear`` layout).
         e_score_correction_bias: ``fp32 [896]``.
         routed_scaling_factor: Multiplier of the renormalized weights.
@@ -2012,10 +2540,9 @@ def run_k3_fused_router(
     """
     m = hidden_states.shape[0]
     device = hidden_states.device
-    num_splits = num_splits_for(_num_sms(device.index))
     with_sort = sort_outputs is not None
-    compiled = _compiled_kernel(_ceil_div(m, 8), num_splits, with_sort, use_pdl)
-    counter, slots = _workspace(device, num_splits)
+    compiled, slot_offset = _compiled_router(m, _num_sms(device.index), with_sort, use_pdl)
+    counter, slots = _workspace(device)
     if with_sort:
         tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
     else:
@@ -2029,7 +2556,7 @@ def run_k3_fused_router(
         ),
         Int32(m),
         Int64(e_score_correction_bias.data_ptr()),
-        Int64(slots.data_ptr()),
+        Int64(slots.data_ptr() + slot_offset),
         Int64(counter.data_ptr()),
         Int64(topk_ids.data_ptr()),
         Int64(topk_weights.data_ptr()),
@@ -2059,7 +2586,7 @@ def k3_fused_router_topk(
     """Router GEMM + ``noaux_tc`` top-16 in one launch.
 
     Args:
-        hidden_states: ``bf16 [M, 7168]``, ``1 <= M <= 64``.
+        hidden_states: ``bf16 [M, 7168]``, ``1 <= M <= 256``.
         weight: Router weight ``bf16 [896, 7168]``.
         e_score_correction_bias: ``fp32 [896]``.
         routed_scaling_factor: Multiplier of the renormalized weights.
@@ -2130,7 +2657,7 @@ def k3_fused_router_sort(
     """Router GEMM + ``noaux_tc`` top-16 + ``moe_sort`` in one launch.
 
     Args:
-        hidden_states: ``bf16 [M, 7168]``, ``1 <= M <= 64``.
+        hidden_states: ``bf16 [M, 7168]``, ``1 <= M <= 256``.
         weight: Router weight ``bf16 [896, 7168]``.
         e_score_correction_bias: ``fp32 [896]``.
         routed_scaling_factor: Multiplier of the renormalized weights.
@@ -2276,8 +2803,8 @@ def _check_gemv_inputs(x: torch.Tensor, w: torch.Tensor) -> None:
         raise ValueError(f"x has K={x.shape[1]}, w has K={k}")
     if n % 8 or k % 128 or _ceil_div(n, _GEMV_ROWS) > _GEMV_MAX_GROUPS:
         raise ValueError(f"N={n} must be a multiple of 8 (<= 65536) and K={k} of 128")
-    if not 1 <= x.shape[0] <= MAX_M:
-        raise ValueError(f"M={x.shape[0]} must be in [1, {MAX_M}]")
+    if not 1 <= x.shape[0] <= GEMV_MAX_M:
+        raise ValueError(f"M={x.shape[0]} must be in [1, {GEMV_MAX_M}]")
     if not x.is_cuda or w.device != x.device or x.data_ptr() % 16 or w.data_ptr() % 16:
         raise ValueError("x and w must be 16-byte aligned tensors on the same CUDA device")
 
