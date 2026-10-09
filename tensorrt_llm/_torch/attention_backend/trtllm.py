@@ -39,6 +39,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from ..pyexecutor.config_utils import is_mla
 from ..ugpu.runtime import UgpuRuntime
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -2533,9 +2534,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 (latent_dim + nvfp4_gather_aux_bytes_per_compressed_token) /
                 min_compress_ratio)
 
-        fp8_context_mla = (quant_config is not None
-                           and quant_config.quant_mode.has_fp8_kv_cache()
-                           and get_sm_version() in (90, 100, 103, 120))
+        fp8_fallback_layers = frozenset()
+        if quant_mode is not None and getattr(quant_mode, "has_fp4_kv_cache",
+                                              lambda: False)():
+            fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
+                config, nvfp4_enabled=True)
+        has_local_fp8_fallback = bool(
+            fp8_fallback_layers and fp8_fallback_layers.intersection(
+                mapping.pp_layers(config.num_hidden_layers)))
+        # FP8 fallback layers stage the same context buffers as an all-FP8
+        # model, even though the model-wide cache quantization is NVFP4.
+        fp8_context_mla = (quant_mode is not None
+                           and (quant_mode.has_fp8_kv_cache()
+                                or has_local_fp8_fallback)
+                           and get_sm_version() in (90, 100, 103, 107, 120))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
@@ -2547,12 +2559,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
         #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
         #     reserve.
-        #   * SM 100 / 103 -- mUseTllmGen is `sm >= 100 && sm != 120`.
+        #   * SM 100 / 103 / 107 -- mUseTllmGen is `sm >= 100 && sm != 120`.
         #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
         # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
-                      and get_sm_version() in (100, 103))
+                      and get_sm_version() in (100, 103, 107))
         short_seq_mha_enabled = int(
             os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled

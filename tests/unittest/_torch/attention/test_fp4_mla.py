@@ -38,7 +38,7 @@ from tensorrt_llm._torch.attention_backend.fp4_mla.fp4_mla_context import (
     _build_fp8_mla_context_metadata,
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
@@ -703,7 +703,7 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             kv_lora_rank=512,
@@ -722,64 +722,6 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(
 
     assert slope == 2 * (320 + 40 + 32)
     assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
-
-
-def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(
-            model_type="kimi_linear",
-            num_hidden_layers=4,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            linear_attn_config={"full_attn_layers": [2, 4]},
-        )
-    )
-
-    slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
-        model_config,
-        Mapping(world_size=1, tp_size=1, pp_size=1, rank=0),
-        num_layers=2,
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        max_batch_size=3,
-        spec_config=SimpleNamespace(tokens_per_gen_step=4),
-    )
-
-    fp4_bytes_per_token = 320 + 40 + 32
-    assert slope == fp4_bytes_per_token + 576 * torch.bfloat16.itemsize
-    assert intercept == 3 * (HP_BLOCK_SIZE + 3) * 576 * 2
-
-
-@pytest.mark.parametrize("rank, num_bf16_layers", [(0, 0), (1, 2)])
-def test_fp4_mla_v2_default_bf16_tail_sizing_uses_global_layers(
-    monkeypatch: pytest.MonkeyPatch, rank: int, num_bf16_layers: int
-) -> None:
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(
-            model_type="kimi_k3",
-            num_hidden_layers=16,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            linear_attn_config={"full_attn_layers": list(range(2, 17, 2))},
-        )
-    )
-    slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
-        model_config,
-        Mapping(world_size=2, tp_size=1, pp_size=2, rank=rank),
-        num_layers=4,
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        max_batch_size=3,
-        spec_config=SimpleNamespace(tokens_per_gen_step=4),
-    )
-
-    num_fp4_layers = 4 - num_bf16_layers
-    assert slope == num_fp4_layers * (320 + 40 + 32) + num_bf16_layers * 576 * 2
-    assert intercept == 3 * 2 * num_fp4_layers * (HP_BLOCK_SIZE + 3) * 576 * 2
 
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
