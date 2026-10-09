@@ -31,6 +31,11 @@ from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, dflash_draft_slot_ids
+from .dspark_markov_fused import (
+    fused_markov_chain_logits,
+    fused_markov_enabled,
+    fused_markov_supported,
+)
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -918,6 +923,18 @@ class DSparkWorker(DFlashWorker):
                     "TP column shard of it."
                 )
             vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+
+        # Full-vocab logits chain through a plain argmax; the fused path computes
+        # the same chain bit for bit with three launches per step.
+        if (
+            vocab_slice is None
+            and fused_markov_enabled()
+            and not self._draft_logits_are_sharded(gen_logits, spec_metadata)
+            and fused_markov_supported(gen_logits, draft_model.markov_w1, draft_model.markov_w2)
+        ):
+            return fused_markov_chain_logits(
+                gen_logits, first_prev_tokens, draft_model.markov_w1, draft_model.markov_w2
+            )
 
         def argmax_fn(step_logits):
             # Full-vocab token ids (TP-aware when sharded); tokens stay in
