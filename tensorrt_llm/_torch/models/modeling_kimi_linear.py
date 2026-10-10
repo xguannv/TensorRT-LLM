@@ -80,6 +80,7 @@ is validated only without block reuse (Mixed cache manager).
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import json
 import math
@@ -123,7 +124,7 @@ from ..modules.linear import TensorParallelMode
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -143,6 +144,16 @@ _K3_HELIX_V_UP_BEFORE_A2A = os.environ.get("TRTLLM_HELIX_V_UP_BEFORE_A2A", "0") 
 _K3_FUSED_ROUTER = os.environ.get("TRTLLM_K3_FUSED_ROUTER", "0")
 if _K3_FUSED_ROUTER not in ("0", "topk", "sort"):
     raise ValueError(f"TRTLLM_K3_FUSED_ROUTER must be 0, topk or sort, got {_K3_FUSED_ROUTER!r}")
+
+# Decode-batch routing tail of the CuteDSL MoE (see k3_route_tail): "1" replaces noaux_tc_op ->
+# moe_sort with one launch on a cluster of at most eight CTAs (same logits, same routing);
+# "gemv" also computes the logits of M <= 32 tokens with a 40-CTA GEMV that runs beside the
+# latent down-projection, which then quantizes the routed input right away.
+_K3_ROUTE_TAIL = os.environ.get("TRTLLM_K3_ROUTE_TAIL", "0")
+if _K3_ROUTE_TAIL not in ("0", "1", "gemv"):
+    raise ValueError(f"TRTLLM_K3_ROUTE_TAIL must be 0, 1 or gemv, got {_K3_ROUTE_TAIL!r}")
+if _K3_ROUTE_TAIL != "0" and _K3_FUSED_ROUTER != "0":
+    raise ValueError("TRTLLM_K3_ROUTE_TAIL and TRTLLM_K3_FUSED_ROUTER are mutually exclusive")
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
@@ -272,12 +283,14 @@ class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
 
     ``KimiK3MoERuntime`` stores the fused router's ``(topk_ids, topk_weights)`` in
     ``precomputed`` right before calling the routed experts; the next ``apply``
-    returns and clears them instead of routing ``logits`` again.
+    returns and clears them instead of routing ``logits`` again. Alternatively it
+    stores a ``deferred`` callable that the next ``apply`` runs (once) on ``logits``.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.precomputed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.deferred: Optional[Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = None
 
     def apply(
         self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None
@@ -285,6 +298,9 @@ class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
         if self.precomputed is not None:
             result, self.precomputed = self.precomputed, None
             return result
+        if self.deferred is not None:
+            route, self.deferred = self.deferred, None
+            return route(logits)
         return super().apply(logits, input_ids)
 
 
@@ -1701,6 +1717,87 @@ class KimiK3MoERuntime(nn.Module):
         routing.precomputed = (topk_ids, topk_weights)
         return logits
 
+    def _route_tail_target(self, num_tokens: int) -> Optional[Tuple[int, int]]:
+        """``(local_expert_offset, local_num_experts)`` if the CuTe routing tail serves this
+        forward (``TRTLLM_K3_ROUTE_TAIL``), else ``None``."""
+        if _K3_ROUTE_TAIL == "0" or torch.compiler.is_compiling():
+            return None
+        routing = self.routed_experts.routing_method
+        backend = self.routed_experts.backend
+        if not isinstance(routing, _KimiK3RoutingMethod) or self.routed_experts.use_dp:
+            return None
+        slot_start = getattr(backend, "slot_start", None)
+        num_local = getattr(backend, "expert_size_per_partition", None)
+        if (
+            slot_start is None
+            or num_local is None
+            or getattr(backend, "num_slots", None) != self.gate.num_experts
+        ):
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_route_tail
+
+        if not 1 <= num_tokens <= k3_route_tail.MAX_M:
+            return None
+        return slot_start, num_local
+
+    def _can_gemv_route(self, hidden_states: torch.Tensor) -> bool:
+        """Whether ``TRTLLM_K3_ROUTE_TAIL=gemv`` computes this forward's router logits."""
+        from ..cute_dsl_kernels.blackwell import k3_route_tail
+
+        backend = self.routed_experts.backend
+        return (
+            _K3_ROUTE_TAIL == "gemv"
+            and hidden_states.shape[0] <= k3_route_tail.GEMV_ROUTE_MAX_M
+            and getattr(backend, "has_nvfp4", False)
+            and getattr(backend, "fc31_input_scale", None) is not None
+            and k3_route_tail.can_use_k3_route(hidden_states, self.gate.weight)
+        )
+
+    def _attach_route(
+        self, outs: Tuple[torch.Tensor, ...], target: Tuple[int, int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(topk_ids, topk_weights)`` of a routing-tail result; the ids carry the
+        ``moe_sort`` outputs for the CuteDSL backend."""
+        topk_ids = outs[0]
+        topk_ids._k3_presorted = ((target[0], target[1], 128), tuple(outs[2:8]))
+        return topk_ids, outs[1]
+
+    def _tail_route(
+        self, logits: torch.Tensor, target: Tuple[int, int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        outs = torch.ops.trtllm.k3_route_tail(
+            logits,
+            self.gate.e_score_correction_bias,
+            float(self.gate.routed_scaling_factor),
+            target[0],
+            target[1],
+            128,
+        )
+        return self._attach_route(outs, target)
+
+    def _gemv_route(self, hidden_states: torch.Tensor, target: Tuple[int, int]) -> torch.Tensor:
+        """Route with the router GEMV + tail; hands the result to the routing method and
+        returns the FP32 logits."""
+        outs = torch.ops.trtllm.k3_route(
+            hidden_states,
+            self.gate.weight,
+            self.gate.e_score_correction_bias,
+            float(self.gate.routed_scaling_factor),
+            target[0],
+            target[1],
+            128,
+        )
+        self.routed_experts.routing_method.precomputed = self._attach_route(outs, target)
+        return outs[8]
+
+    def _quantize_routed_input(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """NVFP4-quantize the routed input like the CuteDSL backend's ``quantize_input``."""
+        backend = self.routed_experts.backend
+        x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+            x, backend.fc31_input_scale, backend.scaling_vector_size, False, False
+        )
+        return Fp4QuantizedTensor(x_fp4, x_sf, is_sf_swizzled=False)
+
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
@@ -1921,6 +2018,8 @@ class KimiK3MoERuntime(nn.Module):
         identity = hidden_states
         projected_input = None
         early_routed_in = None
+        route_target = self._route_tail_target(hidden_states.shape[0])
+        gemv_route = False
         if self._can_fuse_router_down(hidden_states):
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
@@ -1933,21 +2032,28 @@ class KimiK3MoERuntime(nn.Module):
             ):
                 # Forked ahead of the router GEMM: the latent chain needs only
                 # hidden_states.
+                gemv_route = route_target is not None and self._can_gemv_route(hidden_states)
                 self.moe_latent_fork_event.record()
                 with torch.cuda.stream(self.latent_down_stream):
                     self.moe_latent_fork_event.wait()
                     early_routed_in = self._routed_projection(
                         hidden_states, self.routed_expert_down_proj
                     )
+                    if gemv_route:
+                        # Quantized here, the routed input does not wait for the routing.
+                        early_routed_in = self._quantize_routed_input(early_routed_in)
                     self.moe_latent_ready_event.record()
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
             # With the fused router, routing runs inside the routed branch below, so the
             # shared experts fork before it instead of waiting for the router.
-            router_logits = (
-                None if _K3_FUSED_ROUTER != "0" else self.gate.compute_logits(hidden_states)
-            )
+            if gemv_route:
+                router_logits = self._gemv_route(hidden_states, route_target)
+            else:
+                router_logits = (
+                    None if _K3_FUSED_ROUTER != "0" else self.gate.compute_logits(hidden_states)
+                )
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
@@ -1968,14 +2074,24 @@ class KimiK3MoERuntime(nn.Module):
             elif early_routed_in is not None:
                 routed_in = early_routed_in
                 moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
+                if isinstance(routed_in, Fp4QuantizedTensor):
+                    moe_kwargs["output_dtype"] = torch.bfloat16
             else:
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            if route_target is not None and not gemv_route:
+                # Routed by the CuTe tail when the backend asks for the routing (after it
+                # forks the input quantization).
+                self.routed_experts.routing_method.deferred = functools.partial(
+                    self._tail_route, target=route_target
+                )
             y = self.routed_experts(
                 routed_in,
                 logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 **moe_kwargs,
             )
+            if route_target is not None:
+                self.routed_experts.routing_method.deferred = None
             if overlap_shared_allreduce:
                 self.moe_routed_event.record()
             if self._reduce_routed_output:
