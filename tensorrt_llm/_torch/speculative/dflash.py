@@ -31,6 +31,13 @@ from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
 from .interface import SpecMetadata, SpecWorkerBase
+from .spec_tail_kernels import decode_draft_block_table, spec_tail_fusion_enabled
+from .vocab_parallel import (
+    VocabParallelHead,
+    VocabShardedLogits,
+    vocab_parallel_enabled,
+    vocab_parallel_sampling_enabled,
+)
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
@@ -283,6 +290,8 @@ class DFlashWorker(SpecWorkerBase):
         # _lazy_init_ctx_buffers; read by _store_prefill_context.
         self._ctx_reuse_addressable = False
         self._dflash_attention_backend = spec_config.attention_backend
+        # VocabParallelHead per LM head (keyed by id), built on first use.
+        self._vocab_parallel_heads = {}
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -346,6 +355,58 @@ class DFlashWorker(SpecWorkerBase):
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
+
+    def _vocab_parallel_head(self, lm_head) -> Optional[VocabParallelHead]:
+        """The cached ``VocabParallelHead`` of ``lm_head``, or None when the
+        vocab-parallel paths are off or the head is not a plain vocab shard."""
+        if not vocab_parallel_enabled() or lm_head is None:
+            return None
+        key = id(lm_head)
+        if key not in self._vocab_parallel_heads:
+            vocab = int(getattr(lm_head, "num_embeddings", 0) or 0)
+            supported = vocab > 0 and VocabParallelHead.supported(lm_head, vocab)
+            self._vocab_parallel_heads[key] = (
+                VocabParallelHead(lm_head, vocab) if supported else None
+            )
+        return self._vocab_parallel_heads[key]
+
+    def target_vocab_parallel_head(self, lm_head) -> Optional[VocabParallelHead]:
+        if self.guided_decoder is not None:
+            return None
+        return self._vocab_parallel_head(lm_head)
+
+    @staticmethod
+    def _vocab_parallel_target_selection_applies(spec_metadata) -> bool:
+        """Whether this batch's target tokens can come from shard logits: greedy,
+        or temperature-only sampling with the sampling switch on. Rejection
+        sampling needs the full target distribution."""
+        if spec_metadata.is_all_greedy_sample:
+            return True
+        if spec_metadata.use_rejection_sampling:
+            return False
+        from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+
+        return (
+            vocab_parallel_sampling_enabled()
+            and spec_metadata.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK_NO_TOPP
+        )
+
+    def _draft_vocab_parallel_head(self, draft_model, spec_metadata):
+        """The head greedy draft tokens are selected vocab-parallel with, or None."""
+        if (
+            spec_metadata.wants_advanced_draft_sampling
+            or self.guided_decoder is not None
+            or self._d2t is not None
+        ):
+            return None
+        return self._vocab_parallel_head(getattr(draft_model, "lm_head", None))
+
+    def _vocab_parallel_markov_weights(self, draft_model):
+        """``(markov_w1, markov_w2)`` of the intra-block Markov head the draft
+        tokens chain through, or ``(None, None)`` for the plain per-position
+        argmax. Plain DFlash has no Markov head."""
+        del draft_model
+        return None, None
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -502,6 +563,14 @@ class DFlashWorker(SpecWorkerBase):
             return False
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes.
+        if spec_tail_fusion_enabled():
+            decode_draft_block_table(
+                src[self._ctx_pool_idx, :num_seqs, 0],
+                self._ctx_block_divisor,
+                self._ctx_block_tables[:num_seqs],
+                self._ctx_block_counts[:num_seqs],
+            )
+            return True
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64)
         # Placeholder entries past a request's allocation are negative. Count
         # them before clamping: unlike the private arena, whose slots each owned
@@ -975,9 +1044,15 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
+        if isinstance(logits, VocabShardedLogits):
+            raw_logits = logits.local
+            if not self._vocab_parallel_target_selection_applies(spec_metadata):
+                logits = logits.gather()
         K = spec_metadata.runtime_draft_len
 
         if K == 0:
+            if isinstance(logits, VocabShardedLogits):
+                logits = logits.gather()
             return self.skip_drafting(
                 input_ids,
                 position_ids,
@@ -1117,23 +1192,38 @@ class DFlashWorker(SpecWorkerBase):
                 # next one's slot 0 and the last overruns. Degrades, never raises.
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
-                gen_logits = draft_model.logits_processor(
-                    hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
-                )
+                draft_head = self._draft_vocab_parallel_head(draft_model, spec_metadata)
+                if draft_head is not None:
+                    # Greedy draft tokens straight from this rank's vocab shard
+                    # of the block logits, bit-identical to refining the
+                    # gathered logits and taking the per-position argmax.
+                    markov_w1, markov_w2 = self._vocab_parallel_markov_weights(draft_model)
+                    local_block = draft_head.local_logits(hidden_states_out[gen_gather_ids])
+                    gen_draft_tokens = draft_head.markov_tokens(
+                        local_block.view(num_gens, K, -1),
+                        inputs["first_prev_tokens"],
+                        markov_w1,
+                        markov_w2,
+                    )
+                    vocab_size = draft_head.vocab_size
+                else:
+                    gen_logits = draft_model.logits_processor(
+                        hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
+                    )
 
-                vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+                    vocab_size = gen_logits.shape[-1]
+                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                gen_logits = self._refine_block_logits(
-                    draft_model, gen_logits, inputs, spec_metadata
-                )
+                    gen_logits = self._refine_block_logits(
+                        draft_model, gen_logits, inputs, spec_metadata
+                    )
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits,
+                        spec_metadata,
+                        batch_size,
+                        num_contexts=num_contexts,
+                    )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the

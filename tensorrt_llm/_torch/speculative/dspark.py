@@ -359,7 +359,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
-        self._batch_to_slot = torch.full((max_batch,), self._scratch_slot, dtype=torch.long, device="cuda")
+        self._batch_to_slot = torch.full(
+            (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
+        )
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         logger.info(
@@ -859,6 +861,28 @@ class DSparkWorker(DFlashWorker):
         return dflash_draft_slot_ids(
             num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
         )
+
+    def _draft_vocab_parallel_head(self, draft_model, spec_metadata):
+        """Also require Markov weights the vocab-parallel chain can index:
+        contiguous ``[vocab, rank]`` tensors of one dtype."""
+        head = super()._draft_vocab_parallel_head(draft_model, spec_metadata)
+        if head is None or not getattr(draft_model, "has_markov_head", False):
+            return head
+        w1, w2 = draft_model.markov_w1, draft_model.markov_w2
+        if (
+            w1.is_contiguous()
+            and w2.is_contiguous()
+            and w1.shape == w2.shape
+            and w1.dtype == w2.dtype
+            and w2.shape[0] == head.vocab_size
+        ):
+            return head
+        return None
+
+    def _vocab_parallel_markov_weights(self, draft_model):
+        if not getattr(draft_model, "has_markov_head", False):
+            return None, None
+        return draft_model.markov_w1, draft_model.markov_w2
 
     def _refine_block_logits(
         self,

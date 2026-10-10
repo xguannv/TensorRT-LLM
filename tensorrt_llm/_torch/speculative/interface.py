@@ -48,6 +48,8 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .spec_tail_kernels import fused_strict_accept, spec_tail_fusion_enabled
+from .vocab_parallel import VocabShardedLogits
 
 
 def rejection_sampling_one_model(
@@ -1525,6 +1527,13 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
 
+    def target_vocab_parallel_head(self, lm_head):
+        """The ``VocabParallelHead`` this worker selects target tokens with, or
+        None to receive gathered logits. A worker that returns a head receives
+        ``VocabShardedLogits`` as its ``logits`` argument."""
+        del lm_head
+        return None
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         """
         Prepare attention metadata before speculative decoding draft token generation.
@@ -1661,6 +1670,28 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return num_accepted_tokens
 
+    def _force_accept_kernel_args(self, runtime_draft_len: int, spec_metadata,
+                                  device: torch.device) -> Optional[tuple]:
+        """The ``force`` argument of ``fused_strict_accept`` that reproduces
+        :meth:`_apply_force_accepted_tokens` (same warmup skip and draws)."""
+        if self.force_num_accepted_tokens == 0.0:
+            return None
+        if (spec_metadata is not None and spec_metadata.is_cuda_graph
+                and not torch.cuda.is_current_stream_capturing()):
+            return None
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+        if frac_part > 0.0 and base_total < max_total:
+            self._ensure_force_accept_rng_state(device)
+            return (base_total, frac_part, max_total,
+                    self._force_accept_rng_pool,
+                    self._force_accept_rng_counter,
+                    _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+                    _FORCE_ACCEPT_RNG_SLOT_STRIDE)
+        return (base_total, )
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -1693,8 +1724,17 @@ class SpecWorkerBase(nn.Module, ABC):
         runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
+        if not isinstance(logits, VocabShardedLogits) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
+
+        if spec_tail_fusion_enabled():
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+            return fused_strict_accept(
+                target_tokens, draft_tokens, num_contexts, batch_size,
+                self._force_accept_kernel_args(runtime_draft_len,
+                                               spec_metadata,
+                                               target_tokens.device))
 
         # Allocate return buffers
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
@@ -2629,6 +2669,10 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        if isinstance(logits, VocabShardedLogits):
+            # The worker only passes shard logits through when vocab-parallel
+            # selection covers this batch's sampling mode.
+            return logits.select_tokens(spec_metadata)
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
