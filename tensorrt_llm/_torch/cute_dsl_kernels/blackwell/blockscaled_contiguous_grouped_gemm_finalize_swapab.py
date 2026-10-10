@@ -28,9 +28,9 @@ still sees runs of the same permuted tile: the token operand and the per-row met
 (consecutive tiles rotate between them), then MMA, TMA, scheduler and metadata warps.
 
 Requirements: NVFP4 (Float4E2M1FN data, Float8E4M3FN scales, vector 16), K-major operands,
-``n % (128 * h_blocks) == 0``, ``k % 64 == 0``, ``k <= 256`` (one K stage), ``tile_size == 128``;
-``n_tok`` = 64 only when no permuted tile can hold more than 64 valid rows (num_tokens <= 64: a token
-selects an expert at most once).
+``n % (128 * h_blocks) == 0``, ``k % 64 == 0``, ``k <= 256`` (one K stage), ``tile_size == 128``.
+With ``n_tok`` = 64 a permuted tile holding more than 64 valid rows is processed as two 64-row
+sub-tiles (its weight blocks are then read twice).
 """
 
 from typing import Tuple, Type
@@ -140,6 +140,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
         self.epi_cols = 8
         self.stage_rows = 16
         self.num_b_stage = num_b_stage
+        # n_tok-row sub-tiles of a permuted tile (sInfo[3] bits 2+ carry the sub-tile index)
+        self.subs_per_tile = tile_size // n_tok
         self.num_meta_stage = num_meta_stage
 
     def _setup_attributes(self):
@@ -608,27 +610,38 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                 chunk_left = cutlass.Int32(self.sched_chunk)
                 stride = (cutlass.Int32(num_ctas) - 1) * self.sched_chunk
             prev_tok = cutlass.Int32(-1)
+            prev_run = cutlass.Int32(-1)
             expert_idx = cutlass.Int32(0)
             mn_limit = cutlass.Int32(0)
+            num_sub = cutlass.Int32(1)
             while idx < end:
                 tok_tile = idx // num_h_tiles
                 h_tile = idx - tok_tile * num_h_tiles
-                new_tok = cutlass.Int32(0)
                 if tok_tile != prev_tok:
-                    new_tok = cutlass.Int32(2)
                     expert_idx = tile_idx_to_expert_idx[tok_tile]
                     mn_limit = tile_idx_to_mn_limit[tok_tile]
                     prev_tok = tok_tile
-                tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                with cute.arch.elect_one():
-                    sInfo[(0, tile_info_producer_state.index)] = tok_tile
-                    sInfo[(1, tile_info_producer_state.index)] = h_tile
-                    sInfo[(2, tile_info_producer_state.index)] = expert_idx
-                    sInfo[(3, tile_info_producer_state.index)] = 1 + new_tok
-                    sInfo[(4, tile_info_producer_state.index)] = mn_limit
-                self.sched_sync_barrier.arrive_and_wait()
-                tile_info_pipeline.producer_commit(tile_info_producer_state)
-                tile_info_producer_state.advance()
+                    # a permuted tile with more than n_tok valid rows is split into n_tok-row sub-tiles
+                    num_sub = (
+                        cutlass.max(mn_limit - tok_tile * self.tile_size, cutlass.Int32(1))
+                        + self.n_tok
+                        - 1
+                    ) // self.n_tok
+                for sub in cutlass.range(num_sub, unroll=1):
+                    new_run = cutlass.Int32(0)
+                    if tok_tile * self.subs_per_tile + sub != prev_run:
+                        new_run = cutlass.Int32(2)
+                        prev_run = tok_tile * self.subs_per_tile + sub
+                    tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    with cute.arch.elect_one():
+                        sInfo[(0, tile_info_producer_state.index)] = tok_tile
+                        sInfo[(1, tile_info_producer_state.index)] = h_tile
+                        sInfo[(2, tile_info_producer_state.index)] = expert_idx
+                        sInfo[(3, tile_info_producer_state.index)] = 1 + new_run + 4 * sub
+                        sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                    self.sched_sync_barrier.arrive_and_wait()
+                    tile_info_pipeline.producer_commit(tile_info_producer_state)
+                    tile_info_producer_state.advance()
                 idx += 1
                 chunk_left -= 1
                 if chunk_left == 0:
@@ -673,7 +686,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                     b_bar = b_pipeline.producer_get_barrier(b_producer_state)
                     cute.copy(
                         tma_atom_b,
-                        tBgB[(None, tok_tile * (self.tile_size // self.n_tok), 0, 0)],
+                        tBgB[(None, tok_tile * self.subs_per_tile + (tile_info[3] >> 2), 0, 0)],
                         tBsB[(None, b_producer_state.index)],
                         tma_bar_ptr=b_bar,
                     )
@@ -787,6 +800,20 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                         tCsSFB_compact_s2t[(None, None, None, None, b_consumer_state.index)],
                         tCtSFB_compact_s2t,
                     )
+                # the scale factors of a permuted tile cover its 128 rows; sub-tile s of an n_tok = 64
+                # MMA starts 2 TMEM words (64 rows) further
+                tCtSFB_sub = tCtSFB
+                if cutlass.const_expr(self.subs_per_tile > 1):
+                    tCtSFB_sub = cute.make_tensor(
+                        cute.recast_ptr(
+                            acc_tmem_ptr
+                            + self.num_accumulator_tmem_cols
+                            + self.num_sfa_tmem_cols
+                            + (tile_flags >> 2) * 2,
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFB_layout,
+                    )
                 # K fits one stage: one A stage per tile, one accumulator stage per 128-row block
                 ab_pipeline.consumer_wait(ab_consumer_state)
                 num_kblocks = cute.size(tCrA, mode=[2])
@@ -807,7 +834,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                         tiled_mma.set(
                             tcgen05.Field.SFA, tCtSFA_blocks[mb][sf_kblock_coord].iterator
                         )
-                        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+                        tiled_mma.set(tcgen05.Field.SFB, tCtSFB_sub[sf_kblock_coord].iterator)
                         cute.gemm(
                             tiled_mma,
                             tCtAcc[(None, 0, 0)],
@@ -852,7 +879,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
 
             while is_valid_tile:
                 if (tile_info[3] & 2) != 0:
-                    tile_m_start = tile_info[0] * self.tile_size
+                    tile_m_start = tile_info[0] * self.tile_size + (tile_info[3] >> 2) * self.n_tok
                     alpha_val = alpha[tile_info[2]]
                     meta_pipeline.producer_acquire(meta_producer_state)
                     meta_stage = meta_producer_state.index
@@ -933,7 +960,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                 if tile_k % self.num_epi_wg == wg:
                     meta_stage = meta_consumer_state.index
                     n_valid = cutlass.min(
-                        cutlass.max(tile_info[4] - tile_info[0] * self.tile_size, cutlass.Int32(0)),
+                        cutlass.max(
+                            tile_info[4]
+                            - tile_info[0] * self.tile_size
+                            - (tile_info[3] >> 2) * self.n_tok,
+                            cutlass.Int32(0),
+                        ),
                         cutlass.Int32(self.n_tok),
                     )
                     for mb in cutlass.range_constexpr(self.h_blocks):
@@ -1083,15 +1115,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
         )
 
     @staticmethod
-    def can_implement(
-        n: int, k: int, num_tokens: int, n_tok: int, tile_size: int, h_blocks: int = 2
-    ) -> bool:
+    def can_implement(n: int, k: int, n_tok: int, tile_size: int, h_blocks: int = 2) -> bool:
         # the whole K of a tile is one 256-wide stage
-        if tile_size != 128 or n % (128 * h_blocks) != 0 or k % 64 != 0 or k > 256:
-            return False
-        if n_tok == 64:
-            return num_tokens <= 64
-        return n_tok == 128
+        return (
+            tile_size == 128
+            and n_tok in (64, 128)
+            and n % (128 * h_blocks) == 0
+            and k % 64 == 0
+            and k <= 256
+        )
 
 
 __all__: Tuple[str, ...] = ("Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel",)

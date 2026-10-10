@@ -78,8 +78,10 @@ _CUDA_MAX_GRID_DIM_Z = 65_535
 # Opt-in swap-AB kernel for the NVFP4 MoE finalize GEMM (FC2) when the expert K fits one 256-wide
 # stage (an expert's intermediate slice under MoE TP, e.g. Kimi-K3 TP16: K = 192): weights become the
 # MMA M side and the few tokens of a permuted tile the N side, so the epilogue reads only the valid
-# token columns. Shapes the swap-AB kernel cannot run keep the regular kernel.
+# token columns. Shapes the swap-AB kernel cannot run, and batches above
+# _MOE_FINALIZE_SWAPAB_MAX_TOKENS tokens, keep the regular kernel.
 _MOE_FINALIZE_SWAPAB_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB"
+_MOE_FINALIZE_SWAPAB_MAX_TOKENS = 256
 
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
@@ -2807,22 +2809,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.allow_swapab,
             )
 
-        @staticmethod
-        def _swapab_config(num_tokens: int) -> dict:
-            """Swap-AB kernel configuration for ``num_tokens`` rows of output."""
-            # A token selects an expert at most once, so with <= 64 tokens no permuted tile holds more
-            # than 64 valid rows and the narrower token operand is enough.
-            if num_tokens <= 64:
-                return dict(n_tok=64, num_epi_wg=3, h_blocks=2, sched_chunk=4)
-            return dict(n_tok=128, num_epi_wg=3, h_blocks=1, sched_chunk=4)
+        # 64-row token operand, two 128-row weight blocks per tile, three
+        # epilogue warpgroups, round-robin chunks of four tiles
+        SWAPAB_CONFIG = dict(n_tok=64, num_epi_wg=3, h_blocks=2, sched_chunk=4)
 
         def use_swapab(self, n: int, k: int, num_tokens: int) -> bool:
-            if not self.allow_swapab or self.scaling_vector_size != 16:
+            if (not self.allow_swapab or self.scaling_vector_size != 16
+                    or num_tokens > _MOE_FINALIZE_SWAPAB_MAX_TOKENS):
                 return False
-            cfg = self._swapab_config(num_tokens)
+            cfg = self.SWAPAB_CONFIG
             return Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel.can_implement(
-                n, k, num_tokens, cfg["n_tok"], self.tile_size,
-                cfg["h_blocks"])
+                n, k, cfg["n_tok"], self.tile_size, cfg["h_blocks"])
 
         def get_valid_tactics(
             self,
@@ -3077,7 +3074,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             permuted_idx_to_expanded_idx_ptr,
                             num_non_exiting_tiles_ptr, token_final_scales_ptr,
                             m, n, k, l, num_tokens, stream):  # noqa: E741
-            cfg = self._swapab_config(num_tokens)
+            cfg = self.SWAPAB_CONFIG
             args = [
                 a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
                 tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,

@@ -4290,14 +4290,17 @@ def _finalize_inplace(inputs, num_experts, top_k, num_local_experts, local_exper
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
-@pytest.mark.parametrize("ep", [(64, 64, 0), (64, 32, 32)], ids=["tp", "ep2_rank1"])
-@pytest.mark.parametrize("num_tokens", [1, 8, 33, 64, 65, 128])
+@pytest.mark.parametrize(
+    "ep", [(64, 64, 0), (64, 32, 32), (16, 16, 0)], ids=["tp", "ep2_rank1", "tp_dense"]
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 33, 64, 65, 128, 200])
 def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, monkeypatch):
     """Swap-AB finalize (TRTLLM_MOE_FINALIZE_SWAPAB=1) vs the regular finalize kernel.
 
-    K = 192 is an expert's intermediate slice under MoE TP16 (Kimi-K3). Every partial
-    ``bf16(alpha * scale * acc)`` must be bit-identical: with one non-zero top-k scale per token each
-    output element is a single partial. With all scales the 8 partials are summed in BF16 in an
+    K = 192 is an expert's intermediate slice under MoE TP16 (Kimi-K3); with 16 experts most
+    permuted tiles hold more than 64 tokens, which the swap-AB kernel splits into 64-row
+    sub-tiles. Every partial ``bf16(alpha * scale * acc)`` must be bit-identical: with one
+    non-zero top-k scale per token each output element is a single partial. With all scales the 8 partials are summed in BF16 in an
     unspecified order by both kernels; both must stay within the BF16 accumulation bound of the
     exact sum of the partials.
     """
