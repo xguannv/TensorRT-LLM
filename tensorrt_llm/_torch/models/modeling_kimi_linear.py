@@ -207,6 +207,10 @@ _K3_LOWM_OVER_FUSED_MAX_M = 128
 # Negative values rank above the main and shared-expert streams, so the latent chain that
 # gates the routed GEMM1 gets free SMs first.
 _K3_LATENT_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_LATENT_STREAM_PRIORITY", "0"))
+# CUDA stream priority of the stream shared by the attention-side aux work and the MoE shared
+# expert. Negative values let the shared-expert chain take SMs ahead of the persistent routed
+# GEMMs on the main stream, so its all-reduce does not land after them.
+_K3_SHARED_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_SHARED_STREAM_PRIORITY", "0"))
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
@@ -2774,7 +2778,8 @@ class KimiLinearModel(DecoderModel):
 
         # Attention and MoE phases are sequential, so their branch-overlap
         # roles share one stream; MoE-internal overlap roles remain separate.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = [torch.cuda.Stream(priority=_K3_SHARED_STREAM_PRIORITY)]
+        aux_stream_list += [torch.cuda.Stream() for _ in range(2)]
         aux_stream_list.append(torch.cuda.Stream(priority=_K3_LATENT_STREAM_PRIORITY))
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
