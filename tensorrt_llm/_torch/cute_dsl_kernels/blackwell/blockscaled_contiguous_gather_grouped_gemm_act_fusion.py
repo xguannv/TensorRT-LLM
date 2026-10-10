@@ -285,6 +285,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         swiglu_limit: cutlass.Float32 = float("inf"),
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -452,6 +453,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
         self.situ_beta = None if situ_beta is None else float(situ_beta)
         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
+        # L2 evict-first hint (CacheHintSm90::EVICT_FIRST) on the expert weight / scale loads
+        self.weight_evict_first = weight_evict_first
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1789,6 +1792,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # with multicast support to reduce L2 memory traffic
         #
         if warp_idx == self.tma_b_warp_id:
+            weight_cache_kw = (
+                {"cache_policy": cutlass.Int64(0x12F0000000000000)}
+                if cutlass.const_expr(self.weight_evict_first)
+                else {}
+            )
             #
             # Persistent tile scheduling loop
             #
@@ -1856,6 +1864,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        **weight_cache_kw,
                     )
                     cute.copy(
                         tma_atoms_sfb[0],
@@ -1863,6 +1872,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
+                        **weight_cache_kw,
                     )
 
                     b_producer_state.advance()

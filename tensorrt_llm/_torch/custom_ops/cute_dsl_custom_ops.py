@@ -82,6 +82,10 @@ _CUDA_MAX_GRID_DIM_Z = 65_535
 # _MOE_FINALIZE_SWAPAB_MAX_TOKENS tokens, keep the regular kernel.
 _MOE_FINALIZE_SWAPAB_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB"
 _MOE_FINALIZE_SWAPAB_MAX_TOKENS = 256
+# Opt-in L2 evict-first hint on the expert weight loads of the regular NVFP4 MoE
+# gather (FC1) and finalize (FC2) kernels; the swap-AB finalize kernel always
+# uses it.
+_MOE_WEIGHT_EVICT_FIRST_ENV = "TRTLLM_MOE_WEIGHT_EVICT_FIRST"
 
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
@@ -2796,6 +2800,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.allow_swapab = os.environ.get(_MOE_FINALIZE_SWAPAB_ENV,
                                                "0") == "1"
+            self.weight_evict_first = os.environ.get(
+                _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
 
         def unique_id(self):
             return (
@@ -2807,6 +2813,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype,
                 self.scaling_vector_size,
                 self.allow_swapab,
+                self.weight_evict_first,
             )
 
         # 64-row token operand, two 128-row weight blocks per tile, three
@@ -3001,13 +3008,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m)
+                         cluster_shape_mn, raster_along_m,
+                         self.weight_evict_first)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     raster_along_m=raster_along_m,
+                    weight_evict_first=self.weight_evict_first,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -3593,6 +3602,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
             self.swiglu_limit_scalar = swiglu_limit_scalar
+            self.weight_evict_first = os.environ.get(
+                _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3616,6 +3627,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.swiglu_limit_scalar,
                 self.situ_beta,
                 self.situ_linear_beta,
+                self.weight_evict_first,
             )
 
         def get_valid_tactics(
@@ -3821,7 +3833,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
-                         self.situ_beta, self.situ_linear_beta)
+                         self.situ_beta, self.situ_linear_beta,
+                         self.weight_evict_first)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -3835,6 +3848,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     swiglu_limit=self.swiglu_limit_scalar,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
+                    weight_evict_first=self.weight_evict_first,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(

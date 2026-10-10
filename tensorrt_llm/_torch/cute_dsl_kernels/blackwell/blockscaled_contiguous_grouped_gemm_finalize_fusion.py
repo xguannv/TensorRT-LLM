@@ -204,6 +204,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -228,6 +229,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
+        # L2 evict-first hint (CacheHintSm90::EVICT_FIRST) on the expert weight / scale loads
+        self.weight_evict_first = weight_evict_first
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -1277,6 +1280,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
+            weight_cache_kw = (
+                {"cache_policy": cutlass.Int64(0x12F0000000000000)}
+                if cutlass.const_expr(self.weight_evict_first)
+                else {}
+            )
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -1364,6 +1372,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        **weight_cache_kw,
                     )
                     cute.copy(
                         tma_atoms_sfb[0],
@@ -1371,6 +1380,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
+                        **weight_cache_kw,
                     )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
