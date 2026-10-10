@@ -10,6 +10,9 @@ from torch import nn
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
+from tensorrt_llm._torch.distributed.nvls_allreduce import (NVLS_AR_MAX_BYTES,
+                                                            NVLS_AR_MIN_BYTES,
+                                                            NVLSAllReduce)
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -745,6 +748,7 @@ class AllReduce(nn.Module):
         self.strategy = strategy
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
+        self.nvls_allreduce = None
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
@@ -824,6 +828,23 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+
+            # NVLink SHARP (multicast) all-reduce for plain BF16 sums in
+            # [TRTLLM_NVLS_AR_MIN_BYTES, TRTLLM_NVLS_AR_MAX_BYTES] on TP groups
+            # of at least TRTLLM_NVLS_AR_MIN_WORLD_SIZE ranks; off by default.
+            if (os.environ.get("TRTLLM_NVLS_AR", "0") == "1"
+                    and not self._disable_mpi
+                    and dtype in (None, torch.bfloat16) and self.strategy
+                    in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL)
+                    and self.mapping.tp_size >= int(
+                        os.environ.get("TRTLLM_NVLS_AR_MIN_WORLD_SIZE", "16"))
+                    and NVLSAllReduce.is_supported(self.mapping)):
+                try:
+                    self.nvls_allreduce = NVLSAllReduce(self.mapping)
+                except RuntimeError as e:
+                    logger.warning(
+                        f"NVLS AllReduce can't be enabled due to {e}.")
+                    self.nvls_allreduce = None
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
@@ -907,6 +928,12 @@ class AllReduce(nn.Module):
                 key=(self.mapping.tp_rank, all_reduce_params.fusion_op,
                      "debug_fusion_skip"),
             )
+
+        if (self.nvls_allreduce is not None
+                and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
+                and NVLS_AR_MIN_BYTES <= input.numel() * input.element_size() <=
+                NVLS_AR_MAX_BYTES and self.nvls_allreduce.can_use(input)):
+            return self.nvls_allreduce(input)
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
