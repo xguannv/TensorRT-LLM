@@ -46,11 +46,12 @@ def spec_tail_fusion_enabled() -> bool:
 
 
 def draft_fusion_enabled() -> bool:
-    """Whether ``TLLM_DSPARK_DRAFT_FUSION=1`` selects the drafter's fused
-    all-reduce paths (TP-sharded context projection, all-reduce + residual +
-    RMSNorm in one kernel). These change the drafter's rounding, so draft
-    tokens can differ from the unfused drafter in rare near-ties; target
-    verification keeps the output lossless."""
+    """Whether ``TLLM_DSPARK_DRAFT_FUSION=1`` selects the drafter fusions that
+    change its rounding: the TP-sharded context projection (fc split along its
+    input features, reduced with hidden_norm fused into the all-reduce), each
+    layer's all-reduce fused with the residual add and RMSNorm, and q_a / kv_a
+    as one GEMM. Draft tokens can then differ from the unfused drafter in
+    near-ties; target verification keeps the output lossless."""
     return os.environ.get(DRAFT_FUSION_ENV_VAR, "0") == "1"
 
 

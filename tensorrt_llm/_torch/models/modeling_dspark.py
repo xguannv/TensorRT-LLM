@@ -3910,8 +3910,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             fused_a = self._draft_fused_a_proj(layer_idx) if fused_ar is not None else None
             if fused_a is not None:
                 # q_a and kv_a read the same normed input: one GEMM, split after.
+                # Both halves are consumed as row-strided views (q_a_layernorm
+                # and the fused RMSNorm+RoPE read strided rows), so no copies.
                 q_kv_a = fused_a(hs_normed)
-                q_a = q_kv_a[:, : attn.q_lora_rank].contiguous()
+                q_a = q_kv_a[:, : attn.q_lora_rank]
                 blk_latent_rows = q_kv_a[:, attn.q_lora_rank :]
             else:
                 q_a = attn.q_a_proj(hs_normed)

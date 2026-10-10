@@ -1749,8 +1749,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if self.spec_worker is not None:
             # get logits. A worker that selects tokens vocab-parallel takes
             # this rank's vocab shard of the logits instead of gathered ones.
-            vocab_head = self.spec_worker.target_vocab_parallel_head(
-                self.lm_head)
+            get_vocab_head = getattr(self.spec_worker,
+                                     "target_vocab_parallel_head", None)
+            vocab_head = (get_vocab_head(self.lm_head)
+                          if get_vocab_head is not None else None)
             if vocab_head is not None:
                 logits = vocab_head.shard_logits(
                     hidden_states[spec_metadata.gather_ids])
