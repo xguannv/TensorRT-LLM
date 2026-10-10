@@ -630,3 +630,50 @@ def fused_next_new_tokens(
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _vocab_shard_embedding_kernel(
+    ids_ptr, weight_ptr, out_ptr, vocab_start, vocab_end, hidden, BLOCK_H: tl.constexpr
+):
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs < hidden
+    token = tl.load(ids_ptr + row).to(tl.int64)
+    local = (token >= vocab_start) & (token < vocab_end)
+    src = tl.where(local, token - vocab_start, 0)
+    vals = tl.load(weight_ptr + src * hidden + offs, mask=mask & local, other=0.0)
+    tl.store(out_ptr + row.to(tl.int64) * hidden + offs, vals, mask=mask)
+
+
+def vocab_shard_embedding(embedding, ids: torch.Tensor) -> Optional[torch.Tensor]:
+    """``embedding(ids)`` for a COLUMN (vocab-sharded) TP ``Embedding``: this
+    rank's rows of the table, zero for ids outside its shard, then the module's
+    all-reduce. One lookup kernel instead of the eager mask / lookup / fill
+    chain; same values. Returns None for an embedding this does not cover."""
+    from ..modules.linear import TensorParallelMode
+
+    weight = getattr(embedding, "weight", None)
+    if (
+        getattr(embedding, "tp_size", 1) <= 1
+        or getattr(embedding, "tp_mode", None) != TensorParallelMode.COLUMN
+        or getattr(embedding, "all_reduce", None) is None
+        or weight is None
+        or not weight.is_contiguous()
+        or ids.dim() != 1
+    ):
+        return None
+    hidden = weight.shape[1]
+    out = torch.empty((ids.shape[0], hidden), dtype=weight.dtype, device=weight.device)
+    if ids.shape[0] > 0:
+        block_h = 1024
+        _vocab_shard_embedding_kernel[(ids.shape[0], triton.cdiv(hidden, block_h))](
+            ids,
+            weight,
+            out,
+            embedding.vocab_start_index,
+            embedding.vocab_end_index,
+            hidden,
+            BLOCK_H=block_h,
+        )
+    return embedding.all_reduce(out)

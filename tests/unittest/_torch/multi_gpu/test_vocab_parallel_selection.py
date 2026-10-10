@@ -274,6 +274,35 @@ def _worker_accept_check(rank, tp, comm_backend):
     os.environ.pop("TLLM_SPEC_TAIL_FUSION", None)
 
 
+@torch.inference_mode()
+def _embedding_check(rank, tp, comm_backend):
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    from tensorrt_llm._torch.modules.embedding import Embedding
+    from tensorrt_llm._torch.modules.linear import TensorParallelMode
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import vocab_shard_embedding
+
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    vocab, hidden = 1000 * tp, 7168
+    embedding = Embedding(
+        vocab,
+        hidden,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
+    ).cuda()
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    full = torch.randn(vocab, hidden, device="cuda", generator=gen).to(torch.bfloat16)
+    embedding.weight.data.copy_(full[rank * 1000 : (rank + 1) * 1000])
+    for n in (1, 5, 129):
+        ids = torch.randint(0, vocab, (n,), device="cuda", generator=gen)
+        ids[0] = vocab - 3
+        expected = embedding(ids)
+        out = vocab_shard_embedding(embedding, ids)
+        assert out is not None and torch.equal(out, expected)
+        assert torch.equal(out, full[ids])
+
+
 def _submit(executor, fn, comm_backend):
     tp = executor.num_workers
     results = executor.map(_run, *zip(*[(fn, tp, comm_backend)] * tp))
@@ -311,3 +340,9 @@ def test_vocab_parallel_sample(comm_backend, mpi_pool_executor):
 @pytest.mark.parametrize("mpi_pool_executor", _WORLD_SIZES, indirect=True)
 def test_vocab_parallel_strict_accept(comm_backend, mpi_pool_executor):
     _submit(mpi_pool_executor, _worker_accept_check, comm_backend)
+
+
+@_needs_gpus
+@pytest.mark.parametrize("mpi_pool_executor", _WORLD_SIZES, indirect=True)
+def test_vocab_shard_embedding(mpi_pool_executor):
+    _submit(mpi_pool_executor, _embedding_check, "mnnvl")

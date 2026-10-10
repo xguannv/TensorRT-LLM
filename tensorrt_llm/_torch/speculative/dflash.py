@@ -38,6 +38,7 @@ from .spec_tail_kernels import (
     fused_next_new_tokens,
     spec_tail_fusion_enabled,
     store_mla_context_latents,
+    vocab_shard_embedding,
 )
 from .vocab_parallel import (
     VocabParallelHead,
@@ -1441,8 +1442,12 @@ class DFlashWorker(SpecWorkerBase):
         )
         attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
 
-        # Through embed_tokens.forward so a TP-sharded vocab masks and reduces.
-        noise_embedding = dflash_noise_embedding(embed_tokens(prep["embed_ids"]), block_size)
+        # A TP-sharded vocab masks its rows and all-reduces (embed_tokens.forward
+        # semantics; one lookup kernel when the embedding is vocab-sharded).
+        combined_embed = vocab_shard_embedding(embed_tokens, prep["embed_ids"])
+        if combined_embed is None:
+            combined_embed = embed_tokens(prep["embed_ids"])
+        noise_embedding = dflash_noise_embedding(combined_embed, block_size)
 
         gen_start = attn_metadata.num_ctx_tokens
         captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
