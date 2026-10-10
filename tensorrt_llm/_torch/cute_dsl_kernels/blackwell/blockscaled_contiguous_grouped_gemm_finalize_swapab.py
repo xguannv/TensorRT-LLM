@@ -48,6 +48,9 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
+# L2 eviction hint for the streamed expert weights (CacheHintSm90::EVICT_FIRST)
+_EVICT_FIRST = 0x12F0000000000000
+
 
 @dsl_user_op
 def red_add_v8_bf16_from_smem(dst_ptr, src_smem_addr, *, loc=None, ip=None):
@@ -706,6 +709,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                     tAgA[(None, h_tile, 0, expert_idx)],
                     tAsA[(None, ab_producer_state.index)],
                     tma_bar_ptr=tma_bar,
+                    cache_policy=cutlass.Int64(_EVICT_FIRST),
                 )
                 for mb in cutlass.range_constexpr(self.h_blocks):
                     cute.copy(
@@ -713,6 +717,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                         tAgSFA[(None, h_tile * self.h_blocks + mb, 0, expert_idx)],
                         tAsSFA[(None, ab_producer_state.index * self.h_blocks + mb)],
                         tma_bar_ptr=tma_bar,
+                        cache_policy=cutlass.Int64(_EVICT_FIRST),
                     )
                 ab_producer_state.advance()
 
