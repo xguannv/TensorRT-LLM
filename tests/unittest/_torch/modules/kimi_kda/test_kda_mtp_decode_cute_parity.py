@@ -1077,6 +1077,92 @@ def test_beta_cache_sibling_layer_after_aligned_warmup(
         )
 
 
+def _packed_fused_norm_inputs(B, H, num_spec, state_dtype):
+    """Runtime-contract inputs for the packed / fused-norm path: section-strided q / k / v /
+    output-gate views of one fused projection, the bf16 beta tail of [f_a | beta], replay caches
+    and conv windows chained from a CPU-golden round 1, mixed acceptance 0..num_spec and
+    non-identity state slots."""
+    data, _ = _round2_inputs(B, H, num_spec)
+    packed, _ = _pack_new_token_projection_views(data)
+    slots = torch.arange(B - 1, -1, -1, dtype=torch.int32, device="cuda")
+    packed["ssm_state_indices"] = slots
+    for name in (
+        "initial_state_cute",
+        "k_cache",
+        "g_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        slot_order = torch.empty_like(packed[name])
+        slot_order[slots.long()] = packed[name]
+        packed[name] = slot_order
+    pool_accepted = torch.zeros(B, dtype=torch.int32, device="cuda")
+    pool_accepted[slots.long()] = data["num_accepted_tokens"]
+    packed["num_accepted_tokens"] = pool_accepted
+    packed["initial_state_cute"] = packed["initial_state_cute"].to(state_dtype)
+    packed["onorm_weight"] = torch.linspace(
+        0.75, 1.25, data["V"], dtype=torch.float32, device="cuda"
+    )
+    packed["onorm_eps"] = 1e-5
+    return packed
+
+
+@pytest.mark.parametrize(
+    "B,H,num_spec",
+    [(1, 6, 6), (4, 6, 7), (16, 6, 6), (32, 6, 7), (128, 6, 6), (8, 12, 7)],
+    ids=lambda v: str(v),
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("strided_state", [False, True], ids=["pool", "strided"])
+def test_v2_kernel_matches_v1_bitwise(B, H, num_spec, state_dtype, strided_state, monkeypatch):
+    """The latency-scheduled verify kernel (``TRTLLM_K3_KDA_MTP_V2=1``, packed rows + fused gated
+    RMSNorm) performs the same arithmetic as ``kda_decode_mtp_kernel`` in the same order: the
+    outputs, committed state, conv pools and replay caches must match bit for bit. Covers the
+    cluster-pair (HV * B <= 64) and single-CTA grids, fp32 / bf16 state pools and a state that
+    is a strided slice of a larger buffer (non-flat TMA view)."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp_ops
+
+    packed = _packed_fused_norm_inputs(B, H, num_spec, state_dtype)
+
+    def run(v2):
+        monkeypatch.setenv("TRTLLM_K3_KDA_MTP_V2", "1" if v2 else "0")
+        override = None
+        if strided_state:
+            shape = tuple(packed["initial_state_cute"].shape)
+            big = torch.zeros((shape[0], 3) + shape[1:], dtype=state_dtype, device="cuda")
+            override = big[:, 1]
+        return cute_run(
+            packed, packed_token_layout=True, fuse_output_norm=True, state_override=override
+        )
+
+    ref = run(v2=False)
+    operand_checks = []
+    operands_ok = mtp_ops._v2_operands_ok
+
+    def record_operand_check(**kwargs):
+        operand_checks.append(operands_ok(**kwargs))
+        return operand_checks[-1]
+
+    monkeypatch.setattr(mtp_ops, "_v2_operands_ok", record_operand_check)
+    new = run(v2=True)
+    assert operand_checks == [True], "the v2 kernel did not take the call"
+    for name in (
+        "out",
+        "state_v_first",
+        "k_cache",
+        "g_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        assert torch.equal(new[name], ref[name]), f"{name}: v2 differs from v1"
+
+
 if __name__ == "__main__":
     import sys
 

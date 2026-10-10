@@ -52,6 +52,12 @@ Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 compile-time constant per cache allocation; every shape compiles the same
 kernel structure (the drop's benchmark-only setmaxreg / register-weight
 specializations were retired with the latency restructuring).
+
+Kernel selection: calls on the runtime contract (packed token rows, fused gated
+RMSNorm with a bf16 output, 3xTF32 recurrence, vector-aligned operands) run
+``kda_decode_mtp_v2_kernel`` (``kda_mtp_decode_v2.py``: the same arithmetic in
+the same order, bitwise identical results, shorter critical path) unless
+``TRTLLM_K3_KDA_MTP_V2=0``; every other variant runs ``kda_decode_mtp_kernel``.
 """
 
 import os
@@ -79,6 +85,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         TILE_K,
         kda_decode_mtp_kernel,
     )
+    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode_v2 import kda_decode_mtp_v2_kernel
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
@@ -386,6 +393,241 @@ if IS_CUTLASS_DSL_AVAILABLE:
             launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
 
 
+if IS_CUTLASS_DSL_AVAILABLE:
+
+    @cute.jit
+    def _run_kda_decode_mtp_v2(
+        h0: cute.Tensor,
+        x_q: cute.Tensor,
+        x_k: cute.Tensor,
+        x_v: cute.Tensor,
+        w_q: cute.Tensor,
+        w_k: cute.Tensor,
+        w_v: cute.Tensor,
+        cs_q: cute.Tensor,
+        cs_k: cute.Tensor,
+        cs_v: cute.Tensor,
+        A_log: cute.Tensor,
+        g: cute.Tensor,
+        dt_bias: cute.Tensor,
+        beta: cute.Tensor,
+        onorm_g: cute.Tensor,
+        onorm_weight: cute.Tensor,
+        o: cute.Tensor,
+        ht: cute.Tensor,
+        k_cache: cute.Tensor,
+        g_cache: cute.Tensor,
+        v_cache: cute.Tensor,
+        beta_cache: cute.Tensor,
+        ssm_state_indices: cute.Tensor,
+        num_accepted_tokens: cute.Tensor,
+        N: cutlass.Int32,
+        scale: cutlass.Constexpr[float],
+        HV: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
+        V: cutlass.Constexpr[int],
+        NUM_SPEC: cutlass.Constexpr[int],
+        KERNEL_WIDTH: cutlass.Constexpr[int],
+        lower_bound: cutlass.Constexpr[float],
+        onorm_eps: cutlass.Constexpr[float],
+        USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+        SPLIT_V: cutlass.Constexpr[int],
+        stream: cuda.CUstream,
+    ):
+        """Host side of ``kda_decode_mtp_v2_kernel`` (packed rows, fused gated RMSNorm, bf16
+        output, 3xTF32): the tf32 MMA atoms, operand smem layouts and state TMA atoms of
+        ``_run_kda_decode_mtp``, then the launch."""
+        f32 = cutlass.Float32
+        smem_qk_layout = cute.make_layout((2 * NUM_SPEC + 1, K), stride=(K, 1))
+        tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, 3 * T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1 = sm100_utils.make_smem_layout_b(tiled_mma1, (V, 3 * T_PAD, K), f32, 1)
+        tiled_mma_f32a = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, 3 * T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        tiled_mma1k = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1k = sm100_utils.make_smem_layout_b(tiled_mma1k, (V, T_PAD, K), f32, 1)
+        if cutlass.const_expr(cute.rank(ht.shape) == 3):
+            mT_vkl = cute.make_tensor(
+                ht.iterator,
+                cute.make_layout(
+                    (V, K, ht.shape[0]),
+                    stride=(ht.layout.stride[1], ht.layout.stride[2], ht.layout.stride[0]),
+                ),
+            )
+        else:
+            mT_vkl = cute.make_tensor(
+                ht.iterator,
+                cute.make_layout(
+                    (V, K, (ht.shape[1], ht.shape[0])),
+                    stride=(
+                        ht.layout.stride[2],
+                        ht.layout.stride[3],
+                        (ht.layout.stride[1], ht.layout.stride[0]),
+                    ),
+                ),
+            )
+        box_cols = 128 // (h0.element_type.width // 8)
+        box_atom = sm100_utils.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, h0.element_type
+        )
+        box_layout = cute.tile_to_shape(box_atom, (V, box_cols), order=(0, 1))
+        box_layout_t = cute.tile_to_shape(box_atom, (V // SPLIT_V, box_cols), order=(0, 1))
+        tma_atom_t, mT_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(), mT_vkl, box_layout_t, (V // SPLIT_V, box_cols)
+        )
+        if cutlass.const_expr(cute.rank(h0.shape) == 3):
+            mS_vkl = cute.make_tensor(
+                h0.iterator,
+                cute.make_layout(
+                    (V, K, h0.shape[0]),
+                    stride=(h0.layout.stride[1], h0.layout.stride[2], h0.layout.stride[0]),
+                ),
+            )
+        else:
+            mS_vkl = cute.make_tensor(
+                h0.iterator,
+                cute.make_layout(
+                    (V, K, (h0.shape[1], h0.shape[0])),
+                    stride=(
+                        h0.layout.stride[2],
+                        h0.layout.stride[3],
+                        (h0.layout.stride[1], h0.layout.stride[0]),
+                    ),
+                ),
+            )
+        tma_atom_l, mS_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), mS_vkl, box_layout, (V, box_cols)
+        )
+        tiled_mma2h = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, K // 2),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_b2h = sm100_utils.make_smem_layout_b(tiled_mma2h, (V, K // 2, T_PAD), f32, 1)
+        smem_layout_a2 = sm100_utils.make_smem_layout_a(tiled_mma2h, (V, K // 2, T_PAD), f32, 1)
+        tiled_mma2q = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD + K // 2),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_b2q = sm100_utils.make_smem_layout_b(
+            tiled_mma2q, (V, T_PAD + K // 2, T_PAD), f32, 1
+        )
+        tiled_mma3 = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (4 * T_PAD, T_PAD),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_a3 = sm100_utils.make_smem_layout_a(tiled_mma3, (4 * T_PAD, T_PAD, K), f32, 1)
+        smem_layout_b3 = sm100_utils.make_smem_layout_b(tiled_mma3, (4 * T_PAD, T_PAD, K), f32, 1)
+        tiled_mma4 = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD),
+            tcgen05.OperandSource.SMEM,
+        )
+        launched = kda_decode_mtp_v2_kernel(
+            h0,
+            x_q,
+            x_k,
+            x_v,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            A_log,
+            g,
+            dt_bias,
+            beta,
+            onorm_g,
+            onorm_weight,
+            o,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            num_accepted_tokens,
+            smem_qk_layout,
+            tiled_mma1,
+            tiled_mma3,
+            tiled_mma1k,
+            smem_layout_b1,
+            smem_layout_a2,
+            smem_layout_a3,
+            smem_layout_b3,
+            smem_layout_b1k,
+            tiled_mma4,
+            tma_atom_t,
+            mT_tma,
+            box_layout,
+            tma_atom_l,
+            mS_tma,
+            tiled_mma2h,
+            smem_layout_b2h,
+            box_layout_t,
+            tiled_mma2q,
+            smem_layout_b2q,
+            tiled_mma_f32a,
+            scale,
+            HV,
+            K,
+            V,
+            NUM_SPEC,
+            KERNEL_WIDTH,
+            lower_bound,
+            onorm_eps,
+            USE_FLAT_LAYOUT,
+            SPLIT_V,
+        )
+        if cutlass.const_expr(SPLIT_V == 2):
+            # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
+            launched.launch(
+                grid=(HV, N, 2), block=[NUM_THREADS, 1, 1], cluster=(1, 1, 2), stream=stream
+            )
+        else:
+            launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
+
+
 def _require_stride_layout(
     *,
     x_q,
@@ -621,6 +863,48 @@ def _bf16_math_enabled() -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"TRTLLM_KDA_MTP_BF16_MATH must be 0 or 1, got {value!r}")
     return value == "1"
+
+
+def _mtp_v2_enabled() -> bool:
+    """Verify-kernel schedule, from ``TRTLLM_K3_KDA_MTP_V2``.
+
+    Unset / 1 (default): calls on the runtime contract (packed rows, fused gated RMSNorm, bf16
+    output, 3xTF32 recurrence, vector-aligned operands) run ``kda_decode_mtp_v2_kernel``, which
+    produces bitwise the same results with a shorter critical path. 0: every call runs
+    ``kda_decode_mtp_kernel``.
+    """
+    value = os.environ.get("TRTLLM_K3_KDA_MTP_V2", "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"TRTLLM_K3_KDA_MTP_V2 must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def _vec4_rows(tensor: torch.Tensor, dim: int = -1) -> bool:
+    """True when every group of four consecutive elements along the unit-stride dimension `dim`
+    that starts at a multiple of four is one aligned 8 B (bf16) or 16 B (fp32) access: the v2
+    kernel moves its per-token rows with such vector loads and stores."""
+    if tensor.dtype not in (torch.bfloat16, torch.float32) or tensor.stride(dim) != 1:
+        return False
+    if tensor.data_ptr() % (4 * tensor.element_size()):
+        return False
+    return all(
+        stride % 4 == 0 for d, stride in enumerate(tensor.stride()) if d != dim % tensor.ndim
+    )
+
+
+def _v2_operands_ok(*, w_q, w_k, w_v, rows, conv_caches) -> bool:
+    """Operand layouts / dtypes the v2 kernel's vector accesses support (see `_vec4_rows`):
+    token rows and replay caches vectorized along their last dimension, the dim-contiguous conv
+    caches along the channel dimension, conv weights as contiguous [channel][4] rows."""
+    weights_ok = all(
+        w.dtype == w_q.dtype and w.is_contiguous() and w.shape[1] == 4 and _vec4_rows(w)
+        for w in (w_q, w_k, w_v)
+    )
+    return (
+        weights_ok
+        and all(_vec4_rows(t) for t in rows)
+        and all(_vec4_rows(t, dim=1) for t in conv_caches)
+    )
 
 
 def _precompute_control_tensor(device: torch.device, enabled: bool) -> torch.Tensor:
@@ -875,6 +1159,85 @@ def kda_mtp_decode_impl(
     # Two CTAs per (head, request) while they fit in one wave (see SPLIT_MAX_TILES).
     split_v = 2 if HV * N <= SPLIT_MAX_TILES else 1
     bf16_math = _bf16_math_enabled()
+
+    use_v2 = (
+        _mtp_v2_enabled()
+        and packed_token_layout
+        and fuse_output_norm
+        and not quantize_output
+        and not bf16_math
+        and num_spec <= 7
+        and _v2_operands_ok(
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            rows=(x_q_arg, x_k_arg, x_v_arg, g, onorm_g, k_cache, g_cache, v_cache),
+            conv_caches=(cs_q, cs_k, cs_v),
+        )
+    )
+    if use_v2:
+        v2_args = (
+            (h0_arg, 16),
+            (x_q_arg, 16),
+            (x_k_arg, 16),
+            (x_v_arg, 16),
+            (w_q, 16),
+            (w_k, 16),
+            (w_v, 16),
+            (cs_q, 16),
+            (cs_k, 16),
+            (cs_v, 16),
+            (A_log, 16),
+            (g, 16),
+            (dt_bias, 16),
+            (beta, 16),
+            (onorm_g, 16),
+            (onorm_weight, 16),
+            (out, 16),
+            (h0_arg, 16),
+            (k_cache, 16),
+            (g_cache, 16),
+            (v_cache, 16),
+            (beta_cache, beta_cache_assumed_align),
+            (ssm_state_indices, 4),
+            (num_accepted_tokens, 4),
+        )
+        v2_key = (
+            "v2",
+            tuple(_layout_key(t, dynamic_layout=True, assumed_align=a) for t, a in v2_args),
+            scale,
+            HV,
+            K,
+            V_dim,
+            num_spec,
+            W,
+            float(lower_bound),
+            float(onorm_eps),
+            use_flat_layout,
+            split_v,
+        )
+        if v2_key not in _compiled_cache:
+            logger.info(
+                f"kda_mtp_decode: compiling v2 variant H={HV} num_spec={num_spec} split_v={split_v}"
+            )
+            _compiled_cache[v2_key] = cute.compile(
+                _run_kda_decode_mtp_v2,
+                *[_dlpack_arg(t, assumed_align=a) for t, a in v2_args],
+                N,
+                scale=scale,
+                HV=HV,
+                K=K,
+                V=V_dim,
+                NUM_SPEC=num_spec,
+                KERNEL_WIDTH=W,
+                lower_bound=float(lower_bound),
+                onorm_eps=float(onorm_eps),
+                USE_FLAT_LAYOUT=use_flat_layout,
+                SPLIT_V=split_v,
+                stream=stream,
+            )
+        _compiled_cache[v2_key](*[_dlpack_arg(t, assumed_align=a) for t, a in v2_args], N, stream)
+        return out
 
     key = (
         x_q.dtype,
