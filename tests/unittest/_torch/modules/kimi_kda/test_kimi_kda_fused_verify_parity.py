@@ -247,11 +247,15 @@ def test_plain_decode_direct_pool_matches_fallback():
     assert torch.equal(ssm_direct[untouched], ssm_fallback[untouched])
 
 
+@pytest.mark.parametrize("fab_fused", [False, True])
 @pytest.mark.parametrize("checkpoint_fp8", [False, True])
 @torch.no_grad()
-def test_fused_vs_sequential_two_rounds(checkpoint_fp8):
+def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, monkeypatch):
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
+    # fab_fused: beta and the forget gate come from trtllm::k3_kda_fab_proj.
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_FAB_FUSED", fab_fused)
     torch.manual_seed(0)
     B = 4
     T = M + 1
@@ -304,7 +308,18 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8):
     for view in (q_view, k_view, v_view, onorm_view):
         assert view.stride(-2) == 4 * rt_fused.proj_size
         assert view.stride(-1) == 1
-    assert beta_view.stride(-2) == rt_fused._bfa_proj_weight.shape[0]
+    assert (
+        kimi_kda_mixer._use_fused_fab(
+            x1.view(B, T, -1),
+            rt_fused._bfa_proj_weight,
+            rt_fused.f_b_proj.weight,
+            rt_fused.num_heads,
+        )
+        == fab_fused
+    )
+    # beta is a view of the [f_a | b] projection, or its own contiguous tensor when fused.
+    beta_rows = rt_fused.num_heads if fab_fused else rt_fused._bfa_proj_weight.shape[0]
+    assert beta_view.stride(-2) == beta_rows
     assert beta_view.stride(-1) == 1
     out1_seq = rt_seq.forward_verify_sequential(
         x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices

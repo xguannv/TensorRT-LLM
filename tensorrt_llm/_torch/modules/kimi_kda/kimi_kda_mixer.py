@@ -52,6 +52,11 @@ _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
 # Decode verify runs the [f_a | b] and f_b projections (<= 64 rows) on the CuTe low-M
 # BF16 GEMV instead of cuBLAS split-K.
 _KDA_BF16_LOWM_GEMV = os.environ.get("TRTLLM_K3_BF16_LOWM_GEMV", "0") == "1"
+# Decode verify computes beta and the forget gate with one fused CuTe kernel ([f_a | b]
+# projection, then f_b on its BF16 f_a), sized to run next to the QKVG GEMM, for up to this
+# many rows on the aux stream. Takes precedence over TRTLLM_K3_BF16_LOWM_GEMV.
+_KDA_FAB_FUSED = os.environ.get("TRTLLM_K3_KDA_FAB_FUSED", "0") == "1"
+_KDA_FAB_FUSED_MAX_ROWS = 256
 
 
 def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -67,6 +72,19 @@ def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             out = torch.ops.trtllm.k3_bf16_lowm_gemv(x2d, weight)
             return out.view(*x.shape[:-1], weight.shape[0])
     return torch.nn.functional.linear(x, weight)
+
+
+def _use_fused_fab(
+    x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
+) -> bool:
+    """Whether ``trtllm::k3_kda_fab_proj`` is enabled and accepts these operands."""
+    if not _KDA_FAB_FUSED or torch.compiler.is_compiling() or not x.is_contiguous():
+        return False
+    from ...cute_dsl_kernels.blackwell import k3_kda_fab
+
+    return k3_kda_fab.can_use_k3_kda_fab(
+        x.reshape(-1, x.shape[-1]), bfa_weight, fb_weight, num_heads
+    )
 
 
 def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
@@ -1048,8 +1066,18 @@ class KimiKDALinearAttention(nn.Module):
 
         bfa_weight = self._bfa_proj_weight
         if bfa_weight is not None:
+            fb_weight = self.f_b_proj.weight
+            fused_fab = _use_fused_fab(x, bfa_weight, fb_weight, self.num_heads)
 
             def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
+                if fused_fab:
+                    beta, forget_gate = torch.ops.trtllm.k3_kda_fab_proj(
+                        x.reshape(-1, x.shape[-1]), bfa_weight, fb_weight, self.num_heads
+                    )
+                    return (
+                        beta.view(*x.shape[:-1], self.num_heads),
+                        forget_gate.view(*x.shape[:-1], fb_weight.shape[0]),
+                    )
                 bfa = _lowm_gemv_or_linear(x, bfa_weight)
                 f_a = bfa[..., : self.head_dim]
                 beta = bfa[..., self.head_dim : self.head_dim + self.num_heads]
@@ -1057,10 +1085,9 @@ class KimiKDALinearAttention(nn.Module):
                     return beta, _lowm_gemv_or_linear(f_a.contiguous(), self.f_b_proj.weight)
                 return beta, self.f_b_proj(f_a)
 
+            max_rows = _KDA_FAB_FUSED_MAX_ROWS if fused_fab else _KDA_BFA_MULTISTREAM_MAX_ROWS
             projection_aux_stream = (
-                self._projection_aux_stream
-                if 0 < num_rows <= _KDA_BFA_MULTISTREAM_MAX_ROWS
-                else None
+                self._projection_aux_stream if 0 < num_rows <= max_rows else None
             )
             qkvg, (beta, forget_gate) = maybe_execute_in_parallel(
                 _project_qkvg,
