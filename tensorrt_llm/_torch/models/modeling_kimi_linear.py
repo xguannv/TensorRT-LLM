@@ -155,6 +155,31 @@ if _K3_ROUTE_TAIL not in ("0", "1", "gemv"):
 if _K3_ROUTE_TAIL != "0" and _K3_FUSED_ROUTER != "0":
     raise ValueError("TRTLLM_K3_ROUTE_TAIL and TRTLLM_K3_FUSED_ROUTER are mutually exclusive")
 
+# Fused latent projections (cute_dsl_kernels/blackwell/k3_latent_fp8_gemm.py), for token counts
+# in [TRTLLM_K3_LD_FUSED_MIN_M, TRTLLM_K3_LD_FUSED_MAX_M]:
+#   TRTLLM_K3_LD_FUSED: latent_down + the routed experts' NVFP4 input quantization in one chain
+#     (trtllm::k3_latent_down_fp4), bit-exact with fp8_swap_ab_gemm followed by fp4_quantize.
+#   TRTLLM_K3_LU_FUSED: latent_up + the two BF16 adds of the MoE residual update
+#     (trtllm::k3_latent_up_residual), bit-exact with fp8_swap_ab_gemm and the two adds.
+# "1" fuses only where the unfused projection would run fp8_swap_ab_gemm; "2" also replaces the
+# low-M kernel (TRTLLM_K3_FP8W_LOWM_GEMM), whose 1x32 activation scales then become the 1x128
+# scales of the larger-M path.
+_K3_LD_FUSED = os.environ.get("TRTLLM_K3_LD_FUSED", "0")
+_K3_LU_FUSED = os.environ.get("TRTLLM_K3_LU_FUSED", "0")
+for _name, _value in (("TRTLLM_K3_LD_FUSED", _K3_LD_FUSED), ("TRTLLM_K3_LU_FUSED", _K3_LU_FUSED)):
+    if _value not in ("0", "1", "2"):
+        raise ValueError(f"{_name} must be 0, 1 or 2, got {_value!r}")
+_K3_LD_FUSED_MIN_M = int(os.environ.get("TRTLLM_K3_LD_FUSED_MIN_M", "1"))
+_K3_LD_FUSED_MAX_M = int(os.environ.get("TRTLLM_K3_LD_FUSED_MAX_M", "4096"))
+# Up to this M the low-M kernel's cluster split-K beats the fused chains (which use one CTA per
+# 128-row x 128..256-column tile) even in mode "2".
+_K3_LOWM_OVER_FUSED_MAX_M = 128
+
+# CUDA stream priority of the MoE input stream (latent_down chain, routed-output memset).
+# Negative values rank above the main and shared-expert streams, so the latent chain that
+# gates the routed GEMM1 gets free SMs first.
+_K3_LATENT_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_LATENT_STREAM_PRIORITY", "0"))
+
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
@@ -1799,6 +1824,81 @@ class KimiK3MoERuntime(nn.Module):
         return Fp4QuantizedTensor(x_fp4, x_sf, is_sf_swizzled=False)
 
     @staticmethod
+    def _fused_projection_applies(mode: str, x: torch.Tensor, projection: nn.Module) -> bool:
+        """Whether a fused latent projection (mode "1"/"2") replaces ``projection(x)``."""
+        if mode == "0" or torch.compiler.is_compiling():
+            return False
+        if not isinstance(projection, _Fp8BlockScaleWeightReadLinear):
+            return False
+        if _rubin_mxfp8_is_available() or x.dtype != torch.bfloat16:
+            return False
+        if not _K3_LD_FUSED_MIN_M <= x.shape[0] <= _K3_LD_FUSED_MAX_M:
+            return False
+        if (
+            (mode == "1" or x.shape[0] <= _K3_LOWM_OVER_FUSED_MAX_M)
+            and _K3_FP8W_LOWM_GEMM
+            and _k3_lowm_gemm_can_run(x, projection.weight, projection.weight_scale)
+        ):
+            return False
+        return True
+
+    def _fused_latent_input(self, hidden_states: torch.Tensor) -> Optional[Fp4QuantizedTensor]:
+        """NVFP4 routed-expert input straight from the hidden states, or ``None``.
+
+        Runs the latent_down projection with the experts' input quantization fused in
+        (``trtllm::k3_latent_down_fp4``) when enabled and the routed experts would quantize
+        the projection with ``fp4_quantize`` themselves (CuteDSL NVFP4, no dispatch).
+        """
+        down = self.routed_expert_down_proj
+        x = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if not self._fused_projection_applies(_K3_LD_FUSED, x, down):
+            return None
+        moe = self.routed_experts
+        backend = moe.backend
+        if (
+            moe.comm is not None
+            or moe.apply_router_weight_on_input
+            or not getattr(backend, "has_nvfp4", False)
+            or getattr(backend, "scaling_vector_size", None) != 16
+            or not hasattr(backend, "quantize_input_async")
+        ):
+            return None
+        max_tokens = getattr(moe, "moe_max_num_tokens", None)
+        if max_tokens is not None and x.shape[0] > max_tokens:
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_latent_fp8_gemm
+
+        global_sf = getattr(backend, "fc31_input_scale", None)
+        if not k3_latent_fp8_gemm.can_run(x, down.weight, down.weight_scale, global_sf):
+            return None
+        codes, scales = torch.ops.trtllm.k3_latent_down_fp4(
+            x, down.weight, down.weight_scale, global_sf
+        )
+        return Fp4QuantizedTensor(codes, scales, is_sf_swizzled=False)
+
+    def _fused_latent_up_residual(
+        self, latent: torch.Tensor, shared_out: torch.Tensor, residual: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """``residual + (latent_up(latent) + shared_out)`` in one fused chain, or ``None``."""
+        up = self.routed_expert_up_proj
+        x = latent.reshape(-1, latent.shape[-1])
+        if not self._fused_projection_applies(_K3_LU_FUSED, x, up):
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_latent_fp8_gemm
+
+        m = x.shape[0]
+        shared_2d = shared_out.reshape(m, -1)
+        residual_2d = residual.reshape(m, -1)
+        if not k3_latent_fp8_gemm.can_run_residual(
+            x, up.weight, up.weight_scale, shared_2d, residual_2d
+        ):
+            return None
+        out = torch.ops.trtllm.k3_latent_up_residual(
+            x, up.weight, up.weight_scale, shared_2d, residual_2d
+        )
+        return out.view(residual.shape)
+
+    @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
             return projection(hidden_states)
@@ -2036,12 +2136,14 @@ class KimiK3MoERuntime(nn.Module):
                 self.moe_latent_fork_event.record()
                 with torch.cuda.stream(self.latent_down_stream):
                     self.moe_latent_fork_event.wait()
-                    early_routed_in = self._routed_projection(
-                        hidden_states, self.routed_expert_down_proj
-                    )
-                    if gemv_route:
-                        # Quantized here, the routed input does not wait for the routing.
-                        early_routed_in = self._quantize_routed_input(early_routed_in)
+                    early_routed_in = self._fused_latent_input(hidden_states)
+                    if early_routed_in is None:
+                        early_routed_in = self._routed_projection(
+                            hidden_states, self.routed_expert_down_proj
+                        )
+                        if gemv_route:
+                            # Quantized here, the routed input does not wait for the routing.
+                            early_routed_in = self._quantize_routed_input(early_routed_in)
                     self.moe_latent_ready_event.record()
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
@@ -2074,10 +2176,12 @@ class KimiK3MoERuntime(nn.Module):
             elif early_routed_in is not None:
                 routed_in = early_routed_in
                 moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
-                if isinstance(routed_in, Fp4QuantizedTensor):
-                    moe_kwargs["output_dtype"] = torch.bfloat16
             else:
-                routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+                routed_in = self._fused_latent_input(hidden_states)
+                if routed_in is None:
+                    routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            if isinstance(routed_in, Fp4QuantizedTensor):
+                moe_kwargs["output_dtype"] = hidden_states.dtype
             if route_target is not None and not gemv_route:
                 # Routed by the CuTe tail when the backend asks for the routing (after it
                 # forks the input quantization).
@@ -2141,6 +2245,10 @@ class KimiK3MoERuntime(nn.Module):
                     eps=float(self.routed_expert_norm.variance_epsilon),
                 ),
             )
+            if residual is not None:
+                fused = self._fused_latent_up_residual(routed_latent, shared_out, residual)
+                if fused is not None:
+                    return fused
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         if residual is not None:
             from ..modules.kimi_k3_moe_residual import _fused_moe_residual_add
@@ -2506,7 +2614,11 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
             )
-        if self.is_moe and _K3_FUSE_MOE_RESIDUAL and not torch.compiler.is_compiling():
+        if (
+            self.is_moe
+            and (_K3_FUSE_MOE_RESIDUAL or _K3_LU_FUSED != "0")
+            and not torch.compiler.is_compiling()
+        ):
             prefix_sum = self.block_sparse_moe(
                 hidden_states,
                 getattr(attn_metadata, "all_rank_num_tokens", None),
@@ -2538,7 +2650,8 @@ class KimiLinearModel(DecoderModel):
 
         # Attention and MoE phases are sequential, so their branch-overlap
         # roles share one stream; MoE-internal overlap roles remain separate.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list.append(torch.cuda.Stream(priority=_K3_LATENT_STREAM_PRIORITY))
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
