@@ -792,6 +792,104 @@ def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> Non
     )
 
 
+# TRTLLM_K3_ATTN_RES_PDL=1: up to TRTLLM_K3_ATTN_RES_PDL_MAX_M tokens, the fused attn_res(+add)
+# +RMSNorm runs as trtllm::k3_attn_res_(add_)rmsnorm (cute_dsl_kernels/blackwell/k3_attn_res.py):
+# a CTA cluster per token that loads the weights and snapshot rows and reduces their statistics
+# before griddepcontrol.wait, i.e. under the kernel in front of it. It takes precedence over the
+# persistent topology at those token counts. The updated prefix sum is bit-identical; the
+# normalized output can differ from the C++ per-token kernels by one BF16 rounding step in a small
+# fraction of the elements (TRTLLM_K3_ATTN_RES_PDL_EXACT=1 selects a slower, bit-identical variant).
+# TRTLLM_K3_ATTN_RES_PDL=2 also leaves the MoE residual update residual + bf16(routed + shared)
+# of the BF16-add path (kimi_k3_moe_residual) to the next layer's pre-attention mix, which
+# computes it bit-identically (trtllm::k3_attn_res_moe_add_rmsnorm) behind the latent-up GEMM.
+_K3_ATTN_RES_PDL_MODE = os.environ.get("TRTLLM_K3_ATTN_RES_PDL", "0")
+if _K3_ATTN_RES_PDL_MODE not in ("0", "1", "2"):
+    raise ValueError(f"TRTLLM_K3_ATTN_RES_PDL must be 0, 1 or 2, got {_K3_ATTN_RES_PDL_MODE!r}")
+_K3_ATTN_RES_PDL = _K3_ATTN_RES_PDL_MODE != "0"
+_K3_ATTN_RES_PDL_MAX_M = int(os.environ.get("TRTLLM_K3_ATTN_RES_PDL_MAX_M", "64"))
+
+
+class _DeferredMoEResidual(NamedTuple):
+    """A MoE layer's ``residual + bf16(routed + shared)`` that the next layer fuses or materializes."""
+
+    residual: torch.Tensor
+    routed: torch.Tensor
+    shared: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        from ..modules.kimi_k3_moe_residual import _fused_moe_residual_add
+
+        return _fused_moe_residual_add(self.routed, self.shared, self.residual)
+
+
+def _defer_moe_residual(num_tokens: int) -> bool:
+    """Whether a MoE layer leaves its BF16 residual update to the next layer."""
+    return _K3_ATTN_RES_PDL_MODE == "2" and num_tokens <= _K3_ATTN_RES_PDL_MAX_M
+
+
+def _materialize_prefix_sum(hidden_states):
+    if isinstance(hidden_states, _DeferredMoEResidual):
+        return hidden_states.materialize()
+    return hidden_states
+
+
+def _k3_attn_res_pdl(
+    prefix_sum: torch.Tensor,
+    addend: Optional[torch.Tensor],
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+):
+    """``trtllm::k3_attn_res_(add_)rmsnorm`` when enabled and applicable, else ``None``."""
+    if not _K3_ATTN_RES_PDL or prefix_sum.shape[0] > _K3_ATTN_RES_PDL_MAX_M:
+        return None
+    from ..cute_dsl_kernels.blackwell import k3_attn_res
+
+    weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
+    addends = () if addend is None else (addend,)
+    if not k3_attn_res.can_use_k3_attn_res(prefix_sum, addends, block_residual, *weights):
+        return None
+    eps = float(norm.eps)
+    out_eps = _rms_norm_eps(output_norm)
+    if addend is None:
+        return torch.ops.trtllm.k3_attn_res_rmsnorm(
+            prefix_sum, block_residual, *weights, eps, out_eps
+        )
+    return torch.ops.trtllm.k3_attn_res_add_rmsnorm(
+        prefix_sum, addend, block_residual, *weights, eps, out_eps
+    )
+
+
+def _k3_attn_res_pdl_moe_add(
+    deferred: _DeferredMoEResidual,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """``(prefix_sum, normed mix)`` of a deferred MoE residual update, or ``None``."""
+    residual, routed, shared = deferred
+    if residual.shape[0] > _K3_ATTN_RES_PDL_MAX_M:
+        return None
+    from ..cute_dsl_kernels.blackwell import k3_attn_res
+
+    weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
+    if not k3_attn_res.can_use_k3_attn_res(residual, (routed, shared), block_residual, *weights):
+        return None
+    M, H = residual.shape
+    _note_attn_res_fusion("moe_add+attn_res+norm/pdl", True, M, H, int(block_residual.shape[0]) + 1)
+    return torch.ops.trtllm.k3_attn_res_moe_add_rmsnorm(
+        residual,
+        routed,
+        shared,
+        block_residual,
+        *weights,
+        float(norm.eps),
+        _rms_norm_eps(output_norm),
+    )
+
+
 def _apply_attn_res_rmsnorm_fused(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -836,6 +934,10 @@ def _apply_attn_res_rmsnorm_fused(
     # with. Whether those hold up at prefill is a separate question that has
     # not been measured; the ceiling stays at the top of the measured range
     # until it is.
+    pdl_out = _k3_attn_res_pdl(prefix_sum, None, block_residual, proj, norm, output_norm)
+    if pdl_out is not None:
+        _note_attn_res_fusion("attn_res+norm/pdl", True, M, H, N)
+        return pdl_out
     if _use_persistent_attn_res(M, H, N):
         try:
             persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
@@ -905,6 +1007,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     K = int(block_residual.shape[0])
     N = K + 1
     # Same measured window as _apply_attn_res_rmsnorm_fused above.
+    pdl_out = _k3_attn_res_pdl(prefix_sum, addend, block_residual, proj, norm, output_norm)
+    if pdl_out is not None:
+        _note_attn_res_fusion("add+attn_res+norm/pdl", True, M, H, N)
+        return pdl_out
     if _use_persistent_attn_res(M, H, N):
         try:
             persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
@@ -2216,8 +2322,13 @@ class KimiK3MoERuntime(nn.Module):
         all_rank_num_tokens=None,
         *,
         residual: Optional[torch.Tensor] = None,
+        defer_residual: bool = False,
     ) -> torch.Tensor:
-        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
+        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16.
+
+        With ``residual``, returns ``residual + moe_output``; with ``defer_residual`` as well, a
+        ``_DeferredMoEResidual`` instead where that update would be the separate BF16 add.
+        """
         identity = hidden_states
         projected_input = None
         early_routed_in = None
@@ -2379,6 +2490,8 @@ class KimiK3MoERuntime(nn.Module):
                     return fused
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         if residual is not None:
+            if defer_residual:
+                return _DeferredMoEResidual(residual, routed_out, shared_out)
             from ..modules.kimi_k3_moe_residual import _fused_moe_residual_add
 
             return _fused_moe_residual_add(routed_out, shared_out, residual)
@@ -2665,14 +2778,30 @@ class KimiLinearDecoderLayer(nn.Module):
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
-        number of valid bank rows.
+        number of valid bank rows. The prefix sum (input and output) can be a
+        ``_DeferredMoEResidual`` (``TRTLLM_K3_ATTN_RES_PDL=2``).
 
         ``capture`` is ``(spec_metadata, layer_id)``: the attention-side mixture
         computed below IS the aggregated stream value for ``layer_id``, so the
         DSpark tap reuses it instead of recomputing it.
         """
-        prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
+        normed = None
+        if isinstance(hidden_states, _DeferredMoEResidual):
+            # The previous layer's MoE residual update, folded into this mix when possible.
+            if capture is None and num_snapshots > 0:
+                fused = _k3_attn_res_pdl_moe_add(
+                    hidden_states,
+                    valid_block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                    self.input_layernorm,
+                )
+                if fused is not None:
+                    hidden_states, normed = fused
+            if normed is None:
+                hidden_states = hidden_states.materialize()
+        prefix_sum = hidden_states
 
         if capture is not None and not _AUX_ATTN_RES_STREAM_ENABLED:
             # prefix_only wants the incoming running prefix, which is already in
@@ -2702,6 +2831,8 @@ class KimiLinearDecoderLayer(nn.Module):
             )
             capture[0].maybe_capture_hidden_states(capture[1], mixed, None)
             hidden_states = self.input_layernorm(mixed)
+        elif normed is not None:
+            hidden_states = normed
         elif num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
@@ -2751,6 +2882,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 hidden_states,
                 getattr(attn_metadata, "all_rank_num_tokens", None),
                 residual=prefix_sum,
+                defer_residual=_defer_moe_residual(prefix_sum.shape[0]),
             )
             return prefix_sum, num_snapshots
         if self.is_moe:
@@ -2877,6 +3009,7 @@ class KimiLinearModel(DecoderModel):
             hidden_states, num_snapshots = layer(
                 hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
             )
+        hidden_states = _materialize_prefix_sum(hidden_states)
 
         # The last layer has no successor to fold the tap into, so its stream
         # value uses the model's own output-side score weights.
