@@ -152,6 +152,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         fold_sq: bool = False,
         emit_softmax_stats: bool = False,
         balanced_split: bool = False,
+        use_pdl: bool = False,
+        prefetch_next_work: bool = False,
+        reduction_unroll: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -196,6 +199,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ``split_kv`` argument is ignored and the workspace holds the
             partial slots (``get_balanced_workspace_size``).
         :type balanced_split: bool
+        :param use_pdl: Launch the split kernel and the reduction with
+            programmatic dependent launch: their prologues overlap the
+            preceding kernel, which they wait for before touching memory.
+        :type use_pdl: bool
+        :param prefetch_next_work: Every warp role asks the tile scheduler
+            for its next work tile when it starts the current one, not after
+            finishing it: the scheduler's shared-memory reads then do not
+            queue behind the epilogue's global stores at a work-tile boundary.
+        :type prefetch_next_work: bool
+        :param reduction_unroll: Balanced split: partial slots whose O rows
+            ``balanced_reduction_kernel`` loads before accumulating them (in
+            slot order, so the result does not depend on it). Pays off when
+            the M tiles are cut into many partials (batch 1-2).
+        :type reduction_unroll: int
         """
 
         self.latent_dim = 512
@@ -207,6 +224,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
         self.balanced_split = balanced_split
+        self.use_pdl = use_pdl
+        self.prefetch_next_work = prefetch_next_work
+        self.reduction_unroll = reduction_unroll
         self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
         self.is_var_seq = is_var_seq
@@ -1073,6 +1093,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             smem=SplitKVKernelSharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         if cutlass.const_expr(self.balanced_split):
             red_lse = lse
@@ -1100,6 +1121,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 smem=(self.balanced_num_slots + 1) * 4,
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=self.use_pdl,
             )
         elif cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.emit_softmax_stats):
@@ -1137,6 +1159,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=self.use_pdl,
             )
 
     @cute.jit
@@ -1304,8 +1327,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        softmax_scale_log2 = softmax_scale[0] * LOG2_E
-        output_scale_value = output_scale[0]
         mma_tile_coord_v = bidx % cute.size(tiled_mma_qk.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
 
@@ -1402,6 +1423,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
+        if cutlass.const_expr(self.use_pdl):
+            # Everything above only touched this CTA's shared memory; inputs
+            # (the scales too: the preceding RoPE kernel writes them) and
+            # outputs are accessed after the preceding kernel completed.
+            # The reduction is released by the CTAs' exits (no early trigger:
+            # its waiting CTAs would only take the SMs of finished clusters).
+            cute.arch.griddepcontrol_wait()
+        softmax_scale_log2 = softmax_scale[0] * LOG2_E
+        output_scale_value = output_scale[0]
 
         # Balanced split: the cluster's schedule, in shared memory.
         tile_table = None
@@ -1442,6 +1472,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                    tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1479,8 +1512,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         load_q_producer_state,
                         load_k_producer_state,
                     )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             load_q_pipeline.producer_tail(load_q_producer_state)
             load_k_pipeline.producer_tail(load_k_producer_state)
@@ -1493,6 +1529,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                    tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1518,8 +1557,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         k_tile_count,
                         load_v_producer_state,
                     )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
             load_v_pipeline.producer_tail(load_v_producer_state)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1548,6 +1590,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                    tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1598,8 +1643,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         p_mma_consumer_state,
                         mma_o_producer_state,
                     )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             mma_s_pipeline.producer_tail(mma_s_producer_state)
             mma_o_pipeline.producer_tail(mma_o_producer_state)
@@ -1628,6 +1676,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                    tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1663,8 +1714,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             p_mma_producer_state=p_mma_producer_state,
                             p_cor_producer_state=p_cor_producer_state,
                         ))
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
             p_cor_pipeline.producer_tail(p_cor_producer_state)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1695,6 +1749,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             mDesc[slot_base + i, 0] = -1
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1748,8 +1805,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         p_cor_consumer_state=p_cor_consumer_state,
                         mma_o_consumer_state=mma_o_consumer_state,
                     )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
         return
 
@@ -1786,6 +1846,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mSoftmaxStats = None
         if cutlass.const_expr(self.emit_softmax_stats):
             mLSE, mSoftmaxStats = mLSE
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -1927,6 +1989,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mSoftmaxStats = None
         if cutlass.const_expr(self.emit_softmax_stats):
             mLSE, mSoftmaxStats = mLSE
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         row_group, y, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -2019,24 +2083,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     sum_lse[i] = (lse_max[i] + cute.math.log2(sm, fastmath=True)
                                   if not sm == self.lse_dtype(0.0) or sm != sm
                                   else self.lse_dtype.inf)
-                # O: the rows' partials are loaded together, partial by partial
+                # O: the rows' partials are loaded together, reduction_unroll
+                # partials at a time, and accumulated in slot order
+                unroll = self.reduction_unroll
                 rAcc = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
                                              self.acc_dtype)
                 rAcc.fill(0.0)
-                rPart = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
-                                              self.acc_dtype)
-                for j in range(n_parts):
-                    q = tile_slots[1 + j]
-                    for i in cutlass.range_constexpr(rpw):
-                        cute.autovec_copy(
-                            cute.local_tile(mAccO[rr[i], q, None, 0, 0],
-                                            (vec, ), (lane, )), rPart[None, i])
-                    for i in cutlass.range_constexpr(rpw):
-                        scale = cute.math.exp2(mAccLSE[rr[i], q, 0, 0] -
-                                               sum_lse[i],
-                                               fastmath=True)
-                        for e in cutlass.range_constexpr(vec):
-                            rAcc[e, i] += rPart[e, i] * scale
+                rPart = cute.make_rmem_tensor(
+                    cute.make_layout((vec, rpw, unroll)), self.acc_dtype)
+                rPartLSE = cute.make_rmem_tensor(
+                    cute.make_layout((rpw, unroll)), self.lse_dtype)
+                for j0 in range(0, n_parts, unroll):
+                    for u in cutlass.range_constexpr(unroll):
+                        if j0 + u < n_parts:
+                            q = tile_slots[1 + j0 + u]
+                            for i in cutlass.range_constexpr(rpw):
+                                cute.autovec_copy(
+                                    cute.local_tile(mAccO[rr[i], q, None, 0, 0],
+                                                    (vec, ), (lane, )),
+                                    rPart[None, i, u])
+                                rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
+                    for u in cutlass.range_constexpr(unroll):
+                        if j0 + u < n_parts:
+                            for i in cutlass.range_constexpr(rpw):
+                                scale = cute.math.exp2(rPartLSE[i, u] -
+                                                       sum_lse[i],
+                                                       fastmath=True)
+                                for e in cutlass.range_constexpr(vec):
+                                    rAcc[e, i] += rPart[e, i, u] * scale
                 for i in cutlass.range_constexpr(rpw):
                     if row0 + i < rows and self._is_stored_row(row0 + i, c):
                         self._store_reduced_row(mO, mLSE, mSoftmaxStats,
@@ -3383,6 +3457,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                              self.threads_per_warp)],
             )
 
+        if cutlass.const_expr(self.skip_correction_threshold > 0.0):
+            # Keep the running max while this tile raises it by at most
+            # 2**threshold: P stays below 2**threshold and O, row_sum need no
+            # rescale (correction factor 1).
+            if ((row_max_new - row_max) * softmax_params.softmax_scale_log2
+                    <= self.skip_correction_threshold):
+                row_max_new = row_max
         # find correction factor
         correction_factor = cute.math.exp2(
             (row_max - row_max_new) * softmax_params.softmax_scale_log2,

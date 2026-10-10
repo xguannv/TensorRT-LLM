@@ -533,3 +533,105 @@ def test_balanced_split_matches_uniform_split(H, S, helix, lens_name, monkeypatc
         v = valid[b].to("cuda").repeat_interleave(H)
         err = (new_rows[b].float() - gold_rows[b])[v].abs().max().item() if v.any() else 0.0
         assert err <= tol, (b, err)
+
+
+# Launch options of the FP8 kernel (TRTLLM_MLA_PDL, TRTLLM_MLA_PREFETCH_WORK,
+# TRTLLM_MLA_RESCALE_THRESHOLD, TRTLLM_MLA_REDUCTION_UNROLL), compiled per value as part
+# of the runner's cache key.
+
+
+def _set_options(monkeypatch, pdl="1", prefetch_work="1", threshold="0", unroll=None):
+    monkeypatch.setenv("TRTLLM_MLA_PDL", pdl)
+    monkeypatch.setenv("TRTLLM_MLA_PREFETCH_WORK", prefetch_work)
+    monkeypatch.setenv("TRTLLM_MLA_RESCALE_THRESHOLD", threshold)
+    if unroll is None:
+        monkeypatch.delenv("TRTLLM_MLA_REDUCTION_UNROLL", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_MLA_REDUCTION_UNROLL", unroll)
+
+
+@pytest.mark.parametrize("lens_name", ["mixed8", "skew", "single", "k3"])
+@pytest.mark.parametrize(
+    "H,S,helix", [(96, 7, True), (96, 8, True), (96, 6, False), (128, 1, False)]
+)
+def test_pdl_and_work_prefetch_are_bitwise_identical(H, S, helix, lens_name, monkeypatch):
+    """PDL only reorders launches and fetching the next work tile early only
+    reorders the scheduler's reads: O, LSE and the Helix stats are bitwise
+    identical to the plain kernel."""
+    lens = _BALANCED_LENS[lens_name]
+    x = _padded_inputs(lens, S, H, helix=helix, seed=17)
+    tactic = CuteDSLNVMlaDecodeBlackwellRunner.BALANCED_SPLIT_TACTIC
+    _set_options(monkeypatch, pdl="0", prefetch_work="0")
+    ref = _run_guarded(x, H, S, tactic, True, monkeypatch, persistent=True)
+    for pdl, prefetch_work in (("1", "0"), ("0", "1"), ("1", "1")):
+        _set_options(monkeypatch, pdl=pdl, prefetch_work=prefetch_work)
+        new = _run_guarded(x, H, S, tactic, True, monkeypatch, persistent=True)
+        for a, b in zip(new, ref):
+            if a is not None:
+                assert torch.equal(a, b), (pdl, prefetch_work)
+    # the uniform split_kv path launches with PDL as well
+    _set_options(monkeypatch, pdl="0", prefetch_work="0")
+    ref = _run_guarded(x, H, S, 2, True, monkeypatch)
+    _set_options(monkeypatch, pdl="1", prefetch_work="1")
+    new = _run_guarded(x, H, S, 2, True, monkeypatch)
+    for a, b in zip(new, ref):
+        if a is not None:
+            assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("lens_name", list(_BALANCED_LENS))
+@pytest.mark.parametrize(
+    "H,S,helix", [(96, 7, True), (96, 8, True), (96, 6, False), (48, 3, False), (128, 1, False)]
+)
+def test_reduction_unroll_is_bitwise_identical(H, S, helix, lens_name, monkeypatch):
+    """Loading several partial slots before accumulating them keeps the slot
+    order of the accumulation: O, LSE and the Helix stats are bitwise
+    identical for every unroll (and for the batch-size default), also for
+    requests without KV."""
+    lens = _BALANCED_LENS[lens_name]
+    x = _padded_inputs(lens, S, H, helix=helix, seed=29)
+    tactic = CuteDSLNVMlaDecodeBlackwellRunner.BALANCED_SPLIT_TACTIC
+    _set_options(monkeypatch, unroll="1")
+    ref = _run_guarded(x, H, S, tactic, True, monkeypatch, persistent=True)
+    for unroll in ("3", "4", "8", None):
+        _set_options(monkeypatch, unroll=unroll)
+        new = _run_guarded(x, H, S, tactic, True, monkeypatch, persistent=True)
+        for a, b in zip(new, ref):
+            if a is not None:
+                assert torch.equal(a, b), unroll
+
+
+@pytest.mark.parametrize("threshold", ["4", "8"])
+@pytest.mark.parametrize("q_gain", [1.0, 6.0])
+@pytest.mark.parametrize("lens_name", ["k3", "skew"])
+def test_rescale_threshold_matches_reference(threshold, q_gain, lens_name, monkeypatch):
+    """Keeping a stale running max (P up to 2**threshold in FP8) changes only
+    the FP8 rounding of P: O stays within the kernel's tolerance of the fp32
+    reference and of the always-rescaling kernel, the LSE and Helix stats to
+    fp32 rounding. q_gain widens the logits so the max keeps moving."""
+    H, S = 96, 7
+    lens = _BALANCED_LENS[lens_name]
+    x = _padded_inputs(lens, S, H, helix=True, seed=23)
+    if q_gain != 1.0:
+        q = (x["q"].float() * q_gain).to(torch.float8_e4m3fn)
+        x["q"].copy_(q)
+    tactic = CuteDSLNVMlaDecodeBlackwellRunner.BALANCED_SPLIT_TACTIC
+    _set_options(monkeypatch, threshold="0")
+    ref_o, ref_lse, ref_stats = _run_guarded(x, H, S, tactic, True, monkeypatch, persistent=True)
+    _set_options(monkeypatch, threshold=threshold)
+    new_o, new_lse, new_stats = _run_guarded(x, H, S, tactic, True, monkeypatch, persistent=True)
+    gold, valid = _reference_bounded(x, S, H)
+    v = valid.to("cuda")
+    tol = 0.05 * gold.abs().max().item()
+    has_kv = torch.tensor([L > 0 for L in lens], device="cuda")
+    assert torch.isfinite(new_o[has_kv].float()).all()
+    err_new = (new_o.float() - gold).abs()[v].max().item()
+    err_ref = (ref_o.float() - gold).abs()[v].max().item()
+    assert err_new <= tol, (err_new, err_ref)
+    assert (new_o.float() - ref_o.float()).abs()[v].max().item() <= tol
+    fin = torch.isfinite(ref_lse)
+    assert torch.equal(fin, torch.isfinite(new_lse))
+    assert (new_lse[fin] - ref_lse[fin]).abs().max().item() <= 1e-4
+    sfin = torch.isfinite(ref_stats)
+    assert torch.equal(sfin, torch.isfinite(new_stats))
+    assert (new_stats[sfin] - ref_stats[sfin]).abs().max().item() <= 1e-4

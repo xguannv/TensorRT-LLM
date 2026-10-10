@@ -8500,6 +8500,61 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # split_kv value of a balanced-split tactic
         BALANCED_SPLIT_TACTIC = 0
 
+        # Balanced split: largest batch whose reduction loads several
+        # partial slots at once (its M tiles are cut into many partials).
+        _REDUCTION_UNROLL_MAX_BATCH = 2
+        _REDUCTION_UNROLL = 4
+
+        @classmethod
+        def _fp8_kernel_options(
+                cls, batch_size: int,
+                balanced_split: bool) -> Tuple[Tuple[str, object], ...]:
+            """Keyword options of the FP8 kernel (part of its cache key), from
+            the environment where noted:
+
+            * TRTLLM_MLA_PDL: programmatic dependent launch of the split
+              kernel and its reduction (default on with TRTLLM_ENABLE_PDL).
+            * TRTLLM_MLA_PREFETCH_WORK: warp roles fetch their next work tile
+              when they start the current one (default on).
+            * TRTLLM_MLA_RESCALE_THRESHOLD: a row keeps its running max (and
+              skips the O rescale) while a new K tile raises the scaled max by
+              at most this many powers of two; P then stays below 2**threshold
+              (FP8 E4M3 holds up to 448, so at most 8). Default 0: rescale on
+              every increase.
+            * reduction_unroll: partial slots the balanced-split reduction
+              loads at once, ``_REDUCTION_UNROLL`` up to
+              ``_REDUCTION_UNROLL_MAX_BATCH`` requests, else 1 (always 1
+              without the balanced split); TRTLLM_MLA_REDUCTION_UNROLL
+              overrides it. The result does not depend on it.
+            """
+            threshold = float(
+                os.environ.get("TRTLLM_MLA_RESCALE_THRESHOLD", "0"))
+            if not 0.0 <= threshold <= 8.0:
+                raise ValueError(
+                    "TRTLLM_MLA_RESCALE_THRESHOLD must be in [0, 8], got "
+                    f"{threshold}.")
+            unroll = os.environ.get("TRTLLM_MLA_REDUCTION_UNROLL")
+            if not balanced_split:
+                unroll = 1
+            elif unroll is not None:
+                unroll = int(unroll)
+                if unroll < 1:
+                    raise ValueError(
+                        "TRTLLM_MLA_REDUCTION_UNROLL must be >= 1, got "
+                        f"{unroll}.")
+            elif batch_size <= cls._REDUCTION_UNROLL_MAX_BATCH:
+                unroll = cls._REDUCTION_UNROLL
+            else:
+                unroll = 1
+            return (
+                ("use_pdl", os.environ.get("TRTLLM_MLA_PDL", "1") == "1"
+                 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"),
+                ("prefetch_next_work",
+                 os.environ.get("TRTLLM_MLA_PREFETCH_WORK", "1") == "1"),
+                ("skip_correction_threshold", threshold),
+                ("reduction_unroll", unroll),
+            )
+
         def __init__(
             self,
             in_dtype,
@@ -9174,6 +9229,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"{expected_bounds_shape}, got shape="
                         f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
 
+            fp8_options = None
+            if self.kernel_class is BlackwellMultiHeadLatentAttentionForwardFP8:
+                fp8_options = self._fp8_kernel_options(batch_size,
+                                                       balanced_split)
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -9184,6 +9243,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kv_bounds is not None,
                 rows_per_request,
                 balanced_split,
+                fp8_options,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -9205,8 +9265,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            and seq_len_q > 1)
 
                 kernel_kwargs = {}
+                skip_correction_threshold = self._SKIP_CORRECTION_THRESHOLD
                 if balanced_split:
                     kernel_kwargs["balanced_split"] = True
+                if fp8_options is not None:
+                    kernel_kwargs.update(fp8_options)
+                    skip_correction_threshold = kernel_kwargs.pop(
+                        "skip_correction_threshold")
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
@@ -9214,7 +9279,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_pv_tiler_mn,
                     max_active_clusters,
                     self.page_size,
-                    self._SKIP_CORRECTION_THRESHOLD,
+                    skip_correction_threshold,
                     is_persistent,
                     self._IS_VAR_SEQ,
                     self._IS_VAR_SPLIT_KV,
