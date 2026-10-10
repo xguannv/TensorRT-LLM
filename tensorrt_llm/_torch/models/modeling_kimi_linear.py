@@ -53,7 +53,9 @@ layers applied to the full sum). When attention DP is off, the shared experts
 use standard MLP TP over the model TP group: gate/up are column-sharded and down
 is row-sharded. The shared down projection reduces on the auxiliary stream
 while the routed expert chain runs on the main stream. After the streams join,
-the routed latent partial is reduced before its norm/up projection.
+the routed latent partial is reduced before its norm/up projection. With
+``TRTLLM_K3_MERGED_MOE_AR=1`` the shared expert leaves its partial unreduced and
+one all-reduce over ``[latent partial | shared partial]`` serves both.
 Fused-communication routed backends already return a complete routed result and
 need no outer reduction. Under attention DP the shared experts stay replicated.
 ``lm_head`` uses the stock ``LMHead`` (vocab-sharded + gather), so logits are
@@ -129,6 +131,32 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 _K3_FUSE_MOE_RESIDUAL = os.environ.get("TRTLLM_K3_FUSE_MOE_RESIDUAL", "0") == "1"
+
+# MoE block with a TP-sharded shared expert and an outer routed reduction: one all-reduce over
+# [routed latent partial | shared-expert partial] replaces the latent all-reduce (+RMSNorm) and
+# the shared expert's own all-reduce (see ``KimiK3MoERuntime._merged_reduce``).
+_K3_MERGED_MOE_AR = os.environ.get("TRTLLM_K3_MERGED_MOE_AR", "0") == "1"
+# Largest token count that takes the merged all-reduce (0: no limit). At a few hundred tokens
+# the reduction is bandwidth-bound, so merging saves little, and it loses the overlap of the
+# shared expert's own all-reduce with the routed experts when that chain is the longer one.
+_K3_MERGED_MOE_AR_MAX_TOKENS = int(os.environ.get("TRTLLM_K3_MERGED_MOE_AR_MAX_TOKENS", "128"))
+
+# Zero residual operand of the merged MoE all-reduce, one per device, shared by every layer.
+# It only grows outside CUDA graph capture, and a replaced buffer is kept alive because
+# graphs captured earlier still read it.
+_K3_ZERO_RESIDUALS: Dict[torch.device, List[torch.Tensor]] = {}
+
+
+def _k3_zero_residual(numel: int, device: torch.device) -> Optional[torch.Tensor]:
+    """``numel`` BF16 zeros, or ``None`` if that needs a new buffer during graph capture."""
+    buffers = _K3_ZERO_RESIDUALS.setdefault(device, [])
+    if not buffers or buffers[-1].numel() < numel:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        size = max(numel, 2 * buffers[-1].numel()) if buffers else numel
+        buffers.append(torch.zeros(size, dtype=torch.bfloat16, device=device))
+    return buffers[-1][:numel]
+
 
 # SM100/SM103 FP8 weight-read projections with few rows (per-shape limit, see
 # k3_fp8w_lowm_gemm.can_run) run the CuTe low-M GEMM instead of DeepGEMM swap-AB.
@@ -1064,6 +1092,10 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # touched by any later autocast/dtype move.
         self.register_buffer("weight", weight_fp8, persistent=False)
         self.register_buffer("weight_scale", weight_scale, persistent=False)
+        # Set by a caller for the next forward only: a contiguous BF16 ``[M, out_features]``
+        # tensor that the low-M GEMM writes its result into. Other paths return their own
+        # tensor, so the caller compares the result with the buffer it handed in.
+        self.next_output: Optional[torch.Tensor] = None
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -1186,6 +1218,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             raise NotImplementedError("Kimi K3 FP8 weight read does not support LoRA.")
         out_shape = x.shape[:-1] + (self.out_features,)
         x_flat = x.reshape(-1, x.shape[-1])
+        out_buffer, self.next_output = self.next_output, None
 
         if _rubin_mxfp8_is_available():
             act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
@@ -1202,7 +1235,17 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             and x.dtype == torch.bfloat16
             and _k3_lowm_gemm_can_run(x_flat, self.weight, self.weight_scale)
         ):
-            out = torch.ops.trtllm.k3_fp8w_lowm_gemm(x_flat, self.weight, self.weight_scale)
+            if (
+                out_buffer is not None
+                and out_buffer.dtype == torch.bfloat16
+                and out_buffer.shape == (x_flat.shape[0], self.out_features)
+                and out_buffer.is_contiguous()
+            ):
+                from ..cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import k3_fp8w_lowm_gemm_out
+
+                out = k3_fp8w_lowm_gemm_out(x_flat, self.weight, self.weight_scale, out_buffer)
+            else:
+                out = torch.ops.trtllm.k3_fp8w_lowm_gemm(x_flat, self.weight, self.weight_scale)
         else:
             out = torch.ops.trtllm.fp8_swap_ab_gemm(
                 x_flat,
@@ -1637,6 +1680,15 @@ class KimiK3MoERuntime(nn.Module):
                 "Kimi K3 direct MoE tensor parallelism requires the "
                 "ConfigurableMoE all-reduce even when reduce_results=False."
             )
+        # TRTLLM_K3_MERGED_MOE_AR: the shared expert hands back its row-parallel partial and the
+        # routed reduction sums it together with the latent partial (``_merged_reduce``). The
+        # shared partial is reduced as rows of the latent width, so the hidden size must be a
+        # multiple of it.
+        self._merge_moe_allreduce = (
+            _K3_MERGED_MOE_AR
+            and self._reduce_routed_output
+            and cfg.hidden_size % self.moe_hidden_size == 0
+        )
         self.shared_experts = GatedMLP(
             hidden_size=cfg.hidden_size,
             intermediate_size=shared_intermediate,
@@ -1691,6 +1743,53 @@ class KimiK3MoERuntime(nn.Module):
         if self.shared_down_all_reduce is not None:
             return self.shared_down_all_reduce
         return self.shared_experts.down_proj.all_reduce
+
+    def _merged_reduce_buffers(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """``(buffer, zero_residual)`` of the merged MoE all-reduce, or ``None`` to keep two.
+
+        ``buffer`` is flat: the routed latent partial ``[M, moe_hidden_size]`` followed by the
+        shared-expert partial ``[M, hidden_size]``, both contiguous.
+        """
+        num_tokens = hidden_states.shape[0]
+        if (
+            not self._merge_moe_allreduce
+            or num_tokens == 0
+            or 0 < _K3_MERGED_MOE_AR_MAX_TOKENS < num_tokens
+            or hidden_states.dtype != torch.bfloat16
+            or torch.compiler.is_compiling()
+        ):
+            return None
+        numel = num_tokens * (self.moe_hidden_size + self.hidden_size)
+        zero_residual = _k3_zero_residual(numel, hidden_states.device)
+        if zero_residual is None:
+            return None
+        return torch.empty_like(zero_residual), zero_residual
+
+    def _merged_reduce(
+        self, buffer: torch.Tensor, zero_residual: torch.Tensor, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce ``[routed latent partial | shared partial]`` in one collective.
+
+        The buffer is viewed as rows of the latent width (a shared row spans
+        ``hidden_size / moe_hidden_size`` of them) and reduced with the residual-RMSNorm fusion
+        against a zero residual: the residual output is the plain sum of every row, and the norm
+        output of the first ``num_tokens`` rows is ``routed_expert_norm`` of the reduced latent.
+        Returns ``(normed latent [M, moe_hidden_size], reduced shared [M, hidden_size])``.
+        """
+        latent = self.moe_hidden_size
+        rows = buffer.numel() // latent
+        normed, reduced = self.routed_experts.all_reduce(
+            buffer.view(rows, latent),
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=zero_residual.view(rows, latent),
+                norm_weight=self.routed_expert_norm.weight,
+                eps=float(self.routed_expert_norm.variance_epsilon),
+            ),
+        )
+        return normed[:num_tokens], reduced[num_tokens:].view(num_tokens, self.hidden_size)
 
     def _fused_route(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Route with the fused CuTe router when enabled and applicable.
@@ -2163,6 +2262,13 @@ class KimiK3MoERuntime(nn.Module):
             and self.shared_expert_stream is not None
             and not torch.compiler.is_compiling()
         )
+        num_tokens = hidden_states.shape[0]
+        merged = self._merged_reduce_buffers(hidden_states)
+        routed_slot = shared_slot = None
+        if merged is not None:
+            split = num_tokens * self.moe_hidden_size
+            routed_slot = merged[0][:split].view(num_tokens, self.moe_hidden_size)
+            shared_slot = merged[0][split:].view(num_tokens, self.hidden_size)
 
         def _routed_output():
             logits = router_logits
@@ -2182,6 +2288,8 @@ class KimiK3MoERuntime(nn.Module):
                     routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             if isinstance(routed_in, Fp4QuantizedTensor):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
+            if merged is not None:
+                moe_kwargs["moe_output"] = routed_slot
             if route_target is not None and not gemv_route:
                 # Routed by the CuTe tail when the backend asks for the routing (after it
                 # forks the input quantization).
@@ -2198,6 +2306,10 @@ class KimiK3MoERuntime(nn.Module):
                 self.routed_experts.routing_method.deferred = None
             if overlap_shared_allreduce:
                 self.moe_routed_event.record()
+            if merged is not None:
+                if y.data_ptr() != routed_slot.data_ptr():
+                    routed_slot.copy_(y)
+                return routed_slot
             if self._reduce_routed_output:
                 return y
             # Communication-backed paths return a complete routed result.
@@ -2205,14 +2317,23 @@ class KimiK3MoERuntime(nn.Module):
             return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
+            if merged is not None and isinstance(
+                self.shared_experts.down_proj, _Fp8BlockScaleWeightReadLinear
+            ):
+                self.shared_experts.down_proj.next_output = shared_slot
             shared_out = self.shared_experts(
                 identity,
                 final_all_reduce_params=(
                     AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce
+                    if self._defer_shared_allreduce or merged is not None
                     else None
                 ),
             )
+            if merged is not None:
+                # The partial joins the routed reduction (``_merged_reduce``).
+                if shared_out.data_ptr() != shared_slot.data_ptr():
+                    shared_slot.copy_(shared_out)
+                return shared_slot
             if overlap_shared_allreduce:
                 # Wait for all routed chunks, but overlap the norm/up tail.
                 self.moe_routed_event.wait()
@@ -2221,8 +2342,8 @@ class KimiK3MoERuntime(nn.Module):
                 shared_out = self.shared_down_all_reduce(shared_out)
             return shared_out
 
-        # The final join includes the shared all-reduce, keeping it ordered
-        # before any outer routed reduction or the next layer's collectives.
+        # The final join includes the shared all-reduce (or, merged, the shared partial),
+        # keeping it ordered before any outer routed reduction or the next layer's collectives.
         routed_out, shared_out = maybe_execute_in_parallel(
             _routed_output,
             _shared_output,
@@ -2233,18 +2354,21 @@ class KimiK3MoERuntime(nn.Module):
         )
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self._shared_all_reduce()(shared_out)
-        if self._reduce_routed_output:
-            # RMSNorm folded into the routed all-reduce (kARRMSNorm): the
-            # MNNVL kernel normalizes straight out of the lamport buffer, so
-            # the reduced row never round-trips through HBM for a norm kernel.
-            routed_latent = moe_all_reduce(
-                routed_out,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RMS_NORM,
-                    norm_weight=self.routed_expert_norm.weight,
-                    eps=float(self.routed_expert_norm.variance_epsilon),
-                ),
-            )
+        if merged is not None or self._reduce_routed_output:
+            if merged is not None:
+                routed_latent, shared_out = self._merged_reduce(*merged, num_tokens)
+            else:
+                # RMSNorm folded into the routed all-reduce (kARRMSNorm): the
+                # MNNVL kernel normalizes straight out of the lamport buffer, so
+                # the reduced row never round-trips through HBM for a norm kernel.
+                routed_latent = moe_all_reduce(
+                    routed_out,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RMS_NORM,
+                        norm_weight=self.routed_expert_norm.weight,
+                        eps=float(self.routed_expert_norm.variance_epsilon),
+                    ),
+                )
             if residual is not None:
                 fused = self._fused_latent_up_residual(routed_latent, shared_out, residual)
                 if fused is not None:

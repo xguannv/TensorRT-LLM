@@ -123,7 +123,15 @@ class MoEScheduler(ABC):
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
-    ) -> torch.Tensor: ...
+        moe_output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the MoE layer.
+
+        ``moe_output``: optional ``[num_tokens, hidden_size]`` buffer, in the output dtype, for
+        the backend to write the result into. A scheduler hands it to ``run_moe`` (as
+        ``MoECommPlan.moe_output``) only where the backend output is the layer output; the
+        caller compares the returned tensor with it to see whether it was used.
+        """
 
 
 # ============================================================================
@@ -165,6 +173,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         moe = self.moe
 
@@ -236,6 +245,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 input_ids,
                 lora_params=lora_params,
                 input_ready_event=input_ready_event,
+                moe_output=moe_output,
             )
         else:
             if input_ready_event is not None:
@@ -356,6 +366,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -376,6 +387,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             input_ids=input_ids,
             lora_params=lora_params,
             input_ready_event=input_ready_event,
+            moe_output=moe_output,
         )
 
     def _forward_chunk_impl(
@@ -392,6 +404,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -647,6 +660,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             all_rank_num_tokens=all_rank_num_tokens,
             lora_params=lora_params,
             x_ready_event=x_ready_event,
+            moe_output=moe_output,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -887,6 +901,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: Optional[List[int]],
         lora_params: Optional[Dict],
         x_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -906,26 +921,44 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
             router_logits=router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            comm_plan=self._build_comm_plan(all_rank_num_tokens, output_dtype),
+            comm_plan=self._build_comm_plan(
+                all_rank_num_tokens, output_dtype, num_tokens=x.shape[0], moe_output=moe_output
+            ),
         )
 
     def _build_comm_plan(
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
+        num_tokens: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
 
         Backends read the fields they care about and ignore the rest, so the
         set of facts no longer depends on which class is running.
+
+        ``moe_output`` is the caller's output buffer (see ``MoEScheduler.forward``). Without
+        external communication the backend output is the layer output, so a buffer of the
+        output's shape and dtype becomes the plan's output buffer; otherwise it is ignored.
         """
         moe = self.moe
         # Pre-quant dispatch: SFs arrive swizzled; post-quant dispatch: SFs
         # arrive unswizzled. Backends use this to skip a re-swizzle.
         supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
+        requested_output = moe_output
         moe_output, payload_in_workspace = self._plan_onesided_workspace(
             all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
         )
+        if (
+            moe_output is None
+            and moe.comm is None
+            and requested_output is not None
+            and requested_output.dtype == output_dtype
+            and tuple(requested_output.shape) == (num_tokens, moe.hidden_size)
+            and requested_output.is_contiguous()
+        ):
+            moe_output = requested_output
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
@@ -980,8 +1013,11 @@ class FusedCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor],
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
+
+        ``moe_output`` is not used: the fused kernels allocate their outputs per chunk.
 
         Single-chunk case is just ``num_chunks == 1`` -- no separate fast
         path. Invariants enforced here (see class docstring): identical
@@ -990,6 +1026,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+        del moe_output
         if input_ready_event is not None:
             input_ready_event.wait()
 
