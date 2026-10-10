@@ -4259,3 +4259,114 @@ def test_bf16_grouped_gemm_finalize_rubin(
         f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
         + "\n  ".join(failed)
     )
+
+
+def _finalize_inplace(inputs, num_experts, top_k, num_local_experts, local_expert_offset):
+    (a, b, a_sf, b_sf, alpha, output, t2g, t2lim, p2e, nnet, scales) = inputs
+    output.zero_()
+    torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
+        input=a,
+        weight=b,
+        input_scale=a_sf,
+        weight_scale=b_sf,
+        alpha=alpha,
+        output=output,
+        tile_idx_to_group_idx=t2g,
+        tile_idx_to_mn_limit=t2lim,
+        permuted_idx_to_expanded_idx=p2e,
+        num_non_exiting_tiles=nnet,
+        token_final_scales=scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        tile_size=128,
+        output_dtype=torch.bfloat16,
+    )
+    return output.clone()
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("ep", [(64, 64, 0), (64, 32, 32)], ids=["tp", "ep2_rank1"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 33, 64, 65, 128])
+def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, monkeypatch):
+    """Swap-AB finalize (TRTLLM_MOE_FINALIZE_SWAPAB=1) vs the regular finalize kernel.
+
+    K = 192 is an expert's intermediate slice under MoE TP16 (Kimi-K3). Every partial
+    ``bf16(alpha * scale * acc)`` must be bit-identical: with one non-zero top-k scale per token each
+    output element is a single partial. With all scales the 8 partials are summed in BF16 in an
+    unspecified order by both kernels; both must stay within the BF16 accumulation bound of the
+    exact sum of the partials.
+    """
+    num_experts, num_local_experts, local_expert_offset = ep
+    top_k = 8
+    hidden_size = 1024
+    interm_size = 192
+    sf_vec_size = 16
+    torch.manual_seed(num_tokens)
+
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    t2g, t2lim, _, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=128,
+    )
+    m = p2e.size(0)
+    a = torch.randn(m, interm_size, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(
+        num_local_experts, hidden_size, interm_size, device="cuda", dtype=torch.bfloat16
+    )
+    a_gsf = a.abs().max().float() / (448 * 6)
+    b_gsf = b.abs().max().float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_gsf, sf_vec_size, False)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_gsf, sf_vec_size, False)
+    alpha = torch.linspace(0.5, 1.5, num_local_experts, device="cuda") * (a_gsf * b_gsf)
+    inputs = [
+        a.view(torch.float4_e2m1fn_x2),
+        b.view(torch.float4_e2m1fn_x2),
+        a_sf.view(torch.uint8).flatten(),
+        b_sf.view(torch.uint8).view(num_local_experts, hidden_size, interm_size // sf_vec_size),
+        alpha.float(),
+        torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"),
+        t2g,
+        t2lim,
+        p2e,
+        nnet,
+        token_final_scales,
+    ]
+    args = (num_experts, top_k, num_local_experts, local_expert_offset)
+    runner_cls = cute_dsl_custom_ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner
+
+    def run(swapab, scales):
+        monkeypatch.setenv("TRTLLM_MOE_FINALIZE_SWAPAB", "1" if swapab else "0")
+        runner = runner_cls(*args, 128, torch.bfloat16)
+        assert runner.use_swapab(hidden_size, interm_size, num_tokens) == swapab
+        return _finalize_inplace(inputs[:10] + [scales], *args)
+
+    # one non-zero scale per token: every output element is one partial
+    partials = []
+    for slot in range(top_k):
+        one_hot = torch.zeros_like(token_final_scales)
+        one_hot[:, slot] = token_final_scales[:, slot]
+        ref = run(False, one_hot)
+        new = run(True, one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"slot {slot}"
+        partials.append(ref.double())
+
+    assert runner_cls.swapab_kernel_cache, "the swap-AB kernel was not launched"
+    exact = torch.stack(partials).sum(0)
+    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+    for swapab in (False, True):
+        out = run(swapab, token_final_scales).double()
+        err = (out - exact).abs()
+        assert bool((err <= bound).all()), f"swapab={swapab}: max err/bound {(err / bound).max()}"

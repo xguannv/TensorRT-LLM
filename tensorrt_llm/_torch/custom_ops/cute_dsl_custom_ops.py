@@ -75,6 +75,12 @@ def _dense_gemm_scheduler_modes(default: Tuple[str, ...]) -> Tuple[str, ...]:
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUDA_MAX_GRID_DIM_Z = 65_535
 
+# Opt-in swap-AB kernel for the NVFP4 MoE finalize GEMM (FC2) when the expert K fits one 256-wide
+# stage (an expert's intermediate slice under MoE TP, e.g. Kimi-K3 TP16: K = 192): weights become the
+# MMA M side and the few tokens of a permuted tile the N side, so the epilogue reads only the valid
+# token columns. Shapes the swap-AB kernel cannot run keep the regular kernel.
+_MOE_FINALIZE_SWAPAB_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB"
+
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
 # Both dense MXFP8 wrappers pass a scalar one to the CuTe kernel. Keep one
@@ -557,6 +563,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import \
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_swapab import \
+        Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
@@ -2751,6 +2759,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
+        swapab_kernel_cache = dict()
+        # The one tactic offered when the swap-AB kernel takes the shape; its first entry keeps
+        # mma_tiler_mn[0] == tile_size for the fused-MoE tactic-combination checker.
+        SWAPAB_TACTIC = ((128, 64), (1, 1), False, "swapab")
 
         def __init__(self,
                      num_experts: int,
@@ -2780,6 +2792,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError(
                     f"{self.__class__.kernel_class.__name__} supports tile_size (MMA tile M dimension) 128 and 256 only, but got {self.tile_size}"
                 )
+            self.allow_swapab = os.environ.get(_MOE_FINALIZE_SWAPAB_ENV,
+                                               "0") == "1"
 
         def unique_id(self):
             return (
@@ -2790,7 +2804,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
+                self.allow_swapab,
             )
+
+        @staticmethod
+        def _swapab_config(num_tokens: int) -> dict:
+            """Swap-AB kernel configuration for ``num_tokens`` rows of output."""
+            # A token selects an expert at most once, so with <= 64 tokens no permuted tile holds more
+            # than 64 valid rows and the narrower token operand is enough.
+            if num_tokens <= 64:
+                return dict(n_tok=64, num_epi_wg=3, h_blocks=2, sched_chunk=4)
+            return dict(n_tok=128, num_epi_wg=3, h_blocks=1, sched_chunk=4)
+
+        def use_swapab(self, n: int, k: int, num_tokens: int) -> bool:
+            if not self.allow_swapab or self.scaling_vector_size != 16:
+                return False
+            cfg = self._swapab_config(num_tokens)
+            return Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel.can_implement(
+                n, k, num_tokens, cfg["n_tok"], self.tile_size,
+                cfg["h_blocks"])
 
         def get_valid_tactics(
             self,
@@ -2801,6 +2833,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a, b, *_ = inputs
             m, k = a.size(0), a.size(1) * 2
             l, n = b.size(0), b.size(1)  # noqa: E741
+            if self.use_swapab(n, k, inputs[5].size(0)):
+                return [self.SWAPAB_TACTIC]
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2949,8 +2983,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
+            if self.use_swapab(n, k, num_tokens) and (
+                    not isinstance(tactic, tuple) or len(tactic) == 4):
+                self._forward_swapab(a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr,
+                                     alpha_ptr, tile_idx_to_group_idx_ptr,
+                                     tile_idx_to_mn_limit_ptr,
+                                     permuted_idx_to_expanded_idx_ptr,
+                                     num_non_exiting_tiles_ptr,
+                                     token_final_scales_ptr, m, n, k, l,
+                                     num_tokens, stream)
+                return c
+
             if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic[:3]
             else:
                 mma_tiler_mn = (self.tile_size, 128)
                 cluster_shape_mn = (self.tile_size // 128, 1)
@@ -3025,6 +3070,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ]
             compiled_gemm(*exec_args, stream=stream)
             return c
+
+        def _forward_swapab(self, a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr,
+                            alpha_ptr, tile_idx_to_group_idx_ptr,
+                            tile_idx_to_mn_limit_ptr,
+                            permuted_idx_to_expanded_idx_ptr,
+                            num_non_exiting_tiles_ptr, token_final_scales_ptr,
+                            m, n, k, l, num_tokens, stream):  # noqa: E741
+            cfg = self._swapab_config(num_tokens)
+            args = [
+                a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
+                tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
+                permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
+                token_final_scales_ptr, m, n, k, l, num_tokens, self.top_k
+            ]
+            cache_key = (self.scaling_vector_size, self.tile_size,
+                         tuple(sorted(cfg.items())))
+            compiled = self.__class__.swapab_kernel_cache.get(cache_key)
+            if compiled is None:
+                gemm = Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel(
+                    sf_vec_size=self.scaling_vector_size,
+                    tile_size=self.tile_size,
+                    **cfg)
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(1)
+                compiled = cute.compile(
+                    gemm.wrapper,
+                    *args,
+                    tile_size=self.tile_size,
+                    scaling_vector_size=self.scaling_vector_size,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                )
+                self.__class__.swapab_kernel_cache[cache_key] = compiled
+            compiled(*args, stream=stream)
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell",
