@@ -331,6 +331,8 @@ def test_moe_runtime_routes_with_tail(monkeypatch):
     runtime.shared_experts = _Identity()
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = False
+    runtime._merge_moe_allreduce = False
+    runtime.shared_down_all_reduce = None
     runtime.shared_expert_stream = None
     runtime.latent_down_stream = None
     runtime.moe_main_event = runtime.moe_shared_event = runtime.moe_routed_event = None
