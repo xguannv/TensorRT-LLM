@@ -192,6 +192,9 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # BF16 shared/latent MLP weights are optionally quantized once after loading.
 # Checkpoint-native attention FP8 is independent of this lossy conversion.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
+# Also convert the TP-sharded shared expert (gate_up and the row-parallel down,
+# whose reduction the MoE runtime then applies) to the FP8 weight read.
+_KIMI_K3_FP8_WEIGHT_READ_SHARED_TP_ENV = "KIMI_K3_FP8_WEIGHT_READ_SHARED_TP"
 
 
 class KimiK3MoEGate(nn.Module):
@@ -1214,7 +1217,7 @@ def _swap_linear_to_fp8_weight_read(
 
 
 def _convert_moe_mlps_to_fp8_weight_read(
-    model: nn.Module, include_fused_gate_up: bool = True
+    model: nn.Module, include_fused_gate_up: bool = True, include_tp_shards: bool = False
 ) -> int:
     """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
 
@@ -1222,7 +1225,11 @@ def _convert_moe_mlps_to_fp8_weight_read(
     projection on every MoE layer — the bias-free BF16 projections that
     attention data-parallelism re-reads in full each decode step. Attention
     follows checkpoint quantization separately. Routed experts and the dense
-    layer-0 MLP are not converted. Returns the number of projections converted.
+    layer-0 MLP are not converted. With include_tp_shards the TP-sharded
+    shared expert is converted as well; its row-parallel down projection then
+    no longer reduces its output, and the MoE runtime applies that reduction
+    with the original module (shared_down_all_reduce). Returns the number
+    of projections converted.
     """
     count = 0
 
@@ -1245,7 +1252,12 @@ def _convert_moe_mlps_to_fp8_weight_read(
             for attr in shared_attrs:
                 child = getattr(shared, attr, None)
                 if isinstance(child, TrtllmLinear) and child.tp_size != 1:
-                    continue
+                    if not include_tp_shards:
+                        continue
+                    if child.reduce_output:
+                        # The FP8 read is a plain GEMM; the MoE runtime applies
+                        # the row-parallel reduction with the original module.
+                        moe.shared_down_all_reduce = child.all_reduce
                 count += _swap_linear_to_fp8_weight_read(
                     shared, attr, linear_types=(nn.Linear, TrtllmLinear)
                 )
@@ -1600,6 +1612,9 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
+        # Set when the shared expert's TP-sharded down projection is converted
+        # to the FP8 weight read, which does not reduce its output itself.
+        self.shared_down_all_reduce = None
         # Side stream (+ fork/join events) for overlapping shared-expert
         # compute with the routed chain. Only engaged when multi-stream is
         # active (CUDA graphs on); otherwise both run in order on the default
@@ -1629,6 +1644,12 @@ class KimiK3MoERuntime(nn.Module):
         self.routed_expert_norm = RMSNorm(
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
+
+    def _shared_all_reduce(self) -> nn.Module:
+        """The shared expert's row-parallel reduction (kept aside if its down projection is FP8)."""
+        if self.shared_down_all_reduce is not None:
+            return self.shared_down_all_reduce
+        return self.shared_experts.down_proj.all_reduce
 
     def _fused_route(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Route with the fused CuTe router when enabled and applicable.
@@ -1975,7 +1996,9 @@ class KimiK3MoERuntime(nn.Module):
             if overlap_shared_allreduce:
                 # Wait for all routed chunks, but overlap the norm/up tail.
                 self.moe_routed_event.wait()
-                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+                shared_out = self._shared_all_reduce()(shared_out)
+            elif self.shared_down_all_reduce is not None and not self._defer_shared_allreduce:
+                shared_out = self.shared_down_all_reduce(shared_out)
             return shared_out
 
         # The final join includes the shared all-reduce, keeping it ordered
@@ -1989,7 +2012,7 @@ class KimiK3MoERuntime(nn.Module):
             disable_on_compile=True,
         )
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
-            shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+            shared_out = self._shared_all_reduce()(shared_out)
         if self._reduce_routed_output:
             # RMSNorm folded into the routed all-reduce (kARRMSNorm): the
             # MNNVL kernel normalizes straight out of the lamport buffer, so
@@ -3649,7 +3672,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
         if self._fp8_weight_read_moe_mlp and is_sm_100f():
+            shared_tp = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_SHARED_TP_ENV, "0") == "1"
             converted = _convert_moe_mlps_to_fp8_weight_read(
-                self.model, include_fused_gate_up=self.model_config.mapping.enable_attention_dp
+                self.model,
+                include_fused_gate_up=self.model_config.mapping.enable_attention_dp or shared_tp,
+                include_tp_shards=shared_tp,
             )
             logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")
