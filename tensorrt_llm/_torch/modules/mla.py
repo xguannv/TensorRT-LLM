@@ -64,6 +64,7 @@ from .attention import (
     extract_extra_attrs,
 )
 from .linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
+from .mla_fp8_q_absorb import mla_fp8_q_absorb_nope
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
@@ -438,6 +439,11 @@ class MLA(nn.Module):
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
+        # Set by NoPE subclasses (identity Q rotation): with an FP8 KV cache the
+        # absorbed-generation FP8 query is produced by one kernel
+        # (``mla_fp8_q_absorb_nope``) and the RoPE kernel only appends the KV.
+        self.fp8_nope_q_absorb = False
+        self._fp8_q_unit_scale: Optional[torch.Tensor] = None
         ugpu_policy = config.extra_attrs.get("ugpu_policy")
         self._ugpu_policy = ugpu_policy if ugpu_policy is not None else UgpuPolicy()
         self.enable_ugpu_bf16_linear = enable_ugpu_bf16_linear
@@ -2092,7 +2098,51 @@ class MLA(nn.Module):
                     )
 
             rope_stream = self.aux_stream if not use_fp8_mla else None
-            if self.k_b_proj_trans.dtype == torch.bfloat16:
+            if (
+                self.fp8_nope_q_absorb
+                and use_fp8_mla
+                and not fp4_mla
+                and latent_cache is not None
+                and self.k_b_proj_trans.dtype == torch.bfloat16
+                and (
+                    self._fp8_q_unit_scale is not None
+                    or not torch.cuda.is_current_stream_capturing()
+                )
+            ):
+                # The FP8 query (absorbed q_nope, then q_pe) straight from one
+                # kernel; the RoPE kernel, independent of it, only appends the
+                # KV and fills the scheduler buffers and BMM scales. The unit
+                # query scale is created on the first eager call (a capture
+                # before it takes the BF16 path below).
+                if self._fp8_q_unit_scale is None:
+                    self._fp8_q_unit_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+                maybe_execute_in_parallel(
+                    lambda: mla_fp8_q_absorb_nope(
+                        q.view([-1, self.num_heads_tp, self.qk_head_dim]),
+                        self.k_b_proj_trans,
+                        quant_q_buffer,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                    ),
+                    lambda: self.mqa.mla_rope_generation(
+                        fused_q,
+                        q_pe,
+                        latent_cache,
+                        attn_metadata,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                        mla_bmm1_scale,
+                        mla_bmm2_scale,
+                        quant_q_buffer,
+                        quant_scale_qkv=self._fp8_q_unit_scale,
+                        q_rope_applied=True,
+                    ),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
+            elif self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
                 # [num_heads, num_tokens, self.kv_lora_rank]

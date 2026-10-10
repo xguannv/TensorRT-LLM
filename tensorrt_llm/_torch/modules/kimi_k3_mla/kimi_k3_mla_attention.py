@@ -322,6 +322,10 @@ class KimiK3MLAAttention(MLA):
             self.mqa.mla_backend_policy = _kimi_k3_mla_decode_backend_policy
         self.rotary_emb = None
         self.apply_rotary_emb = False
+        # NoPE: with an FP8 KV cache, build the FP8 decode query in one kernel
+        # instead of a BF16 absorption BMM plus its FP8 re-read in the RoPE
+        # kernel (opt-in: TRTLLM_K3_MLA_FP8_Q_ABSORB=1).
+        self.fp8_nope_q_absorb = os.environ.get("TRTLLM_K3_MLA_FP8_Q_ABSORB", "0") == "1"
 
     def _apply_output_gate_and_o_proj(
         self,

@@ -187,3 +187,145 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
         _assert_matches_reference(actual, expected[:, -1], fp8)
     finally:
         manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skip_pre_blackwell
+def test_k3_mla_fp8_kv_decode_q_absorb() -> None:
+    """FP8 KV cache decode: the FP8 query built in one kernel
+    (``fp8_nope_q_absorb``) matches the BF16 absorption BMM + RoPE-kernel
+    quantization path (q_pe bitwise, the absorbed q_nope to one FP8 step), and
+    the KV append and BMM scales of the KV-only RoPE kernel are unchanged."""
+    torch.manual_seed(7)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    config = KimiLinearConfig(
+        vocab_size=128,
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        attn_res_block_size=1,
+        torch_dtype=torch.bfloat16,
+        linear_attn_config={"kda_layers": [], "full_attn_layers": [1], "num_heads": 32},
+        num_attention_heads=96,
+        num_key_value_heads=96,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        rms_norm_eps=1e-6,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+        max_position_embeddings=512,
+    )
+    config._attn_implementation = "eager"
+    reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+    weights = _checkpoint_weights(reference, fp8=False)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=mapping,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+    )
+    with torch.device("cuda"):
+        model = KimiLinearForCausalLM(model_config).eval()
+    projections = {
+        f"{name}.{suffix}": value
+        for name, pair in weights.items()
+        for suffix, value in pair.items()
+    }
+    projections.update(
+        {name: value for name, value in reference.named_parameters() if value.ndim == 1}
+    )
+    load_mla_checkpoint(model, projections, "")
+    runtime = model.model.layers[0].self_attn
+    for module in runtime.modules():
+        if callable(getattr(module, "post_load_weights", None)):
+            module.post_load_weights()
+    mla = runtime.mixer
+
+    batch, context_length = 3, 128
+    scenario = SimpleNamespace(
+        ctx_len=context_length,
+        batch=batch,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.float8_e4m3fn,
+    )
+    manager, metadata = setup_kv_and_metadata(
+        scenario,
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(99)
+    hidden = torch.randn(
+        batch * (context_length + 1),
+        config.hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    captured = {}
+
+    def capture_attention(attn_backend, q, k, v, position_ids, attn_metadata, **kwargs):
+        # Stop at the decode kernel: record what the Q/KV preparation produced.
+        captured["q"] = kwargs["quant_q_buffer"].clone()
+        captured["bmm1"] = kwargs["mla_bmm1_scale"].clone()
+        captured["bmm2"] = kwargs["mla_bmm2_scale"].clone()
+        return q.new_zeros(q.shape[0], mla.num_heads_tp * mla.kv_lora_rank)
+
+    try:
+        extra_attrs = {
+            "attention_metadata": weakref.ref(metadata),
+            "mla_layers": {mla.layer_idx_str: weakref.ref(mla)},
+        }
+        context = hidden.view(batch, context_length + 1, -1)[:, :context_length]
+        with model_extra_attrs(extra_attrs):
+            runtime(context.reshape(-1, config.hidden_size).contiguous(), metadata)
+
+        for request_id in range(batch):
+            manager.impl.add_token(request_id)
+        metadata = get_attention_backend("TRTLLM").Metadata(
+            seq_lens=torch.ones(batch, dtype=torch.int),
+            request_ids=list(range(batch)),
+            max_num_requests=batch,
+            num_contexts=0,
+            prompt_lens=[context_length] * batch,
+            max_num_tokens=batch,
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=[context_length] * batch
+            ),
+            mapping=mapping,
+            enable_context_mla_with_cached_kv=True,
+        )
+        metadata.prepare()
+        extra_attrs["attention_metadata"] = weakref.ref(metadata)
+        decode_in = hidden.view(batch, context_length + 1, -1)[:, -1].contiguous()
+        kv_pool = manager.get_buffers(0)
+        results = {}
+        mla._attn_forward_gen = capture_attention
+        for fused in (False, True):
+            mla.fp8_nope_q_absorb = fused
+            kv_pool.view(torch.uint8).zero_()
+            with model_extra_attrs(extra_attrs):
+                runtime(decode_in, metadata)
+            torch.cuda.synchronize()
+            results[fused] = dict(captured, kv=kv_pool.clone())
+    finally:
+        manager.shutdown()
+
+    old, new = results[False], results[True]
+    head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+    q_old = old["q"].view(torch.float8_e4m3fn).view(batch, 96, head_dim).float()
+    q_new = new["q"].view(torch.float8_e4m3fn).view(batch, 96, head_dim).float()
+    assert torch.equal(q_new[..., 512:], q_old[..., 512:])
+    nope_old, nope_new = q_old[..., :512], q_new[..., :512]
+    step = torch.exp2(torch.floor(torch.log2(nope_old.abs().clamp_min(2.0**-6))) - 3)
+    assert ((nope_new - nope_old).abs() <= step * 1.0001).all()
+    # double rounding (FP32 -> BF16 -> FP8) moves ~3% of values by one step
+    assert (nope_new != nope_old).float().mean().item() < 0.1
+    assert torch.equal(new["bmm1"], old["bmm1"]) and torch.equal(new["bmm2"], old["bmm2"])
+    assert torch.equal(new["kv"].view(torch.uint8), old["kv"].view(torch.uint8))
+    assert new["kv"].view(torch.uint8).any()
