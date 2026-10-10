@@ -54,7 +54,7 @@ Switches (read once per process):
 """
 
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -70,8 +70,13 @@ VOCAB_PARALLEL_SAMPLING_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_SAMPLING"
 VOCAB_PARALLEL_COMM_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_COMM"
 
 _INT32_MAX = tl.constexpr(2**31 - 1)
+# Index reported by a split without valid columns; exact in float32 and above
+# every supported vocab id.
+_EMPTY_INDEX = tl.constexpr(2**24)
 _LOCAL_BLOCK_V = 2048
 _REDUCE_BLOCK_ROWS = 32
+# Programs the local reductions aim to launch (rows x column splits).
+_TARGET_PROGRAMS = 256
 
 
 def vocab_parallel_enabled() -> bool:
@@ -98,12 +103,11 @@ def _argmax_combine(val_a, idx_a, val_b, idx_b):
 
 
 @triton.jit
-def _gumbel_noise(seed, c0, c1, c2, c3):
-    # One standard Gumbel sample per counter tuple: -log(-log(u)), u in (0, 1).
-    r0, _, _, _ = tl.philox(seed, c0, c1, c2, c3)
-    # 23 random bits mapped to the open interval (0, 1); with 23 bits the
-    # midpoint (k + 0.5) / 2^23 is exact in float32, so u never rounds to 1.
-    u = ((r0 >> 9).to(tl.float32) + 0.5) * (1.0 / 8388608.0)
+def _gumbel(r):
+    # Standard Gumbel sample -log(-log(u)) from 32 random bits. 23 bits map to
+    # the open interval (0, 1); with 23 bits the midpoint (k + 0.5) / 2^23 is
+    # exact in float32, so u never rounds to 0 or 1.
+    u = ((r >> 9).to(tl.float32) + 0.5) * (1.0 / 8388608.0)
     return -tl.log(-tl.log(u))
 
 
@@ -114,26 +118,34 @@ def _store_pair(
     stride_out,
     slot,
     best_val,
-    best_idx,
-    col_base,
+    gidx,
+    zero_lo,
+    zero_hi,
+    fill,
     ZERO_WIDTH: tl.constexpr,
 ):
     # Publishes (value, global index) at columns [2 * slot, 2 * slot + 1] of the
-    # row; when ZERO_WIDTH > 0 the rest of the row is zero-filled so an
+    # row. With ZERO_WIDTH > 0 the program flagged `fill` also zeroes the row
+    # outside [zero_lo, zero_hi) -- the other ranks' columns -- so that an
     # all-reduce sum acts as an all-gather.
-    gidx = tl.where(best_idx == _INT32_MAX, col_base, col_base + best_idx)
     base = out_ptr + row.to(tl.int64) * stride_out
+    tl.store(base + 2 * slot, best_val)
+    tl.store(base + 2 * slot + 1, gidx.to(tl.float32))
     if ZERO_WIDTH > 0:
-        offs = tl.arange(0, ZERO_WIDTH)
-        vals = tl.where(
-            offs == 2 * slot,
-            best_val,
-            tl.where(offs == 2 * slot + 1, gidx.to(tl.float32), 0.0),
-        )
-        tl.store(base + offs, vals)
-    else:
-        tl.store(base + 2 * slot, best_val)
-        tl.store(base + 2 * slot + 1, gidx.to(tl.float32))
+        if fill:
+            offs = tl.arange(0, ZERO_WIDTH)
+            tl.store(
+                base + offs,
+                tl.zeros([ZERO_WIDTH], tl.float32),
+                mask=(offs < zero_lo) | (offs >= zero_hi),
+            )
+
+
+@triton.jit
+def _global_index(best_idx, col_base):
+    # A split without valid columns reports an index above any vocab id, so it
+    # never wins a tie.
+    return tl.where(best_idx == _INT32_MAX, _EMPTY_INDEX, col_base + best_idx)
 
 
 @triton.jit
@@ -142,25 +154,43 @@ def _local_argmax_kernel(
     stride_x,
     n_cols,
     col_base,
+    chunk,
     out_ptr,
     stride_out,
-    slot,
+    slot0,
+    zero_lo,
+    zero_hi,
     ZERO_WIDTH: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
+    # Program (row, split) reduces columns [split * chunk, (split + 1) * chunk).
     row = tl.program_id(0)
+    split = tl.program_id(1)
+    lo = split * chunk
+    hi = tl.minimum(lo + chunk, n_cols)
     offs = tl.arange(0, BLOCK_V)
     x_row = x_ptr + row.to(tl.int64) * stride_x
     best_val = tl.full([BLOCK_V], float("-inf"), tl.float32)
     best_idx = tl.full([BLOCK_V], _INT32_MAX, tl.int32)
-    for start in range(0, n_cols, BLOCK_V):
+    for start in range(lo, hi, BLOCK_V):
         cols = start + offs
-        mask = cols < n_cols
+        mask = cols < hi
         vals = tl.load(x_row + cols, mask=mask, other=float("-inf")).to(tl.float32)
         idx = tl.where(mask, cols, _INT32_MAX)
         best_val, best_idx = _argmax_combine(best_val, best_idx, vals, idx)
     val, idx = tl.reduce((best_val, best_idx), 0, _argmax_combine)
-    _store_pair(out_ptr, row, stride_out, slot, val, idx, col_base, ZERO_WIDTH)
+    _store_pair(
+        out_ptr,
+        row,
+        stride_out,
+        slot0 + split,
+        val,
+        _global_index(idx, col_base),
+        zero_lo,
+        zero_hi,
+        split == 0,
+        ZERO_WIDTH,
+    )
 
 
 @triton.jit
@@ -169,42 +199,70 @@ def _local_sample_kernel(
     stride_x,
     n_cols,
     col_base,
+    chunk,
     temp_ptr,
     seed_ptr,
     offset_ptr,
     greedy_threshold,
     out_ptr,
     stride_out,
-    slot,
+    slot0,
+    zero_lo,
+    zero_hi,
     ZERO_WIDTH: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
+    # Gumbel-max over one split of this rank's shard. The noise of global vocab
+    # index v is output (v % 4) of Philox(seed, counter=(v // 4, row, offset
+    # lo, offset hi)): disjoint streams per row and per step, identical on
+    # every rank. col_base and chunk are multiples of 4, so 4-column groups
+    # never straddle splits or shards.
+    GROUPS: tl.constexpr = BLOCK_V // 4
     row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_V)
+    split = tl.program_id(1)
+    lo = split * chunk
+    hi = tl.minimum(lo + chunk, n_cols)
+    offs_g = tl.arange(0, GROUPS)
+    offs_l = tl.arange(0, 4)
     x_row = x_ptr + row.to(tl.int64) * stride_x
     temperature = tl.load(temp_ptr + row).to(tl.float32)
     is_greedy = temperature <= greedy_threshold
     inv_t = 1.0 / tl.where(is_greedy, 1.0, temperature)
     seed = tl.load(seed_ptr + row).to(tl.int64)
     offset = tl.load(offset_ptr + row).to(tl.int64)
-    # Counter: (global vocab index, row, offset low, offset high) -- disjoint
-    # streams per row and per step, identical on every rank.
-    c1 = tl.full([BLOCK_V], 0, tl.uint32) + row.to(tl.uint32)
-    c2 = tl.full([BLOCK_V], 0, tl.uint32) + (offset & 0xFFFFFFFF).to(tl.uint32)
-    c3 = tl.full([BLOCK_V], 0, tl.uint32) + ((offset >> 32) & 0xFFFFFFFF).to(tl.uint32)
-    best_val = tl.full([BLOCK_V], float("-inf"), tl.float32)
-    best_idx = tl.full([BLOCK_V], _INT32_MAX, tl.int32)
-    for start in range(0, n_cols, BLOCK_V):
-        cols = start + offs
-        mask = cols < n_cols
+    c1 = tl.full([GROUPS], 0, tl.uint32) + row.to(tl.uint32)
+    c2 = tl.full([GROUPS], 0, tl.uint32) + (offset & 0xFFFFFFFF).to(tl.uint32)
+    c3 = tl.full([GROUPS], 0, tl.uint32) + ((offset >> 32) & 0xFFFFFFFF).to(tl.uint32)
+    best_val = tl.full([GROUPS, 4], float("-inf"), tl.float32)
+    best_idx = tl.full([GROUPS, 4], _INT32_MAX, tl.int32)
+    for start in range(lo, hi, BLOCK_V):
+        cols = start + offs_g[:, None] * 4 + offs_l[None, :]
+        mask = cols < hi
         vals = tl.load(x_row + cols, mask=mask, other=float("-inf")).to(tl.float32)
         if not is_greedy:
-            noise = _gumbel_noise(seed, (col_base + cols).to(tl.uint32), c1, c2, c3)
+            counter = ((col_base + start) // 4 + offs_g).to(tl.uint32)
+            r0, r1, r2, r3 = tl.philox(seed, counter, c1, c2, c3)
+            # [GROUPS, 2, 2] -> [GROUPS, 4] in lane order r0, r1, r2, r3.
+            noise = tl.join(
+                tl.join(_gumbel(r0), _gumbel(r2)), tl.join(_gumbel(r1), _gumbel(r3))
+            ).reshape([GROUPS, 4])
             vals = vals * inv_t + noise
         idx = tl.where(mask, cols, _INT32_MAX)
         best_val, best_idx = _argmax_combine(best_val, best_idx, vals, idx)
+    best_val, best_idx = tl.reduce((best_val, best_idx), 1, _argmax_combine)
     val, idx = tl.reduce((best_val, best_idx), 0, _argmax_combine)
-    _store_pair(out_ptr, row, stride_out, slot, val, idx, col_base, ZERO_WIDTH)
+    _store_pair(
+        out_ptr,
+        row,
+        stride_out,
+        slot0 + split,
+        val,
+        _global_index(idx, col_base),
+        zero_lo,
+        zero_hi,
+        split == 0,
+        ZERO_WIDTH,
+    )
 
 
 @triton.jit
@@ -280,39 +338,68 @@ def _markov_add_local_argmax_kernel(
     stride_bias,
     n_cols,
     col_base,
+    chunk,
     out_ptr,
     stride_out,
-    slot,
+    slot0,
+    zero_lo,
+    zero_hi,
     ZERO_WIDTH: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
     # base (shard logits of block position `step`) + bias, upcast to fp32 like
-    # the gathered reference, then the shard argmax.
+    # the gathered reference, then the argmax of one split of the shard.
     req = tl.program_id(0)
+    split = tl.program_id(1)
+    lo = split * chunk
+    hi = tl.minimum(lo + chunk, n_cols)
     offs = tl.arange(0, BLOCK_V)
     base_row = base_ptr + req.to(tl.int64) * stride_base
     bias_row = bias_ptr + req.to(tl.int64) * stride_bias
     best_val = tl.full([BLOCK_V], float("-inf"), tl.float32)
     best_idx = tl.full([BLOCK_V], _INT32_MAX, tl.int32)
-    for start in range(0, n_cols, BLOCK_V):
+    for start in range(lo, hi, BLOCK_V):
         cols = start + offs
-        mask = cols < n_cols
+        mask = cols < hi
         base = tl.load(base_row + cols, mask=mask, other=0.0).to(tl.float32)
         bias = tl.load(bias_row + cols, mask=mask, other=0.0).to(tl.float32)
         vals = tl.where(mask, base + bias, float("-inf"))
         idx = tl.where(mask, cols, _INT32_MAX)
         best_val, best_idx = _argmax_combine(best_val, best_idx, vals, idx)
     val, idx = tl.reduce((best_val, best_idx), 0, _argmax_combine)
-    _store_pair(out_ptr, req, stride_out, slot, val, idx, col_base, ZERO_WIDTH)
+    _store_pair(
+        out_ptr,
+        req,
+        stride_out,
+        slot0 + split,
+        val,
+        _global_index(idx, col_base),
+        zero_lo,
+        zero_hi,
+        split == 0,
+        ZERO_WIDTH,
+    )
+
+
+class _PairLayout(NamedTuple):
+    """Where the local kernels publish pairs, for one exchange."""
+
+    buffer: torch.Tensor
+    stride_out: int
+    slot0: int  # first slot owned by this rank
+    zero_lo: int  # columns [zero_lo, zero_hi) are this rank's; the rest is zero-filled
+    zero_hi: int
+    zero_width: int  # 0: no zero fill (NCCL all-gather)
+    splits: int  # column splits per rank (slots per rank)
+    chunk: int  # columns per split
 
 
 class _PairExchange:
-    """Exchanges one ``(value, global index)`` float32 pair per row across TP.
+    """Exchanges ``(value, global index)`` float32 pairs per row across TP.
 
-    ``buffer(rows)`` returns the tensor the local kernels write into and the
-    store layout (row stride, slot, zero-fill width); ``exchange`` returns the
-    tensor holding every rank's pair and its read layout (row stride, slot
-    stride).
+    Over MNNVL each rank owns ``splits`` consecutive pair slots of a zero-padded
+    ``[rows, width]`` buffer that an all-reduce sums; over NCCL each rank
+    publishes one pair per row and the pairs are all-gathered.
     """
 
     def __init__(self, mapping: Mapping):
@@ -340,27 +427,40 @@ class _PairExchange:
             elif backend == "mnnvl":
                 raise RuntimeError("TLLM_SPEC_VOCAB_PARALLEL_COMM=mnnvl but MNNVL is unavailable")
         self.backend = "mnnvl" if self._mnnvl is not None else "nccl"
-        # Row layout of the zero-padded all-reduce buffer.
-        self._width = triton.next_power_of_2(2 * self.tp_size)
 
-    def buffer(self, rows: int, device) -> tuple[torch.Tensor, int, int, int]:
+    def layout(self, rows: int, n_cols: int, device) -> _PairLayout:
+        # Split each row over enough programs to fill the GPU when rows are few;
+        # the per-split pairs travel as extra slots of the same exchange.
+        max_splits = triton.cdiv(n_cols, _LOCAL_BLOCK_V)
+        splits = 1
+        if self.backend == "mnnvl" and self.tp_size > 1:
+            splits = max(1, min(max_splits, triton.cdiv(_TARGET_PROGRAMS, max(rows, 1))))
+        chunk = triton.cdiv(triton.cdiv(n_cols, splits), _LOCAL_BLOCK_V) * _LOCAL_BLOCK_V
+        splits = max(1, triton.cdiv(n_cols, chunk))
         if self.tp_size == 1 or self.backend == "nccl":
-            buf = torch.empty((rows, 2), dtype=torch.float32, device=device)
-            return buf, 2, 0, 0
-        buf = torch.empty((rows, self._width), dtype=torch.float32, device=device)
-        return buf, self._width, self.tp_rank, self._width
+            buf = torch.empty((rows, 2 * splits), dtype=torch.float32, device=device)
+            return _PairLayout(buf, 2 * splits, 0, 0, 0, 0, splits, chunk)
+        width = triton.next_power_of_2(2 * self.tp_size * splits)
+        buf = torch.empty((rows, width), dtype=torch.float32, device=device)
+        lo = 2 * self.tp_rank * splits
+        return _PairLayout(
+            buf, width, self.tp_rank * splits, lo, lo + 2 * splits, width, splits, chunk
+        )
 
-    def exchange(self, buf: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    def exchange(self, layout: _PairLayout) -> tuple[torch.Tensor, int, int, int]:
+        """Every rank's pairs: (tensor, row stride, slot stride, number of slots)."""
+        buf = layout.buffer
         rows = buf.shape[0]
         if self.tp_size == 1:
-            return buf, 2, 0
+            return buf, layout.stride_out, 2, layout.splits
         if self.backend == "mnnvl":
             out = self._mnnvl(buf, all_reduce_params=AllReduceParams())
-            return out, self._width, 2
+            return out, layout.stride_out, 2, self.tp_size * layout.splits
         from ..distributed.ops import allgather
 
+        assert layout.splits == 1
         out = allgather(buf, self.mapping, dim=0)
-        return out, 2, 2 * rows
+        return out, 2, 2 * rows, self.tp_size
 
 
 class VocabParallelHead:
@@ -400,7 +500,9 @@ class VocabParallelHead:
             return False
         if getattr(lm_head, "padding_size", 0) != 0 or getattr(lm_head, "has_any_quant", False):
             return False
-        return int(lm_head.out_features) * mapping.tp_size == int(vocab_size)
+        # The sampler draws Philox noise for 4-column groups of the global vocab.
+        shard = int(lm_head.out_features)
+        return shard % 4 == 0 and shard * mapping.tp_size == int(vocab_size) and vocab_size < 2**24
 
     def local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's ``[rows, shard]`` logits in the head's output dtype."""
@@ -416,35 +518,40 @@ class VocabParallelHead:
 
         return allgather(local, self.mapping, sizes=self.lm_head.gather_output_sizes).float()
 
-    def _launch_local(self, kernel, local: torch.Tensor, extra_args: tuple, rows: int):
-        buf, stride_out, slot, zero_width = self.exchange.buffer(rows, local.device)
+    def _launch_local(self, kernel, local: torch.Tensor, extra_args: tuple) -> _PairLayout:
+        rows, n_cols = local.shape
+        layout = self.exchange.layout(rows, n_cols, local.device)
         if rows > 0:
-            kernel[(rows,)](
+            kernel[(rows, layout.splits)](
                 local,
                 local.stride(0),
-                local.shape[-1],
+                n_cols,
                 self.col_base,
+                layout.chunk,
                 *extra_args,
-                buf,
-                stride_out,
-                slot,
-                ZERO_WIDTH=zero_width,
+                layout.buffer,
+                layout.stride_out,
+                layout.slot0,
+                layout.zero_lo,
+                layout.zero_hi,
+                ZERO_WIDTH=layout.zero_width,
                 BLOCK_V=_LOCAL_BLOCK_V,
                 num_warps=8,
             )
-        return buf
+        return layout
 
-    def _reduce(self, pairs: torch.Tensor, stride_row: int, stride_slot: int, rows: int, out):
+    def _exchange_and_reduce(self, layout: _PairLayout, rows: int, out: torch.Tensor):
+        pairs, stride_row, stride_slot, n_slots = self.exchange.exchange(layout)
         if rows > 0:
             _reduce_pairs_kernel[(triton.cdiv(rows, _REDUCE_BLOCK_ROWS),)](
                 pairs,
                 stride_row,
                 stride_slot,
                 rows,
-                self.mapping.tp_size,
+                n_slots,
                 out,
                 BLOCK_ROWS=_REDUCE_BLOCK_ROWS,
-                BLOCK_SLOTS=triton.next_power_of_2(self.mapping.tp_size),
+                BLOCK_SLOTS=triton.next_power_of_2(n_slots),
                 num_warps=4,
             )
         return out
@@ -452,11 +559,9 @@ class VocabParallelHead:
     def argmax(self, local: torch.Tensor, out_dtype=torch.int64) -> torch.Tensor:
         """Global argmax over the vocab of shard logits ``[rows, shard]``."""
         assert local.dim() == 2 and local.stride(-1) == 1
-        rows = local.shape[0]
-        buf = self._launch_local(_local_argmax_kernel, local, (), rows)
-        pairs, stride_row, stride_slot = self.exchange.exchange(buf)
-        out = torch.empty((rows,), dtype=out_dtype, device=local.device)
-        return self._reduce(pairs, stride_row, stride_slot, rows, out)
+        layout = self._launch_local(_local_argmax_kernel, local, ())
+        out = torch.empty((local.shape[0],), dtype=out_dtype, device=local.device)
+        return self._exchange_and_reduce(layout, local.shape[0], out)
 
     def sample(
         self,
@@ -470,16 +575,11 @@ class VocabParallelHead:
         """Temperature-only sampling (Gumbel-max); rows at or below the greedy
         temperature threshold take the plain argmax."""
         assert local.dim() == 2 and local.stride(-1) == 1
-        rows = local.shape[0]
-        buf = self._launch_local(
-            _local_sample_kernel,
-            local,
-            (temperatures, seeds, offsets, float(greedy_threshold)),
-            rows,
+        layout = self._launch_local(
+            _local_sample_kernel, local, (temperatures, seeds, offsets, float(greedy_threshold))
         )
-        pairs, stride_row, stride_slot = self.exchange.exchange(buf)
-        out = torch.empty((rows,), dtype=out_dtype, device=local.device)
-        return self._reduce(pairs, stride_row, stride_slot, rows, out)
+        out = torch.empty((local.shape[0],), dtype=out_dtype, device=local.device)
+        return self._exchange_and_reduce(layout, local.shape[0], out)
 
     def markov_w2_shard(self, markov_w2: torch.Tensor) -> torch.Tensor:
         """This rank's rows of ``markov_w2`` (cached; a contiguous row slice)."""
@@ -516,15 +616,14 @@ class VocabParallelHead:
             return tokens
         rank = markov_w1.shape[1]
         w2_shard = self.markov_w2_shard(markov_w2)
-        tp = self.mapping.tp_size
         emb = torch.empty((num_reqs, rank), dtype=markov_w1.dtype, device=device)
-        pairs, stride_row, stride_slot = first_prev_tokens, 0, 0
+        pairs, stride_row, stride_slot, n_slots = first_prev_tokens, 0, 0, 1
         for step in range(block_size + 1):
             _markov_reduce_embed_kernel[(num_reqs,)](
                 pairs,
                 stride_row,
                 stride_slot,
-                tp,
+                n_slots,
                 first_prev_tokens,
                 markov_w1,
                 emb,
@@ -534,7 +633,7 @@ class VocabParallelHead:
                 step,
                 RANK=rank,
                 FROM_ANCHOR=step == 0,
-                BLOCK_SLOTS=triton.next_power_of_2(tp),
+                BLOCK_SLOTS=triton.next_power_of_2(n_slots),
                 BLOCK_R=triton.next_power_of_2(rank),
                 num_warps=4,
             )
@@ -543,22 +642,25 @@ class VocabParallelHead:
             # Same F.linear as the reference chain, on this rank's w2 rows.
             bias = F.linear(emb, w2_shard)
             step_logits = local_block[:, step]
-            buf, stride_out, slot, zero_width = self.exchange.buffer(num_reqs, device)
-            _markov_add_local_argmax_kernel[(num_reqs,)](
+            layout = self.exchange.layout(num_reqs, shard, device)
+            _markov_add_local_argmax_kernel[(num_reqs, layout.splits)](
                 step_logits,
                 step_logits.stride(0),
                 bias,
                 bias.stride(0),
                 shard,
                 self.col_base,
-                buf,
-                stride_out,
-                slot,
-                ZERO_WIDTH=zero_width,
+                layout.chunk,
+                layout.buffer,
+                layout.stride_out,
+                layout.slot0,
+                layout.zero_lo,
+                layout.zero_hi,
+                ZERO_WIDTH=layout.zero_width,
                 BLOCK_V=_LOCAL_BLOCK_V,
                 num_warps=8,
             )
-            pairs, stride_row, stride_slot = self.exchange.exchange(buf)
+            pairs, stride_row, stride_slot, n_slots = self.exchange.exchange(layout)
         return tokens
 
 

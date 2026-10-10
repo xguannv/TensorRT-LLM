@@ -177,3 +177,35 @@ def test_decode_draft_block_table_matches_eager(rows, blocks, divisor):
 
 def test_interface_imports_fused_kernels():
     assert interface_module.fused_strict_accept is not None
+
+
+@pytest.mark.parametrize("rows,width", [(1, 576), (192, 576), (768, 576), (5, 100)])
+def test_scatter_rows_to_pool_matches_eager(rows, width):
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import scatter_rows_to_pool
+
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    full = torch.randn(64, 1, 1, 32, width, device="cuda", generator=gen).to(torch.bfloat16)
+    pool = full[:, 0, 0]
+    flat = torch.randperm(64 * 32, device="cuda", generator=gen)[:rows]
+    pages, offsets = flat // 32, flat % 32
+    src = torch.randn(rows, width, device="cuda", generator=gen).to(torch.bfloat16)
+    expected = full.clone()
+    expected[:, 0, 0][pages, offsets] = src
+    scatter_rows_to_pool(src, pool, pages, offsets)
+    assert torch.equal(full, expected)
+
+
+@pytest.mark.parametrize("batch,draft_len", [(1, 6), (32, 6), (128, 7), (300, 6)])
+def test_fused_next_new_tokens_matches_eager(batch, draft_len):
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import fused_next_new_tokens
+
+    gen = torch.Generator(device="cuda").manual_seed(batch)
+    accepted = torch.randint(0, 1000, (batch, draft_len + 1), device="cuda", generator=gen).int()
+    nacc = torch.randint(1, draft_len + 2, (batch,), device="cuda", generator=gen).int()
+    draft = torch.randint(0, 1000, (batch, draft_len), device="cuda", generator=gen).int()
+    worker = _StubSpecWorker()
+    expected = worker._prepare_next_new_tokens(
+        accepted, draft, torch.arange(batch, device="cuda"), batch, nacc
+    )
+    out = fused_next_new_tokens(accepted, draft, nacc)
+    assert out.dtype == expected.dtype and torch.equal(out, expected)

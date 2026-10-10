@@ -100,7 +100,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import get_sm_version, is_sm_100f
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_INTERNAL_AVAILABLE
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceFusionOp, AllReduceParams
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -109,6 +109,11 @@ from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import (
+    draft_fusion_enabled,
+    scatter_rows_to_pool,
+    spec_tail_fusion_enabled,
+)
 from ..utils import AuxStreamType, swizzle_sf, unswizzle_sf
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
@@ -3573,9 +3578,17 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # Must precede BOTH decode paths: each reads the block back out of the
         # pool, so writing it afterwards would attend uninitialised slots.
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
-        pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
-            -1, blk_kv.shape[-1]
-        )
+        if spec_tail_fusion_enabled() and blk_kv.is_contiguous():
+            scatter_rows_to_pool(
+                blk_kv.view(-1, blk_kv.shape[-1]),
+                pool,
+                fixup.pages.reshape(-1),
+                fixup.offsets.reshape(-1),
+            )
+        else:
+            pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
+                -1, blk_kv.shape[-1]
+            )
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
             return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
@@ -3731,6 +3744,60 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             ).squeeze(0)
         return out.unsqueeze(2).contiguous(), None
 
+    def precompute_context_kv_layer_major(self, projected_hidden, positions):
+        """``precompute_context_kv``'s latents laid out ``[L, N, head_dim]``.
+
+        Same GEMM, same frequency gather and the same fused RMSNorm+RoPE kernel
+        per layer, but the kernel reads its layer's slice of the GEMM output in
+        place and writes straight into a layer-major buffer, so no per-layer
+        staging copies run. Returns None when the fused kernel is unavailable
+        (the caller then uses ``precompute_context_kv``).
+        """
+        from ..custom_ops.dspark_rmsnorm_rope_custom_op import (
+            _compile_fused_dspark_rmsnorm_rope,
+            is_fused_dspark_rmsnorm_rope_supported,
+        )
+
+        if not (IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()):
+            return None
+        if self._fused_kv_weight is None:
+            self._build_fused_kv_buffers()
+        n = projected_hidden.shape[0]
+        num_layers = self._num_attn_layers
+        weight_dtype = self._fused_kv_weight.dtype
+        if projected_hidden.dtype != weight_dtype:
+            projected_hidden = projected_hidden.to(weight_dtype)
+        latent = F.linear(projected_hidden, self._fused_kv_weight).view(
+            n, num_layers, self._head_dim
+        )
+        freqs = self._mla_freqs_cis(latent.device)[positions.view(-1).long()]
+        freqs_real = torch.view_as_real(freqs).reshape(-1, freqs.shape[-1], 2)
+        if not is_fused_dspark_rmsnorm_rope_supported(
+            latent[:, 0],
+            self._kv_a_norm_stacked[0],
+            freqs_real,
+            1,
+            self.qk_rope_head_dim,
+            self.kv_lora_rank,
+        ):
+            return None
+        compiled = _compile_fused_dspark_rmsnorm_rope(
+            self._head_dim,
+            self.qk_rope_head_dim,
+            1,
+            self._kv_a_norm_eps,
+            True,
+            True,
+            False,
+            self.kv_lora_rank,
+        )
+        out = torch.empty((num_layers, n, self._head_dim), dtype=latent.dtype, device=latent.device)
+        for layer_idx in range(num_layers):
+            compiled(
+                latent[:, layer_idx], self._kv_a_norm_stacked[layer_idx], freqs_real, out[layer_idx]
+            )
+        return out
+
     # -- block decode ------------------------------------------------------
 
     def dflash_forward(
@@ -3743,12 +3810,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ctx_cache_batch_idx,
         ctx_kv_cache=None,
         ctx_page_table=None,
+        block_fixup: Optional["_MLABlockFixup"] = None,
     ):
         """Eager absorbed-MLA block decode over the drafter's latent cache.
 
         Args mirror the base: ``ctx_k_cache`` is
         ``[pool_slots, L, max_ctx+block_size, 1, kv_cache_head_dim]`` and
-        ``ctx_v_cache`` is unused (``None``).
+        ``ctx_v_cache`` is unused (``None``). ``block_fixup`` optionally
+        supplies the kernel-path fixup operands already built by the worker.
         """
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
@@ -3763,30 +3832,37 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         blk_freqs = self._mla_freqs_cis(device)[query_positions.long()]
 
         slots = ctx_cache_batch_idx.long()
+        paged = ctx_page_table is not None
+        # attention_backend picks the implementation; both kernel backends need
+        # page tables, so the eager gather also covers the private arena.
+        variant = self._mla_block_decode_variant(paged)
+        use_kernel = variant != "eager"
         # Context pages for this batch, resolved once: rows are batch positions
         # when bound to the manager's per-request block table and slots on the
         # private arena, which is exactly what ctx_cache_batch_idx already is.
+        # A caller-built fixup already carries what the kernels read.
         page_tables = (
-            None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
+            None
+            if not paged or (use_kernel and block_fixup is not None)
+            else ctx_page_table.index_select(0, slots).long()
         )
 
         # Valid-key mask, shared by every layer: context slots below this
         # request's length, then the whole block (DSpark is non-causal). Pages
         # past a request's allocation hold another request's data, so the mask
         # is what keeps them out -- not the block table.
-        page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
-        capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
-        # attention_backend picks the implementation; both kernel backends need
-        # page tables, so the eager gather also covers the private arena.
-        variant = self._mla_block_decode_variant(page_tables is not None)
-        use_kernel = variant != "eager"
+        page_size = None if not paged else ctx_kv_cache[0].shape[-2]
+        capacity = ctx_k_cache.shape[2] if not paged else ctx_page_table.shape[1] * page_size
         # Kernel path: index and mask operands are layer-invariant, so build
         # them once here rather than five times inside the decode loop.
-        fixup = (
-            _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
-            if use_kernel
-            else None
-        )
+        if not use_kernel:
+            fixup = None
+        elif block_fixup is not None:
+            fixup = block_fixup
+        else:
+            fixup = _build_mla_block_fixup(
+                num_ctx_per_req[:batch], page_tables, block_size, page_size
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {
@@ -3808,18 +3884,39 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         hidden_states = noise_embedding
         residual = None
+        # With the fused all-reduce, o_proj and down_proj return their
+        # un-reduced partials and each reduction is fused with the residual add
+        # and the following RMSNorm (post_attention_layernorm, the next layer's
+        # input_layernorm, or the final norm).
+        fused_ar = self._draft_fused_all_reduce()
+        partial = None
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
                 residual = hidden_states.clone()
                 hs_normed = layer.input_layernorm(hs_flat)
+            elif partial is not None:
+                res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_normed, res_flat = self._fused_ar_residual_norm(
+                    fused_ar, partial, res_flat, layer.input_layernorm
+                )
+                residual = res_flat.reshape(batch, block_size, -1)
             else:
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
 
-            q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hs_normed)))
+            fused_a = self._draft_fused_a_proj(layer_idx) if fused_ar is not None else None
+            if fused_a is not None:
+                # q_a and kv_a read the same normed input: one GEMM, split after.
+                q_kv_a = fused_a(hs_normed)
+                q_a = q_kv_a[:, : attn.q_lora_rank].contiguous()
+                blk_latent_rows = q_kv_a[:, attn.q_lora_rank :]
+            else:
+                q_a = attn.q_a_proj(hs_normed)
+                blk_latent_rows = None
+            q = attn.q_b_proj(attn.q_a_layernorm(q_a))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             # The 576-wide query is assembled in one buffer rather than
             # cat([absorbed, rope]): q's rope half is a 64-slice of a 192-wide
@@ -3871,7 +3968,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             # The block's own latent comes from the draft hidden; the context's
             # from the projected target hidden (precompute_context_kv). That
             # dual-source split is the DFlash contract, not an MLA detail.
-            blk_latent = attn.kv_a_proj_with_mqa(hs_normed).view(batch, block_size, -1)
+            if blk_latent_rows is None:
+                blk_latent_rows = attn.kv_a_proj_with_mqa(hs_normed)
+            blk_latent = blk_latent_rows.view(batch, block_size, -1)
             # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
             # k_pe out of the reduction, which is what DeepSeek-style MLA wants
             # and what DSpark's own convention (whole row) does not do.
@@ -3905,20 +4004,113 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 scores = scores.masked_fill(~key_valid.view(batch, 1, 1, -1), float("-inf"))
                 probs = torch.softmax(scores, dim=-1).to(kv_full.dtype)
                 ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
-            attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
+            if spec_tail_fusion_enabled():
+                # Same batched GEMM as the einsum, written straight into the
+                # [tokens, heads, v] rows o_proj reads, so no reshape copy.
+                attn_out = torch.empty(
+                    (batch * block_size, num_heads, self.v_head_dim),
+                    dtype=ctx_out.dtype,
+                    device=ctx_out.device,
+                )
+                torch.ops.trtllm.bmm_out(
+                    ctx_out.reshape(batch * block_size, num_heads, -1).transpose(0, 1),
+                    attn._v_b_proj.to(ctx_out.dtype).transpose(1, 2),
+                    attn_out.transpose(0, 1),
+                )
+            else:
+                attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
 
-            hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
             res_flat = residual.reshape(-1, residual.shape[-1])
-            hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
-            hidden_out = layer.mlp(hidden_out)
-            hidden_states = hidden_out.reshape(batch, block_size, -1)
+            if fused_ar is not None:
+                no_reduce = AllReduceParams(enable_allreduce=False)
+                hidden_out = attn.o_proj(
+                    attn_out.reshape(batch * block_size, -1), all_reduce_params=no_reduce
+                )
+                hidden_out, res_flat = self._fused_ar_residual_norm(
+                    fused_ar, hidden_out, res_flat, layer.post_attention_layernorm
+                )
+                partial = layer.mlp(hidden_out, final_all_reduce_params=no_reduce)
+                hidden_states = partial
+            else:
+                hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
+                hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+                hidden_out = layer.mlp(hidden_out)
+                hidden_states = hidden_out.reshape(batch, block_size, -1)
             residual = res_flat.reshape(batch, block_size, -1)
 
+        if partial is not None:
+            hidden_states_out, _ = self._fused_ar_residual_norm(
+                fused_ar, partial, residual.reshape(-1, residual.shape[-1]), self.model.norm
+            )
+            return hidden_states_out
         hidden_states_out, _ = self.model.norm(
             hidden_states.reshape(-1, hidden_states.shape[-1]),
             residual.reshape(-1, residual.shape[-1]),
         )
         return hidden_states_out
+
+    def _draft_fused_all_reduce(self):
+        """The all-reduce the block decode fuses with residual + RMSNorm, or None.
+
+        Enabled by ``TLLM_DSPARK_DRAFT_FUSION=1`` for a TP-sharded drafter
+        whose o_proj reduces over MNNVL (the fusion the MNNVL all-reduce
+        implements).
+        """
+        if not draft_fusion_enabled():
+            return None
+        layers = self.model.layers
+        all_reduce = getattr(layers[0].self_attn.o_proj, "all_reduce", None) if layers else None
+        if all_reduce is None or all_reduce.mnnvl_allreduce is None:
+            return None
+        return all_reduce
+
+    def _draft_fused_a_proj(self, layer_idx: int):
+        """One ``Linear`` computing ``[q_a_proj; kv_a_proj_with_mqa]`` of a layer.
+
+        Both replicated projections read the same normed input, so one GEMM
+        replaces two. The separate modules' weights become row views of the
+        fused weight, so no memory is added. None when either module is
+        quantized or biased.
+        """
+        cache = self.__dict__.setdefault("_fused_a_projs", {})
+        if layer_idx in cache:
+            return cache[layer_idx]
+        attn = self.model.layers[layer_idx].self_attn
+        q_a, kv_a = attn.q_a_proj, attn.kv_a_proj_with_mqa
+        fused = None
+        if (
+            not q_a.has_any_quant
+            and not kv_a.has_any_quant
+            and q_a.bias is None
+            and kv_a.bias is None
+            and q_a.weight.dtype == kv_a.weight.dtype
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            weight = torch.cat([q_a.weight.data, kv_a.weight.data], dim=0).contiguous()
+            fused = Linear(
+                q_a.in_features,
+                weight.shape[0],
+                bias=False,
+                dtype=weight.dtype,
+            ).to(weight.device)
+            fused.weight.data = weight
+            q_a.weight.data = weight[: q_a.out_features]
+            kv_a.weight.data = weight[q_a.out_features :]
+        cache[layer_idx] = fused
+        return fused
+
+    @staticmethod
+    def _fused_ar_residual_norm(all_reduce, partial, residual, norm):
+        """``norm(all_reduce(partial) + residual)`` and the new residual, in one kernel."""
+        return all_reduce(
+            partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm.weight,
+                eps=norm.variance_epsilon,
+            ),
+        )
 
     # -- weights -----------------------------------------------------------
 

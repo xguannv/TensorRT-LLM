@@ -11,7 +11,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm.logger import logger
 
-from ...functional import RotaryScalingType
+from ...functional import AllReduceFusionOp, AllReduceParams, RotaryScalingType
 from ..modules.rotary_embedding import RotaryEmbedding
 
 try:
@@ -25,6 +25,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import draft_fusion_enabled
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
@@ -370,7 +371,56 @@ class DFlashForCausalLM(nn.Module):
         normalize the per-aux features first by overriding this method.
         """
         hidden_states = hidden_states.to(self.fc.weight.dtype)
+        if draft_fusion_enabled() and hidden_states.shape[0] > 0:
+            projected = self._tp_sharded_project_target_hidden(hidden_states)
+            if projected is not None:
+                return projected
         return self.hidden_norm(self.fc(hidden_states))
+
+    def _tp_sharded_project_target_hidden(self, hidden_states: torch.Tensor):
+        """fc split along its input features over the drafter's TP group.
+
+        Each rank multiplies its slice of the captured features by its slice of
+        ``fc.weight`` columns; one all-reduce sums the partials and, over MNNVL,
+        applies hidden_norm in the same kernel. Every rank reads 1/tp of the fc
+        weight instead of all of it. Returns None when the drafter is not
+        TP-sharded or the feature width does not split evenly.
+        """
+        if getattr(self, "_fc_shard", None) is None:
+            self._fc_shard = False
+            mapping = self.model_config.mapping
+            layers = getattr(self.model, "layers", None)
+            o_proj = (
+                getattr(getattr(layers[0], "self_attn", None), "o_proj", None) if layers else None
+            )
+            all_reduce = getattr(o_proj, "all_reduce", None)
+            in_features = self.fc.weight.shape[1]
+            if (
+                mapping.tp_size > 1
+                and not mapping.enable_attention_dp
+                and all_reduce is not None
+                and in_features % mapping.tp_size == 0
+                and isinstance(self.hidden_norm, nn.RMSNorm)
+            ):
+                width = in_features // mapping.tp_size
+                begin = mapping.tp_rank * width
+                weight = self.fc.weight.data[:, begin : begin + width].contiguous()
+                self._fc_shard = (weight, begin, begin + width, all_reduce)
+        if self._fc_shard is False:
+            return None
+        weight, begin, end, all_reduce = self._fc_shard
+        partial = F.linear(hidden_states[:, begin:end], weight)
+        eps = self.hidden_norm.eps
+        if all_reduce.mnnvl_allreduce is not None and eps is not None:
+            return all_reduce(
+                partial,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RMS_NORM,
+                    norm_weight=self.hidden_norm.weight,
+                    eps=eps,
+                ),
+            )
+        return self.hidden_norm(all_reduce(partial))
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Hook applied to the block-attention output before o_proj.
