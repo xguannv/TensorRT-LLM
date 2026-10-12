@@ -68,6 +68,10 @@ _KDA_FAB_FUSED_MAX_ROWS = 256
 # the aux stream as well, with f_b reading the strided f_a view directly.
 _KDA_DECODE_FUSED_FAB = os.environ.get("TRTLLM_K3_KDA_DECODE_FUSED_FAB", "0") == "1"
 _KDA_FUSED_FB_LOWM_ROWS = 224
+# Verify kernel sized for two CTAs per SM (trtllm::kda_mtp_decode two_cta, bitwise the one-CTA
+# kernel) for grids with more (head, request) tiles than SMs, where two tiles per SM overlap
+# their latency-bound stages; single-wave grids keep the one-CTA kernel, which is faster alone.
+_KDA_DECODE_2CTA = os.environ.get("TRTLLM_K3_KDA_DECODE_2CTA", "0") == "1"
 # Launch the verify kernel as a programmatic dependent of the QKVG projection: its state, replay
 # and weight loads run before griddepcontrol.wait. Defaults to TRTLLM_K3_KDA_DECODE_FUSED_FAB.
 _KDA_DECODE_PDL = (
@@ -120,6 +124,14 @@ def _verify_kernel_single_wave(num_heads: int, num_requests: int, device: torch.
     return ctas <= _num_sms(index)
 
 
+def _verify_two_cta(num_heads: int, num_requests: int, device: torch.device) -> bool:
+    """Whether the verify call runs the two-CTA kernel (multi-wave grids only)."""
+    if not _KDA_DECODE_2CTA:
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return num_heads * num_requests > _num_sms(index)
+
+
 def _use_fab_fa(
     x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
 ) -> bool:
@@ -132,6 +144,9 @@ def _use_fab_fa(
     if num_rows <= _KDA_FUSED_FB_LOWM_ROWS and not _verify_kernel_single_wave(
         num_heads, x.shape[0], x.device
     ):
+        return False
+    if _verify_two_cta(num_heads, x.shape[0], x.device):
+        # the two-CTA verify kernel reads the forget gate; the full fab kernel produces it
         return False
     if (
         fb_weight.dtype != torch.bfloat16
@@ -1338,6 +1353,7 @@ class KimiKDALinearAttention(nn.Module):
             fuse_output_norm=True,
             mxfp8_output=mxfp8_output,
             use_pdl=_KDA_DECODE_PDL and not mxfp8_output,
+            two_cta=_verify_two_cta(H, num_decodes, x2d.device),
         )
         if mxfp8_output:
             if not isinstance(out, tuple):

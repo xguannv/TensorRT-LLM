@@ -479,6 +479,7 @@ class KDAKernelDispatch:
         if mxfp8_output:
             kwargs.pop("fuse_output_norm", None)
             kwargs.pop("use_pdl", None)
+            kwargs.pop("two_cta", None)
             op = torch.ops.trtllm.kda_mtp_decode_fp8
         else:
             op = torch.ops.trtllm.kda_mtp_decode

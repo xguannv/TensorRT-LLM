@@ -85,10 +85,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         TILE_K,
         kda_decode_mtp_kernel,
     )
+    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode_2cta import (
+        kda_decode_mtp_2cta_kernel,
+    )
     from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode_v2 import kda_decode_mtp_v2_kernel
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
+# CTAs per SM the two-CTA verify kernel is compiled for (64 registers per thread).
+_TWO_CTA_MIN_BLOCKS = 2
 # One V pass: the kernel runs 16 warps x 8 rows over the full 128-row state.
 _TILE_V = 128
 
@@ -658,7 +663,220 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_pdl=PDL,
             )
         else:
-            launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream, use_pdl=PDL)
+            launched.launch(
+                grid=(HV, N, 1),
+                block=[NUM_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=PDL,
+            )
+
+
+if IS_CUTLASS_DSL_AVAILABLE:
+
+    @cute.jit
+    def _run_kda_decode_mtp_2cta(
+        h0: cute.Tensor,
+        x_q: cute.Tensor,
+        x_k: cute.Tensor,
+        x_v: cute.Tensor,
+        w_q: cute.Tensor,
+        w_k: cute.Tensor,
+        w_v: cute.Tensor,
+        cs_q: cute.Tensor,
+        cs_k: cute.Tensor,
+        cs_v: cute.Tensor,
+        A_log: cute.Tensor,
+        g: cute.Tensor,
+        dt_bias: cute.Tensor,
+        beta: cute.Tensor,
+        onorm_g: cute.Tensor,
+        onorm_weight: cute.Tensor,
+        o: cute.Tensor,
+        k_cache: cute.Tensor,
+        g_cache: cute.Tensor,
+        v_cache: cute.Tensor,
+        beta_cache: cute.Tensor,
+        ssm_state_indices: cute.Tensor,
+        num_accepted_tokens: cute.Tensor,
+        N: cutlass.Int32,
+        scale: cutlass.Constexpr[float],
+        HV: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
+        V: cutlass.Constexpr[int],
+        NUM_SPEC: cutlass.Constexpr[int],
+        KERNEL_WIDTH: cutlass.Constexpr[int],
+        lower_bound: cutlass.Constexpr[float],
+        onorm_eps: cutlass.Constexpr[float],
+        USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+        PDL: cutlass.Constexpr[bool],
+        MIN_BLOCKS: cutlass.Constexpr[int],
+        stream: cuda.CUstream,
+    ):
+        """Host side of ``kda_decode_mtp_2cta_kernel``: v2's tf32 MMA atoms, operand smem
+        layouts and fp32 state TMA atoms, launched for ``MIN_BLOCKS`` CTAs per SM (64 registers
+        per thread at 2)."""
+        f32 = cutlass.Float32
+        tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, 3 * T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1 = sm100_utils.make_smem_layout_b(tiled_mma1, (V, 3 * T_PAD, K), f32, 1)
+        tiled_mma_f32a = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, 3 * T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        tiled_mma1k = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD),
+            tcgen05.OperandSource.TMEM,
+        )
+        smem_layout_b1k = sm100_utils.make_smem_layout_b(tiled_mma1k, (V, T_PAD, K), f32, 1)
+        tiled_mma2h = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, K // 2),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_b2h = sm100_utils.make_smem_layout_b(tiled_mma2h, (V, K // 2, T_PAD), f32, 1)
+        smem_layout_a2 = sm100_utils.make_smem_layout_a(tiled_mma2h, (V, K // 2, T_PAD), f32, 1)
+        tiled_mma2q = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD + K // 2),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_b2q = sm100_utils.make_smem_layout_b(
+            tiled_mma2q, (V, T_PAD + K // 2, T_PAD), f32, 1
+        )
+        tiled_mma3 = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (4 * T_PAD, T_PAD),
+            tcgen05.OperandSource.SMEM,
+        )
+        smem_layout_a3 = sm100_utils.make_smem_layout_a(tiled_mma3, (4 * T_PAD, T_PAD, K), f32, 1)
+        smem_layout_b3 = sm100_utils.make_smem_layout_b(tiled_mma3, (4 * T_PAD, T_PAD, K), f32, 1)
+        tiled_mma4 = sm100_utils.make_trivial_tiled_mma(
+            f32,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            f32,
+            tcgen05.CtaGroup.ONE,
+            (V, T_PAD),
+            tcgen05.OperandSource.SMEM,
+        )
+        if cutlass.const_expr(cute.rank(h0.shape) == 3):
+            mS_vkl = cute.make_tensor(
+                h0.iterator,
+                cute.make_layout(
+                    (V, K, h0.shape[0]),
+                    stride=(h0.layout.stride[1], h0.layout.stride[2], h0.layout.stride[0]),
+                ),
+            )
+        else:
+            mS_vkl = cute.make_tensor(
+                h0.iterator,
+                cute.make_layout(
+                    (V, K, (h0.shape[1], h0.shape[0])),
+                    stride=(
+                        h0.layout.stride[2],
+                        h0.layout.stride[3],
+                        (h0.layout.stride[1], h0.layout.stride[0]),
+                    ),
+                ),
+            )
+        box_atom = sm100_utils.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, f32)
+        box_layout = cute.tile_to_shape(box_atom, (V, 32), order=(0, 1))
+        tma_atom_l, mS_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), mS_vkl, box_layout, (V, 32)
+        )
+        tma_atom_t, mT_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(), mS_vkl, box_layout, (V, 32)
+        )
+        launched = kda_decode_mtp_2cta_kernel(
+            h0,
+            x_q,
+            x_k,
+            x_v,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            A_log,
+            g,
+            dt_bias,
+            beta,
+            onorm_g,
+            onorm_weight,
+            o,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            num_accepted_tokens,
+            tiled_mma1,
+            tiled_mma3,
+            tiled_mma1k,
+            smem_layout_b1,
+            smem_layout_a2,
+            smem_layout_a3,
+            smem_layout_b3,
+            smem_layout_b1k,
+            tiled_mma4,
+            tiled_mma2h,
+            smem_layout_b2h,
+            tiled_mma2q,
+            smem_layout_b2q,
+            tiled_mma_f32a,
+            tma_atom_l,
+            mS_tma,
+            box_layout,
+            tma_atom_t,
+            mT_tma,
+            scale,
+            HV,
+            K,
+            V,
+            NUM_SPEC,
+            KERNEL_WIDTH,
+            lower_bound,
+            onorm_eps,
+            USE_FLAT_LAYOUT,
+            PDL,
+        )
+        launched.launch(
+            grid=(HV, N, 1),
+            block=[NUM_THREADS, 1, 1],
+            stream=stream,
+            use_pdl=PDL,
+            min_blocks_per_mp=MIN_BLOCKS,
+        )
 
 
 def _require_stride_layout(
@@ -1024,6 +1242,7 @@ def kda_mtp_decode_impl(
     fa: Optional[torch.Tensor] = None,
     w_fb: Optional[torch.Tensor] = None,
     use_pdl: bool = False,
+    two_cta: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -1070,6 +1289,9 @@ def kda_mtp_decode_impl(
         use_pdl: launch as a programmatic dependent of the previous grid (v2
             contract only); the kernel loads its state, replay entries and
             weights before ``griddepcontrol.wait``.
+        two_cta: run the two-CTAs-per-SM kernel (``kda_mtp_decode_2cta``,
+            bitwise the v2 kernel) when the call qualifies: v2 contract, fp32
+            state, bf16 projections and conv caches, one CTA per tile.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -1244,6 +1466,80 @@ def kda_mtp_decode_impl(
         g_arg = onorm_g if fused_fb else g
         fa_arg = fa if fused_fb else beta
         w_fb_arg = w_fb if fused_fb else w_q
+        use_2cta = (
+            two_cta
+            and not fused_fb
+            and split_v == 1
+            and h0_arg.dtype == torch.float32
+            and all(t.dtype == torch.bfloat16 for t in (x_q, x_k, x_v, cs_q, cs_k, cs_v))
+        )
+        if use_2cta:
+            args_2cta = (
+                (h0_arg, 16),
+                (x_q_arg, 16),
+                (x_k_arg, 16),
+                (x_v_arg, 16),
+                (w_q, 16),
+                (w_k, 16),
+                (w_v, 16),
+                (cs_q, 16),
+                (cs_k, 16),
+                (cs_v, 16),
+                (A_log, 16),
+                (g_arg, 16),
+                (dt_bias, 16),
+                (beta, 16),
+                (onorm_g, 16),
+                (onorm_weight, 16),
+                (out, 16),
+                (k_cache, 16),
+                (g_cache, 16),
+                (v_cache, 16),
+                (beta_cache, beta_cache_assumed_align),
+                (ssm_state_indices, 4),
+                (num_accepted_tokens, 4),
+            )
+            key_2cta = (
+                "2cta",
+                tuple(_layout_key(t, dynamic_layout=True, assumed_align=a) for t, a in args_2cta),
+                scale,
+                HV,
+                K,
+                V_dim,
+                num_spec,
+                W,
+                float(lower_bound),
+                float(onorm_eps),
+                use_flat_layout,
+                bool(use_pdl),
+                _TWO_CTA_MIN_BLOCKS,
+            )
+            if key_2cta not in _compiled_cache:
+                logger.info(
+                    f"kda_mtp_decode: compiling 2-CTA variant H={HV} num_spec={num_spec}"
+                    f" pdl={bool(use_pdl)}"
+                )
+                _compiled_cache[key_2cta] = cute.compile(
+                    _run_kda_decode_mtp_2cta,
+                    *[_dlpack_arg(t, assumed_align=a) for t, a in args_2cta],
+                    N,
+                    scale=scale,
+                    HV=HV,
+                    K=K,
+                    V=V_dim,
+                    NUM_SPEC=num_spec,
+                    KERNEL_WIDTH=W,
+                    lower_bound=float(lower_bound),
+                    onorm_eps=float(onorm_eps),
+                    USE_FLAT_LAYOUT=use_flat_layout,
+                    PDL=bool(use_pdl),
+                    MIN_BLOCKS=_TWO_CTA_MIN_BLOCKS,
+                    stream=stream,
+                )
+            _compiled_cache[key_2cta](
+                *[_dlpack_arg(t, assumed_align=a) for t, a in args_2cta], N, stream
+            )
+            return out
         v2_args = (
             (h0_arg, 16),
             (x_q_arg, 16),
@@ -1521,6 +1817,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
         use_pdl: bool = False,
+        two_cta: bool = False,
     ) -> torch.Tensor:
         """Fused KDA multi-token verify with in-place state commit."""
         return kda_mtp_decode_impl(
@@ -1556,6 +1853,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_eps=onorm_eps,
             fuse_output_norm=fuse_output_norm,
             use_pdl=use_pdl,
+            two_cta=two_cta,
         )
 
     @kda_mtp_decode.register_fake
@@ -1592,8 +1890,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
         use_pdl: bool = False,
+        two_cta: bool = False,
     ) -> torch.Tensor:
-        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, use_pdl
+        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, use_pdl, two_cta
         return x_q.new_empty(x_v.shape)
 
     @torch.library.custom_op(
