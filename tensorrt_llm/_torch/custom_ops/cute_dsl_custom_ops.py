@@ -82,6 +82,16 @@ _CUDA_MAX_GRID_DIM_Z = 65_535
 # _MOE_FINALIZE_SWAPAB_MAX_TOKENS tokens, keep the regular kernel.
 _MOE_FINALIZE_SWAPAB_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB"
 _MOE_FINALIZE_SWAPAB_MAX_TOKENS = 256
+# Opt-in epilogue for the swap-AB finalize kernel that spreads the rows of every
+# tile over all epilogue warpgroups (tiles of popular experts hold tens of rows)
+# and deals tiles to the CTAs in chunks of two.
+_MOE_FINALIZE_SWAPAB_SPLIT_ROWS_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB_SPLIT_ROWS"
+# Opt-in early weight streaming for the swap-AB finalize kernel: with PDL it
+# schedules tiles and loads expert weights before FC1 completes. The tile
+# metadata must come from a kernel that completed before FC1 started (as in the
+# fused MoE, where FC1 reads it too); never used while autotuning, whose input
+# pre-hook rebuilds the metadata right before the kernel.
+_MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS"
 # Opt-in L2 evict-first hint on the expert weight loads of the regular NVFP4 MoE
 # gather (FC1) and finalize (FC2) kernels; the swap-AB finalize kernel always
 # uses it.
@@ -2800,6 +2810,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.allow_swapab = os.environ.get(_MOE_FINALIZE_SWAPAB_ENV,
                                                "0") == "1"
+            self.swapab_split_rows = os.environ.get(
+                _MOE_FINALIZE_SWAPAB_SPLIT_ROWS_ENV, "0") == "1"
+            self.swapab_early_weights = os.environ.get(
+                _MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS_ENV, "0") == "1"
             self.weight_evict_first = os.environ.get(
                 _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
 
@@ -2813,12 +2827,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.output_dtype,
                 self.scaling_vector_size,
                 self.allow_swapab,
+                self.swapab_split_rows,
+                self.swapab_early_weights,
                 self.weight_evict_first,
             )
 
         # 64-row token operand, two 128-row weight blocks per tile, three
         # epilogue warpgroups, round-robin chunks of four tiles
         SWAPAB_CONFIG = dict(n_tok=64, num_epi_wg=3, h_blocks=2, sched_chunk=4)
+        # TRTLLM_MOE_FINALIZE_SWAPAB_SPLIT_ROWS=1: rows of a tile over all
+        # epilogue warpgroups, chunks of two tiles
+        SWAPAB_SPLIT_ROWS_CONFIG = dict(split_rows=True, sched_chunk=2)
 
         def use_swapab(self, n: int, k: int, num_tokens: int) -> bool:
             if (not self.allow_swapab or self.scaling_vector_size != 16
@@ -3083,7 +3102,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             permuted_idx_to_expanded_idx_ptr,
                             num_non_exiting_tiles_ptr, token_final_scales_ptr,
                             m, n, k, l, num_tokens, stream):  # noqa: E741
-            cfg = self.SWAPAB_CONFIG
+            cfg = dict(self.SWAPAB_CONFIG)
+            if self.swapab_split_rows:
+                cfg.update(self.SWAPAB_SPLIT_ROWS_CONFIG)
+            # the autotuner's input pre-hook rebuilds the tile metadata right
+            # before the kernel, which early weight streaming must not race
+            cfg["early_weights"] = (self.swapab_early_weights
+                                    and not AutoTuner.get().is_tuning_mode)
             args = [
                 a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
                 tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,

@@ -4294,15 +4294,19 @@ def _finalize_inplace(inputs, num_experts, top_k, num_local_experts, local_exper
     "ep", [(64, 64, 0), (64, 32, 32), (16, 16, 0)], ids=["tp", "ep2_rank1", "tp_dense"]
 )
 @pytest.mark.parametrize("num_tokens", [1, 8, 33, 64, 65, 128, 200])
-def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, monkeypatch):
+@pytest.mark.parametrize("variant", ["base", "split", "early", "split_early"])
+def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, variant, monkeypatch):
     """Swap-AB finalize (TRTLLM_MOE_FINALIZE_SWAPAB=1) vs the regular finalize kernel.
 
     K = 192 is an expert's intermediate slice under MoE TP16 (Kimi-K3); with 16 experts most
     permuted tiles hold more than 64 tokens, which the swap-AB kernel splits into 64-row
     sub-tiles. Every partial ``bf16(alpha * scale * acc)`` must be bit-identical: with one
-    non-zero top-k scale per token each output element is a single partial. With all scales the 8 partials are summed in BF16 in an
-    unspecified order by both kernels; both must stay within the BF16 accumulation bound of the
-    exact sum of the partials.
+    non-zero top-k scale per token each output element is a single partial. With all scales the
+    8 partials are summed in BF16 in an unspecified order by both kernels; both must stay within
+    the BF16 accumulation bound of the exact sum of the partials. Variants of the swap-AB
+    kernel: ``split`` spreads the rows of a tile over all epilogue warpgroups
+    (TRTLLM_MOE_FINALIZE_SWAPAB_SPLIT_ROWS=1); ``early`` streams the weights before the previous
+    kernel (here the output memset) completes (TRTLLM_MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS=1).
     """
     num_experts, num_local_experts, local_expert_offset = ep
     top_k = 8
@@ -4352,6 +4356,11 @@ def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, monkeypatc
 
     def run(swapab, scales):
         monkeypatch.setenv("TRTLLM_MOE_FINALIZE_SWAPAB", "1" if swapab else "0")
+        for env, on in (
+            ("TRTLLM_MOE_FINALIZE_SWAPAB_SPLIT_ROWS", "split" in variant),
+            ("TRTLLM_MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS", "early" in variant),
+        ):
+            monkeypatch.setenv(env, "1" if on else "0")
         runner = runner_cls(*args, 128, torch.bfloat16)
         assert runner.use_swapab(hidden_size, interm_size, num_tokens) == swapab
         return _finalize_inplace(inputs[:10] + [scales], *args)

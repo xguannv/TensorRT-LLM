@@ -25,7 +25,8 @@ in weight-memory order (``h`` fastest) and dealt to the persistent CTAs in round
 ``sched_chunk`` tiles, so concurrently running CTAs stream neighbouring weight rows while each CTA
 still sees runs of the same permuted tile: the token operand and the per-row metadata (token index,
 ``alpha * final_scale``) are loaded once per run. Warp roles: ``num_epi_wg`` epilogue warpgroups
-(consecutive tiles rotate between them), then MMA, TMA, scheduler and metadata warps.
+(consecutive tiles rotate between them, or with ``split_rows`` the 8-row groups of every tile do),
+then MMA, TMA, scheduler and metadata warps.
 
 Requirements: NVFP4 (Float4E2M1FN data, Float8E4M3FN scales, vector 16), K-major operands,
 ``n % (128 * h_blocks) == 0``, ``k % 64 == 0``, ``k <= 256`` (one K stage), ``tile_size == 128``.
@@ -79,6 +80,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
     :param sched_chunk: Consecutive tiles per round-robin chunk (0: one contiguous range per CTA).
     :param num_b_stage: Shared-memory slots for the token operand of a run.
     :param num_meta_stage: Shared-memory slots for the per-row metadata of a run.
+    :param split_rows: Every epilogue warpgroup takes part in every tile: the 8-row groups of a tile
+        rotate between the warpgroups (a tile of at most 8 rows still goes to one warpgroup), and
+        each warp stages and reduces its own 32 columns with warp-level synchronization only. Tiles
+        of popular experts (tens of rows) then no longer serialize on one warpgroup.
+    :param early_weights: With programmatic dependent launch, schedule tiles and stream expert
+        weights before the previous grid (the FC1 GEMM) completes; the token operand and metadata
+        loads (both issued by the metadata warp), the MMA and the epilogue wait for it. The tile
+        metadata (``tile_idx_to_expert_idx``, ``tile_idx_to_mn_limit``, ``num_non_exiting_tiles``)
+        and the weights must then be complete before the previous kernel in the stream starts
+        (true when FC1, which reads the same tile metadata, runs right before).
     """
 
     def __init__(
@@ -92,6 +103,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
         sched_chunk: int = 4,
         num_b_stage: int = 3,
         num_meta_stage: int = 4,
+        early_weights: bool = False,
+        split_rows: bool = False,
     ):
         assert tile_size == 128, "swap-AB finalize supports tile_size 128 only"
         assert n_tok in (64, 128)
@@ -102,6 +115,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
         # 0: every CTA takes one contiguous range of tiles; c > 0: chunks of c consecutive tiles are
         # dealt round-robin to the CTAs (concurrent CTAs then stream neighbouring weight rows)
         self.sched_chunk = sched_chunk
+        self.early_weights = early_weights
+        self.split_rows = split_rows
         self.sf_vec_size = sf_vec_size
         self.n_tok = n_tok
         self.tile_size = tile_size
@@ -192,10 +207,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
             8, (self.num_tmem_alloc_cols - self.num_sf_tmem_cols) // self.n_tok
         )
         self.num_accumulator_tmem_cols = self.n_tok * self.num_acc_stage
-        # A warpgroup skips the accumulator stages of the other warpgroups' tiles without waiting on
-        # them, so its next wait is num_epi_wg * h_blocks stages ahead: that must stay within one lap
-        # of the ring or the barrier parity of the previous lap would satisfy it.
-        assert self.num_epi_wg * self.h_blocks <= self.num_acc_stage, (
+        # Without split_rows a warpgroup skips the accumulator stages of the other warpgroups' tiles
+        # without waiting on them, so its next wait is num_epi_wg * h_blocks stages ahead: that must
+        # stay within one lap of the ring or the barrier parity of the previous lap would satisfy it.
+        assert self.split_rows or self.num_epi_wg * self.h_blocks <= self.num_acc_stage, (
             f"num_epi_wg * h_blocks ({self.num_epi_wg * self.h_blocks}) > accumulator stages ({self.num_acc_stage})"
         )
 
@@ -410,6 +425,97 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
         )
         return
 
+    def _load_token_operand(
+        self,
+        b_pipeline,
+        b_producer_state,
+        tma_atom_b,
+        tBgB,
+        tBsB,
+        tma_atom_sfb,
+        tBgSFB,
+        tBsSFB,
+        tok_tile,
+        sub,
+    ):
+        """TMA the n_tok token rows of sub-tile ``sub`` of permuted tile ``tok_tile`` (and the
+        tile's scale factors) into the next token-operand stage."""
+        b_pipeline.producer_acquire(b_producer_state)
+        b_bar = b_pipeline.producer_get_barrier(b_producer_state)
+        cute.copy(
+            tma_atom_b,
+            tBgB[(None, tok_tile * self.subs_per_tile + sub, 0, 0)],
+            tBsB[(None, b_producer_state.index)],
+            tma_bar_ptr=b_bar,
+        )
+        cute.copy(
+            tma_atom_sfb,
+            tBgSFB[(None, tok_tile, 0, 0)],
+            tBsSFB[(None, b_producer_state.index)],
+            tma_bar_ptr=b_bar,
+        )
+
+    @cute.jit
+    def _epilogue_rows(
+        self,
+        tiled_copy_t2r: cute.TiledCopy,
+        tTR_tAcc: cute.Tensor,
+        tTR_rAcc: cute.Tensor,
+        acc_stage: cutlass.Int32,
+        row0: cutlass.Int32,
+        rows: cutlass.Int32,
+        meta_stage: cutlass.Int32,
+        sMetaScale: cute.Tensor,
+        sMetaTokenIdx: cute.Tensor,
+        sC: cute.Tensor,
+        out: cute.Tensor,
+        epi_tidx: cutlass.Int32,
+        wg: cutlass.Int32,
+        h0: cutlass.Int32,
+    ):
+        """Accumulator rows [row0, row0 + rows) of this thread's column h0 + epi_tidx: scale to BF16,
+        stage in sC[:, :, wg], then red-add 16-byte chunks of the staged rows to ``out``."""
+        for s in cutlass.range((rows + self.epi_cols - 1) // self.epi_cols, unroll=1):
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, 0, row0 // self.epi_cols + s, acc_stage)],
+                tTR_rAcc,
+            )
+            for c in cutlass.range_constexpr(self.epi_cols):
+                j = s * self.epi_cols + c
+                if j < rows:
+                    v = tTR_rAcc[c] * sMetaScale[(row0 + j, meta_stage)]
+                    sC[(epi_tidx, j, wg)] = v.to(cutlass.BFloat16)
+        if cutlass.const_expr(self.split_rows):
+            # warp w reduces the columns it staged (32 w .. 32 w + 31): four 8-column chunks a row
+            cute.arch.sync_warp()
+            lane = epi_tidx % self.threads_per_warp
+            warp_col = epi_tidx - lane
+            q = lane
+            while q < rows * 4:
+                jr = q // 4
+                col = warp_col + (q % 4) * 8
+                tok = sMetaTokenIdx[(row0 + jr, meta_stage)]
+                src = sC[(None, jr, wg)].iterator + col
+                dst = cute.domain_offset((tok, h0 + col, 0), out)
+                red_add_v8_bf16_from_smem(dst.iterator.llvm_ptr, src.toint().ir_value())
+                q += self.threads_per_warp
+            cute.arch.sync_warp()
+        else:
+            self._wg_barrier(wg)
+            # 16-byte reds: chunk q covers h0 + 8 * (q % 16) of staged row q // 16
+            chunks_per_row = self.mma_tiler[0] // 8
+            q = epi_tidx
+            while q < rows * chunks_per_row:
+                jr = q // chunks_per_row
+                col = (q % chunks_per_row) * 8
+                tok = sMetaTokenIdx[(row0 + jr, meta_stage)]
+                src = sC[(None, jr, wg)].iterator + col
+                dst = cute.domain_offset((tok, h0 + col, 0), out)
+                red_add_v8_bf16_from_smem(dst.iterator.llvm_ptr, src.toint().ir_value())
+                q += 128
+            self._wg_barrier(wg)
+
     @cute.jit
     def _wg_barrier(self, wg: cutlass.Int32):
         """Named barrier of epilogue warpgroup ``wg``."""
@@ -484,12 +590,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
             tx_count=self.num_tma_load_bytes_b,
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-        # an accumulator stage is drained by the one epilogue warpgroup that owns its tile
+        # an accumulator stage is drained by the one epilogue warpgroup that owns its tile, or with
+        # split_rows by all of them
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 128 * (self.num_epi_wg if self.split_rows else 1)
+            ),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
         tile_info_pipeline = pipeline.PipelineAsync.create(
@@ -588,10 +697,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
         self.cta_sync_barrier.arrive_and_wait()
-        griddepcontrol_wait()
+        if cutlass.const_expr(self.early_weights):
+            # the scheduler, weight-TMA and metadata warps read only data of earlier grids
+            if warp_idx <= self.mma_warp_id:
+                griddepcontrol_wait()
+        else:
+            griddepcontrol_wait()
 
         #
-        # Scheduler warp: this CTA's contiguous range of (permuted tile, h block) tiles, h fastest.
+        # Scheduler warp: this CTA's (permuted tile, h block) tiles, h fastest: a contiguous range or
+        # a round-robin of chunks.
         # sInfo[3]: bit 0 = valid, bit 1 = first tile of a run of the same permuted tile.
         #
         if warp_idx == self.sched_warp_id:
@@ -683,23 +798,22 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                 tok_tile = tile_info[0]
                 h_tile = tile_info[1]
                 expert_idx = tile_info[2]
-                if (tile_info[3] & 2) != 0:
-                    # first tile of a run: load the token operand of the permuted tile once
-                    b_pipeline.producer_acquire(b_producer_state)
-                    b_bar = b_pipeline.producer_get_barrier(b_producer_state)
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB[(None, tok_tile * self.subs_per_tile + (tile_info[3] >> 2), 0, 0)],
-                        tBsB[(None, b_producer_state.index)],
-                        tma_bar_ptr=b_bar,
-                    )
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB[(None, tok_tile, 0, 0)],
-                        tBsSFB[(None, b_producer_state.index)],
-                        tma_bar_ptr=b_bar,
-                    )
-                    b_producer_state.advance()
+                if cutlass.const_expr(not self.early_weights):
+                    if (tile_info[3] & 2) != 0:
+                        # first tile of a run: load the token operand of the permuted tile once
+                        self._load_token_operand(
+                            b_pipeline,
+                            b_producer_state,
+                            tma_atom_b,
+                            tBgB,
+                            tBsB,
+                            tma_atom_sfb,
+                            tBgSFB,
+                            tBsSFB,
+                            tok_tile,
+                            tile_info[3] >> 2,
+                        )
+                        b_producer_state.advance()
 
                 # K fits one stage: one A box of 128 * h_blocks rows plus one SFA box per 128 rows
                 ab_pipeline.producer_acquire(ab_producer_state)
@@ -728,7 +842,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
-            b_pipeline.producer_tail(b_producer_state)
+            if cutlass.const_expr(not self.early_weights):
+                b_pipeline.producer_tail(b_producer_state)
 
         #
         # MMA warp
@@ -874,6 +989,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
             meta_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_meta_stage
             )
+            b_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_b_stage
+            )
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for i in cutlass.range_constexpr(5):
@@ -884,6 +1002,22 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
 
             while is_valid_tile:
                 if (tile_info[3] & 2) != 0:
+                    if cutlass.const_expr(self.early_weights):
+                        # the token operand is the previous grid's output
+                        griddepcontrol_wait()
+                        self._load_token_operand(
+                            b_pipeline,
+                            b_producer_state,
+                            tma_atom_b,
+                            tBgB,
+                            tBsB,
+                            tma_atom_sfb,
+                            tBgSFB,
+                            tBsSFB,
+                            tile_info[0],
+                            tile_info[3] >> 2,
+                        )
+                        b_producer_state.advance()
                     tile_m_start = tile_info[0] * self.tile_size + (tile_info[3] >> 2) * self.n_tok
                     alpha_val = alpha[tile_info[2]]
                     meta_pipeline.producer_acquire(meta_producer_state)
@@ -909,10 +1043,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             meta_pipeline.producer_tail(meta_producer_state)
+            if cutlass.const_expr(self.early_weights):
+                b_pipeline.producer_tail(b_producer_state)
 
         #
-        # Epilogue warpgroups: tile k of this CTA goes to warpgroup k % num_epi_wg; thread t of the
-        # warpgroup owns output column h = h_block * 128 + t (TMEM lane t)
+        # Epilogue warpgroups: tile k of this CTA goes to warpgroup k % num_epi_wg (with split_rows,
+        # 8-row group g of tile k to warpgroup (g + k) % num_epi_wg); thread t of the warpgroup owns
+        # output column h = h_block * 128 + t (TMEM lane t)
         #
         if warp_idx < self.num_epi_warps:
             tmem.allocate(self.num_tmem_alloc_cols)
@@ -954,7 +1091,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
 
             holds_meta = cutlass.Boolean(False)
             tile_k = cutlass.Int32(0)
-            chunks_per_row = self.mma_tiler[0] // 8
             while is_valid_tile:
                 if (tile_info[3] & 2) != 0:
                     if holds_meta:
@@ -962,60 +1098,66 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeSwapABKernel:
                         meta_consumer_state.advance()
                     meta_pipeline.consumer_wait(meta_consumer_state)
                     holds_meta = cutlass.Boolean(True)
-                if tile_k % self.num_epi_wg == wg:
-                    meta_stage = meta_consumer_state.index
-                    n_valid = cutlass.min(
-                        cutlass.max(
-                            tile_info[4]
-                            - tile_info[0] * self.tile_size
-                            - (tile_info[3] >> 2) * self.n_tok,
-                            cutlass.Int32(0),
-                        ),
-                        cutlass.Int32(self.n_tok),
-                    )
+                meta_stage = meta_consumer_state.index
+                n_valid = cutlass.min(
+                    cutlass.max(
+                        tile_info[4]
+                        - tile_info[0] * self.tile_size
+                        - (tile_info[3] >> 2) * self.n_tok,
+                        cutlass.Int32(0),
+                    ),
+                    cutlass.Int32(self.n_tok),
+                )
+                if cutlass.const_expr(self.split_rows):
+                    # first 8-row group of this tile that belongs to this warpgroup
+                    g0 = (wg + self.num_epi_wg - tile_k % self.num_epi_wg) % self.num_epi_wg
+                    for mb in cutlass.range_constexpr(self.h_blocks):
+                        h0 = (tile_info[1] * self.h_blocks + mb) * self.mma_tiler[0]
+                        acc_pipeline.consumer_wait(acc_consumer_state)
+                        row0 = g0 * self.epi_cols
+                        while row0 < n_valid:
+                            self._epilogue_rows(
+                                tiled_copy_t2r,
+                                tTR_tAcc,
+                                tTR_rAcc,
+                                acc_consumer_state.index,
+                                row0,
+                                cutlass.min(n_valid - row0, cutlass.Int32(self.epi_cols)),
+                                meta_stage,
+                                sMetaScale,
+                                sMetaTokenIdx,
+                                sC,
+                                out,
+                                epi_tidx,
+                                wg,
+                                h0,
+                            )
+                            row0 += self.epi_cols * self.num_epi_wg
+                        cute.arch.fence_view_async_tmem_load()
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+                elif tile_k % self.num_epi_wg == wg:
                     for mb in cutlass.range_constexpr(self.h_blocks):
                         h0 = (tile_info[1] * self.h_blocks + mb) * self.mma_tiler[0]
                         acc_pipeline.consumer_wait(acc_consumer_state)
                         row0 = cutlass.Int32(0)
                         while row0 < n_valid:
-                            rows = cutlass.min(n_valid - row0, cutlass.Int32(self.stage_rows))
-                            # TMEM -> scaled BF16 rows in sC[:, 0:rows, wg]
-                            for s in cutlass.range(
-                                (rows + self.epi_cols - 1) // self.epi_cols, unroll=1
-                            ):
-                                cute.copy(
-                                    tiled_copy_t2r,
-                                    tTR_tAcc[
-                                        (
-                                            None,
-                                            None,
-                                            None,
-                                            0,
-                                            row0 // self.epi_cols + s,
-                                            acc_consumer_state.index,
-                                        )
-                                    ],
-                                    tTR_rAcc,
-                                )
-                                for c in cutlass.range_constexpr(self.epi_cols):
-                                    j = s * self.epi_cols + c
-                                    if j < rows:
-                                        v = tTR_rAcc[c] * sMetaScale[(row0 + j, meta_stage)]
-                                        sC[(epi_tidx, j, wg)] = v.to(cutlass.BFloat16)
-                            self._wg_barrier(wg)
-                            # 16-byte reds: chunk q covers h0 + 8 * (q % 16) of staged row q // 16
-                            q = epi_tidx
-                            while q < rows * chunks_per_row:
-                                jr = q // chunks_per_row
-                                col = (q % chunks_per_row) * 8
-                                tok = sMetaTokenIdx[(row0 + jr, meta_stage)]
-                                src = sC[(None, jr, wg)].iterator + col
-                                dst = cute.domain_offset((tok, h0 + col, 0), out)
-                                red_add_v8_bf16_from_smem(
-                                    dst.iterator.llvm_ptr, src.toint().ir_value()
-                                )
-                                q += 128
-                            self._wg_barrier(wg)
+                            self._epilogue_rows(
+                                tiled_copy_t2r,
+                                tTR_tAcc,
+                                tTR_rAcc,
+                                acc_consumer_state.index,
+                                row0,
+                                cutlass.min(n_valid - row0, cutlass.Int32(self.stage_rows)),
+                                meta_stage,
+                                sMetaScale,
+                                sMetaTokenIdx,
+                                sC,
+                                out,
+                                epi_tidx,
+                                wg,
+                                h0,
+                            )
                             row0 += self.stage_rows
                         cute.arch.fence_view_async_tmem_load()
                         acc_pipeline.consumer_release(acc_consumer_state)
