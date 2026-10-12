@@ -162,6 +162,19 @@ def _k3_zero_residual(numel: int, device: torch.device) -> Optional[torch.Tensor
 # k3_fp8w_lowm_gemm.can_run) run the CuTe low-M GEMM instead of DeepGEMM swap-AB.
 _K3_FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
 
+# SMs the DeepGEMM swap-AB GEMM of the SM100/SM103 FP8 weight-read projections leaves free
+# (default 0). DeepGEMM compiles its static persistent grid for a fixed SM count, one CTA per SM;
+# while another kernel holds SMs, the CTAs that land behind it run as a second wave. A CTX worker
+# with the DWDP SM gather (one kernel per MoE layer, resident for most of a prefill iteration)
+# sets this to TRTLLM_DWDP_GATHER_BLOCKS: the grid then fits beside the gather, at the cost of
+# fewer SMs while no gather runs. Projections with fewer than TRTLLM_K3_DEEPGEMM_SM_RESERVE_MIN_K
+# input features keep the full grid: with so few K blocks per tile the GEMM is bound by its
+# output stores, which a smaller grid slows down (MLA kv_b, K = 512: +24% without the gather).
+_K3_DEEPGEMM_SM_RESERVE = int(os.environ.get("TRTLLM_K3_DEEPGEMM_SM_RESERVE", "0"))
+if _K3_DEEPGEMM_SM_RESERVE < 0:
+    raise ValueError(f"TRTLLM_K3_DEEPGEMM_SM_RESERVE must be >= 0, got {_K3_DEEPGEMM_SM_RESERVE}")
+_K3_DEEPGEMM_SM_RESERVE_MIN_K = int(os.environ.get("TRTLLM_K3_DEEPGEMM_SM_RESERVE_MIN_K", "1024"))
+
 # Helix MLA generation applies the V up-projection of all heads before the CP
 # all-to-all (see ``MLA._helix_project_v_partials``), which needs every head's
 # BF16 V weight on each rank.
@@ -1173,6 +1186,50 @@ def _k3_lowm_gemm_can_run(
     return k3_fp8w_lowm_gemm.can_run(x, weight, weight_scale)
 
 
+@functools.lru_cache(maxsize=None)
+def _k3_deep_gemm_num_sms(device_index: int) -> int:
+    """DeepGEMM SM count of the FP8 weight-read GEMM, or 0 to keep DeepGEMM's own."""
+    if _K3_DEEPGEMM_SM_RESERVE == 0:
+        return 0
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    if _K3_DEEPGEMM_SM_RESERVE >= sms:
+        raise ValueError(
+            f"TRTLLM_K3_DEEPGEMM_SM_RESERVE={_K3_DEEPGEMM_SM_RESERVE} leaves no SM of {sms}"
+        )
+    return sms - _K3_DEEPGEMM_SM_RESERVE
+
+
+def _k3_deep_gemm_fp8_swap_ab(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, output_dtype: torch.dtype
+) -> torch.Tensor:
+    """``fp8_swap_ab_gemm`` with ``TRTLLM_K3_DEEPGEMM_SM_RESERVE`` SMs left free.
+
+    DeepGEMM's SM count is process state, read when a GEMM is configured, JIT-compiled (the
+    kernel is specialized on it) and launched; it is set around this call and restored after,
+    so other DeepGEMM users keep the full grid. The choice depends only on K, so each
+    projection always runs (and its autotuner warmup compiles) one grid size.
+    """
+    num_sms = 0
+    if (
+        _K3_DEEPGEMM_SM_RESERVE
+        and x.shape[-1] >= _K3_DEEPGEMM_SM_RESERVE_MIN_K
+        and not torch.compiler.is_compiling()
+    ):
+        num_sms = _k3_deep_gemm_num_sms(x.device.index)
+    if num_sms:
+        from ... import deep_gemm
+
+        saved = deep_gemm.get_num_sms()
+        deep_gemm.set_num_sms(num_sms)
+    try:
+        return torch.ops.trtllm.fp8_swap_ab_gemm(
+            x, weight, weight_scale, output_dtype=output_dtype, disable_ue8m0_cast=True
+        )
+    finally:
+        if num_sms:
+            deep_gemm.set_num_sms(saved)
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
@@ -1357,13 +1414,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             else:
                 out = torch.ops.trtllm.k3_fp8w_lowm_gemm(x_flat, self.weight, self.weight_scale)
         else:
-            out = torch.ops.trtllm.fp8_swap_ab_gemm(
-                x_flat,
-                self.weight,
-                self.weight_scale,
-                output_dtype=x.dtype,
-                disable_ue8m0_cast=True,
-            )
+            out = _k3_deep_gemm_fp8_swap_ab(x_flat, self.weight, self.weight_scale, x.dtype)
         return out.reshape(out_shape)
 
     def forward_prequantized(
