@@ -14,7 +14,7 @@ from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from _torch.modules.helix_test_utils import CACHE_TYPE_SELFKONLY, setup_kv_and_metadata
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
+from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -329,3 +329,174 @@ def test_k3_mla_fp8_kv_decode_q_absorb() -> None:
     assert torch.equal(new["bmm1"], old["bmm1"]) and torch.equal(new["bmm2"], old["bmm2"])
     assert torch.equal(new["kv"].view(torch.uint8), old["kv"].view(torch.uint8))
     assert new["kv"].view(torch.uint8).any()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs an SM100/SM103 GPU",
+)
+@pytest.mark.parametrize(
+    "chunked,mode",
+    [(True, "1"), (False, "1"), (True, "2")],
+    ids=["chunked_prefill", "cached_kv", "chunked_prefill_fp8_fmha"],
+)
+def test_k3_mla_ctx_fp8_expand_matches_default(chunked: bool, mode: str, monkeypatch) -> None:
+    """Context attention over cached FP8 KV with ``TRTLLM_K3_MLA_CTX_FP8_EXPAND=1`` (one FP8
+    GEMM writes K and V) is bit-identical to the DeepGEMM kv_b_proj + cat path, through the
+    chunked-prefill loop (several KV chunks plus the final uncached partition) and through the
+    plain cached-KV path. With ``=2`` the GEMM writes FP8 K / V and FlashInfer's FP8 FMHA runs
+    the partitions: same FP8 inputs as the attention op's FP8 context path, a different FMHA
+    kernel, so the output matches to accumulation-order noise."""
+    torch.manual_seed(11)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    config = KimiLinearConfig(
+        vocab_size=128,
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        attn_res_block_size=1,
+        torch_dtype=torch.bfloat16,
+        linear_attn_config={"kda_layers": [], "full_attn_layers": [1], "num_heads": 32},
+        num_attention_heads=96,
+        num_key_value_heads=96,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        rms_norm_eps=1e-6,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+        max_position_embeddings=1024,
+    )
+    config._attn_implementation = "eager"
+    reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+    weights = _checkpoint_weights(reference, fp8=True)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=mapping,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        quant_config_dict={
+            f"model.layers.0.self_attn.{name}": QuantConfig(
+                quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+            )
+            for name in weights
+        },
+    )
+    with torch.device("cuda"):
+        model = KimiLinearForCausalLM(model_config).eval()
+    projections = {
+        f"{name}.{suffix}": value
+        for name, pair in weights.items()
+        for suffix, value in pair.items()
+    }
+    projections.update(
+        {name: value for name, value in reference.named_parameters() if value.ndim == 1}
+    )
+    load_mla_checkpoint(model, projections, "")
+    runtime = model.model.layers[0].self_attn
+    for module in runtime.modules():
+        if callable(getattr(module, "post_load_weights", None)):
+            module.post_load_weights()
+    mla = runtime.mixer
+    del reference
+
+    total, cached = 384, [256, 200]
+    new = [total - c for c in cached]
+    batch = len(cached)
+    scenario = SimpleNamespace(
+        ctx_len=total,
+        batch=batch,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.float8_e4m3fn,
+    )
+    manager, _ = setup_kv_and_metadata(
+        scenario,
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    hidden = torch.randn(
+        batch, total, config.hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+
+    def context_metadata(seq_lens, cached_lens, runtime_features=None):
+        kwargs = {} if runtime_features is None else {"runtime_features": runtime_features}
+        metadata = get_attention_backend("TRTLLM").Metadata(
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+            request_ids=list(range(batch)),
+            max_num_requests=batch,
+            num_contexts=batch,
+            prompt_lens=list(seq_lens),
+            max_num_tokens=sum(seq_lens),
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lens),
+            mapping=mapping,
+            enable_context_mla_with_cached_kv=True,
+            **kwargs,
+        )
+        metadata.prepare()
+        return metadata
+
+    fused_calls = []
+    fused_expand = mla._fused_fp8_kv_expand
+
+    def counting_expand(*args, **kwargs):
+        fused_calls.append(args[0].shape[0])
+        return fused_expand(*args, **kwargs)
+
+    monkeypatch.setattr(mla, "_fused_fp8_kv_expand", counting_expand)
+    outputs = {}
+    try:
+        # The first chunk fills the FP8 cache with the first cached[i] tokens of each request.
+        first = context_metadata(cached, [0] * batch)
+        extra_attrs = {
+            "attention_metadata": weakref.ref(first),
+            "mla_layers": {mla.layer_idx_str: weakref.ref(mla)},
+        }
+        with model_extra_attrs(extra_attrs):
+            runtime(torch.cat([hidden[i, : cached[i]] for i in range(batch)]), first)
+        second_input = torch.cat([hidden[i, cached[i] :] for i in range(batch)])
+        # 64-token KV chunks: the chunked-prefill loop runs ceil(456 / 64) = 8 partitions.
+        features = (
+            AttentionRuntimeFeatures(
+                chunked_prefill=True, chunk_size=64, chunked_prefill_buffer_batch_size=1
+            )
+            if chunked
+            else None
+        )
+        for flag in ("0", mode):
+            monkeypatch.setenv("TRTLLM_K3_MLA_CTX_FP8_EXPAND", flag)
+            second = context_metadata(new, cached, features)
+            extra_attrs["attention_metadata"] = weakref.ref(second)
+            with model_extra_attrs(extra_attrs):
+                outputs[flag] = runtime(second_input, second)
+            torch.cuda.synchronize()
+        assert mla._use_fused_fp8_kv_expand()
+    finally:
+        manager.shutdown()
+
+    # The first fused step of a process compiles the kernels on 1-token inputs (warmup).
+    while fused_calls and fused_calls[0] == 1:
+        fused_calls.pop(0)
+    if chunked:
+        assert fused_calls == [64] * 7 + [456 - 7 * 64] + [sum(new)]
+    else:
+        assert fused_calls == [total * batch]
+    assert outputs["0"].abs().sum() > 0
+    if mode == "1":
+        assert torch.equal(outputs[mode], outputs["0"])
+    else:
+        assert mla._use_fp8_direct_chunked_prefill(
+            torch.empty(1, dtype=torch.bfloat16), torch.empty(1, dtype=torch.bfloat16)
+        )
+        expected = outputs["0"].float()
+        relative_l2 = (
+            torch.linalg.vector_norm(outputs[mode].float() - expected)
+            / torch.linalg.vector_norm(expected)
+        ).item()
+        assert relative_l2 < 2e-3, f"relative L2 error: {relative_l2}"
+        torch.testing.assert_close(outputs[mode], outputs["0"], atol=2e-2, rtol=2e-2)

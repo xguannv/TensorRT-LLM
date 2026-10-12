@@ -175,6 +175,47 @@ def _mla_kv_strided_enabled() -> bool:
     return os.environ.get("TRTLLM_MLA_KV_STRIDED", "1") != "0"
 
 
+def _mla_ctx_fp8_expand_mode() -> str:
+    """TRTLLM_K3_MLA_CTX_FP8_EXPAND: fused FP8 kv_b_proj expansion of the cached context KV.
+
+    "0" (default): off.
+    "1": one CuTe DSL GEMM (cute_dsl_kernels/blackwell/k3_mla_kv_expand.py) writes BF16 K and V
+         in the attention op's layouts, replacing the DeepGEMM kv_b_proj output and the
+         [T, H, 192] cat. K and V are bit-identical to the default path.
+    "2": chunked prefill with an FP8 KV cache: the same GEMM writes FP8 K and V (the values the
+         attention op's FP8 context path would quantize them to) and the FlashInfer trtllm-gen
+         FP8 ragged FMHA runs on them directly, so the attention op's per-partition Q/K/V FP8
+         copy is skipped too. Other paths behave as "1".
+    """
+    mode = os.environ.get("TRTLLM_K3_MLA_CTX_FP8_EXPAND", "0")
+    if mode not in ("0", "1", "2"):
+        raise ValueError(f"TRTLLM_K3_MLA_CTX_FP8_EXPAND must be 0, 1 or 2, got {mode!r}")
+    return mode
+
+
+@functools.cache
+def _flashinfer_fp8_ragged_mla():
+    """FlashInfer's trtllm-gen ragged (separate Q/K/V) context FMHA, or None."""
+    try:
+        from flashinfer.prefill import trtllm_ragged_attention_deepseek
+    except ImportError:
+        return None
+    return trtllm_ragged_attention_deepseek
+
+
+_FLASHINFER_WORKSPACE_BYTES = 128 << 20
+_flashinfer_workspaces: Dict[int, torch.Tensor] = {}
+
+
+def _flashinfer_workspace(device: torch.device) -> torch.Tensor:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    workspace = _flashinfer_workspaces.get(index)
+    if workspace is None:
+        workspace = torch.zeros(_FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _flashinfer_workspaces[index] = workspace
+    return workspace
+
+
 def _is_cute_dsl_fp8_bmm_available(sm_version: Optional[int] = None) -> bool:
     if sm_version is None:
         sm_version = get_sm_version()
@@ -1105,6 +1146,292 @@ class MLA(nn.Module):
             and getattr(self.kv_b_proj, "bias", None) is None
         )
 
+    def _use_fused_fp8_kv_expand(self) -> bool:
+        """Whether the fused FP8 kv_b_proj expansion (TRTLLM_K3_MLA_CTX_FP8_EXPAND) applies.
+
+        Requires an SM100/SM103 GPU, the K3 / DeepSeek head dimensions and a bias-free FP8
+        block-scaled kv_b_proj in the DeepGEMM layout (UE8M0-resmoothed weight with the packed
+        int32 scale that fp8_swap_ab_gemm consumes).
+        """
+        if _mla_ctx_fp8_expand_mode() == "0":
+            return False
+        weight = getattr(self.kv_b_proj, "weight", None)
+        cached = getattr(self, "_fused_fp8_kv_expand_eligible", None)
+        if cached is not None and cached[0] is weight:
+            return cached[1]
+        scale = getattr(self.kv_b_proj, "weight_scale", None)
+        n = self.num_heads_tp * (self.qk_nope_head_dim + self.v_head_dim)
+        words = math.ceil(self.kv_lora_rank / (128 * 4))
+        eligible = (
+            IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() in (100, 103)
+            and self.qk_nope_head_dim == 128
+            and self.qk_rope_head_dim == 64
+            and self.v_head_dim == 128
+            and self.kv_lora_rank % 128 == 0
+            and getattr(self.kv_b_proj, "bias", None) is None
+            and weight is not None
+            and weight.dtype == torch.float8_e4m3fn
+            and tuple(weight.shape) == (n, self.kv_lora_rank)
+            and scale is not None
+            and scale.dtype == torch.int32
+            and tuple(scale.shape) == (n, words)
+            and scale.stride(0) == 1
+        )
+        self._fused_fp8_kv_expand_eligible = (weight, eligible)
+        return eligible
+
+    def _fused_fp8_kv_expand(
+        self,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        fp8_out: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """kv_b_proj + RoPE concat in one FP8 GEMM -> (k [T, H*qk_head_dim], v [T, H*v_head_dim]).
+
+        BF16 (default): v is the second half of a [T, H*(qk_nope_head_dim + v_head_dim)] buffer
+        because the attention op reads V with that row stride (see _expand_kv_to_k_v).
+        fp8_out: k and v are contiguous E4M3, the unit-scale conversion of the BF16 values.
+        """
+        from ..cute_dsl_kernels.blackwell import k3_mla_kv_expand  # noqa: F401  (registers the op)
+
+        num_tokens = compressed_kv.shape[0]
+        nope_cols = self.num_heads_tp * self.qk_nope_head_dim
+        v_cols = self.num_heads_tp * self.v_head_dim
+        out_dtype = torch.float8_e4m3fn if fp8_out else compressed_kv.dtype
+        k = compressed_kv.new_empty(
+            num_tokens, self.num_heads_tp * self.qk_head_dim, dtype=out_dtype
+        )
+        v_buffer = compressed_kv.new_empty(
+            num_tokens, v_cols if fp8_out else nope_cols + v_cols, dtype=out_dtype
+        )
+        torch.ops.trtllm.k3_mla_kv_expand(
+            compressed_kv.contiguous(),
+            k_pe.reshape(num_tokens, self.qk_rope_head_dim),
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale,
+            k,
+            v_buffer,
+            self.num_heads_tp,
+        )
+        return k, v_buffer if fp8_out else v_buffer[:, nope_cols:]
+
+    def _use_fp8_direct_chunked_prefill(self, q: torch.Tensor, output: torch.Tensor) -> bool:
+        """Whether chunked prefill runs TRTLLM_K3_MLA_CTX_FP8_EXPAND=2 (FP8 K/V + FlashInfer FMHA).
+
+        Needs the fused expansion, an FP8 KV cache (the attention op would run its FP8 context
+        FMHA with unit KV scales), BF16 Q / output without an output scale, no Helix CP or sparse
+        attention, and FlashInfer's trtllm-gen ragged FMHA.
+        """
+        if _mla_ctx_fp8_expand_mode() != "2" or not self._use_fused_fp8_kv_expand():
+            return False
+        mha = self.mha
+        return (
+            isinstance(mha, TrtllmAttention)
+            and mha.has_fp8_kv_cache
+            and not mha.uses_fp4_mla_attention
+            and mha.sparse_params is None
+            and not self.mapping.has_cp_helix()
+            and self.out_scale is None
+            and q.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and _flashinfer_fp8_ragged_mla() is not None
+        )
+
+    _fused_kv_expand_warmed: set = set()
+
+    def _warmup_fused_fp8_kv_expand(self, q: torch.Tensor, output: torch.Tensor) -> None:
+        """Compile the fused expansion kernels (both k_pe layouts, and FP8 outputs for
+        TRTLLM_K3_MLA_CTX_FP8_EXPAND=2) and load FlashInfer's FMHA once per process; otherwise
+        the first context step that reads cached KV pays the CuTe DSL compile."""
+        fp8_direct = self._use_fp8_direct_chunked_prefill(q, output)
+        key = (self.num_heads_tp, self.kv_lora_rank, fp8_direct, q.device)
+        if key in MLA._fused_kv_expand_warmed:
+            return
+        MLA._fused_kv_expand_warmed.add(key)
+        latent = q.new_zeros(1, self.kv_lora_rank + self.qk_rope_head_dim)
+        compressed_kv = latent[:, : self.kv_lora_rank].contiguous()
+        # Chunk loads give a contiguous k_pe; the last partition slices latent_cache.
+        for k_pe in (latent[:, self.kv_lora_rank :].contiguous(), latent[:, self.kv_lora_rank :]):
+            for fp8_out in (False, True) if fp8_direct else (False,):
+                k, v = self._fused_fp8_kv_expand(compressed_kv, k_pe, fp8_out=fp8_out)
+        if fp8_direct:
+            heads = self.num_heads_tp
+            cu = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
+            self._fp8_ragged_attention(
+                q.new_zeros(1, heads * self.qk_head_dim, dtype=torch.float8_e4m3fn),
+                k,
+                v,
+                q.new_empty(1, heads * self.v_head_dim),
+                torch.empty(1, heads, dtype=torch.float, device=q.device),
+                cu[1:],
+                cu,
+                cu,
+                1,
+                1,
+                causal=True,
+            )
+
+    def _fp8_ragged_attention(
+        self,
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        v_fp8: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_kv: torch.Tensor,
+        max_q: int,
+        max_kv: int,
+        causal: bool,
+    ) -> None:
+        """FlashInfer FP8 ragged FMHA over requests that all have query and KV tokens.
+
+        Writes out [Tq, H*v] (BF16) and the base-2 log-sum-exp of the scaled logits [Tq, H].
+        """
+        mha = cast(TrtllmAttention, self.mha)
+        num_tokens = q_fp8.shape[0]
+        _flashinfer_fp8_ragged_mla()(
+            q_fp8.view(num_tokens, self.num_heads_tp, self.qk_head_dim),
+            k_fp8.view(k_fp8.shape[0], self.num_heads_tp, self.qk_head_dim),
+            v_fp8.view(v_fp8.shape[0], self.num_heads_tp, self.v_head_dim),
+            _flashinfer_workspace(q_fp8.device),
+            kv_lens,
+            max_q,
+            max_kv,
+            1.0 / (mha.q_scaling * math.sqrt(self.qk_head_dim)),
+            1.0,
+            1.0,
+            cu_q.numel() - 1,
+            -1,
+            cu_q,
+            cu_kv,
+            False,
+            causal,
+            True,
+            out=out.view(num_tokens, self.num_heads_tp, self.v_head_dim),
+            lse=lse,
+            skip_all_rows_active_check=True,
+        )
+
+    def forward_context_with_chunked_prefill_fp8(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """forward_context_with_chunked_prefill with FP8 K / V straight from the fused GEMM.
+
+        Q is quantized once (unit scale, as the attention op's FP8 context path does per
+        partition); every KV partition is expanded to FP8 K / V by the fused kv_b_proj GEMM and
+        attended by FlashInfer's trtllm-gen FP8 ragged FMHA; partitions merge as before. A KV
+        partition only holds the cached tokens of some requests: FlashInfer gets each contiguous
+        run of those requests (zero-copy row slices, every row active, so it neither compacts nor
+        synchronizes); the rows of the other requests are skipped by the merge (merge_op 0).
+        The merge kernel takes (max, sum) softmax stats in natural-log units: (lse * ln 2, 1) is
+        an equivalent pair for FlashInfer's base-2 lse.
+        """
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        num_contexts = attn_metadata.num_contexts
+        num_tokens = q.shape[0]
+        q_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            q, trtllm_attention.kv_scale_orig_quant
+        )
+        self.softmax_stats_tensor = torch.empty(
+            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2), dtype=torch.float, device=q.device
+        )
+        temp_stats = torch.empty_like(self.softmax_stats_tensor)
+        temp_stats[..., 1] = 1.0
+        lse = torch.empty((num_tokens, self.num_heads_tp), dtype=torch.float, device=q.device)
+        temp_out = q.new_empty((num_tokens, self.num_heads_tp * self.v_head_dim))
+        cu_q = attn_metadata.ctx_uncached_token_indptr[: num_contexts + 1]
+        host_cu_q = attn_metadata.host_ctx_uncached_token_indptr[: num_contexts + 1].tolist()
+        q_lens = [host_cu_q[i + 1] - host_cu_q[i] for i in range(num_contexts)]
+
+        def merge(loop_idx: int) -> None:
+            torch.mul(lse, math.log(2.0), out=temp_stats[..., 0])
+            trtllm_attention.merge_attention_for_mla(
+                output,
+                temp_out,
+                self.softmax_stats_tensor,
+                temp_stats,
+                attn_metadata.merge_op_tensor[loop_idx],
+                attn_metadata,
+            )
+
+        for loop_idx in range(attn_metadata.chunked_loop_num):
+            host_cu_kv = attn_metadata.host_cu_chunked_seq_len[
+                loop_idx, : num_contexts + 1
+            ].tolist()
+            kv_lens = [host_cu_kv[i + 1] - host_cu_kv[i] for i in range(num_contexts)]
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                num_ctx_cached_tokens=host_cu_kv[num_contexts],
+                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
+                chunked_max_seq_len=attn_metadata.max_chunk_len_per_loop[loop_idx],
+                out_dtype=q.dtype,
+            )
+            k_fp8, v_fp8 = self._fused_fp8_kv_expand(
+                chunked_compressed_kv, chunked_k_pe, fp8_out=True
+            )
+            chunked_compressed_kv = None
+            chunked_k_pe = None
+            cu_kv = attn_metadata.cu_chunked_seq_len[loop_idx]
+            begin = 0
+            while begin < num_contexts:
+                if kv_lens[begin] == 0 or q_lens[begin] == 0:
+                    begin += 1
+                    continue
+                end = begin + 1
+                while end < num_contexts and kv_lens[end] > 0 and q_lens[end] > 0:
+                    end += 1
+                qs, qe = host_cu_q[begin], host_cu_q[end]
+                ks, ke = host_cu_kv[begin], host_cu_kv[end]
+                self._fp8_ragged_attention(
+                    q_fp8[qs:qe],
+                    k_fp8[ks:ke],
+                    v_fp8[ks:ke],
+                    temp_out[qs:qe],
+                    lse[qs:qe],
+                    attn_metadata.chunked_seq_len[loop_idx, begin:end],
+                    (cu_q[begin : end + 1] - qs).to(torch.int32),
+                    (cu_kv[begin : end + 1] - ks).to(torch.int32),
+                    max(q_lens[begin:end]),
+                    max(kv_lens[begin:end]),
+                    causal=False,
+                )
+                begin = end
+            k_fp8 = None
+            v_fp8 = None
+            merge(loop_idx)
+
+        # The uncached tokens attend to themselves causally.
+        _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], -1
+        )
+        k_fp8, v_fp8 = self._fused_fp8_kv_expand(compressed_kv, k_pe, fp8_out=True)
+        cu_q32 = cu_q.to(torch.int32)
+        self._fp8_ragged_attention(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            temp_out,
+            lse,
+            cu_q32[1:] - cu_q32[:-1],
+            cu_q32,
+            cu_q32,
+            max(q_lens),
+            max(q_lens),
+            causal=True,
+        )
+        merge(attn_metadata.chunked_loop_num)
+        return output
+
     def _get_kvbproj_head_weights(self):
         """Return cached per-head [H, N, K] views of kv_b_proj.weight."""
         cached = getattr(self, "_kvbproj_head_weights_cache", None)
@@ -1236,22 +1563,25 @@ class MLA(nn.Module):
         assert full_compressed_kv.is_contiguous()
         assert full_k_pe.is_contiguous()
 
-        # compute full_k_nope and full_v from full_compressed_kv
-        full_kv = self.kv_b_proj(full_compressed_kv)
-        full_k_nope, full_v = full_kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
-        )
+        if self._use_fused_fp8_kv_expand():
+            full_k, full_v = self._fused_fp8_kv_expand(full_compressed_kv, full_k_pe)
+        else:
+            # compute full_k_nope and full_v from full_compressed_kv
+            full_kv = self.kv_b_proj(full_compressed_kv)
+            full_k_nope, full_v = full_kv.split(
+                [
+                    self.num_heads_tp * self.qk_nope_head_dim,
+                    self.num_heads_tp * self.v_head_dim,
+                ],
+                -1,
+            )
 
-        full_k_nope = full_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-        )
-        full_k = full_k.view(-1, self.num_heads_tp * self.qk_head_dim)
+            full_k_nope = full_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
+            full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            full_k = maybe_compiled_cat(
+                (full_k_nope, full_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
+            )
+            full_k = full_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # release pytorch activation memory
         full_compressed_kv = None
@@ -1292,18 +1622,29 @@ class MLA(nn.Module):
 
         TRTLLM_MLA_KV_STRIDED=0 forces the cat path so both can be A/B'd in one
         build.
+
+        Fused FP8 path (TRTLLM_K3_MLA_CTX_FP8_EXPAND=1, FP8 block-scaled kv_b_proj): one GEMM
+        writes k (k_nope and the broadcast k_pe) and v directly; see _fused_fp8_kv_expand.
         """
         num_tokens = compressed_kv.shape[0]
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-
-        strided = _mla_kv_strided_enabled() and self._use_kvbproj_strided_out()
+        fused = self._use_fused_fp8_kv_expand()
+        strided = not fused and _mla_kv_strided_enabled() and self._use_kvbproj_strided_out()
         if not getattr(MLA, "_kv_expand_path_logged", False):
             MLA._kv_expand_path_logged = True
+            if fused:
+                path = "fused FP8 GEMM (no cat)"
+            else:
+                path = "strided bmm (no cat)" if strided else "wide GEMM + cat"
             logger.info(
-                f"MLA KV expansion: {'strided bmm (no cat)' if strided else 'wide GEMM + cat'} "
+                f"MLA KV expansion: {path} "
                 f"[TRTLLM_MLA_KV_STRIDED={os.environ.get('TRTLLM_MLA_KV_STRIDED', '1')}, "
-                f"eligible={self._use_kvbproj_strided_out()}]"
+                f"eligible={self._use_kvbproj_strided_out()}, "
+                f"TRTLLM_K3_MLA_CTX_FP8_EXPAND="
+                f"{os.environ.get('TRTLLM_K3_MLA_CTX_FP8_EXPAND', '0')}]"
             )
+        if fused:
+            return self._fused_fp8_kv_expand(compressed_kv, k_pe)
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         if strided:
             weight_k, weight_v = self._get_kvbproj_head_weights()
             # stride-0 batch broadcast: no per-head copy of the latent.
@@ -1612,6 +1953,10 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if self._use_fp8_direct_chunked_prefill(q, output):
+            return self.forward_context_with_chunked_prefill_fp8(
+                q, compressed_kv, latent_cache, attn_metadata, output
+            )
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
@@ -1841,6 +2186,8 @@ class MLA(nn.Module):
                     q.dtype,
                     q.device,
                 )
+                if self._use_fused_fp8_kv_expand():
+                    self._warmup_fused_fp8_kv_expand(q, output)
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100

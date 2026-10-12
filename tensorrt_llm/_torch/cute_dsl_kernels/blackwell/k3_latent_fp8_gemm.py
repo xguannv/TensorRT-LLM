@@ -733,6 +733,8 @@ class K3Fp8LatentGemmKernel:
         # Prefetched weight stages issued before waiting on the previous grid.
         self.prefetch = min(stages, self.kt_total)
         self.staging_bytes = 4 * _RES_WARP_BYTES if epilogue == EPI_RESIDUAL else 16
+        # Epilogue warps (warps 4 .. 4 + epi_warps - 1); subclasses may use two per TMEM lane quarter.
+        self.epi_warps = 4
 
     @cute.jit
     def __call__(
@@ -857,7 +859,7 @@ class K3Fp8LatentGemmKernel:
             sfb_layout,
         ).launch(
             grid=(num_ctas, 1, 1),
-            block=(_THREADS, 1, 1),
+            block=(32 * (_EPI_WARP0 + self.epi_warps), 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
             stream=stream,
@@ -906,9 +908,9 @@ class K3Fp8LatentGemmKernel:
                     cute.arch.mbarrier_init(empty + i, 1)
                 for i in cutlass.range_constexpr(self.acc_bufs):
                     cute.arch.mbarrier_init(storage.acc_full.data_ptr() + i, 1)
-                    cute.arch.mbarrier_init(storage.acc_empty.data_ptr() + i, 4)
+                    cute.arch.mbarrier_init(storage.acc_empty.data_ptr() + i, self.epi_warps)
                 cute.arch.mbarrier_init(storage.tmem_ready, 1)
-                cute.arch.mbarrier_init(storage.tmem_free, 4)
+                cute.arch.mbarrier_init(storage.tmem_free, self.epi_warps)
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
 
@@ -950,6 +952,13 @@ class K3Fp8LatentGemmKernel:
                 m_tiles,
                 tidx - 32 * _EPI_WARP0,
             )
+
+    @cute.jit
+    def tile_coords(self, t: Int32, m_tiles: Int32):
+        """``(n_tile, m_tile)`` of linear tile ``t``: column-major, so the CTAs running together
+        share a weight tile. Every warp role maps tiles through this method."""
+        n_tile = t // m_tiles
+        return n_tile, t - n_tile * m_tiles
 
     @cute.jit
     def producer(
@@ -994,7 +1003,7 @@ class K3Fp8LatentGemmKernel:
         stage_bytes = self.a_stage_bytes + self.b_stage_bytes + 512
         # Weights do not depend on the previous grid: fill the ring with the first tile's
         # weight stages, then wait for the activation.
-        n_tile0 = bidx // m_tiles
+        n_tile0, _ = self.tile_coords(bidx, m_tiles)
         if bidx < num_tiles:
             for kt in cutlass.range(self.prefetch, unroll=1):
                 with cute.arch.elect_one():
@@ -1009,8 +1018,7 @@ class K3Fp8LatentGemmKernel:
             _griddepcontrol_wait()
         it = Int32(0)
         for t in cutlass.range(bidx, num_tiles, gdim, unroll=1):
-            n_tile = t // m_tiles
-            m_tile = t - n_tile * m_tiles
+            n_tile, m_tile = self.tile_coords(t, m_tiles)
             for kt in cutlass.range(self.kt_total, unroll=1):
                 stage = it % self.stages
                 if it >= self.stages:
@@ -1058,7 +1066,7 @@ class K3Fp8LatentGemmKernel:
         sfb_base = storage.sSFB.data_ptr().toint()
         it = Int32(0)
         for t in cutlass.range(bidx, num_tiles, gdim, unroll=1):
-            n_tile = t // m_tiles
+            n_tile, _ = self.tile_coords(t, m_tiles)
             row0 = n_tile * self.bn
             blk0 = row0 // BM
             exps = []
@@ -1237,8 +1245,7 @@ class K3Fp8LatentGemmKernel:
 
         ti = Int32(0)
         for t in cutlass.range(bidx, num_tiles, gdim, unroll=1):
-            n_tile = t // m_tiles
-            m_tile = t - n_tile * m_tiles
+            n_tile, m_tile = self.tile_coords(t, m_tiles)
             buf = ti % self.acc_bufs
             tAcc = cute.make_tensor(acc_tmem_ptr + buf * self.bn, acc_layout)[((None, None), 0, 0)]
             row = m_tile * BM + q
