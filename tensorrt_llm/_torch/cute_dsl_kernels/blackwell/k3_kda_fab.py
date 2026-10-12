@@ -43,12 +43,22 @@ Design:
   already run, so progress needs ``T + 1`` co-resident CTAs, not grid-wide co-residency.
 * Launches sharing a device's counter and workspace must not overlap (stream order; with PDL the
   ticket and the refill happen after ``griddepcontrol.wait``).
+
+``f_a`` mode (:func:`k3_kda_fab_fa`) runs the same GEMM 1 and hand-off but stops at
+``bfa = bf16([f_a | b])``: every CTA becomes a worker that sums an equal share of the
+``[token, 4-row unit]`` partials (same split order, same rounding, so bitwise the ``f_a`` and
+``beta`` of the full kernel) and stores them as BF16 rows. The KDA decode then computes the
+forget gate itself (``kda_mtp_decode_v2`` ``FUSED_FB``), which removes ``W_fb``, the f_b MMA and
+the forget-gate round trip from this kernel. A worker polls the partials of every CTA, so all
+(at most 28) CTAs must become co-resident; next to the ``qkvg`` GEMM, which does not depend on
+this kernel, they do at the latest when that GEMM retires.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -295,6 +305,20 @@ def _st_global_bf16(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_global_bf16x4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
+    """Round four FP32 values to BF16 (nearest even) and store them as 8 bytes."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)] + [_fv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "{\n.reg .b32 lo, hi;\ncvt.rn.bf16x2.f32 lo, $2, $1;\ncvt.rn.bf16x2.f32 hi, $4, $3;\n"
+        "st.global.v2.b32 [$0], {lo, hi};\n}",
+        "l,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _atom_add_u64(addr, value, *, loc=None, ip=None):
     return Int64(
         _asm(
@@ -501,7 +525,9 @@ class _FabTail:
     workspace half cached in shared memory and then run :meth:`tail` on the worker CTAs.
     """
 
-    def _init_common(self, cfg, n_tiles, n1, n2, k, num_heads, use_pdl, geo):
+    def _init_common(
+        self, cfg, n_tiles, n1, n2, k, num_heads, use_pdl, geo, fa_mode=False, warm_w2=True
+    ):
         self.cfg = cfg
         self.n_tiles = n_tiles
         self.n1 = n1
@@ -509,8 +535,17 @@ class _FabTail:
         self.k = k
         self.num_heads = num_heads
         self.use_pdl = use_pdl
+        self.fa_mode = fa_mode
+        # Bytes of W_fb the control warps warm in L2 (the tail's operand; in f_a mode the KDA
+        # decode's, whose per-head TMA load would otherwise come from HBM).
+        self.warm_bytes = n2 * FA_DIM * 2 if warm_w2 else 0
         for name, value in geo.items():
             setattr(self, name, value)
+        if fa_mode:
+            # Every CTA is a worker over an equal share of the [token, 4-row unit] partials.
+            self.items = self.num_ctas
+            units_max = n_tiles * _N_TILE * (n1 // 4)
+            self.fa_units_per_thread = _ceil_div(_ceil_div(units_max, self.items), self.threads)
         self.dirty_bytes = self.groups * cfg.s * self.tg * n1 * 4
         self.beta_units = _ceil_div(num_heads, 4)
         # Tail units (4 consecutive rows of one token) a thread polls at once.
@@ -575,14 +610,15 @@ class _FabTail:
             for i in cutlass.range_constexpr(len(cached)):
                 _sts_b64(params + i * 8, cached[i])
             # Warm L2 with this CTA's share of W_fb for the tail.
-            total = self.n2 * FA_DIM * 2
-            share = _ceil_div(_ceil_div(total, self.num_ctas), 16) * 16
-            off = bidx * share
-            if off < total:
-                nbytes = Int32(share)
-                if off + share > total:
-                    nbytes = total - off
-                _prefetch_l2(w2_addr + Int64(off), nbytes)
+            total = self.warm_bytes
+            if cutlass.const_expr(total > 0):
+                share = _ceil_div(_ceil_div(total, self.num_ctas), 16) * 16
+                off = bidx * share
+                if off < total:
+                    nbytes = Int32(share)
+                    if off + share > total:
+                        nbytes = total - off
+                    _prefetch_l2(w2_addr + Int64(off), nbytes)
         cute.arch.sync_warp()
 
     @cute.jit
@@ -803,6 +839,59 @@ class _FabTail:
                     )
 
     @cute.jit
+    def tail_fa(self, params: Int32, tidx: Int32, worker: Int32, m: Int32, half: Int64):
+        """f_a mode: sum this worker's share of the partials and store ``bf16`` rows of ``bfa``.
+
+        Unit ``idx`` is rows ``[4 u, 4 u + 4)`` of token ``t`` (``idx = t * N1 / 4 + u``); its
+        ``S`` split partials are polled until set and summed in split order, as in :meth:`tail`.
+        """
+        S = self.cfg.s
+        out_addr = _lds_b64(params + _P_FG * 8)
+        upt = self.n1 // 4
+        total = m * upt
+        per = (total + self.items - 1) // self.items
+        begin = worker * per
+        end = begin + per
+        if end > total:
+            end = total
+        slot_stride = self.tg * self.n1 * 4
+        U = self.fa_units_per_thread
+        batch = max(1, _POLL_FLOATS // (4 * S))
+        for b0 in cutlass.range_constexpr(0, U, batch):
+            nb = min(batch, U - b0)
+            valid = []
+            srcs = []
+            dsts = []
+            for i in cutlass.range_constexpr(nb):
+                idx = begin + tidx + (b0 + i) * self.threads
+                t = idx // upt
+                u = idx - t * upt
+                g = t // self.tg
+                valid.append(Int32(idx < end))
+                srcs.append(
+                    half + Int64(((g * S * self.tg + t - g * self.tg) * self.n1 + 4 * u) * 4)
+                )
+                dsts.append(out_addr + Int64((t * self.n1 + 4 * u) * 2))
+            parts = cute.make_rmem_tensor((nb * S * 4,), Float32)
+            ready = Int32(0)
+            while ready == 0:
+                ready = Int32(1)
+                for i in cutlass.range_constexpr(nb):
+                    if valid[i] != 0:
+                        for sp in cutlass.range_constexpr(S):
+                            v = _ld_relaxed_v4_f32(srcs[i] + Int64(sp * slot_stride))
+                            for e in cutlass.range_constexpr(4):
+                                parts[(i * S + sp) * 4 + e] = v[e]
+                            ready = ready & _all_valid4(*v)
+            for i in cutlass.range_constexpr(nb):
+                if valid[i] != 0:
+                    v = [parts[i * S * 4 + e] for e in range(4)]
+                    for sp in cutlass.range_constexpr(1, S):
+                        for e in cutlass.range_constexpr(4):
+                            v[e] = v[e] + parts[(i * S + sp) * 4 + e]
+                    _st_global_bf16x4(dsts[i], *v)
+
+    @cute.jit
     def probe(
         self, warp: Int32, lane: Int32, t0: Int32, tb_rows: int, g: Int32, m: Int32, half: Int64
     ):
@@ -840,6 +929,9 @@ class K3KdaFabKernel(_FabTail):
         k: Hidden size (a multiple of 64).
         num_heads: ``H``; ``beta`` is rows ``[128, 128 + H)`` of ``bfa``.
         use_pdl: Launch with programmatic dependent launch.
+        fa_mode: Stop at ``bfa`` (written through the forget-gate address; see the module
+            docstring).
+        warm_w2: Warm L2 with ``W_fb`` (``n2`` rows at ``w2_addr``).
     """
 
     def __init__(
@@ -851,10 +943,21 @@ class K3KdaFabKernel(_FabTail):
         k: int,
         num_heads: int,
         use_pdl: bool,
+        fa_mode: bool = False,
+        warm_w2: bool = True,
     ):
         validate_config(cfg, n_tiles, n1, n2, k, num_heads)
         self._init_common(
-            cfg, n_tiles, n1, n2, k, num_heads, use_pdl, _geometry(cfg, n_tiles, n2, k)
+            cfg,
+            n_tiles,
+            n1,
+            n2,
+            k,
+            num_heads,
+            use_pdl,
+            _geometry(cfg, n_tiles, n2, k),
+            fa_mode,
+            warm_w2,
         )
 
     @cute.jit
@@ -1058,7 +1161,9 @@ class K3KdaFabKernel(_FabTail):
         # ---- Tail: the last T ranks are workers. ----
         worker = Int32(_lds_b64(params + _P_RANK * 8)) - (self.num_ctas - self.items)
         sW2 = storage.sW.get_tensor(w2_layout.outer, swizzle=w2_layout.inner)
-        if worker >= 0:
+        if cutlass.const_expr(self.fa_mode):
+            self.tail_fa(params, tidx, worker, m, half)
+        elif worker >= 0:
             self.tail(
                 red,
                 sW2,
@@ -1166,10 +1271,21 @@ class K3KdaFabUmmaKernel(_FabTail):
         k: int,
         num_heads: int,
         use_pdl: bool,
+        fa_mode: bool = False,
+        warm_w2: bool = True,
     ):
         validate_config(cfg, n_tiles, n1, n2, k, num_heads)
         self._init_common(
-            cfg, n_tiles, n1, n2, k, num_heads, use_pdl, _geometry(cfg, n_tiles, n2, k)
+            cfg,
+            n_tiles,
+            n1,
+            n2,
+            k,
+            num_heads,
+            use_pdl,
+            _geometry(cfg, n_tiles, n2, k),
+            fa_mode,
+            warm_w2,
         )
         self.mma_tiler = (_UMMA_M, MAX_N1, _K_CHUNK)
 
@@ -1486,7 +1602,9 @@ class K3KdaFabUmmaKernel(_FabTail):
         worker = Int32(_lds_b64(params + _P_RANK * 8)) - (self.num_ctas - self.items)
         region = storage.sB.data_ptr().toint()
         sW2 = storage.sB.get_tensor(w2_layout.outer, swizzle=w2_layout.inner)
-        if worker >= 0:
+        if cutlass.const_expr(self.fa_mode):
+            self.tail_fa(params, tidx, worker, m, half)
+        elif worker >= 0:
             self.tail(
                 region,
                 sW2,
@@ -1664,10 +1782,18 @@ def default_config(n_tiles: int, n2: int = 768, k: int = 7168) -> FabConfig:
 
 @functools.cache
 def _compiled(
-    cfg: FabConfig, n_tiles: int, n1: int, n2: int, k: int, num_heads: int, use_pdl: bool
+    cfg: FabConfig,
+    n_tiles: int,
+    n1: int,
+    n2: int,
+    k: int,
+    num_heads: int,
+    use_pdl: bool,
+    fa_mode: bool = False,
+    warm_w2: bool = True,
 ):
     kernel_cls = K3KdaFabUmmaKernel if cfg.umma else K3KdaFabKernel
-    kernel = kernel_cls(cfg, n_tiles, n1, n2, k, num_heads, use_pdl)
+    kernel = kernel_cls(cfg, n_tiles, n1, n2, k, num_heads, use_pdl, fa_mode, warm_w2)
     dummy = 1 << 20
     ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
     addr = Int64(dummy)
@@ -1763,6 +1889,106 @@ def run_k3_kda_fab(
     )
 
 
+def run_k3_kda_fab_fa(
+    x: torch.Tensor,
+    w_bfa: torch.Tensor,
+    num_heads: int,
+    bfa: torch.Tensor,
+    w_fb: torch.Tensor | None = None,
+    *,
+    config: FabConfig | None = None,
+    use_pdl: bool = True,
+) -> None:
+    """f_a mode: launch into ``bfa`` (``bf16 [M, N1]`` contiguous): ``bf16(x @ W_bfa^T)``, bitwise
+    the ``f_a`` and ``beta`` of :func:`run_k3_kda_fab` with the same ``config``. ``w_fb``
+    (``bf16 [N2, 128]``, optional) is only warmed in L2 for the decode that applies it; ``N2``
+    (768 without it) also selects the default tiling like in the full kernel."""
+    m, k = x.shape
+    n_tiles = _ceil_div(m, _N_TILE)
+    n2 = w_fb.shape[0] if w_fb is not None else 768
+    cfg = config if config is not None else default_config(n_tiles, n2, k)
+    compiled = _compiled(
+        cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads, use_pdl, True, w_fb is not None
+    )
+    words, ws = _device_state(x.device)
+    w1 = make_ptr(cutlass.BFloat16, w_bfa.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    w2_addr = w_fb.data_ptr() if w_fb is not None else w_bfa.data_ptr()
+    compiled(
+        w1,
+        make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        # The W_fb TMA operand is unused in f_a mode: any 16-byte aligned buffer of at least
+        # N2 x 128 BF16 (W_bfa without w_fb).
+        w1,
+        Int32(m),
+        Int64(w2_addr),
+        Int64(bfa.data_ptr()),
+        Int64(bfa.data_ptr()),
+        Int64(ws.data_ptr()),
+        Int64(words.data_ptr()),
+        cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+    )
+
+
+@torch.library.custom_op("trtllm::k3_kda_fab_fa", mutates_args=())
+def k3_kda_fab_fa(
+    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """``bfa = bf16(x @ w_bfa^T)`` (``bf16 [M, N1]``) by the fused fab kernel's GEMM 1 and
+    reduction (f_a mode): columns ``[0, 128)`` are ``f_a``, ``[128, 128 + num_heads)`` ``beta``,
+    bitwise as inside :func:`k3_kda_fab_proj` (same ``W_fb`` row count). ``w_fb`` is only warmed
+    in L2. Accepts what :func:`can_use_k3_kda_fab_fa` does."""
+    _check_fa_inputs(x, w_bfa, num_heads, w_fb)
+    bfa = torch.empty((x.shape[0], w_bfa.shape[0]), dtype=torch.bfloat16, device=x.device)
+    run_k3_kda_fab_fa(x, w_bfa, num_heads, bfa, w_fb)
+    return bfa
+
+
+@k3_kda_fab_fa.register_fake
+def _(
+    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], w_bfa.shape[0]))
+
+
+def _check_fa_inputs(
+    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor | None = None
+) -> None:
+    """:func:`_check_inputs` with an optional ``W_fb`` operand."""
+    if w_fb is not None:
+        _check_inputs(x, w_bfa, w_fb, num_heads)
+        return
+    for name, t in (("x", x), ("w_bfa", w_bfa)):
+        if t.dtype != torch.bfloat16 or t.dim() != 2 or not t.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous 2D bfloat16 tensor")
+        if not t.is_cuda or t.device != x.device or t.data_ptr() % 16:
+            raise ValueError(f"{name} must be a 16-byte aligned tensor on x's CUDA device")
+    m, k = x.shape
+    n1 = w_bfa.shape[0]
+    if w_bfa.shape[1] != k or not 1 <= m <= MAX_M or k % _K_CHUNK:
+        raise ValueError(f"unsupported shapes: x {tuple(x.shape)}, w_bfa {tuple(w_bfa.shape)}")
+    if n1 % 8 or not FA_DIM < n1 <= MAX_N1 or not 1 <= num_heads <= n1 - FA_DIM:
+        raise ValueError(f"N1={n1} / num_heads={num_heads} unsupported")
+
+
+def can_use_k3_kda_fab_fa(
+    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor | None = None
+) -> bool:
+    """Whether :func:`k3_kda_fab_fa` accepts these inputs (non-raising check)."""
+    if not x.is_cuda or not _is_supported_device(x.device.index):
+        return False
+    if torch.cuda.is_current_stream_capturing() and _device_index(x.device) not in _STATE:
+        return False
+    try:
+        _check_fa_inputs(x, w_bfa, num_heads, w_fb)
+        n_tiles = _ceil_div(x.shape[0], _N_TILE)
+        k = x.shape[1]
+        n2 = w_fb.shape[0] if w_fb is not None else 768
+        validate_config(default_config(n_tiles, n2, k), n_tiles, w_bfa.shape[0], n2, k, num_heads)
+    except ValueError:
+        return False
+    return True
+
+
 @torch.library.custom_op("trtllm::k3_kda_fab_proj", mutates_args=())
 def k3_kda_fab_proj(
     x: torch.Tensor, w_bfa: torch.Tensor, w_fb: torch.Tensor, num_heads: int
@@ -1823,8 +2049,11 @@ __all__ = [
     "MAX_M",
     "MAX_N1",
     "can_use_k3_kda_fab",
+    "can_use_k3_kda_fab_fa",
     "default_config",
+    "k3_kda_fab_fa",
     "k3_kda_fab_proj",
     "run_k3_kda_fab",
+    "run_k3_kda_fab_fa",
     "validate_config",
 ]

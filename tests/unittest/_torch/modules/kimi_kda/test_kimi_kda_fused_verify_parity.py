@@ -247,15 +247,20 @@ def test_plain_decode_direct_pool_matches_fallback():
     assert torch.equal(ssm_direct[untouched], ssm_fallback[untouched])
 
 
+@pytest.mark.parametrize("decode_fused_fab", [False, True])
 @pytest.mark.parametrize("fab_fused", [False, True])
 @pytest.mark.parametrize("checkpoint_fp8", [False, True])
 @torch.no_grad()
-def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, monkeypatch):
+def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, decode_fused_fab, monkeypatch):
     from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     # fab_fused: beta and the forget gate come from trtllm::k3_kda_fab_proj.
     monkeypatch.setattr(kimi_kda_mixer, "_KDA_FAB_FUSED", fab_fused)
+    # decode_fused_fab: k3_kda_fab in f_a mode, the forget gate computed inside the verify
+    # kernel (trtllm::kda_mtp_decode_fused_fb), launched with PDL.
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_FUSED_FAB", decode_fused_fab)
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_PDL", decode_fused_fab)
     torch.manual_seed(0)
     B = 4
     T = M + 1
@@ -283,6 +288,14 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, monkeypatch):
         return mtp_verify(**kwargs)
 
     rt_fused._dispatch.mtp_verify = _capturing_mtp_verify
+    fb_calls = []
+    mtp_verify_fused_fb = rt_fused._dispatch.mtp_verify_fused_fb
+
+    def _capturing_mtp_verify_fused_fb(**kwargs):
+        fb_calls.append(kwargs)
+        return mtp_verify_fused_fb(**kwargs)
+
+    rt_fused._dispatch.mtp_verify_fused_fb = _capturing_mtp_verify_fused_fb
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)
@@ -308,17 +321,16 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, monkeypatch):
     for view in (q_view, k_view, v_view, onorm_view):
         assert view.stride(-2) == 4 * rt_fused.proj_size
         assert view.stride(-1) == 1
-    assert (
-        kimi_kda_mixer._use_fused_fab(
-            x1.view(B, T, -1),
-            rt_fused._bfa_proj_weight,
-            rt_fused.f_b_proj.weight,
-            rt_fused.num_heads,
-        )
-        == fab_fused
-    )
+    assert kimi_kda_mixer._use_fused_fab(
+        x1.view(B, T, -1),
+        rt_fused._bfa_proj_weight,
+        rt_fused.f_b_proj.weight,
+        rt_fused.num_heads,
+    ) == (fab_fused or decode_fused_fab)
     # beta is a view of the [f_a | b] projection, or its own contiguous tensor when fused.
-    beta_rows = rt_fused.num_heads if fab_fused else rt_fused._bfa_proj_weight.shape[0]
+    beta_rows = (
+        rt_fused.num_heads if fab_fused or decode_fused_fab else rt_fused._bfa_proj_weight.shape[0]
+    )
     assert beta_view.stride(-2) == beta_rows
     assert beta_view.stride(-1) == 1
     out1_seq = rt_seq.forward_verify_sequential(
@@ -328,10 +340,21 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, monkeypatch):
         out1_fused = rt_fused.forward_verify(
             x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
-    assert mtp_calls[-1]["fuse_output_norm"]
-    assert not mtp_calls[-1]["mxfp8_output"]
-    assert mtp_calls[-1]["onorm_g"].stride(-2) == K
-    assert mtp_calls[-1]["onorm_g"].stride(1) == 4 * rt_fused.proj_size
+    if decode_fused_fab:
+        assert not mtp_calls and len(fb_calls) == 1
+        call = fb_calls[-1]
+        assert call["use_pdl"]
+        # f_a and beta are strided views of the f_a-mode [f_a | b] output
+        assert call["fa"].shape == (1, B * T, K)
+        assert call["fa"].stride(1) == rt_fused._bfa_proj_weight.shape[0]
+        assert call["beta"].stride(1) == rt_fused._bfa_proj_weight.shape[0]
+    else:
+        assert not fb_calls
+        call = mtp_calls[-1]
+        assert call["fuse_output_norm"]
+        assert not call["mxfp8_output"]
+    assert call["onorm_g"].stride(-2) == K
+    assert call["onorm_g"].stride(1) == 4 * rt_fused.proj_size
     print("round 1:")
     ok &= _rep("out", out1_fused, out1_seq)
 
@@ -349,7 +372,8 @@ def test_fused_vs_sequential_two_rounds(checkpoint_fp8, fab_fused, monkeypatch):
         out2_fused = rt_fused.forward_verify(
             x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
-    assert len(mtp_calls) == 2
+    assert len(mtp_calls) + len(fb_calls) == 2
+    assert len(fb_calls) == (2 if decode_fused_fab else 0)
     assert all(call["fuse_output_norm"] for call in mtp_calls)
     assert all(not call["mxfp8_output"] for call in mtp_calls)
     print("round 2 (mixed replay):")

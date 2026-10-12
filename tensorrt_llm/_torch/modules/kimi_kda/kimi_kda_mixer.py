@@ -17,6 +17,7 @@ cache-slot indexing, and speculative-verification state handling directly.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from typing import List, Optional, Tuple
@@ -57,6 +58,21 @@ _KDA_BF16_LOWM_GEMV = os.environ.get("TRTLLM_K3_BF16_LOWM_GEMV", "0") == "1"
 # many rows on the aux stream. Takes precedence over TRTLLM_K3_BF16_LOWM_GEMV.
 _KDA_FAB_FUSED = os.environ.get("TRTLLM_K3_KDA_FAB_FUSED", "0") == "1"
 _KDA_FAB_FUSED_MAX_ROWS = 256
+# Decode verify without the forget-gate round trip (takes precedence over
+# TRTLLM_K3_KDA_FAB_FUSED). Up to _KDA_FAB_FUSED_MAX_ROWS rows, k3_kda_fab runs in f_a mode
+# (BF16 [f_a | b] only) next to the QKVG GEMM and the verify kernel computes the forget gate
+# from f_a itself, when that kernel runs in one wave or the QKVG GEMM has left the low-M
+# kernel (more rows than _KDA_FUSED_FB_LOWM_ROWS: DeepGEMM on every SM, which the full fab
+# kernel slows down more). The f_b MMA costs every wave of the verify kernel, so multi-wave
+# low-M batches keep the full fab kernel. Larger row counts run the [f_a | b] -> f_b chain on
+# the aux stream as well, with f_b reading the strided f_a view directly.
+_KDA_DECODE_FUSED_FAB = os.environ.get("TRTLLM_K3_KDA_DECODE_FUSED_FAB", "0") == "1"
+_KDA_FUSED_FB_LOWM_ROWS = 224
+# Launch the verify kernel as a programmatic dependent of the QKVG projection: its state, replay
+# and weight loads run before griddepcontrol.wait. Defaults to TRTLLM_K3_KDA_DECODE_FUSED_FAB.
+_KDA_DECODE_PDL = (
+    os.environ.get("TRTLLM_K3_KDA_DECODE_PDL", "1" if _KDA_DECODE_FUSED_FAB else "0") == "1"
+)
 
 
 def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -78,12 +94,56 @@ def _use_fused_fab(
     x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
 ) -> bool:
     """Whether ``trtllm::k3_kda_fab_proj`` is enabled and accepts these operands."""
-    if not _KDA_FAB_FUSED or torch.compiler.is_compiling() or not x.is_contiguous():
+    enabled = _KDA_FAB_FUSED or _KDA_DECODE_FUSED_FAB
+    if not enabled or torch.compiler.is_compiling() or not x.is_contiguous():
         return False
     from ...cute_dsl_kernels.blackwell import k3_kda_fab
 
     return k3_kda_fab.can_use_k3_kda_fab(
         x.reshape(-1, x.shape[-1]), bfa_weight, fb_weight, num_heads
+    )
+
+
+@functools.cache
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _verify_kernel_single_wave(num_heads: int, num_requests: int, device: torch.device) -> bool:
+    """Whether ``kda_mtp_decode``'s v2 grid (cluster pairs up to ``SPLIT_MAX_TILES`` tiles) fits
+    in one wave of one CTA per SM."""
+    from ...cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import SPLIT_MAX_TILES
+
+    tiles = num_heads * num_requests
+    ctas = tiles * (2 if tiles <= SPLIT_MAX_TILES else 1)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return ctas <= _num_sms(index)
+
+
+def _use_fab_fa(
+    x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
+) -> bool:
+    """Whether the verify gate comes from ``trtllm::k3_kda_fab_fa`` + the in-kernel f_b.
+
+    ``x`` is the ``[requests, steps, hidden]`` verify input."""
+    if not _KDA_DECODE_FUSED_FAB or torch.compiler.is_compiling() or not x.is_contiguous():
+        return False
+    num_rows = x.shape[0] * x.shape[1]
+    if num_rows <= _KDA_FUSED_FB_LOWM_ROWS and not _verify_kernel_single_wave(
+        num_heads, x.shape[0], x.device
+    ):
+        return False
+    if (
+        fb_weight.dtype != torch.bfloat16
+        or not fb_weight.is_contiguous()
+        or tuple(fb_weight.shape) != (num_heads * 128, 128)
+        or fb_weight.data_ptr() % 16
+    ):
+        return False
+    from ...cute_dsl_kernels.blackwell import k3_kda_fab
+
+    return k3_kda_fab.can_use_k3_kda_fab_fa(
+        x.reshape(-1, x.shape[-1]), bfa_weight, num_heads, fb_weight
     )
 
 
@@ -1042,18 +1102,18 @@ class KimiKDALinearAttention(nn.Module):
         )
 
     def _project_verify_inputs(
-        self, x: torch.Tensor, num_rows: int, preserve_section_strides: bool = False
-    ) -> Optional[
-        tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            Optional[torch.Tensor],
-        ]
-    ]:
-        """Project fused QKVG and [f_a | b] inputs for target verification."""
+        self,
+        x: torch.Tensor,
+        num_rows: int,
+        preserve_section_strides: bool = False,
+        gate_from_fa: bool = False,
+    ) -> Optional[tuple]:
+        """Project fused QKVG and [f_a | b] inputs for target verification.
+
+        Returns ``(q, k, v, forget_gate, beta, onorm_g)``. With ``gate_from_fa`` a seventh
+        element is appended: the BF16 ``f_a`` view when the f_a-mode fab kernel served these
+        rows (``forget_gate`` is then ``None`` and the verify kernel computes it), else ``None``.
+        """
         qkvg_weight = self._qkvg_proj_weight
         fused_qkvg = self.qkvg_proj
         if qkvg_weight is None and fused_qkvg is None:
@@ -1065,11 +1125,23 @@ class KimiKDALinearAttention(nn.Module):
             return fused_qkvg(x)
 
         bfa_weight = self._bfa_proj_weight
+        fab_fa = False
         if bfa_weight is not None:
             fb_weight = self.f_b_proj.weight
-            fused_fab = _use_fused_fab(x, bfa_weight, fb_weight, self.num_heads)
+            fab_fa = gate_from_fa and _use_fab_fa(x, bfa_weight, fb_weight, self.num_heads)
+            fused_fab = not fab_fa and _use_fused_fab(x, bfa_weight, fb_weight, self.num_heads)
 
             def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
+                if fab_fa:
+                    # (beta, f_a): the verify kernel derives the forget gate from f_a.
+                    # W_fb is warmed in L2 for the verify kernel's per-head load.
+                    bfa = torch.ops.trtllm.k3_kda_fab_fa(
+                        x.reshape(-1, x.shape[-1]), bfa_weight, self.num_heads, fb_weight
+                    ).view(*x.shape[:-1], bfa_weight.shape[0])
+                    return (
+                        bfa[..., self.head_dim : self.head_dim + self.num_heads],
+                        bfa[..., : self.head_dim],
+                    )
                 if fused_fab:
                     beta, forget_gate = torch.ops.trtllm.k3_kda_fab_proj(
                         x.reshape(-1, x.shape[-1]), bfa_weight, fb_weight, self.num_heads
@@ -1081,11 +1153,21 @@ class KimiKDALinearAttention(nn.Module):
                 bfa = _lowm_gemv_or_linear(x, bfa_weight)
                 f_a = bfa[..., : self.head_dim]
                 beta = bfa[..., self.head_dim : self.head_dim + self.num_heads]
-                if _KDA_BF16_LOWM_GEMV:
+                if _KDA_BF16_LOWM_GEMV and not (
+                    _KDA_DECODE_FUSED_FAB and num_rows > _KDA_FAB_FUSED_MAX_ROWS
+                ):
                     return beta, _lowm_gemv_or_linear(f_a.contiguous(), self.f_b_proj.weight)
+                # cuBLAS reads the strided f_a rows directly (no contiguous copy).
                 return beta, self.f_b_proj(f_a)
 
-            max_rows = _KDA_FAB_FUSED_MAX_ROWS if fused_fab else _KDA_BFA_MULTISTREAM_MAX_ROWS
+            if fab_fa or fused_fab:
+                max_rows = _KDA_FAB_FUSED_MAX_ROWS
+            elif _KDA_DECODE_FUSED_FAB:
+                # Large batches: the unfused chain still overlaps the (all-SM) QKVG GEMM better
+                # than it runs after it.
+                max_rows = num_rows
+            else:
+                max_rows = _KDA_BFA_MULTISTREAM_MAX_ROWS
             projection_aux_stream = (
                 self._projection_aux_stream if 0 < num_rows <= max_rows else None
             )
@@ -1117,6 +1199,9 @@ class KimiKDALinearAttention(nn.Module):
             )
             if onorm_g is not None:
                 onorm_g = onorm_g.contiguous()
+        if gate_from_fa:
+            f_a = forget_gate if fab_fa else None
+            return q_proj, k_proj, v_proj, None if fab_fa else forget_gate, beta, onorm_g, f_a
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
     def forward_verify_fused(
@@ -1137,7 +1222,19 @@ class KimiKDALinearAttention(nn.Module):
         x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
         T_total = num_decodes * num_steps
 
-        projections = self._project_verify_inputs(x, T_total, preserve_section_strides=True)
+        # The fused epilogue emits the Rubin CuTe scale layout. SM100/103
+        # keep the output BF16 and let the resident-weight DeepGEMM projection
+        # quantize it, while SM107 can pass the prequantized pair through.
+        mxfp8_output = self._fp8_resident_projections and bool(
+            getattr(self.o_proj, "supports_prequantized_input", False)
+        )
+        projections = self._project_verify_inputs(
+            x,
+            T_total,
+            preserve_section_strides=True,
+            gate_from_fa=_KDA_DECODE_FUSED_FAB and not mxfp8_output,
+        )
+        f_a = None
         if projections is None:
             q_proj = self.q_proj(x)
             k_proj = self.k_proj(x)
@@ -1146,13 +1243,14 @@ class KimiKDALinearAttention(nn.Module):
             beta_proj = self.b_proj(x)
             onorm_g = None
         else:
-            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections
+            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections[:6]
+            if len(projections) > 6:
+                f_a = projections[6]
         x_q = q_proj.view(1, T_total, H, K)
         x_k = k_proj.view(1, T_total, H, K)
         x_v = v_proj.view(1, T_total, H, self.head_dim)
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
-        g = forget_gate.view(1, T_total, H, K)
         beta = beta_proj.view(1, T_total, H)
         if onorm_g is None:
             raise RuntimeError(
@@ -1160,12 +1258,6 @@ class KimiKDALinearAttention(nn.Module):
             )
         if self._onorm_w_f32 is None:
             raise RuntimeError("optimized KDA MTP verify requires finalized output-norm weights")
-        # The fused epilogue emits the Rubin CuTe scale layout. SM100/103
-        # keep the output BF16 and let the resident-weight DeepGEMM projection
-        # quantize it, while SM107 can pass the prequantized pair through.
-        mxfp8_output = self._fp8_resident_projections and bool(
-            getattr(self.o_proj, "supports_prequantized_input", False)
-        )
         forward_prequantized = None
         if mxfp8_output:
             forward_prequantized = getattr(self.o_proj, "forward_prequantized", None)
@@ -1178,6 +1270,40 @@ class KimiKDALinearAttention(nn.Module):
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
 
+        if f_a is not None:
+            # Forget gate bf16(f_a @ W_fb^T) inside the verify kernel.
+            out = self._dispatch.mtp_verify_fused_fb(
+                x_q=x_q,
+                x_k=x_k,
+                x_v=x_v,
+                w_q=w_q,
+                w_k=w_k,
+                w_v=w_v,
+                cs_q=layer_cache.kda_conv_q,
+                cs_k=layer_cache.kda_conv_k,
+                cs_v=layer_cache.kda_conv_v,
+                fa=f_a.view(1, T_total, K),
+                w_fb=self.f_b_proj.weight.detach(),
+                beta=beta,
+                A_log=self.A_log.detach(),
+                dt_bias=self.dt_bias.detach(),
+                recurrent_state=ssm_pool,
+                k_cache=layer_cache.kda_k_cache,
+                g_cache=layer_cache.kda_g_cache,
+                v_cache=layer_cache.kda_v_cache,
+                beta_cache=layer_cache.kda_beta_cache,
+                ssm_state_indices=slot_indices,
+                num_spec=num_spec,
+                num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
+                lower_bound=lower_bound,
+                scale=self.head_k_dim**-0.5,
+                onorm_g=onorm_g_view,
+                onorm_weight=self._onorm_w_f32,
+                onorm_eps=self.o_norm.eps,
+                use_pdl=_KDA_DECODE_PDL,
+            )
+            return self.o_proj(out.view(-1, self.proj_size))
+        g = forget_gate.view(1, T_total, H, K)
         out = self._dispatch.mtp_verify(
             x_q=x_q,
             x_k=x_k,
@@ -1211,6 +1337,7 @@ class KimiKDALinearAttention(nn.Module):
             onorm_eps=self.o_norm.eps,
             fuse_output_norm=True,
             mxfp8_output=mxfp8_output,
+            use_pdl=_KDA_DECODE_PDL and not mxfp8_output,
         )
         if mxfp8_output:
             if not isinstance(out, tuple):
