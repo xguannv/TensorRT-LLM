@@ -1,5 +1,6 @@
 import json
 import os
+from typing import Callable, List
 
 import safetensors
 import torch
@@ -9,6 +10,12 @@ from tensorrt_llm.logger import logger
 
 class ExpertStatistic:
     expert_statistic_obj = None
+    # Called with the iteration id at the start of every executor forward step.
+    _iteration_callbacks: List[Callable[[int], None]] = []
+
+    @staticmethod
+    def register_iteration_callback(callback: Callable[[int], None]) -> None:
+        ExpertStatistic._iteration_callbacks.append(callback)
 
     @staticmethod
     def get():
@@ -36,6 +43,8 @@ class ExpertStatistic:
 
     @staticmethod
     def set_iter(iter_id: int) -> None:
+        for callback in ExpertStatistic._iteration_callbacks:
+            callback(iter_id)
         if ExpertStatistic.expert_statistic_obj is not None:
             ExpertStatistic.expert_statistic_obj._set_iter(iter_id)
 

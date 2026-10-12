@@ -119,6 +119,11 @@ from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.fused_moe.interface import MoESchedulerKind
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
+from ..modules.kimi_k3_expert_placement import (
+    expert_placement_for_layer,
+    get_routing_recorder,
+    permute_router_to_slots,
+)
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
@@ -427,23 +432,28 @@ class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
     ``precomputed`` right before calling the routed experts; the next ``apply``
     returns and clears them instead of routing ``logits`` again. Alternatively it
     stores a ``deferred`` callable that the next ``apply`` runs (once) on ``logits``.
+    ``observer``, when set, is called with every top-k id tensor ``apply`` returns.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.precomputed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self.deferred: Optional[Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = None
+        self.observer: Optional[Callable[[torch.Tensor], None]] = None
 
     def apply(
         self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.precomputed is not None:
             result, self.precomputed = self.precomputed, None
-            return result
-        if self.deferred is not None:
+        elif self.deferred is not None:
             route, self.deferred = self.deferred, None
-            return route(logits)
-        return super().apply(logits, input_ids)
+            result = route(logits)
+        else:
+            result = super().apply(logits, input_ids)
+        if self.observer is not None and not torch.compiler.is_compiling():
+            self.observer(result[0])
+        return result
 
 
 class KimiK3RMSNorm(nn.Module):
@@ -1719,27 +1729,35 @@ _K3_DEFAULT_ROUTED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_MXFP8
 # ---------------------------------------------------------------------------
 
 
-def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+# Loader signature: ``(backend, base, ckpt_expert_idx, slot_expert_idx, local_slot_id,
+# get_tensor)``. ``ckpt_expert_idx`` names the checkpoint tensors; ``slot_expert_idx`` is the
+# routed-expert id the slot serves (the same id unless TRTLLM_K3_EXPERT_PLACEMENT relabels it).
+def _load_packed_mxfp4_expert(
+    backend, base, ckpt_expert_idx, slot_expert_idx, local_slot_id, get_tensor
+) -> None:
+    prefix = f"{base}.{ckpt_expert_idx}"
     backend.quant_method.load_packed_mxfp4_expert(
         backend,
-        global_expert_id=expert_idx,
+        global_expert_id=slot_expert_idx,
         local_slot_id=local_slot_id,
-        w1_weight=get_tensor(f"{base}.{expert_idx}.w1.weight_packed"),
-        w1_weight_scale=get_tensor(f"{base}.{expert_idx}.w1.weight_scale"),
-        w2_weight=get_tensor(f"{base}.{expert_idx}.w2.weight_packed"),
-        w2_weight_scale=get_tensor(f"{base}.{expert_idx}.w2.weight_scale"),
-        w3_weight=get_tensor(f"{base}.{expert_idx}.w3.weight_packed"),
-        w3_weight_scale=get_tensor(f"{base}.{expert_idx}.w3.weight_scale"),
+        w1_weight=get_tensor(f"{prefix}.w1.weight_packed"),
+        w1_weight_scale=get_tensor(f"{prefix}.w1.weight_scale"),
+        w2_weight=get_tensor(f"{prefix}.w2.weight_packed"),
+        w2_weight_scale=get_tensor(f"{prefix}.w2.weight_scale"),
+        w3_weight=get_tensor(f"{prefix}.w3.weight_packed"),
+        w3_weight_scale=get_tensor(f"{prefix}.w3.weight_scale"),
     )
 
 
-def _load_nvfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+def _load_nvfp4_expert(
+    backend, base, ckpt_expert_idx, slot_expert_idx, local_slot_id, get_tensor
+) -> None:
     backend.quant_method.load_streaming_nvfp4_expert(
         backend,
-        global_expert_id=expert_idx,
+        global_expert_id=slot_expert_idx,
         local_slot_id=local_slot_id,
         **{
-            f"{w}_{kind}": get_tensor(f"{base}.{expert_idx}.{w}.{kind}")
+            f"{w}_{kind}": get_tensor(f"{base}.{ckpt_expert_idx}.{w}.{kind}")
             for w in ("w1", "w2", "w3")
             for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
         },
@@ -1968,6 +1986,29 @@ class KimiK3MoERuntime(nn.Module):
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
         self.expert_hi = self.expert_lo + self.experts_per_rank
+        # TRTLLM_K3_EXPERT_PLACEMENT: routed-expert id (slot) s holds checkpoint expert
+        # expert_of_slot[s]; ``load_weights`` loads the slots accordingly and permutes the router
+        # into slot order. ``ckpt_expert_ids`` names the checkpoint expert of each local slot.
+        self.expert_of_slot = expert_placement_for_layer(
+            layer_idx, self.num_experts, routed_moe_model_config.mapping.moe_ep_size
+        )
+        self.ckpt_expert_ids = (
+            self.local_expert_ids
+            if self.expert_of_slot is None
+            else tuple(self.expert_of_slot[slot] for slot in self.local_expert_ids)
+        )
+        routing_recorder = get_routing_recorder(
+            rank=model_config.mapping.rank,
+            num_layers=cfg.num_hidden_layers,
+            num_experts=self.num_experts,
+            first_layer=cfg.first_k_dense_replace,
+        )
+        if routing_recorder is not None and isinstance(
+            self.routed_experts.routing_method, _KimiK3RoutingMethod
+        ):
+            self.routed_experts.routing_method.observer = functools.partial(
+                routing_recorder.record, layer_idx
+            )
 
         shared_intermediate = cfg.moe_intermediate_size * cfg.num_shared_experts
         attention_dp = model_config.mapping.enable_attention_dp
@@ -4040,7 +4081,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             moe = layer.block_sparse_moe
             base = f"{prefix}model.layers.{layer_idx}.block_sparse_moe.experts"
             kinds = moe.expert_ckpt_spec.kinds
-            for expert_idx in moe.local_expert_ids:
+            for expert_idx in moe.ckpt_expert_ids:
                 for w in ("w1", "w2", "w3"):
                     for kind in kinds:
                         expected_keys.add(f"{base}.{expert_idx}.{w}.{kind}")
@@ -4080,6 +4121,26 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # Lazy source mappings are load-scoped; finish nonblocking H2D
             # work before the caller can release the weights container.
             torch.cuda.synchronize(device)
+        self._permute_routers_to_expert_placement()
+
+    def _permute_routers_to_expert_placement(self) -> None:
+        """Reorder the router of every layer with a static expert placement into slot order.
+
+        Runs once, after the checkpoint values are in place; see ``TRTLLM_K3_EXPERT_PLACEMENT``.
+        """
+        num_permuted = 0
+        for layer in self.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if not isinstance(moe, KimiK3MoERuntime) or moe.expert_of_slot is None:
+                continue
+            permute_router_to_slots(
+                moe.gate.weight.data, moe.gate.e_score_correction_bias.data, moe.expert_of_slot
+            )
+            num_permuted += 1
+        if num_permuted:
+            logger.info(
+                f"Kimi K3: routers of {num_permuted} MoE layers permuted to the expert placement"
+            )
 
     def _validate_checkpoint_keys(
         self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
@@ -4422,6 +4483,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         def load_expert(
             moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
         ):
+            """Load checkpoint expert ``expert_idx`` into local slot ``local_slot_id``."""
             if device.type == "cuda":
                 torch.cuda.set_device(device)
             backend = moe.routed_experts.backend
@@ -4429,12 +4491,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # split-file and the shared-dict fallback alike), so this is the
             # one place preparation has to be hooked.
             ensure_prepared(moe)
-            moe.expert_ckpt_spec.loader(backend, base, expert_idx, local_slot_id, get_tensor)
+            moe.expert_ckpt_spec.loader(
+                backend,
+                base,
+                expert_idx,
+                moe.local_expert_ids[local_slot_id],
+                local_slot_id,
+                get_tensor,
+            )
             maybe_finalize_layer(moe)
 
         def load_experts_from_weights(layer_idx: int, moe: KimiK3MoERuntime, base: str):
             del layer_idx
-            for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
+            for local_slot_id, expert_idx in enumerate(moe.ckpt_expert_ids):
                 load_expert(
                     moe,
                     base,
@@ -4472,7 +4541,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             split_file_jobs = []
             for layer_idx, moe, base in expert_jobs:
                 del layer_idx
-                for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
+                for local_slot_id, expert_idx in enumerate(moe.ckpt_expert_ids):
                     keys = [
                         f"{base}.{expert_idx}.{w}.{kind}"
                         for w in ("w1", "w2", "w3")
