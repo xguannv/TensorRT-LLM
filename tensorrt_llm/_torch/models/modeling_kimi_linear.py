@@ -239,6 +239,10 @@ if _K3_SHARED_FIRST not in ("0", "1", "router"):
     raise ValueError(f"TRTLLM_K3_SHARED_FIRST must be 0, 1 or router, got {_K3_SHARED_FIRST!r}")
 _K3_SHARED_FIRST_MIN_M = int(os.environ.get("TRTLLM_K3_SHARED_FIRST_MIN_M", "257"))
 _K3_SHARED_FIRST_MAX_M = int(os.environ.get("TRTLLM_K3_SHARED_FIRST_MAX_M", "2048"))
+# The shared expert's all-reduce runs beside the persistent routed GEMMs, which leave no room for
+# the per-SM programs of the pipelined NVLS kernel (TRTLLM_NVLS_AR_V2=1), so it keeps the one-shot
+# NVLS kernel unless TRTLLM_K3_SHARED_AR_NVLS_V2=1.
+_K3_SHARED_AR_NVLS_V2 = os.environ.get("TRTLLM_K3_SHARED_AR_NVLS_V2", "0") == "1"
 # CUDA stream priority of the stream shared by the attention-side aux work and the MoE shared
 # expert. Negative values let the shared-expert chain take SMs ahead of the persistent routed
 # GEMMs on the main stream, so its all-reduce does not land after them.
@@ -1899,6 +1903,9 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
+        shared_ar = getattr(self.shared_experts.down_proj, "all_reduce", None)
+        if not _K3_SHARED_AR_NVLS_V2 and getattr(shared_ar, "nvls_allreduce", None) is not None:
+            shared_ar.nvls_allreduce.version = 1
         # Set when the shared expert's TP-sharded down projection is converted
         # to the FP8 weight read, which does not reduce its output itself.
         self.shared_down_all_reduce = None
