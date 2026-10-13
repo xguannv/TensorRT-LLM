@@ -21,6 +21,7 @@ from ..attention_backend.sparse.hooks import get_sparse_attention_hooks
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
+from ..distributed.helix_a2a_fused import HELIX_A2A_FUSED, HelixAllToAllFused
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
 from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
@@ -268,6 +269,13 @@ def _helix_post_process(
         gathered = _helix_nccl_post_alltoall(gathered)
         return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
                                                    1.0)
+    elif HELIX_A2A_FUSED and HelixAllToAllFused.supports(
+            mapping, partial_o, num_heads_tp_cp, value_dim):
+        # One kernel exchanges and combines (bitwise like the FIFO paths below);
+        # its sender applies zero_kv_mask.
+        return HelixAllToAllFused.get(mapping)(partial_o, softmax_stats,
+                                               num_heads_tp_cp, value_dim,
+                                               zero_kv_mask)
     else:
         # FIFO-based implementation using MNNVL workspace.
         helix = HelixAllToAllNative.get(mapping)
