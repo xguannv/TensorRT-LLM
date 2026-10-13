@@ -832,19 +832,39 @@ class AllReduce(nn.Module):
             # NVLink SHARP (multicast) all-reduce for plain BF16 sums in
             # [TRTLLM_NVLS_AR_MIN_BYTES, TRTLLM_NVLS_AR_MAX_BYTES] on TP groups
             # of at least TRTLLM_NVLS_AR_MIN_WORLD_SIZE ranks; off by default.
-            if (os.environ.get("TRTLLM_NVLS_AR", "0") == "1"
-                    and not self._disable_mpi
-                    and dtype in (None, torch.bfloat16) and self.strategy
-                    in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL)
-                    and self.mapping.tp_size >= int(
-                        os.environ.get("TRTLLM_NVLS_AR_MIN_WORLD_SIZE", "16"))
-                    and NVLSAllReduce.is_supported(self.mapping)):
-                try:
-                    self.nvls_allreduce = NVLSAllReduce(self.mapping)
-                except RuntimeError as e:
-                    logger.warning(
-                        f"NVLS AllReduce can't be enabled due to {e}.")
-                    self.nvls_allreduce = None
+            if os.environ.get("TRTLLM_NVLS_AR", "0") == "1":
+                self.nvls_allreduce = self._create_nvls_allreduce(dtype)
+
+    def _create_nvls_allreduce(
+            self, dtype: Optional[torch.dtype]) -> Optional[NVLSAllReduce]:
+        """The NVLS all-reduce of this group, or None (the reason is logged once)."""
+        min_world_size = int(
+            os.environ.get("TRTLLM_NVLS_AR_MIN_WORLD_SIZE", "16"))
+        if self.mapping.tp_size < min_world_size:
+            logger.info_once(
+                f"[NVLS AR] not used for tp_size={self.mapping.tp_size} < "
+                f"TRTLLM_NVLS_AR_MIN_WORLD_SIZE={min_world_size}",
+                key=("nvls_ar_small_group", self.mapping.tp_size))
+            return None
+        if self._disable_mpi:
+            reason = "MPI is disabled"
+        elif dtype not in (None, torch.bfloat16):
+            reason = f"dtype {dtype} is not BF16"
+        elif self.strategy not in (AllReduceStrategy.AUTO,
+                                   AllReduceStrategy.MNNVL):
+            reason = f"strategy {self.strategy} is not AUTO or MNNVL"
+        elif not NVLSAllReduce.is_supported(self.mapping):
+            reason = "the mapping or GPU is not supported (needs SM90+, no CP, no attention DP)"
+        else:
+            try:
+                return NVLSAllReduce(self.mapping)
+            except RuntimeError as e:
+                reason = f"workspace setup failed: {e}"
+        logger.warning_once(
+            f"[NVLS AR] TRTLLM_NVLS_AR=1, but tp_size={self.mapping.tp_size} "
+            f"all-reduces fall back to {self.strategy}: {reason}",
+            key=("nvls_ar_fallback", reason))
+        return None
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
@@ -932,8 +952,14 @@ class AllReduce(nn.Module):
         if (self.nvls_allreduce is not None
                 and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
                 and NVLS_AR_MIN_BYTES <= input.numel() * input.element_size() <=
-                NVLS_AR_MAX_BYTES and self.nvls_allreduce.can_use(input)):
-            return self.nvls_allreduce(input)
+                NVLS_AR_MAX_BYTES):
+            if self.nvls_allreduce.can_use(input):
+                return self.nvls_allreduce(input)
+            logger.warning_once(
+                f"[NVLS AR] {input.dtype} input of shape {tuple(input.shape)} "
+                f"falls back to {self.strategy} (needs contiguous BF16 with "
+                f"a hidden size that is a multiple of 8)",
+                key=("nvls_ar_input_fallback", input.dtype, input.shape[-1]))
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:

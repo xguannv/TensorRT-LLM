@@ -103,6 +103,9 @@ _V2_KNOBS = {
     "probe": ("TRTLLM_NVLS_AR_V2_PROBE", 1),
 }
 
+# Kernel versions whose first call has been logged (True: pipelined).
+_FIRST_CALL_LOGGED = set()
+
 # 0xFFFF as int16: a BF16 NaN pattern the reducer never stores.
 _SENTINEL_BITS = -1
 _SENTINEL: tl.constexpr = tl.constexpr(_SENTINEL_BITS)
@@ -637,6 +640,17 @@ class NVLSAllReduce:
         self.debug_timestamps: Optional[torch.Tensor] = None
         self.use_pdl = get_env_enable_pdl()
         self._ws = self._get_workspace(mapping, slot, self.max_bytes)
+        if self.version == 2:
+            kernels = (
+                f"pipelined kernel (v2) from {cfg['min_bytes']} bytes, one-shot kernel (v1) below"
+            )
+        else:
+            kernels = "one-shot kernel (v1)"
+        logger.info_once(
+            f"[NVLS AR] active on tp_size={self.world_size}: {kernels}; AllReduce routes plain "
+            f"BF16 sums of [{NVLS_AR_MIN_BYTES}, {NVLS_AR_MAX_BYTES}] bytes here ({__file__})",
+            key=("nvls_ar_active", self.world_size, self.version),
+        )
 
     @staticmethod
     def is_supported(mapping: Mapping) -> bool:
@@ -726,7 +740,15 @@ class NVLSAllReduce:
         if out is None:
             out = torch.empty_like(inp)
         ws = self._ws
-        if self._uses_v2(inp):
+        use_v2 = self._uses_v2(inp)
+        if use_v2 not in _FIRST_CALL_LOGGED:
+            _FIRST_CALL_LOGGED.add(use_v2)
+            capturing = " (CUDA graph capture)" if torch.cuda.is_current_stream_capturing() else ""
+            logger.info(
+                f"[NVLS AR] first {'pipelined (v2)' if use_v2 else 'one-shot (v1)'} kernel "
+                f"call{capturing}: shape {tuple(inp.shape)}, {inp.numel() * 2} bytes"
+            )
+        if use_v2:
             self._launch_v2(inp, out)
             return out
         rpp = self.rows_per_program
