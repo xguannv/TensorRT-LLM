@@ -161,6 +161,9 @@ def _k3_zero_residual(numel: int, device: torch.device) -> Optional[torch.Tensor
 # SM100/SM103 FP8 weight-read projections with few rows (per-shape limit, see
 # k3_fp8w_lowm_gemm.can_run) run the CuTe low-M GEMM instead of DeepGEMM swap-AB.
 _K3_FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
+# With the low-M GEMM on, also serve projections marked ``fp8w_lowm_partial_n_tile`` (the MLA
+# fused q_a/kv_a projection, 2112 rows) although N is not a multiple of 128.
+_K3_FP8W_LOWM_FUSED_A = os.environ.get("TRTLLM_K3_FP8W_LOWM_FUSED_A", "0") == "1"
 
 # SMs the DeepGEMM swap-AB GEMM of the SM100/SM103 FP8 weight-read projections leaves free
 # (default 0). DeepGEMM compiles its static persistent grid for a fixed SM count, one CTA per SM;
@@ -1178,12 +1181,17 @@ def _rubin_mxfp8_is_available() -> bool:
 
 
 def _k3_lowm_gemm_can_run(
-    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    allow_partial_n_tile: bool = False,
 ) -> bool:
     """Whether ``trtllm::k3_fp8w_lowm_gemm`` serves this projection (registers the op)."""
     from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
 
-    return k3_fp8w_lowm_gemm.can_run(x, weight, weight_scale)
+    return k3_fp8w_lowm_gemm.can_run(
+        x, weight, weight_scale, allow_partial_n_tile=allow_partial_n_tile
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -1263,6 +1271,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # tensor that the low-M GEMM writes its result into. Other paths return their own
         # tensor, so the caller compares the result with the buffer it handed in.
         self.next_output: Optional[torch.Tensor] = None
+        # Copied from the source ``Linear`` (the MLA fused q_a/kv_a projection sets it): the
+        # low-M GEMM may serve this weight although N is not a multiple of 128.
+        self.fp8w_lowm_partial_n_tile = False
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -1352,6 +1363,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             result.quant_config = linear.quant_config
             result.tp_size, result.tp_rank = linear.tp_size, linear.tp_rank
             result._weights_transformed = False
+            result.fp8w_lowm_partial_n_tile = getattr(linear, "fp8w_lowm_partial_n_tile", False)
             return result
         weight_fp8, weight_scale = cls.quantize_weight(linear.weight.data)
         return cls(weight_fp8, weight_scale, linear.out_features)
@@ -1400,7 +1412,12 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         elif (
             _K3_FP8W_LOWM_GEMM
             and x.dtype == torch.bfloat16
-            and _k3_lowm_gemm_can_run(x_flat, self.weight, self.weight_scale)
+            and _k3_lowm_gemm_can_run(
+                x_flat,
+                self.weight,
+                self.weight_scale,
+                allow_partial_n_tile=_K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile,
+            )
         ):
             if (
                 out_buffer is not None

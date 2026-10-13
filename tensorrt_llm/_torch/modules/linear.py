@@ -65,13 +65,21 @@ from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
 # k3_fp8w_lowm_gemm.can_run) run the CuTe low-M FP8-weight GEMM instead of DeepGEMM
 # swap-AB.
 _FP8W_LOWM_GEMM = os.environ.get("TRTLLM_K3_FP8W_LOWM_GEMM", "0") == "1"
+# With the low-M GEMM on, also serve linears that set ``fp8w_lowm_partial_n_tile`` (the
+# MLA fused q_a/kv_a projection, 2112 rows) although N is not a multiple of 128.
+_FP8W_LOWM_FUSED_A = os.environ.get("TRTLLM_K3_FP8W_LOWM_FUSED_A", "0") == "1"
 
 
-def _fp8w_lowm_gemm_can_run(input: torch.Tensor, weight: torch.Tensor,
-                            weight_scale: torch.Tensor) -> bool:
+def _fp8w_lowm_gemm_can_run(input: torch.Tensor,
+                            weight: torch.Tensor,
+                            weight_scale: torch.Tensor,
+                            allow_partial_n_tile: bool = False) -> bool:
     """Whether ``trtllm::k3_fp8w_lowm_gemm`` serves this GEMM (registers the op)."""
     from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
-    return k3_fp8w_lowm_gemm.can_run(input, weight, weight_scale)
+    return k3_fp8w_lowm_gemm.can_run(input,
+                                     weight,
+                                     weight_scale,
+                                     allow_partial_n_tile=allow_partial_n_tile)
 
 
 def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
@@ -1367,7 +1375,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     module.weight_scale)
         elif is_sm_100f() and not module.disable_deep_gemm:
             if _FP8W_LOWM_GEMM and _fp8w_lowm_gemm_can_run(
-                    input, module.weight, module.weight_scale):
+                    input,
+                    module.weight,
+                    module.weight_scale,
+                    allow_partial_n_tile=_FP8W_LOWM_FUSED_A
+                    and getattr(module, "fp8w_lowm_partial_n_tile", False)):
                 output = torch.ops.trtllm.k3_fp8w_lowm_gemm(
                     input, module.weight, module.weight_scale)
             else:

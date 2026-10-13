@@ -62,14 +62,7 @@ def _assert_matches_reference(actual: torch.Tensor, expected: torch.Tensor, fp8:
     assert relative_l2 < (0.08 if fp8 else 0.01), f"relative L2 error: {relative_l2}"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    "fp8", [False, pytest.param(True, marks=skip_pre_blackwell)], ids=["bf16", "fp8"]
-)
-@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
-def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
-    torch.manual_seed(42)
-    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+def _k3_mla_config(gate: bool) -> KimiLinearConfig:
     config = KimiLinearConfig(
         vocab_size=128,
         hidden_size=256,
@@ -91,7 +84,16 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
         max_position_embeddings=512,
     )
     config._attn_implementation = "eager"
-    reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+    return config
+
+
+def _build_k3_mla(
+    config: KimiLinearConfig,
+    reference: KimiMLAAttention,
+    mapping: Mapping,
+    fp8: bool,
+):
+    """K3 model with one MLA layer holding ``reference``'s (FP8-quantized) weights."""
     weights = _checkpoint_weights(reference, fp8)
     model_config = ModelConfig(
         pretrained_config=config,
@@ -123,6 +125,40 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
     for module in runtime.modules():
         if callable(getattr(module, "post_load_weights", None)):
             module.post_load_weights()
+    return model, runtime
+
+
+def _decode_metadata(manager, mapping: Mapping, batch: int, context_length: int):
+    """Metadata of one generation step after a ``context_length``-token prefill."""
+    metadata = get_attention_backend("TRTLLM").Metadata(
+        seq_lens=torch.ones(batch, dtype=torch.int),
+        request_ids=list(range(batch)),
+        max_num_requests=batch,
+        num_contexts=0,
+        prompt_lens=[context_length] * batch,
+        max_num_tokens=batch,
+        kv_cache_manager=manager,
+        kv_cache_params=KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=[context_length] * batch
+        ),
+        mapping=mapping,
+        enable_context_mla_with_cached_kv=True,
+    )
+    metadata.prepare()
+    return metadata
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "fp8", [False, pytest.param(True, marks=skip_pre_blackwell)], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
+def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
+    torch.manual_seed(42)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    config = _k3_mla_config(gate)
+    reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+    model, runtime = _build_k3_mla(config, reference, mapping, fp8)
     reference.cuda()
 
     batch, context_length = 2, 128
@@ -166,27 +202,113 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
 
         for request_id in range(batch):
             manager.impl.add_token(request_id)
-        metadata = get_attention_backend("TRTLLM").Metadata(
-            seq_lens=torch.ones(batch, dtype=torch.int),
-            request_ids=list(range(batch)),
-            max_num_requests=batch,
-            num_contexts=0,
-            prompt_lens=[context_length] * batch,
-            max_num_tokens=batch,
-            kv_cache_manager=manager,
-            kv_cache_params=KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=[context_length] * batch
-            ),
-            mapping=mapping,
-            enable_context_mla_with_cached_kv=True,
-        )
-        metadata.prepare()
+        metadata = _decode_metadata(manager, mapping, batch, context_length)
         extra_attrs["attention_metadata"] = weakref.ref(metadata)
         with model_extra_attrs(extra_attrs):
             actual = runtime(hidden[:, -1].contiguous(), metadata)
         _assert_matches_reference(actual, expected[:, -1], fp8)
     finally:
         manager.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="needs an SM100/SM103 GPU",
+)
+@pytest.mark.parametrize("batch", [2, 7])
+def test_k3_mla_fp8_lowm_fused_a(batch: int, monkeypatch) -> None:
+    """``TRTLLM_K3_FP8W_LOWM_FUSED_A``: the fused 2112-row Q-A/KV-A projection runs the low-M
+    FP8 GEMM at decode, and the MLA output still matches Hugging Face and the DeepGEMM run."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    torch.manual_seed(42)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    config = _k3_mla_config(gate=True)
+    reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+    model, runtime = _build_k3_mla(config, reference, mapping, fp8=True)
+    reference.cuda()
+    mla = runtime.mixer
+    # The loader swaps every FP8 attention Linear for the K3 weight-read module; the swap
+    # keeps the partial-tile mark of the fused projection.
+    fused_a = mla.kv_a_proj_with_mqa
+    assert isinstance(fused_a, kimi._Fp8BlockScaleWeightReadLinear)
+    assert mla.fuse_qkv_a_proj and fused_a.fp8w_lowm_partial_n_tile
+    assert not mla.o_proj.fp8w_lowm_partial_n_tile
+    n = config.q_lora_rank + config.kv_lora_rank + config.qk_rope_head_dim
+    assert fused_a.weight.shape == (n, config.hidden_size)
+
+    calls = []
+    can_run = kimi._k3_lowm_gemm_can_run
+
+    def spy(x, weight, weight_scale, allow_partial_n_tile=False):
+        result = can_run(x, weight, weight_scale, allow_partial_n_tile=allow_partial_n_tile)
+        calls.append((weight.shape[0], x.shape[0], result))
+        return result
+
+    monkeypatch.setattr(kimi, "_k3_lowm_gemm_can_run", spy)
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+
+    context_length = 128
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    hidden = torch.randn(
+        batch,
+        context_length + 1,
+        config.hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    causal_mask = torch.full(
+        (context_length + 1, context_length + 1), float("-inf"), device="cuda"
+    ).triu(1)[None, None]
+    expected = reference(hidden, attention_mask=causal_mask)[:, -1]
+
+    context = hidden[:, :context_length].reshape(-1, config.hidden_size).contiguous()
+    scenario = SimpleNamespace(
+        ctx_len=context_length,
+        batch=batch,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.bfloat16,
+    )
+    manager, metadata = setup_kv_and_metadata(
+        scenario,
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+    outputs = {}
+    try:
+        extra_attrs = {
+            "attention_metadata": weakref.ref(metadata),
+            "mla_layers": {mla.layer_idx_str: weakref.ref(mla)},
+        }
+        with model_extra_attrs(extra_attrs):
+            runtime(context, metadata)
+        for request_id in range(batch):
+            manager.impl.add_token(request_id)
+        decode_in = hidden[:, -1].contiguous()
+        for flag in (False, True):
+            monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_FUSED_A", flag)
+            calls.clear()
+            metadata = _decode_metadata(manager, mapping, batch, context_length)
+            extra_attrs["attention_metadata"] = weakref.ref(metadata)
+            with model_extra_attrs(extra_attrs):
+                # The runtime may hand back a reused buffer: keep a copy per run.
+                outputs[flag] = runtime(decode_in, metadata).clone()
+            torch.cuda.synchronize()
+            assert (n, batch, flag) in calls, calls
+    finally:
+        manager.shutdown()
+
+    for flag in (False, True):
+        _assert_matches_reference(outputs[flag], expected, fp8=True)
+    relative_l2 = (
+        torch.linalg.vector_norm(outputs[True].float() - outputs[False].float())
+        / torch.linalg.vector_norm(outputs[False].float())
+    ).item()
+    assert relative_l2 < 2e-2, relative_l2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

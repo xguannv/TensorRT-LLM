@@ -508,6 +508,10 @@ class MLA(nn.Module):
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
+            # q_lora + kv_lora + rope rows (2112 for DeepSeek-V3 / Kimi-K3) leave a partial
+            # last 128-row tile, which the FP8 low-M GEMM serves only on request
+            # (TRTLLM_K3_FP8W_LOWM_FUSED_A).
+            self.kv_a_proj_with_mqa.fp8w_lowm_partial_n_tile = self.fuse_qkv_a_proj
 
             if not self.fuse_qkv_a_proj:
                 self.q_a_proj = Linear(

@@ -4,6 +4,8 @@
 
 Computes ``out[M, N] = x[M, K] @ (W[N, K] * S)^T`` where ``W`` is FP8 E4M3 with one
 power-of-two (UE8M0) scale per 128x128 block and ``x`` is BF16 with ``M <= MAX_M``.
+``N`` only needs to be a multiple of :data:`N_ALIGN`: the weight TMA zero-fills the rows
+of a partial last 128-row tile past ``N`` and the epilogues do not store them.
 
 Low-M kernel (``M <= low_m_max_for(N, K) <= LOW_M_MAX``; kernel coordinates are swapped:
 the weight's N rows are the UMMA M side):
@@ -66,6 +68,10 @@ CTA_K = 128
 MMA_M = 128
 #: MXFP8 scale vector length.
 SF_VEC = 32
+#: Granularity of N. The last 128-row weight tile may be partial: TMA zero-fills its missing
+#: rows and the epilogue does not store them. A multiple of 16 keeps every BF16 output row
+#: 16-byte aligned and the DeepGEMM-packed scale exactly N rows wide (TMA-aligned to 4).
+N_ALIGN = 16
 #: Supported token tiles (UMMA N) of the low-M kernel; public M is padded up to one of these.
 SUPPORTED_MMA_N = (8, 16, 32, 64)
 #: Largest public M served by the low-M kernel (in-kernel activation quantization).
@@ -138,8 +144,8 @@ def smem_bytes(n: int, k: int, tactic: K3LowMTactic) -> int:
 def validate_tactic(n: int, k: int, tactic: K3LowMTactic) -> None:
     if tactic.mma_n not in SUPPORTED_MMA_N:
         raise ValueError(f"mma_n must be one of {SUPPORTED_MMA_N}, got {tactic.mma_n}")
-    if n % MMA_M or k % CTA_K:
-        raise ValueError(f"N={n} and K={k} must be multiples of 128")
+    if n % N_ALIGN or k % CTA_K:
+        raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
     if not 1 <= tactic.split_k <= min(16, k // CTA_K):
         raise ValueError(f"split_k={tactic.split_k} invalid for K={k}")
     for name in ("a_stages", "x_stages", "b_stages"):
@@ -485,7 +491,7 @@ class K3Fp8wLowMGemmKernel:
         self.a_stages = min(tactic.a_stages, self.kt_max)
         self.x_stages = min(tactic.x_stages, self.kt_max)
         self.b_stages = min(tactic.b_stages, self.kt_max)
-        self.n_tiles = n // MMA_M
+        self.n_tiles = _ceil_div(n, MMA_M)
         self.use_pdl = use_pdl
         self.chunks_cap = _ceil_div(self.mma_n // 4, self.split_k)
         mailbox_bytes = (self.split_k - 1) * self.chunks_cap * MMA_M * 16
@@ -520,7 +526,8 @@ class K3Fp8wLowMGemmKernel:
         mWS = cute.make_tensor(
             ws_ptr,
             cute.make_layout(
-                (n // MMA_M, (4, _ceil_div(k // CTA_K, 4))), stride=(MMA_M * 4, (1, 4 * n))
+                (_ceil_div(n, MMA_M), (4, _ceil_div(k // CTA_K, 4))),
+                stride=(MMA_M * 4, (1, 4 * n)),
             ),
         )
         mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
@@ -1030,10 +1037,17 @@ class K3Fp8wLowMGemmKernel:
 
         n_base = n_tile * MMA_M
         nchunks = cute.size(rAcc) // 4
+        # Every thread holds one accumulator row. Rows past N (the zero-filled tail of a
+        # partial last weight tile) are reduced like the others but never stored.
+        m_store = m
+        if cutlass.const_expr(self.n % MMA_M != 0):
+            row0, _ = tTR_cAcc[0]
+            if n_base + row0 >= self.n:
+                m_store = Int32(0)
         if cutlass.const_expr(S == 1):
             for i in cutlass.range_constexpr(nchunks * 4):
                 row, col = tTR_cAcc[i]
-                if col < m:
+                if col < m_store:
                     mOut[col, n_base + row] = rAcc[i].to(cutlass.BFloat16)
         else:
             # Reduce-scatter over 4-column chunks: chunk c is owned by rank c % S. Every
@@ -1101,7 +1115,7 @@ class K3Fp8wLowMGemmKernel:
                                 rAcc[4 * c + 3] = rAcc[4 * c + 3] + v3
                             for j in cutlass.range_constexpr(4):
                                 row, col = tTR_cAcc[4 * c + j]
-                                if col < m:
+                                if col < m_store:
                                     mOut[col, n_base + row] = rAcc[4 * c + j].to(cutlass.BFloat16)
             if q == 0:
                 # The staging buffer must stay valid until the copies have read it.
@@ -1159,8 +1173,8 @@ def mid_smem_bytes(n: int, k: int, tactic: K3MidMTactic) -> int:
 def validate_mid_tactic(n: int, k: int, tactic: K3MidMTactic) -> None:
     if tactic.mma_n not in SUPPORTED_MID_MMA_N:
         raise ValueError(f"mma_n must be one of {SUPPORTED_MID_MMA_N}, got {tactic.mma_n}")
-    if n % MMA_M or k % CTA_K:
-        raise ValueError(f"N={n} and K={k} must be multiples of 128")
+    if n % N_ALIGN or k % CTA_K:
+        raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
     if not 1 <= tactic.split_k <= min(16, k // CTA_K):
         raise ValueError(f"split_k={tactic.split_k} invalid for K={k}")
     if tactic.a_stages < 1 or tactic.b_stages < 1:
@@ -1431,7 +1445,7 @@ class K3Fp8wMidMGemmKernel:
         self.kt_max = _ceil_div(self.kt_total, self.split_k)
         self.a_stages = min(tactic.a_stages, self.kt_max)
         self.b_stages = min(tactic.b_stages, self.kt_max)
-        self.n_tiles = n // MMA_M
+        self.n_tiles = _ceil_div(n, MMA_M)
         self.use_pdl = use_pdl
         self.mma_tiler = (MMA_M, self.mma_n, CTA_K)
         self.a_stage_bytes = MMA_M * CTA_K
@@ -1463,7 +1477,8 @@ class K3Fp8wMidMGemmKernel:
         mWS = cute.make_tensor(
             ws_ptr,
             cute.make_layout(
-                (n // MMA_M, (4, _ceil_div(k // CTA_K, 4))), stride=(MMA_M * 4, (1, 4 * n))
+                (_ceil_div(n, MMA_M), (4, _ceil_div(k // CTA_K, 4))),
+                stride=(MMA_M * 4, (1, 4 * n)),
             ),
         )
         mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
@@ -1851,6 +1866,12 @@ class K3Fp8wMidMGemmKernel:
         out_base = storage.sB.data_ptr().toint()
         out_gmem = mOut.iterator.toint() + Int64(n_tile * MMA_M * 2)
         row_stride = Int64(self.n * 2)
+        # The output stores below give thread q the 8 weight rows starting at (q % 16) * 8
+        # of the tile for every token; past N (partial last tile) it stores nothing.
+        store_cols = Int32(16)
+        if cutlass.const_expr(self.n % MMA_M != 0):
+            if n_tile * MMA_M + (q & 15) * 8 >= self.n:
+                store_cols = Int32(0)
 
         cute.arch.mbarrier_wait(storage.acc_full, 0)
         if cutlass.const_expr(S > 1):
@@ -1918,7 +1939,7 @@ class K3Fp8wMidMGemmKernel:
         # cover one row, so every store is a full line.
         if cutlass.const_expr(S == 1):
             cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
-            for p in cutlass.range(q, m * 16, MMA_M, unroll=1):
+            for p in cutlass.range(q, m * store_cols, MMA_M, unroll=1):
                 t = p >> 4
                 col = (p & 15) * 16
                 w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
@@ -1953,7 +1974,7 @@ class K3Fp8wMidMGemmKernel:
                             )
                 cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
                 # The r-th owned row is token 4 * (rank + (r // 4) * S) + r % 4.
-                for p in cutlass.range(q, my_chunks * 64, MMA_M, unroll=1):
+                for p in cutlass.range(q, my_chunks * 4 * store_cols, MMA_M, unroll=1):
                     r = p >> 4
                     t = 4 * (rank + (r >> 2) * S) + (r & 3)
                     if t < m:
@@ -1991,9 +2012,19 @@ def mid_mma_n_for(m: int) -> int:
     raise ValueError(f"M={m} exceeds {MAX_M}")
 
 
+def _tile_n(n: int) -> int:
+    """N rounded up to whole 128-row weight tiles: the key of the per-shape tables below.
+
+    A partial last tile costs the same CTAs, cluster shape and per-CTA weight slice as a
+    full one, so e.g. the 2112-row MLA ``[q_a; kv_a; k_pe]`` projection uses the 2176 entries.
+    """
+    return _align_up(n, MMA_M)
+
+
 #: Tuned on GB300 for the Kimi-K3 Helix decode projections (CUDA graph, weights not
 #: L2-resident): (N, K, mma_n) -> (split_k, x_stages, b_stages, quant_warps,
-#: quant_groups). The weight ring then takes all remaining shared memory.
+#: quant_groups), N in whole tiles (:func:`_tile_n`). The weight ring then takes all
+#: remaining shared memory.
 _TUNED = {
     # kda_qkvg
     (3072, 7168, 8): (5, 12, 4, 4, 4),
@@ -2015,7 +2046,7 @@ _TUNED = {
     (7168, 768, 16): (1, 6, 4, 8, 4),
     (7168, 768, 32): (1, 6, 4, 8, 4),
     (7168, 768, 64): (1, 4, 4, 8, 2),
-    # mla_q_a_kv_a
+    # mla_q_a_kv_a (2112 rows: q_lora 1536 + kv_lora 512 + rope 64)
     (2176, 7168, 8): (6, 10, 4, 4, 4),
     (2176, 7168, 16): (6, 8, 4, 8, 4),
     (2176, 7168, 32): (6, 8, 4, 8, 4),
@@ -2034,7 +2065,7 @@ _MIN_A_STAGES = 6
 def _heuristic_split(n: int, k: int) -> int:
     """Largest cluster split-K that still runs every cluster in a single wave."""
     kt_total = k // CTA_K
-    n_tiles = n // MMA_M
+    n_tiles = _ceil_div(n, MMA_M)
     best, split = 0, 1
     for s in range(1, min(8, kt_total) + 1):
         if n_tiles > _max_active_clusters(s) or n_tiles * s > _num_sms():
@@ -2050,7 +2081,7 @@ def _heuristic_split(n: int, k: int) -> int:
 def default_tactic(m: int, n: int, k: int) -> K3LowMTactic:
     """Deterministic tactic for ``(M, N, K)``: tuned table first, heuristic otherwise."""
     mma_n = mma_n_for(m)
-    tuned = _TUNED.get((n, k, mma_n))
+    tuned = _TUNED.get((_tile_n(n), k, mma_n))
     if tuned is not None:
         split, x_stages, b_stages, quant_warps, quant_groups = tuned
         base = K3LowMTactic(
@@ -2158,19 +2189,19 @@ _LOW_M_CUTOVER = {
 
 def max_m_for(n: int, k: int) -> int:
     """Largest M for which :func:`can_run` selects this kernel for an ``[N, K]`` weight."""
-    return min(MAX_M, _GATED_MAX_M.get((n, k), _DEFAULT_GATED_MAX_M))
+    return min(MAX_M, _GATED_MAX_M.get((_tile_n(n), k), _DEFAULT_GATED_MAX_M))
 
 
 def low_m_max_for(n: int, k: int) -> int:
     """Largest M served by the low-M kernel for an ``[N, K]`` weight (mid-M path above)."""
-    return _LOW_M_CUTOVER.get((n, k), LOW_M_MAX)
+    return _LOW_M_CUTOVER.get((_tile_n(n), k), LOW_M_MAX)
 
 
 @functools.cache
 def default_mid_tactic(m: int, n: int, k: int) -> K3MidMTactic:
     """Deterministic mid-M tactic: tuned table first, heuristic otherwise."""
     mma_n = mid_mma_n_for(m)
-    tuned = _MID_TUNED.get((n, k, mma_n)) or _MID_DEFAULT.get((n, k))
+    tuned = _MID_TUNED.get((_tile_n(n), k, mma_n)) or _MID_DEFAULT.get((_tile_n(n), k))
     split, b_stages = tuned if tuned is not None else (_heuristic_split(n, k), 4)
     base = K3MidMTactic(mma_n=mma_n, split_k=split, a_stages=1, b_stages=b_stages)
     return dataclasses.replace(base, a_stages=max_mid_a_stages(n, k, base))
@@ -2236,7 +2267,7 @@ def _run_mid(x, w, w_scale, out, tactic: K3MidMTactic, use_pdl: bool) -> torch.T
 
 
 def pack_ue8m0_block_scale(w_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    """Pack power-of-two ``[N/128, K/128]`` FP32 block scales into DeepGEMM's layout.
+    """Pack power-of-two ``[ceil(N/128), K/128]`` FP32 block scales into DeepGEMM's layout.
 
     Produces the same tensor as ``transform_sf_into_required_layout(w_scale, mn=N, k=K,
     recipe=(1, 128, 128), is_sfa=False)``: UE8M0 bytes replicated per row, four K blocks
@@ -2244,7 +2275,7 @@ def pack_ue8m0_block_scale(w_scale: torch.Tensor, n: int, k: int) -> torch.Tenso
     """
     kb = k // CTA_K
     ue8m0 = ((w_scale.contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
-    rows = ue8m0.repeat_interleave(MMA_M, dim=0)
+    rows = ue8m0.repeat_interleave(MMA_M, dim=0)[:n]
     padded = torch.zeros((n, _ceil_div(kb, 4) * 4), dtype=torch.uint8, device=w_scale.device)
     padded[:, :kb] = rows
     words = padded.view(torch.int32)
@@ -2265,8 +2296,8 @@ def prepare_k3_fp8w_lowm_weight(
     preparation or scale copy.
 
     Args:
-        w_fp8: ``[N, K]`` ``float8_e4m3fn`` weight.
-        w_scale: ``[N/128, K/128]`` FP32 block scales.
+        w_fp8: ``[N, K]`` ``float8_e4m3fn`` weight (N a multiple of :data:`N_ALIGN`).
+        w_scale: ``[ceil(N/128), K/128]`` FP32 block scales.
 
     Returns:
         ``(weight, packed_scale)``. Non-power-of-two scales are re-smoothed to UE8M0
@@ -2275,10 +2306,10 @@ def prepare_k3_fp8w_lowm_weight(
     if w_fp8.dtype != torch.float8_e4m3fn or w_fp8.dim() != 2:
         raise ValueError("w_fp8 must be a 2D float8_e4m3fn tensor")
     n, k = w_fp8.shape
-    if n % MMA_M or k % CTA_K:
-        raise ValueError(f"N={n} and K={k} must be multiples of 128")
-    if tuple(w_scale.shape) != (n // MMA_M, k // CTA_K):
-        raise ValueError(f"w_scale must have shape {(n // MMA_M, k // CTA_K)}")
+    if n % N_ALIGN or k % CTA_K:
+        raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
+    if tuple(w_scale.shape) != (_ceil_div(n, MMA_M), k // CTA_K):
+        raise ValueError(f"w_scale must have shape {(_ceil_div(n, MMA_M), k // CTA_K)}")
     w_fp8 = w_fp8.contiguous()
     w_scale = w_scale.to(device=w_fp8.device, dtype=torch.float32).contiguous()
     bits = w_scale.view(torch.int32)
@@ -2338,8 +2369,8 @@ def _check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> No
     n, k = w.shape
     if x.shape[1] != k:
         raise ValueError(f"x has K={x.shape[1]}, weight has K={k}")
-    if n % MMA_M or k % CTA_K:
-        raise ValueError(f"N={n} and K={k} must be multiples of 128")
+    if n % N_ALIGN or k % CTA_K:
+        raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
     words = _ceil_div(k // CTA_K, 4)
     if (
         w_scale.dtype != torch.int32
@@ -2359,14 +2390,22 @@ def _is_supported_device(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
 
 
-def can_run(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> bool:
+def can_run(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    allow_partial_n_tile: bool = False,
+) -> bool:
     """Whether :func:`k3_fp8w_lowm_gemm` accepts these inputs (non-raising check).
 
     Call sites use it to pick this kernel over ``fp8_swap_ab_gemm``: only a 2D CUDA input
     with ``1 <= M <= max_m_for(N, K)`` on SM100/SM103 qualifies, plus everything
-    :func:`_check_inputs` validates.
+    :func:`_check_inputs` validates. A weight whose N is not a multiple of 128 (a partial
+    last row tile) qualifies only with ``allow_partial_n_tile``.
     """
     if x.dim() != 2 or w.dim() != 2 or not x.is_cuda:
+        return False
+    if w.shape[0] % MMA_M and not allow_partial_n_tile:
         return False
     if not 1 <= x.shape[0] <= max_m_for(w.shape[0], w.shape[1]):
         return False
@@ -2413,6 +2452,7 @@ __all__ = [
     "K3MidMTactic",
     "LOW_M_MAX",
     "MAX_M",
+    "N_ALIGN",
     "can_run",
     "default_tactic",
     "k3_fp8w_lowm_gemm",

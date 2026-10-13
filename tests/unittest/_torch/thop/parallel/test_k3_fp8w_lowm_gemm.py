@@ -61,7 +61,8 @@ def _make_activation(m, k, seed):
 
 
 def _reference(x, w_fp8, scale):
-    expanded = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    n, k = w_fp8.shape
+    expanded = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:n, :k]
     return x.float() @ (w_fp8.float() * expanded).t()
 
 
@@ -257,3 +258,318 @@ def test_weight_read_linear_dispatch(m, monkeypatch):
     else:
         torch.testing.assert_close(out, current, rtol=0, atol=0)
     assert _rel_err(out, current.float()) < 5e-2
+
+
+# ---------------------------------------------------------------------------
+# Partial last N tile (N % 128 != 0), e.g. the MLA fused [q_a; kv_a; k_pe] projection.
+# ---------------------------------------------------------------------------
+
+#: (N, K): the Kimi-K3 / DeepSeek-V3 MLA fused-A projection (1536 + 512 + 64 rows) and
+#: small shapes whose last tile keeps 80 / 16 rows.
+PARTIAL_SHAPES = [(2112, 7168), (336, 1280), (144, 640)]
+PARTIAL_MS = [1, 7, 8, 13, 32, 63, 64, 65, 100, 128, 129, 192, 224]
+
+
+def _make_padded_weight(n, k, seed):
+    """FP8 weight of ceil(N/128) * 128 rows (rows >= N random too) plus its block scales."""
+    n_pad = -(-n // 128) * 128
+    w_fp8, scale = _make_weight(n_pad, k, seed)
+    return w_fp8, scale
+
+
+def _run(mod, x, w, packed, tactic=None):
+    out = torch.empty((x.shape[0], w.shape[0]), device="cuda", dtype=torch.bfloat16)
+    mod.run_k3_fp8w_lowm_gemm(x, w, packed, out, tactic=tactic)
+    return out
+
+
+def test_pack_matches_deepgemm_layout_partial_n():
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
+
+    mod = _kernel_module()
+    for n, k in PARTIAL_SHAPES:
+        w_pad, scale = _make_padded_weight(n, k, seed=3)
+        w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+        expected = transform_sf_into_required_layout(
+            scale, mn=n, k=k, recipe=(1, 128, 128), is_sfa=False
+        )
+        assert w.shape == (n, k)
+        assert packed.shape == expected.shape == (n, -(-k // 512))
+        assert packed.stride() == expected.stride() == (1, n)
+        assert torch.equal(packed, expected)
+
+
+@pytest.mark.parametrize("n, k", PARTIAL_SHAPES)
+@pytest.mark.parametrize("m", PARTIAL_MS)
+def test_partial_n_tile_matches_padded_weight(m, n, k):
+    """The N real columns equal the zero-padded weight's run and ignore the padding rows."""
+    mod = _kernel_module()
+    w_pad, scale = _make_padded_weight(n, k, seed=n + k)
+    x = _make_activation(m, k, seed=m)
+
+    w_n, packed_n = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    zero_pad = w_pad.clone()
+    zero_pad[n:] = 0
+    w_z, packed_z = mod.prepare_k3_fp8w_lowm_weight(zero_pad, scale)
+    w_g, packed_g = mod.prepare_k3_fp8w_lowm_weight(w_pad, scale)
+    # The partial and padded weights share the tactic (same tiles, same tuned entry).
+    if m <= mod.low_m_max_for(n, k):
+        assert mod.default_tactic(m, n, k) == mod.default_tactic(m, w_z.shape[0], k)
+    else:
+        assert mod.default_mid_tactic(m, n, k) == mod.default_mid_tactic(m, w_z.shape[0], k)
+
+    out = _run(mod, x, w_n, packed_n)
+    out_zero = _run(mod, x, w_z, packed_z)
+    out_garbage = _run(mod, x, w_g, packed_g)
+    torch.cuda.synchronize()
+
+    assert out.shape == (m, n)
+    assert torch.isfinite(out).all()
+    # Rows of a tile are independent: zero or random padding rows change nothing.
+    assert torch.equal(out, out_zero[:, :n])
+    assert torch.equal(out, out_garbage[:, :n])
+    assert not out_zero[:, n:].any()
+    ref = _mxfp8_emulated_reference(x, w_pad[:n], scale)
+    assert _rel_err(out, ref) < 5e-3
+
+
+@pytest.mark.parametrize("m", [1, 8, 32, 64, 65, 128, 224, 256])
+def test_partial_n_tile_stays_in_bounds(m):
+    """No store lands past the [M, N] output (guard band after it stays untouched)."""
+    mod = _kernel_module()
+    n, k = 2112, 7168
+    w_pad, scale = _make_padded_weight(n, k, seed=21)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=m + 3)
+    guard = 128 * 64
+    buf = torch.full((m * n + guard,), -7.0, device="cuda", dtype=torch.bfloat16)
+    out = buf[: m * n].view(m, n)
+    mod.k3_fp8w_lowm_gemm_out(x, w, packed, out)
+    torch.cuda.synchronize()
+    assert (buf[m * n :] == -7.0).all()
+    zero_pad = w_pad.clone()
+    zero_pad[n:] = 0
+    w_z, packed_z = mod.prepare_k3_fp8w_lowm_weight(zero_pad, scale)
+    assert torch.equal(out, _run(mod, x, w_z, packed_z)[:, :n])
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 4])
+@pytest.mark.parametrize("m", [5, 16, 40, 64])
+def test_partial_n_tile_split_k_tactics(m, split_k):
+    mod = _kernel_module()
+    n, k = 336, 1280
+    w_pad, scale = _make_padded_weight(n, k, seed=11)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=5)
+    tactic = mod.K3LowMTactic(mma_n=mod.mma_n_for(m), split_k=split_k, a_stages=2, x_stages=4)
+    out = _run(mod, x, w, packed, tactic)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _mxfp8_emulated_reference(x, w_pad[:n], scale)) < 5e-3
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 5])
+@pytest.mark.parametrize("m, mma_n", [(40, 64), (65, 96), (128, 128), (200, 224), (250, 256)])
+def test_partial_n_tile_mid_m_tactics(m, mma_n, split_k):
+    mod = _kernel_module()
+    n, k = 336, 1280
+    w_pad, scale = _make_padded_weight(n, k, seed=13)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=9)
+    base = mod.K3MidMTactic(mma_n=mma_n, split_k=split_k, a_stages=1, b_stages=2)
+    tactic = mod.dataclasses.replace(base, a_stages=mod.max_mid_a_stages(n, k, base))
+    out = _run(mod, x, w, packed, tactic)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _mxfp8_emulated_reference(x, w_pad[:n], scale)) < 5e-3
+
+
+def test_partial_n_tile_gate():
+    """``can_run`` takes N % 128 != 0 only on request; the gate follows the padded shape."""
+    mod = _kernel_module()
+    n, k = 2112, 7168
+    assert mod.max_m_for(n, k) == mod.max_m_for(2176, k) == 224
+    assert mod.low_m_max_for(n, k) == mod.low_m_max_for(2176, k)
+    w_pad, scale = _make_padded_weight(n, k, seed=2)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = torch.zeros((8, k), device="cuda", dtype=torch.bfloat16)
+    assert not mod.can_run(x, w, packed)
+    assert mod.can_run(x, w, packed, allow_partial_n_tile=True)
+    x_big = torch.zeros((225, k), device="cuda", dtype=torch.bfloat16)
+    assert not mod.can_run(x_big, w, packed, allow_partial_n_tile=True)
+    # Whole tiles need no opt-in; N must stay a multiple of N_ALIGN.
+    w_full, packed_full = mod.prepare_k3_fp8w_lowm_weight(w_pad[:2048].contiguous(), scale[:16])
+    assert mod.can_run(x, w_full, packed_full)
+    with pytest.raises(ValueError):
+        mod.prepare_k3_fp8w_lowm_weight(w_pad[:2104].contiguous(), scale)
+
+
+@pytest.mark.parametrize("m", [1, 8, 32, 64, 128, 224])
+def test_partial_n_tile_cuda_graph(m):
+    mod = _kernel_module()
+    n, k = 2112, 7168
+    w_pad, scale = _make_padded_weight(n, k, seed=7)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=1)
+    eager = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, w, packed)
+    out = torch.empty_like(eager)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mod.k3_fp8w_lowm_gemm_out(x, w, packed, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mod.k3_fp8w_lowm_gemm_out(x, w, packed, out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+def _fp8_block_scale_linear(w_fp8, scale, partial_n_tile):
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+    n, k = w_fp8.shape
+    linear = Linear(
+        k,
+        n,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128),
+    ).cuda()
+    linear.fp8w_lowm_partial_n_tile = partial_n_tile
+    linear.load_weights([{"weight": w_fp8, "weight_scale": scale}])
+    linear.post_load_weights()
+    return linear
+
+
+@pytest.mark.parametrize("m", [1, 8, 32, 64, 128, 224, 225])
+@pytest.mark.parametrize("fused_a", [False, True])
+def test_fp8_block_scale_linear_partial_n_dispatch(m, fused_a, monkeypatch):
+    """``FP8BlockScalesLinearMethod`` serves a marked 2112-row linear with this kernel."""
+    from tensorrt_llm._torch.modules import linear as linear_mod
+
+    mod = _kernel_module()
+    n, k = 2112, 7168
+    w_pad, scale = _make_padded_weight(n, k, seed=31)
+    linear = _fp8_block_scale_linear(w_pad[:n].contiguous(), scale, partial_n_tile=True)
+    assert linear.weight.shape == (n, k)
+    assert linear.weight_scale.shape == (n, 14) and linear.weight_scale.stride() == (1, n)
+    x = _make_activation(m, k, seed=m)
+
+    monkeypatch.setattr(linear_mod, "_FP8W_LOWM_GEMM", True)
+    monkeypatch.setattr(linear_mod, "_FP8W_LOWM_FUSED_A", fused_a)
+    out = linear(x)
+    current = torch.ops.trtllm.fp8_swap_ab_gemm(
+        x, linear.weight, linear.weight_scale, disable_ue8m0_cast=True
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (m, n) and out.is_contiguous()
+    if fused_a and m <= mod.max_m_for(n, k):
+        direct = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, linear.weight, linear.weight_scale)
+        assert torch.equal(out, direct)
+    else:
+        assert torch.equal(out, current)
+    ref = _reference(x, w_pad[:n], scale)
+    assert _rel_err(out, ref) < 5e-2
+    assert _rel_err(out, ref) <= _rel_err(current, ref) * (1.0 + 2e-3)
+
+    # An unmarked linear never takes the partial-tile path.
+    plain = _fp8_block_scale_linear(w_pad[:n].contiguous(), scale, partial_n_tile=False)
+    assert torch.equal(plain(x), current)
+
+
+@pytest.mark.parametrize("m", [8, 32, 64, 128, 224])
+def test_fp8_block_scale_linear_partial_n_cuda_graph(m, monkeypatch):
+    from tensorrt_llm._torch.modules import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "_FP8W_LOWM_GEMM", True)
+    monkeypatch.setattr(linear_mod, "_FP8W_LOWM_FUSED_A", True)
+    n, k = 2112, 7168
+    w_pad, scale = _make_padded_weight(n, k, seed=37)
+    linear = _fp8_block_scale_linear(w_pad[:n].contiguous(), scale, partial_n_tile=True)
+    x = _make_activation(m, k, seed=m)
+    eager = linear(x)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        linear(x)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = linear(x)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+
+def _weight_read_linear(w_fp8, scale, partial_n_tile):
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    linear = kimi._Fp8BlockScaleWeightReadLinear(w_fp8.clone(), scale.clone(), w_fp8.shape[0])
+    linear._weights_transformed = False
+    linear.transform_weights()
+    linear.fp8w_lowm_partial_n_tile = partial_n_tile
+    return linear
+
+
+@pytest.mark.parametrize("m", [1, 8, 32, 64, 128, 224, 225])
+@pytest.mark.parametrize("fused_a", [False, True])
+def test_weight_read_linear_partial_n_dispatch(m, fused_a, monkeypatch):
+    """Kimi-K3 ``_Fp8BlockScaleWeightReadLinear`` (the runtime MLA fused-A module) serves the
+    marked 2112-row weight with this kernel only under ``TRTLLM_K3_FP8W_LOWM_FUSED_A``."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    mod = _kernel_module()
+    n, k = 2112, 7168
+    w_pad, scale = _make_padded_weight(n, k, seed=41)
+    linear = _weight_read_linear(w_pad[:n].contiguous(), scale, partial_n_tile=True)
+    x = _make_activation(m, k, seed=m)
+
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_FUSED_A", fused_a)
+    out = linear(x)
+    current = torch.ops.trtllm.fp8_swap_ab_gemm(
+        x, linear.weight, linear.weight_scale, disable_ue8m0_cast=True
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (m, n) and out.is_contiguous()
+    if fused_a and m <= mod.max_m_for(n, k):
+        direct = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, linear.weight, linear.weight_scale)
+        assert torch.equal(out, direct)
+    else:
+        assert torch.equal(out, current)
+    ref = _reference(x, w_pad[:n], scale)
+    assert _rel_err(out, ref) <= _rel_err(current, ref) * (1.0 + 2e-3)
+
+    unmarked = _weight_read_linear(w_pad[:n].contiguous(), scale, partial_n_tile=False)
+    assert torch.equal(unmarked(x), current)
+
+
+@pytest.mark.parametrize("m", [8, 32, 64, 128, 224])
+def test_weight_read_linear_partial_n_cuda_graph(m, monkeypatch):
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_FUSED_A", True)
+    n, k = 2112, 7168
+    w_pad, scale = _make_padded_weight(n, k, seed=43)
+    linear = _weight_read_linear(w_pad[:n].contiguous(), scale, partial_n_tile=True)
+    x = _make_activation(m, k, seed=m)
+    eager = linear(x)
+    assert torch.equal(
+        eager, torch.ops.trtllm.k3_fp8w_lowm_gemm(x, linear.weight, linear.weight_scale)
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        linear(x)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = linear(x)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
