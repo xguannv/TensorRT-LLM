@@ -239,6 +239,11 @@ if not _K3_FP8_MID_FAMILIES <= _K3_FP8_MID_KNOWN:
         f"got {sorted(_K3_FP8_MID_FAMILIES)}"
     )
 _K3_FP8_MID_MIN_M = int(os.environ.get("TRTLLM_K3_FP8_MID_MIN_M", "1"))
+# With the "lu" family on: the routed all-reduce + RMSNorm also quantizes the latent to FP8
+# (MNNVL RMS_NORM_QUANT_FP8_BLOCKSCALE: 1x128 UE8M0 block scales in DeepGEMM's packed layout,
+# bit-identical to quantizing the BF16 norm output separately), and the mid-M GEMM reads it
+# directly, so the separate latent_up activation quantization disappears.
+_K3_LU_AR_QUANT = os.environ.get("TRTLLM_K3_LU_AR_QUANT", "0") == "1"
 _K3_FP8_MID_MAX_M = int(os.environ.get("TRTLLM_K3_FP8_MID_MAX_M", "4096"))
 # Attribute name of an FP8 weight-read projection -> its TRTLLM_K3_FP8_MID_GEMM family.
 _K3_FP8_MID_FAMILY_OF_ATTR = {
@@ -2326,6 +2331,61 @@ class KimiK3MoERuntime(nn.Module):
         )
         return out.view(residual.shape)
 
+    def _latent_up_from_quantized_all_reduce(
+        self,
+        routed_out: torch.Tensor,
+        shared_out: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        moe_all_reduce: Optional[nn.Module],
+    ) -> Optional[torch.Tensor]:
+        """``TRTLLM_K3_LU_AR_QUANT``: routed all-reduce + RMSNorm + FP8 block quantization in one
+        MNNVL launch, then the mid-M latent_up GEMM with the residual update; ``None`` if it does
+        not apply (the caller then runs the BF16 all-reduce + RMSNorm path)."""
+        if (
+            not _K3_LU_AR_QUANT
+            or residual is None
+            or moe_all_reduce is None
+            or getattr(moe_all_reduce, "mnnvl_allreduce", None) is None
+            or moe_all_reduce.mapping.tp_size == 1
+            or torch.compiler.is_compiling()
+        ):
+            return None
+        up = self.routed_expert_up_proj
+        if not isinstance(up, _Fp8BlockScaleWeightReadLinear) or up.mid_weight_sf is None:
+            return None
+        x = routed_out.reshape(-1, routed_out.shape[-1])
+        m = x.shape[0]
+        if x.dtype != torch.bfloat16 or not _K3_FP8_MID_MIN_M <= m <= _K3_FP8_MID_MAX_M:
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
+
+        if k3_fp8_mid_gemm.tile_for(m, up.out_features, up.in_features, packed=True) is None:
+            return None
+        shared_2d = shared_out.reshape(m, -1)
+        residual_2d = residual.reshape(m, -1)
+        out = moe_all_reduce(
+            routed_out,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE,
+                norm_weight=self.routed_expert_norm.weight,
+                eps=float(self.routed_expert_norm.variance_epsilon),
+            ),
+        )
+        if not isinstance(out, tuple) or len(out) != 2:
+            raise RuntimeError(
+                "Kimi K3: the MNNVL all-reduce did not return FP8 block-scale output"
+            )
+        latent_fp8, latent_scale = out
+        latent_fp8 = latent_fp8.reshape(m, -1)
+        if not k3_fp8_mid_gemm.can_run_packed(
+            latent_fp8, latent_scale, up.weight, up.mid_weight_sf, shared_2d, residual_2d
+        ):
+            raise RuntimeError("Kimi K3: unexpected FP8 block-scale all-reduce output layout")
+        fused = torch.ops.trtllm.k3_fp8_mid_residual_packed(
+            latent_fp8, latent_scale, up.weight, up.mid_weight_sf, shared_2d, residual_2d
+        )
+        return fused.view(residual.shape)
+
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
@@ -2721,6 +2781,11 @@ class KimiK3MoERuntime(nn.Module):
             if merged is not None:
                 routed_latent, shared_out = self._merged_reduce(*merged, num_tokens)
             else:
+                fused = self._latent_up_from_quantized_all_reduce(
+                    routed_out, shared_out, residual, moe_all_reduce
+                )
+                if fused is not None:
+                    return fused
                 # RMSNorm folded into the routed all-reduce (kARRMSNorm): the
                 # MNNVL kernel normalizes straight out of the lamport buffer, so
                 # the reduced row never round-trips through HBM for a norm kernel.

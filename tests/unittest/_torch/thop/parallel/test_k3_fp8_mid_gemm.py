@@ -172,3 +172,53 @@ def test_weight_read_linear_forward(monkeypatch, m):
     lin.k3_mid_family = "qb"
     lin.mid_weight_sf = None
     assert not lin.prepare_mid_gemm()
+
+
+@pytest.mark.parametrize("m", [1, 128, 224, 448, 896, 1000, 1792])
+@pytest.mark.parametrize("tn", [None, 64, 128, 192, 256])
+def test_packed_scale_residual_bit_exact(m, tn):
+    """Activation quantized upstream with DeepGEMM-packed scales (the layout of the fused MNNVL
+    all-reduce + RMSNorm + FP8 block quantization) gives the unfused result bit for bit."""
+    mid = _mid()
+    n, k = 7168, 3584
+    w, w_scale = _weight(n, k, seed=m + 11)
+    x = _activation(m, k, seed=m + 11)
+    gen = torch.Generator(device="cuda").manual_seed(m + 1)
+    shared = (torch.randn((m, n), device="cuda", generator=gen) * 4).to(torch.bfloat16)
+    residual = (torch.randn((m, n), device="cuda", generator=gen) * 30).to(torch.bfloat16)
+    ref = residual + (_deepgemm_bf16(x, w, w_scale) + shared)
+    w_sf = mid.expand_weight_scale(w_scale, n, k)
+    xq, xs = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, False)
+    assert mid.can_run_packed(xq, xs, w, w_sf, shared, residual)
+    if tn is None:
+        out = torch.ops.trtllm.k3_fp8_mid_residual_packed(xq, xs, w, w_sf, shared, residual)
+    else:
+        out = torch.empty_like(residual)
+        mid.run_k3_fp8_mid_gemm(
+            xq,
+            xs,
+            w,
+            w_sf,
+            out,
+            shared,
+            residual,
+            tiler=(256, tn),
+            cluster=(2, 1),
+            xs_packed_ld=xs.stride(1),
+        )
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_can_run_packed_rejects():
+    mid = _mid()
+    n, k, m = 7168, 3584, 96
+    w, w_scale = _weight(n, k, seed=9)
+    w_sf = mid.expand_weight_scale(w_scale, n, k)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    xq, xs = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, False)
+    shared = torch.zeros((m, n), device="cuda", dtype=torch.bfloat16)
+    assert mid.can_run_packed(xq, xs, w, w_sf, shared, shared)
+    assert not mid.can_run_packed(xq, xs, w, None, shared, shared)
+    assert not mid.can_run_packed(xq, xs.contiguous(), w, w_sf, shared, shared)
+    assert not mid.can_run_packed(xq[:, : k - 128], xs, w, w_sf, shared, shared)
+    assert not mid.can_run_packed(xq, xs, w, w_sf, shared.float(), shared)

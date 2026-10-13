@@ -38,7 +38,8 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
-from cutlass import Int32
+from cutlass import Int32, Int64
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.warp import (
     LdMatrix8x8x16bOp,
@@ -47,6 +48,7 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix16x8x8bOp,
 )
 from cutlass.cute.runtime import make_ptr
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import k3_latent_fp8_gemm as _lat
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
@@ -72,6 +74,23 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+@dsl_user_op
+def _ldg_b32(addr, *, loc=None, ip=None):
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
     """Persistent swap-AB MXFP8 GEMM ``C[Nw, Mtok] = W[Nw, K] x X[Mtok, K]^T`` (C column-major).
 
@@ -88,12 +107,22 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         epilogue: str = EPI_BF16,
         use_pdl: bool = True,
         res_stages: int = 2,
+        sfb_packed: bool = False,
     ):
         super().__init__(SF_VEC, mma_tiler_mn, cluster_shape_mn, False, 1, True)
         if epilogue not in (EPI_BF16, EPI_RESIDUAL):
             raise ValueError(f"unknown epilogue {epilogue!r}")
         self.epilogue_kind = epilogue
         self.use_pdl = use_pdl
+        # Activation scales as DeepGEMM-packed UE8M0 words (int32 ``[ceil(K/512)][ld]``, byte
+        # ``kb % 4`` of word ``(kb // 4, token)``), the layout of the fused all-reduce + RMSNorm +
+        # FP8 block quantization: an extra warp expands them into the scale atoms of each stage.
+        self.sfb_packed = sfb_packed
+        self.sfb_warp_id = self.tma_warp_id + 1
+        if sfb_packed:
+            self.threads_per_cta += self.threads_per_warp
+        # 128-token scale atoms per stage (the 192-token tile reads a 256-token window).
+        self.sfb_atoms = _ceil_div(mma_tiler_mn[1], BLOCK)
         # Shared + residual sub-tile buffers: the first ``res_stages`` sub-tiles of a tile are
         # loaded while its mainloop runs, later ones as earlier buffers free up (deeper
         # prefetch measured no faster on GB300: it costs mainloop stages).
@@ -129,11 +158,14 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         c_ptr: cute.Pointer,
         shared_ptr: cute.Pointer,
         residual_ptr: cute.Pointer,
+        xsf_ld: Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         """Dynamic-shape entry: W ``[n_w, k]``, X ``[m_tok, k]`` (both K-major FP8), scale atoms
-        ``[ceil(rows/128)][k/128][512]`` (UE8M0), C / shared / residual BF16 ``[m_tok, n_w]``."""
+        ``[ceil(rows/128)][k/128][512]`` (UE8M0), C / shared / residual BF16 ``[m_tok, n_w]``.
+        With ``sfb_packed``, ``xsf_ptr`` holds the packed activation scale words with leading
+        dimension ``xsf_ld`` instead."""
         a_tensor = cute.make_tensor(
             w_ptr, layout=cute.make_ordered_layout((n_w, k, 1), order=(1, 0, 2))
         )
@@ -165,6 +197,9 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
             c_tensor,
             s_tensor,
             r_tensor,
+            xsf_ptr,
+            xsf_ld,
+            Int32(m_tok),
             max_active_clusters,
             stream,
         )
@@ -179,6 +214,9 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         c_tensor: cute.Tensor,
         s_tensor: cute.Tensor,
         r_tensor: cute.Tensor,
+        xsf_ptr: cute.Pointer,
+        xsf_ld: Int32,
+        m_tok: Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -280,6 +318,13 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
+        if cutlass.const_expr(self.sfb_packed):
+            # The scale-expanding warp writes the activation scale atoms, not TMA.
+            if cutlass.const_expr(
+                cute.cosize(self.sfb_smem_layout_staged) != self.num_ab_stage * self.sfb_atoms * 512
+            ):
+                raise ValueError("unexpected activation scale SMEM layout")
+            sfb_copy_size = 0
         self.num_tma_load_bytes = (
             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
@@ -318,6 +363,7 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             res_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.res_stages]
+            sfb_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             sC: cute.struct.Align[
@@ -376,6 +422,9 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
             self.res_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
+            xsf_ptr,
+            xsf_ld,
+            m_tok,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -416,6 +465,9 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         res_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
+        xsf_ptr: cute.Pointer,
+        xsf_ld: Int32,
+        m_tok: Int32,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == self.tma_warp_id:
@@ -444,6 +496,7 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
         tmem_holding_buf = storage.tmem_holding_buf
         res_full = storage.res_full_mbar_ptr.data_ptr()
+        sfb_full = storage.sfb_full_mbar_ptr.data_ptr()
 
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
@@ -479,6 +532,12 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
                 with cute.arch.elect_one():
                     for i in cutlass.range_constexpr(self.res_stages):
                         cute.arch.mbarrier_init(res_full + i, 1)
+        if cutlass.const_expr(self.sfb_packed):
+            if warp_idx == self.sfb_warp_id:
+                with cute.arch.elect_one():
+                    for i in cutlass.range_constexpr(self.num_ab_stage):
+                        # Arrivals: the scale-expanding warp of each CTA of the MMA pair.
+                        cute.arch.mbarrier_init(sfb_full + i, 2 if use_2cta_instrs else 1)
         cute.arch.mbarrier_init_fence()
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed(aligned=True)
@@ -666,13 +725,14 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
                         tma_bar_ptr=bar,
                         mcast_mask=b_full_mcast_mask,
                     )
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_slice[(None, kb)],
-                        tBsSFB[(None, pre_state.index)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(not self.sfb_packed):
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_slice[(None, kb)],
+                            tBsSFB[(None, pre_state.index)],
+                            tma_bar_ptr=bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
                     pre_state.advance()
                 for kb in cutlass.range(k_pre, k_block_cnt, 1, unroll=1):
                     ab_pipeline.producer_acquire(ab_producer_state)
@@ -698,18 +758,36 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
                         tma_bar_ptr=bar,
                         mcast_mask=sfa_full_mcast_mask,
                     )
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_slice[(None, kb)],
-                        tBsSFB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(not self.sfb_packed):
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_slice[(None, kb)],
+                            tBsSFB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
                     ab_producer_state.advance()
                 k_pre = Int32(0)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             ab_pipeline.producer_tail(ab_producer_state)
+
+        #
+        # Scale-expanding warp (packed activation scales)
+        #
+        if cutlass.const_expr(self.sfb_packed):
+            if warp_idx == self.sfb_warp_id:
+                self.expand_packed_sfb(
+                    storage,
+                    sfb_full,
+                    tile_sched_params,
+                    k_block_cnt,
+                    xsf_ptr,
+                    xsf_ld,
+                    m_tok,
+                    use_2cta_instrs,
+                    cta_rank_in_cluster,
+                )
 
         #
         # MMA warp
@@ -809,6 +887,10 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
                 for k_block in range(k_block_cnt):
                     if is_leader_cta:
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        if cutlass.const_expr(self.sfb_packed):
+                            cute.arch.mbarrier_wait(
+                                sfb_full + ab_consumer_state.index, ab_consumer_state.phase
+                            )
                         s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
                         cute.copy(
                             tiled_copy_s2t_sfa,
@@ -1057,6 +1139,71 @@ class K3Fp8MidGemmKernel(Sm100BlockScaledPersistentDenseGemmKernel):
         if cutlass.const_expr(self.use_pdl):
             griddepcontrol_launch_dependents()
 
+    @cute.jit
+    def expand_packed_sfb(
+        self,
+        storage,
+        sfb_full: cute.Pointer,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
+        k_block_cnt: Int32,
+        xsf_ptr: cute.Pointer,
+        xsf_ld: Int32,
+        m_tok: Int32,
+        use_2cta_instrs: cutlass.Constexpr,
+        cta_rank_in_cluster: Int32,
+    ):
+        """Write each stage's activation scale atoms from the packed UE8M0 words.
+
+        Lane ``l`` owns tokens ``128 a + 32 g + l`` (``g < 4``) of atom ``a``: the 16 bytes at
+        ``l * 16`` hold their exponents, each replicated over the four K32 slots. A packed word
+        holds four K blocks, so it is loaded once per four stages of a tile. Tokens past ``M``
+        get the neutral exponent (their FP8 rows are TMA zero fill).
+        """
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+        lane = cute.arch.lane_idx()
+        empty = storage.ab_empty_mbar_ptr.data_ptr()
+        sfb_base = storage.sSFB.data_ptr().toint()
+        stage_bytes = self.sfb_atoms * 512
+        leader = (cta_rank_in_cluster // 2) * 2
+        rW = cute.make_rmem_tensor((self.sfb_atoms * 4,), Int32)
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+        it = Int32(0)
+        while work_tile.is_valid_tile:
+            atom0 = (work_tile.tile_idx[1] * self.cta_tile_shape_mnk[1]) // BLOCK
+            for kb in cutlass.range(k_block_cnt, unroll=1):
+                stage = it % self.num_ab_stage
+                if it >= self.num_ab_stage:
+                    cute.arch.mbarrier_wait(empty + stage, ((it // self.num_ab_stage) % 2) ^ 1)
+                if kb % 4 == 0:
+                    for i in cutlass.range_constexpr(self.sfb_atoms):
+                        for g in cutlass.range_constexpr(4):
+                            t = (atom0 + i) * BLOCK + g * 32 + lane
+                            w = Int32(0x7F7F7F7F)
+                            if t < m_tok:
+                                w = _ldg_b32(xsf_ptr.toint() + (Int64(kb // 4) * xsf_ld + t) * 4)
+                            rW[i * 4 + g] = w
+                shift = (kb % 4) * 8
+                for i in cutlass.range_constexpr(self.sfb_atoms):
+                    words = []
+                    for g in cutlass.range_constexpr(4):
+                        e = (rW[i * 4 + g] >> shift) & Int32(0xFF)
+                        words.append(e * Int32(0x01010101))
+                    _lat._sts_v4_b32(sfb_base + stage * stage_bytes + i * 512 + lane * 16, *words)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    if cutlass.const_expr(use_2cta_instrs):
+                        cute.arch.mbarrier_arrive(sfb_full + stage, leader)
+                    else:
+                        cute.arch.mbarrier_arrive(sfb_full + stage)
+                it = it + 1
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
     def _smem_load_atom_for(self, tiled_copy_t2r):
         """SMEM -> register atom that inverts the accumulator's SMEM store atom."""
         store_atom = sm100_utils.get_smem_store_op(
@@ -1115,8 +1262,9 @@ def _compiled_gemm(
     epilogue: str,
     use_pdl: bool,
     res_stages: int = 2,
+    sfb_packed: bool = False,
 ):
-    kernel = K3Fp8MidGemmKernel(tiler, cluster, epilogue, use_pdl, res_stages)
+    kernel = K3Fp8MidGemmKernel(tiler, cluster, epilogue, use_pdl, res_stages, sfb_packed)
     dummy = 1 << 20
     f8 = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
     sf = make_ptr(cutlass.Float8E8M0FNU, dummy, cute.AddressSpace.gmem, assumed_align=16)
@@ -1134,6 +1282,7 @@ def _compiled_gemm(
         bf,
         bf,
         bf,
+        Int32(1),
         _max_active_clusters(cluster[0] * cluster[1]),
         stream,
         options="--opt-level 2",
@@ -1172,6 +1321,11 @@ _TUNED_TN = {
     (768, 7168): (None, 64, 64, 64, 64, 128),  # MLA output gate
     (3072, 7168): (None, 64, 128, None, 128, 192),  # KDA fused q / k / v / g
 }
+#: Token tiles when the activation arrives already quantized with DeepGEMM-packed scales (the
+#: fused all-reduce + RMSNorm + FP8 block quantization in front of latent_up).
+_TUNED_TN_PACKED = {
+    (7168, 3584): (64, 128, 256, 192, 192, 256),
+}
 
 
 def _heuristic_tn(m: int, n: int) -> int:
@@ -1186,11 +1340,14 @@ def _heuristic_tn(m: int, n: int) -> int:
     return best
 
 
-def tile_for(m: int, n: int, k: int) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+def tile_for(
+    m: int, n: int, k: int, packed: bool = False
+) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
     """(MMA tiler, cluster) for an ``[M, K] x [N, K]^T`` problem, or ``None`` where the tuned
     table says the production path is faster. Shapes outside the table use a makespan heuristic.
+    ``packed`` selects the table for prequantized activations with DeepGEMM-packed scales.
     """
-    row = _TUNED_TN.get((_ceil_div(n, BLOCK) * BLOCK, k))
+    row = (_TUNED_TN_PACKED if packed else _TUNED_TN).get((_ceil_div(n, BLOCK) * BLOCK, k))
     if row is None:
         return (256, _heuristic_tn(m, n)), (2, 1)
     for max_m, tn in zip(_M_BUCKETS, row):
@@ -1212,8 +1369,15 @@ def run_k3_fp8_mid_gemm(
     cluster: Optional[Tuple[int, int]] = None,
     use_pdl: bool = True,
     res_stages: int = 2,
+    xs_packed_ld: int = 0,
 ) -> None:
-    """Launch the GEMM on prequantized operands (``xs`` / ``w_sf`` in the CUTLASS atom layout)."""
+    """Launch the GEMM on prequantized operands.
+
+    ``w_sf`` is in the CUTLASS atom layout (:func:`expand_weight_scale`). ``xs`` is either the
+    activation scale in the same atom layout (:func:`quantize_act`) or, with ``xs_packed_ld > 0``,
+    DeepGEMM-packed int32 words ``[ceil(K/512)][xs_packed_ld]`` as produced by the fused
+    all-reduce + RMSNorm + FP8 block quantization.
+    """
     m, k = xq.shape
     n = w.shape[0]
     if tiler is None:
@@ -1221,8 +1385,9 @@ def run_k3_fp8_mid_gemm(
     epilogue = EPI_RESIDUAL if residual is not None else EPI_BF16
     if residual is None:
         shared = residual = out
+    packed = xs_packed_ld > 0
     stream = cuda.CUstream(torch.cuda.current_stream(xq.device).cuda_stream)
-    _compiled_gemm(tuple(tiler), tuple(cluster), epilogue, use_pdl, res_stages)(
+    _compiled_gemm(tuple(tiler), tuple(cluster), epilogue, use_pdl, res_stages, packed)(
         cutlass.Int64(n),
         cutlass.Int64(m),
         cutlass.Int64(k),
@@ -1233,6 +1398,7 @@ def run_k3_fp8_mid_gemm(
         _gmem_ptr(cutlass.BFloat16, out),
         _gmem_ptr(cutlass.BFloat16, shared),
         _gmem_ptr(cutlass.BFloat16, residual),
+        Int32(xs_packed_ld if packed else 1),
         stream,
     )
 
@@ -1303,6 +1469,52 @@ def can_run(
     return _is_supported_device(x.device.index)
 
 
+def _check_bf16_rows(t: Optional[torch.Tensor], m: int, n: int) -> bool:
+    return (
+        t is not None
+        and t.dtype == torch.bfloat16
+        and tuple(t.shape) == (m, n)
+        and t.is_contiguous()
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def can_run_packed(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_sf: Optional[torch.Tensor],
+    shared: torch.Tensor,
+    residual: torch.Tensor,
+) -> bool:
+    """Whether :func:`k3_fp8_mid_residual_packed_op` accepts these inputs (non-raising check).
+
+    ``xq`` is the E4M3 activation ``[M, K]`` and ``xs`` its DeepGEMM-packed UE8M0 scale, int32
+    ``[M, ceil(K/512)]`` with strides ``(1, ld)``, ``ld >= M`` (the fused all-reduce output).
+    """
+    if w_sf is None or xq.dim() != 2 or xs.dim() != 2 or w.dim() != 2 or not xq.is_cuda:
+        return False
+    if xq.dtype != torch.float8_e4m3fn or xs.dtype != torch.int32:
+        return False
+    if w.dtype != torch.float8_e4m3fn or not w.is_contiguous():
+        return False
+    m, k = xq.shape
+    n = w.shape[0]
+    if not 1 <= m <= MAX_M or w.shape[1] != k or k % CTA_K or n % 16:
+        return False
+    if not xq.is_contiguous() or xq.data_ptr() % 16 or w.data_ptr() % 16:
+        return False
+    if tuple(xs.shape) != (m, _ceil_div(k // CTA_K, 4)) or xs.stride(0) != 1:
+        return False
+    if xs.shape[1] > 1 and xs.stride(1) < m:
+        return False
+    if w_sf.dtype != torch.uint8 or w_sf.numel() != _ceil_div(n, BLOCK) * (k // CTA_K) * 512:
+        return False
+    if not (_check_bf16_rows(shared, m, n) and _check_bf16_rows(residual, m, n)):
+        return False
+    return _is_supported_device(xq.device.index)
+
+
 @torch.library.custom_op("trtllm::k3_fp8_mid_gemm", mutates_args=())
 def k3_fp8_mid_gemm_op(x: torch.Tensor, w: torch.Tensor, w_sf: torch.Tensor) -> torch.Tensor:
     """BF16 ``x @ dequant(w)^T``; ``w_sf`` from :func:`expand_weight_scale`."""
@@ -1332,8 +1544,45 @@ def _(x, w, w_sf, shared, residual):
     return torch.empty_like(residual)
 
 
+@torch.library.custom_op("trtllm::k3_fp8_mid_residual_packed", mutates_args=())
+def k3_fp8_mid_residual_packed_op(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_sf: torch.Tensor,
+    shared: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """``residual + bf16(bf16(xq @ dequant(w)^T) + shared)`` for an activation quantized upstream
+    (E4M3 ``xq`` + DeepGEMM-packed UE8M0 scale ``xs``, see :func:`can_run_packed`)."""
+    m, k = xq.shape
+    n = w.shape[0]
+    out = torch.empty_like(residual)
+    tiler, cluster = tile_for(m, n, k, packed=True) or ((256, _heuristic_tn(m, n)), (2, 1))
+    run_k3_fp8_mid_gemm(
+        xq,
+        xs,
+        w,
+        w_sf,
+        out,
+        shared,
+        residual,
+        tiler=tiler,
+        cluster=cluster,
+        xs_packed_ld=xs.stride(1) if xs.shape[1] > 1 else max(m, 1),
+    )
+    return out
+
+
+@k3_fp8_mid_residual_packed_op.register_fake
+def _(xq, xs, w, w_sf, shared, residual):
+    return torch.empty_like(residual)
+
+
 __all__ = [
     "can_run",
+    "can_run_packed",
+    "k3_fp8_mid_residual_packed_op",
     "k3_fp8_mid_gemm_op",
     "k3_fp8_mid_residual_op",
     "K3Fp8MidGemmKernel",
