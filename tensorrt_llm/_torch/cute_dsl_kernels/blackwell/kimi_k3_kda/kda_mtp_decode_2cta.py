@@ -51,9 +51,10 @@ off for grids with more tiles than SMs.
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Int64
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .kda_mtp_decode_v2 import (
     NUM_THREADS,
@@ -140,6 +141,66 @@ def _cp_async_wait_all(*, loc=None, ip=None):
     _st_asm("cp.async.wait_group 0;", "", [], loc=loc, ip=ip)
 
 
+@dsl_user_op
+def _st_global_u8(addr, value, *, loc=None, ip=None):
+    _st_asm(
+        "st.global.u8 [$0], $1;",
+        "l,r",
+        [Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_global_u32(addr, value, *, loc=None, ip=None):
+    _st_asm(
+        "st.global.u32 [$0], $1;",
+        "l,r",
+        [Int64(addr).ir_value(loc=loc, ip=ip), cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _rcp_approx_ftz(x: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(x).ir_value(loc=loc, ip=ip)],
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e4m3(x: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Int32:
+    """E4M3 bits of ``x`` (round to nearest even, saturating to the finite range)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(0.0).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x).ir_value(loc=loc, ip=ip),
+            ],
+            "{ .reg .b16 h; cvt.rn.satfinite.e4m3x2.f32 h, $1, $2; cvt.u32.u16 $0, h; }",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _ld_shared_b32x2(addr):
     from .kda_mtp_decode_v2 import _asm_words
 
@@ -213,6 +274,9 @@ def kda_decode_mtp_2cta_kernel(
     beta_cache: cute.Tensor,
     ssm_state_indices: cute.Tensor,
     num_accepted_tokens: cute.Tensor,
+    o8: cute.Tensor,
+    osf: cute.Tensor,
+    sf_lead: cutlass.Int32,
     tiled_mma1: cute.TiledMma,
     tiled_mma3: cute.TiledMma,
     tiled_mma1k: cute.TiledMma,
@@ -242,8 +306,14 @@ def kda_decode_mtp_2cta_kernel(
     onorm_eps: cutlass.Constexpr[float],
     USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
     PDL: cutlass.Constexpr[bool],
+    FP8_OUT: cutlass.Constexpr[bool] = False,
 ):
-    """See the module docstring. Grid ``(HV, N, 1)``, one (head, request) tile per CTA."""
+    """See the module docstring. Grid ``(HV, N, 1)``, one (head, request) tile per CTA.
+
+    ``FP8_OUT``: instead of the BF16 output ``o``, write its 1x128-block E4M3 quantization for the
+    DeepGEMM o_proj: ``o8`` (uint8 ``[T, HV * V]``) and the packed UE8M0 scales ``osf`` (uint8 view
+    of the int32 ``[ceil(HV / 4), sf_lead]`` buffer, byte ``h % 4`` of word ``h // 4`` for head
+    ``h``), bitwise what ``fp8_quantize_1x128_packed`` makes of the BF16 output."""
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % 32
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1150,9 +1220,54 @@ def kda_decode_mtp_2cta_kernel(
             rms_partial / cutlass.Float32(V) + cutlass.Float32(onorm_eps), fastmath=True
         )
         output_row = i_n * NEW_TOK + token_idx
-        for i in cutlass.range(V // 32, unroll_full=True):
-            v_idx = i * 32 + in_warp_tid
-            o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(pre_values[i] * inv_rms)
+        if cutlass.const_expr(FP8_OUT):
+            # fp8_quantize_1x128_packed on this head's 128 BF16 values of the token: UE8M0 scale
+            # 2^ceil(log2(max(amax, 1e-10) * rcp(448))), values * 2^-scale to E4M3
+            vals = []
+            amax = cutlass.Float32(0.0)
+            for i in cutlass.range_constexpr(V // 32):
+                v = cutlass.Float32(cutlass.BFloat16(pre_values[i] * inv_rms))
+                vals.append(v)
+                amax = cute.arch.fmax(amax, cute.arch.fmax(v, -v))
+            for offset in [16, 8, 4, 2, 1]:
+                amax = cute.arch.fmax(
+                    amax,
+                    cute.arch.shuffle_sync_bfly(amax, offset=offset, mask=-1, mask_and_clamp=31),
+                )
+            amax = cute.arch.fmax(amax, cutlass.Float32(1e-10))
+            dq_bits = (amax * _rcp_approx_ftz(cutlass.Float32(448.0))).bitcast(cutlass.Int32)
+            sf = ((dq_bits >> 23) & cutlass.Int32(255)) + cutlass.Int32(
+                (dq_bits & cutlass.Int32(0x7FFFFF)) != 0
+            )
+            q_scale = ((cutlass.Int32(254) - sf) << 23).bitcast(cutlass.Float32)
+            if sf == 0:
+                q_scale = cutlass.Float32(1.0)
+            for i in cutlass.range_constexpr(V // 32):
+                _st_global_u8(
+                    gaddr(o8, (output_row, hv_off + i * 32 + in_warp_tid)),
+                    _cvt_e4m3(vals[i] * q_scale),
+                )
+            if in_warp_tid == 0:
+                word = (i_hv // 4) * sf_lead + output_row
+                _st_global_u8(gaddr(osf, (word * 4 + i_hv % 4,)), sf)
+                if cutlass.const_expr((HV - 1) % 4 != 3):
+                    if i_hv == HV - 1:
+                        # bytes of the last word past the last head are zero
+                        for b in cutlass.range_constexpr((HV - 1) % 4 + 1, 4):
+                            _st_global_u8(gaddr(osf, (word * 4 + b,)), cutlass.Int32(0))
+        else:
+            for i in cutlass.range(V // 32, unroll_full=True):
+                v_idx = i * 32 + in_warp_tid
+                o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(pre_values[i] * inv_rms)
+    if cutlass.const_expr(FP8_OUT):
+        # scale rows past the last token (TMA padding) are zero
+        _, n_req, _ = cute.arch.grid_dim()
+        if (i_n == n_req - 1) & (i_hv == 0) & (tidx < 32):
+            rows = n_req * NEW_TOK
+            for w in cutlass.range_constexpr((HV + 3) // 4):
+                pad_row = rows + tidx
+                if pad_row < sf_lead:
+                    _st_global_u32(gaddr(osf, ((w * sf_lead + pad_row) * 4,)), cutlass.Int32(0))
     # the state stores must have read their smem boxes before the CTA exits
     if (tidx == 0) | (tidx == 256):
         cute.arch.cp_async_bulk_wait_group(0, read=True)

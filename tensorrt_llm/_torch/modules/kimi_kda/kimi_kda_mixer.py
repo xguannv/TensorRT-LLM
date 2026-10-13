@@ -77,6 +77,10 @@ _KDA_DECODE_2CTA = os.environ.get("TRTLLM_K3_KDA_DECODE_2CTA", "0") == "1"
 _KDA_DECODE_PDL = (
     os.environ.get("TRTLLM_K3_KDA_DECODE_PDL", "1" if _KDA_DECODE_FUSED_FAB else "0") == "1"
 )
+# The two-CTA verify kernel quantizes its output for the DeepGEMM o_proj itself (1x128 E4M3 +
+# packed UE8M0 scales, bitwise the separate quantize kernel), when o_proj would run DeepGEMM on
+# the BF16 output; o_proj then takes the prequantized pair.
+_KDA_DECODE_FP8_OUT = os.environ.get("TRTLLM_K3_KDA_DECODE_FP8_OUT", "0") == "1"
 
 
 def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -160,6 +164,30 @@ def _use_fab_fa(
     return k3_kda_fab.can_use_k3_kda_fab_fa(
         x.reshape(-1, x.shape[-1]), bfa_weight, num_heads, fb_weight
     )
+
+
+def _o_proj_takes_prequantized_fp8(o_proj: nn.Module, num_rows: int) -> bool:
+    """Whether ``o_proj`` on ``num_rows`` BF16 rows quantizes them 1x128 for DeepGEMM
+    (``fp8_swap_ab_gemm``), so that it can take the prequantized pair instead."""
+    if not isinstance(o_proj, Linear) or not o_proj.has_fp8_block_scales:
+        return False
+    if o_proj.disable_deep_gemm or o_proj.use_cute_dsl_blockscaling_mm:
+        return False
+    if o_proj.lora is not None or getattr(o_proj, "_ugpu_weight_shards", None) is not None:
+        return False
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        return False
+    from .. import linear as linear_module
+
+    if linear_module._FP8W_LOWM_GEMM:
+        from ...cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+        weight = o_proj.weight
+        if num_rows <= k3_fp8w_lowm_gemm.max_m_for(weight.shape[0], weight.shape[1]):
+            return False
+    return True
 
 
 def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
@@ -1319,7 +1347,18 @@ class KimiKDALinearAttention(nn.Module):
             )
             return self.o_proj(out.view(-1, self.proj_size))
         g = forget_gate.view(1, T_total, H, K)
-        out = self._dispatch.mtp_verify(
+        two_cta = _verify_two_cta(H, num_decodes, x2d.device)
+        verify = self._dispatch.mtp_verify
+        fp8_out = (
+            _KDA_DECODE_FP8_OUT
+            and two_cta
+            and not mxfp8_output
+            and not torch.compiler.is_compiling()
+            and _o_proj_takes_prequantized_fp8(self.o_proj, T_total)
+        )
+        if fp8_out:
+            verify = self._dispatch.mtp_verify_fp8_packed
+        out = verify(
             x_q=x_q,
             x_k=x_k,
             x_v=x_v,
@@ -1351,10 +1390,13 @@ class KimiKDALinearAttention(nn.Module):
             onorm_weight=self._onorm_w_f32,
             onorm_eps=self.o_norm.eps,
             fuse_output_norm=True,
-            mxfp8_output=mxfp8_output,
+            **({} if fp8_out else {"mxfp8_output": mxfp8_output}),
             use_pdl=_KDA_DECODE_PDL and not mxfp8_output,
-            two_cta=_verify_two_cta(H, num_decodes, x2d.device),
+            two_cta=two_cta,
         )
+        if fp8_out:
+            # (E4M3 [T, H * V], packed UE8M0 scales): the DeepGEMM operand o_proj would build
+            return self.o_proj(out)
         if mxfp8_output:
             if not isinstance(out, tuple):
                 raise RuntimeError("MXFP8-output MTP KDA must return activation and scale")

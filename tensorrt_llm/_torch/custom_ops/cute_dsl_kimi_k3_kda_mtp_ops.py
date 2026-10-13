@@ -698,6 +698,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         beta_cache: cute.Tensor,
         ssm_state_indices: cute.Tensor,
         num_accepted_tokens: cute.Tensor,
+        o8: cute.Tensor,
+        osf: cute.Tensor,
+        sf_lead: cutlass.Int32,
         N: cutlass.Int32,
         scale: cutlass.Constexpr[float],
         HV: cutlass.Constexpr[int],
@@ -711,6 +714,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         PDL: cutlass.Constexpr[bool],
         MIN_BLOCKS: cutlass.Constexpr[int],
         stream: cuda.CUstream,
+        FP8_OUT: cutlass.Constexpr[bool] = False,
     ):
         """Host side of ``kda_decode_mtp_2cta_kernel``: v2's tf32 MMA atoms, operand smem
         layouts and state TMA atoms (fp32 or bf16 state), launched for ``MIN_BLOCKS`` CTAs per SM
@@ -844,6 +848,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             beta_cache,
             ssm_state_indices,
             num_accepted_tokens,
+            o8,
+            osf,
+            sf_lead,
             tiled_mma1,
             tiled_mma3,
             tiled_mma1k,
@@ -873,6 +880,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_eps,
             USE_FLAT_LAYOUT,
             PDL,
+            FP8_OUT,
         )
         launched.launch(
             grid=(HV, N, 1),
@@ -1247,6 +1255,7 @@ def kda_mtp_decode_impl(
     w_fb: Optional[torch.Tensor] = None,
     use_pdl: bool = False,
     two_cta: bool = False,
+    fp8_out: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -1297,6 +1306,13 @@ def kda_mtp_decode_impl(
             bitwise the v2 kernel) when the call qualifies: v2 contract, fp32
             or bf16 state, bf16 projections and conv caches, forget gate from
             the projection, one CTA per tile.
+        fp8_out: return ``fp8_quantize_1x128_packed_ue8m0(out, False)`` of the BF16
+            output instead of the output (``out`` must be ``None``): E4M3
+            ``[T_total, HV * V]`` and the DeepGEMM MN-major packed UE8M0 scales
+            ``[T_total, ceil(HV / 4)]`` int32 (stride ``(1, pad4(T_total))``), the
+            prequantized operand of the o_proj GEMM. The two-CTA kernel quantizes in
+            its epilogue (bitwise the separate quantize kernel); other kernels run the
+            quantize kernel on their BF16 output.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -1326,6 +1342,8 @@ def kda_mtp_decode_impl(
         raise ValueError("cu_seqlens may be None only with packed_token_layout=True.")
     else:
         N = cu_seqlens.shape[0] - 1
+    if fp8_out and (out is not None or quantize_output or not fuse_output_norm):
+        raise ValueError("fp8_out needs the fused output norm and allocates its own outputs")
     if quantize_output:
         if out is not None:
             raise ValueError("quantize_output does not accept a caller-provided out tensor.")
@@ -1479,6 +1497,18 @@ def kda_mtp_decode_impl(
             and all(t.dtype == torch.bfloat16 for t in (x_q, x_k, x_v, cs_q, cs_k, cs_v))
         )
         if use_2cta:
+            if fp8_out:
+                sf_lead = (T_total + 3) // 4 * 4
+                o8 = torch.empty(
+                    (sf_lead, HV * V_dim), dtype=torch.float8_e4m3fn, device=x_q.device
+                )
+                sf_buf = torch.empty(((HV + 3) // 4, sf_lead), dtype=torch.int32, device=x_q.device)
+                o8_arg = o8.view(torch.uint8)
+                osf_arg = sf_buf.view(torch.uint8).view(-1)
+            else:
+                sf_lead = 4
+                o8_arg = out
+                osf_arg = out
             args_2cta = (
                 (h0_arg, 16),
                 (x_q_arg, 16),
@@ -1503,6 +1533,8 @@ def kda_mtp_decode_impl(
                 (beta_cache, beta_cache_assumed_align),
                 (ssm_state_indices, 4),
                 (num_accepted_tokens, 4),
+                (o8_arg, 16),
+                (osf_arg, 16),
             )
             key_2cta = (
                 "2cta",
@@ -1518,6 +1550,7 @@ def kda_mtp_decode_impl(
                 use_flat_layout,
                 bool(use_pdl),
                 _TWO_CTA_MIN_BLOCKS,
+                bool(fp8_out),
             )
             if key_2cta not in _compiled_cache:
                 logger.info(
@@ -1527,6 +1560,7 @@ def kda_mtp_decode_impl(
                 _compiled_cache[key_2cta] = cute.compile(
                     _run_kda_decode_mtp_2cta,
                     *[_dlpack_arg(t, assumed_align=a) for t, a in args_2cta],
+                    sf_lead,
                     N,
                     scale=scale,
                     HV=HV,
@@ -1540,10 +1574,13 @@ def kda_mtp_decode_impl(
                     PDL=bool(use_pdl),
                     MIN_BLOCKS=_TWO_CTA_MIN_BLOCKS,
                     stream=stream,
+                    FP8_OUT=bool(fp8_out),
                 )
             _compiled_cache[key_2cta](
-                *[_dlpack_arg(t, assumed_align=a) for t, a in args_2cta], N, stream
+                *[_dlpack_arg(t, assumed_align=a) for t, a in args_2cta], sf_lead, N, stream
             )
+            if fp8_out:
+                return o8[:T_total], sf_buf.as_strided((T_total, sf_buf.shape[0]), (1, sf_lead))
             return out
         v2_args = (
             (h0_arg, 16),
@@ -1613,6 +1650,8 @@ def kda_mtp_decode_impl(
                 stream=stream,
             )
         _compiled_cache[v2_key](*[_dlpack_arg(t, assumed_align=a) for t, a in v2_args], N, stream)
+        if fp8_out:
+            return torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(out.view(T_total, -1), False)
         return out
 
     key = (
@@ -1770,6 +1809,8 @@ def kda_mtp_decode_impl(
 
     if quantize_output:
         return out, output_scale
+    if fp8_out:
+        return torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(out.view(T_total, -1), False)
     return out
 
 
@@ -1899,6 +1940,139 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> torch.Tensor:
         del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, use_pdl, two_cta
         return x_q.new_empty(x_v.shape)
+
+    @torch.library.custom_op(
+        "trtllm::kda_mtp_decode_fp8_packed",
+        mutates_args=(
+            "cs_q",
+            "cs_k",
+            "cs_v",
+            "recurrent_state",
+            "k_cache",
+            "g_cache",
+            "v_cache",
+            "beta_cache",
+        ),
+        device_types="cuda",
+    )
+    def kda_mtp_decode_fp8_packed(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: Optional[float] = None,
+        zero_accepted_hint: bool = False,
+        regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+        fuse_output_norm: bool = False,
+        use_pdl: bool = False,
+        two_cta: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused KDA multi-token verify whose output is the DeepGEMM 1x128 FP8 operand: E4M3
+        values and MN-major packed UE8M0 scales, bitwise ``fp8_quantize_1x128_packed_ue8m0``
+        of the BF16 output of ``trtllm::kda_mtp_decode``."""
+        return kda_mtp_decode_impl(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            v_cache=v_cache,
+            beta_cache=beta_cache,
+            ssm_state_indices=ssm_state_indices,
+            cu_seqlens=cu_seqlens,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            lower_bound=lower_bound,
+            scale=scale,
+            zero_accepted_hint=zero_accepted_hint,
+            regular_metadata_hint=regular_metadata_hint,
+            packed_token_layout=packed_token_layout,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=fuse_output_norm,
+            use_pdl=use_pdl,
+            two_cta=two_cta,
+            fp8_out=True,
+        )
+
+    @kda_mtp_decode_fp8_packed.register_fake
+    def _(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: Optional[float] = None,
+        zero_accepted_hint: bool = False,
+        regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+        fuse_output_norm: bool = False,
+        use_pdl: bool = False,
+        two_cta: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, use_pdl, two_cta
+        rows = x_q.shape[1]
+        lead = (rows + 3) // 4 * 4
+        words = (x_v.shape[2] + 3) // 4
+        values = x_q.new_empty((rows, x_v.shape[2] * x_v.shape[3]), dtype=torch.float8_e4m3fn)
+        scales = torch.empty_strided((rows, words), (1, lead), dtype=torch.int32, device=x_q.device)
+        return values, scales
 
     @torch.library.custom_op(
         "trtllm::kda_mtp_decode_fused_fb",

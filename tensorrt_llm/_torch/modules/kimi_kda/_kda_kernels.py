@@ -485,6 +485,17 @@ class KDAKernelDispatch:
             op = torch.ops.trtllm.kda_mtp_decode
         return op(**kwargs)
 
+    def mtp_verify_fp8_packed(self, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused KDA multi-token verify returning the DeepGEMM 1x128 FP8 o_proj operand.
+
+        Thin passthrough to ``trtllm::kda_mtp_decode_fp8_packed``: E4M3 values and MN-major
+        packed UE8M0 scales, bitwise ``fp8_quantize_1x128_packed_ue8m0`` of the BF16 output.
+        """
+        if self.verify_kernel_path != "optimized":
+            raise RuntimeError("mtp_verify_fp8_packed needs the optimized verify path")
+        _load_mtp_module()
+        return torch.ops.trtllm.kda_mtp_decode_fp8_packed(**kwargs)
+
     def mtp_verify_fused_fb(self, **kwargs) -> torch.Tensor:
         """Fused KDA multi-token verify that computes its forget gate from ``f_a``.
 
