@@ -786,6 +786,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # Async input quantization (see quantize_input_async / _join_pending_x_ready).
         self._x_quant_event = torch.cuda.Event()
         self._pending_x_ready_event: Optional[torch.cuda.Event] = None
+        # When set by the caller, recorded (once) right after the FC1 grid of
+        # the next run_moe_nvfp4_impl call and cleared: work ordered after it
+        # runs beside FC2.
+        self.post_fc1_event: Optional[torch.cuda.Event] = None
 
         self.scaling_vector_size = 16
         self.quant_config = override_quant_config if override_quant_config is not None else self.quant_config
@@ -1210,6 +1214,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
         x, x_sf = gather_act_op(**gather_act_kwargs)
+        if self.post_fc1_event is not None:
+            self.post_fc1_event.record()
+            self.post_fc1_event = None
 
         if self.use_fused_finalize:
             if has_aux_streams:
