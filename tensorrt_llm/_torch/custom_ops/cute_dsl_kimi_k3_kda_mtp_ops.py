@@ -713,8 +713,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         stream: cuda.CUstream,
     ):
         """Host side of ``kda_decode_mtp_2cta_kernel``: v2's tf32 MMA atoms, operand smem
-        layouts and fp32 state TMA atoms, launched for ``MIN_BLOCKS`` CTAs per SM (64 registers
-        per thread at 2)."""
+        layouts and state TMA atoms (fp32 or bf16 state), launched for ``MIN_BLOCKS`` CTAs per SM
+        (64 registers per thread at 2)."""
         f32 = cutlass.Float32
         tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
             f32,
@@ -808,13 +808,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ),
                 ),
             )
-        box_atom = sm100_utils.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.K_SW128, f32)
-        box_layout = cute.tile_to_shape(box_atom, (V, 32), order=(0, 1))
+        # 128 B swizzled box rows: 32 fp32 or 64 bf16 state columns per box
+        box_cols = 128 // (h0.element_type.width // 8)
+        box_atom = sm100_utils.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, h0.element_type
+        )
+        box_layout = cute.tile_to_shape(box_atom, (V, box_cols), order=(0, 1))
         tma_atom_l, mS_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), mS_vkl, box_layout, (V, 32)
+            cpasync.CopyBulkTensorTileG2SOp(), mS_vkl, box_layout, (V, box_cols)
         )
         tma_atom_t, mT_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(), mS_vkl, box_layout, (V, 32)
+            cpasync.CopyBulkTensorTileS2GOp(), mS_vkl, box_layout, (V, box_cols)
         )
         launched = kda_decode_mtp_2cta_kernel(
             h0,
@@ -1291,7 +1295,8 @@ def kda_mtp_decode_impl(
             weights before ``griddepcontrol.wait``.
         two_cta: run the two-CTAs-per-SM kernel (``kda_mtp_decode_2cta``,
             bitwise the v2 kernel) when the call qualifies: v2 contract, fp32
-            state, bf16 projections and conv caches, one CTA per tile.
+            or bf16 state, bf16 projections and conv caches, forget gate from
+            the projection, one CTA per tile.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -1470,7 +1475,7 @@ def kda_mtp_decode_impl(
             two_cta
             and not fused_fb
             and split_v == 1
-            and h0_arg.dtype == torch.float32
+            and h0_arg.dtype in (torch.float32, torch.bfloat16)
             and all(t.dtype == torch.bfloat16 for t in (x_q, x_k, x_v, cs_q, cs_k, cs_v))
         )
         if use_2cta:

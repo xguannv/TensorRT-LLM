@@ -15,16 +15,18 @@
 """KDA multi-token verify sized for two CTAs per SM (large batches).
 
 Computes exactly what ``kda_mtp_decode_v2.kda_decode_mtp_v2_kernel`` computes on its runtime
-contract (packed rows, fused gated RMSNorm with a bf16 output, 3xTF32 chunk recurrence, fp32
-state, bf16 projections and conv caches, one CTA per (head, request) tile, forget gate from the
-projection) with the same arithmetic in the same order, so outputs, committed state, conv windows
-and replay caches are bitwise identical. A tile still takes one 512-thread CTA; the footprint
-shrinks so that two tiles share an SM when the grid has more tiles than SMs:
+contract (packed rows, fused gated RMSNorm with a bf16 output, 3xTF32 chunk recurrence, fp32 or
+bf16 state, bf16 projections and conv caches, fp32 replay gates, one CTA per (head, request)
+tile, forget gate from the projection) with the same arithmetic in the same order, so outputs,
+committed state, conv windows and replay caches are bitwise identical. A tile still takes one
+512-thread CTA; the footprint shrinks so that two tiles share an SM when the grid has more tiles
+than SMs:
 
 * **Tensor memory: 256 columns.** S0 enters GEMM1 as two sequential A operands in the same 128
   columns (S0 hi for GEMM1, then S0 lo for the K~ sweep, issued in v2's order), and the GEMM2
   accumulator (S0 * decay) is seeded into those columns once GEMM1 is done. D4 | D2 | D1 | D3
-  = 208 columns.
+  = 208 columns. A bf16 state is exact in tf32, so (as in v2) it has no lo part and GEMM1 is
+  the hi pass alone.
 * **Shared memory: <= 114 KB** (113.7 KB at seven drafts). One 64 KB region holds, in turn, the
   S0 TMA boxes (S0 is moved into registers and its hi part into tensor memory right after the
   precompute), the GEMM3 tiles with the cumulative gates and e^{G_c}, the GEMM1 / Kbar / Bcoef
@@ -37,12 +39,14 @@ shrinks so that two tiles share an SM when the grid has more tiles than SMs:
   the GEMM3 result reuses the conv-weight words. Kbar and V' go straight into their swizzled
   tiles from the row-per-thread producers.
 * **Registers: 64 per thread** (``min_blocks_per_mp=2``); D1 is read from tensor memory in the
-  16-column pieces each consumer needs. The tensor-memory allocation permit is released right
-  after the allocation so that the SM's other CTA can allocate.
+  16-column pieces each consumer needs, and a bf16 S0 row stays in registers as packed bf16x2
+  words. The tensor-memory allocation permit is released right after the allocation so that the
+  SM's other CTA can allocate.
 
-Alone on an SM a tile takes ~0.8 us longer than in the v2 kernel (the precompute reads bf16 and
-GEMM1's two A operands are serialized); two tiles per SM finish ~20% sooner than two waves of v2
-tiles, so the kernel pays off for grids with more tiles than SMs.
+Alone on an SM a tile is not faster than in the v2 kernel (with an fp32 state it takes ~0.8 us
+longer: the precompute reads bf16 and GEMM1's two A operands are serialized); two tiles per SM
+finish ~20% (fp32 state) to ~27% (bf16 state) sooner than two waves of v2 tiles, so the kernel pays
+off for grids with more tiles than SMs.
 """
 
 import cutlass
@@ -56,6 +60,7 @@ from .kda_mtp_decode_v2 import (
     T_PAD,
     TILE_K,
     _st_asm,
+    cvt_bf16x2,
     gaddr,
     griddepcontrol_wait,
     ld_row4,
@@ -73,13 +78,14 @@ from .kda_mtp_decode_v2 import ld_shared_f32x4 as _ld_shared_f32x4
 
 TMEM_COLS = 256
 # The 64 KB operand region (floats), used in turn as
-#   P0: the four S0 TMA boxes (128 x 32 fp32 each, 128B swizzle), until S0 is in registers
+#   P0: the S0 TMA boxes (128 B swizzled rows: four 128 x 32 fp32 or two 128 x 64 bf16 boxes),
+#       until S0 is in registers
 #   P1: A3 = [Kf; Qf hi; Qf lo; -] 64 x 128, B3 hi / lo 16 x 128 (GEMM3), the cumulative gates
 #       and e^{G_c} (both kept through P2 / P3)
 #   P2 (once GEMM3 is done): B1 = [K~hi; Q~; K~lo] 48 x 128, B1k = K~hi 16 x 128, then
 #      [Bcoef hi; Kbar hi] and [Bcoef lo; Kbar lo] (16 + 128) x 16 each (GEMM2 B tiles)
 #   P3 (once GEMM1 is done): A2 hi / lo = V'^T 128 x 16 over B1
-#   P4 (once GEMM2 is done): the four committed-state TMA boxes
+#   P4 (once GEMM2 is done): the committed-state TMA boxes
 OFF_A3 = 0
 OFF_B3HI = 8192
 OFF_B3LO = 10240
@@ -153,6 +159,19 @@ def _st_shared_b32x2(addr, a, b):
         "r,r,r",
         [cutlass.Int32(addr).ir_value(), cutlass.Int32(a).ir_value(), cutlass.Int32(b).ir_value()],
     )
+
+
+def _s0_value(r_state, r_state_w, idx, packed):
+    """fp32 value of S0 column ``idx`` of this thread's row: ``r_state[idx]``, or for a packed bf16
+    state the bf16 value ``idx`` of the bf16x2 words ``r_state_w`` (even values in the low half)."""
+    if cutlass.const_expr(packed):
+        w = r_state_w[idx // 2]
+        if cutlass.const_expr(idx % 2 == 0):
+            w = w << 16
+        else:
+            w = w & cutlass.Int32(-65536)
+        return w.bitcast(cutlass.Float32)
+    return r_state[idx]
 
 
 def _load_new_token_qkv(
@@ -246,9 +265,14 @@ def kda_decode_mtp_2cta_kernel(
     assert NUM_SPEC <= 7 and t_max <= T_PAD
     assert NEW_TOK <= REPLAY_WARP0 and REPLAY_WARP0 + NUM_SPEC <= TMA_WARP
     assert K == 128 and V == 128 and KERNEL_WIDTH == 4 and NUM_THREADS == 512
-    assert h0.element_type == cutlass.Float32, "fp32 recurrent state"
-    BOX_COLS = 32  # fp32 columns per 128 B swizzled box row
+    STATE_DTYPE = h0.element_type
+    STATE_BF16 = STATE_DTYPE == cutlass.BFloat16
+    assert STATE_BF16 or STATE_DTYPE == cutlass.Float32, "fp32 or bf16 recurrent state"
+    # a bf16 state is exact in tf32: no S0 lo part (v2's S0_LO)
+    S0_LO = not STATE_BF16
+    BOX_COLS = 128 // (STATE_DTYPE.width // 8)  # state columns per 128 B swizzled box row
     NUM_SLABS = K // BOX_COLS
+    assert g_cache.element_type == cutlass.Float32, "fp32 replay gates (cp.async into sG)"
     assert cs_q.element_type == cutlass.BFloat16 and x_q.element_type == cutlass.BFloat16
     k_weight_base = KERNEL_WIDTH * K
     v_weight_base = 2 * KERNEL_WIDTH * K
@@ -306,6 +330,9 @@ def kda_decode_mtp_2cta_kernel(
     sE = cute.make_tensor(sRegion.iterator + OFF_E, cute.make_layout((t_max * K,)))
     sEc = cute.make_tensor(sRegion.iterator + OFF_EC, cute.make_layout((K,)))
     sBoxf = cute.make_tensor(sRegion.iterator, cute.make_layout((V * K,)))
+    sBoxh = cute.make_tensor(
+        cute.recast_ptr(sRegion.iterator, dtype=cutlass.BFloat16), cute.make_layout((V * K,))
+    )
 
     # ---- load phase (v2's schedule): slot-independent loads under the slot load; then the
     #      slot-dependent ones. Window and replay raw conv rows and replay gates go to smem through
@@ -374,14 +401,14 @@ def kda_decode_mtp_2cta_kernel(
             _cp_async_8(saddr(sXrv, w * V + k4), gaddr(cs_v, (slot, hv_off + k4, w)))
         _cp_async_commit()
     commit_len = num_accepted_tokens[slot]
-    # S0 into the region's four boxes (consumed right after the precompute)
+    # S0 into the region's boxes (consumed right after the precompute)
     if warp_idx == TMA_WARP:
         with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar_ld, V * K * 4)
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar_ld, V * K * (STATE_DTYPE.width // 8))
     for sl_h in cutlass.range_constexpr(NUM_SLABS):
         sTl_h = cute.make_tensor(
             cute.recast_ptr(
-                sRegion.iterator + sl_h * (V * 32), box_layout.inner, dtype=cutlass.Float32
+                sRegion.iterator + sl_h * (V * 32), box_layout.inner, dtype=STATE_DTYPE
             ),
             box_layout.outer,
         )
@@ -563,7 +590,7 @@ def kda_decode_mtp_2cta_kernel(
     for sl_h in cutlass.range_constexpr(NUM_SLABS):
         sT_h = cute.make_tensor(
             cute.recast_ptr(
-                sRegion.iterator + sl_h * (V * 32), box_layout.inner, dtype=cutlass.Float32
+                sRegion.iterator + sl_h * (V * 32), box_layout.inner, dtype=STATE_DTYPE
             ),
             box_layout.outer,
         )
@@ -587,16 +614,31 @@ def kda_decode_mtp_2cta_kernel(
     v_row = wg_tidx
     vx = 4 * (wg_tidx % 8)
     r_state = cute.make_rmem_tensor(cute.make_layout((32,)), cutlass.Float32)
+    # a bf16 state stays packed: bf16x2 words, value 2 i in the low half of word i
+    r_state_w = cute.make_rmem_tensor(cute.make_layout((16,)), cutlass.Int32)
     cute.arch.mbarrier_wait(mbar_ld, 0)
-    for c in cutlass.range(8, unroll_full=True):
-        off_l = wg * (V * 32) + 32 * wg_tidx + ((4 * c) ^ vx)
-        for i in cutlass.range(4, unroll_full=True):
-            r_state[4 * c + i] = sBoxf[off_l + i]
+    if cutlass.const_expr(STATE_BF16):
+        # bf16 box: 64 columns per 128 B row, so this warpgroup's 32 columns are the 16 B
+        # chunks [4 (wg % 2), +4) of box wg // 2 (v2), kept as raw bf16x2 words
+        for c in cutlass.range_constexpr(4):
+            chunk = (4 * (wg % 2) + c) ^ (wg_tidx % 8)
+            off_l = (wg // 2) * (V * 64) + 64 * wg_tidx + 8 * chunk
+            words = _ld_shared_f32x4(saddr(sBoxh, off_l))
+            for i in cutlass.range_constexpr(4):
+                r_state_w[4 * c + i] = words[i].bitcast(cutlass.Int32)
+    else:
+        for c in cutlass.range(8, unroll_full=True):
+            off_l = wg * (V * 32) + 32 * wg_tidx + ((4 * c) ^ vx)
+            for i in cutlass.range(4, unroll_full=True):
+                r_state[4 * c + i] = sBoxf[off_l + i]
     for jj in cutlass.range_constexpr(4):
         if wg == jj:
             for c in cutlass.range_constexpr(4):
                 for i in cutlass.range_constexpr(8):
-                    r8[i] = round_tf32(r_state[8 * c + i])
+                    if cutlass.const_expr(S0_LO):
+                        r8[i] = round_tf32(r_state[8 * c + i])
+                    else:
+                        r8[i] = _s0_value(r_state, r_state_w, 8 * c + i, STATE_BF16)
                 cute.copy(st8, r8, tX_st8[(None, None, None, 4 * jj + c)])
     cute.arch.fence_view_async_tmem_store()
     cute.arch.barrier()
@@ -708,7 +750,8 @@ def kda_decode_mtp_2cta_kernel(
         if quarter == t % 4:
             xc = kc ^ (4 * (t % 8))
             sB1f[b1_base + 32 * t + xc] = r_b1[3 * (t // 4)]
-            sB1kf[b1k_base + 32 * t + xc] = r_b1[3 * (t // 4)]
+            if cutlass.const_expr(S0_LO):
+                sB1kf[b1k_base + 32 * t + xc] = r_b1[3 * (t // 4)]
             sB1f[b1_base + 32 * (T_PAD + t) + xc] = r_b1[3 * (t // 4) + 1]
             sB1f[b1_base + 32 * (2 * T_PAD + t) + xc] = r_b1[3 * (t // 4) + 2]
     ld3 = cute.make_copy_atom(
@@ -753,7 +796,10 @@ def kda_decode_mtp_2cta_kernel(
             cute.gemm(tiled_mma1, tD1, tX_tf[(None, None, kb_i)], tCrB1[(None, None, kb_i, 0)], tD1)
             tiled_mma1.set(tcgen05.Field.ACCUMULATE, True)
         with cute.arch.elect_one():
-            tcgen05.commit(mbar1a)
+            if cutlass.const_expr(S0_LO):
+                tcgen05.commit(mbar1a)
+            else:
+                tcgen05.commit(mbar1)
     # ---- under GEMM1: D4 zero, Bcoef tiles (warpgroups 1..2, from sLB), Kbar tiles, the new
     #      tokens' replay-cache rows and conv-window commits
     st16 = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition.x16), cutlass.Float32)
@@ -820,28 +866,33 @@ def kda_decode_mtp_2cta_kernel(
                 ww = _ld_shared_b32x2(src)
                 st_global_b32x2(gaddr(cs_sec, (slot, off_sec + k4, w)), ww[0], ww[1])
     # ---- GEMM1's S0 lo sweep once the hi pass has read X
-    cute.arch.mbarrier_wait(mbar1a, 0)
-    tcgen05_fence_after_thread_sync()
-    for jj in cutlass.range_constexpr(4):
-        if wg == jj:
-            for c in cutlass.range_constexpr(4):
-                for i in cutlass.range_constexpr(8):
-                    s_hi = round_tf32(r_state[8 * c + i])
-                    r8[i] = r_state[8 * c + i] - s_hi
-                cute.copy(st8, r8, tX_st8[(None, None, None, 4 * jj + c)])
-    cute.arch.fence_view_async_tmem_store()
-    cute.arch.fence_view_async_shared()
-    tcgen05_fence_before_thread_sync()
-    cute.arch.barrier()
-    tcgen05_fence_after_thread_sync()
-    if warp_idx == 0:
-        tiled_mma1k.set(tcgen05.Field.ACCUMULATE, True)
-        for kb_i in cutlass.range_constexpr(K // 8):
-            cute.gemm(
-                tiled_mma1k, tD1k, tX_tf[(None, None, kb_i)], tCrB1k[(None, None, kb_i, 0)], tD1k
-            )
-        with cute.arch.elect_one():
-            tcgen05.commit(mbar1)
+    if cutlass.const_expr(S0_LO):
+        cute.arch.mbarrier_wait(mbar1a, 0)
+        tcgen05_fence_after_thread_sync()
+        for jj in cutlass.range_constexpr(4):
+            if wg == jj:
+                for c in cutlass.range_constexpr(4):
+                    for i in cutlass.range_constexpr(8):
+                        s_hi = round_tf32(r_state[8 * c + i])
+                        r8[i] = r_state[8 * c + i] - s_hi
+                    cute.copy(st8, r8, tX_st8[(None, None, None, 4 * jj + c)])
+        cute.arch.fence_view_async_tmem_store()
+        cute.arch.fence_view_async_shared()
+        tcgen05_fence_before_thread_sync()
+        cute.arch.barrier()
+        tcgen05_fence_after_thread_sync()
+        if warp_idx == 0:
+            tiled_mma1k.set(tcgen05.Field.ACCUMULATE, True)
+            for kb_i in cutlass.range_constexpr(K // 8):
+                cute.gemm(
+                    tiled_mma1k,
+                    tD1k,
+                    tX_tf[(None, None, kb_i)],
+                    tCrB1k[(None, None, kb_i, 0)],
+                    tD1k,
+                )
+            with cute.arch.elect_one():
+                tcgen05.commit(mbar1)
     # ---- GEMM2 accumulator seed S0 * e^{G_c} into X once GEMM1 is done
     cute.arch.mbarrier_wait(mbar1, 0)
     tcgen05_fence_after_thread_sync()
@@ -849,7 +900,10 @@ def kda_decode_mtp_2cta_kernel(
         if wg == jj:
             for c in cutlass.range_constexpr(4):
                 for i in cutlass.range_constexpr(8):
-                    r8[i] = r_state[8 * c + i] * sEc[jj * 32 + 8 * c + i]
+                    r8[i] = (
+                        _s0_value(r_state, r_state_w, 8 * c + i, STATE_BF16)
+                        * sEc[jj * 32 + 8 * c + i]
+                    )
                 cute.copy(st8, r8, tX_st8[(None, None, None, 4 * jj + c)])
     cute.arch.fence_view_async_tmem_store()
     # ---- warpgroup 0: V' by forward substitution (row v per thread) straight into the A2 tiles
@@ -1040,11 +1094,21 @@ def kda_decode_mtp_2cta_kernel(
             for cc in cutlass.range_constexpr(4):
                 cute.copy(ld8, tX_ld8[(None, None, None, 4 * jj + cc)], r8)
                 cute.arch.fence_view_async_tmem_load()
-                for h in cutlass.range_constexpr(2):
-                    c = 2 * cc + h
-                    off_b = jj * (V * 32) + 32 * wg_tidx + ((4 * c) ^ vx)
-                    for i in cutlass.range_constexpr(4):
-                        sBoxf[off_b + i] = r8[4 * h + i]
+                if cutlass.const_expr(STATE_BF16):
+                    # bf16 box jj // 2, 16 B chunk 4 (jj % 2) + cc, round to nearest (v2's
+                    # cvt.rn per value, two values per cvt.rn.bf16x2)
+                    chunk = (4 * (jj % 2) + cc) ^ (wg_tidx % 8)
+                    off_b = (jj // 2) * (V * 64) + 64 * wg_tidx + 8 * chunk
+                    st_shared_f32x4(
+                        saddr(sBoxh, off_b),
+                        *[cvt_bf16x2(r8[2 * i + 1], r8[2 * i]) for i in range(4)],
+                    )
+                else:
+                    for h in cutlass.range_constexpr(2):
+                        c = 2 * cc + h
+                        off_b = jj * (V * 32) + 32 * wg_tidx + ((4 * c) ^ vx)
+                        for i in cutlass.range_constexpr(4):
+                            sBoxf[off_b + i] = r8[4 * h + i]
     tcgen05_fence_before_thread_sync()
     if warp_idx > 0:
         cute.arch.barrier_arrive(barrier_id=8, number_of_threads=NUM_THREADS)

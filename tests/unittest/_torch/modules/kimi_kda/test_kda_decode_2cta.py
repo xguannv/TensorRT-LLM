@@ -16,8 +16,9 @@
 
 ``kda_mtp_decode_impl(..., two_cta=True)`` must reproduce the one-CTA v2 kernel bit for bit
 (outputs, committed recurrent state, conv windows, replay caches) over several verify rounds with
-mixed acceptance, with and without PDL, eagerly and under CUDA graph replay; the mixer must route
-multi-wave verify calls to it only when the switch is on and the result must not change.
+mixed acceptance, for fp32 and bf16 recurrent states, with and without PDL, eagerly and under CUDA
+graph replay; the mixer must route multi-wave verify calls to it only when the switch is on and
+the result must not change.
 """
 
 import pytest
@@ -25,6 +26,7 @@ import torch
 
 from tests.unittest._torch.modules.kimi_kda.test_kda_decode_fused_fab import (
     MUTATED,
+    N1,
     _assert_same,
     _clone,
     _decode_kwargs,
@@ -45,6 +47,12 @@ def _impl():
     return kda_mtp_decode_impl
 
 
+def _layer_with_state(batch, num_spec, seed, state_dtype):
+    lay = _layer(batch, num_spec, seed=seed)
+    lay["state"] = lay["state"].to(state_dtype)
+    return lay
+
+
 def _gate(lay, num_rows):
     g = torch.Generator(device="cpu").manual_seed(num_rows)
     gate = (torch.randn(num_rows, 6 * 128, generator=g) * 0.5).bfloat16().cuda()
@@ -52,11 +60,18 @@ def _gate(lay, num_rows):
     return gate, beta
 
 
+STATE_DTYPES = [
+    pytest.param(torch.float32, id="fp32_state"),
+    pytest.param(torch.bfloat16, id="bf16_state"),
+]
+
+
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
 @pytest.mark.parametrize("use_pdl", [False, True])
 @pytest.mark.parametrize("batch,num_spec", [(32, 6), (32, 7), (64, 5), (128, 6), (26, 2)])
 @torch.no_grad()
-def test_two_cta_verify_bitwise(batch, num_spec, use_pdl):
-    lay = _layer(batch, num_spec, seed=200 + batch + num_spec)
+def test_two_cta_verify_bitwise(batch, num_spec, use_pdl, state_dtype):
+    lay = _layer_with_state(batch, num_spec, 200 + batch + num_spec, state_dtype)
     gate, beta = _gate(lay, batch * (num_spec + 1))
     ref, two = _clone(lay), _clone(lay)
     for rnd in range(3):
@@ -72,10 +87,11 @@ def test_two_cta_verify_bitwise(batch, num_spec, use_pdl):
             _next_acceptance(state, batch, num_spec, seed=300 + rnd)
 
 
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
 @torch.no_grad()
-def test_two_cta_cuda_graph():
+def test_two_cta_cuda_graph(state_dtype):
     batch, num_spec = 64, 7
-    lay = _layer(batch, num_spec, seed=17)
+    lay = _layer_with_state(batch, num_spec, 17, state_dtype)
     gate, beta = _gate(lay, batch * (num_spec + 1))
     ref, graphed = _clone(lay), _clone(lay)
     stream = torch.cuda.Stream()
@@ -103,22 +119,28 @@ def test_two_cta_cuda_graph():
             _next_acceptance(state, batch, num_spec, seed=400 + rnd)
 
 
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
 @torch.no_grad()
-def test_two_cta_falls_back_on_bf16_state():
-    """The two-CTA kernel takes fp32 state only; other calls run the v2 kernel unchanged."""
+def test_two_cta_falls_back_on_fused_forget_gate(state_dtype):
+    """The two-CTA kernel takes the forget gate from the projection only; a call with the fused
+    forget gate runs the v2 kernel unchanged."""
     batch, num_spec = 32, 6
-    lay = _layer(batch, num_spec, seed=5)
-    lay["state"] = lay["state"].bfloat16()
-    gate, beta = _gate(lay, batch * (num_spec + 1))
+    lay = _layer_with_state(batch, num_spec, 5, state_dtype)
+    m = batch * (num_spec + 1)
+    g = torch.Generator(device="cpu").manual_seed(m)
+    bfa = (torch.randn(m, N1, generator=g) * 0.5).bfloat16().cuda()
     ref, two = _clone(lay), _clone(lay)
-    out_ref = _impl()(**_decode_kwargs(ref, batch, num_spec, g=gate, beta=beta))
-    out_two = _impl()(**_decode_kwargs(two, batch, num_spec, g=gate, beta=beta), two_cta=True)
+    out_ref = _impl()(**_decode_kwargs(ref, batch, num_spec, bfa=bfa, use_pdl=True))
+    kw = _decode_kwargs(two, batch, num_spec, bfa=bfa, use_pdl=True)
+    out_two = _impl()(**kw, two_cta=True)
     _assert_same("out", out_two, out_ref)
-    _assert_same("state", two["state"], ref["state"])
+    for key in MUTATED:
+        _assert_same(key, two[key], ref[key])
 
 
+@pytest.mark.parametrize("state_dtype", STATE_DTYPES)
 @torch.no_grad()
-def test_mixer_routes_multi_wave_verify(monkeypatch):
+def test_mixer_routes_multi_wave_verify(monkeypatch, state_dtype):
     """forward_verify_fused with the switch on: the two-CTA kernel for a multi-wave grid, bitwise
     the same outputs and pools as with the switch off."""
     from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
@@ -140,7 +162,7 @@ def test_mixer_routes_multi_wave_verify(monkeypatch):
         rt.finalize_decode_weights()
         conv_pool, ssm_pool = _make_pools(batch, seed=2)
         runtimes.append(rt)
-        pools.append(ssm_pool)
+        pools.append(ssm_pool.to(state_dtype))
         caches.append(_make_fused_layer_cache(batch, conv_pool))
     calls = []
     verify = runtimes[1]._dispatch.mtp_verify
