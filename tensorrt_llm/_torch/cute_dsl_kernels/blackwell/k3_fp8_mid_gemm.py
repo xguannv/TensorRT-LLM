@@ -1310,21 +1310,22 @@ def expand_weight_scale(w_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
 #: projections, from A/B runs of the whole chain (activation quantization + GEMM [+ residual
 #: update]) against the production path on GB300 (CUDA graph, cold weights). ``None`` marks the
 #: buckets where the production path (DeepGEMM, the low-M kernel or the fused latent chain) is
-#: as fast or faster. Keys are (N rounded up to 128, K); bucket ``i`` covers M up to
+#: as fast or faster; up to 64 tokens the low-M kernel (activation quantized inside the GEMM)
+#: always serves. Keys are (N rounded up to 128, K); bucket ``i`` covers M up to
 #: ``_M_BUCKETS[i]``.
-_M_BUCKETS = (176, 336, 672, 1120, 1568, MAX_M)
+_M_BUCKETS = (64, 176, 336, 672, 1120, 1568, MAX_M)
 _TUNED_TN = {
-    (7168, 3584): (64, None, None, 192, 192, 192),  # latent_up (+ residual update)
-    (7168, 768): (64, 128, 64, 128, 192, 128),  # KDA / MLA o_proj
-    (18432, 1536): (128, 128, 128, 192, 192, 256),  # MLA q_b
-    (2176, 7168): (None, None, 64, 128, 192, 256),  # MLA fused q_a / kv_a (2112 rows)
-    (768, 7168): (None, 64, 64, 64, 64, 128),  # MLA output gate
-    (3072, 7168): (None, 64, 128, None, 128, 192),  # KDA fused q / k / v / g
+    (7168, 3584): (None, 64, None, None, 192, 192, 192),  # latent_up (+ residual update)
+    (7168, 768): (None, 64, 128, 64, 128, 192, 128),  # KDA / MLA o_proj
+    (18432, 1536): (None, 128, 128, 128, 192, 192, 256),  # MLA q_b
+    (2176, 7168): (None, None, None, 64, 128, 192, 256),  # MLA fused q_a / kv_a (2112 rows)
+    (768, 7168): (None, None, 64, 64, 64, 64, 128),  # MLA output gate
+    (3072, 7168): (None, None, 64, 128, None, 128, 192),  # KDA fused q / k / v / g
 }
 #: Token tiles when the activation arrives already quantized with DeepGEMM-packed scales (the
 #: fused all-reduce + RMSNorm + FP8 block quantization in front of latent_up).
 _TUNED_TN_PACKED = {
-    (7168, 3584): (64, 128, 256, 192, 192, 256),
+    (7168, 3584): (None, 64, 128, 256, 192, 192, 256),
 }
 
 
