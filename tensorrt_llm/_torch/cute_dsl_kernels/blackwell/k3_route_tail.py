@@ -7,7 +7,7 @@ the split-K reduction before them) by one launch on a cluster of eight small CTA
 routing occupies few SMs next to the side-stream kernels it runs with. ``k3_route`` puts a
 router GEMV with a fixed 40-CTA grid in front of it (``M <= 64``).
 
-* Input: FP32 router logits ``[M, 896]`` (``1 <= M <= 256``), or ``S`` split-K partials
+* Input: FP32 router logits ``[M, 896]`` (``1 <= M <= 2048``), or ``S`` split-K partials
   ``[S, R, 896]`` (``R >= M``) that are summed in split order.
 * Top-k, bit-identical to ``noaux_tc_op`` on the same logits (selection, order, weights). A
   team of ``G`` warps routes one token, lane ``g`` of the team owning experts
@@ -26,8 +26,13 @@ router GEMV with a fixed 40-CTA grid in front of it (``M <= 64``).
   local-expert order) and writes the rows of its own tokens: rows of an expert follow the token
   order, which is what ``moe_sort``'s single-CTA kernels produce (its cluster kernel orders rows
   by atomics). CTA 0 writes the tile arrays.
+* ``256 < M <= 2048`` (:class:`K3RouteWideKernel`): independent CTAs of 8-32 tokens run the
+  same top-k; each publishes per-expert token masks (and the top-k slot of each masked token)
+  to a persistent workspace, and the last CTA to arrive (arrival counter) writes the same
+  ``moe_sort`` outputs, rows again in ascending token order.
 
-The kernels keep no state between launches, so a captured CUDA graph replays them as is.
+The cluster kernels keep no state between launches; the multi-CTA kernel resets its arrival
+counter before it exits. Either way a captured CUDA graph replays them as is.
 """
 
 from __future__ import annotations
@@ -58,7 +63,9 @@ from .k3_fused_router import (
     NUM_EXPERTS,
     TOP_K,
     _asm,
+    _atom_add_relaxed_gpu,
     _div_rn_f32,
+    _fence_acq_rel_gpu,
     _fv,
     _iv,
     _lds_b32,
@@ -71,6 +78,7 @@ from .k3_fused_router import (
     _renormalize,
     _st_global_b32,
     _st_global_f32,
+    _st_relaxed_b32,
     _sts_b32,
     _sts_v4_f32,
     _unit_scale_fast_path,
@@ -550,6 +558,8 @@ class K3RouteTailKernel:
         # Local experts handled per thread in the sort scan (contiguous).
         self.experts_per_thread = (local_cap + self.threads - 1) // self.threads
         self.max_tiles_per_expert = (MAX_M + TILE - 1) // TILE
+        # Skip candidate-ranking rounds in which the warp has no candidate.
+        self.skip_empty_rank_rounds = False
 
     @cute.jit
     def __call__(
@@ -777,6 +787,49 @@ class K3RouteTailKernel:
         local_num: Int32,
     ):
         """Top-16 of one token by one team; its first warp writes ids/weights and mask bits."""
+        expert, weight = self.select_token(
+            token,
+            team,
+            team_warp,
+            lane,
+            rows,
+            logits_addr,
+            bias_smem,
+            scale_bits,
+            logits_out_addr,
+            cand_smem,
+            top_smem,
+            xchg_smem,
+        )
+        if team_warp == 0:
+            if lane < TOP_K:
+                out = (token * TOP_K + lane) * 4
+                _st_global_b32(ids_addr + Int64(out), expert)
+                _st_global_f32(vals_addr + Int64(out), weight)
+                if cutlass.const_expr(self.with_sort):
+                    _sts_b32(ids_smem + (token_local * TOP_K + lane) * 4, expert)
+                    local = expert - local_offset
+                    if local >= 0 and local < local_num:
+                        _red_shared_or(mask_smem + local * 4, _bit(token_local))
+
+    @cute.jit
+    def select_token(
+        self,
+        token: Int32,
+        team: Int32,
+        team_warp: Int32,
+        lane: Int32,
+        rows: Int32,
+        logits_addr: Int64,
+        bias_smem: Int32,
+        scale_bits: Int64,
+        logits_out_addr: Int64,
+        cand_smem: Int32,
+        top_smem: Int32,
+        xchg_smem: Int32,
+    ):
+        """Top-16 of one token by one team: returns ``(expert, weight)``, the ``lane``-th
+        selection in lanes ``0..15`` of the team's first warp."""
         n_slots = self.slots
         stride = self.team_lanes
         g = team_warp * 32 + lane
@@ -852,7 +905,12 @@ class K3RouteTailKernel:
                 r = Int32(0)
                 for w in cutlass.range_constexpr(self.team_warps):
                     other = cand_smem + w * region_bytes
-                    for o in cutlass.range(0, counts[w], 4, unroll=1):
+                    limit = counts[w]
+                    if cutlass.const_expr(c0 > 0 and self.skip_empty_rank_rounds):
+                        # No candidate of this warp in this round: skip the count.
+                        if num_mine <= c0 * 32:
+                            limit = Int32(0)
+                    for o in cutlass.range(0, limit, 4, unroll=1):
                         r = _count_greater4(r, other + o * _CAND_BYTES, key)
                 if valid != 0 and r < TOP_K:
                     _sts_b32(top_smem + r * 8, 65535 - (Int32(key) & 0xFFFF))
@@ -865,23 +923,15 @@ class K3RouteTailKernel:
             if team_warp == 0:
                 expert, score = self.topk_rounds(row, split_stride, bias_smem, lane)
 
+        weight = Float32(0.0)
         if team_warp == 0:
             total = _warp_sum_f32(score)
             # Exact FP32 fast path of noaux_tc's FP64 expression (see k3_fused_router).
-            weight = Float32(0.0)
             if _unit_scale_fast_path(scale_bits, total) != 0:
                 weight = _div_rn_f32(score, total)
             else:
                 weight = _renormalize(score, total, scale_bits)
-            if lane < TOP_K:
-                out = (token * TOP_K + lane) * 4
-                _st_global_b32(ids_addr + Int64(out), expert)
-                _st_global_f32(vals_addr + Int64(out), weight)
-                if cutlass.const_expr(self.with_sort):
-                    _sts_b32(ids_smem + (token_local * TOP_K + lane) * 4, expert)
-                    local = expert - local_offset
-                    if local >= 0 and local < local_num:
-                        _red_shared_or(mask_smem + local * 4, _bit(token_local))
+        return expert, weight
 
     @cute.jit
     def topk_rounds(self, row: Int64, split_stride: Int64, bias_smem: Int32, lane: Int32):
@@ -1025,6 +1075,512 @@ class K3RouteTailKernel:
                 perm = _lds_b32(base_smem + local * 4) + _popc(word & _low_bits_mask(token_local))
                 _st_global_b32(p2e_addr + Int64(perm * 4), expanded)
             _st_global_b32(e2p_addr + Int64(expanded * 4), perm)
+
+
+# ---------------------------------------------------------------------------
+# Multi-CTA routing (M > 256)
+# ---------------------------------------------------------------------------
+
+#: Largest token count of the multi-CTA routing (:class:`K3RouteWideKernel`).
+WIDE_MAX_M = 2048
+#: Largest number of local experts the multi-CTA sort serves (expert parallelism >= 4).
+WIDE_LOCAL_CAP = 224
+#: Cells (local experts x CTAs) of the sort's shared-memory table (32 KB): the sort serves
+#: ``local_num_experts * ceil(M / tokens_per_cta) <= 8192``.
+WIDE_TABLE_CELLS = 8192
+_WIDE_MAX_CTAS = WIDE_MAX_M // 8
+#: Workspace of the multi-CTA sort: arrival counter, then per CTA its number of local
+#: selections, the ``[CTA][local expert]`` token masks, and per CTA a list of its local
+#: selections (``tokens_per_cta * 16`` slots).
+_WIDE_COUNT_OFFSET = 128
+_WIDE_MASK_OFFSET = _WIDE_COUNT_OFFSET + _WIDE_MAX_CTAS * 4
+_WIDE_LIST_OFFSET = _WIDE_MASK_OFFSET + WIDE_TABLE_CELLS * 4
+_WIDE_WORKSPACE_BYTES = _WIDE_LIST_OFFSET + WIDE_MAX_M * TOP_K * 4
+#: Smem words of the top-k phase per region (aliased by the sort's table): bias, then per team.
+_WIDE_BIAS_WORDS = NUM_EXPERTS
+#: Cells per step of the sort's per-expert scan.
+_SCAN_CHUNK = 8
+
+
+@dsl_user_op
+def _ld_relaxed_b32_or_zero(valid, addr, *, loc=None, ip=None):
+    """``*addr`` (relaxed, GPU scope) if ``valid != 0`` else 0."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(valid, loc=loc, ip=ip), _lv(addr, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nmov.b32 $0, 0;\n"
+            "@p ld.relaxed.gpu.global.b32 $0, [$2];\n}",
+            "=&r,r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _lds_b32_or_zero(valid, addr, *, loc=None, ip=None):
+    """Shared ``*addr`` if ``valid != 0`` else 0."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(valid, loc=loc, ip=ip), _iv(addr, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nmov.b32 $0, 0;\n@p ld.shared.b32 $0, [$2];\n}",
+            "=&r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sts_b32_if(valid, addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(valid, loc=loc, ip=ip), _iv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "{\n.reg .pred p;\nsetp.ne.u32 p, $0, 0;\n@p st.shared.b32 [$1], $2;\n}",
+        "r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _atom_shared_add(addr, value, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+            "atom.shared.add.u32 $0, [$1], $2;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+class K3RouteWideKernel(K3RouteTailKernel):
+    """Top-16 (+ ``moe_sort``) of up to :data:`WIDE_MAX_M` tokens on a grid of independent CTAs.
+
+    CTA ``c`` routes tokens ``[T c, T c + T)`` (``T = tokens_per_cta``) with the teams of
+    :class:`K3RouteTailKernel` (same selection code, so the same top-k). The sort is done by the
+    CTA that finishes last:
+
+    * Each CTA marks, per local expert ``j``, a ``T``-bit mask of its tokens that selected ``j``
+      in shared memory, appends each such selection ``(j, token, slot k)`` to its list in the
+      workspace and stores ``expanded_idx_to_permuted_idx = -1`` for its selections of other
+      ranks' experts. It then publishes the masks (``[c][j]``) and its list length and takes a
+      ticket from an arrival counter (release fence first).
+    * The CTA that draws the last ticket resets the counter and builds ``moe_sort``'s metadata:
+      it loads the whole mask table and the first ``2 T`` list entries of every CTA in one round
+      of loads (later entries, rare at EP16, are loaded as needed), then, in shared memory,
+      turns each expert's masks into token counts and per-cell row offsets (rows of an expert in
+      ascending token order), lays out the tiles like :class:`K3RouteTailKernel`, and writes
+      the rows of all listed selections.
+
+    No CTA waits on another, so the grid needs no co-residency. Launches sharing the workspace
+    must not overlap (stream order provides that); each launch leaves the counter at zero, so a
+    captured CUDA graph replays as is.
+
+    Args:
+        tokens_per_cta: Tokens per CTA: 8 or 16 (with the sort), or 32 (top-k only).
+        num_warps: Warps per CTA: 8 or 16 (with the sort), or 4 (top-k only).
+        warps_per_token: Warps routing one token (1, 2, 4 or 7).
+        num_splits: Split-K partial logits summed in split order (1 = plain logits).
+        with_sort: Also produce the ``moe_sort`` outputs.
+        use_pdl: Launch with programmatic dependent launch.
+        local_cap: Largest number of local experts served (at most :data:`WIDE_LOCAL_CAP`).
+    """
+
+    def __init__(
+        self,
+        tokens_per_cta: int,
+        num_warps: int,
+        warps_per_token: int,
+        num_splits: int,
+        with_sort: bool,
+        use_pdl: bool,
+        local_cap: int = WIDE_LOCAL_CAP,
+    ):
+        super().__init__(1, num_warps, warps_per_token, num_splits, with_sort, use_pdl, local_cap)
+        if tokens_per_cta not in ((8, 16) if with_sort else (8, 16, 32)):
+            raise ValueError(f"tokens_per_cta={tokens_per_cta} must be 8 or 16 (32 top-k only)")
+        if num_warps not in ((8, 16) if with_sort else (4, 8, 16)):
+            raise ValueError(f"num_warps={num_warps} must be 8 or 16 (4 top-k only)")
+        if local_cap > WIDE_LOCAL_CAP:
+            raise ValueError(f"local_cap={local_cap} must be at most {WIDE_LOCAL_CAP}")
+        self.tokens = tokens_per_cta
+        self.max_ctas = WIDE_MAX_M // tokens_per_cta
+        # Sort: mask-table words per thread; list entries per CTA loaded up front (twice the
+        # tokens, about twice the expected local selections at EP16), 32 / list_slots CTAs per
+        # warp-wide load.
+        self.table_items = WIDE_TABLE_CELLS // self.threads
+        self.list_slots = min(2 * tokens_per_cta, 32)
+        self.lists_per_load = 32 // self.list_slots
+        self.list_loads = (self.max_ctas + num_warps * self.lists_per_load - 1) // (
+            num_warps * self.lists_per_load
+        )
+        self.cand_words = num_warps * self.region_slots * 4
+        self.topk_words = (
+            _WIDE_BIAS_WORDS + self.cand_words + self.teams * TOP_K * 2 + self.teams * 16
+        )
+        self.skip_empty_rank_rounds = True
+
+    @cute.jit
+    def __call__(
+        self,
+        m: Int32,
+        rows: Int32,
+        logits_addr: Int64,
+        bias_addr: Int64,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_offset: Int32,
+        local_num: Int32,
+        scale_bits: Int64,
+        ws_addr: Int64,
+        stream: cuda.CUstream,
+    ):
+        scratch_words = self.topk_words
+        if cutlass.const_expr(self.with_sort):
+            scratch_words = max(scratch_words, WIDE_TABLE_CELLS)
+
+        @cute.struct
+        class SharedStorage:
+            # Top-k phase: bias, candidate regions, top-16 and exchange slots; the sort's
+            # [CTA][local expert] table aliases them.
+            scratch: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, scratch_words], 16]
+            mask: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.local_cap], 16]
+            # Sort: first tile per local expert.
+            tile: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.local_cap], 16]
+            warp_tot: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.num_warps], 16]
+            # [0]: last-CTA flag, [1]: number of local selections of this CTA.
+            flag: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
+
+        self.shared_storage = SharedStorage
+
+        num_ctas = (m + (self.tokens - 1)) // self.tokens
+        self.kernel(
+            m,
+            rows,
+            logits_addr,
+            bias_addr,
+            ids_addr,
+            vals_addr,
+            e2p_addr,
+            p2e_addr,
+            tile_expert_addr,
+            tile_limit_addr,
+            total_addr,
+            num_tiles_addr,
+            local_offset,
+            local_num,
+            scale_bits,
+            ws_addr,
+        ).launch(
+            grid=(num_ctas, 1, 1),
+            block=(self.threads, 1, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        m: Int32,
+        rows: Int32,
+        logits_addr: Int64,
+        bias_addr: Int64,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_offset: Int32,
+        local_num: Int32,
+        scale_bits: Int64,
+        ws_addr: Int64,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        scratch = storage.scratch.data_ptr().toint()
+        mask_smem = storage.mask.data_ptr().toint()
+        tile_smem = storage.tile.data_ptr().toint()
+        warp_tot_smem = storage.warp_tot.data_ptr().toint()
+        flag_smem = storage.flag.data_ptr().toint()
+        bias_smem = scratch
+        cand_all = bias_smem + _WIDE_BIAS_WORDS * 4
+        top_all = cand_all + self.cand_words * 4
+        xchg_all = top_all + self.teams * TOP_K * 8
+        team = warp // self.team_warps
+        team_warp = warp - team * self.team_warps
+        cand_smem = cand_all + team * (self.team_warps * self.region_slots * _CAND_BYTES)
+        top_smem = top_all + team * (TOP_K * 8)
+        xchg_smem = xchg_all + team * 64
+
+        num_ctas = (m + (self.tokens - 1)) // self.tokens
+        t_begin = cta * self.tokens
+        t_end = t_begin + self.tokens
+        if t_end > m:
+            t_end = m
+        ws_count = ws_addr + Int64(_WIDE_COUNT_OFFSET)
+        ws_mask = ws_addr + Int64(_WIDE_MASK_OFFSET)
+        ws_list = ws_addr + Int64(_WIDE_LIST_OFFSET)
+        list_base = ws_list + Int64(cta * (self.tokens * TOP_K * 4))
+
+        if cutlass.const_expr(self.with_sort):
+            for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
+                _sts_b32(mask_smem + j * 4, Int32(0))
+            if tidx == 0:
+                _sts_b32(flag_smem + 4, Int32(0))
+        # The bias is a weight: stage it in shared memory before waiting on the previous grid.
+        for e4 in cutlass.range(tidx, NUM_EXPERTS // 4, self.threads, unroll=1):
+            v = _ld_nc_v4_f32(bias_addr + Int64(e4 * 16))
+            _sts_v4_f32(bias_smem + e4 * 16, v[0], v[1], v[2], v[3])
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_wait()
+        cute.arch.barrier()
+
+        for token in cutlass.range(t_begin + team, t_end, self.teams, unroll=1):
+            expert, weight = self.select_token(
+                token,
+                team,
+                team_warp,
+                lane,
+                rows,
+                logits_addr,
+                bias_smem,
+                scale_bits,
+                Int64(0),
+                cand_smem,
+                top_smem,
+                xchg_smem,
+            )
+            if team_warp == 0:
+                if lane < TOP_K:
+                    out = (token * TOP_K + lane) * 4
+                    _st_global_b32(ids_addr + Int64(out), expert)
+                    _st_global_f32(vals_addr + Int64(out), weight)
+                    if cutlass.const_expr(self.with_sort):
+                        local = expert - local_offset
+                        token_local = token - t_begin
+                        if local >= 0 and local < local_num:
+                            _red_shared_or(mask_smem + local * 4, _bit(token_local))
+                            pos = _atom_shared_add(flag_smem + 4, Int32(1))
+                            _st_global_b32(
+                                list_base + Int64(pos * 4),
+                                (local << 12) | (token_local << 4) | lane,
+                            )
+                        else:
+                            _st_global_b32(e2p_addr + Int64(out), Int32(-1))
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_launch_dependents()
+
+        if cutlass.const_expr(self.with_sort):
+            cute.arch.barrier()
+            for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
+                _st_global_b32(
+                    ws_mask + Int64((cta * local_num + j) * 4), _lds_b32(mask_smem + j * 4)
+                )
+            if tidx == 0:
+                _st_global_b32(ws_count + Int64(cta * 4), _lds_b32(flag_smem + 4))
+            cute.arch.barrier()
+            if tidx == 0:
+                _fence_acq_rel_gpu()
+                ticket = _atom_add_relaxed_gpu(ws_addr, Int32(1))
+                last = Int32(0)
+                if ticket == num_ctas - 1:
+                    _fence_acq_rel_gpu()
+                    _st_relaxed_b32(ws_addr, Int32(0))
+                    last = Int32(1)
+                _sts_b32(flag_smem, last)
+            cute.arch.barrier()
+            if _lds_b32(flag_smem) != 0:
+                self.wide_sort(
+                    tidx,
+                    warp,
+                    lane,
+                    num_ctas,
+                    ws_count,
+                    ws_mask,
+                    ws_list,
+                    scratch,
+                    tile_smem,
+                    warp_tot_smem,
+                    e2p_addr,
+                    p2e_addr,
+                    tile_expert_addr,
+                    tile_limit_addr,
+                    total_addr,
+                    num_tiles_addr,
+                    local_num,
+                )
+
+    @cute.jit
+    def wide_sort(
+        self,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        num_ctas: Int32,
+        ws_count: Int64,
+        ws_mask: Int64,
+        ws_list: Int64,
+        table_smem: Int32,
+        tile_smem: Int32,
+        warp_tot_smem: Int32,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_num: Int32,
+    ):
+        """``moe_sort`` metadata from the published masks and lists of all CTAs (last CTA)."""
+        list_words = self.tokens * TOP_K
+        cells = num_ctas * local_num
+        # One round of loads: the [CTA][local expert] mask table, then the list length and the
+        # first list_slots entries of each CTA (lane l of a warp-wide load: CTA
+        # lists_per_load * (warp + q * num_warps) + l / list_slots, entry l % list_slots).
+        table = []
+        for i in cutlass.range_constexpr(self.table_items):
+            idx = tidx + i * self.threads
+            valid = Int32(0)
+            if idx < cells:
+                valid = Int32(1)
+            table.append(_ld_relaxed_b32_or_zero(valid, ws_mask + Int64(idx * 4)))
+        slots = self.list_slots
+        slot = lane % slots
+        counts = []
+        entries = []
+        for q in cutlass.range_constexpr(self.list_loads):
+            c = (warp + q * self.num_warps) * self.lists_per_load + lane // slots
+            valid = Int32(0)
+            if c < num_ctas:
+                valid = Int32(1)
+            counts.append(_ld_relaxed_b32_or_zero(valid, ws_count + Int64(c * 4)))
+            entries.append(
+                _ld_relaxed_b32_or_zero(valid, ws_list + Int64((c * list_words + slot) * 4))
+            )
+        for i in cutlass.range_constexpr(self.table_items):
+            idx = tidx + i * self.threads
+            valid = Int32(0)
+            if idx < cells:
+                valid = Int32(1)
+            _sts_b32_if(valid, table_smem + idx * 4, table[i])
+        cute.arch.barrier()
+
+        # Thread per local expert: token count, and per cell the expert's rows in earlier CTAs
+        # (stored above the cell's mask, which has at most 16 bits).
+        ept = self.experts_per_thread
+        j0 = tidx * ept
+        totals = []
+        for q in cutlass.range_constexpr(ept):
+            j = j0 + q
+            run = Int32(0)
+            if j < local_num:
+                for c0 in cutlass.range(0, num_ctas, _SCAN_CHUNK, unroll=1):
+                    words = []
+                    valids = []
+                    for u in cutlass.range_constexpr(_SCAN_CHUNK):
+                        valid = Int32(0)
+                        if c0 + u < num_ctas:
+                            valid = Int32(1)
+                        valids.append(valid)
+                        words.append(
+                            _lds_b32_or_zero(valid, table_smem + ((c0 + u) * local_num + j) * 4)
+                        )
+                    for u in cutlass.range_constexpr(_SCAN_CHUNK):
+                        _sts_b32_if(
+                            valids[u],
+                            table_smem + ((c0 + u) * local_num + j) * 4,
+                            (run << 16) | words[u],
+                        )
+                        run = run + _popc(words[u])
+            totals.append(run)
+
+        # Tile layout: ceil(count / 128) tiles per local expert, in local-expert order.
+        tiles = [(totals[q] + (TILE - 1)) >> 7 for q in range(ept)]
+        thread_tiles = tiles[0]
+        for q in cutlass.range_constexpr(1, ept):
+            thread_tiles = thread_tiles + tiles[q]
+        inclusive = _warp_inclusive_sum(thread_tiles)
+        if lane == 31:
+            _sts_b32(warp_tot_smem + warp * 4, inclusive)
+        cute.arch.barrier()
+        tile = inclusive - thread_tiles
+        num_tiles = Int32(0)
+        for w in cutlass.range_constexpr(self.num_warps):
+            cnt_w = _lds_b32(warp_tot_smem + w * 4)
+            if w < warp:
+                tile = tile + cnt_w
+            num_tiles = num_tiles + cnt_w
+        for q in cutlass.range_constexpr(ept):
+            if j0 + q < local_num:
+                _sts_b32(tile_smem + (j0 + q) * 4, tile * TILE)
+            if tiles[q] != 0:
+                end = tile * TILE + totals[q]
+                for t in cutlass.range(tiles[q], unroll=1):
+                    limit = (tile + t + 1) * TILE
+                    if limit > end:
+                        limit = end
+                    _st_global_b32(tile_expert_addr + Int64((tile + t) * 4), j0 + q)
+                    _st_global_b32(tile_limit_addr + Int64((tile + t) * 4), limit)
+            tile = tile + tiles[q]
+        if tidx == 0:
+            _st_global_b32(total_addr, num_tiles * TILE)
+            _st_global_b32(num_tiles_addr, num_tiles)
+        cute.arch.barrier()
+
+        # Rows of the listed selections: entry (j, token t, slot k) of CTA c lands in row
+        # first_row(j) + rows of j in CTAs before c + tokens of the mask before t.
+        for q in cutlass.range_constexpr(self.list_loads):
+            c = (warp + q * self.num_warps) * self.lists_per_load + lane // slots
+            n = counts[q]
+            if c < num_ctas:
+                if slot < n:
+                    self.place_entry(
+                        entries[q], c, local_num, table_smem, tile_smem, e2p_addr, p2e_addr
+                    )
+                for i in cutlass.range(slot + slots, n, slots, unroll=1):
+                    entry = _ld_relaxed_b32_or_zero(
+                        Int32(1), ws_list + Int64((c * list_words + i) * 4)
+                    )
+                    self.place_entry(entry, c, local_num, table_smem, tile_smem, e2p_addr, p2e_addr)
+
+    @cute.jit
+    def place_entry(
+        self,
+        entry: Int32,
+        c: Int32,
+        local_num: Int32,
+        table_smem: Int32,
+        tile_smem: Int32,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+    ):
+        j = entry >> 12
+        t = (entry >> 4) & 0xFF
+        k = entry & 15
+        cell = _lds_b32(table_smem + (c * local_num + j) * 4)
+        rank = _lds_b32(tile_smem + j * 4) + (cell >> 16) + _popc(cell & 0xFFFF & _low_bits_mask(t))
+        expanded = (c * self.tokens + t) * TOP_K + k
+        _st_global_b32(e2p_addr + Int64(expanded * 4), rank)
+        _st_global_b32(p2e_addr + Int64(rank * 4), expanded)
 
 
 class K3RouterGemvKernel:
@@ -1365,12 +1921,21 @@ def _check_inputs(logits: torch.Tensor, e_score_correction_bias: torch.Tensor) -
             raise ValueError("inputs must be 16-byte aligned tensors on the same CUDA device")
 
 
-def can_use_k3_route_tail(num_tokens: int, logits: torch.Tensor) -> bool:
-    """Whether the routing tail serves ``num_tokens`` tokens of these logits (non-raising)."""
+def can_use_k3_route_tail(
+    num_tokens: int, logits: torch.Tensor, local_num_experts: int | None = None
+) -> bool:
+    """Whether the routing tail serves ``num_tokens`` tokens of these logits (non-raising).
+
+    Above :data:`MAX_M` tokens the sort needs :func:`wide_sort_fits` (``local_num_experts=None``
+    skips that check).
+    """
+    if num_tokens > MAX_M and local_num_experts is not None:
+        if not wide_sort_fits(num_tokens, local_num_experts):
+            return False
     return (
         logits.is_cuda
         and _is_supported_device(logits.device.index)
-        and 1 <= num_tokens <= MAX_M
+        and 1 <= num_tokens <= WIDE_MAX_M
         and logits.dtype == torch.float32
         and logits.shape[-1] == NUM_EXPERTS
     )
@@ -1457,6 +2022,168 @@ def run_k3_route_tail(
     )
 
 
+#: Local-expert capacity of the multi-CTA build for expert parallelism >= 14 (EP16: 56).
+_WIDE_SMALL_LOCAL_CAP = 64
+
+
+def _wide_cells(m: int, local_num_experts: int, tokens_per_cta: int) -> int:
+    return local_num_experts * ((m + tokens_per_cta - 1) // tokens_per_cta)
+
+
+def wide_sort_fits(m: int, local_num_experts: int) -> bool:
+    """Whether the multi-CTA sort serves ``m`` tokens over ``local_num_experts`` local experts
+    (its table holds ``local experts x CTAs <= WIDE_TABLE_CELLS`` cells, CTAs of 16 tokens)."""
+    return (
+        1 <= m <= WIDE_MAX_M
+        and 1 <= local_num_experts <= WIDE_LOCAL_CAP
+        and _wide_cells(m, local_num_experts, 16) <= WIDE_TABLE_CELLS
+    )
+
+
+def default_wide_config(m: int, local_num_experts: int = 56) -> tuple[int, int, int]:
+    """``(tokens_per_cta, num_warps, warps_per_token)`` of the multi-CTA routing for ``m``
+    tokens (``MAX_M < m <= WIDE_MAX_M``).
+
+    Measured on GB300 (EP16, 384-1344 tokens, beside the latent_down GEMM on another stream):
+    one token per warp in 16-warp CTAs of 16 tokens. 8-token CTAs are as fast alone but slower
+    next to the GEMM (twice the CTAs for the SMs it leaves free); two tokens per warp or
+    two-warp teams are slower.
+    """
+    return 16, 16, 1
+
+
+@functools.cache
+def _compiled_wide(
+    tokens_per_cta: int,
+    num_warps: int,
+    warps_per_token: int,
+    num_splits: int,
+    with_sort: bool,
+    use_pdl: bool,
+    local_cap: int,
+):
+    kernel = K3RouteWideKernel(
+        tokens_per_cta, num_warps, warps_per_token, num_splits, with_sort, use_pdl, local_cap
+    )
+    dummy = Int64(1 << 20)
+    return cute.compile(
+        kernel,
+        Int32(MAX_M + 1),
+        Int32(MAX_M + 1),
+        *([dummy] * 10),
+        Int32(0),
+        Int32(local_cap),
+        Int64(0),
+        dummy,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_WIDE_WORKSPACES: dict[int, torch.Tensor] = {}
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def wide_workspace(device: torch.device) -> torch.Tensor:
+    """Persistent per-device state of the multi-CTA sort (arrival counter + mask slots).
+
+    Between launches the counter is zero; each launch restores that. It must be created
+    outside CUDA graph capture (a capture would allocate it from the graph's private pool).
+    """
+    index = _device_index(device)
+    workspace = _WIDE_WORKSPACES.get(index)
+    if workspace is None:
+        workspace = torch.zeros(
+            _WIDE_WORKSPACE_BYTES // 4, dtype=torch.int32, device=torch.device("cuda", index)
+        )
+        _WIDE_WORKSPACES[index] = workspace
+    return workspace
+
+
+def wide_workspace_ready(device: torch.device) -> bool:
+    """Whether this device's multi-CTA sort workspace exists (see :func:`wide_workspace`)."""
+    return _device_index(device) in _WIDE_WORKSPACES
+
+
+def run_k3_route_wide(
+    logits: torch.Tensor,
+    num_tokens: int,
+    e_score_correction_bias: torch.Tensor,
+    routed_scaling_factor: float,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sort_outputs: tuple[torch.Tensor, ...] | None,
+    local_expert_offset: int,
+    local_num_experts: int,
+    *,
+    tokens_per_cta: int | None = None,
+    num_warps: int | None = None,
+    warps_per_token: int | None = None,
+    use_pdl: bool = True,
+) -> None:
+    """Launch the multi-CTA routing on the current stream (inputs are not re-validated).
+
+    Same arguments and outputs as :func:`run_k3_route_tail` (without ``logits_out``) for
+    ``1 <= num_tokens <= WIDE_MAX_M`` and, with ``sort_outputs``, ``local_num_experts <=
+    WIDE_LOCAL_CAP`` and ``local_num_experts * ceil(num_tokens / tokens_per_cta) <=
+    WIDE_TABLE_CELLS``. The configuration defaults come from :func:`default_wide_config`.
+    """
+    m = num_tokens
+    default_tokens, default_warps, default_team = default_wide_config(m, local_num_experts)
+    if tokens_per_cta is None:
+        tokens_per_cta = default_tokens
+    if num_warps is None:
+        num_warps = default_warps
+    if warps_per_token is None:
+        warps_per_token = default_team
+    if not 1 <= m <= WIDE_MAX_M:
+        raise ValueError(f"num_tokens={m} must be in [1, {WIDE_MAX_M}]")
+    with_sort = sort_outputs is not None
+    if with_sort and (
+        local_num_experts > WIDE_LOCAL_CAP
+        or _wide_cells(m, local_num_experts, tokens_per_cta) > WIDE_TABLE_CELLS
+    ):
+        raise ValueError(
+            f"the multi-CTA sort serves at most {WIDE_LOCAL_CAP} local experts and "
+            f"{WIDE_TABLE_CELLS} (local experts x CTAs) cells"
+        )
+    splits = 1 if logits.dim() == 2 else logits.shape[0]
+    rows = logits.shape[0] if logits.dim() == 2 else logits.shape[1]
+    local_cap = (
+        _WIDE_SMALL_LOCAL_CAP if local_num_experts <= _WIDE_SMALL_LOCAL_CAP else WIDE_LOCAL_CAP
+    )
+    compiled = _compiled_wide(
+        tokens_per_cta, num_warps, warps_per_token, splits, with_sort, use_pdl, local_cap
+    )
+    if with_sort:
+        tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
+        workspace = wide_workspace(logits.device).data_ptr()
+    else:
+        tile_expert = tile_limit = e2p = p2e = total = num_tiles = workspace = 0
+    scale_bits = struct.unpack("<q", struct.pack("<d", float(routed_scaling_factor)))[0]
+    compiled(
+        Int32(m),
+        Int32(rows),
+        Int64(logits.data_ptr()),
+        Int64(e_score_correction_bias.data_ptr()),
+        Int64(topk_ids.data_ptr()),
+        Int64(topk_weights.data_ptr()),
+        Int64(e2p),
+        Int64(p2e),
+        Int64(tile_expert),
+        Int64(tile_limit),
+        Int64(total),
+        Int64(num_tiles),
+        Int32(local_expert_offset),
+        Int32(local_num_experts),
+        Int64(scale_bits),
+        Int64(workspace),
+        cuda.CUstream(torch.cuda.current_stream(logits.device).cuda_stream),
+    )
+
+
 def _route_tail_outputs(
     logits: torch.Tensor,
     m: int,
@@ -1509,7 +2236,8 @@ def k3_route_tail(
         local_expert_offset: First expert of this rank.
         local_num_experts: Experts of this rank.
         tile_tokens_dim: Must be 128.
-        num_tokens: ``M`` (default: all rows of ``logits``), ``1 <= M <= 256``.
+        num_tokens: ``M`` (default: all rows of ``logits``), ``1 <= M <= 2048``; above 256
+            tokens (multi-CTA kernel) see :func:`wide_sort_fits`.
 
     Returns:
         ``(topk_ids int32 [M, 16], topk_weights fp32 [M, 16], tile_idx_to_expert_idx,
@@ -1524,18 +2252,24 @@ def k3_route_tail(
         raise ValueError(f"tile_tokens_dim must be {TILE}")
     rows = logits.shape[0] if logits.dim() == 2 else logits.shape[1]
     m = rows if num_tokens < 0 else num_tokens
-    if not 1 <= m <= min(rows, MAX_M):
-        raise ValueError(f"num_tokens={m} must be in [1, {min(rows, MAX_M)}]")
+    if not 1 <= m <= min(rows, WIDE_MAX_M):
+        raise ValueError(f"num_tokens={m} must be in [1, {min(rows, WIDE_MAX_M)}]")
     if not (
         0 <= local_expert_offset
         and 1 <= local_num_experts
         and local_expert_offset + local_num_experts <= NUM_EXPERTS
     ):
         raise ValueError("invalid local expert range")
+    if m > MAX_M and not wide_sort_fits(m, local_num_experts):
+        raise ValueError(
+            f"above {MAX_M} tokens the sort serves local experts x ceil(M / 16) <= "
+            f"{WIDE_TABLE_CELLS} (at most {WIDE_LOCAL_CAP} local experts)"
+        )
     outs = _route_tail_outputs(
         logits, m, e_score_correction_bias, local_num_experts, tile_tokens_dim
     )
-    run_k3_route_tail(
+    run = run_k3_route_tail if m <= MAX_M else run_k3_route_wide
+    run(
         logits,
         m,
         e_score_correction_bias,
@@ -1750,9 +2484,18 @@ __all__ = [
     "k3_route",
     "run_k3_router_gemv",
     "MAX_M",
+    "WIDE_LOCAL_CAP",
+    "WIDE_MAX_M",
+    "WIDE_TABLE_CELLS",
     "K3RouteTailKernel",
+    "K3RouteWideKernel",
     "can_use_k3_route_tail",
     "default_config",
+    "default_wide_config",
     "k3_route_tail",
     "run_k3_route_tail",
+    "run_k3_route_wide",
+    "wide_sort_fits",
+    "wide_workspace",
+    "wide_workspace_ready",
 ]

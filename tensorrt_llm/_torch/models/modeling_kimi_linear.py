@@ -198,6 +198,9 @@ if _K3_ROUTE_TAIL not in ("0", "1", "gemv"):
     raise ValueError(f"TRTLLM_K3_ROUTE_TAIL must be 0, 1 or gemv, got {_K3_ROUTE_TAIL!r}")
 if _K3_ROUTE_TAIL != "0" and _K3_FUSED_ROUTER != "0":
     raise ValueError("TRTLLM_K3_ROUTE_TAIL and TRTLLM_K3_FUSED_ROUTER are mutually exclusive")
+# Largest token count the routing tail serves: up to 256 tokens one cluster, above that (at most
+# 2048 tokens, see k3_route_tail.wide_sort_fits) a grid of CTAs whose last CTA does the sort.
+_K3_ROUTE_TAIL_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTE_TAIL_MAX_M", "2048"))
 
 # Fused latent projections (cute_dsl_kernels/blackwell/k3_latent_fp8_gemm.py), for token counts
 # in [TRTLLM_K3_LD_FUSED_MIN_M, TRTLLM_K3_LD_FUSED_MAX_M]:
@@ -2038,8 +2041,17 @@ class KimiK3MoERuntime(nn.Module):
             return None
         from ..cute_dsl_kernels.blackwell import k3_route_tail
 
-        if not 1 <= num_tokens <= k3_route_tail.MAX_M:
+        if not 1 <= num_tokens <= min(_K3_ROUTE_TAIL_MAX_M, k3_route_tail.WIDE_MAX_M):
             return None
+        if num_tokens > k3_route_tail.MAX_M:
+            if not k3_route_tail.wide_sort_fits(num_tokens, num_local):
+                return None
+            # The multi-CTA kernel's workspace must exist before graph capture.
+            device = self.gate.e_score_correction_bias.device
+            if not torch.cuda.is_current_stream_capturing():
+                k3_route_tail.wide_workspace(device)
+            elif not k3_route_tail.wide_workspace_ready(device):
+                return None
         return slot_start, num_local
 
     def _can_gemv_route(self, hidden_states: torch.Tensor) -> bool:

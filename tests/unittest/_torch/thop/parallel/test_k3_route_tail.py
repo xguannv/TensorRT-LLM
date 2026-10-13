@@ -14,7 +14,8 @@
 # limitations under the License.
 """Correctness of the Kimi-K3 routing tail (``trtllm::k3_route_tail``, ``trtllm::k3_route``).
 
-``k3_route_tail`` replaces ``noaux_tc_op`` -> ``moe_sort`` on given FP32 logits:
+``k3_route_tail`` replaces ``noaux_tc_op`` -> ``moe_sort`` on given FP32 logits (one cluster up to
+256 tokens, a grid of CTAs with a last-CTA sort above):
 
 * top-k ids and weights must be bit-identical to ``noaux_tc_op`` on the same logits;
 * the ``moe_sort`` outputs must be bit-identical to a token-ordered sort of the ids, and match
@@ -51,6 +52,21 @@ def _module():
 
 def _logits(m, seed, mode="rand"):
     gen = torch.Generator(device="cuda").manual_seed(seed)
+    if mode == "realistic":
+        # Router-like logits: hidden states (unit norm) against unit expert directions, plus
+        # per-expert popularity (some hot experts); the tokens of one request (an MTP verify
+        # window of 7) share most of their hidden state; bias spread ~0.19 as in Kimi-K3.
+        dim = 512
+        directions = torch.randn((NUM_EXPERTS, dim), device="cuda", generator=gen)
+        directions = directions / directions.norm(dim=1, keepdim=True)
+        popularity = torch.randn((NUM_EXPERTS,), device="cuda", generator=gen) * 0.7
+        requests = torch.randn(((m + 6) // 7, dim), device="cuda", generator=gen)
+        hidden = requests.repeat_interleave(7, dim=0)[:m] * 0.85
+        hidden = hidden + torch.randn((m, dim), device="cuda", generator=gen) * 0.5
+        hidden = hidden / hidden.norm(dim=1, keepdim=True)
+        logits = (hidden @ directions.t()) * 22.0 + popularity - 1.5
+        bias = (torch.rand((NUM_EXPERTS,), device="cuda", generator=gen) - 0.5) * 0.19
+        return logits.contiguous(), bias
     if mode == "rand":
         logits = torch.randn((m, NUM_EXPERTS), device="cuda", generator=gen) * 2
         bias = torch.randn((NUM_EXPERTS,), device="cuda", generator=gen) * 0.01
@@ -249,6 +265,155 @@ def test_route_gemv(m, offset, num_local):
     assert same >= 0.99 * m * TOP_K
 
 
+# ---------------------------------------------------------------------------
+# Multi-CTA path (M > 256)
+# ---------------------------------------------------------------------------
+
+WIDE_MS = [257, 384, 512, 896, 1344]
+# EP16 ranks (56 local experts), EP8 (112) and TP4xEP4 (224).
+WIDE_LAYOUTS = [(0, 56), (7 * 56, 56), (15 * 56, 56), (448, 112), (3 * 224, 224)]
+
+
+@pytest.mark.parametrize("m", WIDE_MS)
+@pytest.mark.parametrize("mode", ["realistic", "rand", "skew", "ties"])
+def test_wide_matches_noaux_and_sort(m, mode):
+    rt = _module()
+    logits, bias = _logits(m, seed=m, mode=mode)
+    for offset, num_local in WIDE_LAYOUTS:
+        if not rt.wide_sort_fits(m, num_local):
+            # The sort's table holds local experts x ceil(M / 16) <= 8192 cells.
+            assert num_local * ((m + 15) // 16) > rt.WIDE_TABLE_CELLS
+            with pytest.raises(ValueError):
+                torch.ops.trtllm.k3_route_tail(logits, bias, 1.0, offset, num_local, TILE)
+            continue
+        outs = torch.ops.trtllm.k3_route_tail(logits, bias, 1.0, offset, num_local, TILE)
+        _check_outputs(outs, logits, bias, 1.0, offset, num_local)
+
+
+@pytest.mark.parametrize("m", [257, 896, 2048])
+def test_wide_routed_scaling_factor_and_max_m(m):
+    _module()
+    logits, bias = _logits(m, seed=200 + m, mode="realistic")
+    outs = torch.ops.trtllm.k3_route_tail(logits, bias, 2.5, 7 * 56, 56, TILE)
+    _check_outputs(outs, logits, bias, 2.5, 7 * 56, 56)
+
+
+@pytest.mark.parametrize("m", [300, 896, 1344])
+@pytest.mark.parametrize(
+    "tokens_per_cta,num_warps,warps_per_token",
+    [(8, 8, 1), (8, 16, 1), (16, 8, 1), (16, 16, 1), (16, 8, 2), (16, 16, 4)],
+)
+def test_wide_configs(m, tokens_per_cta, num_warps, warps_per_token):
+    rt = _module()
+    logits, bias = _logits(m, seed=11 * m + tokens_per_cta, mode="realistic")
+    for offset, num_local in [(7 * 56, 56), (224, 224)]:
+        outs = rt._route_tail_outputs(logits, m, bias, num_local, TILE)
+        if num_local * ((m + tokens_per_cta - 1) // tokens_per_cta) > rt.WIDE_TABLE_CELLS:
+            with pytest.raises(ValueError):
+                rt.run_k3_route_wide(
+                    logits,
+                    m,
+                    bias,
+                    1.0,
+                    outs[0],
+                    outs[1],
+                    outs[2:],
+                    offset,
+                    num_local,
+                    tokens_per_cta=tokens_per_cta,
+                )
+            continue
+        # Poison the outputs: every entry the contract covers must be written.
+        for t in outs:
+            t.view(torch.int32).fill_(-7)
+        rt.run_k3_route_wide(
+            logits,
+            m,
+            bias,
+            1.0,
+            outs[0],
+            outs[1],
+            outs[2:],
+            offset,
+            num_local,
+            tokens_per_cta=tokens_per_cta,
+            num_warps=num_warps,
+            warps_per_token=warps_per_token,
+        )
+        _check_outputs(outs, logits, bias, 1.0, offset, num_local)
+
+
+@pytest.mark.parametrize("m", [257, 1344, 2048])
+@pytest.mark.parametrize("tokens_per_cta,num_warps", [(8, 4), (16, 8), (32, 8)])
+def test_wide_topk_only(m, tokens_per_cta, num_warps):
+    rt = _module()
+    logits, bias = _logits(m, seed=m + 1, mode="realistic")
+    ids = torch.empty((m, TOP_K), dtype=torch.int32, device="cuda")
+    vals = torch.empty((m, TOP_K), dtype=torch.float32, device="cuda")
+    rt.run_k3_route_wide(
+        logits,
+        m,
+        bias,
+        1.0,
+        ids,
+        vals,
+        None,
+        0,
+        NUM_EXPERTS,
+        tokens_per_cta=tokens_per_cta,
+        num_warps=num_warps,
+    )
+    ref_ids, ref_vals = _noaux(logits, bias, 1.0)
+    _assert_bit_equal(ids, ref_ids, "topk_ids")
+    _assert_bit_equal(vals, ref_vals, "topk_weights")
+
+
+def test_wide_split_partials():
+    """``[S, R, 896]`` partials (R > M) are summed in split order above 256 tokens too."""
+    _module()
+    m = 300
+    gen = torch.Generator(device="cuda").manual_seed(m)
+    partials = torch.randn((2, m + 5, NUM_EXPERTS), device="cuda", generator=gen)
+    bias = torch.randn((NUM_EXPERTS,), device="cuda", generator=gen) * 0.01
+    outs = torch.ops.trtllm.k3_route_tail(partials, bias, 1.0, 7 * 56, 56, TILE, m)
+    _check_outputs(outs, partials[0, :m] + partials[1, :m], bias, 1.0, 7 * 56, 56)
+
+
+def test_wide_rejects_large_local_range():
+    rt = _module()
+    logits, bias = _logits(300, seed=1)
+    assert not rt.can_use_k3_route_tail(300, logits, 448)
+    assert rt.can_use_k3_route_tail(300, logits, 224)
+    assert not rt.can_use_k3_route_tail(1344, logits, 224)
+    assert rt.can_use_k3_route_tail(rt.WIDE_MAX_M, logits, 56)
+    assert not rt.can_use_k3_route_tail(rt.WIDE_MAX_M + 1, logits, 56)
+    with pytest.raises(ValueError):
+        torch.ops.trtllm.k3_route_tail(logits, bias, 1.0, 0, 448, TILE)
+
+
+def test_wide_cuda_graph_replay():
+    """Replays reuse the arrival counter: several launches (different grids) per graph."""
+    _module()
+    shapes = [(896, 7 * 56, 56), (512, 224, 224), (1344, 15 * 56, 56)]
+    statics, outs = [], []
+    for m, offset, num_local in shapes:
+        logits, bias = _logits(m, seed=3 + m, mode="realistic")
+        statics.append((logits.clone(), bias))
+        torch.ops.trtllm.k3_route_tail(statics[-1][0], bias, 1.0, offset, num_local, TILE)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for (static, bias), (m, offset, num_local) in zip(statics, shapes):
+            outs.append(torch.ops.trtllm.k3_route_tail(static, bias, 1.0, offset, num_local, TILE))
+    for seed in range(4):
+        for (static, bias), (m, _, _) in zip(statics, shapes):
+            mode = ("realistic", "rand", "skew", "ties")[seed]
+            static.copy_(_logits(m, seed=20 + seed, mode=mode)[0])
+        graph.replay()
+        torch.cuda.synchronize()
+        for (static, bias), out, (m, offset, num_local) in zip(statics, outs, shapes):
+            _check_outputs(out, static, bias, 1.0, offset, num_local)
+
+
 def test_routing_method_deferred():
     """``_KimiK3RoutingMethod`` runs a deferred router once on the logits it is given."""
     import tensorrt_llm  # noqa: F401
@@ -277,7 +442,8 @@ def test_routing_method_deferred():
     _assert_bit_equal(ids, _noaux(logits, bias, 1.0)[0], "regular routing after the deferred one")
 
 
-def test_moe_runtime_routes_with_tail(monkeypatch):
+@pytest.mark.parametrize("m,offset,num_local", [(28, 224, 224), (896, 7 * 56, 56)])
+def test_moe_runtime_routes_with_tail(monkeypatch, m, offset, num_local):
     """``TRTLLM_K3_ROUTE_TAIL=1``: ``KimiK3MoERuntime`` hands the routed experts the tail's
     top-k (with the ``moe_sort`` outputs attached) when they ask for the routing."""
     from types import SimpleNamespace
@@ -289,7 +455,6 @@ def test_moe_runtime_routes_with_tail(monkeypatch):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     _module()
-    m, offset, num_local = 28, 224, 224
     logits, bias = _logits(m, seed=5)
     routing = _KimiK3RoutingMethod(
         top_k=TOP_K,
@@ -352,3 +517,51 @@ def test_moe_runtime_routes_with_tail(monkeypatch):
     assert key == (offset, num_local, TILE) and len(sort_outputs) == 6
     _check_outputs((ids, weights, *sort_outputs), logits, bias, 1.0, offset, num_local)
     assert routing.deferred is None
+
+
+def test_route_tail_target_limits(monkeypatch):
+    """The routing tail serves up to ``TRTLLM_K3_ROUTE_TAIL_MAX_M`` tokens, above 256 only with
+    at most 224 local experts."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _KimiK3RoutingMethod
+
+    rt = _module()
+    bias = torch.zeros(NUM_EXPERTS, device="cuda")
+    routing = _KimiK3RoutingMethod(
+        top_k=TOP_K,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=lambda: bias,
+        is_fused=True,
+    )
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(e_score_correction_bias=bias, num_experts=NUM_EXPERTS)
+
+    def target(num_tokens, num_local):
+        runtime.routed_experts = SimpleNamespace(
+            routing_method=routing,
+            use_dp=False,
+            backend=SimpleNamespace(
+                slot_start=0, expert_size_per_partition=num_local, num_slots=NUM_EXPERTS
+            ),
+        )
+        return runtime._route_tail_target(num_tokens)
+
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "1")
+    assert target(256, 896) == (0, 896)
+    assert target(257, 896) is None
+    assert target(1344, 56) == (0, 56)
+    assert rt.wide_workspace_ready(bias.device)
+    assert target(1344, 224) is None  # sort table: 224 x 84 cells > 8192
+    assert target(rt.WIDE_MAX_M + 1, 56) is None
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL_MAX_M", 256)
+    assert target(256, 56) == (0, 56)
+    assert target(257, 56) is None
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "0")
+    assert target(28, 56) is None
