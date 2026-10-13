@@ -30,6 +30,12 @@ from ..mla import MLA
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 
+# TRTLLM_K3_MLA_GATE_FP8=1: when o_proj (a K3 FP8 weight-read projection) would quantize its BF16
+# input 1x128 for its GEMM, the output-gate multiply emits that FP8 operand directly
+# (output_gate_fp8.gate_mul_fp8_packed: sigmoid, multiply and quantization in one kernel, the same
+# bytes), and o_proj runs on it.
+_K3_MLA_GATE_FP8 = os.environ.get("TRTLLM_K3_MLA_GATE_FP8", "0") == "1"
+
 # Deliberate divergence from upstream, which defaults this to "cute-dsl".
 #
 # On the FlashInfer/CuTe-DSL pair this branch currently ships, the CuTe-DSL MLA
@@ -333,7 +339,20 @@ class KimiK3MLAAttention(MLA):
         attn_out: torch.Tensor,
     ) -> torch.Tensor:
         if self.use_output_gate:
-            attn_out = attn_out * self.g_proj(hidden_states).sigmoid()
+            gate = self.g_proj(hidden_states)
+            takes_fp8 = getattr(self.o_proj, "takes_fp8_packed_input", None)
+            if (
+                _K3_MLA_GATE_FP8
+                and takes_fp8 is not None
+                and attn_out.dim() == 2
+                and attn_out.dtype == torch.bfloat16
+                and attn_out.shape[-1] % 128 == 0
+                and takes_fp8(attn_out.shape[0])
+            ):
+                from .output_gate_fp8 import gate_mul_fp8_packed
+
+                return self.o_proj.forward_fp8_packed(*gate_mul_fp8_packed(attn_out, gate))
+            attn_out = attn_out * gate.sigmoid()
         return self.o_proj(attn_out)
 
     def forward(
