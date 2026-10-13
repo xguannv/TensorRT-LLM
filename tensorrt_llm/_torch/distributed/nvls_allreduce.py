@@ -53,6 +53,19 @@ bitwise identical. The switch rounds the FP32 sum to BF16 faithfully (within
 one BF16 ulp of the exact sum; it differs from the round-to-nearest result of
 the Lamport two-shot kernel in about a quarter of the elements) and
 deterministically.
+
+With ``TRTLLM_NVLS_AR_V2=1``, messages of at least
+``TRTLLM_NVLS_AR_V2_MIN_BYTES`` use a chunk-pipelined kernel instead
+(``_nvls_allreduce_v2_kernel``). The steps are the same, but they run per
+chunk (16 KiB by default) in three groups of persistent programs: stagers copy
+chunks in and arrive on per-chunk flags, reducers reduce and multicast a chunk
+as soon as every rank has staged it, and drainers copy complete chunks out of
+the Lamport buffer. The input copy, the barrier, the NVLink traffic and the
+output copy of different chunks overlap instead of running one after another.
+Each vector is still reduced once by the switch, so all ranks receive the same
+bits (in tests they also match the one-shot kernel bit for bit). The
+per-chunk flags and call counters are separate from the one-shot kernel's, so
+both kernels can share a workspace in any call order.
 """
 
 import math
@@ -75,6 +88,20 @@ from ..flashinfer_utils import get_env_enable_pdl
 # kernel when TRTLLM_NVLS_AR=1.
 NVLS_AR_MIN_BYTES = int(os.environ.get("TRTLLM_NVLS_AR_MIN_BYTES", 1 << 20))
 NVLS_AR_MAX_BYTES = int(os.environ.get("TRTLLM_NVLS_AR_MAX_BYTES", 32 << 20))
+
+# Pipelined kernel (TRTLLM_NVLS_AR_V2=1) knobs: name -> (environment variable,
+# default). ``stagers``, ``reducers`` or ``drainers`` <= 0 means one program of
+# that kind per SM.
+_V2_KNOBS = {
+    "min_bytes": ("TRTLLM_NVLS_AR_V2_MIN_BYTES", 4 << 20),
+    "warps": ("TRTLLM_NVLS_AR_V2_WARPS", 8),
+    "chunk_bytes": ("TRTLLM_NVLS_AR_V2_CHUNK_BYTES", 16384),
+    "group": ("TRTLLM_NVLS_AR_V2_GROUP", 1),
+    "stagers": ("TRTLLM_NVLS_AR_V2_STAGERS", 0),
+    "reducers": ("TRTLLM_NVLS_AR_V2_REDUCERS", 0),
+    "drainers": ("TRTLLM_NVLS_AR_V2_DRAINERS", 0),
+    "probe": ("TRTLLM_NVLS_AR_V2_PROBE", 1),
+}
 
 # 0xFFFF as int16: a BF16 NaN pattern the reducer never stores.
 _SENTINEL_BITS = -1
@@ -288,6 +315,201 @@ def _nvls_allreduce_kernel(
     tl.store(epoch_ptr + pid, (epoch + 1).to(tl.int32))
 
 
+@triton.jit
+def _globaltimer(dummy):
+    """Nanosecond global timer (debug timestamps)."""
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;",
+        "=l,r,~{memory}",
+        args=[dummy],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _spin_while_sentinel(ptrs, mask):
+    """Spin until the 32-bit word at each masked pointer holds no 0xFFFF half."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+        .reg .u32 %w, %h;
+        .reg .pred %p_skip, %p_wait;
+        setp.eq.s32 %p_skip, $2, 0;
+        mov.u32 $0, 0;
+        @%p_skip bra NVLS_SPIN_DONE;
+        NVLS_SPIN_LOOP:
+        ld.volatile.global.u32 %w, [$1];
+        and.b32 %h, %w, 65535;
+        setp.eq.u32 %p_wait, %h, 65535;
+        shr.u32 %h, %w, 16;
+        setp.eq.or.u32 %p_wait, %h, 65535, %p_wait;
+        @%p_wait bra NVLS_SPIN_LOOP;
+        NVLS_SPIN_DONE:
+        }
+        """,
+        "=r,l,r,~{memory}",
+        args=[ptrs, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _has_sentinel(w):
+    """Whether either BF16 half of the 32-bit word ``w`` holds the sentinel 0xFFFF."""
+    return ((w & 0xFFFF) == 0xFFFF) | (((w >> 16) & 0xFFFF) == 0xFFFF)
+
+
+@triton.jit(do_not_specialize=["rank", "n_vec", "ch", "n_chunks", "p_a", "p_r", "p_c"])
+def _nvls_allreduce_v2_kernel(
+    inp_ptr,
+    out_ptr,
+    in_buf_ptr,
+    out_buf_ptr,
+    in_mc_addr,
+    out_mc_addr,
+    flag_uc_addr,
+    flag_mc_addr,
+    epoch_ptr,
+    dbg_ptr,
+    rank,
+    n_vec,
+    ch,
+    n_chunks,
+    p_a,
+    p_r,
+    p_c,
+    VRT: tl.constexpr,
+    GROUP: tl.constexpr,
+    RTILE: tl.constexpr,
+    CB: tl.constexpr,
+    PROBE: tl.constexpr,
+    FLAG_SPACING: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    USE_PDL: tl.constexpr,
+    DEBUG: tl.constexpr,
+):
+    """Chunk-pipelined multicast all-reduce of ``n_vec`` 16-byte vectors.
+
+    The message is cut into chunks of ``ch`` vectors (a multiple of
+    ``WORLD_SIZE``, at most ``CB``); rank ``r`` reduces the ``r``-th
+    ``ch / WORLD_SIZE`` vectors (at most ``VRT``) of every chunk. Three groups
+    of persistent programs walk the chunks in order:
+
+    * stagers (``p_a`` programs, chunks ``pid, pid + p_a, ...``) copy a chunk
+      into this rank's input buffer and arrive on the chunk's flag;
+    * reducers (``p_r`` programs) take ``GROUP`` consecutive chunks at a time,
+      wait until every rank has arrived on them, reduce this rank's slices in
+      the switch and multicast the sums into every rank's output buffer;
+    * drainers (``p_c`` programs) wait until a chunk is complete in the local
+      output buffer (no sentinel left), copy it out, re-arm it and count the
+      chunk's use in its epoch.
+
+    A chunk is reduced as soon as every rank has staged it, so the input copy,
+    the NVLink traffic and the output copy of different chunks overlap.
+
+    A chunk's flag target is ``(epoch + 1) * WORLD_SIZE``. The drainer bumps the
+    epoch only after the chunk is complete, i.e. after this rank's reducer has
+    read it. The input and output buffers are reused by the next call only after
+    this call's kernel has finished on this rank, which needs every chunk
+    complete, i.e. every rank's reduction of this call done. Stagers and
+    reducers never wait on drainers, and programs start in ``pid`` order, so a
+    grid that is not fully resident still makes progress.
+    """
+    pid = tl.program_id(0)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    FLAG_BYTES: tl.constexpr = FLAG_SPACING * 4
+    if pid < p_a:
+        for c in range(pid, n_chunks, p_a):
+            c0 = c * ch
+            c1 = tl.minimum(c0 + ch, n_vec)
+            for b in range(c0, c1, CB):
+                v = b + tl.arange(0, CB)
+                m = (v < c1)[:, None]
+                offs = v.to(tl.int64)[:, None] * 4 + tl.arange(0, 4)[None, :]
+                x = tl.load(inp_ptr + offs, mask=m)
+                tl.store(in_buf_ptr + offs, x, mask=m)
+            tl.debug_barrier()
+            _arrive(flag_mc_addr + c.to(tl.int64) * FLAG_BYTES, False)
+            if DEBUG:
+                tl.store(dbg_ptr + c * 8, _globaltimer(c))
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+    elif pid < p_a + p_r:
+        # RTILE >= threads: a smaller tile would be replicated across threads,
+        # and every multimem instruction must run exactly once per vector.
+        lane = tl.arange(0, RTILE)
+        sub = lane // VRT
+        li = lane % VRT
+        n_groups = (n_chunks + GROUP - 1) // GROUP
+        for g in range(pid - p_a, n_groups, p_r):
+            for i in range(GROUP):
+                c = g * GROUP + i
+                if c < n_chunks:
+                    epoch = tl.load(epoch_ptr + c)
+                    _wait(flag_uc_addr + c.to(tl.int64) * FLAG_BYTES, (epoch + 1) * WORLD_SIZE)
+                    if DEBUG:
+                        tl.store(dbg_ptr + c * 8 + 1, _globaltimer(c))
+            tl.debug_barrier()
+            cl = g * GROUP + sub
+            c0 = cl * ch
+            clen = tl.minimum(ch, n_vec - c0)
+            share = (clen + WORLD_SIZE - 1) // WORLD_SIZE
+            j = rank * share + li
+            m = (sub < GROUP) & (cl < n_chunks) & (li < share) & (j < clen)
+            voff = (c0 + j).to(tl.int64) * 16
+            a, b, cc, d = _multimem_ld_reduce_bf16x8(in_mc_addr + voff, m)
+            _multimem_st_b128(
+                out_mc_addr + voff,
+                _no_sentinel(a),
+                _no_sentinel(b),
+                _no_sentinel(cc),
+                _no_sentinel(d),
+                m,
+            )
+            if DEBUG:
+                for i in range(GROUP):
+                    c = g * GROUP + i
+                    if c < n_chunks:
+                        tl.store(dbg_ptr + c * 8 + 2, _globaltimer(c))
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+    else:
+        SLICES: tl.constexpr = triton.next_power_of_2(WORLD_SIZE)
+        k = tl.arange(0, SLICES)
+        for c in range(pid - p_a - p_r, n_chunks, p_c):
+            c0 = c * ch
+            c1 = tl.minimum(c0 + ch, n_vec)
+            if PROBE:
+                # Wait on the first word of every rank's slice before reading
+                # the whole chunk, so that waiting costs little L2 bandwidth.
+                share = (c1 - c0 + WORLD_SIZE - 1) // WORLD_SIZE
+                pm = (k < WORLD_SIZE) & (k * share < c1 - c0)
+                _spin_while_sentinel(out_buf_ptr + (c0 + k * share).to(tl.int64) * 4, pm)
+                tl.debug_barrier()
+            for b in range(c0, c1, CB):
+                v = b + tl.arange(0, CB)
+                m = (v < c1)[:, None]
+                offs = v.to(tl.int64)[:, None] * 4 + tl.arange(0, 4)[None, :]
+                y = tl.load(out_buf_ptr + offs, mask=m, other=0, volatile=True)
+                pending = tl.max(tl.max((_has_sentinel(y) & m).to(tl.int32), axis=1), axis=0)
+                while pending != 0:
+                    y = tl.load(out_buf_ptr + offs, mask=m, other=0, volatile=True)
+                    pending = tl.max(tl.max((_has_sentinel(y) & m).to(tl.int32), axis=1), axis=0)
+                tl.store(out_ptr + offs, y, mask=m)
+                tl.store(out_buf_ptr + offs, tl.full([CB, 4], -1, tl.int32), mask=m)
+            epoch = tl.load(epoch_ptr + c)
+            tl.store(epoch_ptr + c, epoch + 1)
+            if DEBUG:
+                tl.store(dbg_ptr + c * 8 + 3, _globaltimer(c))
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+
+
 class _MulticastBuffer:
     """One rank's slice of a multicast object, mapped unicast and multicast.
 
@@ -363,6 +585,10 @@ class NVLSAllReduce:
     Workspaces are shared per ``(mapping, slot)``. Calls on one slot must be
     ordered by one CUDA stream on every rank; use different slots for
     all-reduces that may run concurrently on different streams.
+
+    ``version=2`` (default from ``TRTLLM_NVLS_AR_V2``) sends messages of at least
+    ``v2["min_bytes"]`` to the chunk-pipelined kernel and smaller ones to the
+    one-shot kernel; ``v2_config`` overrides the ``TRTLLM_NVLS_AR_V2_*`` knobs.
     """
 
     _workspaces: Dict[Tuple[Mapping, str], Dict] = {}
@@ -379,6 +605,8 @@ class NVLSAllReduce:
         rows_per_program: Optional[int] = None,
         num_warps: Optional[int] = None,
         fence_sys: Optional[bool] = None,
+        version: Optional[int] = None,
+        v2_config: Optional[Dict[str, int]] = None,
     ):
         self.mapping = mapping
         self.world_size = mapping.tp_size
@@ -389,6 +617,24 @@ class NVLSAllReduce:
         if fence_sys is None:
             fence_sys = os.environ.get("TRTLLM_NVLS_AR_FENCE_SYS", "0") == "1"
         self.fence_sys = fence_sys
+        if version is None:
+            version = 2 if os.environ.get("TRTLLM_NVLS_AR_V2", "0") == "1" else 1
+        self.version = version
+        num_sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        cfg = {key: int(os.environ.get(env, default)) for key, (env, default) in _V2_KNOBS.items()}
+        cfg.update(v2_config or {})
+        for key, default in (
+            ("stagers", num_sms // 3),
+            ("reducers", num_sms),
+            ("drainers", num_sms),
+        ):
+            if cfg[key] <= 0:
+                cfg[key] = max(1, default)
+        self.v2 = cfg
+        # Optional int64 tensor of per-chunk timestamps (benchmarks only).
+        self.debug_timestamps: Optional[torch.Tensor] = None
         self.use_pdl = get_env_enable_pdl()
         self._ws = self._get_workspace(mapping, slot, self.max_bytes)
 
@@ -413,7 +659,9 @@ class NVLSAllReduce:
                 )
             return ws
         data_bytes = math.ceil(max_bytes / (1 << 20)) * (1 << 20)
-        flag_bytes = cls.MAX_PROGRAMS * cls.FLAG_SPACING * 4
+        # Two flag arrays: per-program flags of the one-shot kernel, per-chunk
+        # flags of the pipelined kernel.
+        flag_bytes = 2 * cls.MAX_PROGRAMS * cls.FLAG_SPACING * 4
         comm = mpi_comm().Split(
             int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank), mapping.tp_rank
         )
@@ -423,8 +671,10 @@ class NVLSAllReduce:
         flags = buf.uc_tensor(2 * data_bytes, flag_bytes, torch.int32)
         out_buf.fill_(_SENTINEL_BITS)
         flags.zero_()
-        # Per-program call counters, local to this rank.
+        # Per-program (one-shot) and per-chunk (pipelined) call counters, local
+        # to this rank.
         epoch = torch.zeros(cls.MAX_PROGRAMS, dtype=torch.int32, device="cuda")
+        epoch_v2 = torch.zeros(cls.MAX_PROGRAMS, dtype=torch.int32, device="cuda")
         torch.cuda.synchronize()
         comm.Barrier()
         ws = {
@@ -434,11 +684,14 @@ class NVLSAllReduce:
             "out_buf": out_buf,
             "flags": flags,
             "epoch": epoch,
+            "epoch_v2": epoch_v2,
             "data_bytes": data_bytes,
             "in_mc_addr": buf.mc_ptr,
             "out_mc_addr": buf.mc_ptr + data_bytes,
             "flag_uc_addr": flags.data_ptr(),
             "flag_mc_addr": buf.mc_ptr + 2 * data_bytes,
+            "flag_v2_uc_addr": flags.data_ptr() + flag_bytes // 2,
+            "flag_v2_mc_addr": buf.mc_ptr + 2 * data_bytes + flag_bytes // 2,
         }
         logger.info(
             f"[NVLS AR] workspace slot={slot} tp={mapping.tp_size} rank={mapping.tp_rank} "
@@ -452,13 +705,19 @@ class NVLSAllReduce:
             return False
         hidden = inp.shape[-1]
         rows = inp.numel() // max(hidden, 1)
-        return (
-            hidden % 8 == 0
-            and hidden <= 16384
-            and rows > 0
-            and triton.cdiv(rows, self.rows_per_program) <= self.MAX_PROGRAMS
-            and inp.numel() * 2 <= self._ws["data_bytes"]
-        )
+        if self._uses_v2(inp):
+            fits = triton.cdiv(inp.numel() // 8, self._v2_chunk_vectors()) <= self.MAX_PROGRAMS
+        else:
+            fits = hidden <= 16384 and triton.cdiv(rows, self.rows_per_program) <= self.MAX_PROGRAMS
+        return hidden % 8 == 0 and rows > 0 and fits and inp.numel() * 2 <= self._ws["data_bytes"]
+
+    def _uses_v2(self, inp: torch.Tensor) -> bool:
+        """Whether ``inp`` goes to the pipelined kernel (else the one-shot kernel)."""
+        return self.version == 2 and inp.numel() * inp.element_size() >= self.v2["min_bytes"]
+
+    def _v2_chunk_vectors(self) -> int:
+        """16-byte vectors per chunk of the pipelined kernel (a multiple of the group size)."""
+        return max(1, self.v2["chunk_bytes"] // 16 // self.world_size) * self.world_size
 
     def __call__(self, inp: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Sum the contiguous BF16 tensor ``inp`` over the group."""
@@ -467,6 +726,9 @@ class NVLSAllReduce:
         if out is None:
             out = torch.empty_like(inp)
         ws = self._ws
+        if self._uses_v2(inp):
+            self._launch_v2(inp, out)
+            return out
         rpp = self.rows_per_program
         _nvls_allreduce_kernel[(triton.cdiv(rows, rpp),)](
             inp.view(torch.int16),
@@ -492,3 +754,47 @@ class NVLSAllReduce:
             launch_pdl=self.use_pdl,
         )
         return out
+
+    def _launch_v2(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+        ws = self._ws
+        cfg = self.v2
+        n_vec = inp.numel() // 8
+        ch = self._v2_chunk_vectors()
+        n_chunks = triton.cdiv(n_vec, ch)
+        threads = 32 * cfg["warps"]
+        vrt = triton.next_power_of_2(triton.cdiv(ch, self.world_size))
+        group = max(1, min(cfg["group"], threads // vrt))
+        p_a = min(n_chunks, cfg["stagers"])
+        p_r = min(triton.cdiv(n_chunks, group), cfg["reducers"])
+        p_c = min(n_chunks, cfg["drainers"])
+        debug = self.debug_timestamps is not None
+        _nvls_allreduce_v2_kernel[(p_a + p_r + p_c,)](
+            inp.view(torch.int32),
+            out.view(torch.int32),
+            ws["in_buf"].view(torch.int32),
+            ws["out_buf"].view(torch.int32),
+            ws["in_mc_addr"],
+            ws["out_mc_addr"],
+            ws["flag_v2_uc_addr"],
+            ws["flag_v2_mc_addr"],
+            ws["epoch_v2"],
+            self.debug_timestamps if debug else ws["epoch_v2"],
+            self.rank,
+            n_vec,
+            ch,
+            n_chunks,
+            p_a,
+            p_r,
+            p_c,
+            VRT=vrt,
+            GROUP=group,
+            RTILE=max(threads, group * vrt),
+            CB=max(threads, triton.next_power_of_2(ch)),
+            PROBE=bool(cfg["probe"]),
+            FLAG_SPACING=self.FLAG_SPACING,
+            WORLD_SIZE=self.world_size,
+            USE_PDL=self.use_pdl,
+            DEBUG=debug,
+            num_warps=cfg["warps"],
+            launch_pdl=self.use_pdl,
+        )

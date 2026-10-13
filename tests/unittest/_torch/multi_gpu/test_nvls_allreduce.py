@@ -71,10 +71,11 @@ def _check(out, exact, comm):
     assert len(set(digests)) == 1, "ranks disagree on the all-reduce bits"
 
 
-def _run_rank(world_size, shapes, use_allreduce_module):
+def _run_rank(world_size, shapes, use_allreduce_module, version):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     os.environ["TRTLLM_NVLS_AR"] = "1"
+    os.environ["TRTLLM_NVLS_AR_V2"] = "1" if version == 2 else "0"
     os.environ["TRTLLM_NVLS_AR_MIN_WORLD_SIZE"] = str(world_size)
     try:
         comm = MPI.COMM_WORLD
@@ -82,8 +83,17 @@ def _run_rank(world_size, shapes, use_allreduce_module):
         if use_allreduce_module:
             ar = AllReduce(mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.bfloat16)
             assert ar.nvls_allreduce is not None
+            assert ar.nvls_allreduce.version == version
         else:
-            ar = NVLSAllReduce(mapping, slot="unittest")
+            # Every size through the requested kernel (the AllReduce path keeps the
+            # size threshold, so the pipelined case there mixes both kernels on one
+            # workspace).
+            ar = NVLSAllReduce(
+                mapping,
+                slot=f"unittest_v{version}",
+                version=version,
+                v2_config={"min_bytes": 0},
+            )
 
         # Eager: mixed shapes back to back on one workspace.
         for i, (rows, hidden) in enumerate(shapes):
@@ -127,9 +137,10 @@ SHAPES = ((224, 7168), (32, 7168), (896, 3584), (37, 3584), (3, 7168), (896, 716
 
 @skip_pre_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.parametrize("version", [1, 2], ids=["oneshot", "pipelined"])
 @pytest.mark.parametrize("use_allreduce_module", [False, True], ids=["direct", "allreduce"])
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
-def test_nvls_allreduce(use_allreduce_module, mpi_pool_executor):
+def test_nvls_allreduce(use_allreduce_module, version, mpi_pool_executor):
     if use_allreduce_module:
         # AllReduce routes only messages inside the size window.
         shapes = tuple(s for s in SHAPES if s[0] * s[1] * 2 >= 1 << 20)
@@ -137,7 +148,7 @@ def test_nvls_allreduce(use_allreduce_module, mpi_pool_executor):
         shapes = SHAPES
     world_size = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(
-        _run_rank, *zip(*[(world_size, shapes, use_allreduce_module)] * world_size)
+        _run_rank, *zip(*[(world_size, shapes, use_allreduce_module, version)] * world_size)
     )
     for r in results:
         assert r is True
