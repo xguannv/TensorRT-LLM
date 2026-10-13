@@ -168,7 +168,12 @@ def _use_fab_fa(
 
 def _o_proj_takes_prequantized_fp8(o_proj: nn.Module, num_rows: int) -> bool:
     """Whether ``o_proj`` on ``num_rows`` BF16 rows quantizes them 1x128 for DeepGEMM
-    (``fp8_swap_ab_gemm``), so that it can take the prequantized pair instead."""
+    (``fp8_swap_ab_gemm``) or for the K3 mid-M FP8 GEMM, so that it can take the prequantized
+    pair instead (a K3 FP8 weight-read projection decides itself, see
+    ``takes_fp8_packed_input``)."""
+    takes_fp8_packed = getattr(o_proj, "takes_fp8_packed_input", None)
+    if takes_fp8_packed is not None:
+        return bool(takes_fp8_packed(num_rows))
     if not isinstance(o_proj, Linear) or not o_proj.has_fp8_block_scales:
         return False
     if o_proj.disable_deep_gemm or o_proj.use_cute_dsl_blockscaling_mm:
@@ -1395,7 +1400,10 @@ class KimiKDALinearAttention(nn.Module):
             two_cta=two_cta,
         )
         if fp8_out:
-            # (E4M3 [T, H * V], packed UE8M0 scales): the DeepGEMM operand o_proj would build
+            # (E4M3 [T, H * V], packed UE8M0 scales): the operand o_proj would build
+            forward_fp8_packed = getattr(self.o_proj, "forward_fp8_packed", None)
+            if forward_fp8_packed is not None:
+                return forward_fp8_packed(*out)
             return self.o_proj(out)
         if mxfp8_output:
             if not isinstance(out, tuple):

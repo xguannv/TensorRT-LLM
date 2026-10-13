@@ -1323,9 +1323,11 @@ _TUNED_TN = {
     (3072, 7168): (None, None, 64, 128, None, 128, 192),  # KDA fused q / k / v / g
 }
 #: Token tiles when the activation arrives already quantized with DeepGEMM-packed scales (the
-#: fused all-reduce + RMSNorm + FP8 block quantization in front of latent_up).
+#: per-tile scale expansion makes narrow tiles relatively dearer than with scale atoms). A
+#: shape missing here uses the scale-atom table.
 _TUNED_TN_PACKED = {
-    (7168, 3584): (None, 64, 128, 256, 192, 192, 256),
+    (7168, 3584): (None, 64, 128, 256, 192, 192, 256),  # latent_up (fused all-reduce quant)
+    (7168, 768): (None, 128, 128, 128, 128, 192, 192),  # o_proj (KDA verify / MLA gate quant)
 }
 
 
@@ -1348,7 +1350,8 @@ def tile_for(
     table says the production path is faster. Shapes outside the table use a makespan heuristic.
     ``packed`` selects the table for prequantized activations with DeepGEMM-packed scales.
     """
-    row = (_TUNED_TN_PACKED if packed else _TUNED_TN).get((_ceil_div(n, BLOCK) * BLOCK, k))
+    key = (_ceil_div(n, BLOCK) * BLOCK, k)
+    row = (_TUNED_TN_PACKED.get(key) if packed else None) or _TUNED_TN.get(key)
     if row is None:
         return (256, _heuristic_tn(m, n)), (2, 1)
     for max_m, tn in zip(_M_BUCKETS, row):
@@ -1485,10 +1488,11 @@ def can_run_packed(
     xs: torch.Tensor,
     w: torch.Tensor,
     w_sf: Optional[torch.Tensor],
-    shared: torch.Tensor,
-    residual: torch.Tensor,
+    shared: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
 ) -> bool:
-    """Whether :func:`k3_fp8_mid_residual_packed_op` accepts these inputs (non-raising check).
+    """Whether :func:`k3_fp8_mid_gemm_packed_op` (or, with ``shared`` and ``residual``,
+    :func:`k3_fp8_mid_residual_packed_op`) accepts these inputs (non-raising check).
 
     ``xq`` is the E4M3 activation ``[M, K]`` and ``xs`` its DeepGEMM-packed UE8M0 scale, int32
     ``[M, ceil(K/512)]`` with strides ``(1, ld)``, ``ld >= M`` (the fused all-reduce output).
@@ -1511,7 +1515,11 @@ def can_run_packed(
         return False
     if w_sf.dtype != torch.uint8 or w_sf.numel() != _ceil_div(n, BLOCK) * (k // CTA_K) * 512:
         return False
-    if not (_check_bf16_rows(shared, m, n) and _check_bf16_rows(residual, m, n)):
+    if (shared is None) != (residual is None):
+        return False
+    if shared is not None and not (
+        _check_bf16_rows(shared, m, n) and _check_bf16_rows(residual, m, n)
+    ):
         return False
     return _is_supported_device(xq.device.index)
 
@@ -1545,6 +1553,31 @@ def _(x, w, w_sf, shared, residual):
     return torch.empty_like(residual)
 
 
+def _packed_ld(xs: torch.Tensor, m: int) -> int:
+    return xs.stride(1) if xs.shape[1] > 1 else max(m, 1)
+
+
+@torch.library.custom_op("trtllm::k3_fp8_mid_gemm_packed", mutates_args=())
+def k3_fp8_mid_gemm_packed_op(
+    xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, w_sf: torch.Tensor
+) -> torch.Tensor:
+    """BF16 ``xq @ dequant(w)^T`` for an activation quantized upstream (E4M3 ``xq`` +
+    DeepGEMM-packed UE8M0 scale ``xs``, see :func:`can_run_packed`)."""
+    m, k = xq.shape
+    n = w.shape[0]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=xq.device)
+    tiler, cluster = tile_for(m, n, k, packed=True) or ((256, _heuristic_tn(m, n)), (2, 1))
+    run_k3_fp8_mid_gemm(
+        xq, xs, w, w_sf, out, tiler=tiler, cluster=cluster, xs_packed_ld=_packed_ld(xs, m)
+    )
+    return out
+
+
+@k3_fp8_mid_gemm_packed_op.register_fake
+def _(xq, xs, w, w_sf):
+    return xq.new_empty((xq.shape[0], w.shape[0]), dtype=torch.bfloat16)
+
+
 @torch.library.custom_op("trtllm::k3_fp8_mid_residual_packed", mutates_args=())
 def k3_fp8_mid_residual_packed_op(
     xq: torch.Tensor,
@@ -1570,7 +1603,7 @@ def k3_fp8_mid_residual_packed_op(
         residual,
         tiler=tiler,
         cluster=cluster,
-        xs_packed_ld=xs.stride(1) if xs.shape[1] > 1 else max(m, 1),
+        xs_packed_ld=_packed_ld(xs, m),
     )
     return out
 
@@ -1583,6 +1616,7 @@ def _(xq, xs, w, w_sf, shared, residual):
 __all__ = [
     "can_run",
     "can_run_packed",
+    "k3_fp8_mid_gemm_packed_op",
     "k3_fp8_mid_residual_packed_op",
     "k3_fp8_mid_gemm_op",
     "k3_fp8_mid_residual_op",

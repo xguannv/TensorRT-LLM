@@ -222,3 +222,19 @@ def test_can_run_packed_rejects():
     assert not mid.can_run_packed(xq, xs.contiguous(), w, w_sf, shared, shared)
     assert not mid.can_run_packed(xq[:, : k - 128], xs, w, w_sf, shared, shared)
     assert not mid.can_run_packed(xq, xs, w, w_sf, shared.float(), shared)
+
+
+@pytest.mark.parametrize("m", [1, 203, 448, 896, 1344, 1792])
+def test_packed_scale_gemm_matches_bf16_path(m):
+    """The packed-scale GEMM on ``fp8_quantize_1x128_packed_ue8m0(x)`` equals the BF16-input mid
+    GEMM (and DeepGEMM) bit for bit: the o_proj operand the KDA verify kernel emits."""
+    mid = _mid()
+    n, k = 7168, 768
+    w, w_scale = _weight(n, k, seed=m + 21)
+    x = _activation(m, k, seed=m + 21)
+    w_sf = mid.expand_weight_scale(w_scale, n, k)
+    xq, xs = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, False)
+    assert mid.can_run_packed(xq, xs, w, w_sf)
+    out = torch.ops.trtllm.k3_fp8_mid_gemm_packed(xq, xs, w, w_sf)
+    torch.testing.assert_close(out, torch.ops.trtllm.k3_fp8_mid_gemm(x, w, w_sf), rtol=0, atol=0)
+    torch.testing.assert_close(out, _deepgemm_bf16(x, w, w_scale), rtol=0, atol=0)

@@ -1470,6 +1470,56 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             m, n, self.in_features
         ) is not None and k3_fp8_mid_gemm.can_run(x_flat, self.weight, self.mid_weight_sf)
 
+    def _mid_gemm_applies_rows(self, num_rows: int, packed: bool = False) -> bool:
+        if self.mid_weight_sf is None or torch.compiler.is_compiling():
+            return False
+        if not _K3_FP8_MID_MIN_M <= num_rows <= _K3_FP8_MID_MAX_M:
+            return False
+        from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
+
+        tile = k3_fp8_mid_gemm.tile_for(
+            num_rows, self.out_features, self.in_features, packed=packed
+        )
+        return tile is not None
+
+    def takes_fp8_packed_input(self, num_rows: int) -> bool:
+        """Whether :meth:`forward_fp8_packed` serves ``num_rows`` rows with the GEMM ``forward``
+        would run on their BF16 values (the mid-M GEMM, or DeepGEMM where ``forward`` quantizes
+        for ``fp8_swap_ab_gemm``), so a producer may emit the 1x128 FP8 operand instead."""
+        if _rubin_mxfp8_is_available() or torch.compiler.is_compiling():
+            return False
+        if self._mid_gemm_applies_rows(num_rows, packed=True):
+            return True
+        if _K3_FP8W_LOWM_GEMM:
+            from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+            if num_rows <= k3_fp8w_lowm_gemm.max_m_for(self.out_features, self.in_features):
+                return False
+        if _K3_DEEPGEMM_SM_RESERVE and self.in_features >= _K3_DEEPGEMM_SM_RESERVE_MIN_K:
+            return False
+        return True
+
+    def forward_fp8_packed(self, act: torch.Tensor, act_scale: torch.Tensor) -> torch.Tensor:
+        """Project an activation quantized upstream: E4M3 ``[M, K]`` plus DeepGEMM-packed UE8M0
+        1x128 scales (int32 ``[M, ceil(K / 512)]``, strides ``(1, ld)``), the bytes
+        ``fp8_quantize_1x128_packed_ue8m0`` makes of the BF16 activation. Same output as
+        :meth:`forward` on that activation where :meth:`takes_fp8_packed_input` holds."""
+        if self._mid_gemm_applies_rows(act.shape[0], packed=True):
+            from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
+
+            if k3_fp8_mid_gemm.can_run_packed(act, act_scale, self.weight, self.mid_weight_sf):
+                return torch.ops.trtllm.k3_fp8_mid_gemm_packed(
+                    act, act_scale, self.weight, self.mid_weight_sf
+                )
+        return torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+            act,
+            act_scale,
+            self.weight,
+            self.weight_scale,
+            output_dtype=torch.bfloat16,
+            disable_ue8m0_cast=True,
+        )
+
     def forward(
         self,
         x: torch.Tensor,

@@ -186,3 +186,71 @@ def test_mixer_routes_fp8_out_to_o_proj(monkeypatch):
         accept = torch.randint(0, M + 1, (batch,), generator=gen, device="cuda", dtype=torch.int32)
         for cache in caches:
             cache.prev_num_accepted_tokens.copy_(accept)
+
+
+@pytest.mark.parametrize("mid_gemm", [True, False])
+@torch.no_grad()
+def test_mixer_routes_fp8_out_to_k3_weight_read_o_proj(monkeypatch, mid_gemm):
+    """With the Kimi-K3 FP8 weight-read o_proj (as the model swaps it in): the FP8-output verify
+    feeds its packed operand to the mid-M FP8 GEMM where the ``o`` family applies, else to the
+    prequantized DeepGEMM GEMM; bitwise the same o_proj output as the BF16 verify + o_proj."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear as mk
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tests.unittest._torch.modules.kimi_kda.test_kimi_kda_fused_verify_parity import (
+        HIDDEN,
+        H,
+        M,
+        _make_fused_layer_cache,
+        _make_pools,
+        _make_runtime,
+    )
+
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_2CTA", True)
+    monkeypatch.setattr(mk, "_K3_FP8W_LOWM_GEMM", False)
+    monkeypatch.setattr(mk, "_K3_FP8_MID_FAMILIES", frozenset({"o"} if mid_gemm else ()))
+    monkeypatch.setattr(mk, "_K3_FP8_MID_MIN_M", 1)
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    batch = num_sms // H + 4  # more (head, request) tiles than SMs
+    steps = M + 1
+    runtimes, pools, caches = [], [], []
+    for _ in range(2):
+        rt = _make_runtime(seed=1, checkpoint_fp8=True)
+        rt.finalize_decode_weights()
+        # As the model loader does: swap the checkpoint FP8 o_proj, then post-load everything.
+        assert mk._swap_linear_to_fp8_weight_read(rt, "o_proj", (Linear,)) == 1
+        assert rt.o_proj.k3_mid_family == "o"
+        for module in rt.modules():
+            if isinstance(module, Linear):
+                module.post_load_weights()
+        rt.o_proj.post_load_weights()
+        assert rt.o_proj.prepare_mid_gemm() == mid_gemm
+        conv_pool, ssm_pool = _make_pools(batch, seed=2)
+        runtimes.append(rt)
+        pools.append(ssm_pool.to(torch.bfloat16))
+        caches.append(_make_fused_layer_cache(batch, conv_pool))
+    rows = batch * steps
+    assert kimi_kda_mixer._o_proj_takes_prequantized_fp8(runtimes[1].o_proj, rows)
+    assert runtimes[1].o_proj._mid_gemm_applies_rows(rows, packed=True) == mid_gemm
+    packed_calls = []
+    forward_fp8_packed = runtimes[1].o_proj.forward_fp8_packed
+
+    def _capturing(act, act_scale):
+        packed_calls.append((act.shape, act_scale.stride()))
+        return forward_fp8_packed(act, act_scale)
+
+    runtimes[1].o_proj.forward_fp8_packed = _capturing
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    for rnd in range(2):
+        x = (torch.randn(rows, HIDDEN, generator=gen, device="cuda") * 0.5).bfloat16()
+        outs = []
+        for i, (rt, ssm, cache) in enumerate(zip(runtimes, pools, caches)):
+            monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_FP8_OUT", i == 1)
+            outs.append(rt.forward_verify_fused(x, steps, cache, ssm, slots))
+        assert len(packed_calls) == rnd + 1
+        _assert_same(f"round {rnd} out", outs[1], outs[0])
+        _assert_same(f"round {rnd} state", pools[1], pools[0])
+        accept = torch.randint(0, M + 1, (batch,), generator=gen, device="cuda", dtype=torch.int32)
+        for cache in caches:
+            cache.prev_num_accepted_tokens.copy_(accept)
