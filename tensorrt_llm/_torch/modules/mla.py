@@ -2445,12 +2445,20 @@ class MLA(nn.Module):
                     )
 
             rope_stream = self.aux_stream if not use_fp8_mla else None
+            # BF16 absorption weight: the module weight, or the dequantized copy
+            # that an FP8 block-scaled kv_b_proj keeps for the SM100-family BMM.
+            w_kc_bf16 = (
+                self.k_b_proj_trans
+                if self.k_b_proj_trans.dtype == torch.bfloat16
+                else self.k_b_proj_trans_dequant
+            )
             if (
                 self.fp8_nope_q_absorb
                 and use_fp8_mla
                 and not fp4_mla
                 and latent_cache is not None
-                and self.k_b_proj_trans.dtype == torch.bfloat16
+                and w_kc_bf16 is not None
+                and w_kc_bf16.dtype == torch.bfloat16
                 and (
                     self._fp8_q_unit_scale is not None
                     or not torch.cuda.is_current_stream_capturing()
@@ -2466,7 +2474,7 @@ class MLA(nn.Module):
                 maybe_execute_in_parallel(
                     lambda: mla_fp8_q_absorb_nope(
                         q.view([-1, self.num_heads_tp, self.qk_head_dim]),
-                        self.k_b_proj_trans,
+                        w_kc_bf16,
                         quant_q_buffer,
                         self.qk_nope_head_dim,
                         self.qk_rope_head_dim,
