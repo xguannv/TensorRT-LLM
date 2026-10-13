@@ -222,6 +222,34 @@ _K3_LD_FUSED_MAX_M = int(os.environ.get("TRTLLM_K3_LD_FUSED_MAX_M", "4096"))
 # 128-row x 128..256-column tile) even in mode "2".
 _K3_LOWM_OVER_FUSED_MAX_M = 128
 
+# Mid-M FP8 GEMM (cute_dsl_kernels/blackwell/k3_fp8_mid_gemm.py: persistent 2-CTA swap-AB MXFP8,
+# no split-K, bit-exact with fp8_swap_ab_gemm) for token counts in [TRTLLM_K3_FP8_MID_MIN_M,
+# TRTLLM_K3_FP8_MID_MAX_M] where its tuned table (k3_fp8_mid_gemm.tile_for) measured it faster
+# than the production path. TRTLLM_K3_FP8_MID_GEMM is a comma list of projection families:
+#   lu: latent_up + the MoE residual update (replaces k3_latent_up_residual / the unfused path)
+#   o: attention o_proj   qb: MLA q_b_proj   qa: MLA fused q_a/kv_a   g: MLA output gate
+#   qkvg: KDA fused q/k/v/g projection
+_K3_FP8_MID_FAMILIES = frozenset(
+    f for f in os.environ.get("TRTLLM_K3_FP8_MID_GEMM", "").split(",") if f
+)
+_K3_FP8_MID_KNOWN = frozenset(("lu", "o", "qb", "qa", "g", "qkvg"))
+if not _K3_FP8_MID_FAMILIES <= _K3_FP8_MID_KNOWN:
+    raise ValueError(
+        f"TRTLLM_K3_FP8_MID_GEMM families must be in {sorted(_K3_FP8_MID_KNOWN)}, "
+        f"got {sorted(_K3_FP8_MID_FAMILIES)}"
+    )
+_K3_FP8_MID_MIN_M = int(os.environ.get("TRTLLM_K3_FP8_MID_MIN_M", "1"))
+_K3_FP8_MID_MAX_M = int(os.environ.get("TRTLLM_K3_FP8_MID_MAX_M", "4096"))
+# Attribute name of an FP8 weight-read projection -> its TRTLLM_K3_FP8_MID_GEMM family.
+_K3_FP8_MID_FAMILY_OF_ATTR = {
+    "o_proj": "o",
+    "q_b_proj": "qb",
+    "kv_a_proj_with_mqa": "qa",
+    "g_proj": "g",
+    "qkvg_proj": "qkvg",
+    "routed_expert_up_proj": "lu",
+}
+
 # CUDA stream priority of the MoE input stream (latent_down chain, routed-output memset).
 # Negative values rank above the main and shared-expert streams, so the latent chain that
 # gates the routed GEMM1 gets free SMs first.
@@ -1294,6 +1322,10 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # Copied from the source ``Linear`` (the MLA fused q_a/kv_a projection sets it): the
         # low-M GEMM may serve this weight although N is not a multiple of 128.
         self.fp8w_lowm_partial_n_tile = False
+        # TRTLLM_K3_FP8_MID_GEMM family of this projection (set when it is swapped in) and,
+        # once prepared, its weight scale expanded to per-row scale atoms for the mid-M GEMM.
+        self.k3_mid_family: Optional[str] = None
+        self.mid_weight_sf: Optional[torch.Tensor] = None
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -1405,6 +1437,34 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     def post_load_weights(self) -> None:
         self.transform_weights()
 
+    def prepare_mid_gemm(self) -> bool:
+        """Expand the weight scale for the mid-M GEMM if this projection's family is enabled."""
+        if self.k3_mid_family not in _K3_FP8_MID_FAMILIES or _rubin_mxfp8_is_available():
+            return False
+        if self._fused_projection is not None:
+            # A row view of the KDA fused q/k/v/g weight; the fused module serves forward.
+            return False
+        self.transform_weights()
+        from ..cute_dsl_kernels.blackwell.k3_fp8_mid_gemm import expand_weight_scale
+
+        self.mid_weight_sf = expand_weight_scale(
+            self.weight_scale, self.out_features, self.in_features
+        )
+        return True
+
+    def mid_gemm_applies(self, x_flat: torch.Tensor) -> bool:
+        """Whether ``trtllm::k3_fp8_mid_gemm`` serves this forward."""
+        if self.mid_weight_sf is None or torch.compiler.is_compiling():
+            return False
+        if not _K3_FP8_MID_MIN_M <= x_flat.shape[0] <= _K3_FP8_MID_MAX_M:
+            return False
+        from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
+
+        m, n = x_flat.shape[0], self.out_features
+        return k3_fp8_mid_gemm.tile_for(
+            m, n, self.in_features
+        ) is not None and k3_fp8_mid_gemm.can_run(x_flat, self.weight, self.mid_weight_sf)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1419,7 +1479,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         x_flat = x.reshape(-1, x.shape[-1])
         out_buffer, self.next_output = self.next_output, None
 
-        if _rubin_mxfp8_is_available():
+        if self.mid_weight_sf is not None and self.mid_gemm_applies(x_flat):
+            out = torch.ops.trtllm.k3_fp8_mid_gemm(x_flat, self.weight, self.mid_weight_sf)
+        elif _rubin_mxfp8_is_available():
             act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
             out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
                 act_fp8,
@@ -1493,7 +1555,9 @@ def _swap_linear_to_fp8_weight_read(
     child = getattr(parent, attr, None)
     if not isinstance(child, linear_types):
         return 0
-    setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
+    converted = _Fp8BlockScaleWeightReadLinear.from_linear(child)
+    converted.k3_mid_family = _K3_FP8_MID_FAMILY_OF_ATTR.get(attr)
+    setattr(parent, attr, converted)
     child.weight.data = child.weight.data.new_empty(0)
     return 1
 
@@ -2230,6 +2294,22 @@ class KimiK3MoERuntime(nn.Module):
         """``residual + (latent_up(latent) + shared_out)`` in one fused chain, or ``None``."""
         up = self.routed_expert_up_proj
         x = latent.reshape(-1, latent.shape[-1])
+        if (
+            isinstance(up, _Fp8BlockScaleWeightReadLinear)
+            and up.mid_weight_sf is not None
+            and x.dtype == torch.bfloat16
+            and up.mid_gemm_applies(x)
+        ):
+            from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
+
+            m = x.shape[0]
+            shared_2d = shared_out.reshape(m, -1)
+            residual_2d = residual.reshape(m, -1)
+            if k3_fp8_mid_gemm.can_run(x, up.weight, up.mid_weight_sf, shared_2d, residual_2d):
+                out = torch.ops.trtllm.k3_fp8_mid_residual(
+                    x, up.weight, up.mid_weight_sf, shared_2d, residual_2d
+                )
+                return out.view(residual.shape)
         if not self._fused_projection_applies(_K3_LU_FUSED, x, up):
             return None
         from ..cute_dsl_kernels.blackwell import k3_latent_fp8_gemm
@@ -4338,3 +4418,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 include_tp_shards=shared_tp,
             )
             logger.info(f"Kimi K3: quantized {converted} BF16 shared/latent MLP projections to FP8")
+        if _K3_FP8_MID_FAMILIES:
+            prepared = sum(
+                module.prepare_mid_gemm()
+                for module in self.model.modules()
+                if isinstance(module, _Fp8BlockScaleWeightReadLinear)
+            )
+            logger.info(
+                f"Kimi K3: mid-M FP8 GEMM for {sorted(_K3_FP8_MID_FAMILIES)} on {prepared} "
+                f"projections, M in [{_K3_FP8_MID_MIN_M}, {_K3_FP8_MID_MAX_M}]"
+            )

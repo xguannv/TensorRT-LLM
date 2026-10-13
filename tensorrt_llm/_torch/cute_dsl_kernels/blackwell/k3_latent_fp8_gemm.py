@@ -492,15 +492,20 @@ class K3Fp8Quant1x128Kernel:
     A work item is one (row, 32-element group); the four groups of a 128-element block are
     handled by four consecutive lanes, which share the block's absolute maximum through two
     shuffles. Each lane writes its own (replicated) scale byte. Rows ``M .. 128 * ceil(M/128)``
-    get the neutral scale 1.0 (their FP8 rows are TMA zero-fill in the GEMM).
+    get the neutral scale 1.0 (their FP8 rows are TMA zero-fill in the GEMM). With
+    ``sf_m_major`` the scale atoms are ordered ``[ceil(M/128)][K/128][512 B]`` (the CUTLASS
+    block-scaled layout) instead of ``[K/128][ceil(M/128)][512 B]``.
     """
 
-    def __init__(self, k: int, use_pdl: bool, threads: int = 128, items: int = 2):
+    def __init__(
+        self, k: int, use_pdl: bool, threads: int = 128, items: int = 2, sf_m_major: bool = False
+    ):
         if k % CTA_K:
             raise ValueError(f"K={k} must be a multiple of {CTA_K}")
         self.k = k
         self.groups = k // SF_VEC
         self.use_pdl = use_pdl
+        self.sf_m_major = sf_m_major
         self._THREADS = threads
         self._ITEMS = items
 
@@ -562,7 +567,11 @@ class K3Fp8Quant1x128Kernel:
                 r = item // self.groups
                 g = item - r * self.groups
                 rr = r & (BM - 1)
-                sf_off = ((g >> 2) * m_tiles + (r >> 7)) * 512 + (rr & 31) * 16 + (rr >> 5) * 4
+                if cutlass.const_expr(self.sf_m_major):
+                    atom = (r >> 7) * (self.k // CTA_K) + (g >> 2)
+                else:
+                    atom = (g >> 2) * m_tiles + (r >> 7)
+                sf_off = atom * 512 + (rr & 31) * 16 + (rr >> 5) * 4
                 sf_addr = xs_ptr.toint() + Int64(sf_off + (g & 3))
                 if r < m:
                     e_a = _ue8m0_of_amax(amax)
@@ -1396,8 +1405,8 @@ def bn_for(m: int, n: int) -> int:
 
 
 @functools.cache
-def _compiled_quant(k: int, use_pdl: bool):
-    kernel = K3Fp8Quant1x128Kernel(k, use_pdl)
+def _compiled_quant(k: int, use_pdl: bool, sf_m_major: bool = False):
+    kernel = K3Fp8Quant1x128Kernel(k, use_pdl, sf_m_major=sf_m_major)
     dummy = 1 << 20
     x_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
     xq_ptr = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
@@ -1424,12 +1433,17 @@ def _gmem_ptr(dtype, tensor: torch.Tensor):
 
 
 def quantize_act_1x128(
-    x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor, *, use_pdl: bool = True
+    x: torch.Tensor,
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    *,
+    use_pdl: bool = True,
+    sf_m_major: bool = False,
 ) -> None:
     """Launch :class:`K3Fp8Quant1x128Kernel` on the current stream."""
     m, k = x.shape
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-    _compiled_quant(k, use_pdl)(
+    _compiled_quant(k, use_pdl, sf_m_major)(
         _gmem_ptr(cutlass.BFloat16, x),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
         _gmem_ptr(cutlass.Uint8, xs),
