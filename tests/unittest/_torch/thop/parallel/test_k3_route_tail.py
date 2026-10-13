@@ -281,8 +281,8 @@ def test_wide_matches_noaux_and_sort(m, mode):
     logits, bias = _logits(m, seed=m, mode=mode)
     for offset, num_local in WIDE_LAYOUTS:
         if not rt.wide_sort_fits(m, num_local):
-            # The sort's table holds local experts x ceil(M / 16) <= 8192 cells.
-            assert num_local * ((m + 15) // 16) > rt.WIDE_TABLE_CELLS
+            assert not rt.wide_table_fits(m, num_local, 8)
+            assert not rt.wide_table_fits(m, num_local, 16)
             with pytest.raises(ValueError):
                 torch.ops.trtllm.k3_route_tail(logits, bias, 1.0, offset, num_local, TILE)
             continue
@@ -308,7 +308,7 @@ def test_wide_configs(m, tokens_per_cta, num_warps, warps_per_token):
     logits, bias = _logits(m, seed=11 * m + tokens_per_cta, mode="realistic")
     for offset, num_local in [(7 * 56, 56), (224, 224)]:
         outs = rt._route_tail_outputs(logits, m, bias, num_local, TILE)
-        if num_local * ((m + tokens_per_cta - 1) // tokens_per_cta) > rt.WIDE_TABLE_CELLS:
+        if not rt.wide_table_fits(m, num_local, tokens_per_cta):
             with pytest.raises(ValueError):
                 rt.run_k3_route_wide(
                     logits,
@@ -377,6 +377,18 @@ def test_wide_split_partials():
     bias = torch.randn((NUM_EXPERTS,), device="cuda", generator=gen) * 0.01
     outs = torch.ops.trtllm.k3_route_tail(partials, bias, 1.0, 7 * 56, 56, TILE, m)
     _check_outputs(outs, partials[0, :m] + partials[1, :m], bias, 1.0, 7 * 56, 56)
+
+
+def test_wide_default_config():
+    """8-token CTAs (compact sort tables) up to 1024 tokens where the tables fit, else 16."""
+    rt = _module()
+    assert rt.default_wide_config(384, 56) == (8, 8, 1)
+    assert rt.default_wide_config(896, 56) == (8, 8, 1)
+    assert rt.default_wide_config(1344, 56) == (16, 16, 1)
+    assert rt.wide_table_fits(1344, 56, 8)
+    assert rt.default_wide_config(2048, 56) == (16, 16, 1)
+    assert rt.wide_sort_fits(2048, 56)
+    assert rt.default_wide_config(512, 224) == (16, 16, 1)
 
 
 def test_wide_rejects_large_local_range():
@@ -558,7 +570,7 @@ def test_route_tail_target_limits(monkeypatch):
     assert target(257, 896) is None
     assert target(1344, 56) == (0, 56)
     assert rt.wide_workspace_ready(bias.device)
-    assert target(1344, 224) is None  # sort table: 224 x 84 cells > 8192
+    assert target(1344, 224) is None  # sort tables do not fit
     assert target(rt.WIDE_MAX_M + 1, 56) is None
     monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL_MAX_M", 256)
     assert target(256, 56) == (0, 56)
