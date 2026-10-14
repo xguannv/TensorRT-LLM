@@ -24,11 +24,20 @@ re-read and convert.
 FP8 conversion is round-to-nearest-even with saturation to +-448, as the MLA
 RoPE kernel's; the q_nope part is rounded once from the FP32 accumulator
 instead of through BF16.
+
+With ``TRTLLM_K3_MLA_FP8_Q_ABSORB_CUTE=1`` on SM100/SM103 the same bytes come from
+the persistent tcgen05 kernel in
+:mod:`tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_mla_q_absorb` (about 2x
+faster at decode token counts); unsupported operands keep the Triton kernel.
 """
+
+import os
 
 import torch
 import triton
 import triton.language as tl
+
+_USE_CUTE = os.environ.get("TRTLLM_K3_MLA_FP8_Q_ABSORB_CUTE", "0") == "1"
 
 
 @triton.jit
@@ -119,6 +128,12 @@ def mla_fp8_q_absorb_nope(
         out = out.view(torch.float8_e4m3fn)
     if num_tokens == 0:
         return
+    if _USE_CUTE:
+        from ..cute_dsl_kernels.blackwell import k3_mla_q_absorb
+
+        if k3_mla_q_absorb.can_run(q, w_kc, out, nope_dim, rope_dim):
+            k3_mla_q_absorb.k3_mla_q_absorb(q, w_kc, out, nope_dim, rope_dim)
+            return
     cfg = _launch_config(num_tokens)
     assert lora_dim % cfg["BLOCK_N"] == 0
     grid = (num_heads, lora_dim // cfg["BLOCK_N"], cfg["M_SPLITS"])
