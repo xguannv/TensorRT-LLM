@@ -35,7 +35,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory, _check_cu_result, cuda
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -67,8 +67,17 @@ class HelixAllToAllFused:
         self.ws_addr = self.workspace.ptr
         self.rank_stride = self.workspace.rank_stride
         self.half_bytes = nbytes // 2 // 16 * 16
-        local = self.workspace.as_torch_strided_tensor(torch.int32)[mapping.cp_rank]
-        local.fill_(SENTINEL)
+        # Arm this rank's segment with the sentinel bytes through the driver: the kernel only uses
+        # raw addresses, and a DLPack tensor view of fabric memory must never be freed while the
+        # process runs (its storage deleter dereferences the capsule of the base tensor).
+        _check_cu_result(
+            cuda.cuMemsetD8Async(
+                cuda.CUdeviceptr(self.ws_addr + mapping.cp_rank * self.rank_stride),
+                SENTINEL & 0xFF,
+                nbytes,
+                cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            )
+        )
         # Launch counter (ticket) of the kernel.
         self.state = torch.zeros(8, dtype=torch.int64, device="cuda")
         num_sms = torch.cuda.get_device_properties(
