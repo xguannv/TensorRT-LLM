@@ -684,3 +684,97 @@ def test_route_umma_cuda_graph_replay(monkeypatch):
             _assert_bit_equal(got, exp, what)
         _assert_bit_equal(outs[8], eager[8], "logits")
         _check_outputs(outs, outs[8], bias, 1.0, offset, num_local)
+
+
+@pytest.mark.parametrize("m,offset,num_local", [(7, 224, 224), (56, 0, 896), (128, 0, 896)])
+def test_moe_runtime_routes_with_umma_gemm(monkeypatch, m, offset, num_local):
+    """``TRTLLM_K3_ROUTE_TAIL=1`` + ``TRTLLM_K3_ROUTER_GEMM=umma``: the runtime computes the
+    UMMA GEMM's split-K partials, hands the routed experts their first split as the logits and
+    routes with the tail on all splits when the experts ask for the routing."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _KimiK3RoutingMethod
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    _module()
+    ru = _umma_module()
+    h, w, bias = _router_inputs(m, seed=11 + m)
+    routing = _KimiK3RoutingMethod(
+        top_k=TOP_K,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=lambda: bias,
+        is_fused=True,
+    )
+    seen = {}
+
+    class _Routed:
+        routing_method = routing
+        use_dp = False
+        backend = SimpleNamespace(
+            slot_start=offset, expert_size_per_partition=num_local, num_slots=NUM_EXPERTS
+        )
+
+        def __call__(self, value, router_logits, **kwargs):
+            seen["logits"] = router_logits
+            seen["routing"] = routing.apply(router_logits)
+            return value
+
+    class _Identity(nn.Module):
+        def forward(self, value, **kwargs):
+            return value
+
+    def _no_cublas(value):
+        raise AssertionError("the cuBLAS router GEMM must not run")
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(
+        compute_logits=_no_cublas,
+        weight=w,
+        e_score_correction_bias=bias,
+        routed_scaling_factor=1.0,
+        num_experts=NUM_EXPERTS,
+    )
+    runtime.routed_experts = _Routed()
+    runtime.routed_expert_down_proj = _Identity()
+    runtime.routed_expert_norm = _Identity()
+    runtime.routed_expert_up_proj = _Identity()
+    runtime.shared_experts = _Identity()
+    runtime._reduce_routed_output = False
+    runtime._defer_shared_allreduce = False
+    runtime._merge_moe_allreduce = False
+    runtime.shared_down_all_reduce = None
+    runtime.shared_expert_stream = None
+    runtime.latent_down_stream = None
+    runtime.moe_main_event = runtime.moe_shared_event = runtime.moe_routed_event = None
+    runtime.moe_latent_fork_event = runtime.moe_latent_ready_event = None
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "1")
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTER_GEMM", "umma")
+    monkeypatch.setattr(runtime, "_can_fuse_router_down", lambda value: False)
+    monkeypatch.setattr(runtime, "_routed_projection", lambda value, projection: value)
+
+    with with_multi_stream(False):
+        runtime(h)
+    parts = torch.empty((ru.DEFAULT_SPLITS, m, NUM_EXPERTS), device="cuda")
+    ru.run_k3_router_umma(h, w, parts)
+    torch.cuda.synchronize()
+    _assert_bit_equal(seen["logits"], parts[0], "placeholder logits = first split")
+    ids, weights = seen["routing"]
+    ref = torch.ops.trtllm.k3_route_tail(parts, bias, 1.0, offset, num_local, TILE)
+    _assert_bit_equal(ids, ref[0], "topk_ids")
+    _assert_bit_equal(weights, ref[1], "topk_weights")
+    key, sort_outputs = ids._k3_presorted
+    assert key == (offset, num_local, TILE)
+    logits = parts[0].clone()
+    for s in range(1, parts.shape[0]):
+        logits = logits + parts[s]
+    _check_outputs((ids, weights, *sort_outputs), logits, bias, 1.0, offset, num_local)
+    assert routing.deferred is None
+    # Above TRTLLM_K3_ROUTER_GEMM_MAX_M the cuBLAS GEMM serves the forward again.
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTER_GEMM_MAX_M", m - 1)
+    assert not runtime._can_umma_route(h)

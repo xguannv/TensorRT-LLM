@@ -201,6 +201,19 @@ if _K3_ROUTE_TAIL != "0" and _K3_FUSED_ROUTER != "0":
 # Largest token count the routing tail serves: up to 256 tokens one cluster, above that (at most
 # 2048 tokens, see k3_route_tail.wide_sort_fits) a grid of CTAs whose last CTA does the sort.
 _K3_ROUTE_TAIL_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTE_TAIL_MAX_M", "2048"))
+# With TRTLLM_K3_ROUTE_TAIL=1: "umma" computes the router logits of up to
+# TRTLLM_K3_ROUTER_GEMM_MAX_M tokens as split-K partials of the 35-CTA tcgen05 router GEMM
+# (cute_dsl_kernels/blackwell/k3_router_umma.py) instead of the cuBLAS GEMM + split-K reduction;
+# the routing tail sums the partials. Same stream order as the cuBLAS GEMM (the shared expert
+# forks after it); the logits differ from cuBLAS at FP32 rounding level.
+_K3_ROUTER_GEMM = os.environ.get("TRTLLM_K3_ROUTER_GEMM", "cublas")
+if _K3_ROUTER_GEMM not in ("cublas", "umma"):
+    raise ValueError(f"TRTLLM_K3_ROUTER_GEMM must be cublas or umma, got {_K3_ROUTER_GEMM!r}")
+_K3_ROUTER_GEMM_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTER_GEMM_MAX_M", "256"))
+# With TRTLLM_K3_ROUTE_TAIL=gemv: "1" launches only the router GEMV (k3_route_tail.ROUTER_GEMV)
+# before the shared expert forks and runs the routing tail on its split-K partials when the routed
+# experts ask for the routing, so the shared expert starts right after the GEMV.
+_K3_ROUTE_GEMV_DEFER_TAIL = os.environ.get("TRTLLM_K3_ROUTE_GEMV_DEFER_TAIL", "0") == "1"
 
 # Fused latent projections (cute_dsl_kernels/blackwell/k3_latent_fp8_gemm.py), for token counts
 # in [TRTLLM_K3_LD_FUSED_MIN_M, TRTLLM_K3_LD_FUSED_MAX_M]:
@@ -2267,6 +2280,48 @@ class KimiK3MoERuntime(nn.Module):
         )
         return self._attach_route(outs, target)
 
+    def _can_umma_route(self, hidden_states: torch.Tensor) -> bool:
+        """Whether ``TRTLLM_K3_ROUTER_GEMM=umma`` computes this forward's router logits."""
+        if _K3_ROUTER_GEMM != "umma" or not 1 <= hidden_states.shape[0] <= _K3_ROUTER_GEMM_MAX_M:
+            return False
+        from ..cute_dsl_kernels.blackwell import k3_router_umma
+
+        return k3_router_umma.can_run(hidden_states, self.gate.weight)
+
+    def _umma_router_partials(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FP32 split-K partial router logits ``[S, M, 896]`` of the UMMA router GEMM."""
+        from ..cute_dsl_kernels.blackwell import k3_router_umma
+
+        partials = torch.empty(
+            (k3_router_umma.DEFAULT_SPLITS, hidden_states.shape[0], self.gate.num_experts),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        k3_router_umma.run_k3_router_umma(hidden_states, self.gate.weight, partials)
+        return partials
+
+    def _gemv_router_partials(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Split-K partial router logits ``[S, M, 896]`` of ``k3_route``'s router GEMM (the
+        ``mma.sync`` GEMV or, with ``TRTLLM_K3_ROUTER_GEMV=umma``, the UMMA GEMM)."""
+        from ..cute_dsl_kernels.blackwell import k3_route_tail
+
+        if k3_route_tail.ROUTER_GEMV == "umma":
+            return self._umma_router_partials(hidden_states)
+        partials = torch.empty(
+            (k3_route_tail.DEFAULT_GEMV_SPLITS, hidden_states.shape[0], self.gate.num_experts),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        k3_route_tail.run_k3_router_gemv(hidden_states, self.gate.weight, partials)
+        return partials
+
+    def _tail_route_partials(
+        self, partials: torch.Tensor, logits: torch.Tensor, target: Tuple[int, int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Routing tail on a router GEMM's split-K partials (``logits`` is their first split, the
+        placeholder the routed experts were handed)."""
+        return self._tail_route(partials, target)
+
     def _gemv_route(self, hidden_states: torch.Tensor, target: Tuple[int, int]) -> torch.Tensor:
         """Route with the router GEMV + tail; hands the result to the routing method and
         returns the FP32 logits."""
@@ -2665,6 +2720,7 @@ class KimiK3MoERuntime(nn.Module):
         shared_partial = None
         route_target = self._route_tail_target(hidden_states.shape[0])
         gemv_route = False
+        router_partials = None
         if self._can_fuse_router_down(hidden_states):
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
@@ -2698,8 +2754,14 @@ class KimiK3MoERuntime(nn.Module):
                     shared_partial = self._shared_gemms_first(identity, self.moe_latent_fork_event)
             # With the fused router, routing runs inside the routed branch below, so the
             # shared experts fork before it instead of waiting for the router.
-            if gemv_route:
+            if gemv_route and _K3_ROUTE_GEMV_DEFER_TAIL:
+                router_partials = self._gemv_router_partials(hidden_states)
+                router_logits = router_partials[0]
+            elif gemv_route:
                 router_logits = self._gemv_route(hidden_states, route_target)
+            elif route_target is not None and self._can_umma_route(hidden_states):
+                router_partials = self._umma_router_partials(hidden_states)
+                router_logits = router_partials[0]
             else:
                 router_logits = (
                     None if _K3_FUSED_ROUTER != "0" else self.gate.compute_logits(hidden_states)
@@ -2748,12 +2810,18 @@ class KimiK3MoERuntime(nn.Module):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
             if merged is not None:
                 moe_kwargs["moe_output"] = routed_slot
-            if route_target is not None and not gemv_route:
+            if route_target is not None and (router_partials is not None or not gemv_route):
                 # Routed by the CuTe tail when the backend asks for the routing (after it
-                # forks the input quantization).
-                self.routed_experts.routing_method.deferred = functools.partial(
-                    self._tail_route, target=route_target
-                )
+                # forks the input quantization); with the UMMA router GEMM the tail sums its
+                # split-K partials.
+                if router_partials is not None:
+                    self.routed_experts.routing_method.deferred = functools.partial(
+                        self._tail_route_partials, router_partials, target=route_target
+                    )
+                else:
+                    self.routed_experts.routing_method.deferred = functools.partial(
+                        self._tail_route, target=route_target
+                    )
             y = self.routed_experts(
                 routed_in,
                 logits,
