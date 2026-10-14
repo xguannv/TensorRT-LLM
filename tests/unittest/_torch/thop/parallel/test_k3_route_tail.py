@@ -755,6 +755,7 @@ def test_moe_runtime_routes_with_umma_gemm(monkeypatch, m, offset, num_local):
     runtime.moe_latent_fork_event = runtime.moe_latent_ready_event = None
     monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "1")
     monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTER_GEMM", "umma")
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTER_GEMM_MAX_M", 256)
     monkeypatch.setattr(runtime, "_can_fuse_router_down", lambda value: False)
     monkeypatch.setattr(runtime, "_routed_projection", lambda value, projection: value)
 

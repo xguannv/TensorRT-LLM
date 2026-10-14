@@ -203,13 +203,16 @@ if _K3_ROUTE_TAIL != "0" and _K3_FUSED_ROUTER != "0":
 _K3_ROUTE_TAIL_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTE_TAIL_MAX_M", "2048"))
 # With TRTLLM_K3_ROUTE_TAIL=1: "umma" computes the router logits of up to
 # TRTLLM_K3_ROUTER_GEMM_MAX_M tokens as split-K partials of the 35-CTA tcgen05 router GEMM
-# (cute_dsl_kernels/blackwell/k3_router_umma.py) instead of the cuBLAS GEMM + split-K reduction;
-# the routing tail sums the partials. Same stream order as the cuBLAS GEMM (the shared expert
-# forks after it); the logits differ from cuBLAS at FP32 rounding level.
+# (cute_dsl_kernels/blackwell/k3_router_umma.py) instead of the cuBLAS GEMM (about 112 CTAs, which
+# slow the latent down-projection running beside it) + split-K reduction; the routing tail sums
+# the partials. Same stream order as the cuBLAS GEMM (the shared expert forks after it); the
+# logits differ from cuBLAS at FP32 rounding level. The default limit of 64 tokens keeps 128-token
+# steps (b16) on cuBLAS: there the 35-CTA GEMM and the tail on its partials end later than the
+# cuBLAS chain and the ranks' shared-expert chains drift apart (gen-only b16: +5.5 ms per step).
 _K3_ROUTER_GEMM = os.environ.get("TRTLLM_K3_ROUTER_GEMM", "cublas")
 if _K3_ROUTER_GEMM not in ("cublas", "umma"):
     raise ValueError(f"TRTLLM_K3_ROUTER_GEMM must be cublas or umma, got {_K3_ROUTER_GEMM!r}")
-_K3_ROUTER_GEMM_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTER_GEMM_MAX_M", "256"))
+_K3_ROUTER_GEMM_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTER_GEMM_MAX_M", "64"))
 # With TRTLLM_K3_ROUTE_TAIL=gemv: "1" launches only the router GEMV (k3_route_tail.ROUTER_GEMV)
 # before the shared expert forks and runs the routing tail on its split-K partials when the routed
 # experts ask for the routing, so the shared expert starts right after the GEMV.
