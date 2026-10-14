@@ -157,6 +157,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reduction_unroll: int = 1,
         balanced_max_requests: int = BALANCED_MAX_REQUESTS,
         reduction_col_split: int = 1,
+        aligned_segment_cost: int = -1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -226,6 +227,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             and fewer registers per partial when the tiles have many
             partials). The result does not depend on it.
         :type reduction_col_split: int
+        :param aligned_segment_cost: Balanced split with up to 32 requests:
+            when >= 0, the clusters of a chunk may be aligned to requests (one
+            segment each, see ``build_mla_balanced_schedule``) if that costs at
+            most this many K tiles more per cluster than the even split. -1
+            keeps the even split.
+        :type aligned_segment_cost: int
         """
 
         self.latent_dim = 512
@@ -257,6 +264,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 "reduction_col_split must divide latent_dim / 32 and needs "
                 f"the tile-indexed reduction, got {reduction_col_split}.")
         self.reduction_col_split = reduction_col_split
+        self.aligned_segment_cost = (aligned_segment_cost
+                                     if self.balanced_tile_reduction else -1)
         self.reduction_unroll = reduction_unroll
         self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
@@ -1485,6 +1494,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     self.balanced_num_clusters,
                     self.num_m_chunks,
                     self.balanced_min_units,
+                    self.aligned_segment_cost,
                 )
             cute.arch.barrier()
 
@@ -2602,7 +2612,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
         page_per_tile = ceil_div(self.mma_qk_tiler[1] // self.page_size,
                                  qk_params.tiled_mma_qk.thr_id.shape)
-        # load q once at first iteration, before the page-table read of K
+        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
+                                      cutlass.Int32)
+        for i in cutlass.range_constexpr(page_per_tile):
+            k_idx[i] = (common_params.mPT[k_index] if self.mma_qk_tiler[1] //
+                        self.page_size == 1 else common_params.mPT[
+                            (k_index * qk_params.tiled_mma_qk.thr_id.shape +
+                             common_params.blk_coord[0]) * page_per_tile + i])
+        # load q once at first iteration
         load_q_pipeline = common_params.load_q_pipeline
         if load_q:
             # get the mbar ptr from pipeline.
@@ -2627,13 +2644,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tma_bar_ptr=tma_bar_ptr,
                 )
             load_q_producer_state.advance()
-        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
-                                      cutlass.Int32)
-        for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (common_params.mPT[k_index] if self.mma_qk_tiler[1] //
-                        self.page_size == 1 else common_params.mPT[
-                            (k_index * qk_params.tiled_mma_qk.thr_id.shape +
-                             common_params.blk_coord[0]) * page_per_tile + i])
         # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
             load_k_producer_state)

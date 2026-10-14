@@ -568,6 +568,7 @@ def build_mla_balanced_schedule(
     num_clusters: cutlass.Constexpr,
     num_chunks: cutlass.Constexpr,
     min_units: cutlass.Constexpr,
+    aligned_segment_cost: cutlass.Constexpr = -1,
 ):
     """One warp writes the shared-memory schedule of its CTA's cluster.
 
@@ -577,6 +578,14 @@ def build_mla_balanced_schedule(
     requests is prefix-summed with warp shuffles. ``min_units``
     lower-bounds the units per cluster so a small batch with short KV is not
     cut into segments shorter than their fixed cost.
+
+    ``aligned_segment_cost >= 0`` (at most 32 requests): the lanes of a chunk
+    may instead be aligned to requests. With the shortest lane length ``T``
+    that fits, request ``b`` gets ``n_b = ceil(T_b / T)`` lanes and lane ``j``
+    of them runs K tiles ``[j T_b / n_b, (j + 1) T_b / n_b)`` of it, a single
+    segment; the remaining lanes and the spare clusters idle. The aligned
+    schedule is used when its longest lane is at most ``W +
+    aligned_segment_cost`` (the K tiles a segment boundary costs).
     """
     lane = cute.arch.lane_idx()
     num_requests = cache_seqs.shape[0]
@@ -599,15 +608,24 @@ def build_mla_balanced_schedule(
             if b < num_requests:
                 table[b + 1] = carry + incl
             carry = carry + cute.arch.shuffle_sync(incl, 31)
+    G = num_clusters
+    C = num_chunks
+    n = G // C
+    s = G - n * C
+    cluster_idx = cute.arch.block_idx()[0] // 2
+    V = carry
+    W = cutlass.max((V * C + (G - 1)) // G, min_units)
+    aligned = False
+    qa_al = cutlass.Int32(0)
+    qb_al = cutlass.Int32(0)
+    if cutlass.const_expr(aligned_segment_cost >= 0 and groups == 1
+                          and n <= 32):
+        aligned, qa_al, qb_al = _aligned_lane_range(kv[0], num_requests, V, W,
+                                                    k_tile, n, C, lane,
+                                                    cluster_idx,
+                                                    aligned_segment_cost)
     if lane == 0:
         table[0] = 0
-        G = num_clusters
-        C = num_chunks
-        n = G // C
-        s = G - n * C
-        cluster_idx = cute.arch.block_idx()[0] // 2
-        V = carry
-        W = cutlass.max((V * C + (G - 1)) // G, min_units)
         nW = cutlass.min(W * n, V)
         Lw = V - nW
         qa = cutlass.min(cluster_idx // C * W, V)
@@ -619,11 +637,76 @@ def build_mla_balanced_schedule(
                 Ws = (s_tot + (s - 1)) // s
                 qa = cutlass.min(spare * Ws, s_tot)
                 qb = cutlass.min((spare + 1) * Ws, s_tot)
+        if aligned:
+            nW = V
+            Lw = cutlass.Int32(0)
+            qa = qa_al
+            qb = qb_al
         params[0] = num_requests
         params[1] = nW
         params[2] = Lw
         params[3] = qa
         params[4] = qb
+
+
+@cute.jit
+def _warp_scan(value: cutlass.Int32, lane: cutlass.Int32) -> cutlass.Int32:
+    """Inclusive warp prefix sum."""
+    for d in cutlass.range_constexpr(5):
+        up = cute.arch.shuffle_sync_up(value, offset=1 << d)
+        if lane >= (1 << d):
+            value = value + up
+    return value
+
+
+@cute.jit
+def _aligned_lane_range(kv, num_requests, V, W, k_tile: cutlass.Constexpr,
+                        n: cutlass.Constexpr, C: cutlass.Constexpr, lane,
+                        cluster_idx, segment_cost: cutlass.Constexpr):
+    """Request-aligned lanes of ``build_mla_balanced_schedule`` (lane b holds
+    request b's KV length ``kv``): (use it, this cluster's range begin, end).
+
+    The lane length is the smallest ``T`` with ``sum_b ceil(T_b / T) <= n``
+    (``ceil(V / n)`` when that fits, else a binary search); request b gets
+    ``ceil(T_b / T)`` lanes and lanes past them idle."""
+    tiles = cutlass.Int32(0)
+    if lane < num_requests:
+        tiles = (cutlass.max(kv, 0) + (k_tile - 1)) // k_tile
+    excl = _warp_scan(tiles, lane) - tiles
+    lane_len = cutlass.max((V + (n - 1)) // n, 1)
+    need = cute.arch.warp_redux_sync((tiles + lane_len - 1) // lane_len, "add")
+    if need > n:
+        lo = lane_len
+        hi = cutlass.max(cute.arch.warp_redux_sync(tiles, "max"), 1)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if cute.arch.warp_redux_sync((tiles + mid - 1) // mid, "add") <= n:
+                hi = mid
+            else:
+                lo = mid
+        lane_len = hi
+    nb = (tiles + lane_len - 1) // lane_len
+    longest = cute.arch.warp_redux_sync(
+        (tiles + cutlass.max(nb, 1) - 1) // cutlass.max(nb, 1), "max")
+    lanes_before = _warp_scan(nb, lane) - nb
+    lane_of_chunk = cluster_idx // C
+    owner_mask = cute.arch.vote_ballot_sync(
+        nb > 0 and lanes_before <= lane_of_chunk
+        and lane_of_chunk < lanes_before + nb)
+    owner = cutlass.Int32(0)
+    if owner_mask != 0:
+        owner = cute.arch.popc(owner_mask ^ (owner_mask - 1)) - 1
+    t = cute.arch.shuffle_sync(tiles, owner)
+    k = cutlass.max(cute.arch.shuffle_sync(nb, owner), 1)
+    j = lane_of_chunk - cute.arch.shuffle_sync(lanes_before, owner)
+    base = cute.arch.shuffle_sync(excl, owner)
+    qa = base + j * t // k
+    qb = base + (j + 1) * t // k
+    if owner_mask == 0 or cluster_idx >= n * C:
+        qa = cutlass.Int32(0)
+        qb = cutlass.Int32(0)
+    use = num_requests <= n and V > 0 and longest <= W + segment_cost
+    return use, qa, qb
 
 
 def create_mla_balanced_tile_scheduler(

@@ -8562,10 +8562,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
               per M tile, else the kernel's ``BALANCED_MAX_REQUESTS``. The
               result does not depend on it.
             * reduction_col_split (balanced split up to ``_SMALL_BATCH``
-              requests): reduction CTAs per row group of an M tile, 4 up to 2
-              requests, 2 up to 8, else 1 (the tiles of smaller batches are
-              cut into more partials); TRTLLM_MLA_REDUCTION_COL_SPLIT
+              requests): reduction CTAs per row group of an M tile, 2 up to 4
+              requests, else 1 (the tiles of smaller batches are cut into
+              more partials; more CTAs than fit in one wave cost more than
+              they save); TRTLLM_MLA_REDUCTION_COL_SPLIT
               overrides it. The result does not depend on it.
+            * aligned_segment_cost (balanced split up to ``_SMALL_BATCH``
+              requests): TRTLLM_MLA_ALIGNED_SPLIT, the K tiles a segment
+              boundary is taken to cost; with it >= 0 a batch may run
+              request-aligned clusters (one segment each) instead of the even
+              split, which moves the split-KV boundaries (results differ in
+              rounding). Default -1: even split.
             """
             threshold = float(
                 os.environ.get("TRTLLM_MLA_RESCALE_THRESHOLD", "0"))
@@ -8577,9 +8584,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             col_split = 1
             if small:
                 col_split = int(
-                    os.environ.get(
-                        "TRTLLM_MLA_REDUCTION_COL_SPLIT",
-                        4 if batch_size <= 2 else 2 if batch_size <= 8 else 1))
+                    os.environ.get("TRTLLM_MLA_REDUCTION_COL_SPLIT",
+                                   2 if batch_size <= 4 else 1))
                 if col_split not in (1, 2, 4, 8, 16):
                     raise ValueError(
                         "TRTLLM_MLA_REDUCTION_COL_SPLIT must be 1, 2, 4, 8 or "
@@ -8613,6 +8619,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ("balanced_max_requests",
                      32 if small else kernel.BALANCED_MAX_REQUESTS),
                     ("reduction_col_split", col_split),
+                    ("aligned_segment_cost",
+                     int(os.environ.get("TRTLLM_MLA_ALIGNED_SPLIT", "-1"))
+                     if small else -1),
                 )
             return options
 
