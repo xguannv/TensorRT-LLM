@@ -8550,9 +8550,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
               (FP8 E4M3 holds up to 448, so at most 8). Default 0: rescale on
               every increase.
             * reduction_unroll: partial slots the balanced-split reduction
-              loads at once. Up to ``_SMALL_BATCH`` requests
-              ``4 * reduction_col_split`` (64 registers of partials per
-              lane); past that ``_REDUCTION_UNROLL`` up to
+              loads at once. Up to ``_SMALL_BATCH`` requests about the
+              partials an M tile is cut into (8 up to 2 requests, 4 up to 4,
+              else 2; at most ``4 * reduction_col_split``, 64 registers per
+              lane), fewer registers letting more CTAs stay resident; past
+              that ``_REDUCTION_UNROLL`` up to
               ``_REDUCTION_UNROLL_MAX_BATCH`` requests, else 1 (always 1
               without the balanced split). TRTLLM_MLA_REDUCTION_UNROLL
               overrides it. The result does not depend on it.
@@ -8573,6 +8575,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
               request-aligned clusters (one segment each) instead of the even
               split, which moves the split-KV boundaries (results differ in
               rounding). Default -1: even split.
+            * bf16_partials (balanced split): TRTLLM_MLA_PARTIAL_BF16=1 stores
+              the split-KV partial O in BF16 (half the partial traffic; one
+              more BF16 rounding of the partials). Default 0: FP32.
             """
             threshold = float(
                 os.environ.get("TRTLLM_MLA_RESCALE_THRESHOLD", "0"))
@@ -8600,7 +8605,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         "TRTLLM_MLA_REDUCTION_UNROLL must be >= 1, got "
                         f"{unroll}.")
             elif small:
-                unroll = 4 * col_split
+                # about the partials per M tile, within 64 registers per lane
+                unroll = 8 if batch_size <= 2 else 4 if batch_size <= 4 else 2
+                unroll = min(unroll, 4 * col_split)
             elif batch_size <= cls._REDUCTION_UNROLL_MAX_BATCH:
                 unroll = cls._REDUCTION_UNROLL
             else:
@@ -8622,6 +8629,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ("aligned_segment_cost",
                      int(os.environ.get("TRTLLM_MLA_ALIGNED_SPLIT", "-1"))
                      if small else -1),
+                    ("bf16_partials",
+                     os.environ.get("TRTLLM_MLA_PARTIAL_BF16", "0") == "1"),
                 )
             return options
 

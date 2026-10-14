@@ -158,6 +158,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         balanced_max_requests: int = BALANCED_MAX_REQUESTS,
         reduction_col_split: int = 1,
         aligned_segment_cost: int = -1,
+        bf16_partials: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -233,6 +234,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             most this many K tiles more per cluster than the even split. -1
             keeps the even split.
         :type aligned_segment_cost: int
+        :param bf16_partials: Balanced split: store the split-KV partial O in
+            BF16 instead of the accumulator type (half the partial traffic;
+            the partials then carry one BF16 rounding, like the per-rank O
+            the Helix merge combines). The partial LSE stays FP32.
+        :type bf16_partials: bool
         """
 
         self.latent_dim = 512
@@ -266,6 +272,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.reduction_col_split = reduction_col_split
         self.aligned_segment_cost = (aligned_segment_cost
                                      if self.balanced_tile_reduction else -1)
+        if bf16_partials and not balanced_split:
+            raise ValueError("bf16_partials needs the balanced split.")
+        self.partial_dtype = cutlass.BFloat16 if bf16_partials else acc_dtype
         self.reduction_unroll = reduction_unroll
         self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
@@ -2157,6 +2166,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                       self.acc_dtype)
         rPartLSE = cute.make_rmem_tensor(cute.make_layout((rpw, unroll)),
                                          self.lse_dtype)
+        # partials in partial_dtype: loaded here, widened into rPart
+        rPartIn = rPart
+        if cutlass.const_expr(self.partial_dtype != self.acc_dtype):
+            rPartIn = cute.make_rmem_tensor(
+                cute.make_layout((vec, rpw, unroll)), self.partial_dtype)
         rLSE.fill(-self.lse_dtype.inf)
         if lane < n_parts:
             q = tile_slots[1 + lane]
@@ -2169,7 +2183,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 for i in cutlass.range_constexpr(rpw):
                     cute.autovec_copy(
                         cute.local_tile(mAccO[rr[i], q, None, 0, 0], (vec, ),
-                                        (col_tile, )), rPart[None, i, u])
+                                        (col_tile, )), rPartIn[None, i, u])
                     rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
         # global LSE of each row: lanes take the partials (first the
         # max, then the sum of the partials' LSEs, both lane-parallel)
@@ -2201,6 +2215,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         rAcc = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
                                      self.acc_dtype)
         rAcc.fill(0.0)
+        if cutlass.const_expr(self.partial_dtype != self.acc_dtype):
+            rPart.store(rPartIn.load().to(self.acc_dtype))
         for u in cutlass.range_constexpr(unroll):
             if u < n_parts:
                 for i in cutlass.range_constexpr(rpw):
@@ -2215,9 +2231,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     for i in cutlass.range_constexpr(rpw):
                         cute.autovec_copy(
                             cute.local_tile(mAccO[rr[i], q, None, 0, 0],
-                                            (vec, ), (col_tile, )), rPart[None,
-                                                                          i, u])
+                                            (vec, ), (col_tile, )),
+                            rPartIn[None, i, u])
                         rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
+            if cutlass.const_expr(self.partial_dtype != self.acc_dtype):
+                rPart.store(rPartIn.load().to(self.acc_dtype))
             for u in cutlass.range_constexpr(unroll):
                 if j0 + u < n_parts:
                     for i in cutlass.range_constexpr(rpw):
@@ -3909,6 +3927,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(target == "final"):
             tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
             tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+        elif cutlass.const_expr(target == "slot"
+                                and self.partial_dtype != self.acc_dtype):
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.partial_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.partial_dtype))
         else:
             tR2G_rO_src = tTR_rAcc
         if cute.elem_less(tTR_cO[0][0], common_params.H):
@@ -4327,7 +4349,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         workspace: cute.Tensor,
     ) -> tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
         """Views of the balanced-split workspace: partial O (H, slots, D, 1,
-        1), partial LSE (H, slots, 1, 1) and slot descriptors (slots, 2)."""
+        1) in ``partial_dtype``, partial LSE (H, slots, 1, 1) and slot
+        descriptors (slots, 2)."""
         slots = self.balanced_num_slots
         align = 256 // self.q_dtype.width
         acc_o_layout = cute.make_layout(
@@ -4335,20 +4358,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             stride=(cute.assume(D, align), cute.assume(H * D, align), 1, 0, 0),
         )
         acc_o = cute.make_tensor(
-            cute.recast_ptr(workspace.iterator, dtype=acc_dtype), acc_o_layout)
+            cute.recast_ptr(workspace.iterator, dtype=self.partial_dtype),
+            acc_o_layout)
         acc_lse_layout = cute.make_layout((H, slots, 1, 1), stride=(1, H, 0, 0))
+        o_bytes = cute.cosize(acc_o_layout) * (self.partial_dtype.width // 8)
         acc_lse = cute.make_tensor(
             cute.recast_ptr(
-                workspace.iterator + cute.cosize(acc_o_layout) *
-                (acc_dtype.width // 8),
+                workspace.iterator + o_bytes,
                 dtype=acc_dtype,
             ),
             acc_lse_layout,
         )
         desc = cute.make_tensor(
             cute.recast_ptr(
-                workspace.iterator +
-                (cute.cosize(acc_o_layout) + cute.cosize(acc_lse_layout)) *
+                workspace.iterator + o_bytes + cute.cosize(acc_lse_layout) *
                 (acc_dtype.width // 8),
                 dtype=cutlass.Int32,
             ),

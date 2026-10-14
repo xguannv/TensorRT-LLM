@@ -666,16 +666,25 @@ def _aligned_lane_range(kv, num_requests, V, W, k_tile: cutlass.Constexpr,
     """Request-aligned lanes of ``build_mla_balanced_schedule`` (lane b holds
     request b's KV length ``kv``): (use it, this cluster's range begin, end).
 
-    The lane length is the smallest ``T`` with ``sum_b ceil(T_b / T) <= n``
+    Not used for fewer than 2 requests with KV or more than ``n``. The lane
+    length is the smallest ``T`` with ``sum_b ceil(T_b / T) <= n``
     (``ceil(V / n)`` when that fits, else a binary search); request b gets
     ``ceil(T_b / T)`` lanes and lanes past them idle."""
     tiles = cutlass.Int32(0)
     if lane < num_requests:
         tiles = (cutlass.max(kv, 0) + (k_tile - 1)) // k_tile
     excl = _warp_scan(tiles, lane) - tiles
+    # Some request gets at most n // r lanes (r requests with KV): a lane is
+    # at least ceil(T_min / (n // r)) long, which rules out most batches
+    # before the search.
+    r = cute.arch.popc(cute.arch.vote_ballot_sync(tiles > 0))
+    t_min = cute.arch.warp_redux_sync(tiles if tiles > 0 else 1 << 30, "min")
+    lower = (t_min + n // cutlass.max(r, 1) - 1) // cutlass.max(
+        n // cutlass.max(r, 1), 1)
+    possible = r >= 2 and r <= n and lower <= W + segment_cost
     lane_len = cutlass.max((V + (n - 1)) // n, 1)
     need = cute.arch.warp_redux_sync((tiles + lane_len - 1) // lane_len, "add")
-    if need > n:
+    if possible and need > n:
         lo = lane_len
         hi = cutlass.max(cute.arch.warp_redux_sync(tiles, "max"), 1)
         while hi - lo > 1:
@@ -705,7 +714,7 @@ def _aligned_lane_range(kv, num_requests, V, W, k_tile: cutlass.Constexpr,
     if owner_mask == 0 or cluster_idx >= n * C:
         qa = cutlass.Int32(0)
         qb = cutlass.Int32(0)
-    use = num_requests <= n and V > 0 and longest <= W + segment_cost
+    use = possible and longest <= W + segment_cost
     return use, qa, qb
 
 
