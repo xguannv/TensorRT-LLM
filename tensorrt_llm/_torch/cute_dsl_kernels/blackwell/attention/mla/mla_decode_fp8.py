@@ -155,6 +155,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         use_pdl: bool = False,
         prefetch_next_work: bool = False,
         reduction_unroll: int = 1,
+        balanced_max_requests: int = BALANCED_MAX_REQUESTS,
+        reduction_col_split: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -203,16 +205,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             programmatic dependent launch: their prologues overlap the
             preceding kernel, which they wait for before touching memory.
         :type use_pdl: bool
-        :param prefetch_next_work: Every warp role asks the tile scheduler
-            for its next work tile when it starts the current one, not after
-            finishing it: the scheduler's shared-memory reads then do not
-            queue behind the epilogue's global stores at a work-tile boundary.
+        :param prefetch_next_work: The MMA, softmax and correction warps ask
+            the tile scheduler for their next work tile when they start the
+            current one, not after finishing it (the load warps always ask
+            after issuing the current tile's loads).
         :type prefetch_next_work: bool
         :param reduction_unroll: Balanced split: partial slots whose O rows
             ``balanced_reduction_kernel`` loads before accumulating them (in
             slot order, so the result does not depend on it). Pays off when
             the M tiles are cut into many partials (batch 1-2).
         :type reduction_unroll: int
+        :param balanced_max_requests: Balanced split: largest batch the
+            shared-memory schedule holds (a multiple of 32, at most
+            ``BALANCED_MAX_REQUESTS``). Up to 32 requests the schedule is built
+            and looked up within one warp's registers.
+        :type balanced_max_requests: int
+        :param reduction_col_split: Balanced split with up to 32 requests:
+            CTAs that share each row group of an M tile in the reduction, each
+            combining ``latent_dim / reduction_col_split`` columns (more CTAs
+            and fewer registers per partial when the tiles have many
+            partials). The result does not depend on it.
+        :type reduction_col_split: int
         """
 
         self.latent_dim = 512
@@ -226,6 +239,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.balanced_split = balanced_split
         self.use_pdl = use_pdl
         self.prefetch_next_work = prefetch_next_work
+        if (balanced_max_requests % 32 != 0 or balanced_max_requests
+                > BlackwellMultiHeadLatentAttentionForwardFP8.
+                BALANCED_MAX_REQUESTS):
+            raise ValueError(
+                "balanced_max_requests must be a multiple of 32 up to "
+                f"{BlackwellMultiHeadLatentAttentionForwardFP8.BALANCED_MAX_REQUESTS}, "
+                f"got {balanced_max_requests}.")
+        self.balanced_max_requests = balanced_max_requests
+        # Small batches: one reduction CTA per (row group, M tile) instead of
+        # per (row group, partial slot).
+        self.balanced_tile_reduction = (balanced_split
+                                        and balanced_max_requests <= 32)
+        if self.latent_dim % (32 * reduction_col_split) != 0 or (
+                reduction_col_split > 1 and not self.balanced_tile_reduction):
+            raise ValueError(
+                "reduction_col_split must divide latent_dim / 32 and needs "
+                f"the tile-indexed reduction, got {reduction_col_split}.")
+        self.reduction_col_split = reduction_col_split
         self.reduction_unroll = reduction_unroll
         self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
@@ -997,7 +1028,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # Balanced split: per-request K-tile prefix table and the
             # cluster's schedule parameters
             tile_table: cute.struct.MemRange[cutlass.Int32,
-                                             self.BALANCED_MAX_REQUESTS +
+                                             self.balanced_max_requests +
                                              1 if self.balanced_split else 1]
             sched_params: cute.struct.MemRange[
                 cutlass.Int32, MLABalancedTileScheduler.NUM_PARAMS]
@@ -1099,9 +1130,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             red_lse = lse
             if cutlass.const_expr(self.emit_softmax_stats):
                 red_lse = (lse, softmax_stats)
-            # (row groups, partial slots + requests): a slot's CTAs combine
-            # the M tile whose first partial it holds; the per-request CTAs
-            # write the empty result of requests without KV.
+            # (row groups, M tiles), or (row groups, partial slots +
+            # requests / 4) past 32 requests: see balanced_reduction_kernel.
             self.balanced_reduction_kernel(
                 o,
                 red_lse,
@@ -1113,8 +1143,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ).launch(
                 grid=(
                     cute.ceil_div(ws_rows, self.BALANCED_REDUCTION_ROWS),
-                    self.balanced_num_slots +
-                    cute.ceil_div(q_latent.shape[3], self.num_compute_warps),
+                    (q_latent.shape[3] * self.num_m_chunks *
+                     self.reduction_col_split if self.balanced_tile_reduction
+                     else self.balanced_num_slots +
+                     cute.ceil_div(q_latent.shape[3], self.num_compute_warps)),
                     1,
                 ),
                 block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
@@ -1428,7 +1460,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # (the scales too: the preceding RoPE kernel writes them) and
             # outputs are accessed after the preceding kernel completed.
             # The reduction is released by the CTAs' exits (no early trigger:
-            # its waiting CTAs would only take the SMs of finished clusters).
+            # its CTAs would wait on the SMs of running clusters, and slow
+            # them down).
             cute.arch.griddepcontrol_wait()
         softmax_scale_log2 = softmax_scale[0] * LOG2_E
         output_scale_value = output_scale[0]
@@ -1438,7 +1471,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(self.balanced_split):
             tile_table = (
                 storage.tile_table.get_tensor(
-                    cute.make_layout(self.BALANCED_MAX_REQUESTS + 1)),
+                    cute.make_layout(self.balanced_max_requests + 1)),
                 storage.sched_params.get_tensor(
                     cute.make_layout(MLABalancedTileScheduler.NUM_PARAMS)),
             )
@@ -1448,7 +1481,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tile_table[0],
                     tile_table[1],
                     self.mma_qk_tiler[1],
-                    self.BALANCED_MAX_REQUESTS,
+                    self.balanced_max_requests,
                     self.balanced_num_clusters,
                     self.num_m_chunks,
                     self.balanced_min_units,
@@ -1462,6 +1495,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 0] and warp_idx <= self.empty_warp_ids[-1]:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
 
+        # The load warps look up their next work tile after issuing the
+        # current one's loads (prefetch_next_work applies to the other roles),
+        # so the first Q / K loads leave as early as possible.
         if warp_idx == self.load_tma_k_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
             load_q_producer_state = pipeline.make_pipeline_state(
@@ -1472,9 +1508,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                    tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
-                if cutlass.const_expr(self.prefetch_next_work):
-                    tile_sched.advance_to_next_work()
-                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1512,11 +1545,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         load_q_producer_state,
                         load_k_producer_state,
                     )
-                if cutlass.const_expr(self.prefetch_next_work):
-                    work_tile = next_work_tile
-                else:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
 
             load_q_pipeline.producer_tail(load_q_producer_state)
             load_k_pipeline.producer_tail(load_k_producer_state)
@@ -1529,9 +1559,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                    tile_table, cache_seqs)
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
-                if cutlass.const_expr(self.prefetch_next_work):
-                    tile_sched.advance_to_next_work()
-                    next_work_tile = tile_sched.get_current_work()
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, local_split_kv = self._work_k_range(
                     work_tile, split_kv, cache_seqs, block_split_kvs)
@@ -1557,11 +1584,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         k_tile_count,
                         load_v_producer_state,
                     )
-                if cutlass.const_expr(self.prefetch_next_work):
-                    work_tile = next_work_tile
-                else:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
             load_v_pipeline.producer_tail(load_v_producer_state)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1968,15 +1992,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """Combine the partials of the M tiles a balanced split cut across
         clusters, and write the empty result of requests without KV.
 
-        Grid ``(row groups, partial slots + requests / 4)``, 4 warps per CTA:
+        4 warps per CTA; each warp combines ``BALANCED_REDUCTION_ROWS / 4``
+        rows of an M tile, loading them together. The partials of a tile are
+        the slots whose descriptor names it, combined in slot order
+        (LSE-weighted, as ``reduction_kernel``) into O, LSE and the softmax
+        stats. A request without KV gets what ``reduction_kernel`` stores for
+        it (O = 0, LSE = +inf, stats (-inf, 0)). Grid:
 
-        * ``y < num_slots``: if slot ``y`` holds the first K tile of its M
-          tile, combine every slot of that tile (LSE-weighted, as
-          ``reduction_kernel``) into O, LSE and the softmax stats; each warp
-          combines ``BALANCED_REDUCTION_ROWS / 4`` rows, loading them together.
-        * ``y >= num_slots``: warp w checks request ``4 * (y - num_slots) + w``;
-          if it has no KV, it stores what ``reduction_kernel`` stores for such a
-          request (O = 0, LSE = +inf, stats (-inf, 0)).
+        * ``balanced_tile_reduction``: ``(row groups, M tiles *
+          reduction_col_split)``; CTA ``(g, t * reduction_col_split + j)``
+          combines column block ``j`` of row group ``g`` of M tile ``t``
+          (nothing when a single segment covered the tile) or, for a request
+          without KV, writes its empty rows.
+        * otherwise ``(row groups, partial slots + requests / 4)``: for
+          ``y < num_slots``, the CTA combines the M tile whose first K tile
+          slot ``y`` holds; for ``y >= num_slots``, warp w checks request
+          ``4 * (y - num_slots) + w``.
 
         :param mO: Output tensor (folded view)
         :param mLSE: LSE tensor (folded view), or ``(lse, softmax_stats)``
@@ -2009,130 +2040,186 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.recast_ptr(storage, dtype=cutlass.Int32),
             cute.make_layout(num_slots + 1))
 
-        if y < num_slots:
-            tile = mDesc[y, 0]
-            if tile >= 0 and mDesc[y, 1] == 0:
-                if warp_idx == 0:
-                    groups = ceil_div(num_slots, self.threads_per_warp)
-                    # all descriptor loads first (clamped, unconditional)
-                    rTile = cute.make_rmem_tensor(cute.make_layout(groups),
-                                                  cutlass.Int32)
-                    for g in cutlass.range_constexpr(groups):
-                        rTile[g] = mDesc[
-                            cutlass.min(g * self.threads_per_warp +
-                                        lane, num_slots - 1), 0]
-                    count = cutlass.Int32(0)
-                    for g in cutlass.range_constexpr(groups):
-                        q = g * self.threads_per_warp + lane
-                        match = False
-                        if q < num_slots:
-                            match = rTile[g] == tile
-                        ballot = cute.arch.vote_ballot_sync(match)
-                        if match:
-                            below = cute.arch.popc(
-                                ballot & cutlass.Int32(cute.arch.lanemask_lt()))
-                            tile_slots[1 + count + below] = q
-                        count = count + cute.arch.popc(ballot)
-                    if lane == 0:
-                        tile_slots[0] = count
-                pipeline.sync(barrier_id=4)
-                n_parts = tile_slots[0]
-                b = tile // num_chunks
-                c = tile % num_chunks
-                # rows past the M tile read row rows - 1 and are not stored
-                rr = cute.make_rmem_tensor(cute.make_layout(rpw), cutlass.Int32)
+        if cutlass.const_expr(self.balanced_tile_reduction):
+            tile = y // self.reduction_col_split
+            col = y % self.reduction_col_split
+            b = tile // num_chunks
+            c = tile % num_chunks
+            if warp_idx == 0:
+                self._gather_tile_slots(mDesc, tile, tile_slots, lane)
+            pipeline.sync(barrier_id=4)
+            if tile_slots[0] > 0:
+                self._combine_tile_rows(mO, mLSE, mSoftmaxStats, mAccO, mAccLSE,
+                                        cache_seqs, kv_bounds, tile_slots, row0,
+                                        b, c, lane, col)
+            elif cache_seqs[b] <= 0:
+                rZero = cute.make_rmem_tensor(
+                    cute.make_layout(vec // self.reduction_col_split),
+                    self.acc_dtype)
+                rZero.fill(0.0)
                 for i in cutlass.range_constexpr(rpw):
-                    rr[i] = cutlass.min(row0 + i, rows - 1)
-                # global LSE of each row: lanes take the partials (first the
-                # max, then the sum of the partials' LSEs, both lane-parallel)
-                rLSE = cute.make_rmem_tensor(cute.make_layout(rpw),
-                                             self.lse_dtype)
-                lse_max = cute.make_rmem_tensor(cute.make_layout(rpw),
-                                                self.lse_dtype)
-                sum_lse = cute.make_rmem_tensor(cute.make_layout(rpw),
-                                                self.lse_dtype)
-                rLSE.fill(-self.lse_dtype.inf)
-                if lane < n_parts:
-                    q = tile_slots[1 + lane]
-                    for i in cutlass.range_constexpr(rpw):
-                        rLSE[i] = mAccLSE[rr[i], q, 0, 0]
-                for i in cutlass.range_constexpr(rpw):
-                    lse_max[i] = rLSE[i]
-                for j0 in range(self.threads_per_warp, n_parts,
-                                self.threads_per_warp):
-                    if j0 + lane < n_parts:
-                        q = tile_slots[1 + j0 + lane]
-                        for i in cutlass.range_constexpr(rpw):
-                            lse_max[i] = cute.arch.fmax(lse_max[i],
-                                                        mAccLSE[rr[i], q, 0, 0])
-                for i in cutlass.range_constexpr(rpw):
-                    m = cute.arch.warp_reduction_max(lse_max[i])
-                    lse_max[i] = m if m != -self.lse_dtype.inf else 0.0
-                    sum_lse[i] = cute.math.exp2(rLSE[i] - lse_max[i],
-                                                fastmath=True)
-                for j0 in range(self.threads_per_warp, n_parts,
-                                self.threads_per_warp):
-                    if j0 + lane < n_parts:
-                        q = tile_slots[1 + j0 + lane]
-                        for i in cutlass.range_constexpr(rpw):
-                            sum_lse[i] += cute.math.exp2(
-                                mAccLSE[rr[i], q, 0, 0] - lse_max[i],
-                                fastmath=True)
-                for i in cutlass.range_constexpr(rpw):
-                    sm = cute.arch.warp_reduction_sum(sum_lse[i])
-                    sum_lse[i] = (lse_max[i] + cute.math.log2(sm, fastmath=True)
-                                  if not sm == self.lse_dtype(0.0) or sm != sm
-                                  else self.lse_dtype.inf)
-                # O: the rows' partials are loaded together, reduction_unroll
-                # partials at a time, and accumulated in slot order
-                unroll = self.reduction_unroll
-                rAcc = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
-                                             self.acc_dtype)
-                rAcc.fill(0.0)
-                rPart = cute.make_rmem_tensor(
-                    cute.make_layout((vec, rpw, unroll)), self.acc_dtype)
-                rPartLSE = cute.make_rmem_tensor(
-                    cute.make_layout((rpw, unroll)), self.lse_dtype)
-                for j0 in range(0, n_parts, unroll):
-                    for u in cutlass.range_constexpr(unroll):
-                        if j0 + u < n_parts:
-                            q = tile_slots[1 + j0 + u]
-                            for i in cutlass.range_constexpr(rpw):
-                                cute.autovec_copy(
-                                    cute.local_tile(mAccO[rr[i], q, None, 0, 0],
-                                                    (vec, ), (lane, )),
-                                    rPart[None, i, u])
-                                rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
-                    for u in cutlass.range_constexpr(unroll):
-                        if j0 + u < n_parts:
-                            for i in cutlass.range_constexpr(rpw):
-                                scale = cute.math.exp2(rPartLSE[i, u] -
-                                                       sum_lse[i],
-                                                       fastmath=True)
-                                for e in cutlass.range_constexpr(vec):
-                                    rAcc[e, i] += rPart[e, i, u] * scale
-                for i in cutlass.range_constexpr(rpw):
-                    if row0 + i < rows and self._is_stored_row(row0 + i, c):
+                    r = row0 + i
+                    if r < rows and self._is_stored_row(r, c):
                         self._store_reduced_row(mO, mLSE, mSoftmaxStats,
-                                                cache_seqs, kv_bounds,
-                                                rAcc[None, i], sum_lse[i],
-                                                row0 + i, c, b, lane)
+                                                cache_seqs, kv_bounds, rZero,
+                                                self.lse_dtype.inf, r, c, b,
+                                                lane, col)
         else:
-            b = (y - num_slots) * self.num_compute_warps + warp_idx
-            if b < cache_seqs.shape[0]:
-                if cache_seqs[b] <= 0:
-                    rZero = cute.make_rmem_tensor(cute.make_layout(vec),
-                                                  self.acc_dtype)
-                    rZero.fill(0.0)
-                    for c in cutlass.range_constexpr(num_chunks):
-                        for i in range(self.BALANCED_REDUCTION_ROWS):
-                            r = row_group * self.BALANCED_REDUCTION_ROWS + i
-                            if r < rows and self._is_stored_row(r, c):
-                                self._store_reduced_row(mO, mLSE, mSoftmaxStats,
-                                                        cache_seqs, kv_bounds,
-                                                        rZero,
-                                                        self.lse_dtype.inf, r,
-                                                        c, b, lane)
+            if y < num_slots:
+                tile = mDesc[y, 0]
+                if tile >= 0 and mDesc[y, 1] == 0:
+                    if warp_idx == 0:
+                        self._gather_tile_slots(mDesc, tile, tile_slots, lane)
+                    pipeline.sync(barrier_id=4)
+                    self._combine_tile_rows(mO, mLSE, mSoftmaxStats, mAccO,
+                                            mAccLSE, cache_seqs, kv_bounds,
+                                            tile_slots, row0,
+                                            tile // num_chunks,
+                                            tile % num_chunks, lane, 0)
+            else:
+                b = (y - num_slots) * self.num_compute_warps + warp_idx
+                if b < cache_seqs.shape[0]:
+                    if cache_seqs[b] <= 0:
+                        rZero = cute.make_rmem_tensor(cute.make_layout(vec),
+                                                      self.acc_dtype)
+                        rZero.fill(0.0)
+                        for c in cutlass.range_constexpr(num_chunks):
+                            for i in range(self.BALANCED_REDUCTION_ROWS):
+                                r = row_group * self.BALANCED_REDUCTION_ROWS + i
+                                if r < rows and self._is_stored_row(r, c):
+                                    self._store_reduced_row(
+                                        mO, mLSE, mSoftmaxStats, cache_seqs,
+                                        kv_bounds, rZero, self.lse_dtype.inf, r,
+                                        c, b, lane, 0)
+
+    @cute.jit
+    def _gather_tile_slots(self, mDesc, tile, tile_slots, lane):
+        """One warp lists the partial slots of M tile ``tile`` in slot order:
+        ``tile_slots[0]`` is their count, ``tile_slots[1:]`` the slots."""
+        num_slots = self.balanced_num_slots
+        groups = ceil_div(num_slots, self.threads_per_warp)
+        # all descriptor loads first (clamped, unconditional)
+        rTile = cute.make_rmem_tensor(cute.make_layout(groups), cutlass.Int32)
+        for g in cutlass.range_constexpr(groups):
+            rTile[g] = mDesc[cutlass.min(g * self.threads_per_warp +
+                                         lane, num_slots - 1), 0]
+        count = cutlass.Int32(0)
+        for g in cutlass.range_constexpr(groups):
+            q = g * self.threads_per_warp + lane
+            match = False
+            if q < num_slots:
+                match = rTile[g] == tile
+            ballot = cute.arch.vote_ballot_sync(match)
+            if match:
+                below = cute.arch.popc(ballot
+                                       & cutlass.Int32(cute.arch.lanemask_lt()))
+                tile_slots[1 + count + below] = q
+            count = count + cute.arch.popc(ballot)
+        if lane == 0:
+            tile_slots[0] = count
+
+    @cute.jit
+    def _combine_tile_rows(self, mO, mLSE, mSoftmaxStats, mAccO, mAccLSE,
+                           cache_seqs, kv_bounds, tile_slots, row0, b, c, lane,
+                           col):
+        """One warp combines rows ``[row0, row0 + rpw)`` of M tile (b, c),
+        column block ``col`` of ``reduction_col_split``, from the partial
+        slots listed in ``tile_slots`` and stores them.
+
+        The first ``reduction_unroll`` partials are loaded together with the
+        LSEs, before the global LSE is reduced; every element accumulates the
+        partials in slot order."""
+        rows = mAccO.shape[0]
+        rpw = self.BALANCED_REDUCTION_ROWS // self.num_compute_warps
+        vec = self.latent_dim // (self.threads_per_warp *
+                                  self.reduction_col_split)
+        col_tile = col * self.threads_per_warp + lane
+        unroll = self.reduction_unroll
+        n_parts = tile_slots[0]
+        # rows past the M tile read row rows - 1 and are not stored
+        rr = cute.make_rmem_tensor(cute.make_layout(rpw), cutlass.Int32)
+        for i in cutlass.range_constexpr(rpw):
+            rr[i] = cutlass.min(row0 + i, rows - 1)
+        rLSE = cute.make_rmem_tensor(cute.make_layout(rpw), self.lse_dtype)
+        lse_max = cute.make_rmem_tensor(cute.make_layout(rpw), self.lse_dtype)
+        sum_lse = cute.make_rmem_tensor(cute.make_layout(rpw), self.lse_dtype)
+        rPart = cute.make_rmem_tensor(cute.make_layout((vec, rpw, unroll)),
+                                      self.acc_dtype)
+        rPartLSE = cute.make_rmem_tensor(cute.make_layout((rpw, unroll)),
+                                         self.lse_dtype)
+        rLSE.fill(-self.lse_dtype.inf)
+        if lane < n_parts:
+            q = tile_slots[1 + lane]
+            for i in cutlass.range_constexpr(rpw):
+                rLSE[i] = mAccLSE[rr[i], q, 0, 0]
+        # O of the first partials (the global LSE does not gate the loads)
+        for u in cutlass.range_constexpr(unroll):
+            if u < n_parts:
+                q = tile_slots[1 + u]
+                for i in cutlass.range_constexpr(rpw):
+                    cute.autovec_copy(
+                        cute.local_tile(mAccO[rr[i], q, None, 0, 0], (vec, ),
+                                        (col_tile, )), rPart[None, i, u])
+                    rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
+        # global LSE of each row: lanes take the partials (first the
+        # max, then the sum of the partials' LSEs, both lane-parallel)
+        for i in cutlass.range_constexpr(rpw):
+            lse_max[i] = rLSE[i]
+        for j0 in range(self.threads_per_warp, n_parts, self.threads_per_warp):
+            if j0 + lane < n_parts:
+                q = tile_slots[1 + j0 + lane]
+                for i in cutlass.range_constexpr(rpw):
+                    lse_max[i] = cute.arch.fmax(lse_max[i], mAccLSE[rr[i], q, 0,
+                                                                    0])
+        for i in cutlass.range_constexpr(rpw):
+            m = cute.arch.warp_reduction_max(lse_max[i])
+            lse_max[i] = m if m != -self.lse_dtype.inf else 0.0
+            sum_lse[i] = cute.math.exp2(rLSE[i] - lse_max[i], fastmath=True)
+        for j0 in range(self.threads_per_warp, n_parts, self.threads_per_warp):
+            if j0 + lane < n_parts:
+                q = tile_slots[1 + j0 + lane]
+                for i in cutlass.range_constexpr(rpw):
+                    sum_lse[i] += cute.math.exp2(mAccLSE[rr[i], q, 0, 0] -
+                                                 lse_max[i],
+                                                 fastmath=True)
+        for i in cutlass.range_constexpr(rpw):
+            sm = cute.arch.warp_reduction_sum(sum_lse[i])
+            sum_lse[i] = (lse_max[i] + cute.math.log2(sm, fastmath=True)
+                          if not sm == self.lse_dtype(0.0) or sm != sm else
+                          self.lse_dtype.inf)
+        # O: reduction_unroll partials at a time, accumulated in slot order
+        rAcc = cute.make_rmem_tensor(cute.make_layout((vec, rpw)),
+                                     self.acc_dtype)
+        rAcc.fill(0.0)
+        for u in cutlass.range_constexpr(unroll):
+            if u < n_parts:
+                for i in cutlass.range_constexpr(rpw):
+                    scale = cute.math.exp2(rPartLSE[i, u] - sum_lse[i],
+                                           fastmath=True)
+                    for e in cutlass.range_constexpr(vec):
+                        rAcc[e, i] += rPart[e, i, u] * scale
+        for j0 in range(unroll, n_parts, unroll):
+            for u in cutlass.range_constexpr(unroll):
+                if j0 + u < n_parts:
+                    q = tile_slots[1 + j0 + u]
+                    for i in cutlass.range_constexpr(rpw):
+                        cute.autovec_copy(
+                            cute.local_tile(mAccO[rr[i], q, None, 0, 0],
+                                            (vec, ), (col_tile, )), rPart[None,
+                                                                          i, u])
+                        rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
+            for u in cutlass.range_constexpr(unroll):
+                if j0 + u < n_parts:
+                    for i in cutlass.range_constexpr(rpw):
+                        scale = cute.math.exp2(rPartLSE[i, u] - sum_lse[i],
+                                               fastmath=True)
+                        for e in cutlass.range_constexpr(vec):
+                            rAcc[e, i] += rPart[e, i, u] * scale
+        for i in cutlass.range_constexpr(rpw):
+            if row0 + i < rows and self._is_stored_row(row0 + i, c):
+                self._store_reduced_row(mO, mLSE, mSoftmaxStats, cache_seqs,
+                                        kv_bounds, rAcc[None, i], sum_lse[i],
+                                        row0 + i, c, b, lane, col)
 
     def _is_stored_row(self, r, c):
         """Whether row r of chunk c is a real (q_tok, head) row."""
@@ -2142,15 +2229,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
     @cute.jit
     def _store_reduced_row(self, mO, mLSE, mSoftmaxStats, cache_seqs, kv_bounds,
-                           rAcc, global_lse, r, c, b, lane):
-        """One warp stores a combined row: O (``vec`` values per lane), LSE
-        and, for Helix, the softmax stats (as ``reduction_kernel``)."""
-        vec = self.latent_dim // self.threads_per_warp
+                           rAcc, global_lse, r, c, b, lane, col):
+        """One warp stores a combined row, column block ``col`` of
+        ``reduction_col_split``: O (``vec`` values per lane) and, from block
+        0, the LSE and, for Helix, the softmax stats (as
+        ``reduction_kernel``)."""
+        vec = self.latent_dim // (self.threads_per_warp *
+                                  self.reduction_col_split)
         rO = cute.make_rmem_tensor(cute.make_layout(vec), self.o_dtype)
         rO.store(rAcc.load().to(self.o_dtype))
-        gO = cute.local_tile(mO[r, None, c, b], (vec, ), (lane, ))
+        gO = cute.local_tile(mO[r, None, c, b], (vec, ),
+                             (col * self.threads_per_warp + lane, ))
         cute.autovec_copy(rO, gO)
-        if lane == 0:
+        if lane == 0 and col == 0:
             mLSE[r, c, b] = global_lse
             if cutlass.const_expr(self.emit_softmax_stats):
                 if cutlass.const_expr(kv_bounds is not None):
@@ -2511,14 +2602,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
         page_per_tile = ceil_div(self.mma_qk_tiler[1] // self.page_size,
                                  qk_params.tiled_mma_qk.thr_id.shape)
-        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
-                                      cutlass.Int32)
-        for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (common_params.mPT[k_index] if self.mma_qk_tiler[1] //
-                        self.page_size == 1 else common_params.mPT[
-                            (k_index * qk_params.tiled_mma_qk.thr_id.shape +
-                             common_params.blk_coord[0]) * page_per_tile + i])
-        # load q once at first iteration
+        # load q once at first iteration, before the page-table read of K
         load_q_pipeline = common_params.load_q_pipeline
         if load_q:
             # get the mbar ptr from pipeline.
@@ -2543,6 +2627,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     tma_bar_ptr=tma_bar_ptr,
                 )
             load_q_producer_state.advance()
+        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
+                                      cutlass.Int32)
+        for i in cutlass.range_constexpr(page_per_tile):
+            k_idx[i] = (common_params.mPT[k_index] if self.mma_qk_tiler[1] //
+                        self.page_size == 1 else common_params.mPT[
+                            (k_index * qk_params.tiled_mma_qk.thr_id.shape +
+                             common_params.blk_coord[0]) * page_per_tile + i])
         # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
             load_k_producer_state)

@@ -380,12 +380,18 @@ class MLABalancedTileScheduler:
     partial: it goes to a workspace slot (lanes own 2 slots, spares
     ``slots_per_spare``) and a reduction combines the partials of the tile.
 
-    The schedule lives in shared memory, written once per CTA by
+    The schedule is written once per CTA to shared memory by
     ``build_mla_balanced_schedule``: ``table[b]`` is the number of units of
     requests ``< b`` per chunk (``table[num_requests] = V``) and ``params``
     holds ``(num_requests, n * W, V - n * W, range begin, range end)`` of
-    this cluster. Only the position ``q`` and the partial count are carried
-    in registers.
+    this cluster. Every warp role reads the parameters and its lane's slice
+    of the table into registers once (``create_mla_balanced_tile_scheduler``):
+    with at most 32 requests lane ``l`` holds ``table[l]`` and a segment
+    lookup is a warp ballot; with more, lane ``l`` holds ``table[32 l]`` and
+    a lookup adds one shared-memory load per lane. The position ``q``, the
+    partial count and the current segment's (K-tile count, partial flag)
+    are carried in registers, so advancing to the next segment needs no
+    lookup.
     """
 
     NUM_PARAMS = 5
@@ -399,17 +405,25 @@ class MLABalancedTileScheduler:
         slots_per_spare: int,
         q: cutlass.Int32,
         n_partial: cutlass.Int32,
+        regs: tuple,
+        cur_k_count: cutlass.Int32,
+        cur_is_partial: cutlass.Int32,
     ):
         self.table = table
         self.params = params
-        # binary-search depth covering every request index the table holds
-        self.search_depth = (cute.size(table.layout) - 2).bit_length()
+        # 32-request groups of the table (its size is max_requests + 1)
+        self.groups = (cute.size(table.layout) - 1 + 31) // 32
         self.num_clusters = num_clusters
         self.num_chunks = num_chunks
         self.num_lanes = (num_clusters // num_chunks) * num_chunks
         self.slots_per_spare = slots_per_spare
         self.q = q
         self.n_partial = n_partial
+        # loop-invariant registers: (lane's table entry, num_requests, n * W,
+        # V - n * W, range end, V)
+        self.regs = regs
+        self.cur_k_count = cur_k_count
+        self.cur_is_partial = cur_is_partial
 
     @staticmethod
     def num_slots(num_clusters: int, num_chunks: int,
@@ -427,6 +441,8 @@ class MLABalancedTileScheduler:
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.q)
         values += cutlass.extract_mlir_values(self.n_partial)
+        values += cutlass.extract_mlir_values(self.cur_k_count)
+        values += cutlass.extract_mlir_values(self.cur_is_partial)
         return values
 
     def __new_from_mlir_values__(self, values):
@@ -438,49 +454,64 @@ class MLABalancedTileScheduler:
             self.slots_per_spare,
             cutlass.new_from_mlir_values(self.q, [values[0]]),
             cutlass.new_from_mlir_values(self.n_partial, [values[1]]),
+            self.regs,
+            cutlass.new_from_mlir_values(self.cur_k_count, [values[2]]),
+            cutlass.new_from_mlir_values(self.cur_is_partial, [values[3]]),
         )
 
     @staticmethod
     def _cluster_idx():
         return cute.arch.block_idx()[0] // 2
 
-    def _param(self, i: int):
-        # Shared-memory loads are per-thread values to the compiler; the
-        # schedule is the same for every lane, so mark it warp-uniform.
-        return cute.arch.make_warp_uniform(self.params[i])
-
     @cute.jit
     def _segment(self):
         """(request, chunk, k_index, k_count, is_partial) of the segment at q.
 
-        Every lane computes the same values (a fixed-depth search over the
-        prefix table, results marked warp-uniform).
+        Every lane gets the same values (warp ballots and shuffles over the
+        table entries the lanes hold, results marked warp-uniform).
         """
+        top, num_requests, n_w, l_w, range_end, v_total = self.regs
         cluster_idx = self._cluster_idx()
         c = cluster_idx % self.num_chunks
         p = self.q
-        p_end = self._param(4)
+        p_end = range_end
         if cutlass.const_expr(self.num_lanes < self.num_clusters):
             if cluster_idx >= self.num_lanes:
                 # spare: q runs over the chunks' leftovers, Lw positions each
-                n_w = self._param(1)
-                l_w = self._param(2)
                 lw = cutlass.max(l_w, 1)
                 c = self.q // lw
                 p = n_w + (self.q - c * lw)
-                p_end = n_w + cutlass.min(l_w, p_end - c * lw)
+                p_end = n_w + cutlass.min(l_w, range_end - c * lw)
         # largest b < num_requests with table[b] <= p (table[0] = 0 <= p);
         # requests without KV have no units
-        num_requests = self._param(0)
-        lo = cutlass.Int32(0)
-        for k in cutlass.range_constexpr(self.search_depth):
-            cand = lo + (1 << (self.search_depth - 1 - k))
-            if cand < num_requests:
-                if self.table[cand] <= p:
-                    lo = cand
-        lo = cute.arch.make_warp_uniform(lo)
-        tile_begin = cute.arch.make_warp_uniform(self.table[lo])
-        tile_end = cute.arch.make_warp_uniform(self.table[lo + 1])
+        lane = cute.arch.lane_idx()
+        if cutlass.const_expr(self.groups == 1):
+            idx = cute.arch.popc(
+                cute.arch.vote_ballot_sync(lane < num_requests
+                                           and top <= p)) - 1
+            idx = cute.arch.make_warp_uniform(idx)
+            lo = idx
+            tile_begin = cute.arch.shuffle_sync(top, idx)
+            tile_end = cute.arch.shuffle_sync(top, cutlass.min(idx + 1, 31))
+        else:
+            g = cute.arch.popc(
+                cute.arch.vote_ballot_sync(lane * 32 < num_requests
+                                           and top <= p)) - 1
+            g = cute.arch.make_warp_uniform(g)
+            b = g * 32 + lane
+            v = self.table[cutlass.min(b, num_requests - 1)]
+            idx = cute.arch.popc(
+                cute.arch.vote_ballot_sync(b < num_requests and v <= p)) - 1
+            idx = cute.arch.make_warp_uniform(idx)
+            lo = g * 32 + idx
+            tile_begin = cute.arch.shuffle_sync(v, idx)
+            tile_end = cute.arch.shuffle_sync(v, cutlass.min(idx + 1, 31))
+            if idx == 31:
+                tile_end = self.table[cutlass.min(lo + 1, num_requests)]
+        if lo + 1 >= num_requests:
+            tile_end = v_total
+        tile_begin = cute.arch.make_warp_uniform(tile_begin)
+        tile_end = cute.arch.make_warp_uniform(tile_end)
         k_count = cutlass.min(tile_end, p_end) - p
         is_partial = cutlass.Int32(0)
         if p > tile_begin or p + k_count < tile_end:
@@ -505,10 +536,14 @@ class MLABalancedTileScheduler:
         return base + self.n_partial
 
     def get_current_work(self, *, loc=None, ip=None) -> MLABalancedWorkTileInfo:
+        """Work tile of the segment at q; also remembers its K-tile count and
+        partial flag for ``advance_to_next_work``."""
         b, c, k_index, k_count, is_partial = self._segment()
+        self.cur_k_count = k_count
+        self.cur_is_partial = is_partial
         return MLABalancedWorkTileInfo(
             (cute.arch.block_idx()[0] % 2, c, b, self._slot()),
-            self.q < self._param(4),
+            self.q < self.regs[4],
             k_index,
             k_count,
             is_partial,
@@ -518,9 +553,9 @@ class MLABalancedTileScheduler:
         return self.get_current_work(loc=loc, ip=ip)
 
     def advance_to_next_work(self, *, loc=None, ip=None):
-        _, _, _, k_count, is_partial = self._segment()
-        self.q += k_count
-        self.n_partial += is_partial
+        """Step past the segment of the last ``get_current_work``."""
+        self.q += self.cur_k_count
+        self.n_partial += self.cur_is_partial
 
 
 @cute.jit
@@ -599,10 +634,27 @@ def create_mla_balanced_tile_scheduler(
     slots_per_spare: int,
 ) -> MLABalancedTileScheduler:
     """Scheduler over the shared-memory schedule written by
-    ``build_mla_balanced_schedule``."""
+    ``build_mla_balanced_schedule``; reads the parameters and this lane's
+    table entry (``table[l]``, or ``table[32 l]`` past 32 requests) into
+    registers."""
+    lane = cute.arch.lane_idx()
+    num_requests = cute.arch.make_warp_uniform(params[0])
+    if cutlass.const_expr(cute.size(table.layout) - 1 <= 32):
+        top = table[cutlass.min(lane, num_requests)]
+    else:
+        top = table[cutlass.min(lane * 32, num_requests)]
+    regs = (
+        top,
+        num_requests,
+        cute.arch.make_warp_uniform(params[1]),
+        cute.arch.make_warp_uniform(params[2]),
+        cute.arch.make_warp_uniform(params[4]),
+        cute.arch.make_warp_uniform(table[num_requests]),
+    )
     return MLABalancedTileScheduler(table, params, num_clusters, num_chunks,
                                     slots_per_spare,
                                     cute.arch.make_warp_uniform(params[3]),
+                                    cutlass.Int32(0), regs, cutlass.Int32(0),
                                     cutlass.Int32(0))
 
 

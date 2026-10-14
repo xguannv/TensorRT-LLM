@@ -8529,6 +8529,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # partial slots at once (its M tiles are cut into many partials).
         _REDUCTION_UNROLL_MAX_BATCH = 2
         _REDUCTION_UNROLL = 4
+        # Balanced split up to this many requests: small-batch kernel variant
+        # (register schedule, one reduction CTA group per M tile).
+        _SMALL_BATCH = 32
 
         @classmethod
         def _fp8_kernel_options(
@@ -8547,9 +8550,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
               (FP8 E4M3 holds up to 448, so at most 8). Default 0: rescale on
               every increase.
             * reduction_unroll: partial slots the balanced-split reduction
-              loads at once, ``_REDUCTION_UNROLL`` up to
+              loads at once. Up to ``_SMALL_BATCH`` requests
+              ``4 * reduction_col_split`` (64 registers of partials per
+              lane); past that ``_REDUCTION_UNROLL`` up to
               ``_REDUCTION_UNROLL_MAX_BATCH`` requests, else 1 (always 1
-              without the balanced split); TRTLLM_MLA_REDUCTION_UNROLL
+              without the balanced split). TRTLLM_MLA_REDUCTION_UNROLL
+              overrides it. The result does not depend on it.
+            * balanced_max_requests (balanced split only): 32 up to
+              ``_SMALL_BATCH`` requests, so the schedule is built and looked
+              up in one warp's registers and the reduction runs one CTA group
+              per M tile, else the kernel's ``BALANCED_MAX_REQUESTS``. The
+              result does not depend on it.
+            * reduction_col_split (balanced split up to ``_SMALL_BATCH``
+              requests): reduction CTAs per row group of an M tile, 4 up to 2
+              requests, 2 up to 8, else 1 (the tiles of smaller batches are
+              cut into more partials); TRTLLM_MLA_REDUCTION_COL_SPLIT
               overrides it. The result does not depend on it.
             """
             threshold = float(
@@ -8558,6 +8573,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError(
                     "TRTLLM_MLA_RESCALE_THRESHOLD must be in [0, 8], got "
                     f"{threshold}.")
+            small = balanced_split and batch_size <= cls._SMALL_BATCH
+            col_split = 1
+            if small:
+                col_split = int(
+                    os.environ.get(
+                        "TRTLLM_MLA_REDUCTION_COL_SPLIT",
+                        4 if batch_size <= 2 else 2 if batch_size <= 8 else 1))
+                if col_split not in (1, 2, 4, 8, 16):
+                    raise ValueError(
+                        "TRTLLM_MLA_REDUCTION_COL_SPLIT must be 1, 2, 4, 8 or "
+                        f"16, got {col_split}.")
             unroll = os.environ.get("TRTLLM_MLA_REDUCTION_UNROLL")
             if not balanced_split:
                 unroll = 1
@@ -8567,11 +8593,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError(
                         "TRTLLM_MLA_REDUCTION_UNROLL must be >= 1, got "
                         f"{unroll}.")
+            elif small:
+                unroll = 4 * col_split
             elif batch_size <= cls._REDUCTION_UNROLL_MAX_BATCH:
                 unroll = cls._REDUCTION_UNROLL
             else:
                 unroll = 1
-            return (
+            options = (
                 ("use_pdl", os.environ.get("TRTLLM_MLA_PDL", "1") == "1"
                  and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"),
                 ("prefetch_next_work",
@@ -8579,6 +8607,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ("skip_correction_threshold", threshold),
                 ("reduction_unroll", unroll),
             )
+            if balanced_split:
+                kernel = BlackwellMultiHeadLatentAttentionForwardFP8
+                options += (
+                    ("balanced_max_requests",
+                     32 if small else kernel.BALANCED_MAX_REQUESTS),
+                    ("reduction_col_split", col_split),
+                )
+            return options
 
         def __init__(
             self,
