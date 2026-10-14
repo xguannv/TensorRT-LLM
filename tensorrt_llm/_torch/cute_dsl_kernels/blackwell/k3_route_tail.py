@@ -5,7 +5,8 @@
 ``k3_route_tail`` replaces ``noaux_tc_op`` -> ``moe_sort`` (and, given split-K partial logits,
 the split-K reduction before them) by one launch on a cluster of eight small CTAs, so the
 routing occupies few SMs next to the side-stream kernels it runs with. ``k3_route`` puts a
-router GEMV with a fixed 40-CTA grid in front of it (``M <= 64``).
+router GEMV with a fixed 40-CTA grid in front of it (``M <= 64``), or the 35-CTA ``tcgen05``
+router GEMM of :mod:`k3_router_umma` (``M <= 256``, ``TRTLLM_K3_ROUTER_GEMV=umma``).
 
 * Input: FP32 router logits ``[M, 896]`` (``1 <= M <= 2048``), or ``S`` split-K partials
   ``[S, R, 896]`` (``R >= M``) that are summed in split order.
@@ -38,6 +39,7 @@ counter before it exits. Either way a captured CUDA graph replays them as is.
 from __future__ import annotations
 
 import functools
+import os
 import struct
 
 import cuda.bindings.driver as cuda
@@ -92,9 +94,15 @@ from .k3_fused_router import (
 MAX_M = 256
 #: Largest token count of the router GEMV.
 GEMV_MAX_M = 64
-#: Largest token count the model routes with the GEMV: above it the GEMV (7 MMA warps per CTA)
-#: is slower than the GEMM in situ (GB300, M = 56).
-GEMV_ROUTE_MAX_M = 32
+#: Router GEMM of :func:`k3_route`: ``mma`` (:class:`K3RouterGemvKernel`, ``mma.sync``, 40 CTAs,
+#: ``M <= 64``) or ``umma`` (:mod:`k3_router_umma`, ``tcgen05``, 35 CTAs, ``M <= 256``).
+ROUTER_GEMV = os.environ.get("TRTLLM_K3_ROUTER_GEMV", "mma")
+if ROUTER_GEMV not in ("mma", "umma"):
+    raise ValueError(f"TRTLLM_K3_ROUTER_GEMV must be mma or umma, got {ROUTER_GEMV!r}")
+#: Largest token count the model routes with :func:`k3_route` (``TRTLLM_K3_ROUTE_TAIL=gemv``):
+#: above 32 tokens the ``mma.sync`` GEMV (7 MMA warps per CTA) is slower than the GEMM in situ
+#: (GB300, M = 56); the UMMA GEMM stays bandwidth-bound.
+GEMV_ROUTE_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTE_GEMV_MAX_M", "32"))
 #: Largest cluster (portable cluster size).
 MAX_CTAS = 8
 #: Tokens per CTA are capped by the 32-bit token mask of the sort.
@@ -2510,13 +2518,22 @@ def can_use_k3_route(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
         and hidden_states.dim() == 2
         and hidden_states.is_contiguous()
         and tuple(hidden_states.shape[1:]) == (HIDDEN_SIZE,)
-        and 1 <= hidden_states.shape[0] <= GEMV_MAX_M
+        and 1 <= hidden_states.shape[0] <= _route_gemv_max_m()
         and hidden_states.data_ptr() % 16 == 0
         and weight.dtype == torch.bfloat16
         and tuple(weight.shape) == (NUM_EXPERTS, HIDDEN_SIZE)
         and weight.is_contiguous()
         and weight.data_ptr() % 16 == 0
     )
+
+
+def _route_gemv_max_m() -> int:
+    """Largest token count of :func:`k3_route`'s router GEMM."""
+    if ROUTER_GEMV == "umma":
+        from .k3_router_umma import MAX_M as umma_max_m
+
+        return min(umma_max_m, MAX_M)
+    return GEMV_MAX_M
 
 
 @torch.library.custom_op("trtllm::k3_route", mutates_args=())
@@ -2540,7 +2557,8 @@ def k3_route(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Router GEMM (capped grid) + ``noaux_tc`` top-16 + ``moe_sort`` for ``M <= 64`` tokens.
+    """Router GEMM (capped grid) + ``noaux_tc`` top-16 + ``moe_sort`` for ``M <= 64`` tokens
+    (``M <= 256`` with the UMMA router GEMM, ``TRTLLM_K3_ROUTER_GEMV=umma``).
 
     Args:
         hidden_states: ``bf16 [M, 7168]``.
@@ -2550,19 +2568,31 @@ def k3_route(
         local_expert_offset: First expert of this rank.
         local_num_experts: Experts of this rank.
         tile_tokens_dim: Must be 128.
-        num_splits: K splits of the GEMV (``8 * num_splits`` CTAs).
+        num_splits: K splits of the ``mma.sync`` GEMV (``8 * num_splits`` CTAs); the UMMA GEMM
+            uses ``k3_router_umma.DEFAULT_SPLITS`` (``7 * S`` CTAs).
 
     Returns:
         :func:`k3_route_tail`'s eight outputs followed by the FP32 logits ``[M, 896]`` (the
         split-K sum the top-k was computed from).
     """
     if not can_use_k3_route(hidden_states, weight):
-        raise ValueError("k3_route needs bf16 [M <= 64, 7168] activations and a [896, 7168] weight")
+        raise ValueError(
+            f"k3_route needs bf16 [M <= {_route_gemv_max_m()}, 7168] activations and a "
+            "[896, 7168] weight"
+        )
     m = hidden_states.shape[0]
-    partials = torch.empty(
-        (num_splits, m, NUM_EXPERTS), dtype=torch.float32, device=hidden_states.device
-    )
-    run_k3_router_gemv(hidden_states, weight, partials)
+    if ROUTER_GEMV == "umma":
+        from .k3_router_umma import DEFAULT_SPLITS, run_k3_router_umma
+
+        partials = torch.empty(
+            (DEFAULT_SPLITS, m, NUM_EXPERTS), dtype=torch.float32, device=hidden_states.device
+        )
+        run_k3_router_umma(hidden_states, weight, partials)
+    else:
+        partials = torch.empty(
+            (num_splits, m, NUM_EXPERTS), dtype=torch.float32, device=hidden_states.device
+        )
+        run_k3_router_gemv(hidden_states, weight, partials)
     logits = torch.empty((m, NUM_EXPERTS), dtype=torch.float32, device=hidden_states.device)
     outs = _route_tail_outputs(
         partials, m, e_score_correction_bias, local_num_experts, tile_tokens_dim

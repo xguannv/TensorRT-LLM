@@ -577,3 +577,110 @@ def test_route_tail_target_limits(monkeypatch):
     assert target(257, 56) is None
     monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "0")
     assert target(28, 56) is None
+
+
+# ---------------------------------------------------------------------------
+# UMMA router GEMM (k3_router_umma, TRTLLM_K3_ROUTER_GEMV=umma)
+# ---------------------------------------------------------------------------
+
+UMMA_MS = [1, 7, 13, 16, 17, 28, 32, 33, 56, 64, 65, 112, 128, 224, 256]
+
+
+def _umma_module():
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_router_umma
+
+    return k3_router_umma
+
+
+def _router_inputs(m, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    h = torch.randn((m, HIDDEN), device="cuda", generator=gen).to(torch.bfloat16)
+    w = (torch.randn((NUM_EXPERTS, HIDDEN), device="cuda", generator=gen) * 0.02).to(torch.bfloat16)
+    bias = torch.randn((NUM_EXPERTS,), device="cuda", generator=gen) * 0.01
+    return h, w, bias
+
+
+@pytest.mark.parametrize("m", UMMA_MS)
+@pytest.mark.parametrize("splits", [5, 8])
+def test_umma_partials(m, splits):
+    """Every partial is the FP32 product over its K slice; the slices tile K in order, the
+    result is deterministic and no slot is left unwritten."""
+    ru = _umma_module()
+    h, w, _ = _router_inputs(m, seed=m + 100 * splits)
+    parts = torch.full((splits, m, NUM_EXPERTS), float("nan"), device="cuda")
+    ru.run_k3_router_umma(h, w, parts)
+    torch.cuda.synchronize()
+    assert not torch.isnan(parts).any()
+    chunks = HIDDEN // 64
+    start = 0
+    for s in range(splits):
+        count = chunks // splits + (1 if s < chunks % splits else 0)
+        lo, hi = start * 64, (start + count) * 64
+        exact = (h[:, lo:hi].double() @ w[:, lo:hi].double().t()).float()
+        torch.testing.assert_close(parts[s], exact, rtol=0, atol=2e-5)
+        start += count
+    assert start == chunks
+    exact = (h.double() @ w.double().t()).float()
+    torch.testing.assert_close(parts.sum(0), exact, rtol=0, atol=5e-5)
+    again = torch.empty_like(parts)
+    ru.run_k3_router_umma(h, w, again)
+    torch.cuda.synchronize()
+    _assert_bit_equal(again, parts, "second launch")
+
+
+@pytest.mark.parametrize("m", [1, 7, 16, 32, 33, 56, 64, 112, 128, 224, 256])
+@pytest.mark.parametrize("offset,num_local", [(7 * 56, 56), (224, 224), (0, 896)])
+def test_route_umma(monkeypatch, m, offset, num_local):
+    """``k3_route`` on the UMMA GEMM: the logits match the FP32 product, the routing is exact on
+    them and agrees with the production GEMM's selection except at near-ties."""
+    rt = _module()
+    _umma_module()
+    monkeypatch.setattr(rt, "ROUTER_GEMV", "umma")
+    h, w, bias = _router_inputs(m, seed=m + offset)
+    assert rt.can_use_k3_route(h, w)
+    outs = torch.ops.trtllm.k3_route(h, w, bias, 1.0, offset, num_local, TILE)
+    logits = outs[8]
+    exact = (h.double() @ w.double().t()).float()
+    torch.testing.assert_close(logits, exact, rtol=0, atol=5e-5)
+    ref_gemm = torch.ops.trtllm.dsv3_router_gemm_op(h, w.t(), bias=None, out_dtype=torch.float32)
+    torch.testing.assert_close(logits, ref_gemm, rtol=0, atol=1e-4)
+    _check_outputs(outs, logits, bias, 1.0, offset, num_local)
+    chain_ids, _ = _noaux(ref_gemm, bias, 1.0)
+    same = sum(
+        len(set(a) & set(b)) for a, b in zip(outs[0].cpu().tolist(), chain_ids.cpu().tolist())
+    )
+    assert same >= 0.99 * m * TOP_K
+
+
+def test_route_umma_limits(monkeypatch):
+    rt = _module()
+    _umma_module()
+    h, w, _ = _router_inputs(257, seed=1)
+    monkeypatch.setattr(rt, "ROUTER_GEMV", "mma")
+    assert rt.can_use_k3_route(h[:64], w) and not rt.can_use_k3_route(h[:65], w)
+    monkeypatch.setattr(rt, "ROUTER_GEMV", "umma")
+    assert rt.can_use_k3_route(h[:256], w) and not rt.can_use_k3_route(h, w)
+
+
+def test_route_umma_cuda_graph_replay(monkeypatch):
+    rt = _module()
+    _umma_module()
+    monkeypatch.setattr(rt, "ROUTER_GEMV", "umma")
+    m, offset, num_local = 32, 224, 224
+    h, w, bias = _router_inputs(m, seed=7)
+    static = h.clone()
+    torch.ops.trtllm.k3_route(static, w, bias, 1.0, offset, num_local, TILE)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = torch.ops.trtllm.k3_route(static, w, bias, 1.0, offset, num_local, TILE)
+    for seed in range(3):
+        fresh, _, _ = _router_inputs(m, seed=20 + seed)
+        static.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = torch.ops.trtllm.k3_route(static, w, bias, 1.0, offset, num_local, TILE)
+        for got, exp, what in zip(outs, eager, ("ids", "weights")):
+            _assert_bit_equal(got, exp, what)
+        _assert_bit_equal(outs[8], eager[8], "logits")
+        _check_outputs(outs, outs[8], bias, 1.0, offset, num_local)
