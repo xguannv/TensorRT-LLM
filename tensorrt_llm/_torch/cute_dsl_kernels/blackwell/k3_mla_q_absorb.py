@@ -27,13 +27,15 @@ The absorbed part is a batched GEMM over heads (``M`` = tokens, ``N`` = lora, ``
 run by :class:`K3MlaQAbsorbKernel`, a warp-specialized persistent kernel built on
 :class:`PersistentDenseGemmKernel` (TMA warp, MMA warp, four epilogue warps):
 ``tcgen05.mma`` kind::f16 with FP32 accumulation in tensor memory, double-buffered
-accumulators, and a TMA-store epilogue in 128-column sub-tiles. Each output element is the
-same K-ordered chain of 16-wide MMA steps as the Triton kernel's ``tl.dot``; the epilogue takes
-``max.f32(acc, -448)`` (NaN -> -448) and converts with ``cvt.rn.satfinite`` (clamps the rest to
-+-448), which is the Triton kernel's ``min(max(acc, -448), 448)`` rounded to nearest even, so
-the bytes are identical. Four more warps per CTA copy ``q_pe`` (grid-stride over 16-byte
-chunks, overlapping the GEMM). With PDL the TMA warp issues the weight stages of its first
-tile before ``griddepcontrol.wait``.
+accumulators, and a TMA-store epilogue in 64-column sub-tiles. Its stage counts leave
+:data:`SMEM_HEADROOM` of shared memory on each SM so that the MLA RoPE / KV-append kernel on the
+aux stream runs beside the persistent CTAs instead of after the whole grid. Each output element
+is the same K-ordered chain of 16-wide MMA steps as the Triton kernel's ``tl.dot``; the
+epilogue takes ``max.f32(acc, -448)`` (NaN -> -448) and converts with ``cvt.rn.satfinite``
+(clamps the rest to +-448), which is the Triton kernel's ``min(max(acc, -448), 448)`` rounded to
+nearest even, so the bytes are identical. Four more warps per CTA copy ``q_pe`` (grid-stride
+over 16-byte chunks, overlapping the GEMM). With PDL the TMA warp issues the weight stages of
+its first tile before ``griddepcontrol.wait``.
 """
 
 from __future__ import annotations
@@ -64,6 +66,10 @@ MAX_TOKENS = 16384
 CTA_M = 128
 #: q_pe elements per 16-byte load.
 PE_VEC = 8
+#: Shared memory left free per SM. The MLA RoPE / KV-append kernel that runs next to this one on
+#: the aux stream (``applyMLARopeAndAssignQKVKernelGeneration``: 2208 B static + 1 KB reserved
+#: per 256-thread block) must fit beside the persistent CTA, or it waits for the whole grid.
+SMEM_HEADROOM = 4096
 
 
 @dsl_user_op
@@ -173,7 +179,8 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         use_pdl: bool,
         pe_warps: int = 4,
         pe_unroll: int = 8,
-        epi_n: int = 128,
+        epi_n: int = 64,
+        smem_headroom: int = SMEM_HEADROOM,
     ):
         assert pe_warps > 0 and rope_dim % PE_VEC == 0
         super().__init__(
@@ -193,11 +200,13 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         self.pe_warp_id = tuple(range(6, 6 + pe_warps))
         self.pe_unroll = pe_unroll
         self.epi_n = epi_n
+        self.smem_headroom = smem_headroom
         self.threads_per_cta = 32 * (len(self.epilogue_warp_id) + 2 + len(self.pe_warp_id))
 
     def _setup_attributes(self):
         """The parent's setup with an ``epi_n``-column epilogue sub-tile (fewer, larger TMA
-        stores than its 32-column default for an 8-bit output)."""
+        stores than its 32-column default for an 8-bit output) and the stage counts sized to
+        leave ``smem_headroom`` bytes of shared memory per SM."""
         super()._setup_attributes()
         self.epi_tile = (cute.make_layout(CTA_M), cute.make_layout(self.epi_n))
         tiled_mma = self._create_tiled_mma()
@@ -210,7 +219,7 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
             self.a_dtype,
             self.b_dtype,
             self.c_dtype,
-            self.smem_capacity,
+            self.smem_capacity - self.smem_headroom,
             self.occupancy,
             True,
             c_smem_layout,
@@ -782,7 +791,8 @@ def _compiled(
     use_pdl: bool,
     pe_warps: int = 4,
     pe_unroll: int = 8,
-    epi_n: int = 128,
+    epi_n: int = 64,
+    smem_headroom: int = SMEM_HEADROOM,
 ):
     kernel = K3MlaQAbsorbKernel(
         num_heads,
@@ -795,6 +805,7 @@ def _compiled(
         pe_warps,
         pe_unroll,
         min(epi_n, tile_n),
+        smem_headroom,
     )
     dummy = 1 << 20
     bf = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
