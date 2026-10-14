@@ -42,6 +42,8 @@ from test_cute_dsl_mla_flat_fold import (  # noqa: E402
 )
 
 if _HAVE_DEPS:
+    import cutlass  # noqa: E402
+
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (  # noqa: E402
         CuteDSLNVMlaDecodeBlackwellRunner,
     )
@@ -152,3 +154,77 @@ def test_bf16_partials(small, lens_name, monkeypatch):
     # LSE and softmax stats come from the FP32 partial LSEs
     assert torch.equal(bf16[1], fp32[1])
     assert torch.equal(bf16[2], fp32[2])
+
+
+# Ragged small decode batches like a GSM8K / warmup GEN step on one Helix
+# rank: B < max batch, per-rank KV 0..~140 tokens (most requests hold no or
+# one K tile here), all-empty batches, and tiny K tiles.
+_RAGGED = {
+    "empty": lambda rng, B: [0] * B,
+    "one_token": lambda rng, B: [int(rng.choice([1, 2, 8, 9])) for _ in range(B)],
+    "gsm8k_rank": lambda rng, B: [int(rng.integers(0, 141)) for _ in range(B)],
+    "tile_edges": lambda rng, B: [
+        int(rng.choice([0, 63, 64, 65, 127, 128, 129, 300])) for _ in range(B)
+    ],
+}
+
+
+@pytest.mark.parametrize("bf16_partials", [False, True])
+@pytest.mark.parametrize("kind", list(_RAGGED))
+@pytest.mark.parametrize("B", [1, 3, 7, 16, 32])
+def test_ragged_small_kv_batches(B, kind, bf16_partials, monkeypatch):
+    """Every request with KV is stored and close to the reference, requests
+    without KV get the empty result, nothing past the batch is written, and a
+    CUDA graph replay of the step reproduces the eager outputs bitwise."""
+    import numpy as np
+
+    H, S = 96, 8
+    lens = _RAGGED[kind](np.random.default_rng(B * 31 + len(kind)), B)
+    x = _padded_inputs(lens, S, H, helix=True, seed=25)
+    env = {"TRTLLM_MLA_PARTIAL_BF16": "1"} if bf16_partials else {}
+    o, lse, stats = _run(x, H, S, monkeypatch, env=env)
+    gold, valid = _reference_bounded(x, S, H)
+    if valid.any():
+        v = valid.to("cuda")
+        err = (o.float() - gold).abs()[v].max().item()
+        assert err <= 0.05 * max(gold.abs().max().item(), 1e-6), err
+    for b, L in enumerate(lens):
+        if L <= 0:
+            assert (o[b] == 0).all()
+            assert torch.isinf(lse[b]).all() and (lse[b] > 0).all()
+
+    # CUDA graph capture + replay of the same step
+    for k, val in env.items():
+        monkeypatch.setenv(k, val)
+    runner = CuteDSLNVMlaDecodeBlackwellRunner(
+        in_dtype=cutlass.Float8E4M3FN,
+        num_heads=H,
+        seq_len_q=S,
+        page_size=64,
+        max_batch_size=64,
+        emit_softmax_stats=True,
+    )
+    inputs = list(x["inputs"])
+    out = torch.empty(B, S, H, 512, dtype=torch.bfloat16, device="cuda")
+    st = torch.empty(B * S, H, 2, dtype=torch.float32, device="cuda")
+    _, _, _, _, ws_size = runner.get_workspace_layout(H, S, 512, 64, cutlass.Float32)
+    inputs[6] = out.permute(2, 3, 1, 0)
+    inputs[7] = torch.zeros(ws_size, dtype=torch.uint8, device="cuda")
+    inputs[8] = st
+    inputs[9] = x["kv_bounds"]
+    tactic = ((128, 128), (128, 256), _BALANCED, True)
+    runner.forward(inputs, tactic)
+    torch.cuda.synchronize()
+    eager = (out.clone(), st.clone())
+    out.fill_(float("nan"))
+    st.fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.forward(inputs, tactic)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager[0])
+    assert torch.equal(st, eager[1])
