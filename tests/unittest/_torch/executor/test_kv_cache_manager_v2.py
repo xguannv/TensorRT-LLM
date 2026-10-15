@@ -135,6 +135,24 @@ def test_python_backend_preserves_ugpu_cache_creation_arguments() -> None:
     )
 
 
+@pytest.mark.parametrize("backend", ["cpp", "python"])
+def test_backend_cache_creation_forwards_priority_callback(backend: str) -> None:
+    impl = SimpleNamespace(create_kv_cache=MagicMock(return_value=object()))
+    reuse_scope = object()
+
+    def callback(_ordinal, _life_cycle):
+        return 0
+
+    with (
+        patch.object(kv_cache_manager_v2_module, "KV_CACHE_MANAGER_V2_BACKEND", backend),
+        patch.object(kv_cache_manager_v2_module, "ReuseScope", MagicMock(return_value=reuse_scope)),
+    ):
+        _create_backend_kv_cache(impl, None, None, [1, 2], 13, 17, None, callback)
+
+    _, kwargs = impl.create_kv_cache.call_args
+    assert kwargs["custom_priority_callback"] is callback
+
+
 class _CacheTierInitError(Exception):
     pass
 

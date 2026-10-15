@@ -18,7 +18,18 @@ import os
 import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -149,6 +160,15 @@ def _get_kv_cache_ugpu_id(kv_cache) -> int | None:
     return kv_cache.ugpu_id
 
 
+# Page eviction priorities of the v2 cache backends: [0, 100], default 35. Lower values are
+# evicted first; pages of one priority are evicted least recently used first.
+PAGE_PRIORITY_MIN = 0
+PAGE_PRIORITY_DEFAULT = 35
+
+PagePriorityCallback = Callable[[int, object], int]
+"""Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
+
+
 def _create_backend_kv_cache(
     impl,
     lora_task_id: int | None,
@@ -157,7 +177,14 @@ def _create_backend_kv_cache(
     request_id: int,
     expected_prompt_length: int | None,
     ugpu_id: int | None,
+    custom_priority_callback: PagePriorityCallback | None = None,
 ):
+    # Both backends default to their own priority callback; pass one only when overridden.
+    extra_kwargs = (
+        {}
+        if custom_priority_callback is None
+        else {"custom_priority_callback": custom_priority_callback}
+    )
     if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
         assert ugpu_id is None, "The C++ KV cache manager V2 does not support uGPU localization"
         return impl.create_kv_cache(
@@ -165,6 +192,7 @@ def _create_backend_kv_cache(
             input_tokens,
             id=request_id,
             expected_prompt_length=expected_prompt_length,
+            **extra_kwargs,
         )
     return impl.create_kv_cache(
         ReuseScope(lora_id=lora_task_id, salt=salt, ugpu_id=ugpu_id),
@@ -172,6 +200,7 @@ def _create_backend_kv_cache(
         id=request_id,
         expected_prompt_length=expected_prompt_length,
         ugpu_id=ugpu_id,
+        **extra_kwargs,
     )
 
 
@@ -2843,6 +2872,10 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         """Hook for recurrent-state managers; attention-only caches have no snapshots."""
 
+    def _context_priority_callback(self, req: LlmRequest) -> Optional[PagePriorityCallback]:
+        """Page priority callback for a context request's new cache; None keeps the default."""
+        return None
+
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
 
@@ -2893,6 +2926,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     - 1,
                     ugpu_id=ugpu_id,
+                    custom_priority_callback=self._context_priority_callback(req),
                 )
                 if kv_cache is None:
                     return None
@@ -4487,6 +4521,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_dummy: bool = False,
         expected_prompt_length: int | None = None,
         ugpu_id: int | None = None,
+        custom_priority_callback: PagePriorityCallback | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
@@ -4519,6 +4554,7 @@ class KVCacheManagerV2(BaseResourceManager):
             request_id,
             expected_prompt_length,
             ugpu_id,
+            custom_priority_callback,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:

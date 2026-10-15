@@ -23,6 +23,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor import mamba_cache_manager as mamba_cache_manager_module
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     _create_kv_cache_manager,
@@ -34,6 +35,8 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
     KVCacheManagerV2,
     Role,
@@ -45,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _KDA_BETA_CACHE_ALIGNMENT_BYTES,
+    LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV,
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     KDAHybridCacheManagerV2,
@@ -58,6 +62,8 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _get_local_mamba_cache_layout,
     _get_mamba_hybrid_pool_size,
     _get_num_cuda_graph_padding_dummy_slots,
+    _is_recurrent_state_life_cycle,
+    _low_priority_recurrent_state,
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
@@ -93,10 +99,17 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    ReuseScope,
     SsmLayerConfig,
     _introspection,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
+    AttnLifeCycle as PyAttnLifeCycle,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
+    SsmLifeCycle as PySsmLifeCycle,
+)
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -2974,6 +2987,7 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
         is_dummy=False,
         expected_prompt_length=127,
         ugpu_id=None,
+        custom_priority_callback=None,
     )
     assert log_debug.call_count == expected_log_count
     assert get_num_reusable_tokens_before_hybrid_pruning.call_count == expected_log_count
@@ -3173,6 +3187,159 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         assert mgr.get_state_indices([request_b_after_eviction.py_request_id], [False]) == [
             request_b_state_index
         ]
+    finally:
+        for request in requests:
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def test_low_priority_recurrent_state_callback_maps_life_cycles():
+    attention = PyAttnLifeCycle(None, 0)
+    sliding_window = PyAttnLifeCycle(256, 0)
+    assert not _is_recurrent_state_life_cycle(attention)
+    assert not _is_recurrent_state_life_cycle(sliding_window)
+    assert _low_priority_recurrent_state(0, attention) == PAGE_PRIORITY_DEFAULT
+    assert _low_priority_recurrent_state(3, sliding_window) == PAGE_PRIORITY_DEFAULT
+    assert _is_recurrent_state_life_cycle(PySsmLifeCycle())
+    assert _low_priority_recurrent_state(3, PySsmLifeCycle()) == PAGE_PRIORITY_MIN
+
+
+@skip_no_cuda
+def test_v2_hybrid_low_priority_snapshot_callback_selection(monkeypatch):
+    short = _make_v2_conversation_request(1, list(range(32)), "conv-1")
+    long = _make_v2_conversation_request(2, list(range(64)), "conv-2")
+    dummy = _make_v2_conversation_request(3, list(range(32)), "conv-3")
+    dummy.is_dummy_request = True
+
+    monkeypatch.delenv(LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV, raising=False)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        additional_snapshot_offsets_from_end=[0],
+    )
+    try:
+        assert mgr._context_priority_callback(short) is None
+    finally:
+        mgr.shutdown()
+
+    monkeypatch.setenv(LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV, "48")
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        additional_snapshot_offsets_from_end=[0],
+    )
+    try:
+        assert mgr._context_priority_callback(short) is _low_priority_recurrent_state
+        assert mgr._context_priority_callback(long) is None
+        assert mgr._context_priority_callback(dummy) is None
+    finally:
+        mgr.shutdown()
+
+    # Without block reuse no snapshot is ever committed, so nothing is demoted.
+    mgr = _build_v2_hybrid_with_mamba_layer(enable_block_reuse=False)
+    try:
+        assert mgr._context_priority_callback(short) is None
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_low_priority_snapshot_callback_reaches_backend(monkeypatch):
+    calls = []
+
+    def recording_callback(ordinal, life_cycle):
+        priority = _low_priority_recurrent_state(ordinal, life_cycle)
+        calls.append((_is_recurrent_state_life_cycle(life_cycle), priority))
+        return priority
+
+    monkeypatch.setenv(LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV, "48")
+    monkeypatch.setattr(
+        mamba_cache_manager_module, "_low_priority_recurrent_state", recording_callback
+    )
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        additional_snapshot_offsets_from_end=[0],
+    )
+    long = _make_v2_conversation_request(1, [1] + list(range(100, 163)), "conv-1")
+    short = _make_v2_conversation_request(2, [2] + list(range(100, 131)), "conv-2")
+    try:
+        _run_v2_hybrid_context(mgr, long)
+        mgr.free_resources(long)
+        assert calls == []
+
+        _run_v2_hybrid_context(mgr, short)
+        mgr.free_resources(short)
+        assert (True, PAGE_PRIORITY_MIN) in calls
+        assert (False, PAGE_PRIORITY_DEFAULT) in calls
+        assert set(calls) <= {(True, PAGE_PRIORITY_MIN), (False, PAGE_PRIORITY_DEFAULT)}
+    finally:
+        for request in (long, short):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
+def _has_prompt_end_snapshot(mgr: MambaHybridCacheManagerV2, tokens: list[int]) -> bool:
+    """Whether the radix tree holds the recurrent-state snapshot at the end of ``tokens``."""
+    ssm_life_cycle = _introspection.ssm_life_cycle_id(mgr.impl)
+    num_tokens, pages = _introspection.reuse_match_pages(
+        mgr.impl, ReuseScope(lora_id=None, salt=None), tokens, ssm_life_cycle
+    )
+    last_block = (len(tokens) - 1) // mgr.tokens_per_block
+    return num_tokens >= len(tokens) and len(pages) > last_block and pages[last_block] is not None
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("demote_short_prompts", [False, True])
+def test_v2_hybrid_short_prompt_snapshot_eviction_order(monkeypatch, demote_short_prompts):
+    """Short-prompt snapshots go before older long-prompt ones once demoted; plain LRU otherwise."""
+    if demote_short_prompts:
+        monkeypatch.setenv(LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV, "48")
+    else:
+        monkeypatch.delenv(LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV, raising=False)
+    # Large recurrent states leave 16 state slots against 64 attention blocks, so the
+    # recurrent-state pool is the one that evicts.
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=4,
+        mamba_num_heads=256,
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        max_num_turns=3,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    old_long_tokens = [1] + list(range(100, 163))
+    short_tokens = [2] + list(range(100, 131))
+    requests = [
+        _make_v2_conversation_request(1, old_long_tokens, "conv-1"),
+        _make_v2_conversation_request(2, short_tokens, "conv-2"),
+    ]
+    try:
+        for request in requests:
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+        assert _has_prompt_end_snapshot(mgr, old_long_tokens)
+        assert _has_prompt_end_snapshot(mgr, short_tokens)
+
+        for request_id in range(3, 256):
+            request = _make_v2_conversation_request(
+                request_id, [request_id] + list(range(100, 163)), f"conv-{request_id}"
+            )
+            requests.append(request)
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+            old_long_kept = _has_prompt_end_snapshot(mgr, old_long_tokens)
+            short_kept = _has_prompt_end_snapshot(mgr, short_tokens)
+            if not (old_long_kept and short_kept):
+                break
+        else:
+            pytest.fail("the recurrent-state pool never evicted a snapshot")
+
+        if demote_short_prompts:
+            assert old_long_kept and not short_kept
+        else:
+            assert short_kept and not old_long_kept
     finally:
         for request in requests:
             if request.py_request_id in mgr.kv_cache_map:

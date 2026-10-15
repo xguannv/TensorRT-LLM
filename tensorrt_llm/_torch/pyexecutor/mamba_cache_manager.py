@@ -29,7 +29,8 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
-    BlockReusePolicy, KVCacheManagerV2, Role)
+    PAGE_PRIORITY_DEFAULT, PAGE_PRIORITY_MIN, BlockReusePolicy,
+    KVCacheManagerV2, PagePriorityCallback, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -3003,6 +3004,26 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         )
 
 
+# Context requests whose prompt is shorter than this many tokens commit their
+# recurrent-state pages (live state and snapshots) at the lowest eviction
+# priority; attention pages keep the default priority. 0 (default) disables.
+# A snapshot is only reusable at its exact token boundary and takes a full state
+# slot whatever the prompt length, while a short prompt is cheap to recompute.
+LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV = "TLLM_V2_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN"
+
+
+def _is_recurrent_state_life_cycle(life_cycle) -> bool:
+    """Attention life cycles carry a sliding-window size; recurrent-state ones do not."""
+    return not hasattr(life_cycle, "window_size")
+
+
+def _low_priority_recurrent_state(_ordinal: int, life_cycle) -> int:
+    """Lowest eviction priority for recurrent-state pages, default for the rest."""
+    if _is_recurrent_state_life_cycle(life_cycle):
+        return PAGE_PRIORITY_MIN
+    return PAGE_PRIORITY_DEFAULT
+
+
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
@@ -3104,6 +3125,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
         self._branch_snapshots_skipped_total: Dict[str, int] = {}
+        self._low_priority_snapshot_prompt_len = 0
+        if kv_cache_config.enable_block_reuse:
+            self._low_priority_snapshot_prompt_len = max(
+                0, int(os.environ.get(LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV,
+                                      "0")))
+            if self._low_priority_snapshot_prompt_len > 0:
+                logger.info(
+                    "Recurrent-state pages of context requests shorter than "
+                    f"{self._low_priority_snapshot_prompt_len} tokens use the "
+                    "lowest eviction priority")
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
@@ -3363,6 +3394,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy: bool = False,
         expected_prompt_length: Optional[int] = None,
         ugpu_id: Optional[int] = None,
+        custom_priority_callback: Optional[PagePriorityCallback] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -3372,6 +3404,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             is_dummy=is_dummy,
             expected_prompt_length=expected_prompt_length,
             ugpu_id=ugpu_id,
+            custom_priority_callback=custom_priority_callback,
         )
         if (self.mapping.rank == 0 and kv_cache is not None
                 and input_tokens is not None and not is_dummy
@@ -3391,6 +3424,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"latest_recurrent_snapshot_tokens="
                 f"{kv_cache.num_committed_tokens}")
         return kv_cache
+
+    def _context_priority_callback(
+            self, req: LlmRequest) -> Optional[PagePriorityCallback]:
+        """Demote the recurrent state of short prompts, see LOW_PRIORITY_SNAPSHOT_PROMPT_LEN_ENV."""
+        if (self.local_num_mamba_layers > 0 and not req.is_dummy
+                and req.prompt_len < self._low_priority_snapshot_prompt_len):
+            return _low_priority_recurrent_state
+        return None
 
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (
