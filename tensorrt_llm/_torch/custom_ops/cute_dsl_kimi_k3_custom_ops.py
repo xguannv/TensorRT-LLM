@@ -31,6 +31,7 @@ The ``trtllm::kda_prefill`` operator updates selected recurrent-state pool rows
 in place. Intermediate matrices remain private runner workspace.
 """
 
+import functools
 import os
 import weakref
 from typing import Optional
@@ -60,6 +61,27 @@ if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:
     from ..modules.fla.index import prepare_chunk_indices
 else:
     raise ImportError("Kimi K3 KDA prefill requires NVIDIA CUTLASS DSL and FlashInfer")
+
+
+def _kda_prefill_num_ctas(device: torch.device, ceiling: int = 148) -> int:
+    """Persistent grid of the KDA prefill kernels (fused K1-K3 and K4): at most ``ceiling`` CTAs.
+
+    With ``TRTLLM_K3_KDA_PREFILL_SM_RESERVE=1`` the grid also keeps ``TRTLLM_CUTEDSL_SM_RESERVE``
+    SMs free like the other CuTeDSL persistent grids, so the CTAs that would land on SMs a
+    resident kernel holds (the DWDP gather) do not run their static work share as a second wave.
+    Every work unit is computed by one CTA, so the outputs do not depend on the grid.
+    """
+    from ..cute_dsl_kernels import sm_reserve
+
+    reserve = sm_reserve() if os.environ.get("TRTLLM_K3_KDA_PREFILL_SM_RESERVE", "0") == "1" else 0
+    if reserve <= 0:
+        return ceiling
+    return max(1, min(ceiling, _device_sm_count(device.index or 0) - reserve))
+
+
+@functools.lru_cache(maxsize=None)
+def _device_sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _ct(t, etype):
@@ -734,6 +756,7 @@ def _launch_fused_k123_inv(
     # compile-time batch stride, which depends on T. Varlen fixes B=1, so that
     # batch stride is never used and all T shapes can keep sharing one compile.
     eqlen_t_key = T if not is_varlen else -1
+    num_ctas = _kda_prefill_num_ctas(q.device)
     cache_key = (
         H,
         is_varlen,
@@ -745,6 +768,7 @@ def _launch_fused_k123_inv(
         eqlen_t_key,
         use_beta_sigmoid_in_kernel,
         beta.dtype,
+        num_ctas,
     )
 
     # Inputs are guaranteed contiguous by upstream linear projections.
@@ -843,6 +867,7 @@ def _launch_fused_k123_inv(
             use_safe_gate=safe_gate,
             use_beta_sigmoid=use_beta_sigmoid_in_kernel,
             varlen_pure=varlen_pure,
+            num_ctas=num_ctas,
         )
         _fused_k123_cache[cache_key] = cute.compile(host_fn, *ct_args)
     k123_fn = _fused_k123_cache[cache_key]
@@ -1129,6 +1154,7 @@ def _chunk_kda_fwd(
         cu_for_k4,
         chunk_offsets_for_k4,
         cu_eqlen_passed=(not is_varlen),
+        num_sm=_kda_prefill_num_ctas(state_pool.device),
         H=H,
         V_dim=V_dim,
     )

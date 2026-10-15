@@ -18,9 +18,10 @@ Persistent Fused K1+K2+K3 Kernel for KDA.
 Fuses gate activation + cumsum + scaling (K1), intra sub-chunk Aqk/Akk (K2),
 and inter sub-chunk solve + merged inverse (K3) into a single persistent kernel.
 
-Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
-  Total work units = (NT/4) * H * B, distributed round-robin across SMs
-  Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
+Grid: (num_ctas, 1, 1) persistent blocks (at most NUM_SMS = 148), each loops over work units
+  Total work units = (NT/4) * H * B, distributed round-robin across the blocks
+  Block i processes work units i, i+num_ctas, i+2*num_ctas, ...
+  Every work unit is computed by one block, so the result does not depend on num_ctas.
 Block: 992 threads (31 warps), warp-specialized with setmaxnreg:
   Warps 0-15:  TMA+K1 fused (8×2, vec2, prefetch pipeline) – 4 WGs, 56 regs
   Warps 16-26: K2 MMA compute (10 active + warp 26 as TMA producer) – 72 regs
@@ -973,6 +974,7 @@ def fused_kernel123(
     valid_tokens: cutlass.Int32,
     USE_BETA_SIGMOID: cutlass.Constexpr[int],
     VARLEN_PURE: cutlass.Constexpr[int] = 0,
+    NUM_CTAS: cutlass.Constexpr[int] = NUM_SMS,
 ):
     block_id, _, _ = cute.arch.block_idx()
     tidx = cute.arch.thread_idx()[0]
@@ -1098,7 +1100,7 @@ def fused_kernel123(
     # get_slice() and scalar layout invariants to the kernel prologue,
     # keeping register pressure < 64 and eliminating prologue spill.
     # =================================================================
-    for work_id in for_generate(block_id, total_cgs, NUM_SMS):
+    for work_id in for_generate(block_id, total_cgs, NUM_CTAS):
         i_cg = cutlass.Int32(0)
         i_h = cutlass.Int32(0)
         i_b = cutlass.Int32(0)
@@ -2129,8 +2131,11 @@ def make_host_function(
     use_safe_gate=False,
     use_beta_sigmoid=False,
     varlen_pure=False,
+    num_ctas=NUM_SMS,
 ):
     """
+    `num_ctas` is the persistent grid (at most NUM_SMS); the result does not depend on it.
+
     `varlen_pure=True` asserts that all seq lengths in the batch are multiples
     of BT (= 64). Under that assumption every chunk has 64 valid rows so the
     four mask sites (K1 row mask, K1 store mask, MMA accumulator zero-fill,
@@ -2143,6 +2148,7 @@ def make_host_function(
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
     _USE_BETA_SIGMOID = 1 if use_beta_sigmoid else 0
     _VARLEN_PURE = 1 if (is_varlen and varlen_pure) else 0
+    _NUM_CTAS = max(1, min(int(num_ctas), NUM_SMS))
     if is_varlen:
         assert B == 1, "Varlen requires B=1"
         assert T_padded is not None, "T_padded required for varlen"
@@ -2298,7 +2304,7 @@ def make_host_function(
         # Constant grid: the persistent for_generate loop bounds work by the
         # runtime total_cgs, so blocks past the work count exit immediately.
         # (A shape-dependent min() here would re-bake the grid per NT.)
-        _grid_x = NUM_SMS
+        _grid_x = _NUM_CTAS
 
         fused_kernel123(
             tma_atom_Q,
@@ -2341,6 +2347,7 @@ def make_host_function(
             valid_tokens,
             _USE_BETA_SIGMOID,
             _VARLEN_PURE,
+            _NUM_CTAS,
         ).launch(
             grid=(_grid_x, 1, 1),
             block=(THREADS, 1, 1),
