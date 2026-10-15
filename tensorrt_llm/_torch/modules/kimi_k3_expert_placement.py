@@ -9,8 +9,12 @@ Placement (``TRTLLM_K3_EXPERT_PLACEMENT=<file.json>``)
     once after loading, permutes the router weight rows and the score-correction bias into slot
     order. Routing then returns slot ids directly, so the forward path is unchanged (nothing
     runs at decode time, CUDA graphs are unaffected). K3 routes with one expert group, so the
-    relabelled router selects the same experts with the same weights; only the order of exactly
-    tied scores can differ. Layers the file does not list keep the identity placement.
+    relabelled router computes bitwise the same scores and selects the same experts with the same
+    weights, except where two scores are equal in fp32: the routing kernels break such ties by
+    routed-expert id, i.e. by slot instead of by checkpoint expert. With the real K3 routers that
+    reorders the top-k of about 0.1% of the token-layers and changes the selected expert (between
+    two equal-score experts) of about 0.01%. Layers the file does not list keep the identity
+    placement.
 
     File format::
 
