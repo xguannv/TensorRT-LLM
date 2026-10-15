@@ -133,6 +133,48 @@ def test_relabelled_router_routes_to_the_same_experts(num_tokens):
     torch.testing.assert_close(weights_p, weights, rtol=0, atol=0)
 
 
+@_needs_sm100
+@pytest.mark.parametrize("num_tokens", [384, 896, 1792])
+def test_relabelled_router_noaux_routes_to_the_same_experts(num_tokens):
+    """Above the routing tail's token limit (b >= 64 decode batches) the router GEMM feeds the
+    DeepSeek-V3 ``noaux_tc`` routing; on the permuted router it picks, per token, the slots holding
+    exactly the experts (and weights) the original router picks."""
+    import tensorrt_llm  # noqa: F401  (registers the ops)
+    from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+
+    hidden = 7168
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens)
+    weight = (torch.randn(NUM_EXPERTS, hidden, device="cuda", generator=gen) * 0.02).to(
+        torch.bfloat16
+    )
+    bias = torch.randn(NUM_EXPERTS, device="cuda", generator=gen) * 0.01
+    x = torch.randn(num_tokens, hidden, device="cuda", generator=gen).to(torch.bfloat16)
+    perm = _permutation(NUM_EXPERTS, 5)
+    perm_t = torch.tensor(perm, device="cuda")
+
+    def route(w, b):
+        logits = torch.ops.trtllm.dsv3_router_gemm_op(x, w.t(), bias=None, out_dtype=torch.float32)
+        routing = DeepSeekV3MoeRoutingMethod(
+            top_k=TOP_K,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=2.5,
+            callable_e_score_correction_bias=lambda: b,
+        )
+        ids, weights = routing.apply(logits)
+        return logits, ids.long(), weights
+
+    logits, ids, weights = route(weight, bias)
+    weight_p, bias_p = weight.clone(), bias.clone()
+    permute_router_to_slots(weight_p, bias_p, perm)
+    logits_p, ids_p, weights_p = route(weight_p, bias_p)
+
+    torch.testing.assert_close(logits_p, logits[:, perm_t], rtol=0, atol=0)
+    # Same experts in the same order, same weights.
+    torch.testing.assert_close(perm_t[ids_p], ids, rtol=0, atol=0)
+    torch.testing.assert_close(weights_p, weights, rtol=0, atol=0)
+
+
 @_needs_cuda
 @pytest.mark.parametrize("every", [1, 3])
 def test_routing_recorder_counts_graph_replays(tmp_path, every):
