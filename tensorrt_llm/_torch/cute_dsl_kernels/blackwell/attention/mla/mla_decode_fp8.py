@@ -1506,8 +1506,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # its CTAs would wait on the SMs of running clusters, and slow
             # them down).
             cute.arch.griddepcontrol_wait()
-        softmax_scale_log2 = softmax_scale[0] * LOG2_E
-        output_scale_value = output_scale[0]
 
         # Balanced split: the cluster's schedule, in shared memory.
         tile_table = None
@@ -1729,6 +1727,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if (warp_idx >= self.compute_warp_ids[0]
                 and warp_idx <= self.compute_warp_ids[-1]):
             cute.arch.setmaxregister_increase(self.softmax_reg_num)
+            # The scales are read by the warps that use them only: a warp
+            # whose register count drops (setmaxnreg) first waits for its
+            # outstanding loads.
+            softmax_scale_log2 = softmax_scale[0] * LOG2_E
             mma_s_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.mma_s_stage)
             p_mma_producer_state = pipeline.make_pipeline_state(
@@ -1796,6 +1798,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if (warp_idx >= self.correction_warp_ids[0]
                 and warp_idx <= self.correction_warp_ids[-1]):
             cute.arch.setmaxregister_increase(self.correction_reg_num)
+            softmax_scale_log2 = softmax_scale[0] * LOG2_E
+            output_scale_value = output_scale[0]
             p_cor_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.p_cor_stage)
             mma_o_consumer_state = pipeline.make_pipeline_state(
@@ -2917,6 +2921,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     k_tile_count -= 1
                     pending_pv += 1
 
+            # Q is released once the segment's last Q*K^T is issued (the
+            # release completes with it), so the next segment's Q loads while
+            # the remaining P*V run.
+            if k_tile_count == 0:
+                load_q_pipeline.consumer_release(load_q_release_state)
             while k_tile_count > 0:
                 (
                     tiled_mma_qk,
@@ -2932,6 +2941,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     mma_s_producer_state,
                     wait_q=False,
                 )
+                k_tile_count -= 1
+                if k_tile_count == 0:
+                    load_q_pipeline.consumer_release(load_q_release_state)
                 (
                     tiled_mma_pv,
                     load_v_consumer_state,
@@ -2945,9 +2957,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     p_mma_consumer_state,
                     mma_o_producer_state,
                 )
-                k_tile_count -= 1
-            # release q consumer states
-            load_q_pipeline.consumer_release(load_q_release_state)
             load_q_release_state.advance()
             while pending_pv > 0:
                 (
