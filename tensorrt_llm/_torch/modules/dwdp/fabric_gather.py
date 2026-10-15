@@ -19,7 +19,10 @@ Opt-in via ``TRTLLM_DWDP_PREFETCH_GATHER=1``: an SM kernel issuing 16-byte loads
 engine but occupies SMs for the whole step, so it only pays off while compute hides behind the copy.
 ``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library; ``TRTLLM_DWDP_GATHER_BLOCKS`` and
 ``TRTLLM_DWDP_GATHER_THREADS`` size the grid; the launcher reads ``TRTLLM_DWDP_GATHER_CLUSTER`` and
-``TRTLLM_DWDP_GATHER_KERNEL=tma``.  See ``apply_compute_side_defaults`` for the compute-side knobs.
+``TRTLLM_DWDP_GATHER_KERNEL=tma``.  ``TRTLLM_DWDP_GATHER_ROWS`` re-cuts a layer's plan into that many
+equal-byte grid rows instead of one row per peer, so the grid can be smaller than two blocks per peer
+(set ``TRTLLM_DWDP_GATHER_BLOCKS`` to rows x blocks per row and the SM reserves to match).  See
+``apply_compute_side_defaults`` for the compute-side knobs.
 """
 
 from __future__ import annotations
@@ -39,6 +42,10 @@ _ENABLE_ENV = "TRTLLM_DWDP_PREFETCH_GATHER"
 _LIB_ENV = "TRTLLM_DWDP_GATHER_LIB"
 _BLOCKS_ENV = "TRTLLM_DWDP_GATHER_BLOCKS"
 _THREADS_ENV = "TRTLLM_DWDP_GATHER_THREADS"
+_ROWS_ENV = "TRTLLM_DWDP_GATHER_ROWS"
+
+#: Row cut granularity: the TMA kernel moves a descriptor in 16 KiB chunks.
+ROW_CUT_BYTES = 16384
 
 #: Load width of the kernel; every descriptor pointer and byte count must be a multiple of it.
 LINE_BYTES = 16
@@ -140,6 +147,37 @@ def gather_op() -> Optional[Callable]:
     return _op
 
 
+def regroup_rows(
+    groups: List[List[Tuple[int, int, int]]], rows: int
+) -> List[List[Tuple[int, int, int]]]:
+    """Re-cut descriptor groups into ``rows`` groups of (nearly) equal bytes, keeping the order.
+
+    Descriptors are split at ``ROW_CUT_BYTES`` multiples, so every piece keeps the 16-byte
+    alignment of its parent.  Returns ``groups`` unchanged if ``rows`` is not smaller.
+    """
+    if rows <= 0 or rows >= len(groups):
+        return groups
+    flat = [d for group in groups for d in group]
+    total = sum(size for _, _, size in flat)
+    if total == 0:
+        return groups
+    per_row = -(-total // rows)
+    per_row = -(-per_row // ROW_CUT_BYTES) * ROW_CUT_BYTES
+    out: List[List[Tuple[int, int, int]]] = [[]]
+    room = per_row
+    for dst, src, size in flat:
+        offset = 0
+        while offset < size:
+            if room == 0:
+                out.append([])
+                room = per_row
+            take = min(size - offset, room)
+            out[-1].append((dst + offset, src + offset, take))
+            offset += take
+            room -= take
+    return [group for group in out if group]
+
+
 def build_plan(
     groups: List[List[Tuple[int, int, int]]], device: torch.device
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]]:
@@ -157,6 +195,7 @@ def build_plan(
     lines: List[int] = []
     row_starts: List[int] = [0]
 
+    groups = regroup_rows(groups, _int_env(_ROWS_ENV, 0))
     for descriptors in groups:
         for dst_ptr, src_ptr, size in descriptors:
             if dst_ptr % LINE_BYTES or src_ptr % LINE_BYTES or size % LINE_BYTES:
