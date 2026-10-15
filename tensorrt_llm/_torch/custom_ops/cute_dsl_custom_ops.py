@@ -96,6 +96,42 @@ _MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS_ENV = "TRTLLM_MOE_FINALIZE_SWAPAB_EARLY_WEIGH
 # gather (FC1) and finalize (FC2) kernels; the swap-AB finalize kernel always
 # uses it.
 _MOE_WEIGHT_EVICT_FIRST_ENV = "TRTLLM_MOE_WEIGHT_EVICT_FIRST"
+# Optional tactic pins of the regular NVFP4 MoE gather (FC1) and finalize (FC2)
+# kernels, "<MMA tile N>" or "<MMA tile N>x<cluster N>" (e.g. "128", "128x2"):
+# the autotuner then only considers the valid tactics that match. Every rank
+# tunes these kernels on its own, on synthetic balanced routing, and the
+# candidates are close there, so ranks of one expert-parallel group otherwise
+# run different tactics; skewed decode routing separates them by a few percent.
+_MOE_GATHER_GEMM_TACTIC_ENV = "TRTLLM_MOE_GATHER_GEMM_TACTIC"
+_MOE_FINALIZE_TACTIC_ENV = "TRTLLM_MOE_FINALIZE_TACTIC"
+
+
+def _moe_tactic_pin(env_name: str) -> Optional[Tuple[int, ...]]:
+    """``(tile_n,)`` or ``(tile_n, cluster_n)`` from a MoE tactic pin env var, or ``None``."""
+    pin = os.environ.get(env_name, "").strip().lower()
+    if not pin:
+        return None
+    try:
+        return tuple(int(part) for part in pin.split("x"))
+    except ValueError as e:
+        raise ValueError(
+            f"{env_name}={pin!r}: expected '<tile N>' or '<tile N>x<cluster N>'"
+        ) from e
+
+
+def _apply_moe_tactic_pin(pin: Optional[Tuple[int, ...]],
+                          tactics: List[Tuple]) -> List[Tuple]:
+    """The ``(mma_tiler_mn, cluster_shape_mn, raster_along_m)`` tactics matching
+    ``pin`` (see ``_moe_tactic_pin``); all of them if ``pin`` is ``None`` or
+    matches none."""
+    if pin is None:
+        return tactics
+    pinned = [
+        t for t in tactics
+        if t[0][1] == pin[0] and (len(pin) < 2 or t[1][1] == pin[1])
+    ]
+    return pinned or tactics
+
 
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
@@ -2816,6 +2852,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 _MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS_ENV, "0") == "1"
             self.weight_evict_first = os.environ.get(
                 _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
+            self.tactic_pin = _moe_tactic_pin(_MOE_FINALIZE_TACTIC_ENV)
 
         def unique_id(self):
             return (
@@ -2830,6 +2867,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.swapab_split_rows,
                 self.swapab_early_weights,
                 self.weight_evict_first,
+                self.tactic_pin,
             )
 
         # 64-row token operand, two 128-row weight blocks per tile, three
@@ -2895,7 +2933,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     valid_tactics.append(
                         (mma_tiler_mn, cluster_shape_mn, raster_along_m))
 
-            return valid_tactics
+            return _apply_moe_tactic_pin(self.tactic_pin, valid_tactics)
 
         def get_tuning_config(self) -> TuningConfig:
             key = self.unique_id()
@@ -3629,6 +3667,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.swiglu_limit_scalar = swiglu_limit_scalar
             self.weight_evict_first = os.environ.get(
                 _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
+            self.tactic_pin = _moe_tactic_pin(_MOE_GATHER_GEMM_TACTIC_ENV)
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3653,6 +3692,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.situ_beta,
                 self.situ_linear_beta,
                 self.weight_evict_first,
+                self.tactic_pin,
             )
 
         def get_valid_tactics(
@@ -3698,7 +3738,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     valid_tactics.append(
                         (mma_tiler_mn, cluster_shape_mn, raster_along_m))
 
-            return valid_tactics
+            return _apply_moe_tactic_pin(self.tactic_pin, valid_tactics)
 
         def get_tuning_config(self) -> TuningConfig:
             key = self.unique_id()
