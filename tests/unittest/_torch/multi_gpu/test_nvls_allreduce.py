@@ -277,6 +277,208 @@ def _run_rank_decode_pattern(world_size, rows, num_layers, protocol="gpu"):
     return True
 
 
+class _ZeroCopySpy:
+    """Records, for every NVLS all-reduce call, whether its input is the workspace's input
+    buffer (a zero-copy call)."""
+
+    def __enter__(self):
+        self.calls = []
+        self._call = NVLSAllReduce.__call__
+        spy = self
+
+        def call(nvls, inp, out=None):
+            spy.calls.append(inp.data_ptr() == nvls._ws["in_buf"].data_ptr())
+            return spy._call(nvls, inp, out)
+
+        NVLSAllReduce.__call__ = call
+        return self
+
+    def __exit__(self, *exc):
+        NVLSAllReduce.__call__ = self._call
+
+
+def _k3_o_proj(n, k, seed):
+    """The K3 FP8 weight-read o_proj (``_Fp8BlockScaleWeightReadLinear``) with its mid-M GEMM."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_fp8_mid_gemm import expand_weight_scale
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    w = (torch.randn((n, k), device="cuda", generator=gen) * 0.02).to(torch.bfloat16)
+    w_fp8, w_scale = _Fp8BlockScaleWeightReadLinear.quantize_weight(w)
+    lin = _Fp8BlockScaleWeightReadLinear(w_fp8, w_scale, n)
+    lin.mid_weight_sf = expand_weight_scale(w_scale, n, k)
+    return lin
+
+
+def _row_linear(mapping, k_per_rank, n, seed):
+    """A row-parallel BF16 ``Linear`` that all-reduces its output (the K3 shared-expert down
+    projection), opted in to zero-copy NVLS input."""
+    from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+
+    lin = Linear(
+        k_per_rank * mapping.tp_size,
+        n,
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        reduce_output=True,
+    ).cuda()
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    lin.weight.data.copy_(
+        torch.randn(lin.weight.shape, device="cuda", generator=gen).to(torch.bfloat16) * 0.05
+    )
+    lin.nvls_zero_copy = True
+    return lin
+
+
+def _assert_same_bits(outs, refs, comm):
+    for out, ref in zip(outs, refs):
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), (
+            "zero-copy output differs from the copied-input output"
+        )
+    digests = comm.allgather([_bits_digest(out) for out in outs])
+    assert all(d == digests[0] for d in digests), "ranks disagree on the all-reduce bits"
+
+
+def _run_rank_zero_copy_producers(world_size, rows, protocol):
+    """GEMM producers writing straight into ``AllReduce.nvls_input_buffer``
+    (TRTLLM_NVLS_AR_ZERO_COPY=1): the K3 o_proj (FP8 mid-M GEMM on BF16 or prequantized input)
+    before a pipelined-kernel all-reduce, and a row-parallel ``Linear`` (cuBLAS, the shared-expert
+    down projection) before a one-shot all-reduce, on one workspace. Per layer the o_proj
+    all-reduce runs on the main stream and the shared expert on a side stream after it, joined
+    before the next layer, as in the K3 decode step. The outputs are bitwise those of the
+    copied-input path, eager on one and two streams and in CUDA graphs replayed with new inputs."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    os.environ["TRTLLM_NVLS_AR"] = "1"
+    os.environ["TRTLLM_NVLS_AR_V2"] = "1"
+    os.environ["TRTLLM_NVLS_AR_MIN_WORLD_SIZE"] = str(world_size)
+    os.environ["TRTLLM_NVLS_AR_PROTOCOL"] = protocol
+    os.environ["TRTLLM_NVLS_AR_PTX_STAGING"] = "copy"
+    os.environ["TRTLLM_NVLS_AR_ZERO_COPY"] = "1"
+    try:
+        comm = MPI.COMM_WORLD
+        mapping = Mapping(world_size=world_size, rank=rank, tp_size=world_size)
+        hidden, k_o, k_sh, num_layers = 7168, 768, 384, 3
+        o_ars = [
+            AllReduce(mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.bfloat16)
+            for _ in range(num_layers)
+        ]
+        o_projs = [_k3_o_proj(hidden, k_o, seed=100 * rank + i) for i in range(num_layers)]
+        sh_downs = [
+            _row_linear(mapping, k_sh, hidden, seed=100 * rank + 50 + i) for i in range(num_layers)
+        ]
+        for lin in sh_downs:
+            # The K3 shared expert keeps the one-shot kernel.
+            lin.all_reduce.nvls_allreduce.version = 1
+        nvls_ars = [ar.nvls_allreduce for ar in o_ars] + [
+            lin.all_reduce.nvls_allreduce for lin in sh_downs
+        ]
+        assert all(nvls.zero_copy and nvls.slot == "main" for nvls in nvls_ars)
+        x_o = [torch.zeros(rows, k_o, device="cuda", dtype=torch.bfloat16) for _ in o_ars]
+        x_sh = [torch.zeros(rows, k_sh, device="cuda", dtype=torch.bfloat16) for _ in o_ars]
+        consumer = torch.full((hidden, 64), 0.01, device="cuda", dtype=torch.bfloat16)
+        aux = torch.cuda.Stream()
+        forks = [torch.cuda.Event() for _ in o_ars]
+        joins = [torch.cuda.Event() for _ in o_ars]
+
+        def set_zero_copy(on):
+            for nvls in nvls_ars:
+                nvls.zero_copy = on
+
+        def layers(packed, two_streams):
+            outs = []
+            for i in range(num_layers):
+                o_projs[i].next_output = o_ars[i].nvls_input_buffer((rows, hidden))
+                if packed:
+                    xq, xs = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x_o[i], False)
+                    partial = o_projs[i].forward_fp8_packed(xq, xs)
+                else:
+                    partial = o_projs[i](x_o[i])
+                o = o_ars[i](partial)
+                consumed = torch.matmul(o, consumer)
+                if two_streams:
+                    forks[i].record()
+                    with torch.cuda.stream(aux):
+                        forks[i].wait()
+                        sh = sh_downs[i](x_sh[i])
+                        joins[i].record()
+                    joins[i].wait()
+                else:
+                    sh = sh_downs[i](x_sh[i])
+                outs += [o, consumed, sh]
+            return outs
+
+        seed = [rank]
+
+        def fill():
+            gen = torch.Generator(device="cuda")
+            for i in range(num_layers):
+                seed[0] += 7
+                gen.manual_seed(seed[0])
+                x_o[i].copy_(torch.randn(x_o[i].shape, device="cuda", generator=gen) * 2)
+                x_sh[i].copy_(torch.randn(x_sh[i].shape, device="cuda", generator=gen))
+
+        for packed in (False, True):
+            for two_streams in (False, True):
+                fill()
+                with with_multi_stream(two_streams):
+                    set_zero_copy(False)
+                    with _ZeroCopySpy() as spy:
+                        refs = layers(packed, two_streams)
+                    assert spy.calls == [False] * (2 * num_layers), spy.calls
+                    set_zero_copy(True)
+                    with _ZeroCopySpy() as spy:
+                        outs = layers(packed, two_streams)
+                    assert spy.calls == [True] * (2 * num_layers), spy.calls
+                torch.cuda.synchronize()
+                _assert_same_bits(outs, refs, comm)
+
+        for packed in (False, True):
+            graphs, outs = [], []
+            for on in (False, True):
+                set_zero_copy(on)
+                with with_multi_stream(True):
+                    layers(packed, True)
+                torch.cuda.synchronize()
+                comm.Barrier()
+                graph = torch.cuda.CUDAGraph()
+                with with_multi_stream(True), torch.cuda.graph(graph):
+                    outs.append(layers(packed, True))
+                graphs.append(graph)
+            for _ in range(3):
+                fill()
+                torch.cuda.synchronize()
+                comm.Barrier()
+                for graph in graphs:
+                    graph.replay()
+                torch.cuda.synchronize()
+                _assert_same_bits(outs[1], outs[0], comm)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@skip_pre_hopper
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="the K3 mid-M FP8 GEMM needs SM100 / SM103",
+)
+@pytest.mark.parametrize("protocol", ["gpu", "ptx"])
+@pytest.mark.parametrize("rows", [256, 896], ids=["b32", "b128"])
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_nvls_allreduce_zero_copy_producers(rows, protocol, mpi_pool_executor):
+    world_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        _run_rank_zero_copy_producers, *zip(*[(world_size, rows, protocol)] * world_size)
+    )
+    for r in results:
+        assert r is True
+
+
 @skip_pre_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
 @pytest.mark.parametrize("protocol", ["gpu", "ptx"])

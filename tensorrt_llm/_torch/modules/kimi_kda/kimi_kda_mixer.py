@@ -564,6 +564,19 @@ class KimiKDALinearAttention(nn.Module):
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
         ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32 (default) or bf16
 
+        # Generation only: the one o_proj call produces the all-reduce input, and writes it
+        # straight into the NVLS all-reduce's input buffer when there is one
+        # (TRTLLM_NVLS_AR_ZERO_COPY=1).
+        zero_copy = (
+            num_prefills == 0
+            and self._o_allreduce is not None
+            and hasattr(self.o_proj, "next_output")
+        )
+        if zero_copy:
+            self.o_proj.next_output = self._o_allreduce.nvls_input_buffer(
+                (hidden_states.shape[0], self.hidden_size)
+            )
+
         outputs: List[torch.Tensor] = []
         if num_prefills > 0:
             outputs.append(
@@ -617,6 +630,8 @@ class KimiKDALinearAttention(nn.Module):
                     )
                 )
         out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+        if zero_copy:
+            self.o_proj.next_output = None
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.

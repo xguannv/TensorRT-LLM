@@ -1557,20 +1557,34 @@ def _packed_ld(xs: torch.Tensor, m: int) -> int:
     return xs.stride(1) if xs.shape[1] > 1 else max(m, 1)
 
 
+def k3_fp8_mid_gemm_packed(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_sf: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """BF16 ``xq @ dequant(w)^T`` for an activation quantized upstream (E4M3 ``xq`` +
+    DeepGEMM-packed UE8M0 scale ``xs``, see :func:`can_run_packed`), into ``out`` (a
+    contiguous, 16-byte aligned BF16 ``[M, N]`` tensor) when given."""
+    m, k = xq.shape
+    n = w.shape[0]
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=xq.device)
+    tiler, cluster = tile_for(m, n, k, packed=True) or ((256, _heuristic_tn(m, n)), (2, 1))
+    run_k3_fp8_mid_gemm(
+        xq, xs, w, w_sf, out, tiler=tiler, cluster=cluster, xs_packed_ld=_packed_ld(xs, m)
+    )
+    return out
+
+
 @torch.library.custom_op("trtllm::k3_fp8_mid_gemm_packed", mutates_args=())
 def k3_fp8_mid_gemm_packed_op(
     xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, w_sf: torch.Tensor
 ) -> torch.Tensor:
     """BF16 ``xq @ dequant(w)^T`` for an activation quantized upstream (E4M3 ``xq`` +
     DeepGEMM-packed UE8M0 scale ``xs``, see :func:`can_run_packed`)."""
-    m, k = xq.shape
-    n = w.shape[0]
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=xq.device)
-    tiler, cluster = tile_for(m, n, k, packed=True) or ((256, _heuristic_tn(m, n)), (2, 1))
-    run_k3_fp8_mid_gemm(
-        xq, xs, w, w_sf, out, tiler=tiler, cluster=cluster, xs_packed_ld=_packed_ld(xs, m)
-    )
-    return out
+    return k3_fp8_mid_gemm_packed(xq, xs, w, w_sf)
 
 
 @k3_fp8_mid_gemm_packed_op.register_fake
@@ -1624,6 +1638,7 @@ __all__ = [
     "MAX_M",
     "expand_weight_scale",
     "k3_fp8_mid_gemm",
+    "k3_fp8_mid_gemm_packed",
     "quantize_act",
     "run_k3_fp8_mid_gemm",
     "tile_for",

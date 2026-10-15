@@ -675,8 +675,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              out: Optional[torch.Tensor] = None):
+        """``out``: optional contiguous BF16 ``[*input.shape[:-1], N]`` tensor
+        that the CuTe DSL BF16 GEMM and the cuBLAS GEMM of ``F.linear`` (without
+        bias) write the result into, with the bits they would return; the other
+        paths return their own tensor."""
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output
@@ -687,6 +694,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = apply_low_m_gemm(module, input, module.weight, bias)
             if output is not None:
                 return output
+        if out is not None and (out.dtype != torch.bfloat16
+                                or not out.is_contiguous() or input.dim() < 2
+                                or tuple(out.shape) != tuple(input.shape[:-1]) +
+                                (module.weight.shape[0], )):
+            out = None
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -694,10 +706,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             input_2d = input.view(-1, input.shape[-1])  # [M, K]
             m, k = input_2d.shape
             n = module.weight.shape[0]
-            output = torch.empty(m,
-                                 n,
-                                 dtype=torch.bfloat16,
-                                 device=input.device)
+            output = (out.view(m, n) if out is not None else torch.empty(
+                m, n, dtype=torch.bfloat16, device=input.device))
             bf16_gemm_op = (torch.ops.trtllm.cute_dsl_bf16_gemm_rubin
                             if get_sm_version() == 107 else
                             torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
@@ -727,6 +737,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 out_dtype=None,
                 output_buffer_kind=output_buffer_kind,
                 group=group)
+        elif (out is not None and bias is None
+              and input.dtype == module.weight.dtype):
+            # What F.linear runs without a bias (matmul folds the leading dims
+            # into one mm), into ``out``.
+            torch.mm(input.reshape(-1, input.shape[-1]),
+                     module.weight.t(),
+                     out=out.view(-1, out.shape[-1]))
+            output = out
         else:
             output = F.linear(input, module.weight, bias)
         return output
@@ -3769,6 +3787,11 @@ class Linear(nn.Module):
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=allreduce_strategy,
                                     dtype=self.dtype) if reduce_output else None
+        # Set by an owner that orders this layer's GEMM after the previous NVLS
+        # all-reduce on its workspace slot (see AllReduce.nvls_input_buffer):
+        # with TRTLLM_NVLS_AR_ZERO_COPY=1 the row-parallel BF16 GEMM then writes
+        # its partial straight into the NVLS all-reduce's input buffer.
+        self.nvls_zero_copy = False
 
         self._weights_created = False
         self._weights_transformed = False
@@ -4340,6 +4363,25 @@ class Linear(nn.Module):
             assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
             return False
 
+    def _nvls_zero_copy_input(
+            self, input: Union[torch.Tensor, Fp4QuantizedTensor],
+            bias: Optional[torch.Tensor],
+            all_reduce_params: Optional[AllReduceParams]
+    ) -> Optional[torch.Tensor]:
+        """The NVLS all-reduce input buffer that this layer's unquantized BF16
+        GEMM can write its row-parallel partial into (``nvls_zero_copy`` and
+        TRTLLM_NVLS_AR_ZERO_COPY=1, see ``AllReduce.nvls_input_buffer``), or
+        None."""
+        if (not getattr(self, "nvls_zero_copy", False)
+                or self.all_reduce is None or bias is not None
+                or type(self.quant_method) is not UnquantizedLinearMethod
+                or not isinstance(input, torch.Tensor) or input.dim() < 2
+                or input.dtype != torch.bfloat16
+                or self.weight.dtype != torch.bfloat16):
+            return None
+        return self.all_reduce.nvls_input_buffer(
+            tuple(input.shape[:-1]) + (self.out_features, ), all_reduce_params)
+
     def forward(
         self,
         input: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -4380,7 +4422,19 @@ class Linear(nn.Module):
                         supports_nccl_symmetric_memory_window_output
                         and self.all_reduce.uses_nccl_symmetric_memory_window()
                         and not (self.lora is not None and lora_params))
-                    if use_nccl_symmetric_memory_window:
+                    nvls_input = None
+                    if not use_ugpu and not (self.lora is not None
+                                             and lora_params):
+                        nvls_input = self._nvls_zero_copy_input(
+                            input, bias, all_reduce_params)
+                    if nvls_input is not None:
+                        # The GEMM writes straight into the NVLS all-reduce's
+                        # input buffer.
+                        output = self.quant_method.apply(self,
+                                                         input,
+                                                         bias,
+                                                         out=nvls_input)
+                    elif use_nccl_symmetric_memory_window:
                         output = self.quant_method.apply(self, input, bias)
                     else:
                         output = self.apply_linear(input, bias, lora_params,

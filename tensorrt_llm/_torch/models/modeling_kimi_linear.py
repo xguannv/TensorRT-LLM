@@ -113,6 +113,7 @@ from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
+from ..distributed.nvls_allreduce import NVLSAllReduce
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
@@ -297,6 +298,12 @@ _K3_SHARED_FIRST_MAX_M = int(os.environ.get("TRTLLM_K3_SHARED_FIRST_MAX_M", "204
 # the per-SM programs of the pipelined NVLS kernel (TRTLLM_NVLS_AR_V2=1), so it keeps the one-shot
 # NVLS kernel unless TRTLLM_K3_SHARED_AR_NVLS_V2=1.
 _K3_SHARED_AR_NVLS_V2 = os.environ.get("TRTLLM_K3_SHARED_AR_NVLS_V2", "0") == "1"
+# NVLS workspace slot of the shared expert's all-reduce. "main" shares the o_proj all-reduce's
+# workspace (and, with TRTLLM_NVLS_AR_ZERO_COPY=1, its input buffer): every shared-expert
+# all-reduce, from its down projection on, lies between the layer's o_proj all-reduce (whose
+# output the shared expert consumes) and the next layer's o_proj (which runs after the MoE
+# join), so the two never overlap. Any other name gives it a workspace of its own.
+_K3_SHARED_AR_NVLS_SLOT = os.environ.get("TRTLLM_K3_SHARED_AR_NVLS_SLOT", "main")
 # CUDA stream priority of the stream shared by the attention-side aux work and the MoE shared
 # expert. Negative values let the shared-expert chain take SMs ahead of the persistent routed
 # GEMMs on the main stream, so its all-reduce does not land after them.
@@ -1346,9 +1353,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # touched by any later autocast/dtype move.
         self.register_buffer("weight", weight_fp8, persistent=False)
         self.register_buffer("weight_scale", weight_scale, persistent=False)
-        # Set by a caller for the next forward only: a contiguous BF16 ``[M, out_features]``
-        # tensor that the low-M GEMM writes its result into. Other paths return their own
-        # tensor, so the caller compares the result with the buffer it handed in.
+        # Set by a caller for the next forward only (``forward``, ``forward_fp8_packed`` or
+        # ``forward_prequantized`` consumes and clears it): a contiguous BF16
+        # ``[M, out_features]`` tensor that the low-M and mid-M GEMMs write their result into.
+        # Other paths return their own tensor, so the caller compares the result with the
+        # buffer it handed in.
         self.next_output: Optional[torch.Tensor] = None
         # Copied from the source ``Linear`` (the MLA fused q_a/kv_a projection sets it): the
         # low-M GEMM may serve this weight although N is not a multiple of 128.
@@ -1525,15 +1534,34 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             return False
         return True
 
+    def _take_next_output(self, num_rows: int) -> Optional[torch.Tensor]:
+        """Clear :attr:`next_output`; return it if it is a contiguous, 16-byte aligned BF16
+        ``[num_rows, out_features]`` tensor."""
+        out, self.next_output = self.next_output, None
+        if (
+            out is None
+            or out.dtype != torch.bfloat16
+            or tuple(out.shape) != (num_rows, self.out_features)
+            or not out.is_contiguous()
+            or out.data_ptr() % 16
+        ):
+            return None
+        return out
+
     def forward_fp8_packed(self, act: torch.Tensor, act_scale: torch.Tensor) -> torch.Tensor:
         """Project an activation quantized upstream: E4M3 ``[M, K]`` plus DeepGEMM-packed UE8M0
         1x128 scales (int32 ``[M, ceil(K / 512)]``, strides ``(1, ld)``), the bytes
         ``fp8_quantize_1x128_packed_ue8m0`` makes of the BF16 activation. Same output as
         :meth:`forward` on that activation where :meth:`takes_fp8_packed_input` holds."""
+        out_buffer = self._take_next_output(act.shape[0])
         if self._mid_gemm_applies_rows(act.shape[0], packed=True):
             from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
 
             if k3_fp8_mid_gemm.can_run_packed(act, act_scale, self.weight, self.mid_weight_sf):
+                if out_buffer is not None:
+                    return k3_fp8_mid_gemm.k3_fp8_mid_gemm_packed(
+                        act, act_scale, self.weight, self.mid_weight_sf, out=out_buffer
+                    )
                 return torch.ops.trtllm.k3_fp8_mid_gemm_packed(
                     act, act_scale, self.weight, self.mid_weight_sf
                 )
@@ -1558,10 +1586,15 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             raise NotImplementedError("Kimi K3 FP8 weight read does not support LoRA.")
         out_shape = x.shape[:-1] + (self.out_features,)
         x_flat = x.reshape(-1, x.shape[-1])
-        out_buffer, self.next_output = self.next_output, None
+        out_buffer = self._take_next_output(x_flat.shape[0])
 
         if self.mid_weight_sf is not None and self.mid_gemm_applies(x_flat):
-            out = torch.ops.trtllm.k3_fp8_mid_gemm(x_flat, self.weight, self.mid_weight_sf)
+            if out_buffer is not None:
+                from ..cute_dsl_kernels.blackwell.k3_fp8_mid_gemm import k3_fp8_mid_gemm
+
+                out = k3_fp8_mid_gemm(x_flat, self.weight, self.mid_weight_sf, out=out_buffer)
+            else:
+                out = torch.ops.trtllm.k3_fp8_mid_gemm(x_flat, self.weight, self.mid_weight_sf)
         elif _rubin_mxfp8_is_available():
             act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
             out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
@@ -1582,12 +1615,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 allow_partial_n_tile=_K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile,
             )
         ):
-            if (
-                out_buffer is not None
-                and out_buffer.dtype == torch.bfloat16
-                and out_buffer.shape == (x_flat.shape[0], self.out_features)
-                and out_buffer.is_contiguous()
-            ):
+            if out_buffer is not None:
                 from ..cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import k3_fp8w_lowm_gemm_out
 
                 out = k3_fp8w_lowm_gemm_out(x_flat, self.weight, self.weight_scale, out_buffer)
@@ -1603,6 +1631,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         activation_scale: torch.Tensor,
     ) -> torch.Tensor:
         """Project an activation that the fused KDA producer already quantized."""
+        self.next_output = None
         if activation.dtype is not torch.float8_e4m3fn:
             raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
         if not self.supports_prequantized_input:
@@ -2079,9 +2108,20 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
+        if isinstance(self.shared_experts.down_proj, TrtllmLinear):
+            # Its all-reduce follows it on the same stream, after the layer's o_proj
+            # all-reduce (see _K3_SHARED_AR_NVLS_SLOT).
+            self.shared_experts.down_proj.nvls_zero_copy = True
         shared_ar = getattr(self.shared_experts.down_proj, "all_reduce", None)
-        if not _K3_SHARED_AR_NVLS_V2 and getattr(shared_ar, "nvls_allreduce", None) is not None:
-            shared_ar.nvls_allreduce.version = 1
+        shared_nvls = getattr(shared_ar, "nvls_allreduce", None)
+        if shared_nvls is not None:
+            if _K3_SHARED_AR_NVLS_SLOT != shared_nvls.slot:
+                shared_nvls = NVLSAllReduce(
+                    shared_nvls.mapping, slot=_K3_SHARED_AR_NVLS_SLOT, version=shared_nvls.version
+                )
+                shared_ar.nvls_allreduce = shared_nvls
+            if not _K3_SHARED_AR_NVLS_V2:
+                shared_nvls.version = 1
         # Set when the shared expert's TP-sharded down projection is converted
         # to the FP8 weight read, which does not reduce its output itself.
         self.shared_down_all_reduce = None
@@ -2887,10 +2927,16 @@ class KimiK3MoERuntime(nn.Module):
             return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
-            if merged is not None and isinstance(
-                self.shared_experts.down_proj, _Fp8BlockScaleWeightReadLinear
-            ):
-                self.shared_experts.down_proj.next_output = shared_slot
+            down_proj = self.shared_experts.down_proj
+            if isinstance(down_proj, _Fp8BlockScaleWeightReadLinear):
+                if merged is not None:
+                    down_proj.next_output = shared_slot
+                elif self.shared_down_all_reduce is not None and not self._defer_shared_allreduce:
+                    # The FP8 down projection writes its partial straight into the NVLS
+                    # all-reduce's input buffer when there is one (TRTLLM_NVLS_AR_ZERO_COPY=1).
+                    down_proj.next_output = self.shared_down_all_reduce.nvls_input_buffer(
+                        (identity.shape[0], down_proj.out_features)
+                    )
             shared_out = self.shared_experts(
                 identity,
                 final_all_reduce_params=(
@@ -3117,7 +3163,17 @@ class KimiMLARuntime(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
+        o_proj = self.mixer.o_proj
+        zero_copy = self._o_allreduce is not None and hasattr(o_proj, "next_output")
+        if zero_copy:
+            # o_proj writes its partial straight into the NVLS all-reduce's input
+            # buffer when there is one (TRTLLM_NVLS_AR_ZERO_COPY=1).
+            o_proj.next_output = self._o_allreduce.nvls_input_buffer(
+                (hidden_states.shape[0], o_proj.out_features)
+            )
         out = self.mixer(hidden_states, attn_metadata)
+        if zero_copy:
+            o_proj.next_output = None
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.

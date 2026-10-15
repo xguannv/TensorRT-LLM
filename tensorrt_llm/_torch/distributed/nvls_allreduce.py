@@ -62,6 +62,20 @@ step 3 depends on the arrival protocol (``TRTLLM_NVLS_AR_PROTOCOL``):
   call. ``TRTLLM_NVLS_AR_PTX_STAGING=inline`` publishes per program / chunk
   instead (correct, but slow for that reason).
 
+Zero-copy input (``TRTLLM_NVLS_AR_ZERO_COPY=1``, served to producers by
+``AllReduce.nvls_input_buffer``): the producer of the message, typically the
+GEMM whose row-parallel partial is reduced, writes it straight into
+``input_buffer(shape)``, and the call skips step 1 (and the ``ptx`` copy). The
+producer must start after the previous call on the same workspace slot has
+finished on this rank, i.e. be ordered after it by stream order, or by an event
+across streams, with every PDL kernel in between executing
+``griddepcontrol.wait``: that call's reducers on every rank read this rank's
+input buffer until its last output vector has arrived here (see below). The
+publish needs nothing more under ``ptx``: the producer grid has completed and
+its stores are visible before this kernel's ``griddepcontrol.wait`` returns
+(or, without PDL, before it starts), exactly as for a copy kernel, so they
+precede the publishing thread's fences.
+
 Step 4 needs no fence: the output buffer is a Lamport buffer. The polling loads
 are 32-bit system-scope (volatile) loads of the 32-bit elements of the
 multicast stores, so a non-sentinel word is the store of this call: the rank
@@ -130,7 +144,7 @@ _V2_KNOBS = {
     "probe": ("TRTLLM_NVLS_AR_V2_PROBE", 1),
 }
 
-# Kernel versions whose first call has been logged (True: pipelined).
+# (pipelined, zero-copy input) kernel variants whose first call has been logged.
 _FIRST_CALL_LOGGED = set()
 
 # 0xFFFF as int16: a BF16 NaN pattern the reducer never stores.
@@ -787,6 +801,9 @@ class NVLSAllReduce:
     ``version=2`` (default from ``TRTLLM_NVLS_AR_V2``) sends messages of at least
     ``v2["min_bytes"]`` to the chunk-pipelined kernel and smaller ones to the
     one-shot kernel; ``v2_config`` overrides the ``TRTLLM_NVLS_AR_V2_*`` knobs.
+
+    ``zero_copy`` (default from ``TRTLLM_NVLS_AR_ZERO_COPY``) lets
+    ``zero_copy_buffer`` hand the input buffer to producers.
     """
 
     _workspaces: Dict[Tuple[Mapping, str], Dict] = {}
@@ -807,8 +824,10 @@ class NVLSAllReduce:
         v2_config: Optional[Dict[str, int]] = None,
         protocol: Optional[str] = None,
         ptx_staging: Optional[str] = None,
+        zero_copy: Optional[bool] = None,
     ):
         self.mapping = mapping
+        self.slot = slot
         self.world_size = mapping.tp_size
         self.rank = mapping.tp_rank
         self.max_bytes = max_bytes or NVLS_AR_MAX_BYTES
@@ -829,6 +848,9 @@ class NVLSAllReduce:
             raise ValueError(
                 f"TRTLLM_NVLS_AR_PTX_STAGING must be copy, once or inline, got {self.ptx_staging!r}"
             )
+        if zero_copy is None:
+            zero_copy = os.environ.get("TRTLLM_NVLS_AR_ZERO_COPY", "0") == "1"
+        self.zero_copy = zero_copy
         if version is None:
             version = 2 if os.environ.get("TRTLLM_NVLS_AR_V2", "0") == "1" else 1
         self.version = version
@@ -857,9 +879,10 @@ class NVLSAllReduce:
             kernels = "one-shot kernel (v1)"
         logger.info_once(
             f"[NVLS AR] active on tp_size={self.world_size}: {kernels}, protocol "
-            f"{self.protocol}; AllReduce routes plain "
+            f"{self.protocol}, zero-copy producers {'on' if self.zero_copy else 'off'}; "
+            f"AllReduce routes plain "
             f"BF16 sums of [{NVLS_AR_MIN_BYTES}, {NVLS_AR_MAX_BYTES}] bytes here ({__file__})",
-            key=("nvls_ar_active", self.world_size, self.version, self.protocol),
+            key=("nvls_ar_active", self.world_size, self.version, self.protocol, self.zero_copy),
         )
 
     @staticmethod
@@ -929,13 +952,24 @@ class NVLSAllReduce:
 
     def input_buffer(self, shape: Tuple[int, ...]) -> torch.Tensor:
         """BF16 view of this rank's input buffer: a producer that writes the input here
-        saves the all-reduce its input copy (the call must pass this tensor)."""
+        saves the all-reduce its input copy (the call must pass this tensor). The producer
+        must be ordered after the previous call on this workspace slot (module docstring)."""
         numel = math.prod(shape)
         if numel * 2 > self._ws["data_bytes"]:
             raise ValueError(
                 f"NVLS input buffer holds {self._ws['data_bytes']} bytes, {numel * 2} requested"
             )
         return self._ws["in_buf"][:numel].view(torch.bfloat16).view(shape)
+
+    def zero_copy_buffer(self, shape: Tuple[int, ...]) -> Optional[torch.Tensor]:
+        """``input_buffer(shape)`` if zero-copy producers are enabled and this all-reduce
+        can sum a BF16 tensor of ``shape``, else None."""
+        if not self.zero_copy or len(shape) == 0:
+            return None
+        if math.prod(shape) * 2 > self._ws["data_bytes"]:
+            return None
+        buf = self.input_buffer(shape)
+        return buf if self.can_use(buf) else None
 
     def can_use(self, inp: torch.Tensor) -> bool:
         if inp.dtype != torch.bfloat16 or not inp.is_contiguous() or inp.dim() == 0:
@@ -964,14 +998,16 @@ class NVLSAllReduce:
             out = torch.empty_like(inp)
         ws = self._ws
         use_v2 = self._uses_v2(inp)
-        if use_v2 not in _FIRST_CALL_LOGGED:
-            _FIRST_CALL_LOGGED.add(use_v2)
+        zero_copy = inp.data_ptr() == ws["in_buf"].data_ptr()
+        if (use_v2, zero_copy) not in _FIRST_CALL_LOGGED:
+            _FIRST_CALL_LOGGED.add((use_v2, zero_copy))
             capturing = " (CUDA graph capture)" if torch.cuda.is_current_stream_capturing() else ""
+            source = "zero-copy input" if zero_copy else "copied input"
             logger.info(
                 f"[NVLS AR] first {'pipelined (v2)' if use_v2 else 'one-shot (v1)'} kernel "
-                f"call{capturing}: shape {tuple(inp.shape)}, {inp.numel() * 2} bytes"
+                f"call with {source}{capturing}: shape {tuple(inp.shape)}, "
+                f"{inp.numel() * 2} bytes, slot {self.slot}"
             )
-        zero_copy = inp.data_ptr() == ws["in_buf"].data_ptr()
         publish_once = False
         if self.protocol == "ptx" and self.ptx_staging != "inline":
             if not zero_copy and (self.ptx_staging == "copy" or not use_v2):

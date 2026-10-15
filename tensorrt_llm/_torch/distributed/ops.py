@@ -866,6 +866,34 @@ class AllReduce(nn.Module):
             key=("nvls_ar_fallback", reason))
         return None
 
+    def nvls_input_buffer(
+        self,
+        shape: Tuple[int, ...],
+        all_reduce_params: Optional[AllReduceParams] = None
+    ) -> Optional[torch.Tensor]:
+        """With TRTLLM_NVLS_AR_ZERO_COPY=1: the NVLS all-reduce's input buffer as
+        a BF16 tensor of ``shape``, if ``forward`` sends a BF16 tensor of that
+        shape with these parameters to the NVLS all-reduce; else None.
+
+        A producer that writes its result into this tensor and passes it to
+        ``forward`` saves the all-reduce its input copy. The tensor aliases the
+        input of every NVLS all-reduce on the same workspace slot, so the
+        producer must run after the previous one of them has finished, and
+        nothing may read the tensor after ``forward``.
+        """
+        nvls = self.nvls_allreduce
+        if nvls is None or not nvls.zero_copy or len(shape) == 0:
+            return None
+        if self.symm_mem_allreduce is not None or torch.compiler.is_compiling():
+            return None
+        if all_reduce_params is not None and (
+                not all_reduce_params.enable_allreduce
+                or all_reduce_params.fusion_op != AllReduceFusionOp.NONE):
+            return None
+        if not NVLS_AR_MIN_BYTES <= math.prod(shape) * 2 <= NVLS_AR_MAX_BYTES:
+            return None
+        return nvls.zero_copy_buffer(tuple(shape))
+
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
 
