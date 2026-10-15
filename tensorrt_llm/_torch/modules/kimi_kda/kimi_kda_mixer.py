@@ -54,10 +54,11 @@ _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
 # BF16 GEMV instead of cuBLAS split-K.
 _KDA_BF16_LOWM_GEMV = os.environ.get("TRTLLM_K3_BF16_LOWM_GEMV", "0") == "1"
 # Decode verify computes beta and the forget gate with one fused CuTe kernel ([f_a | b]
-# projection, then f_b on its BF16 f_a), sized to run next to the QKVG GEMM, for up to this
-# many rows on the aux stream. Takes precedence over TRTLLM_K3_BF16_LOWM_GEMV.
+# projection, then f_b on its BF16 f_a), sized to run next to the QKVG GEMM, for up to
+# TRTLLM_K3_KDA_FAB_MAX_ROWS rows (default 256, at most k3_kda_fab.MAX_M = 512) on the aux stream.
+# Takes precedence over TRTLLM_K3_BF16_LOWM_GEMV.
 _KDA_FAB_FUSED = os.environ.get("TRTLLM_K3_KDA_FAB_FUSED", "0") == "1"
-_KDA_FAB_FUSED_MAX_ROWS = 256
+_KDA_FAB_FUSED_MAX_ROWS = int(os.environ.get("TRTLLM_K3_KDA_FAB_MAX_ROWS", "256"))
 # Decode verify without the forget-gate round trip (takes precedence over
 # TRTLLM_K3_KDA_FAB_FUSED). Up to _KDA_FAB_FUSED_MAX_ROWS rows, k3_kda_fab runs in f_a mode
 # (BF16 [f_a | b] only) next to the QKVG GEMM and the verify kernel computes the forget gate
@@ -105,11 +106,12 @@ def _use_fused_fab(
     enabled = _KDA_FAB_FUSED or _KDA_DECODE_FUSED_FAB
     if not enabled or torch.compiler.is_compiling() or not x.is_contiguous():
         return False
+    x2d = x.reshape(-1, x.shape[-1])
+    if x2d.shape[0] > _KDA_FAB_FUSED_MAX_ROWS:
+        return False
     from ...cute_dsl_kernels.blackwell import k3_kda_fab
 
-    return k3_kda_fab.can_use_k3_kda_fab(
-        x.reshape(-1, x.shape[-1]), bfa_weight, fb_weight, num_heads
-    )
+    return k3_kda_fab.can_use_k3_kda_fab(x2d, bfa_weight, fb_weight, num_heads)
 
 
 @functools.cache
@@ -145,6 +147,8 @@ def _use_fab_fa(
     if not _KDA_DECODE_FUSED_FAB or torch.compiler.is_compiling() or not x.is_contiguous():
         return False
     num_rows = x.shape[0] * x.shape[1]
+    if num_rows > _KDA_FAB_FUSED_MAX_ROWS:
+        return False
     if num_rows <= _KDA_FUSED_FB_LOWM_ROWS and not _verify_kernel_single_wave(
         num_heads, x.shape[0], x.device
     ):
