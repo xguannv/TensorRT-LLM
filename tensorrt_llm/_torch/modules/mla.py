@@ -193,6 +193,17 @@ def _mla_ctx_fp8_expand_mode() -> str:
     return mode
 
 
+def _use_mla_ctx_cute_fmha() -> bool:
+    """TRTLLM_K3_MLA_CTX_FMHA=cute: the FP8 context FMHA runs FlashInfer's CuTe DSL kernel with
+    exact softmax correction (cute_dsl_kernels/blackwell/k3_mla_ctx_fmha.py) instead of trtllm-gen."""
+    from ..cute_dsl_kernels.blackwell.k3_mla_ctx_fmha import (
+        mla_ctx_cute_fmha_available,
+        mla_ctx_cute_fmha_enabled,
+    )
+
+    return mla_ctx_cute_fmha_enabled() and mla_ctx_cute_fmha_available()
+
+
 @functools.cache
 def _flashinfer_fp8_ragged_mla():
     """FlashInfer's trtllm-gen ragged (separate Q/K/V) context FMHA, or None."""
@@ -1264,19 +1275,20 @@ class MLA(nn.Module):
         if fp8_direct:
             heads = self.num_heads_tp
             cu = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
-            self._fp8_ragged_attention(
-                q.new_zeros(1, heads * self.qk_head_dim, dtype=torch.float8_e4m3fn),
-                k,
-                v,
-                q.new_empty(1, heads * self.v_head_dim),
-                torch.empty(1, heads, dtype=torch.float, device=q.device),
-                cu[1:],
-                cu,
-                cu,
-                1,
-                1,
-                causal=True,
-            )
+            for causal in (True, False):
+                self._fp8_ragged_attention(
+                    q.new_zeros(1, heads * self.qk_head_dim, dtype=torch.float8_e4m3fn),
+                    k,
+                    v,
+                    q.new_empty(1, heads * self.v_head_dim),
+                    torch.empty(1, heads, dtype=torch.float, device=q.device),
+                    cu[1:],
+                    cu,
+                    cu,
+                    1,
+                    1,
+                    causal=causal,
+                )
 
     def _fp8_ragged_attention(
         self,
@@ -1298,6 +1310,24 @@ class MLA(nn.Module):
         """
         mha = cast(TrtllmAttention, self.mha)
         num_tokens = q_fp8.shape[0]
+        softmax_scale = 1.0 / (mha.q_scaling * math.sqrt(self.qk_head_dim))
+        if _use_mla_ctx_cute_fmha():
+            from ..cute_dsl_kernels.blackwell.k3_mla_ctx_fmha import mla_ctx_cute_fmha
+
+            mla_ctx_cute_fmha(
+                q_fp8.view(num_tokens, self.num_heads_tp, self.qk_head_dim),
+                k_fp8.view(k_fp8.shape[0], self.num_heads_tp, self.qk_head_dim),
+                v_fp8.view(v_fp8.shape[0], self.num_heads_tp, self.v_head_dim),
+                out.view(num_tokens, self.num_heads_tp, self.v_head_dim),
+                lse,
+                cu_q,
+                cu_kv,
+                max_q,
+                max_kv,
+                softmax_scale,
+                causal,
+            )
+            return
         # trtllm-gen keeps float2 softmax stats for heads x requests x round_up(max_q, 256)
         # rows in the workspace when it returns the LSE; the rest is scratch.
         stats_bytes = 8 * self.num_heads_tp * (cu_q.numel() - 1) * (-(-max_q // 256) * 256)
@@ -1309,7 +1339,7 @@ class MLA(nn.Module):
             kv_lens,
             max_q,
             max_kv,
-            1.0 / (mha.q_scaling * math.sqrt(self.qk_head_dim)),
+            softmax_scale,
             1.0,
             1.0,
             cu_q.numel() - 1,

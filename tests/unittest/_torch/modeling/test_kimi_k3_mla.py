@@ -459,8 +459,13 @@ def test_k3_mla_fp8_kv_decode_q_absorb() -> None:
 )
 @pytest.mark.parametrize(
     "chunked,mode",
-    [(True, "1"), (False, "1"), (True, "2")],
-    ids=["chunked_prefill", "cached_kv", "chunked_prefill_fp8_fmha"],
+    [(True, "1"), (False, "1"), (True, "2"), (True, "2cute")],
+    ids=[
+        "chunked_prefill",
+        "cached_kv",
+        "chunked_prefill_fp8_fmha",
+        "chunked_prefill_fp8_cute_fmha",
+    ],
 )
 def test_k3_mla_ctx_fp8_expand_matches_default(chunked: bool, mode: str, monkeypatch) -> None:
     """Context attention over cached FP8 KV with ``TRTLLM_K3_MLA_CTX_FP8_EXPAND=1`` (one FP8
@@ -590,8 +595,11 @@ def test_k3_mla_ctx_fp8_expand_matches_default(chunked: bool, mode: str, monkeyp
             if chunked
             else None
         )
+        if mode == "2cute":
+            # The CuTe DSL FMHA (TRTLLM_K3_MLA_CTX_FMHA=cute) on the same FP8 partitions.
+            monkeypatch.setenv("TRTLLM_K3_MLA_CTX_FMHA", "cute")
         for flag in ("0", mode):
-            monkeypatch.setenv("TRTLLM_K3_MLA_CTX_FP8_EXPAND", flag)
+            monkeypatch.setenv("TRTLLM_K3_MLA_CTX_FP8_EXPAND", flag[:1])
             second = context_metadata(new, cached, features)
             extra_attrs["attention_metadata"] = weakref.ref(second)
             with model_extra_attrs(extra_attrs):
@@ -620,5 +628,11 @@ def test_k3_mla_ctx_fp8_expand_matches_default(chunked: bool, mode: str, monkeyp
             torch.linalg.vector_norm(outputs[mode].float() - expected)
             / torch.linalg.vector_norm(expected)
         ).item()
-        assert relative_l2 < 2e-3, f"relative L2 error: {relative_l2}"
-        torch.testing.assert_close(outputs[mode], outputs["0"], atol=2e-2, rtol=2e-2)
+        if mode == "2":
+            assert relative_l2 < 2e-3, f"relative L2 error: {relative_l2}"
+            torch.testing.assert_close(outputs[mode], outputs["0"], atol=2e-2, rtol=2e-2)
+        else:
+            # A different FMHA: its FP8 rounding of P is independent of the trtllm-gen one, and
+            # each is ~2.5e-2 (relative L2) from an FP32 reference on these diffuse random rows
+            # (test_k3_mla_ctx_cute_fmha.py checks the kernel against that reference).
+            assert relative_l2 < 8e-2, f"relative L2 error: {relative_l2}"
