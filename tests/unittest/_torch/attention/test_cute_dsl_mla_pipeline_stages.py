@@ -12,14 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CuTe DSL FP8 MLA decode, balanced split: pipeline depths and schedule size.
+"""CuTe DSL FP8 MLA decode, balanced split: pipeline depths, schedule size and
+reduction variant.
 
 The balanced-split kernel runs 3 K-tile stages and 2 P stages while its
-shared-memory schedule holds at most 256 requests (2 and 3 past that), and
-sizes the schedule to the batch rounded up to a power of two. None of this may
-change the result: every stage combination that fits in shared memory and
-every schedule size must give BITWISE identical outputs. A combination that
-does not fit is rejected when the kernel is compiled.
+shared-memory schedule holds at most 256 requests (2 and 3 past that), sizes
+the schedule to the batch rounded up to a power of two, and above 24 requests
+reduces per partial slot instead of per M tile. None of this may change the
+result: every stage combination that fits in shared memory, every schedule
+size and both reduction variants must give BITWISE identical outputs. A stage
+combination that does not fit is rejected when the kernel is compiled.
 
 Requires 1 SM100/SM103 GPU and nvidia-cutlass-dsl.
 """
@@ -58,6 +60,7 @@ _MAX_BATCH = 256
 # cluster still runs several segments.
 _CASES = {
     "b16_s8": (96, 8, [1800] * 16),
+    "b28_s8": (96, 8, [2000] * 28),
     "b32_s8_mixed": (96, 8, [300 + 97 * i for i in range(32)]),
     "b33_s7": (96, 7, [3000, 70, 1500, 8191, 64, 513, 0, 2048, 4500, 9, 600] * 3),
     "b64_s6": (96, 6, [1200] * 64),
@@ -92,6 +95,8 @@ def _options(batch_size):
     "batch_size,max_requests,stages",
     [
         (1, 32, (3, 2)),
+        (24, 32, (3, 2)),
+        (25, 32, (3, 2)),
         (32, 32, (3, 2)),
         (33, 64, (3, 2)),
         (64, 64, (3, 2)),
@@ -105,9 +110,11 @@ def _options(batch_size):
 def test_default_pipeline_options(batch_size, max_requests, stages, monkeypatch):
     monkeypatch.delenv("TRTLLM_MLA_K_STAGES", raising=False)
     monkeypatch.delenv("TRTLLM_MLA_P_STAGES", raising=False)
+    monkeypatch.delenv("TRTLLM_MLA_TILE_REDUCTION", raising=False)
     opts = _options(batch_size)
     assert opts["balanced_max_requests"] == max_requests
     assert (opts["k_stages"], opts["p_stages"]) == stages
+    assert opts["tile_reduction"] == (batch_size <= 24)
     monkeypatch.setenv("TRTLLM_MLA_K_STAGES", "2")
     monkeypatch.setenv("TRTLLM_MLA_P_STAGES", "3")
     opts = _options(batch_size)
@@ -149,6 +156,16 @@ def test_schedule_size_is_bitwise_identical(case, monkeypatch):
         CuteDSLNVMlaDecodeBlackwellRunner, "_fp8_kernel_options", classmethod(full_table)
     )
     _assert_same(_run(x, H, S, monkeypatch), sized)
+
+
+@pytest.mark.parametrize("case", ["b16_s8", "b28_s8", "b32_s8_mixed"])
+def test_reduction_variants_are_bitwise_identical(case, monkeypatch):
+    """Tile- and slot-indexed reductions of the register-schedule batches."""
+    H, S, lens = _CASES[case]
+    x = _padded_inputs(lens, S, H, helix=True, seed=44)
+    tile = _run(x, H, S, monkeypatch, env={"TRTLLM_MLA_TILE_REDUCTION": "1"})
+    slot = _run(x, H, S, monkeypatch, env={"TRTLLM_MLA_TILE_REDUCTION": "0"})
+    _assert_same(slot, tile)
 
 
 def test_stages_that_do_not_fit_are_rejected(monkeypatch):

@@ -161,6 +161,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         bf16_partials: bool = False,
         k_stages: int = 2,
         p_stages: int = 3,
+        tile_reduction: Optional[bool] = None,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -249,6 +250,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             operand), 2 or ``mma_lookahead + 1`` (3). With 2 the softmax
             writes P once P*V has read the stage two K tiles back.
         :type p_stages: int
+        :param tile_reduction: Balanced split: run the reduction with one CTA
+            group per (row group, M tile) (True) or per (row group, partial
+            slot) (False); None picks the former for the register schedule
+            (``balanced_max_requests`` 32). The result does not depend on it.
+        :type tile_reduction: Optional[bool]
         """
 
         self.latent_dim = 512
@@ -272,8 +278,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.balanced_max_requests = balanced_max_requests
         # Small batches: one reduction CTA per (row group, M tile) instead of
         # per (row group, partial slot).
-        self.balanced_tile_reduction = (balanced_split
-                                        and balanced_max_requests <= 32)
+        self.balanced_tile_reduction = (
+            balanced_split and (balanced_max_requests <= 32
+                                if tile_reduction is None else tile_reduction))
         if self.latent_dim % (32 * reduction_col_split) != 0 or (
                 reduction_col_split > 1 and not self.balanced_tile_reduction):
             raise ValueError(

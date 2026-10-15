@@ -8535,6 +8535,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Balanced split with a schedule table of up to this many requests:
         # 3 K-tile stages and 2 P stages (see _fp8_kernel_options).
         _DEEP_K_MAX_REQUESTS = 256
+        # Small-batch variant up to this many requests: tile-indexed
+        # reduction; past it, slot-indexed (see _fp8_kernel_options).
+        _TILE_REDUCTION_MAX_BATCH = 24
 
         @classmethod
         def _fp8_kernel_options(
@@ -8567,8 +8570,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
               per M tile, else the batch rounded up to a power of two, at
               least 64 (the shared-memory schedule holds that many
               requests). The result does not depend on it.
-            * reduction_col_split (balanced split up to ``_SMALL_BATCH``
-              requests): reduction CTAs per row group of an M tile, 2 up to 4
+            * tile_reduction (balanced split up to ``_SMALL_BATCH``
+              requests): the reduction runs one CTA group per M tile up to
+              ``_TILE_REDUCTION_MAX_BATCH`` requests, else one per partial
+              slot (fewer CTAs scan the slot list once the batch has many M
+              tiles); TRTLLM_MLA_TILE_REDUCTION=0/1 overrides it. The result
+              does not depend on it.
+            * reduction_col_split (balanced split with the tile-indexed
+              reduction): reduction CTAs per row group of an M tile, 2 up to 4
               requests, else 1 (the tiles of smaller batches are cut into
               more partials; more CTAs than fit in one wave cost more than
               they save); TRTLLM_MLA_REDUCTION_COL_SPLIT
@@ -8596,8 +8605,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     "TRTLLM_MLA_RESCALE_THRESHOLD must be in [0, 8], got "
                     f"{threshold}.")
             small = balanced_split and batch_size <= cls._SMALL_BATCH
+            tile_env = os.environ.get("TRTLLM_MLA_TILE_REDUCTION")
+            tile_reduction = (small
+                              and (batch_size <= cls._TILE_REDUCTION_MAX_BATCH
+                                   if tile_env is None else tile_env == "1"))
             col_split = 1
-            if small:
+            if tile_reduction:
                 col_split = int(
                     os.environ.get("TRTLLM_MLA_REDUCTION_COL_SPLIT",
                                    2 if batch_size <= 4 else 1))
@@ -8650,6 +8663,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      os.environ.get("TRTLLM_MLA_PARTIAL_BF16", "0") == "1"),
                     ("k_stages", k_stages),
                     ("p_stages", p_stages),
+                    ("tile_reduction", tile_reduction),
                 )
             return options
 
