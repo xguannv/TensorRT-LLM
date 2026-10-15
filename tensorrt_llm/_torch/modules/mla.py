@@ -207,11 +207,13 @@ _FLASHINFER_WORKSPACE_BYTES = 128 << 20
 _flashinfer_workspaces: Dict[int, torch.Tensor] = {}
 
 
-def _flashinfer_workspace(device: torch.device) -> torch.Tensor:
+def _flashinfer_workspace(device: torch.device, min_bytes: int = 0) -> torch.Tensor:
+    """FlashInfer FMHA workspace of at least ``min_bytes`` (128 MiB minimum), grown on demand."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     workspace = _flashinfer_workspaces.get(index)
-    if workspace is None:
-        workspace = torch.zeros(_FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+    if workspace is None or workspace.numel() < min_bytes:
+        size = max(_FLASHINFER_WORKSPACE_BYTES, -(-min_bytes // (64 << 20)) * (64 << 20))
+        workspace = torch.zeros(size, dtype=torch.uint8, device=device)
         _flashinfer_workspaces[index] = workspace
     return workspace
 
@@ -1296,11 +1298,14 @@ class MLA(nn.Module):
         """
         mha = cast(TrtllmAttention, self.mha)
         num_tokens = q_fp8.shape[0]
+        # trtllm-gen keeps float2 softmax stats for heads x requests x round_up(max_q, 256)
+        # rows in the workspace when it returns the LSE; the rest is scratch.
+        stats_bytes = 8 * self.num_heads_tp * (cu_q.numel() - 1) * (-(-max_q // 256) * 256)
         _flashinfer_fp8_ragged_mla()(
             q_fp8.view(num_tokens, self.num_heads_tp, self.qk_head_dim),
             k_fp8.view(k_fp8.shape[0], self.num_heads_tp, self.qk_head_dim),
             v_fp8.view(v_fp8.shape[0], self.num_heads_tp, self.v_head_dim),
-            _flashinfer_workspace(q_fp8.device),
+            _flashinfer_workspace(q_fp8.device, stats_bytes + (32 << 20)),
             kv_lens,
             max_q,
             max_kv,

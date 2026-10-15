@@ -612,11 +612,23 @@ def create_py_executor(
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
+    # MLA chunked prefill expands the cached KV in partitions of
+    # chunk_size * chunked_prefill_buffer_batch_size tokens (4 * max_num_tokens by
+    # default). TRTLLM_MLA_CHUNKED_PREFILL_MAX_TOKENS caps a partition instead, so a
+    # larger max_num_tokens does not also grow the partition buffers and the attention
+    # workspace (neither is covered by the KV-cache memory profiling).
+    mla_chunk_kwargs = {}
+    mla_chunk_cap = int(
+        os.environ.get("TRTLLM_MLA_CHUNKED_PREFILL_MAX_TOKENS", "0"))
+    if mla_chunk_cap > 0 and max_num_tokens:
+        mla_chunk_kwargs["chunked_prefill_buffer_batch_size"] = max(
+            1, mla_chunk_cap // max_num_tokens)
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
         cache_reuse=kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
         chunk_size=max_num_tokens,
+        **mla_chunk_kwargs,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
