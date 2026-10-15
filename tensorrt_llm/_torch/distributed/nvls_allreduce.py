@@ -33,18 +33,45 @@ Per program:
    lanes holds the sentinel ``0xFFFF`` (a NaN the reducer never stores), copy
    them out and re-arm them with the sentinel.
 
-The arrival in step 2 is ordered after the input stores by a GPU-scope fence:
-the input lives in this rank's memory, which the switch reads through this
-GPU's L2, so stores that are visible GPU-wide are visible to the switch.
-``TRTLLM_NVLS_AR_FENCE_SYS=1`` uses the system-scope fence of the PTX memory
-model instead (slower).
+How the input stores of step 1 are ordered before the other ranks' reads of
+step 3 depends on the arrival protocol (``TRTLLM_NVLS_AR_PROTOCOL``):
 
-Step 4 needs no fence: the output buffer is a Lamport buffer. A rank re-arms an
-output row only after reading the single store each slice receives per call,
-and the next store into that row follows the next call's arrival, which this
-rank makes only after this call's kernel (re-arming included) has finished.
-The input buffer is rewritten by the next call only after every slice of this
-call has arrived, i.e. after every reducer has read it.
+* ``gpu`` (default): every program (pipelined kernel: every stager, per chunk)
+  arrives after a GPU-scope fence. The PTX memory model does not order the
+  input stores before another GPU's reads with a GPU-scope fence; it works
+  because the switch reads the input through this GPU's L2.
+* ``sys``: the same with a system-scope fence (``TRTLLM_NVLS_AR_FENCE_SYS=1``
+  also selects it). The input is written through the unicast address and read
+  through the multicast one, an alias, with no proxy fence in between.
+* ``ptx``: follows the PTX memory model. The whole input is in the input buffer
+  before the call's first arrival: a producer wrote it there
+  (``input_buffer``), a copy kernel puts it there
+  (``TRTLLM_NVLS_AR_PTX_STAGING=copy``, the default), or the pipelined
+  kernel's stagers copy it and the last one to finish publishes (``once``).
+  One thread per call and rank then publishes all of it: ``fence.proxy.alias``
+  (the input was written through the unicast alias of the multicast address),
+  ``fence.acq_rel.sys`` (release to the other GPUs) and a relaxed
+  ``multimem.red`` on every flag, which the waiters read with
+  ``ld.acquire.sys``. The one-shot kernel's publisher also polls its own flag,
+  so it orders its multicast reductions before those unicast loads with
+  another ``fence.proxy.alias``, as in the CUDA Programming Guide's multicast
+  example. A system-scope fence costs about 1 us on a quiet GPU but 8 to over
+  100 us while the GPU has multicast stores or reductions in flight (its own;
+  traffic from other GPUs does not slow it), which is why the protocol
+  publishes once per call before this GPU issues any multicast traffic of the
+  call. ``TRTLLM_NVLS_AR_PTX_STAGING=inline`` publishes per program / chunk
+  instead (correct, but slow for that reason).
+
+Step 4 needs no fence: the output buffer is a Lamport buffer. The polling loads
+are 32-bit system-scope (volatile) loads of the 32-bit elements of the
+multicast stores, so a non-sentinel word is the store of this call: the rank
+re-armed the word in the previous call after reading that call's store (which
+orders the store before the re-arm), and the next store into the word follows
+the next call's arrival, which this rank makes only after this call's kernel
+(re-arming included) has finished. The input buffer is rewritten by the next
+call only after every slice of this call has arrived, i.e. after every
+reducer has read it (each reducer stores its sums only after its reduction
+returned them).
 
 The barrier target comes from a per-program call counter kept on the rank, so
 the kernel keeps no host state and replays inside CUDA graphs. Every rank
@@ -110,52 +137,59 @@ _FIRST_CALL_LOGGED = set()
 _SENTINEL_BITS = -1
 _SENTINEL: tl.constexpr = tl.constexpr(_SENTINEL_BITS)
 
+# Arrival protocols (TRTLLM_NVLS_AR_PROTOCOL; see the module docstring) and the
+# fences that precede their arrival reductions.
+PROTOCOLS = ("gpu", "sys", "ptx")
+_ARRIVE_FENCES = {
+    "gpu": "fence.acq_rel.gpu;",
+    "sys": "fence.acq_rel.sys;",
+    "ptx": "fence.proxy.alias;\nfence.acq_rel.sys;",
+}
+
+
+def _arrive_asm(protocol: str, post_alias: bool) -> str:
+    """PTX of an arrival by thread 0: the fences of ``protocol``, then ``$2``
+    reductions (adding 1 on every rank) at a stride of ``$3`` bytes from ``$1``.
+    With ``post_alias``, a proxy fence orders these multicast reductions before
+    the thread's later unicast loads of the flags."""
+    red = "multimem.red.relaxed.sys"
+    tail = "fence.proxy.alias;" if post_alias else ""
+    return f"""
+    {{
+    .reg .u32 %ltid, %n;
+    .reg .u64 %a;
+    .reg .pred %p_skip, %p_end;
+    mov.u32 %ltid, %tid.x;
+    mov.u32 $0, 0;
+    setp.ne.u32 %p_skip, %ltid, 0;
+    @%p_skip bra NVLS_ARRIVE_DONE;
+    {_ARRIVE_FENCES[protocol]}
+    mov.u64 %a, $1;
+    mov.u32 %n, $2;
+    NVLS_ARRIVE_LOOP:
+    {red}.global.add.u32 [%a], 1;
+    add.u64 %a, %a, $3;
+    sub.u32 %n, %n, 1;
+    setp.ne.u32 %p_end, %n, 0;
+    @%p_end bra NVLS_ARRIVE_LOOP;
+    {tail}
+    NVLS_ARRIVE_DONE:
+    }}
+    """
+
 
 @triton.jit
-def _arrive(flag_mc_addr, FENCE_SYS: tl.constexpr):
-    """Thread 0: publish the CTA's staged input and add 1 to the flag on every rank."""
-    if FENCE_SYS:
-        return tl.inline_asm_elementwise(
-            """
-            {
-            .reg .u32 %ltid;
-            .reg .pred %p_skip;
-            mov.u32 %ltid, %tid.x;
-            mov.u32 $0, 0;
-            setp.ne.u32 %p_skip, %ltid, 0;
-            @%p_skip bra NVLS_ARRIVE_DONE;
-            fence.acq_rel.sys;
-            multimem.red.relaxed.sys.global.add.u32 [$1], 1;
-            NVLS_ARRIVE_DONE:
-            }
-            """,
-            "=r,l,~{memory}",
-            args=[flag_mc_addr],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
-    else:
-        return tl.inline_asm_elementwise(
-            """
-            {
-            .reg .u32 %ltid;
-            .reg .pred %p_skip;
-            mov.u32 %ltid, %tid.x;
-            mov.u32 $0, 0;
-            setp.ne.u32 %p_skip, %ltid, 0;
-            @%p_skip bra NVLS_ARRIVE_DONE;
-            fence.acq_rel.gpu;
-            multimem.red.relaxed.sys.global.add.u32 [$1], 1;
-            NVLS_ARRIVE_DONE:
-            }
-            """,
-            "=r,l,~{memory}",
-            args=[flag_mc_addr],
-            dtype=tl.uint32,
-            is_pure=False,
-            pack=1,
-        )
+def _arrive(flag_mc_addr, count, stride, ASM: tl.constexpr):
+    """Thread 0: publish the input staged so far and add 1 to ``count`` (>= 1) flags
+    ``stride`` bytes apart on every rank (``ASM`` from ``_arrive_asm``)."""
+    return tl.inline_asm_elementwise(
+        ASM,
+        "=r,l,r,l,~{memory}",
+        args=[flag_mc_addr, count.to(tl.uint32), stride.to(tl.int64)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -240,6 +274,62 @@ def _no_sentinel(v):
     return lo | (hi << 16)
 
 
+def _publish_last_asm(protocol: str) -> str:
+    """PTX of a single publish by the last of ``$2`` arriving CTAs (thread 0 of each).
+
+    Thread 0 adds 1 to the local counter ``$1`` with acquire-release semantics at GPU
+    scope (releasing the CTA's staged input, which the preceding CTA barrier made
+    visible to it). The last arrival resets the counter, then publishes the input of
+    all CTAs with the fences of ``protocol`` and adds 1 to the ``$4`` flags at ``$3``
+    (``$5`` bytes apart) on every rank.
+    """
+    return f"""
+    {{
+    .reg .u32 %ltid, %n, %old, %last;
+    .reg .u64 %a;
+    .reg .pred %p_skip, %p_end;
+    mov.u32 %ltid, %tid.x;
+    mov.u32 $0, 0;
+    setp.ne.u32 %p_skip, %ltid, 0;
+    @%p_skip bra NVLS_PUBLISH_DONE;
+    atom.acq_rel.gpu.global.add.u32 %old, [$1], 1;
+    sub.u32 %last, $2, 1;
+    setp.ne.u32 %p_skip, %old, %last;
+    @%p_skip bra NVLS_PUBLISH_DONE;
+    st.relaxed.gpu.global.u32 [$1], 0;
+    {_ARRIVE_FENCES[protocol]}
+    mov.u64 %a, $3;
+    mov.u32 %n, $4;
+    NVLS_PUBLISH_LOOP:
+    multimem.red.relaxed.sys.global.add.u32 [%a], 1;
+    add.u64 %a, %a, $5;
+    sub.u32 %n, %n, 1;
+    setp.ne.u32 %p_end, %n, 0;
+    @%p_end bra NVLS_PUBLISH_LOOP;
+    NVLS_PUBLISH_DONE:
+    }}
+    """
+
+
+@triton.jit
+def _publish_last(cnt_addr, n_arrivals, flag_mc_addr, n_flags, stride, ASM: tl.constexpr):
+    """Thread 0: arrive on the local counter; the last of ``n_arrivals`` publishes."""
+    return tl.inline_asm_elementwise(
+        ASM,
+        "=r,l,r,l,r,l,~{memory}",
+        args=[
+            cnt_addr,
+            n_arrivals.to(tl.uint32),
+            flag_mc_addr,
+            n_flags.to(tl.uint32),
+            stride.to(tl.int64),
+        ],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
 @triton.jit(do_not_specialize=["rank", "num_rows"])
 def _nvls_allreduce_kernel(
     inp_ptr,
@@ -255,31 +345,49 @@ def _nvls_allreduce_kernel(
     num_rows,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    BLOCK_V: tl.constexpr,
     ROWS: tl.constexpr,
     VEC_BLOCK: tl.constexpr,
     FLAG_SPACING: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    FENCE_SYS: tl.constexpr,
+    ARRIVE_ASM: tl.constexpr,
+    ZERO_COPY: tl.constexpr,
+    PUBLISH_ONCE: tl.constexpr,
+    POLL16: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
+    """One-shot kernel. ``inp_ptr`` / ``in_buf_ptr`` are int16 views (one BF16 value
+    per element); ``out_ptr`` / ``out_buf_ptr`` are int16 or int32 views (``POLL16``).
+
+    ``ZERO_COPY``: the rows are already in the input buffer (written by an earlier
+    kernel). ``PUBLISH_ONCE`` (needs ``ZERO_COPY``): program 0 arrives on the flags
+    of all programs at once instead of every program on its own.
+    """
     pid = tl.program_id(0)
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
     epoch = tl.load(epoch_ptr + pid).to(tl.uint32)
 
     rows = pid * ROWS + tl.arange(0, ROWS)
-    cols = tl.arange(0, BLOCK_H)
-    mask = (rows[:, None] < num_rows) & (cols[None, :] < H)
-    offs = rows.to(tl.int64)[:, None] * H + cols[None, :]
 
     # 1. Stage this program's rows in the rank's input buffer.
-    x = tl.load(inp_ptr + offs, mask=mask)
-    tl.store(in_buf_ptr + offs, x, mask=mask)
-    tl.debug_barrier()
+    if not ZERO_COPY:
+        cols_h = tl.arange(0, BLOCK_H)
+        mask_h = (rows[:, None] < num_rows) & (cols_h[None, :] < H)
+        offs_h = rows.to(tl.int64)[:, None] * H + cols_h[None, :]
+        x = tl.load(inp_ptr + offs_h, mask=mask_h)
+        tl.store(in_buf_ptr + offs_h, x, mask=mask_h)
+        tl.debug_barrier()
 
     # 2. Wait until every rank has staged these rows.
     flag_off = pid.to(tl.int64) * (FLAG_SPACING * 4)
-    _arrive(flag_mc_addr + flag_off, FENCE_SYS)
+    if PUBLISH_ONCE:
+        if pid == 0:
+            _arrive(
+                flag_mc_addr, tl.cdiv(num_rows, ROWS), flag_off * 0 + FLAG_SPACING * 4, ARRIVE_ASM
+            )
+    else:
+        _arrive(flag_mc_addr + flag_off, pid * 0 + 1, flag_off * 0, ARRIVE_ASM)
     _wait(flag_uc_addr + flag_off, (epoch + 1) * WORLD_SIZE)
     tl.debug_barrier()
 
@@ -308,13 +416,41 @@ def _nvls_allreduce_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     # 4. Wait for the rows in the local output buffer, copy them out, re-arm.
-    y = tl.load(out_buf_ptr + offs, mask=mask, other=0, volatile=True)
-    pending = tl.max(tl.max(((y == _SENTINEL) & mask).to(tl.int32), axis=1), axis=0)
-    while pending != 0:
-        y = tl.load(out_buf_ptr + offs, mask=mask, other=0, volatile=True)
-        pending = tl.max(tl.max(((y == _SENTINEL) & mask).to(tl.int32), axis=1), axis=0)
-    tl.store(out_ptr + offs, y, mask=mask)
-    tl.store(out_buf_ptr + offs, tl.full([ROWS, BLOCK_H], _SENTINEL, tl.int16), mask=mask)
+    #    POLL16: 16-bit polling loads (``out_ptr`` / ``out_buf_ptr`` int16 views).
+    #    Otherwise 32-bit ones, the element size of the multicast stores (int32
+    #    views), in 16-byte vectors.
+    if POLL16:
+        cols16 = tl.arange(0, BLOCK_H)
+        mask16 = (rows[:, None] < num_rows) & (cols16[None, :] < H)
+        offs16 = rows.to(tl.int64)[:, None] * H + cols16[None, :]
+        y = tl.load(out_buf_ptr + offs16, mask=mask16, other=0, volatile=True)
+        pending = tl.max(tl.max(((y == _SENTINEL) & mask16).to(tl.int32), axis=1), axis=0)
+        while pending != 0:
+            y = tl.load(out_buf_ptr + offs16, mask=mask16, other=0, volatile=True)
+            pending = tl.max(tl.max(((y == _SENTINEL) & mask16).to(tl.int32), axis=1), axis=0)
+        tl.store(out_ptr + offs16, y, mask=mask16)
+        tl.store(out_buf_ptr + offs16, tl.full([ROWS, BLOCK_H], _SENTINEL, tl.int16), mask=mask16)
+    else:
+        # Wait on the first word of every rank's slice before reading the rows,
+        # so that waiting costs little L2 bandwidth.
+        SLICES: tl.constexpr = triton.next_power_of_2(WORLD_SIZE)
+        k = tl.arange(0, SLICES)
+        pm = (k < WORLD_SIZE) & (k * share < total)
+        _spin_while_sentinel(out_buf_ptr + ((pid * ROWS * VPR).to(tl.int64) + k * share) * 4, pm)
+        tl.debug_barrier()
+        # [16-byte vector, 32-bit word] tile over the program's rows.
+        vv = tl.arange(0, ROWS * BLOCK_V)
+        r_v = pid * ROWS + vv // BLOCK_V
+        v_r = vv % BLOCK_V
+        vmask = ((r_v < num_rows) & (v_r < VPR))[:, None]
+        offs = (r_v.to(tl.int64) * VPR + v_r)[:, None] * 4 + tl.arange(0, 4)[None, :]
+        y = tl.load(out_buf_ptr + offs, mask=vmask, other=0, volatile=True)
+        pending = tl.max(tl.max((_has_sentinel(y) & vmask).to(tl.int32), axis=1), axis=0)
+        while pending != 0:
+            y = tl.load(out_buf_ptr + offs, mask=vmask, other=0, volatile=True)
+            pending = tl.max(tl.max((_has_sentinel(y) & vmask).to(tl.int32), axis=1), axis=0)
+        tl.store(out_ptr + offs, y, mask=vmask)
+        tl.store(out_buf_ptr + offs, tl.full([ROWS * BLOCK_V, 4], -1, tl.int32), mask=vmask)
     tl.store(epoch_ptr + pid, (epoch + 1).to(tl.int32))
 
 
@@ -378,6 +514,7 @@ def _nvls_allreduce_v2_kernel(
     flag_mc_addr,
     epoch_ptr,
     dbg_ptr,
+    cnt_ptr,
     rank,
     n_vec,
     ch,
@@ -392,6 +529,10 @@ def _nvls_allreduce_v2_kernel(
     PROBE: tl.constexpr,
     FLAG_SPACING: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    ARRIVE_ASM: tl.constexpr,
+    ZERO_COPY: tl.constexpr,
+    PUBLISH_ONCE: tl.constexpr,
+    PUBLISH_ASM: tl.constexpr,
     USE_PDL: tl.constexpr,
     DEBUG: tl.constexpr,
 ):
@@ -403,7 +544,9 @@ def _nvls_allreduce_v2_kernel(
     of persistent programs walk the chunks in order:
 
     * stagers (``p_a`` programs, chunks ``pid, pid + p_a, ...``) copy a chunk
-      into this rank's input buffer and arrive on the chunk's flag;
+      into this rank's input buffer and arrive on the chunk's flag (with
+      ``PUBLISH_ONCE``, the last stager to finish arrives on all chunks' flags;
+      with ``ZERO_COPY`` too, a single stager does that without copying);
     * reducers (``p_r`` programs) take ``GROUP`` consecutive chunks at a time,
       wait until every rank has arrived on them, reduce this rank's slices in
       the switch and multicast the sums into every rank's output buffer;
@@ -426,23 +569,59 @@ def _nvls_allreduce_v2_kernel(
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
     FLAG_BYTES: tl.constexpr = FLAG_SPACING * 4
-    if pid < p_a:
+    if PUBLISH_ONCE:
+        if pid < p_a:
+            # Every stager copies its chunks; the last one to finish publishes all
+            # chunks at once (one set of fences per call and rank).
+            if ZERO_COPY:
+                # A single stager (p_a == 1): the input is in place, publish it.
+                _arrive(flag_mc_addr, n_chunks, p_a.to(tl.int64) * 0 + FLAG_BYTES, ARRIVE_ASM)
+            else:
+                for c in range(pid, n_chunks, p_a):
+                    c0 = c * ch
+                    c1 = tl.minimum(c0 + ch, n_vec)
+                    for b in range(c0, c1, CB):
+                        v = b + tl.arange(0, CB)
+                        m = (v < c1)[:, None]
+                        offs = v.to(tl.int64)[:, None] * 4 + tl.arange(0, 4)[None, :]
+                        x = tl.load(inp_ptr + offs, mask=m)
+                        tl.store(in_buf_ptr + offs, x, mask=m)
+                tl.debug_barrier()
+                _publish_last(
+                    cnt_ptr,
+                    p_a,
+                    flag_mc_addr,
+                    n_chunks,
+                    p_a.to(tl.int64) * 0 + FLAG_BYTES,
+                    PUBLISH_ASM,
+                )
+            if DEBUG:
+                tl.store(dbg_ptr + pid * 8, _globaltimer(pid))
+            if USE_PDL:
+                tl.extra.cuda.gdc_launch_dependents()
+    elif pid < p_a:
         for c in range(pid, n_chunks, p_a):
-            c0 = c * ch
-            c1 = tl.minimum(c0 + ch, n_vec)
-            for b in range(c0, c1, CB):
-                v = b + tl.arange(0, CB)
-                m = (v < c1)[:, None]
-                offs = v.to(tl.int64)[:, None] * 4 + tl.arange(0, 4)[None, :]
-                x = tl.load(inp_ptr + offs, mask=m)
-                tl.store(in_buf_ptr + offs, x, mask=m)
-            tl.debug_barrier()
-            _arrive(flag_mc_addr + c.to(tl.int64) * FLAG_BYTES, False)
+            if not ZERO_COPY:
+                c0 = c * ch
+                c1 = tl.minimum(c0 + ch, n_vec)
+                for b in range(c0, c1, CB):
+                    v = b + tl.arange(0, CB)
+                    m = (v < c1)[:, None]
+                    offs = v.to(tl.int64)[:, None] * 4 + tl.arange(0, 4)[None, :]
+                    x = tl.load(inp_ptr + offs, mask=m)
+                    tl.store(in_buf_ptr + offs, x, mask=m)
+                tl.debug_barrier()
+            _arrive(
+                flag_mc_addr + c.to(tl.int64) * FLAG_BYTES,
+                c * 0 + 1,
+                c.to(tl.int64) * 0,
+                ARRIVE_ASM,
+            )
             if DEBUG:
                 tl.store(dbg_ptr + c * 8, _globaltimer(c))
         if USE_PDL:
             tl.extra.cuda.gdc_launch_dependents()
-    elif pid < p_a + p_r:
+    if pid >= p_a and pid < p_a + p_r:
         # RTILE >= threads: a smaller tile would be replicated across threads,
         # and every multimem instruction must run exactly once per vector.
         lane = tl.arange(0, RTILE)
@@ -481,7 +660,7 @@ def _nvls_allreduce_v2_kernel(
                         tl.store(dbg_ptr + c * 8 + 2, _globaltimer(c))
         if USE_PDL:
             tl.extra.cuda.gdc_launch_dependents()
-    else:
+    elif pid >= p_a + p_r:
         SLICES: tl.constexpr = triton.next_power_of_2(WORLD_SIZE)
         k = tl.arange(0, SLICES)
         for c in range(pid - p_a - p_r, n_chunks, p_c):
@@ -511,6 +690,22 @@ def _nvls_allreduce_v2_kernel(
                 tl.store(dbg_ptr + c * 8 + 3, _globaltimer(c))
         if USE_PDL:
             tl.extra.cuda.gdc_launch_dependents()
+
+
+def _resolve_protocol(protocol: Optional[str], fence_sys: Optional[bool]) -> str:
+    """The arrival protocol: argument, else TRTLLM_NVLS_AR_PROTOCOL, else the legacy
+    TRTLLM_NVLS_AR_FENCE_SYS switch (1: ``sys``), else ``gpu``."""
+    if protocol is None and fence_sys is not None:
+        protocol = "sys" if fence_sys else "gpu"
+    if protocol is None:
+        protocol = os.environ.get("TRTLLM_NVLS_AR_PROTOCOL")
+    if protocol is None:
+        protocol = "sys" if os.environ.get("TRTLLM_NVLS_AR_FENCE_SYS", "0") == "1" else "gpu"
+    if protocol not in PROTOCOLS:
+        raise ValueError(
+            f"TRTLLM_NVLS_AR_PROTOCOL must be one of {sorted(PROTOCOLS)}, got {protocol!r}"
+        )
+    return protocol
 
 
 class _MulticastBuffer:
@@ -610,6 +805,8 @@ class NVLSAllReduce:
         fence_sys: Optional[bool] = None,
         version: Optional[int] = None,
         v2_config: Optional[Dict[str, int]] = None,
+        protocol: Optional[str] = None,
+        ptx_staging: Optional[str] = None,
     ):
         self.mapping = mapping
         self.world_size = mapping.tp_size
@@ -617,9 +814,21 @@ class NVLSAllReduce:
         self.max_bytes = max_bytes or NVLS_AR_MAX_BYTES
         self.rows_per_program = rows_per_program or int(os.environ.get("TRTLLM_NVLS_AR_ROWS", "1"))
         self.num_warps = num_warps or int(os.environ.get("TRTLLM_NVLS_AR_WARPS", "8"))
-        if fence_sys is None:
-            fence_sys = os.environ.get("TRTLLM_NVLS_AR_FENCE_SYS", "0") == "1"
-        self.fence_sys = fence_sys
+        self.protocol = _resolve_protocol(protocol, fence_sys)
+        # Under "ptx", the one-shot kernel's thread 0 polls (unicast) the flag it has
+        # just reduced into through the multicast address.
+        self._arrive_asm_v1 = _arrive_asm(self.protocol, self.protocol == "ptx")
+        self._arrive_asm_v2 = _arrive_asm(self.protocol, False)
+        self._publish_asm = _publish_last_asm(self.protocol)
+        # How the "ptx" protocol stages the input: "copy" (a copy kernel, then one
+        # publish per call), "once" (the pipelined kernel's stagers copy, the last one
+        # publishes once; the one-shot kernel uses "copy"), "inline" (every program /
+        # chunk publishes its own rows).
+        self.ptx_staging = ptx_staging or os.environ.get("TRTLLM_NVLS_AR_PTX_STAGING", "copy")
+        if self.ptx_staging not in ("copy", "once", "inline"):
+            raise ValueError(
+                f"TRTLLM_NVLS_AR_PTX_STAGING must be copy, once or inline, got {self.ptx_staging!r}"
+            )
         if version is None:
             version = 2 if os.environ.get("TRTLLM_NVLS_AR_V2", "0") == "1" else 1
         self.version = version
@@ -647,9 +856,10 @@ class NVLSAllReduce:
         else:
             kernels = "one-shot kernel (v1)"
         logger.info_once(
-            f"[NVLS AR] active on tp_size={self.world_size}: {kernels}; AllReduce routes plain "
+            f"[NVLS AR] active on tp_size={self.world_size}: {kernels}, protocol "
+            f"{self.protocol}; AllReduce routes plain "
             f"BF16 sums of [{NVLS_AR_MIN_BYTES}, {NVLS_AR_MAX_BYTES}] bytes here ({__file__})",
-            key=("nvls_ar_active", self.world_size, self.version),
+            key=("nvls_ar_active", self.world_size, self.version, self.protocol),
         )
 
     @staticmethod
@@ -689,6 +899,8 @@ class NVLSAllReduce:
         # to this rank.
         epoch = torch.zeros(cls.MAX_PROGRAMS, dtype=torch.int32, device="cuda")
         epoch_v2 = torch.zeros(cls.MAX_PROGRAMS, dtype=torch.int32, device="cuda")
+        # Arrivals of the pipelined kernel's stagers in the current call (publish once).
+        stage_cnt = torch.zeros(1, dtype=torch.int32, device="cuda")
         torch.cuda.synchronize()
         comm.Barrier()
         ws = {
@@ -699,6 +911,7 @@ class NVLSAllReduce:
             "flags": flags,
             "epoch": epoch,
             "epoch_v2": epoch_v2,
+            "stage_cnt": stage_cnt,
             "data_bytes": data_bytes,
             "in_mc_addr": buf.mc_ptr,
             "out_mc_addr": buf.mc_ptr + data_bytes,
@@ -713,6 +926,16 @@ class NVLSAllReduce:
         )
         cls._workspaces[key] = ws
         return ws
+
+    def input_buffer(self, shape: Tuple[int, ...]) -> torch.Tensor:
+        """BF16 view of this rank's input buffer: a producer that writes the input here
+        saves the all-reduce its input copy (the call must pass this tensor)."""
+        numel = math.prod(shape)
+        if numel * 2 > self._ws["data_bytes"]:
+            raise ValueError(
+                f"NVLS input buffer holds {self._ws['data_bytes']} bytes, {numel * 2} requested"
+            )
+        return self._ws["in_buf"][:numel].view(torch.bfloat16).view(shape)
 
     def can_use(self, inp: torch.Tensor) -> bool:
         if inp.dtype != torch.bfloat16 or not inp.is_contiguous() or inp.dim() == 0:
@@ -748,15 +971,25 @@ class NVLSAllReduce:
                 f"[NVLS AR] first {'pipelined (v2)' if use_v2 else 'one-shot (v1)'} kernel "
                 f"call{capturing}: shape {tuple(inp.shape)}, {inp.numel() * 2} bytes"
             )
+        zero_copy = inp.data_ptr() == ws["in_buf"].data_ptr()
+        publish_once = False
+        if self.protocol == "ptx" and self.ptx_staging != "inline":
+            if not zero_copy and (self.ptx_staging == "copy" or not use_v2):
+                ws["in_buf"][: inp.numel()].copy_(inp.view(torch.int16).reshape(-1))
+                zero_copy = True
+            publish_once = True
         if use_v2:
-            self._launch_v2(inp, out)
+            self._launch_v2(inp, out, zero_copy, publish_once)
             return out
         rpp = self.rows_per_program
+        # The "ptx" protocol polls 32-bit words (the element size of the multicast
+        # stores); the other protocols keep 16-bit polling.
+        poll16 = self.protocol != "ptx"
         _nvls_allreduce_kernel[(triton.cdiv(rows, rpp),)](
             inp.view(torch.int16),
-            out.view(torch.int16),
+            out.view(torch.int16 if poll16 else torch.int32),
             ws["in_buf"],
-            ws["out_buf"],
+            ws["out_buf"].view(torch.int16 if poll16 else torch.int32),
             ws["in_mc_addr"],
             ws["out_mc_addr"],
             ws["flag_uc_addr"],
@@ -766,18 +999,24 @@ class NVLSAllReduce:
             rows,
             H=hidden,
             BLOCK_H=triton.next_power_of_2(hidden),
+            BLOCK_V=triton.next_power_of_2(hidden // 8),
             ROWS=rpp,
             VEC_BLOCK=64 * self.num_warps,
             FLAG_SPACING=self.FLAG_SPACING,
             WORLD_SIZE=self.world_size,
-            FENCE_SYS=self.fence_sys,
+            ARRIVE_ASM=self._arrive_asm_v1,
+            ZERO_COPY=zero_copy,
+            PUBLISH_ONCE=publish_once,
+            POLL16=poll16,
             USE_PDL=self.use_pdl,
             num_warps=self.num_warps,
             launch_pdl=self.use_pdl,
         )
         return out
 
-    def _launch_v2(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+    def _launch_v2(
+        self, inp: torch.Tensor, out: torch.Tensor, zero_copy: bool, publish_once: bool
+    ) -> None:
         ws = self._ws
         cfg = self.v2
         n_vec = inp.numel() // 8
@@ -786,7 +1025,7 @@ class NVLSAllReduce:
         threads = 32 * cfg["warps"]
         vrt = triton.next_power_of_2(triton.cdiv(ch, self.world_size))
         group = max(1, min(cfg["group"], threads // vrt))
-        p_a = min(n_chunks, cfg["stagers"])
+        p_a = 1 if zero_copy and publish_once else min(n_chunks, cfg["stagers"])
         p_r = min(triton.cdiv(n_chunks, group), cfg["reducers"])
         p_c = min(n_chunks, cfg["drainers"])
         debug = self.debug_timestamps is not None
@@ -801,6 +1040,7 @@ class NVLSAllReduce:
             ws["flag_v2_mc_addr"],
             ws["epoch_v2"],
             self.debug_timestamps if debug else ws["epoch_v2"],
+            ws["stage_cnt"],
             self.rank,
             n_vec,
             ch,
@@ -815,6 +1055,10 @@ class NVLSAllReduce:
             PROBE=bool(cfg["probe"]),
             FLAG_SPACING=self.FLAG_SPACING,
             WORLD_SIZE=self.world_size,
+            ARRIVE_ASM=self._arrive_asm_v2,
+            ZERO_COPY=zero_copy,
+            PUBLISH_ONCE=publish_once,
+            PUBLISH_ASM=self._publish_asm,
             USE_PDL=self.use_pdl,
             DEBUG=debug,
             num_warps=cfg["warps"],
