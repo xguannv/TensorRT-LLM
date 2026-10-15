@@ -159,6 +159,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reduction_col_split: int = 1,
         aligned_segment_cost: int = -1,
         bf16_partials: bool = False,
+        k_stages: int = 2,
+        p_stages: int = 3,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -239,6 +241,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             the partials then carry one BF16 rounding, like the per-rank O
             the Helix merge combines). The partial LSE stays FP32.
         :type bf16_partials: bool
+        :param k_stages: Shared-memory stages of the K tiles (Q*K^T
+            operands). With 3 the load warp runs one K tile further ahead, and
+            a segment's first K tiles load during the previous segment.
+        :type k_stages: int
+        :param p_stages: Shared-memory stages of P (softmax output, P*V
+            operand), 2 or ``mma_lookahead + 1`` (3). With 2 the softmax
+            writes P once P*V has read the stage two K tiles back.
+        :type p_stages: int
         """
 
         self.latent_dim = 512
@@ -275,6 +285,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if bf16_partials and not balanced_split:
             raise ValueError("bf16_partials needs the balanced split.")
         self.partial_dtype = cutlass.BFloat16 if bf16_partials else acc_dtype
+        if k_stages < 2 or p_stages not in (2, 3):
+            raise ValueError("k_stages must be >= 2 and p_stages 2 or 3, got "
+                             f"{k_stages}, {p_stages}.")
+        self.k_stages = k_stages
+        self.p_stages = p_stages
         self.reduction_unroll = reduction_unroll
         self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
@@ -403,7 +418,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         self.load_q_stage = 1
-        self.load_k_stage = 2
+        self.load_k_stage = self.k_stages
         self.load_v_stage = 2
         # The MMA warp issues Q*K^T of K tile j + mma_lookahead before P*V of
         # tile j, so the softmax and the O rescale of tile j overlap two
@@ -411,7 +426,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # need one buffer per tile in flight.
         self.mma_lookahead = 2
         self.mma_s_stage = self.mma_lookahead + 1
-        self.p_mma_stage = self.mma_lookahead + 1
+        self.p_mma_stage = self.p_stages
         self.p_cor_stage = self.mma_lookahead + 1
         self.mma_o_stage = 2
 
@@ -989,23 +1004,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         @cute.struct
         class SplitKVKernelSharedStorage:
-            # Pipeline barriers
-            load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                  self.load_q_stage * 2]
-            load_k_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                  self.load_k_stage * 2]
-            load_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                  self.load_v_stage * 2]
-            mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                 self.mma_s_stage * 2]
-            p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                 self.p_mma_stage * 2]
-            p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                 self.p_cor_stage * 2]
-            mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
-                                                 self.mma_o_stage * 2]
-
-            # Smem tensors
+            # Smem tensors (the 1024-byte aligned buffers first: the members
+            # after them need no alignment padding)
             smem_p: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype,
                                      cute.cosize(p_smem_layout_staged)],
@@ -1037,6 +1037,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                      cute.cosize(vc_smem_layout_staged)],
                 1024,
             ]
+
+            # Pipeline barriers
+            load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                  self.load_q_stage * 2]
+            load_k_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                  self.load_k_stage * 2]
+            load_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                  self.load_v_stage * 2]
+            mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                 self.mma_s_stage * 2]
+            p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                 self.p_mma_stage * 2]
+            p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                 self.p_cor_stage * 2]
+            mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64,
+                                                 self.mma_o_stage * 2]
+
             softmax_smem_exchange: cute.struct.MemRange[self.acc_dtype,
                                                         self.num_compute_warps *
                                                         self.threads_per_warp]
@@ -1057,6 +1074,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
 
+        smem_bytes = SplitKVKernelSharedStorage.size_in_bytes()
+        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        if cutlass.const_expr(smem_bytes > smem_capacity):
+            raise ValueError(
+                f"MLA decode shared storage of {smem_bytes} bytes exceeds the "
+                f"{smem_capacity} available (k_stages={self.k_stages}, "
+                f"p_stages={self.p_stages}, balanced_max_requests="
+                f"{self.balanced_max_requests}).")
         if cutlass.const_expr(self.emit_softmax_stats):
             split_kv_kernel = self.split_kv_kernel(
                 qk_tiled_mma,
@@ -1734,6 +1759,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        k_tile_total=self._work_k_total(work_tile, cache_seqs),
                         kv_bounds=kv_bounds,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
@@ -2350,6 +2376,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             return work_tile.k_index, work_tile.k_count, cutlass.Int32(1)
         return self.get_k_tile_count(split_kv, cache_seqs, block_split_kvs,
                                      work_tile.tile_idx)
+
+    def _work_k_total(self, work_tile, cache_seqs):
+        """K tiles of the request of a work tile (the balanced schedule
+        carries it; else from the request's KV length)."""
+        if cutlass.const_expr(self.balanced_split):
+            return work_tile.k_total
+        return cute.ceil_div(cache_seqs[work_tile.tile_idx[2]],
+                             self.mma_qk_tiler[1])
 
     def _work_is_partial(self, work_tile):
         """Balanced split: whether the work tile is a partial of its M tile."""
@@ -3132,7 +3166,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
         """
 
-        k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
+        k_tile_total = common_params.k_tile_total
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            # The KV bound of this thread's S row (one row per thread), read
+            # once per segment ahead of the masked tiles.
+            common_params.row_k_bound = common_params.kv_bounds[
+                common_params.blk_coord[2] * self.seq_len_q +
+                self._row_q_token(common_params, softmax_params)]
 
         row_max = -self.acc_dtype.inf
         row_sum = self.acc_dtype(0)
@@ -3418,7 +3458,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32]
         """
 
-        softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
+        # With fewer P stages than K tiles in flight, the stage is acquired
+        # just before P is written.
+        late_p_acquire = self.p_mma_stage < self.mma_lookahead + 1
+        if cutlass.const_expr(not late_p_acquire):
+            softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
         softmax_params.mma_s_pipeline.consumer_wait(mma_s_consumer_state)
 
         # load S from tmem
@@ -3478,15 +3522,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     else:
                         q_tok = common_params.blk_coord[1]
                     if cutlass.const_expr(common_params.kv_bounds is not None):
-                        # Per-token rank-local bound; subsumes the causal
-                        # offset and non-owner ranks. fold_sq M-tile padding
-                        # rows derive q_tok >= S_q; their results are
-                        # discarded but the read must stay in bounds.
-                        q_tok_c = (q_tok if cute.elem_less(
-                            q_tok, self.seq_len_q) else self.seq_len_q - 1)
-                        k_bound = common_params.kv_bounds[
-                            common_params.blk_coord[2] * self.seq_len_q +
-                            q_tok_c]
+                        # Per-token rank-local bound (compute reads it for
+                        # the thread's row); subsumes the causal offset and
+                        # non-owner ranks.
+                        k_bound = common_params.row_k_bound
                     else:
                         if cutlass.const_expr(self.flat_fold_padded):
                             # Padding rows past H * S_q derive q_tok >= S_q;
@@ -3539,15 +3578,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     else:
                         q_tok = common_params.blk_coord[1]
                     if cutlass.const_expr(common_params.kv_bounds is not None):
-                        # Per-token rank-local bound; subsumes the causal
-                        # offset and non-owner ranks. fold_sq M-tile padding
-                        # rows derive q_tok >= S_q; their results are
-                        # discarded but the read must stay in bounds.
-                        q_tok_c = (q_tok if cute.elem_less(
-                            q_tok, self.seq_len_q) else self.seq_len_q - 1)
-                        k_bound = common_params.kv_bounds[
-                            common_params.blk_coord[2] * self.seq_len_q +
-                            q_tok_c]
+                        # Per-token rank-local bound (compute reads it for
+                        # the thread's row); subsumes the causal offset and
+                        # non-owner ranks.
+                        k_bound = common_params.row_k_bound
                     else:
                         if cutlass.const_expr(self.flat_fold_padded):
                             # Padding rows past H * S_q derive q_tok >= S_q;
@@ -3623,6 +3657,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # quantize
         tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
 
+        if cutlass.const_expr(late_p_acquire):
+            softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
         # create sP
         sP = softmax_params.sP[None, None, None,
                                (None, p_mma_producer_state.index)]
@@ -3707,6 +3743,38 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             row_sum,
             correction_factor,
         )
+
+    @cute.jit
+    def _row_q_token(self, common_params: SimpleNamespace,
+                     softmax_params: SimpleNamespace) -> cutlass.Int32:
+        """Query token of this softmax thread's S row (the TMEM lane it
+        loads), clamped to seq_len_q - 1 for M-tile padding rows."""
+        tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
+            cute.select(self.mma_qk_tiler, mode=[0, 1]))
+        tStS_fake = softmax_params.tiled_mma_qk.make_fragment_C(
+            cute.append(tStS_shape, self.mma_s_stage))
+        tStS = cute.make_tensor(common_params.tmem_ptr,
+                                tStS_fake.layout)[None, None, None, 0]
+        tAcc = tStS[(None, None), 0, 0]
+        cS = cute.make_identity_tensor(
+            (self.mma_qk_tiler[0] // self.cluster_shape_mnk[0],
+             self.mma_qk_tiler[1]))
+        tmem_tiled_copy = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                self.acc_dtype), tAcc)
+        tTR_tS = tmem_tiled_copy.get_slice(
+            common_params.tidx %
+            (self.num_compute_warps * self.threads_per_warp)).partition_D(cS)
+        cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
+        if cutlass.const_expr(self.fold_sq):
+            q_tok = (common_params.blk_coord[1] * self.fold_rows +
+                     tTR_tS[0][0] +
+                     common_params.blk_coord[0] * cta_m_rows) // self.num_heads
+        else:
+            q_tok = common_params.blk_coord[1]
+        return (q_tok if cute.elem_less(q_tok, self.seq_len_q) else
+                self.seq_len_q - 1)
 
     @cute.jit
     def _o_gmem_tile(self, common_params: SimpleNamespace, iter_n: int,

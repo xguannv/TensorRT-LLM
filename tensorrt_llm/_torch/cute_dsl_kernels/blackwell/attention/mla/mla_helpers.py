@@ -321,16 +321,19 @@ class MLABalancedWorkTileInfo:
 
     ``blk_coord`` is ``(cta_in_cluster, chunk, request, partial_slot)``; the
     segment covers K tiles ``[k_index, k_index + k_count)`` of that
-    (request, chunk) M tile. ``is_partial`` (Int32 0/1) is set when the segment
-    does not cover the whole M tile, i.e. its result is a split-KV partial.
+    (request, chunk) M tile, which has ``k_total`` K tiles. ``is_partial``
+    (Int32 0/1) is set when the segment does not cover the whole M tile, i.e.
+    its result is a split-KV partial.
     """
 
-    def __init__(self, blk_coord, is_valid, k_index, k_count, is_partial):
+    def __init__(self, blk_coord, is_valid, k_index, k_count, is_partial,
+                 k_total):
         self.blk_coord = blk_coord
         self.is_valid = cutlass.Boolean(is_valid)
         self.k_index = k_index
         self.k_count = k_count
         self.is_partial = is_partial
+        self.k_total = k_total
 
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.blk_coord)
@@ -338,16 +341,18 @@ class MLABalancedWorkTileInfo:
         values += cutlass.extract_mlir_values(self.k_index)
         values += cutlass.extract_mlir_values(self.k_count)
         values += cutlass.extract_mlir_values(self.is_partial)
+        values += cutlass.extract_mlir_values(self.k_total)
         return values
 
     def __new_from_mlir_values__(self, values):
-        n = len(values) - 4
+        n = len(values) - 5
         return MLABalancedWorkTileInfo(
             cutlass.new_from_mlir_values(self.blk_coord, values[:n]),
             cutlass.new_from_mlir_values(self.is_valid, [values[n]]),
             cutlass.new_from_mlir_values(self.k_index, [values[n + 1]]),
             cutlass.new_from_mlir_values(self.k_count, [values[n + 2]]),
             cutlass.new_from_mlir_values(self.is_partial, [values[n + 3]]),
+            cutlass.new_from_mlir_values(self.k_total, [values[n + 4]]),
         )
 
     @property
@@ -465,7 +470,8 @@ class MLABalancedTileScheduler:
 
     @cute.jit
     def _segment(self):
-        """(request, chunk, k_index, k_count, is_partial) of the segment at q.
+        """(request, chunk, k_index, k_count, is_partial, request K tiles) of
+        the segment at q.
 
         Every lane gets the same values (warp ballots and shuffles over the
         table entries the lanes hold, results marked warp-uniform).
@@ -516,7 +522,7 @@ class MLABalancedTileScheduler:
         is_partial = cutlass.Int32(0)
         if p > tile_begin or p + k_count < tile_end:
             is_partial = cutlass.Int32(1)
-        return lo, c, p - tile_begin, k_count, is_partial
+        return lo, c, p - tile_begin, k_count, is_partial, tile_end - tile_begin
 
     @cute.jit
     def owned_slots(self):
@@ -538,7 +544,7 @@ class MLABalancedTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> MLABalancedWorkTileInfo:
         """Work tile of the segment at q; also remembers its K-tile count and
         partial flag for ``advance_to_next_work``."""
-        b, c, k_index, k_count, is_partial = self._segment()
+        b, c, k_index, k_count, is_partial, k_total = self._segment()
         self.cur_k_count = k_count
         self.cur_is_partial = is_partial
         return MLABalancedWorkTileInfo(
@@ -547,6 +553,7 @@ class MLABalancedTileScheduler:
             k_index,
             k_count,
             is_partial,
+            k_total,
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):

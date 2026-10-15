@@ -8532,6 +8532,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Balanced split up to this many requests: small-batch kernel variant
         # (register schedule, one reduction CTA group per M tile).
         _SMALL_BATCH = 32
+        # Balanced split with a schedule table of up to this many requests:
+        # 3 K-tile stages and 2 P stages (see _fp8_kernel_options).
+        _DEEP_K_MAX_REQUESTS = 256
 
         @classmethod
         def _fp8_kernel_options(
@@ -8561,8 +8564,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             * balanced_max_requests (balanced split only): 32 up to
               ``_SMALL_BATCH`` requests, so the schedule is built and looked
               up in one warp's registers and the reduction runs one CTA group
-              per M tile, else the kernel's ``BALANCED_MAX_REQUESTS``. The
-              result does not depend on it.
+              per M tile, else the batch rounded up to a power of two, at
+              least 64 (the shared-memory schedule holds that many
+              requests). The result does not depend on it.
             * reduction_col_split (balanced split up to ``_SMALL_BATCH``
               requests): reduction CTAs per row group of an M tile, 2 up to 4
               requests, else 1 (the tiles of smaller batches are cut into
@@ -8578,6 +8582,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             * bf16_partials (balanced split): TRTLLM_MLA_PARTIAL_BF16=1 stores
               the split-KV partial O in BF16 (half the partial traffic; one
               more BF16 rounding of the partials). Default 0: FP32.
+            * k_stages, p_stages (balanced split): shared-memory stages of the
+              K tiles and of P. 3 and 2 while the schedule table holds at most
+              ``_DEEP_K_MAX_REQUESTS`` requests (the third K stage then fits
+              in shared memory), else 2 and 3; TRTLLM_MLA_K_STAGES and
+              TRTLLM_MLA_P_STAGES override them. The result does not depend
+              on them.
             """
             threshold = float(
                 os.environ.get("TRTLLM_MLA_RESCALE_THRESHOLD", "0"))
@@ -8622,15 +8632,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             if balanced_split:
                 kernel = BlackwellMultiHeadLatentAttentionForwardFP8
+                max_requests = (32 if small else min(
+                    kernel.BALANCED_MAX_REQUESTS,
+                    max(64, 1 << (batch_size - 1).bit_length())))
+                deep_k = max_requests <= cls._DEEP_K_MAX_REQUESTS
+                k_stages = int(
+                    os.environ.get("TRTLLM_MLA_K_STAGES", 3 if deep_k else 2))
+                p_stages = int(
+                    os.environ.get("TRTLLM_MLA_P_STAGES", 2 if deep_k else 3))
                 options += (
-                    ("balanced_max_requests",
-                     32 if small else kernel.BALANCED_MAX_REQUESTS),
+                    ("balanced_max_requests", max_requests),
                     ("reduction_col_split", col_split),
                     ("aligned_segment_cost",
                      int(os.environ.get("TRTLLM_MLA_ALIGNED_SPLIT", "-1"))
                      if small else -1),
                     ("bf16_partials",
                      os.environ.get("TRTLLM_MLA_PARTIAL_BF16", "0") == "1"),
+                    ("k_stages", k_stages),
+                    ("p_stages", p_stages),
                 )
             return options
 

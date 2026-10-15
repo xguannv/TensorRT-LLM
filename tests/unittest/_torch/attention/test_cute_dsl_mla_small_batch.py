@@ -17,11 +17,11 @@
 Up to 32 requests the runner compiles the balanced-split kernel with a
 register schedule (``balanced_max_requests=32``) and a reduction that runs one
 CTA group per M tile, optionally split by columns. The result must be BITWISE
-identical to the general variant (``balanced_max_requests=1024``, one reduction
-CTA group per partial slot) and must not depend on the column split. The
-opt-in request-aligned split (TRTLLM_MLA_ALIGNED_SPLIT) and BF16 partials
-(TRTLLM_MLA_PARTIAL_BF16) move the split-KV rounding only: they are checked
-against the fp32 reference and, where nothing changes, bitwise.
+identical to the general variant (a shared-memory schedule of 64 or more
+requests, one reduction CTA group per partial slot) and must not depend on the
+column split. The opt-in request-aligned split (TRTLLM_MLA_ALIGNED_SPLIT) and
+BF16 partials (TRTLLM_MLA_PARTIAL_BF16) move the split-KV rounding only: they
+are checked against the fp32 reference and, where nothing changes, bitwise.
 
 Requires 1 SM100/SM103 GPU and nvidia-cutlass-dsl.
 """
