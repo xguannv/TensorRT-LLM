@@ -38,6 +38,16 @@ N = 2048
 M_VALUES = (256, 384, 896, 133)
 
 
+def _fp8_weight_128x128_ue8m0(w: torch.Tensor):
+    """E4M3 weight with one power-of-two FP32 scale per 128x128 block (the DeepSeek recipe)."""
+    n, k = w.shape
+    blocks = w.float().view(n // 128, 128, k // 128, 128)
+    amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    w_fp8 = (blocks / scale).to(torch.float8_e4m3fn).view(n, k)
+    return w_fp8, scale.view(n // 128, k // 128)
+
+
 def _packed_scale_values(scale: torch.Tensor, m: int) -> torch.Tensor:
     """The ``[m, ceil(K / 512)]`` int32 words of a packed MN-major UE8M0 scale tensor."""
     return scale[:m].contiguous()
@@ -60,8 +70,7 @@ def test_cuda_and_triton_quantization_match(m):
 def test_pin_skips_tuning_and_runs_pinned_kernel(monkeypatch, pin, m):
     torch.manual_seed(m)
     x = torch.randn(m, K, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    w_scale = torch.rand(N // 128, K // 128, device="cuda", dtype=torch.float32) + 0.5
+    w, w_scale = _fp8_weight_128x128_ue8m0(torch.randn(N, K, device="cuda", dtype=torch.bfloat16))
 
     seen_tactics = []
     quantize = ops._fp8_quantize_1x128_ue8m0
@@ -81,9 +90,9 @@ def test_pin_skips_tuning_and_runs_pinned_kernel(monkeypatch, pin, m):
     monkeypatch.setattr(AutoTuner, "choose_one", recording_choose_one)
     monkeypatch.setattr(ops, "_FP8_QUANT_1X128_TACTIC", pin)
     with autotune():
-        torch.ops.trtllm.fp8_swap_ab_gemm(x, w, w_scale, disable_ue8m0_cast=True)
+        torch.ops.trtllm.fp8_swap_ab_gemm(x, w, w_scale)
     seen_tactics.clear()
-    out_pinned = torch.ops.trtllm.fp8_swap_ab_gemm(x, w, w_scale, disable_ue8m0_cast=True)
+    out_pinned = torch.ops.trtllm.fp8_swap_ab_gemm(x, w, w_scale)
 
     expected = (
         ops.Fp8QuantKernelRunner.TACTIC_TRITON
@@ -98,6 +107,7 @@ def test_pin_skips_tuning_and_runs_pinned_kernel(monkeypatch, pin, m):
         if pin == "triton"
         else ops.Fp8QuantKernelRunner.TACTIC_TRITON
     )
-    runner = ops.fp8SwapABGemmRunner(torch.bfloat16, True, quant_tactic=other)
+    runner = ops.fp8SwapABGemmRunner(torch.bfloat16, False, quant_tactic=other)
     out_other = runner(inputs=[x, w, w_scale], tactic=0)
+    assert torch.isfinite(out_pinned).all()
     assert torch.equal(out_pinned, out_other)
