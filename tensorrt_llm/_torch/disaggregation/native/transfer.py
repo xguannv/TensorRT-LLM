@@ -586,8 +586,16 @@ class Sender(SenderBase):
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
+
+        A context-first receiver sends REQUEST_DATA only to the ranks that hold
+        its request's KV cache, after the context phase produced it. When no
+        TxSession has claimed such an entry within the TTL, none ever will (the
+        session already ended, or the receiver names a request this rank never
+        had), so the receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
+        orphaned_infos: list[RecvReqInfo] = []
         with self._sessions_lock, self._peer_requests_lock:
             stale_req_rids = [
                 rid
@@ -601,8 +609,12 @@ class Sender(SenderBase):
             ]
             for rid in stale_req_rids:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    req_info_map = self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
+                    if req_info_map:
+                        orphaned_infos.extend(
+                            info for info in req_info_map.values() if not info.need_aux
+                        )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
             for rid in stale_cancel_rids:
                 if rid in self._sessions:
@@ -613,6 +625,36 @@ class Sender(SenderBase):
                     key for key in self._cancel_failed_result_keys if key[0] != rid
                 }
                 logger.debug(f"Swept stale pre-cancel tombstone for rid={rid}")
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
+
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
+        """Send FAILED for a context-first REQUEST_DATA that no TxSession claimed.
+
+        This resolves the receiver's peer reservation, so its RxSession reports
+        the request as failed. The sweep runs on the executor and listener
+        threads, so the message goes through the thread-safe outbox.
+        """
+        logger.warning(
+            f"KV transfer request rid={info.unique_rid} from receiver "
+            f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+        )
+        try:
+            peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+            message = _make_kv_result_msg(
+                self._instance_rank,
+                info.unique_rid,
+                info.slice_id if info.slice_id is not None else 0,
+                True,  # is_last_slice
+                AgentResult.FAILED,
+            )
+            if not self._reliable_message_outbox.submit(peer_ri.self_endpoint, message):
+                logger.error(f"Failed to queue FAILED result for orphaned rid={info.unique_rid}")
+        except (KeyError, ValueError) as exc:
+            # KeyError: the receiver rank never registered with this sender;
+            # ValueError: it registered without an endpoint.
+            logger.error(f"Failed to notify receiver of orphaned rid={info.unique_rid}: {exc}")
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id

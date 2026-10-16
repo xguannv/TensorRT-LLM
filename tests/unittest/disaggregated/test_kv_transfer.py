@@ -1496,6 +1496,94 @@ def test_session_has_transferring_tasks_false():
         gen_transfer_worker.shutdown()
 
 
+def _wait_until(predicate, timeout_s: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("schedule_style", [0, 1], ids=["ctx_first", "gen_first"])
+def test_receive_without_context_session_fails_after_sweep(schedule_style):
+    """A receive that no context TxSession will ever serve must end, not hang.
+
+    A context-first generation request whose context KV cache is gone (its
+    TxSession failed and was closed, or the request names a disagg_request_id
+    the context rank never had, as a re-posted generation request with a new
+    id does) leaves its REQUEST_DATA unclaimed on the sender. Once that entry
+    outlives the sweep TTL the sender reports FAILED, so the RxSession fails
+    instead of holding its KV cache and transfer budget forever. Generation-first
+    entries may legitimately stay unclaimed (ADP broadcast) and are only evicted.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    sender = ctx_tw._sender
+    sc = tensorrt_llm.bindings.SamplingConfig(SamplingParams(temperature=0)._get_sampling_config())
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    gen_request = LlmRequest(
+        request_id=600,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=sc,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=599,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=setup["ctx_info_endpoint"],
+        disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
+    )
+    page_table = gen_tw._rank_info.page_table
+    empty_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+    )
+
+    try:
+        rx = gen_tw.create_rx_session(gen_request)
+        rx.receive(empty_slice)
+        assert _wait_until(lambda: sender._get_req_info(unique_rid) is not None)
+        assert rx.wait_complete(blocking=False) is None
+        assert rx.has_transferring_tasks()
+
+        # Inside the TTL the sender keeps waiting for a TxSession.
+        ctx_tw.sweep_stale_req_infos()
+        time.sleep(0.2)
+        assert sender._get_req_info(unique_rid) is not None
+        assert rx.wait_complete(blocking=False) is None
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(sender), "_STALE_REQ_INFO_TTL_S", 0.0)
+            ctx_tw.sweep_stale_req_infos()
+        assert sender._get_req_info(unique_rid) is None
+        if schedule_style == 0:
+            assert _wait_until(lambda: rx.wait_complete(blocking=False) == WaitResult.FAILED)
+            assert rx.has_failed()
+            assert not rx.has_transferring_tasks()
+        else:
+            time.sleep(0.2)
+            assert rx.wait_complete(blocking=False) is None
+            assert rx.has_transferring_tasks()
+        rx.close()
+
+        # The same workers keep serving ordinary transfers.
+        add_and_verify_request(setup, 0, 1, setup["request_len"], send_first=True)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
 @pytest.mark.timeout(120)
 def test_incompatible_peer_fails_only_affected_requests():
     """An incompatible context peer must fail only the requests targeting it.
