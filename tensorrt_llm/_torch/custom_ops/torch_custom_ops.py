@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
@@ -2132,6 +2133,16 @@ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     return a, a_sf
 
 
+# Pins the FP8 1x128 quantization that ``fp8_swap_ab_gemm`` runs ("cuda" or "triton") instead
+# of autotuning it. Each rank tunes this choice on its own, and ranks profiling side by side on
+# one node can measure the two backends alike, so the ranks of one model may end up on different
+# kernels and the slower one gates every collective that follows.
+_FP8_QUANT_1X128_TACTIC = os.environ.get("TRTLLM_FP8_QUANT_1X128_TACTIC", "")
+if _FP8_QUANT_1X128_TACTIC not in ("", "cuda", "triton"):
+    raise ValueError("TRTLLM_FP8_QUANT_1X128_TACTIC must be cuda or triton, got "
+                     f"{_FP8_QUANT_1X128_TACTIC!r}")
+
+
 class Fp8QuantKernelRunner(TunableRunner):
     """Profiles only the FP8 1x128 quantization kernel (no GEMM).
 
@@ -2330,13 +2341,18 @@ def fp8_swap_ab_gemm(
 
     # Step 1: Select best quantization kernel (CUDA vs Triton).
     # Profiles only _quantize (no GEMM), with empty M-buckets.
-    quant_runner = Fp8QuantKernelRunner()
-    _, quant_tactic = tuner.choose_one(
-        "trtllm::fp8_quant_1x128_tactic",
-        [quant_runner],
-        Fp8QuantKernelRunner.tuning_config,
-        [input],
-    )
+    if _FP8_QUANT_1X128_TACTIC:
+        quant_tactic = (Fp8QuantKernelRunner.TACTIC_TRITON
+                        if _FP8_QUANT_1X128_TACTIC == "triton" else
+                        Fp8QuantKernelRunner.TACTIC_CUDA)
+    else:
+        quant_runner = Fp8QuantKernelRunner()
+        _, quant_tactic = tuner.choose_one(
+            "trtllm::fp8_quant_1x128_tactic",
+            [quant_runner],
+            Fp8QuantKernelRunner.tuning_config,
+            [input],
+        )
 
     # Step 2: Run quantize + GEMM. Single tactic triggers DeepGemm JIT
     # warmup across M-buckets without re-profiling the quant kernel.
