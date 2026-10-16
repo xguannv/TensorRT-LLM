@@ -1,32 +1,43 @@
-# Kimi-K3 NVFP4 AgentX 最新优化配方（2026-10-13）
+# Kimi-K3 NVFP4 AgentX 最新优化配方（2026-10-15，快照 s53）
 
 ## 代码
 
 | 项 | 值 |
 |---|---|
-| TRT-LLM 分支 | gitlab `ftp/tekit` `user/dongxuy/k3_agentx_opt`。本配方对应快照 s44 = `b71f9788d3`（b ≤ 16 的点用 s43 = `6158a944b6`，两者差别只在融合 Helix a2a 的修复，b ≤ 16 不开 a2a 融合）。分支头之后的 `185efc7b0f`（只改测试）和 `310160b62f`（CuTe q absorb 给 RoPE kernel 留 SMEM，输出不变，A/B 待测）可直接带上 |
+| TRT-LLM 分支 | gitlab `ftp/tekit` `user/dongxuy/k3_agentx_opt`。本配方对应快照 s53 = `91e96bff7c`。分支头之后的 `fa56986d3a`（测试）、`4de7004ab3`（文档）、`1e68f87f10`（可选的 MoE tactic 固定开关，默认关）不改变默认行为，可直接带上 |
 | 起点 | `b0d8f6484a`（rubin-advance 9-23，0924 参考）→ 快进 rubin-advance `9a51c77ed5` + cherry-pick |
-| 运行镜像 | taizhongw 的 b0d8 镜像（sm103）。分支需在该镜像里编译 sm103（`scripts/build_wheel.py --cuda_architectures "103-real" --skip_building_wheel --linking_install_binary`；有 C++ 改动：Helix a2a fence 修复、MNNVL AR one-shot 上限），然后把 `tensorrt_llm/`（含编译出的库）+ `triton_kernels/` 复制成快照目录，放在 `PYTHONPATH` 最前面 |
-| 快照 | jhb `/home/dongxuy/work_dir/k3_opt_snaps/s44`、`s43`（每个目录的 `COMMIT` 文件记录 commit，工作区干净） |
-| harness | `bench-trtllm-disagg-opt` 分支 `dongxuy/k3-agentx-opt`（jhb，未推远端）；yaml：`opt/jhb_yamls/jhb_s44f_*.yaml`、`jhb_s43f_*.yaml`（各开关全在 yaml 里，以下各节就是这些 yaml 的内容） |
+| 运行镜像 | taizhongw 的 b0d8 镜像（sm103）。分支需在该镜像里编译 sm103（`scripts/build_wheel.py --cuda_architectures "103-real" --skip_building_wheel --linking_install_binary`；有 C++ 改动），然后把 `tensorrt_llm/`（含编译出的库）+ `triton_kernels/` 复制成快照目录，放在 `PYTHONPATH` 最前面 |
+| 快照 | jhb `/home/dongxuy/work_dir/k3_opt_snaps/s53`（目录里的 `COMMIT` 文件记录 commit，工作区干净） |
+| harness | `bench-trtllm-disagg-opt` 分支 `dongxuy/k3-agentx-opt`（jhb，未推远端）；yaml：`opt/jhb_yamls/jhb_s53f_*.yaml`（各开关全在 yaml 里，以下各节就是这些 yaml 的内容） |
+| 专家重排表 | 本目录 `placements/k3_ep16_e2e_c88b32_v2.json`（c264 b32）、`placements/k3_ep16_e2e_b128like_v2.json`（c220 b128） |
 
-所有优化都在环境变量开关后面，默认关闭；不设开关就是继承代码（S1）的行为。
+所有优化都在环境变量开关后面，默认关闭（s48 的低 batch MLA decode、s49 的 B ≥ 32 MLA decode 流水、s50 的 KDA fab 分级 tail 除外：这三项逐位一致、默认开）。
 
 ## 公共配置（所有点）
 
-ctx_config: `{tp_size: 1, max_batch: 16, max_num_tokens: 16384, enable_attention_dp: true, gpu_memory_fraction: 0.7}`，16 个 CTX（DWDP16）。
+ctx_config: `{tp_size: 1, max_batch: 16, max_num_tokens: 32768, enable_attention_dp: true, gpu_memory_fraction: 0.67}`，16 个 CTX（DWDP16）。
 
 ```yaml
 extra_ctx_config:
   moe_config:
-    max_num_tokens: 16384          # MoE 一个 16k 分块（原 8192）
+    max_num_tokens: 32768                       # 一次迭代 32k token，摊薄每次约 2 s 的 DWDP gather
+  kv_cache_config:
+    block_reuse_config:
+      max_num_turns: 3
 extra_ctx_worker_env:
   K3_TOKENIZER_FASTPATH: "1"
   TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: "16384"
   TLLM_V2_CTX_DEMOTE_MAX_ITERS: "8"
   TLLM_ROUTING_DISABLE_COOP_LAUNCH: "1"
-  TRTLLM_K3_DEEPGEMM_SM_RESERVE: "30"   # 给 DWDP gather 留 30 个 SM
-  TRTLLM_K3_MLA_CTX_FP8_EXPAND: "2"     # 融合 cached-KV 展开 + FlashInfer FP8 ragged FMHA
+  TRTLLM_K3_DEEPGEMM_SM_RESERVE: "16"           # 给 DWDP gather 留 16 个 SM
+  TRTLLM_CUTEDSL_SM_RESERVE: "16"
+  TRTLLM_DWDP_GATHER_ROWS: "8"                  # gather 8 行 × 16 块
+  TRTLLM_DWDP_GATHER_BLOCKS: "16"
+  TRTLLM_K3_KDA_PREFILL_SM_RESERVE: "1"         # KDA prefill grid 让出 gather 的 SM
+  TRTLLM_K3_MLA_CTX_FP8_EXPAND: "2"             # 融合 cached-KV 展开
+  TRTLLM_K3_MLA_CTX_FMHA: "cute"                # CuTe DSL FP8 MLA 上下文 FMHA（非逐位一致，GSM8K 已过）
+  TRTLLM_MLA_CHUNKED_PREFILL_MAX_TOKENS: "65536" # 分块 prefill 分区上限（否则 KV cache v2 扩容时 OOM）
+  TLLM_V2_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN: "16384" # 16k 以下 prompt 的 KDA 快照最先逐出
   FLASHINFER_WORKSPACE_BASE: <共享目录>
 extra_server_env:
   K3_TOKENIZER_FASTPATH: "1"
@@ -75,7 +86,7 @@ GEN 公共开关：
 
 ## 按 batch 的差异
 
-### 低 batch b1 / b4（MoE TP4×EP4）——c18 b1、c84 b4（16p3d）
+### 低 batch b1 / b2 / b4（MoE TP4×EP4）——c18 b1、c36 b2、c84 b4（16p3d）
 
 ```yaml
 extra_gen_config: {moe_expert_parallel_size: 4, moe_tensor_parallel_size: 4}
@@ -83,6 +94,7 @@ extra_gen_config: {moe_expert_parallel_size: 4, moe_tensor_parallel_size: 4}
   TRTLLM_K3_ATTN_RES_PDL: "2"
   TRTLLM_LOW_M_GEMM_BACKEND: auto
   TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES: "2097152"
+  TRTLLM_MLA_PARTIAL_BF16: "1"                # split-KV partial O 存 BF16（有损，GSM8K 0.9606）
 ```
 
 ### b8 / b16（MoE TP16 + swap-AB）——c105 b8、c171 b16（16p3d）、c116 b16（16p2d）
@@ -94,6 +106,7 @@ extra_gen_config: {moe_expert_parallel_size: 1, moe_tensor_parallel_size: 16}
   TRTLLM_K3_ATTN_RES_PDL_MAX_M: "128"        # 只有 b16
   TRTLLM_LOW_M_GEMM_BACKEND: auto
   TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES: "2097152"
+  TRTLLM_MLA_PARTIAL_BF16: "1"
   TRTLLM_MOE_FINALIZE_SWAPAB: "1"
   TRTLLM_MOE_FINALIZE_SWAPAB_SPLIT_ROWS: "1"
   TRTLLM_MOE_FINALIZE_SWAPAB_EARLY_WEIGHTS: "1"
@@ -102,7 +115,7 @@ extra_gen_config: {moe_expert_parallel_size: 1, moe_tensor_parallel_size: 16}
 ### b ≥ 32（MoE EP16）——c264 b32、16p2d c302 / c360 b64、c220 b128、c300 b192、c400 b256
 
 ```yaml
-  TRTLLM_HELIX_A2A_FUSED: "1"           # 需快照 s44（b71f9788d3 修复）
+  TRTLLM_HELIX_A2A_FUSED: "1"
   TRTLLM_K3_KDA_DECODE_2CTA: "1"
   TRTLLM_K3_KDA_DECODE_FP8_OUT: "1"
   TRTLLM_K3_LATENT_STREAM_PRIORITY: "-1"
@@ -110,6 +123,11 @@ extra_gen_config: {moe_expert_parallel_size: 1, moe_tensor_parallel_size: 16}
   TRTLLM_K3_LU_FUSED: "1"               # c264 b32 用 "2"
   TRTLLM_NVLS_AR: "1"
   TRTLLM_NVLS_AR_V2: "1"
+  TRTLLM_NVLS_AR_PROTOCOL: "ptx"        # 符合 PTX 内存模型的到达协议（每次调用一次 sys fence），结果与 gpu 协议逐位相同
+  TRTLLM_NVLS_AR_ZERO_COPY: "1"         # o_proj / shared down 的 GEMM 直接写 NVLS 对称缓冲
+  # 只有 c264 b32 和 c220 b128：EP16 静态专家重排
+  TRTLLM_K3_EXPERT_PLACEMENT: <本目录>/placements/k3_ep16_e2e_c88b32_v2.json     # c264 b32
+  TRTLLM_K3_EXPERT_PLACEMENT: <本目录>/placements/k3_ep16_e2e_b128like_v2.json   # c220 b128
 ```
 
 ## 拓扑（gen_configs）
@@ -119,6 +137,7 @@ extra_gen_config: {moe_expert_parallel_size: 1, moe_tensor_parallel_size: 16}
 | 点 | 行 |
 |---|---|
 | c18 b1 | `[16, 3, 16, 1, 7, helix, 0.8, 6, 0, 6]` |
+| c36 b2 | `[16, 3, 16, 2, 14, helix, 0.8, 6, 0, 12]` |
 | c84 b4 | `[16, 3, 16, 4, 32, helix, 0.8, 7, 0, 28]` |
 | c105 b8 | `[16, 3, 16, 8, 56, helix, 0.8, 6, 0, 35]` |
 | c171 b16 | `[16, 3, 16, 16, 128, helix, 0.8, 7, 0, 57]` |
@@ -137,14 +156,27 @@ segment 16（不用 segment 8）。jhb 集群配置需加 OccupiedIdleGPUsJobRea
 | 开关 | 原因 |
 |---|---|
 | `TRTLLM_K3_SHARED_FIRST`、M > 256 多 CTA 路由（s34+） | shared expert 饿死，b128 变慢 |
-| `TRTLLM_K3_FUSED_ROUTER=sort` | 同上（低 batch 在重新评估） |
+| `TRTLLM_K3_FUSED_ROUTER=sort` | 同上 |
 | `TRTLLM_NVLS_AR` 用于 b ≤ 16（MoE TP16） | 收益约 0.2%，曾在预热时崩溃 |
-| `TRTLLM_HELIX_A2A_FUSED` 用于 b ≤ 16 | 持平；且必须用 s44 及以后，否则 GEN 启动段错误 |
-| CTX `block_reuse_config.max_num_turns` 1 / 16 | 都比默认 5 差 |
+| `TRTLLM_HELIX_A2A_FUSED` 用于 b ≤ 16 | 持平 |
+| `TRTLLM_NVLS_AR_FENCE_SYS=1` | 只作用于 v1，b128 +2.3%；用 `TRTLLM_NVLS_AR_PROTOCOL=ptx` |
+| `TRTLLM_NVLS_AR_ROWS=4` | b128 shared AR 上关键路径，变慢 |
+| `TRTLLM_K3_KDA_FAB_MAX_ROWS=384`（b64） | 非逐位一致，未过 GSM8K |
+| b128 mtp5 | 步长 −2.2%，但每个提交 token 慢 1.4% |
+| CTX `block_reuse_config.max_num_turns` 1 / 16 | 都比 3 / 5 差 |
 | 精度测试 | 去掉 `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`（harness 性能跑注入的固定接受长度） |
 
-## 结果状态
+## 结果（AgentX e2e 3600 s，jhb GB300；tps/user = 1000 / p90 ITL，tps/GPU 按全部 GPU）
 
-- 本配方（s43f / s44f）的 11 个正式点 e2e 正在 jhb 上排队，尚无 e2e 数字。
-- gen-only：b128 53.39 ms（s32 55.43）、b16 20.94 ms（s33 21.89）。新增开关全部逐位 / 逐字节一致；GSM8K b16 s38 0.9613。
-- 目前已测得的最好 e2e 点来自更早的快照（s28 / s30 / s33，开关是本配方的子集），见网页正式点表。
+| 点 | 快照 | tps/user | out tps/GPU | p90 TTFT | 0924 参考 |
+|---|---|---|---|---|---|
+| c18 b1 | s53f | 374.53 | 11.37 | 12.8 s | 256.41 / 9.44 |
+| c36 b2 | s53f | 328.95 | 22.59 | 9.5 s | 16p6d-helix8 c36 b1 226.76 / 17.46 |
+| c171 b16 | s53f | 166.39 | 103.83 | 7.9 s | 106.27 / 78.36 |
+| 16p2d c360 b64 | s53f | 84.96 | 219.75 | 15.7 s | — |
+| c220 b128 | s52f | 57.94 | 196.73 | 8.6 s | 38.28 / 133.05 |
+| c300 b192 | s53f | 39.82 | 223.83 | 11.4 s | — |
+| c400 b256 | s53f | 31.5 | 243.4 | 19.2 s | — |
+
+其余点（c84 b4、c105 b8、16p2d c116 b16、c264 b32、16p2d c302 b64、c220 b128 + 专家重排）的 s53f 在跑或排队。
+GSM8K：s53 b16 + 全套 CTX 设置 0.9644 / 0.9651；s53 c220 GEN 配置 + 专家重排 0.9621 / 0.9629（参考 0.9613 / 0.9621）。
