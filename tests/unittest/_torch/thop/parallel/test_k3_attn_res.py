@@ -195,6 +195,75 @@ def test_mxfp8_side_output(m: int, n: int, mode: int, monkeypatch):
     assert torch.equal(xs, ref_s)
 
 
+def _lamport_workspace(rows: torch.Tensor, dirty: int):
+    """A one-rank stand-in for an MNNVL Lamport workspace (``k3_lamport_ar`` layout: three
+    buffers of two stages) whose last all-reduce left ``rows`` in the broadcast stage of buffer
+    ``dirty``; the rest holds the empty-slot sentinel."""
+    m = rows.shape[0]
+    stage_bytes = -(-m * HIDDEN * 2 // 1024) * 1024
+    bytes_per_buffer = 2 * stage_bytes
+    uc = torch.full((3 * bytes_per_buffer // 4,), -(2**31), dtype=torch.int32, device="cuda")
+    flags = torch.zeros(9, dtype=torch.int32, device="cuda")
+    flags[0], flags[1], flags[2] = (dirty + 1) % 3, dirty, bytes_per_buffer
+    start = (dirty * 2 + 1) * stage_bytes // 4
+    stage = uc[start : start + m * HIDDEN // 2]
+    return uc, flags, stage
+
+
+@pytest.mark.parametrize("mx", [False, True])
+@pytest.mark.parametrize("n", [2, 6, 12])
+@pytest.mark.parametrize("m", [1, 7, 14, 32])
+def test_lamport_addend(m: int, n: int, mx: bool, monkeypatch):
+    """ADD_PREFIX with the addend polled from a Lamport workspace equals the tensor addend."""
+    pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_lamport_ar")
+    k3 = _k3()
+    monkeypatch.setattr(k3, "_EXACT", False)
+    t = _inputs(m, n, 1.0, seed=3 * m + n)
+    addend = t["addend"].clone()
+    # A Lamport row never holds -0 (the all-reduce stores +0), so no word is the sentinel.
+    addend[addend == 0] = 0
+    uc, flags, stage = _lamport_workspace(addend, dirty=2)
+    stage.copy_(addend.view(torch.int32).flatten())
+    w = _weights(t)
+    ops = torch.ops.trtllm
+    if mx:
+        ref = ops.k3_attn_res_add_rmsnorm_mx(t["layer"], addend, t["block"], *w)
+        got = ops.k3_attn_res_add_rmsnorm_lamport_mx(
+            t["layer"], uc.data_ptr(), flags.data_ptr(), t["block"], *w
+        )
+    else:
+        ref = ops.k3_attn_res_add_rmsnorm(t["layer"], addend, t["block"], *w)
+        got = ops.k3_attn_res_add_rmsnorm_lamport(
+            t["layer"], uc.data_ptr(), flags.data_ptr(), t["block"], *w
+        )
+    for i, (a, b) in enumerate(zip(ref, got)):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"output {i}"
+
+
+def test_lamport_addend_polls_until_rows_arrive():
+    """The kernel waits for rows that land after it started (written from another stream)."""
+    pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_lamport_ar")
+    m, n = 14, 6
+    t = _inputs(m, n, 1.0, seed=5)
+    addend = t["addend"].clone()
+    addend[addend == 0] = 0
+    uc, flags, stage = _lamport_workspace(addend, dirty=0)
+    w = _weights(t)
+    ref = torch.ops.trtllm.k3_attn_res_add_rmsnorm(t["layer"], addend, t["block"], *w)
+    src = addend.view(torch.int32).flatten()
+    writer = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(writer):
+        torch.cuda._sleep(2_000_000)
+        stage.copy_(src)
+    got = torch.ops.trtllm.k3_attn_res_add_rmsnorm_lamport(
+        t["layer"], uc.data_ptr(), flags.data_ptr(), t["block"], *w
+    )
+    torch.cuda.synchronize()
+    for i, (a, b) in enumerate(zip(ref, got)):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"output {i}"
+
+
 @pytest.mark.parametrize("exact", [True, False])
 @pytest.mark.parametrize("n", [4, 9])
 def test_graph_replay_pdl_chain(n: int, exact: bool):

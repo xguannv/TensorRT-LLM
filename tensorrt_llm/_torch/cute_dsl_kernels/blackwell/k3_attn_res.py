@@ -642,6 +642,28 @@ def _stg_u8_if(valid, addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _selp_b32(cond, a, b, *, loc=None, ip=None):
+    """32-bit ``a if cond != 0 else b``."""
+    return Int32(
+        _asm_se(
+            T.i32(),
+            [_iv(cond, loc=loc, ip=ip), _iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nselp.b32 $0, $2, $3, p;\n}",
+            "=r,r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _lamport_ops():
+    """``k3_lamport_ar`` (the pushed MNNVL all-reduce), imported by the Lamport-addend variant."""
+    from . import k3_lamport_ar
+
+    return k3_lamport_ar
+
+
+@dsl_user_op
 def _selp(cond, a, b, *, loc=None, ip=None):
     """``a if cond != 0 else b``."""
     return Float32(
@@ -1065,12 +1087,16 @@ class K3AttnResFastKernel:
         use_pdl: bool,
         cluster: int = 4,
         mxfp8: bool = False,
+        lamport: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
         if add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE) or cluster not in (1, 2, 4, 8):
             raise ValueError(f"add_mode={add_mode} cluster={cluster}")
+        if lamport and add_mode != ADD_PREFIX:
+            raise ValueError("the Lamport addend is an ADD_PREFIX variant")
         self.mxfp8 = mxfp8
+        self.lamport = lamport
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -1278,7 +1304,19 @@ class K3AttnResFastKernel:
                 _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
-            addend = unpack(load(add_addr + row + col, False))
+            if cutlass.const_expr(self.lamport):
+                # The addend is the result of the MNNVL all-reduce that completed last on a Lamport
+                # workspace (add_addr: its local unicast base, add2_addr: its state flags), finished
+                # without the gather: polled from the broadcast stage of the call's buffer (see
+                # k3_lamport_ar.poll_result_v4). Threads past the row poll the row's first vector
+                # and use zeros.
+                off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
+                polled = _lamport_ops().poll_result_v4(
+                    add_addr, add2_addr, Int32(token), off, HIDDEN_SIZE
+                )
+                addend = unpack([_selp_b32(valid, w, Int32(0)) for w in polled])
+            else:
+                addend = unpack(load(add_addr + row + col, False))
             pre = unpack(prefix)
             x = [_round_bf16(_add_ftz(pre[e], addend[e])) for e in range(8)]
         elif cutlass.const_expr(self.add_mode == ADD_MOE):
@@ -1404,11 +1442,12 @@ def _compiled(
     cluster: int | None,
     exact: bool,
     mxfp8: bool = False,
+    lamport: bool = False,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
-        kernel = K3AttnResFastKernel(num_candidates, add_mode, use_pdl, cluster, mxfp8)
+        kernel = K3AttnResFastKernel(num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport)
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1476,6 +1515,7 @@ def run_k3_attn_res(
     cluster: int | None = None,
     exact: bool | None = None,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    lamport_addend: tuple[int, int] | None = None,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1499,20 +1539,37 @@ def run_k3_attn_res(
             :func:`k3_fp8w_lowm_mxfp8.run_k3_fp8w_lowm_gemm_mxfp8`: E4M3 ``xq [M, 7168]`` and one
             UE8M0 exponent per 1x32 group ``xs [M, 224]`` (uint8), bitwise what that GEMM's BF16
             twin quantizes ``output`` to (vectorized kernel only).
+        lamport_addend: ``(uc_local, flags)`` device addresses of an MNNVL Lamport workspace
+            (``k3_lamport_ar.LamportWorkspace``) instead of ``addends`` (which must be ``()``):
+            ``bf16(layer + addend)`` with the ``[M, 7168]`` result of the all-reduce that
+            completed last on the workspace, finished without its gather
+            (``run_lamport_finish_in_place``), polled from its broadcast stage after
+            ``griddepcontrol.wait``; the same bits as the gathered tensor, so the same results
+            (vectorized kernel only). The next all-reduce on the workspace re-arms that buffer:
+            it must not start before this kernel completed (its producer must trigger only
+            after its own ``griddepcontrol.wait``, as the push producers and the C++ kernels do).
     """
     if exact is None:
         exact = _EXACT
-    if mxfp8_out is not None and exact:
-        raise ValueError("the MXFP8 side output needs the vectorized kernel")
-    add_mode = len(addends)
+    if (mxfp8_out is not None or lamport_addend is not None) and exact:
+        raise ValueError("the MXFP8 side output and the Lamport addend need the vectorized kernel")
+    lamport = lamport_addend is not None
+    if lamport and addends:
+        raise ValueError("pass either addends or lamport_addend")
+    add_mode = ADD_PREFIX if lamport else len(addends)
     if cluster is None and not exact:
         cluster = fast_cluster_size(layer.shape[0], block.shape[0] + 1)
     mxfp8 = mxfp8_out is not None
-    compiled = _compiled(block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8)
+    compiled = _compiled(block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8, lamport)
+    if lamport:
+        add_addr, add2_addr = lamport_addend
+    else:
+        add_addr = addends[0].data_ptr() if add_mode >= 1 else 0
+        add2_addr = addends[1].data_ptr() if add_mode == 2 else 0
     compiled(
         Int64(layer.data_ptr()),
-        Int64(addends[0].data_ptr() if add_mode >= 1 else 0),
-        Int64(addends[1].data_ptr() if add_mode == 2 else 0),
+        Int64(add_addr),
+        Int64(add2_addr),
         Int64(block.data_ptr()),
         Int64(res_weight.data_ptr()),
         Int64(rms_weight.data_ptr()),
@@ -1713,6 +1770,84 @@ def _(prefix, addend, block, res_weight, rms_weight, out_weight, rms_eps, out_ep
     return (torch.empty_like(prefix), torch.empty_like(prefix), *_mxfp8_outputs(prefix))
 
 
+@torch.library.custom_op("trtllm::k3_attn_res_add_rmsnorm_lamport", mutates_args=())
+def k3_attn_res_add_rmsnorm_lamport(
+    prefix: torch.Tensor,
+    uc_local: int,
+    flags: int,
+    block: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    rms_eps: float,
+    out_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`k3_attn_res_add_rmsnorm` whose addend is the result of the all-reduce that
+    completed last on the Lamport workspace ``(uc_local, flags)``, read from its broadcast stage
+    (see ``lamport_addend`` of :func:`run_k3_attn_res`); vectorized kernel."""
+    updated = torch.empty_like(prefix)
+    output = torch.empty_like(prefix)
+    run_k3_attn_res(
+        prefix,
+        (),
+        block,
+        res_weight,
+        rms_weight,
+        out_weight,
+        rms_eps,
+        out_eps,
+        output,
+        updated,
+        exact=False,
+        lamport_addend=(uc_local, flags),
+    )
+    return updated, output
+
+
+@k3_attn_res_add_rmsnorm_lamport.register_fake
+def _(prefix, uc_local, flags, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    return torch.empty_like(prefix), torch.empty_like(prefix)
+
+
+@torch.library.custom_op("trtllm::k3_attn_res_add_rmsnorm_lamport_mx", mutates_args=())
+def k3_attn_res_add_rmsnorm_lamport_mx(
+    prefix: torch.Tensor,
+    uc_local: int,
+    flags: int,
+    block: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    rms_eps: float,
+    out_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`k3_attn_res_add_rmsnorm_lamport` plus the MXFP8 form ``(xq, xs)`` of its output."""
+    updated = torch.empty_like(prefix)
+    output = torch.empty_like(prefix)
+    xq, xs = _mxfp8_outputs(prefix)
+    run_k3_attn_res(
+        prefix,
+        (),
+        block,
+        res_weight,
+        rms_weight,
+        out_weight,
+        rms_eps,
+        out_eps,
+        output,
+        updated,
+        exact=False,
+        mxfp8_out=(xq, xs),
+        lamport_addend=(uc_local, flags),
+    )
+    return updated, output, xq, xs
+
+
+@k3_attn_res_add_rmsnorm_lamport_mx.register_fake
+def _(prefix, uc_local, flags, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    return (torch.empty_like(prefix), torch.empty_like(prefix), *_mxfp8_outputs(prefix))
+
+
 @torch.library.custom_op("trtllm::k3_attn_res_moe_add_rmsnorm_mx", mutates_args=())
 def k3_attn_res_moe_add_rmsnorm_mx(
     residual: torch.Tensor,
@@ -1763,6 +1898,8 @@ __all__ = [
     "can_use_k3_attn_res",
     "cluster_size",
     "k3_attn_res_add_rmsnorm",
+    "k3_attn_res_add_rmsnorm_lamport",
+    "k3_attn_res_add_rmsnorm_lamport_mx",
     "k3_attn_res_add_rmsnorm_mx",
     "k3_attn_res_moe_add_rmsnorm",
     "k3_attn_res_moe_add_rmsnorm_mx",
