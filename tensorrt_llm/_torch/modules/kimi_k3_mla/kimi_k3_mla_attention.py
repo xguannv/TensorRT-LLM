@@ -545,7 +545,7 @@ class KimiK3MLAAttention(MLA):
     @staticmethod
     def _flashinfer_cute_norm(device: torch.device) -> bool:
         """Whether FlashInfer's ``rmsnorm`` runs its CuTe DSL ``RMSNormKernel`` on ``device``
-        (the arithmetic the fused KV and q_b paths reproduce), not its CUDA JIT kernel."""
+        (the arithmetic ``k3_mla_kv_append`` reproduces), not its CUDA JIT kernel."""
         try:
             from flashinfer.norm import _use_cuda_norm
         except ImportError:
@@ -786,8 +786,9 @@ class KimiK3MLAAttention(MLA):
         attention applied the V up-projection itself (TRTLLM_K3_MLA_FUSED_V_UP), the gate GEMM
         is enqueued only after the all-to-all and its combine (still depending only on the
         attention): enqueued before them, it takes the SMs the fused reduction leaves free and
-        the all-to-all launches later. The main stream waits for the mask where the all-to-all
-        reads it and for the gate just before o_proj, where both are long done.
+        the all-to-all launches later. TRTLLM_K3_MLA_GATE_EARLY enqueues it where it is forked
+        in that case too. The main stream waits for the mask where the all-to-all reads it and
+        for the gate just before o_proj, where both are long done.
         """
         num_tokens = hidden_states.shape[0]
         mask_fork, mask_ready, gate_fork, gate_ready = self._gate_events
