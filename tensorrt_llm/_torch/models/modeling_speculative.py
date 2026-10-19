@@ -29,6 +29,7 @@ from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import tail_v2_enabled
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1753,12 +1754,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                      "target_vocab_parallel_head", None)
             vocab_head = (get_vocab_head(self.lm_head)
                           if get_vocab_head is not None else None)
+            gather_ids = spec_metadata.gather_ids
+            if (tail_v2_enabled() and attn_metadata.num_contexts == 0
+                    and gather_ids is not None
+                    and gather_ids.shape[0] == hidden_states.shape[0]):
+                # A generation-only batch gathers every token in order
+                # (gather ids 0..num_tokens-1): no gather copy is needed.
+                head_input = hidden_states
+            else:
+                head_input = hidden_states[gather_ids]
             if vocab_head is not None:
-                logits = vocab_head.shard_logits(
-                    hidden_states[spec_metadata.gather_ids])
+                logits = vocab_head.shard_logits(head_input)
             else:
                 logits = self.logits_processor.forward(
-                    hidden_states[spec_metadata.gather_ids],
+                    head_input,
                     self.lm_head,
                     attn_metadata,
                     True,
