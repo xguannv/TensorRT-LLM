@@ -77,6 +77,13 @@ _EMPTY_INDEX = tl.constexpr(2**24)
 _LOCAL_BLOCK_V = 2048
 # Shard columns per program of the fused Markov step.
 _MARKOV_BLOCK_V = 128
+# Floats per request row of the fused Markov step's exchange (multi-rank). The
+# one-shot all-reduce runs width / 4 threads per row, and those threads also
+# clear the Lamport buffer that the workspace's previous all-reduce wrote --
+# before step 0, the drafter's last all-reduce (~450 KB at 14 tokens), which
+# 8 threads per row (a 32-float row) take ~40 us to clear on GB300. 1024
+# floats run 4 CTAs of 64 threads per row.
+_MARKOV_EXCHANGE_WIDTH = 1024
 # Capacity of the one-launch Markov chain's exchange sets.
 _CHAIN_MAX_STEPS = 16
 _CHAIN_MAX_REQS = 16
@@ -468,6 +475,7 @@ def _markov_round_kernel(
     RANK: tl.constexpr,
     FROM_ANCHOR: tl.constexpr,
     ZERO_WIDTH: tl.constexpr,
+    ZERO_CHUNK: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_SLOTS: tl.constexpr,
     BLOCK_V: tl.constexpr,
@@ -478,8 +486,15 @@ def _markov_round_kernel(
     # previous step's exchanged pairs), gather its markov_w1 row, compute the
     # columns' markov_w2 bias, add the step's shard logits and reduce to a
     # (value, global index) candidate. The last program to finish reduces every
-    # program's candidates to this rank's pair per request and publishes it
-    # (with the rest of the row zeroed) for the all-reduce exchange.
+    # program's candidates to this rank's pair per request and publishes it for
+    # the all-reduce exchange; every program zeroes ZERO_CHUNK columns of the
+    # rest of the row.
+    #
+    # PDL: the program triggers its dependents before its own wait. The
+    # dependent (the exchange all-reduce, or at a single rank the next step's
+    # kernel) reads this grid's output only after its own griddepcontrol.wait,
+    # which returns once this grid has completed, so the early trigger only
+    # lets it launch and read its own weights sooner.
     pid = tl.program_id(0)
     reqs = tl.arange(0, BLOCK_B)
     rmask = reqs < num_reqs
@@ -537,6 +552,15 @@ def _markov_round_kernel(
     pbase = partial_ptr + (pid * BLOCK_B + reqs) * 2
     tl.store(pbase, cand_val)
     tl.store(pbase + 1, cand_idx.to(tl.float32))
+    # After the wait: the output can reuse memory that the previous grid read.
+    row = out_ptr + reqs.to(tl.int64) * stride_out
+    z = pid * ZERO_CHUNK + tl.arange(0, ZERO_CHUNK)
+    zmask = (
+        rmask[:, None]
+        & (z[None, :] < ZERO_WIDTH)
+        & ((z[None, :] < 2 * slot) | (z[None, :] >= 2 * slot + 2))
+    )
+    tl.store(row[:, None] + z[None, :], tl.zeros([BLOCK_B, ZERO_CHUNK], tl.float32), mask=zmask)
     # Last-arriving program: every program's candidates are visible to it once
     # its acquire-release ticket observes their releases.
     tl.debug_barrier()
@@ -550,10 +574,6 @@ def _markov_round_kernel(
             pm, tl.load(qptrs + 1, mask=pm, other=0.0, volatile=True).to(tl.int32), _INT32_MAX
         )
         win_val, win_idx = _argmax_pairs(qv, qi, 0)
-        row = out_ptr + reqs.to(tl.int64) * stride_out
-        z = tl.arange(0, ZERO_WIDTH)
-        zmask = rmask[:, None] & ((z[None, :] < 2 * slot) | (z[None, :] >= 2 * slot + 2))
-        tl.store(row[:, None] + z[None, :], tl.zeros([BLOCK_B, ZERO_WIDTH], tl.float32), mask=zmask)
         tl.store(row + 2 * slot, win_val, mask=rmask)
         tl.store(row + 2 * slot + 1, win_idx.to(tl.float32), mask=rmask)
         tl.atomic_xchg(ticket_ptr, 0, sem="relaxed", scope="gpu")
@@ -1030,7 +1050,7 @@ class VocabParallelHead:
         )
         programs, block_b, partial, ticket = self._markov_round_buffers(num_reqs, device)
         tp = self.exchange.tp_size
-        width = triton.next_power_of_2(2 * tp)
+        width = max(_MARKOV_EXCHANGE_WIDTH, triton.next_power_of_2(2 * tp)) if tp > 1 else 2
         pairs, stride_pairs, n_slots = first_prev_tokens, 0, 1
         for step in range(block_size + 1):
             if step == block_size:
@@ -1082,6 +1102,7 @@ class VocabParallelHead:
                 RANK=rank,
                 FROM_ANCHOR=step == 0,
                 ZERO_WIDTH=width,
+                ZERO_CHUNK=triton.next_power_of_2(triton.cdiv(width, programs)),
                 BLOCK_B=block_b,
                 BLOCK_SLOTS=triton.next_power_of_2(max(tp, 1)),
                 BLOCK_V=_MARKOV_BLOCK_V,
