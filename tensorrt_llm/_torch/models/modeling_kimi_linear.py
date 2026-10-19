@@ -331,6 +331,72 @@ _K3_MOE_L2_PREFETCH_MAX_M = int(os.environ.get("TRTLLM_K3_MOE_L2_PREFETCH_MAX_M"
 # MoE runtimes of one model by layer index (keyed by the model's text config), for the prefetch of the
 # next MoE layer's weights.
 _K3_MOE_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiK3MoERuntime]"] = {}
+# TRTLLM_K3_LATENT_AR_OWN_WS=1: for up to TRTLLM_K3_LATENT_AR_OWN_WS_MAX_M tokens, the routed latent
+# all-reduce + RMSNorm (the same MNNVL Lamport kernels) runs on a workspace of its own instead of the
+# one it shares with the shared expert's all-reduce. It then no longer has to follow the shared-expert
+# chain: the main stream issues it and latent_up right after the routed FC2 and joins the shared
+# stream after latent_up. Applies where latent_up does not add the shared output itself (no fused
+# latent_up + residual variant); the output is bit-identical.
+_K3_LATENT_AR_OWN_WS = os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS", "0") == "1"
+_K3_LATENT_AR_OWN_WS_MAX_M = int(os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS_MAX_M", "64"))
+# The routed latent all-reduce's own MNNVL workspaces, by all-reduce mapping.
+_K3_LATENT_AR_WORKSPACES: Dict[Mapping, Dict[str, Any]] = {}
+
+
+def _k3_latent_ar_workspace(
+    mapping: Mapping, dtype: torch.dtype, hidden_size: int, max_tokens: int
+) -> Dict[str, Any]:
+    """MNNVL Lamport workspace of the routed latent all-reduce alone (three buffers and the state
+    flags, laid out as ``get_or_scale_allreduce_mnnvl_workspace`` lays out the shared one), sized
+    for up to ``max_tokens`` rows of ``hidden_size``. Collective over the all-reduce group: every
+    rank builds it at the same point of model construction."""
+    workspace = _K3_LATENT_AR_WORKSPACES.get(mapping)
+    if workspace is not None:
+        if workspace["max_tokens"] < max_tokens:
+            raise ValueError(
+                f"Kimi K3 latent all-reduce workspace serves {workspace['max_tokens']} tokens, "
+                f"{max_tokens} requested"
+            )
+        return workspace
+    from ...bindings.internal.runtime import McastGPUBuffer
+    from ..distributed.ops import MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace
+
+    # The shared workspace's communicator (split by the all-reduce group) is the same group.
+    comm = get_or_scale_allreduce_mnnvl_workspace(mapping, dtype)["mpi_comm"]
+    need = max(
+        MNNVLAllReduce.get_required_workspace_size(m, hidden_size, mapping.tp_size, dtype)
+        for m in range(1, max_tokens + 1)
+    )
+    buffer_bytes = -(-need // (1 << 20)) << 20
+    use_fabric_handle = (
+        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
+    )
+    handle = McastGPUBuffer(
+        3 * buffer_bytes,
+        mapping.tp_size,
+        mapping.tp_rank,
+        mapping.local_rank,
+        use_fabric_handle,
+        comm.py2f(),
+    )
+    # Lamport-clean (-0.0) before any rank writes into it.
+    buffer = handle.get_uc_buffer(mapping.tp_rank, (3 * buffer_bytes // 4,), torch.float32, 0)
+    buffer.fill_(-0.0)
+    torch.cuda.synchronize()
+    comm.Barrier()
+    # [current index, dirty index, bytes per buffer, dirty stages, bytes to clear x4, arrivals]
+    flags = torch.tensor(
+        [0, 2, buffer_bytes, 0, 0, 0, 0, 0, 0], dtype=torch.uint32, device=buffer.device
+    )
+    workspace = {
+        "handle": handle,
+        "buffer": buffer.view(dtype).view(3, -1),
+        "flags": flags,
+        "max_tokens": max_tokens,
+    }
+    _K3_LATENT_AR_WORKSPACES[mapping] = workspace
+    return workspace
+
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
@@ -1859,6 +1925,10 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
+    # TRTLLM_K3_LATENT_AR_OWN_WS: the routed latent all-reduce's own MNNVL workspace (``None``: it
+    # shares the one of the shared expert's all-reduce).
+    _latent_ar_ws: Optional[Dict[str, Any]] = None
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -2186,6 +2256,12 @@ class KimiK3MoERuntime(nn.Module):
         self._moe_group[layer_idx] = self
         self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
         self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
+        if _K3_LATENT_AR_OWN_WS and self._reduce_routed_output:
+            mnnvl = getattr(self.routed_experts.all_reduce, "mnnvl_allreduce", None)
+            if mnnvl is not None and mnnvl.mapping.tp_size > 1:
+                self._latent_ar_ws = _k3_latent_ar_workspace(
+                    mnnvl.mapping, mnnvl.dtype, self.moe_hidden_size, _K3_LATENT_AR_OWN_WS_MAX_M
+                )
 
     def _next_moe_layer(self) -> Optional["KimiK3MoERuntime"]:
         """The MoE runtime of the next MoE layer of this model, if any."""
@@ -2658,6 +2734,57 @@ class KimiK3MoERuntime(nn.Module):
         )
         return out.view(residual.shape)
 
+    def _latent_up_reads_shared(self, latent: torch.Tensor) -> bool:
+        """Whether a latent_up variant that adds the shared-expert output itself (the quantized
+        all-reduce + mid-M GEMM, the mid-M GEMM, the fused latent_up + residual) may serve the
+        ``[M, moe_hidden_size]`` BF16 routed latent ``latent`` (or a tensor shaped like it)."""
+        up = self.routed_expert_up_proj
+        if isinstance(up, _Fp8BlockScaleWeightReadLinear) and up.mid_weight_sf is not None:
+            m = latent.shape[0]
+            if _K3_LU_AR_QUANT and _K3_FP8_MID_MIN_M <= m <= _K3_FP8_MID_MAX_M:
+                from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
+
+                if (
+                    k3_fp8_mid_gemm.tile_for(m, up.out_features, up.in_features, packed=True)
+                    is not None
+                ):
+                    return True
+            if up.mid_gemm_applies(latent):
+                return True
+        return self._fused_projection_applies(_K3_LU_FUSED, latent, up)
+
+    def _own_workspace_latent_tail(
+        self,
+        routed_out: torch.Tensor,
+        shared_out: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        defer_residual: bool,
+    ):
+        """``TRTLLM_K3_LATENT_AR_OWN_WS``: the routed latent all-reduce + RMSNorm on its own MNNVL
+        workspace and latent_up, issued on the main stream before it joins the shared-expert
+        stream, whose output only the residual update reads. Returns what ``forward`` returns."""
+        workspace = self._latent_ar_ws
+        (routed_latent,) = torch.ops.trtllm.mnnvl_fusion_allreduce(
+            routed_out.contiguous(),
+            self.routed_expert_norm.weight,
+            None,
+            float(self.routed_expert_norm.variance_epsilon),
+            workspace["buffer"],
+            workspace["flags"],
+            True,
+            None,
+            int(AllReduceFusionOp.RMS_NORM),
+        )
+        routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        self.moe_shared_event.wait()
+        if residual is not None:
+            if defer_residual:
+                return _DeferredMoEResidual(residual, routed_out, shared_out)
+            from ..modules.kimi_k3_moe_residual import _fused_moe_residual_add
+
+            return _fused_moe_residual_add(routed_out, shared_out, residual)
+        return routed_out + shared_out
+
     def _latent_up_from_quantized_all_reduce(
         self,
         routed_out: torch.Tensor,
@@ -3115,6 +3242,30 @@ class KimiK3MoERuntime(nn.Module):
                 if self._shared_needs_all_reduce():
                     shared_out = self._shared_all_reduce()(shared_partial)
                 self.moe_shared_event.record()
+            self.moe_shared_event.wait()
+        elif (
+            self._latent_ar_ws is not None
+            and merged is None
+            and moe_all_reduce is not None
+            and not self._defer_shared_allreduce
+            and num_tokens <= self._latent_ar_ws["max_tokens"]
+            and self.shared_expert_stream is not None
+            and do_multi_stream()
+            and not torch.compiler.is_compiling()
+        ):
+            # The fork / join of maybe_execute_in_parallel, with the join left open until it is
+            # known whether the latent all-reduce runs on its own workspace.
+            self.moe_main_event.record()
+            routed_out = _routed_output()
+            with torch.cuda.stream(self.shared_expert_stream):
+                self.moe_main_event.wait()
+                shared_out = _shared_output()
+                self.moe_shared_event.record()
+            latent = routed_out.reshape(-1, routed_out.shape[-1])
+            if latent.dtype == torch.bfloat16 and not self._latent_up_reads_shared(latent):
+                return self._own_workspace_latent_tail(
+                    routed_out, shared_out, residual, defer_residual
+                )
             self.moe_shared_event.wait()
         else:
             routed_out, shared_out = maybe_execute_in_parallel(
