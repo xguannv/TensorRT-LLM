@@ -236,3 +236,84 @@ def test_layer_major_context_latents_match(num_tokens):
     if out is None:
         pytest.skip("fused RMSNorm+RoPE kernel unavailable")
     assert torch.equal(out.transpose(0, 1), expected[:, :, 0])
+
+
+class _FakeSideAllReduce:
+    """Single-rank stand-in for PrivateMNNVLAllReduce: RMSNorm of the partial."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fits(self, num_tokens, hidden):
+        return True
+
+    def rms_norm(self, partial, gamma, eps):
+        x = partial.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+        return (x * gamma.float()).to(partial.dtype)
+
+
+class _FakeShardedDrafter(_FakeMLADrafter):
+    """The fake drafter with a TP-sharded fc (one rank) and layer-major latents."""
+
+    def __init__(self):
+        super().__init__()
+        gen = torch.Generator(device="cuda").manual_seed(2)
+        self.fc = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16, device="cuda"))
+        self.hidden_norm = SimpleNamespace(
+            weight=(torch.rand(HIDDEN, device="cuda", generator=gen) + 0.5).to(torch.bfloat16),
+            eps=1e-6,
+        )
+        self._fc_w = (torch.randn(HIDDEN, 2 * HIDDEN, device="cuda", generator=gen) * 0.1).to(
+            torch.bfloat16
+        )
+        self._fc_shard = (self._fc_w, HIDDEN, 3 * HIDDEN, SimpleNamespace(mnnvl_allreduce=object()))
+        self.model_config = SimpleNamespace(mapping=Mapping())
+
+    def project_target_hidden(self, hidden):
+        partial = torch.nn.functional.linear(hidden[:, HIDDEN : 3 * HIDDEN], self._fc_w)
+        return _FakeSideAllReduce().rms_norm(partial, self.hidden_norm.weight, self.hidden_norm.eps)
+
+    def precompute_context_kv_layer_major(self, projected, positions):
+        latent, _ = self.precompute_context_kv(projected, positions)
+        return latent[:, :, 0].transpose(0, 1).contiguous()
+
+
+@pytest.mark.parametrize("num_gens", [1, 5, 32])
+def test_side_stream_context_latents_match(num_gens, monkeypatch):
+    """TLLM_DSPARK_CTX_SIDE_STREAM: the latents computed on the side stream
+    store exactly what the main-stream path stores, with the same bookkeeping."""
+    import tensorrt_llm._torch.speculative.private_mnnvl_allreduce as pm
+
+    monkeypatch.setattr(pm, "PrivateMNNVLAllReduce", _FakeSideAllReduce)
+    monkeypatch.setenv(SPEC_TAIL_FUSION_ENV_VAR, "1")
+    monkeypatch.setenv("TLLM_DSPARK_TAIL_V2", "1")
+    worker, accepted, nacc, spec_md, make_md, total = _case(0, num_gens, 100 + num_gens)
+    ref_worker = copy.deepcopy(worker)
+    outs = []
+    for w, side in ((ref_worker, "0"), (worker, "1")):
+        monkeypatch.setenv("TLLM_DSPARK_CTX_SIDE_STREAM", side)
+        drafter = _FakeShardedDrafter()
+        md = make_md()
+        w._ctx_side = w._launch_ctx_side(drafter, spec_md, md, total)
+        assert (w._ctx_side is not None) == (side == "1")
+        inputs = w.prepare_1st_drafter_inputs(
+            input_ids=None,
+            position_ids=None,
+            hidden_states=torch.empty(1, HIDDEN, device="cuda"),
+            accepted_tokens=accepted,
+            num_accepted_tokens=nacc,
+            attn_metadata=md,
+            spec_metadata=spec_md,
+            draft_model=drafter,
+            total_target_tokens=total,
+        )
+        torch.cuda.synchronize()
+        outs.append((inputs, md))
+    (ref, ref_md), (out, md) = outs
+    for key in ("noise_embedding", "query_positions", "num_ctx_per_req", "first_prev_tokens"):
+        assert torch.equal(out[key], ref[key]), key
+    assert torch.equal(worker._ctx_len, ref_worker._ctx_len)
+    assert torch.equal(md._seq_lens_cuda, ref_md._seq_lens_cuda)
+    for layer in range(LAYERS):
+        assert torch.equal(worker._ctx_kv_buf[layer], ref_worker._ctx_kv_buf[layer]), layer
