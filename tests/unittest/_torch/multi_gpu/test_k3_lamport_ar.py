@@ -126,6 +126,18 @@ def _run_rank(world_size):
                     bad += differ(ref, out)
                     bad += differ(ref, allreduce(x))
 
+        # Two-shot finish in place + gather (what a consumer polling the result rows reads).
+        for m in (100, 300):
+            if lamport.one_shot_for(m, 7168, world_size, threshold):
+                continue
+            x = _input(m, 7168, 41 * m, rank, 1)
+            ref = allreduce(x)
+            lamport.run_lamport_push(ws, x, False)
+            lamport.run_lamport_finish_in_place(ws, m, 7168)
+            out = lamport.run_lamport_gather(ws, torch.empty_like(x))
+            bad += differ(ref, out)
+            bad += differ(ref, allreduce(x))
+
         # GEMM push epilogue + finish against the GEMM followed by the C++ all-reduce.
         for n, k in ((7168, 768), (7168, 384)):
             w, w_scale = _weights(n, k, 11 + rank)

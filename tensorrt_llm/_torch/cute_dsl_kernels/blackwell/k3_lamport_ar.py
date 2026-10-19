@@ -691,6 +691,38 @@ def poll_result_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, h
     return w
 
 
+class K3LamportGatherKernel:
+    """Copy the result rows of the last in-place two-shot call on a workspace into a tensor
+    (:func:`poll_result_v4` per 16-byte vector), for a consumer that cannot poll them itself.
+    Grid ``(m, ceil(hidden / 8 / 128))``; it waits for its predecessor (the finish kernel)."""
+
+    def __init__(self, hidden: int, use_pdl: bool):
+        if hidden % 8:
+            raise ValueError(f"hidden={hidden} must be a multiple of 8")
+        self.H = hidden
+        self.use_pdl = use_pdl
+        self.vecs = hidden // 8
+        self.cols = _ceil_div(self.vecs, THREADS)
+
+    @cute.jit
+    def __call__(self, uc_local: Int64, flags: Int64, out: Int64, m: Int32, stream: cuda.CUstream):
+        self.kernel(uc_local, flags, out, m).launch(
+            grid=(m, self.cols, 1), block=(THREADS, 1, 1), stream=stream, use_pdl=self.use_pdl
+        )
+
+    @cute.kernel
+    def kernel(self, uc_local: Int64, flags: Int64, out: Int64, m: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        tok, by, _ = cute.arch.block_idx()
+        v = by * THREADS + tidx
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+            griddepcontrol_launch_dependents()
+        if v < self.vecs:
+            w = poll_result_v4(uc_local, flags, tok, v * 16, self.H)
+            st_v4(out + Int64(tok * self.H + v * 8) * 2, *w)
+
+
 @functools.cache
 def _compiled_finish(
     world: int,
@@ -769,6 +801,25 @@ def run_lamport_finish(
     return out
 
 
+@functools.cache
+def _compiled_gather(hidden: int, use_pdl: bool):
+    kernel = K3LamportGatherKernel(hidden, use_pdl)
+    a = Int64(1 << 20)
+    return cute.compile(kernel, a, a, a, Int32(1), _stream())
+
+
+def run_lamport_gather(
+    ws: LamportWorkspace, out: torch.Tensor, use_pdl: bool = True
+) -> torch.Tensor:
+    """Copy the result of the last in-place two-shot call on ``ws`` into ``out`` (contiguous BF16
+    ``[m, hidden]``); run it before the next all-reduce on the workspace. Returns ``out``."""
+    m, hidden = out.shape
+    _compiled_gather(hidden, use_pdl)(
+        Int64(ws.uc_local), Int64(ws.flags.data_ptr()), Int64(out.data_ptr()), Int32(m), _stream()
+    )
+    return out
+
+
 def run_lamport_finish_in_place(
     ws: LamportWorkspace, num_tokens: int, hidden: int, use_pdl: bool = True
 ) -> None:
@@ -788,6 +839,7 @@ def run_lamport_finish_in_place(
 
 __all__ = [
     "K3LamportFinishKernel",
+    "K3LamportGatherKernel",
     "K3LamportPushKernel",
     "LamportWorkspace",
     "one_shot_for",
@@ -797,5 +849,6 @@ __all__ = [
     "required_bytes",
     "run_lamport_finish",
     "run_lamport_finish_in_place",
+    "run_lamport_gather",
     "run_lamport_push",
 ]

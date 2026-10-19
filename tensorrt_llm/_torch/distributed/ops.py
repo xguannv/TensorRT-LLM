@@ -594,6 +594,38 @@ class LamportPushTarget:
         self.pushed = False
 
 
+class LamportResult:
+    """The result of a pushed two-shot all-reduce left in the MNNVL workspace
+    (``AllReduce.finish_lamport_push(..., in_place=True)``).
+
+    A consumer that runs next reads its rows with
+    ``k3_lamport_ar.poll_result_v4(workspace.uc_local, workspace.flags, ...)``
+    after its own ``griddepcontrol.wait``; ``materialize`` copies them into a
+    tensor instead. The rows live until the next all-reduce on the workspace
+    re-arms their buffer: the next pushed call's finish kernel does that as
+    soon as it is resident, which its producer allows only after its own
+    ``griddepcontrol.wait`` (every earlier grid, the consumer included, has
+    then completed); the C++ kernels re-arm after their wait. So the consumer
+    must lie on every dependency path from this call to the next one on the
+    workspace (for the attention output: A_mid, after which the shared expert
+    forks), and every kernel between them must wait before it triggers or
+    completes.
+    """
+
+    def __init__(self, target: LamportPushTarget):
+        self.target = target
+        self.workspace = target.workspace
+        self.shape = tuple(target.output.shape)
+
+    def materialize(self) -> torch.Tensor:
+        """The result as a BF16 tensor (a copy kernel on the current stream)."""
+        from ..cute_dsl_kernels.blackwell import k3_lamport_ar
+        from ..flashinfer_utils import get_env_enable_pdl
+        return k3_lamport_ar.run_lamport_gather(self.workspace,
+                                                self.target.output,
+                                                use_pdl=get_env_enable_pdl())
+
+
 class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
@@ -789,10 +821,20 @@ class MNNVLAllReduce(nn.Module):
         return LamportPushTarget(view, one_shot, cpp_one_shot, output)
 
     @staticmethod
-    def finish_lamport_push(target: LamportPushTarget) -> torch.Tensor:
-        """Complete a pushed all-reduce; returns ``target.output``."""
+    def finish_lamport_push(
+            target: LamportPushTarget,
+            in_place: bool = False) -> Union[torch.Tensor, LamportResult]:
+        """Complete a pushed all-reduce; returns ``target.output``, or with
+        ``in_place`` (two-shot transport only) a ``LamportResult``."""
         from ..cute_dsl_kernels.blackwell import k3_lamport_ar
         from ..flashinfer_utils import get_env_enable_pdl
+        if in_place and not target.one_shot:
+            k3_lamport_ar.run_lamport_finish_in_place(
+                target.workspace,
+                target.output.shape[0],
+                target.output.shape[1],
+                use_pdl=get_env_enable_pdl())
+            return LamportResult(target)
         return k3_lamport_ar.run_lamport_finish(
             target.workspace,
             target.output,
@@ -1034,11 +1076,16 @@ class AllReduce(nn.Module):
             return None
         return self.mnnvl_allreduce.lamport_push_target(num_tokens, hidden_dim)
 
-    def finish_lamport_push(self, target: LamportPushTarget) -> torch.Tensor:
-        """The all-reduce result of a target the producer has pushed."""
+    def finish_lamport_push(
+            self,
+            target: LamportPushTarget,
+            in_place: bool = False) -> Union[torch.Tensor, LamportResult]:
+        """The all-reduce result of a target the producer has pushed: a tensor,
+        or with ``in_place`` (where the two-shot transport ran) a
+        ``LamportResult`` that the next kernel reads from the workspace."""
         if not target.pushed:
             raise RuntimeError("the producer did not push this all-reduce")
-        return self.mnnvl_allreduce.finish_lamport_push(target)
+        return self.mnnvl_allreduce.finish_lamport_push(target, in_place)
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
