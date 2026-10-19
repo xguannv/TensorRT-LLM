@@ -507,6 +507,14 @@ class KDAKernelDispatch:
         _load_mtp_module()
         return torch.ops.trtllm.kda_mtp_decode_fused_fb(**kwargs)
 
+    def mtp_verify_fused_fb_mx(self, **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """:meth:`mtp_verify_fused_fb` plus the MXFP8 form ``(xq, xs)`` of the output for the
+        o_proj low-M GEMM: passthrough to ``trtllm::kda_mtp_decode_fused_fb_mx``."""
+        if self.verify_kernel_path != "optimized":
+            raise RuntimeError("mtp_verify_fused_fb_mx needs the optimized verify path")
+        _load_mtp_module()
+        return torch.ops.trtllm.kda_mtp_decode_fused_fb_mx(**kwargs)
+
     def can_use_indexed_prefill(
         self,
         *,

@@ -83,6 +83,10 @@ _KDA_DECODE_PDL = (
 # packed UE8M0 scales, bitwise the separate quantize kernel), when o_proj would run DeepGEMM on
 # the BF16 output; o_proj then takes the prequantized pair.
 _KDA_DECODE_FP8_OUT = os.environ.get("TRTLLM_K3_KDA_DECODE_FP8_OUT", "0") == "1"
+# Fused-forget-gate verify: where o_proj runs the low-M FP8 GEMM on the verify output, the verify
+# kernel's norm epilogue also stores the MXFP8 form of its BF16 output and o_proj runs the low-M
+# GEMM on that (k3_fp8w_lowm_mxfp8) instead of quantizing the BF16 rows itself; bitwise the same.
+_KDA_DECODE_MXFP8 = os.environ.get("TRTLLM_K3_KDA_DECODE_MXFP8", "0") == "1"
 # Decode verify (fused path): once this layer's QKVG projection and [f_a | b] kernel are done, the
 # projection aux stream prefetches the next KDA layer's QKVG, [f_a | b], f_b and o_proj weights
 # into L2 (cp.async.bulk.prefetch.L2, k3_l2_prefetch) while this layer's recurrence and all-reduce
@@ -1427,7 +1431,19 @@ class KimiKDALinearAttention(nn.Module):
 
         if f_a is not None:
             # Forget gate bf16(f_a @ W_fb^T) inside the verify kernel.
-            out = self._dispatch.mtp_verify_fused_fb(
+            takes_mxfp8 = getattr(self.o_proj, "takes_mxfp8_input", None)
+            mxfp8_o = (
+                _KDA_DECODE_MXFP8
+                and not torch.compiler.is_compiling()
+                and takes_mxfp8 is not None
+                and takes_mxfp8(T_total)
+            )
+            verify_fused_fb = (
+                self._dispatch.mtp_verify_fused_fb_mx
+                if mxfp8_o
+                else self._dispatch.mtp_verify_fused_fb
+            )
+            out = verify_fused_fb(
                 x_q=x_q,
                 x_k=x_k,
                 x_v=x_v,
@@ -1457,6 +1473,9 @@ class KimiKDALinearAttention(nn.Module):
                 onorm_eps=self.o_norm.eps,
                 use_pdl=_KDA_DECODE_PDL,
             )
+            if mxfp8_o:
+                out, xq, xs = out
+                return self.o_proj.forward_mxfp8(out.view(-1, self.proj_size), xq, xs)
             return self.o_proj(out.view(-1, self.proj_size))
         g = forget_gate.view(1, T_total, H, K)
         two_cta = _verify_two_cta(H, num_decodes, x2d.device)

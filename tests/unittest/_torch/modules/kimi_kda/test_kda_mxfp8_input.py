@@ -12,12 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KDA verify with an MXFP8 projection input (``TRTLLM_K3_ATTN_RES_MXFP8``).
+"""KDA verify with MXFP8 projection inputs.
 
-The decoder layer hands the mixer the MXFP8 form of its rows (``next_input_mxfp8``); the fused FP8
-QKVG projection then runs the low-M GEMM on it. The verify results (output, committed state, conv
-windows, replay caches) must be bitwise those of the BF16 input, and the hand-off is consumed by
-one forward.
+* ``TRTLLM_K3_ATTN_RES_MXFP8``: the decoder layer hands the mixer the MXFP8 form of its rows
+  (``next_input_mxfp8``); the fused FP8 QKVG projection runs the low-M GEMM on it. The hand-off is
+  consumed by one forward.
+* ``TRTLLM_K3_KDA_DECODE_MXFP8``: the fused-forget-gate verify kernel also stores the MXFP8 form of
+  its BF16 output, which the FP8 o_proj consumes.
+
+The verify results (output, committed state, conv windows, replay caches) must be bitwise those of
+the BF16 path, and the MXFP8 rows must be exactly the low-M GEMM's quantization of the BF16 rows.
 """
 
 from types import SimpleNamespace
@@ -106,6 +110,10 @@ def _runtime_with_fp8_qkvg(aux, seed):
     rt.qkvg_proj = linear
     rt.qkvg_split_sizes = [H * K] * 4
     rt._qkvg_proj_weight = None
+    o_weight = (torch.randn((HIDDEN, H * K), generator=gen, device="cuda") * 0.03).bfloat16()
+    rt.o_proj = kimi._Fp8BlockScaleWeightReadLinear(
+        *kimi._Fp8BlockScaleWeightReadLinear.quantize_weight(o_weight), HIDDEN
+    )
     return rt
 
 
@@ -202,6 +210,71 @@ def test_mxfp8_input_is_bitwise(graph, monkeypatch):
     assert not calls
     out, state = run_once(True)
     assert calls and all(shape == (x.shape[0], HIDDEN) for shape in calls)
+    assert torch.equal(out, ref_out)
+    for name in MUTATED:
+        assert torch.equal(state[name], ref_state[name]), name
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@torch.no_grad()
+def test_mxfp8_decode_output_is_bitwise(graph, monkeypatch):
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_FUSED_FAB", True)
+    monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_PDL", True)
+    aux = torch.cuda.Stream()
+    rt = _runtime_with_fp8_qkvg(aux, seed=2)
+    cache, ssm, x = _state(seed=5)
+    assert rt.o_proj.takes_mxfp8_input(x.shape[0])
+    snap = _snapshot(cache, ssm)
+    slots = torch.arange(B, dtype=torch.int32, device="cuda")
+    main = torch.cuda.Stream()
+    verify_mx = rt._dispatch.mtp_verify_fused_fb_mx
+    produced = []
+
+    def recording_verify_mx(**kwargs):
+        res = verify_mx(**kwargs)
+        produced.append(res)
+        return res
+
+    monkeypatch.setattr(rt._dispatch, "mtp_verify_fused_fb_mx", recording_verify_mx)
+
+    def verify():
+        out = rt.forward_verify(x, NUM_SPEC + 1, cache, None, ssm, slots)
+        torch.cuda.current_stream().wait_stream(aux)
+        return out
+
+    def run_once(mxfp8):
+        monkeypatch.setattr(kimi_kda_mixer, "_KDA_DECODE_MXFP8", mxfp8)
+        produced.clear()
+        _restore(cache, ssm, snap)
+        with torch.cuda.stream(main), with_multi_stream(True):
+            if not graph:
+                out = verify().clone()
+            else:
+                verify()  # warm-up (compiles, allocates the fab state)
+                _restore(cache, ssm, snap)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=main):
+                    out_g = verify()
+                _restore(cache, ssm, snap)
+                g.replay()
+                out = out_g.clone()
+        torch.cuda.synchronize()
+        return out, _snapshot(cache, ssm)
+
+    ref_out, ref_state = run_once(False)
+    assert not produced
+    out, state = run_once(True)
+    assert produced
+    o, xq, xs = produced[-1]
+    ref_q, ref_s = mx.mxfp8_quantize_reference(o.view(x.shape[0], H * K))
+    assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(xs, ref_s)
     assert torch.equal(out, ref_out)
     for name in MUTATED:
         assert torch.equal(state[name], ref_state[name]), name

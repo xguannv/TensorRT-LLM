@@ -48,6 +48,11 @@ Optional (compile-time) variants, both bitwise identical to the plain kernel fed
   gate and computes ``bf16(f_a @ W_fb[h]^T)`` itself: warps 8..15 each own 16 ``W_fb`` rows
   (TMA-loaded into free scratch words up front) and run eight ``mma.sync`` k16 steps on f_a
   fragments loaded with the other new-token rows, before the precompute barrier.
+* **MXFP8 output.** The norm epilogue also stores the MXFP8 form of the BF16 output for the
+  o_proj low-M GEMM (``k3_fp8w_lowm_mxfp8``): E4M3 codes ``[T, HV * V]`` and one UE8M0 exponent
+  per 1x32 group ``[T, HV * V / 32]``. A group is one 32-channel column block of a token row, one
+  value per lane of the token's warp; amax, exponent and E4M3 conversion are the low-M GEMM's own,
+  so the codes are bitwise what it would quantize the BF16 output to.
 """
 
 import os
@@ -58,6 +63,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from .. import k3_fp8w_lowm_mxfp8 as mx_ops
 
 NUM_THREADS = 512
 #: TRTLLM_K3_KDA_DECODE_EARLY_TRIGGER=1 (PDL builds): release the dependent grid (the o_proj GEMM)
@@ -129,6 +136,76 @@ def cvt_bf16x2(hi: cutlass.Float32, lo: cutlass.Float32, *, loc=None, ip=None) -
         )
     )
     return w.bitcast(cutlass.Float32)
+
+
+@dsl_user_op
+def _bf16_bits(x: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Int32:
+    """BF16 bits of ``x`` (round to nearest even) in the low half of a word, zero high half."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Float32(x).ir_value(loc=loc, ip=ip)],
+            "{\n.reg .f32 z;\nmov.f32 z, 0f00000000;\ncvt.rn.bf16x2.f32 $0, z, $1;\n}",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _shfl_bfly_b32(value, offset: int, *, loc=None, ip=None) -> cutlass.Int32:
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 0x1f, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _e4m3_of_bf16_lo(word, inv_scale, *, loc=None, ip=None) -> cutlass.Int32:
+    """E4M3 code of the low BF16 half of ``word`` times the packed power-of-two ``inv_scale``:
+    the per-element arithmetic of ``k3_fp8w_lowm_gemm._quant_bf16x8_to_e4m3`` (exact BF16
+    multiply, satfinite round-to-nearest conversion)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Int32(word).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(inv_scale).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n.reg .b32 p;\n.reg .b16 h;\n"
+            "mul.rn.bf16x2 p, $1, $2;\n"
+            "cvt.rn.satfinite.e4m3x2.bf16x2 h, p;\n"
+            "cvt.u32.u16 $0, h;\n"
+            "and.b32 $0, $0, 255;\n}",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def st_global_u8(addr, v):
+    _st_asm(
+        "st.global.u8 [$0], $1;",
+        "l,r",
+        [Int64(addr).ir_value(), cutlass.Int32(v).ir_value()],
+    )
 
 
 @dsl_user_op
@@ -472,6 +549,8 @@ def kda_decode_mtp_v2_kernel(
     tma_atom_fb: cute.CopyAtom,
     mFb_tma: cute.Tensor,
     fb_layout: cute.ComposedLayout,
+    xq_addr: Int64,
+    xs_addr: Int64,
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -484,6 +563,7 @@ def kda_decode_mtp_v2_kernel(
     SPLIT_V: cutlass.Constexpr[int],
     PDL: cutlass.Constexpr[bool],
     FUSED_FB: cutlass.Constexpr[bool],
+    MXFP8_OUT: cutlass.Constexpr[bool] = False,
 ):
     """KDA MTP verify, packed-token / fused-norm contract (see the module docstring).
 
@@ -498,6 +578,8 @@ def kda_decode_mtp_v2_kernel(
     TMA-loaded via ``tma_atom_fb`` before ``griddepcontrol.wait``, f_a fragments loaded with the
     other new-token rows): FP32 accumulation, the operands, positions and k order of
     ``k3_kda_fab``'s tail, so bitwise its forget gate.
+    ``MXFP8_OUT``: also store the MXFP8 form of ``o`` at ``xq_addr`` (E4M3 ``[T, HV * V]``) and
+    ``xs_addr`` (UE8M0 ``[T, HV * V / 32]``); the addresses are unused otherwise.
     """
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % 32
@@ -1610,6 +1692,20 @@ def kda_decode_mtp_v2_kernel(
             for i in cutlass.range(V // 32, unroll_full=True):
                 v_idx = i * 32 + in_warp_tid
                 o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(pre_values[i] * inv_rms)
+                if cutlass.const_expr(MXFP8_OUT):
+                    # Channels [32 i, 32 i + 32) of this head form one 1x32 group of the o_proj
+                    # input row: one value per lane, so the group amax is a warp reduction.
+                    word = _bf16_bits(pre_values[i] * inv_rms)
+                    amax = word
+                    for offset in (16, 8, 4, 2, 1):
+                        amax = mx_ops.amax_pair(amax, _shfl_bfly_b32(amax, offset))
+                    e_a = mx_ops.ue8m0_of_amax(amax)
+                    code = _e4m3_of_bf16_lo(word, mx_ops.bf16x2_inv_scale(e_a))
+                    row_q = Int64(output_row) * (HV * V)
+                    st_global_u8(xq_addr + row_q + i_hv * V + v_idx, code)
+                    if in_warp_tid == 0:
+                        row_s = Int64(output_row) * (HV * V // 32)
+                        st_global_u8(xs_addr + row_s + i_hv * (V // 32) + i, e_a)
             token_idx = token_idx + NUM_THREADS // 32
     # the state stores must have read their smem boxes before the CTA exits
     if (tidx == st_tid0) | (tidx == 256 + st_tid0):

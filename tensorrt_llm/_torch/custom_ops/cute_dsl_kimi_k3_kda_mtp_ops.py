@@ -428,6 +428,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_accepted_tokens: cute.Tensor,
         fa: cute.Tensor,
         w_fb: cute.Tensor,
+        xq_addr: cutlass.Int64,
+        xs_addr: cutlass.Int64,
         N: cutlass.Int32,
         scale: cutlass.Constexpr[float],
         HV: cutlass.Constexpr[int],
@@ -441,13 +443,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         SPLIT_V: cutlass.Constexpr[int],
         PDL: cutlass.Constexpr[bool],
         FUSED_FB: cutlass.Constexpr[bool],
+        MXFP8_OUT: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
         """Host side of ``kda_decode_mtp_v2_kernel`` (packed rows, fused gated RMSNorm, bf16
         output, 3xTF32): the tf32 MMA atoms, operand smem layouts and state TMA atoms of
         ``_run_kda_decode_mtp``, then the launch. With ``FUSED_FB``, ``fa`` is the BF16
         ``[1, T, 128]`` f_a view and ``w_fb`` the BF16 ``[HV * 128, 128]`` f_b weight (else both
-        are unused placeholders)."""
+        are unused placeholders). With ``MXFP8_OUT`` the kernel also stores the MXFP8 form of the
+        output at ``xq_addr`` / ``xs_addr`` (unused otherwise)."""
         f32 = cutlass.Float32
         smem_qk_layout = cute.make_layout((2 * NUM_SPEC + 1, K), stride=(K, 1))
         tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
@@ -640,6 +644,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tma_atom_fb,
             mFb_tma,
             fb_layout,
+            xq_addr,
+            xs_addr,
             scale,
             HV,
             K,
@@ -652,6 +658,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_V,
             PDL,
             FUSED_FB,
+            MXFP8_OUT,
         )
         if cutlass.const_expr(SPLIT_V == 2):
             # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
@@ -1256,6 +1263,7 @@ def kda_mtp_decode_impl(
     use_pdl: bool = False,
     two_cta: bool = False,
     fp8_out: bool = False,
+    mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -1313,6 +1321,10 @@ def kda_mtp_decode_impl(
             prequantized operand of the o_proj GEMM. The two-CTA kernel quantizes in
             its epilogue (bitwise the separate quantize kernel); other kernels run the
             quantize kernel on their BF16 output.
+        mxfp8_out: ``(xq, xs)`` (v2 kernel only): also store the MXFP8 form of the BF16
+            output for the o_proj low-M GEMM (``k3_fp8w_lowm_mxfp8``): contiguous E4M3
+            ``xq [T_total, HV * V]`` and uint8 ``xs [T_total, HV * V / 32]`` (one UE8M0
+            exponent per 1x32 group), bitwise that GEMM's quantization of the output.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -1479,6 +1491,8 @@ def kda_mtp_decode_impl(
             conv_caches=(cs_q, cs_k, cs_v),
         )
     )
+    if mxfp8_out is not None and not use_v2:
+        raise ValueError("the MXFP8 side output needs the v2 kernel contract")
     if (fused_fb or use_pdl) and not use_v2:
         raise ValueError(
             "the fused forget gate and PDL launch need the v2 kernel contract (packed rows, "
@@ -1492,6 +1506,7 @@ def kda_mtp_decode_impl(
         use_2cta = (
             two_cta
             and not fused_fb
+            and mxfp8_out is None
             and split_v == 1
             and h0_arg.dtype in (torch.float32, torch.bfloat16)
             and all(t.dtype == torch.bfloat16 for t in (x_q, x_k, x_v, cs_q, cs_k, cs_v))
@@ -1610,6 +1625,12 @@ def kda_mtp_decode_impl(
             (fa_arg, 16 if fused_fb else 2),
             (w_fb_arg, 16),
         )
+        mxfp8 = mxfp8_out is not None
+        mx_addrs = (
+            (cutlass.Int64(mxfp8_out[0].data_ptr()), cutlass.Int64(mxfp8_out[1].data_ptr()))
+            if mxfp8
+            else (cutlass.Int64(0), cutlass.Int64(0))
+        )
         v2_key = (
             "v2",
             tuple(_layout_key(t, dynamic_layout=True, assumed_align=a) for t, a in v2_args),
@@ -1625,6 +1646,7 @@ def kda_mtp_decode_impl(
             split_v,
             bool(use_pdl),
             fused_fb,
+            mxfp8,
         )
         if v2_key not in _compiled_cache:
             logger.info(
@@ -1634,6 +1656,7 @@ def kda_mtp_decode_impl(
             _compiled_cache[v2_key] = cute.compile(
                 _run_kda_decode_mtp_v2,
                 *[_dlpack_arg(t, assumed_align=a) for t, a in v2_args],
+                *mx_addrs,
                 N,
                 scale=scale,
                 HV=HV,
@@ -1647,9 +1670,12 @@ def kda_mtp_decode_impl(
                 SPLIT_V=split_v,
                 PDL=bool(use_pdl),
                 FUSED_FB=fused_fb,
+                MXFP8_OUT=mxfp8,
                 stream=stream,
             )
-        _compiled_cache[v2_key](*[_dlpack_arg(t, assumed_align=a) for t, a in v2_args], N, stream)
+        _compiled_cache[v2_key](
+            *[_dlpack_arg(t, assumed_align=a) for t, a in v2_args], *mx_addrs, N, stream
+        )
         if fp8_out:
             return torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(out.view(T_total, -1), False)
         return out
@@ -2188,6 +2214,132 @@ if IS_CUTLASS_DSL_AVAILABLE:
         use_pdl: bool,
     ) -> torch.Tensor:
         return x_q.new_empty(x_v.shape)
+
+    def _mxfp8_rows(x_v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Empty ``(xq, xs)`` for the MXFP8 form of the ``[1, T, HV, V]`` output rows."""
+        t, width = x_v.shape[1], x_v.shape[2] * x_v.shape[3]
+        return (
+            x_v.new_empty((t, width), dtype=torch.float8_e4m3fn),
+            x_v.new_empty((t, width // 32), dtype=torch.uint8),
+        )
+
+    @torch.library.custom_op(
+        "trtllm::kda_mtp_decode_fused_fb_mx",
+        mutates_args=(
+            "cs_q",
+            "cs_k",
+            "cs_v",
+            "recurrent_state",
+            "k_cache",
+            "g_cache",
+            "v_cache",
+            "beta_cache",
+        ),
+        device_types="cuda",
+    )
+    def kda_mtp_decode_fused_fb_mx(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        fa: torch.Tensor,
+        w_fb: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        onorm_g: torch.Tensor,
+        onorm_weight: torch.Tensor,
+        onorm_eps: float,
+        use_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """:func:`kda_mtp_decode_fused_fb` plus the MXFP8 form ``(xq, xs)`` of its output (E4M3
+        ``[T, HV * V]``, one UE8M0 exponent per 1x32 group ``[T, HV * V / 32]``) for the o_proj
+        low-M GEMM (``k3_fp8w_lowm_mxfp8``); the BF16 output is unchanged."""
+        xq, xs = _mxfp8_rows(x_v)
+        out = kda_mtp_decode_impl(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=None,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            v_cache=v_cache,
+            beta_cache=beta_cache,
+            ssm_state_indices=ssm_state_indices,
+            cu_seqlens=None,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            lower_bound=lower_bound,
+            scale=scale,
+            packed_token_layout=True,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=True,
+            fa=fa,
+            w_fb=w_fb,
+            use_pdl=use_pdl,
+            mxfp8_out=(xq, xs),
+        )
+        return out, xq, xs
+
+    @kda_mtp_decode_fused_fb_mx.register_fake
+    def _(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        fa: torch.Tensor,
+        w_fb: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        onorm_g: torch.Tensor,
+        onorm_weight: torch.Tensor,
+        onorm_eps: float,
+        use_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (x_q.new_empty(x_v.shape), *_mxfp8_rows(x_v))
 
     @torch.library.custom_op(
         "trtllm::kda_mtp_decode_fp8",
