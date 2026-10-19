@@ -1,0 +1,682 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Kimi-K3 routed latent all-reduce + RMSNorm (MNNVL one-shot, SM100/SM103) with an early PDL
+trigger, bit-identical to ``oneshotAllreduceFusionKernel<WS, bf16, kARRMSNorm>``.
+
+The C++ kernel (``mnnvlAllreduceKernels.cu``) serves the one-shot sizes of the latent all-reduce
+(``M`` rows of 3584 BF16; ``M <= 38`` launches clusters of 4 CTAs x 112 threads per row). It
+triggers its programmatic dependents only after the cross-rank reduction, so latent_up cannot
+start loading its weight while the all-reduce waits for the other ranks.
+:class:`K3LatentArNormKernel` does the same work with the same arithmetic and triggers right after
+its own ``griddepcontrol.wait``:
+
+* Thread ``t`` of cluster CTA ``c`` owns the eight values ``[8 (112 c + t), + 8)`` of its row. It
+  replaces BF16 ``-0`` by ``+0`` (the Lamport sentinel), stores the 16 bytes into slot
+  ``(row, rank)`` of every rank's current Lamport buffer through the multicast address, clears
+  this rank's dirty buffer (the bytes the previous launch on the workspace left to clear), and
+  polls its eight values of all ``WS`` slots in the local buffer. Ranks are summed in FP32 in
+  chunks of eight like the C++ kernel (each chunk from 0, chunks added in rank order) and rounded
+  to BF16.
+* RMSNorm: BF16 squares (``mul.rn.bf16x2``) summed in element order; butterfly warp sums (the
+  half warp first adds 0 for its missing upper half); the block sum ``(w0 + w2) + (w1 + w3)`` of
+  the reference's warp-0 butterfly over four warp sums; the four CTA sums of the row added in CTA
+  order from 0 through distributed shared memory; ``rsqrt.approx(div.rn(sum, 3584) + eps)``; then
+  ``bf16((x * r) * gamma)``.
+* Lamport state: the same flag words as ``LamportFlags`` (current / dirty buffer, buffer bytes,
+  dirty stages, bytes to clear per stage, arrival counter), so the C++ one- and two-shot kernels
+  can use the same workspace before or after it. Each warp counts one arrival once its lanes
+  have read the flags; at the end, thread 0 of CTA (0, 0) waits for all warps of the grid, rotates
+  the buffers and resets the counter.
+
+PDL: ``griddepcontrol.wait`` first; with ``early_trigger`` the dependents are triggered right
+after it (they may only start reading what they do not wait for, e.g. latent_up its weight),
+else after the reduction like the C++ kernel.
+"""
+
+from __future__ import annotations
+
+import functools
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+import torch
+from cutlass import Float32, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+from .k3_route_tail import _griddepcontrol_launch_dependents, _griddepcontrol_wait
+
+#: Row width (the latent) and values per thread (one 16-byte access).
+HIDDEN = 3584
+ELTS = 8
+#: Cluster of CTAs per row and threads per CTA, as the C++ launcher picks them for 3584 BF16 values
+#: and ``M <= 38`` rows (adjustGridConfig): 4 x 112.
+CLUSTER = 4
+THREADS = HIDDEN // ELTS // CLUSTER
+#: Warps per CTA (the last one is a half warp).
+WARPS = (THREADS + 31) // 32
+#: Largest row count with that launch shape.
+MAX_M = 38
+#: Ranks summed per chunk (``accumulateLamportRanksChunked``).
+RANK_CHUNK = 8
+#: World sizes the C++ launcher dispatches.
+WORLD_SIZES = (2, 4, 8, 16, 32, 64)
+#: Lamport buffers per workspace.
+NUM_LAMPORT_BUFFERS = 3
+
+assert THREADS * CLUSTER * ELTS == HIDDEN and THREADS % 16 == 0
+
+
+def _asm(res, operands, text, constraints, *, loc=None, ip=None):
+    return llvm.inline_asm(
+        res,
+        operands,
+        text,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def _iv(value, *, loc=None, ip=None):
+    return Int32(value).ir_value(loc=loc, ip=ip)
+
+
+def _lv(value, *, loc=None, ip=None):
+    return Int64(value).ir_value(loc=loc, ip=ip)
+
+
+def _fv(value, *, loc=None, ip=None):
+    return Float32(value).ir_value(loc=loc, ip=ip)
+
+
+def _unpack(res, ty, cls, n, *, loc=None, ip=None):
+    return tuple(cls(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(n))
+
+
+@dsl_user_op
+def _ld_v4(addr, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_lv(addr, loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ld_vol_v4(addr, *, loc=None, ip=None):
+    """16 bytes of the Lamport buffer, read past L1 (peers write it over NVLink)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_lv(addr, loc=loc, ip=ip)],
+        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _st_v4(addr, v0, v1, v2, v3, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_sentinel_v4(addr, *, loc=None, ip=None):
+    """Four FP32 ``-0`` words (``getPackedLamportInit<float4, float>``)."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)],
+        "{\n.reg .b32 t;\nmov.b32 t, 0x80000000;\nst.global.v4.b32 [$0], {t, t, t, t};\n}",
+        "l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _sanitize(word, *, loc=None, ip=None):
+    """A BF16 pair with each ``-0`` (0x8000) replaced by ``+0``."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(word, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\n.reg .b32 lo, hi;\n"
+            "and.b32 lo, $1, 0xffff;\nsetp.eq.u32 p, lo, 0x8000;\nselp.b32 lo, 0, lo, p;\n"
+            "and.b32 hi, $1, 0xffff0000;\nsetp.eq.u32 p, hi, 0x80000000;\nselp.b32 hi, 0, hi, p;\n"
+            "or.b32 $0, lo, hi;\n}",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _clean4(w0, w1, w2, w3, *, loc=None, ip=None):
+    """1 if none of the four words is the sentinel (``isLamportDirty`` is false)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(w, loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+            "{\n.reg .pred p;\n"
+            "setp.ne.b32 p, $1, 0x80000000;\nsetp.ne.and.b32 p, $2, 0x80000000, p;\n"
+            "setp.ne.and.b32 p, $3, 0x80000000, p;\nsetp.ne.and.b32 p, $4, 0x80000000, p;\n"
+            "selp.u32 $0, 1, 0, p;\n}",
+            "=r,r,r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16x2_f32(word, *, loc=None, ip=None):
+    """(low, high) BF16 of a pair as FP32."""
+    res = _asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [_iv(word, loc=loc, ip=ip)],
+        "{\n.reg .b32 lo, hi;\nshl.b32 lo, $2, 16;\nand.b32 hi, $2, 0xffff0000;\n"
+        "mov.b32 $0, lo;\nmov.b32 $1, hi;\n}",
+        "=f,=f,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.f32(), Float32, 2, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _pack_bf16x2(lo, hi, *, loc=None, ip=None):
+    """Round two FP32 values to a BF16 pair (``lo`` in the low half)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_fv(lo, loc=loc, ip=ip), _fv(hi, loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sq_bf16x2(word, *, loc=None, ip=None):
+    """Elementwise BF16 square of a pair (``mul.rn.bf16x2``)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(word, loc=loc, ip=ip)],
+            "mul.rn.bf16x2 $0, $1, $1;",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fadd(a, b, *, loc=None, ip=None):
+    return Float32(
+        _asm(
+            T.f32(),
+            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fmul(a, b, *, loc=None, ip=None):
+    return Float32(
+        _asm(
+            T.f32(),
+            [_fv(a, loc=loc, ip=ip), _fv(b, loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _rms_scale(total, eps, *, loc=None, ip=None):
+    """``rsqrtf(total / 3584 + eps)`` as the C++ kernel computes it (IEEE division, then add)."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [_fv(total, loc=loc, ip=ip), _fv(eps, loc=loc, ip=ip)],
+            "{\n.reg .f32 q;\ndiv.rn.f32 q, $1, 0f45600000;\nadd.rn.f32 q, q, $2;\n"
+            "rsqrt.approx.f32 $0, q;\n}",
+            "=f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _shfl_bfly(value, offset: int, mask: int, *, loc=None, ip=None):
+    return Float32(
+        _asm(
+            T.f32(),
+            [_fv(value, loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 0x1f, {mask};",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sts_f32(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
+        "st.shared.f32 [$0], $1;",
+        "r,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _lds_f32(addr, *, loc=None, ip=None):
+    return Float32(
+        _asm(
+            T.f32(), [_iv(addr, loc=loc, ip=ip)], "ld.shared.f32 $0, [$1];", "=f,r", loc=loc, ip=ip
+        )
+    )
+
+
+@dsl_user_op
+def _st_cluster_f32(local_addr, peer, value, *, loc=None, ip=None):
+    """Store ``value`` at ``local_addr`` of cluster CTA ``peer``'s shared memory."""
+    _asm(
+        None,
+        [_iv(local_addr, loc=loc, ip=ip), _iv(peer, loc=loc, ip=ip), _fv(value, loc=loc, ip=ip)],
+        "{\n.reg .b32 ra;\nmapa.shared::cluster.u32 ra, $0, $1;\n"
+        "st.shared::cluster.f32 [ra], $2;\n}",
+        "r,r,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _cluster_sync_release_acquire(*, loc=None, ip=None):
+    _asm(
+        None,
+        [],
+        "barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;",
+        "",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _warp_sync(half_mask: int, is_half, *, loc=None, ip=None):
+    """``bar.warp.sync`` over the warp's existing lanes (the last warp of the CTA may be a half
+    warp: ``half_mask``)."""
+    _asm(
+        None,
+        [_iv(is_half, loc=loc, ip=ip)],
+        "{\n.reg .pred p;\nsetp.ne.s32 p, $0, 0;\n"
+        f"@p bar.warp.sync {half_mask};\n@!p bar.warp.sync 0xffffffff;\n}}",
+        "r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _bar_sync(*, loc=None, ip=None):
+    _asm(None, [], "bar.sync 0;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _red_add_release_gpu(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "red.release.gpu.global.add.u32 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_acquire_gpu_u32(addr, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_lv(addr, loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_u32(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "st.global.u32 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+class K3LatentArNormKernel:
+    """One-shot MNNVL all-reduce + RMSNorm of ``M`` rows of 3584 BF16 (see the module docstring)."""
+
+    def __init__(self, world_size: int, use_pdl: bool, early_trigger: bool, norm: bool = True):
+        if world_size not in WORLD_SIZES:
+            raise ValueError(f"unsupported world size {world_size}")
+        self.world_size = world_size
+        self.use_pdl = use_pdl
+        self.early_trigger = early_trigger
+        # Without ``norm`` the output is the BF16 sum (``kAllReduce``), e.g. to check the rank order.
+        self.norm = norm
+        self.rank_chunk = min(RANK_CHUNK, world_size)
+
+    @cute.jit
+    def __call__(
+        self,
+        x_addr: Int64,
+        gamma_addr: Int64,
+        out_addr: Int64,
+        uc_addr: Int64,
+        mc_addr: Int64,
+        flags_addr: Int64,
+        rank: Int32,
+        m: Int32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        @cute.struct
+        class SharedStorage:
+            # Warp sums, the block sum, and the row's CTA sums (written by the cluster peers).
+            warp_sum: cute.struct.MemRange[cutlass.Float32, WARPS]
+            block_sum: cute.struct.MemRange[cutlass.Float32, 1]
+            cta_sum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, CLUSTER], 16]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            x_addr, gamma_addr, out_addr, uc_addr, mc_addr, flags_addr, rank, m, eps
+        ).launch(
+            grid=(m, CLUSTER, 1),
+            block=(THREADS, 1, 1),
+            cluster=(1, CLUSTER, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x_addr: Int64,
+        gamma_addr: Int64,
+        out_addr: Int64,
+        uc_addr: Int64,
+        mc_addr: Int64,
+        flags_addr: Int64,
+        rank: Int32,
+        m: Int32,
+        eps: Float32,
+    ):
+        ws = self.world_size
+        tidx, _, _ = cute.arch.thread_idx()
+        row, cy, _ = cute.arch.block_idx()
+        crank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        warp_sum = storage.warp_sum.data_ptr().toint()
+        block_sum = storage.block_sum.data_ptr().toint()
+        cta_sum = storage.cta_sum.data_ptr().toint()
+
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_wait()
+            if cutlass.const_expr(self.early_trigger):
+                _griddepcontrol_launch_dependents()
+
+        # LamportFlags: [current, dirty, bytes per buffer, dirty stages], bytes to clear x4.
+        f0, f1, f2, f3 = _ld_v4(flags_addr)
+        c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
+        # One arrival per warp once its lanes hold the flags: CTA (0, 0) rotates them only after
+        # every warp of the grid has read them.
+        counter = flags_addr + Int64(32)
+        _warp_sync(0xFFFF if THREADS % 32 else 0xFFFFFFFF, warp == WARPS - 1)
+        if lane == 0:
+            _red_add_release_gpu(counter, Int32(1))
+        cur = Int64(f0)
+        dirty = Int64(f1)
+        buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
+        dirty_stages = f3
+        col = (crank * THREADS + tidx) * ELTS
+        cur_off = cur * buf_bytes
+
+        # Broadcast this rank's eight values into slot (row, rank) of every rank's buffer.
+        xw = _ld_v4(x_addr + Int64((row * HIDDEN + col) * 2))
+        if cutlass.const_expr(self.norm):
+            gw = _ld_v4(gamma_addr + Int64(col * 2))
+        sw = [_sanitize(w) for w in xw]
+        slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
+        _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
+
+        # Clear this rank's dirty buffer (all stages the previous launch used).
+        n_threads = m * CLUSTER * THREADS
+        gtid = (row * CLUSTER + cy) * THREADS + tidx
+        clear = (c0, c1, c2, c3)
+        for s in cutlass.range_constexpr(4):
+            if s < dirty_stages:
+                stage_bytes = buf_bytes // Int64(dirty_stages)
+                base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
+                n_vec = (clear[s] + 15) >> 4
+                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                    _st_sentinel_v4(base + Int64(p) * Int64(16))
+
+        # Sum all ranks' values in chunks of RANK_CHUNK, polling until no word is the sentinel.
+        acc = [Float32(0.0)] * ELTS
+        row_base = uc_addr + cur_off + Int64((row * ws * HIDDEN + col) * 2)
+        for rb in cutlass.range_constexpr(0, ws, self.rank_chunk):
+            chunk = [Float32(0.0)] * ELTS
+            ready = Int32(0)
+            while ready == 0:
+                ready = Int32(1)
+                for i in cutlass.range_constexpr(ELTS):
+                    chunk[i] = Float32(0.0)
+                for rr in cutlass.range_constexpr(self.rank_chunk):
+                    w = _ld_vol_v4(row_base + Int64((rb + rr) * HIDDEN * 2))
+                    ready = ready & _clean4(w[0], w[1], w[2], w[3])
+                    for j in cutlass.range_constexpr(4):
+                        lo, hi = _bf16x2_f32(w[j])
+                        chunk[2 * j] = _fadd(chunk[2 * j], lo)
+                        chunk[2 * j + 1] = _fadd(chunk[2 * j + 1], hi)
+            for i in cutlass.range_constexpr(ELTS):
+                acc[i] = _fadd(acc[i], chunk[i])
+        red = [_pack_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(4)]
+
+        if cutlass.const_expr(self.use_pdl and not self.early_trigger):
+            _griddepcontrol_launch_dependents()
+
+        if cutlass.const_expr(self.norm):
+            # RMSNorm: this thread's BF16 squares in element order.
+            thread_sum = Float32(0.0)
+            for j in cutlass.range_constexpr(4):
+                lo, hi = _bf16x2_f32(_sq_bf16x2(red[j]))
+                thread_sum = _fadd(thread_sum, lo)
+                thread_sum = _fadd(thread_sum, hi)
+            # Warp butterflies; the half warp first adds 0 for its missing upper half.
+            v = thread_sum
+            if warp == WARPS - 1:
+                v = _fadd(v, Float32(0.0))
+                for off in (8, 4, 2, 1):
+                    v = _fadd(v, _shfl_bfly(v, off, 0xFFFF))
+            else:
+                for off in (16, 8, 4, 2, 1):
+                    v = _fadd(v, _shfl_bfly(v, off, 0xFFFFFFFF))
+            if lane == 0:
+                _sts_f32(warp_sum + warp * 4, v)
+            _bar_sync()
+            if warp == 0:
+                b = Float32(0.0)
+                if lane < WARPS:
+                    b = _lds_f32(warp_sum + lane * 4)
+                for off in (16, 8, 4, 2, 1):
+                    b = _fadd(b, _shfl_bfly(b, off, 0xFFFFFFFF))
+                if lane == 0:
+                    _sts_f32(block_sum, b)
+            _bar_sync()
+            bsum = _lds_f32(block_sum)
+            # Row sum: CTA c's sum into every peer's slot c, then the four slots in CTA order.
+            if tidx < CLUSTER:
+                _st_cluster_f32(cta_sum + crank * 4, tidx, bsum)
+            _cluster_sync_release_acquire()
+            total = Float32(0.0)
+            for c in cutlass.range_constexpr(CLUSTER):
+                total = _fadd(total, _lds_f32(cta_sum + c * 4))
+            scale = _rms_scale(total, eps)
+
+            ow = []
+            for j in cutlass.range_constexpr(4):
+                x_lo, x_hi = _bf16x2_f32(red[j])
+                g_lo, g_hi = _bf16x2_f32(gw[j])
+                ow.append(
+                    _pack_bf16x2(_fmul(_fmul(x_lo, scale), g_lo), _fmul(_fmul(x_hi, scale), g_hi))
+                )
+            _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), ow[0], ow[1], ow[2], ow[3])
+        else:
+            _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3])
+
+        # CTA (0, 0): rotate the buffers once every warp of the grid has read the flags.
+        if crank == 0:
+            if tidx == 0:
+                if row == 0:
+                    arrived = _ld_acquire_gpu_u32(counter)
+                    while arrived < m * (CLUSTER * WARPS):
+                        arrived = _ld_acquire_gpu_u32(counter)
+                    nxt = f0 + 1
+                    if nxt == NUM_LAMPORT_BUFFERS:
+                        nxt = Int32(0)
+                    _st_v4(flags_addr, nxt, f0, f2, Int32(1))
+                    _st_v4(
+                        flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0)
+                    )
+                    _st_u32(counter, Int32(0))
+
+
+@functools.cache
+def _compiled(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool):
+    kernel = K3LatentArNormKernel(world_size, use_pdl, early_trigger, norm)
+    return cute.compile(
+        kernel,
+        Int64(0),
+        Int64(0),
+        Int64(0),
+        Int64(0),
+        Int64(0),
+        Int64(0),
+        Int32(0),
+        Int32(1),
+        Float32(1e-6),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+@functools.cache
+def _is_supported_device(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
+
+
+def can_run(x: torch.Tensor, gamma: torch.Tensor, world_size: int) -> bool:
+    """Whether :func:`run_k3_latent_ar_norm` serves this all-reduce (non-raising check)."""
+    return (
+        x.is_cuda
+        and _is_supported_device(x.device.index)
+        and world_size in WORLD_SIZES
+        and x.dtype == torch.bfloat16
+        and x.dim() == 2
+        and x.shape[1] == HIDDEN
+        and 1 <= x.shape[0] <= MAX_M
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and gamma.dtype == torch.bfloat16
+        and tuple(gamma.shape) == (HIDDEN,)
+        and gamma.is_contiguous()
+        and gamma.data_ptr() % 16 == 0
+    )
+
+
+def run_k3_latent_ar_norm(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    *,
+    uc_addr: int,
+    mc_addr: int,
+    flags: torch.Tensor,
+    rank: int,
+    world_size: int,
+    use_pdl: bool = True,
+    early_trigger: bool = True,
+    norm: bool = True,
+) -> None:
+    """Launch on the current stream: ``out`` (``[M, 3584]`` BF16) = RMSNorm(``gamma``, ``eps``) of
+    the sum of every rank's ``x`` over the MNNVL Lamport workspace (local unicast base
+    ``uc_addr``, multicast base ``mc_addr``, state ``flags``), bit-identical to the C++ one-shot
+    kernel (``norm=False``: the BF16 sum alone). Every rank of the group launches it with its
+    ``rank``."""
+    _compiled(world_size, use_pdl, early_trigger, norm)(
+        Int64(x.data_ptr()),
+        Int64(gamma.data_ptr()),
+        Int64(out.data_ptr()),
+        Int64(uc_addr),
+        Int64(mc_addr),
+        Int64(flags.data_ptr()),
+        Int32(rank),
+        Int32(x.shape[0]),
+        Float32(eps),
+        cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+    )
+
+
+__all__ = [
+    "HIDDEN",
+    "MAX_M",
+    "WORLD_SIZES",
+    "K3LatentArNormKernel",
+    "can_run",
+    "run_k3_latent_ar_norm",
+]

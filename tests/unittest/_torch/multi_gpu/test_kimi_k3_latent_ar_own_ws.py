@@ -17,7 +17,8 @@
 ``TRTLLM_K3_LATENT_AR_OWN_WS``: ``KimiK3MoERuntime.forward`` runs on every rank with stand-ins for
 the routed experts (a per-rank latent partial) and the TP-sharded BF16 shared expert (which reduces
 its output on the shared MNNVL workspace), the real latent RMSNorm and a BF16 latent up-projection.
-With the latent all-reduce on its own workspace the result (and the deferred residual) must be
+With the latent all-reduce on its own workspace (C++ kernels, or with ``TRTLLM_K3_LATENT_AR_CUTE``
+``k3_latent_ar_norm`` for the one-shot sizes) the result (and the deferred residual) must be
 bit-identical to the shared-workspace path, eagerly and under CUDA graph replay, and the own
 workspace must serve exactly the forwards it applies to.
 """
@@ -187,7 +188,9 @@ def _own_ws_rank(world):
             else:
                 torch.testing.assert_close(a, b, rtol=0, atol=0)
 
-        for num_tokens in SEQ_LENS:
+        # The C++ one-shot kernel, then (TRTLLM_K3_LATENT_AR_CUTE) k3_latent_ar_norm on the own workspace.
+        for cute_mode, num_tokens in [(c, n) for c in ("0", "1") for n in SEQ_LENS]:
+            mkl._K3_LATENT_AR_CUTE = cute_mode
             latents, shareds, residual = _rank_inputs(world, num_tokens, num_tokens)
             set_inputs(latents, shareds)
             hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
@@ -237,6 +240,7 @@ def _own_ws_rank(world):
                 assert_same(graph_out, run(False, True, hidden, residual))
             del graph
 
+        mkl._K3_LATENT_AR_CUTE = "0"
         # Above the workspace's token limit the shared workspace serves the forward.
         num_tokens = MAX_TOKENS + 1
         latents, shareds, residual = _rank_inputs(world, num_tokens, 5)

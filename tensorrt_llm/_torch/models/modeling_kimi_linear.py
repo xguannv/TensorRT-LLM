@@ -339,6 +339,13 @@ _K3_MOE_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiK3MoERuntime]"] 
 # latent_up + residual variant); the output is bit-identical.
 _K3_LATENT_AR_OWN_WS = os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS", "0") == "1"
 _K3_LATENT_AR_OWN_WS_MAX_M = int(os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS_MAX_M", "64"))
+# TRTLLM_K3_LATENT_AR_CUTE (with TRTLLM_K3_LATENT_AR_OWN_WS): the one-shot sizes of that all-reduce
+# run k3_latent_ar_norm, bit-identical to the C++ one-shot kernel but triggering its programmatic
+# dependents (latent_up) right after its griddepcontrol.wait instead of after the cross-rank
+# reduction ("1"), or after the reduction like the C++ kernel ("late").
+_K3_LATENT_AR_CUTE = os.environ.get("TRTLLM_K3_LATENT_AR_CUTE", "0")
+if _K3_LATENT_AR_CUTE not in ("0", "1", "late"):
+    raise ValueError(f"TRTLLM_K3_LATENT_AR_CUTE must be 0, 1 or late, got {_K3_LATENT_AR_CUTE!r}")
 # The routed latent all-reduce's own MNNVL workspaces, by all-reduce mapping.
 _K3_LATENT_AR_WORKSPACES: Dict[Mapping, Dict[str, Any]] = {}
 
@@ -391,8 +398,12 @@ def _k3_latent_ar_workspace(
     workspace = {
         "handle": handle,
         "buffer": buffer.view(dtype).view(3, -1),
+        # The multicast view of the same buffers (stores reach every rank's copy).
+        "mc": handle.get_mc_buffer((3 * buffer_bytes // 4,), torch.float32, 0),
         "flags": flags,
         "max_tokens": max_tokens,
+        "rank": mapping.tp_rank,
+        "world_size": mapping.tp_size,
     }
     _K3_LATENT_AR_WORKSPACES[mapping] = workspace
     return workspace
@@ -2764,17 +2775,46 @@ class KimiK3MoERuntime(nn.Module):
         workspace and latent_up, issued on the main stream before it joins the shared-expert
         stream, whose output only the residual update reads. Returns what ``forward`` returns."""
         workspace = self._latent_ar_ws
-        (routed_latent,) = torch.ops.trtllm.mnnvl_fusion_allreduce(
-            routed_out.contiguous(),
-            self.routed_expert_norm.weight,
-            None,
-            float(self.routed_expert_norm.variance_epsilon),
-            workspace["buffer"],
-            workspace["flags"],
-            True,
-            None,
-            int(AllReduceFusionOp.RMS_NORM),
-        )
+        gamma = self.routed_expert_norm.weight
+        eps = float(self.routed_expert_norm.variance_epsilon)
+        latent = routed_out.reshape(-1, routed_out.shape[-1]).contiguous()
+        routed_latent = None
+        if _K3_LATENT_AR_CUTE != "0":
+            from ..cute_dsl_kernels.blackwell import k3_latent_ar_norm
+            from ..distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+
+            world_size = workspace["world_size"]
+            one_shot = (
+                latent.numel() * world_size * latent.element_size()
+                <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+            )
+            if one_shot and k3_latent_ar_norm.can_run(latent, gamma, world_size):
+                routed_latent = torch.empty_like(latent)
+                k3_latent_ar_norm.run_k3_latent_ar_norm(
+                    latent,
+                    gamma,
+                    eps,
+                    routed_latent,
+                    uc_addr=workspace["buffer"].data_ptr(),
+                    mc_addr=workspace["mc"].data_ptr(),
+                    flags=workspace["flags"],
+                    rank=workspace["rank"],
+                    world_size=world_size,
+                    early_trigger=_K3_LATENT_AR_CUTE == "1",
+                )
+        if routed_latent is None:
+            (routed_latent,) = torch.ops.trtllm.mnnvl_fusion_allreduce(
+                latent,
+                gamma,
+                None,
+                eps,
+                workspace["buffer"],
+                workspace["flags"],
+                True,
+                None,
+                int(AllReduceFusionOp.RMS_NORM),
+            )
+        routed_latent = routed_latent.view(routed_out.shape)
         routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         self.moe_shared_event.wait()
         if residual is not None:
