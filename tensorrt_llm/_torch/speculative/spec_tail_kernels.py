@@ -34,6 +34,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .vocab_parallel import _INT32_MAX as _VP_INT32_MAX
+
 SPEC_TAIL_FUSION_ENV_VAR = "TLLM_SPEC_TAIL_FUSION"
 DRAFT_FUSION_ENV_VAR = "TLLM_DSPARK_DRAFT_FUSION"
 TAIL_V2_ENV_VAR = "TLLM_DSPARK_TAIL_V2"
@@ -195,6 +197,230 @@ def fused_strict_accept(
         num_warps=4,
     )
     return accepted, num_accepted
+
+
+@triton.jit
+def _pair_argmax(vals, idx, axis: tl.constexpr):
+    # The index the vocab-parallel _argmax_combine reduction selects, from
+    # native reductions: NaN beats every number and the lowest index wins among
+    # NaNs; otherwise the largest value wins and the lowest index among equal
+    # values (+0.0 == -0.0). The selected index is unique, so it does not depend
+    # on the reduction order.
+    is_nan = vals != vals
+    any_nan = tl.max(is_nan.to(tl.int32), axis=axis) > 0
+    vmax = tl.max(tl.where(is_nan, float("-inf"), vals), axis=axis)
+    cand = tl.where(
+        tl.expand_dims(any_nan, axis), is_nan, (vals == tl.expand_dims(vmax, axis)) & ~is_nan
+    )
+    return tl.min(tl.where(cand, idx, _VP_INT32_MAX), axis=axis)
+
+
+@triton.jit
+def _select_accept_kernel(
+    pairs_ptr,
+    stride_row,
+    n_slots,
+    draft_ptr,
+    stride_draft,
+    accepted_ptr,
+    num_accepted_ptr,
+    num_ctx,
+    num_gen,
+    pool_ptr,
+    counter_ptr,
+    base_total,
+    frac,
+    max_total,
+    prev_ptr,
+    state_idx_ptr,
+    dummy_ptr,
+    kv_lens_ptr,
+    rewind_ptr,
+    DRAFT_LEN: tl.constexpr,
+    FORCE: tl.constexpr,
+    COUNTER_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POOL_MASK: tl.constexpr,
+    KDA_REPLAY: tl.constexpr,
+    KV_REWIND: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+):
+    # Pairs are (value, index) float32 couples, slot s of a row at columns
+    # [2 s, 2 s + 1]; a row is loaded as one contiguous run and split.
+    width = DRAFT_LEN + 1
+    rows = tl.arange(0, BLOCK_B)
+    cols = tl.arange(0, BLOCK_K)
+    gen_mask = rows < num_gen
+    tile_mask = gen_mask[:, None] & (cols[None, :] < width)
+    draft_mask = gen_mask[:, None] & (cols[None, :] < DRAFT_LEN)
+
+    # Everything that does not depend on the selection is read first.
+    d = tl.load(
+        draft_ptr + rows[:, None] * stride_draft + cols[None, :], mask=draft_mask, other=0
+    ).to(tl.int32)
+    if KDA_REPLAY:
+        slot = tl.load(state_idx_ptr + num_ctx + rows, mask=gen_mask, other=0).to(tl.int64)
+        dummy = tl.load(dummy_ptr + num_ctx + rows, mask=gen_mask, other=0) != 0
+        current = tl.load(prev_ptr + slot, mask=gen_mask, other=0)
+    if KV_REWIND:
+        kv = tl.load(kv_lens_ptr + num_ctx + rows, mask=gen_mask)
+    if FORCE == 2:
+        counter = tl.load(counter_ptr) + 1
+        idx = (counter * COUNTER_STRIDE + rows.to(tl.int64) * SLOT_STRIDE) & POOL_MASK
+        rand = tl.load(pool_ptr + idx, mask=gen_mask, other=1.0)
+        # Every warp reads the old value before any warp writes the new one.
+        tl.debug_barrier()
+        tl.store(counter_ptr, counter)
+
+    lanes = tl.arange(0, 2 * BLOCK_SLOTS)
+    lane_ok = lanes < 2 * n_slots
+
+    # Context requests: accept the selected token only.
+    c = tl.arange(0, BLOCK_C)
+    cmask = c < num_ctx
+    cm2 = cmask[:, None] & lane_ok[None, :]
+    craw = tl.load(
+        pairs_ptr + c[:, None].to(tl.int64) * stride_row + lanes[None, :], mask=cm2, other=0.0
+    )
+    cvals, cidxf = tl.split(tl.reshape(craw, [BLOCK_C, BLOCK_SLOTS, 2]))
+    cok = cmask[:, None] & (tl.arange(0, BLOCK_SLOTS)[None, :] < n_slots)
+    t_ctx = _pair_argmax(
+        tl.where(cok, cvals, float("-inf")), tl.where(cok, cidxf.to(tl.int32), _VP_INT32_MAX), 1
+    )
+    tl.store(accepted_ptr + c * width, t_ctx, mask=cmask)
+    tl.store(num_accepted_ptr + c, tl.full([BLOCK_C], 1, tl.int32), mask=cmask)
+
+    # Generation requests: the K+1 selected tokens of each request (the global
+    # argmax / draw of every row's exchanged pairs, as the vocab-parallel
+    # selection reduces them), then strict acceptance as _strict_accept_kernel.
+    prow = num_ctx + rows[:, None] * width + cols[None, :]
+    m3 = tile_mask[:, :, None] & lane_ok[None, None, :]
+    graw = tl.load(
+        pairs_ptr + prow[:, :, None].to(tl.int64) * stride_row + lanes[None, None, :],
+        mask=m3,
+        other=0.0,
+    )
+    gvals, gidxf = tl.split(tl.reshape(graw, [BLOCK_B, BLOCK_K, BLOCK_SLOTS, 2]))
+    gok = tile_mask[:, :, None] & (tl.arange(0, BLOCK_SLOTS)[None, None, :] < n_slots)
+    t_gen = _pair_argmax(
+        tl.where(gok, gvals, float("-inf")), tl.where(gok, gidxf.to(tl.int32), _VP_INT32_MAX), 2
+    )
+    tl.store(
+        accepted_ptr + (num_ctx + rows[:, None]) * width + cols[None, :], t_gen, mask=tile_mask
+    )
+    mismatch = draft_mask & (d != t_gen)
+    first_mismatch = tl.min(tl.where(mismatch, cols[None, :], DRAFT_LEN), axis=1)
+    n = 1 + first_mismatch
+    if FORCE == 1:
+        n = tl.full([BLOCK_B], 0, tl.int32) + base_total
+    elif FORCE == 2:
+        extra = (rand < frac).to(tl.int32)
+        n = tl.minimum(base_total + extra, max_total)
+    n = n.to(tl.int32)
+    tl.store(num_accepted_ptr + num_ctx + rows, n, mask=gen_mask)
+
+    if KDA_REPLAY:
+        # KDAHybridCacheManagerV2.update_mamba_states: record the accepted draft
+        # prefix per state slot; dummy requests keep the slot's current value.
+        # All slots were read before any is written, as gather-then-put does.
+        accepted_drafts = tl.maximum(n - 1, 0).to(current.dtype)
+        tl.debug_barrier()
+        tl.store(prev_ptr + slot, tl.where(dummy, current, accepted_drafts), mask=gen_mask)
+    if KV_REWIND:
+        # DFlashWorker._prepare_kv_for_draft_forward.
+        tl.store(rewind_ptr + rows, 1 - n, mask=gen_mask)
+        tl.store(kv_lens_ptr + num_ctx + rows, kv + 1, mask=gen_mask)
+
+
+def fused_select_accept(
+    pairs: tuple,
+    draft_tokens: torch.Tensor,
+    num_contexts: int,
+    batch_size: int,
+    force: Optional[tuple] = None,
+    kda_replay: Optional[tuple] = None,
+    kv_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Vocab-parallel target selection, strict acceptance and the per-step
+    bookkeeping that follows it, in one launch.
+
+    Args:
+        pairs: ``(pairs, row stride, slot stride, slots)`` from
+            ``VocabShardedLogits.select_pairs``: every rank's ``(value, global
+            index)`` candidates of the ``num_contexts + num_gens * (K + 1)`` rows.
+        draft_tokens, num_contexts, batch_size, force: as :func:`fused_strict_accept`.
+        kda_replay: ``(prev_num_accepted_tokens, state_indices, dummy_mask)`` to
+            also apply ``KDAHybridCacheManagerV2.update_mamba_states``, or None.
+        kv_lens: ``attn_metadata.kv_lens_cuda`` to also apply
+            ``DFlashWorker._prepare_kv_for_draft_forward`` (its gen rows += 1), or None.
+    Returns:
+        ``accepted_tokens [batch_size, K + 1]`` int32, ``num_accepted_tokens
+        [batch_size]`` int32 (the values of the reduce + :func:`fused_strict_accept`
+        path) and, with ``kv_lens``, the ``[num_gens]`` int32 KV rewind amounts
+        ``1 - num_accepted``.
+    """
+    pair_buf, stride_row, stride_slot, n_slots = pairs
+    num_gens = batch_size - num_contexts
+    draft_len = draft_tokens.shape[-1]
+    device = pair_buf.device
+    accepted = torch.empty((batch_size, draft_len + 1), dtype=torch.int32, device=device)
+    num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    rewind = (
+        torch.empty((num_gens,), dtype=torch.int32, device=device) if kv_lens is not None else None
+    )
+    if batch_size == 0:
+        return accepted, num_accepted, rewind
+    assert draft_tokens.dim() == 2 and (num_gens == 0 or draft_tokens.stride(-1) == 1)
+    force_mode, base_total, frac, max_total = 0, 0, 0.0, 0
+    pool, counter, counter_stride, slot_stride, pool_mask = pair_buf, pair_buf, 1, 1, 0
+    if force is not None and len(force) == 1:
+        force_mode, base_total = 1, int(force[0])
+    elif force is not None:
+        base_total, frac, max_total, pool, counter, counter_stride, slot_stride = force
+        force_mode = 2
+        pool_mask = pool.numel() - 1
+    prev, state_idx, dummy = kda_replay if kda_replay is not None else (accepted,) * 3
+    if kda_replay is not None:
+        assert prev.dim() == 1 and state_idx.stride(-1) == 1 and dummy.stride(-1) == 1
+    # Interleaved (value, index) slots, as the MNNVL / single-rank exchange lays them out.
+    assert stride_slot == 2 and pair_buf.stride(-1) == 1
+    _select_accept_kernel[(1,)](
+        pair_buf,
+        stride_row,
+        n_slots,
+        draft_tokens,
+        draft_tokens.stride(0) if num_gens > 0 else draft_len,
+        accepted,
+        num_accepted,
+        num_contexts,
+        num_gens,
+        pool,
+        counter,
+        base_total,
+        float(frac),
+        max_total,
+        prev,
+        state_idx,
+        dummy,
+        kv_lens if kv_lens is not None else accepted,
+        rewind if rewind is not None else accepted,
+        DRAFT_LEN=draft_len,
+        FORCE=force_mode,
+        COUNTER_STRIDE=counter_stride,
+        SLOT_STRIDE=slot_stride,
+        POOL_MASK=pool_mask,
+        KDA_REPLAY=kda_replay is not None,
+        KV_REWIND=kv_lens is not None,
+        BLOCK_C=triton.next_power_of_2(max(num_contexts, 1)),
+        BLOCK_B=triton.next_power_of_2(max(num_gens, 1)),
+        BLOCK_K=triton.next_power_of_2(draft_len + 1),
+        BLOCK_SLOTS=triton.next_power_of_2(n_slots),
+        num_warps=4,
+    )
+    return accepted, num_accepted, rewind
 
 
 @triton.jit
@@ -691,6 +917,83 @@ def _next_new_tokens_kernel(
         d.to(out_ptr.dtype.element_ty),
         mask=dmask,
     )
+
+
+@triton.jit
+def _next_new_tokens_rewind_kernel(
+    accepted_ptr,
+    stride_accepted,
+    num_accepted_ptr,
+    draft_ptr,
+    stride_draft,
+    out_ptr,
+    batch_size,
+    kv_lens_ptr,
+    rewind_ptr,
+    num_ctx,
+    num_gen,
+    DRAFT_LEN: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # _next_new_tokens_kernel for a batch in one program, plus
+    # DFlashWorker._apply_kv_rewind_after_draft on the gen rows.
+    rows = tl.arange(0, BLOCK_B)
+    cols = tl.arange(0, BLOCK_K)
+    rmask = rows < batch_size
+    nacc = tl.load(num_accepted_ptr + rows, mask=rmask, other=1)
+    last = tl.load(accepted_ptr + rows.to(tl.int64) * stride_accepted + (nacc - 1), mask=rmask)
+    width = DRAFT_LEN + 1
+    tl.store(out_ptr + rows * width, last.to(out_ptr.dtype.element_ty), mask=rmask)
+    dmask = rmask[:, None] & (cols[None, :] < DRAFT_LEN)
+    d = tl.load(draft_ptr + rows[:, None].to(tl.int64) * stride_draft + cols[None, :], mask=dmask)
+    tl.store(
+        out_ptr + rows[:, None] * width + 1 + cols[None, :],
+        d.to(out_ptr.dtype.element_ty),
+        mask=dmask,
+    )
+    gmask = rows < num_gen
+    kv = tl.load(kv_lens_ptr + num_ctx + rows, mask=gmask)
+    amount = tl.load(rewind_ptr + rows, mask=gmask)
+    tl.store(kv_lens_ptr + num_ctx + rows, tl.maximum(kv - amount, 0), mask=gmask)
+
+
+def fused_next_new_tokens_rewind(
+    accepted_tokens: torch.Tensor,
+    next_draft_tokens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    rewind: torch.Tensor,
+    num_contexts: int,
+) -> torch.Tensor:
+    """:func:`fused_next_new_tokens` and ``kv_lens[num_contexts:][:num_gens] =
+    (kv_lens - rewind).clamp(min=0)`` in one launch (one program)."""
+    batch_size, draft_len = next_draft_tokens.shape
+    num_gens = rewind.shape[0]
+    dtype = torch.promote_types(accepted_tokens.dtype, next_draft_tokens.dtype)
+    out = torch.empty((batch_size, draft_len + 1), dtype=dtype, device=accepted_tokens.device)
+    if batch_size == 0 and num_gens == 0:
+        return out
+    assert accepted_tokens.stride(-1) == 1 and next_draft_tokens.stride(-1) == 1
+    assert kv_lens.stride(-1) == 1 and rewind.is_contiguous()
+    _next_new_tokens_rewind_kernel[(1,)](
+        accepted_tokens,
+        accepted_tokens.stride(0),
+        num_accepted_tokens,
+        next_draft_tokens,
+        next_draft_tokens.stride(0),
+        out,
+        batch_size,
+        kv_lens,
+        rewind,
+        num_contexts,
+        num_gens,
+        DRAFT_LEN=draft_len,
+        BLOCK_B=triton.next_power_of_2(max(batch_size, num_gens, 1)),
+        BLOCK_K=triton.next_power_of_2(max(draft_len, 1)),
+        num_warps=4,
+    )
+    return out
 
 
 def fused_next_new_tokens(

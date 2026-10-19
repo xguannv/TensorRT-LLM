@@ -556,6 +556,33 @@ class VocabParallelHead:
             )
         return out
 
+    def selection_pairs(self, local: torch.Tensor, spec_metadata) -> tuple:
+        """Every rank's ``(value, global index)`` pairs of the target selection,
+        not yet reduced: ``(pairs, row stride, slot stride, slots)``.
+
+        The same local kernel and exchange as :meth:`VocabShardedLogits.select_tokens`
+        (argmax for an all-greedy batch, else the Gumbel-max draw), for a caller
+        that reduces the pairs inside a fused consumer kernel.
+        """
+        assert local.dim() == 2 and local.stride(-1) == 1
+        if spec_metadata.is_all_greedy_sample:
+            layout = self._launch_local(_local_argmax_kernel, local, ())
+        else:
+            from ..pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+
+            rows = local.shape[0]
+            layout = self._launch_local(
+                _local_sample_kernel,
+                local,
+                (
+                    spec_metadata.temperatures[:rows],
+                    spec_metadata.seeds[:rows],
+                    spec_metadata.offsets[:rows],
+                    float(GREEDY_TEMPERATURE_THRESHOLD),
+                ),
+            )
+        return self.exchange.exchange(layout)
+
     def argmax(self, local: torch.Tensor, out_dtype=torch.int64) -> torch.Tensor:
         """Global argmax over the vocab of shard logits ``[rows, shard]``."""
         assert local.dim() == 2 and local.stride(-1) == 1
@@ -686,6 +713,11 @@ class VocabShardedLogits:
     def gather(self) -> torch.Tensor:
         """The gathered ``[rows, vocab]`` float32 logits."""
         return self.head.gather_full_logits(self.local)
+
+    def select_pairs(self, spec_metadata) -> tuple:
+        """The unreduced exchanged pairs of :meth:`select_tokens` (see
+        :meth:`VocabParallelHead.selection_pairs`)."""
+        return self.head.selection_pairs(self.local, spec_metadata)
 
     def select_tokens(self, spec_metadata) -> torch.Tensor:
         """One target token per row: the argmax for an all-greedy batch, else a

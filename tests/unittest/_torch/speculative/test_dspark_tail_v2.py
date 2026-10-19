@@ -155,3 +155,149 @@ def test_block_table_decode_parallel_matches(rows, n_blocks, holes):
     torch.cuda.synchronize()
     assert torch.equal(table, table_ref)
     assert torch.equal(counts, counts_ref)
+
+
+def _pairs(rows, n_slots, gen, ties=False, nans=False):
+    """An exchanged pair buffer: ``[rows, width]`` FP32, ``(value, index)`` per slot."""
+    width = triton_next_pow2(2 * n_slots)
+    buf = torch.zeros(rows, width, device="cuda")
+    vals = torch.randn(rows, n_slots, device="cuda", generator=gen)
+    if ties:
+        vals = vals.round()
+    if nans:
+        vals[0, 3] = float("nan")
+        vals[1, 7] = float("nan")
+        vals[1, 2] = float("nan")
+    idx = torch.randint(0, 163840, (rows, n_slots), device="cuda", generator=gen).float()
+    buf[:, 0 : 2 * n_slots : 2] = vals
+    buf[:, 1 : 2 * n_slots : 2] = idx
+    return buf, width
+
+
+def triton_next_pow2(x):
+    return 1 << (x - 1).bit_length()
+
+
+@pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (0, 2), (0, 4), (2, 3), (3, 0)])
+@pytest.mark.parametrize("force", [None, "const", "frac"])
+@pytest.mark.parametrize("ties,nans", [(False, False), (True, True)])
+def test_fused_select_accept_matches_reduce_then_accept(num_contexts, num_gens, force, ties, nans):
+    import types
+    from types import SimpleNamespace
+
+    import triton
+
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import KDAHybridCacheManagerV2
+    from tensorrt_llm._torch.speculative import vocab_parallel as vp
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+        fused_select_accept,
+        fused_strict_accept,
+    )
+
+    K, n_slots = 6, 80
+    batch = num_contexts + num_gens
+    rows = num_contexts + num_gens * (K + 1)
+    gen = torch.Generator(device="cuda").manual_seed(rows * 13 + int(ties) + len(str(force)))
+    buf, width = _pairs(max(rows, 2), n_slots, gen, ties=ties, nans=nans and rows >= 2)
+    buf = buf[:rows].contiguous()
+    targets = torch.empty(rows, dtype=torch.int64, device="cuda")
+    vp._reduce_pairs_kernel[(triton.cdiv(max(rows, 1), vp._REDUCE_BLOCK_ROWS),)](
+        buf,
+        width,
+        2,
+        rows,
+        n_slots,
+        targets,
+        BLOCK_ROWS=vp._REDUCE_BLOCK_ROWS,
+        BLOCK_SLOTS=triton.next_power_of_2(n_slots),
+    )
+    # Drafts that match a random-length prefix of the targets.
+    t_gen = targets[num_contexts:].view(num_gens, K + 1) if num_gens else targets[:0].view(0, K + 1)
+    drafts = torch.randint(0, 163840, (num_gens, K), device="cuda", generator=gen).to(torch.int32)
+    for g in range(num_gens):
+        keep = int(torch.randint(0, K + 1, (1,), device="cuda", generator=gen))
+        drafts[g, :keep] = t_gen[g, :keep].to(torch.int32)
+    pool = torch.rand(1 << 10, device="cuda", generator=gen)
+    force_args = {
+        None: None,
+        "const": (3,),
+        "frac": (2, 0.6, K + 1, pool, torch.zeros(1, dtype=torch.int64, device="cuda"), 7, 3),
+    }[force]
+    ref_force = force_args
+    if force == "frac":
+        ref_force = force_args[:4] + (force_args[4].clone(),) + force_args[5:]
+    ref_acc, ref_n = fused_strict_accept(targets, drafts, num_contexts, batch, ref_force)
+
+    # KDA replay record and drafter KV prep, eager reference.
+    slots = torch.randperm(64, device="cuda", generator=gen)[: max(batch, 1)].to(torch.int32)
+    dummy = torch.zeros(64, dtype=torch.bool, device="cuda")
+    if num_gens > 1:
+        dummy[num_contexts + num_gens - 1] = True
+    prev0 = torch.randint(0, 7, (64,), device="cuda", generator=gen).to(torch.int32)
+    kv0 = torch.randint(0, 1000, (64,), device="cuda", generator=gen).to(torch.int32)
+    mgr = SimpleNamespace(
+        _use_kda_replay_update=True,
+        local_num_mamba_layers=1,
+        prev_num_accepted_tokens=prev0.clone(),
+        _dummy_request_mask=dummy,
+    )
+    mgr._record_kda_replay_acceptance = types.MethodType(
+        KDAHybridCacheManagerV2._record_kda_replay_acceptance, mgr
+    )
+    md = SimpleNamespace(num_contexts=num_contexts, num_seqs=batch)
+    if num_gens > 0:
+        KDAHybridCacheManagerV2.update_mamba_states(
+            mgr, attn_metadata=md, num_accepted_tokens=ref_n, state_indices=slots
+        )
+    ref_kv = kv0.clone()
+    ref_rewind = 1 - ref_n[num_contexts:batch]
+    if batch > num_contexts:
+        ref_kv[num_contexts:batch] += 1
+
+    prev = prev0.clone()
+    kv = kv0.clone()
+    acc, n, rewind = fused_select_accept(
+        (buf, width, 2, n_slots),
+        drafts,
+        num_contexts,
+        batch,
+        force_args,
+        kda_replay=(prev, slots, dummy) if num_gens > 0 else None,
+        kv_lens=kv,
+    )
+    torch.cuda.synchronize()
+    gen_rows = slice(num_contexts, batch)
+    assert torch.equal(acc[gen_rows], ref_acc[gen_rows])
+    assert torch.equal(acc[:num_contexts, 0], ref_acc[:num_contexts, 0])
+    assert torch.equal(n, ref_n)
+    assert torch.equal(prev, mgr.prev_num_accepted_tokens)
+    assert torch.equal(kv, ref_kv)
+    assert torch.equal(rewind, ref_rewind)
+    if force == "frac":
+        assert torch.equal(force_args[4], ref_force[4])
+
+
+@pytest.mark.parametrize("num_contexts,num_gens", [(0, 2), (1, 3), (0, 16)])
+def test_next_new_tokens_rewind_matches(num_contexts, num_gens):
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+        fused_next_new_tokens,
+        fused_next_new_tokens_rewind,
+    )
+
+    K = 6
+    batch = num_contexts + num_gens
+    gen = torch.Generator(device="cuda").manual_seed(batch)
+    accepted = torch.randint(0, 1000, (batch, K + 1), device="cuda", generator=gen).to(torch.int32)
+    n = torch.randint(1, K + 2, (batch,), device="cuda", generator=gen).to(torch.int32)
+    drafts = torch.randint(0, 1000, (batch, K), device="cuda", generator=gen).to(torch.int32)
+    kv0 = torch.randint(0, 9, (32,), device="cuda", generator=gen).to(torch.int32)
+    rewind = (1 - n[num_contexts:]).contiguous()
+    ref = fused_next_new_tokens(accepted, drafts, n)
+    ref_kv = kv0.clone()
+    ref_kv[num_contexts:batch] -= rewind
+    ref_kv[num_contexts:batch].clamp_(min=0)
+    kv = kv0.clone()
+    out = fused_next_new_tokens_rewind(accepted, drafts, n, kv, rewind, num_contexts)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    assert torch.equal(kv, ref_kv)

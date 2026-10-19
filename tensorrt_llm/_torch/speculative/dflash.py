@@ -26,7 +26,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ..pyexecutor.mamba_cache_manager import KDAHybridCacheManagerV2, MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
@@ -38,6 +38,8 @@ from .spec_tail_kernels import (
     dflash_gen_prepare,
     dflash_noise_embedding,
     fused_next_new_tokens,
+    fused_next_new_tokens_rewind,
+    fused_select_accept,
     spec_tail_fusion_enabled,
     store_mla_context_latents,
     tail_v2_enabled,
@@ -1124,9 +1126,14 @@ class DFlashWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
-        )
+        fused_accept = self._fused_select_accept(logits, attn_metadata, spec_metadata)
+        if fused_accept is not None:
+            accepted_tokens, num_accepted_tokens, bookkeeping_done = fused_accept
+        else:
+            bookkeeping_done = False
+            accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+                logits, attn_metadata, spec_metadata
+            )
 
         # Opt-in acceptance recording (env-gated; eager-mode measurement
         # runs only). Skipped for CUDA-graph batches (capture/replay/warmup
@@ -1144,17 +1151,22 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
-        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
+        if (
+            not bookkeeping_done
+            and num_gens > 0
+            and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        ):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
                 state_indices=attn_metadata.mamba_metadata.state_indices,
             )
 
-        self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
-        self._prepare_kv_for_draft_forward(
-            attn_metadata, num_accepted_tokens, num_contexts, batch_size
-        )
+        if not bookkeeping_done:
+            self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+            self._prepare_kv_for_draft_forward(
+                attn_metadata, num_accepted_tokens, num_contexts, batch_size
+            )
 
         # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
         # The draft model uses standard 1D RoPE, so only scalar positions are needed.
@@ -1296,15 +1308,30 @@ class DFlashWorker(SpecWorkerBase):
             next_draft_tokens = gen_draft_tokens
 
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
-        self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
-
-        next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens,
-            next_draft_tokens,
-            spec_metadata.batch_indices_cuda,
-            batch_size,
-            num_accepted_tokens,
-        )
+        fused_rewind = self._fused_kv_rewind_operands(attn_metadata, spec_metadata, batch_size)
+        if (
+            fused_rewind is not None
+            and next_draft_tokens.shape[0] == batch_size
+            and next_draft_tokens.is_contiguous()
+            and accepted_tokens.stride(-1) == 1
+        ):
+            # The rewind rides in the next-new-tokens kernel.
+            self._kv_rewind_pending = False
+            next_new_tokens = fused_next_new_tokens_rewind(
+                accepted_tokens[:batch_size],
+                next_draft_tokens,
+                num_accepted_tokens[:batch_size],
+                *fused_rewind,
+            )
+        else:
+            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+            next_new_tokens = self._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                spec_metadata.batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
 
         # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
@@ -1318,6 +1345,86 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _fused_select_accept(self, logits, attn_metadata, spec_metadata):
+        """``TLLM_DSPARK_TAIL_V2``: target selection, strict acceptance, the KDA
+        replay record and the drafter's KV-length prep in one kernel.
+
+        Applies to vocab-parallel target selection with strict acceptance. It
+        writes what ``sample_and_accept_draft_tokens``, the KDA
+        ``update_mamba_states`` and ``_prepare_kv_for_draft_forward`` write,
+        after ``_prepare_attn_metadata_for_dflash`` (moved ahead: it only saves
+        metadata tensors the acceptance does not touch). Returns ``(accepted,
+        num_accepted, True)``, or None to take the unfused path.
+        """
+        if not tail_v2_enabled() or not isinstance(logits, VocabShardedLogits):
+            return None
+        if logits.head.exchange.backend != "mnnvl" and logits.head.exchange.tp_size > 1:
+            return None
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
+            return None
+        mgr = attn_metadata.kv_cache_manager
+        kda_replay = None
+        if num_gens > 0 and isinstance(mgr, MambaHybridCacheManager):
+            if not (
+                isinstance(mgr, KDAHybridCacheManagerV2)
+                and type(mgr).update_mamba_states is KDAHybridCacheManagerV2.update_mamba_states
+                and mgr._use_kda_replay_update
+            ):
+                return None
+            if mgr.local_num_mamba_layers > 0:
+                state_indices = attn_metadata.mamba_metadata.state_indices
+                if state_indices is None:
+                    state_indices = mgr.get_state_indices()
+                if mgr.prev_num_accepted_tokens is None or mgr._dummy_request_mask is None:
+                    return None
+                kda_replay = (
+                    mgr.prev_num_accepted_tokens,
+                    state_indices,
+                    mgr._dummy_request_mask,
+                )
+        draft_tokens = self._reshape_draft_tokens_for_accept(spec_metadata, num_gens, logits.device)
+        pairs = logits.select_pairs(spec_metadata)
+        self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+        kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
+        accepted, num_accepted, rewind = fused_select_accept(
+            pairs,
+            draft_tokens,
+            num_contexts,
+            batch_size,
+            self._force_accept_kernel_args(draft_tokens.shape[-1], spec_metadata, logits.device),
+            kda_replay=kda_replay,
+            kv_lens=kv_lens,
+        )
+        if kv_lens is not None:
+            self._kv_rewind_amount = rewind
+            self._kv_rewind_nc = num_contexts
+            self._kv_rewind_bs = batch_size
+            self._kv_rewind_pending = True
+            attn_metadata.update_for_spec_dec()
+        self._fused_kv_rewind_armed = kv_lens is not None
+        return accepted, num_accepted, True
+
+    def _fused_kv_rewind_operands(self, attn_metadata, spec_metadata, batch_size: int):
+        """``(kv_lens, amounts, num_contexts)`` when the rewind after the draft
+        forward runs inside the next-new-tokens kernel, else None (the
+        ``_apply_kv_rewind_after_draft`` path, which also covers warmup)."""
+        if not getattr(self, "_fused_kv_rewind_armed", False):
+            return None
+        self._fused_kv_rewind_armed = False
+        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        if (
+            is_warmup
+            or self._kv_rewind_amount is None
+            or not hasattr(attn_metadata, "kv_lens_cuda")
+            or self._kv_rewind_bs != batch_size
+            or not spec_tail_fusion_enabled()
+        ):
+            return None
+        return attn_metadata.kv_lens_cuda, self._kv_rewind_amount, self._kv_rewind_nc
 
     def _block_gather_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int, num_rows: int
