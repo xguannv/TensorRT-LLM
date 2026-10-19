@@ -583,6 +583,22 @@ _NEG_ZERO_BITS = tl.constexpr(-(2**31))
 
 
 @triton.jit
+def _wait_pairs_written(xptr, xm):
+    # Spin until no pair of the tile holds the -0.0 sentinel. Only a scalar is
+    # loop-carried: Triton 3.8 fails to compile (TritonGPURemoveLayoutConversions)
+    # a while loop that carries the [16, TP] tiles once TP >= 8.
+    pending = tl.full((), 1, tl.int32)
+    while pending > 0:
+        xv = tl.load(xptr, mask=xm, other=0.0, volatile=True)
+        xi = tl.load(xptr + 1, mask=xm, other=0.0, volatile=True)
+        dirty = xm & (
+            (xv.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
+            | (xi.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
+        )
+        pending = tl.max(tl.max(dirty.to(tl.int32), axis=1), axis=0)
+
+
+@triton.jit
 def _markov_chain_kernel(
     anchor_ptr,
     w1_ptr,
@@ -669,19 +685,11 @@ def _markov_chain_kernel(
             # Wait for every rank's pair of the previous step, then take the winner.
             region = cur_set * SET_FLOATS + (step - 1) * (BLOCK_B * TP * 2)
             xptr = uc_ptr + region + (reqs[:, None] * TP + ranks[None, :]) * 2
+            _wait_pairs_written(xptr, xm)
+            # Read again once all are written: a slot is written once per launch
+            # and cleared only in a later one, so this read sees the polled values.
             xv = tl.load(xptr, mask=xm, other=0.0, volatile=True)
             xi = tl.load(xptr + 1, mask=xm, other=0.0, volatile=True)
-            dirty = xm & (
-                (xv.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
-                | (xi.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
-            )
-            while tl.max(tl.max(dirty.to(tl.int32), axis=1), axis=0) > 0:
-                xv = tl.load(xptr, mask=xm, other=0.0, volatile=True)
-                xi = tl.load(xptr + 1, mask=xm, other=0.0, volatile=True)
-                dirty = xm & (
-                    (xv.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
-                    | (xi.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
-                )
             _, best = _argmax_pairs(
                 tl.where(xm, xv, float("-inf")), tl.where(xm, xi.to(tl.int32), _INT32_MAX), 1
             )

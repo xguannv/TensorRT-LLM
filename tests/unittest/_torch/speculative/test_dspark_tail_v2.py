@@ -411,3 +411,50 @@ def test_draft_l2_prefetch_in_cuda_graph():
     assert torch.equal(eager, ref)
     assert torch.equal(outs["pf"], ref)
     assert torch.equal(outs["late"], ref)
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8, 16])
+def test_markov_kernels_compile_at_decode_shapes(tp):
+    """The fused Markov kernels compile at the decode graph's constexprs for every
+    TP size (the multi-GPU tests only reach TP 2 and 4): a 10240-column vocab
+    shard, markov rank 256, 6 or 7 steps, 1-4 requests, and rank-dependent
+    integer arguments (Triton specializes integers equal to 1)."""
+    import triton
+
+    from tensorrt_llm._torch.speculative import vocab_parallel as vp
+
+    shard, rank, vocab = 10240, 256, 163840
+    programs = triton.cdiv(shard, vp._MARKOV_BLOCK_V)
+    set_floats = vp._CHAIN_MAX_STEPS * vp._CHAIN_MAX_REQS * tp * 2
+    width = max(vp._MARKOV_EXCHANGE_WIDTH, triton.next_power_of_2(2 * tp))
+    f32, i32, bf16 = torch.float32, torch.int32, torch.bfloat16
+    w1 = torch.empty(vocab, rank, dtype=bf16, device="cuda")
+    w2 = torch.empty(shard, rank, dtype=bf16, device="cuda")
+    partial = torch.empty(
+        vp._CHAIN_MAX_STEPS * programs * vp._CHAIN_MAX_REQS * 2, dtype=f32, device="cuda"
+    )
+    tickets = torch.zeros(vp._CHAIN_MAX_STEPS, dtype=i32, device="cuda")
+    launch = torch.zeros(1, dtype=i32, device="cuda")
+    xbuf = torch.empty(3 * set_floats, dtype=f32, device="cuda")
+    for steps, num_reqs, tp_rank in ((6, 2, 1), (7, 1, 0), (7, 4, min(5, tp - 1))):
+        local = torch.empty(num_reqs, steps, shard, dtype=bf16, device="cuda")
+        anchors = torch.zeros(num_reqs, dtype=i32, device="cuda")
+        tokens = torch.empty(num_reqs, steps, dtype=i32, device="cuda")
+        vp._markov_chain_kernel.warmup(
+            anchors, w1, w2, w2.stride(0), local, local.stride(0), local.stride(1), tokens,
+            tokens.stride(0), partial, tickets, launch, xbuf, xbuf, num_reqs, vocab, shard,
+            tp_rank * shard, tp_rank, STEPS=steps, RANK=rank, TP=tp,
+            BLOCK_B=vp._CHAIN_MAX_REQS, BLOCK_V=vp._MARKOV_BLOCK_V,
+            BLOCK_P=triton.next_power_of_2(programs), SET_FLOATS=set_floats, num_warps=4,
+            grid=(programs,),
+        )  # fmt: skip
+        pairs = torch.empty(num_reqs, width, dtype=f32, device="cuda")
+        for step in (0, 1, steps - 1):
+            vp._markov_round_kernel.warmup(
+                pairs, width, tp, anchors, w1, w2, w2.stride(0), local[:, 0], local.stride(0),
+                tokens, tokens.stride(0), step, partial, tickets, pairs, width, tp_rank,
+                num_reqs, vocab, shard, tp_rank * shard, RANK=rank, FROM_ANCHOR=step == 0,
+                ZERO_WIDTH=width, ZERO_CHUNK=triton.next_power_of_2(triton.cdiv(width, programs)),
+                BLOCK_B=16, BLOCK_SLOTS=triton.next_power_of_2(tp), BLOCK_V=vp._MARKOV_BLOCK_V,
+                BLOCK_P=triton.next_power_of_2(programs), num_warps=4, grid=(programs,),
+            )  # fmt: skip
