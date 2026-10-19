@@ -20,7 +20,8 @@ from __future__ import annotations
 import functools
 import math
 import os
-from typing import List, Optional, Tuple
+import weakref
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from fla.modules import ShortConvolution
@@ -33,7 +34,7 @@ from ....quantization import QuantAlgo
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
-from ...modules.multi_stream_utils import maybe_execute_in_parallel
+from ...modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..linear import Linear
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
@@ -82,6 +83,19 @@ _KDA_DECODE_PDL = (
 # packed UE8M0 scales, bitwise the separate quantize kernel), when o_proj would run DeepGEMM on
 # the BF16 output; o_proj then takes the prequantized pair.
 _KDA_DECODE_FP8_OUT = os.environ.get("TRTLLM_K3_KDA_DECODE_FP8_OUT", "0") == "1"
+# Decode verify (fused path): once this layer's QKVG projection and [f_a | b] kernel are done, the
+# projection aux stream prefetches the next KDA layer's QKVG, [f_a | b], f_b and o_proj weights
+# into L2 (cp.async.bulk.prefetch.L2, k3_l2_prefetch) while this layer's recurrence and all-reduce
+# leave HBM idle; the next layer's projections then read them from L2. Hints only: no result
+# depends on them. Up to TRTLLM_K3_KDA_L2_PREFETCH_MAX_ROWS verify rows (larger batches keep HBM
+# busy through the layer). The prefetch kernel stays on the aux stream, which the Kimi-K3 MoE block
+# of the same layer reuses for its shared experts and joins back; no main-stream kernel waits for
+# it (an extra cross-stream dependency costs a programmatic dependent its early launch).
+_KDA_L2_PREFETCH = os.environ.get("TRTLLM_K3_KDA_L2_PREFETCH", "0") == "1"
+_KDA_L2_PREFETCH_MAX_ROWS = int(os.environ.get("TRTLLM_K3_KDA_L2_PREFETCH_MAX_ROWS", "64"))
+# KDA mixers of one model by layer index (keyed by the model's text config), for the prefetch of
+# the next KDA layer's weights.
+_KDA_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiKDALinearAttention]"] = {}
 
 
 def _lowm_gemv_or_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -419,6 +433,11 @@ class KimiKDALinearAttention(nn.Module):
         self._projection_join_event = torch.cuda.Event()
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
+        # L2 prefetch of the next KDA layer's projection weights (TRTLLM_K3_KDA_L2_PREFETCH).
+        self._kda_group = _KDA_LAYERS.setdefault(id(cfg), weakref.WeakValueDictionary())
+        self._kda_group[layer_idx] = self
+        self._l2_prefetch_ranges_cache: Optional[List[Tuple[int, int]]] = None
+        self._l2_prefetch_start = torch.cuda.Event()
 
     def finalize_decode_weights(self) -> None:
         """Build fused projection weights and decode constants after weight load.
@@ -1271,6 +1290,60 @@ class KimiKDALinearAttention(nn.Module):
             return q_proj, k_proj, v_proj, None if fab_fa else forget_gate, beta, onorm_g, f_a
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
+    def _next_kda_layer(self) -> Optional["KimiKDALinearAttention"]:
+        """The KDA mixer of the next KDA layer of this model, if any."""
+        later = [idx for idx in self._kda_group.keys() if idx > self.layer_idx]
+        return self._kda_group.get(min(later)) if later else None
+
+    def l2_prefetch_ranges(self) -> List[Tuple[int, int]]:
+        """``(address, bytes)`` of the weights the fused verify path streams from HBM: the QKVG
+        and o_proj weights and scales, ``[f_a | b]`` and ``f_b``."""
+        if self._l2_prefetch_ranges_cache is None:
+            from ...cute_dsl_kernels.blackwell.k3_l2_prefetch import MAX_RANGES, tensor_range
+
+            tensors = [self._qkvg_proj_weight]
+            for module in (self.qkvg_proj, self.o_proj):
+                if module is not None:
+                    tensors += [
+                        getattr(module, "weight", None),
+                        getattr(module, "weight_scale", None),
+                    ]
+            tensors += [self._bfa_proj_weight, self.f_b_proj.weight]
+            ranges = []
+            for tensor in tensors:
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda and tensor.numel():
+                    try:
+                        ranges.append(tensor_range(tensor))
+                    except ValueError:
+                        continue
+            self._l2_prefetch_ranges_cache = ranges[:MAX_RANGES]
+        return self._l2_prefetch_ranges_cache
+
+    def _issue_l2_prefetch(self, num_rows: int) -> None:
+        """Prefetch the next KDA layer's weights into L2 from the projection aux stream, after the
+        projections of this layer (see ``TRTLLM_K3_KDA_L2_PREFETCH``)."""
+        if (
+            not _KDA_L2_PREFETCH
+            or num_rows > _KDA_L2_PREFETCH_MAX_ROWS
+            or self._projection_aux_stream is None
+            or not do_multi_stream()
+            or torch.compiler.is_compiling()
+        ):
+            return
+        nxt = self._next_kda_layer()
+        ranges = nxt.l2_prefetch_ranges() if nxt is not None else []
+        if not ranges:
+            return
+        from ...cute_dsl_kernels.blackwell.k3_l2_prefetch import run_k3_l2_prefetch
+
+        # Recorded after the [f_a | b] join: the prefetch starts once QKVG and [f_a | b] are done
+        # (both read their weights from HBM), i.e. under the recurrence. The aux stream is joined
+        # back by its next user (see TRTLLM_K3_KDA_L2_PREFETCH).
+        self._l2_prefetch_start.record()
+        with torch.cuda.stream(self._projection_aux_stream):
+            self._l2_prefetch_start.wait()
+            run_k3_l2_prefetch(ranges)
+
     def forward_verify_fused(
         self, x2d, num_steps, layer_cache, ssm_pool, slot_indices
     ) -> torch.Tensor:
@@ -1301,6 +1374,7 @@ class KimiKDALinearAttention(nn.Module):
             preserve_section_strides=True,
             gate_from_fa=_KDA_DECODE_FUSED_FAB and not mxfp8_output,
         )
+        self._issue_l2_prefetch(T_total)
         f_a = None
         if projections is None:
             q_proj = self.q_proj(x)
