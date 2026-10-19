@@ -170,3 +170,61 @@ def test_decoder_layers_with_deferred_moe_residual(m: int, monkeypatch):
             return mkl._materialize_prefix_sum(h)
 
     assert torch.equal(run("2"), run("0"))
+
+
+class _FakeKdaMixer:
+    """Stands in for the KDA mixer: records the MXFP8 hand-off it is given for each call."""
+
+    def __init__(self):
+        self.next_input_mxfp8 = None
+        self.seen = []
+
+    def qkvg_takes_mxfp8(self, num_rows):
+        return True
+
+    def __call__(self, h, metadata):
+        self.seen.append((h, self.next_input_mxfp8))
+        self.next_input_mxfp8 = None
+        return (h.float() * 0.75).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("m", [7, 32])
+def test_decoder_layers_mxfp8_handoff(m: int, monkeypatch):
+    """``TRTLLM_K3_ATTN_RES_MXFP8``: a KDA layer whose pre-attention mix folds in the previous MoE
+    residual hands the mixer the MXFP8 form of its output, bitwise the low-M GEMM's quantization of
+    the BF16 rows; the layer outputs do not change, and context batches get no hand-off."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_attn_res
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx
+
+    monkeypatch.setattr(k3_attn_res, "_EXACT", False)
+    monkeypatch.setattr(mkl, "_K3_FUSE_MOE_RESIDUAL", True)
+    layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    for layer in layers:
+        layer.linear_attn = _FakeKdaMixer()
+    bank = _rows(8, m, HIDDEN)
+    hidden = _rows(m, HIDDEN)
+
+    def run(mxfp8, num_contexts=0):
+        monkeypatch.setattr(mkl, "_K3_ATTN_RES_MXFP8", mxfp8)
+        metadata = SimpleNamespace(num_contexts=num_contexts)
+        for layer in layers:
+            layer.linear_attn.seen.clear()
+        h, snaps = hidden, 3
+        with _patched("2"):
+            for layer in layers:
+                h, snaps = layer(h, bank, snaps, metadata)
+            return mkl._materialize_prefix_sum(h)
+
+    ref = run(False)
+    assert all(x is None for layer in layers for _, x in layer.linear_attn.seen)
+    assert torch.equal(run(True, num_contexts=1), ref)
+    assert all(x is None for layer in layers for _, x in layer.linear_attn.seen)
+    assert torch.equal(run(True), ref)
+    # The first layer's input is a plain row (no deferred MoE update), the second one's is not.
+    (_, first), (rows, handoff) = layers[0].linear_attn.seen[0], layers[1].linear_attn.seen[0]
+    assert first is None and handoff is not None
+    ref_q, ref_s = mx.mxfp8_quantize_reference(rows)
+    assert torch.equal(handoff[0].view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(handoff[1], ref_s)

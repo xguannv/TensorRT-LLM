@@ -1013,11 +1013,11 @@ if _K3_ATTN_RES_PDL_MODE not in ("0", "1", "2"):
     raise ValueError(f"TRTLLM_K3_ATTN_RES_PDL must be 0, 1 or 2, got {_K3_ATTN_RES_PDL_MODE!r}")
 _K3_ATTN_RES_PDL = _K3_ATTN_RES_PDL_MODE != "0"
 _K3_ATTN_RES_PDL_MAX_M = int(os.environ.get("TRTLLM_K3_ATTN_RES_PDL_MAX_M", "64"))
-# TRTLLM_K3_ATTN_RES_MXFP8=1: in KDA layers, the pre-attention mix that folds in the previous MoE
-# residual (trtllm::k3_attn_res_moe_add_rmsnorm_mx) also stores the MXFP8 form of its output, and
-# the fused QKVG projection runs the low-M GEMM on it (k3_fp8w_lowm_mxfp8) instead of quantizing
-# the BF16 rows itself: bitwise the same projection, generation-only batches where the projection
-# runs the low-M kernel.
+# TRTLLM_K3_ATTN_RES_MXFP8=1: the pre-attention mix that folds in the previous MoE residual
+# (trtllm::k3_attn_res_moe_add_rmsnorm_mx) also stores the MXFP8 form of its output, and the
+# attention's first projection (KDA fused QKVG, MLA fused q_a / kv_a) runs the low-M GEMM on it
+# (k3_fp8w_lowm_mxfp8) instead of quantizing the BF16 rows itself: bitwise the same projection,
+# generation-only batches where the projection runs the low-M kernel.
 _K3_ATTN_RES_MXFP8 = os.environ.get("TRTLLM_K3_ATTN_RES_MXFP8", "0") == "1"
 
 
@@ -3787,14 +3787,15 @@ class KimiLinearDecoderLayer(nn.Module):
         self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
     def _attn_takes_mxfp8(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
-        """Whether the pre-attention mix should also emit its MXFP8 form for the KDA mixer
-        (``TRTLLM_K3_ATTN_RES_MXFP8``; generation-only batches, see ``qkvg_takes_mxfp8``)."""
-        return (
-            _K3_ATTN_RES_MXFP8
-            and self.is_kda
-            and attn_metadata.num_contexts == 0
-            and self.linear_attn.qkvg_takes_mxfp8(num_rows)
-        )
+        """Whether the pre-attention mix should also emit its MXFP8 form for the attention mixer
+        (``TRTLLM_K3_ATTN_RES_MXFP8``; generation-only batches): the KDA fused QKVG projection
+        (``qkvg_takes_mxfp8``) or the MLA fused q_a / kv_a projection (``q_a_takes_mxfp8``)."""
+        if not _K3_ATTN_RES_MXFP8 or attn_metadata.num_contexts != 0:
+            return False
+        if self.is_kda:
+            return self.linear_attn.qkvg_takes_mxfp8(num_rows)
+        q_a_takes_mxfp8 = getattr(self.self_attn.mixer, "q_a_takes_mxfp8", None)
+        return q_a_takes_mxfp8 is not None and q_a_takes_mxfp8(num_rows)
 
     def forward(
         self,
@@ -3887,6 +3888,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.linear_attn.next_input_mxfp8 = tuple(attn_input_mxfp8)
             hidden_states = self.linear_attn(hidden_states, attn_metadata)
         else:
+            if attn_input_mxfp8:
+                self.self_attn.mixer.next_input_mxfp8 = tuple(attn_input_mxfp8)
             hidden_states = self.self_attn(hidden_states, attn_metadata)
 
         if prefix_sum is None:
