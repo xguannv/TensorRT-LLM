@@ -39,6 +39,22 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = int(
     os.environ.get("TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES", 64 * 1024 * 8 * 2))
 
+# TRTLLM_K3_AR_PUSH=1: a producer kernel may store its BF16 output straight into
+# the Lamport buffers of the MNNVL all-reduce that follows it (the K3 low-M FP8
+# GEMM's push epilogue, cute_dsl_kernels/blackwell/k3_lamport_ar.py):
+# AllReduce.lamport_push_target hands the buffers to the producer and
+# AllReduce.finish_lamport_push completes the all-reduce, bitwise like the C++
+# kernel the call replaces. Off by default.
+_K3_AR_PUSH = os.environ.get("TRTLLM_K3_AR_PUSH", "0") == "1"
+# Pushed all-reduces of at most this many bytes (num_tokens * hidden_dim *
+# group_size * 2) use the one-shot transport, larger ones the two-shot
+# transport. The result always reproduces the C++ kernel that
+# TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES selects (a pushed all-reduce that replaces
+# the one-shot kernel always uses the one-shot transport).
+_K3_AR_PUSH_ONE_SHOT_MAX_BYTES = int(
+    os.environ.get("TRTLLM_K3_AR_PUSH_ONE_SHOT_MAX_BYTES",
+                   str(_MNNVL_ONE_SHOT_THRESHOLD_BYTES)))
+
 _thread_local = threading.local()
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
@@ -558,6 +574,26 @@ def reducescatter(
     return output
 
 
+class LamportPushTarget:
+    """One MNNVL all-reduce whose input the producer pushes (TRTLLM_K3_AR_PUSH).
+
+    Made by ``AllReduce.lamport_push_target`` for a single call. The producer
+    stores its BF16 ``[num_tokens, hidden]`` output into the Lamport slots of
+    ``workspace`` (a ``k3_lamport_ar.LamportWorkspace``) with the ``one_shot``
+    or two-shot transport and sets ``pushed``; ``AllReduce.finish_lamport_push``
+    then writes the all-reduce result into ``output``, reproducing the C++
+    one-shot kernel if ``cpp_one_shot``, else the two-shot kernel.
+    """
+
+    def __init__(self, workspace, one_shot: bool, cpp_one_shot: bool,
+                 output: torch.Tensor):
+        self.workspace = workspace
+        self.one_shot = one_shot
+        self.cpp_one_shot = cpp_one_shot
+        self.output = output
+        self.pushed = False
+
+
 class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
@@ -691,6 +727,59 @@ class MNNVLAllReduce(nn.Module):
         if is_fusion and len(outputs) > 1:
             return tuple(outputs)
         return outputs[0]
+
+    # Device views of the workspaces for pushed all-reduces, by the address of
+    # the workspace's buffer (a scaled workspace is a new buffer).
+    _lamport_views: Dict[int, object] = {}
+
+    def lamport_push_target(self, num_tokens: int,
+                            hidden_dim: int) -> Optional[LamportPushTarget]:
+        """A ``LamportPushTarget`` for a plain all-reduce of BF16
+        ``[num_tokens, hidden_dim]`` on this workspace, or None.
+
+        The first call per workspace builds its device peer table, so it must
+        not run during CUDA graph capture (it returns None there); the eager
+        warm-up forwards make it.
+        """
+        from ..cute_dsl_kernels.blackwell import k3_lamport_ar
+        world = self.mapping.tp_size
+        nbytes = num_tokens * hidden_dim * world * 2
+        cpp_one_shot = nbytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+        one_shot = cpp_one_shot or nbytes <= _K3_AR_PUSH_ONE_SHOT_MAX_BYTES
+        need = max(
+            self.get_required_workspace_size(num_tokens, hidden_dim, world,
+                                             self.dtype),
+            k3_lamport_ar.required_bytes(num_tokens, hidden_dim, world,
+                                         one_shot))
+        if need >= 2**32 - 1:
+            return None
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=need)
+        key = workspace["uc_buffer"].data_ptr()
+        view = MNNVLAllReduce._lamport_views.get(key)
+        if view is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            view = k3_lamport_ar.LamportWorkspace.from_mnnvl(
+                workspace, world, self.mapping.tp_rank)
+            MNNVLAllReduce._lamport_views[key] = view
+        output = torch.empty(num_tokens,
+                             hidden_dim,
+                             dtype=self.dtype,
+                             device=workspace["uc_buffer"].device)
+        return LamportPushTarget(view, one_shot, cpp_one_shot, output)
+
+    @staticmethod
+    def finish_lamport_push(target: LamportPushTarget) -> torch.Tensor:
+        """Complete a pushed all-reduce; returns ``target.output``."""
+        from ..cute_dsl_kernels.blackwell import k3_lamport_ar
+        from ..flashinfer_utils import get_env_enable_pdl
+        return k3_lamport_ar.run_lamport_finish(
+            target.workspace,
+            target.output,
+            target.one_shot,
+            use_pdl=get_env_enable_pdl(),
+            cpp_one_shot=target.cpp_one_shot)
 
 
 class AllReduce(nn.Module):
@@ -893,6 +982,44 @@ class AllReduce(nn.Module):
         if not NVLS_AR_MIN_BYTES <= math.prod(shape) * 2 <= NVLS_AR_MAX_BYTES:
             return None
         return nvls.zero_copy_buffer(tuple(shape))
+
+    def lamport_push_target(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        all_reduce_params: Optional[AllReduceParams] = None
+    ) -> Optional[LamportPushTarget]:
+        """With TRTLLM_K3_AR_PUSH=1: a ``LamportPushTarget`` if ``forward`` would
+        run the MNNVL all-reduce on a BF16 ``[num_tokens, hidden_dim]`` input
+        with these parameters (plain sum, no fusion); else None.
+
+        A producer that stores its output into the target (and sets
+        ``pushed``) replaces the input of this all-reduce;
+        ``finish_lamport_push`` then returns the same result ``forward`` would.
+        Targets must be finished in the order they were pushed, by every rank.
+        """
+        if (not _K3_AR_PUSH or self.mnnvl_allreduce is None
+                or self.mapping.tp_size == 1
+                or self.symm_mem_allreduce is not None
+                or torch.compiler.is_compiling()):
+            return None
+        if all_reduce_params is not None and (
+                not all_reduce_params.enable_allreduce
+                or all_reduce_params.fusion_op != AllReduceFusionOp.NONE):
+            return None
+        if self.mnnvl_allreduce.dtype != torch.bfloat16 or num_tokens <= 0 \
+                or hidden_dim % 8:
+            return None
+        if (self.nvls_allreduce is not None and NVLS_AR_MIN_BYTES <=
+                num_tokens * hidden_dim * 2 <= NVLS_AR_MAX_BYTES):
+            return None
+        return self.mnnvl_allreduce.lamport_push_target(num_tokens, hidden_dim)
+
+    def finish_lamport_push(self, target: LamportPushTarget) -> torch.Tensor:
+        """The all-reduce result of a target the producer has pushed."""
+        if not target.pushed:
+            raise RuntimeError("the producer did not push this all-reduce")
+        return self.mnnvl_allreduce.finish_lamport_push(target)
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.

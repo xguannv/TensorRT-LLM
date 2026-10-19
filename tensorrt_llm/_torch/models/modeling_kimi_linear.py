@@ -1477,6 +1477,13 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # Other paths return their own tensor, so the caller compares the result with the
         # buffer it handed in.
         self.next_output: Optional[torch.Tensor] = None
+        # Set by a caller for the next forward only (every forward consumes and clears it): the
+        # ``LamportPushTarget`` (``AllReduce.lamport_push_target``) of the all-reduce that
+        # follows this projection (TRTLLM_K3_AR_PUSH). Where the low-M GEMM without split-K
+        # serves ``forward`` / ``forward_gated``, it stores its output into that all-reduce's
+        # Lamport buffers instead, marks the target pushed and returns the all-reduce's
+        # output tensor, which ``AllReduce.finish_lamport_push`` fills.
+        self.next_ar_push = None
         # Copied from the source ``Linear`` (the MLA fused q_a/kv_a projection sets it): the
         # low-M GEMM may serve this weight although N is not a multiple of 128.
         self.fp8w_lowm_partial_n_tile = False
@@ -1666,11 +1673,39 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             return None
         return out
 
+    def _take_next_ar_push(self, x_flat: torch.Tensor, gated: bool = False):
+        """Clear :attr:`next_ar_push`; return it if the low-M GEMM can push this forward's
+        ``[M, out_features]`` output into it (low-M kernel without split-K)."""
+        push, self.next_ar_push = self.next_ar_push, None
+        if (
+            push is None
+            or x_flat.dtype != torch.bfloat16
+            or tuple(push.output.shape) != (x_flat.shape[0], self.out_features)
+        ):
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+        tactic = k3_fp8w_lowm_gemm.ar_push_tactic(
+            x_flat.shape[0], self.out_features, self.in_features, gated=gated
+        )
+        return push if tactic is not None else None
+
+    def _run_ar_push(self, x_flat: torch.Tensor, push, gate=None) -> torch.Tensor:
+        """The low-M GEMM with the all-reduce push epilogue; returns the all-reduce output."""
+        from ..cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import run_k3_fp8w_lowm_gemm_ar_push
+
+        run_k3_fp8w_lowm_gemm_ar_push(
+            x_flat, self.weight, self.weight_scale, push.workspace, push.one_shot, gate=gate
+        )
+        push.pushed = True
+        return push.output
+
     def forward_fp8_packed(self, act: torch.Tensor, act_scale: torch.Tensor) -> torch.Tensor:
         """Project an activation quantized upstream: E4M3 ``[M, K]`` plus DeepGEMM-packed UE8M0
         1x128 scales (int32 ``[M, ceil(K / 512)]``, strides ``(1, ld)``), the bytes
         ``fp8_quantize_1x128_packed_ue8m0`` makes of the BF16 activation. Same output as
         :meth:`forward` on that activation where :meth:`takes_fp8_packed_input` holds."""
+        self.next_ar_push = None
         out_buffer = self._take_next_output(act.shape[0])
         if self._mid_gemm_applies_rows(act.shape[0], packed=True):
             from ..cute_dsl_kernels.blackwell import k3_fp8_mid_gemm
@@ -1705,6 +1740,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         out_shape = x.shape[:-1] + (self.out_features,)
         x_flat = x.reshape(-1, x.shape[-1])
         out_buffer = self._take_next_output(x_flat.shape[0])
+        ar_push = self._take_next_ar_push(x_flat)
 
         if self.mid_weight_sf is not None and self.mid_gemm_applies(x_flat):
             if out_buffer is not None:
@@ -1733,7 +1769,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 allow_partial_n_tile=_K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile,
             )
         ):
-            if out_buffer is not None:
+            if ar_push is not None:
+                out = self._run_ar_push(x_flat, ar_push)
+            elif out_buffer is not None:
                 from ..cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import k3_fp8w_lowm_gemm_out
 
                 out = k3_fp8w_lowm_gemm_out(x_flat, self.weight, self.weight_scale, out_buffer)
@@ -1848,6 +1886,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 self.out_features, self.in_features
             ):
                 self.next_output = None
+                self.next_ar_push = None
                 out = k3_fp8w_lowm_gemm.k3_fp8w_lowm_gemm_sigmoid(
                     x_flat, self.weight, self.weight_scale
                 )
@@ -1861,6 +1900,10 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         """
         from ..cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import k3_fp8w_lowm_gemm_gated
 
+        ar_push = self._take_next_ar_push(x, gated=True)
+        if ar_push is not None:
+            self.next_output = None
+            return self._run_ar_push(x, ar_push, gate=gate)
         return k3_fp8w_lowm_gemm_gated(
             x, gate, self.weight, self.weight_scale, out=self._take_next_output(x.shape[0])
         )
@@ -1872,6 +1915,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     ) -> torch.Tensor:
         """Project an activation that the fused KDA producer already quantized."""
         self.next_output = None
+        self.next_ar_push = None
         if activation.dtype is not torch.float8_e4m3fn:
             raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
         if not self.supports_prequantized_input:
@@ -3394,15 +3438,21 @@ class KimiK3MoERuntime(nn.Module):
 
         def _shared_output():
             down_proj = self.shared_experts.down_proj
+            ar_push = None
             if isinstance(down_proj, _Fp8BlockScaleWeightReadLinear):
                 if merged is not None:
                     down_proj.next_output = shared_slot
                 elif self.shared_down_all_reduce is not None and not self._defer_shared_allreduce:
                     # The FP8 down projection writes its partial straight into the NVLS
-                    # all-reduce's input buffer when there is one (TRTLLM_NVLS_AR_ZERO_COPY=1).
+                    # all-reduce's input buffer when there is one (TRTLLM_NVLS_AR_ZERO_COPY=1),
+                    # or into the MNNVL all-reduce's Lamport buffers (TRTLLM_K3_AR_PUSH).
                     down_proj.next_output = self.shared_down_all_reduce.nvls_input_buffer(
                         (identity.shape[0], down_proj.out_features)
                     )
+                    ar_push = self.shared_down_all_reduce.lamport_push_target(
+                        identity.shape[0], down_proj.out_features
+                    )
+                    down_proj.next_ar_push = ar_push
             shared_out = self.shared_experts(
                 identity,
                 final_all_reduce_params=(
@@ -3416,10 +3466,16 @@ class KimiK3MoERuntime(nn.Module):
                 if shared_out.data_ptr() != shared_slot.data_ptr():
                     shared_slot.copy_(shared_out)
                 return shared_slot
+            if ar_push is not None:
+                down_proj.next_ar_push = None
             if overlap_shared_allreduce:
                 # Wait for all routed chunks, but overlap the norm/up tail.
                 self.moe_routed_event.wait()
                 shared_out = self._shared_all_reduce()(shared_out)
+            elif ar_push is not None and ar_push.pushed:
+                shared_out = self.shared_down_all_reduce.finish_lamport_push(ar_push).view(
+                    shared_out.shape
+                )
             elif self.shared_down_all_reduce is not None and not self._defer_shared_allreduce:
                 shared_out = self.shared_down_all_reduce(shared_out)
             return shared_out
@@ -3661,10 +3717,22 @@ class KimiMLARuntime(nn.Module):
             o_proj.next_output = self._o_allreduce.nvls_input_buffer(
                 (hidden_states.shape[0], o_proj.out_features)
             )
+        # TRTLLM_K3_AR_PUSH: o_proj stores its partial straight into the all-reduce's Lamport
+        # buffers where the low-M GEMM serves it.
+        ar_push = None
+        if zero_copy and hasattr(o_proj, "next_ar_push"):
+            ar_push = self._o_allreduce.lamport_push_target(
+                hidden_states.shape[0], o_proj.out_features
+            )
+            o_proj.next_ar_push = ar_push
         out = self.mixer(hidden_states, attn_metadata)
         if zero_copy:
             o_proj.next_output = None
-        if self._o_allreduce is not None:
+        if ar_push is not None:
+            o_proj.next_ar_push = None
+        if ar_push is not None and ar_push.pushed:
+            out = self._o_allreduce.finish_lamport_push(ar_push).view(out.shape)
+        elif self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
             out = self._o_allreduce(out)

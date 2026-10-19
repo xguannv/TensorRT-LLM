@@ -609,6 +609,14 @@ class KimiKDALinearAttention(nn.Module):
             self.o_proj.next_output = self._o_allreduce.nvls_input_buffer(
                 (hidden_states.shape[0], self.hidden_size)
             )
+        # TRTLLM_K3_AR_PUSH: o_proj stores its partial straight into the all-reduce's Lamport
+        # buffers where the low-M GEMM serves it.
+        ar_push = None
+        if zero_copy and hasattr(self.o_proj, "next_ar_push"):
+            ar_push = self._o_allreduce.lamport_push_target(
+                hidden_states.shape[0], self.hidden_size
+            )
+            self.o_proj.next_ar_push = ar_push
 
         outputs: List[torch.Tensor] = []
         if num_prefills > 0:
@@ -666,7 +674,11 @@ class KimiKDALinearAttention(nn.Module):
         if zero_copy:
             self.o_proj.next_output = None
         self.next_input_mxfp8 = None
-        if self._o_allreduce is not None:
+        if ar_push is not None:
+            self.o_proj.next_ar_push = None
+        if ar_push is not None and ar_push.pushed:
+            out = self._o_allreduce.finish_lamport_push(ar_push).view(out.shape)
+        elif self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
             out = self._o_allreduce(out)
