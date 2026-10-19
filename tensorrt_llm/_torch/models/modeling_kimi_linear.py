@@ -379,6 +379,40 @@ _K3_MOE_L2_PREFETCH_MAX_M = int(os.environ.get("TRTLLM_K3_MOE_L2_PREFETCH_MAX_M"
 # MoE runtimes of one model by layer index (keyed by the model's text config), for the prefetch of the
 # next MoE layer's weights.
 _K3_MOE_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiK3MoERuntime]"] = {}
+# TRTLLM_K3_EXPERT_L2_PREFETCH=<B> (1..32; 0 = off): routed-expert weights from L2 at decode batch
+# sizes. For up to TRTLLM_K3_EXPERT_L2_PREFETCH_MAX_M tokens, when the CuTe routing tail routed the
+# layer, every MoE layer issues one k3_expert_l2_prefetch launch on a side stream once its routed FC2
+# is done (HBM is then mostly idle under the latent all-reduce). The launch records this layer's
+# routing on this rank (the tokens of each touched local expert) into a persistent routing record of
+# the layer, and prefetches into L2 the gate_up / down weights and scales of the B experts with the
+# most tokens in the next MoE layer's record: the experts that layer read in the previous decode
+# step, which the tokens of a request mostly pick again. The lines stay in L2 until the next layer's
+# routed GEMMs read them (see k3_expert_l2_prefetch). Hints only: bit-exact, and a stale record (the
+# first step, a step of another batch size) only changes what is prefetched.
+# TRTLLM_K3_EXPERT_L2_PREFETCH_CTAS / _CHUNK_KB: launch shape (32 one-warp CTAs, 32 KB pieces).
+_K3_EXPERT_L2_PREFETCH = int(os.environ.get("TRTLLM_K3_EXPERT_L2_PREFETCH", "0"))
+if not 0 <= _K3_EXPERT_L2_PREFETCH <= 32:
+    raise ValueError(
+        f"TRTLLM_K3_EXPERT_L2_PREFETCH must be in [0, 32], got {_K3_EXPERT_L2_PREFETCH}"
+    )
+_K3_EXPERT_L2_PREFETCH_MAX_M = int(os.environ.get("TRTLLM_K3_EXPERT_L2_PREFETCH_MAX_M", "32"))
+_K3_EXPERT_L2_PREFETCH_CTAS = int(os.environ.get("TRTLLM_K3_EXPERT_L2_PREFETCH_CTAS", "32"))
+_K3_EXPERT_L2_PREFETCH_CHUNK = (
+    int(os.environ.get("TRTLLM_K3_EXPERT_L2_PREFETCH_CHUNK_KB", "32")) << 10
+)
+
+
+class _ExpertL2PrefetchState:
+    """``TRTLLM_K3_EXPERT_L2_PREFETCH`` state shared by the MoE layers of one model: the side
+    stream of the prefetch launches, and whether it holds work the main stream has not joined."""
+
+    def __init__(self):
+        self.stream: Optional[torch.cuda.Stream] = None
+        self.pending = False
+
+
+# Expert L2 prefetch state of each model (keyed like _K3_MOE_LAYERS).
+_K3_EXPERT_L2_STATE: Dict[int, _ExpertL2PrefetchState] = {}
 # TRTLLM_K3_LATENT_AR_OWN_WS=1: for up to TRTLLM_K3_LATENT_AR_OWN_WS_MAX_M tokens, the routed latent
 # all-reduce + RMSNorm (the same MNNVL Lamport kernels) runs on a workspace of its own instead of the
 # one it shares with the shared expert's all-reduce. It then no longer has to follow the shared-expert
@@ -2326,6 +2360,13 @@ class KimiK3MoERuntime(nn.Module):
     # TRTLLM_K3_LATENT_AR_OWN_WS: the routed latent all-reduce's own MNNVL workspace (``None``: it
     # shares the one of the shared expert's all-reduce).
     _latent_ar_ws: Optional[Dict[str, Any]] = None
+    # TRTLLM_K3_EXPERT_L2_PREFETCH: the model's shared state (``None``: off), this layer's routing
+    # record (allocated outside graph capture), the routing-tail outputs of the current forward,
+    # and this layer's expert weight ranges with the weight addresses they were built for.
+    _expl2_state: Optional[_ExpertL2PrefetchState] = None
+    _expl2_record: Optional[torch.Tensor] = None
+    _expl2_route: Optional[Tuple[torch.Tensor, ...]] = None
+    _expl2_ranges: Tuple[Tuple[int, ...], List[Tuple[int, int, int]]] = ((), [])
 
     def __init__(
         self,
@@ -2660,6 +2701,9 @@ class KimiK3MoERuntime(nn.Module):
         self._moe_group[layer_idx] = self
         self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
         self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
+        if _K3_EXPERT_L2_PREFETCH:
+            self._expl2_state = _K3_EXPERT_L2_STATE.setdefault(id(cfg), _ExpertL2PrefetchState())
+            self._expl2_event = torch.cuda.Event()
         if _K3_LATENT_AR_OWN_WS and self._reduce_routed_output:
             mnnvl = getattr(self.routed_experts.all_reduce, "mnnvl_allreduce", None)
             if mnnvl is not None and mnnvl.mapping.tp_size > 1:
@@ -2729,6 +2773,118 @@ class KimiK3MoERuntime(nn.Module):
                 run_k3_l2_prefetch(self.l2_prefetch_ranges("lu"))
             if "front" in _K3_MOE_L2_PREFETCH:
                 run_k3_l2_prefetch(nxt.l2_prefetch_ranges("front"))
+
+    def _expert_l2_weight_ranges(self) -> List[Tuple[int, int, int]]:
+        """``(base, stride, bytes)`` of every local expert's slice of this layer's routed gate_up
+        and down weights and their block scales (``TRTLLM_K3_EXPERT_L2_PREFETCH``), or ``[]`` when
+        the backend does not hold them as dense ``[local experts, ...]`` tensors."""
+        backend = self.routed_experts.backend
+        scales = getattr(backend, "quant_scales", None)
+        tensors = [
+            getattr(backend, "w3_w1_weight", None),
+            getattr(scales, "fc1_weight_block", None),
+            getattr(backend, "w2_weight", None),
+            getattr(scales, "fc2_weight_block", None),
+        ]
+        if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
+            return []
+        key = tuple(t.data_ptr() for t in tensors)
+        if self._expl2_ranges[0] != key:
+            from ..cute_dsl_kernels.blackwell.k3_expert_l2_prefetch import expert_ranges
+
+            try:
+                ranges = expert_ranges(tensors, self.experts_per_rank)
+            except ValueError as err:
+                logger.warning_once(
+                    f"TRTLLM_K3_EXPERT_L2_PREFETCH: layer {self.layer_idx} weights not prefetched "
+                    f"({err})",
+                    key="k3_expert_l2_prefetch_ranges",
+                )
+                ranges = []
+            self._expl2_ranges = (key, ranges)
+        return self._expl2_ranges[1]
+
+    def _issue_expert_l2_prefetch(self, num_tokens: int) -> None:
+        """``TRTLLM_K3_EXPERT_L2_PREFETCH``: once this layer's routed FC2 is done, one
+        ``k3_expert_l2_prefetch`` launch on the model's expert-prefetch stream records this
+        layer's routing (the routing-tail outputs of this forward) into its routing record and
+        prefetches into L2 the weights of the next MoE layer's experts with the most tokens in that
+        layer's record.
+
+        Ordering: the launch waits for an event recorded on the main stream right after the routed
+        FC2 (a full dependency: FC2 and, through the PDL chain, the routing tail are complete), and
+        the event is waited on only by the side stream, so no main-stream kernel (latent
+        all-reduce, latent_up) gains an incoming edge. The side stream is joined once per forward,
+        by the last MoE layer where the main stream joins the shared-expert stream
+        (:meth:`_join_expert_l2_prefetch`). The routing-tail outputs it reads stay allocated until
+        the side stream is done with them (``record_stream``: a few KB per layer, held until graph
+        capture ends).
+
+        Records: one ``int32 [RECORD_INTS]`` per layer, allocated (empty: no entries, nothing to
+        prefetch) by the first eager forward that gets here, i.e. a CUDA graph warmup run, so they
+        live outside every graph memory pool and all captured graphs share them. In step N the
+        launch after layer L reads the next layer's record, written in step N-1 by that layer's own
+        launch (same stream, earlier replay), and writes layer L's record for step N+1. On the first
+        steps after start-up or after a batch-size switch a record holds the warmup's or another
+        batch size's routing of that layer: a valid but less accurate hint."""
+        outs = self._expl2_route
+        self._expl2_route = None
+        state = self._expl2_state
+        if (
+            state is None
+            or outs is None
+            or num_tokens > _K3_EXPERT_L2_PREFETCH_MAX_M
+            or not do_multi_stream()
+            or torch.compiler.is_compiling()
+        ):
+            return
+        from ..cute_dsl_kernels.blackwell import k3_expert_l2_prefetch as xpf
+
+        if self.experts_per_rank > xpf.MAX_LOCAL:
+            return
+        if self._expl2_record is None:
+            if torch.cuda.is_current_stream_capturing():
+                return
+            device = outs[0].device
+            for layer in list(self._moe_group.values()):
+                if layer._expl2_record is None:
+                    layer._expl2_record = xpf.new_record(device)
+            if state.stream is None:
+                state.stream = torch.cuda.Stream(device=device)
+        nxt = self._next_moe_layer()
+        ranges = []
+        record_in = None
+        if nxt is not None and nxt._expl2_record is not None:
+            ranges = nxt._expert_l2_weight_ranges()
+            record_in = nxt._expl2_record
+        sort_outputs = (outs[2], outs[3], outs[7])
+        self._expl2_event.record()
+        with torch.cuda.stream(state.stream):
+            self._expl2_event.wait()
+            for t in sort_outputs:
+                t.record_stream(state.stream)
+            xpf.run_k3_expert_l2_prefetch(
+                num_local=self.experts_per_rank,
+                record_out=self._expl2_record,
+                sort_outputs=sort_outputs,
+                record_in=record_in,
+                ranges=ranges,
+                budget=_K3_EXPERT_L2_PREFETCH,
+                ctas=_K3_EXPERT_L2_PREFETCH_CTAS,
+                chunk=_K3_EXPERT_L2_PREFETCH_CHUNK,
+            )
+        state.pending = True
+
+    def _join_expert_l2_prefetch(self) -> None:
+        """``TRTLLM_K3_EXPERT_L2_PREFETCH``: in the last MoE layer, join the expert-prefetch stream
+        into the current (main) stream. Called right where the main stream joins the shared-expert
+        stream, so the kernel after it already waits for another stream; the joined launch (this
+        layer's record, nothing to prefetch) started after this layer's routed FC2 and is short."""
+        state = self._expl2_state
+        if state is None or not state.pending or self._next_moe_layer() is not None:
+            return
+        torch.cuda.current_stream().wait_stream(state.stream)
+        state.pending = False
 
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """FP32 router logits; ``TRTLLM_K3_ROUTER_EXACT`` serves ``M <= 16`` BF16 tokens with
@@ -2969,6 +3125,9 @@ class KimiK3MoERuntime(nn.Module):
         ``moe_sort`` outputs for the CuteDSL backend."""
         topk_ids = outs[0]
         topk_ids._k3_presorted = ((target[0], target[1], 128), tuple(outs[2:8]))
+        if self._expl2_state is not None:
+            # Recorded by _issue_expert_l2_prefetch after the routed FC2.
+            self._expl2_route = outs
         return topk_ids, outs[1]
 
     def _tail_route(
@@ -3228,6 +3387,7 @@ class KimiK3MoERuntime(nn.Module):
             routed_out = up.forward_mxfp8(routed_latent, *latent_mxfp8)
         else:
             routed_out = self._routed_projection(routed_latent, up)
+        self._join_expert_l2_prefetch()
         self.moe_shared_event.wait()
         if residual is not None:
             if defer_residual:
@@ -3668,6 +3828,7 @@ class KimiK3MoERuntime(nn.Module):
             )
             if early_routed_in is not None:
                 self._issue_l2_prefetch(num_tokens)
+            self._issue_expert_l2_prefetch(num_tokens)
             if route_target is not None:
                 self.routed_experts.routing_method.deferred = None
             if overlap_shared_allreduce:
@@ -3765,6 +3926,7 @@ class KimiK3MoERuntime(nn.Module):
                 if self._shared_needs_all_reduce():
                     shared_out = self._shared_all_reduce()(shared_partial)
                 self.moe_shared_event.record()
+            self._join_expert_l2_prefetch()
             self.moe_shared_event.wait()
         elif (
             self._latent_ar_ws is not None
@@ -3791,6 +3953,7 @@ class KimiK3MoERuntime(nn.Module):
                 return self._own_workspace_latent_tail(
                     routed_out, shared_out, residual, defer_residual
                 )
+            self._join_expert_l2_prefetch()
             self.moe_shared_event.wait()
         else:
             routed_out, shared_out = maybe_execute_in_parallel(
@@ -3801,6 +3964,7 @@ class KimiK3MoERuntime(nn.Module):
                 self.shared_expert_stream,
                 disable_on_compile=True,
             )
+            self._join_expert_l2_prefetch()
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self._shared_all_reduce()(shared_out)
         if merged is not None or self._reduce_routed_output:
