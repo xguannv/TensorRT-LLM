@@ -127,6 +127,13 @@ class DraftL2Prefetch:
     hints: no value changes. The side-stream kernel depends fully on the GEMM
     it follows, so it does not compete with that GEMM for HBM.
 
+    In the TP16 b2 decode graph (gen-only, GB300) it does not pay off: o_proj,
+    gate_up, down and the next [q_a | kv_a] get 3.5-5 us faster per layer, but
+    the prefetch traffic delays the kernels issued right after the fork (q_b
+    3.4 -> ~7.9 us, the block RoPE and the split-KV reduction by 0.3-1 us), so
+    the five layers take ~14 us longer per step. Keep it off unless the fork
+    point or the prefetch rate is retuned.
+
     :meth:`join` must run on the main stream before the step (or graph capture)
     ends; the kernel after the join loses its programmatic early launch.
     """
