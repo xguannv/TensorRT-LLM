@@ -18,9 +18,9 @@ One Helix CP rank (16-way group) on one GPU: the real ``KimiK3MLAAttention`` (FP
 FP8 KV cache, CuTe FP8 MLA decode, V up-projection before the all-to-all) with the all-to-all
 replaced by a local stand-in, run eagerly and in CUDA graphs with multi-stream enabled. Every
 combination of ``TRTLLM_K3_MLA_GATE_SIDE``, ``TRTLLM_K3_MLA_Q_NORM_PDL``,
-``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``), ``TRTLLM_K3_MLA_KV_FUSED`` and ``TRTLLM_K3_MLA_GATE_EARLY``
-must give the default path's output bit for bit; the fused KV kernel must also write the same cache
-bytes and decode buffers as the kernels it replaces.
+``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``), ``TRTLLM_K3_MLA_KV_FUSED``, ``TRTLLM_K3_MLA_GATE_EARLY`` and
+``TRTLLM_K3_MLA_KV_JOIN_EARLY`` must give the default path's output bit for bit; the fused KV
+kernel must also write the same cache bytes and decode buffers as the kernels it replaces.
 """
 
 import math
@@ -231,13 +231,16 @@ def _build(batch, q_len, kv_len, monkeypatch):
     return model, mixer, manager, md, x
 
 
-def _set(monkeypatch, k3mla, gate, qnorm, kv, prio, kv_fused=False, gate_early=False):
+def _set(
+    monkeypatch, k3mla, gate, qnorm, kv, prio, kv_fused=False, gate_early=False, kv_join=False
+):
     monkeypatch.setattr(k3mla, "_K3_MLA_GATE_SIDE", gate)
     monkeypatch.setattr(k3mla, "_K3_MLA_Q_NORM_PDL", qnorm)
     monkeypatch.setattr(k3mla, "_K3_MLA_KV_SIDE", kv)
     monkeypatch.setattr(k3mla, "_K3_MLA_KV_SIDE_PRIO", prio)
     monkeypatch.setattr(k3mla, "_K3_MLA_KV_FUSED", kv_fused)
     monkeypatch.setattr(k3mla, "_K3_MLA_GATE_EARLY", gate_early)
+    monkeypatch.setattr(k3mla, "_K3_MLA_KV_JOIN_EARLY", kv_join)
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
@@ -285,14 +288,16 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
     try:
         with torch.inference_mode():
             for cfg in [
-                (False,) * 6,
-                (True, False, False, False, False, False),
-                (True, True, True, False, False, False),
-                (True, True, True, True, False, False),
-                (True, False, True, True, False, False),
-                (True, True, True, True, True, False),
-                (True, False, True, False, True, False),
-                (True, True, True, True, True, True),
+                (False,) * 7,
+                (True, False, False, False, False, False, False),
+                (True, True, True, False, False, False, False),
+                (True, True, True, True, False, False, False),
+                (True, False, True, True, False, False, False),
+                (True, True, True, True, True, False, False),
+                (True, False, True, False, True, False, False),
+                (True, True, True, True, True, False, True),
+                (True, True, True, True, True, True, False),
+                (True,) * 7,
             ]:
                 _set(monkeypatch, k3mla, *cfg)
                 calls.update(dict.fromkeys(calls, 0))
@@ -325,11 +330,11 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
         manager.shutdown()
     # Eager runs and graph replays are compared separately: the decode op may pick another
     # tactic outside a capture. The default path's replays must agree among themselves too.
-    ref_eager, ref_graph = results[(False,) * 6][0], results[(False,) * 6][1][0]
+    ref_eager, ref_graph = results[(False,) * 7][0], results[(False,) * 7][1][0]
     assert torch.isfinite(ref_graph).all() and ref_graph.abs().max() > 0
     assert torch.isfinite(ref_eager).all() and ref_eager.abs().max() > 0
     for (cfg, mode), counts in taken.items():
-        gate, qnorm, kv, _, kv_fused, _ = cfg
+        gate, qnorm, kv, _, kv_fused, _, _ = cfg
         # The eager runs are single-stream: the KV half stays on the main stream there.
         side = kv and mode == "graph"
         expect = {
@@ -456,7 +461,7 @@ def test_fused_v_up_matches_bmm(batch, monkeypatch):
     results = {}
     try:
         with torch.inference_mode():
-            for cfg in [(False,) * 6, (True,) * 4 + (False,) * 2, (True,) * 6]:
+            for cfg in [(False,) * 7, (True,) * 4 + (False,) * 3, (True,) * 7]:
                 _set(monkeypatch, k3mla, *cfg)
                 for fused in (False, True):
                     mixer.helix_v_up_in_attention = fused
@@ -484,8 +489,8 @@ def test_fused_v_up_matches_bmm(batch, monkeypatch):
                     assert bmm_calls[0] == (0 if fused else 3), (cfg, fused, bmm_calls[0])
     finally:
         manager.shutdown()
-    ref_graph = results[(False,) * 6, False][1]
-    for cfg in [(False,) * 6, (True,) * 4 + (False,) * 2, (True,) * 6]:
+    ref_graph = results[(False,) * 7, False][1]
+    for cfg in [(False,) * 7, (True,) * 4 + (False,) * 3, (True,) * 7]:
         (eager, graph), (eager_f, graph_f) = results[cfg, False], results[cfg, True]
         assert torch.equal(graph, ref_graph), f"graph {cfg} vs default"
         assert torch.isfinite(graph).all() and graph.abs().max() > 0

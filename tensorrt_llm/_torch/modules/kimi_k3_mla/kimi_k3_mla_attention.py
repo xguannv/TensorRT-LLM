@@ -75,6 +75,11 @@ _K3_MLA_KV_FUSED = os.environ.get("TRTLLM_K3_MLA_KV_FUSED", "0") == "1"
 # the output-gate GEMM where it is forked, before the all-to-all, instead of after the all-to-all
 # and its combine. Scheduling only, bit-exact.
 _K3_MLA_GATE_EARLY = os.environ.get("TRTLLM_K3_MLA_GATE_EARLY", "0") == "1"
+# TRTLLM_K3_MLA_KV_JOIN_EARLY=1 (with TRTLLM_K3_MLA_KV_FUSED): the main stream joins the KV side
+# stream before the q absorb instead of before the decode, so the decode's only dependency is the
+# q absorb on its own stream (a programmatic dependent that also waits for another stream loses
+# its early launch). The fused KV half ends long before q_b does. Scheduling only, bit-exact.
+_K3_MLA_KV_JOIN_EARLY = os.environ.get("TRTLLM_K3_MLA_KV_JOIN_EARLY", "0") == "1"
 # One side stream per device, shared by all MLA layers (their side work never overlaps).
 _GATE_SIDE_STREAMS: dict[tuple[int, bool], torch.cuda.Stream] = {}
 
@@ -740,9 +745,12 @@ class KimiK3MLAAttention(MLA):
                     q_rope_applied=True,
                 )
             kv_ready.record()
+        join_early = fused_kv and _K3_MLA_KV_JOIN_EARLY
         q = self._q_a_layernorm_maybe_fused(q)
         q = self.q_b_proj(q)
         q_pe = q.view([-1, heads, self.qk_head_dim])[..., self.qk_nope_head_dim :]
+        if join_early:
+            kv_ready.wait()
         mla_fp8_q_absorb_nope(
             q.view([-1, heads, self.qk_head_dim]),
             w_kc_bf16,
@@ -752,7 +760,8 @@ class KimiK3MLAAttention(MLA):
         )
         if self.expert_l2_prefetch_hook is not None:
             self.expert_l2_prefetch_hook(num_tokens)
-        kv_ready.wait()
+        if not join_early:
+            kv_ready.wait()
         attn_out = self._attn_forward_gen(
             self.mqa,
             fused_q.view([num_tokens, heads * (lora + rope)]),
