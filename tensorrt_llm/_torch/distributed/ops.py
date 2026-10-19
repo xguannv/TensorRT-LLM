@@ -135,11 +135,20 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+        creating = mapping not in allreduce_mnnvl_workspaces
+        failure = MNNVLAllReduce.failed_mnnvl_workspaces.get(mapping)
+        if creating and failure is not None:
+            # Do not retry: a failed McastGPUBuffer construction does not free
+            # its fabric allocation, and every AllReduce module of the model
+            # asks for this workspace.
+            raise RuntimeError(
+                f"MNNVL workspace creation failed earlier for this mapping: {failure}"
+            )
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
         # Creating the workspace if it doesn't exist
-        if mapping not in allreduce_mnnvl_workspaces:
+        if creating:
             # Do the communicator split if there is no communicator in the workspace
             comm = mpi_comm().Split(
                 int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
@@ -163,25 +172,34 @@ def get_or_scale_allreduce_mnnvl_workspace(
             )
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
-        mcast_buf_handle = McastGPUBuffer(
-            workspace_size_bytes,
-            mapping.tp_size,
-            mapping.tp_rank,
-            mapping.local_rank,
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            comm.py2f(),  # Fortran handle for the MPI communicator
-        )
+        try:
+            # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
+            mcast_buf_handle = McastGPUBuffer(
+                workspace_size_bytes,
+                mapping.tp_size,
+                mapping.tp_rank,
+                mapping.local_rank,
+                use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+                comm.py2f(),  # Fortran handle for the MPI communicator
+            )
 
-        # We use per FP32 element in the buffer for lamport sync
-        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
-                                                (workspace_size_bytes //
-                                                 (torch.float32.itemsize), ),
-                                                torch.float32, 0)
-        buffer.fill_(-0.0)
-        # Wait until the initialization is done
-        torch.cuda.synchronize()
-        comm.Barrier()
+            # We use per FP32 element in the buffer for lamport sync
+            buffer = mcast_buf_handle.get_uc_buffer(
+                mapping.tp_rank,
+                (workspace_size_bytes // (torch.float32.itemsize), ),
+                torch.float32, 0)
+            buffer.fill_(-0.0)
+            # Wait until the initialization is done
+            torch.cuda.synchronize()
+            comm.Barrier()
+        except Exception as e:
+            if creating:
+                MNNVLAllReduce.failed_mnnvl_workspaces[mapping] = repr(e)
+                logger.warning(
+                    f"[MNNVL] Workspace creation failed for pp_rank {mapping.pp_rank}, cp_rank {mapping.cp_rank}, "
+                    f"tp_size {mapping.tp_size}: {e!r}. The all-reduces of this mapping will not use MNNVL."
+                )
+            raise
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
@@ -636,6 +654,9 @@ class MNNVLAllReduce(nn.Module):
     from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+    # Mappings whose initial workspace creation failed (repr of the error):
+    # get_or_scale_allreduce_mnnvl_workspace does not retry them.
+    failed_mnnvl_workspaces: Dict[Mapping, str] = {}
     # Device views of the workspaces for pushed all-reduces (TRTLLM_K3_AR_PUSH),
     # by the address of the workspace's buffer (a scaled workspace is a new
     # buffer).
