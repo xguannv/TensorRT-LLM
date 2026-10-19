@@ -377,9 +377,19 @@ _K3_MOE_L2_PREFETCH = frozenset(
 if not _K3_MOE_L2_PREFETCH <= {"lu", "front"}:
     raise ValueError(f"TRTLLM_K3_MOE_L2_PREFETCH must list lu / front, got {_K3_MOE_L2_PREFETCH}")
 _K3_MOE_L2_PREFETCH_MAX_M = int(os.environ.get("TRTLLM_K3_MOE_L2_PREFETCH_MAX_M", "64"))
+# TRTLLM_K3_MOE_L2_PREFETCH_NEXT_MLA=1: where the next decoder layer is an MLA layer, the MoE block
+# also prefetches that layer's q_b projection weight and scale (28 MB) into L2 on the latent-down
+# stream once its routed FC2 is done, under the same conditions as TRTLLM_K3_MOE_L2_PREFETCH (up to
+# TRTLLM_K3_MOE_L2_PREFETCH_MAX_M tokens, a later MoE layer joins the stream). At decode batch
+# sizes most q_b CTAs become resident only when the q_a GEMM's CTAs leave and then stream their
+# weight slice from HBM; from L2 that part is shorter. Hints only: bit-exact.
+_K3_MOE_L2_PREFETCH_NEXT_MLA = os.environ.get("TRTLLM_K3_MOE_L2_PREFETCH_NEXT_MLA", "0") == "1"
 # MoE runtimes of one model by layer index (keyed by the model's text config), for the prefetch of the
 # next MoE layer's weights.
 _K3_MOE_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiK3MoERuntime]"] = {}
+# MLA runtimes of one model by layer index (keyed like _K3_MOE_LAYERS), for the prefetch of the
+# next MLA layer's q_b weight (TRTLLM_K3_MOE_L2_PREFETCH_NEXT_MLA).
+_K3_MLA_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiMLARuntime]"] = {}
 # TRTLLM_K3_EXPERT_L2_PREFETCH=<B> (1..32; 0 = off): routed-expert weights from L2 at decode batch
 # sizes, for up to TRTLLM_K3_EXPERT_L2_PREFETCH_MAX_M tokens with the CuTe routing tail. Every MoE
 # layer records its routing on this rank (the tokens of each touched local expert) into a persistent
@@ -2769,6 +2779,7 @@ class KimiK3MoERuntime(nn.Module):
         # routed FC2 that starts this layer's prefetch on the latent-down stream.
         self._moe_group = _K3_MOE_LAYERS.setdefault(id(cfg), weakref.WeakValueDictionary())
         self._moe_group[layer_idx] = self
+        self._layers_key = id(cfg)
         self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
         self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
         if _K3_LATENT_AR_SIDE_CLEAR and has_latent_stream:
@@ -2822,12 +2833,13 @@ class KimiK3MoERuntime(nn.Module):
         return ranges
 
     def _issue_l2_prefetch(self, num_tokens: int) -> None:
-        """``TRTLLM_K3_MOE_L2_PREFETCH``: once the routed FC2 is done, prefetch into L2 on the
-        latent-down stream. Only when a later MoE layer exists: its latent_down follows on this
-        stream and is joined into the main stream, so the prefetch needs no join of its own (a join
-        in front of a programmatic dependent would cost it its early launch)."""
+        """``TRTLLM_K3_MOE_L2_PREFETCH`` / ``TRTLLM_K3_MOE_L2_PREFETCH_NEXT_MLA``: once the routed
+        FC2 is done, prefetch into L2 on the latent-down stream. Only when a later MoE layer exists:
+        its latent_down follows on this stream and is joined into the main stream, so the prefetch
+        needs no join of its own (a join in front of a programmatic dependent would cost it its
+        early launch)."""
         if (
-            not _K3_MOE_L2_PREFETCH
+            not (_K3_MOE_L2_PREFETCH or _K3_MOE_L2_PREFETCH_NEXT_MLA)
             or num_tokens > _K3_MOE_L2_PREFETCH_MAX_M
             or self.latent_down_stream is None
             or self.moe_fc2_event is None
@@ -2838,6 +2850,15 @@ class KimiK3MoERuntime(nn.Module):
         nxt = self._next_moe_layer()
         if nxt is None or nxt.latent_down_stream is not self.latent_down_stream:
             return
+        mla_ranges = []
+        if _K3_MOE_L2_PREFETCH_NEXT_MLA:
+            next_mla = _K3_MLA_LAYERS.get(getattr(self, "_layers_key", None), {}).get(
+                self.layer_idx + 1
+            )
+            if next_mla is not None:
+                mla_ranges = next_mla.q_b_l2_prefetch_ranges()
+        if not _K3_MOE_L2_PREFETCH and not mla_ranges:
+            return
         from ..cute_dsl_kernels.blackwell.k3_l2_prefetch import run_k3_l2_prefetch
 
         self.moe_fc2_event.record()
@@ -2847,6 +2868,8 @@ class KimiK3MoERuntime(nn.Module):
                 run_k3_l2_prefetch(self.l2_prefetch_ranges("lu"))
             if "front" in _K3_MOE_L2_PREFETCH:
                 run_k3_l2_prefetch(nxt.l2_prefetch_ranges("front"))
+            if mla_ranges:
+                run_k3_l2_prefetch(mla_ranges)
 
     def _issue_latent_ar_clear(self, num_tokens: int) -> None:
         """``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``: once latent_up is issued, re-arm the Lamport buffer of
@@ -4327,6 +4350,9 @@ class KimiMLARuntime(nn.Module):
         # Set by the decoder layer for one forward (TRTLLM_K3_AR_PUSH_AMID): a pushed o_proj
         # all-reduce may be finished in place and returned as a LamportResult.
         self.ar_result_in_place = False
+        # TRTLLM_K3_MOE_L2_PREFETCH_NEXT_MLA: found by the previous layer's MoE block.
+        _K3_MLA_LAYERS.setdefault(id(cfg), weakref.WeakValueDictionary())[layer_idx] = self
+        self._q_b_l2_ranges: Tuple[Tuple[int, ...], List[Tuple[int, int]]] = ((), [])
         attention_config = copy.copy(model_config)
         attention_config._frozen = False
         attention_config.quant_config_dict = {
@@ -4380,6 +4406,28 @@ class KimiMLARuntime(nn.Module):
             aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
         )
+
+    def q_b_l2_prefetch_ranges(self) -> List[Tuple[int, int]]:
+        """``(address, bytes)`` of the q_b projection's weight and scale
+        (TRTLLM_K3_MOE_L2_PREFETCH_NEXT_MLA); recomputed when the tensors move."""
+        q_b_proj = getattr(self.mixer, "q_b_proj", None)
+        tensors = [
+            t
+            for t in (getattr(q_b_proj, "weight", None), getattr(q_b_proj, "weight_scale", None))
+            if isinstance(t, torch.Tensor) and t.is_cuda and t.numel()
+        ]
+        key = tuple(t.data_ptr() for t in tensors)
+        if self._q_b_l2_ranges[0] != key:
+            from ..cute_dsl_kernels.blackwell.k3_l2_prefetch import tensor_range
+
+            ranges = []
+            for tensor in tensors:
+                try:
+                    ranges.append(tensor_range(tensor))
+                except ValueError:
+                    continue
+            self._q_b_l2_ranges = (key, ranges)
+        return self._q_b_l2_ranges[1]
 
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
