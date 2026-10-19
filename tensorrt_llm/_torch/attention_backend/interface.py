@@ -930,9 +930,9 @@ class AttentionForwardArgs:
 
     softmax_stats_tensor: Optional[torch.Tensor] = None
     # Helix MLA generation: the V up-projection of every head (BF16 [num_heads,
-    # v_head_dim, kv_lora_rank]) applied inside the attention to its output rows,
-    # written to helix_v_up_out ([num_tokens, num_heads, v_head_dim]). A backend
-    # that does so sets helix_v_up_done; the others ignore both tensors.
+    # v_head_dim, kv_lora_rank]) a backend may fuse into its attention, writing the
+    # projected rows to helix_v_up_out ([num_tokens, num_heads, v_head_dim]). A
+    # backend that does so sets helix_v_up_done; the others ignore both tensors.
     helix_v_up_weight: Optional[torch.Tensor] = None
     helix_v_up_out: Optional[torch.Tensor] = None
     helix_v_up_done: bool = False

@@ -9710,10 +9710,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if (self.kernel_class is not
                     BlackwellMultiHeadLatentAttentionForwardFP8
                     or not balanced_split or not self.emit_softmax_stats
-                    or self.num_heads >= self._MMA_TILE_M
-                    or self.seq_len_q <= 1 or rows > V_UP_MAX_ROWS):
+                    or not self.fuses_v_up(self.num_heads, self.seq_len_q,
+                                           batch_size)):
                 return 0
             return v_up_rows_bucket(rows)
+
+        @classmethod
+        def fuses_v_up(cls, num_heads: int, seq_len_q: int,
+                       batch_size: int) -> bool:
+            """Whether the FP8 kernel runs a Helix decode of this shape with
+            the V up-projection fused into its reduction (given ``v_weight``):
+            the balanced split, the folded query (fewer heads than the M tile,
+            several tokens per request) and at most
+            ``mla_decode_fp8_v_up.MAX_ROWS`` rows per head."""
+            return (cls._BALANCED_SPLIT
+                    and batch_size <= BlackwellMultiHeadLatentAttentionForwardFP8.
+                    BALANCED_MAX_REQUESTS and num_heads < cls._MMA_TILE_M
+                    and seq_len_q > 1
+                    and batch_size * seq_len_q <= V_UP_MAX_ROWS)
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_mla_decode_fp8_blackwell",

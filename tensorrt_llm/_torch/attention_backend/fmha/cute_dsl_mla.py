@@ -582,12 +582,18 @@ class CuteDslMlaFmha(PhasedFmha):
         if kernel_dtype != torch.float8_e4m3fn:
             op(*args, *trailing_args)
             return
-        # The FP8 op applies a requested Helix V up-projection itself (fused into its
-        # reduction where it can); v_out precedes the defaulted arguments.
+        # A requested Helix V up-projection is handed to the FP8 op where it fuses it into its
+        # reduction (otherwise the MLA module runs its BMM); v_out precedes the defaulted
+        # arguments.
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            CuteDSLNVMlaDecodeBlackwellRunner,
+        )
+
         v_up = (
             params.fwd.helix_v_up_weight is not None
             and params.fwd.helix_v_up_out is not None
             and params.fwd.softmax_stats_tensor is not None
+            and CuteDSLNVMlaDecodeBlackwellRunner.fuses_v_up(num_heads, seq_len_q, batch_size)
         )
         op(
             *args,
