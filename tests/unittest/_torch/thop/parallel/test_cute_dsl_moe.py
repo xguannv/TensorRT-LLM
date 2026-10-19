@@ -4382,3 +4382,156 @@ def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, variant, m
         out = run(swapab, token_final_scales).double()
         err = (out - exact).abs()
         assert bool((err <= bound).all()), f"swapab={swapab}: max err/bound {(err / bound).max()}"
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize(
+    "shape",
+    [(3584, 768, 896, 224, 224, 16), (1024, 256, 64, 16, 0, 8)],
+    ids=["k3_tp4ep4", "small"],
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 14, 32])
+def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, monkeypatch):
+    """Small-batch MoE kernels (TRTLLM_MOE_LOWM=1) vs the regular gather (FC1, SiTU) and finalize
+    (FC2) kernels.
+
+    FC1: the quantized output rows and their scale factors of every valid permuted row must be
+    bit-identical. FC2: with one non-zero top-k scale per token every output element is one
+    partial and must be bit-identical; with all scales the partials are added in BF16 in an
+    unspecified order by both kernels, which must stay within the BF16 accumulation bound of the
+    exact sum of the partials.
+    """
+    hidden_size, interm_size, num_experts, num_local_experts, local_expert_offset, top_k = shape
+    sf_vec_size = 16
+    torch.manual_seed(1000 + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    # at least one token on this rank
+    token_selected_experts[0, 0] = local_expert_offset
+    t2g, t2lim, _, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=128,
+    )
+    m = p2e.size(0)
+    num_tiles = int(nnet.item())
+    limits = t2lim[:num_tiles].tolist()
+    valid_rows = [r for t in range(num_tiles) for r in range(t * 128, limits[t])]
+
+    def quantize(t):
+        gsf = t.abs().max().float() / (448 * 6)
+        q, sf = torch.ops.trtllm.fp4_quantize(t, 1 / gsf, sf_vec_size, False)
+        return q, sf, gsf
+
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    x, x_sf, x_gsf = quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    w1 = torch.randn(
+        num_local_experts, 2 * interm_size, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    w1, w1_sf, w1_gsf = quantize(w1)
+    w1_sf = w1_sf.view(num_local_experts, 2 * interm_size, hidden_size // sf_vec_size)
+    alpha1 = torch.linspace(0.5, 1.5, num_local_experts, device="cuda") * (x_gsf * w1_gsf)
+    fc2_input_scale = torch.tensor([448 * 6 / 4.0], dtype=torch.float32, device="cuda")
+
+    def fc1(lowm):
+        monkeypatch.setenv("TRTLLM_MOE_LOWM", "1" if lowm else "0")
+        runner = cute_dsl_custom_ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            128,
+            sf_vec_size,
+            activation_type=ActivationType.SiTu,
+            situ_beta=SITU_BETA,
+            situ_linear_beta=SITU_LINEAR_BETA,
+        )
+        assert runner.use_lowm(num_tokens, 2 * interm_size, hidden_size) == lowm
+        c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+            x.view(torch.float4_e2m1fn_x2),
+            w1.view(torch.float4_e2m1fn_x2),
+            x_sf.view(torch.uint8),
+            w1_sf.view(torch.uint8),
+            alpha1.float(),
+            t2g,
+            t2lim,
+            p2e,
+            nnet,
+            fc2_input_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=128,
+            scaling_vector_size=sf_vec_size,
+            activation_type=ActivationType.SiTu,
+            situ_beta=SITU_BETA,
+            situ_linear_beta=SITU_LINEAR_BETA,
+        )
+        return c.view(torch.uint8), c_sf.view(torch.uint8)
+
+    c_ref, c_sf_ref = fc1(False)
+    c_new, c_sf_new = fc1(True)
+    rows = torch.tensor(valid_rows, device="cuda")
+    assert torch.equal(c_ref[rows], c_new[rows]), "FC1 output rows differ"
+    assert (c_ref[rows] != 0).any(), "FC1 output is all zero"
+    sf_cols = interm_size // sf_vec_size
+    sf_ref = unswizzle_sf(c_sf_ref, m, interm_size, sf_vec_size).view(m, sf_cols)
+    sf_new = unswizzle_sf(c_sf_new, m, interm_size, sf_vec_size).view(m, sf_cols)
+    assert torch.equal(sf_ref[rows], sf_new[rows]), "FC1 output scale factors differ"
+
+    w2 = torch.randn(
+        num_local_experts, hidden_size, interm_size, device="cuda", dtype=torch.bfloat16
+    )
+    w2, w2_sf, w2_gsf = quantize(w2)
+    w2_sf = w2_sf.view(num_local_experts, hidden_size, interm_size // sf_vec_size)
+    alpha2 = torch.linspace(0.5, 1.5, num_local_experts, device="cuda") * (
+        w2_gsf / fc2_input_scale[0]
+    )
+    inputs = [
+        c_ref.view(torch.float4_e2m1fn_x2),
+        w2.view(torch.float4_e2m1fn_x2),
+        c_sf_ref.flatten(),
+        w2_sf.view(torch.uint8),
+        alpha2.float(),
+        torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"),
+        t2g,
+        t2lim,
+        p2e,
+        nnet,
+        token_final_scales,
+    ]
+    args = (num_experts, top_k, num_local_experts, local_expert_offset)
+
+    def fc2(lowm, scales):
+        monkeypatch.setenv("TRTLLM_MOE_LOWM", "1" if lowm else "0")
+        runner = cute_dsl_custom_ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+            *args, 128, torch.bfloat16
+        )
+        assert runner.use_lowm(num_tokens, hidden_size, interm_size) == lowm
+        return _finalize_inplace(inputs[:10] + [scales], *args)
+
+    partials = []
+    for slot in range(top_k):
+        one_hot = torch.zeros_like(token_final_scales)
+        one_hot[:, slot] = token_final_scales[:, slot]
+        ref = fc2(False, one_hot)
+        new = fc2(True, one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"FC2 slot {slot}"
+        partials.append(ref.double())
+    exact = torch.stack(partials).sum(0)
+    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+    for lowm in (False, True):
+        out = fc2(lowm, token_final_scales).double()
+        err = (out - exact).abs()
+        assert bool((err <= bound).all()), f"lowm={lowm}: max err/bound {(err / bound).max()}"

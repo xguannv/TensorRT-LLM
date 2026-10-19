@@ -104,6 +104,21 @@ _MOE_WEIGHT_EVICT_FIRST_ENV = "TRTLLM_MOE_WEIGHT_EVICT_FIRST"
 # run different tactics; skewed decode routing separates them by a few percent.
 _MOE_GATHER_GEMM_TACTIC_ENV = "TRTLLM_MOE_GATHER_GEMM_TACTIC"
 _MOE_FINALIZE_TACTIC_ENV = "TRTLLM_MOE_FINALIZE_TACTIC"
+# Opt-in small-batch kernels (cute_dsl_kernels/blackwell/k3_moe_lowm.py) for the NVFP4 MoE gather
+# (FC1, SiTU epilogue) and finalize (FC2) GEMMs: with at most TRTLLM_MOE_LOWM_MAX_TOKENS tokens
+# (default and limit 32) and 128-row tiles they take the place of the regular kernels. They stream
+# each touched expert's weights in equal work units over all SMs (swap-AB, the tokens are the MMA
+# N side). FC1's output is bit-identical; every FC2 partial is bit-identical and the partials of a
+# token are added in an unspecified order, as with the regular kernel.
+_MOE_LOWM_ENV = "TRTLLM_MOE_LOWM"
+_MOE_LOWM_MAX_TOKENS_ENV = "TRTLLM_MOE_LOWM_MAX_TOKENS"
+
+
+def _moe_lowm_max_tokens() -> int:
+    """Largest token count served by the small-batch MoE kernels (0: disabled)."""
+    if os.environ.get(_MOE_LOWM_ENV, "0") != "1":
+        return 0
+    return max(0, min(int(os.environ.get(_MOE_LOWM_MAX_TOKENS_ENV, "32")), 32))
 
 
 def _moe_tactic_pin(env_name: str) -> Optional[Tuple[int, ...]]:
@@ -627,6 +642,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.k3_moe_lowm import (K3MoeFc1LowMKernel,
+                                                          K3MoeFc2LowMKernel)
+    from ..cute_dsl_kernels.blackwell.k3_moe_lowm import \
+        n_tok_for as k3_moe_lowm_n_tok_for
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
@@ -639,7 +658,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
-    from ..cute_dsl_kernels.blackwell.utils import make_ptr
+    from ..cute_dsl_kernels.blackwell.utils import TRTLLM_ENABLE_PDL, make_ptr
 
     @functools.cache
     def _get_full_device_max_active_clusters(device_id: int, cluster_size: int,
@@ -2853,6 +2872,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.weight_evict_first = os.environ.get(
                 _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
             self.tactic_pin = _moe_tactic_pin(_MOE_FINALIZE_TACTIC_ENV)
+            self.lowm_max_tokens = _moe_lowm_max_tokens()
 
         def unique_id(self):
             return (
@@ -2868,7 +2888,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.swapab_early_weights,
                 self.weight_evict_first,
                 self.tactic_pin,
+                self.lowm_max_tokens,
             )
+
+        def use_lowm(self, num_tokens: int, n: int, k: int) -> bool:
+            """Whether the small-batch FC2 kernel (TRTLLM_MOE_LOWM) serves this call."""
+            return (0 < num_tokens <= self.lowm_max_tokens
+                    and self.tile_size == 128 and self.scaling_vector_size == 16
+                    and n % 128 == 0 and k % 256 == 0)
+
+        def _forward_lowm(self, ptrs, m, n, k, num_local, num_tokens, stream):
+            n_tok = k3_moe_lowm_n_tok_for(num_tokens)
+            num_ctas = get_max_activate_clusters(1)
+            # Early weight streaming reads the tile metadata before griddepcontrol.wait, which the
+            # autotuner's input pre-hook rebuilds right before the kernel.
+            early = not AutoTuner.get().is_tuning_mode
+            cache_key = ("lowm", n_tok, n, k, self.top_k, early, num_ctas)
+            compiled = self.__class__.kernel_cache.get(cache_key)
+            if compiled is None:
+                kernel = K3MoeFc2LowMKernel(n_tok,
+                                            n,
+                                            k,
+                                            self.top_k,
+                                            use_pdl=TRTLLM_ENABLE_PDL,
+                                            early_weights=early)
+                compiled = cute.compile(kernel.wrapper, *ptrs, m, num_local,
+                                        num_tokens, num_ctas, stream)
+                self.__class__.kernel_cache[cache_key] = compiled
+            compiled(*ptrs, m, num_local, num_tokens, stream)
 
         # 64-row token operand, two 128-row weight blocks per tile, three
         # epilogue warpgroups, round-robin chunks of four tiles
@@ -3043,6 +3090,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            if self.use_lowm(num_tokens, n, k):
+                self._forward_lowm([
+                    a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
+                    tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
+                    token_final_scales_ptr
+                ], m, n, k, l, num_tokens, stream)
+                return c
 
             if self.use_swapab(n, k, num_tokens) and (
                     not isinstance(tactic, tuple) or len(tactic) == 4):
@@ -3668,6 +3724,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.weight_evict_first = os.environ.get(
                 _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
             self.tactic_pin = _moe_tactic_pin(_MOE_GATHER_GEMM_TACTIC_ENV)
+            # TRTLLM_MOE_LOWM: the small-batch kernel has a SiTU epilogue only
+            self.lowm_max_tokens = (_moe_lowm_max_tokens()
+                                    if self.activation_type
+                                    == ActivationType.SiTu else 0)
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3693,7 +3753,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.situ_linear_beta,
                 self.weight_evict_first,
                 self.tactic_pin,
+                self.lowm_max_tokens,
             )
+
+        def use_lowm(self, orig_m: int, n: int, k: int) -> bool:
+            """Whether the small-batch FC1 kernel (TRTLLM_MOE_LOWM) serves this call."""
+            return (0 < orig_m <= self.lowm_max_tokens and self.tile_size == 128
+                    and self.scaling_vector_size == 16 and n % 128 == 0
+                    and k % 256 == 0)
+
+        def _forward_lowm(self, ptrs, orig_m, m, n, k, num_local, stream):
+            n_tok = k3_moe_lowm_n_tok_for(orig_m)
+            num_ctas = get_max_activate_clusters(1)
+            cache_key = ("lowm", n_tok, n, k, self.top_k, self.situ_beta,
+                         self.situ_linear_beta, num_ctas)
+            compiled = self.__class__.kernel_cache.get(cache_key)
+            if compiled is None:
+                kernel = K3MoeFc1LowMKernel(n_tok,
+                                            n,
+                                            k,
+                                            self.top_k,
+                                            self.situ_beta,
+                                            self.situ_linear_beta,
+                                            use_pdl=TRTLLM_ENABLE_PDL)
+                compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m,
+                                        num_local, num_ctas, stream)
+                self.__class__.kernel_cache[cache_key] = compiled
+            compiled(*ptrs, orig_m, m, num_local, stream)
 
         def get_valid_tactics(
             self,
@@ -3883,6 +3969,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            if self.use_lowm(orig_m, n, k):
+                self._forward_lowm([
+                    a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr,
+                    alpha_ptr, tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr, permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr, global_sf_ptr
+                ], orig_m, m, n, k, l, stream)
+                return c, c_sf
 
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
