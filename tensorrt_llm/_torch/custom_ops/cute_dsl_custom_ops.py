@@ -118,15 +118,18 @@ _MOE_LOWM_MAX_TOKENS_ENV = "TRTLLM_MOE_LOWM_MAX_TOKENS"
 # with the max-shared carveout and triggers FC2's launch only at the start of each CTA's last work
 # unit (k3_moe_lowm.py, share_sm). Unset: the device maximum, FC2 launched right away.
 _MOE_LOWM_FC1_SMEM_KB_ENV = "TRTLLM_MOE_LOWM_FC1_SMEM_KB"
-# Persistent CTAs of the small-batch FC1 / FC2 kernels (default: one per SM). Fewer CTAs leave SMs
-# free for kernels on other streams (the shared expert); the work units are split over the CTAs.
+# Persistent CTAs of the small-batch FC1 / FC2 kernels (default: one per SM): "<N>" for every token
+# tile or "<n_tok>:<N>,..." per token tile (8, 16, 32: up to 8 / 16 / 32 tokens); 0 or a tile not
+# listed: one per SM. Fewer CTAs leave SMs free for kernels on other streams (the shared expert);
+# the work units are split over the CTAs.
 _MOE_LOWM_FC1_CTAS_ENV = "TRTLLM_MOE_LOWM_FC1_CTAS"
 _MOE_LOWM_FC2_CTAS_ENV = "TRTLLM_MOE_LOWM_FC2_CTAS"
 # When the small-batch FC1 kernel releases FC2's launch: "wait" (right after its own
 # griddepcontrol.wait, so FC2 streams its weights early) or "last" (when each CTA starts its last
 # work unit, so a launched FC2 grid whose CTAs wait for SM space does not hold back the CTAs of
-# kernels on other streams for most of FC1). Unset: "last" with TRTLLM_MOE_LOWM_FC1_SMEM_KB,
-# "wait" otherwise.
+# kernels on other streams for most of FC1); "<mode>" for every token tile or
+# "<n_tok>:<mode>,..." per token tile. Unset (or a tile not listed): "last" with
+# TRTLLM_MOE_LOWM_FC1_SMEM_KB, "wait" otherwise.
 _MOE_LOWM_FC1_TRIGGER_ENV = "TRTLLM_MOE_LOWM_FC1_TRIGGER"
 
 
@@ -142,24 +145,56 @@ def _moe_lowm_fc1_smem_bytes() -> int:
     return max(0, int(os.environ.get(_MOE_LOWM_FC1_SMEM_KB_ENV, "0"))) * 1024
 
 
-def _moe_lowm_fc1_late_trigger(smem_cap: int) -> bool:
-    """Whether the small-batch FC1 kernel releases FC2 at its CTAs' last work unit."""
-    trigger = os.environ.get(_MOE_LOWM_FC1_TRIGGER_ENV, "")
-    if trigger not in ("", "wait", "last"):
-        raise ValueError(
-            f"{_MOE_LOWM_FC1_TRIGGER_ENV} must be wait or last, got {trigger!r}")
-    return trigger == "last" or (not trigger and smem_cap > 0)
+def _moe_lowm_fc1_triggers() -> Tuple[Tuple[int, str], ...]:
+    """``((n_tok, mode), ...)`` of TRTLLM_MOE_LOWM_FC1_TRIGGER (n_tok 0: every token tile)."""
+    spec = os.environ.get(_MOE_LOWM_FC1_TRIGGER_ENV, "").strip()
+    if not spec:
+        return ()
+    items = [((0, spec) if ":" not in item else
+              (int(item.split(":")[0]), item.split(":")[1]))
+             for item in spec.split(",")]
+    for _, mode in items:
+        if mode not in ("wait", "last"):
+            raise ValueError(
+                f"{_MOE_LOWM_FC1_TRIGGER_ENV} modes must be wait or last, got {spec!r}")
+    return tuple(items)
 
 
-def _moe_lowm_ctas(env_name: str) -> int:
-    """Requested persistent CTAs of a small-batch MoE kernel (0: one per SM)."""
-    return max(0, int(os.environ.get(env_name, "0")))
+def _moe_lowm_fc1_late_trigger(triggers: Tuple[Tuple[int, str], ...],
+                               smem_cap: int, n_tok: int) -> bool:
+    """Whether the small-batch FC1 kernel for token tile ``n_tok`` releases FC2 at its CTAs'
+    last work unit."""
+    mode = ""
+    for key, value in triggers:
+        if key in (0, n_tok):
+            mode = value
+    return mode == "last" or (not mode and smem_cap > 0)
 
 
-def _moe_lowm_grid(requested: int) -> int:
-    """Persistent CTAs of a small-batch MoE kernel: one per SM, or ``requested`` if fewer."""
+def _moe_lowm_ctas(env_name: str) -> Tuple[Tuple[int, int], ...]:
+    """``((n_tok, ctas), ...)`` requested for a small-batch MoE kernel by ``env_name`` (n_tok 0:
+    every token tile; empty: one CTA per SM)."""
+    spec = os.environ.get(env_name, "").strip()
+    if not spec:
+        return ()
+    if ":" not in spec:
+        return ((0, max(0, int(spec))), )
+    requested = []
+    for item in spec.split(","):
+        n_tok, ctas = item.split(":")
+        requested.append((int(n_tok), max(0, int(ctas))))
+    return tuple(requested)
+
+
+def _moe_lowm_grid(requested: Tuple[Tuple[int, int], ...], n_tok: int) -> int:
+    """Persistent CTAs of a small-batch MoE kernel for token tile ``n_tok``: one per SM, or the
+    requested count if fewer."""
     num_sms = get_max_activate_clusters(1)
-    return min(requested, num_sms) if requested > 0 else num_sms
+    want = 0
+    for key, ctas in requested:
+        if key in (0, n_tok):
+            want = ctas
+    return min(want, num_sms) if want > 0 else num_sms
 
 
 def _moe_tactic_pin(env_name: str) -> Optional[Tuple[int, ...]]:
@@ -2942,7 +2977,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def _forward_lowm(self, ptrs, m, n, k, num_local, num_tokens, stream):
             n_tok = k3_moe_lowm_n_tok_for(num_tokens)
-            num_ctas = _moe_lowm_grid(self.lowm_ctas)
+            num_ctas = _moe_lowm_grid(self.lowm_ctas, n_tok)
             # Early weight streaming reads the tile metadata before griddepcontrol.wait, which the
             # autotuner's input pre-hook rebuilds right before the kernel.
             early = not AutoTuner.get().is_tuning_mode
@@ -3773,7 +3808,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                     == ActivationType.SiTu else 0)
             self.lowm_smem = _moe_lowm_fc1_smem_bytes()
             self.lowm_ctas = _moe_lowm_ctas(_MOE_LOWM_FC1_CTAS_ENV)
-            self.lowm_late_trigger = _moe_lowm_fc1_late_trigger(self.lowm_smem)
+            self.lowm_triggers = _moe_lowm_fc1_triggers()
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3802,7 +3837,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.lowm_max_tokens,
                 self.lowm_smem,
                 self.lowm_ctas,
-                self.lowm_late_trigger,
+                self.lowm_triggers,
             )
 
         def use_lowm(self, orig_m: int, n: int, k: int) -> bool:
@@ -3813,10 +3848,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def _forward_lowm(self, ptrs, orig_m, m, n, k, num_local, stream):
             n_tok = k3_moe_lowm_n_tok_for(orig_m)
-            num_ctas = _moe_lowm_grid(self.lowm_ctas)
+            num_ctas = _moe_lowm_grid(self.lowm_ctas, n_tok)
+            late_trigger = _moe_lowm_fc1_late_trigger(self.lowm_triggers,
+                                                      self.lowm_smem, n_tok)
             cache_key = ("lowm", n_tok, n, k, self.top_k, self.situ_beta,
                          self.situ_linear_beta, num_ctas, self.lowm_smem,
-                         self.lowm_late_trigger)
+                         late_trigger)
             compiled = self.__class__.kernel_cache.get(cache_key)
             if compiled is None:
                 smem = ({
@@ -3831,7 +3868,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.situ_beta,
                     self.situ_linear_beta,
                     use_pdl=TRTLLM_ENABLE_PDL,
-                    late_trigger=self.lowm_late_trigger,
+                    late_trigger=late_trigger,
                     **smem)
                 compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m,
                                         num_local, num_ctas, stream)
