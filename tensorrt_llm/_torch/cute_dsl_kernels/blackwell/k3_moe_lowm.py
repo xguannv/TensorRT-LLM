@@ -297,6 +297,8 @@ class K3MoeFc1LowMKernel:
         CTA's last work unit (see the module docstring), for use with a reduced ``smem_capacity``.
     :param late_trigger: Trigger dependents at the start of each CTA's last work unit (``True``) or
         right after ``griddepcontrol.wait`` (``False``); ``None`` follows ``share_sm``.
+    :param prefetch_experts: The weight TMA warp loads the experts of the first 32 tiles together
+        with the tile count (one memory latency less before the first weight load).
     """
 
     def __init__(
@@ -316,6 +318,7 @@ class K3MoeFc1LowMKernel:
         smem_capacity: int = _SMEM_CAPACITY,
         share_sm: bool = False,
         late_trigger: Optional[bool] = None,
+        prefetch_experts: bool = True,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % (2 * 64) == 0 and n % _MMA_M == 0, f"n {n} must be a multiple of 128"
@@ -334,6 +337,9 @@ class K3MoeFc1LowMKernel:
         self.use_pdl = use_pdl
         self.share_sm = share_sm
         self.late_trigger = share_sm if late_trigger is None else late_trigger
+        # The weight TMA warp loads the experts of the first 32 tiles (lane i: tile i) together with
+        # the tile count, so the first weight load waits for one memory latency instead of two.
+        self.prefetch_experts = prefetch_experts
         # After the stores of a work unit, add 1 to tile_ready[tile] (GPU-scope release), so FC2
         # can start a tile once all n / 128 of its units are stored, without waiting for this grid.
         self.signal_tiles = signal_tiles
@@ -602,6 +608,12 @@ class K3MoeFc1LowMKernel:
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
 
+        t2e_pre = Int32(0)
+        if cutlass.const_expr(self.prefetch_experts):
+            if warp_idx == _TMA_WARP:
+                t2e_pre = tile_idx_to_expert_idx[
+                    cutlass.min(cute.arch.lane_idx(), cute.size(tile_idx_to_expert_idx) - 1)
+                ]
         # This CTA's contiguous range of work units (tile, 128-row block of W1).
         total = Int32(num_non_exiting_tiles[0]) * NBLK
         w_lo = (Int32(bid) * total) // Int32(nctas)
@@ -652,7 +664,14 @@ class K3MoeFc1LowMKernel:
                 w_idx = w_lo + j
                 tile = w_idx // NBLK
                 blk = w_idx - tile * NBLK
-                expert = tile_idx_to_expert_idx[tile]
+                expert = Int32(0)
+                if cutlass.const_expr(self.prefetch_experts):
+                    if tile < 32:
+                        expert = cute.arch.shuffle_sync(t2e_pre, tile)
+                    else:
+                        expert = tile_idx_to_expert_idx[tile]
+                else:
+                    expert = tile_idx_to_expert_idx[tile]
                 for kb in cutlass.range(NKB, unroll=1):
                     stage = g % S
                     if g >= S:
