@@ -157,23 +157,6 @@ def _bf16_bits(x: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Int32:
 
 
 @dsl_user_op
-def _shfl_bfly_b32(value, offset: int, *, loc=None, ip=None) -> cutlass.Int32:
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
-            f"shfl.sync.bfly.b32 $0, $1, {offset}, 0x1f, 0xffffffff;",
-            "=r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def _e4m3_of_bf16_lo(word, inv_scale, *, loc=None, ip=None) -> cutlass.Int32:
     """E4M3 code of the low BF16 half of ``word`` times the packed power-of-two ``inv_scale``:
     the per-element arithmetic of ``k3_fp8w_lowm_gemm._quant_bf16x8_to_e4m3`` (exact BF16
@@ -203,6 +186,14 @@ def _e4m3_of_bf16_lo(word, inv_scale, *, loc=None, ip=None) -> cutlass.Int32:
 def st_global_u8(addr, v):
     _st_asm(
         "st.global.u8 [$0], $1;",
+        "l,r",
+        [Int64(addr).ir_value(), cutlass.Int32(v).ir_value()],
+    )
+
+
+def st_global_u32(addr, v):
+    _st_asm(
+        "st.global.b32 [$0], $1;",
         "l,r",
         [Int64(addr).ir_value(), cutlass.Int32(v).ir_value()],
     )
@@ -1692,20 +1683,30 @@ def kda_decode_mtp_v2_kernel(
             for i in cutlass.range(V // 32, unroll_full=True):
                 v_idx = i * 32 + in_warp_tid
                 o[0, output_row, i_hv, v_idx] = cutlass.BFloat16(pre_values[i] * inv_rms)
-                if cutlass.const_expr(MXFP8_OUT):
-                    # Channels [32 i, 32 i + 32) of this head form one 1x32 group of the o_proj
-                    # input row: one value per lane, so the group amax is a warp reduction.
-                    word = _bf16_bits(pre_values[i] * inv_rms)
-                    amax = word
-                    for offset in (16, 8, 4, 2, 1):
-                        amax = mx_ops.amax_pair(amax, _shfl_bfly_b32(amax, offset))
-                    e_a = mx_ops.ue8m0_of_amax(amax)
+            if cutlass.const_expr(MXFP8_OUT):
+                # Channels [32 i, 32 i + 32) of this head form 1x32 group i of the o_proj input
+                # row, one value per lane: the group amax is a warp reduction. Groups (0, 1) and
+                # (2, 3) share the BF16 halves of a word, so two interleaved chains reduce all four.
+                bits = [_bf16_bits(pre_values[i] * inv_rms) for i in range(V // 32)]
+                words = [bits[2 * j] | (bits[2 * j + 1] << 16) for j in range(V // 64)]
+                amax = list(words)
+                for offset in [16, 8, 4, 2, 1]:
+                    for j in cutlass.range_constexpr(V // 64):
+                        amax[j] = mx_ops.amax_pair(
+                            amax[j], cute.arch.shuffle_sync_bfly(amax[j], offset=offset)
+                        )
+                row_q = xq_addr + Int64(output_row) * (HV * V) + i_hv * V + in_warp_tid
+                packed_e = cutlass.Int32(0)
+                for i in cutlass.range_constexpr(V // 32):
+                    shift = 16 * (i % 2)
+                    e_a = mx_ops.ue8m0_of_amax((amax[i // 2] >> shift) & 0xFFFF)
+                    word = (words[i // 2] >> shift) & 0xFFFF
                     code = _e4m3_of_bf16_lo(word, mx_ops.bf16x2_inv_scale(e_a))
-                    row_q = Int64(output_row) * (HV * V)
-                    st_global_u8(xq_addr + row_q + i_hv * V + v_idx, code)
-                    if in_warp_tid == 0:
-                        row_s = Int64(output_row) * (HV * V // 32)
-                        st_global_u8(xs_addr + row_s + i_hv * (V // 32) + i, e_a)
+                    st_global_u8(row_q + i * 32, code)
+                    packed_e = packed_e | (e_a << (8 * i))
+                if in_warp_tid == 0:
+                    row_s = xs_addr + Int64(output_row) * (HV * V // 32) + i_hv * (V // 32)
+                    st_global_u32(row_s, packed_e)
             token_idx = token_idx + NUM_THREADS // 32
     # the state stores must have read their smem boxes before the CTA exits
     if (tidx == st_tid0) | (tidx == 256 + st_tid0):
