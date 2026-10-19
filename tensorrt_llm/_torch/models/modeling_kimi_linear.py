@@ -1729,6 +1729,74 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             out = _k3_deep_gemm_fp8_swap_ab(x_flat, self.weight, self.weight_scale, x.dtype)
         return out.reshape(out_shape)
 
+    def gated_applies(self, x: torch.Tensor, gate: torch.Tensor) -> bool:
+        """Whether :meth:`forward_gated` serves ``x`` and ``gate`` with one gated low-M GEMM.
+
+        That is where :meth:`forward` would run the low-M GEMM on ``x * gate`` (same kernel
+        family and split), so the gated launch is bitwise equal to the multiply plus
+        :meth:`forward`.
+        """
+        if (
+            not _K3_FP8W_LOWM_GEMM
+            or _rubin_mxfp8_is_available()
+            or torch.compiler.is_compiling()
+            or x.dtype != torch.bfloat16
+            or x.dim() != 2
+            or not x.is_contiguous()
+        ):
+            return False
+        if self.mid_weight_sf is not None and self._mid_gemm_applies_rows(x.shape[0]):
+            return False
+        from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+        return k3_fp8w_lowm_gemm.can_run_gated(
+            x,
+            gate,
+            self.weight,
+            self.weight_scale,
+            allow_partial_n_tile=_K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile,
+        )
+
+    def forward_sigmoid(self, x: torch.Tensor) -> torch.Tensor:
+        """``forward(x).sigmoid()``, bit for bit; one low-M GEMM launch with a sigmoid
+        epilogue where :meth:`forward` would run the low-M GEMM."""
+        x_flat = x.reshape(-1, x.shape[-1])
+        if (
+            _K3_FP8W_LOWM_GEMM
+            and not _rubin_mxfp8_is_available()
+            and not torch.compiler.is_compiling()
+            and x.dtype == torch.bfloat16
+            and not (self.mid_weight_sf is not None and self.mid_gemm_applies(x_flat))
+            and _k3_lowm_gemm_can_run(
+                x_flat,
+                self.weight,
+                self.weight_scale,
+                allow_partial_n_tile=_K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile,
+            )
+        ):
+            from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+            if x_flat.shape[0] <= k3_fp8w_lowm_gemm.low_m_max_for(
+                self.out_features, self.in_features
+            ):
+                self.next_output = None
+                out = k3_fp8w_lowm_gemm.k3_fp8w_lowm_gemm_sigmoid(
+                    x_flat, self.weight, self.weight_scale
+                )
+                return out.reshape(x.shape[:-1] + (self.out_features,))
+        return self.forward(x).sigmoid()
+
+    def forward_gated(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """``forward(x * gate)`` in one gated low-M GEMM launch (where :meth:`gated_applies`).
+
+        ``x`` and ``gate`` are BF16 ``[M, in_features]``; the gate may be a row-strided view.
+        """
+        from ..cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import k3_fp8w_lowm_gemm_gated
+
+        return k3_fp8w_lowm_gemm_gated(
+            x, gate, self.weight, self.weight_scale, out=self._take_next_output(x.shape[0])
+        )
+
     def forward_prequantized(
         self,
         activation: torch.Tensor,

@@ -573,3 +573,197 @@ def test_weight_read_linear_partial_n_cuda_graph(m, monkeypatch):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, eager)
+
+
+# ---------------------------------------------------------------------------
+# Gated low-M GEMM: out = bf16(x * gate) @ W^T (the MLA output gate fused into o_proj).
+# ---------------------------------------------------------------------------
+
+#: (N, K): the Kimi-K3 Helix o_proj, a split-K shape, and a partial last N tile.
+GATED_SHAPES = [(7168, 768), (384, 1280), (2112, 7168)]
+GATED_MS = [1, 7, 8, 14, 28, 32, 56, 64]
+
+
+def _make_gate(m, k, seed, row_stride=None):
+    """Sigmoid gate in BF16 (with exact 0 / 1 entries), optionally a column slice of a wider
+    tensor (row stride ``row_stride``)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed + 2)
+    width = k if row_stride is None else row_stride
+    g = (torch.randn((m, width), device="cuda", generator=gen) * 4).to(torch.bfloat16).sigmoid()
+    g.view(-1)[::97] = 0
+    g.view(-1)[1::89] = 1
+    return g[:, width - k :] if row_stride is not None else g
+
+
+@pytest.mark.parametrize("n, k", GATED_SHAPES)
+@pytest.mark.parametrize("m", GATED_MS)
+@pytest.mark.parametrize("strided", [False, True], ids=["contig", "strided"])
+def test_gated_matches_multiply_then_gemm(m, n, k, strided):
+    """Bitwise equal to PyTorch's ``x * gate`` followed by the plain low-M kernel."""
+    mod = _kernel_module()
+    w_pad, scale = _make_padded_weight(n, k, seed=n + k)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=m)
+    gate = _make_gate(m, k, seed=m, row_stride=k + 1024 if strided else None)
+    plain = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_k3_fp8w_lowm_gemm(x * gate, w, packed, plain, tactic=mod.default_tactic(m, n, k))
+    out = mod.k3_fp8w_lowm_gemm_gated(x, gate, w, packed)
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain)
+    ref = _mxfp8_emulated_reference((x * gate).contiguous(), w_pad[:n], scale)
+    assert _rel_err(out, ref) < 5e-3
+
+
+@pytest.mark.parametrize("m", [7, 14, 32])
+def test_gated_cuda_graph_after_side_stream(m):
+    """Graph replay with the gate written on another stream right before the launch."""
+    mod = _kernel_module()
+    n, k = 7168, 768
+    w_fp8, scale = _make_weight(n, k, seed=7)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
+    x = _make_activation(m, k, seed=1)
+    logits = _make_activation(m, k, seed=2)
+    eager = mod.k3_fp8w_lowm_gemm_gated(x, logits.sigmoid(), w, packed)
+    out = torch.empty_like(eager)
+    gate = torch.empty_like(x)
+    side = torch.cuda.Stream()
+    fork, join = torch.cuda.Event(), torch.cuda.Event()
+
+    def step():
+        fork.record()
+        with torch.cuda.stream(side):
+            fork.wait()
+            torch.sigmoid(logits, out=gate)
+            join.record()
+        join.wait()
+        mod.k3_fp8w_lowm_gemm_gated(x, gate, w, packed, out=out)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    for _ in range(3):
+        out.zero_()
+        gate.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager)
+
+
+def test_gated_rejects_unsupported_inputs():
+    mod = _kernel_module()
+    n, k = 7168, 768
+    w_fp8, scale = _make_weight(n, k, seed=2)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
+    x = torch.zeros((8, k), device="cuda", dtype=torch.bfloat16)
+    assert mod.can_run_gated(x, torch.zeros_like(x), w, packed)
+    # M above the low-M kernel, wrong dtype / shape, unaligned row stride.
+    big = torch.zeros((mod.low_m_max_for(n, k) + 1, k), device="cuda", dtype=torch.bfloat16)
+    assert not mod.can_run_gated(big, torch.zeros_like(big), w, packed)
+    assert not mod.can_run_gated(x, torch.zeros_like(x, dtype=torch.float32), w, packed)
+    assert not mod.can_run_gated(x, torch.zeros((8, k - 128), device="cuda").bfloat16(), w, packed)
+    wide = torch.zeros((8, k + 4), device="cuda", dtype=torch.bfloat16)
+    assert not mod.can_run_gated(x, wide[:, 4:], w, packed)
+    with pytest.raises(ValueError):
+        mod.k3_fp8w_lowm_gemm_gated(big, torch.zeros_like(big), w, packed)
+
+
+@pytest.mark.parametrize("m", [7, 14, 64, 65])
+def test_weight_read_linear_forward_gated(m, monkeypatch):
+    """``forward_gated`` serves M <= LOW_M_MAX and equals ``forward(x * gate)`` bitwise."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+    torch.manual_seed(0)
+    n, k = 7168, 768
+    weight = (torch.randn((n, k), device="cuda") * 0.02).to(torch.bfloat16)
+    linear = kimi._Fp8BlockScaleWeightReadLinear(
+        *kimi._Fp8BlockScaleWeightReadLinear.quantize_weight(weight), n
+    )
+    x = _make_activation(m, k, seed=m)
+    gate = _make_gate(m, k, seed=m)
+    applies = linear.gated_applies(x, gate)
+    assert applies == (m <= _kernel_module().low_m_max_for(n, k))
+    if applies:
+        out = linear.forward_gated(x, gate)
+        torch.cuda.synchronize()
+        assert torch.equal(out, linear(x * gate))
+
+
+# ---------------------------------------------------------------------------
+# Sigmoid epilogue: torch.sigmoid of the BF16 output (the MLA output gate projection).
+# ---------------------------------------------------------------------------
+
+
+def _sigmoid_all_bf16_kernel():
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+
+    mod = _kernel_module()
+
+    @cute.kernel
+    def kernel(src: cute.Tensor, dst: cute.Tensor):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        i = bidx * 256 + tidx
+        dst[i] = mod.sigmoid_bf16(src[i])
+
+    @cute.jit
+    def launch(src: cute.Tensor, dst: cute.Tensor, stream: cuda.CUstream):
+        kernel(src, dst).launch(grid=(256, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch
+
+
+def test_sigmoid_bf16_matches_torch_on_every_bf16():
+    """``sigmoid_bf16`` equals ``torch.sigmoid`` on all 65536 BF16 bit patterns."""
+    import cuda.bindings.driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    bits = torch.arange(-(2**15), 2**15, dtype=torch.int32, device="cuda").to(torch.int16)
+    src = bits.view(torch.bfloat16)
+    dst = torch.empty_like(src)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _sigmoid_all_bf16_kernel()(from_dlpack(src), from_dlpack(dst), stream)
+    torch.cuda.synchronize()
+    ref = torch.sigmoid(src)
+    same = dst.view(torch.int16) == ref.view(torch.int16)
+    both_nan = torch.isnan(dst) & torch.isnan(ref)
+    assert bool((same | both_nan).all()), f"{int((~(same | both_nan)).sum())} BF16 inputs differ"
+
+
+@pytest.mark.parametrize("n, k", [(768, 7168), (384, 1280), (2112, 7168)])
+@pytest.mark.parametrize("m", [1, 7, 14, 32, 64])
+def test_sigmoid_epilogue_matches_torch(m, n, k):
+    """``k3_fp8w_lowm_gemm_sigmoid`` is ``torch.sigmoid`` of the plain kernel, bitwise."""
+    mod = _kernel_module()
+    w_pad, scale = _make_padded_weight(n, k, seed=n + k)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=m) * 0.05
+    plain = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_k3_fp8w_lowm_gemm(x, w, packed, plain, tactic=mod.default_tactic(m, n, k))
+    out = mod.k3_fp8w_lowm_gemm_sigmoid(x, w, packed)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.sigmoid(plain))
+
+
+@pytest.mark.parametrize("m", [7, 14, 64, 65])
+def test_weight_read_linear_forward_sigmoid(m, monkeypatch):
+    """``forward_sigmoid`` equals ``forward(x).sigmoid()`` bitwise on every path."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+    torch.manual_seed(0)
+    n, k = 768, 7168
+    weight = (torch.randn((n, k), device="cuda") * 0.02).to(torch.bfloat16)
+    linear = kimi._Fp8BlockScaleWeightReadLinear(
+        *kimi._Fp8BlockScaleWeightReadLinear.quantize_weight(weight), n
+    )
+    x = _make_activation(m, k, seed=m)
+    out = linear.forward_sigmoid(x)
+    torch.cuda.synchronize()
+    assert torch.equal(out, linear(x).sigmoid())
