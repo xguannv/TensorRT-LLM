@@ -18,9 +18,11 @@
 the routed experts (a per-rank latent partial) and the TP-sharded BF16 shared expert (which reduces
 its output on the shared MNNVL workspace), the real latent RMSNorm and a BF16 latent up-projection.
 With the latent all-reduce on its own workspace (C++ kernels, or with ``TRTLLM_K3_LATENT_AR_CUTE``
-``k3_latent_ar_norm`` for the one-shot sizes) the result (and the deferred residual) must be
-bit-identical to the shared-workspace path, eagerly and under CUDA graph replay, and the own
-workspace must serve exactly the forwards it applies to.
+``k3_latent_ar_norm`` for the one-shot sizes; with ``TRTLLM_K3_LATENT_AR_ROW`` its row kernel, with
+``TRTLLM_K3_LATENT_AR_SIDE_CLEAR`` the Lamport buffer re-armed on the latent-down stream, with
+``TRTLLM_K3_LU_MX_STAGES`` latent_up's MXFP8 GEMM on other stages) the result (and the deferred
+residual) must be bit-identical to the shared-workspace path, eagerly and under CUDA graph replay,
+and the own workspace must serve exactly the forwards it applies to.
 """
 
 import os
@@ -165,6 +167,8 @@ def _own_ws_rank(world):
         runtime.moe_routed_event = runtime.moe_latent_fork_event = None
         runtime.moe_latent_ready_event = None
         runtime.moe_fc2_event = None
+        runtime.shared_tail_stream = None
+        runtime.moe_shared_act_event = None
         flags = workspace["flags"]
 
         def set_inputs(latents, shareds):
@@ -269,6 +273,71 @@ def _own_ws_rank(world):
                 )
         if hasattr(up, "forward_mxfp8"):
             assert mx_calls == [1, 1, 7, 7, 14, 14]
+
+        # TRTLLM_K3_LATENT_AR_ROW (row kernel), TRTLLM_K3_LU_MX_STAGES (latent_up's MXFP8 GEMM stages)
+        # and TRTLLM_K3_LATENT_AR_SIDE_CLEAR (the latent-down stream re-arms the Lamport buffer after
+        # latent_up and marks the state clean; the test joins that stream after every forward, as the
+        # next MoE layer's latent_down join does). Eagerly and under CUDA graph replay.
+        latent_stream = torch.cuda.Stream()
+        next_layer = SimpleNamespace(latent_down_stream=latent_stream)
+        runtime._next_moe_layer = lambda: next_layer
+        runtime.latent_ar_clear_stream = latent_stream
+        mkl._K3_LATENT_AR_ROW = True
+        for stages, side_clear in (("", False), ("12:8", True), ("12:6", True)):
+            mkl._K3_LU_MX_STAGES = stages
+            runtime.moe_lu_event = torch.cuda.Event() if side_clear else None
+            for num_tokens in (1, 7, 14, 18):
+                latents, shareds, residual = _rank_inputs(world, num_tokens, 60 + num_tokens)
+                set_inputs(latents, shareds)
+                hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+                for defer in (False, True):
+                    ref = run(False, True, hidden, residual, defer)
+                    out = run(True, True, hidden, residual, defer)
+                    torch.cuda.current_stream().wait_stream(latent_stream)
+                    assert_same(out, ref)
+                    torch.cuda.synchronize()
+                    # The side clear left the state clean (no bytes to clear for the next call).
+                    assert (int(flags[3].item()) == 0) == side_clear
+            # CUDA graph: two forwards per replay, the latent-down stream joined after each.
+            num_tokens = 14
+            latents, shareds, residual = _rank_inputs(world, num_tokens, 80)
+            static_lat = latents[rank].clone()
+            static_sh = shareds[rank].clone()
+            static_res = residual.clone()
+            runtime.routed_experts.partial = static_lat
+            runtime.shared_experts.partial = static_sh
+            hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+            for _ in range(2):
+                run(True, True, hidden, static_res)
+                torch.cuda.current_stream().wait_stream(latent_stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            runtime._latent_ar_ws = workspace
+            with with_multi_stream(True), torch.inference_mode(), torch.cuda.graph(graph):
+                first = runtime(hidden, residual=static_res)
+                if side_clear:
+                    torch.cuda.current_stream().wait_stream(latent_stream)
+                second = runtime(hidden, residual=static_res)
+                if side_clear:
+                    torch.cuda.current_stream().wait_stream(latent_stream)
+            for step in range(3):
+                latents, shareds, residual = _rank_inputs(world, num_tokens, 90 + 7 * step)
+                static_lat.copy_(latents[rank])
+                static_sh.copy_(shareds[rank])
+                static_res.copy_(residual)
+                before = int(flags[0].item())
+                graph.replay()
+                check_rotated(before, 2)
+                set_inputs(latents, shareds)
+                ref = run(False, True, hidden, residual)
+                assert_same(first, ref)
+                assert_same(second, ref)
+            del graph
+        runtime.moe_lu_event = None
+        runtime.latent_ar_clear_stream = None
+        del runtime._next_moe_layer
+        mkl._K3_LATENT_AR_ROW = False
+        mkl._K3_LU_MX_STAGES = ""
         mkl._K3_LU_MXFP8 = False
         mkl._K3_LATENT_AR_CUTE = "0"
         # Above the workspace's token limit the shared workspace serves the forward.

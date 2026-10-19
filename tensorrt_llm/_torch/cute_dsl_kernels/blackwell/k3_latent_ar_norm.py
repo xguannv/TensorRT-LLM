@@ -36,6 +36,15 @@ output.
 PDL: ``griddepcontrol.wait`` first; with ``early_trigger`` the dependents are triggered right
 after it (they may only start reading what they do not wait for, e.g. latent_up its weight),
 else after the reduction like the C++ kernel.
+
+:class:`K3LatentArRowKernel` (``TRTLLM_K3_LATENT_AR_ROW``) computes the same result, bit for bit,
+with one 512-thread CTA per row: four groups of 128 threads play the four cluster CTAs (same warp
+boundaries and reduction trees, the group sums added in order after a CTA barrier instead of a
+cluster barrier); the rank's own slot is summed from registers instead of being polled back from
+the multicast loopback, and after the first polling round only the slots that have not arrived
+are loaded again. :class:`K3LamportClearKernel` (``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``) re-arms the
+buffer a call used on a side stream and marks the state clean, so that the next call skips the
+clear (M x world x 7 KB of sentinel stores) on its critical path.
 """
 
 from __future__ import annotations
@@ -797,11 +806,492 @@ def run_k3_latent_ar_norm(
     )
 
 
+# ---------------------------------------------------------------------------
+# One CTA per row (TRTLLM_K3_LATENT_AR_ROW) and the side-stream re-arm of the Lamport buffer
+# ---------------------------------------------------------------------------
+
+#: Row kernel: four groups of 128 threads per CTA; threads ``t < 112`` of group ``g`` play thread
+#: ``t`` of cluster CTA ``g`` of :class:`K3LatentArNormKernel`, the others shadow lane ``t - 16`` of
+#: their (half) warp and never store.
+ROW_GROUPS = CLUSTER
+ROW_GROUP_THREADS = 128
+ROW_THREADS = ROW_GROUPS * ROW_GROUP_THREADS
+ROW_WARPS = ROW_THREADS // 32
+#: Largest row count of the row kernel (one CTA per row).
+ROW_MAX_M = 64
+#: World sizes of the row kernel (one bit per rank of the arrival mask).
+ROW_WORLD_SIZES = (2, 4, 8, 16)
+#: CTAs x threads of :class:`K3LamportClearKernel`.
+CLEAR_CTAS = 64
+CLEAR_THREADS = 256
+
+assert ROW_GROUP_THREADS - THREADS == 16
+
+
+@dsl_user_op
+def _ld_vol_v4_pred(addr, pred, o0, o1, o2, o3, *, loc=None, ip=None):
+    """16 bytes of the Lamport buffer (read past L1) if ``pred`` != 0, else ``(o0, o1, o2, o3)``
+    (a predicated load: no branch)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_iv(pred, loc=loc, ip=ip)]
+        + [_iv(v, loc=loc, ip=ip) for v in (o0, o1, o2, o3)]
+        + [_lv(addr, loc=loc, ip=ip)],
+        "{\n.reg .pred p;\nsetp.ne.b32 p, $4, 0;\nmov.b32 $0, $5;\nmov.b32 $1, $6;\n"
+        "mov.b32 $2, $7;\nmov.b32 $3, $8;\n"
+        "@p ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$9];\n}",
+        "=&r,=&r,=&r,=&r,r,r,r,r,r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _atom_add_acq_rel_gpu(addr, value, *, loc=None, ip=None):
+    """``atom.acq_rel.gpu.global.add.u32``; returns the previous value."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+class K3LatentArRowKernel:
+    """:class:`K3LatentArNormKernel` with one 512-thread CTA per row (same result, bit for bit).
+
+    * Group ``g`` (threads ``128 g ...``) does what cluster CTA ``g`` does, with the same warp
+      boundaries (its fourth warp is the half warp); the four group sums are added in group order
+      after a CTA barrier instead of through distributed shared memory and a cluster barrier.
+    * Every round polls all ranks' slots of the thread's eight values at once. The rank's own slot
+      is not read back: the sanitized values the thread stored through the multicast address are
+      summed from its registers, so the last rank to arrive does not wait for its own data to
+      come back from the switch. After the first round only the slots that have not arrived are
+      loaded again (predicated loads).
+    * The previous call's buffer is re-armed by :class:`K3LamportClearKernel` on a side stream,
+      which marks the state clean; if the state still says the buffer is dirty, this kernel clears
+      it itself after its push, like the C++ kernels.
+    """
+
+    def __init__(
+        self,
+        world_size: int,
+        use_pdl: bool,
+        early_trigger: bool,
+        norm: bool = True,
+        mxfp8: bool = False,
+    ):
+        if world_size not in ROW_WORLD_SIZES:
+            raise ValueError(f"unsupported world size {world_size}")
+        if mxfp8 and not norm:
+            raise ValueError("the MXFP8 output is the normalized output's")
+        self.world_size = world_size
+        self.use_pdl = use_pdl
+        self.early_trigger = early_trigger
+        self.norm = norm
+        self.mxfp8 = mxfp8
+        self.rank_chunk = min(RANK_CHUNK, world_size)
+
+    @cute.jit
+    def __call__(
+        self,
+        x_addr: Int64,
+        gamma_addr: Int64,
+        out_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
+        uc_addr: Int64,
+        mc_addr: Int64,
+        flags_addr: Int64,
+        rank: Int32,
+        m: Int32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        @cute.struct
+        class SharedStorage:
+            warp_sum: cute.struct.MemRange[cutlass.Float32, ROW_WARPS]
+            group_sum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, ROW_GROUPS], 16]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            x_addr,
+            gamma_addr,
+            out_addr,
+            xq_addr,
+            xs_addr,
+            uc_addr,
+            mc_addr,
+            flags_addr,
+            rank,
+            m,
+            eps,
+        ).launch(
+            grid=(m, 1, 1),
+            block=(ROW_THREADS, 1, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x_addr: Int64,
+        gamma_addr: Int64,
+        out_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
+        uc_addr: Int64,
+        mc_addr: Int64,
+        flags_addr: Int64,
+        rank: Int32,
+        m: Int32,
+        eps: Float32,
+    ):
+        ws = self.world_size
+        tidx, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        grp = tidx // ROW_GROUP_THREADS
+        t = tidx - grp * ROW_GROUP_THREADS
+        active = t < THREADS
+        # The group's fourth warp is the half warp (lanes 0-15 active).
+        half = (warp % WARPS) == WARPS - 1
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        warp_sum = storage.warp_sum.data_ptr().toint()
+        group_sum = storage.group_sum.data_ptr().toint()
+
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_wait()
+            if cutlass.const_expr(self.early_trigger):
+                _griddepcontrol_launch_dependents()
+
+        f0, f1, f2, f3 = _ld_v4(flags_addr)
+        c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
+        counter = flags_addr + Int64(32)
+        cute.arch.sync_warp()
+        if lane == 0:
+            _red_add_release_gpu(counter, Int32(1))
+        cur = Int64(f0)
+        dirty = Int64(f1)
+        buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
+        dirty_stages = f3
+        # An inactive thread loads and polls the columns of lane t - 16 of its half warp.
+        tc = t
+        if t >= THREADS:
+            tc = t - (ROW_GROUP_THREADS - THREADS)
+        col = (grp * THREADS + tc) * ELTS
+        cur_off = cur * buf_bytes
+
+        # Broadcast this rank's eight values into slot (row, rank) of every rank's buffer.
+        xw = _ld_v4(x_addr + Int64((row * HIDDEN + col) * 2))
+        if cutlass.const_expr(self.norm):
+            gw = _ld_v4(gamma_addr + Int64(col * 2))
+        sw = [_sanitize(w) for w in xw]
+        if active:
+            slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
+            _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
+
+        # Clear the previous call's buffer if the side-stream re-arm has not.
+        n_threads = m * ROW_THREADS
+        gtid = row * ROW_THREADS + tidx
+        clear = (c0, c1, c2, c3)
+        for s in cutlass.range_constexpr(4):
+            if s < dirty_stages:
+                stage_bytes = buf_bytes // Int64(dirty_stages)
+                base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
+                n_vec = (clear[s] + 15) >> 4
+                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                    _st_sentinel_v4(base + Int64(p) * Int64(16))
+
+        # Poll every slot; the own slot comes from the registers. Bit r of `have`: slot r arrived.
+        row_base = uc_addr + cur_off + Int64((row * ws * HIDDEN + col) * 2)
+        words = cute.make_rmem_tensor((ws * 4,), Int32)
+        have = Int32(0)
+        for rr in cutlass.range_constexpr(ws):
+            w = _ld_vol_v4(row_base + Int64(rr * HIDDEN * 2))
+            for e in cutlass.range_constexpr(4):
+                words[rr * 4 + e] = w[e]
+            if rr == rank:
+                for e in cutlass.range_constexpr(4):
+                    words[rr * 4 + e] = sw[e]
+            have = have | (
+                _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
+                << rr
+            )
+        full = Int32((1 << ws) - 1)
+        while have != full:
+            missing = have
+            for rr in cutlass.range_constexpr(ws):
+                w = _ld_vol_v4_pred(
+                    row_base + Int64(rr * HIDDEN * 2),
+                    ((missing >> rr) & Int32(1)) ^ Int32(1),
+                    words[rr * 4],
+                    words[rr * 4 + 1],
+                    words[rr * 4 + 2],
+                    words[rr * 4 + 3],
+                )
+                for e in cutlass.range_constexpr(4):
+                    words[rr * 4 + e] = w[e]
+            for rr in cutlass.range_constexpr(ws):
+                have = have | (
+                    _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
+                    << rr
+                )
+        # Sum in chunks of RANK_CHUNK ranks (each chunk from 0, chunks in rank order).
+        acc = [Float32(0.0)] * ELTS
+        for rb in cutlass.range_constexpr(0, ws, self.rank_chunk):
+            chunk = [Float32(0.0)] * ELTS
+            for rr in cutlass.range_constexpr(self.rank_chunk):
+                for j in cutlass.range_constexpr(4):
+                    lo, hi = _bf16x2_f32(words[(rb + rr) * 4 + j])
+                    chunk[2 * j] = _fadd(chunk[2 * j], lo)
+                    chunk[2 * j + 1] = _fadd(chunk[2 * j + 1], hi)
+            for i in cutlass.range_constexpr(ELTS):
+                acc[i] = _fadd(acc[i], chunk[i])
+        red = [_pack_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(4)]
+
+        if cutlass.const_expr(self.use_pdl and not self.early_trigger):
+            _griddepcontrol_launch_dependents()
+
+        if cutlass.const_expr(self.norm):
+            thread_sum = Float32(0.0)
+            for j in cutlass.range_constexpr(4):
+                lo, hi = _bf16x2_f32(_sq_bf16x2(red[j]))
+                thread_sum = _fadd(thread_sum, lo)
+                thread_sum = _fadd(thread_sum, hi)
+            v = thread_sum
+            if half:
+                if lane < 16:
+                    v = _fadd(v, Float32(0.0))
+                    for off in (8, 4, 2, 1):
+                        v = _fadd(v, _shfl_bfly(v, off, 0xFFFF))
+            else:
+                for off in (16, 8, 4, 2, 1):
+                    v = _fadd(v, _shfl_bfly(v, off, 0xFFFFFFFF))
+            if lane == 0:
+                _sts_f32(warp_sum + warp * 4, v)
+            _bar_sync()
+            # The group's first warp sums the group's warp sums (lanes past them add 0).
+            if (warp % WARPS) == 0:
+                b = Float32(0.0)
+                if lane < WARPS:
+                    b = _lds_f32(warp_sum + (warp + lane) * 4)
+                for off in (16, 8, 4, 2, 1):
+                    b = _fadd(b, _shfl_bfly(b, off, 0xFFFFFFFF))
+                if lane == 0:
+                    _sts_f32(group_sum + (warp // WARPS) * 4, b)
+            _bar_sync()
+            total = Float32(0.0)
+            for c in cutlass.range_constexpr(ROW_GROUPS):
+                total = _fadd(total, _lds_f32(group_sum + c * 4))
+            scale = _rms_scale(total, eps)
+            if active:
+                ow = []
+                for j in cutlass.range_constexpr(4):
+                    x_lo, x_hi = _bf16x2_f32(red[j])
+                    g_lo, g_hi = _bf16x2_f32(gw[j])
+                    ow.append(
+                        _pack_bf16x2(
+                            _fmul(_fmul(x_lo, scale), g_lo), _fmul(_fmul(x_hi, scale), g_hi)
+                        )
+                    )
+                _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), ow[0], ow[1], ow[2], ow[3])
+                if cutlass.const_expr(self.mxfp8):
+                    amax = _amax_bf16x8(ow[0], ow[1], ow[2], ow[3])
+                    if half:
+                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFF))
+                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFF))
+                    else:
+                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFFFFFF))
+                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFFFFFF))
+                    e = _ue8m0_of_amax(amax)
+                    q0, q1 = _quant_bf16x8_to_e4m3(ow[0], ow[1], ow[2], ow[3], _bf16x2_inv_scale(e))
+                    _st_v2(xq_addr + Int64(row * HIDDEN + col), q0, q1)
+                    if (t & 3) == 0:
+                        _st_u8(xs_addr + Int64(row * (HIDDEN // 32) + (col >> 5)), e)
+        else:
+            if active:
+                _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3])
+
+        # CTA 0: rotate the buffers once every warp of the grid has read the flags.
+        if tidx == 0:
+            if row == 0:
+                arrived = _ld_acquire_gpu_u32(counter)
+                while arrived < m * ROW_WARPS:
+                    arrived = _ld_acquire_gpu_u32(counter)
+                nxt = f0 + 1
+                if nxt == NUM_LAMPORT_BUFFERS:
+                    nxt = Int32(0)
+                _st_v4(flags_addr, nxt, f0, f2, Int32(1))
+                _st_v4(flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0))
+                _st_u32(counter, Int32(0))
+
+
+class K3LamportClearKernel:
+    """Re-arm the Lamport buffer the last call on a workspace used (the state's dirty buffer, every
+    dirty stage) with the sentinel, then mark the state clean (dirty stages 0), so the next call
+    skips its own clear.
+
+    Launch it (without PDL) after the all-reduce has completed and before the next call on the
+    workspace, e.g. on a side stream that the next call's stream joins first. A rank's buffer of
+    call ``n`` is written again by the other ranks only in call ``n + 3``, which they reach after
+    this rank's push of call ``n + 2``, so any point between the two calls is safe. ``ctr_addr`` is
+    a zeroed ``int32`` the kernel returns to zero (its CTAs count themselves on it; the last one
+    marks the state clean)."""
+
+    def __init__(self, ctas: int = CLEAR_CTAS):
+        self.ctas = ctas
+
+    @cute.jit
+    def __call__(self, uc_addr: Int64, flags_addr: Int64, ctr_addr: Int64, stream: cuda.CUstream):
+        self.kernel(uc_addr, flags_addr, ctr_addr).launch(
+            grid=(self.ctas, 1, 1), block=(CLEAR_THREADS, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, uc_addr: Int64, flags_addr: Int64, ctr_addr: Int64):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        _f0, f1, f2, f3 = _ld_v4(flags_addr)
+        c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
+        dirty = Int64(f1)
+        buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
+        clear = (c0, c1, c2, c3)
+        gtid = bidx * CLEAR_THREADS + tidx
+        n_threads = self.ctas * CLEAR_THREADS
+        for s in cutlass.range_constexpr(4):
+            if s < f3:
+                stage_bytes = buf_bytes // Int64(f3)
+                base = uc_addr + (dirty * Int64(f3) + Int64(s)) * stage_bytes
+                n_vec = (clear[s] + 15) >> 4
+                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                    _st_sentinel_v4(base + Int64(p) * Int64(16))
+        _bar_sync()
+        if tidx == 0:
+            done = _atom_add_acq_rel_gpu(ctr_addr, Int32(1))
+            if done == self.ctas - 1:
+                # Every CTA has read the state: mark it clean and reset the counter.
+                _st_u32(flags_addr + Int64(12), Int32(0))
+                _st_u32(ctr_addr, Int32(0))
+
+
+@functools.cache
+def _compiled_row(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool, mxfp8: bool):
+    kernel = K3LatentArRowKernel(world_size, use_pdl, early_trigger, norm, mxfp8)
+    a = Int64(0)
+    return cute.compile(
+        kernel,
+        a,
+        a,
+        a,
+        a,
+        a,
+        a,
+        a,
+        a,
+        Int32(0),
+        Int32(1),
+        Float32(1e-6),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+@functools.cache
+def _compiled_clear(ctas: int):
+    a = Int64(0)
+    return cute.compile(
+        K3LamportClearKernel(ctas), a, a, a, cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+
+def can_run_row(x: torch.Tensor, gamma: torch.Tensor, world_size: int) -> bool:
+    """Whether :func:`run_k3_latent_ar_norm_row` serves this all-reduce (non-raising check)."""
+    return (
+        x.is_cuda
+        and _is_supported_device(x.device.index)
+        and world_size in ROW_WORLD_SIZES
+        and x.dtype == torch.bfloat16
+        and x.dim() == 2
+        and x.shape[1] == HIDDEN
+        and 1 <= x.shape[0] <= ROW_MAX_M
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and gamma.dtype == torch.bfloat16
+        and tuple(gamma.shape) == (HIDDEN,)
+        and gamma.is_contiguous()
+        and gamma.data_ptr() % 16 == 0
+    )
+
+
+def run_k3_latent_ar_norm_row(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    *,
+    uc_addr: int,
+    mc_addr: int,
+    flags: torch.Tensor,
+    rank: int,
+    world_size: int,
+    use_pdl: bool = True,
+    early_trigger: bool = True,
+    norm: bool = True,
+    mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """:func:`run_k3_latent_ar_norm` with :class:`K3LatentArRowKernel` (same result, bit for bit,
+    for up to :data:`ROW_MAX_M` rows)."""
+    mxfp8 = mxfp8_out is not None
+    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8)(
+        Int64(x.data_ptr()),
+        Int64(gamma.data_ptr()),
+        Int64(out.data_ptr()),
+        Int64(mxfp8_out[0].data_ptr() if mxfp8 else 0),
+        Int64(mxfp8_out[1].data_ptr() if mxfp8 else 0),
+        Int64(uc_addr),
+        Int64(mc_addr),
+        Int64(flags.data_ptr()),
+        Int32(rank),
+        Int32(x.shape[0]),
+        Float32(eps),
+        cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+    )
+
+
+def run_k3_lamport_clear(
+    uc_addr: int, flags: torch.Tensor, ctr: torch.Tensor, ctas: int = CLEAR_CTAS
+) -> None:
+    """Launch :class:`K3LamportClearKernel` on the current stream for the workspace with local
+    unicast base ``uc_addr`` and state ``flags``; ``ctr`` is the workspace's zeroed ``int32``
+    counter."""
+    _compiled_clear(ctas)(
+        Int64(uc_addr),
+        Int64(flags.data_ptr()),
+        Int64(ctr.data_ptr()),
+        cuda.CUstream(torch.cuda.current_stream(flags.device).cuda_stream),
+    )
+
+
 __all__ = [
     "HIDDEN",
     "MAX_M",
+    "ROW_MAX_M",
+    "ROW_WORLD_SIZES",
     "WORLD_SIZES",
+    "K3LamportClearKernel",
     "K3LatentArNormKernel",
+    "K3LatentArRowKernel",
     "can_run",
+    "can_run_row",
+    "run_k3_lamport_clear",
     "run_k3_latent_ar_norm",
+    "run_k3_latent_ar_norm_row",
 ]

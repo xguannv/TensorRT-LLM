@@ -435,6 +435,23 @@ if _K3_LATENT_AR_CUTE not in ("0", "1", "late"):
 # of the normalized latent and latent_up runs the low-M FP8 GEMM on it (forward_mxfp8) instead of
 # quantizing the BF16 rows itself: bitwise the same projection, where latent_up runs the low-M kernel.
 _K3_LU_MXFP8 = os.environ.get("TRTLLM_K3_LU_MXFP8", "0") == "1"
+# TRTLLM_K3_LATENT_AR_ROW=1 (with TRTLLM_K3_LATENT_AR_CUTE): the one-shot sizes of the latent
+# all-reduce run k3_latent_ar_norm's row kernel (one 512-thread CTA per row instead of a cluster of
+# four; the rank's own slot is summed from registers instead of being polled back from the
+# multicast loopback; slots that arrived are not reloaded): the same result, bit for bit.
+_K3_LATENT_AR_ROW = os.environ.get("TRTLLM_K3_LATENT_AR_ROW", "0") == "1"
+# TRTLLM_K3_LATENT_AR_SIDE_CLEAR=1 (with TRTLLM_K3_LATENT_AR_CUTE): once latent_up is issued, the
+# latent-down stream re-arms the Lamport buffer the latent all-reduce just used
+# (k3_latent_ar_norm.run_k3_lamport_clear) and marks the workspace state clean, so the next layer's
+# all-reduce skips the clear (the M x ranks x 7 KB of sentinel stores) on its critical path. Only
+# where a later MoE layer exists: its latent_down follows on that stream and is joined into the main
+# stream before its routed GEMMs. The data is unchanged.
+_K3_LATENT_AR_SIDE_CLEAR = os.environ.get("TRTLLM_K3_LATENT_AR_SIDE_CLEAR", "0") == "1"
+# TRTLLM_K3_LU_MX_STAGES=<a>:<b> (with TRTLLM_K3_LU_MXFP8): latent_up's MXFP8 GEMM runs with <a> weight
+# stages and <b> activation stages (k3_fp8w_lowm_mxfp8.K3LowMMxTactic; same split-K and K-tile order,
+# so bitwise the default tactic's result) instead of the default (deepest weight ring next to an
+# activation ring holding every K tile, whose scales are released all at once).
+_K3_LU_MX_STAGES = os.environ.get("TRTLLM_K3_LU_MX_STAGES", "")
 # The routed latent all-reduce's own MNNVL workspaces, by all-reduce mapping.
 _K3_LATENT_AR_WORKSPACES: Dict[Mapping, Dict[str, Any]] = {}
 
@@ -490,6 +507,8 @@ def _k3_latent_ar_workspace(
         # The multicast view of the same buffers (stores reach every rank's copy).
         "mc": handle.get_mc_buffer((3 * buffer_bytes // 4,), torch.float32, 0),
         "flags": flags,
+        # Counter of the side-stream Lamport clear (TRTLLM_K3_LATENT_AR_SIDE_CLEAR).
+        "clear_ctr": torch.zeros(1, dtype=torch.int32, device=buffer.device),
         "max_tokens": max_tokens,
         "rank": mapping.tp_rank,
         "world_size": mapping.tp_size,
@@ -2372,6 +2391,10 @@ class KimiK3MoERuntime(nn.Module):
     # TRTLLM_K3_LATENT_AR_OWN_WS: the routed latent all-reduce's own MNNVL workspace (``None``: it
     # shares the one of the shared expert's all-reduce).
     _latent_ar_ws: Optional[Dict[str, Any]] = None
+    # TRTLLM_K3_LATENT_AR_SIDE_CLEAR: recorded once latent_up is issued, and the stream that then
+    # re-arms the latent all-reduce's Lamport buffer (the latent-down stream; ``None``: no side clear).
+    moe_lu_event: Optional[torch.cuda.Event] = None
+    latent_ar_clear_stream: Optional[torch.cuda.Stream] = None
     # TRTLLM_K3_EXPERT_L2_PREFETCH: the model's shared state (``None``: off), this layer's routing
     # record (allocated outside graph capture), the routing-tail outputs of the current forward,
     # whether a routing of this layer was ever recorded, and this layer's expert weight ranges with
@@ -2746,6 +2769,9 @@ class KimiK3MoERuntime(nn.Module):
         self._moe_group[layer_idx] = self
         self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
         self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
+        if _K3_LATENT_AR_SIDE_CLEAR and has_latent_stream:
+            self.moe_lu_event = torch.cuda.Event()
+            self.latent_ar_clear_stream = self.latent_down_stream
         if _K3_EXPERT_L2_PREFETCH and self.expert_replicas is None:
             self._expl2_state = _K3_EXPERT_L2_STATE.setdefault(id(cfg), _ExpertL2PrefetchState())
             self._expl2_event = torch.cuda.Event()
@@ -2819,6 +2845,68 @@ class KimiK3MoERuntime(nn.Module):
                 run_k3_l2_prefetch(self.l2_prefetch_ranges("lu"))
             if "front" in _K3_MOE_L2_PREFETCH:
                 run_k3_l2_prefetch(nxt.l2_prefetch_ranges("front"))
+
+    def _issue_latent_ar_clear(self, num_tokens: int) -> None:
+        """``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``: once latent_up is issued, re-arm the Lamport buffer of
+        the latent all-reduce that just ran on the latent-down stream (``run_k3_lamport_clear``),
+        which also marks the workspace state clean, so the next latent all-reduce on the workspace
+        skips its own clear. Only when a later MoE layer exists: its latent_down follows on this
+        stream and is joined into the main stream before its routed GEMMs (and with them that
+        layer's all-reduce), so the clear needs no join of its own; the next call on the workspace
+        writes into the cleared buffer only after its push of the call after it (three buffers)."""
+        workspace = self._latent_ar_ws
+        stream = self.latent_ar_clear_stream
+        if (
+            self.moe_lu_event is None
+            or stream is None
+            or workspace is None
+            or num_tokens > workspace["max_tokens"]
+            or not do_multi_stream()
+            or torch.compiler.is_compiling()
+        ):
+            return
+        nxt = self._next_moe_layer()
+        if nxt is None or nxt.latent_down_stream is not stream:
+            return
+        from ..cute_dsl_kernels.blackwell.k3_latent_ar_norm import run_k3_lamport_clear
+
+        self.moe_lu_event.record()
+        with torch.cuda.stream(stream):
+            self.moe_lu_event.wait()
+            run_k3_lamport_clear(
+                workspace["buffer"].data_ptr(), workspace["flags"], workspace["clear_ctr"]
+            )
+
+    def _latent_up_mxfp8(
+        self, routed_latent: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor
+    ) -> torch.Tensor:
+        """latent_up on the MXFP8 form ``(xq, xs)`` of ``routed_latent`` (``TRTLLM_K3_LU_MXFP8``),
+        with the stages of ``TRTLLM_K3_LU_MX_STAGES`` where that tactic is valid for the shape."""
+        up = self.routed_expert_up_proj
+        if _K3_LU_MX_STAGES:
+            from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8
+
+            x = routed_latent.reshape(-1, routed_latent.shape[-1])
+            m = x.shape[0]
+            if k3_fp8w_lowm_mxfp8.can_run_mxfp8(xq, xs, up.weight, up.weight_scale):
+                base = k3_fp8w_lowm_mxfp8.default_mx_tactic(m, up.out_features, up.in_features)
+                a_stages, b_stages = (int(v) for v in _K3_LU_MX_STAGES.split(":"))
+                tactic = k3_fp8w_lowm_mxfp8.K3LowMMxTactic(
+                    mma_n=base.mma_n, split_k=base.split_k, a_stages=a_stages, b_stages=b_stages
+                )
+                try:
+                    k3_fp8w_lowm_mxfp8.validate_tactic(up.out_features, up.in_features, tactic)
+                except ValueError:
+                    tactic = None
+                if tactic is not None:
+                    out = torch.empty(
+                        (m, up.out_features), dtype=torch.bfloat16, device=routed_latent.device
+                    )
+                    k3_fp8w_lowm_mxfp8.run_k3_fp8w_lowm_gemm_mxfp8(
+                        xq, xs, up.weight, up.weight_scale, out, tactic=tactic
+                    )
+                    return out.reshape(routed_latent.shape[:-1] + (up.out_features,))
+        return up.forward_mxfp8(routed_latent, xq, xs)
 
     def _expert_l2_weight_ranges(self) -> List[Tuple[int, int, int]]:
         """``(base, stride, bytes)`` of every local expert's slice of this layer's routed gate_up
@@ -3475,7 +3563,8 @@ class KimiK3MoERuntime(nn.Module):
                 latent.numel() * world_size * latent.element_size()
                 <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
             )
-            if one_shot and k3_latent_ar_norm.can_run(latent, gamma, world_size):
+            row = _K3_LATENT_AR_ROW and k3_latent_ar_norm.can_run_row(latent, gamma, world_size)
+            if one_shot and (row or k3_latent_ar_norm.can_run(latent, gamma, world_size)):
                 routed_latent = torch.empty_like(latent)
                 m, k = latent.shape
                 if (
@@ -3488,7 +3577,12 @@ class KimiK3MoERuntime(nn.Module):
                         torch.empty((m, k), dtype=torch.float8_e4m3fn, device=latent.device),
                         torch.empty((m, k // 32), dtype=torch.uint8, device=latent.device),
                     )
-                k3_latent_ar_norm.run_k3_latent_ar_norm(
+                launch = (
+                    k3_latent_ar_norm.run_k3_latent_ar_norm_row
+                    if row
+                    else k3_latent_ar_norm.run_k3_latent_ar_norm
+                )
+                launch(
                     latent,
                     gamma,
                     eps,
@@ -3515,9 +3609,10 @@ class KimiK3MoERuntime(nn.Module):
             )
         routed_latent = routed_latent.view(routed_out.shape)
         if latent_mxfp8 is not None:
-            routed_out = up.forward_mxfp8(routed_latent, *latent_mxfp8)
+            routed_out = self._latent_up_mxfp8(routed_latent, *latent_mxfp8)
         else:
             routed_out = self._routed_projection(routed_latent, up)
+        self._issue_latent_ar_clear(latent.shape[0])
         self._join_expert_l2_prefetch()
         self.moe_shared_event.wait()
         if residual is not None:

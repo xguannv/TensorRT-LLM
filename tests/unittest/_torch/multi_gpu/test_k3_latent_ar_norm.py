@@ -14,12 +14,14 @@
 # limitations under the License.
 """``k3_latent_ar_norm``: CuTe one-shot MNNVL all-reduce + RMSNorm vs the C++ kernel.
 
-On every rank: the CuTe kernel (early and late PDL trigger, eagerly and under CUDA graph replay)
-must match ``mnnvl_fusion_allreduce`` (``RMS_NORM``, and ``NONE`` for the plain sum) bit for bit,
-its MXFP8 side output must be the low-M FP8 GEMM's quantization of the normalized rows,
-while it shares its Lamport workspace with the C++ one-shot and two-shot kernels in any order.
-The 16-rank chunked summation order is checked on the available GPUs by filling the other ranks'
-slots of the Lamport buffer through the multicast address (sum only, against an FP32 reference).
+On every rank: the CuTe kernels (the cluster kernel and the row kernel, early and late PDL trigger,
+eagerly and under CUDA graph replay) must match ``mnnvl_fusion_allreduce`` (``RMS_NORM``, and
+``NONE`` for the plain sum) bit for bit, their MXFP8 side output must be the low-M FP8 GEMM's
+quantization of the normalized rows, while they share their Lamport workspace with the C++
+one-shot and two-shot kernels in any order, with or without the side-stream re-arm
+(``run_k3_lamport_clear``) between calls. The 16-rank chunked summation order is checked on the
+available GPUs by filling the other ranks' slots of the Lamport buffer through the multicast
+address (sum only, against an FP32 reference).
 """
 
 import os
@@ -145,6 +147,35 @@ def _ar_norm_rank(world):
             )
             return out if mx is None else (out, *mx)
 
+        def row_ar(x, early=True, norm=True, world_size=world, mxfp8=False):
+            out = torch.empty_like(x)
+            mx = None
+            if mxfp8:
+                mx = (
+                    torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                    torch.empty((x.shape[0], HIDDEN // 32), dtype=torch.uint8, device=x.device),
+                )
+            kan.run_k3_latent_ar_norm_row(
+                x,
+                gamma,
+                EPS,
+                out,
+                uc_addr=own["buffer"].data_ptr(),
+                mc_addr=own["mc"].data_ptr(),
+                flags=own["flags"],
+                rank=rank,
+                world_size=world_size,
+                early_trigger=early,
+                norm=norm,
+                mxfp8_out=mx,
+            )
+            return out if mx is None else (out, *mx)
+
+        clear_ctr = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+        def side_clear():
+            kan.run_k3_lamport_clear(own["buffer"].data_ptr(), own["flags"], clear_ctr)
+
         def same(a, b):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
 
@@ -173,6 +204,31 @@ def _ar_norm_rank(world):
                     cpp(big, AllReduceFusionOp.RMS_NORM, shared_ws),
                 )
                 same(cute_ar(x), ref)
+                # The row kernel, with and without the side-stream re-arm before it; the state is
+                # clean after a re-arm and the buffer holds the sentinel.
+                assert kan.can_run_row(x, gamma, world)
+                same(row_ar(x), ref)
+                same(row_ar(x, early=False), ref)
+                side_clear()
+                torch.cuda.synchronize()
+                state = own["flags"].cpu().tolist()
+                assert state[3] == 0 and state[8] == 0
+                stage = own["buffer"].view(torch.int32)[state[1]]
+                assert bool((stage[: num_tokens * world * HIDDEN // 2] == -(2**31)).all())
+                same(row_ar(x), ref)
+                same(row_ar(x, norm=False), ref_sum)
+                out, xq, xs = row_ar(x, mxfp8=True)
+                same(out, ref)
+                assert torch.equal(xq.view(torch.uint8), exq.view(torch.uint8))
+                assert torch.equal(xs, exs)
+                side_clear()
+                same(
+                    cpp(big, AllReduceFusionOp.RMS_NORM, own),
+                    cpp(big, AllReduceFusionOp.RMS_NORM, shared_ws),
+                )
+                side_clear()
+                same(cute_ar(x), ref)
+                same(row_ar(x), ref)
         torch.cuda.synchronize()
 
         # CUDA graph: two launches per replay, new inputs each replay.
@@ -197,6 +253,35 @@ def _ar_norm_rank(world):
                 ref = cpp(static_x, AllReduceFusionOp.RMS_NORM, shared_ws)
                 same(first, ref)
                 same(second, cpp(ref, AllReduceFusionOp.RMS_NORM, shared_ws))
+            del graph
+            # The row kernel with the re-arm on a side stream that the next call joins first.
+            side = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    outs = []
+                    src = static_x
+                    for _ in range(3):
+                        outs.append(row_ar(src))
+                        src = outs[-1]
+                        done = torch.cuda.Event()
+                        fork = torch.cuda.Event()
+                        fork.record()
+                        with torch.cuda.stream(side):
+                            fork.wait()
+                            side_clear()
+                            done.record()
+                        torch.cuda.current_stream().wait_event(done)
+            torch.cuda.synchronize()
+            for step in range(3):
+                static_x.copy_(_inputs(world, num_tokens, 30 + step)[rank])
+                comm.Barrier()
+                graph.replay()
+                torch.cuda.synchronize()
+                ref = static_x
+                for out in outs:
+                    ref = cpp(ref, AllReduceFusionOp.RMS_NORM, shared_ws)
+                    same(out, ref)
             del graph
 
         # 16 ranks on `world` GPUs (sum only): rank r also stands for ranks r + world, ...;
@@ -228,6 +313,18 @@ def _ar_norm_rank(world):
                     chunks.append(c)
                 expect = ((torch.zeros_like(chunks[0]) + chunks[0]) + chunks[1]).bfloat16()
                 same(out, expect)
+                comm.Barrier()
+                # The row kernel (its own slot from the registers) on the same 16-rank layout.
+                torch.cuda.synchronize()
+                cur = int(own["flags"][0].item())
+                start = cur * buf_bytes // 2
+                stage = mc[start : start + num_tokens * 16 * HIDDEN].view(num_tokens, 16, HIDDEN)
+                for v in range(rank + world, 16, world):
+                    sanitized = torch.where(xs[v] == 0, torch.zeros_like(xs[v]), xs[v])
+                    stage[:, v, :].copy_(sanitized)
+                torch.cuda.synchronize()
+                comm.Barrier()
+                same(row_ar(xs[rank], norm=False, world_size=16), expect)
                 comm.Barrier()
             # The C++ kernel resumes on the workspace after the 16-rank launches.
             x = _inputs(world, 14, 1)[rank]
