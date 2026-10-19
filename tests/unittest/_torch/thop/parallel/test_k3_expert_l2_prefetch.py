@@ -239,6 +239,7 @@ def _runtimes(n_layers, num_local=NLOC):
         group[rt.layer_idx] = rt
         rt._expl2_state = state
         rt._expl2_event = torch.cuda.Event()
+        rt._expl2_attn_event = torch.cuda.Event()
         rts.append(rt)
     return rts, state
 
@@ -274,40 +275,48 @@ def test_runtime_hook_records_prefetches_and_joins(monkeypatch):
     monkeypatch.setattr(xpf, "run_k3_expert_l2_prefetch", spy)
 
     def forward(m, routes):
+        """Per layer: the attention block's prefetch point, the routing, the record after the
+        routed FC2, and the join site (a no-op but in the last layer)."""
         for rt, (outs, target) in zip(rts, routes):
+            rt.issue_expert_l2_prefetch(m)
             rt._attach_route(outs, target)
             assert rt._expl2_route is outs
-            rt._issue_expert_l2_prefetch(m)
+            rt._record_expert_l2_routing(m)
             assert rt._expl2_route is None
-            rt._join_expert_l2_prefetch()  # a no-op but in the last layer
-        return outs
+            rt._join_expert_l2_prefetch()
 
     with with_multi_stream(True):
-        # too many tokens / no routing-tail outputs: nothing issued
+        # too many tokens / no routing-tail outputs: nothing issued, nothing allocated
         outs, target = _route_outs(40, 0)
         rts[0]._attach_route(outs, target)
-        rts[0]._issue_expert_l2_prefetch(40)
-        rts[0]._issue_expert_l2_prefetch(14)
+        rts[0]._record_expert_l2_routing(40)
+        rts[0]._record_expert_l2_routing(14)
+        rts[0].issue_expert_l2_prefetch(14)
         assert not calls and rts[0]._expl2_record is None
-        # eager (warmup): records allocated for every layer, written, stream joined
+        # eager (the warmup): records allocated for every layer and written; nothing recorded
+        # before, so nothing prefetched; the stream is joined by the last layer
         forward(14, [_route_outs(14, seed) for seed in (1, 2, 3)])
         assert state.stream is not None and not state.pending
-        assert all(rt._expl2_record is not None for rt in rts)
+        assert all(rt._expl2_record is not None and rt._expl2_recorded for rt in rts)
         assert all(s == state.stream for s, _ in calls)
-        assert [kw["record_in"] is not None for _, kw in calls] == [True, True, False]
-        assert calls[0][1]["record_in"] is rts[1]._expl2_record
-        assert calls[0][1]["ranges"] == rts[1]._expert_l2_weight_ranges()
-        assert calls[0][1]["budget"] == 8 and calls[2][1]["ranges"] == []
+        assert [kw.get("record_out") is rt._expl2_record for (_, kw), rt in zip(calls, rts)] == [
+            True
+        ] * 3
+        assert all(kw.get("ctas") == 1 and "record_in" not in kw for _, kw in calls)
         torch.cuda.synchronize()
-        ref = mkl.KimiK3MoERuntime._expert_l2_weight_ranges(rts[0])
-        assert ref and ref[0][1] == rts[0].routed_experts.backend.w3_w1_weight[0].numel()
-        # captured: every launch on the side stream, joined by the last layer before capture ends
+        # captured: each layer prefetches its own experts from its record, then records again
         calls.clear()
         routes = [_route_outs(14, seed) for seed in (4, 5, 6)]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             forward(14, routes)
-        assert len(calls) == 3 and not state.pending
+        assert len(calls) == 6 and not state.pending
+        assert all(s == state.stream for s, _ in calls)
+        for i, rt in enumerate(rts):
+            pf = calls[2 * i][1]
+            assert pf["record_in"] is rt._expl2_record and pf["budget"] == 8
+            assert pf["ranges"] == rt._expert_l2_weight_ranges()
+            assert calls[2 * i + 1][1]["record_out"] is rt._expl2_record
     graph.replay()
     torch.cuda.synchronize()
     graph.replay()
@@ -322,6 +331,8 @@ def test_runtime_hook_records_prefetches_and_joins(monkeypatch):
         ref = _Backend(NLOC, i)
         assert torch.equal(rt.routed_experts.backend.w3_w1_weight, ref.w3_w1_weight)
         assert torch.equal(rt.routed_experts.backend.w2_weight, ref.w2_weight)
+    ranges = rts[0]._expert_l2_weight_ranges()
+    assert ranges and ranges[0][1] == rts[0].routed_experts.backend.w3_w1_weight[0].numel()
 
 
 def test_runtime_hook_off():
@@ -333,9 +344,16 @@ def test_runtime_hook_off():
         rt._expl2_state = None
     outs, target = _route_outs(14, 0)
     with with_multi_stream(True):
+        rts[0].issue_expert_l2_prefetch(14)
         rts[0]._attach_route(outs, target)
         assert rts[0]._expl2_route is None
-        rts[0]._issue_expert_l2_prefetch(14)
+        rts[0]._record_expert_l2_routing(14)
         rts[1]._join_expert_l2_prefetch()
     assert rts[0]._expl2_record is None and state.stream is None
     assert mkl.KimiK3MoERuntime._expl2_state is None
+    # the attention modules carry no hook by default
+    from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+
+    assert KimiKDALinearAttention.expert_l2_prefetch_hook is None
+    assert KimiK3MLAAttention.expert_l2_prefetch_hook is None

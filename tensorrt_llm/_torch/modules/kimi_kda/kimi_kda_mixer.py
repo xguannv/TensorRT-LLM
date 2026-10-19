@@ -21,7 +21,7 @@ import functools
 import math
 import os
 import weakref
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from fla.modules import ShortConvolution
@@ -286,6 +286,10 @@ def _kda_expand_fla_conv_cache(conv_state: torch.Tensor) -> torch.Tensor:
 
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
+
+    # TRTLLM_K3_EXPERT_L2_PREFETCH: set by the decoder layer to its MoE block's
+    # issue_expert_l2_prefetch, called with the verify rows once the projections are issued.
+    expert_l2_prefetch_hook: Optional[Callable[[int], None]] = None
 
     def __init__(
         self,
@@ -1417,6 +1421,8 @@ class KimiKDALinearAttention(nn.Module):
             gate_from_fa=_KDA_DECODE_FUSED_FAB and not mxfp8_output,
         )
         self._issue_l2_prefetch(T_total)
+        if self.expert_l2_prefetch_hook is not None:
+            self.expert_l2_prefetch_hook(T_total)
         f_a = None
         if projections is None:
             q_proj = self.q_proj(x)

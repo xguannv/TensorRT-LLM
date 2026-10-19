@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -252,6 +252,11 @@ class KimiK3MLAAttention(MLA):
     checkpoint projection topology, positional encoding, KV-B runtime layout,
     and gated output projection.
     """
+
+    # TRTLLM_K3_EXPERT_L2_PREFETCH: set by the decoder layer to its MoE block's
+    # issue_expert_l2_prefetch, called with the token count once q_b and the q absorption are
+    # issued (generation path with the KV half on a side stream).
+    expert_l2_prefetch_hook: Optional[Callable[[int], None]] = None
 
     def __init__(
         self,
@@ -603,6 +608,8 @@ class KimiK3MLAAttention(MLA):
             self.qk_nope_head_dim,
             rope,
         )
+        if self.expert_l2_prefetch_hook is not None:
+            self.expert_l2_prefetch_hook(num_tokens)
         kv_ready.wait()
         attn_out = self._attn_forward_gen(
             self.mqa,
