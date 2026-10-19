@@ -52,7 +52,16 @@ _ENABLED = os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT", "0") == "1"
 # destination with the staged bytes / a torch reference of the overlap gathers (raises
 # on a mismatch; logs once when the first N commits have matched).
 _VERIFY_COMMITS = int(os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT_VERIFY", "0"))
-_BLOCK_OFFSETS_TRITON = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") == "1"
+# TRTLLM_KV_BLOCK_OFFSETS_TRITON=1: Triton block-offset copy; =2: also one launch for the
+# target and draft KV tables of a step (TrtllmAttentionMetadata.prepare).
+_BLOCK_OFFSETS_TRITON = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") in ("1", "2")
+_BLOCK_OFFSETS_PAIR = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") == "2"
+# TRTLLM_STATE_INDEX_COPY_KERNEL=1: the mamba state-index and dummy-mask uploads of
+# prepare_resources as one SM kernel instead of two copy-engine copies.
+_STATE_INDEX_COPY_KERNEL = os.environ.get("TRTLLM_STATE_INDEX_COPY_KERNEL", "0") == "1"
+# TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1: the one-model spec sampler's four store scatters in
+# one kernel, with the slot tensor kept on the device while the slots do not change.
+_SPEC_SAMPLER_FUSED_SCATTER = os.environ.get("TRTLLM_SPEC_SAMPLER_FUSED_SCATTER", "0") == "1"
 _FUSED_HELIX_PREPROCESS = os.environ.get("TRTLLM_FUSED_HELIX_SPEC_PREPROCESS", "0") == "1"
 
 _ACTIVE: Optional["InputCommit"] = None
@@ -95,6 +104,18 @@ def block_offsets_triton_enabled() -> bool:
 
 def fused_helix_spec_preprocess_enabled() -> bool:
     return _FUSED_HELIX_PREPROCESS
+
+
+def block_offsets_pair_enabled() -> bool:
+    return _BLOCK_OFFSETS_PAIR
+
+
+def state_index_copy_kernel_enabled() -> bool:
+    return _STATE_INDEX_COPY_KERNEL
+
+
+def spec_sampler_fused_scatter_enabled() -> bool:
+    return _SPEC_SAMPLER_FUSED_SCATTER
 
 
 def active_input_commit() -> Optional["InputCommit"]:
@@ -199,8 +220,30 @@ def copy_batch_block_offsets_from_host(
     tensors do not have that layout or the copy is large enough for the C++ kernel to be
     as fast, so the caller uses the C++ kernel instead.
     """
-    if host_offsets.dim() != 4 or dst.dim() != 4:
+    job = block_offsets_copy_job(host_offsets, dst, copy_idx, index_scales, kv_offset)
+    if job is None:
         return False
+    if job[-1] > 0:
+        _copy_block_offsets_kernel[(job[-1],)](*job[:-1], BLOCK=_BLOCK_OFFSETS_BLOCK)
+    return True
+
+
+def block_offsets_copy_job(
+    host_offsets: torch.Tensor,
+    dst: torch.Tensor,
+    copy_idx: torch.Tensor,
+    index_scales: torch.Tensor,
+    kv_offset: torch.Tensor,
+) -> Optional[tuple]:
+    """Kernel arguments of one ``copy_batch_block_offsets_from_host`` call, or None.
+
+    None when the Triton copy does not apply (see ``copy_batch_block_offsets_from_host``);
+    otherwise ``(src, dst, copy_idx, scales, kv_offset, src_max_seqs, dst_max_seqs,
+    num_blocks, num_seqs, num_chunks, num_programs)`` with ``num_programs == 0`` when there
+    is nothing to copy.
+    """
+    if host_offsets.dim() != 4 or dst.dim() != 4:
+        return None
     num_pools, src_max_seqs, kv_factor, num_blocks = host_offsets.shape
     num_seqs = copy_idx.shape[0]
     host_tensors = (host_offsets, copy_idx, index_scales, kv_offset)
@@ -219,14 +262,12 @@ def copy_batch_block_offsets_from_host(
         and index_scales.numel() >= num_pools
         and kv_offset.numel() >= num_pools
     ):
-        return False
+        return None
     if num_pools * num_seqs * num_blocks > _BLOCK_OFFSETS_TRITON_MAX_ENTRIES:
-        return False
-    if num_seqs == 0 or num_blocks == 0:
-        return True
-    num_chunks = _cdiv(num_blocks, _BLOCK_OFFSETS_BLOCK)
-    grid = (num_pools * num_seqs * num_chunks,)
-    _copy_block_offsets_kernel[grid](
+        return None
+    num_chunks = _cdiv(num_blocks, _BLOCK_OFFSETS_BLOCK) if num_blocks else 0
+    num_programs = num_pools * num_seqs * num_chunks
+    return (
         host_offsets,
         dst,
         copy_idx,
@@ -237,7 +278,283 @@ def copy_batch_block_offsets_from_host(
         num_blocks,
         num_seqs,
         num_chunks,
-        BLOCK=_BLOCK_OFFSETS_BLOCK,
+        num_programs,
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "a_src_max_seqs",
+        "a_dst_max_seqs",
+        "a_num_blocks",
+        "a_num_seqs",
+        "a_num_chunks",
+        "a_programs",
+        "b_src_max_seqs",
+        "b_dst_max_seqs",
+        "b_num_blocks",
+        "b_num_seqs",
+        "b_num_chunks",
+    ]
+)
+def _copy_block_offsets_pair_kernel(
+    a_src,
+    a_dst,
+    a_copy_idx,
+    a_scales,
+    a_kv_offset,
+    a_src_max_seqs,
+    a_dst_max_seqs,
+    a_num_blocks,
+    a_num_seqs,
+    a_num_chunks,
+    a_programs,
+    b_src,
+    b_dst,
+    b_copy_idx,
+    b_scales,
+    b_kv_offset,
+    b_src_max_seqs,
+    b_dst_max_seqs,
+    b_num_blocks,
+    b_num_seqs,
+    b_num_chunks,
+    BLOCK: tl.constexpr,
+):
+    # Programs [0, a_programs) do job a, the rest job b; each as in _copy_block_offsets_kernel.
+    pid = tl.program_id(0)
+    if pid < a_programs:
+        chunk = pid % a_num_chunks
+        seq = (pid // a_num_chunks) % a_num_seqs
+        pool = pid // (a_num_chunks * a_num_seqs)
+        _block_offsets_rows(
+            a_src,
+            a_dst,
+            a_copy_idx,
+            a_scales,
+            a_kv_offset,
+            a_src_max_seqs,
+            a_dst_max_seqs,
+            a_num_blocks,
+            pool,
+            seq,
+            chunk,
+            BLOCK,
+        )
+    else:
+        pid_b = pid - a_programs
+        chunk = pid_b % b_num_chunks
+        seq = (pid_b // b_num_chunks) % b_num_seqs
+        pool = pid_b // (b_num_chunks * b_num_seqs)
+        _block_offsets_rows(
+            b_src,
+            b_dst,
+            b_copy_idx,
+            b_scales,
+            b_kv_offset,
+            b_src_max_seqs,
+            b_dst_max_seqs,
+            b_num_blocks,
+            pool,
+            seq,
+            chunk,
+            BLOCK,
+        )
+
+
+def copy_block_offsets_jobs(jobs: Sequence[tuple]) -> None:
+    """Run ``block_offsets_copy_job`` results on the current stream, two jobs per launch."""
+    jobs = [job for job in jobs if job[-1] > 0]
+    for i in range(0, len(jobs) - 1, 2):
+        a, b = jobs[i], jobs[i + 1]
+        _copy_block_offsets_pair_kernel[(a[-1] + b[-1],)](*a, *b[:-1], BLOCK=_BLOCK_OFFSETS_BLOCK)
+    if len(jobs) % 2:
+        job = jobs[-1]
+        _copy_block_offsets_kernel[(job[-1],)](*job[:-1], BLOCK=_BLOCK_OFFSETS_BLOCK)
+
+
+@triton.jit(do_not_specialize=["n0", "n1"])
+def _small_copy_pair_kernel(dst0, src0, n0, dst1, src1, n1, BLOCK: tl.constexpr):
+    # Program 0 copies n0 bytes src0 -> dst0, program 1 copies n1 bytes src1 -> dst1.
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    if pid == 0:
+        mask = offs < n0
+        tl.store(dst0 + offs, tl.load(src0 + offs, mask=mask), mask=mask)
+    else:
+        mask = offs < n1
+        tl.store(dst1 + offs, tl.load(src1 + offs, mask=mask), mask=mask)
+
+
+_SMALL_COPY_MAX_BYTES = 4096
+
+
+def copy_small_pinned_pair(
+    dst0: torch.Tensor, src0: torch.Tensor, dst1: torch.Tensor, src1: torch.Tensor
+) -> bool:
+    """``dst0.copy_(src0, non_blocking=True); dst1.copy_(src1, non_blocking=True)`` as one
+    kernel on the current stream, for small contiguous pinned host sources.
+
+    The kernel reads the host buffers over the host link when it runs, as the copy engine
+    reads them when the DMA runs, so the host-side lifetime rules are those of the copies.
+    Returns False (nothing launched) when a pair does not qualify.
+    """
+    pairs = ((dst0, src0), (dst1, src1))
+    for dst, src in pairs:
+        if not (
+            dst.is_cuda
+            and src.is_pinned()
+            and dst.is_contiguous()
+            and src.is_contiguous()
+            and dst.dtype == src.dtype
+            and dst.numel() == src.numel()
+            and dst.numel() * dst.element_size() <= _SMALL_COPY_MAX_BYTES
+        ):
+            return False
+    nbytes = [dst.numel() * dst.element_size() for dst, _ in pairs]
+    block = triton.next_power_of_2(max(max(nbytes), 16))
+    _small_copy_pair_kernel[(2,)](
+        dst0.view(torch.uint8),
+        src0.view(torch.uint8),
+        nbytes[0],
+        dst1.view(torch.uint8),
+        src1.view(torch.uint8),
+        nbytes[1],
+        BLOCK=block,
+    )
+    return True
+
+
+@triton.jit(
+    do_not_specialize=[
+        "width_new",
+        "width_next",
+        "width_draft",
+        "num_slots",
+        "s_new_r",
+        "s_new_c",
+        "s_next_r",
+        "s_next_c",
+        "s_draft_r",
+        "s_draft_c",
+        "s_lens",
+    ]
+)
+def _spec_store_scatter_kernel(
+    slots_ptr,
+    store_new,
+    store_next,
+    store_lens,
+    store_draft,
+    src_new,
+    src_next,
+    src_lens,
+    src_draft,
+    width_new,
+    width_next,
+    width_draft,
+    num_slots,
+    s_new_r,
+    s_new_c,
+    s_next_r,
+    s_next_c,
+    s_draft_r,
+    s_draft_c,
+    s_lens,
+    BLOCK: tl.constexpr,
+):
+    # Request p (program p) with slot s = slots[p]:
+    #   store_new[t, s] = src_new[p, t]      t < width_new   (store_new is [width_new, num_slots])
+    #   store_next[t, s] = src_next[p, t]    t < width_next
+    #   store_lens[s] = src_lens[p]
+    #   store_draft[s, j] = src_draft[p, j]  j < width_draft (store_draft is [num_slots, width_draft])
+    p = tl.program_id(0)
+    slot = tl.load(slots_ptr + p).to(tl.int64)
+    p64 = p.to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    m = offs < width_new
+    val = tl.load(src_new + p64 * s_new_r + offs * s_new_c, mask=m)
+    tl.store(store_new + offs * num_slots + slot, val, mask=m)
+    m = offs < width_next
+    val = tl.load(src_next + p64 * s_next_r + offs * s_next_c, mask=m)
+    tl.store(store_next + offs * num_slots + slot, val, mask=m)
+    tl.store(store_lens + slot, tl.load(src_lens + p64 * s_lens))
+    m = offs < width_draft
+    val = tl.load(src_draft + p64 * s_draft_r + offs * s_draft_c, mask=m)
+    tl.store(store_draft + slot * width_draft + offs, val, mask=m)
+
+
+def scatter_spec_store(
+    slots: torch.Tensor,
+    store_new: torch.Tensor,
+    store_next: torch.Tensor,
+    store_lens: torch.Tensor,
+    store_draft: torch.Tensor,
+    src_new: torch.Tensor,
+    src_next: torch.Tensor,
+    src_lens: torch.Tensor,
+    src_draft: torch.Tensor,
+) -> bool:
+    """The four slot scatters of the one-model spec sampler's store in one kernel.
+
+    Same result as ``store_new.T.index_copy_(0, slots, src_new)``,
+    ``store_next.T.index_copy_(0, slots, src_next)``, ``store_lens.index_copy_(0, slots,
+    src_lens)`` and ``store_draft.index_copy_(0, slots, src_draft)`` for unique slots, with
+    ``store_new`` / ``store_next`` the ``[width, num_slots]`` and ``store_draft`` the
+    ``[num_slots, width]`` contiguous store buffers and the sources ``[n, width]`` / ``[n]``.
+    Returns False (nothing launched) when the shapes or dtypes do not match that layout.
+    """
+    n = slots.shape[0]
+    stores = (store_new, store_next, store_lens, store_draft)
+    srcs = (src_new, src_next, src_lens, src_draft)
+    num_slots = store_lens.shape[0]
+    if not (
+        slots.is_cuda
+        and slots.dim() == 1
+        and all(t.is_cuda and t.is_contiguous() for t in stores)
+        and all(s.is_cuda and s.dtype == t.dtype for s, t in zip(srcs, stores))
+        and store_new.dim() == 2
+        and store_next.dim() == 2
+        and store_draft.dim() == 2
+        and store_lens.dim() == 1
+        and store_new.shape[1] == num_slots
+        and store_next.shape[1] == num_slots
+        and store_draft.shape[0] == num_slots
+        and src_new.dim() == 2
+        and src_next.dim() == 2
+        and src_draft.dim() == 2
+        and src_lens.dim() == 1
+        and tuple(src_new.shape) == (n, store_new.shape[0])
+        and tuple(src_next.shape) == (n, store_next.shape[0])
+        and tuple(src_draft.shape) == (n, store_draft.shape[1])
+        and src_lens.shape[0] == n
+    ):
+        return False
+    if n == 0:
+        return True
+    width = max(store_new.shape[0], store_next.shape[0], store_draft.shape[1], 1)
+    _spec_store_scatter_kernel[(n,)](
+        slots,
+        store_new,
+        store_next,
+        store_lens,
+        store_draft,
+        src_new,
+        src_next,
+        src_lens,
+        src_draft,
+        store_new.shape[0],
+        store_next.shape[0],
+        store_draft.shape[1],
+        num_slots,
+        src_new.stride(0),
+        src_new.stride(1),
+        src_next.stride(0),
+        src_next.stride(1),
+        src_draft.stride(0),
+        src_draft.stride(1),
+        src_lens.stride(0),
+        BLOCK=triton.next_power_of_2(width),
     )
     return True
 

@@ -44,6 +44,28 @@ class DeviceCopyBuffer:
             last[:n] = flat
             self._last_host_values = last
 
+    def holds(self, host: torch.Tensor) -> bool:
+        """Whether the last values written (or staged) equal ``host``, so ``update`` would skip."""
+        flat = host.reshape(-1)
+        last = self._last_host_values
+        return (
+            last is not None
+            and last.numel() >= flat.numel()
+            and torch.equal(last[: flat.numel()], flat)
+        )
+
+    def remember(self, host: torch.Tensor) -> None:
+        """Record ``host`` as the buffer's values after something else wrote them to the buffer."""
+        flat = host.reshape(-1)
+        n = flat.numel()
+        last = self._last_host_values
+        if last is None or last.numel() <= n:
+            self._last_host_values = flat.clone()
+        else:
+            last = last.clone()
+            last[:n] = flat
+            self._last_host_values = last
+
     def stage(self, host: torch.Tensor, input_commit) -> bool:
         """``update`` through a batched input commit (``pyexecutor/input_commit.py``).
 
@@ -51,17 +73,10 @@ class DeviceCopyBuffer:
         ``input_commit``, which writes the buffer when it commits, and remembers the values.
         Returns whether a copy was staged (False: the buffer already holds the values).
         """
-        flat = host.reshape(-1)
-        n = flat.numel()
-        last = self._last_host_values
-        if last is not None and last.numel() >= n and torch.equal(last[:n], flat):
+        if self.holds(host):
             self.update(host)  # the skip path (verifies the held values under TLLM_DEBUG_MODE)
             return False
-        input_commit.stage(self._tensor.view(-1)[:n], flat)
-        if last is None or last.numel() <= n:
-            self._last_host_values = flat.clone()
-        else:
-            last = last.clone()
-            last[:n] = flat
-            self._last_host_values = last
+        flat = host.reshape(-1)
+        input_commit.stage(self._tensor.view(-1)[: flat.numel()], flat)
+        self.remember(flat)
         return True
