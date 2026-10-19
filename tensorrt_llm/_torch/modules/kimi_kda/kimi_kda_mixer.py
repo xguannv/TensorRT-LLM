@@ -438,6 +438,10 @@ class KimiKDALinearAttention(nn.Module):
         self._kda_group[layer_idx] = self
         self._l2_prefetch_ranges_cache: Optional[List[Tuple[int, int]]] = None
         self._l2_prefetch_start = torch.cuda.Event()
+        # Set by the decoder layer for the next forward only (TRTLLM_K3_ATTN_RES_MXFP8): the
+        # MXFP8 form ``(xq, xs)`` of the generation rows, which the fused QKVG projection of the
+        # verify path consumes instead of quantizing the BF16 rows (see qkvg_takes_mxfp8).
+        self.next_input_mxfp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def finalize_decode_weights(self) -> None:
         """Build fused projection weights and decode constants after weight load.
@@ -566,6 +570,12 @@ class KimiKDALinearAttention(nn.Module):
         # verify call never allocates (a capture-unsafe lazy allocation).
         self._build_mtp_conv_weights()
 
+    def qkvg_takes_mxfp8(self, num_rows: int) -> bool:
+        """Whether the fused FP8 QKVG projection of ``num_rows`` rows can take their MXFP8 form
+        (``next_input_mxfp8``) instead of the BF16 rows: it runs the low-M kernel on them."""
+        takes = getattr(self.qkvg_proj, "takes_mxfp8_input", None)
+        return self._qkvg_proj_weight is None and takes is not None and takes(num_rows)
+
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
@@ -651,6 +661,7 @@ class KimiKDALinearAttention(nn.Module):
         out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         if zero_copy:
             self.o_proj.next_output = None
+        self.next_input_mxfp8 = None
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
@@ -1204,10 +1215,13 @@ class KimiKDALinearAttention(nn.Module):
         fused_qkvg = self.qkvg_proj
         if qkvg_weight is None and fused_qkvg is None:
             return None
+        mxfp8_input, self.next_input_mxfp8 = self.next_input_mxfp8, None
 
         def _project_qkvg() -> torch.Tensor:
             if qkvg_weight is not None:
                 return torch.nn.functional.linear(x, qkvg_weight)
+            if mxfp8_input is not None:
+                return fused_qkvg.forward_mxfp8(x, *mxfp8_input)
             return fused_qkvg(x)
 
         bfa_weight = self._bfa_proj_weight

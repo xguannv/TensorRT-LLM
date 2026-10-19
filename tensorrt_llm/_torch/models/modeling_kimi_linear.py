@@ -1013,6 +1013,12 @@ if _K3_ATTN_RES_PDL_MODE not in ("0", "1", "2"):
     raise ValueError(f"TRTLLM_K3_ATTN_RES_PDL must be 0, 1 or 2, got {_K3_ATTN_RES_PDL_MODE!r}")
 _K3_ATTN_RES_PDL = _K3_ATTN_RES_PDL_MODE != "0"
 _K3_ATTN_RES_PDL_MAX_M = int(os.environ.get("TRTLLM_K3_ATTN_RES_PDL_MAX_M", "64"))
+# TRTLLM_K3_ATTN_RES_MXFP8=1: in KDA layers, the pre-attention mix that folds in the previous MoE
+# residual (trtllm::k3_attn_res_moe_add_rmsnorm_mx) also stores the MXFP8 form of its output, and
+# the fused QKVG projection runs the low-M GEMM on it (k3_fp8w_lowm_mxfp8) instead of quantizing
+# the BF16 rows itself: bitwise the same projection, generation-only batches where the projection
+# runs the low-M kernel.
+_K3_ATTN_RES_MXFP8 = os.environ.get("TRTLLM_K3_ATTN_RES_MXFP8", "0") == "1"
 
 
 class _DeferredMoEResidual(NamedTuple):
@@ -1073,8 +1079,10 @@ def _k3_attn_res_pdl_moe_add(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """``(prefix_sum, normed mix)`` of a deferred MoE residual update, or ``None``."""
+    mxfp8: bool = False,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """``(prefix_sum, normed mix)`` of a deferred MoE residual update, or ``None``; with
+    ``mxfp8``, ``(prefix_sum, normed mix, xq, xs)`` (the MXFP8 form of the mix)."""
     residual, routed, shared = deferred
     if residual.shape[0] > _K3_ATTN_RES_PDL_MAX_M:
         return None
@@ -1085,7 +1093,12 @@ def _k3_attn_res_pdl_moe_add(
         return None
     M, H = residual.shape
     _note_attn_res_fusion("moe_add+attn_res+norm/pdl", True, M, H, int(block_residual.shape[0]) + 1)
-    return torch.ops.trtllm.k3_attn_res_moe_add_rmsnorm(
+    op = (
+        torch.ops.trtllm.k3_attn_res_moe_add_rmsnorm_mx
+        if mxfp8
+        else torch.ops.trtllm.k3_attn_res_moe_add_rmsnorm
+    )
+    return op(
         residual,
         routed,
         shared,
@@ -1728,6 +1741,60 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         else:
             out = _k3_deep_gemm_fp8_swap_ab(x_flat, self.weight, self.weight_scale, x.dtype)
         return out.reshape(out_shape)
+
+    def _runs_low_m_kernel(self, num_rows: int) -> bool:
+        """Whether :meth:`forward` on ``num_rows`` BF16 rows would run the low-M kernel (the
+        input-independent part of its dispatch: not the mid-M or Rubin paths, the low-M GEMM on,
+        ``num_rows`` within the low-M kernel's range)."""
+        if (
+            not _K3_FP8W_LOWM_GEMM
+            or _rubin_mxfp8_is_available()
+            or torch.compiler.is_compiling()
+            or self._mid_gemm_applies_rows(num_rows)
+        ):
+            return False
+        if self.weight.shape[0] % 128 and not (
+            _K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile
+        ):
+            return False
+        from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+        return 1 <= num_rows <= k3_fp8w_lowm_gemm.low_m_max_for(*self.weight.shape)
+
+    def takes_mxfp8_input(self, num_rows: int) -> bool:
+        """Whether a producer should hand :meth:`forward_mxfp8` the MXFP8 form of ``num_rows``
+        rows: where :meth:`forward` would run the low-M kernel, whose in-kernel quantization the
+        MXFP8 GEMM replaces."""
+        return self._runs_low_m_kernel(num_rows)
+
+    def forward_mxfp8(self, x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+        """:meth:`forward` on the BF16 rows ``x``, bit for bit, given their MXFP8 form ``(xq,
+        xs)`` (E4M3 ``[M, K]`` and one UE8M0 exponent per 1x32 group, e.g. from
+        ``trtllm::k3_attn_res_*_mx``): the low-M GEMM on the prequantized operand where
+        :meth:`forward` would run the low-M kernel, else :meth:`forward` on ``x``."""
+        from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8
+
+        x_flat = x.reshape(-1, x.shape[-1])
+        allow_partial = _K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile
+        if not (
+            x.dtype == torch.bfloat16
+            and self._runs_low_m_kernel(x_flat.shape[0])
+            and xq.shape[0] == x_flat.shape[0]
+            and _k3_lowm_gemm_can_run(
+                x_flat, self.weight, self.weight_scale, allow_partial_n_tile=allow_partial
+            )
+            and k3_fp8w_lowm_mxfp8.can_run_mxfp8(
+                xq, xs, self.weight, self.weight_scale, allow_partial_n_tile=allow_partial
+            )
+        ):
+            return self.forward(x)
+        out = self._take_next_output(x_flat.shape[0])
+        if out is None:
+            out = torch.empty(
+                (x_flat.shape[0], self.out_features), dtype=torch.bfloat16, device=x.device
+            )
+        k3_fp8w_lowm_mxfp8.run_k3_fp8w_lowm_gemm_mxfp8(xq, xs, self.weight, self.weight_scale, out)
+        return out.reshape(x.shape[:-1] + (self.out_features,))
 
     def gated_applies(self, x: torch.Tensor, gate: torch.Tensor) -> bool:
         """Whether :meth:`forward_gated` serves ``x`` and ``gate`` with one gated low-M GEMM.
@@ -3719,6 +3786,16 @@ class KimiLinearDecoderLayer(nn.Module):
         self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
         self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
+    def _attn_takes_mxfp8(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Whether the pre-attention mix should also emit its MXFP8 form for the KDA mixer
+        (``TRTLLM_K3_ATTN_RES_MXFP8``; generation-only batches, see ``qkvg_takes_mxfp8``)."""
+        return (
+            _K3_ATTN_RES_MXFP8
+            and self.is_kda
+            and attn_metadata.num_contexts == 0
+            and self.linear_attn.qkvg_takes_mxfp8(num_rows)
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3740,6 +3817,7 @@ class KimiLinearDecoderLayer(nn.Module):
         """
         valid_block_residual = block_residual[:num_snapshots]
         normed = None
+        attn_input_mxfp8 = None
         if isinstance(hidden_states, _DeferredMoEResidual):
             # The previous layer's MoE residual update, folded into this mix when possible.
             if capture is None and num_snapshots > 0:
@@ -3749,9 +3827,10 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.self_attention_res_proj,
                     self.self_attention_res_norm,
                     self.input_layernorm,
+                    mxfp8=self._attn_takes_mxfp8(hidden_states.residual.shape[0], attn_metadata),
                 )
                 if fused is not None:
-                    hidden_states, normed = fused
+                    hidden_states, normed, *attn_input_mxfp8 = fused
             if normed is None:
                 hidden_states = hidden_states.materialize()
         prefix_sum = hidden_states
@@ -3804,6 +3883,8 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = None
 
         if self.is_kda:
+            if attn_input_mxfp8:
+                self.linear_attn.next_input_mxfp8 = tuple(attn_input_mxfp8)
             hidden_states = self.linear_attn(hidden_states, attn_metadata)
         else:
             hidden_states = self.self_attn(hidden_states, attn_metadata)

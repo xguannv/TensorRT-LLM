@@ -897,3 +897,25 @@ def test_sf_slots_epilogue_variants(m, monkeypatch):
     torch.cuda.synchronize()
     for a, b in zip(*results):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("m", [1, 7, 14, 32, 64, 65])
+def test_weight_read_linear_forward_mxfp8(m, monkeypatch):
+    """``forward_mxfp8`` on the MXFP8 form of ``x`` equals ``forward(x)`` bitwise on every path
+    (the MXFP8 GEMM where ``forward`` runs the low-M kernel, ``forward`` itself elsewhere)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    monkeypatch.setattr(kimi, "_K3_FP8W_LOWM_GEMM", True)
+    torch.manual_seed(0)
+    n, k = 3072, 7168
+    weight = (torch.randn((n, k), device="cuda") * 0.02).to(torch.bfloat16)
+    linear = kimi._Fp8BlockScaleWeightReadLinear(
+        *kimi._Fp8BlockScaleWeightReadLinear.quantize_weight(weight), n
+    )
+    assert linear.takes_mxfp8_input(m) == (m <= _kernel_module().low_m_max_for(n, k))
+    x = _make_activation(m, k, seed=m)
+    xq, xs = mx.mxfp8_quantize_reference(x)
+    out = linear.forward_mxfp8(x, xq, xs)
+    torch.cuda.synchronize()
+    assert torch.equal(out, linear(x))
