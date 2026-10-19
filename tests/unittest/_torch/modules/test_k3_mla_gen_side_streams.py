@@ -344,6 +344,11 @@ def test_mxfp8_q_a_input_matches_bf16_input(batch, monkeypatch):
     mx = pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_fp8w_lowm_mxfp8")
     import weakref
 
+    from tensorrt_llm._torch.models import modeling_kimi_linear as mk
+
+    if not hasattr(mk._Fp8BlockScaleWeightReadLinear, "forward_mxfp8"):
+        pytest.skip("needs _Fp8BlockScaleWeightReadLinear.forward_mxfp8")
+
     from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
     from tensorrt_llm._torch.utils import model_extra_attrs
