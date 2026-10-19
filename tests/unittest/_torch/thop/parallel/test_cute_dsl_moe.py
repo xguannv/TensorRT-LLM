@@ -4394,9 +4394,10 @@ def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, variant, m
     ids=["k3_tp4ep4", "small"],
 )
 @pytest.mark.parametrize("num_tokens", [1, 7, 14, 32])
-def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, monkeypatch):
+@pytest.mark.parametrize("fc1_smem_kb", [0, 160], ids=["fc1_smem_max", "fc1_smem_160k"])
+def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, fc1_smem_kb, monkeypatch):
     """Small-batch MoE kernels (TRTLLM_MOE_LOWM=1) vs the regular gather (FC1, SiTU) and finalize
-    (FC2) kernels.
+    (FC2) kernels; ``fc1_smem_kb`` > 0 caps FC1's shared memory (TRTLLM_MOE_LOWM_FC1_SMEM_KB).
 
     FC1: the quantized output rows and their scale factors of every valid permuted row must be
     bit-identical. FC2: with one non-zero top-k scale per token every output element is one
@@ -4445,6 +4446,7 @@ def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, monkeypatch):
 
     def fc1(lowm):
         monkeypatch.setenv("TRTLLM_MOE_LOWM", "1" if lowm else "0")
+        monkeypatch.setenv("TRTLLM_MOE_LOWM_FC1_SMEM_KB", str(fc1_smem_kb))
         runner = cute_dsl_custom_ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts,
             top_k,

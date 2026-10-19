@@ -112,6 +112,12 @@ _MOE_FINALIZE_TACTIC_ENV = "TRTLLM_MOE_FINALIZE_TACTIC"
 # token are added in an unspecified order, as with the regular kernel.
 _MOE_LOWM_ENV = "TRTLLM_MOE_LOWM"
 _MOE_LOWM_MAX_TOKENS_ENV = "TRTLLM_MOE_LOWM_MAX_TOKENS"
+# Shared memory cap (KB) of one CTA of the small-batch FC1 kernel (fewer weight stages), so that a
+# CTA of a kernel running concurrently on another stream (the shared expert's down GEMM, 69 KB)
+# fits on the same SM instead of waiting for FC1's CTAs to exit. With the cap, FC1 also launches
+# with the max-shared carveout and triggers FC2's launch only at the start of each CTA's last work
+# unit (k3_moe_lowm.py, share_sm). Unset: the device maximum, FC2 launched right away.
+_MOE_LOWM_FC1_SMEM_KB_ENV = "TRTLLM_MOE_LOWM_FC1_SMEM_KB"
 
 
 def _moe_lowm_max_tokens() -> int:
@@ -119,6 +125,11 @@ def _moe_lowm_max_tokens() -> int:
     if os.environ.get(_MOE_LOWM_ENV, "0") != "1":
         return 0
     return max(0, min(int(os.environ.get(_MOE_LOWM_MAX_TOKENS_ENV, "32")), 32))
+
+
+def _moe_lowm_fc1_smem_bytes() -> int:
+    """Shared memory cap of one small-batch FC1 CTA in bytes (0: the device maximum)."""
+    return max(0, int(os.environ.get(_MOE_LOWM_FC1_SMEM_KB_ENV, "0"))) * 1024
 
 
 def _moe_tactic_pin(env_name: str) -> Optional[Tuple[int, ...]]:
@@ -3728,6 +3739,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.lowm_max_tokens = (_moe_lowm_max_tokens()
                                     if self.activation_type
                                     == ActivationType.SiTu else 0)
+            self.lowm_smem = _moe_lowm_fc1_smem_bytes()
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3754,6 +3766,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.weight_evict_first,
                 self.tactic_pin,
                 self.lowm_max_tokens,
+                self.lowm_smem,
             )
 
         def use_lowm(self, orig_m: int, n: int, k: int) -> bool:
@@ -3766,16 +3779,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n_tok = k3_moe_lowm_n_tok_for(orig_m)
             num_ctas = get_max_activate_clusters(1)
             cache_key = ("lowm", n_tok, n, k, self.top_k, self.situ_beta,
-                         self.situ_linear_beta, num_ctas)
+                         self.situ_linear_beta, num_ctas, self.lowm_smem)
             compiled = self.__class__.kernel_cache.get(cache_key)
             if compiled is None:
+                smem = ({
+                    "smem_capacity": self.lowm_smem,
+                    "share_sm": True
+                } if self.lowm_smem else {})
                 kernel = K3MoeFc1LowMKernel(n_tok,
                                             n,
                                             k,
                                             self.top_k,
                                             self.situ_beta,
                                             self.situ_linear_beta,
-                                            use_pdl=TRTLLM_ENABLE_PDL)
+                                            use_pdl=TRTLLM_ENABLE_PDL,
+                                            **smem)
                 compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m,
                                         num_local, num_ctas, stream)
                 self.__class__.kernel_cache[cache_key] = compiled

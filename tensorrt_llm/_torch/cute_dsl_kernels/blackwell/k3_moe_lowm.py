@@ -31,6 +31,10 @@ same epilogue instruction sequence), written in the same permuted layout (``c`` 
   stream its weights on SMs this grid leaves. Successors that read data before their own
   ``griddepcontrol.wait`` may only read data written before this grid's predecessor completed (as
   the tile metadata and the weights are for the FC2 kernels).
+* Sharing SMs (``share_sm``, with a reduced ``smem_capacity``): FC1 then launches with the
+  max-shared carveout, so each SM keeps the shared memory FC1 leaves free for a CTA of a kernel
+  on another stream, and triggers its dependents only when a CTA starts its last work unit: a
+  launched dependent grid whose CTAs wait for SM space holds back the CTAs of every other kernel.
 """
 
 from typing import Optional, Tuple
@@ -287,6 +291,10 @@ class K3MoeFc1LowMKernel:
         epilogue of the previous one).
     :param max_ab_stage: Cap on the weight ring depth (the rest of shared memory sizes it).
     :param use_pdl: Launch with programmatic dependent launch and wait on the previous grid.
+    :param smem_capacity: Shared memory one CTA may use (bytes); the weight ring gets what the
+        other buffers leave. Below the device maximum, a CTA of a concurrent kernel can share the SM.
+    :param share_sm: Launch with the max-shared carveout and trigger dependents at the start of each
+        CTA's last work unit (see the module docstring), for use with a reduced ``smem_capacity``.
     """
 
     def __init__(
@@ -303,6 +311,8 @@ class K3MoeFc1LowMKernel:
         signal_tiles: bool = False,
         prefetch_tail: bool = False,
         trace: bool = False,
+        smem_capacity: int = _SMEM_CAPACITY,
+        share_sm: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % (2 * 64) == 0 and n % _MMA_M == 0, f"n {n} must be a multiple of 128"
@@ -319,6 +329,7 @@ class K3MoeFc1LowMKernel:
         self.situ_linear_beta = float(situ_linear_beta)
         self.num_acc_stage = num_acc_stage
         self.use_pdl = use_pdl
+        self.share_sm = share_sm
         # After the stores of a work unit, add 1 to tile_ready[tile] (GPU-scope release), so FC2
         # can start a tile once all n / 128 of its units are stored, without waiting for this grid.
         self.signal_tiles = signal_tiles
@@ -346,8 +357,9 @@ class K3MoeFc1LowMKernel:
             + n_tok * self.sacc_row_floats * 4
             + 4 * 1024  # barriers, TMEM holder and alignment slack
         )
-        self.num_ab_stage = min(max_ab_stage, (_SMEM_CAPACITY - fixed) // self.a_stage_bytes)
-        assert self.num_ab_stage >= 2
+        smem_capacity = min(smem_capacity, _SMEM_CAPACITY)
+        self.num_ab_stage = min(max_ab_stage, (smem_capacity - fixed) // self.a_stage_bytes)
+        assert self.num_ab_stage >= 2, f"{smem_capacity} B of shared memory leave < 2 weight stages"
 
     @cute.jit
     def __call__(
@@ -503,6 +515,7 @@ class K3MoeFc1LowMKernel:
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
+            preferred_smem_carveout=100 if self.share_sm else None,
         )
 
     @cute.kernel
@@ -579,7 +592,8 @@ class K3MoeFc1LowMKernel:
         if cutlass.const_expr(self.use_pdl):
             # Tile metadata, tokens and token scales come from the previous grid.
             griddepcontrol_wait()
-            griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.share_sm):
+                griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
@@ -628,6 +642,9 @@ class K3MoeFc1LowMKernel:
                     self._prefetch_unit(w_raw, w_sf_raw, tile_idx_to_expert_idx, w_hi - 1)
             g = Int32(0)
             for j in cutlass.range(num_units, unroll=1):
+                if cutlass.const_expr(self.use_pdl and self.share_sm):
+                    if j == num_units - 1:
+                        griddepcontrol_launch_dependents()
                 w_idx = w_lo + j
                 tile = w_idx // NBLK
                 blk = w_idx - tile * NBLK
