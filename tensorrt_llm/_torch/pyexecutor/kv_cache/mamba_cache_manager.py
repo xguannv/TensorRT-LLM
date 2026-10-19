@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
@@ -1520,7 +1521,13 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask_buffer.update(self._dummy_request_mask_host)
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            self._dummy_request_mask_buffer.stage(self._dummy_request_mask_host,
+                                                  input_commit)
+        else:
+            self._dummy_request_mask_buffer.update(
+                self._dummy_request_mask_host)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
