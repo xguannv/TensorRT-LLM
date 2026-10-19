@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bit-exactness of the batched input commit and the Triton block-offset copy.
+"""Bit-exactness of the batched input commit and the other llprep upload kernels.
 
-Every check compares against the operations the commit replaces: ``Tensor.copy_`` for
-staged host->device copies, the overlap-scheduler gather sequence of
-``PyTorchModelEngine._prepare_tp_inputs`` for the fixup, and the C++
-``copy_batch_block_offsets_to_device`` for the block offsets.
+Every check compares against the operations the kernels replace: ``Tensor.copy_`` for
+staged host->device copies and the small pinned-copy kernel, the overlap-scheduler gather
+sequence of ``PyTorchModelEngine._prepare_tp_inputs`` for the fixup, the C++
+``copy_batch_block_offsets_to_device`` for the block offsets (one or two tables per
+launch), and ``index_copy_`` for the spec sampler's store scatter.
 """
 
 import random
@@ -32,9 +33,13 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.input_commit import (
     InputCommit,
     active_input_commit,
+    block_offsets_copy_job,
     copy_batch_block_offsets_from_host,
+    copy_block_offsets_jobs,
+    copy_small_pinned_pair,
     fused_helix_spec_preprocess,
     input_commit_scope,
+    scatter_spec_store,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -327,3 +332,202 @@ def test_fused_helix_spec_preprocess_matches_eager_sequence(
     torch.cuda.synchronize()
     for a, b in zip(got, ref):
         assert torch.equal(a, b)
+
+
+def _block_offsets_case(seed: int, num_pools: int, num_blocks: int, num_seqs: int):
+    gen = torch.Generator().manual_seed(seed)
+    src_max_seqs = num_seqs + 3
+    host = torch.randint(
+        0, 1 << 20, (num_pools, src_max_seqs, 2, num_blocks), generator=gen, dtype=torch.int32
+    )
+    host[torch.rand(host.shape, generator=gen) < 0.2] = -1
+    # A prefix of a pinned buffer, as IndexMapper.get_copy_index returns it.
+    copy_idx = torch.randperm(src_max_seqs, generator=gen).to(torch.int32).pin_memory()[:num_seqs]
+    scales = torch.randint(1, 97, (num_pools,), generator=gen, dtype=torch.int32)
+    kv_offset = torch.randint(0, 1 << 16, (num_pools,), generator=gen, dtype=torch.int32)
+    dst = torch.randint(
+        -5, 5, (num_pools + 1, num_seqs + 2, 2, num_blocks), generator=gen, dtype=torch.int32
+    ).cuda()
+    return [host.pin_memory(), dst, copy_idx, scales.pin_memory(), kv_offset.pin_memory()]
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        [(2, 976, 2), (1, 4096, 2)],  # target + draft tables, as in K3 helix16
+        [(1, 15584, 1), (2, 64, 1)],
+        [(2, 976, 4), (1, 1024, 0), (3, 100, 3)],  # an empty job, then an odd job out
+    ],
+)
+def test_block_offsets_jobs_match_separate_copies(shapes) -> None:
+    cases = [_block_offsets_case(i + 11, *shape) for i, shape in enumerate(shapes)]
+    refs = []
+    for host, dst, copy_idx, scales, kv_offset in cases:
+        ref = dst.clone()
+        if copy_idx.numel():  # nothing to copy for an empty batch
+            _cpp_block_offsets(host, ref, copy_idx, scales, kv_offset)
+        refs.append(ref)
+    jobs = [block_offsets_copy_job(*case) for case in cases]
+    assert all(job is not None for job in jobs)
+    copy_block_offsets_jobs(jobs)
+    torch.cuda.synchronize()
+    for case, ref in zip(cases, refs):
+        assert torch.equal(case[1], ref)
+
+
+def test_attention_metadata_pairs_target_and_draft_block_offsets() -> None:
+    target = _block_offsets_case(1, 2, 976, 2)
+    draft = _block_offsets_case(2, 1, 512, 2)
+    refs = []
+    for host, dst, copy_idx, scales, kv_offset in (target, draft):
+        ref = dst.clone()
+        _cpp_block_offsets(host, ref, copy_idx, scales, kv_offset)
+        refs.append(ref)
+
+    def manager(case):
+        def make_job(dst, request_ids, beam_width, num_contexts, num_seqs):
+            assert dst is case[1] and num_seqs == case[2].shape[0]
+            return block_offsets_copy_job(*case)
+
+        return SimpleNamespace(block_offsets_copy_job=make_job)
+
+    class _Metadata(TrtllmAttentionMetadata):
+        num_seqs = 2  # a plain value instead of the seq_lens-derived property
+
+    md = object.__new__(_Metadata)
+    md.__dict__.update(
+        kv_cache_manager=manager(target),
+        draft_kv_cache_manager=manager(draft),
+        kv_cache_block_offsets=target[1],
+        draft_kv_cache_block_offsets=draft[1],
+        request_ids=[3, 4],
+        beam_width=1,
+        num_contexts=0,
+    )
+    assert md._copy_target_and_draft_block_offsets()
+    torch.cuda.synchronize()
+    assert torch.equal(target[1], refs[0]) and torch.equal(draft[1], refs[1])
+    # A manager without the Triton job (e.g. a V1 draft cache) keeps the two copies.
+    md.draft_kv_cache_manager = SimpleNamespace()
+    assert not md._copy_target_and_draft_block_offsets()
+
+
+@pytest.mark.parametrize(
+    "dtype0,n0,dtype1,n1",
+    [
+        (torch.int32, 3, torch.bool, 3),
+        (torch.int64, 17, torch.int32, 1),
+        (torch.int32, 1024, torch.bool, 7),
+    ],
+)
+def test_small_pinned_pair_copy_matches_copy(dtype0, n0, dtype1, n1) -> None:
+    rng = random.Random(n0 * 31 + n1)
+    srcs = [
+        torch.tensor(_random_values(dtype, n, rng), dtype=dtype).pin_memory()
+        for dtype, n in ((dtype0, n0), (dtype1, n1))
+    ]
+    dsts = [torch.zeros(src.shape, dtype=src.dtype, device="cuda") for src in srcs]
+    assert copy_small_pinned_pair(dsts[0], srcs[0], dsts[1], srcs[1])
+    torch.cuda.synchronize()
+    for dst, src in zip(dsts, srcs):
+        assert torch.equal(dst.cpu(), src)
+    # Pageable source, size mismatch or a large copy: not handled, the caller copies.
+    assert not copy_small_pinned_pair(dsts[0], srcs[0].clone(), dsts[1], srcs[1])
+    assert not copy_small_pinned_pair(dsts[0][:1], srcs[0], dsts[1], srcs[1])
+    big = torch.zeros(2048, dtype=torch.int32).pin_memory()
+    assert not copy_small_pinned_pair(big.cuda(), big, dsts[1], srcs[1])
+
+
+def test_state_index_upload_kernel_matches_copies(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.pyexecutor import mamba_cache_manager as mcm
+
+    manager = object.__new__(mcm.MambaHybridCacheManagerV2)
+    manager.__dict__.update(
+        cuda_state_indices=torch.full((3,), -7, dtype=torch.int32, device="cuda"),
+        _host_state_indices=torch.tensor([11, 4, 0], dtype=torch.int32).pin_memory(),
+        _dummy_request_mask=torch.ones(3, dtype=torch.bool, device="cuda"),
+        _dummy_request_mask_host=torch.ones(3, dtype=torch.bool).pin_memory(),
+    )
+    monkeypatch.setattr(mcm, "state_index_copy_kernel_enabled", lambda: False)
+    assert not manager._upload_state_indices_and_dummy_mask([False, True])
+    monkeypatch.setattr(mcm, "state_index_copy_kernel_enabled", lambda: True)
+    assert manager._upload_state_indices_and_dummy_mask([False, True])
+    torch.cuda.synchronize()
+    assert manager.cuda_state_indices.tolist() == [11, 4, 0]
+    assert manager._dummy_request_mask.tolist() == [False, True, False]
+    # Inside an input commit the uploads are staged by the copy path instead.
+    with input_commit_scope(SimpleNamespace()):
+        assert not manager._upload_state_indices_and_dummy_mask([False])
+
+
+@pytest.mark.parametrize("n,num_slots", [(1, 3), (2, 3), (4, 9), (7, 64)])
+@pytest.mark.parametrize("accepted,draft", [(7, 6), (8, 7), (3, 2)])
+def test_spec_store_scatter_matches_index_copy(n, num_slots, accepted, draft) -> None:
+    gen = torch.Generator().manual_seed(n * 100 + num_slots + accepted)
+
+    def store():
+        return SimpleNamespace(
+            new_tokens=torch.randint(
+                0, 99, (accepted, num_slots, 1), generator=gen, dtype=torch.int32
+            ).cuda(),
+            next_new_tokens=torch.randint(
+                0, 99, (draft + 1, num_slots, 1), generator=gen, dtype=torch.int32
+            ).cuda(),
+            next_draft_tokens=torch.randint(
+                0, 99, (num_slots, draft), generator=gen, dtype=torch.int32
+            ).cuda(),
+            new_tokens_lens=torch.randint(
+                0, 99, (num_slots,), generator=gen, dtype=torch.int32
+            ).cuda(),
+        )
+
+    ref, got = store(), None
+    got = SimpleNamespace(**{k: v.clone() for k, v in vars(ref).items()})
+    # Worker outputs are wider row-major buffers sliced to the batch, as in sample_async.
+    skip = 1
+    out_new = torch.randint(
+        0, 1 << 30, (n + 2, accepted + 3), generator=gen, dtype=torch.int32
+    ).cuda()
+    out_next = torch.randint(
+        0, 1 << 30, (n + 2, draft + 1), generator=gen, dtype=torch.int32
+    ).cuda()
+    out_draft = torch.randint(
+        0, 1 << 30, (n + 2, draft + 2), generator=gen, dtype=torch.int32
+    ).cuda()
+    out_lens = torch.randint(0, 8, (n + 2,), generator=gen, dtype=torch.int32).cuda()
+    o_new = out_new[skip : skip + n, :accepted]
+    o_next = out_next[skip : skip + n]
+    o_draft = out_draft[skip : skip + n, :draft]
+    o_lens = out_lens[skip : skip + n]
+    slots = torch.randperm(num_slots, generator=gen)[:n].cuda()
+
+    ref.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new)
+    ref.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next)
+    ref.new_tokens_lens.index_copy_(0, slots, o_lens)
+    ref.next_draft_tokens.index_copy_(0, slots, o_draft)
+    assert scatter_spec_store(
+        slots,
+        got.new_tokens.squeeze(-1),
+        got.next_new_tokens.squeeze(-1),
+        got.new_tokens_lens,
+        got.next_draft_tokens,
+        o_new,
+        o_next,
+        o_lens,
+        o_draft,
+    )
+    torch.cuda.synchronize()
+    for key in vars(ref):
+        assert torch.equal(getattr(got, key), getattr(ref, key)), key
+    # A source of another width does not match the store layout: the caller uses index_copy_.
+    assert not scatter_spec_store(
+        slots,
+        got.new_tokens.squeeze(-1),
+        got.next_new_tokens.squeeze(-1),
+        got.new_tokens_lens,
+        got.next_draft_tokens,
+        out_new[skip : skip + n],
+        o_next,
+        o_lens,
+        o_draft,
+    )

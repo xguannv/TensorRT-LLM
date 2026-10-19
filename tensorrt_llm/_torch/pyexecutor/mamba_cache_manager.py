@@ -28,7 +28,9 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    active_input_commit, copy_small_pinned_pair,
+    state_index_copy_kernel_enabled)
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     PAGE_PRIORITY_DEFAULT, PAGE_PRIORITY_MIN, BlockReusePolicy,
     KVCacheManagerV2, PagePriorityCallback, Role)
@@ -4159,14 +4161,40 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}")
                 self._host_state_indices[i] = base_index
 
-        self.cuda_state_indices.copy_(self._host_state_indices,
-                                      non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(is_dummy)
+        if not self._upload_state_indices_and_dummy_mask(is_dummy):
+            self.cuda_state_indices.copy_(self._host_state_indices,
+                                          non_blocking=True)
+            self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
+
+    @torch.inference_mode()
+    def _upload_state_indices_and_dummy_mask(self,
+                                             is_dummy: List[bool]) -> bool:
+        """TRTLLM_STATE_INDEX_COPY_KERNEL=1: both uploads of _setup_state_indices in one kernel.
+
+        Same stream position, sources and destinations as the two non-blocking
+        copies; the kernel reads the pinned host buffers when it runs, as the
+        DMA does, without two copy-engine handoffs in front of the next step's
+        input chain. Returns False (nothing uploaded) to fall back to the copies.
+        """
+        if (not state_index_copy_kernel_enabled()
+                or active_input_commit() is not None
+                or self._dummy_request_mask is None):
+            return False
+        n = len(is_dummy)
+        assert n <= self._dummy_request_mask_host.shape[0]
+        self._dummy_request_mask_host.zero_()
+        if n > 0:
+            self._dummy_request_mask_host[:n].copy_(
+                torch.tensor(is_dummy, dtype=torch.bool))
+        return copy_small_pinned_pair(self.cuda_state_indices,
+                                      self._host_state_indices,
+                                      self._dummy_request_mask,
+                                      self._dummy_request_mask_host)
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
