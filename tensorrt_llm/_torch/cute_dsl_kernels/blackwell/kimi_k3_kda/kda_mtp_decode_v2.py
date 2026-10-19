@@ -50,6 +50,8 @@ Optional (compile-time) variants, both bitwise identical to the plain kernel fed
   fragments loaded with the other new-token rows, before the precompute barrier.
 """
 
+import os
+
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
@@ -58,6 +60,11 @@ from cutlass.cute.typing import Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 NUM_THREADS = 512
+#: TRTLLM_K3_KDA_DECODE_EARLY_TRIGGER=1 (PDL builds): release the dependent grid (the o_proj GEMM)
+#: right after ``griddepcontrol.wait`` instead of at exit, so it can become resident on the SMs this
+#: grid leaves free and stream its weights during the recurrence. The trigger follows this grid's
+#: own wait, so anything a dependent reads before its wait is still older than its predecessor.
+EARLY_TRIGGER = os.environ.get("TRTLLM_K3_KDA_DECODE_EARLY_TRIGGER", "0") == "1"
 TILE_K = 128
 # Chunk length padding (MMA N granularity); NUM_SPEC <= 7 -> T_loop <= 15.
 T_PAD = 16
@@ -250,6 +257,11 @@ def st_shared_f32x4(addr, a, b, c, d):
 @dsl_user_op
 def griddepcontrol_wait(*, loc=None, ip=None):
     _st_asm("griddepcontrol.wait;", "", [], loc=loc, ip=ip)
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None):
+    _st_asm("griddepcontrol.launch_dependents;", "", [], loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -735,6 +747,8 @@ def kda_decode_mtp_v2_kernel(
         # Everything above only reads this layer's pools, metadata and weights; the new-token
         # rows are the previous grids' outputs.
         griddepcontrol_wait()
+        if cutlass.const_expr(EARLY_TRIGGER):
+            griddepcontrol_launch_dependents()
         if warp_idx < NEW_TOK:
             _load_new_token_row(
                 *new_rows,

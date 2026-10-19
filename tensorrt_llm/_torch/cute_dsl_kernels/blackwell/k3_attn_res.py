@@ -66,6 +66,11 @@ ADD_NONE, ADD_PREFIX, ADD_MOE = 0, 1, 2
 
 #: Programmatic dependent launch unless TRTLLM_ENABLE_PDL=0 (the stack-wide switch).
 _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+#: TRTLLM_K3_ATTN_RES_EARLY_TRIGGER=1: release the dependent grid right after ``griddepcontrol.wait``
+#: instead of after the last store, so the next kernel (a decode projection) can become resident and
+#: stream its weights while this one finishes. The trigger still follows this kernel's own wait, so
+#: a dependent that reads data older than its predecessor before its own wait stays safe.
+_EARLY_TRIGGER = os.environ.get("TRTLLM_K3_ATTN_RES_EARLY_TRIGGER", "0") == "1"
 
 _THREADS = 256
 _WARPS = _THREADS // 32
@@ -847,6 +852,8 @@ class K3AttnResKernel:
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
+            if cutlass.const_expr(_EARLY_TRIGGER):
+                _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             # bf16(prefix + addend): the C++ kernels' fused add (fast-math add.ftz). All loads
@@ -976,7 +983,7 @@ class K3AttnResKernel:
             y = _round_bf16(_mul_ftz(mixed[j], out_rs))
             st_item(out_addr + row, j, _mul_ftz(y, out_w[j]))
 
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and not _EARLY_TRIGGER):
             _bar_sync(3)
             _griddepcontrol_launch_dependents()
 
@@ -1196,6 +1203,8 @@ class K3AttnResFastKernel:
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
+            if cutlass.const_expr(_EARLY_TRIGGER):
+                _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             addend = unpack(load(add_addr + row + col, False))
@@ -1275,7 +1284,7 @@ class K3AttnResFastKernel:
         words = [_pack_bf16x2(y[2 * i], y[2 * i + 1]) for i in range(4)]
         _stg_v4_if(valid, out_addr + row + col, words)
 
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and not _EARLY_TRIGGER):
             _bar_sync(4, self.threads)
             _griddepcontrol_launch_dependents()
 
