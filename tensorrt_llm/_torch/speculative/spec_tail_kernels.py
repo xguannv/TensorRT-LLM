@@ -39,6 +39,10 @@ from .vocab_parallel import _INT32_MAX as _VP_INT32_MAX
 SPEC_TAIL_FUSION_ENV_VAR = "TLLM_SPEC_TAIL_FUSION"
 DRAFT_FUSION_ENV_VAR = "TLLM_DSPARK_DRAFT_FUSION"
 TAIL_V2_ENV_VAR = "TLLM_DSPARK_TAIL_V2"
+# Largest number of generation requests the one-program fused tail kernels
+# (selection + acceptance, the Markov steps) take; larger batches keep the
+# unfused, row-parallel kernels. Measured in the decode graph at 1-4 requests.
+TAIL_V2_MAX_GENS = 16
 
 _BLOCK_TABLE_BLOCK = 2048
 # Columns per program of the parallel draft block-table decode.

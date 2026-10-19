@@ -36,6 +36,7 @@ from .dspark_draft_gemm import draft_gemm
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
     BLOCK_TABLE_CHUNK,
+    TAIL_V2_MAX_GENS,
     ctx_side_stream_enabled,
     decode_draft_block_table,
     decode_draft_block_table_parallel,
@@ -1272,6 +1273,7 @@ class DFlashWorker(SpecWorkerBase):
                     if (
                         markov_v2_enabled()
                         and markov_w1 is not None
+                        and num_gens <= TAIL_V2_MAX_GENS
                         and (
                             draft_head.exchange.backend == "mnnvl"
                             or draft_head.exchange.tp_size == 1
@@ -1470,6 +1472,8 @@ class DFlashWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+        if num_gens > TAIL_V2_MAX_GENS:
+            return None
         if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
             return None
         mgr = attn_metadata.kv_cache_manager
