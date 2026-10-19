@@ -4835,7 +4835,7 @@ def test_cute_dsl_moe_lowm_dyn_backend_dispatch(num_tokens, monkeypatch):
             use_fused_finalize=True,
             activation_type=ActivationType.SiTu,
             scaling_vector_size=sf_vec_size,
-            lowm_dyn_max_tokens=32 if dyn else 0,
+            lowm_dyn_token_range=(1, 32) if dyn else (1, 0),
             _lowm_dyn_counters=None,
             _join_pending_x_ready=lambda: None,
             _has_moe_output_memset_aux_stream=lambda: False,
@@ -4869,3 +4869,51 @@ def test_cute_dsl_moe_lowm_dyn_backend_dispatch(num_tokens, monkeypatch):
     for dyn in (False, True):
         err = (run(dyn, token_final_scales).double() - exact).abs()
         assert bool((err <= bound).all()), f"dyn={dyn}: max err/bound {(err / bound).max()}"
+
+
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        ({}, (1, 0)),
+        ({"TRTLLM_MOE_LOWM_DYN": "1"}, (1, 0)),
+        ({"TRTLLM_MOE_LOWM_DYN": "1", "TRTLLM_MOE_LOWM": "1"}, (1, 32)),
+        (
+            {
+                "TRTLLM_MOE_LOWM_DYN": "1",
+                "TRTLLM_MOE_LOWM": "1",
+                "TRTLLM_MOE_LOWM_DYN_MIN_TOKENS": "9",
+                "TRTLLM_MOE_LOWM_DYN_MAX_TOKENS": "16",
+            },
+            (9, 16),
+        ),
+        (
+            {
+                "TRTLLM_MOE_LOWM_DYN": "1",
+                "TRTLLM_MOE_LOWM": "1",
+                "TRTLLM_MOE_LOWM_MAX_TOKENS": "8",
+                "TRTLLM_MOE_LOWM_DYN_MAX_TOKENS": "16",
+            },
+            (1, 8),
+        ),
+    ],
+    ids=["off", "dyn_without_lowm", "dyn", "dyn_9_16", "capped_by_lowm"],
+)
+def test_moe_lowm_dyn_token_range(env, expected, monkeypatch):
+    """TRTLLM_MOE_LOWM_DYN serves MIN_TOKENS <= tokens <= MAX_TOKENS, within the small-batch limit."""
+    for name in (
+        "TRTLLM_MOE_LOWM",
+        "TRTLLM_MOE_LOWM_MAX_TOKENS",
+        "TRTLLM_MOE_LOWM_DYN",
+        "TRTLLM_MOE_LOWM_DYN_MIN_TOKENS",
+        "TRTLLM_MOE_LOWM_DYN_MAX_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    token_range = cute_dsl_custom_ops.moe_lowm_dyn_token_range()
+    assert token_range == expected
+    applies = cute_dsl_custom_ops.K3MoeLowMDynRunner.applies
+    for num_tokens in (1, 7, 8, 9, 14, 16, 17, 32):
+        assert applies(num_tokens, 1536, 3584, 128, 16, token_range) == (
+            expected[0] <= num_tokens <= expected[1]
+        )

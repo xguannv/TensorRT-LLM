@@ -135,10 +135,13 @@ _MOE_LOWM_FC1_TRIGGER_ENV = "TRTLLM_MOE_LOWM_FC1_TRIGGER"
 # that hands out their work units dynamically (cute_dsl_kernels/blackwell/k3_moe_lowm_dyn.py): no wave
 # tail at the end of FC1, no grid boundary between FC1 and FC2, every SM streams weights until the end.
 # FC1's output is bit-identical and every FC2 partial is bit-identical (added in an unspecified order,
-# as with the two small-batch kernels). TRTLLM_MOE_LOWM_DYN_CTAS: its persistent CTAs ("<N>" or
-# "<n_tok>:<N>,..."; default one per SM); TRTLLM_MOE_LOWM_DYN_FC2_CHUNK: 128-row W2 blocks per FC2
-# work unit ("<N>" or "<n_tok>:<N>,..."; default 1).
+# as with the two small-batch kernels). Only for TRTLLM_MOE_LOWM_DYN_MIN_TOKENS <= tokens <=
+# TRTLLM_MOE_LOWM_DYN_MAX_TOKENS (default 1 and the small-batch limit). TRTLLM_MOE_LOWM_DYN_CTAS: its
+# persistent CTAs ("<N>" or "<n_tok>:<N>,..."; default one per SM); TRTLLM_MOE_LOWM_DYN_FC2_CHUNK:
+# 128-row W2 blocks per FC2 work unit ("<N>" or "<n_tok>:<N>,..."; default 1).
 _MOE_LOWM_DYN_ENV = "TRTLLM_MOE_LOWM_DYN"
+_MOE_LOWM_DYN_MIN_TOKENS_ENV = "TRTLLM_MOE_LOWM_DYN_MIN_TOKENS"
+_MOE_LOWM_DYN_MAX_TOKENS_ENV = "TRTLLM_MOE_LOWM_DYN_MAX_TOKENS"
 _MOE_LOWM_DYN_CTAS_ENV = "TRTLLM_MOE_LOWM_DYN_CTAS"
 _MOE_LOWM_DYN_FC2_CHUNK_ENV = "TRTLLM_MOE_LOWM_DYN_FC2_CHUNK"
 # Weight ring stages of the fused kernel ("<N>" or "<n_tok>:<N>,..."; default 6 for up to 16 tokens:
@@ -155,12 +158,15 @@ def _moe_lowm_max_tokens() -> int:
     return max(0, min(int(os.environ.get(_MOE_LOWM_MAX_TOKENS_ENV, "32")), 32))
 
 
-def moe_lowm_dyn_max_tokens() -> int:
-    """Largest token count served by the fused small-batch MoE kernel (TRTLLM_MOE_LOWM_DYN; 0:
-    disabled)."""
+def moe_lowm_dyn_token_range() -> Tuple[int, int]:
+    """``(min, max)`` token counts served by the fused small-batch MoE kernel (TRTLLM_MOE_LOWM_DYN;
+    max 0: disabled)."""
     if os.environ.get(_MOE_LOWM_DYN_ENV, "0") != "1":
-        return 0
-    return _moe_lowm_max_tokens()
+        return 1, 0
+    lo = max(1, int(os.environ.get(_MOE_LOWM_DYN_MIN_TOKENS_ENV, "1")))
+    hi = min(_moe_lowm_max_tokens(),
+             int(os.environ.get(_MOE_LOWM_DYN_MAX_TOKENS_ENV, "32")))
+    return lo, hi
 
 
 def _moe_lowm_fc1_smem_bytes() -> int:
@@ -4314,11 +4320,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @staticmethod
         def applies(num_tokens: int, n1: int, k1: int, tile_size: int,
-                    scaling_vector_size: int, max_tokens: int) -> bool:
-            """Whether the fused kernel serves ``num_tokens`` tokens of W1 [n1, k1] experts."""
-            return (0 < num_tokens <= max_tokens and tile_size == 128
-                    and scaling_vector_size == 16 and n1 % 256 == 0
-                    and (n1 // 2) % 256 == 0 and k1 % 256 == 0)
+                    scaling_vector_size: int, token_range: Tuple[int,
+                                                                 int]) -> bool:
+            """Whether the fused kernel serves ``num_tokens`` tokens of W1 [n1, k1] experts
+            (``token_range`` from :func:`moe_lowm_dyn_token_range`)."""
+            return (token_range[0] <= num_tokens <= token_range[1]
+                    and tile_size == 128 and scaling_vector_size == 16
+                    and n1 % 256 == 0 and (n1 // 2) % 256 == 0
+                    and k1 % 256 == 0)
 
         @classmethod
         def new_counters(cls, device: torch.device) -> torch.Tensor:
