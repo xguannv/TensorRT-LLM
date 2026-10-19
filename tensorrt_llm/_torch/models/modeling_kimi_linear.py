@@ -312,11 +312,14 @@ _K3_SHARED_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_SHARED_STREAM_PRIORIT
 
 # Small-batch MoE front end (b1-b4 decode), each bit-identical to the path it replaces:
 #   TRTLLM_K3_LD_FP4=1: latent_down with the routed experts' NVFP4 input quantization in its epilogue
-#     (k3_fp8w_lowm_gemm_nvfp4, byte-identical to the low-M GEMM followed by fp4_quantize) wherever
-#     the low-M kernel serves latent_down and the CuteDSL NVFP4 experts would quantize it.
+#     (k3_fp8w_lowm_gemm_nvfp4, byte-identical to the low-M GEMM followed by fp4_quantize) for up to
+#     TRTLLM_K3_LD_FP4_MAX_M tokens where the low-M kernel serves latent_down and the CuteDSL NVFP4
+#     experts would quantize it. Pair it with TRTLLM_K3_LATENT_AR_OWN_WS: the earlier routed FC1
+#     otherwise pushes the shared-expert chain (and the latent all-reduce behind it) later.
 #   TRTLLM_K3_ROUTER_EXACT=1: router logits of M <= 16 tokens from k3_router_exact (bit-identical
 #     to dsv3_router_gemm_op; its weight is copied into shared memory before griddepcontrol.wait).
 _K3_LD_FP4 = os.environ.get("TRTLLM_K3_LD_FP4", "0") == "1"
+_K3_LD_FP4_MAX_M = int(os.environ.get("TRTLLM_K3_LD_FP4_MAX_M", "32"))
 _K3_ROUTER_EXACT = os.environ.get("TRTLLM_K3_ROUTER_EXACT", "0") == "1"
 # TRTLLM_K3_MOE_L2_PREFETCH: comma list of what the latent-down stream prefetches into L2 once the
 # routed FC2 is done (the latent all-reduce, latent_up and the next attention block leave HBM mostly
@@ -339,7 +342,7 @@ _K3_MOE_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiK3MoERuntime]"] 
 # stream after latent_up. Applies where latent_up does not add the shared output itself (no fused
 # latent_up + residual variant); the output is bit-identical.
 _K3_LATENT_AR_OWN_WS = os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS", "0") == "1"
-_K3_LATENT_AR_OWN_WS_MAX_M = int(os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS_MAX_M", "64"))
+_K3_LATENT_AR_OWN_WS_MAX_M = int(os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS_MAX_M", "32"))
 # TRTLLM_K3_LATENT_AR_CUTE (with TRTLLM_K3_LATENT_AR_OWN_WS): the one-shot sizes of that all-reduce
 # run k3_latent_ar_norm, bit-identical to the C++ one-shot kernel but triggering its programmatic
 # dependents (latent_up) right after its griddepcontrol.wait instead of after the cross-rank
@@ -2630,8 +2633,10 @@ class KimiK3MoERuntime(nn.Module):
         ):
             return None
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if x.dtype != torch.bfloat16 or (
-            down.mid_weight_sf is not None and down.mid_gemm_applies(x)
+        if (
+            x.dtype != torch.bfloat16
+            or x.shape[0] > _K3_LD_FP4_MAX_M
+            or (down.mid_weight_sf is not None and down.mid_gemm_applies(x))
         ):
             return None
         from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
