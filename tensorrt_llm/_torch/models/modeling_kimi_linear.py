@@ -3887,7 +3887,7 @@ class KimiMLARuntime(nn.Module):
         ar_push = None
         if zero_copy and hasattr(o_proj, "next_ar_push"):
             ar_push = self._o_allreduce.lamport_push_target(
-                hidden_states.shape[0], o_proj.out_features
+                hidden_states.shape[0], o_proj.out_features, in_place=self.ar_result_in_place
             )
             o_proj.next_ar_push = ar_push
         out = self.mixer(hidden_states, attn_metadata)

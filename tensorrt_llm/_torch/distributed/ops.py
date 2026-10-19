@@ -786,10 +786,15 @@ class MNNVLAllReduce(nn.Module):
             return tuple(outputs)
         return outputs[0]
 
-    def lamport_push_target(self, num_tokens: int,
-                            hidden_dim: int) -> Optional[LamportPushTarget]:
+    def lamport_push_target(
+            self,
+            num_tokens: int,
+            hidden_dim: int,
+            in_place: bool = False) -> Optional[LamportPushTarget]:
         """A ``LamportPushTarget`` for a plain all-reduce of BF16
-        ``[num_tokens, hidden_dim]`` on this workspace, or None.
+        ``[num_tokens, hidden_dim]`` on this workspace, or None. ``in_place``:
+        the caller finishes it in place (``finish_lamport_push(in_place=True)``),
+        which takes the two-shot transport at every size.
 
         The first call per workspace builds its device peer table, so it must
         not run during CUDA graph capture (it returns None there); the eager
@@ -799,7 +804,7 @@ class MNNVLAllReduce(nn.Module):
         world = self.mapping.tp_size
         nbytes = num_tokens * hidden_dim * world * 2
         cpp_one_shot = nbytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-        one_shot = nbytes <= _K3_AR_PUSH_ONE_SHOT_MAX_BYTES
+        one_shot = not in_place and nbytes <= _K3_AR_PUSH_ONE_SHOT_MAX_BYTES
         need = max(
             self.get_required_workspace_size(num_tokens, hidden_dim, world,
                                              self.dtype),
@@ -1049,7 +1054,8 @@ class AllReduce(nn.Module):
         self,
         num_tokens: int,
         hidden_dim: int,
-        all_reduce_params: Optional[AllReduceParams] = None
+        all_reduce_params: Optional[AllReduceParams] = None,
+        in_place: bool = False,
     ) -> Optional[LamportPushTarget]:
         """With TRTLLM_K3_AR_PUSH=1: a ``LamportPushTarget`` if ``forward`` would
         run the MNNVL all-reduce on a BF16 ``[num_tokens, hidden_dim]`` input
@@ -1059,6 +1065,8 @@ class AllReduce(nn.Module):
         ``pushed``) replaces the input of this all-reduce;
         ``finish_lamport_push`` then returns the same result ``forward`` would.
         Targets must be finished in the order they were pushed, by every rank.
+        ``in_place`` requests the two-shot transport, which
+        ``finish_lamport_push(in_place=True)`` needs.
         """
         if (not _K3_AR_PUSH or self.mnnvl_allreduce is None
                 or self.mapping.tp_size == 1
@@ -1075,7 +1083,8 @@ class AllReduce(nn.Module):
         if (self.nvls_allreduce is not None and NVLS_AR_MIN_BYTES <=
                 num_tokens * hidden_dim * 2 <= NVLS_AR_MAX_BYTES):
             return None
-        return self.mnnvl_allreduce.lamport_push_target(num_tokens, hidden_dim)
+        return self.mnnvl_allreduce.lamport_push_target(num_tokens, hidden_dim,
+                                                        in_place)
 
     def finish_lamport_push(
             self,

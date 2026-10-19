@@ -254,7 +254,7 @@ def _run_rank_amid(world_size):
             ref = kimi._apply_attn_res_add_and_rmsnorm(
                 prefix, allreduce(linear(x)), block, proj, norm, out_norm
             )
-            target = allreduce.lamport_push_target(m, hidden)
+            target = allreduce.lamport_push_target(m, hidden, in_place=True)
             linear.next_ar_push = target
             linear(x)
             assert target.pushed
@@ -265,8 +265,9 @@ def _run_rank_amid(world_size):
                 bad += int((a.view(torch.int16) != b.view(torch.int16)).sum())
         torch.cuda.synchronize()
         assert comm.allreduce(bad) == 0, f"rank {rank}: {bad} values differ"
-        # The two-shot sizes (at least M = 64) took the in-place path.
-        assert in_place >= 1
+        # Every size took the in-place path (the two-shot transport, also where the C++ kernel
+        # is one-shot).
+        assert in_place == 3
     except Exception:
         traceback.print_exc()
         raise

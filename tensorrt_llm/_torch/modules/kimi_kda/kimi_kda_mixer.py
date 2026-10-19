@@ -621,7 +621,7 @@ class KimiKDALinearAttention(nn.Module):
         ar_push = None
         if zero_copy and hasattr(self.o_proj, "next_ar_push"):
             ar_push = self._o_allreduce.lamport_push_target(
-                hidden_states.shape[0], self.hidden_size
+                hidden_states.shape[0], self.hidden_size, in_place=self.ar_result_in_place
             )
             self.o_proj.next_ar_push = ar_push
 
