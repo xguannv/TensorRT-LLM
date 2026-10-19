@@ -203,6 +203,94 @@ def _run_rank(world_size):
     return True
 
 
+def _run_rank_amid(world_size):
+    """o_proj push -> in-place finish -> A_mid reading the Lamport rows (TRTLLM_K3_AR_PUSH_AMID)
+    against o_proj -> C++ all-reduce -> A_mid, through the model helpers."""
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    import importlib
+
+    from torch import nn
+
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+
+    # Not ``from ... import ops``: see _run_rank.
+    dist_ops = importlib.import_module("tensorrt_llm._torch.distributed.ops")
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm.mapping import Mapping
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    torch.cuda.set_device(rank)
+    switches = {
+        (dist_ops, "_K3_AR_PUSH"): True,
+        (kimi, "_K3_AR_PUSH_AMID"): True,
+        (kimi, "_K3_FP8W_LOWM_GEMM"): True,
+        (kimi, "_K3_ATTN_RES_PDL"): True,
+    }
+    saved = {key: getattr(*key) for key in switches}
+    try:
+        for (module, name), value in switches.items():
+            setattr(module, name, value)
+        mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        allreduce = AllReduce(
+            mapping=mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.bfloat16
+        )
+        hidden = 7168
+        w, w_scale = _weights(hidden, 768, 21 + rank)
+        linear = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden)
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        proj = nn.Linear(hidden, 1, bias=False, dtype=torch.bfloat16, device="cuda")
+        proj.weight.data.copy_(torch.randn(1, hidden, device="cuda", generator=gen) * 0.05)
+        norm = kimi.KimiK3RMSNorm(hidden, eps=1e-6, dtype=torch.bfloat16, device="cuda")
+        norm.weight.data.copy_(1 + 0.1 * torch.randn(hidden, device="cuda", generator=gen))
+        out_norm = RMSNorm(hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16).cuda()
+        out_norm.weight.data.copy_(1 + 0.1 * torch.randn(hidden, device="cuda", generator=gen))
+        bad = 0
+        in_place = 0
+        for m in (14, 32, 64):
+            x = _input(m, 768, 9 * m, rank, 0)
+            prefix = (torch.randn(m, hidden, device="cuda", generator=gen)).to(torch.bfloat16)
+            block = (torch.randn(4, m, hidden, device="cuda", generator=gen)).to(torch.bfloat16)
+            ref = kimi._apply_attn_res_add_and_rmsnorm(
+                prefix, allreduce(linear(x)), block, proj, norm, out_norm
+            )
+            target = allreduce.lamport_push_target(m, hidden)
+            linear.next_ar_push = target
+            linear(x)
+            assert target.pushed
+            result = allreduce.finish_lamport_push(target, in_place=True)
+            in_place += int(isinstance(result, dist_ops.LamportResult))
+            got = kimi._apply_attn_res_add_and_rmsnorm(prefix, result, block, proj, norm, out_norm)
+            for a, b in zip(ref, got):
+                bad += int((a.view(torch.int16) != b.view(torch.int16)).sum())
+        torch.cuda.synchronize()
+        assert comm.allreduce(bad) == 0, f"rank {rank}: {bad} values differ"
+        # The two-shot sizes (at least M = 64) took the in-place path.
+        assert in_place >= 1
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        for (module, name), value in saved.items():
+            setattr(module, name, value)
+    return True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_k3_ar_push_amid(mpi_pool_executor):
+    world_size = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs")
+    if not hasattr(torch.ops.trtllm, "k3_attn_res_add_rmsnorm_lamport"):
+        pytest.skip("needs trtllm::k3_attn_res_add_rmsnorm_lamport")
+    results = mpi_pool_executor.map(_run_rank_amid, *zip(*[(world_size,)] * world_size))
+    for r in results:
+        assert r is True
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
 def test_k3_lamport_ar(mpi_pool_executor):
