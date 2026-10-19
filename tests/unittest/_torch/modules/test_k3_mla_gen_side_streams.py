@@ -334,3 +334,75 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
         assert torch.equal(eager, ref_eager), f"eager {cfg}"
         for r in replays:
             assert torch.equal(r, ref_graph), f"graph {cfg}"
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_mxfp8_q_a_input_matches_bf16_input(batch, monkeypatch):
+    """The fused q_a / kv_a projection on the MXFP8 form of the layer input (``next_input_mxfp8``,
+    as the decoder layer hands it over) gives the BF16 input's output bit for bit, eagerly and in
+    CUDA graphs, on the default path and with every side-stream switch."""
+    mx = pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_fp8w_lowm_mxfp8")
+    import weakref
+
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    q_len = 8 if batch == 4 else 7
+    model, mixer, manager, md, x = _build(batch, q_len, 448, monkeypatch)
+    extra = {
+        "attention_metadata": weakref.ref(md),
+        "mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)},
+    }
+    pool = manager.get_buffers(0)
+    pool_init = pool.clone()
+    assert mixer.q_a_takes_mxfp8(x.shape[0])
+    xq, xs = mx.mxfp8_quantize_reference(x)
+    calls = [0]
+    forward_mxfp8 = mixer.kv_a_proj_with_mqa.forward_mxfp8
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return forward_mxfp8(*args, **kwargs)
+
+    monkeypatch.setattr(mixer.kv_a_proj_with_mqa, "forward_mxfp8", counted)
+    results = {}
+    try:
+        with torch.inference_mode():
+            for cfg in [(False,) * 4, (True,) * 4]:
+                _set(monkeypatch, k3mla, *cfg)
+                for use_mx in (False, True):
+
+                    def run():
+                        if use_mx:
+                            mixer.next_input_mxfp8 = (xq, xs)
+                        return mixer(x, md)
+
+                    pool.copy_(pool_init)
+                    with model_extra_attrs(extra):
+                        eager = run().clone()
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    with with_multi_stream(True), torch.cuda.stream(s), model_extra_attrs(extra):
+                        run()
+                    torch.cuda.current_stream().wait_stream(s)
+                    graph = torch.cuda.CUDAGraph()
+                    with (
+                        with_multi_stream(True),
+                        torch.cuda.graph(graph, stream=s),
+                        model_extra_attrs(extra),
+                    ):
+                        out = run()
+                    pool.copy_(pool_init)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    results[cfg, use_mx] = (eager, out.clone())
+                    assert mixer.next_input_mxfp8 is None
+    finally:
+        manager.shutdown()
+    assert calls[0] == 6  # eager, warm-up and capture of the two MXFP8 runs
+    for cfg in [(False,) * 4, (True,) * 4]:
+        (eager, graph), (eager_mx, graph_mx) = results[cfg, False], results[cfg, True]
+        assert torch.isfinite(graph).all() and graph.abs().max() > 0
+        assert torch.equal(eager_mx, eager), f"eager {cfg}"
+        assert torch.equal(graph_mx, graph), f"graph {cfg}"

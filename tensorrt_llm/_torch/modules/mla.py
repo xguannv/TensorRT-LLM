@@ -899,6 +899,10 @@ class MLA(nn.Module):
         q[..., self.qk_nope_head_dim :] = q_pe.view(-1, self.num_heads_tp, self.qk_rope_head_dim)
         return k_pe
 
+    def _project_qkv_a(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The fused q_a / kv_a projection of ``hidden_states`` (``fuse_qkv_a_proj``)."""
+        return self.kv_a_proj_with_mqa(hidden_states)
+
     def _attn_forward_gen(
         self,
         attn_backend: AttentionBackend,
@@ -1088,7 +1092,7 @@ class MLA(nn.Module):
             q = hidden_states
         else:
             if self.fuse_qkv_a_proj:
-                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                q, compressed_kv, k_pe = self._project_qkv_a(hidden_states).split(
                     [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
                 )
             else:

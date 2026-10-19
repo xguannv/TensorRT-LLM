@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -375,6 +375,29 @@ class KimiK3MLAAttention(MLA):
         self._gate_events = tuple(torch.cuda.Event() for _ in range(4))
         # TRTLLM_K3_MLA_KV_SIDE: fork of the KV half after q_a, join before the decode.
         self._kv_events = (torch.cuda.Event(), torch.cuda.Event())
+        # Set by the decoder layer for the next forward only: the MXFP8 form ``(xq, xs)`` of the
+        # layer input (``trtllm::k3_attn_res_*_mx``), which the fused q_a / kv_a projection
+        # consumes instead of quantizing the BF16 rows itself (see q_a_takes_mxfp8).
+        self.next_input_mxfp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def q_a_takes_mxfp8(self, num_rows: int) -> bool:
+        """Whether the fused q_a / kv_a projection of ``num_rows`` rows can take their MXFP8 form
+        (``next_input_mxfp8``): it runs the low-M kernel on them."""
+        takes = getattr(self.kv_a_proj_with_mqa, "takes_mxfp8_input", None)
+        return (
+            self.fuse_qkv_a_proj
+            and not self.is_lite
+            and takes is not None
+            and bool(takes(num_rows))
+        )
+
+    def _project_qkv_a(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The fused q_a / kv_a projection; on ``next_input_mxfp8`` when the decoder layer
+        handed it over (``forward_mxfp8``: bitwise the projection of the BF16 rows)."""
+        mxfp8_input, self.next_input_mxfp8 = self.next_input_mxfp8, None
+        if mxfp8_input is not None:
+            return self.kv_a_proj_with_mqa.forward_mxfp8(hidden_states, *mxfp8_input)
+        return super()._project_qkv_a(hidden_states)
 
     def _apply_output_gate_and_o_proj(
         self,
@@ -521,7 +544,7 @@ class KimiK3MLAAttention(MLA):
             if self.k_b_proj_trans.dtype == torch.bfloat16
             else self.k_b_proj_trans_dequant
         )
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+        q, compressed_kv, k_pe = self._project_qkv_a(hidden_states).split(
             [self.q_lora_rank, lora, rope], -1
         )
         fused_q = torch.empty(
@@ -678,6 +701,17 @@ class KimiK3MLAAttention(MLA):
         return self.o_proj(attn_out * gate)
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        try:
+            return self._forward(hidden_states, attn_metadata)
+        finally:
+            # consumed by the projection; never carried into another forward
+            self.next_input_mxfp8 = None
+
+    def _forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
