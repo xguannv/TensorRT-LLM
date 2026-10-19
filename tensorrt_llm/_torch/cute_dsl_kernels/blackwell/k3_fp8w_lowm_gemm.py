@@ -42,6 +42,12 @@ Mid-M path (``low_m_max_for(N, K) < M <= MAX_M``):
   shared staging buffer with 16-byte stores.
 * :func:`can_run` only accepts M up to :func:`max_m_for` (the measured cross-over against
   ``fp8_swap_ab_gemm`` for the shape); the op itself accepts any ``M <= MAX_M``.
+
+NVFP4 output (``trtllm::k3_fp8w_lowm_gemm_nvfp4``, low-M kernel): the epilogue rounds each output
+to BF16 and quantizes it like ``fp4_quantize`` (16-feature groups, E4M3 scales with the global
+scale, linear scale layout), so the routed experts' NVFP4 input comes straight out of the latent
+down-projection. A 16-feature group is half a warp of the epilogue (one feature row per thread):
+the group maximum is a shuffle reduction and two lanes pack one byte of codes.
 """
 
 from __future__ import annotations
@@ -472,6 +478,168 @@ def _griddepcontrol_launch_dependents(*, loc=None, ip=None):
     _asm(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
 
 
+@dsl_user_op
+def _bf16_round_f32(value, *, loc=None, ip=None):
+    """``float(bf16_rn(value))``: what a BF16 store followed by a BF16 load yields."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 h, z;\ncvt.rn.bf16.f32 h, $1;\nmov.b16 z, 0;\nmov.b32 $0, {z, h};\n}",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _abs_f32(value, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _max_f32(a, b, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "max.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _shfl_xor_f32(value, mask, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {mask}, 31, -1;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_global_f32(addr, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.f32 $0, [$1];",
+            "=f,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _rcp_approx_ftz(value, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _nvfp4_scale(amax, gsf, rgsf, rcp6, *, loc=None, ip=None):
+    """NVFP4 scale of one 16-element group with the arithmetic of ``cvt_warp_fp16_to_fp4``
+    (E4M3 scale): ``sf = e4m3(gsf * (amax * rcp(6)))`` and ``out_scale = amax != 0 ?
+    rcp(f32(sf) * rcp(gsf)) : 0`` (``rcp`` = ``rcp.approx.ftz.f32``). Returns the scale byte
+    and the output scale."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32(), T.f32()]),
+        [cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in (amax, gsf, rgsf, rcp6)],
+        "{\n"
+        ".reg .f32 s, f, z;\n"
+        ".reg .b16 h, l16, h16;\n"
+        ".reg .b32 hw;\n"
+        ".reg .pred p;\n"
+        "mov.f32 z, 0f00000000;\n"
+        "mul.rn.f32 s, $2, $5;\n"
+        "mul.rn.f32 s, $3, s;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 h, z, s;\n"
+        "cvt.rn.f16x2.e4m3x2 hw, h;\n"
+        "mov.b32 {l16, h16}, hw;\n"
+        "cvt.f32.f16 f, l16;\n"
+        "mul.rn.f32 f, f, $4;\n"
+        "rcp.approx.ftz.f32 f, f;\n"
+        "setp.eq.f32 p, $2, 0f00000000;\n"
+        "selp.f32 $1, 0f00000000, f, p;\n"
+        "cvt.u32.u16 $0, h;\n"
+        "and.b32 $0, $0, 255;\n"
+        "}",
+        "=r,=f,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _e2m1x2(lo, hi, scale, *, loc=None, ip=None):
+    """``(e2m1(hi * scale) << 4) | e2m1(lo * scale)`` (``mul.rn``, satfinite RN conversion)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in (lo, hi, scale)],
+            "{\n"
+            ".reg .f32 a, b;\n"
+            ".reg .b8 c;\n"
+            ".reg .b16 w;\n"
+            "mul.rn.f32 a, $1, $3;\n"
+            "mul.rn.f32 b, $2, $3;\n"
+            "cvt.rn.satfinite.e2m1x2.f32 c, b, a;\n"
+            "cvt.u16.u8 w, c;\n"
+            "cvt.u32.u16 $0, w;\n"
+            "}",
+            "=r,f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_b8(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "st.global.u8 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
@@ -480,8 +648,11 @@ def _griddepcontrol_launch_dependents(*, loc=None, ip=None):
 class K3Fp8wLowMGemmKernel:
     """Swap-AB MXFP8 GEMM with in-kernel activation quantization and cluster split-K."""
 
-    def __init__(self, n: int, k: int, tactic: K3LowMTactic, use_pdl: bool):
+    def __init__(self, n: int, k: int, tactic: K3LowMTactic, use_pdl: bool, fp4_out: bool = False):
         validate_tactic(n, k, tactic)
+        if fp4_out and n % MMA_M:
+            raise ValueError("the NVFP4 output needs whole 128-row weight tiles")
+        self.fp4_out = fp4_out
         self.n = n
         self.k = k
         self.mma_n = tactic.mma_n
@@ -516,8 +687,13 @@ class K3Fp8wLowMGemmKernel:
         ws_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
         m: Int32,
+        fp4_sf_addr: Int64,
+        fp4_gsf_addr: Int64,
         stream: cuda.CUstream,
     ):
+        """With ``fp4_out``, ``out_ptr`` holds the NVFP4 codes (``uint8 [M, N/2]``),
+        ``fp4_sf_addr`` the scales (``uint8 [M, N/16]``) and ``fp4_gsf_addr`` the FP32 global
+        scale; both addresses are unused (0) otherwise."""
         n, k = self.n, self.k
         mW = cute.make_tensor(w_ptr, cute.make_layout((n, k, 1), stride=(k, 1, n * k)))
         mX = cute.make_tensor(x_ptr, cute.make_layout((m, k), stride=(k, 1)))
@@ -624,6 +800,9 @@ class K3Fp8wLowMGemmKernel:
             sfa_layout,
             sfb_layout,
             x_layout,
+            out_ptr.toint(),
+            fp4_sf_addr,
+            fp4_gsf_addr,
         ).launch(
             grid=(self.n_tiles * self.split_k, 1, 1),
             block=(self.threads, 1, 1),
@@ -650,6 +829,9 @@ class K3Fp8wLowMGemmKernel:
         sfa_layout: cute.Layout,
         sfb_layout: cute.Layout,
         x_layout: cute.Layout,
+        out_addr: Int64,
+        fp4_sf_addr: Int64,
+        fp4_gsf_addr: Int64,
     ):
         S = self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -710,8 +892,10 @@ class K3Fp8wLowMGemmKernel:
             cute.arch.cluster_arrive_relaxed()
 
         if warp_idx == _TMA_WARP:
-            # Weight producer: never waits on the previous grid.
-            if cutlass.const_expr(self.use_pdl):
+            # Weight producer: never waits on the previous grid. The NVFP4 variant feeds the
+            # routed experts' persistent grid, which must not become resident (and hold every SM)
+            # before this GEMM is done: its dependents launch only when it completes.
+            if cutlass.const_expr(self.use_pdl and not self.fp4_out):
                 _griddepcontrol_launch_dependents()
             sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
             gA = cute.local_tile(
@@ -816,6 +1000,9 @@ class K3Fp8wLowMGemmKernel:
                     mbox_full,
                     peers_quantized,
                     tmem_holding_buf,
+                    out_addr,
+                    fp4_sf_addr,
+                    fp4_gsf_addr,
                 )
 
     @cute.jit
@@ -1008,8 +1195,19 @@ class K3Fp8wLowMGemmKernel:
         mbox_full,
         peers_quantized,
         tmem_holding_buf,
+        out_addr: Int64,
+        fp4_sf_addr: Int64,
+        fp4_gsf_addr: Int64,
     ):
         S = self.split_k
+        gsf = cutlass.Float32(0.0)
+        rgsf = cutlass.Float32(0.0)
+        rcp6 = cutlass.Float32(0.0)
+        if cutlass.const_expr(self.fp4_out):
+            # The NVFP4 global scale is a weight-side constant.
+            gsf = _ld_global_f32(fp4_gsf_addr)
+            rgsf = _rcp_approx_ftz(gsf)
+            rcp6 = _rcp_approx_ftz(cutlass.Float32(6.0))
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
         cute.arch.mbarrier_wait(tmem_ready, 0)
@@ -1048,7 +1246,12 @@ class K3Fp8wLowMGemmKernel:
             for i in cutlass.range_constexpr(nchunks * 4):
                 row, col = tTR_cAcc[i]
                 if col < m_store:
-                    mOut[col, n_base + row] = rAcc[i].to(cutlass.BFloat16)
+                    if cutlass.const_expr(self.fp4_out):
+                        self._store_nvfp4(
+                            rAcc[i], q, n_base, col, out_addr, fp4_sf_addr, gsf, rgsf, rcp6
+                        )
+                    else:
+                        mOut[col, n_base + row] = rAcc[i].to(cutlass.BFloat16)
         else:
             # Reduce-scatter over 4-column chunks: chunk c is owned by rank c % S. Every
             # thread holds one accumulator row. Partials for each owner are staged in the
@@ -1116,10 +1319,59 @@ class K3Fp8wLowMGemmKernel:
                             for j in cutlass.range_constexpr(4):
                                 row, col = tTR_cAcc[4 * c + j]
                                 if col < m_store:
-                                    mOut[col, n_base + row] = rAcc[4 * c + j].to(cutlass.BFloat16)
+                                    if cutlass.const_expr(self.fp4_out):
+                                        self._store_nvfp4(
+                                            rAcc[4 * c + j],
+                                            q,
+                                            n_base,
+                                            col,
+                                            out_addr,
+                                            fp4_sf_addr,
+                                            gsf,
+                                            rgsf,
+                                            rcp6,
+                                        )
+                                    else:
+                                        mOut[col, n_base + row] = rAcc[4 * c + j].to(
+                                            cutlass.BFloat16
+                                        )
             if q == 0:
                 # The staging buffer must stay valid until the copies have read it.
                 _bulk_wait_read()
+
+    @cute.jit
+    def _store_nvfp4(
+        self,
+        value,
+        q: Int32,
+        n_base: Int32,
+        col: Int32,
+        codes_addr: Int64,
+        sf_addr: Int64,
+        gsf,
+        rgsf,
+        rcp6,
+    ):
+        """NVFP4 output of one token column: ``fp4_quantize`` of the BF16-rounded row values.
+
+        Thread ``q`` holds output feature ``n_base + q``; a 16-feature scale group is one half
+        of a warp. All 32 lanes must call this (shuffles), for the same column.
+        """
+        lane = q % 32
+        b = _bf16_round_f32(value)
+        amax = _abs_f32(b)
+        for mask in cutlass.range_constexpr(4):
+            amax = _max_f32(amax, _shfl_xor_f32(amax, 1 << mask))
+        sf, scale = _nvfp4_scale(amax, gsf, rgsf, rcp6)
+        partner = _shfl_xor_f32(b, 1)
+        feature = n_base + q
+        if lane % 2 == 0:
+            _stg_b8(
+                codes_addr + Int64(col) * (self.n // 2) + Int64(feature // 2),
+                _e2m1x2(b, partner, scale),
+            )
+        if lane % 16 == 0:
+            _stg_b8(sf_addr + Int64(col) * (self.n // 16) + Int64(feature // 16), sf)
 
 
 # ---------------------------------------------------------------------------
@@ -2122,15 +2374,16 @@ def default_tactic(m: int, n: int, k: int) -> K3LowMTactic:
 
 
 @functools.cache
-def _compiled_kernel(n: int, k: int, tactic: K3LowMTactic, use_pdl: bool):
-    kernel = K3Fp8wLowMGemmKernel(n, k, tactic, use_pdl)
+def _compiled_kernel(n: int, k: int, tactic: K3LowMTactic, use_pdl: bool, fp4_out: bool = False):
+    kernel = K3Fp8wLowMGemmKernel(n, k, tactic, use_pdl, fp4_out)
     dummy = 1 << 20
     w_ptr = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
     x_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
     ws_ptr = make_ptr(cutlass.Uint8, dummy, cute.AddressSpace.gmem, assumed_align=16)
-    out_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    out_dtype = cutlass.Uint8 if fp4_out else cutlass.BFloat16
+    out_ptr = make_ptr(out_dtype, dummy, cute.AddressSpace.gmem, assumed_align=16)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(kernel, w_ptr, x_ptr, ws_ptr, out_ptr, Int32(1), stream)
+    return cute.compile(kernel, w_ptr, x_ptr, ws_ptr, out_ptr, Int32(1), Int64(0), Int64(0), stream)
 
 
 #: Mid-M tactics tuned on GB300 (CUDA graph, weights not L2-resident; score = alone +
@@ -2356,9 +2609,46 @@ def run_k3_fp8w_lowm_gemm(
         make_ptr(cutlass.Uint8, w_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         Int32(m),
+        Int64(0),
+        Int64(0),
         stream,
     )
     return out
+
+
+def run_k3_fp8w_lowm_gemm_nvfp4(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    global_sf: torch.Tensor,
+    codes: torch.Tensor,
+    sf: torch.Tensor,
+    *,
+    tactic: K3LowMTactic | None = None,
+    use_pdl: bool = True,
+) -> None:
+    """Low-M kernel with the NVFP4 output epilogue, on the current stream.
+
+    Writes ``fp4_quantize(bf16(x @ dequant(w)^T), global_sf)`` (16-element groups, E4M3 scales
+    in the linear layout) into ``codes`` (``uint8 [M, N/2]``) and ``sf`` (``uint8 [M, N/16]``),
+    byte-identical to :func:`run_k3_fp8w_lowm_gemm` followed by ``trtllm::fp4_quantize``.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    if tactic is None:
+        tactic = default_tactic(m, n, k)
+    compiled = _compiled_kernel(n, k, tactic, use_pdl, True)
+    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    compiled(
+        make_ptr(cutlass.Float8E4M3FN, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Uint8, w_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Uint8, codes.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        Int32(m),
+        Int64(sf.data_ptr()),
+        Int64(global_sf.data_ptr()),
+        stream,
+    )
 
 
 def _check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> None:
@@ -2447,6 +2737,52 @@ def k3_fp8w_lowm_gemm_out(
     return run_k3_fp8w_lowm_gemm(x, w, w_scale, out)
 
 
+def can_run_nvfp4(
+    x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor, global_sf: torch.Tensor
+) -> bool:
+    """Whether :func:`k3_fp8w_lowm_gemm_nvfp4` accepts these inputs (non-raising check): the
+    low-M kernel serves ``M`` (``M <= low_m_max_for(N, K)``), ``N`` is a multiple of 128 and
+    ``global_sf`` is one FP32 value on the same device."""
+    if not can_run(x, w, w_scale) or x.shape[0] > low_m_max_for(w.shape[0], w.shape[1]):
+        return False
+    return (
+        w.shape[0] % MMA_M == 0
+        and global_sf.dtype == torch.float32
+        and global_sf.numel() == 1
+        and global_sf.device == x.device
+        and global_sf.data_ptr() % 4 == 0
+    )
+
+
+@torch.library.custom_op("trtllm::k3_fp8w_lowm_gemm_nvfp4", mutates_args=())
+def k3_fp8w_lowm_gemm_nvfp4(
+    x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor, global_sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4 ``(codes uint8 [M, N/2], scales uint8 [M, N/16])`` of :func:`k3_fp8w_lowm_gemm`.
+
+    Byte-identical to ``trtllm::fp4_quantize(k3_fp8w_lowm_gemm(x, w, w_scale), global_sf, 16,
+    False, False)`` (E4M3 scales, linear layout) in one launch; ``M`` must be served by the
+    low-M kernel (:func:`can_run_nvfp4`).
+    """
+    _check_inputs(x, w, w_scale)
+    m, n = x.shape[0], w.shape[0]
+    if m > low_m_max_for(n, w.shape[1]) or n % MMA_M:
+        raise ValueError(f"M={m}, N={n} not served by the NVFP4 low-M path")
+    codes = torch.empty((m, n // 2), dtype=torch.uint8, device=x.device)
+    sf = torch.empty((m, n // 16), dtype=torch.uint8, device=x.device)
+    run_k3_fp8w_lowm_gemm_nvfp4(x, w, w_scale, global_sf, codes, sf)
+    return codes, sf
+
+
+@k3_fp8w_lowm_gemm_nvfp4.register_fake
+def _(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor, global_sf: torch.Tensor):
+    m, n = x.shape[0], w.shape[0]
+    return (
+        x.new_empty((m, n // 2), dtype=torch.uint8),
+        x.new_empty((m, n // 16), dtype=torch.uint8),
+    )
+
+
 __all__ = [
     "K3LowMTactic",
     "K3MidMTactic",
@@ -2454,13 +2790,16 @@ __all__ = [
     "MAX_M",
     "N_ALIGN",
     "can_run",
+    "can_run_nvfp4",
     "default_tactic",
     "k3_fp8w_lowm_gemm",
+    "k3_fp8w_lowm_gemm_nvfp4",
     "k3_fp8w_lowm_gemm_out",
     "low_m_max_for",
     "max_m_for",
     "pack_ue8m0_block_scale",
     "prepare_k3_fp8w_lowm_weight",
     "run_k3_fp8w_lowm_gemm",
+    "run_k3_fp8w_lowm_gemm_nvfp4",
     "validate_tactic",
 ]
