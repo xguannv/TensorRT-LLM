@@ -131,6 +131,30 @@ def _is_visual_gen_instance(obj) -> bool:
 
 # yapf: enable
 
+
+def _forced_sampling_temperature() -> Optional[float]:
+    """Temperature from ``TRTLLM_SERVE_FORCE_TEMPERATURE``, or None when unset.
+
+    A benchmarking aid: with it set, every completion and chat request this
+    server handles samples with that temperature, whatever the client sent. For
+    example, a disaggregated generation server benchmarked by a client that
+    sends temperature 0 then takes the same sampling path (one-model
+    speculative decoding: argmax vs. temperature sampling CUDA graph) and
+    decodes the same kind of text as under a client that sends no temperature
+    (server default 1.0). Unset or empty keeps each request's temperature.
+    """
+    value = os.getenv("TRTLLM_SERVE_FORCE_TEMPERATURE", "")
+    if not value:
+        return None
+    temperature = float(value)
+    if temperature < 0:
+        raise ValueError(
+            f"TRTLLM_SERVE_FORCE_TEMPERATURE must be >= 0, got {value!r}")
+    return temperature
+
+
+_FORCED_TEMPERATURE = _forced_sampling_temperature()
+
 # msgspec msgpack is an opt-in transport for the disagg orchestrator->worker
 # request body: the large agentic chat body otherwise blocks the serving event
 # loop on stdlib json.loads. Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1 (must be
@@ -1600,6 +1624,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if _FORCED_TEMPERATURE is not None:
+                sampling_params.temperature = _FORCED_TEMPERATURE
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2039,6 +2065,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
+            if _FORCED_TEMPERATURE is not None:
+                sampling_params.temperature = _FORCED_TEMPERATURE
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
