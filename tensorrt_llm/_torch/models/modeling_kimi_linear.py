@@ -465,6 +465,9 @@ _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 # Also convert the TP-sharded shared expert (gate_up and the row-parallel down,
 # whose reduction the MoE runtime then applies) to the FP8 weight read.
 _KIMI_K3_FP8_WEIGHT_READ_SHARED_TP_ENV = "KIMI_K3_FP8_WEIGHT_READ_SHARED_TP"
+# Also convert the dense (non-MoE) layers' BF16 MLP (layer 0) to the FP8 weight read (lossy like
+# the other conversions): see _convert_dense_mlps_to_fp8_weight_read.
+_KIMI_K3_FP8_WEIGHT_READ_DENSE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_DENSE_MLP"
 
 
 class KimiK3MoEGate(nn.Module):
@@ -1954,6 +1957,79 @@ def _swap_linear_to_fp8_weight_read(
     setattr(parent, attr, converted)
     child.weight.data = child.weight.data.new_empty(0)
     return 1
+
+
+class _Fp8RowParallelLinear(nn.Module):
+    """FP8 weight-read GEMM of a row-parallel projection followed by the all-reduce that the
+    replaced ``Linear`` (``reduce_output``) ran on its output."""
+
+    def __init__(self, fp8: "_Fp8BlockScaleWeightReadLinear", all_reduce: Optional[nn.Module]):
+        super().__init__()
+        self.fp8 = fp8
+        self.all_reduce = all_reduce
+        self.in_features = fp8.in_features
+        self.out_features = fp8.out_features
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        out = self.fp8(x)
+        if self.all_reduce is not None and (
+            all_reduce_params is None or all_reduce_params.enable_allreduce
+        ):
+            out = self.all_reduce(out, all_reduce_params=all_reduce_params)
+        return out
+
+
+def _convert_dense_mlps_to_fp8_weight_read(model: nn.Module) -> int:
+    """``KIMI_K3_FP8_WEIGHT_READ_DENSE_MLP``: swap the BF16 ``GatedMLP`` of the dense (non-MoE)
+    layers to FP8 block-scale weight reads (``_Fp8BlockScaleWeightReadLinear``, the low-M GEMM at
+    decode batch sizes). The per-rank intermediate size need not be a multiple of the 128-wide
+    scale blocks: each half of ``gate_up`` then gains zero rows and ``down`` zero columns up to
+    the next multiple, so the padded intermediate columns are ``act(0) * 0 = 0`` and add nothing.
+    The row-parallel ``down`` keeps its all-reduce (``_Fp8RowParallelLinear``). Returns the number
+    of projections converted."""
+    count = 0
+    for layer in model.layers:
+        if getattr(layer, "is_moe", True):
+            continue
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, GatedMLP):
+            continue
+        gate_up, down = mlp.gate_up_proj, mlp.down_proj
+        if not isinstance(gate_up, (nn.Linear, TrtllmLinear)) or not isinstance(
+            down, (nn.Linear, TrtllmLinear)
+        ):
+            continue
+        if getattr(gate_up, "bias", None) is not None or getattr(down, "bias", None) is not None:
+            continue
+        w_gu, w_dn = gate_up.weight.data, down.weight.data
+        if w_gu.dtype != torch.bfloat16 or w_dn.dtype != torch.bfloat16:
+            continue
+        inter = w_dn.shape[1]
+        if w_gu.shape[0] != 2 * inter or w_gu.shape[1] % 128 or w_dn.shape[0] % 128:
+            continue
+        pad = -inter % 128
+        if pad:
+            zeros = w_gu.new_zeros((pad, w_gu.shape[1]))
+            w_gu = torch.cat((w_gu[:inter], zeros, w_gu[inter:], zeros))
+            w_dn = torch.cat((w_dn, w_dn.new_zeros((w_dn.shape[0], pad))), dim=1)
+        quantize = _Fp8BlockScaleWeightReadLinear.quantize_weight
+        mlp.gate_up_proj = _Fp8BlockScaleWeightReadLinear(*quantize(w_gu), w_gu.shape[0])
+        all_reduce = down.all_reduce if getattr(down, "reduce_output", False) else None
+        mlp.down_proj = _Fp8RowParallelLinear(
+            _Fp8BlockScaleWeightReadLinear(*quantize(w_dn), w_dn.shape[0]), all_reduce
+        )
+        gate_up.weight.data = gate_up.weight.data.new_empty(0)
+        down.weight.data = down.weight.data.new_empty(0)
+        count += 2
+    if count:
+        gc.collect()
+        torch.cuda.empty_cache()
+    return count
 
 
 def _convert_moe_mlps_to_fp8_weight_read(
@@ -5301,6 +5377,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
+        if os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_DENSE_MLP_ENV, "0") == "1" and is_sm_100f():
+            converted = _convert_dense_mlps_to_fp8_weight_read(self.model)
+            logger.info(f"Kimi K3: quantized {converted} BF16 dense MLP projections to FP8")
         if self._fp8_weight_read_moe_mlp and is_sm_100f():
             shared_tp = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_SHARED_TP_ENV, "0") == "1"
             converted = _convert_moe_mlps_to_fp8_weight_read(
