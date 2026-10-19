@@ -49,6 +49,7 @@ from .spec_tail_kernels import (
 from .vocab_parallel import (
     VocabParallelHead,
     VocabShardedLogits,
+    markov_v2_enabled,
     vocab_parallel_enabled,
     vocab_parallel_sampling_enabled,
 )
@@ -1250,7 +1251,17 @@ class DFlashWorker(SpecWorkerBase):
                     )
                     if local_block is None:
                         local_block = draft_head.local_logits(block_hidden)
-                    gen_draft_tokens = draft_head.markov_tokens(
+                    markov = draft_head.markov_tokens
+                    if (
+                        markov_v2_enabled()
+                        and markov_w1 is not None
+                        and (
+                            draft_head.exchange.backend == "mnnvl"
+                            or draft_head.exchange.tp_size == 1
+                        )
+                    ):
+                        markov = draft_head.markov_tokens_fused
+                    gen_draft_tokens = markov(
                         local_block.view(num_gens, K, -1),
                         inputs["first_prev_tokens"],
                         markov_w1,

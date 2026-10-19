@@ -181,6 +181,66 @@ def _markov_check(rank, tp, comm_backend):
         assert torch.equal(out, expected)
 
 
+def _assert_markov_near_ties(full, anchors, w1, w2, fused, atol):
+    """``fused`` equals the reference chain except where its token's biased logit
+    ties the reference winner's to within ``atol`` (then the chains part ways)."""
+    from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
+
+    expected = _markov_reference(full, anchors, w1, w2)
+    mismatches = 0
+    for req in range(full.shape[0]):
+        prev = anchors[req : req + 1]
+        for step in range(full.shape[1]):
+            biased = full[req, step].float() + dspark_markov_step_bias(prev, w1, w2)[0].float()
+            got, want = int(fused[req, step]), int(expected[req, step])
+            if got != want:
+                mismatches += 1
+                assert abs(float(biased[got]) - float(biased[want])) <= atol, (req, step)
+                break
+            prev = fused[req, step : step + 1].long()
+    assert mismatches <= max(1, fused.shape[0] // 8)
+
+
+@torch.inference_mode()
+def _markov_fused_check(rank, tp, comm_backend):
+    head, vocab = _make_head(rank, tp, comm_backend)
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    for num_reqs, block in ((1, 1), (1, 7), (2, 6), (4, 7), (32, 6)):
+        full = (torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3).to(
+            torch.bfloat16
+        )
+        anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+        anchors[0] = -1 if num_reqs > 1 else anchors[0]  # out-of-vocab anchor -> zero bias
+        local = full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+        fused = head.markov_tokens_fused(local, anchors, w1, w2)
+        gathered = MPI.COMM_WORLD.allgather(fused.cpu())
+        assert all(torch.equal(g, gathered[0]) for g in gathered)
+        _assert_markov_near_ties(full, anchors, w1, w2, fused, atol=0.05)
+    # Zero bias: exact, including the many cross-shard ties of quantized logits.
+    full = torch.randint(0, 3, (16, 6, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+    anchors = torch.randint(0, vocab, (16,), device="cuda", generator=gen)
+    zero_w2 = torch.zeros_like(w2)
+    local = full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+    assert torch.equal(
+        head.markov_tokens_fused(local, anchors, w1, zero_w2),
+        _markov_reference(full, anchors, w1, zero_w2),
+    )
+    # CUDA graph replay reproduces the eager tokens.
+    full = (torch.randn(2, 6, vocab, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+    local = full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+    anchors = torch.randint(0, vocab, (2,), device="cuda", generator=gen)
+    eager = head.markov_tokens_fused(local, anchors, w1, w2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = head.markov_tokens_fused(local, anchors, w1, w2)
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager)
+
+
 @torch.inference_mode()
 def _sample_check(rank, tp, comm_backend):
     from tensorrt_llm._torch.speculative.vocab_parallel import VocabShardedLogits
@@ -326,6 +386,13 @@ def test_vocab_parallel_argmax(comm_backend, mpi_pool_executor):
 @pytest.mark.parametrize("mpi_pool_executor", _WORLD_SIZES, indirect=True)
 def test_vocab_parallel_markov_tokens(comm_backend, mpi_pool_executor):
     _submit(mpi_pool_executor, _markov_check, comm_backend)
+
+
+@_needs_gpus
+@pytest.mark.parametrize("comm_backend", ["mnnvl"])
+@pytest.mark.parametrize("mpi_pool_executor", _WORLD_SIZES, indirect=True)
+def test_vocab_parallel_markov_tokens_fused(comm_backend, mpi_pool_executor):
+    _submit(mpi_pool_executor, _markov_fused_check, comm_backend)
 
 
 @_needs_gpus

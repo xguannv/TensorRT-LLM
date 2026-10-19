@@ -68,12 +68,15 @@ from tensorrt_llm.mapping import Mapping
 VOCAB_PARALLEL_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL"
 VOCAB_PARALLEL_SAMPLING_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_SAMPLING"
 VOCAB_PARALLEL_COMM_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_COMM"
+MARKOV_V2_ENV_VAR = "TLLM_DSPARK_MARKOV_V2"
 
 _INT32_MAX = tl.constexpr(2**31 - 1)
 # Index reported by a split without valid columns; exact in float32 and above
 # every supported vocab id.
 _EMPTY_INDEX = tl.constexpr(2**24)
 _LOCAL_BLOCK_V = 2048
+# Shard columns per program of the fused Markov step.
+_MARKOV_BLOCK_V = 128
 _REDUCE_BLOCK_ROWS = 32
 # Programs the local reductions aim to launch (rows x column splits).
 _TARGET_PROGRAMS = 256
@@ -82,6 +85,12 @@ _TARGET_PROGRAMS = 256
 def vocab_parallel_enabled() -> bool:
     """Whether ``TLLM_SPEC_VOCAB_PARALLEL=1`` selects the vocab-parallel paths."""
     return os.environ.get(VOCAB_PARALLEL_ENV_VAR, "0") == "1"
+
+
+def markov_v2_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_MARKOV_V2=1`` runs each DSpark Markov step as one
+    fused kernel (see :meth:`VocabParallelHead.markov_tokens_fused`)."""
+    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") == "1"
 
 
 def vocab_parallel_sampling_enabled() -> bool:
@@ -381,6 +390,140 @@ def _markov_add_local_argmax_kernel(
     )
 
 
+@triton.jit
+def _argmax_pairs(vals, idx, axis: tl.constexpr):
+    # The (value, index) that a _argmax_combine reduction along ``axis`` returns,
+    # from native reductions: NaN beats every number and the lowest index wins
+    # among NaNs; otherwise the largest value, lowest index among equal values
+    # (+0.0 == -0.0). The selected index is unique, so it does not depend on the
+    # reduction order; the value is the selected entry's (NaN, or the maximum).
+    is_nan = vals != vals
+    any_nan = tl.max(is_nan.to(tl.int32), axis=axis) > 0
+    vmax = tl.max(tl.where(is_nan, float("-inf"), vals), axis=axis)
+    cand = tl.where(
+        tl.expand_dims(any_nan, axis), is_nan, (vals == tl.expand_dims(vmax, axis)) & ~is_nan
+    )
+    best = tl.min(tl.where(cand, idx, _INT32_MAX), axis=axis)
+    return tl.where(any_nan, float("nan"), vmax), best
+
+
+@triton.jit
+def _markov_round_kernel(
+    pairs_ptr,
+    stride_pairs,
+    n_slots,
+    anchor_ptr,
+    w1_ptr,
+    w2_ptr,
+    stride_w2,
+    base_ptr,
+    stride_base,
+    tokens_ptr,
+    stride_tokens,
+    step,
+    partial_ptr,
+    ticket_ptr,
+    out_ptr,
+    stride_out,
+    slot,
+    num_reqs,
+    vocab,
+    n_cols,
+    col_base,
+    RANK: tl.constexpr,
+    FROM_ANCHOR: tl.constexpr,
+    ZERO_WIDTH: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    # One Markov step for every request over this program's BLOCK_V shard
+    # columns: resolve prev (the anchor at step 0, else the global argmax of the
+    # previous step's exchanged pairs), gather its markov_w1 row, compute the
+    # columns' markov_w2 bias, add the step's shard logits and reduce to a
+    # (value, global index) candidate. The last program to finish reduces every
+    # program's candidates to this rank's pair per request and publishes it
+    # (with the rest of the row zeroed) for the all-reduce exchange.
+    pid = tl.program_id(0)
+    reqs = tl.arange(0, BLOCK_B)
+    rmask = reqs < num_reqs
+    cols = pid * BLOCK_V + tl.arange(0, BLOCK_V)
+    cmask = cols < n_cols
+    r = tl.arange(0, RANK)
+    # The weight block is older than any predecessor in the chain: read it
+    # before waiting on the previous grid.
+    w2 = tl.load(w2_ptr + cols[:, None].to(tl.int64) * stride_w2 + r[None, :], mask=cmask[:, None])
+    if not FROM_ANCHOR:
+        # Step > 0: this step's shard logits were written by the block's LM head,
+        # which completed before step 0's kernel (it waits on it) ran.
+        base = tl.load(
+            base_ptr + reqs[:, None].to(tl.int64) * stride_base + cols[None, :],
+            mask=rmask[:, None] & cmask[None, :],
+            other=0.0,
+        )
+    tl.extra.cuda.gdc_launch_dependents()
+    tl.extra.cuda.gdc_wait()
+    if FROM_ANCHOR:
+        base = tl.load(
+            base_ptr + reqs[:, None].to(tl.int64) * stride_base + cols[None, :],
+            mask=rmask[:, None] & cmask[None, :],
+            other=0.0,
+        )
+        prev = tl.load(anchor_ptr + reqs, mask=rmask, other=-1).to(tl.int64)
+    else:
+        s = tl.arange(0, BLOCK_SLOTS)
+        smask = rmask[:, None] & (s[None, :] < n_slots)
+        pptrs = pairs_ptr + reqs[:, None].to(tl.int64) * stride_pairs + 2 * s[None, :]
+        vals = tl.load(pptrs, mask=smask, other=float("-inf"))
+        gidx = tl.where(smask, tl.load(pptrs + 1, mask=smask, other=0.0).to(tl.int32), _INT32_MAX)
+        _, best = _argmax_pairs(vals, gidx, 1)
+        prev = best.to(tl.int64)
+        if pid == 0:
+            tl.store(
+                tokens_ptr + reqs.to(tl.int64) * stride_tokens + step - 1,
+                prev.to(tl.int32),
+                mask=rmask,
+            )
+    valid = rmask & (prev >= 0) & (prev < vocab)
+    w1 = tl.load(
+        w1_ptr + tl.where(valid, prev, 0)[:, None] * RANK + r[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    # F.linear(markov_w1[prev], w2) rounds the FP32 dot to the weights' dtype.
+    bias = tl.dot(w1, tl.trans(w2)).to(w2.dtype).to(tl.float32)
+    vals = tl.where(rmask[:, None] & cmask[None, :], base.to(tl.float32) + bias, float("-inf"))
+    idx = tl.where(cmask[None, :], cols[None, :], _INT32_MAX) + tl.zeros(
+        [BLOCK_B, BLOCK_V], tl.int32
+    )
+    cand_val, cand_idx = _argmax_pairs(vals, idx, 1)
+    cand_idx = _global_index(cand_idx, col_base)
+    pbase = partial_ptr + (pid * BLOCK_B + reqs) * 2
+    tl.store(pbase, cand_val)
+    tl.store(pbase + 1, cand_idx.to(tl.float32))
+    # Last-arriving program: every program's candidates are visible to it once
+    # its acquire-release ticket observes their releases.
+    tl.debug_barrier()
+    ticket = tl.atomic_add(ticket_ptr, 1, sem="acq_rel", scope="gpu")
+    if ticket == tl.num_programs(0) - 1:
+        p = tl.arange(0, BLOCK_P)
+        pm = (p[:, None] < tl.num_programs(0)) & rmask[None, :]
+        qptrs = partial_ptr + (p[:, None] * BLOCK_B + reqs[None, :]) * 2
+        qv = tl.load(qptrs, mask=pm, other=float("-inf"), volatile=True)
+        qi = tl.where(
+            pm, tl.load(qptrs + 1, mask=pm, other=0.0, volatile=True).to(tl.int32), _INT32_MAX
+        )
+        win_val, win_idx = _argmax_pairs(qv, qi, 0)
+        row = out_ptr + reqs.to(tl.int64) * stride_out
+        z = tl.arange(0, ZERO_WIDTH)
+        zmask = rmask[:, None] & ((z[None, :] < 2 * slot) | (z[None, :] >= 2 * slot + 2))
+        tl.store(row[:, None] + z[None, :], tl.zeros([BLOCK_B, ZERO_WIDTH], tl.float32), mask=zmask)
+        tl.store(row + 2 * slot, win_val, mask=rmask)
+        tl.store(row + 2 * slot + 1, win_idx.to(tl.float32), mask=rmask)
+        tl.atomic_xchg(ticket_ptr, 0, sem="relaxed", scope="gpu")
+
+
 class _PairLayout(NamedTuple):
     """Where the local kernels publish pairs, for one exchange."""
 
@@ -607,6 +750,112 @@ class VocabParallelHead:
         )
         out = torch.empty((local.shape[0],), dtype=out_dtype, device=local.device)
         return self._exchange_and_reduce(layout, local.shape[0], out)
+
+    def _markov_round_buffers(self, num_reqs: int, device):
+        """Persistent scratch of the fused Markov steps (candidates, ticket), and
+        the per-rank-pair exchange layout: one slot per rank."""
+        programs = triton.cdiv(self.shard_width, _MARKOV_BLOCK_V)
+        block_b = max(16, triton.next_power_of_2(max(num_reqs, 1)))
+        key = (programs, block_b, str(device))
+        cache = getattr(self, "_markov_round_cache", None)
+        if cache is None or cache[0] != key:
+            partial = torch.empty((programs * block_b * 2,), dtype=torch.float32, device=device)
+            ticket = torch.zeros((1,), dtype=torch.int32, device=device)
+            self._markov_round_cache = (key, partial, ticket)
+        return programs, block_b, self._markov_round_cache[1], self._markov_round_cache[2]
+
+    def markov_tokens_fused(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        markov_w1: torch.Tensor,
+        markov_w2: torch.Tensor,
+    ) -> torch.Tensor:
+        """:meth:`markov_tokens` with one launch per step (plus the exchange).
+
+        Each step's kernel resolves prev, gathers its ``markov_w1`` row, computes
+        this rank's ``markov_w2`` bias columns, adds the step's shard logits and
+        publishes the rank's (value, global index) pair; the exchange is the same
+        all-reduce. The bias is an FP32 dot of the BF16 row and weights rounded
+        to BF16, like the ``F.linear`` of the unfused chain, but its summation
+        order differs, so a draft token can differ where two vocab entries tie to
+        within that rounding. Requires the MNNVL (or single-rank) exchange.
+        """
+        num_reqs, block_size, shard = local_block.shape
+        device = local_block.device
+        tokens = torch.empty((num_reqs, block_size), dtype=torch.int32, device=device)
+        if num_reqs == 0 or block_size == 0:
+            return tokens
+        rank = markov_w1.shape[1]
+        w2_shard = self.markov_w2_shard(markov_w2)
+        assert (
+            w2_shard.stride(-1) == 1 and markov_w1.is_contiguous() and local_block.stride(-1) == 1
+        )
+        programs, block_b, partial, ticket = self._markov_round_buffers(num_reqs, device)
+        tp = self.exchange.tp_size
+        width = triton.next_power_of_2(2 * tp)
+        pairs, stride_pairs, n_slots = first_prev_tokens, 0, 1
+        for step in range(block_size + 1):
+            if step == block_size:
+                # The last step's pairs only resolve the final draft token.
+                emb = torch.empty((num_reqs, rank), dtype=markov_w1.dtype, device=device)
+                _markov_reduce_embed_kernel[(num_reqs,)](
+                    pairs,
+                    stride_pairs,
+                    2,
+                    n_slots,
+                    first_prev_tokens,
+                    markov_w1,
+                    emb,
+                    tokens,
+                    tokens.stride(0),
+                    self.vocab_size,
+                    step,
+                    RANK=rank,
+                    FROM_ANCHOR=False,
+                    BLOCK_SLOTS=triton.next_power_of_2(n_slots),
+                    BLOCK_R=triton.next_power_of_2(rank),
+                    num_warps=4,
+                )
+                break
+            buf = torch.empty((num_reqs, width), dtype=torch.float32, device=device)
+            step_logits = local_block[:, step]
+            _markov_round_kernel[(programs,)](
+                pairs,
+                stride_pairs,
+                n_slots,
+                first_prev_tokens,
+                markov_w1,
+                w2_shard,
+                w2_shard.stride(0),
+                step_logits,
+                step_logits.stride(0),
+                tokens,
+                tokens.stride(0),
+                step,
+                partial,
+                ticket,
+                buf,
+                width,
+                self.mapping.tp_rank if tp > 1 else 0,
+                num_reqs,
+                self.vocab_size,
+                shard,
+                self.col_base,
+                RANK=rank,
+                FROM_ANCHOR=step == 0,
+                ZERO_WIDTH=width,
+                BLOCK_B=block_b,
+                BLOCK_SLOTS=triton.next_power_of_2(max(tp, 1)),
+                BLOCK_V=_MARKOV_BLOCK_V,
+                BLOCK_P=triton.next_power_of_2(programs),
+                num_warps=4,
+                launch_pdl=True,
+            )
+            if tp > 1:
+                buf = self.exchange._mnnvl(buf, all_reduce_params=AllReduceParams())
+            pairs, stride_pairs, n_slots = buf, width, tp
+        return tokens
 
     def markov_w2_shard(self, markov_w2: torch.Tensor) -> torch.Tensor:
         """This rank's rows of ``markov_w2`` (cached; a contiguous row slice)."""
