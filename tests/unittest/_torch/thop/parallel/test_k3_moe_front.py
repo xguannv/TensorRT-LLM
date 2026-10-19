@@ -178,6 +178,7 @@ def _runtime(layer_idx=1, group=None):
         comm=None, apply_router_weight_on_input=False, backend=_Backend()
     )
     rt.layer_idx = layer_idx
+    rt._router_exact = False
     rt.latent_down_stream = torch.cuda.Stream()
     rt.moe_fc2_event = torch.cuda.Event()
     rt._moe_group = group if group is not None else weakref.WeakValueDictionary()
@@ -186,17 +187,30 @@ def _runtime(layer_idx=1, group=None):
     return rt
 
 
-def test_runtime_router_exact(monkeypatch):
-    from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
-
+def test_runtime_router_exact():
     rt = _runtime()
     for m in (7, 14, 16, 32):
         x = _hidden(m, m)
         ref = rt.gate.compute_logits(x)
-        monkeypatch.setattr(mkl, "_K3_ROUTER_EXACT", True)
+        rt._router_exact = True
         out = rt._router_logits(x)
-        monkeypatch.setattr(mkl, "_K3_ROUTER_EXACT", False)
+        rt._router_exact = False
         assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "kda"])
+def test_router_exact_for_layer(monkeypatch, mode):
+    """TRTLLM_K3_ROUTER_EXACT=1 selects every MoE layer, =kda only those after a KDA block."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
+
+    cfg = SimpleNamespace(
+        linear_attn_config={"kda_layers": [1, 2, 3, 5, 6, 7], "full_attn_layers": [4, 8]}
+    )
+    monkeypatch.setattr(mkl, "_K3_ROUTER_EXACT_MODE", mode)
+    got = [mkl._router_exact_for_layer(cfg, i) for i in range(8)]
+    kda = [mkl._is_kda_layer(cfg, i) for i in range(8)]
+    assert got == {"0": [False] * 8, "1": [True] * 8, "kda": kda}[mode]
+    assert kda == [True, True, True, False, True, True, True, False]
 
 
 def test_runtime_ld_fp4(monkeypatch):

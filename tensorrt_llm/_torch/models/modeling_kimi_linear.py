@@ -363,9 +363,15 @@ def _k3_shared_tail_stream() -> Optional[torch.cuda.Stream]:
 #     otherwise pushes the shared-expert chain (and the latent all-reduce behind it) later.
 #   TRTLLM_K3_ROUTER_EXACT=1: router logits of M <= 16 tokens from k3_router_exact (bit-identical
 #     to dsv3_router_gemm_op; its weight is copied into shared memory before griddepcontrol.wait).
+#     =kda: only in the MoE blocks of KDA layers. The faster router also starts the route tail
+#     earlier, inside the burst of latent_down and the shared gate_up; after an MLA attention block
+#     the route tail then stretches by ~3 us (b2 gen-only, GB300) and the routing chain gets longer
+#     than with dsv3_router_gemm_op, while after a KDA attention block the front gets shorter.
 _K3_LD_FP4 = os.environ.get("TRTLLM_K3_LD_FP4", "0") == "1"
 _K3_LD_FP4_MAX_M = int(os.environ.get("TRTLLM_K3_LD_FP4_MAX_M", "32"))
-_K3_ROUTER_EXACT = os.environ.get("TRTLLM_K3_ROUTER_EXACT", "0") == "1"
+_K3_ROUTER_EXACT_MODE = os.environ.get("TRTLLM_K3_ROUTER_EXACT", "0")
+if _K3_ROUTER_EXACT_MODE not in ("0", "1", "kda"):
+    raise ValueError(f"TRTLLM_K3_ROUTER_EXACT must be 0, 1 or kda, got {_K3_ROUTER_EXACT_MODE!r}")
 # TRTLLM_K3_MOE_L2_PREFETCH: comma list of what the latent-down stream prefetches into L2 once the
 # routed FC2 is done (the latent all-reduce, latent_up and the next attention block leave HBM mostly
 # idle; k3_l2_prefetch, hints only): "lu" this layer's latent_up weight, "front" the next MoE layer's
@@ -738,6 +744,13 @@ def _is_kda_layer(cfg, layer_idx: int) -> bool:
 
 def _is_mla_layer(cfg, layer_idx: int) -> bool:
     return (layer_idx + 1) in cfg.linear_attn_config["full_attn_layers"]
+
+
+def _router_exact_for_layer(cfg, layer_idx: int) -> bool:
+    """Whether ``TRTLLM_K3_ROUTER_EXACT`` serves the router of this layer's MoE block."""
+    if _K3_ROUTER_EXACT_MODE == "kda":
+        return _is_kda_layer(cfg, layer_idx)
+    return _K3_ROUTER_EXACT_MODE == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -2430,6 +2443,7 @@ class KimiK3MoERuntime(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self._router_exact = _router_exact_for_layer(cfg, layer_idx)
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
@@ -3078,8 +3092,9 @@ class KimiK3MoERuntime(nn.Module):
 
     def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """FP32 router logits; ``TRTLLM_K3_ROUTER_EXACT`` serves ``M <= 16`` BF16 tokens with
-        ``k3_router_exact`` (bit-identical to the ``dsv3_router_gemm_op`` it replaces)."""
-        if _K3_ROUTER_EXACT and not torch.compiler.is_compiling():
+        ``k3_router_exact`` (bit-identical to the ``dsv3_router_gemm_op`` it replaces) in the
+        layers it selects."""
+        if self._router_exact and not torch.compiler.is_compiling():
             from ..cute_dsl_kernels.blackwell import k3_router_exact
 
             x = hidden_states.reshape(-1, self.gate.gating_dim)
