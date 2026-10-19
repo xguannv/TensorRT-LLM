@@ -20,6 +20,8 @@ group) and consumes the same resmoothed FP8 weight + DeepGEMM-packed UE8M0 scale
 the current SM100/SM103 path, which quantizes activations with one scale per 1x128.
 """
 
+import functools
+
 import pytest
 import torch
 
@@ -767,3 +769,131 @@ def test_weight_read_linear_forward_sigmoid(m, monkeypatch):
     out = linear.forward_sigmoid(x)
     torch.cuda.synchronize()
     assert torch.equal(out, linear(x).sigmoid())
+
+
+# Kimi-K3 low-M projections (N, K): latent down / up, KDA qkvg, KDA / MLA o_proj, MLA q_a+kv_a,
+# MLA q_b, MLA gate, shared expert gate-up / down.
+K3_LOW_M_SHAPES = [
+    (3584, 7168),
+    (7168, 3584),
+    (3072, 7168),
+    (7168, 768),
+    (2112, 7168),
+    (18432, 1536),
+    (768, 7168),
+    (12288, 7168),
+    (7168, 6144),
+]
+
+
+def _use_sf_slots(monkeypatch, mod, on):
+    """Compile kernels from here on with ``TRTLLM_K3_LOWM_SF_SLOTS`` = ``on`` (fresh caches)."""
+    monkeypatch.setattr(mod, "_SF_SLOTS", on)
+    for name in ("_compiled_kernel", "_compiled_gated_kernel"):
+        monkeypatch.setattr(mod, name, functools.cache(getattr(mod, name).__wrapped__))
+
+
+def test_sf_slots_fit_tmem_allocation(monkeypatch):
+    """Default tactics whose weight ring wraps get several SFB slots inside the unchanged TMEM
+    allocation; the others keep one."""
+    mod = _kernel_module()
+    monkeypatch.setattr(mod, "_SF_SLOTS", True)
+    torch.zeros(1, device="cuda")  # the split-K heuristic queries the device's cluster occupancy
+    wrapping = 0
+    for n, k in K3_LOW_M_SHAPES:
+        for m in (8, 16, 32, 64):
+            if m > mod.low_m_max_for(n, k):
+                continue
+            tactics = [mod.default_tactic(m, n, k)]
+            try:
+                tactics.append(mod.gated_tactic(m, n, k))
+            except ValueError:
+                pass  # no gated tactic fits this shape
+            for tactic in tactics:
+                kt_max = -(-(k // mod.CTA_K) // tactic.split_k)
+                b_stages = min(tactic.b_stages, kt_max)
+                a_stages = min(tactic.a_stages, kt_max)
+                slots = mod._sf_slots(tactic.mma_n, b_stages, kt_max, a_stages)
+                assert b_stages % slots == 0
+                assert tactic.mma_n + mod._SF_TMEM_COLS * (1 + slots) <= mod._TMEM_COLS
+                assert (slots > 1) == (kt_max > a_stages)
+                wrapping += slots > 1
+    assert wrapping > 0
+
+
+@pytest.mark.parametrize("n, k", K3_LOW_M_SHAPES)
+@pytest.mark.parametrize("m", [7, 14, 32, 64])
+def test_sf_slots_bitwise(m, n, k, monkeypatch):
+    """Per-K-tile TMEM scale slots do not change a single output bit."""
+    mod = _kernel_module()
+    w_pad, scale = _make_padded_weight(n, k, seed=n + k)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=m)
+    outs = []
+    for on in (False, True):
+        _use_sf_slots(monkeypatch, mod, on)
+        outs.append(_run(mod, x, w, packed))
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1])
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 5])
+@pytest.mark.parametrize(
+    "m, b_stages, quant_warps, quant_groups",
+    [(5, 4, 4, 4), (5, 8, 4, 4), (40, 2, 4, 2), (40, 4, 8, 4), (40, 6, 8, 2)],
+)
+def test_sf_slots_split_k_tactics(m, b_stages, quant_warps, quant_groups, split_k, monkeypatch):
+    """Two to four slots (B ring depths 2-8, the weight ring wrapping), ranks with unequal K-tile
+    counts."""
+    mod = _kernel_module()
+    n, k = 384, 1280
+    w_fp8, scale = _make_weight(n, k, seed=11)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_fp8, scale)
+    x = _make_activation(m, k, seed=5)
+    tactic = mod.K3LowMTactic(
+        mma_n=mod.mma_n_for(m),
+        split_k=split_k,
+        a_stages=2,
+        x_stages=quant_groups * 2,
+        b_stages=b_stages,
+        quant_warps=quant_warps,
+        quant_groups=quant_groups,
+    )
+    outs = []
+    for on in (False, True):
+        _use_sf_slots(monkeypatch, mod, on)
+        outs.append(_run(mod, x, w, packed, tactic=tactic))
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1])
+
+
+@pytest.mark.parametrize("m", [7, 32, 64])
+def test_sf_slots_epilogue_variants(m, monkeypatch):
+    """NVFP4 output, gated and sigmoid kernels with and without scale slots."""
+    mod = _kernel_module()
+    results = []
+    for on in (False, True):
+        _use_sf_slots(monkeypatch, mod, on)
+        res = []
+        n, k = 7168, 768
+        w_pad, scale = _make_padded_weight(n, k, seed=1)
+        w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad, scale)
+        x = _make_activation(m, k, seed=m)
+        gsf = torch.full((1,), 448.0 * 6.0 / 64.0, device="cuda", dtype=torch.float32)
+        codes = torch.empty((m, n // 2), device="cuda", dtype=torch.uint8)
+        sf = torch.empty((m, n // 16), device="cuda", dtype=torch.uint8)
+        mod.run_k3_fp8w_lowm_gemm_nvfp4(x, w, packed, gsf, codes, sf)
+        res += [codes, sf]
+        n, k = 2112, 7168
+        w_pad, scale = _make_padded_weight(n, k, seed=2)
+        w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+        x = _make_activation(m, k, seed=m)
+        res.append(mod.k3_fp8w_lowm_gemm_gated(x, _make_gate(m, k, seed=m), w, packed))
+        n, k = 768, 7168
+        w_pad, scale = _make_padded_weight(n, k, seed=3)
+        w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad, scale)
+        res.append(mod.k3_fp8w_lowm_gemm_sigmoid(_make_activation(m, k, seed=m) * 0.05, w, packed))
+        results.append(res)
+    torch.cuda.synchronize()
+    for a, b in zip(*results):
+        assert torch.equal(a, b)

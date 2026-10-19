@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -104,6 +105,10 @@ _QUANT_DONE_BARRIER_ID = 2
 _EPI_BARRIER_ID = 3
 _TMEM_COLS = 128
 _SF_TMEM_COLS = 16
+#: ``TRTLLM_K3_LOWM_SF_SLOTS=1``: where the weight ring wraps, the low-M kernels copy the activation
+#: scales (SFB) of consecutive K tiles into different TMEM slots (:func:`_sf_slots`); 0 (default)
+#: uses one slot.
+_SF_SLOTS = os.environ.get("TRTLLM_K3_LOWM_SF_SLOTS", "0") == "1"
 #: L2 eviction hint for the streamed weight (CacheHintSm90::EVICT_FIRST).
 _EVICT_FIRST = 0x12F0000000000000
 #: BF16 bit pattern of ~1e-4; activation groups below this amax share its scale.
@@ -118,6 +123,28 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _align_up(a: int, b: int) -> int:
     return _ceil_div(a, b) * b
+
+
+def _sf_slot_budget(mma_n: int) -> int:
+    """SFB slots that fit next to the accumulator and SFA in :data:`_TMEM_COLS` columns."""
+    return (_TMEM_COLS - mma_n - _SF_TMEM_COLS) // _SF_TMEM_COLS
+
+
+def _sf_slots(mma_n: int, b_stages: int, kt_max: int, a_stages: int) -> int:
+    """TMEM SFB slots of the low-M kernel: K tile ``kt`` uses slot ``kt % slots``.
+
+    With one slot, the scale copy of a K tile waits for the MMAs of the previous tile to read
+    the same columns, and so do the MMAs behind it. That matters where the weight ring wraps
+    (``kt_max > a_stages``): there the MMAs release the weight stages the TMA warp refills. With
+    ``TRTLLM_K3_LOWM_SF_SLOTS=1`` such kernels use the largest divisor of ``b_stages`` that fits
+    the TMEM allocation (4 for ``mma_n <= 32``, 2 for 64), so the allocation stays
+    :data:`_TMEM_COLS` columns and each B ring stage has a fixed slot. Kernels whose whole weight
+    slice fits the ring keep one slot (measured: several slots cost them ~0.2 us).
+    """
+    if not _SF_SLOTS or kt_max <= a_stages:
+        return 1
+    budget = _sf_slot_budget(mma_n)
+    return max(d for d in range(1, b_stages + 1) if b_stages % d == 0 and d <= budget)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -778,6 +805,7 @@ class K3Fp8wLowMGemmKernel:
         self.warps_per_group = tactic.quant_warps // tactic.quant_groups
         self.quant_threads = 32 * tactic.quant_warps
         self.threads = 32 * _QUANT_WARP0 + self.quant_threads
+        self.sf_slots = _sf_slots(self.mma_n, self.b_stages, self.kt_max, self.a_stages)
 
     @cute.jit
     def __call__(
@@ -1233,19 +1261,23 @@ class K3Fp8wLowMGemmKernel:
                 tiled_mma, self.mma_tiler, SF_VEC, cute.slice_(sfa_layout, (None, None, None, 0))
             ),
         )
-        sfb_tmem_ptr = cute.recast_ptr(
-            acc_tmem_ptr + self.mma_n + _SF_TMEM_COLS, dtype=cutlass.Float8E8M0FNU
-        )
-        tCtSFB = cute.make_tensor(
-            sfb_tmem_ptr,
-            blockscaled_utils.make_tmem_layout_sfb(
-                tiled_mma, self.mma_tiler, SF_VEC, cute.slice_(sfb_layout, (None, None, None, 0))
-            ),
+        sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+            tiled_mma, self.mma_tiler, SF_VEC, cute.slice_(sfb_layout, (None, None, None, 0))
         )
         sSFA = storage.sSFA.get_tensor(sfa_layout)
         sSFB = storage.sSFB.get_tensor(sfb_layout)
         s2t_sfa, tCsSFA_s2t, tCtSFA_s2t = self._s2t_partition(sSFA, tCtSFA)
-        s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = self._s2t_partition(sSFB, tCtSFB)
+        # SFB slot j: TMEM columns [mma_n + 16 * (1 + j), +16) (see _sf_slots).
+        sfb_slots = []
+        for j in cutlass.range_constexpr(self.sf_slots):
+            tCtSFB = cute.make_tensor(
+                cute.recast_ptr(
+                    acc_tmem_ptr + self.mma_n + _SF_TMEM_COLS * (1 + j),
+                    dtype=cutlass.Float8E8M0FNU,
+                ),
+                sfb_tmem_layout,
+            )
+            sfb_slots.append((tCtSFB, *self._s2t_partition(sSFB, tCtSFB)))
 
         # The weight scale is folded into SFB, so SFA is a constant 1.0 (UE8M0 127).
         lane = cute.arch.lane_idx()
@@ -1262,26 +1294,59 @@ class K3Fp8wLowMGemmKernel:
         num_kphases = cute.size(tCrA, mode=[2])
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        for kt in cutlass.range(kt_count, unroll=1):
-            a_stage = kt % self.a_stages
-            b_stage = kt % self.b_stages
-            cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
-            cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
-            cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
-            for kp in cutlass.range_constexpr(num_kphases):
-                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
-                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                cute.gemm(
-                    tiled_mma,
-                    tCtAcc,
-                    tCrA[(None, None, kp, a_stage)],
-                    tCrB[(None, None, kp, b_stage)],
-                    tCtAcc,
-                )
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            with cute.arch.elect_one():
-                tcgen05.commit(a_empty + a_stage)
-                tcgen05.commit(b_empty + b_stage)
+        if cutlass.const_expr(self.sf_slots == 1):
+            tCtSFB, s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = sfb_slots[0]
+            for kt in cutlass.range(kt_count, unroll=1):
+                a_stage = kt % self.a_stages
+                b_stage = kt % self.b_stages
+                cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
+                cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
+                for kp in cutlass.range_constexpr(num_kphases):
+                    tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                    tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[(None, None, kp, a_stage)],
+                        tCrB[(None, None, kp, b_stage)],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                with cute.arch.elect_one():
+                    tcgen05.commit(a_empty + a_stage)
+                    tcgen05.commit(b_empty + b_stage)
+        else:
+            # Unrolled over the B ring: stage b and its scale slot b % sf_slots are
+            # compile-time constants. Steps past kt_count only update the MMA descriptor.
+            for kt0 in cutlass.range(0, kt_count, self.b_stages, unroll=1):
+                for b_stage in cutlass.range_constexpr(self.b_stages):
+                    kt = kt0 + b_stage
+                    a_stage = kt % self.a_stages
+                    tCtSFB, s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = sfb_slots[b_stage % self.sf_slots]
+                    live = kt < kt_count
+                    if live:
+                        cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                        cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
+                        cute.copy(
+                            s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t
+                        )
+                    for kp in cutlass.range_constexpr(num_kphases):
+                        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                        if live:
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[(None, None, kp, a_stage)],
+                                tCrB[(None, None, kp, b_stage)],
+                                tCtAcc,
+                            )
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    if live:
+                        with cute.arch.elect_one():
+                            tcgen05.commit(a_empty + a_stage)
+                            tcgen05.commit(b_empty + b_stage)
         with cute.arch.elect_one():
             tcgen05.commit(acc_full)
 
