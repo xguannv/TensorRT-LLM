@@ -80,6 +80,8 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
+from .disagg_gen_prefetch import (num_prefetch_admissions,
+                                  pop_prefetch_requests, prefetch_request_limit)
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -354,6 +356,13 @@ def _distributed_warmup_guard(dist: Distributed,
             else:
                 start_rank_crash_kill_watchdog(world, error_delivered=None)
         raise
+
+
+def _is_prefetchable_queue_item(item: RequestQueueItem) -> bool:
+    """A generation-only request without child requests (KV prefetch admission)."""
+    request = item.request
+    return (request is not None and not item.child_req_ids and
+            request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY)
 
 
 @dataclasses.dataclass
@@ -1101,6 +1110,16 @@ class PyExecutor:
         # Optional GPU keepalive for the fill gate (TRTLLM_GPU_KEEPALIVE=1).
         # Allocates nothing here; its device side is set up at its first tick.
         self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)
+        # TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS: generation-only requests admitted
+        # beyond the batch size so that their KV-cache transfer runs while the
+        # batch is full (see disagg_gen_prefetch.py). Disaggregated workers
+        # without attention DP or pipeline parallelism only.
+        self._disagg_gen_prefetch_limit = 0
+        if (self.kv_cache_transceiver is not None
+                and not self.enable_attention_dp and self.dist.pp_size == 1
+                and not self.is_benchmark_disagg):
+            self._disagg_gen_prefetch_limit = prefetch_request_limit(
+                self.max_num_active_requests)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -6658,6 +6677,19 @@ class PyExecutor:
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
+        if (self._disagg_gen_prefetch_limit > 0 and not getattr(
+                self, "_mm_encoder_item_scheduling_enabled", False)):
+            num_admitted = total_num_active_requests + sum(
+                1 + len(item.child_req_ids or ()) for item in new_requests)
+            num_pending_init = len(new_requests) + sum(
+                1 for request in self.active_requests
+                if request.is_disagg_generation_init_state)
+            num_extra = num_prefetch_admissions(self._disagg_gen_prefetch_limit,
+                                                admission_capacity,
+                                                num_admitted, num_pending_init)
+            if num_extra > 0:
+                new_requests = new_requests + pop_prefetch_requests(
+                    waiting_queue, num_extra, _is_prefetchable_queue_item)
         if (not new_requests or
                 not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
                 or self.enable_attention_dp):
