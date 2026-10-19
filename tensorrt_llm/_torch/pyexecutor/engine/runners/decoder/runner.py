@@ -50,6 +50,8 @@ from tensorrt_llm._torch.pyexecutor.input_commit import (
     active_input_commit,
     batched_input_commit_enabled,
     block_offsets_triton_enabled,
+    fused_helix_spec_preprocess,
+    fused_helix_spec_preprocess_enabled,
     input_commit_scope,
     warmup_input_commit_kernels,
 )
@@ -2966,6 +2968,13 @@ class DecoderRunner(ScheduledModelRunner):
                     f"(CUDA graph captures {self._spec_head_fused_captures}; "
                     "graph replays rerun the captured launch and are not counted)"
                 )
+        # TRTLLM_FUSED_HELIX_SPEC_PREPROCESS=1: a Helix spec step the fused head prep does not
+        # take (e.g. one with context requests) does both blocks below in one launch.
+        head_fused = head_fused or (
+            enable_spec_decode
+            and fused_helix_spec_preprocess_enabled()
+            and self._fused_helix_spec_preprocess(inputs, runtime_draft_len)
+        )
 
         if enable_spec_decode and not head_fused and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -3046,6 +3055,53 @@ class DecoderRunner(ScheduledModelRunner):
             self.guided_decoder.token_event.record()
 
         return inputs
+
+    def _fused_helix_spec_preprocess(self, inputs: dict[str, Any], runtime_draft_len: int) -> bool:
+        """The overlap correction and helix verify-group buffers in one kernel.
+
+        With TRTLLM_FUSED_HELIX_SPEC_PREPROCESS=1, for a helix speculative step
+        under the overlap scheduler (non-mrope positions, generation requests
+        not treated as chunked context), applies the position / kv-length /
+        helix-position corrections of _preprocess_inputs and the
+        recompute_helix_spec_buffers derivation in one launch (~24 small
+        kernels otherwise). Returns False when the step takes the generic path.
+        """
+        if self._config.disable_overlap_scheduler or not self.mapping.has_cp_helix():
+            return False
+        md = inputs.get("attn_metadata")
+        if (
+            md is None
+            or md.kv_cache_manager is None
+            or not getattr(md, "_helix_spec_tokens_valid", False)
+            or not hasattr(md, "kv_lens_cuda")
+            or inputs["position_ids"].ndim != 2
+        ):
+            return False
+        num_ctx_requests = md.num_contexts
+        num_chunked_ctx_requests = md.num_chunked_ctx_requests
+        if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
+            return False
+        num_ctx_tokens = md.num_ctx_tokens
+        num_tokens = inputs["input_ids"].shape[0]
+        gen_tokens = num_tokens - num_ctx_tokens
+        tokens_per_seq = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+        fused_helix_spec_preprocess(
+            position_ids=inputs["position_ids"][0, num_ctx_tokens:num_tokens],
+            pos_offsets=self.previous_pos_id_offsets_cuda,
+            helix_positions=md.helix_position_offsets[:gen_tokens],
+            helix_slots=md.helix_local_slots[:gen_tokens],
+            helix_bounds=md.helix_kv_bounds[:gen_tokens],
+            kv_lens=md.kv_lens_cuda,
+            kv_offsets=self.previous_kv_lens_offsets_cuda[: md.num_generations],
+            kv_start=num_ctx_requests,
+            bound_start=md.num_contexts,
+            tokens_per_seq=tokens_per_seq,
+            phys=md.kv_cache_manager.tokens_per_block,
+            cp_size=self.mapping.cp_size,
+            cp_rank=self.mapping.cp_rank,
+        )
+        md.on_update_kv_lens()
+        return True
 
     def _fused_spec_head_prep(self, inputs: dict[str, Any], runtime_draft_len: int) -> bool:
         """The spec decode step's head bookkeeping of ``_preprocess_inputs`` in one launch.
