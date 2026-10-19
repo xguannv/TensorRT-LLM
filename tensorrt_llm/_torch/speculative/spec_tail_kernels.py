@@ -36,13 +36,26 @@ import triton.language as tl
 
 SPEC_TAIL_FUSION_ENV_VAR = "TLLM_SPEC_TAIL_FUSION"
 DRAFT_FUSION_ENV_VAR = "TLLM_DSPARK_DRAFT_FUSION"
+TAIL_V2_ENV_VAR = "TLLM_DSPARK_TAIL_V2"
 
 _BLOCK_TABLE_BLOCK = 2048
+# Columns per program of the parallel draft block-table decode.
+BLOCK_TABLE_CHUNK = _BLOCK_TABLE_BLOCK
 
 
 def spec_tail_fusion_enabled() -> bool:
     """Whether ``TLLM_SPEC_TAIL_FUSION=1`` selects the fused tail kernels."""
     return os.environ.get(SPEC_TAIL_FUSION_ENV_VAR, "0") == "1"
+
+
+def tail_v2_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_TAIL_V2=1`` (with ``TLLM_SPEC_TAIL_FUSION=1``) selects
+    the second set of fused tail kernels. They write bitwise the values of the
+    paths they replace: the MLA drafter's context and block RoPE kernels with
+    in-kernel table lookups and the block latents stored straight into the
+    paged pool, the column-parallel draft block-table decode, and shape-only
+    operands built once instead of every step."""
+    return spec_tail_fusion_enabled() and os.environ.get(TAIL_V2_ENV_VAR, "0") == "1"
 
 
 def draft_fusion_enabled() -> bool:
@@ -237,6 +250,84 @@ def decode_draft_block_table(
         counts,
         BLOCK=_BLOCK_TABLE_BLOCK,
         num_warps=8,
+    )
+
+
+@triton.jit
+def _decode_block_table_chunk_kernel(
+    src_ptr,
+    stride_src,
+    stride_src_col,
+    n_blocks,
+    divisor,
+    table_ptr,
+    stride_table,
+    partial_ptr,
+    BLOCK: tl.constexpr,
+):
+    # Program (row, chunk) decodes columns [chunk * BLOCK, (chunk + 1) * BLOCK)
+    # and records how many of them are allocated (encoded >= 0).
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    cols = chunk * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_blocks
+    src_row = src_ptr + row.to(tl.int64) * stride_src
+    encoded = tl.load(src_row + cols * stride_src_col, mask=mask, other=-1).to(tl.int64)
+    decoded = tl.maximum(encoded, 0) // divisor
+    tl.store(table_ptr + row.to(tl.int64) * stride_table + cols, decoded.to(tl.int32), mask=mask)
+    count = tl.sum((encoded >= 0).to(tl.int32), axis=0)
+    tl.store(partial_ptr + row * tl.num_programs(1) + chunk, count)
+
+
+@triton.jit
+def _sum_block_counts_kernel(
+    partial_ptr, n_chunks, counts_ptr, rows, BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr
+):
+    r = tl.arange(0, BLOCK_R)
+    c = tl.arange(0, BLOCK_C)
+    mask = (r[:, None] < rows) & (c[None, :] < n_chunks)
+    partial = tl.load(partial_ptr + r[:, None] * n_chunks + c[None, :], mask=mask, other=0)
+    tl.store(counts_ptr + r, tl.sum(partial.to(tl.int64), axis=1), mask=r < rows)
+
+
+def decode_draft_block_table_parallel(
+    src: torch.Tensor,
+    divisor: int,
+    table: torch.Tensor,
+    counts: torch.Tensor,
+    partial: torch.Tensor,
+) -> None:
+    """:func:`decode_draft_block_table` with the columns of a row spread over programs.
+
+    Same outputs (integer arithmetic, order-free). ``partial`` is an int32
+    scratch of at least ``rows * cdiv(blocks, _BLOCK_TABLE_BLOCK)`` elements.
+    """
+    rows, n_blocks = src.shape
+    assert table.shape[-1] == n_blocks and table.stride(-1) == 1
+    if rows == 0:
+        return
+    n_chunks = triton.cdiv(n_blocks, _BLOCK_TABLE_BLOCK)
+    assert partial.dtype == torch.int32 and partial.numel() >= rows * n_chunks
+    _decode_block_table_chunk_kernel[(rows, n_chunks)](
+        src,
+        src.stride(0),
+        src.stride(1),
+        n_blocks,
+        int(divisor),
+        table,
+        table.stride(0),
+        partial,
+        BLOCK=_BLOCK_TABLE_BLOCK,
+        num_warps=8,
+    )
+    _sum_block_counts_kernel[(1,)](
+        partial,
+        n_chunks,
+        counts,
+        rows,
+        BLOCK_R=triton.next_power_of_2(rows),
+        BLOCK_C=triton.next_power_of_2(n_chunks),
+        num_warps=4,
     )
 
 

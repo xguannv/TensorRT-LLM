@@ -32,12 +32,15 @@ from .accept_stats import maybe_create_recorder
 from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
+    BLOCK_TABLE_CHUNK,
     decode_draft_block_table,
+    decode_draft_block_table_parallel,
     dflash_gen_prepare,
     dflash_noise_embedding,
     fused_next_new_tokens,
     spec_tail_fusion_enabled,
     store_mla_context_latents,
+    tail_v2_enabled,
     vocab_shard_embedding,
 )
 from .vocab_parallel import (
@@ -286,6 +289,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
         self._ctx_block_counts = None  # per-request allocated block count
+        self._ctx_block_partial = None  # parallel decode's per-chunk block counts
         self._ctx_pool_idx = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
         self._ctx_kv_indptr = None
@@ -550,6 +554,12 @@ class DFlashWorker(SpecWorkerBase):
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
         self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        # Per-(request, column chunk) allocated-block counts of the parallel decode.
+        self._ctx_block_partial = torch.zeros(
+            num_slots * ((max_blocks + BLOCK_TABLE_CHUNK - 1) // BLOCK_TABLE_CHUNK),
+            dtype=torch.int32,
+            device="cuda",
+        )
         logger.info(
             f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
             f"pool_idx={self._ctx_pool_idx}, divisor={self._ctx_block_divisor}, "
@@ -571,6 +581,15 @@ class DFlashWorker(SpecWorkerBase):
             return False
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes.
+        if tail_v2_enabled():
+            decode_draft_block_table_parallel(
+                src[self._ctx_pool_idx, :num_seqs, 0],
+                self._ctx_block_divisor,
+                self._ctx_block_tables[:num_seqs],
+                self._ctx_block_counts[:num_seqs],
+                self._ctx_block_partial,
+            )
+            return True
         if spec_tail_fusion_enabled():
             decode_draft_block_table(
                 src[self._ctx_pool_idx, :num_seqs, 0],
@@ -1396,6 +1415,29 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_kv_ptrs_key = ptrs
         return self._ctx_kv_ptrs
 
+    def _fused_prepare_constants(
+        self, num_contexts: int, num_gens: int, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The block fixup's upper-triangle mask and the gen rows' batch indices.
+
+        Shape-only. With ``TLLM_DSPARK_TAIL_V2=1`` they are built once per shape
+        outside graph capture and reused, so no kernel recomputes them per step.
+        """
+        key = (num_contexts, num_gens, block_size)
+        cache = self.__dict__.setdefault("_fused_prepare_constant_cache", {})
+        if tail_v2_enabled() and key in cache:
+            return cache[key]
+        idx = torch.arange(block_size, device="cuda")
+        valid = (idx.view(1, block_size) > idx.view(block_size, 1)).view(
+            1, block_size, 1, block_size
+        )
+        batch_idx = torch.arange(
+            num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
+        )
+        if tail_v2_enabled() and not torch.cuda.is_current_stream_capturing():
+            cache[key] = (valid, batch_idx)
+        return valid, batch_idx
+
     def _prepare_gen_drafter_inputs_fused(
         self,
         accepted_tokens,
@@ -1471,13 +1513,11 @@ class DFlashWorker(SpecWorkerBase):
             prep["store_mask"],
         )
 
-        idx = torch.arange(block_size, device="cuda")
+        valid, batch_idx = self._fused_prepare_constants(num_contexts, num_gens, block_size)
         block_fixup = _MLABlockFixup(
             pages=prep["blk_pages"],
             offsets=prep["blk_offsets"],
-            valid=(idx.view(1, block_size) > idx.view(block_size, 1)).view(
-                1, block_size, 1, block_size
-            ),
+            valid=valid,
             page_tables_i32=self._ctx_block_tables[num_contexts : num_contexts + num_gens],
             seq_lens_i32=prep["blk_seq_lens"],
             kv_bounds_i32=prep["blk_kv_bounds"],
@@ -1488,9 +1528,7 @@ class DFlashWorker(SpecWorkerBase):
             "num_ctx_per_req": prep["num_ctx"],
             "ctx_k_cache": self._ctx_k_buf,
             "ctx_v_cache": self._ctx_v_buf,
-            "ctx_cache_batch_idx": torch.arange(
-                num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
-            ),
+            "ctx_cache_batch_idx": batch_idx,
             "first_prev_tokens": prep["bonus"],
             "ctx_kv_cache": self._ctx_kv_buf,
             "ctx_page_table": self._ctx_block_tables,

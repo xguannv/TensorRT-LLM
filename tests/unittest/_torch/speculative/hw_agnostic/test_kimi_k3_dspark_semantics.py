@@ -1255,6 +1255,51 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
 
 
 @needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_tail_v2_is_bitwise(monkeypatch):
+    """``TLLM_DSPARK_TAIL_V2=1`` changes launches, not values.
+
+    The fused block RoPE kernel (query rope half + block latent norm/rope +
+    pool store) and the one-launch context latents must reproduce the
+    TLLM_SPEC_TAIL_FUSION=1 path bit for bit: a batch of two unequal requests
+    through the paged cute-dsl block decode, and the layer-major context
+    latents against the per-layer ones.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    g = torch.Generator().manual_seed(42)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    monkeypatch.setenv("TLLM_SPEC_TAIL_FUSION", "1")
+    monkeypatch.setenv("TLLM_DSPARK_TAIL_V2", "0")
+    base = _run_mla_block_decode(drafter, requests, paged=True)
+    captured = requests[0][0].to("cuda", torch.bfloat16)
+    projected = drafter.project_target_hidden(captured)
+    positions = torch.arange(37, 37 + captured.shape[0], device="cuda")
+    ctx_base = drafter.precompute_context_kv_layer_major(projected, positions)
+
+    monkeypatch.setenv("TLLM_DSPARK_TAIL_V2", "1")
+    fused = _run_mla_block_decode(drafter, requests, paged=True)
+    ctx_fused = drafter.precompute_context_kv_layer_major(projected, positions)
+
+    assert ctx_base is not None and ctx_fused is not None
+    assert torch.equal(fused.view(torch.int32), base.view(torch.int32))
+    assert torch.equal(ctx_fused.view(torch.int16), ctx_base.view(torch.int16))
+
+
+@needs_cuda
 def test_mla_dspark_auto_backend_resolves_to_cutedsl():
     """AUTO is the one-pass kernel, and it must reach the dispatch as such.
 
