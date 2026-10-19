@@ -604,6 +604,10 @@ class MNNVLAllReduce(nn.Module):
     from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+    # Device views of the workspaces for pushed all-reduces (TRTLLM_K3_AR_PUSH),
+    # by the address of the workspace's buffer (a scaled workspace is a new
+    # buffer).
+    _lamport_views: Dict[int, object] = {}
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RMS_NORM,
@@ -627,7 +631,29 @@ class MNNVLAllReduce(nn.Module):
             )
 
         # Initialize the workspace
-        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype)
+        if _K3_AR_PUSH and self.dtype == torch.bfloat16:
+            # The device view of the workspace for pushed all-reduces (its
+            # peer table is a host-to-device copy, which CUDA graph capture
+            # does not allow).
+            self._lamport_view(workspace)
+
+    def _lamport_view(self, workspace: Dict):
+        """The ``k3_lamport_ar.LamportWorkspace`` of an MNNVL workspace."""
+        key = workspace["uc_buffer"].data_ptr()
+        view = MNNVLAllReduce._lamport_views.get(key)
+        if view is None:
+            from ..cute_dsl_kernels.blackwell import k3_lamport_ar
+            view = k3_lamport_ar.LamportWorkspace.from_mnnvl(
+                workspace, self.mapping.tp_size, self.mapping.tp_rank)
+            MNNVLAllReduce._lamport_views[key] = view
+            logger.info_once(
+                f"[MNNVL AllReduce] TRTLLM_K3_AR_PUSH: Lamport workspace view "
+                f"for tp_size {self.mapping.tp_size} "
+                f"({view.bytes_per_buffer} bytes per buffer)",
+                key=("k3_ar_push_view", self.mapping.tp_size))
+        return view
 
     @staticmethod
     def get_supported_dtypes():
@@ -728,10 +754,6 @@ class MNNVLAllReduce(nn.Module):
             return tuple(outputs)
         return outputs[0]
 
-    # Device views of the workspaces for pushed all-reduces, by the address of
-    # the workspace's buffer (a scaled workspace is a new buffer).
-    _lamport_views: Dict[int, object] = {}
-
     def lamport_push_target(self, num_tokens: int,
                             hidden_dim: int) -> Optional[LamportPushTarget]:
         """A ``LamportPushTarget`` for a plain all-reduce of BF16
@@ -755,14 +777,11 @@ class MNNVLAllReduce(nn.Module):
             return None
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping, self.dtype, buffer_size_bytes=need)
-        key = workspace["uc_buffer"].data_ptr()
-        view = MNNVLAllReduce._lamport_views.get(key)
-        if view is None:
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            view = k3_lamport_ar.LamportWorkspace.from_mnnvl(
-                workspace, world, self.mapping.tp_rank)
-            MNNVLAllReduce._lamport_views[key] = view
+        if (workspace["uc_buffer"].data_ptr()
+                not in MNNVLAllReduce._lamport_views
+                and torch.cuda.is_current_stream_capturing()):
+            return None
+        view = self._lamport_view(workspace)
         output = torch.empty(num_tokens,
                              hidden_dim,
                              dtype=self.dtype,
