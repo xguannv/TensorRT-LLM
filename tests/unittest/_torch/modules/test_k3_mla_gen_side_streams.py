@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
     reason="needs an SM100/SM103 GPU",
 )
 
-H, HEADS, CP, CP_RANK, PAGE = 1024, 96, 16, 1, 64
+H, HEADS, CP, CP_RANK, PAGE = 7168, 96, 16, 1, 64
 _SHAPES = {
     "q_a_proj": (1536, H),
     "kv_a_proj_with_mqa": (576, H),
@@ -82,6 +82,12 @@ def _load(model, projections):
             weights[key] = torch.zeros(shape, dtype=param.dtype)
     weights.update({f"model.layers.0.self_attn.{n}": v for n, v in projections.items()})
     model.load_weights(weights)
+    # What the model loader runs next (``ModelLoader._walk_full_post_load``): among others it
+    # converts the FP8 projections' scales to the layout their GEMMs read.
+    for module in model.modules():
+        post_load_weights = getattr(module, "post_load_weights", None)
+        if post_load_weights is not None and not getattr(module, "_weights_removed", False):
+            post_load_weights()
 
 
 def _build(batch, q_len, kv_len, monkeypatch):
@@ -235,6 +241,7 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
     import weakref
 
     from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
+    from tensorrt_llm._torch.modules.kimi_k3_mla import q_norm_pdl
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
     from tensorrt_llm._torch.utils import model_extra_attrs
 
@@ -246,7 +253,30 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
     }
     pool = manager.get_buffers(0)
     pool_init = pool.clone()
+    # Count the entry points of each switch's path, to check every path is taken.
+    calls = dict.fromkeys(("gated", "sigmoid", "q_norm", "kv_side"), 0)
+
+    def counted(name, fn):
+        def wrapper(*args, **kwargs):
+            calls[name] += 1
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(mixer.o_proj, "forward_gated", counted("gated", mixer.o_proj.forward_gated))
+    monkeypatch.setattr(
+        mixer.g_proj, "forward_sigmoid", counted("sigmoid", mixer.g_proj.forward_sigmoid)
+    )
+    monkeypatch.setattr(
+        q_norm_pdl,
+        "rmsnorm_release_at_launch",
+        counted("q_norm", q_norm_pdl.rmsnorm_release_at_launch),
+    )
+    monkeypatch.setattr(
+        mixer, "_forward_gen_kv_side", counted("kv_side", mixer._forward_gen_kv_side)
+    )
     results = {}
+    taken = {}
     try:
         with torch.inference_mode():
             for cfg in [
@@ -257,9 +287,12 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
                 (True, False, True, True),
             ]:
                 _set(monkeypatch, k3mla, *cfg)
+                calls.update(dict.fromkeys(calls, 0))
                 pool.copy_(pool_init)
                 with model_extra_attrs(extra):
                     eager = mixer(x, md).clone()
+                taken[cfg, "eager"] = dict(calls)
+                calls.update(dict.fromkeys(calls, 0))
                 s = torch.cuda.Stream()
                 s.wait_stream(torch.cuda.current_stream())
                 with with_multi_stream(True), torch.cuda.stream(s), model_extra_attrs(extra):
@@ -272,6 +305,7 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
                     model_extra_attrs(extra),
                 ):
                     out = mixer(x, md)
+                taken[cfg, "graph"] = dict(calls)
                 replays = []
                 for _ in range(3):
                     pool.copy_(pool_init)
@@ -285,6 +319,17 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
     # tactic outside a capture. The default path's replays must agree among themselves too.
     ref_eager, ref_graph = results[(False,) * 4][0], results[(False,) * 4][1][0]
     assert torch.isfinite(ref_graph).all() and ref_graph.abs().max() > 0
+    assert torch.isfinite(ref_eager).all() and ref_eager.abs().max() > 0
+    for (cfg, mode), counts in taken.items():
+        gate, qnorm, kv, _ = cfg
+        # The eager runs are single-stream: the KV half stays on the main stream there.
+        expect = {
+            "gated": gate,
+            "sigmoid": gate,
+            "q_norm": qnorm,
+            "kv_side": kv and mode == "graph",
+        }
+        assert {k: v > 0 for k, v in counts.items()} == expect, (cfg, mode, counts)
     for cfg, (eager, replays) in results.items():
         assert torch.equal(eager, ref_eager), f"eager {cfg}"
         for r in replays:
