@@ -301,3 +301,35 @@ def test_next_new_tokens_rewind_matches(num_contexts, num_gens):
     torch.cuda.synchronize()
     assert torch.equal(out, ref)
     assert torch.equal(kv, ref_kv)
+
+
+@pytest.mark.parametrize(
+    "role,n,k",
+    [
+        ("q_kv_a", 2112, 7168),
+        ("q_b", 768, 1536),
+        ("gate_up", 1792, 7168),
+        ("down", 7168, 896),
+        ("ctx_latent", 2880, 7168),
+        ("lm_head", 10240, 7168),
+    ],
+)
+@pytest.mark.parametrize("m", [7, 14, 28, 32, 40])
+def test_draft_gemm_pins(monkeypatch, role, n, k, m):
+    """The pinned drafter GEMMs compute x @ W^T (to BF16 rounding), and step aside
+    above the pinned row range or with the switch off."""
+    from tensorrt_llm._torch.speculative.dspark_draft_gemm import DRAFT_GEMM_ENV_VAR, draft_gemm
+
+    gen = torch.Generator(device="cuda").manual_seed(m + n)
+    x = (torch.randn(m, k, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", generator=gen) / k**0.5).to(torch.bfloat16)
+    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "0")
+    assert draft_gemm(x, w, role) is None
+    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
+    out = draft_gemm(x, w, role)
+    if m > 32:
+        assert out is None
+        return
+    ref = x.float() @ w.float().t()
+    assert out is not None and out.shape == (m, n) and out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

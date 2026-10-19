@@ -30,6 +30,7 @@ from ..pyexecutor.mamba_cache_manager import KDAHybridCacheManagerV2, MambaHybri
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
+from .dspark_draft_gemm import draft_gemm
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
     BLOCK_TABLE_CHUNK,
@@ -1241,7 +1242,14 @@ class DFlashWorker(SpecWorkerBase):
                     # of the block logits, bit-identical to refining the
                     # gathered logits and taking the per-position argmax.
                     markov_w1, markov_w2 = self._vocab_parallel_markov_weights(draft_model)
-                    local_block = draft_head.local_logits(hidden_states_out[gen_gather_ids])
+                    block_hidden = hidden_states_out[gen_gather_ids]
+                    local_block = (
+                        draft_gemm(block_hidden, draft_head.lm_head.weight, "lm_head")
+                        if getattr(draft_head.lm_head, "bias", None) is None
+                        else None
+                    )
+                    if local_block is None:
+                        local_block = draft_head.local_logits(block_hidden)
                     gen_draft_tokens = draft_head.markov_tokens(
                         local_block.view(num_gens, K, -1),
                         inputs["first_prev_tokens"],

@@ -108,6 +108,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
+from ..speculative.dspark_draft_gemm import draft_gemm
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
     draft_fusion_enabled,
@@ -397,6 +398,41 @@ def _rope_last_dims_batched(
     nope = t[..., :-rope_head_dim]
     rope = apply_dspark_rotary_batched(t[..., -rope_head_dim:], freqs_cis, inverse=inverse)
     return torch.cat([nope, rope], dim=-1)
+
+
+def _plain(linear) -> bool:
+    """A BF16 Linear without bias or quantization (its weight is the whole GEMM)."""
+    return (
+        getattr(linear, "bias", None) is None
+        and not getattr(linear, "has_any_quant", True)
+        and linear.weight.dtype == torch.bfloat16
+    )
+
+
+def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params) -> torch.Tensor:
+    """``mlp(x, final_all_reduce_params=down_all_reduce_params)`` for the MLA
+    drafter, with the gate_up / down GEMMs pinned by ``TLLM_DSPARK_DRAFT_GEMM``
+    when it applies (same activation kernel in between)."""
+    gate_up, down = getattr(mlp, "gate_up_proj", None), getattr(mlp, "down_proj", None)
+    h1 = None
+    if (
+        gate_up is not None
+        and down is not None
+        and _plain(gate_up)
+        and _plain(down)
+        and not getattr(down_all_reduce_params, "enable_allreduce", True)
+        and not mlp._can_fuse_gate_up_swiglu()
+        and not mlp._can_fuse_gate_up_swiglu_fp4out()
+        and not mlp._can_fuse_swiglu_fp8_quant()
+    ):
+        h1 = draft_gemm(x, gate_up.weight, "gate_up")
+    if h1 is None:
+        return mlp(x, final_all_reduce_params=down_all_reduce_params)
+    h2 = mlp._apply_activation(h1)
+    out = draft_gemm(h2, down.weight, "down")
+    if out is None:
+        out = down(h2, all_reduce_params=down_all_reduce_params, layer_idx=mlp.layer_idx)
+    return out
 
 
 def _mla_rope_into(
@@ -3786,9 +3822,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         weight_dtype = self._fused_kv_weight.dtype
         if projected_hidden.dtype != weight_dtype:
             projected_hidden = projected_hidden.to(weight_dtype)
-        latent = F.linear(projected_hidden, self._fused_kv_weight).view(
-            n, num_layers, self._head_dim
-        )
+        latent = draft_gemm(projected_hidden, self._fused_kv_weight, "ctx_latent")
+        if latent is None:
+            latent = F.linear(projected_hidden, self._fused_kv_weight)
+        latent = latent.view(n, num_layers, self._head_dim)
         if tail_v2_enabled() and self._mla_tail_v2_supported(latent.device):
             # Every layer in one launch, the RoPE table read by position in the
             # kernel; bitwise the per-layer launches below.
@@ -3952,13 +3989,22 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 # q_a and kv_a read the same normed input: one GEMM, split after.
                 # Both halves are consumed as row-strided views (q_a_layernorm
                 # and the fused RMSNorm+RoPE read strided rows), so no copies.
-                q_kv_a = fused_a(hs_normed)
+                q_kv_a = draft_gemm(hs_normed, fused_a.weight, "q_kv_a")
+                if q_kv_a is None:
+                    q_kv_a = fused_a(hs_normed)
                 q_a = q_kv_a[:, : attn.q_lora_rank]
                 blk_latent_rows = q_kv_a[:, attn.q_lora_rank :]
             else:
                 q_a = attn.q_a_proj(hs_normed)
                 blk_latent_rows = None
-            q = attn.q_b_proj(attn.q_a_layernorm(q_a))
+            q_a_normed = attn.q_a_layernorm(q_a)
+            q = (
+                draft_gemm(q_a_normed, attn.q_b_proj.weight, "q_b")
+                if _plain(attn.q_b_proj)
+                else None
+            )
+            if q is None:
+                q = attn.q_b_proj(q_a_normed)
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             if fused_block_rope:
                 query = torch.empty(
@@ -4111,7 +4157,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 hidden_out, res_flat = self._fused_ar_residual_norm(
                     fused_ar, hidden_out, res_flat, layer.post_attention_layernorm
                 )
-                partial = layer.mlp(hidden_out, final_all_reduce_params=no_reduce)
+                partial = _draft_mlp(layer.mlp, hidden_out, no_reduce)
                 hidden_states = partial
             else:
                 hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
