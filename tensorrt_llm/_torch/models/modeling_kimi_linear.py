@@ -1033,6 +1033,12 @@ _K3_ATTN_RES_MXFP8 = os.environ.get("TRTLLM_K3_ATTN_RES_MXFP8", "0") == "1"
 # MNNVL Lamport workspace (trtllm::k3_attn_res_add_rmsnorm_lamport): the same bits, one kernel
 # boundary and one copy of the rows fewer.
 _K3_AR_PUSH_AMID = os.environ.get("TRTLLM_K3_AR_PUSH_AMID", "0") == "1"
+# TRTLLM_K3_DENSE_MLP_FULL_TP=1: the dense layer-0 MLP is split over the whole TP group, across
+# nodes (its all-reduce runs on the multi-node NVLink fabric like the attention's), instead of the
+# largest subgroup within one node: each rank reads 1/tp_size of the BF16 gate_up / down weights
+# instead of 1/gpus_per_node. The all-reduce sums tp_size partials instead of gpus_per_node, so
+# the rounding differs from the default split (not bitwise).
+_K3_DENSE_MLP_FULL_TP = os.environ.get("TRTLLM_K3_DENSE_MLP_FULL_TP", "0") == "1"
 
 
 class _DeferredMoEResidual(NamedTuple):
@@ -3967,7 +3973,10 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_tp_size = 1
             else:
                 self.mlp_tp_size = math.gcd(cfg.intermediate_size, model_config.mapping.tp_size)
-                if self.mlp_tp_size > model_config.mapping.gpus_per_node:
+                if (
+                    self.mlp_tp_size > model_config.mapping.gpus_per_node
+                    and not _K3_DENSE_MLP_FULL_TP
+                ):
                     self.mlp_tp_size = math.gcd(
                         self.mlp_tp_size, model_config.mapping.gpus_per_node
                     )
@@ -3976,7 +3985,8 @@ class KimiLinearDecoderLayer(nn.Module):
             # K3's dense layer is BF16, so a unit block size gives the same
             # subgroup selection as DeepSeek-V3. Attention DP replicates the
             # MLP because ranks own different tokens; otherwise the subgroup
-            # is block-aligned and stays within one node.
+            # is block-aligned and stays within one node, unless
+            # TRTLLM_K3_DENSE_MLP_FULL_TP spans the whole TP group.
             self.mlp = GatedMLP(
                 hidden_size=cfg.hidden_size,
                 intermediate_size=cfg.intermediate_size,
