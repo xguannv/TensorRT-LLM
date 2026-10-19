@@ -3873,6 +3873,33 @@ class PyExecutor:
                                           op=ReduceOp.MAX)
         return int(local_need_check)
 
+    def _use_fused_disagg_status_entry(self) -> bool:
+        """Whether both progress-entry votes can share one int64 allgather.
+
+        With TRTLLM_DISAGG_GEN_FAST_SYNC=1 and PP of 1, the generation vote
+        (world) and the context vote (TP x CP) span the same ranks, so one
+        fixed-size allgather of both flags replaces the two pickled
+        collectives and yields the same two decisions on every rank.
+        """
+        fused = getattr(self, "_fused_disagg_status_entry", None)
+        if fused is None:
+            world = self._dist_size(self.dist, "world_size")
+            fused = (os.environ.get("TRTLLM_DISAGG_GEN_FAST_SYNC", "0") == "1"
+                     and world > 1
+                     and self._dist_size(self.dist, "pp_size") == 1
+                     and world == self._dist_size(self.dist, "tp_size") *
+                     self._dist_size(self.dist, "cp_size"))
+            self._fused_disagg_status_entry = fused
+        return fused
+
+    def _sync_disagg_status_entries(
+            self, local_need_gen_check: bool,
+            local_need_ctx_check: bool) -> Tuple[int, int]:
+        flags = self.dist.tp_cp_allgather_int64(
+            [int(local_need_gen_check),
+             int(local_need_ctx_check)])
+        return int(flags[:, 0].max()), int(flags[:, 1].max())
+
     def _check_disagg_transfer_progress_when_idle(
             self,
             num_fitting_reqs: int,
@@ -3896,9 +3923,17 @@ class PyExecutor:
 
         local_need_gen_check = (uses_async_gen_transfer and local_needs_progress
                                 and wait_for_disagg_gen_transfer_progress)
+        local_need_ctx_check = is_idle or (uses_async_gen_transfer
+                                           and local_needs_progress)
 
-        any_need_gen_check = self._sync_disagg_gen_status_entry(
-            local_need_gen_check)
+        fused_entry = self._use_fused_disagg_status_entry()
+        if fused_entry:
+            any_need_gen_check, any_need_check = (
+                self._sync_disagg_status_entries(local_need_gen_check,
+                                                 local_need_ctx_check))
+        else:
+            any_need_gen_check = self._sync_disagg_gen_status_entry(
+                local_need_gen_check)
         if any_need_gen_check > 0:
             if local_need_gen_check:
                 logger.debug(
@@ -3907,10 +3942,9 @@ class PyExecutor:
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
-        local_need_ctx_check = is_idle or (uses_async_gen_transfer
-                                           and local_needs_progress)
-        any_need_check = self._sync_disagg_ctx_status_entry(
-            local_need_ctx_check)
+        if not fused_entry:
+            any_need_check = self._sync_disagg_ctx_status_entry(
+                local_need_ctx_check)
         if any_need_check > 0:
             if local_need_ctx_check and not all_gen_first:
                 logger.warning(

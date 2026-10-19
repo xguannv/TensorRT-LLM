@@ -185,6 +185,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._gen_allgather: Callable = (
             pp_allgather if m.enable_attention_dp else self._dist.allgather
         )
+        # Optional cheap idle probe for the per-iteration generation status
+        # check (TRTLLM_DISAGG_GEN_FAST_SYNC=1). It replaces the two pickled
+        # allgathers of an idle check by one fixed-size int64 allgather of the
+        # local receive-session count over the same ranks (the whole world,
+        # i.e. TP x CP when PP is 1), so every rank takes the same branch.
+        self._gen_idle_probe = (
+            os.environ.get("TRTLLM_DISAGG_GEN_FAST_SYNC", "0") == "1"
+            and self._gen_need_sync
+            and not m.enable_attention_dp
+            and m.pp_size == 1
+        )
+
+    def _any_rank_has_recv_sessions(self) -> bool:
+        counts = self._dist.tp_cp_allgather_int64([len(self._recv_sessions)])
+        return bool(counts.any())
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -948,6 +963,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return [], [], []
+        # With no receive session on any rank, the consensus below gathers
+        # empty lists and returns three empty lists without side effects.
+        # Only the non-blocking poll is short-circuited; blocking and
+        # at-least-N calls keep their pacing.
+        if (
+            getattr(self, "_gen_idle_probe", False)
+            and at_least_request_num == 0
+            and not self._any_rank_has_recv_sessions()
+        ):
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
