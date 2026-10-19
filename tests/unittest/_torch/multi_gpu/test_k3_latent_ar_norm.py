@@ -21,7 +21,9 @@ quantization of the normalized rows, while they share their Lamport workspace wi
 one-shot and two-shot kernels in any order, with or without the side-stream re-arm
 (``run_k3_lamport_clear``) between calls. The 16-rank chunked summation order is checked on the
 available GPUs by filling the other ranks' slots of the Lamport buffer through the multicast
-address (sum only, against an FP32 reference).
+address (sum only, against an FP32 reference). The row kernel, which re-polls only the slots still
+missing and rotates the buffers while it polls, also runs with the ranks arriving in varying
+orders.
 """
 
 import os
@@ -232,6 +234,23 @@ def _ar_norm_rank(world):
                 same(row_ar(x), ref)
         torch.cuda.synchronize()
 
+        # The row kernel with the ranks arriving in varying orders (each rank sleeps a drawn number
+        # of cycles first; the same draws on every rank): its re-polls of the missing slots and its
+        # buffer rotation while it polls.
+        delay_gen = torch.Generator().manual_seed(1234)
+        for num_tokens in (1, 7, 14):
+            for trial in range(6):
+                x = _inputs(world, num_tokens, trial % 3)[rank]
+                ref = cpp(x, AllReduceFusionOp.RMS_NORM, shared_ws)
+                delays = torch.randint(0, 40000, (world,), generator=delay_gen).tolist()
+                torch.cuda.synchronize()
+                comm.Barrier()
+                torch.cuda._sleep(delays[rank])
+                same(row_ar(x), ref)
+                if trial % 2:
+                    side_clear()
+        torch.cuda.synchronize()
+
         # CUDA graph: two launches per replay, new inputs each replay.
         for num_tokens in (7, 14):
             static_x = torch.empty((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
@@ -327,6 +346,23 @@ def _ar_norm_rank(world):
                 comm.Barrier()
                 same(row_ar(xs[rank], norm=False, world_size=16), expect)
                 comm.Barrier()
+                # Again with the real ranks' slots arriving in varying orders.
+                for trial in range(4):
+                    torch.cuda.synchronize()
+                    cur = int(own["flags"][0].item())
+                    start = cur * buf_bytes // 2
+                    stage = mc[start : start + num_tokens * 16 * HIDDEN].view(
+                        num_tokens, 16, HIDDEN
+                    )
+                    for v in range(rank + world, 16, world):
+                        sanitized = torch.where(xs[v] == 0, torch.zeros_like(xs[v]), xs[v])
+                        stage[:, v, :].copy_(sanitized)
+                    delays = torch.randint(0, 40000, (world,), generator=delay_gen).tolist()
+                    torch.cuda.synchronize()
+                    comm.Barrier()
+                    torch.cuda._sleep(delays[rank])
+                    same(row_ar(xs[rank], norm=False, world_size=16), expect)
+                    comm.Barrier()
             # The C++ kernel resumes on the workspace after the 16-rank launches.
             x = _inputs(world, 14, 1)[rank]
             same(cpp(x, AllReduceFusionOp.RMS_NORM, own), cute_ar(x))

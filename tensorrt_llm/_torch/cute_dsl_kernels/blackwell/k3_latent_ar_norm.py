@@ -39,10 +39,11 @@ else after the reduction like the C++ kernel.
 
 :class:`K3LatentArRowKernel` (``TRTLLM_K3_LATENT_AR_ROW``) computes the same result, bit for bit,
 with one 512-thread CTA per row: four groups of 128 threads play the four cluster CTAs (same warp
-boundaries and reduction trees, the group sums added in order after a CTA barrier instead of a
-cluster barrier); the rank's own slot is summed from registers instead of being polled back from
-the multicast loopback, and after the first polling round only the slots that have not arrived
-are loaded again. :class:`K3LamportClearKernel` (``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``) re-arms the
+boundaries and reduction trees; every thread forms the group sums after one CTA barrier instead of
+a cluster barrier); the rank's own slot is summed from registers instead of being polled back
+from the multicast loopback, after the first polling round only the slots that have not arrived
+are loaded again, and CTA 0 rotates the buffers while it waits for the other ranks instead of at
+the end. :class:`K3LamportClearKernel` (``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``) re-arms the
 buffer a call used on a side stream and marks the state clean, so that the next call skips the
 clear (M x world x 7 KB of sentinel stores) on its critical path.
 """
@@ -866,8 +867,10 @@ class K3LatentArRowKernel:
     """:class:`K3LatentArNormKernel` with one 512-thread CTA per row (same result, bit for bit).
 
     * Group ``g`` (threads ``128 g ...``) does what cluster CTA ``g`` does, with the same warp
-      boundaries (its fourth warp is the half warp); the four group sums are added in group order
-      after a CTA barrier instead of through distributed shared memory and a cluster barrier.
+      boundaries (its fourth warp is the half warp). After one CTA barrier every thread forms the
+      four group sums from the sixteen warp sums as the cluster kernel's warp butterfly does,
+      ``(w0 + w2) + (w1 + w3)``, and adds them in group order (no cluster barrier, no second CTA
+      barrier).
     * Every round polls all ranks' slots of the thread's eight values at once. The rank's own slot
       is not read back: the sanitized values the thread stored through the multicast address are
       summed from its registers, so the last rank to arrive does not wait for its own data to
@@ -876,6 +879,9 @@ class K3LatentArRowKernel:
     * The previous call's buffer is re-armed by :class:`K3LamportClearKernel` on a side stream,
       which marks the state clean; if the state still says the buffer is dirty, this kernel clears
       it itself after its push, like the C++ kernels.
+    * CTA 0 rotates the buffers right after its first polling round when every warp of the grid
+      has counted itself by then (as a rule), so that the acquire load and the state stores are
+      not on the grid's tail; otherwise it waits for the count at the end, like the cluster kernel.
     """
 
     def __init__(
@@ -916,7 +922,6 @@ class K3LatentArRowKernel:
         @cute.struct
         class SharedStorage:
             warp_sum: cute.struct.MemRange[cutlass.Float32, ROW_WARPS]
-            group_sum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, ROW_GROUPS], 16]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -966,7 +971,6 @@ class K3LatentArRowKernel:
         half = (warp % WARPS) == WARPS - 1
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         warp_sum = storage.warp_sum.data_ptr().toint()
-        group_sum = storage.group_sum.data_ptr().toint()
 
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
@@ -1026,6 +1030,22 @@ class K3LatentArRowKernel:
                 _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
                 << rr
             )
+        # CTA 0 rotates the buffers once every warp of the grid has read the flags: here, while it
+        # waits for the other ranks, if they all have by the end of its first polling round (as a
+        # rule), else at the end.
+        rotated = Int32(0)
+        if tidx == 0:
+            if row == 0:
+                if _ld_acquire_gpu_u32(counter) >= m * ROW_WARPS:
+                    nxt0 = f0 + 1
+                    if nxt0 == NUM_LAMPORT_BUFFERS:
+                        nxt0 = Int32(0)
+                    _st_v4(flags_addr, nxt0, f0, f2, Int32(1))
+                    _st_v4(
+                        flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0)
+                    )
+                    _st_u32(counter, Int32(0))
+                    rotated = Int32(1)
         full = Int32((1 << ws) - 1)
         while have != full:
             missing = have
@@ -1079,19 +1099,13 @@ class K3LatentArRowKernel:
             if lane == 0:
                 _sts_f32(warp_sum + warp * 4, v)
             _bar_sync()
-            # The group's first warp sums the group's warp sums (lanes past them add 0).
-            if (warp % WARPS) == 0:
-                b = Float32(0.0)
-                if lane < WARPS:
-                    b = _lds_f32(warp_sum + (warp + lane) * 4)
-                for off in (16, 8, 4, 2, 1):
-                    b = _fadd(b, _shfl_bfly(b, off, 0xFFFFFFFF))
-                if lane == 0:
-                    _sts_f32(group_sum + (warp // WARPS) * 4, b)
-            _bar_sync()
+            # The cluster kernel's butterfly over a group's four warp sums (lanes past them add 0)
+            # yields (w0 + w2) + (w1 + w3); every thread forms it for each group and adds the
+            # group sums in order, so one CTA barrier is enough.
             total = Float32(0.0)
             for c in cutlass.range_constexpr(ROW_GROUPS):
-                total = _fadd(total, _lds_f32(group_sum + c * 4))
+                w4 = [_lds_f32(warp_sum + (c * WARPS + k) * 4) for k in range(WARPS)]
+                total = _fadd(total, _fadd(_fadd(w4[0], w4[2]), _fadd(w4[1], w4[3])))
             scale = _rms_scale(total, eps)
             if active:
                 ow = []
@@ -1121,18 +1135,21 @@ class K3LatentArRowKernel:
             if active:
                 _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3])
 
-        # CTA 0: rotate the buffers once every warp of the grid has read the flags.
+        # CTA 0: rotate the buffers now if it could not after its first polling round.
         if tidx == 0:
             if row == 0:
-                arrived = _ld_acquire_gpu_u32(counter)
-                while arrived < m * ROW_WARPS:
+                if rotated == 0:
                     arrived = _ld_acquire_gpu_u32(counter)
-                nxt = f0 + 1
-                if nxt == NUM_LAMPORT_BUFFERS:
-                    nxt = Int32(0)
-                _st_v4(flags_addr, nxt, f0, f2, Int32(1))
-                _st_v4(flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0))
-                _st_u32(counter, Int32(0))
+                    while arrived < m * ROW_WARPS:
+                        arrived = _ld_acquire_gpu_u32(counter)
+                    nxt = f0 + 1
+                    if nxt == NUM_LAMPORT_BUFFERS:
+                        nxt = Int32(0)
+                    _st_v4(flags_addr, nxt, f0, f2, Int32(1))
+                    _st_v4(
+                        flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0)
+                    )
+                    _st_u32(counter, Int32(0))
 
 
 class K3LamportClearKernel:
