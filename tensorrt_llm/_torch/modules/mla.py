@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from typing import Dict, Optional, cast
+from typing import Callable, Dict, Optional, cast
 
 import torch
 from torch import nn
@@ -68,6 +68,38 @@ from .mla_fp8_q_absorb import mla_fp8_q_absorb_nope
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
+
+
+def helix_gen_zero_kv_mask(
+    attn_metadata: AttentionMetadata, num_tokens: int
+) -> Optional[torch.Tensor]:
+    """Per-token mask of the ``num_tokens`` generation tokens this CP rank owns no KV for.
+
+    Used by the Helix generation combine (``_helix_post_process``) to make those rows a
+    no-op. It only depends on the step's metadata, so callers may compute it ahead of the
+    attention (see ``MLA.helix_zero_kv_mask_fn``).
+    """
+    helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
+    if helix_kv_bounds is not None and getattr(attn_metadata, "_helix_spec_tokens_valid", False):
+        # Speculative verify groups: KV ownership is per-TOKEN. A rank
+        # owning only the tail page of a group has zero visible KV for
+        # the group's leading tokens while its per-sequence kv_len is
+        # nonzero, so the per-sequence mask below misses those rows.
+        # Their decode rows are fully masked with a finite sentinel,
+        # making partial_o an average over (possibly uninitialized)
+        # pool values; the combine multiplies by corr = 0 and
+        # 0 * NaN would poison the token on every CP rank — sanitize
+        # by the per-token bound instead.
+        return helix_kv_bounds[:num_tokens] == 0
+    # MLA processes only the generation token slice, so build the mask
+    # from [num_contexts, num_seqs). Skip this expansion when the more
+    # precise per-token bounds above are valid.
+    return _helix_zero_kv_mask(
+        attn_metadata,
+        num_tokens,
+        seq_start=attn_metadata.num_contexts,
+        num_seqs=attn_metadata.num_generations,
+    )
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -498,6 +530,18 @@ class MLA(nn.Module):
         # (``mla_fp8_q_absorb_nope``) and the RoPE kernel only appends the KV.
         self.fp8_nope_q_absorb = False
         self._fp8_q_unit_scale: Optional[torch.Tensor] = None
+        # Helix generation hand-off, set around one forward by a caller that projects the
+        # attention output itself (Kimi K3): a callable returning the zero-local-KV mask it
+        # computed ahead of time (``helix_gen_zero_kv_mask``; called on the current stream
+        # where the mask is needed, after the attention kernel), a callable run right before
+        # the all-to-all is enqueued (after the V up-projection), and whether the
+        # all-to-all's combined output is left in ``helix_gen_output`` instead of being
+        # copied into the ``output`` buffer (only with the V up-projection before the
+        # all-to-all, where both hold the same values).
+        self.helix_zero_kv_mask_fn: Optional[Callable[[], Optional[torch.Tensor]]] = None
+        self.helix_pre_exchange_fn: Optional[Callable[[], None]] = None
+        self.defer_helix_gen_output = False
+        self.helix_gen_output: Optional[torch.Tensor] = None
         ugpu_policy = config.extra_attrs.get("ugpu_policy")
         self._ugpu_policy = ugpu_policy if ugpu_policy is not None else UgpuPolicy()
         self.enable_ugpu_bf16_linear = enable_ugpu_bf16_linear
@@ -889,34 +933,16 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            if helix_kv_bounds is not None and getattr(
-                attn_metadata, "_helix_spec_tokens_valid", False
-            ):
-                # Speculative verify groups: KV ownership is per-TOKEN. A rank
-                # owning only the tail page of a group has zero visible KV for
-                # the group's leading tokens while its per-sequence kv_len is
-                # nonzero, so the per-sequence mask above misses those rows.
-                # Their decode rows are fully masked with a finite sentinel,
-                # making partial_o an average over (possibly uninitialized)
-                # pool values; the combine multiplies by corr = 0 and
-                # 0 * NaN would poison the token on every CP rank — sanitize
-                # by the per-token bound instead.
-                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
+            if self.helix_zero_kv_mask_fn is not None:
+                zero_kv_mask = self.helix_zero_kv_mask_fn()
             else:
-                # MLA processes only the generation token slice here, so build
-                # the mask from [num_contexts, num_seqs). Skip this expansion
-                # when the more precise per-token bounds above are valid.
-                zero_kv_mask = _helix_zero_kv_mask(
-                    attn_metadata,
-                    partial_o.shape[0],
-                    seq_start=attn_metadata.num_contexts,
-                    num_seqs=attn_metadata.num_generations,
-                )
+                zero_kv_mask = helix_gen_zero_kv_mask(attn_metadata, partial_o.shape[0])
             value_dim = kv_lora_rank
             if helix_v_up:
                 partial_o = self._helix_project_v_partials(partial_o)
                 value_dim = self.v_head_dim
+            if self.helix_pre_exchange_fn is not None:
+                self.helix_pre_exchange_fn()
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
@@ -2617,6 +2643,9 @@ class MLA(nn.Module):
         if helix_v_up:
             # The V up-projection already ran before the all-to-all.
             assert attn_out_latent.shape == (q.shape[0], self.num_heads_tp_cp * self.v_head_dim)
+            if self.defer_helix_gen_output:
+                self.helix_gen_output = attn_out_latent
+                return output
             output.view(attn_out_latent.shape).copy_(attn_out_latent)
             return output
 

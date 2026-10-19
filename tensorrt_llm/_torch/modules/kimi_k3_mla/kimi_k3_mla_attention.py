@@ -21,12 +21,16 @@ from ....logger import logger
 from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
-from ...attention_backend import AttentionMetadata, TrtllmAttention
+from ...attention_backend import AttentionInputType, AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType
+from ...utils import AuxStreamType, is_nvfp4_marlin_enabled
 from ..linear import Linear, TensorParallelMode
-from ..mla import MLA
+from ..mla import MLA, helix_gen_zero_kv_mask
+from ..mla_fp8_q_absorb import mla_fp8_q_absorb_nope
+from ..multi_stream_utils import do_multi_stream
+from ..rms_norm import RMSNorm
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 
@@ -35,6 +39,41 @@ _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 # (output_gate_fp8.gate_mul_fp8_packed: sigmoid, multiply and quantization in one kernel, the same
 # bytes), and o_proj runs on it.
 _K3_MLA_GATE_FP8 = os.environ.get("TRTLLM_K3_MLA_GATE_FP8", "0") == "1"
+
+# TRTLLM_K3_MLA_GATE_SIDE=1: in a generation-only Helix batch (V up-projection before the
+# all-to-all) whose o_proj runs the low-M GEMM, the Helix zero-KV mask and the output gate
+# sigmoid(g_proj(x)), which only depend on the step metadata and the layer input, run on a
+# side stream; o_proj then multiplies the all-to-all's combined output by the gate while
+# quantizing it (``k3_fp8w_lowm_gemm_gated``) and reads that output where the combine left
+# it. After the combine only o_proj remains. Bit-exact.
+_K3_MLA_GATE_SIDE = os.environ.get("TRTLLM_K3_MLA_GATE_SIDE", "0") == "1"
+# TRTLLM_K3_MLA_Q_NORM_PDL=1: the q_a RMSNorm releases the q_b GEMM at launch instead of after
+# its store (``q_norm_pdl``; same kernel code, bit-exact), so q_b streams its weights while
+# q_a and the norm still run.
+_K3_MLA_Q_NORM_PDL = os.environ.get("TRTLLM_K3_MLA_Q_NORM_PDL", "0") == "1"
+# TRTLLM_K3_MLA_KV_SIDE=1 (with TRTLLM_K3_MLA_GATE_SIDE): in that generation path the KV half
+# (kv_a RMSNorm, latent concat, KV append + decode scheduler buffers) runs on the attention aux
+# stream from the q_a output to the decode, and the main stream (q_a RMSNorm, q_b, q absorb)
+# joins it only before the decode; the generic path joins after each step, which keeps q_b
+# from launching before the kv_a RMSNorm ends. Same kernels and arguments, bit-exact.
+_K3_MLA_KV_SIDE = os.environ.get("TRTLLM_K3_MLA_KV_SIDE", "0") == "1"
+# TRTLLM_K3_MLA_KV_SIDE_PRIO=1: run that KV half on a high-priority stream of its own, so its
+# small kernels are dispatched ahead of grids that were launched early (PDL) and still wait
+# for shared memory (the q absorb behind q_b).
+_K3_MLA_KV_SIDE_PRIO = os.environ.get("TRTLLM_K3_MLA_KV_SIDE_PRIO", "0") == "1"
+# One side stream per device, shared by all MLA layers (their side work never overlaps).
+_GATE_SIDE_STREAMS: dict[tuple[int, bool], torch.cuda.Stream] = {}
+
+
+def _gate_side_stream(device: torch.device, high_priority: bool = False) -> torch.cuda.Stream:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _GATE_SIDE_STREAMS.get((index, high_priority))
+    if stream is None:
+        priority = torch.cuda.Stream.priority_range()[1] if high_priority else 0
+        stream = torch.cuda.Stream(device=index, priority=priority)
+        _GATE_SIDE_STREAMS[(index, high_priority)] = stream
+    return stream
+
 
 # Deliberate divergence from upstream, which defaults this to "cute-dsl".
 #
@@ -332,6 +371,10 @@ class KimiK3MLAAttention(MLA):
         # instead of a BF16 absorption BMM plus its FP8 re-read in the RoPE
         # kernel (opt-in: TRTLLM_K3_MLA_FP8_Q_ABSORB=1).
         self.fp8_nope_q_absorb = os.environ.get("TRTLLM_K3_MLA_FP8_Q_ABSORB", "0") == "1"
+        # TRTLLM_K3_MLA_GATE_SIDE: side-stream fork / join of the zero-KV mask and the gate.
+        self._gate_events = tuple(torch.cuda.Event() for _ in range(4))
+        # TRTLLM_K3_MLA_KV_SIDE: fork of the KV half after q_a, join before the decode.
+        self._kv_events = (torch.cuda.Event(), torch.cuda.Event())
 
     def _apply_output_gate_and_o_proj(
         self,
@@ -355,11 +398,292 @@ class KimiK3MLAAttention(MLA):
             attn_out = attn_out * gate.sigmoid()
         return self.o_proj(attn_out)
 
+    @staticmethod
+    def _runs_flashinfer_rmsnorm(norm) -> bool:
+        """Whether ``norm(x)`` runs FlashInfer's BF16 RMSNorm (no residual, no fused quant)."""
+        return (
+            type(norm) is RMSNorm
+            and not (norm.use_cuda_tile or norm.use_gemma or norm.is_nvfp4)
+            and not norm.return_hp_output
+            and IS_FLASHINFER_AVAILABLE
+            and not is_nvfp4_marlin_enabled()
+        )
+
+    def _q_a_layernorm_maybe_fused(self, q: torch.Tensor, return_norm_out: bool = False):
+        norm = self.q_a_layernorm
+        if (
+            _K3_MLA_Q_NORM_PDL
+            and not return_norm_out
+            and self._runs_flashinfer_rmsnorm(norm)
+            and get_env_enable_pdl()
+            and self._resolve_qa_fused_scale() is None
+        ):
+            # Where the base path runs FlashInfer's RMSNorm, run the same kernel with its PDL
+            # trigger at launch (bit-exact; see ``q_norm_pdl``).
+            from .q_norm_pdl import can_use, rmsnorm_release_at_launch
+
+            if can_use(q, norm.weight):
+                return rmsnorm_release_at_launch(q, norm.weight, norm.variance_epsilon)
+        return super()._q_a_layernorm_maybe_fused(q, return_norm_out)
+
+    def _side_gate_applies(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> bool:
+        """Whether this forward takes the ``TRTLLM_K3_MLA_GATE_SIDE`` path."""
+        if not (_K3_MLA_GATE_SIDE and self.use_output_gate):
+            return False
+        if (
+            type(hidden_states) is not torch.Tensor
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.dim() != 2
+            or hidden_states.shape[0] != attn_metadata.num_tokens
+        ):
+            return False
+        if attn_metadata.num_contexts != 0 or self.sparse_attn_hooks is not None:
+            return False
+        if not self._helix_v_up_enabled() or not hasattr(self.o_proj, "gated_applies"):
+            return False
+        from ...cute_dsl_kernels.blackwell.k3_fp8w_lowm_gemm import low_m_max_for
+
+        return hidden_states.shape[0] <= low_m_max_for(
+            self.o_proj.out_features, self.o_proj.in_features
+        )
+
+    def _kv_side_applies(self, multi_stream: bool) -> bool:
+        """Whether the generation-only forward can run :meth:`_forward_gen_kv_side`: the fused
+        q_a / kv_a projection, an FP8 KV cache with the FP8 q absorb, NoPE, and the aux
+        stream in use."""
+        w_kc = getattr(self, "k_b_proj_trans", None)
+        if w_kc is not None and w_kc.dtype != torch.bfloat16:
+            w_kc = self.k_b_proj_trans_dequant
+        return (
+            _K3_MLA_KV_SIDE
+            and multi_stream
+            and self.aux_stream is not None
+            and not self.is_lite
+            and self.fuse_qkv_a_proj
+            and self.fp8_nope_q_absorb
+            and not self.apply_rotary_emb
+            and not self.llama_4_scaling
+            and self._helix_v_up_enabled()
+            and isinstance(self.mqa, TrtllmAttention)
+            and getattr(self.mqa, "has_fp8_kv_cache", False)
+            and not self.mqa.uses_fp4_mla_attention
+            and w_kc is not None
+            and w_kc.dtype == torch.bfloat16
+            and self._fp8_q_unit_scale is not None
+        )
+
+    def _latent_row(self, compressed_kv: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
+        """``torch.concat([kv_a_layernorm(compressed_kv), k_pe], -1)``, bit for bit; where the
+        norm is FlashInfer's, it writes straight into the concatenated row and ``k_pe`` is
+        copied beside it (a tiny copy instead of the batched concat kernel)."""
+        norm = self.kv_a_layernorm
+        if not (self._runs_flashinfer_rmsnorm(norm) and compressed_kv.dtype == torch.bfloat16):
+            return torch.concat([norm(compressed_kv), k_pe], dim=-1)
+        from flashinfer.norm import rmsnorm
+
+        lora = compressed_kv.shape[-1]
+        latent = torch.empty(
+            (compressed_kv.shape[0], lora + k_pe.shape[-1]),
+            dtype=compressed_kv.dtype,
+            device=compressed_kv.device,
+        )
+        rmsnorm(
+            compressed_kv,
+            norm.weight,
+            norm.variance_epsilon,
+            out=latent[:, :lora],
+            enable_pdl=get_env_enable_pdl(),
+        )
+        latent[:, lora:].copy_(k_pe)
+        return latent
+
+    def _forward_gen_kv_side(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """Absorbed Helix generation with the KV half on the aux stream; returns the combined
+        all-to-all output (``num_tokens x num_heads_tp_cp * v_head_dim``).
+
+        The calls and their arguments are those of ``MLA._forward_impl`` and
+        ``forward_absorption_generation`` for this configuration; only the stream order
+        changes. The KV append (``mla_rope_generation`` with ``q_rope_applied``) reads only the
+        latent row and the cache metadata; ``fused_q`` and ``q_pe`` are passed for their shape
+        and strides, which is why a ``q_pe``-shaped placeholder stands in for the q_b output it
+        precedes. Its scheduler / scale buffers are allocated on the aux stream that writes
+        them, and the main stream joins before the decode reads them.
+        """
+        num_tokens = attn_metadata.num_tokens
+        heads, lora, rope = self.num_heads_tp, self.kv_lora_rank, self.qk_rope_head_dim
+        device = hidden_states.device
+        w_kc_bf16 = (
+            self.k_b_proj_trans
+            if self.k_b_proj_trans.dtype == torch.bfloat16
+            else self.k_b_proj_trans_dequant
+        )
+        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+            [self.q_lora_rank, lora, rope], -1
+        )
+        fused_q = torch.empty(
+            [num_tokens, heads, lora + rope], dtype=hidden_states.dtype, device=device
+        )
+        quant_q_buffer = torch.empty(
+            num_tokens, heads, lora + rope, dtype=torch.uint8, device=device
+        )
+        kv_fork, kv_ready = self._kv_events
+        kv_fork.record()
+        kv_stream = (
+            _gate_side_stream(device, high_priority=True)
+            if _K3_MLA_KV_SIDE_PRIO
+            else self.aux_stream
+        )
+        with torch.cuda.stream(kv_stream):
+            kv_fork.wait()
+            latent_cache = self._latent_row(compressed_kv, k_pe)
+            num_seqs = attn_metadata.num_seqs
+            cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+            cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+            fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+            q_pe_shape = torch.empty(
+                [num_tokens, heads, self.qk_head_dim], dtype=hidden_states.dtype, device=device
+            )[..., self.qk_nope_head_dim :]
+            self.mqa.mla_rope_generation(
+                fused_q,
+                q_pe_shape,
+                latent_cache,
+                attn_metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+                quant_scale_qkv=self._fp8_q_unit_scale,
+                q_rope_applied=True,
+            )
+            kv_ready.record()
+        q = self._q_a_layernorm_maybe_fused(q)
+        q = self.q_b_proj(q)
+        q_pe = q.view([-1, heads, self.qk_head_dim])[..., self.qk_nope_head_dim :]
+        mla_fp8_q_absorb_nope(
+            q.view([-1, heads, self.qk_head_dim]),
+            w_kc_bf16,
+            quant_q_buffer,
+            self.qk_nope_head_dim,
+            rope,
+        )
+        kv_ready.wait()
+        attn_out = self._attn_forward_gen(
+            self.mqa,
+            fused_q.view([num_tokens, heads * (lora + rope)]),
+            None,
+            None,
+            None,
+            attn_metadata,
+            helix_v_up=True,
+            attention_input_type=AttentionInputType.generation_only,
+            out_scale=self.out_scale,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+        )
+        assert attn_out.shape == (num_tokens, self.num_heads_tp_cp * self.v_head_dim)
+        return attn_out
+
+    def _forward_side_gate(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """Generation forward with the zero-KV mask and the output gate on a side stream.
+
+        The mask (one small kernel) is forked once the layer input is written; the gate (one
+        GEMM with a sigmoid epilogue) is forked when the all-to-all is enqueued, so it runs on
+        the SMs the all-to-all leaves idle instead of beside the q_a / q_b GEMMs. The main
+        stream waits for the mask where the all-to-all reads it and for the gate just before
+        o_proj, where both are long done.
+        """
+        num_tokens = hidden_states.shape[0]
+        mask_fork, mask_ready, gate_fork, gate_ready = self._gate_events
+        multi_stream = do_multi_stream()
+        side = _gate_side_stream(hidden_states.device) if multi_stream else None
+        gates = []
+        mask_joined = [not multi_stream]
+
+        def gate_of(x):
+            forward_sigmoid = getattr(self.g_proj, "forward_sigmoid", None)
+            if forward_sigmoid is not None:
+                return forward_sigmoid(x)
+            return self.g_proj(x).sigmoid()
+
+        if multi_stream:
+            mask_fork.record()
+            with torch.cuda.stream(side):
+                mask_fork.wait()
+                zero_kv_mask = helix_gen_zero_kv_mask(attn_metadata, num_tokens)
+                mask_ready.record()
+        else:
+            zero_kv_mask = helix_gen_zero_kv_mask(attn_metadata, num_tokens)
+
+        def zero_kv_mask_fn():
+            if not mask_joined[0]:
+                mask_ready.wait()
+                mask_joined[0] = True
+            return zero_kv_mask
+
+        def pre_exchange():
+            if multi_stream:
+                gate_fork.record()
+                with torch.cuda.stream(side):
+                    gate_fork.wait()
+                    gates.append(gate_of(hidden_states))
+                    gate_ready.record()
+            else:
+                gates.append(gate_of(hidden_states))
+
+        attn_outputs = None
+        self.helix_zero_kv_mask_fn = zero_kv_mask_fn
+        self.helix_pre_exchange_fn = pre_exchange
+        self.defer_helix_gen_output = True
+        try:
+            attn_out = None
+            if self._kv_side_applies(multi_stream):
+                attn_out = self._forward_gen_kv_side(hidden_states, attn_metadata)
+            else:
+                attn_outputs = self._create_outputs(hidden_states, attn_metadata)
+                super().forward_impl(None, hidden_states, attn_metadata, attn_output=attn_outputs)
+                attn_out = self.helix_gen_output
+        finally:
+            self.helix_zero_kv_mask_fn = None
+            self.helix_pre_exchange_fn = None
+            self.defer_helix_gen_output = False
+            self.helix_gen_output = None
+        if attn_out is None:
+            attn_out = attn_outputs[0]
+        if not mask_joined[0]:
+            mask_ready.wait()
+        if gates:
+            gate = gates[0]
+            if multi_stream:
+                gate_ready.wait()
+        else:
+            gate = gate_of(hidden_states)
+        if self.o_proj.gated_applies(attn_out, gate):
+            return self.o_proj.forward_gated(attn_out, gate)
+        return self.o_proj(attn_out * gate)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        if self._side_gate_applies(hidden_states, attn_metadata):
+            return self._forward_side_gate(hidden_states, attn_metadata)
         # _create_outputs() rather than create_output(): the base implementation
         # takes a list so a sparse-attention backend can append its own buffers,
         # and it routes through the sparse hooks when they are installed. The
