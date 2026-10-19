@@ -406,3 +406,69 @@ def test_mxfp8_q_a_input_matches_bf16_input(batch, monkeypatch):
         assert torch.isfinite(graph).all() and graph.abs().max() > 0
         assert torch.equal(eager_mx, eager), f"eager {cfg}"
         assert torch.equal(graph_mx, graph), f"graph {cfg}"
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_fused_v_up_matches_bmm(batch, monkeypatch):
+    """``helix_v_up_in_attention`` (TRTLLM_K3_MLA_FUSED_V_UP): the CuTe DSL decode applies the V
+    up-projection in its reduction; the layer output is bitwise the BMM path's, eagerly and in
+    CUDA graphs, on the default path and with every side-stream switch."""
+    import weakref
+
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    monkeypatch.setenv("TRTLLM_MLA_PARTIAL_BF16", "1")
+    q_len = 8 if batch == 4 else 7
+    model, mixer, manager, md, x = _build(batch, q_len, 448, monkeypatch)
+    extra = {
+        "attention_metadata": weakref.ref(md),
+        "mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)},
+    }
+    pool = manager.get_buffers(0)
+    pool_init = pool.clone()
+    bmm_calls = [0]
+    project = mixer._helix_project_v_partials
+
+    def counted(*args, **kwargs):
+        bmm_calls[0] += 1
+        return project(*args, **kwargs)
+
+    monkeypatch.setattr(mixer, "_helix_project_v_partials", counted)
+    results = {}
+    try:
+        with torch.inference_mode():
+            for cfg in [(False,) * 4, (True,) * 4]:
+                _set(monkeypatch, k3mla, *cfg)
+                for fused in (False, True):
+                    mixer.helix_v_up_in_attention = fused
+                    bmm_calls[0] = 0
+                    pool.copy_(pool_init)
+                    with model_extra_attrs(extra):
+                        eager = mixer(x, md).clone()
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    with with_multi_stream(True), torch.cuda.stream(s), model_extra_attrs(extra):
+                        mixer(x, md)
+                    torch.cuda.current_stream().wait_stream(s)
+                    graph = torch.cuda.CUDAGraph()
+                    with (
+                        with_multi_stream(True),
+                        torch.cuda.graph(graph, stream=s),
+                        model_extra_attrs(extra),
+                    ):
+                        out = mixer(x, md)
+                    pool.copy_(pool_init)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    results[cfg, fused] = (eager, out.clone())
+                    # eager, warm-up and capture each project V once on the BMM path, never fused
+                    assert bmm_calls[0] == (0 if fused else 3), (cfg, fused, bmm_calls[0])
+    finally:
+        manager.shutdown()
+    for cfg in [(False,) * 4, (True,) * 4]:
+        (eager, graph), (eager_f, graph_f) = results[cfg, False], results[cfg, True]
+        assert torch.isfinite(graph).all() and graph.abs().max() > 0
+        assert torch.equal(eager_f, eager), f"eager {cfg}"
+        assert torch.equal(graph_f, graph), f"graph {cfg}"

@@ -534,14 +534,19 @@ class MLA(nn.Module):
         # attention output itself (Kimi K3): a callable returning the zero-local-KV mask it
         # computed ahead of time (``helix_gen_zero_kv_mask``; called on the current stream
         # where the mask is needed, after the attention kernel), a callable run right before
-        # the all-to-all is enqueued (after the V up-projection), and whether the
-        # all-to-all's combined output is left in ``helix_gen_output`` instead of being
-        # copied into the ``output`` buffer (only with the V up-projection before the
+        # the all-to-all is enqueued (after the V up-projection; its argument says whether the
+        # attention backend applied the projection, see ``helix_v_up_in_attention``), and
+        # whether the all-to-all's combined output is left in ``helix_gen_output`` instead of
+        # being copied into the ``output`` buffer (only with the V up-projection before the
         # all-to-all, where both hold the same values).
         self.helix_zero_kv_mask_fn: Optional[Callable[[], Optional[torch.Tensor]]] = None
-        self.helix_pre_exchange_fn: Optional[Callable[[], None]] = None
+        self.helix_pre_exchange_fn: Optional[Callable[[bool], None]] = None
         self.defer_helix_gen_output = False
         self.helix_gen_output: Optional[torch.Tensor] = None
+        # With the V up-projection before the all-to-all: ask the attention backend to apply
+        # it to its output rows (``AttentionForwardArgs.helix_v_up_weight``); a backend that
+        # cannot leaves it to ``_helix_project_v_partials`` as without the request.
+        self.helix_v_up_in_attention = False
         ugpu_policy = config.extra_attrs.get("ugpu_policy")
         self._ugpu_policy = ugpu_policy if ugpu_policy is not None else UgpuPolicy()
         self.enable_ugpu_bf16_linear = enable_ugpu_bf16_linear
@@ -927,12 +932,24 @@ class MLA(nn.Module):
                 (q.shape[0], self.num_heads_tp, 2), device=q.device, dtype=torch.float32
             )
             kwargs["softmax_stats_tensor"] = softmax_stats
+            v_weight = self.helix_v_b_proj_full if helix_v_up else None
+            if (
+                self.helix_v_up_in_attention
+                and v_weight is not None
+                and v_weight.dtype == torch.bfloat16
+                and v_weight.is_contiguous()
+            ):
+                kwargs["helix_v_up_weight"] = v_weight
+                kwargs["helix_v_up_out"] = q.new_empty(
+                    (q.shape[0], self.num_heads_tp, self.v_head_dim), dtype=torch.bfloat16
+                )
+            forward_args = AttentionForwardArgs(**kwargs)
             partial_o = attn_backend.forward(
                 q,
                 k,
                 v,
                 attn_metadata,
-                forward_args=AttentionForwardArgs(**kwargs),
+                forward_args=forward_args,
             )
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
@@ -943,10 +960,15 @@ class MLA(nn.Module):
                 zero_kv_mask = helix_gen_zero_kv_mask(attn_metadata, partial_o.shape[0])
             value_dim = kv_lora_rank
             if helix_v_up:
-                partial_o = self._helix_project_v_partials(partial_o)
+                if forward_args.helix_v_up_done:
+                    partial_o = forward_args.helix_v_up_out.view(
+                        partial_o.shape[0], self.num_heads_tp * self.v_head_dim
+                    )
+                else:
+                    partial_o = self._helix_project_v_partials(partial_o)
                 value_dim = self.v_head_dim
             if self.helix_pre_exchange_fn is not None:
-                self.helix_pre_exchange_fn()
+                self.helix_pre_exchange_fn(forward_args.helix_v_up_done)
             return _helix_post_process(
                 partial_o,
                 softmax_stats,

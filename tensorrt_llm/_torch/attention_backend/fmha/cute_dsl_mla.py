@@ -548,7 +548,7 @@ class CuteDslMlaFmha(PhasedFmha):
 
         o_kernel = output_view.permute(2, 3, 1, 0)
 
-        op(
+        args = (
             q_latent,
             q_rope,
             c_pool_latent,
@@ -562,6 +562,8 @@ class CuteDslMlaFmha(PhasedFmha):
             page_size,
             softmax_scale,
             output_scale,
+        )
+        trailing_args = (
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
             params.fwd.softmax_stats_tensor,
@@ -577,6 +579,23 @@ class CuteDslMlaFmha(PhasedFmha):
                 else None
             ),
         )
+        if kernel_dtype != torch.float8_e4m3fn:
+            op(*args, *trailing_args)
+            return
+        # The FP8 op applies a requested Helix V up-projection itself (fused into its
+        # reduction where it can); v_out precedes the defaulted arguments.
+        v_up = (
+            params.fwd.helix_v_up_weight is not None
+            and params.fwd.helix_v_up_out is not None
+            and params.fwd.softmax_stats_tensor is not None
+        )
+        op(
+            *args,
+            params.fwd.helix_v_up_out if v_up else None,
+            *trailing_args,
+            params.fwd.helix_v_up_weight if v_up else None,
+        )
+        params.fwd.helix_v_up_done = v_up
 
     def run_mla_generation(
         self,

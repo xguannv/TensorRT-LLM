@@ -8606,6 +8606,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
         BlackwellMultiHeadLatentAttentionForwardFP8
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
+        MAX_ROWS as V_UP_MAX_ROWS, V_HEAD_DIM as V_UP_HEAD_DIM,
+        BlackwellMlaDecodeFP8VUp, v_up_rows_bucket)
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
 
@@ -9480,6 +9483,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.kernel_class is BlackwellMultiHeadLatentAttentionForwardFP8:
                 fp8_options = self._fp8_kernel_options(batch_size,
                                                        balanced_split)
+            # Helix V up-projection (kwargs v_weight / v_out): fused into the
+            # balanced split's reduction where it applies, else a BMM after
+            # the kernel (see _v_up_rows).
+            v_weight = kwargs.get("v_weight")
+            v_out = kwargs.get("v_out")
+            v_rows = (self._v_up_rows(batch_size, balanced_split, v_weight,
+                                      v_out) if v_weight is not None else 0)
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -9491,7 +9501,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 rows_per_request,
                 balanced_split,
                 fp8_options,
-            )
+            ) + ((("v_rows", v_rows), ) if v_rows else ())
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
                 # for seconds -- always log enough to identify the variant.
@@ -9519,7 +9529,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_kwargs.update(fp8_options)
                     skip_correction_threshold = kernel_kwargs.pop(
                         "skip_correction_threshold")
-                mla = self.kernel_class(
+                kernel_class = self.kernel_class
+                if v_rows:
+                    kernel_class = BlackwellMlaDecodeFP8VUp
+                    kernel_kwargs["v_rows"] = v_rows
+                mla = kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
                     mma_qk_tiler_mn,
@@ -9601,8 +9615,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     block_split_kvs_ct,
                     softmax_scale_ct,
                     output_scale_ct,
-                    stream,
                 ])
+                if v_rows:
+                    compile_target = mla.run_with_softmax_stats_v_up
+                    compile_args.extend([
+                        cute.runtime.from_dlpack(
+                            v_weight, assumed_align=16).mark_layout_dynamic(),
+                        cute.runtime.from_dlpack(
+                            v_out, assumed_align=16).mark_layout_dynamic(),
+                    ])
+                compile_args.append(stream)
                 CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = (
                     cute.compile(
                         compile_target,
@@ -9647,14 +9669,55 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
-                stream,
             ])
+            if v_rows:
+                runtime_args.extend([v_weight, v_out])
+            runtime_args.append(stream)
             compiled_mla(*runtime_args)
+            if v_weight is not None and not v_rows:
+                # o is (H, D, S_q, B): V[b * S_q + s, h] = o[h, :, s, b] @ w[h].T
+                torch.ops.trtllm.bmm_out(
+                    o.permute(0, 3, 2, 1).reshape(self.num_heads,
+                                                  batch_size * seq_len_q,
+                                                  d_latent),
+                    v_weight.transpose(1, 2),
+                    v_out.transpose(0, 1),
+                )
             return o
+
+        def _v_up_rows(self, batch_size: int, balanced_split: bool,
+                       v_weight: torch.Tensor, v_out: torch.Tensor) -> int:
+            """UMMA N of the reduction fused with the V up-projection, or 0
+            when the forward runs the BMM after the kernel instead: the fused
+            reduction needs the FP8 kernel's balanced split with the Helix
+            softmax stats and the folded query, and at most
+            ``mla_decode_fp8_v_up.MAX_ROWS`` rows per head."""
+            rows = batch_size * self.seq_len_q
+            expected_w = (self.num_heads, V_UP_HEAD_DIM, 512)
+            expected_out = (rows, self.num_heads, V_UP_HEAD_DIM)
+            if (tuple(v_weight.shape) != expected_w
+                    or v_weight.dtype != torch.bfloat16
+                    or not v_weight.is_contiguous() or v_out is None
+                    or tuple(v_out.shape) != expected_out
+                    or v_out.dtype != torch.bfloat16
+                    or not v_out.is_contiguous()):
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner V up-projection needs a "
+                    f"contiguous BF16 v_weight {expected_w} and v_out "
+                    f"{expected_out}, got {tuple(v_weight.shape)} "
+                    f"{v_weight.dtype} and "
+                    f"{None if v_out is None else tuple(v_out.shape)}.")
+            if (self.kernel_class is not
+                    BlackwellMultiHeadLatentAttentionForwardFP8
+                    or not balanced_split or not self.emit_softmax_stats
+                    or self.num_heads >= self._MMA_TILE_M
+                    or self.seq_len_q <= 1 or rows > V_UP_MAX_ROWS):
+                return 0
+            return v_up_rows_bucket(rows)
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_mla_decode_fp8_blackwell",
-        mutates_args=("o", "workspace", "softmax_stats"),
+        mutates_args=("o", "workspace", "softmax_stats", "v_out"),
         device_types="cuda",
     )
     def cute_dsl_mla_decode_fp8_blackwell(
@@ -9671,14 +9734,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: torch.Tensor,
         output_scale: torch.Tensor,
+        v_out: Optional[torch.Tensor],
         max_batch_size: int = 0,
         softmax_stats: Optional[torch.Tensor] = None,
         kv_bounds: Optional[torch.Tensor] = None,
+        v_weight: Optional[torch.Tensor] = None,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103/SM107).
 
         kv_bounds: helix speculative verify groups -- per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
+        v_weight / v_out (Helix, with softmax_stats): the V up-projection of
+        every head, BF16 [num_heads, v_head_dim, kv_lora_rank], applied to the
+        output rows into BF16 v_out [B * seq_len_q, num_heads, v_head_dim];
+        o is then scratch (the balanced split fuses the projection into its
+        reduction and leaves o unspecified). v_out has no default: a mutated
+        argument the caller leaves out is missing from the positional
+        arguments the custom op's version-counter bookkeeping indexes.
         """
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
@@ -9711,9 +9783,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # is_persistent still come from a length-4 tactic.
         if not (isinstance(best_tactic, tuple) and len(best_tactic) == 4):
             best_tactic = runner.default_tactic(int(q_latent.shape[-1]))
+        v_kwargs = {}
+        if v_weight is not None:
+            v_kwargs = {"v_weight": v_weight, "v_out": v_out}
         runner(
             inputs,
             tactic=best_tactic,
+            **v_kwargs,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp8_blackwell")
@@ -9731,9 +9807,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: torch.Tensor,
         output_scale: torch.Tensor,
+        v_out: Optional[torch.Tensor],
         max_batch_size: int = 0,
         softmax_stats: Optional[torch.Tensor] = None,
         kv_bounds: Optional[torch.Tensor] = None,
+        v_weight: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 

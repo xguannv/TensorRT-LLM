@@ -61,6 +61,11 @@ _K3_MLA_KV_SIDE = os.environ.get("TRTLLM_K3_MLA_KV_SIDE", "0") == "1"
 # small kernels are dispatched ahead of grids that were launched early (PDL) and still wait
 # for shared memory (the q absorb behind q_b).
 _K3_MLA_KV_SIDE_PRIO = os.environ.get("TRTLLM_K3_MLA_KV_SIDE_PRIO", "0") == "1"
+# TRTLLM_K3_MLA_FUSED_V_UP=1: with the V up-projection before the Helix all-to-all, the CuTe DSL
+# FP8 decode applies it inside its balanced-split reduction (one kernel instead of the reduction
+# and a BMM, bitwise the same output) up to 32 rows per head (batch * tokens per request, see
+# mla_decode_fp8_v_up.MAX_ROWS); larger batches and the other attention backends keep the BMM.
+_K3_MLA_FUSED_V_UP = os.environ.get("TRTLLM_K3_MLA_FUSED_V_UP", "0") == "1"
 # One side stream per device, shared by all MLA layers (their side work never overlaps).
 _GATE_SIDE_STREAMS: dict[tuple[int, bool], torch.cuda.Stream] = {}
 
@@ -375,6 +380,7 @@ class KimiK3MLAAttention(MLA):
         self._gate_events = tuple(torch.cuda.Event() for _ in range(4))
         # TRTLLM_K3_MLA_KV_SIDE: fork of the KV half after q_a, join before the decode.
         self._kv_events = (torch.cuda.Event(), torch.cuda.Event())
+        self.helix_v_up_in_attention = _K3_MLA_FUSED_V_UP
         # Set by the decoder layer for the next forward only: the MXFP8 form ``(xq, xs)`` of the
         # layer input (``trtllm::k3_attn_res_*_mx``), which the fused q_a / kv_a projection
         # consumes instead of quantizing the BF16 rows itself (see q_a_takes_mxfp8).
@@ -627,9 +633,12 @@ class KimiK3MLAAttention(MLA):
 
         The mask (one small kernel) is forked once the layer input is written; the gate (one
         GEMM with a sigmoid epilogue) is forked when the all-to-all is enqueued, so it runs on
-        the SMs the all-to-all leaves idle instead of beside the q_a / q_b GEMMs. The main
-        stream waits for the mask where the all-to-all reads it and for the gate just before
-        o_proj, where both are long done.
+        the SMs the all-to-all leaves idle instead of beside the q_a / q_b GEMMs. When the
+        attention applied the V up-projection itself (TRTLLM_K3_MLA_FUSED_V_UP), the gate GEMM
+        is enqueued only after the all-to-all and its combine (still depending only on the
+        attention): enqueued before them, it takes the SMs the fused reduction leaves free and
+        the all-to-all launches later. The main stream waits for the mask where the all-to-all
+        reads it and for the gate just before o_proj, where both are long done.
         """
         num_tokens = hidden_states.shape[0]
         mask_fork, mask_ready, gate_fork, gate_ready = self._gate_events
@@ -659,13 +668,21 @@ class KimiK3MLAAttention(MLA):
                 mask_joined[0] = True
             return zero_kv_mask
 
-        def pre_exchange():
+        late_enqueue = [False]
+
+        def enqueue_gate():
+            with torch.cuda.stream(side):
+                gate_fork.wait()
+                gates.append(gate_of(hidden_states))
+                gate_ready.record()
+
+        def pre_exchange(v_up_in_attention: bool):
             if multi_stream:
                 gate_fork.record()
-                with torch.cuda.stream(side):
-                    gate_fork.wait()
-                    gates.append(gate_of(hidden_states))
-                    gate_ready.record()
+                if v_up_in_attention:
+                    late_enqueue[0] = True
+                else:
+                    enqueue_gate()
             else:
                 gates.append(gate_of(hidden_states))
 
@@ -686,6 +703,8 @@ class KimiK3MLAAttention(MLA):
             self.helix_pre_exchange_fn = None
             self.defer_helix_gen_output = False
             self.helix_gen_output = None
+        if late_enqueue[0]:
+            enqueue_gate()
         if attn_out is None:
             attn_out = attn_outputs[0]
         if not mask_joined[0]:

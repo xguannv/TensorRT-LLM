@@ -1177,34 +1177,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             use_pdl=self.use_pdl,
         )
         if cutlass.const_expr(self.balanced_split):
-            red_lse = lse
-            if cutlass.const_expr(self.emit_softmax_stats):
-                red_lse = (lse, softmax_stats)
-            # (row groups, M tiles), or (row groups, partial slots +
-            # requests / 4) past 32 requests: see balanced_reduction_kernel.
-            self.balanced_reduction_kernel(
-                o,
-                red_lse,
-                acc_o,
-                acc_lse,
-                part_desc,
-                cache_seqs,
-                kv_bounds,
-            ).launch(
-                grid=(
-                    cute.ceil_div(ws_rows, self.BALANCED_REDUCTION_ROWS),
-                    (q_latent.shape[3] * self.num_m_chunks *
-                     self.reduction_col_split if self.balanced_tile_reduction
-                     else self.balanced_num_slots +
-                     cute.ceil_div(q_latent.shape[3], self.num_compute_warps)),
-                    1,
-                ),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=(self.balanced_num_slots + 1) * 4,
-                stream=stream,
-                min_blocks_per_mp=1,
-                use_pdl=self.use_pdl,
-            )
+            self._launch_balanced_reduction(o, lse, softmax_stats, acc_o,
+                                            acc_lse, part_desc, cache_seqs,
+                                            kv_bounds, ws_rows,
+                                            q_latent.shape[3], stream)
         elif cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.emit_softmax_stats):
                 reduction_kernel = self.reduction_kernel(
@@ -1243,6 +1219,41 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 min_blocks_per_mp=1,
                 use_pdl=self.use_pdl,
             )
+
+    @cute.jit
+    def _launch_balanced_reduction(self, o, lse, softmax_stats, acc_o, acc_lse,
+                                   part_desc, cache_seqs, kv_bounds, ws_rows,
+                                   batch_size, stream):
+        """Launch the balanced split's reduction after the split kernel (the
+        folded O / LSE / softmax-stats views and the workspace views of
+        ``_run``)."""
+        red_lse = lse
+        if cutlass.const_expr(self.emit_softmax_stats):
+            red_lse = (lse, softmax_stats)
+        # (row groups, M tiles), or (row groups, partial slots +
+        # requests / 4) past 32 requests: see balanced_reduction_kernel.
+        self.balanced_reduction_kernel(
+            o,
+            red_lse,
+            acc_o,
+            acc_lse,
+            part_desc,
+            cache_seqs,
+            kv_bounds,
+        ).launch(
+            grid=(
+                cute.ceil_div(ws_rows, self.BALANCED_REDUCTION_ROWS),
+                (batch_size * self.num_m_chunks * self.reduction_col_split
+                 if self.balanced_tile_reduction else self.balanced_num_slots +
+                 cute.ceil_div(batch_size, self.num_compute_warps)),
+                1,
+            ),
+            block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
+            smem=(self.balanced_num_slots + 1) * 4,
+            stream=stream,
+            min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
+        )
 
     @cute.jit
     def make_paged_tiled_tma_atom(
