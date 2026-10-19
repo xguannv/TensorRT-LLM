@@ -43,3 +43,25 @@ class DeviceCopyBuffer:
             last = last.clone()
             last[:n] = flat
             self._last_host_values = last
+
+    def stage(self, host: torch.Tensor, input_commit) -> bool:
+        """``update`` through a batched input commit (``pyexecutor/input_commit.py``).
+
+        Skips like ``update`` when the values are unchanged; otherwise stages the copy into
+        ``input_commit``, which writes the buffer when it commits, and remembers the values.
+        Returns whether a copy was staged (False: the buffer already holds the values).
+        """
+        flat = host.reshape(-1)
+        n = flat.numel()
+        last = self._last_host_values
+        if last is not None and last.numel() >= n and torch.equal(last[:n], flat):
+            self.update(host)  # the skip path (verifies the held values under TLLM_DEBUG_MODE)
+            return False
+        input_commit.stage(self._tensor.view(-1)[:n], flat)
+        if last is None or last.numel() <= n:
+            self._last_host_values = flat.clone()
+        else:
+            last = last.clone()
+            last[:n] = flat
+            self._last_host_values = last
+        return True

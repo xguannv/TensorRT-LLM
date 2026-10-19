@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
 
 KDA_PREFILL_CHUNK_SIZE = 64
 
@@ -77,7 +78,15 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             aligned_state_indices = self._generation_state_indices[
                 : generation_state_indices.shape[0]
             ]
-            aligned_state_indices.copy_(generation_state_indices)
+            input_commit = active_input_commit()
+            if input_commit is not None and self.state_indices_staged:
+                # The int32 indices are written by the commit too; stage the same values.
+                input_commit.stage(
+                    aligned_state_indices,
+                    self.state_indices_cpu[attn_metadata.num_contexts : batch_size],
+                )
+            else:
+                aligned_state_indices.copy_(generation_state_indices)
             self.generation_state_indices = aligned_state_indices
 
         self.kda_varlen_is_aligned = (

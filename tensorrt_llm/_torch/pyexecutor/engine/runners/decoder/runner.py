@@ -45,6 +45,14 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     get_mrope_dummy_seq_slot,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    InputCommit,
+    active_input_commit,
+    batched_input_commit_enabled,
+    block_offsets_triton_enabled,
+    input_commit_scope,
+    warmup_input_commit_kernels,
+)
 from tensorrt_llm._torch.pyexecutor.k3ll_flags import k3ll_census_dispatch, k3ll_flag
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -493,6 +501,14 @@ class DecoderRunner(ScheduledModelRunner):
         self.position_ids_cuda = torch.empty(
             (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
         )
+        # TRTLLM_BATCHED_INPUT_COMMIT=1: the host->device input copies of a
+        # CUDA-graph decode step (and the overlap-scheduler gathers) are
+        # written by one kernel right before the replay; see input_commit.py.
+        self._input_commit: InputCommit | None = (
+            InputCommit() if batched_input_commit_enabled() and prefer_pinned() else None
+        )
+        if self._input_commit is not None or block_offsets_triton_enabled():
+            warmup_input_commit_kernels(self._input_commit)
         # Host counter of the steady-state generation prepare cache.
         self._steady_gen_positions_pinned = torch.empty(
             (self._config.max_num_tokens,), dtype=torch.int, pin_memory=prefer_pinned()
@@ -4202,15 +4218,70 @@ class DecoderRunner(ScheduledModelRunner):
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
+        # Set by forward() for a batched input commit (see input_commit.py).
+        input_commit = active_input_commit()
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.input_ids_cuda[:num_tokens], input_ids)
+            else:
+                input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
+                self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         if num_draft_tokens > 0:
-            draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
-        if next_draft_tokens_device is not None:
+            if input_commit is not None:
+                input_commit.stage(self.draft_tokens_cuda[:num_draft_tokens], draft_tokens)
+            else:
+                draft_tokens = torch.tensor(
+                    draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
+        if (
+            next_draft_tokens_device is not None
+            and input_commit is not None
+            and not generation_requests
+        ):
+            # Same values as the branch below, written by the commit kernel: it
+            # gathers the previous step's tokens / accepted lengths by the slots
+            # staged with it, and writes the whole offset buffers (zero outside
+            # the gathered ranges). Steps with generation requests next to the
+            # extend requests keep the branch below (their previous slots carry
+            # one token each, which the commit's fixed-width gather does not).
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+            if previous_batch_len > 0:
+                # The device copies of the slot tables are not read by the
+                # commit; keep them current for the steps that do read them.
+                if previous_batch_indices != self._staged_previous_batch_indices:
+                    input_commit.stage(
+                        self.previous_batch_indices_cuda[:previous_batch_len],
+                        previous_batch_indices,
+                    )
+                    self._staged_previous_batch_indices = list(previous_batch_indices)
+                if previous_pos_indices != self._staged_previous_pos_indices:
+                    input_commit.stage(
+                        self.previous_pos_indices_cuda[: len(previous_pos_indices)],
+                        previous_pos_indices,
+                    )
+                    self._staged_previous_pos_indices = list(previous_pos_indices)
+            input_commit.set_overlap_fixup(
+                previous_slots=previous_batch_indices,
+                tokens_per_req=runtime_tokens_per_gen_step,
+                draft_width=runtime_tokens_per_gen_step - 1,
+                new_tokens=new_tokens_device,
+                new_tokens_lens=new_tokens_lens_device,
+                next_draft_tokens=next_draft_tokens_device,
+                input_ids=self.input_ids_cuda,
+                input_ids_start=num_tokens,
+                draft_tokens=self.draft_tokens_cuda,
+                draft_tokens_start=num_draft_tokens,
+                pos_offsets=self.previous_pos_id_offsets_cuda,
+                pos_offsets_start=(num_extend_reqeust_wo_dummy - previous_batch_len)
+                * runtime_tokens_per_gen_step,
+                kv_offsets=self.previous_kv_lens_offsets_cuda,
+                kv_offsets_start=num_extend_reqeust_wo_dummy - previous_batch_len,
+            )
+        elif next_draft_tokens_device is not None:
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
             num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
@@ -4383,11 +4454,21 @@ class DecoderRunner(ScheduledModelRunner):
                 )
             final_position_ids = self.mrope_position_ids_cuda[:, :, :total_num_tokens]
         else:
-            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids, non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.position_ids_cuda[:total_num_tokens], host_position_ids)
+            else:
+                self.position_ids_cuda[:total_num_tokens].copy_(
+                    host_position_ids, non_blocking=True
+                )
             final_position_ids = self.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
         if enable_spec_decode:
-            self._gather_ids_buffer.update(torch.tensor(gather_ids, dtype=torch.int))
+            if input_commit is not None:
+                self._gather_ids_buffer.stage(
+                    torch.tensor(gather_ids, dtype=torch.int), input_commit
+                )
+            else:
+                self._gather_ids_buffer.update(torch.tensor(gather_ids, dtype=torch.int))
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -4723,6 +4804,64 @@ class DecoderRunner(ScheduledModelRunner):
         )
         return inputs, gather_ids_device, runtime_draft_len
 
+    def _input_commit_for_step(
+        self,
+        scheduled_requests: ScheduledRequests,
+        attn_metadata: AttentionMetadata,
+        can_run_graph: bool,
+        promoted_context_request_ids: frozenset[int],
+        *,
+        enable_spec_decode: bool,
+        is_dummy: bool,
+        use_lora_graph: bool,
+    ) -> InputCommit | None:
+        """The batched input commit for this step, or None to copy one by one.
+
+        Limited to the input-preparation path whose device-side reads of the
+        staged buffers were audited: a CUDA-graph replay (not warmup or
+        capture) of a generation-only batch without padding dummies, on a
+        one-engine speculative-decoding runner, using TRT-LLM attention
+        without FlashMLA or FP4 MLA pools, Helix or no context parallelism,
+        and without MRoPE, beam search, LoRA, guided decoding or attention DP.
+        """
+        if self._input_commit is None or not can_run_graph or is_dummy:
+            return None
+        if (
+            scheduled_requests.num_context_requests > 0
+            or promoted_context_request_ids
+            or scheduled_requests.num_generation_requests == 0
+        ):
+            return None
+        if (
+            self._config.use_mrope
+            or self.use_beam_search
+            or self._config.enable_attention_dp
+            or self.lora_model_config is not None
+            or use_lora_graph
+            or self.guided_decoder is not None
+        ):
+            return None
+        spec_config = self._config.spec_config
+        if (
+            not enable_spec_decode
+            or spec_config is None
+            or not spec_config.spec_dec_mode.use_one_engine()
+        ):
+            return None
+        if self.mapping is not None:
+            cp_type = self.mapping.cp_config.get("cp_type", None)
+            if cp_type is not None and cp_type != CpType.HELIX:
+                return None
+        if (
+            type(attn_metadata) is not TrtllmAttentionMetadata
+            or attn_metadata.enable_flash_mla
+            or attn_metadata.fp4_mla_state is not None
+        ):
+            return None
+        if any(request.is_dummy for request in scheduled_requests.generation_requests):
+            return None
+        return self._input_commit
+
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
         self,
@@ -4998,6 +5137,15 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
+            input_commit = self._input_commit_for_step(
+                execution_requests,
+                attn_metadata,
+                can_run_graph,
+                execution_promoted_context_ids,
+                enable_spec_decode=enable_spec_decode,
+                is_dummy=is_dummy,
+                use_lora_graph=use_lora_graph,
+            )
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -5005,22 +5153,47 @@ class DecoderRunner(ScheduledModelRunner):
                 execution_promoted_context_ids,
                 enable_spec_decode=enable_spec_decode,
             ):
-                inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
-                    execution_requests,
-                    kv_cache_manager,
-                    attn_metadata,
-                    spec_metadata,
-                    new_tensors_device,
-                    cache_indirection_buffer,
-                    resource_manager,
-                    can_run_graph,
-                    execution_promoted_context_ids,
-                    use_lora_graph=use_lora_graph,
-                    enable_spec_decode=enable_spec_decode,
-                    runtime_draft_len=runtime_draft_len,
-                    is_dummy=is_dummy,
-                    gather_context_logits=gather_context_logits,
-                )
+                if input_commit is None:
+                    inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
+                        execution_requests,
+                        kv_cache_manager,
+                        attn_metadata,
+                        spec_metadata,
+                        new_tensors_device,
+                        cache_indirection_buffer,
+                        resource_manager,
+                        can_run_graph,
+                        execution_promoted_context_ids,
+                        use_lora_graph=use_lora_graph,
+                        enable_spec_decode=enable_spec_decode,
+                        runtime_draft_len=runtime_draft_len,
+                        is_dummy=is_dummy,
+                        gather_context_logits=gather_context_logits,
+                    )
+                else:
+                    input_commit.begin()
+                    try:
+                        with input_commit_scope(input_commit):
+                            inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
+                                execution_requests,
+                                kv_cache_manager,
+                                attn_metadata,
+                                spec_metadata,
+                                new_tensors_device,
+                                cache_indirection_buffer,
+                                resource_manager,
+                                can_run_graph,
+                                execution_promoted_context_ids,
+                                use_lora_graph=use_lora_graph,
+                                enable_spec_decode=enable_spec_decode,
+                                runtime_draft_len=runtime_draft_len,
+                                is_dummy=is_dummy,
+                                gather_context_logits=gather_context_logits,
+                            )
+                    except BaseException:
+                        input_commit.abort()
+                        raise
+                    input_commit.commit()
             if execution_promoted_context_ids:
                 self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
                 self.iter_states["num_ctx_tokens"] = sum(

@@ -28,6 +28,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..pyexecutor.input_commit import active_input_commit
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -585,7 +586,11 @@ class DFlashSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        self._batch_indices_buffer.update(torch.arange(num_seqs, dtype=torch.int))
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            self._batch_indices_buffer.stage(torch.arange(num_seqs, dtype=torch.int), input_commit)
+        else:
+            self._batch_indices_buffer.update(torch.arange(num_seqs, dtype=torch.int))
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -624,7 +629,10 @@ class DFlashSpecMetadata(SpecMetadata):
                 [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
                 dtype=torch.long,
             )
-            worker._batch_to_slot_buffer.update(mapping)
+            if input_commit is not None:
+                worker._batch_to_slot_buffer.stage(mapping, input_commit)
+            else:
+                worker._batch_to_slot_buffer.update(mapping)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
