@@ -118,6 +118,16 @@ _MOE_LOWM_MAX_TOKENS_ENV = "TRTLLM_MOE_LOWM_MAX_TOKENS"
 # with the max-shared carveout and triggers FC2's launch only at the start of each CTA's last work
 # unit (k3_moe_lowm.py, share_sm). Unset: the device maximum, FC2 launched right away.
 _MOE_LOWM_FC1_SMEM_KB_ENV = "TRTLLM_MOE_LOWM_FC1_SMEM_KB"
+# Persistent CTAs of the small-batch FC1 / FC2 kernels (default: one per SM). Fewer CTAs leave SMs
+# free for kernels on other streams (the shared expert); the work units are split over the CTAs.
+_MOE_LOWM_FC1_CTAS_ENV = "TRTLLM_MOE_LOWM_FC1_CTAS"
+_MOE_LOWM_FC2_CTAS_ENV = "TRTLLM_MOE_LOWM_FC2_CTAS"
+# When the small-batch FC1 kernel releases FC2's launch: "wait" (right after its own
+# griddepcontrol.wait, so FC2 streams its weights early) or "last" (when each CTA starts its last
+# work unit, so a launched FC2 grid whose CTAs wait for SM space does not hold back the CTAs of
+# kernels on other streams for most of FC1). Unset: "last" with TRTLLM_MOE_LOWM_FC1_SMEM_KB,
+# "wait" otherwise.
+_MOE_LOWM_FC1_TRIGGER_ENV = "TRTLLM_MOE_LOWM_FC1_TRIGGER"
 
 
 def _moe_lowm_max_tokens() -> int:
@@ -130,6 +140,26 @@ def _moe_lowm_max_tokens() -> int:
 def _moe_lowm_fc1_smem_bytes() -> int:
     """Shared memory cap of one small-batch FC1 CTA in bytes (0: the device maximum)."""
     return max(0, int(os.environ.get(_MOE_LOWM_FC1_SMEM_KB_ENV, "0"))) * 1024
+
+
+def _moe_lowm_fc1_late_trigger(smem_cap: int) -> bool:
+    """Whether the small-batch FC1 kernel releases FC2 at its CTAs' last work unit."""
+    trigger = os.environ.get(_MOE_LOWM_FC1_TRIGGER_ENV, "")
+    if trigger not in ("", "wait", "last"):
+        raise ValueError(
+            f"{_MOE_LOWM_FC1_TRIGGER_ENV} must be wait or last, got {trigger!r}")
+    return trigger == "last" or (not trigger and smem_cap > 0)
+
+
+def _moe_lowm_ctas(env_name: str) -> int:
+    """Requested persistent CTAs of a small-batch MoE kernel (0: one per SM)."""
+    return max(0, int(os.environ.get(env_name, "0")))
+
+
+def _moe_lowm_grid(requested: int) -> int:
+    """Persistent CTAs of a small-batch MoE kernel: one per SM, or ``requested`` if fewer."""
+    num_sms = get_max_activate_clusters(1)
+    return min(requested, num_sms) if requested > 0 else num_sms
 
 
 def _moe_tactic_pin(env_name: str) -> Optional[Tuple[int, ...]]:
@@ -2884,6 +2914,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 _MOE_WEIGHT_EVICT_FIRST_ENV, "0") == "1"
             self.tactic_pin = _moe_tactic_pin(_MOE_FINALIZE_TACTIC_ENV)
             self.lowm_max_tokens = _moe_lowm_max_tokens()
+            self.lowm_ctas = _moe_lowm_ctas(_MOE_LOWM_FC2_CTAS_ENV)
 
         def unique_id(self):
             return (
@@ -2900,6 +2931,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.weight_evict_first,
                 self.tactic_pin,
                 self.lowm_max_tokens,
+                self.lowm_ctas,
             )
 
         def use_lowm(self, num_tokens: int, n: int, k: int) -> bool:
@@ -2910,7 +2942,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def _forward_lowm(self, ptrs, m, n, k, num_local, num_tokens, stream):
             n_tok = k3_moe_lowm_n_tok_for(num_tokens)
-            num_ctas = get_max_activate_clusters(1)
+            num_ctas = _moe_lowm_grid(self.lowm_ctas)
             # Early weight streaming reads the tile metadata before griddepcontrol.wait, which the
             # autotuner's input pre-hook rebuilds right before the kernel.
             early = not AutoTuner.get().is_tuning_mode
@@ -3740,6 +3772,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                     if self.activation_type
                                     == ActivationType.SiTu else 0)
             self.lowm_smem = _moe_lowm_fc1_smem_bytes()
+            self.lowm_ctas = _moe_lowm_ctas(_MOE_LOWM_FC1_CTAS_ENV)
+            self.lowm_late_trigger = _moe_lowm_fc1_late_trigger(self.lowm_smem)
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3767,6 +3801,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tactic_pin,
                 self.lowm_max_tokens,
                 self.lowm_smem,
+                self.lowm_ctas,
+                self.lowm_late_trigger,
             )
 
         def use_lowm(self, orig_m: int, n: int, k: int) -> bool:
@@ -3777,23 +3813,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def _forward_lowm(self, ptrs, orig_m, m, n, k, num_local, stream):
             n_tok = k3_moe_lowm_n_tok_for(orig_m)
-            num_ctas = get_max_activate_clusters(1)
+            num_ctas = _moe_lowm_grid(self.lowm_ctas)
             cache_key = ("lowm", n_tok, n, k, self.top_k, self.situ_beta,
-                         self.situ_linear_beta, num_ctas, self.lowm_smem)
+                         self.situ_linear_beta, num_ctas, self.lowm_smem,
+                         self.lowm_late_trigger)
             compiled = self.__class__.kernel_cache.get(cache_key)
             if compiled is None:
                 smem = ({
                     "smem_capacity": self.lowm_smem,
                     "share_sm": True
                 } if self.lowm_smem else {})
-                kernel = K3MoeFc1LowMKernel(n_tok,
-                                            n,
-                                            k,
-                                            self.top_k,
-                                            self.situ_beta,
-                                            self.situ_linear_beta,
-                                            use_pdl=TRTLLM_ENABLE_PDL,
-                                            **smem)
+                kernel = K3MoeFc1LowMKernel(
+                    n_tok,
+                    n,
+                    k,
+                    self.top_k,
+                    self.situ_beta,
+                    self.situ_linear_beta,
+                    use_pdl=TRTLLM_ENABLE_PDL,
+                    late_trigger=self.lowm_late_trigger,
+                    **smem)
                 compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m,
                                         num_local, num_ctas, stream)
                 self.__class__.kernel_cache[cache_key] = compiled

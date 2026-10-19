@@ -4394,10 +4394,16 @@ def test_nvfp4_grouped_gemm_finalize_swapab_blackwell(num_tokens, ep, variant, m
     ids=["k3_tp4ep4", "small"],
 )
 @pytest.mark.parametrize("num_tokens", [1, 7, 14, 32])
-@pytest.mark.parametrize("fc1_smem_kb", [0, 160], ids=["fc1_smem_max", "fc1_smem_160k"])
-def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, fc1_smem_kb, monkeypatch):
+@pytest.mark.parametrize(
+    "launch",
+    [(0, 0, ""), (160, 0, ""), (0, 100, ""), (0, 100, "last")],
+    ids=["fc1_smem_max", "fc1_smem_160k", "ctas_100", "ctas_100_late_trigger"],
+)
+def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, launch, monkeypatch):
     """Small-batch MoE kernels (TRTLLM_MOE_LOWM=1) vs the regular gather (FC1, SiTU) and finalize
-    (FC2) kernels; ``fc1_smem_kb`` > 0 caps FC1's shared memory (TRTLLM_MOE_LOWM_FC1_SMEM_KB).
+    (FC2) kernels. ``launch`` = (FC1 shared memory cap in KB, TRTLLM_MOE_LOWM_FC1_SMEM_KB; grid of
+    both kernels, TRTLLM_MOE_LOWM_FC1_CTAS / _FC2_CTAS, 0 = one CTA per SM; FC1 trigger point,
+    TRTLLM_MOE_LOWM_FC1_TRIGGER).
 
     FC1: the quantized output rows and their scale factors of every valid permuted row must be
     bit-identical. FC2: with one non-zero top-k scale per token every output element is one
@@ -4406,6 +4412,10 @@ def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, fc1_smem_kb, monkeypatch):
     exact sum of the partials.
     """
     hidden_size, interm_size, num_experts, num_local_experts, local_expert_offset, top_k = shape
+    fc1_smem_kb, ctas, trigger = launch
+    monkeypatch.setenv("TRTLLM_MOE_LOWM_FC1_CTAS", str(ctas))
+    monkeypatch.setenv("TRTLLM_MOE_LOWM_FC2_CTAS", str(ctas))
+    monkeypatch.setenv("TRTLLM_MOE_LOWM_FC1_TRIGGER", trigger)
     sf_vec_size = 16
     torch.manual_seed(1000 + num_tokens)
     logits = torch.randn(num_tokens, num_experts, device="cuda")

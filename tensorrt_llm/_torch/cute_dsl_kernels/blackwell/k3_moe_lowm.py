@@ -295,6 +295,8 @@ class K3MoeFc1LowMKernel:
         other buffers leave. Below the device maximum, a CTA of a concurrent kernel can share the SM.
     :param share_sm: Launch with the max-shared carveout and trigger dependents at the start of each
         CTA's last work unit (see the module docstring), for use with a reduced ``smem_capacity``.
+    :param late_trigger: Trigger dependents at the start of each CTA's last work unit (``True``) or
+        right after ``griddepcontrol.wait`` (``False``); ``None`` follows ``share_sm``.
     """
 
     def __init__(
@@ -313,6 +315,7 @@ class K3MoeFc1LowMKernel:
         trace: bool = False,
         smem_capacity: int = _SMEM_CAPACITY,
         share_sm: bool = False,
+        late_trigger: Optional[bool] = None,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % (2 * 64) == 0 and n % _MMA_M == 0, f"n {n} must be a multiple of 128"
@@ -330,6 +333,7 @@ class K3MoeFc1LowMKernel:
         self.num_acc_stage = num_acc_stage
         self.use_pdl = use_pdl
         self.share_sm = share_sm
+        self.late_trigger = share_sm if late_trigger is None else late_trigger
         # After the stores of a work unit, add 1 to tile_ready[tile] (GPU-scope release), so FC2
         # can start a tile once all n / 128 of its units are stored, without waiting for this grid.
         self.signal_tiles = signal_tiles
@@ -592,7 +596,7 @@ class K3MoeFc1LowMKernel:
         if cutlass.const_expr(self.use_pdl):
             # Tile metadata, tokens and token scales come from the previous grid.
             griddepcontrol_wait()
-            if cutlass.const_expr(not self.share_sm):
+            if cutlass.const_expr(not self.late_trigger):
                 griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.trace):
             if tidx == 0:
@@ -642,7 +646,7 @@ class K3MoeFc1LowMKernel:
                     self._prefetch_unit(w_raw, w_sf_raw, tile_idx_to_expert_idx, w_hi - 1)
             g = Int32(0)
             for j in cutlass.range(num_units, unroll=1):
-                if cutlass.const_expr(self.use_pdl and self.share_sm):
+                if cutlass.const_expr(self.use_pdl and self.late_trigger):
                     if j == num_units - 1:
                         griddepcontrol_launch_dependents()
                 w_idx = w_lo + j
