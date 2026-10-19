@@ -91,12 +91,15 @@ _KDA_DECODE_MXFP8 = os.environ.get("TRTLLM_K3_KDA_DECODE_MXFP8", "0") == "1"
 # projection aux stream prefetches the next KDA layer's QKVG, [f_a | b], f_b and o_proj weights
 # into L2 (cp.async.bulk.prefetch.L2, k3_l2_prefetch) while this layer's recurrence and all-reduce
 # leave HBM idle; the next layer's projections then read them from L2. Hints only: no result
-# depends on them. Up to TRTLLM_K3_KDA_L2_PREFETCH_MAX_ROWS verify rows (larger batches keep HBM
-# busy through the layer). The prefetch kernel stays on the aux stream, which the Kimi-K3 MoE block
-# of the same layer reuses for its shared experts and joins back; no main-stream kernel waits for
-# it (an extra cross-stream dependency costs a programmatic dependent its early launch).
+# depends on them. Up to TRTLLM_K3_KDA_L2_PREFETCH_MAX_ROWS verify rows (default 16, i.e. b1 / b2
+# with MTP): the prefetched lines stay in L2 through the MoE block, whose weight streams then run
+# about 1 % slower; measured on a single-GPU replica of the layer, that costs more than the
+# attention block gains from 4 requests up. The prefetch kernel stays on the aux stream, which the
+# Kimi-K3 MoE block of the same layer reuses for its shared experts and joins back; no main-stream
+# kernel waits for it (an extra cross-stream dependency costs a programmatic dependent its early
+# launch).
 _KDA_L2_PREFETCH = os.environ.get("TRTLLM_K3_KDA_L2_PREFETCH", "0") == "1"
-_KDA_L2_PREFETCH_MAX_ROWS = int(os.environ.get("TRTLLM_K3_KDA_L2_PREFETCH_MAX_ROWS", "64"))
+_KDA_L2_PREFETCH_MAX_ROWS = int(os.environ.get("TRTLLM_K3_KDA_L2_PREFETCH_MAX_ROWS", "16"))
 # KDA mixers of one model by layer index (keyed by the model's text config), for the prefetch of
 # the next KDA layer's weights.
 _KDA_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiKDALinearAttention]"] = {}
