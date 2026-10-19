@@ -2642,6 +2642,988 @@ def _(
     )
 
 
+# ---------------------------------------------------------------------------
+# Redundant expert copies: per-step copy choice (TRTLLM_K3_EXPERT_REPLICAS)
+# ---------------------------------------------------------------------------
+
+#: Most two-copy experts of one layer.
+REP_MAX_ENTRIES = 64
+#: Most copy slots per EP rank.
+REP_MAX_COPIES = 32
+#: Largest local slot count (home slots + copy slots) of the replica tail.
+REP_LOCAL_CAP = 256
+#: Home experts per EP rank of the replica tail: the per-rank counters of the copy choice are 8-bit
+#: fields of one word, so it serves EP4 (224 experts per rank).
+REP_NUM_HOME = NUM_EXPERTS // 4
+#: Word offsets of a replica table (``int32``, one per layer and EP rank, see
+#: :func:`replica_table`): the bitmap of the two-copy experts; the bitmap of the experts whose copy
+#: this rank holds, its per-word prefix counts and those experts in ascending order (copy slot
+#: ``n`` holds the ``n``-th, ``-1`` after the last); the entries in priority order (``x | home
+#: rank << 10 | copy rank << 12 | 1 << 14``, zero words after the last); the entry count.
+REP_FLEX_OFF = 0
+REP_MINE_OFF = 32
+REP_PREFIX_OFF = 64
+REP_COPYX_OFF = 96
+REP_LIST_OFF = REP_COPYX_OFF + REP_MAX_COPIES
+REP_COUNT_OFF = REP_LIST_OFF + REP_MAX_ENTRIES
+REP_TABLE_WORDS = REP_COUNT_OFF + 4
+
+
+def replica_table(entries, rank: int, num_home: int = REP_NUM_HOME) -> list[int]:
+    """Replica table of EP rank ``rank`` (``REP_TABLE_WORDS`` signed 32-bit words).
+
+    Args:
+        entries: ``(home expert, copy rank)`` pairs in priority order (at most
+            :data:`REP_MAX_ENTRIES` distinct experts); expert ``x`` lives in local slot
+            ``x - (x // num_home) * num_home`` of rank ``x // num_home``.
+        rank: EP rank of the table.
+        num_home: Home experts per rank.
+
+    The copies held by ``rank`` take its local slots ``num_home, num_home + 1, ...`` in
+    ascending expert order.
+    """
+    if len(entries) > REP_MAX_ENTRIES or len({x for x, _ in entries}) != len(entries):
+        raise ValueError(f"at most {REP_MAX_ENTRIES} distinct two-copy experts")
+    words = [0] * REP_TABLE_WORDS
+    for i, (x, r) in enumerate(entries):
+        h = x // num_home
+        if not (0 <= x < NUM_EXPERTS and 0 <= r < NUM_EXPERTS // num_home and r != h):
+            raise ValueError(f"bad copy {(x, r)}")
+        words[REP_FLEX_OFF + x // 32] |= 1 << (x % 32)
+        words[REP_LIST_OFF + i] = x | (h << 10) | (r << 12) | (1 << 14)
+    mine = sorted(x for x, r in entries if r == rank)
+    if len(mine) > REP_MAX_COPIES or num_home + len(mine) > REP_LOCAL_CAP:
+        raise ValueError(f"more than {REP_MAX_COPIES} copies or {REP_LOCAL_CAP} local slots")
+    for n in range(REP_MAX_COPIES):
+        words[REP_COPYX_OFF + n] = mine[n] if n < len(mine) else -1
+    for x in mine:
+        words[REP_MINE_OFF + x // 32] |= 1 << (x % 32)
+    before = 0
+    for w in range(NUM_EXPERTS // 32):
+        words[REP_PREFIX_OFF + w] = before
+        before += bin(words[REP_MINE_OFF + w]).count("1")
+    words[REP_COUNT_OFF] = len(entries)
+    return [w - (1 << 32) if w >= (1 << 31) else w for w in words]
+
+
+def replica_choice(selected_experts, entries, num_home: int = REP_NUM_HOME) -> list[bool]:
+    """Reference of the kernel's copy choice for one forward step: per entry, whether its copy
+    (not its home slot) computes it. ``selected_experts``: every routed expert id of the step."""
+    touched = set(int(x) for x in selected_experts)
+    flex = {x for x, _ in entries}
+    counts = [0] * (NUM_EXPERTS // num_home)
+    for x in touched - flex:
+        counts[x // num_home] += 1
+    choice = []
+    for x, r in entries:
+        h = x // num_home
+        copy = x in touched and counts[r] < counts[h]
+        if x in touched:
+            counts[r if copy else h] += 1
+        choice.append(copy)
+    return choice
+
+
+@dsl_user_op
+def _clock64(*, loc=None, ip=None):
+    return Int64(_asm(T.i64(), [], "mov.u64 $0, %clock64;", "=l", loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _stg_u64(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+        "st.global.u64 [$0], $1;",
+        "l,l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _redux_add_u32(value, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(value, loc=loc, ip=ip)],
+            "redux.sync.add.u32 $0, $1, 0xffffffff;",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _replica_lane(entry, word, *, loc=None, ip=None):
+    """Lane part of the copy choice for the entry this lane holds: ``(hit, ranks)``: ``hit`` 1
+    if it is a valid entry whose expert the step selected (``word``: the selected-expert bitmap
+    word holding it), ``ranks`` its home rank (bits 0-7) and copy rank (bits 8-15)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_iv(entry, loc=loc, ip=ip), _iv(word, loc=loc, ip=ip)],
+        "{\n.reg .b32 x, v, h, r;\n"
+        "and.b32 x, $2, 31;\n"
+        "shr.b32 $0, $3, x;\n"
+        "bfe.u32 v, $2, 14, 1;\n"
+        "and.b32 $0, $0, v;\n"
+        "and.b32 $0, $0, 1;\n"
+        "bfe.u32 h, $2, 10, 2;\n"
+        "bfe.u32 r, $2, 12, 2;\n"
+        "shl.b32 r, r, 8;\n"
+        "or.b32 $1, h, r;\n}",
+        "=&r,=&r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 2, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ballot(value, *, loc=None, ip=None):
+    """Warp ballot of ``value != 0``."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(value, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nvote.sync.ballot.b32 $0, p, 0xffffffff;\n}",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _replica_item(ranks, lane, *, loc=None, ip=None):
+    """The three walk words of a touched entry (home rank ``h``, copy rank ``r`` from ``ranks``):
+    the byte selectors of ``h`` (bits 0-15) and ``r`` (bits 16-31) for ``prmt``, the home
+    increment ``1 << 8 h`` and the copy increment ``1 << 8 r`` with the lane in bits 27-31."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 3),
+        [_iv(ranks, loc=loc, ip=ip), _iv(lane, loc=loc, ip=ip)],
+        "{\n.reg .b32 h, r, t;\n"
+        "and.b32 h, $3, 255;\n"
+        "shr.b32 r, $3, 8;\n"
+        "or.b32 $0, h, 0x4440;\n"
+        "or.b32 t, r, 0x4440;\n"
+        "shl.b32 t, t, 16;\n"
+        "or.b32 $0, $0, t;\n"
+        "shl.b32 h, h, 3;\n"
+        "shl.b32 $1, 1, h;\n"
+        "shl.b32 r, r, 3;\n"
+        "shl.b32 $2, 1, r;\n"
+        "shl.b32 t, $4, 27;\n"
+        "or.b32 $2, $2, t;\n}",
+        "=&r,=&r,=&r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _replica_step(counts, picked, sel, inc_home, inc_copy, *, loc=None, ip=None):
+    """One touched entry of the copy choice (words of :func:`_replica_item`; all zero: a padding
+    item that changes nothing). ``counts`` holds per EP rank the experts touched so far (bytes);
+    the copy is chosen when its rank has fewer, the expert is counted on the chosen rank and, for
+    the copy, bit ``lane`` of ``picked`` is set. Dependent chain: ``prmt`` -> ``setp`` -> ``selp``.
+    Returns ``(counts, picked)``."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [
+            _iv(counts, loc=loc, ip=ip),
+            _iv(picked, loc=loc, ip=ip),
+            _iv(sel, loc=loc, ip=ip),
+            _iv(inc_home, loc=loc, ip=ip),
+            _iv(inc_copy, loc=loc, ip=ip),
+        ],
+        "{\n.reg .b32 z, sr, ic, ln, uh, ur, ua, ub, t;\n.reg .pred pr;\n"
+        "mov.b32 z, 0;\n"
+        "shr.b32 sr, $4, 16;\n"
+        "and.b32 ic, $6, 0x07ffffff;\n"
+        "shr.b32 ln, $6, 27;\n"
+        "prmt.b32 uh, $2, z, $4;\n"
+        "prmt.b32 ur, $2, z, sr;\n"
+        "add.u32 ua, $2, $5;\n"
+        "add.u32 ub, $2, ic;\n"
+        "setp.lt.u32 pr, ur, uh;\n"
+        "selp.b32 $0, ub, ua, pr;\n"
+        "selp.b32 t, 1, 0, pr;\n"
+        "shl.b32 t, t, ln;\n"
+        "or.b32 $1, $3, t;\n}",
+        "=&r,=&r,r,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+#: Touched entries walked per group (their loads issued together).
+_REP_GROUP = 8
+
+
+class K3RouteTailRepKernel(K3RouteTailKernel):
+    """:class:`K3RouteTailKernel` with a per-step copy choice for redundant expert copies.
+
+    The routed ids stay home experts ``x``; home expert ``x`` is local slot ``x - home_offset``
+    of EP rank ``x // 224``, and the two-copy experts of the replica table also have a copy slot
+    ``224 + n`` on another rank. Each CTA ORs the experts its tokens selected into a bitmap that
+    the cluster shares; then every warp counts per EP rank the touched single-copy experts and
+    walks the touched entries in priority order: an entry goes to the copy whose rank has touched
+    fewer experts so far (ties: home), which then counts it. The sort serves only the chosen copy
+    of each two-copy expert. Every rank computes the same choice from the same top-k.
+
+    Args:
+        num_entries: Entries walked (a compile-time bound; the table's entries after its count
+            are zero words, which change nothing).
+        Others as :class:`K3RouteTailKernel` (always with the sort).
+    """
+
+    def __init__(
+        self,
+        num_ctas: int,
+        num_warps: int,
+        warps_per_token: int,
+        num_splits: int,
+        use_pdl: bool,
+        num_entries: int,
+        trace: bool = False,
+    ):
+        super().__init__(
+            num_ctas, num_warps, warps_per_token, num_splits, True, use_pdl, REP_LOCAL_CAP
+        )
+        # Debug: thread 0 of every CTA stores %clock64 at 8 phase boundaries to trace_addr.
+        self.trace = trace
+        if not 0 <= num_entries <= REP_MAX_ENTRIES:
+            raise ValueError(f"num_entries={num_entries} must be in [0, {REP_MAX_ENTRIES}]")
+        self.num_entries = num_entries
+        self.num_home = REP_NUM_HOME
+        self.home_words = REP_NUM_HOME // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        m: Int32,
+        rows: Int32,
+        logits_addr: Int64,
+        bias_addr: Int64,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_num: Int32,
+        home_offset: Int32,
+        table_addr: Int64,
+        scale_bits: Int64,
+        trace_addr: Int64,
+        stream: cuda.CUstream,
+    ):
+        teams = self.teams
+
+        @cute.struct
+        class SharedStorage:
+            bias: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, NUM_EXPERTS], 16]
+            table: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, REP_TABLE_WORDS], 16]
+            mask: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.local_cap], 16]
+            masks: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, self.num_ctas * self.local_cap], 16
+            ]
+            base: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.local_cap], 16]
+            ids: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, _MAX_TOKENS_PER_CTA * TOP_K], 16
+            ]
+            cand: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, self.num_warps * self.region_slots * 4], 16
+            ]
+            top: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, teams * TOP_K * 2], 16]
+            xchg: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, teams * 16], 16]
+            warp_tot: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.num_warps], 16]
+            # This CTA's selected experts (bitmap), every CTA's (broadcast), and the two-copy
+            # experts this step computes on their copy (bitmap).
+            touched: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 32], 16]
+            touched_all: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, self.num_ctas * 32], 16
+            ]
+            moved: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 32], 16]
+            # The touched entries of a chunk in walk order (plus a group of padding).
+            walk: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 3 * (32 + _REP_GROUP)], 16
+            ]
+
+        self.shared_storage = SharedStorage
+
+        kernel = self.kernel(
+            m,
+            rows,
+            logits_addr,
+            bias_addr,
+            ids_addr,
+            vals_addr,
+            e2p_addr,
+            p2e_addr,
+            tile_expert_addr,
+            tile_limit_addr,
+            total_addr,
+            num_tiles_addr,
+            local_num,
+            home_offset,
+            table_addr,
+            scale_bits,
+            trace_addr,
+        )
+        if cutlass.const_expr(self.num_ctas > 1):
+            kernel.launch(
+                grid=(self.num_ctas, 1, 1),
+                block=(self.threads, 1, 1),
+                cluster=(self.num_ctas, 1, 1),
+                smem=self.shared_storage.size_in_bytes(),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+        else:
+            kernel.launch(
+                grid=(1, 1, 1),
+                block=(self.threads, 1, 1),
+                smem=self.shared_storage.size_in_bytes(),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+
+    @cute.kernel
+    def kernel(
+        self,
+        m: Int32,
+        rows: Int32,
+        logits_addr: Int64,
+        bias_addr: Int64,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_num: Int32,
+        home_offset: Int32,
+        table_addr: Int64,
+        scale_bits: Int64,
+        trace_addr: Int64,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        rank, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.trace):
+            if tidx == 0:
+                _stg_u64(trace_addr + Int64(rank * 64), _clock64())
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        bias_smem = storage.bias.data_ptr().toint()
+        table_smem = storage.table.data_ptr().toint()
+        mask_smem = storage.mask.data_ptr().toint()
+        masks_smem = storage.masks.data_ptr().toint()
+        base_smem = storage.base.data_ptr().toint()
+        ids_smem = storage.ids.data_ptr().toint()
+        touched_smem = storage.touched.data_ptr().toint()
+        touched_all_smem = storage.touched_all.data_ptr().toint()
+        moved_smem = storage.moved.data_ptr().toint()
+        walk_smem = storage.walk.data_ptr().toint()
+        team = warp // self.team_warps
+        team_warp = warp - team * self.team_warps
+        cand_smem = storage.cand.data_ptr().toint() + team * (
+            self.team_warps * self.region_slots * _CAND_BYTES
+        )
+        top_smem = storage.top.data_ptr().toint() + team * (TOP_K * 8)
+        xchg_smem = storage.xchg.data_ptr().toint() + team * 64
+        warp_tot_smem = storage.warp_tot.data_ptr().toint()
+
+        per_cta = (m + self.num_ctas - 1) // self.num_ctas
+        t_begin = rank * per_cta
+        t_end = t_begin + per_cta
+        if t_end > m:
+            t_end = m
+
+        for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
+            _sts_b32(mask_smem + j * 4, Int32(0))
+        if tidx < 32:
+            _sts_b32(touched_smem + tidx * 4, Int32(0))
+            _sts_b32(moved_smem + tidx * 4, Int32(0))
+        # The bias and the replica table are weights: stage them before waiting on the producer,
+        # all loads ahead of the stores (one memory round trip).
+        if cutlass.const_expr(self.threads >= NUM_EXPERTS // 4):
+            b0, b1, b2, b3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+            t0, t1, t2, t3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+            if tidx < NUM_EXPERTS // 4:
+                b0, b1, b2, b3 = _ld_nc_v4_f32(bias_addr + Int64(tidx * 16))
+            if tidx < REP_TABLE_WORDS // 4:
+                t0, t1, t2, t3 = _ld_nc_v4_f32(table_addr + Int64(tidx * 16))
+            if tidx < NUM_EXPERTS // 4:
+                _sts_v4_f32(bias_smem + tidx * 16, b0, b1, b2, b3)
+            if tidx < REP_TABLE_WORDS // 4:
+                _sts_v4_f32(table_smem + tidx * 16, t0, t1, t2, t3)
+        else:
+            for e4 in cutlass.range(tidx, NUM_EXPERTS // 4, self.threads, unroll=1):
+                v = _ld_nc_v4_f32(bias_addr + Int64(e4 * 16))
+                _sts_v4_f32(bias_smem + e4 * 16, v[0], v[1], v[2], v[3])
+            for q in cutlass.range(tidx, REP_TABLE_WORDS // 4, self.threads, unroll=1):
+                v = _ld_nc_v4_f32(table_addr + Int64(q * 16))
+                _sts_v4_f32(table_smem + q * 16, v[0], v[1], v[2], v[3])
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_wait()
+        cute.arch.barrier()
+        self.stamp(tidx, rank, trace_addr, 1)
+
+        for token in cutlass.range(t_begin + team, t_end, self.teams, unroll=1):
+            self.topk_token_rep(
+                token,
+                token - t_begin,
+                team,
+                team_warp,
+                lane,
+                rows,
+                logits_addr,
+                bias_smem,
+                ids_addr,
+                vals_addr,
+                scale_bits,
+                cand_smem,
+                top_smem,
+                xchg_smem,
+                ids_smem,
+                mask_smem,
+                touched_smem,
+                table_smem,
+                home_offset,
+            )
+        if cutlass.const_expr(self.use_pdl):
+            _griddepcontrol_launch_dependents()
+
+        cute.arch.barrier()
+        self.stamp(tidx, rank, trace_addr, 2)
+        if cutlass.const_expr(self.num_ctas > 1):
+            # Broadcast this CTA's token masks and selected-expert bitmap into every CTA.
+            for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
+                word = _lds_b32(mask_smem + j * 4)
+                dst = masks_smem + (rank * self.local_cap + j) * 4
+                for c in cutlass.range_constexpr(self.num_ctas):
+                    _st_dsmem_b32(dst, Int32(c), word)
+            if tidx < NUM_EXPERTS // 32:
+                word = _lds_b32(touched_smem + tidx * 4)
+                dst = touched_all_smem + (rank * 32 + tidx) * 4
+                for c in cutlass.range_constexpr(self.num_ctas):
+                    _st_dsmem_b32(dst, Int32(c), word)
+            _cluster_arrive_release()
+            _cluster_wait_acquire()
+        self.stamp(tidx, rank, trace_addr, 3)
+        # One warp computes the choice into the moved bitmap (the walk is sequential; redundant
+        # copies in every warp would compete for issue slots).
+        if warp == 0:
+            self.choose(lane, touched_smem, touched_all_smem, table_smem, moved_smem, walk_smem)
+        cute.arch.barrier()
+        self.stamp(tidx, rank, trace_addr, 4)
+        self.sort_rep(
+            tidx,
+            warp,
+            lane,
+            rank,
+            t_begin,
+            t_end,
+            mask_smem,
+            masks_smem,
+            base_smem,
+            ids_smem,
+            warp_tot_smem,
+            table_smem,
+            moved_smem,
+            e2p_addr,
+            p2e_addr,
+            tile_expert_addr,
+            tile_limit_addr,
+            total_addr,
+            num_tiles_addr,
+            local_num,
+            home_offset,
+            trace_addr,
+        )
+        self.stamp(tidx, rank, trace_addr, 7)
+
+    @cute.jit
+    def stamp(self, tidx: Int32, rank: Int32, trace_addr: Int64, k: int):
+        if cutlass.const_expr(self.trace):
+            if tidx == 0:
+                _stg_u64(trace_addr + Int64(rank * 64 + k * 8), _clock64())
+
+    @cute.jit
+    def copy_slot(self, expert: Int32, table_smem: Int32):
+        """Local copy slot of ``expert`` on this rank, or -1 when the rank holds no copy of it."""
+        slot = Int32(-1)
+        mine = _lds_b32(table_smem + (REP_MINE_OFF + (expert >> 5)) * 4)
+        if ((mine >> (expert & 31)) & 1) != 0:
+            slot = (
+                self.num_home
+                + _lds_b32(table_smem + (REP_PREFIX_OFF + (expert >> 5)) * 4)
+                + _popc(mine & _low_bits_mask(expert & 31))
+            )
+        return slot
+
+    @cute.jit
+    def topk_token_rep(
+        self,
+        token: Int32,
+        token_local: Int32,
+        team: Int32,
+        team_warp: Int32,
+        lane: Int32,
+        rows: Int32,
+        logits_addr: Int64,
+        bias_smem: Int32,
+        ids_addr: Int64,
+        vals_addr: Int64,
+        scale_bits: Int64,
+        cand_smem: Int32,
+        top_smem: Int32,
+        xchg_smem: Int32,
+        ids_smem: Int32,
+        mask_smem: Int32,
+        touched_smem: Int32,
+        table_smem: Int32,
+        home_offset: Int32,
+    ):
+        """Top-16 of one token by one team; its first warp writes ids / weights, the token bit of
+        the local slots (home or copy) of each selection, and the selected-expert bitmap."""
+        expert, weight = self.select_token(
+            token,
+            team,
+            team_warp,
+            lane,
+            rows,
+            logits_addr,
+            bias_smem,
+            scale_bits,
+            Int64(0),
+            cand_smem,
+            top_smem,
+            xchg_smem,
+        )
+        if team_warp == 0:
+            if lane < TOP_K:
+                out = (token * TOP_K + lane) * 4
+                _st_global_b32(ids_addr + Int64(out), expert)
+                _st_global_f32(vals_addr + Int64(out), weight)
+                _sts_b32(ids_smem + (token_local * TOP_K + lane) * 4, expert)
+                _red_shared_or(touched_smem + (expert >> 5) * 4, _bit(expert & 31))
+                local = expert - home_offset
+                if local >= 0 and local < self.num_home:
+                    _red_shared_or(mask_smem + local * 4, _bit(token_local))
+                copy = self.copy_slot(expert, table_smem)
+                if copy >= 0:
+                    _red_shared_or(mask_smem + copy * 4, _bit(token_local))
+
+    @cute.jit
+    def choose(
+        self,
+        lane: Int32,
+        touched_smem: Int32,
+        touched_all_smem: Int32,
+        table_smem: Int32,
+        moved_smem: Int32,
+        walk_smem: Int32,
+    ):
+        """One warp: the step's copy choice, as the bitmap of the two-copy experts computed on
+        their copy (``moved_smem``). Lane ``l`` holds entry
+        ``32 c + l`` of chunk ``c``; the touched entries are compacted into ``walk_smem`` and
+        walked in groups whose loads are issued together."""
+        word = Int32(0)
+        packed = Int32(0)
+        if lane < NUM_EXPERTS // 32:
+            if cutlass.const_expr(self.num_ctas > 1):
+                for c in cutlass.range_constexpr(self.num_ctas):
+                    word = word | _lds_b32(touched_all_smem + (c * 32 + lane) * 4)
+            else:
+                word = _lds_b32(touched_smem + lane * 4)
+            single = word & (_lds_b32(table_smem + (REP_FLEX_OFF + lane) * 4) ^ Int32(-1))
+            packed = _popc(single) << ((lane // self.home_words) * 8)
+        counts = _redux_add_u32(packed)
+        for c in cutlass.range_constexpr((self.num_entries + 31) // 32):
+            entry = _lds_b32(table_smem + (REP_LIST_OFF + c * 32 + lane) * 4)
+            hit, ranks = _replica_lane(entry, _shfl_idx_b32(word, (entry & 1023) >> 5))
+            mask = _ballot(hit)
+            touched = _popc(mask)
+            if hit != 0:
+                pos = _popc(mask & _low_bits_mask(lane))
+                sel, inc_home, inc_copy = _replica_item(ranks, lane)
+                _sts_b32(walk_smem + pos * 12, sel)
+                _sts_b32(walk_smem + pos * 12 + 4, inc_home)
+                _sts_b32(walk_smem + pos * 12 + 8, inc_copy)
+            if lane < 3 * _REP_GROUP:
+                _sts_b32(walk_smem + touched * 12 + lane * 4, Int32(0))
+            _syncwarp()
+            picked = Int32(0)
+            for g in cutlass.range(0, (touched + _REP_GROUP - 1) // _REP_GROUP, 1, unroll=1):
+                base = walk_smem + g * (_REP_GROUP * 12)
+                items = [_lds_b32(base + k * 4) for k in range(3 * _REP_GROUP)]
+                for k in cutlass.range_constexpr(_REP_GROUP):
+                    counts, picked = _replica_step(
+                        counts, picked, items[3 * k], items[3 * k + 1], items[3 * k + 2]
+                    )
+            if ((picked >> lane) & 1) != 0:
+                x = entry & 1023
+                _red_shared_or(moved_smem + (x >> 5) * 4, _bit(x & 31))
+            _syncwarp()
+
+    @cute.jit
+    def moved(self, expert: Int32, moved_smem: Int32):
+        """1 if this step computes two-copy ``expert`` on its copy, else 0."""
+        return (_lds_b32(moved_smem + (expert >> 5) * 4) >> (expert & 31)) & 1
+
+    @cute.jit
+    def slot_dropped(self, j: Int32, home_offset: Int32, table_smem: Int32, moved_smem: Int32):
+        """1 if local slot ``j`` is a copy this step does not use (a moved expert's home slot, the
+        copy slot of an expert that stays home, or an empty copy slot), else 0."""
+        dropped = Int32(0)
+        if j < self.num_home:
+            dropped = self.moved(home_offset + j, moved_smem)
+        else:
+            expert = _lds_b32(table_smem + (REP_COPYX_OFF + j - self.num_home) * 4)
+            dropped = Int32(1)
+            if expert >= 0:
+                dropped = self.moved(expert, moved_smem) ^ 1
+        return dropped
+
+    @cute.jit
+    def sort_rep(
+        self,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        rank: Int32,
+        t_begin: Int32,
+        t_end: Int32,
+        mask_smem: Int32,
+        masks_smem: Int32,
+        base_smem: Int32,
+        ids_smem: Int32,
+        warp_tot_smem: Int32,
+        table_smem: Int32,
+        moved_smem: Int32,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_num: Int32,
+        home_offset: Int32,
+        trace_addr: Int64,
+    ):
+        """``moe_sort`` metadata over the local slots, the copies not used left empty."""
+        ept = self.experts_per_thread
+        j0 = tidx * ept
+        counts = []
+        before = []
+        for q in cutlass.range_constexpr(ept):
+            j = j0 + q
+            jj = j
+            if j >= local_num:
+                jj = Int32(0)
+            words = []
+            for c in cutlass.range_constexpr(self.num_ctas):
+                if cutlass.const_expr(self.num_ctas > 1):
+                    words.append(_lds_b32(masks_smem + (c * self.local_cap + jj) * 4))
+                else:
+                    words.append(_lds_b32(mask_smem + jj * 4))
+            cnt = Int32(0)
+            pre = Int32(0)
+            for c in cutlass.range_constexpr(self.num_ctas):
+                n = _popc(words[c])
+                cnt = cnt + n
+                if c < rank:
+                    pre = pre + n
+            if j >= local_num:
+                cnt = Int32(0)
+            if self.slot_dropped(jj, home_offset, table_smem, moved_smem) != 0:
+                cnt = Int32(0)
+            counts.append(cnt)
+            before.append(pre)
+        tiles = [(counts[q] + (TILE - 1)) >> 7 for q in range(ept)]
+        thread_tiles = tiles[0]
+        for q in cutlass.range_constexpr(1, ept):
+            thread_tiles = thread_tiles + tiles[q]
+        inclusive = _warp_inclusive_sum(thread_tiles)
+        if lane == 31:
+            _sts_b32(warp_tot_smem + warp * 4, inclusive)
+        cute.arch.barrier()
+        self.stamp(tidx, rank, trace_addr, 5)
+        tile = inclusive - thread_tiles
+        num_tiles = Int32(0)
+        for w in cutlass.range_constexpr(self.num_warps):
+            cnt_w = _lds_b32(warp_tot_smem + w * 4)
+            if w < warp:
+                tile = tile + cnt_w
+            num_tiles = num_tiles + cnt_w
+        for q in cutlass.range_constexpr(ept):
+            j = j0 + q
+            if tiles[q] != 0:
+                _sts_b32(base_smem + j * 4, tile * TILE + before[q])
+                if rank == 0:
+                    for t in cutlass.range_constexpr(self.max_tiles_per_expert):
+                        if t < tiles[q]:
+                            limit = tile * TILE + counts[q]
+                            if limit > (tile + t + 1) * TILE:
+                                limit = (tile + t + 1) * TILE
+                            _st_global_b32(tile_expert_addr + Int64((tile + t) * 4), j)
+                            _st_global_b32(tile_limit_addr + Int64((tile + t) * 4), limit)
+            tile = tile + tiles[q]
+        if rank == 0 and tidx == 0:
+            _st_global_b32(total_addr, num_tiles * TILE)
+            _st_global_b32(num_tiles_addr, num_tiles)
+        cute.arch.barrier()
+        self.stamp(tidx, rank, trace_addr, 6)
+
+        n_entries = (t_end - t_begin) * TOP_K
+        for e in cutlass.range(tidx, n_entries, self.threads, unroll=1):
+            token_local = e >> 4
+            expanded = t_begin * TOP_K + e
+            expert = _lds_b32(ids_smem + e * 4)
+            slot = Int32(-1)
+            local = expert - home_offset
+            if local >= 0 and local < self.num_home:
+                if self.moved(expert, moved_smem) == 0:
+                    slot = local
+            copy = self.copy_slot(expert, table_smem)
+            if copy >= 0:
+                if self.moved(expert, moved_smem) != 0:
+                    slot = copy
+            perm = Int32(-1)
+            if slot >= 0:
+                word = _lds_b32(mask_smem + slot * 4)
+                perm = _lds_b32(base_smem + slot * 4) + _popc(word & _low_bits_mask(token_local))
+                _st_global_b32(p2e_addr + Int64(perm * 4), expanded)
+            _st_global_b32(e2p_addr + Int64(expanded * 4), perm)
+
+
+@functools.cache
+def _compiled_tail_rep(
+    num_ctas: int,
+    num_warps: int,
+    warps_per_token: int,
+    num_splits: int,
+    use_pdl: bool,
+    num_entries: int,
+    trace: bool = False,
+):
+    kernel = K3RouteTailRepKernel(
+        num_ctas, num_warps, warps_per_token, num_splits, use_pdl, num_entries, trace
+    )
+    dummy = Int64(1 << 20)
+    return cute.compile(
+        kernel,
+        Int32(num_ctas),
+        Int32(num_ctas),
+        *([dummy] * 10),
+        Int32(REP_NUM_HOME),
+        Int32(0),
+        dummy,
+        Int64(0),
+        Int64(0),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+def _rep_walk(num_entries: int) -> int:
+    """Compile-time entry walk of ``num_entries`` entries (a multiple of 8, so few variants)."""
+    return min(REP_MAX_ENTRIES, (num_entries + 7) // 8 * 8)
+
+
+def run_k3_route_tail_rep(
+    logits: torch.Tensor,
+    num_tokens: int,
+    e_score_correction_bias: torch.Tensor,
+    routed_scaling_factor: float,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sort_outputs: tuple[torch.Tensor, ...],
+    local_num_experts: int,
+    home_offset: int,
+    replica_table: torch.Tensor,
+    num_entries: int,
+    *,
+    num_ctas: int | None = None,
+    warps_per_token: int | None = None,
+    num_warps: int | None = None,
+    use_pdl: bool = True,
+    trace: torch.Tensor | None = None,
+) -> None:
+    """Launch the replica routing tail on the current stream (inputs are not re-validated).
+
+    As :func:`run_k3_route_tail` (``M <= 256``, always with the sort), with the sort over the
+    ``local_num_experts`` local slots of an EP rank whose home experts start at
+    ``home_offset``, the copies of the ``replica_table`` (:func:`replica_table`, a CUDA int32
+    tensor) and its ``num_entries`` entries.
+    """
+    m = num_tokens
+    default_ctas, default_team, default_warps = default_config(m)
+    if num_ctas is None:
+        num_ctas = default_ctas
+    if warps_per_token is None:
+        warps_per_token = default_team
+    if num_warps is None:
+        num_warps = default_warps
+    if (m + num_ctas - 1) // num_ctas > _MAX_TOKENS_PER_CTA:
+        raise ValueError(f"M={m} needs more than {num_ctas} CTAs")
+    splits = 1 if logits.dim() == 2 else logits.shape[0]
+    rows = logits.shape[0] if logits.dim() == 2 else logits.shape[1]
+    compiled = _compiled_tail_rep(
+        num_ctas, num_warps, warps_per_token, splits, use_pdl, _rep_walk(num_entries),
+        trace is not None,
+    )
+    tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
+    scale_bits = struct.unpack("<q", struct.pack("<d", float(routed_scaling_factor)))[0]
+    compiled(
+        Int32(m),
+        Int32(rows),
+        Int64(logits.data_ptr()),
+        Int64(e_score_correction_bias.data_ptr()),
+        Int64(topk_ids.data_ptr()),
+        Int64(topk_weights.data_ptr()),
+        Int64(e2p),
+        Int64(p2e),
+        Int64(tile_expert),
+        Int64(tile_limit),
+        Int64(total),
+        Int64(num_tiles),
+        Int32(local_num_experts),
+        Int32(home_offset),
+        Int64(replica_table.data_ptr()),
+        Int64(scale_bits),
+        Int64(trace.data_ptr() if trace is not None else 0),
+        cuda.CUstream(torch.cuda.current_stream(logits.device).cuda_stream),
+    )
+
+
+@torch.library.custom_op("trtllm::k3_route_tail_rep", mutates_args=())
+def k3_route_tail_rep(
+    logits: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    routed_scaling_factor: float,
+    local_expert_offset: int,
+    local_num_experts: int,
+    home_offset: int,
+    replica_table: torch.Tensor,
+    num_entries: int,
+    tile_tokens_dim: int = TILE,
+    num_tokens: int = -1,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """:func:`k3_route_tail` with redundant expert copies (``TRTLLM_K3_EXPERT_REPLICAS``).
+
+    Args:
+        logits, e_score_correction_bias, routed_scaling_factor, tile_tokens_dim, num_tokens: As
+            :func:`k3_route_tail` (``1 <= M <= 256``).
+        local_expert_offset: First routed-MoE slot of this rank (``rank * local_num_experts``).
+        local_num_experts: Local slots of this rank (224 home slots, then copy slots).
+        home_offset: First home expert of this rank (``rank * 224``).
+        replica_table: This rank's :func:`replica_table` (``int32 [REP_TABLE_WORDS]``).
+        num_entries: Entries of the table (two-copy experts).
+
+    Returns:
+        :func:`k3_route_tail`'s outputs: the top-k ids are home experts (bit-identical to
+        ``noaux_tc_op``), the sort covers the local slots and serves each two-copy expert on the
+        copy the step chose for it.
+    """
+    _check_inputs(logits, e_score_correction_bias)
+    if tile_tokens_dim != TILE:
+        raise ValueError(f"tile_tokens_dim must be {TILE}")
+    rows = logits.shape[0] if logits.dim() == 2 else logits.shape[1]
+    m = rows if num_tokens < 0 else num_tokens
+    if not 1 <= m <= min(rows, MAX_M):
+        raise ValueError(f"num_tokens={m} must be in [1, {min(rows, MAX_M)}]")
+    if not (
+        REP_NUM_HOME <= local_num_experts <= REP_LOCAL_CAP
+        and home_offset % REP_NUM_HOME == 0
+        and 0 <= home_offset < NUM_EXPERTS
+        and local_expert_offset == (home_offset // REP_NUM_HOME) * local_num_experts
+        and 0 <= num_entries <= REP_MAX_ENTRIES
+    ):
+        raise ValueError("invalid local slot range or entry count for the replica tail")
+    if (
+        replica_table.dtype != torch.int32
+        or replica_table.numel() != REP_TABLE_WORDS
+        or not replica_table.is_contiguous()
+        or replica_table.device != logits.device
+        or replica_table.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"replica_table must be a 16-byte aligned int32 [{REP_TABLE_WORDS}] tensor"
+        )
+    outs = _route_tail_outputs(
+        logits, m, e_score_correction_bias, local_num_experts, tile_tokens_dim
+    )
+    run_k3_route_tail_rep(
+        logits,
+        m,
+        e_score_correction_bias,
+        routed_scaling_factor,
+        outs[0],
+        outs[1],
+        outs[2:],
+        local_num_experts,
+        home_offset,
+        replica_table,
+        num_entries,
+    )
+    return outs
+
+
+@k3_route_tail_rep.register_fake
+def _(
+    logits: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    routed_scaling_factor: float,
+    local_expert_offset: int,
+    local_num_experts: int,
+    home_offset: int,
+    replica_table: torch.Tensor,
+    num_entries: int,
+    tile_tokens_dim: int = TILE,
+    num_tokens: int = -1,
+):
+    rows = logits.shape[0] if logits.dim() == 2 else logits.shape[1]
+    m = rows if num_tokens < 0 else num_tokens
+    max_tiles, max_permuted = sort_buffer_sizes(m, local_num_experts, tile_tokens_dim)
+
+    def i32(*shape):
+        return logits.new_empty(shape, dtype=torch.int32)
+
+    return (
+        i32(m, TOP_K),
+        logits.new_empty((m, TOP_K), dtype=torch.float32),
+        i32(max_tiles),
+        i32(max_tiles),
+        i32(m, TOP_K),
+        i32(max_permuted),
+        i32(1),
+        i32(1),
+    )
+
+
 __all__ = [
     "DEFAULT_GEMV_SPLITS",
     "GEMV_MAX_M",
@@ -2667,4 +3649,14 @@ __all__ = [
     "wide_table_fits",
     "wide_workspace",
     "wide_workspace_ready",
+    "K3RouteTailRepKernel",
+    "REP_LOCAL_CAP",
+    "REP_MAX_COPIES",
+    "REP_MAX_ENTRIES",
+    "REP_NUM_HOME",
+    "REP_TABLE_WORDS",
+    "k3_route_tail_rep",
+    "replica_choice",
+    "replica_table",
+    "run_k3_route_tail_rep",
 ]

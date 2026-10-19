@@ -123,6 +123,7 @@ from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_k3_expert_placement import (
     expert_placement_for_layer,
+    expert_replicas_for_layer,
     get_routing_recorder,
     permute_router_to_slots,
 )
@@ -631,6 +632,8 @@ class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
     returns and clears them instead of routing ``logits`` again. Alternatively it
     stores a ``deferred`` callable that the next ``apply`` runs (once) on ``logits``.
     ``observer``, when set, is called with every top-k id tensor ``apply`` returns.
+    ``slot_map`` (``TRTLLM_K3_EXPERT_REPLICAS``), when set, maps the routed (home) expert ids of a
+    result without attached ``moe_sort`` outputs to the routed MoE's home-copy slots.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -638,6 +641,7 @@ class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
         self.precomputed: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self.deferred: Optional[Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]] = None
         self.observer: Optional[Callable[[torch.Tensor], None]] = None
+        self.slot_map: Optional[torch.Tensor] = None
 
     def apply(
         self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None
@@ -651,6 +655,12 @@ class _KimiK3RoutingMethod(DeepSeekV3MoeRoutingMethod):
             result = super().apply(logits, input_ids)
         if self.observer is not None and not torch.compiler.is_compiling():
             self.observer(result[0])
+        if self.slot_map is not None and getattr(result[0], "_k3_presorted", None) is None:
+            ids = result[0]
+            result = (
+                torch.index_select(self.slot_map, 0, ids.reshape(-1)).view(ids.shape),
+                result[1],
+            )
         return result
 
 
@@ -2371,6 +2381,10 @@ class KimiK3MoERuntime(nn.Module):
     _expl2_route: Optional[Tuple[torch.Tensor, ...]] = None
     _expl2_recorded = False
     _expl2_ranges: Tuple[Tuple[int, ...], List[Tuple[int, int, int]]] = ((), [])
+    # TRTLLM_K3_EXPERT_REPLICAS: this layer's redundant expert copies (``None``: off) and the
+    # routing tail's copy-choice table of this rank.
+    expert_replicas = None
+    _replica_table: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -2477,6 +2491,26 @@ class KimiK3MoERuntime(nn.Module):
             situ_beta=float(situ_beta),
             situ_linear_beta=situ_linear_beta_moe,
         )
+        # TRTLLM_K3_EXPERT_REPLICAS: every EP rank holds its home slots, then copy slots (the
+        # routed MoE's slots are rank-major; routing still returns home slot ids).
+        self.expert_replicas = expert_replicas_for_layer(
+            layer_idx, self.num_experts, routed_moe_model_config.mapping.moe_ep_size
+        )
+        if self.expert_replicas is not None:
+            from ..cute_dsl_kernels.blackwell import k3_route_tail
+
+            replicas = self.expert_replicas
+            if (
+                replicas.num_home != k3_route_tail.REP_NUM_HOME
+                or replicas.num_local > k3_route_tail.REP_LOCAL_CAP
+                or len(replicas.entries) > k3_route_tail.REP_MAX_ENTRIES
+            ):
+                raise ValueError(
+                    f"TRTLLM_K3_EXPERT_REPLICAS serves EP4 ({k3_route_tail.REP_NUM_HOME} home "
+                    f"slots per rank), at most {k3_route_tail.REP_LOCAL_CAP} local slots and "
+                    f"{k3_route_tail.REP_MAX_ENTRIES} two-copy experts per layer"
+                )
+            routed_moe_kwargs["num_experts"] = replicas.num_slots
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
@@ -2562,6 +2596,13 @@ class KimiK3MoERuntime(nn.Module):
             if self.expert_of_slot is None
             else tuple(self.expert_of_slot[slot] for slot in self.local_expert_ids)
         )
+        if self.expert_replicas is not None:
+            # Local slots: the rank's home slots, then its copies (each holds a home slot's
+            # checkpoint expert).
+            homes = self.expert_replicas.home_slots_of_local(self.replica_rank)
+            self.ckpt_expert_ids = tuple(
+                homes if self.expert_of_slot is None else (self.expert_of_slot[x] for x in homes)
+            )
         routing_recorder = get_routing_recorder(
             rank=model_config.mapping.rank,
             num_layers=cfg.num_hidden_layers,
@@ -2705,7 +2746,7 @@ class KimiK3MoERuntime(nn.Module):
         self._moe_group[layer_idx] = self
         self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
         self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
-        if _K3_EXPERT_L2_PREFETCH:
+        if _K3_EXPERT_L2_PREFETCH and self.expert_replicas is None:
             self._expl2_state = _K3_EXPERT_L2_STATE.setdefault(id(cfg), _ExpertL2PrefetchState())
             self._expl2_event = torch.cuda.Event()
             self._expl2_attn_event = torch.cuda.Event()
@@ -3067,7 +3108,11 @@ class KimiK3MoERuntime(nn.Module):
         the CuteDSL backend). Returns the FP32 router logits, or ``None`` when
         the caller must route the regular way.
         """
-        if _K3_FUSED_ROUTER == "0" or torch.compiler.is_compiling():
+        if (
+            _K3_FUSED_ROUTER == "0"
+            or torch.compiler.is_compiling()
+            or self.expert_replicas is not None
+        ):
             return None
         routing = self.routed_experts.routing_method
         backend = self.routed_experts.backend
@@ -3120,16 +3165,26 @@ class KimiK3MoERuntime(nn.Module):
             return None
         slot_start = getattr(backend, "slot_start", None)
         num_local = getattr(backend, "expert_size_per_partition", None)
+        num_slots = (
+            self.gate.num_experts
+            if self.expert_replicas is None
+            else self.expert_replicas.num_slots
+        )
         if (
             slot_start is None
             or num_local is None
-            or getattr(backend, "num_slots", None) != self.gate.num_experts
+            or getattr(backend, "num_slots", None) != num_slots
         ):
             return None
         from ..cute_dsl_kernels.blackwell import k3_route_tail
 
         if not 1 <= num_tokens <= min(_K3_ROUTE_TAIL_MAX_M, k3_route_tail.WIDE_MAX_M):
             return None
+        if self.expert_replicas is not None:
+            # Only the cluster tail chooses copies; above it the home copies serve (slot_map).
+            if num_tokens > k3_route_tail.MAX_M or not self._ensure_replica_tables():
+                return None
+            return slot_start, num_local
         if num_tokens > k3_route_tail.MAX_M:
             if not k3_route_tail.wide_sort_fits(num_tokens, num_local):
                 return None
@@ -3148,6 +3203,7 @@ class KimiK3MoERuntime(nn.Module):
         backend = self.routed_experts.backend
         return (
             _K3_ROUTE_TAIL == "gemv"
+            and self.expert_replicas is None
             and hidden_states.shape[0] <= k3_route_tail.GEMV_ROUTE_MAX_M
             and getattr(backend, "has_nvfp4", False)
             and getattr(backend, "fc31_input_scale", None) is not None
@@ -3169,6 +3225,19 @@ class KimiK3MoERuntime(nn.Module):
     def _tail_route(
         self, logits: torch.Tensor, target: Tuple[int, int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.expert_replicas is not None:
+            outs = torch.ops.trtllm.k3_route_tail_rep(
+                logits,
+                self.gate.e_score_correction_bias,
+                float(self.gate.routed_scaling_factor),
+                target[0],
+                target[1],
+                self.replica_rank * self.expert_replicas.num_home,
+                self._replica_table,
+                len(self.expert_replicas.entries),
+                128,
+            )
+            return self._attach_route(outs, target)
         outs = torch.ops.trtllm.k3_route_tail(
             logits,
             self.gate.e_score_correction_bias,
@@ -3178,6 +3247,32 @@ class KimiK3MoERuntime(nn.Module):
             128,
         )
         return self._attach_route(outs, target)
+
+    @property
+    def replica_rank(self) -> int:
+        """EP rank of this layer's routed experts (``TRTLLM_K3_EXPERT_REPLICAS``)."""
+        return self.expert_lo // self.expert_replicas.num_local
+
+    def _ensure_replica_tables(self) -> bool:
+        """Create the copy-choice table of the routing tail and the home-slot map of the other
+        routing paths (``TRTLLM_K3_EXPERT_REPLICAS``) on the router's device; False while a CUDA
+        graph is being captured before they exist."""
+        if self._replica_table is not None:
+            return True
+        device = self.gate.e_score_correction_bias.device
+        if device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+            return False
+        from ..cute_dsl_kernels.blackwell import k3_route_tail
+
+        replicas = self.expert_replicas
+        table = k3_route_tail.replica_table(
+            replicas.entries, self.replica_rank, replicas.num_home
+        )
+        self._replica_table = torch.tensor(table, dtype=torch.int32, device=device)
+        self.routed_experts.routing_method.slot_map = torch.tensor(
+            replicas.routed_slot_of_home(), dtype=torch.int32, device=device
+        )
+        return True
 
     def _can_umma_route(self, hidden_states: torch.Tensor) -> bool:
         """Whether ``TRTLLM_K3_ROUTER_GEMM=umma`` computes this forward's router logits."""
@@ -3499,7 +3594,8 @@ class KimiK3MoERuntime(nn.Module):
     # The TP CuteDSL gate scopes validation; fusion does not depend on it.
     def _can_fuse_router_down(self, hidden_states: torch.Tensor) -> bool:
         if (
-            torch.compiler.is_compiling()
+            self.expert_replicas is not None
+            or torch.compiler.is_compiling()
             or _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
             or not hidden_states.is_cuda
             or self.routed_experts.use_dp
@@ -3753,6 +3849,11 @@ class KimiK3MoERuntime(nn.Module):
         early_routed_in = None
         shared_first = False
         shared_partial = None
+        if self.expert_replicas is not None and not self._ensure_replica_tables():
+            raise RuntimeError(
+                "TRTLLM_K3_EXPERT_REPLICAS: the copy tables are created after loading the "
+                "weights or in the first eager forward, before CUDA graph capture"
+            )
         route_target = self._route_tail_target(hidden_states.shape[0])
         gemv_route = False
         router_partials = None
@@ -5275,6 +5376,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 moe.gate.weight.data, moe.gate.e_score_correction_bias.data, moe.expert_of_slot
             )
             num_permuted += 1
+        for layer in self.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if isinstance(moe, KimiK3MoERuntime) and moe.expert_replicas is not None:
+                moe._ensure_replica_tables()
         if num_permuted:
             logger.info(
                 f"Kimi K3: routers of {num_permuted} MoE layers permuted to the expert placement"

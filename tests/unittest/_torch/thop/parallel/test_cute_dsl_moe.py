@@ -4871,6 +4871,150 @@ def test_cute_dsl_moe_lowm_dyn_backend_dispatch(num_tokens, monkeypatch):
         assert bool((err <= bound).all()), f"dyn={dyn}: max err/bound {(err / bound).max()}"
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("num_tokens", [7, 14])
+@pytest.mark.parametrize("dyn", [False, True])
+def test_cute_dsl_moe_expert_copies_keep_contributions(num_tokens, dyn, monkeypatch):
+    """TRTLLM_K3_EXPERT_REPLICAS end to end on four simulated EP4 ranks: each rank routes with
+    ``k3_route_tail_rep`` (224 home slots + 8 copy slots, gathered from the same expert weights)
+    and runs ``CuteDslFusedMoE.run_moe_nvfp4_impl`` over its local slots. With one non-zero top-k
+    scale per token every selection is computed on exactly one rank, and the sum over ranks is
+    bit-identical to four home-only ranks routed by ``k3_route_tail``: same experts, same weights,
+    only the adding rank changes. With all scales both stay within the BF16 accumulation bound of
+    the exact sum."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_route_tail as rt
+
+    hidden, inter, num_experts, top_k, ep, home, slots = 3584, 768, 896, 16, 4, 224, 8
+    num_local = home + slots
+    sf_vec = 16
+    monkeypatch.setenv("TRTLLM_MOE_LOWM", "1")
+    torch.manual_seed(5000 + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda") * 2
+    bias = torch.randn(num_experts, device="cuda") * 0.01
+    scales, ids = torch.ops.trtllm.noaux_tc_op(logits, bias, 1, 1, top_k, 1.0)
+    scales = scales.float()
+    selected = sorted(set(ids.flatten().tolist()))
+    # Copies of the busiest rank's selected experts on the calmest ranks first, so the step moves
+    # some of them.
+    count = [len([x for x in selected if x // home == r]) for r in range(ep)]
+    busy = max(range(ep), key=lambda r: count[r])
+    calm = sorted((r for r in range(ep) if r != busy), key=lambda r: count[r]) + [busy]
+    entries, per_rank = [], [0] * ep
+    for x in [x for x in selected if x // home == busy] + selected + list(range(num_experts)):
+        if x in dict(entries):
+            continue
+        r = next((r for r in calm if r != x // home and per_rank[r] < slots), None)
+        if r is not None:
+            entries.append((x, r))
+            per_rank[r] += 1
+        if len(entries) == ep * slots:
+            break
+    assert any(rt.replica_choice(ids.flatten().tolist(), entries))
+
+    def quantize(t):
+        gsf = t.abs().max().float() / (448 * 6)
+        q, sf = torch.ops.trtllm.fp4_quantize(t, 1 / gsf, sf_vec, False)
+        return q, sf, gsf
+
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    x, x_sf, x_gsf = quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden)[:num_tokens]
+    fc2_input_scale = torch.tensor([448 * 6 / 4.0], dtype=torch.float32, device="cuda")
+    # Per-expert weights of the selected experts (the others are never computed).
+    weights = {}
+    alpha1 = torch.ones(num_experts, dtype=torch.float32, device="cuda")
+    alpha2 = torch.ones(num_experts, dtype=torch.float32, device="cuda")
+    for e in selected:
+        bf16 = dict(device="cuda", dtype=torch.bfloat16)
+        q1, sf1, g1 = quantize(torch.randn(1, 2 * inter, hidden, **bf16))
+        q2, sf2, g2 = quantize(torch.randn(1, hidden, inter, **bf16))
+        for name, value in (("w1", q1), ("w1_sf", sf1), ("w2", q2), ("w2_sf", sf2)):
+            if name not in weights:
+                weights[name] = torch.zeros(
+                    (num_experts, value.numel()), dtype=value.dtype, device="cuda"
+                )
+            weights[name][e] = value.flatten()
+        alpha1[e] = x_gsf * g1
+        alpha2[e] = g2 / fc2_input_scale[0]
+
+    def view_of(experts, slot_start):
+        index = torch.tensor(experts, dtype=torch.long, device="cuda")
+        n = len(experts)
+
+        def take(name, *shape):
+            return weights[name].index_select(0, index).view(n, *shape)
+
+        return SimpleNamespace(
+            w3_w1_weight=take("w1", 2 * inter, hidden // 2),
+            fc1_weight_scale=take("w1_sf", 2 * inter, -1),
+            fc1_global_scale=alpha1.index_select(0, index),
+            w2_weight=take("w2", hidden, inter // 2),
+            fc2_weight_scale=take("w2_sf", hidden, -1),
+            fc2_global_scale=alpha2.index_select(0, index),
+            expert_size_per_partition=n,
+            slot_start=slot_start,
+        )
+
+    def run_rank(rank, copies, token_scales):
+        home_slots = list(range(rank * home, (rank + 1) * home))
+        if copies:
+            table = torch.tensor(rt.replica_table(entries, rank), dtype=torch.int32, device="cuda")
+            local = home_slots + sorted(e for e, r in entries if r == rank)
+            local += [home_slots[0]] * (num_local - len(local))
+            slot_start, esp, num_slots = rank * num_local, num_local, ep * num_local
+            outs = torch.ops.trtllm.k3_route_tail_rep(
+                logits, bias, 1.0, slot_start, esp, rank * home, table, len(entries), 128
+            )
+        else:
+            local = home_slots
+            slot_start, esp, num_slots = rank * home, home, num_experts
+            outs = torch.ops.trtllm.k3_route_tail(logits, bias, 1.0, slot_start, esp, 128)
+        topk_ids = outs[0]
+        topk_ids._k3_presorted = ((slot_start, esp, 128), tuple(outs[2:8]))
+        backend = SimpleNamespace(
+            num_slots=num_slots,
+            use_fused_finalize=True,
+            activation_type=ActivationType.SiTu,
+            scaling_vector_size=sf_vec,
+            lowm_dyn_token_range=(1, 32) if dyn else (1, 0),
+            _lowm_dyn_counters=None,
+            _join_pending_x_ready=lambda: None,
+            _has_moe_output_memset_aux_stream=lambda: False,
+            fc2_input_scale=fc2_input_scale,
+            situ_beta=SITU_BETA,
+            situ_linear_beta=SITU_LINEAR_BETA,
+            swiglu_limit_scalar=float("inf"),
+            post_fc1_event=None,
+            mapping=SimpleNamespace(moe_ep_size=ep),
+        )
+        out = torch.full((num_tokens, hidden), 5.0, dtype=torch.bfloat16, device="cuda")
+        CuteDslFusedMoE.run_moe_nvfp4_impl(
+            backend, x, topk_ids, token_scales, x_sf.view(torch.uint8), out,
+            view_of(local, slot_start)
+        )
+        torch.cuda.synchronize()
+        return out
+
+    def total(copies, token_scales):
+        return sum(run_rank(r, copies, token_scales).double() for r in range(ep))
+
+    partials = []
+    for k in range(top_k):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, k] = scales[:, k]
+        base = total(False, one_hot)
+        assert torch.equal(base, total(True, one_hot)), f"top-k slot {k}"
+        partials.append(base)
+    exact = torch.stack(partials).sum(0)
+    bound = 4 * top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+    for copies in (False, True):
+        err = (total(copies, scales) - exact).abs()
+        assert bool((err <= bound).all()), f"copies={copies}: max err/bound {(err / bound).max()}"
+
+
 @pytest.mark.parametrize(
     "env,expected",
     [

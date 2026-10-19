@@ -26,6 +26,18 @@ Placement (``TRTLLM_K3_EXPERT_PLACEMENT=<file.json>``)
     ``ep_size`` is the expert-parallel size the placement was balanced for; another size still
     loads correctly (a placement is a relabelling) but is not balanced.
 
+Redundant copies (``TRTLLM_K3_EXPERT_REPLICAS=1`` with a ``kimi_k3_expert_placement/v2`` file)
+    A v2 file has the v1 fields (its ``expert_of_slot`` is the home placement) plus
+    ``replica_slots`` (``S``) and, per layer, ``replicas``: ``[[x, r], ...]`` in priority order,
+    a second copy of home slot ``x`` on EP rank ``r != x // n``, at most ``S`` per rank. With the
+    switch on, EP rank ``r`` holds ``n + S`` slots: its ``n`` home slots, then the copies placed
+    on it in ascending order (the routed MoE has ``ep_size * (n + S)`` slots, rank-major). Routing
+    still returns home slot ids; for every forward step the routing tail picks one copy of each
+    touched two-copy expert (in entry order, the copy whose rank has touched fewer experts so
+    far; ties go home) and computes all of that expert's tokens there. Every rank sees the same
+    top-k, so the choice needs no communication. The expert outputs are the same; only the rank
+    that adds them changes. Without the switch a v2 file acts as its v1 part.
+
 Routing statistics (``TRTLLM_K3_ROUTING_STATS_DIR=<dir>``)
     Rank 0 counts, for every forward step, the tokens routed to each expert of each MoE layer:
     all tokens, and, when ``TRTLLM_K3_ROUTING_STATS_STRIDE`` gives the tokens per request
@@ -41,6 +53,7 @@ Routing statistics (``TRTLLM_K3_ROUTING_STATS_DIR=<dir>``)
 """
 
 import atexit
+import dataclasses
 import functools
 import json
 import os
@@ -56,12 +69,14 @@ import torch
 from tensorrt_llm.logger import logger
 
 EXPERT_PLACEMENT_ENV = "TRTLLM_K3_EXPERT_PLACEMENT"
+EXPERT_REPLICAS_ENV = "TRTLLM_K3_EXPERT_REPLICAS"
 ROUTING_STATS_DIR_ENV = "TRTLLM_K3_ROUTING_STATS_DIR"
 ROUTING_STATS_STRIDE_ENV = "TRTLLM_K3_ROUTING_STATS_STRIDE"
 ROUTING_STATS_EVERY_ENV = "TRTLLM_K3_ROUTING_STATS_EVERY"
 ROUTING_STATS_CHUNK_ENV = "TRTLLM_K3_ROUTING_STATS_CHUNK"
 
 _PLACEMENT_FORMAT = "kimi_k3_expert_placement/v1"
+_PLACEMENT_FORMAT_V2 = "kimi_k3_expert_placement/v2"
 
 
 @functools.lru_cache(maxsize=4)
@@ -73,9 +88,10 @@ def load_expert_placement(path: str, num_experts: int) -> dict[int, tuple[int, .
     """
     with open(path) as f:
         data = json.load(f)
-    if data.get("format") != _PLACEMENT_FORMAT:
+    if data.get("format") not in (_PLACEMENT_FORMAT, _PLACEMENT_FORMAT_V2):
         raise ValueError(
-            f"{path}: expected format {_PLACEMENT_FORMAT!r}, got {data.get('format')!r}"
+            f"{path}: expected format {_PLACEMENT_FORMAT!r} or {_PLACEMENT_FORMAT_V2!r}, got "
+            f"{data.get('format')!r}"
         )
     if data.get("num_experts") != num_experts:
         raise ValueError(
@@ -115,6 +131,116 @@ def expert_placement_for_layer(
         key="kimi_k3_expert_placement_loaded",
     )
     return tables.get(layer_idx)
+
+
+@dataclasses.dataclass(frozen=True)
+class KimiK3ExpertReplicas:
+    """Second copies of some home slots of one MoE layer (see the module docstring)."""
+
+    num_experts: int
+    ep_size: int
+    #: Copy slots per EP rank (``S``).
+    slots_per_rank: int
+    #: ``(home slot, EP rank of the copy)`` in priority order.
+    entries: tuple[tuple[int, int], ...]
+
+    @property
+    def num_home(self) -> int:
+        """Home slots per EP rank."""
+        return self.num_experts // self.ep_size
+
+    @property
+    def num_local(self) -> int:
+        """Slots per EP rank: home slots, then copy slots."""
+        return self.num_home + self.slots_per_rank
+
+    @property
+    def num_slots(self) -> int:
+        """Slots of the routed MoE (rank-major)."""
+        return self.ep_size * self.num_local
+
+    def copies_on(self, rank: int) -> list[int]:
+        """Home slots whose copy EP rank ``rank`` holds, in local-slot (ascending) order."""
+        return sorted(x for x, r in self.entries if r == rank)
+
+    def home_slots_of_local(self, rank: int) -> list[int]:
+        """Home slot whose expert each local slot of ``rank`` holds; copy slots without a copy
+        repeat the rank's first home slot (never routed to)."""
+        home = list(range(rank * self.num_home, (rank + 1) * self.num_home))
+        copies = self.copies_on(rank)
+        return home + copies + [home[0]] * (self.slots_per_rank - len(copies))
+
+    def routed_slot_of_home(self) -> list[int]:
+        """Routed-MoE slot of the home copy of each home slot."""
+        return [x + (x // self.num_home) * self.slots_per_rank for x in range(self.num_experts)]
+
+
+@functools.lru_cache(maxsize=4)
+def load_expert_replicas(path: str, num_experts: int) -> tuple[int, int, dict[int, tuple]]:
+    """``(replica_slots, ep_size, {layer: entries})`` of a v2 placement file (layers without
+    copies dropped). Raises ``ValueError`` on a file that is not v2 or breaks the rules."""
+    with open(path) as f:
+        data = json.load(f)
+    if data.get("format") != _PLACEMENT_FORMAT_V2:
+        raise ValueError(f"{path}: redundant copies need format {_PLACEMENT_FORMAT_V2!r}")
+    if data.get("num_experts") != num_experts:
+        raise ValueError(
+            f"{path}: placement is for {data.get('num_experts')} experts, "
+            f"the model has {num_experts}"
+        )
+    ep_size = int(data["ep_size"])
+    slots = int(data["replica_slots"])
+    if ep_size < 2 or num_experts % ep_size or slots < 1:
+        raise ValueError(
+            f"{path}: needs ep_size >= 2 dividing {num_experts} and replica_slots >= 1"
+        )
+    num_home = num_experts // ep_size
+    layers = {}
+    for layer, raw in data.get("replicas", {}).items():
+        entries = tuple((int(x), int(r)) for x, r in raw)
+        per_rank = [0] * ep_size
+        for x, r in entries:
+            if not (0 <= x < num_experts and 0 <= r < ep_size and r != x // num_home):
+                raise ValueError(f"{path}: layer {layer}: bad copy {[x, r]}")
+            per_rank[r] += 1
+        if len({x for x, _ in entries}) != len(entries) or max(per_rank) > slots:
+            raise ValueError(
+                f"{path}: layer {layer}: an expert copied twice or more than {slots} copies "
+                "on a rank"
+            )
+        if entries:
+            layers[int(layer)] = entries
+    return slots, ep_size, layers
+
+
+def expert_replicas_for_layer(
+    layer_idx: int, num_experts: int, ep_size: int
+) -> Optional[KimiK3ExpertReplicas]:
+    """Redundant copies of ``layer_idx`` when ``TRTLLM_K3_EXPERT_REPLICAS=1`` and
+    ``TRTLLM_K3_EXPERT_PLACEMENT`` names a v2 file, else ``None``.
+
+    Layers without copies still get ``replica_slots`` (empty) copy slots, so every MoE layer has
+    the same slot layout. Raises ``ValueError`` when the file was made for another EP size.
+    """
+    if os.environ.get(EXPERT_REPLICAS_ENV, "0") != "1":
+        return None
+    path = os.environ.get(EXPERT_PLACEMENT_ENV)
+    if not path:
+        raise ValueError(
+            f"{EXPERT_REPLICAS_ENV}=1 needs {EXPERT_PLACEMENT_ENV}=<v2 placement file>"
+        )
+    slots, file_ep, layers = load_expert_replicas(path, num_experts)
+    if file_ep != ep_size:
+        raise ValueError(
+            f"{path}: copies were placed for ep_size={file_ep}, the routed MoE runs with "
+            f"ep_size={ep_size}"
+        )
+    logger.info_once(
+        f"Kimi K3 redundant expert copies from {path}: {slots} copy slots per EP rank, "
+        f"{len(layers)} layers with copies",
+        key="kimi_k3_expert_replicas_loaded",
+    )
+    return KimiK3ExpertReplicas(num_experts, ep_size, slots, layers.get(layer_idx, ()))
 
 
 def permute_router_to_slots(

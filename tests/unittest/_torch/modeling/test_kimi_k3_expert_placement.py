@@ -89,6 +89,89 @@ def test_expert_placement_for_layer_follows_env(tmp_path, monkeypatch):
     assert expert_placement_for_layer(3, 16, ep_size=2) == perm
 
 
+def _write_v2(path, tables, replicas, num_experts=896, ep_size=4, slots=8):
+    data = {
+        "format": "kimi_k3_expert_placement/v2",
+        "num_experts": num_experts,
+        "ep_size": ep_size,
+        "replica_slots": slots,
+        "expert_of_slot": {str(k): list(v) for k, v in tables.items()},
+        "replicas": {str(k): [list(e) for e in v] for k, v in replicas.items()},
+    }
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+def _clear_placement_caches():
+    load_expert_placement.cache_clear()
+    placement.load_expert_replicas.cache_clear()
+
+
+def test_v2_file_without_switch_is_its_v1_placement(tmp_path, monkeypatch):
+    perm = _permutation(896, 3)
+    path = _write_v2(tmp_path / "p2.json", {2: perm}, {2: [(5, 1), (300, 0)]})
+    _clear_placement_caches()
+    monkeypatch.setenv(placement.EXPERT_PLACEMENT_ENV, path)
+    monkeypatch.delenv(placement.EXPERT_REPLICAS_ENV, raising=False)
+    assert expert_placement_for_layer(2, 896, ep_size=4) == perm
+    assert placement.expert_replicas_for_layer(2, 896, ep_size=4) is None
+    monkeypatch.setenv(placement.EXPERT_REPLICAS_ENV, "0")
+    assert placement.expert_replicas_for_layer(2, 896, ep_size=4) is None
+
+
+def test_expert_replicas_for_layer(tmp_path, monkeypatch):
+    path = _write_v2(tmp_path / "p2.json", {}, {2: [(5, 1), (300, 0), (700, 1)]}, slots=2)
+    _clear_placement_caches()
+    monkeypatch.setenv(placement.EXPERT_PLACEMENT_ENV, path)
+    monkeypatch.setenv(placement.EXPERT_REPLICAS_ENV, "1")
+    reps = placement.expert_replicas_for_layer(2, 896, ep_size=4)
+    assert reps.entries == ((5, 1), (300, 0), (700, 1))
+    assert (reps.num_home, reps.num_local, reps.num_slots) == (224, 226, 904)
+    assert reps.copies_on(1) == [5, 700] and reps.copies_on(0) == [300] and reps.copies_on(3) == []
+    local1 = reps.home_slots_of_local(1)
+    assert local1[:224] == list(range(224, 448)) and local1[224:] == [5, 700]
+    # An unused copy slot repeats the rank's first home slot.
+    assert reps.home_slots_of_local(0)[224:] == [300, 0]
+    slot_of = reps.routed_slot_of_home()
+    assert slot_of[5] == 5 and slot_of[224] == 226 and slot_of[895] == 3 * 226 + 223
+    # A layer without copies keeps the slot layout (empty copy slots).
+    other = placement.expert_replicas_for_layer(7, 896, ep_size=4)
+    assert other.entries == () and other.num_local == 226
+    with pytest.raises(ValueError):  # placed for EP4
+        placement.expert_replicas_for_layer(2, 896, ep_size=8)
+
+
+@pytest.mark.parametrize(
+    "replicas,slots",
+    [
+        ({1: [(5, 0)]}, 2),  # copy on the home rank
+        ({1: [(5, 1), (5, 2)]}, 2),  # an expert copied twice
+        ({1: [(5, 1), (6, 1), (7, 1)]}, 2),  # more than replica_slots copies on a rank
+        ({1: [(896, 1)]}, 2),  # no such expert
+        ({1: [(5, 4)]}, 2),  # no such rank
+    ],
+)
+def test_expert_replicas_reject_bad_files(tmp_path, monkeypatch, replicas, slots):
+    path = _write_v2(tmp_path / "bad2.json", {}, replicas, slots=slots)
+    _clear_placement_caches()
+    monkeypatch.setenv(placement.EXPERT_PLACEMENT_ENV, path)
+    monkeypatch.setenv(placement.EXPERT_REPLICAS_ENV, "1")
+    with pytest.raises(ValueError):
+        placement.expert_replicas_for_layer(1, 896, ep_size=4)
+
+
+def test_expert_replicas_need_a_v2_file(tmp_path, monkeypatch):
+    path = _write_placement(tmp_path / "p1.json", {1: _permutation(896, 4)}, num_experts=896)
+    _clear_placement_caches()
+    monkeypatch.setenv(placement.EXPERT_PLACEMENT_ENV, path)
+    monkeypatch.setenv(placement.EXPERT_REPLICAS_ENV, "1")
+    with pytest.raises(ValueError):
+        placement.expert_replicas_for_layer(1, 896, ep_size=4)
+    monkeypatch.delenv(placement.EXPERT_PLACEMENT_ENV)
+    with pytest.raises(ValueError):
+        placement.expert_replicas_for_layer(1, 896, ep_size=4)
+
+
 def test_permute_router_to_slots_moves_rows():
     perm = _permutation(8, 2)
     weight = torch.arange(8 * 3, dtype=torch.float32).view(8, 3)

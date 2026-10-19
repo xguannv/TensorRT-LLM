@@ -779,3 +779,283 @@ def test_moe_runtime_routes_with_umma_gemm(monkeypatch, m, offset, num_local):
     # Above TRTLLM_K3_ROUTER_GEMM_MAX_M the cuBLAS GEMM serves the forward again.
     monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTER_GEMM_MAX_M", m - 1)
     assert not runtime._can_umma_route(h)
+
+
+# ---------------------------------------------------------------------------
+# Redundant expert copies (trtllm::k3_route_tail_rep, TRTLLM_K3_EXPERT_REPLICAS)
+# ---------------------------------------------------------------------------
+
+REP_EP = 4
+REP_HOME = NUM_EXPERTS // REP_EP
+
+
+def _copy_entries(slots, seed, hot=()):
+    """``slots`` copies per EP rank of experts homed on other ranks, in a seeded priority order
+    (``hot`` first)."""
+    gen = torch.Generator().manual_seed(seed)
+    rest = torch.randperm(NUM_EXPERTS, generator=gen).tolist()
+    order = list(hot) + [x for x in rest if x not in hot]
+    entries, per_rank = [], [0] * REP_EP
+    for x in order:
+        options = [r for r in range(REP_EP) if r != x // REP_HOME and per_rank[r] < slots]
+        if options:
+            r = options[int(torch.randint(len(options), (1,), generator=gen))]
+            entries.append((x, r))
+            per_rank[r] += 1
+        if len(entries) == REP_EP * slots:
+            break
+    return entries
+
+
+def _copy_slots(ids, entries, slots):
+    """Routed-MoE slot (``[M, 16]`` int32) of every selection under the reference copy choice."""
+    rt = _module()
+    num_local = REP_HOME + slots
+    choice = rt.replica_choice(ids.flatten().tolist(), entries)
+    copy_of = {}
+    for (x, r), on_copy in zip(entries, choice):
+        if on_copy:  # copy slots of a rank in ascending expert order
+            mine = sorted(e for e, q in entries if q == r)
+            copy_of[x] = r * num_local + REP_HOME + mine.index(x)
+    return torch.tensor(
+        [
+            [copy_of.get(x, (x // REP_HOME) * num_local + x % REP_HOME) for x in row]
+            for row in ids.cpu().tolist()
+        ],
+        dtype=torch.int32,
+    )
+
+
+def _check_sort(sort_outs, sel, vals, offset, num_local, num_slots):
+    """The sort outputs of one rank against ``moe_sort`` / the token-ordered sort of ``sel``."""
+    tile_expert, tile_limit, e2p, p2e, total, num_tiles = sort_outs
+    ref = torch.ops.trtllm.moe_sort(
+        token_selected_experts=sel.cuda(),
+        token_final_scales=vals,
+        num_experts=num_slots,
+        top_k=TOP_K,
+        local_expert_offset=offset,
+        local_num_experts=num_local,
+        tile_tokens_dim=TILE,
+    )
+    n = int(num_tiles.item())
+    _assert_bit_equal(num_tiles, ref[5], "num_non_exiting_tiles")
+    _assert_bit_equal(total, ref[4], "total_num_padded_tokens")
+    _assert_bit_equal(tile_expert[:n], ref[0][:n], "tile_idx_to_expert_idx")
+    _assert_bit_equal(tile_limit[:n], ref[1][:n], "tile_idx_to_mn_limit")
+    c_expert, c_limit, c_e2p, c_p2e = _token_ordered_sort(sel, offset, num_local)
+    assert tile_expert[:n].tolist() == c_expert and tile_limit[:n].tolist() == c_limit
+    _assert_bit_equal(e2p.cpu(), c_e2p, "expanded_idx_to_permuted_idx (token order)")
+    p2e_cpu = p2e.cpu()
+    for perm, expanded in c_p2e.items():
+        assert int(p2e_cpu[perm]) == expanded, f"permuted_idx_to_expanded_idx[{perm}]"
+
+
+def _run_replicas(logits, bias, entries, slots, scale=1.0, num_tokens=-1):
+    """``k3_route_tail_rep`` of every EP rank; checks top-k, the sort and that every selection is
+    computed on exactly one rank. Returns the reference slots."""
+    rt = _module()
+    m = logits.shape[0] if num_tokens < 0 else num_tokens
+    num_local = REP_HOME + slots
+    owner = torch.zeros((m, TOP_K), dtype=torch.int32)
+    sel = None
+    for rank in range(REP_EP):
+        table = torch.tensor(rt.replica_table(entries, rank), dtype=torch.int32, device="cuda")
+        outs = torch.ops.trtllm.k3_route_tail_rep(
+            logits, bias, scale, rank * num_local, num_local, rank * REP_HOME, table,
+            len(entries), TILE, num_tokens,
+        )
+        if sel is None:
+            if logits.dim() == 2:
+                flat = logits[:m]
+            else:
+                flat = logits[0, :m].clone()
+                for s in range(1, logits.shape[0]):
+                    flat = flat + logits[s, :m]
+            ref_ids, ref_vals = _noaux(flat, bias, scale)
+            sel = _copy_slots(ref_ids, entries, slots)
+        _assert_bit_equal(outs[0], ref_ids, "topk_ids")
+        _assert_bit_equal(outs[1], ref_vals, "topk_weights")
+        _check_sort(outs[2:], sel, ref_vals, rank * num_local, num_local, REP_EP * num_local)
+        owner += (outs[4].cpu() >= 0).to(torch.int32)
+    assert (owner == 1).all(), "every selection is computed on exactly one rank"
+    return sel
+
+
+@pytest.mark.parametrize("m", [1, 7, 14, 16, 28, 32, 64, 112, 256])
+@pytest.mark.parametrize("slots", [4, 8, 16])
+@pytest.mark.parametrize("mode", ["realistic", "rand", "skew"])
+def test_tail_replicas(m, slots, mode):
+    logits, bias = _logits(m, seed=31 * m + slots, mode=mode)
+    hot = range(224, 232) if mode == "skew" else ()
+    _run_replicas(logits, bias, _copy_entries(slots, seed=m + slots, hot=hot), slots)
+
+
+def test_tail_replicas_move_load_off_the_busiest_rank():
+    """Many hot experts on rank 1 with copies elsewhere: the step moves some of them, and the
+    busiest rank touches fewer experts."""
+    m = 14
+    logits, bias = _logits(m, seed=5)
+    logits[:, 224:264] += 6
+    slots = 8
+    entries = _copy_entries(slots, seed=3, hot=range(224, 264))
+    sel = _run_replicas(logits, bias, entries, slots)
+    num_local = REP_HOME + slots
+    per_rank = [len({s for s in sel.flatten().tolist() if s // num_local == r}) for r in range(4)]
+    ids, _ = _noaux(logits, bias, 1.0)
+    home = [len({x for x in ids.flatten().tolist() if x // REP_HOME == r}) for r in range(4)]
+    assert home.index(max(home)) == 1 and max(per_rank) < max(home), (home, per_rank)
+
+
+@pytest.mark.parametrize("slots", [1, 8])
+def test_tail_replicas_without_entries(slots):
+    """No two-copy expert: the home slots serve, as the plain tail does."""
+    m = 32
+    logits, bias = _logits(m, seed=9, mode="realistic")
+    _run_replicas(logits, bias, [], slots)
+
+
+@pytest.mark.parametrize("m", [7, 100])
+def test_tail_replicas_split_partials(m):
+    gen = torch.Generator(device="cuda").manual_seed(m)
+    partials = torch.randn((5, m + 3, NUM_EXPERTS), device="cuda", generator=gen)
+    bias = torch.randn((NUM_EXPERTS,), device="cuda", generator=gen) * 0.01
+    _run_replicas(partials, bias, _copy_entries(8, seed=m), 8, num_tokens=m)
+
+
+def test_tail_replicas_routed_scaling_factor():
+    logits, bias = _logits(28, seed=77, mode="realistic")
+    _run_replicas(logits, bias, _copy_entries(4, seed=77), 4, scale=2.5)
+
+
+def test_tail_replicas_cuda_graph_replay():
+    rt = _module()
+    m, slots = 14, 8
+    entries = _copy_entries(slots, seed=21)
+    num_local = REP_HOME + slots
+    logits, bias = _logits(m, seed=4, mode="realistic")
+    static = logits.clone()
+    rank = 2
+    table = torch.tensor(rt.replica_table(entries, rank), dtype=torch.int32, device="cuda")
+    args = (bias, 1.0, rank * num_local, num_local, rank * REP_HOME, table, len(entries), TILE)
+    torch.ops.trtllm.k3_route_tail_rep(static, *args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = torch.ops.trtllm.k3_route_tail_rep(static, *args)
+    for seed in range(4):
+        fresh, _ = _logits(m, seed=40 + seed, mode="realistic" if seed % 2 else "skew")
+        static.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_ids, ref_vals = _noaux(static, bias, 1.0)
+        _assert_bit_equal(outs[0], ref_ids, "topk_ids")
+        sel = _copy_slots(ref_ids, entries, slots)
+        _check_sort(outs[2:], sel, ref_vals, rank * num_local, num_local, REP_EP * num_local)
+
+
+def test_tail_replicas_rejects_bad_arguments():
+    rt = _module()
+    logits, bias = _logits(7, seed=1)
+    table = torch.tensor(rt.replica_table([], 0), dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError):  # local slots do not start at rank * local_num_experts
+        torch.ops.trtllm.k3_route_tail_rep(logits, bias, 1.0, 224, 232, 224 * 2, table, 0, TILE)
+    with pytest.raises(ValueError):  # more than REP_LOCAL_CAP local slots
+        torch.ops.trtllm.k3_route_tail_rep(logits, bias, 1.0, 0, 300, 0, table, 0, TILE)
+    with pytest.raises(ValueError):  # wrong table size
+        torch.ops.trtllm.k3_route_tail_rep(logits, bias, 1.0, 0, 232, 0, table[:-4], 0, TILE)
+    big, big_bias = _logits(257, seed=2)
+    with pytest.raises(ValueError):  # above the cluster tail
+        torch.ops.trtllm.k3_route_tail_rep(big, big_bias, 1.0, 0, 232, 0, table, 0, TILE)
+
+
+def test_replica_table_and_choice_reference():
+    rt = _module()
+    entries = [(5, 1), (300, 0), (700, 1), (230, 3)]
+    t = rt.replica_table(entries, 1)
+    assert len(t) == rt.REP_TABLE_WORDS
+    # Copies on rank 1: experts 5 and 700, copy slots 224 and 225 (ascending).
+    assert t[rt.REP_COPYX_OFF] == 5 and t[rt.REP_COPYX_OFF + 1] == 700
+    assert t[rt.REP_COPYX_OFF + 2] == -1
+    assert t[rt.REP_MINE_OFF + 0] == 1 << 5 and t[rt.REP_MINE_OFF + 700 // 32] == 1 << (700 % 32)
+    assert t[rt.REP_PREFIX_OFF + 0] == 0 and t[rt.REP_PREFIX_OFF + 1] == 1
+    assert t[rt.REP_PREFIX_OFF + 700 // 32] == 1 and t[rt.REP_PREFIX_OFF + 27] == 2
+    assert t[rt.REP_FLEX_OFF + 300 // 32] == 1 << (300 % 32)
+    assert t[rt.REP_COUNT_OFF] == 4
+    assert t[rt.REP_LIST_OFF + 1] == 300 | (1 << 10) | (0 << 12) | (1 << 14)
+    # Choice: rank 0 has touched 3 single-copy experts, rank 1 one, rank 3 none.
+    touched = [1, 2, 3, 250, 5, 300, 230]
+    # entry (5, 1): home 0 (3) vs copy 1 (1) -> copy; entry (300, 0): home 1 (2) vs 0 (3) -> home;
+    # entry (700, 1): untouched; entry (230, 3): home 1 (3) vs 3 (0) -> copy.
+    assert rt.replica_choice(touched, entries) == [True, False, False, True]
+    # Ties stay home.
+    assert rt.replica_choice([5], [(5, 1)]) == [False]
+    assert rt.replica_choice([5, 1], [(5, 1)]) == [True]
+    with pytest.raises(ValueError):
+        rt.replica_table([(5, 0)], 0)  # copy on the home rank
+
+
+def test_moe_runtime_routes_with_expert_copies(monkeypatch):
+    """``TRTLLM_K3_EXPERT_REPLICAS`` in ``KimiK3MoERuntime``: the routing tail target covers the
+    rank's ``224 + S`` slots up to 256 tokens, ``_tail_route`` runs ``k3_route_tail_rep`` with the
+    rank's table, and the routing method maps the home ids of results without ``moe_sort`` outputs
+    to home-copy slots."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _KimiK3RoutingMethod
+    from tensorrt_llm._torch.modules.kimi_k3_expert_placement import KimiK3ExpertReplicas
+
+    rt = _module()
+    slots, rank = 8, 2
+    entries = tuple(_copy_entries(slots, seed=12))
+    replicas = KimiK3ExpertReplicas(NUM_EXPERTS, REP_EP, slots, entries)
+    num_local = replicas.num_local
+    m = 14
+    logits, bias = _logits(m, seed=13, mode="realistic")
+    routing = _KimiK3RoutingMethod(
+        top_k=TOP_K,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=lambda: bias,
+        is_fused=True,
+    )
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(
+        e_score_correction_bias=bias, num_experts=NUM_EXPERTS, routed_scaling_factor=1.0
+    )
+    runtime.routed_experts = SimpleNamespace(
+        routing_method=routing,
+        use_dp=False,
+        backend=SimpleNamespace(
+            slot_start=rank * num_local,
+            expert_size_per_partition=num_local,
+            num_slots=replicas.num_slots,
+        ),
+    )
+    runtime.expert_replicas = replicas
+    runtime.expert_lo = rank * num_local
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "1")
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL_MAX_M", 2048)
+    assert runtime.replica_rank == rank
+    target = runtime._route_tail_target(m)
+    assert target == (rank * num_local, num_local)
+    assert runtime._route_tail_target(257) is None  # only the cluster tail chooses copies
+    ids, weights = runtime._tail_route(logits, target)
+    key, sort_outputs = ids._k3_presorted
+    assert key == (rank * num_local, num_local, TILE)
+    ref_ids, ref_vals = _noaux(logits, bias, 1.0)
+    _assert_bit_equal(ids, ref_ids, "topk_ids")
+    _assert_bit_equal(weights, ref_vals, "topk_weights")
+    sel = _copy_slots(ref_ids, list(entries), slots)
+    _check_sort(sort_outputs, sel, ref_vals, rank * num_local, num_local, replicas.num_slots)
+    # Fallback paths (no moe_sort outputs attached): home ids -> home-copy slots.
+    mapped, _ = routing.apply(logits)
+    _assert_bit_equal(
+        mapped.cpu(), ref_ids.cpu() + (ref_ids.cpu() // REP_HOME) * slots, "slot_map of home ids"
+    )
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "gemv")
+    assert not runtime._can_gemv_route(torch.zeros(m, HIDDEN, device="cuda"))
