@@ -32,6 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor.input_commit import active_input_commit
 from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
 
@@ -846,7 +847,12 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
+        input_commit = active_input_commit()
+
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            if input_commit is not None:
+                input_commit.stage(dst[:len(values)], values)
+                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
@@ -1204,13 +1210,19 @@ class SpecMetadata:
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot.
+        input_commit = active_input_commit()
         if self.use_rejection_sampling and self.batch_slot_ids is not None:
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            if input_commit is not None:
+                input_commit.stage(
+                    self.batch_slot_ids[:len(per_request_slot_ids)],
+                    per_request_slot_ids)
+            else:
+                self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
+                    torch.tensor(per_request_slot_ids,
+                                 dtype=torch.long,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
@@ -1239,23 +1251,32 @@ class SpecMetadata:
                 request_top_ks.append(tk_val)
                 request_top_ps.append(tp_val)
 
-            self.request_temperatures[:len(request_temperatures)].copy_(
-                torch.tensor(request_temperatures,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True)
-            self.request_top_ks[:len(request_top_ks)].copy_(
-                torch.tensor(request_top_ks,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
-            self.request_top_ps[:len(request_top_ps)].copy_(
-                torch.tensor(request_top_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            if input_commit is not None:
+                input_commit.stage(
+                    self.request_temperatures[:len(request_temperatures)],
+                    request_temperatures)
+                input_commit.stage(self.request_top_ks[:len(request_top_ks)],
+                                   request_top_ks)
+                input_commit.stage(self.request_top_ps[:len(request_top_ps)],
+                                   request_top_ps)
+            else:
+                self.request_temperatures[:len(request_temperatures)].copy_(
+                    torch.tensor(request_temperatures,
+                                 dtype=torch.float32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True)
+                self.request_top_ks[:len(request_top_ks)].copy_(
+                    torch.tensor(request_top_ks,
+                                 dtype=torch.int32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
+                self.request_top_ps[:len(request_top_ps)].copy_(
+                    torch.tensor(request_top_ps,
+                                 dtype=torch.float32,
+                                 pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1276,15 +1297,23 @@ class SpecMetadata:
                 top_ks.extend(tk_val for _ in range(num_tokens))
                 top_ps.extend(tp_val for _ in range(num_tokens))
 
-            self.temperatures[:len(temperatures)].copy_(torch.tensor(
-                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-            self.top_ks[:len(top_ks)].copy_(torch.tensor(
-                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
-            self.top_ps[:len(top_ps)].copy_(torch.tensor(
-                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.temperatures[:len(temperatures)],
+                                   temperatures)
+                input_commit.stage(self.top_ks[:len(top_ks)], top_ks)
+                input_commit.stage(self.top_ps[:len(top_ps)], top_ps)
+            else:
+                self.temperatures[:len(temperatures)].copy_(torch.tensor(
+                    temperatures,
+                    dtype=torch.float32,
+                    pin_memory=prefer_pinned()),
+                                                            non_blocking=True)
+                self.top_ks[:len(top_ks)].copy_(torch.tensor(
+                    top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
+                                                non_blocking=True)
+                self.top_ps[:len(top_ps)].copy_(torch.tensor(
+                    top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                non_blocking=True)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, int]]

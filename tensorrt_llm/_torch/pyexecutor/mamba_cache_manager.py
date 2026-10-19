@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     PAGE_PRIORITY_DEFAULT, PAGE_PRIORITY_MIN, BlockReusePolicy,
     KVCacheManagerV2, PagePriorityCallback, Role)
@@ -1434,8 +1435,13 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
-                                       non_blocking=True)
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            input_commit.stage(self._dummy_request_mask,
+                               self._dummy_request_mask_host)
+        else:
+            self._dummy_request_mask.copy_(self._dummy_request_mask_host,
+                                           non_blocking=True)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:

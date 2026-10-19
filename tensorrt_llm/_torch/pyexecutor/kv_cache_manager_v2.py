@@ -96,6 +96,7 @@ from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .input_commit import block_offsets_triton_enabled, copy_batch_block_offsets_from_host
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -4486,6 +4487,17 @@ class KVCacheManagerV2(BaseResourceManager):
             self._copy_batch_block_offsets_per_layer(
                 dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
             )
+            return
+
+        # TRTLLM_KV_BLOCK_OFFSETS_TRITON=1: same copy split over many CTAs (the C++ kernel
+        # uses one CTA per pool and sequence, which is bound by host-read latency).
+        if block_offsets_triton_enabled() and copy_batch_block_offsets_from_host(
+            self.host_kv_cache_block_offsets,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+        ):
             return
 
         copy_batch_block_offsets_to_device(

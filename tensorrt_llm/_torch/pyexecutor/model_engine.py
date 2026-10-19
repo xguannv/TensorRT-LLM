@@ -93,6 +93,10 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
+from .input_commit import (InputCommit, active_input_commit,
+                           batched_input_commit_enabled,
+                           block_offsets_triton_enabled, input_commit_scope,
+                           warmup_input_commit_kernels)
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState,
@@ -915,6 +919,14 @@ class PyTorchModelEngine(ModelEngine):
         self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
                                              dtype=torch.int,
                                              device='cuda')
+        # TRTLLM_BATCHED_INPUT_COMMIT=1: the host->device input copies of a
+        # CUDA-graph decode step (and the overlap-scheduler gathers) are
+        # written by one kernel right before the replay; see input_commit.py.
+        self._input_commit: Optional[InputCommit] = (
+            InputCommit()
+            if batched_input_commit_enabled() and prefer_pinned() else None)
+        if self._input_commit is not None or block_offsets_triton_enabled():
+            warmup_input_commit_kernels(self._input_commit)
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
@@ -6210,12 +6222,18 @@ class PyTorchModelEngine(ModelEngine):
         assert total_num_tokens <= self.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
         )
+        # Set by forward() for a batched input commit (see input_commit.py).
+        input_commit = active_input_commit()
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids,
-                                     dtype=torch.int,
-                                     pin_memory=prefer_pinned())
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.input_ids_cuda[:num_tokens], input_ids)
+            else:
+                input_ids = torch.tensor(input_ids,
+                                         dtype=torch.int,
+                                         pin_memory=prefer_pinned())
+                self.input_ids_cuda[:num_tokens].copy_(input_ids,
+                                                       non_blocking=True)
 
             # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
             if self.is_draft_model and num_accepted_tokens_device is not None:
@@ -6292,18 +6310,28 @@ class PyTorchModelEngine(ModelEngine):
                             draft_first_draft_seq_slots_cuda[:total_tokens], 0]
 
         if num_draft_tokens > 0:
-            draft_tokens = torch.tensor(draft_tokens,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
-                                                             non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.draft_tokens_cuda[:num_draft_tokens],
+                                   draft_tokens)
+            else:
+                draft_tokens = torch.tensor(draft_tokens,
+                                            dtype=torch.int,
+                                            pin_memory=prefer_pinned())
+                self.draft_tokens_cuda[:len(draft_tokens)].copy_(
+                    draft_tokens, non_blocking=True)
         if self.is_spec_decode and len(num_accepted_draft_tokens) > 0:
-            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
-                                                     dtype=torch.int,
-                                                     pin_memory=prefer_pinned())
-            self.num_accepted_draft_tokens_cuda[:len(
-                num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
-                                                  non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(
+                    self.num_accepted_draft_tokens_cuda[:len(
+                        num_accepted_draft_tokens)], num_accepted_draft_tokens)
+            else:
+                num_accepted_draft_tokens = torch.tensor(
+                    num_accepted_draft_tokens,
+                    dtype=torch.int,
+                    pin_memory=prefer_pinned())
+                self.num_accepted_draft_tokens_cuda[:len(
+                    num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
+                                                      non_blocking=True)
 
             # Update num_accepted_draft_tokens_cuda for first_draft_requests directly from num_accepted_tokens_device (draft model only)
             if self.is_draft_model and len(first_draft_seq_slots) > 0:
@@ -6332,7 +6360,40 @@ class PyTorchModelEngine(ModelEngine):
                     self.
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] = accepted_tokens
-        if next_draft_tokens_device is not None:
+        if next_draft_tokens_device is not None and input_commit is not None:
+            # Same values as the branch below, written by the commit kernel.
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                self.runtime_draft_len)
+            previous_batch_tokens = (previous_batch_len *
+                                     runtime_tokens_per_gen_step)
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(
+                extend_dummy_requests)
+            if previous_batch_len > 0:
+                input_commit.stage(
+                    self.previous_batch_indices_cuda[:previous_batch_len],
+                    previous_batch_indices)
+                input_commit.stage(
+                    self.previous_pos_indices_cuda[:previous_batch_tokens],
+                    previous_pos_indices)
+            input_commit.set_overlap_fixup(
+                previous_slots=previous_batch_indices,
+                tokens_per_req=runtime_tokens_per_gen_step,
+                draft_width=runtime_tokens_per_gen_step - 1,
+                new_tokens=new_tokens_device,
+                new_tokens_lens=new_tokens_lens_device,
+                next_draft_tokens=next_draft_tokens_device,
+                input_ids=self.input_ids_cuda,
+                input_ids_start=num_tokens,
+                draft_tokens=self.draft_tokens_cuda,
+                draft_tokens_start=num_draft_tokens,
+                pos_offsets=self.previous_pos_id_offsets_cuda,
+                pos_offsets_start=(num_extend_reqeust_wo_dummy -
+                                   previous_batch_len) *
+                runtime_tokens_per_gen_step,
+                kv_offsets=self.previous_kv_lens_offsets_cuda,
+                kv_offsets_start=num_extend_reqeust_wo_dummy -
+                previous_batch_len)
+        elif next_draft_tokens_device is not None:
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
@@ -6483,19 +6544,27 @@ class PyTorchModelEngine(ModelEngine):
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
-            position_ids = torch.tensor(position_ids,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
-                                                            non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.position_ids_cuda[:total_num_tokens],
+                                   position_ids)
+            else:
+                position_ids = torch.tensor(position_ids,
+                                            dtype=torch.int,
+                                            pin_memory=prefer_pinned())
+                self.position_ids_cuda[:total_num_tokens].copy_(
+                    position_ids, non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
                                                             0)
 
         if self.enable_spec_decode:
-            self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
-                gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                                                         non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.gather_ids_cuda[:len(gather_ids)],
+                                   gather_ids)
+            else:
+                self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
+                    gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
+                                                             non_blocking=True)
 
             # Update gather_ids for first_draft_requests on GPU (draft model only)
             if self.is_draft_model and len(first_draft_seq_slots) > 0:
@@ -7403,6 +7472,49 @@ class PyTorchModelEngine(ModelEngine):
 
         return lora_params
 
+    def _input_commit_for_step(
+            self, scheduled_requests: ScheduledRequests,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            attn_metadata: AttentionMetadata, can_run_graph: bool,
+            promoted_context_request_ids: frozenset[int]
+    ) -> Optional[InputCommit]:
+        """The batched input commit for this step, or None to copy one by one.
+
+        Limited to the input-preparation path whose device-side reads of the
+        staged buffers were audited: a CUDA-graph replay of a generation-only
+        batch without padding dummies, on a one-model speculative-decoding
+        engine, using TRT-LLM attention without FlashMLA, FP4 MLA pools or
+        uGPU fork-join, and without multimodal, beam search, LoRA, guided
+        decoding, attention DP, star attention or encoder-decoder inputs.
+        """
+        if self._input_commit is None or not can_run_graph or self.is_warmup:
+            return None
+        if (scheduled_requests.num_context_requests > 0
+                or promoted_context_request_ids
+                or scheduled_requests.num_generation_requests == 0):
+            return None
+        if (self.use_mrope or self.use_beam_search or self.is_draft_model
+                or self.enable_attention_dp
+                or self.lora_model_config is not None
+                or getattr(self, "guided_decoder", None) is not None
+                or self._is_encoder_decoder_model()):
+            return None
+        if (not self.enable_spec_decode or self.spec_config is None
+                or self.spec_config.spec_dec_mode.has_draft_model()):
+            return None
+        if (self.mapping is not None
+                and self.mapping.cp_config.get('cp_type', None) == CpType.STAR):
+            return None
+        if (type(attn_metadata) is not TrtllmAttentionMetadata
+                or attn_metadata.enable_flash_mla
+                or attn_metadata.high_precision_kv_pool is not None
+                or _ugpu_forkjoin_enabled(kv_cache_manager)):
+            return None
+        if any(request.is_dummy
+               for request in scheduled_requests.generation_requests):
+            return None
+        return self._input_commit
+
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
         self,
@@ -8033,11 +8145,31 @@ class PyTorchModelEngine(ModelEngine):
                     execution_requests.generation_requests,
                 )
 
-            inputs, gather_ids = self._prepare_inputs(
+            input_commit = self._input_commit_for_step(
                 execution_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager, can_run_graph, execution_promoted_context_ids)
+                can_run_graph, execution_promoted_context_ids)
+            if input_commit is None:
+                inputs, gather_ids = self._prepare_inputs(
+                    execution_requests, kv_cache_manager, attn_metadata,
+                    spec_metadata, new_tensors_device, cache_indirection_buffer,
+                    num_accepted_tokens_device, req_id_to_old_request,
+                    resource_manager, can_run_graph,
+                    execution_promoted_context_ids)
+            else:
+                input_commit.begin()
+                try:
+                    with input_commit_scope(input_commit):
+                        inputs, gather_ids = self._prepare_inputs(
+                            execution_requests, kv_cache_manager, attn_metadata,
+                            spec_metadata, new_tensors_device,
+                            cache_indirection_buffer,
+                            num_accepted_tokens_device, req_id_to_old_request,
+                            resource_manager, can_run_graph,
+                            execution_promoted_context_ids)
+                except BaseException:
+                    input_commit.abort()
+                    raise
+                input_commit.commit()
             if execution_promoted_context_ids:
                 self.iter_states[
                     'num_ctx_requests'] = scheduled_requests.num_context_requests

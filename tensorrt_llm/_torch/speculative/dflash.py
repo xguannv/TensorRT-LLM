@@ -26,6 +26,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.input_commit import active_input_commit
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.mamba_cache_manager import KDAHybridCacheManagerV2, MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -160,10 +161,14 @@ class DFlashSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(
-            num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            input_commit.stage(self.batch_indices_cuda[:num_seqs], range(num_seqs))
+        else:
+            batch_indices = torch.arange(
+                num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
+            )
+            self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -195,13 +200,17 @@ class DFlashSpecMetadata(SpecMetadata):
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
-            mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-            worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+            slots = [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids]
+            if input_commit is not None:
+                input_commit.stage(worker._batch_to_slot[:num_seqs], slots)
+            else:
+                mapping = torch.tensor(
+                    slots,
+                    dtype=torch.long,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                )
+                worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
