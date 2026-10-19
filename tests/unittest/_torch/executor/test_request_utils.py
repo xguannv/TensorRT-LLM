@@ -9,11 +9,14 @@ This module tests:
 
 """
 
+import random
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 
+from tensorrt_llm._torch.pyexecutor import request_utils
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
@@ -24,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     get_from_waiting_queue,
     merge_helix_requests,
     merge_requests,
+    partition_context_for_helix,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
@@ -340,6 +344,88 @@ def test_merge_helix_requests_empty_ranks_with_padding():
         # total_input_len_cp is always the full prompt length.
         assert llm_request.total_input_len_cp == len(input_tokens)
         assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 16])
+@pytest.mark.parametrize("tokens_per_block", [1, 2, 5, 64])
+def test_sliced_helix_partition_matches_tensor_partition(cp_size, tokens_per_block):
+    """TRTLLM_SLICED_HELIX_PARTITION returns exactly the lists of the tensor partition."""
+    rng = random.Random(1000 * cp_size + tokens_per_block)
+    span = cp_size * tokens_per_block
+    lengths = {1, 2, tokens_per_block, tokens_per_block + 1, span - 1, span, span + 1}
+    lengths |= {3 * span + tokens_per_block // 2 + 1, 10 * span, 1000}
+    for length in sorted(n for n in lengths if n > 0):
+        tokens = [rng.randrange(1 << 31) for _ in range(length)]
+        prompt = np.asarray(tokens, dtype=np.int64)
+        for rank in range(cp_size):
+            with patch.object(request_utils, "_SLICED_HELIX_PARTITION", False):
+                expected = partition_context_for_helix(tokens, rank, cp_size, tokens_per_block)
+            with patch.object(request_utils, "_SLICED_HELIX_PARTITION", True):
+                sliced = partition_context_for_helix(tokens, rank, cp_size, tokens_per_block)
+            from_array = request_utils._partition_prompt_array_for_helix(
+                prompt, rank, cp_size, tokens_per_block
+            )
+            assert sliced == expected, (length, rank)
+            assert from_array == expected, (length, rank)
+            assert all(type(v) is int for v in sliced[0] + sliced[1])
+            assert all(type(v) is int for v in from_array[0] + from_array[1])
+    for sliced_on in (False, True):
+        with patch.object(request_utils, "_SLICED_HELIX_PARTITION", sliced_on):
+            with pytest.raises(ValueError):
+                partition_context_for_helix([], 0, cp_size, tokens_per_block)
+    with pytest.raises(ValueError):
+        request_utils._partition_prompt_array_for_helix(
+            np.zeros(0, dtype=np.int32), 0, cp_size, tokens_per_block
+        )
+
+
+def test_prompt_token_array_reads_the_request_prompt():
+    """The int32 prompt taken from the request's pickle state equals input_token_ids."""
+    rng = random.Random(3)
+    for length in (1, 63, 64, 65, 5000):
+        tokens = [rng.randrange(0, 2**31 - 1) for _ in range(length)]
+        request = trtllm.Request(
+            input_token_ids=tokens,
+            max_tokens=4,
+            streaming=False,
+            sampling_config=trtllm.SamplingConfig(),
+            output_config=trtllm.OutputConfig(),
+        )
+        prompt = request_utils._prompt_token_array(request)
+        assert prompt is not None and prompt.dtype == np.int32
+        assert prompt.tolist() == request.input_token_ids == tokens
+    # Anything but a bound request takes the list path.
+    assert request_utils._prompt_token_array(Mock()) is None
+    assert request_utils._prompt_token_array(SimpleNamespace(input_token_ids=[1, 2])) is None
+
+
+def test_sliced_helix_partition_merge_requests():
+    """merge_helix_requests builds the same per-rank requests with the sliced partition."""
+    rng = random.Random(7)
+    input_tokens = [rng.randrange(1, 150000) for _ in range(64 * 37 + 21)]
+    request_item = RequestQueueItem(
+        id=3,
+        request=trtllm.Request(
+            input_token_ids=input_tokens,
+            max_tokens=8,
+            streaming=False,
+            sampling_config=trtllm.SamplingConfig(),
+            output_config=trtllm.OutputConfig(),
+        ),
+    )
+    for rank in range(16):
+        built = []
+        for sliced_on in (False, True):
+            with patch.object(request_utils, "_SLICED_HELIX_PARTITION", sliced_on):
+                (req,) = merge_helix_requests(
+                    [request_item],
+                    cp_rank=rank,
+                    cp_size=16,
+                    tokens_per_block=64,
+                    exclude_last_generation_logits=False,
+                )
+            built.append((req.get_tokens(0), req.total_input_len_cp, req.seqlen_this_rank_cp))
+        assert built[0] == built[1], rank
 
 
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")

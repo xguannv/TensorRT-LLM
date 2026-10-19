@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
 
+import numpy as np
 import torch
 
 from tensorrt_llm._utils import nvtx_range
@@ -14,6 +15,12 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+
+# TRTLLM_SLICED_HELIX_PARTITION=1: take a new Helix request's prompt as an int32 array from
+# the request's pickle state and gather only the blocks this CP rank owns, instead of
+# building a Python list and a tensor of the whole padded prompt
+# (see _partition_prompt_array_for_helix and _partition_context_for_helix_sliced).
+_SLICED_HELIX_PARTITION = os.environ.get("TRTLLM_SLICED_HELIX_PARTITION", "0") == "1"
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -264,6 +271,10 @@ def partition_context_for_helix(
     Raises:
         ValueError: If the prompt is empty (no blocks to distribute).
     """
+    if _SLICED_HELIX_PARTITION and isinstance(input_token_ids, list):
+        return _partition_context_for_helix_sliced(
+            input_token_ids, cp_rank, cp_size, tokens_per_block
+        )
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
@@ -307,6 +318,63 @@ def partition_context_for_helix(
         position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
     return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
+
+
+def _partition_context_for_helix_sliced(
+    input_token_ids: List[int], cp_rank: int, cp_size: int, tokens_per_block: int
+) -> Tuple[List[int], List[int], int, int]:
+    """partition_context_for_helix by slicing the owned blocks out of the prompt list.
+
+    Returns the same lists as the tensor version, which pads the whole prompt to a block
+    multiple, splits it into one view per block and strips the padding again: only the
+    blocks of this rank are touched, so the cost scales with the local share of the prompt.
+    """
+    input_len = len(input_token_ids)
+    num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    padding_len = num_total_blocks * tokens_per_block - input_len
+    input_ids_this_rank = []
+    position_ids_this_rank = []
+    # Round-robin block assignment, as in partition_context_for_helix: rank r owns blocks
+    # {r, r+cp_size, ...}. The last block is cut at input_len, so it carries no padding.
+    for start in range(cp_rank * tokens_per_block, input_len, cp_size * tokens_per_block):
+        end = min(start + tokens_per_block, input_len)
+        input_ids_this_rank += input_token_ids[start:end]
+        position_ids_this_rank += range(start, end)
+    return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
+
+
+def _partition_prompt_array_for_helix(
+    prompt: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
+) -> Tuple[List[int], List[int], int, int]:
+    """_partition_context_for_helix_sliced for a prompt held as a 1-D integer array."""
+    input_len = int(prompt.shape[0])
+    num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    padding_len = num_total_blocks * tokens_per_block - input_len
+    starts = np.arange(cp_rank * tokens_per_block, input_len, cp_size * tokens_per_block)
+    positions = (starts[:, None] + np.arange(tokens_per_block)).ravel()
+    positions = positions[positions < input_len]
+    return prompt[positions].tolist(), positions.tolist(), input_len, padding_len
+
+
+def _prompt_token_array(executor_request) -> Optional[np.ndarray]:
+    """The prompt of a bound ExecutorRequest as an int32 array, or None.
+
+    The binding's __getstate__ carries input_token_ids as a raw int32 byte buffer (one
+    memcpy), while the input_token_ids property builds a Python int per token.
+    """
+    getstate = getattr(type(executor_request), "__getstate__", None)
+    if getstate is None or not isinstance(executor_request, ExecutorRequest):
+        return None
+    state = getstate(executor_request)
+    if not isinstance(state, tuple) or not state or not isinstance(state[0], bytes):
+        return None
+    if len(state[0]) % 4:
+        return None
+    return np.frombuffer(state[0], dtype=np.int32)
 
 
 def merge_requests_to_llm_requests(
@@ -361,9 +429,15 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
-        input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
-            req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
-        )
+        prompt = _prompt_token_array(req_item.request) if _SLICED_HELIX_PARTITION else None
+        if prompt is not None:
+            input_ids_this_rank, position_ids_this_rank, input_len, _ = (
+                _partition_prompt_array_for_helix(prompt, cp_rank, cp_size, tokens_per_block)
+            )
+        else:
+            input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
+                req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
+            )
 
         req = executor_request_to_llm_request(
             req_id=req_item.id,
