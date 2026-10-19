@@ -66,6 +66,15 @@ _K3_MLA_KV_SIDE_PRIO = os.environ.get("TRTLLM_K3_MLA_KV_SIDE_PRIO", "0") == "1"
 # and a BMM, bitwise the same output) up to 32 rows per head (batch * tokens per request, see
 # mla_decode_fp8_v_up.MAX_ROWS); larger batches and the other attention backends keep the BMM.
 _K3_MLA_FUSED_V_UP = os.environ.get("TRTLLM_K3_MLA_FUSED_V_UP", "0") == "1"
+# TRTLLM_K3_MLA_KV_FUSED=1 (with TRTLLM_K3_MLA_KV_SIDE): the KV half of that path (kv_a RMSNorm,
+# latent row, KV append with the decode's scale and scheduler buffers) is one kernel
+# (``k3_mla_kv_append``) instead of the RMSNorm, the k_pe copy and ``mla_rope_generation``; it
+# writes the same bytes.
+_K3_MLA_KV_FUSED = os.environ.get("TRTLLM_K3_MLA_KV_FUSED", "0") == "1"
+# TRTLLM_K3_MLA_GATE_EARLY=1 (with TRTLLM_K3_MLA_GATE_SIDE and the fused V up-projection): enqueue
+# the output-gate GEMM where it is forked, before the all-to-all, instead of after the all-to-all
+# and its combine. Scheduling only, bit-exact.
+_K3_MLA_GATE_EARLY = os.environ.get("TRTLLM_K3_MLA_GATE_EARLY", "0") == "1"
 # One side stream per device, shared by all MLA layers (their side work never overlaps).
 _GATE_SIDE_STREAMS: dict[tuple[int, bool], torch.cuda.Stream] = {}
 
@@ -533,6 +542,125 @@ class KimiK3MLAAttention(MLA):
         latent[:, lora:].copy_(k_pe)
         return latent
 
+    @staticmethod
+    def _flashinfer_cute_norm(device: torch.device) -> bool:
+        """Whether FlashInfer's ``rmsnorm`` runs its CuTe DSL ``RMSNormKernel`` on ``device``
+        (the arithmetic the fused KV and q_b paths reproduce), not its CUDA JIT kernel."""
+        try:
+            from flashinfer.norm import _use_cuda_norm
+        except ImportError:
+            return False
+        return not _use_cuda_norm(device)
+
+    def _kv_fused_applies(
+        self,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        """Whether the KV half of :meth:`_forward_gen_kv_side` can run as one
+        ``k3_mla_kv_append`` kernel (``TRTLLM_K3_MLA_KV_FUSED``): the norm the default path runs
+        is FlashInfer's, the batch is generation only with whole requests, the cache is FP8
+        without a quantization scale and the rotary table is the backend's FP32 one."""
+        if not _K3_MLA_KV_FUSED or not self._runs_flashinfer_rmsnorm(self.kv_a_layernorm):
+            return False
+        if not self._flashinfer_cute_norm(compressed_kv.device):
+            return False
+        from ...cute_dsl_kernels.blackwell import k3_mla_kv_append as kv_append
+
+        mqa = self.mqa
+        num_gen = attn_metadata.num_generations
+        return (
+            kv_append.can_run(compressed_kv, k_pe, self.kv_a_layernorm.weight)
+            and attn_metadata.num_contexts == 0
+            and num_gen > 0
+            and compressed_kv.shape[0] % num_gen == 0
+            and self.kv_lora_rank == kv_append.KV_LORA_RANK
+            and self.qk_rope_head_dim == kv_append.ROPE_DIM
+            and getattr(mqa, "_nvfp4_mla_kv_scale_orig_quant", None) is None
+            and getattr(mqa, "rotary_cos_sin", None) is not None
+            and mqa.rotary_cos_sin.dtype == torch.float32
+            and attn_metadata.kv_cache_manager is not None
+        )
+
+    def _kv_append_fused(
+        self,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+        mla_bmm1_scale: torch.Tensor,
+        mla_bmm2_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """``k3_mla_kv_append`` for :meth:`_forward_gen_kv_side`: returns the latent row and fills
+        the KV cache and the scale / scheduler buffers as ``_latent_row`` followed by
+        ``mla_rope_generation`` (``q_rope_applied``) do. The page pool and page table are viewed
+        exactly as the CuTe DSL decode views them (``CuteDslMlaFmha._run_mla_decode``)."""
+        from ...cute_dsl_kernels.blackwell import k3_mla_kv_append as kv_append
+
+        mqa = self.mqa
+        md = attn_metadata
+        num_tokens = compressed_kv.shape[0]
+        num_gen = md.num_generations
+        mqa._ensure_rope_table_size(md.max_seq_len)
+        kv_pool = md.kv_cache_manager.get_buffers(mqa.layer_idx)
+        packed_block = 1
+        for size in kv_pool.shape[1:]:
+            packed_block *= size
+        block_stride = kv_pool.stride(0)
+        layers_in_pool = block_stride // packed_block if packed_block else 1
+        page_offset = 0
+        if layers_in_pool > 1 and block_stride == layers_in_pool * packed_block:
+            page_offset = kv_pool.storage_offset() // packed_block
+            kv_pool = kv_pool.as_strided(
+                (kv_pool.shape[0] * layers_in_pool, *kv_pool.shape[1:]),
+                (packed_block, *kv_pool.stride()[1:]),
+                0,
+            )
+        kv_pages = kv_pool.view(torch.float8_e4m3fn)[
+            :, 0, :, 0, : self.kv_lora_rank + self.qk_rope_head_dim
+        ]
+        pool_idx = int(md.host_kv_cache_pool_mapping[mqa.get_local_layer_idx(md), 0])
+        page_table = md.kv_cache_block_offsets[pool_idx, :, 0, :]
+        helix_slots = helix_inactive = None
+        if getattr(md, "_helix_spec_tokens_valid", False):
+            helix_slots = md.helix_local_slots
+        else:
+            helix_inactive = getattr(md, "helix_is_inactive_rank", None)
+        latent = torch.empty(
+            (num_tokens, self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=compressed_kv.dtype,
+            device=compressed_kv.device,
+        )
+        kv_append.k3_mla_kv_append(
+            compressed_kv,
+            k_pe,
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.variance_epsilon,
+            latent=latent,
+            kv_lens=md.kv_lens_cuda_runtime[:num_gen],
+            seq_len=num_tokens // num_gen,
+            num_heads=mqa.num_heads,
+            cos_sin=mqa.rotary_cos_sin,
+            positions=getattr(md, "helix_position_offsets", None),
+            helix_slots=helix_slots,
+            helix_inactive=helix_inactive,
+            page_table=page_table,
+            page_offset=page_offset,
+            kv_pages=kv_pages,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            bmm1_scale=mla_bmm1_scale,
+            bmm2_scale=mla_bmm2_scale,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            host_bmm1=kv_append.host_bmm1_scale(
+                mqa.q_scaling, mqa.qk_nope_head_dim + mqa.qk_rope_head_dim
+            ),
+        )
+        return latent
+
     def _forward_gen_kv_side(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
@@ -573,30 +701,44 @@ class KimiK3MLAAttention(MLA):
         )
         with torch.cuda.stream(kv_stream):
             kv_fork.wait()
-            latent_cache = self._latent_row(compressed_kv, k_pe)
+            fused_kv = self._kv_fused_applies(compressed_kv, k_pe, attn_metadata)
+            if not fused_kv:
+                latent_cache = self._latent_row(compressed_kv, k_pe)
             num_seqs = attn_metadata.num_seqs
             cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
             cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
             fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
             mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
             mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
-            q_pe_shape = torch.empty(
-                [num_tokens, heads, self.qk_head_dim], dtype=hidden_states.dtype, device=device
-            )[..., self.qk_nope_head_dim :]
-            self.mqa.mla_rope_generation(
-                fused_q,
-                q_pe_shape,
-                latent_cache,
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-                quant_scale_qkv=self._fp8_q_unit_scale,
-                q_rope_applied=True,
-            )
+            if fused_kv:
+                latent_cache = self._kv_append_fused(
+                    compressed_kv,
+                    k_pe,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                )
+            else:
+                q_pe_shape = torch.empty(
+                    [num_tokens, heads, self.qk_head_dim], dtype=hidden_states.dtype, device=device
+                )[..., self.qk_nope_head_dim :]
+                self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe_shape,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    quant_scale_qkv=self._fp8_q_unit_scale,
+                    q_rope_applied=True,
+                )
             kv_ready.record()
         q = self._q_a_layernorm_maybe_fused(q)
         q = self.q_b_proj(q)
@@ -686,7 +828,7 @@ class KimiK3MLAAttention(MLA):
         def pre_exchange(v_up_in_attention: bool):
             if multi_stream:
                 gate_fork.record()
-                if v_up_in_attention:
+                if v_up_in_attention and not _K3_MLA_GATE_EARLY:
                     late_enqueue[0] = True
                 else:
                     enqueue_gate()

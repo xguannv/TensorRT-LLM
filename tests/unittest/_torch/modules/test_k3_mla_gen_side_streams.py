@@ -17,8 +17,10 @@
 One Helix CP rank (16-way group) on one GPU: the real ``KimiK3MLAAttention`` (FP8 projections,
 FP8 KV cache, CuTe FP8 MLA decode, V up-projection before the all-to-all) with the all-to-all
 replaced by a local stand-in, run eagerly and in CUDA graphs with multi-stream enabled. Every
-combination of ``TRTLLM_K3_MLA_GATE_SIDE``, ``TRTLLM_K3_MLA_Q_NORM_PDL`` and
-``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``) must give the default path's output bit for bit.
+combination of ``TRTLLM_K3_MLA_GATE_SIDE``, ``TRTLLM_K3_MLA_Q_NORM_PDL``,
+``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``), ``TRTLLM_K3_MLA_KV_FUSED`` and ``TRTLLM_K3_MLA_GATE_EARLY``
+must give the default path's output bit for bit; the fused KV kernel must also write the same cache
+bytes and decode buffers as the kernels it replaces.
 """
 
 import math
@@ -229,11 +231,13 @@ def _build(batch, q_len, kv_len, monkeypatch):
     return model, mixer, manager, md, x
 
 
-def _set(monkeypatch, k3mla, gate, qnorm, kv, prio):
+def _set(monkeypatch, k3mla, gate, qnorm, kv, prio, kv_fused=False, gate_early=False):
     monkeypatch.setattr(k3mla, "_K3_MLA_GATE_SIDE", gate)
     monkeypatch.setattr(k3mla, "_K3_MLA_Q_NORM_PDL", qnorm)
     monkeypatch.setattr(k3mla, "_K3_MLA_KV_SIDE", kv)
     monkeypatch.setattr(k3mla, "_K3_MLA_KV_SIDE_PRIO", prio)
+    monkeypatch.setattr(k3mla, "_K3_MLA_KV_FUSED", kv_fused)
+    monkeypatch.setattr(k3mla, "_K3_MLA_GATE_EARLY", gate_early)
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
@@ -254,7 +258,7 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
     pool = manager.get_buffers(0)
     pool_init = pool.clone()
     # Count the entry points of each switch's path, to check every path is taken.
-    calls = dict.fromkeys(("gated", "sigmoid", "q_norm", "kv_side"), 0)
+    calls = dict.fromkeys(("gated", "sigmoid", "q_norm", "kv_side", "kv_fused"), 0)
 
     def counted(name, fn):
         def wrapper(*args, **kwargs):
@@ -275,16 +279,20 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
     monkeypatch.setattr(
         mixer, "_forward_gen_kv_side", counted("kv_side", mixer._forward_gen_kv_side)
     )
+    monkeypatch.setattr(mixer, "_kv_append_fused", counted("kv_fused", mixer._kv_append_fused))
     results = {}
     taken = {}
     try:
         with torch.inference_mode():
             for cfg in [
-                (False,) * 4,
-                (True, False, False, False),
-                (True, True, True, False),
-                (True, True, True, True),
-                (True, False, True, True),
+                (False,) * 6,
+                (True, False, False, False, False, False),
+                (True, True, True, False, False, False),
+                (True, True, True, True, False, False),
+                (True, False, True, True, False, False),
+                (True, True, True, True, True, False),
+                (True, False, True, False, True, False),
+                (True, True, True, True, True, True),
             ]:
                 _set(monkeypatch, k3mla, *cfg)
                 calls.update(dict.fromkeys(calls, 0))
@@ -317,17 +325,19 @@ def test_side_stream_paths_match_default(batch, monkeypatch):
         manager.shutdown()
     # Eager runs and graph replays are compared separately: the decode op may pick another
     # tactic outside a capture. The default path's replays must agree among themselves too.
-    ref_eager, ref_graph = results[(False,) * 4][0], results[(False,) * 4][1][0]
+    ref_eager, ref_graph = results[(False,) * 6][0], results[(False,) * 6][1][0]
     assert torch.isfinite(ref_graph).all() and ref_graph.abs().max() > 0
     assert torch.isfinite(ref_eager).all() and ref_eager.abs().max() > 0
     for (cfg, mode), counts in taken.items():
-        gate, qnorm, kv, _ = cfg
+        gate, qnorm, kv, _, kv_fused, _ = cfg
         # The eager runs are single-stream: the KV half stays on the main stream there.
+        side = kv and mode == "graph"
         expect = {
             "gated": gate,
             "sigmoid": gate,
             "q_norm": qnorm,
-            "kv_side": kv and mode == "graph",
+            "kv_side": side,
+            "kv_fused": side and kv_fused,
         }
         assert {k: v > 0 for k, v in counts.items()} == expect, (cfg, mode, counts)
     for cfg, (eager, replays) in results.items():
@@ -417,7 +427,9 @@ def test_mxfp8_q_a_input_matches_bf16_input(batch, monkeypatch):
 def test_fused_v_up_matches_bmm(batch, monkeypatch):
     """``helix_v_up_in_attention`` (TRTLLM_K3_MLA_FUSED_V_UP): the CuTe DSL decode applies the V
     up-projection in its reduction; the layer output is bitwise the BMM path's, eagerly and in
-    CUDA graphs, on the default path and with every side-stream switch."""
+    CUDA graphs, on the default path and with every side-stream switch (with the fused V
+    up-projection the output gate is enqueued late by default, early with
+    TRTLLM_K3_MLA_GATE_EARLY)."""
     import weakref
 
     from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
@@ -444,7 +456,7 @@ def test_fused_v_up_matches_bmm(batch, monkeypatch):
     results = {}
     try:
         with torch.inference_mode():
-            for cfg in [(False,) * 4, (True,) * 4]:
+            for cfg in [(False,) * 6, (True,) * 4 + (False,) * 2, (True,) * 6]:
                 _set(monkeypatch, k3mla, *cfg)
                 for fused in (False, True):
                     mixer.helix_v_up_in_attention = fused
@@ -472,8 +484,118 @@ def test_fused_v_up_matches_bmm(batch, monkeypatch):
                     assert bmm_calls[0] == (0 if fused else 3), (cfg, fused, bmm_calls[0])
     finally:
         manager.shutdown()
-    for cfg in [(False,) * 4, (True,) * 4]:
+    ref_graph = results[(False,) * 6, False][1]
+    for cfg in [(False,) * 6, (True,) * 4 + (False,) * 2, (True,) * 6]:
         (eager, graph), (eager_f, graph_f) = results[cfg, False], results[cfg, True]
+        assert torch.equal(graph, ref_graph), f"graph {cfg} vs default"
         assert torch.isfinite(graph).all() and graph.abs().max() > 0
         assert torch.equal(eager_f, eager), f"eager {cfg}"
         assert torch.equal(graph_f, graph), f"graph {cfg}"
+
+
+def _kv_half_inputs(num_tokens, seed):
+    """Raw kv_a projection rows ``[compressed_kv | k_pe]`` with signed zeros, values the E4M3
+    conversion saturates and E4M3 subnormals mixed in."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    raw = torch.randn((num_tokens, 2112), device="cuda", generator=gen) * 2.0
+    special = torch.tensor([0.0, -0.0, 600.0, -900.0, 1e-3, -2e-3, 448.0, -448.0], device="cuda")
+    pick = torch.randint(0, 9, raw.shape, device="cuda", generator=gen)
+    raw = torch.where(pick < 8, special[pick.clamp(max=7)], raw)
+    # Some rows tiny or huge as a whole (the RMS scale is large / small there).
+    raw[0] *= 1e-4
+    raw[-1] *= 30.0
+    raw = raw.to(torch.bfloat16)
+    return raw[:, 1536:2048], raw[:, 2048:2112]
+
+
+@pytest.mark.parametrize("helix", ["none", "inactive", "slots"])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_kv_append_matches_rope_generation(batch, helix, monkeypatch):
+    """``k3_mla_kv_append`` (TRTLLM_K3_MLA_KV_FUSED) writes the latent row, the paged FP8 cache
+    rows and the decode's scale / scheduler buffers bit for bit like the FlashInfer RMSNorm, the
+    k_pe copy and ``mla_rope_generation(q_rope_applied=True)`` of the default KV half, for every
+    Helix write mode (none, per-request inactive flags, per-token slots with positions)."""
+    q_len = 8 if batch == 4 else 7
+    kv_len = 448
+    model, mixer, manager, md, _ = _build(batch, q_len, kv_len, monkeypatch)
+    num_tokens = batch * q_len
+    dev = torch.device("cuda")
+    if helix == "inactive":
+        md.helix_position_offsets = torch.randint(
+            0, kv_len, (num_tokens,), dtype=torch.int32, device=dev
+        )
+        md.helix_is_inactive_rank = torch.tensor(
+            [b % 2 == 1 for b in range(batch)], dtype=torch.bool, device=dev
+        )
+    elif helix == "slots":
+        md.helix_position_offsets = torch.randint(
+            0, kv_len, (num_tokens,), dtype=torch.int32, device=dev
+        )
+        md.helix_is_inactive_rank = torch.ones(batch, dtype=torch.bool, device=dev)
+        slots = torch.arange(num_tokens, dtype=torch.int32, device=dev) % q_len + kv_len
+        slots[1::3] = -1
+        # Rows inside the cached context, distinct per request (no two tokens share a row).
+        slots[2::5] = (torch.arange(2, num_tokens, 5, dtype=torch.int32, device=dev) * 37) % kv_len
+        md.helix_local_slots = slots
+        md._helix_spec_tokens_valid = True
+    pool = manager.get_buffers(0)
+    pool_init = pool.clone()
+    heads = mixer.num_heads_tp
+
+    def buffers():
+        return (
+            torch.full((batch + 1,), -7, dtype=torch.int32, device=dev),
+            torch.full((batch + 1,), -7, dtype=torch.int32, device=dev),
+            torch.full((1,), 7, dtype=torch.uint32, device=dev),
+            torch.full((2,), -7.0, dtype=torch.float32, device=dev),
+            torch.full((1,), -7.0, dtype=torch.float32, device=dev),
+        )
+
+    try:
+        with torch.inference_mode():
+            for seed in range(3):
+                compressed_kv, k_pe = _kv_half_inputs(num_tokens, seed)
+                assert mixer._kv_fused_applies(compressed_kv, k_pe, md) is False
+                monkeypatch.setattr(
+                    "tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention._K3_MLA_KV_FUSED",
+                    True,
+                )
+                assert mixer._kv_fused_applies(compressed_kv, k_pe, md)
+                # Default KV half.
+                pool.copy_(pool_init)
+                ref = buffers()
+                latent_ref = mixer._latent_row(compressed_kv, k_pe)
+                fused_q = torch.empty((num_tokens, heads, 576), dtype=torch.bfloat16, device=dev)
+                quant_q = torch.zeros((num_tokens, heads, 576), dtype=torch.uint8, device=dev)
+                q_pe_shape = torch.empty(
+                    (num_tokens, heads, 192), dtype=torch.bfloat16, device=dev
+                )[..., 128:]
+                mixer.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe_shape,
+                    latent_ref,
+                    md,
+                    *ref,
+                    quant_q,
+                    quant_scale_qkv=mixer._fp8_q_unit_scale,
+                    q_rope_applied=True,
+                )
+                torch.cuda.synchronize()
+                pool_ref = pool.clone()
+                # Fused kernel.
+                pool.copy_(pool_init)
+                got = buffers()
+                latent = mixer._kv_append_fused(compressed_kv, k_pe, md, *got)
+                torch.cuda.synchronize()
+                assert torch.equal(latent.view(torch.int16), latent_ref.view(torch.int16)), seed
+                assert torch.equal(pool.view(torch.uint8), pool_ref.view(torch.uint8)), seed
+                # The default path only writes the scheduler slots of the batch.
+                for a, b in zip(got, ref):
+                    assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), (seed, a, b)
+                assert not torch.equal(pool.view(torch.uint8), pool_init.view(torch.uint8))
+                monkeypatch.setattr(
+                    "tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention._K3_MLA_KV_FUSED",
+                    False,
+                )
+    finally:
+        manager.shutdown()
