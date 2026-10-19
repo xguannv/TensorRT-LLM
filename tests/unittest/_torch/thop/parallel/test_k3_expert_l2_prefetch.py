@@ -357,3 +357,69 @@ def test_runtime_hook_off():
 
     assert KimiKDALinearAttention.expert_l2_prefetch_hook is None
     assert KimiK3MLAAttention.expert_l2_prefetch_hook is None
+
+
+@pytest.mark.parametrize("budget", [0, 8])
+def test_decoder_layer_wires_the_hook(monkeypatch, budget):
+    """KimiLinearDecoderLayer hands its attention block the MoE block's prefetch entry point
+    (KDA: the mixer itself; MLA: KimiMLARuntime.mixer) only when the switch is on."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
+    from tensorrt_llm._torch.utils import AuxStreamType
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    class _Attn(nn.Module):
+        expert_l2_prefetch_hook = None
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class _MLA(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.mixer = _Attn()
+
+    class _MoE(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def issue_expert_l2_prefetch(self, num_tokens):
+            pass
+
+    monkeypatch.setattr(mkl, "KimiKDALinearAttention", _Attn)
+    monkeypatch.setattr(mkl, "KimiMLARuntime", _MLA)
+    monkeypatch.setattr(mkl, "KimiK3MoERuntime", _MoE)
+    monkeypatch.setattr(mkl, "_K3_EXPERT_L2_PREFETCH", budget)
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1), quant_config=QuantConfig()
+    )
+    cfg = SimpleNamespace(
+        hidden_size=256,
+        intermediate_size=512,
+        num_experts=8,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        linear_attn_config={"kda_layers": [1, 2], "full_attn_layers": [3]},
+        rms_norm_eps=1e-5,
+        attn_res_block_size=1,
+    )
+    aux = {t: object() for t in AuxStreamType}
+    kda = mkl.KimiLinearDecoderLayer(model_config, cfg, layer_idx=1, aux_stream_dict=aux)
+    mla = mkl.KimiLinearDecoderLayer(model_config, cfg, layer_idx=2, aux_stream_dict=aux)
+    assert kda.is_moe and kda.is_kda and mla.is_moe and not mla.is_kda
+    if budget:
+        assert (
+            kda.linear_attn.expert_l2_prefetch_hook == kda.block_sparse_moe.issue_expert_l2_prefetch
+        )
+        assert (
+            mla.self_attn.mixer.expert_l2_prefetch_hook
+            == mla.block_sparse_moe.issue_expert_l2_prefetch
+        )
+    else:
+        assert kda.linear_attn.expert_l2_prefetch_hook is None
+        assert mla.self_attn.mixer.expert_l2_prefetch_hook is None
