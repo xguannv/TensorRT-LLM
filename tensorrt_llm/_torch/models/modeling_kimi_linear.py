@@ -283,6 +283,21 @@ _K3_FP8_MID_FAMILY_OF_ATTR = {
 # Negative values rank above the main and shared-expert streams, so the latent chain that
 # gates the routed GEMM1 gets free SMs first.
 _K3_LATENT_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_LATENT_STREAM_PRIORITY", "0"))
+# TRTLLM_K3_ROUTER_FIRST=1: for up to TRTLLM_K3_ROUTER_FIRST_MAX_M tokens, the router GEMM is issued
+# (captured) on the main stream before latent_down is issued on the latent stream. Both still
+# depend only on the MoE input (the latent fork event is recorded before the router), so the graph
+# has the same edges; only the node creation order changes, which decides which of the two the
+# graph launches first once the MoE input's producer releases its dependents (PDL). At decode
+# batch sizes latent_down's low-M GEMM is 112 CTAs x ~225 KB of shared memory, and with up to 16
+# tokens the router GEMM (dsv3 router MMA kernel) is 112 CTAs whose registers fill most of an SM,
+# so no SM holds one of each: launched second, the router gets only the SMs latent_down leaves
+# and runs in several waves, and the routing (which gates the routed FC1 together with
+# latent_down) ends late. Launched first, the router takes its SMs and latent_down starts on the
+# rest. nsys node tracing turns latent_down's cross-stream programmatic edge into a full edge (it
+# then waits for the MoE input's producer to complete), so such traces show the router first in
+# either order.
+_K3_ROUTER_FIRST = os.environ.get("TRTLLM_K3_ROUTER_FIRST", "0") == "1"
+_K3_ROUTER_FIRST_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTER_FIRST_MAX_M", "64"))
 # Shared expert ahead of the routed FC1 for token counts in [TRTLLM_K3_SHARED_FIRST_MIN_M,
 # TRTLLM_K3_SHARED_FIRST_MAX_M]. The persistent routed grids (FC1, FC2) hold every SM while they
 # run, and FC1 also fills each SM's register file, so shared-expert kernels that are still
@@ -3452,6 +3467,29 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _issue_router(
+        self,
+        hidden_states: torch.Tensor,
+        gemv_route: bool,
+        route_target: Optional[Tuple[int, int]],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Issue the router GEMM on the current stream; returns ``(router_logits,
+        router_partials)`` (the split-K partials of the router GEMMs whose routing tail sums
+        them, else ``None``; ``router_logits`` is ``None`` with the fused router)."""
+        # With the fused router, routing runs inside the routed branch, so the shared experts
+        # fork before it instead of waiting for the router.
+        if gemv_route and _K3_ROUTE_GEMV_DEFER_TAIL:
+            router_partials = self._gemv_router_partials(hidden_states)
+            return router_partials[0], router_partials
+        if gemv_route:
+            return self._gemv_route(hidden_states, route_target), None
+        if route_target is not None and self._can_umma_route(hidden_states):
+            router_partials = self._umma_router_partials(hidden_states)
+            return router_partials[0], router_partials
+        if _K3_FUSED_ROUTER != "0":
+            return None, None
+        return self._router_logits(hidden_states), None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3478,6 +3516,7 @@ class KimiK3MoERuntime(nn.Module):
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
         else:
+            router_issued = False
             if (
                 self.latent_down_stream is not None
                 and do_multi_stream()
@@ -3487,6 +3526,12 @@ class KimiK3MoERuntime(nn.Module):
                 # hidden_states.
                 gemv_route = route_target is not None and self._can_gemv_route(hidden_states)
                 self.moe_latent_fork_event.record()
+                if _K3_ROUTER_FIRST and hidden_states.shape[0] <= _K3_ROUTER_FIRST_MAX_M:
+                    # Router before latent_down in creation order (see _K3_ROUTER_FIRST).
+                    router_logits, router_partials = self._issue_router(
+                        hidden_states, gemv_route, route_target
+                    )
+                    router_issued = True
                 with torch.cuda.stream(self.latent_down_stream):
                     self.moe_latent_fork_event.wait()
                     early_routed_in = self._lowm_fp4_latent_input(hidden_states)
@@ -3506,19 +3551,9 @@ class KimiK3MoERuntime(nn.Module):
                 shared_first = self._shared_first_applies(hidden_states.shape[0])
                 if shared_first and _K3_SHARED_FIRST == "1":
                     shared_partial = self._shared_gemms_first(identity, self.moe_latent_fork_event)
-            # With the fused router, routing runs inside the routed branch below, so the
-            # shared experts fork before it instead of waiting for the router.
-            if gemv_route and _K3_ROUTE_GEMV_DEFER_TAIL:
-                router_partials = self._gemv_router_partials(hidden_states)
-                router_logits = router_partials[0]
-            elif gemv_route:
-                router_logits = self._gemv_route(hidden_states, route_target)
-            elif route_target is not None and self._can_umma_route(hidden_states):
-                router_partials = self._umma_router_partials(hidden_states)
-                router_logits = router_partials[0]
-            else:
-                router_logits = (
-                    None if _K3_FUSED_ROUTER != "0" else self._router_logits(hidden_states)
+            if not router_issued:
+                router_logits, router_partials = self._issue_router(
+                    hidden_states, gemv_route, route_target
                 )
             if shared_first and _K3_SHARED_FIRST == "router":
                 self.moe_main_event.record()
