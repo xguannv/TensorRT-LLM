@@ -1212,8 +1212,13 @@ def _compiled_clear(ctas: int):
     )
 
 
-def can_run_row(x: torch.Tensor, gamma: torch.Tensor, world_size: int) -> bool:
-    """Whether :func:`run_k3_latent_ar_norm_row` serves this all-reduce (non-raising check)."""
+def can_run_row(
+    x: torch.Tensor, gamma: torch.Tensor, world_size: int, buffer_bytes: int | None = None
+) -> bool:
+    """Whether :func:`run_k3_latent_ar_norm_row` serves this all-reduce (non-raising check); with
+    ``buffer_bytes``, also that one Lamport buffer of that size holds every rank's rows."""
+    if buffer_bytes is not None and x.dim() == 2 and x.numel() * world_size * 2 > buffer_bytes:
+        return False
     return (
         x.is_cuda
         and _is_supported_device(x.device.index)
@@ -1248,7 +1253,9 @@ def run_k3_latent_ar_norm_row(
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """:func:`run_k3_latent_ar_norm` with :class:`K3LatentArRowKernel` (same result, bit for bit,
-    for up to :data:`ROW_MAX_M` rows)."""
+    for up to :data:`ROW_MAX_M` rows). Each Lamport buffer of the workspace must hold the rows of
+    every rank (``M x world_size x 3584 x 2`` bytes, as the one-shot sizing of the MNNVL
+    workspace guarantees for the one-shot sizes; see :func:`can_run_row`)."""
     mxfp8 = mxfp8_out is not None
     _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8)(
         Int64(x.data_ptr()),

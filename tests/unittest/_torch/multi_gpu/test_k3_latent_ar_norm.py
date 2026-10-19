@@ -206,7 +206,8 @@ def _ar_norm_rank(world):
                 same(cute_ar(x), ref)
                 # The row kernel, with and without the side-stream re-arm before it; the state is
                 # clean after a re-arm and the buffer holds the sentinel.
-                assert kan.can_run_row(x, gamma, world)
+                assert kan.can_run_row(x, gamma, world, own["buffer_bytes"])
+                assert not kan.can_run_row(x, gamma, world, num_tokens * world * HIDDEN * 2 - 16)
                 same(row_ar(x), ref)
                 same(row_ar(x, early=False), ref)
                 side_clear()

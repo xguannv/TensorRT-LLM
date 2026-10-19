@@ -510,6 +510,8 @@ def _k3_latent_ar_workspace(
         # Counter of the side-stream Lamport clear (TRTLLM_K3_LATENT_AR_SIDE_CLEAR).
         "clear_ctr": torch.zeros(1, dtype=torch.int32, device=buffer.device),
         "max_tokens": max_tokens,
+        # Bytes of one of the three Lamport buffers.
+        "buffer_bytes": buffer_bytes,
         "rank": mapping.tp_rank,
         "world_size": mapping.tp_size,
     }
@@ -3563,7 +3565,9 @@ class KimiK3MoERuntime(nn.Module):
                 latent.numel() * world_size * latent.element_size()
                 <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
             )
-            row = _K3_LATENT_AR_ROW and k3_latent_ar_norm.can_run_row(latent, gamma, world_size)
+            row = _K3_LATENT_AR_ROW and k3_latent_ar_norm.can_run_row(
+                latent, gamma, world_size, workspace["buffer_bytes"]
+            )
             if one_shot and (row or k3_latent_ar_norm.can_run(latent, gamma, world_size)):
                 routed_latent = torch.empty_like(latent)
                 m, k = latent.shape
