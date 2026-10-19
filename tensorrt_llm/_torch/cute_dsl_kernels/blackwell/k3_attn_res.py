@@ -54,6 +54,8 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from . import k3_fp8w_lowm_mxfp8 as mx_ops
+
 #: Hidden size the kernel is specialized for.
 HIDDEN_SIZE = 7168
 #: Candidate counts (snapshots + the layer row) the kernel is instantiated for.
@@ -587,6 +589,45 @@ def _shfl_xor(value, offset: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _shfl_xor_b32(value, offset: int, *, loc=None, ip=None):
+    return Int32(
+        _asm_se(
+            T.i32(),
+            [_iv(value, loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 0x1f, 0xffffffff;",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_v2_if(valid, addr, w0, w1, *, loc=None, ip=None):
+    _asm_se(
+        None,
+        [_iv(valid, loc=loc, ip=ip), _lv(addr, loc=loc, ip=ip)]
+        + [_iv(w, loc=loc, ip=ip) for w in (w0, w1)],
+        "{\n.reg .pred p;\nsetp.ne.u32 p, $0, 0;\n@p st.global.v2.b32 [$1], {$2, $3};\n}",
+        "r,l,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _stg_u8_if(valid, addr, value, *, loc=None, ip=None):
+    _asm_se(
+        None,
+        [_iv(valid, loc=loc, ip=ip), _lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "{\n.reg .pred p;\nsetp.ne.u32 p, $0, 0;\n@p st.global.u8 [$1], $2;\n}",
+        "r,l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _selp(cond, a, b, *, loc=None, ip=None):
     """``a if cond != 0 else b``."""
     return Float32(
@@ -694,6 +735,8 @@ class K3AttnResKernel:
         out_w_addr: Int64,
         out_addr: Int64,
         upd_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1001,11 +1044,19 @@ class K3AttnResFastKernel:
     reduces its sum of squares (a second round).
     """
 
-    def __init__(self, num_candidates: int, add_mode: int, use_pdl: bool, cluster: int = 4):
+    def __init__(
+        self,
+        num_candidates: int,
+        add_mode: int,
+        use_pdl: bool,
+        cluster: int = 4,
+        mxfp8: bool = False,
+    ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
         if add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE) or cluster not in (1, 2, 4, 8):
             raise ValueError(f"add_mode={add_mode} cluster={cluster}")
+        self.mxfp8 = mxfp8
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -1033,6 +1084,8 @@ class K3AttnResFastKernel:
         out_w_addr: Int64,
         out_addr: Int64,
         upd_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1058,6 +1111,8 @@ class K3AttnResFastKernel:
             out_w_addr,
             out_addr,
             upd_addr,
+            xq_addr,
+            xs_addr,
             m,
             eps,
             out_eps,
@@ -1092,6 +1147,8 @@ class K3AttnResFastKernel:
         out_w_addr: Int64,
         out_addr: Int64,
         upd_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1283,6 +1340,23 @@ class K3AttnResFastKernel:
         y = [_mul_ftz(_round_bf16(_mul_ftz(mixed[e], out_rs)), w_out[e]) for e in range(8)]
         words = [_pack_bf16x2(y[2 * i], y[2 * i + 1]) for i in range(4)]
         _stg_v4_if(valid, out_addr + row + col, words)
+        if cutlass.const_expr(self.mxfp8):
+            # MXFP8 form of the stored BF16 row for the low-M FP8 GEMM (k3_fp8w_lowm_mxfp8): four
+            # consecutive lanes hold one 1x32 group; the GEMM's own amax / exponent / E4M3
+            # conversion, so its operands are bitwise those of its in-kernel quantization.
+            amax = mx_ops.amax_bf16x8_words(*words)
+            amax = mx_ops.amax_pair(amax, _shfl_xor_b32(amax, 1))
+            amax = mx_ops.amax_pair(amax, _shfl_xor_b32(amax, 2))
+            e_a = mx_ops.ue8m0_of_amax(amax)
+            q0, q1 = mx_ops.quant_bf16x8_to_e4m3(*words, mx_ops.bf16x2_inv_scale(e_a))
+            chan = Int64(rank * self.vecs + tidx) * 8
+            qrow = Int64(token) * HIDDEN_SIZE
+            _stg_v2_if(valid, xq_addr + qrow + chan, q0, q1)
+            _stg_u8_if(
+                valid & Int32((tidx & 3) == 0),
+                xs_addr + Int64(token) * (HIDDEN_SIZE // 32) + (chan >> 5),
+                e_a,
+            )
 
         if cutlass.const_expr(self.use_pdl and not _EARLY_TRIGGER):
             _bar_sync(4, self.threads)
@@ -1309,14 +1383,23 @@ def fast_cluster_size(num_tokens: int, num_candidates: int) -> int:
 
 
 @functools.cache
-def _compiled(num_candidates: int, add_mode: int, use_pdl: bool, cluster: int | None, exact: bool):
+def _compiled(
+    num_candidates: int,
+    add_mode: int,
+    use_pdl: bool,
+    cluster: int | None,
+    exact: bool,
+    mxfp8: bool = False,
+):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
-        kernel = K3AttnResFastKernel(num_candidates, add_mode, use_pdl, cluster)
+        kernel = K3AttnResFastKernel(num_candidates, add_mode, use_pdl, cluster, mxfp8)
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
+        addr,
+        addr,
         addr,
         addr,
         addr,
@@ -1378,6 +1461,7 @@ def run_k3_attn_res(
     use_pdl: bool = _USE_PDL,
     cluster: int | None = None,
     exact: bool | None = None,
+    mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1397,13 +1481,20 @@ def run_k3_attn_res(
         exact: The per-element kernel (bit-identical to the C++ ops) instead of the vectorized
             one (identical updated prefix; the statistics are summed in another order); default
             ``TRTLLM_K3_ATTN_RES_PDL_EXACT``.
+        mxfp8_out: ``(xq, xs)``: also store the MXFP8 form of ``output`` for
+            :func:`k3_fp8w_lowm_mxfp8.run_k3_fp8w_lowm_gemm_mxfp8`: E4M3 ``xq [M, 7168]`` and one
+            UE8M0 exponent per 1x32 group ``xs [M, 224]`` (uint8), bitwise what that GEMM's BF16
+            twin quantizes ``output`` to (vectorized kernel only).
     """
     if exact is None:
         exact = _EXACT
+    if mxfp8_out is not None and exact:
+        raise ValueError("the MXFP8 side output needs the vectorized kernel")
     add_mode = len(addends)
     if cluster is None and not exact:
         cluster = fast_cluster_size(layer.shape[0], block.shape[0] + 1)
-    compiled = _compiled(block.shape[0] + 1, add_mode, use_pdl, cluster, exact)
+    mxfp8 = mxfp8_out is not None
+    compiled = _compiled(block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8)
     compiled(
         Int64(layer.data_ptr()),
         Int64(addends[0].data_ptr() if add_mode >= 1 else 0),
@@ -1414,6 +1505,8 @@ def run_k3_attn_res(
         Int64(out_weight.data_ptr()),
         Int64(output.data_ptr()),
         Int64(updated.data_ptr() if add_mode else 0),
+        Int64(mxfp8_out[0].data_ptr() if mxfp8 else 0),
+        Int64(mxfp8_out[1].data_ptr() if mxfp8 else 0),
         Int32(layer.shape[0]),
         Float32(rms_eps),
         Float32(out_eps),
@@ -1525,6 +1618,125 @@ def _(residual, routed, shared, block, res_weight, rms_weight, out_weight, rms_e
     return torch.empty_like(residual), torch.empty_like(residual)
 
 
+def _mxfp8_outputs(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    m = rows.shape[0]
+    return (
+        torch.empty((m, HIDDEN_SIZE), dtype=torch.float8_e4m3fn, device=rows.device),
+        torch.empty((m, HIDDEN_SIZE // 32), dtype=torch.uint8, device=rows.device),
+    )
+
+
+@torch.library.custom_op("trtllm::k3_attn_res_rmsnorm_mx", mutates_args=())
+def k3_attn_res_rmsnorm_mx(
+    layer: torch.Tensor,
+    block: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    rms_eps: float,
+    out_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`k3_attn_res_rmsnorm` plus the MXFP8 form ``(xq, xs)`` of its output (see
+    :func:`run_k3_attn_res`); vectorized kernel."""
+    output = torch.empty_like(layer)
+    xq, xs = _mxfp8_outputs(layer)
+    run_k3_attn_res(
+        layer,
+        (),
+        block,
+        res_weight,
+        rms_weight,
+        out_weight,
+        rms_eps,
+        out_eps,
+        output,
+        None,
+        exact=False,
+        mxfp8_out=(xq, xs),
+    )
+    return output, xq, xs
+
+
+@k3_attn_res_rmsnorm_mx.register_fake
+def _(layer, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    return (torch.empty_like(layer), *_mxfp8_outputs(layer))
+
+
+@torch.library.custom_op("trtllm::k3_attn_res_add_rmsnorm_mx", mutates_args=())
+def k3_attn_res_add_rmsnorm_mx(
+    prefix: torch.Tensor,
+    addend: torch.Tensor,
+    block: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    rms_eps: float,
+    out_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`k3_attn_res_add_rmsnorm` plus the MXFP8 form ``(xq, xs)`` of its output."""
+    output = torch.empty_like(prefix)
+    updated = torch.empty_like(prefix)
+    xq, xs = _mxfp8_outputs(prefix)
+    run_k3_attn_res(
+        prefix,
+        (addend,),
+        block,
+        res_weight,
+        rms_weight,
+        out_weight,
+        rms_eps,
+        out_eps,
+        output,
+        updated,
+        exact=False,
+        mxfp8_out=(xq, xs),
+    )
+    return updated, output, xq, xs
+
+
+@k3_attn_res_add_rmsnorm_mx.register_fake
+def _(prefix, addend, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    return (torch.empty_like(prefix), torch.empty_like(prefix), *_mxfp8_outputs(prefix))
+
+
+@torch.library.custom_op("trtllm::k3_attn_res_moe_add_rmsnorm_mx", mutates_args=())
+def k3_attn_res_moe_add_rmsnorm_mx(
+    residual: torch.Tensor,
+    routed: torch.Tensor,
+    shared: torch.Tensor,
+    block: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    rms_eps: float,
+    out_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`k3_attn_res_moe_add_rmsnorm` plus the MXFP8 form ``(xq, xs)`` of its output."""
+    output = torch.empty_like(residual)
+    prefix = torch.empty_like(residual)
+    xq, xs = _mxfp8_outputs(residual)
+    run_k3_attn_res(
+        residual,
+        (routed, shared),
+        block,
+        res_weight,
+        rms_weight,
+        out_weight,
+        rms_eps,
+        out_eps,
+        output,
+        prefix,
+        exact=False,
+        mxfp8_out=(xq, xs),
+    )
+    return prefix, output, xq, xs
+
+
+@k3_attn_res_moe_add_rmsnorm_mx.register_fake
+def _(residual, routed, shared, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    return (torch.empty_like(residual), torch.empty_like(residual), *_mxfp8_outputs(residual))
+
+
 __all__ = [
     "ADD_MOE",
     "ADD_NONE",
@@ -1537,7 +1749,10 @@ __all__ = [
     "can_use_k3_attn_res",
     "cluster_size",
     "k3_attn_res_add_rmsnorm",
+    "k3_attn_res_add_rmsnorm_mx",
     "k3_attn_res_moe_add_rmsnorm",
+    "k3_attn_res_moe_add_rmsnorm_mx",
     "k3_attn_res_rmsnorm",
+    "k3_attn_res_rmsnorm_mx",
     "run_k3_attn_res",
 ]

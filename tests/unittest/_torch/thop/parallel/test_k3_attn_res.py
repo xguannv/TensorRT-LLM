@@ -162,6 +162,39 @@ def test_ops(exact: bool, monkeypatch):
     assert _mismatches(prefix, ref_prefix) == 0 and _mismatches(out, ref_out) == 0
 
 
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("n", [2, 6, 12])
+@pytest.mark.parametrize("m", [1, 7, 14, 32, 64])
+def test_mxfp8_side_output(m: int, n: int, mode: int, monkeypatch):
+    """The ``_mx`` ops return the vectorized kernel's BF16 results and the MXFP8 form of the
+    normalized output that the low-M GEMM's in-kernel quantization makes of it."""
+    k3 = _k3()
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx
+
+    monkeypatch.setattr(k3, "_EXACT", False)
+    t = _inputs(m, n, 1.0, seed=m + n)
+    t["layer"][0, :64] = 0  # an all-zero 1x32 group of the mixture input
+    w = _weights(t)
+    ops = torch.ops.trtllm
+    if mode == 0:
+        ref = (ops.k3_attn_res_rmsnorm(t["layer"], t["block"], *w),)
+        got = ops.k3_attn_res_rmsnorm_mx(t["layer"], t["block"], *w)
+    elif mode == 1:
+        ref = ops.k3_attn_res_add_rmsnorm(t["layer"], t["addend"], t["block"], *w)
+        got = ops.k3_attn_res_add_rmsnorm_mx(t["layer"], t["addend"], t["block"], *w)
+    else:
+        ref = ops.k3_attn_res_moe_add_rmsnorm(t["layer"], t["addend"], t["shared"], t["block"], *w)
+        got = ops.k3_attn_res_moe_add_rmsnorm_mx(
+            t["layer"], t["addend"], t["shared"], t["block"], *w
+        )
+    for i, (a, b) in enumerate(zip(ref, got)):
+        assert _mismatches(b, a) == 0, f"BF16 output {i}"
+    xq, xs = got[len(ref) :]
+    ref_q, ref_s = mx.mxfp8_quantize_reference(ref[-1])
+    assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(xs, ref_s)
+
+
 @pytest.mark.parametrize("exact", [True, False])
 @pytest.mark.parametrize("n", [4, 9])
 def test_graph_replay_pdl_chain(n: int, exact: bool):
