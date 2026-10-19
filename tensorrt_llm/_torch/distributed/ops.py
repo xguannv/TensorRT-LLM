@@ -48,9 +48,9 @@ _MNNVL_ONE_SHOT_THRESHOLD_BYTES = int(
 _K3_AR_PUSH = os.environ.get("TRTLLM_K3_AR_PUSH", "0") == "1"
 # Pushed all-reduces of at most this many bytes (num_tokens * hidden_dim *
 # group_size * 2) use the one-shot transport, larger ones the two-shot
-# transport. The result always reproduces the C++ kernel that
-# TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES selects (a pushed all-reduce that replaces
-# the one-shot kernel always uses the one-shot transport).
+# transport (default: the transport of the C++ kernel the call replaces). The
+# result always reproduces the C++ kernel that TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES
+# selects, whichever transport carries it.
 _K3_AR_PUSH_ONE_SHOT_MAX_BYTES = int(
     os.environ.get("TRTLLM_K3_AR_PUSH_ONE_SHOT_MAX_BYTES",
                    str(_MNNVL_ONE_SHOT_THRESHOLD_BYTES)))
@@ -799,7 +799,7 @@ class MNNVLAllReduce(nn.Module):
         world = self.mapping.tp_size
         nbytes = num_tokens * hidden_dim * world * 2
         cpp_one_shot = nbytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-        one_shot = cpp_one_shot or nbytes <= _K3_AR_PUSH_ONE_SHOT_MAX_BYTES
+        one_shot = nbytes <= _K3_AR_PUSH_ONE_SHOT_MAX_BYTES
         need = max(
             self.get_required_workspace_size(num_tokens, hidden_dim, world,
                                              self.dtype),
@@ -833,7 +833,8 @@ class MNNVLAllReduce(nn.Module):
                 target.workspace,
                 target.output.shape[0],
                 target.output.shape[1],
-                use_pdl=get_env_enable_pdl())
+                use_pdl=get_env_enable_pdl(),
+                cpp_one_shot=target.cpp_one_shot)
             return LamportResult(target)
         return k3_lamport_ar.run_lamport_finish(
             target.workspace,

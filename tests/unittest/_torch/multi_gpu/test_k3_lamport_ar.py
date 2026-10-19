@@ -109,15 +109,14 @@ def _run_rank(world_size):
         def differ(ref, out):
             return int((ref.view(torch.int16) != out.view(torch.int16)).sum())
 
-        # Push kernel + finish kernel against the C++ all-reduce, every transport that can
-        # reproduce the C++ kernel the size selects, with C++ calls in between.
+        # Push kernel + finish kernel against the C++ all-reduce, both transports reproducing
+        # the C++ kernel the size selects, with C++ calls in between.
         for m, h in ((1, 7168), (14, 7168), (64, 7168), (300, 7168), (14, 3584), (5, 64)):
             cpp_one_shot = lamport.one_shot_for(m, h, world_size, threshold)
-            transports = (True,) if cpp_one_shot else (False, True)
             for kind in (0, 1, 2):
                 x = _input(m, h, 3 * m + kind, rank, kind)
                 ref = allreduce(x)
-                for one_shot in transports:
+                for one_shot in (False, True):
                     if lamport.required_bytes(m, h, world_size, one_shot) > ws.bytes_per_buffer:
                         continue
                     out = torch.empty_like(x)
@@ -127,13 +126,12 @@ def _run_rank(world_size):
                     bad += differ(ref, allreduce(x))
 
         # Two-shot finish in place + gather (what a consumer polling the result rows reads).
-        for m in (100, 300):
-            if lamport.one_shot_for(m, 7168, world_size, threshold):
-                continue
+        for m in (1, 100, 300):
+            cpp_one_shot = lamport.one_shot_for(m, 7168, world_size, threshold)
             x = _input(m, 7168, 41 * m, rank, 1)
             ref = allreduce(x)
             lamport.run_lamport_push(ws, x, False)
-            lamport.run_lamport_finish_in_place(ws, m, 7168)
+            lamport.run_lamport_finish_in_place(ws, m, 7168, cpp_one_shot=cpp_one_shot)
             out = lamport.run_lamport_gather(ws, torch.empty_like(x))
             bad += differ(ref, out)
             bad += differ(ref, allreduce(x))
@@ -147,7 +145,7 @@ def _run_rank(world_size):
                 y = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
                 lowm.run_k3_fp8w_lowm_gemm(x, w, w_scale, y)
                 ref = allreduce(y)
-                for one_shot in (True,) if cpp_one_shot else (False, True):
+                for one_shot in (False, True):
                     lowm.run_k3_fp8w_lowm_gemm_ar_push(x, w, w_scale, ws, one_shot)
                     out = lamport.run_lamport_finish(
                         ws, torch.empty_like(y), one_shot, cpp_one_shot=cpp_one_shot

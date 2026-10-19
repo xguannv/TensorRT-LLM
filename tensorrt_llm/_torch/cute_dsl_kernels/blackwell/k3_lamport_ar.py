@@ -22,7 +22,8 @@ workspace's rotation state (current / dirty buffer, bytes to clear, CTA arrival 
 like the C++ kernels, so fused and C++ calls can alternate on one workspace. Values are
 sanitized (``-0`` sent as ``+0``) before they enter a Lamport buffer, which the sentinel needs;
 the sums use the C++ order and round to nearest even, so the output is bitwise that of the C++
-all-reduce of the same input.
+all-reduce of the same input. Either transport can reproduce either C++ kernel's result (see
+:class:`K3LamportFinishKernel`).
 
 Ordering (details in :class:`K3LamportFinishKernel`): the producer reads the rotation state
 after its own ``griddepcontrol.wait``; the finish kernel's workers read it and poll without
@@ -453,8 +454,12 @@ class K3LamportFinishKernel:
     Numerics. ``cpp_one_shot`` names the C++ kernel whose result the call reproduces (default:
     the transport's own): the one-shot kernel sums chunks of eight ranks above eight ranks and
     stores the rounded sum as is; the two-shot kernel sums up to sixteen ranks in one chunk and
-    replaces ``-0`` by ``+0`` (its result passes through a Lamport buffer). The one-shot
-    transport can reproduce either; the two-shot transport only the two-shot result.
+    replaces ``-0`` by ``+0`` (its result passes through a Lamport buffer). Either transport
+    reproduces either result. The two-shot transport replaces ``-0`` in a one-shot result too,
+    which has none: the inputs carry no ``-0``, and every partial sum of BF16 values in FP32 is
+    a multiple of ``2**-133``, the smallest BF16 denormal (FP32 rounds only where its spacing
+    exceeds that), so a nonzero sum rounds to a nonzero BF16 value and an exact zero is ``+0``
+    under round-to-nearest.
     """
 
     def __init__(
@@ -471,8 +476,6 @@ class K3LamportFinishKernel:
             raise ValueError(f"hidden={hidden} must be a multiple of 8")
         if cpp_one_shot is None:
             cpp_one_shot = one_shot
-        if cpp_one_shot and not one_shot:
-            raise ValueError("the two-shot transport cannot reproduce the one-shot result")
         if not gather and one_shot:
             raise ValueError("only the two-shot transport leaves its result in the workspace")
         self.W = world
@@ -483,7 +486,8 @@ class K3LamportFinishKernel:
         self.gather = gather
         self.vecs = hidden // 8
         self.cols = _ceil_div(self.vecs, THREADS)
-        # Ranks per partial sum and the output sanitization of the reproduced C++ kernel.
+        # Ranks per partial sum of the reproduced C++ kernel, and whether the one-shot transport
+        # sanitizes its output like the two-shot kernel (the two-shot transport always does).
         self.chunk = (world if world <= 8 else 8) if cpp_one_shot else min(world, 16)
         self.sanitize_out = not cpp_one_shot
 
@@ -821,12 +825,17 @@ def run_lamport_gather(
 
 
 def run_lamport_finish_in_place(
-    ws: LamportWorkspace, num_tokens: int, hidden: int, use_pdl: bool = True
+    ws: LamportWorkspace,
+    num_tokens: int,
+    hidden: int,
+    use_pdl: bool = True,
+    cpp_one_shot: bool = False,
 ) -> None:
     """Two-shot finish without the gather: the result of the pushed call stays in every rank's
-    broadcast stage, where a consumer that runs next reads it with :func:`poll_result_v4`."""
+    broadcast stage, where a consumer that runs next reads it with :func:`poll_result_v4`.
+    ``cpp_one_shot`` as in :func:`run_lamport_finish`."""
     _check(ws, num_tokens, hidden, False)
-    _compiled_finish(ws.world, hidden, False, use_pdl, False, False, False)(
+    _compiled_finish(ws.world, hidden, False, use_pdl, False, cpp_one_shot, False)(
         Int64(ws.uc_local),
         Int64(ws.mc_base),
         Int64(ws.flags.data_ptr()),
