@@ -49,6 +49,7 @@ from .spec_tail_kernels import (
 from .vocab_parallel import (
     VocabParallelHead,
     VocabShardedLogits,
+    markov_chain_kernel_enabled,
     markov_v2_enabled,
     vocab_parallel_enabled,
     vocab_parallel_sampling_enabled,
@@ -1261,6 +1262,8 @@ class DFlashWorker(SpecWorkerBase):
                         )
                     ):
                         markov = draft_head.markov_tokens_fused
+                        if markov_chain_kernel_enabled() and num_gens <= 16 and K <= 16:
+                            markov = draft_head.markov_tokens_chain
                     gen_draft_tokens = markov(
                         local_block.view(num_gens, K, -1),
                         inputs["first_prev_tokens"],

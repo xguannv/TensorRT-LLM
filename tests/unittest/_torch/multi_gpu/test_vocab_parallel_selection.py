@@ -242,6 +242,49 @@ def _markov_fused_check(rank, tp, comm_backend):
 
 
 @torch.inference_mode()
+def _markov_chain_check(rank, tp, comm_backend):
+    """The one-launch chain produces exactly the per-step fused kernel's tokens,
+    across repeated launches (rotating exchange sets) and CUDA-graph replay."""
+    head, vocab = _make_head(rank, tp, comm_backend)
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    for _ in range(2):
+        for num_reqs, block in ((1, 1), (1, 7), (2, 6), (4, 7), (16, 6), (3, 16)):
+            full = (torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3).to(
+                torch.bfloat16
+            )
+            anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+            anchors[0] = -1 if num_reqs > 1 else anchors[0]
+            local = full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+            fused = head.markov_tokens_fused(local, anchors, w1, w2)
+            chain = head.markov_tokens_chain(local, anchors, w1, w2)
+            assert torch.equal(chain, fused), (num_reqs, block)
+    # Zero bias: exact against the reference, ties included.
+    full = torch.randint(0, 3, (16, 6, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+    anchors = torch.randint(0, vocab, (16,), device="cuda", generator=gen)
+    zero_w2 = torch.zeros_like(w2)
+    local = full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+    assert torch.equal(
+        head.markov_tokens_chain(local, anchors, w1, zero_w2),
+        _markov_reference(full, anchors, w1, zero_w2),
+    )
+    # CUDA graph replay, several launches per replay.
+    full = (torch.randn(2, 6, vocab, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+    local = full[..., rank * SHARD : (rank + 1) * SHARD].contiguous()
+    anchors = torch.randint(0, vocab, (2,), device="cuda", generator=gen)
+    eager = head.markov_tokens_fused(local, anchors, w1, w2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = [head.markov_tokens_chain(local, anchors, w1, w2) for _ in range(4)]
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        for out in outs:
+            assert torch.equal(out, eager)
+
+
+@torch.inference_mode()
 def _sample_check(rank, tp, comm_backend):
     from tensorrt_llm._torch.speculative.vocab_parallel import VocabShardedLogits
 
@@ -393,6 +436,13 @@ def test_vocab_parallel_markov_tokens(comm_backend, mpi_pool_executor):
 @pytest.mark.parametrize("mpi_pool_executor", _WORLD_SIZES, indirect=True)
 def test_vocab_parallel_markov_tokens_fused(comm_backend, mpi_pool_executor):
     _submit(mpi_pool_executor, _markov_fused_check, comm_backend)
+
+
+@_needs_gpus
+@pytest.mark.parametrize("comm_backend", ["mnnvl"])
+@pytest.mark.parametrize("mpi_pool_executor", _WORLD_SIZES, indirect=True)
+def test_vocab_parallel_markov_chain_kernel(comm_backend, mpi_pool_executor):
+    _submit(mpi_pool_executor, _markov_chain_check, comm_backend)
 
 
 @_needs_gpus

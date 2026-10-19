@@ -77,6 +77,9 @@ _EMPTY_INDEX = tl.constexpr(2**24)
 _LOCAL_BLOCK_V = 2048
 # Shard columns per program of the fused Markov step.
 _MARKOV_BLOCK_V = 128
+# Capacity of the one-launch Markov chain's exchange sets.
+_CHAIN_MAX_STEPS = 16
+_CHAIN_MAX_REQS = 16
 _REDUCE_BLOCK_ROWS = 32
 # Programs the local reductions aim to launch (rows x column splits).
 _TARGET_PROGRAMS = 256
@@ -89,8 +92,14 @@ def vocab_parallel_enabled() -> bool:
 
 def markov_v2_enabled() -> bool:
     """Whether ``TLLM_DSPARK_MARKOV_V2=1`` runs each DSpark Markov step as one
-    fused kernel (see :meth:`VocabParallelHead.markov_tokens_fused`)."""
-    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") == "1"
+    fused kernel (see :meth:`VocabParallelHead.markov_tokens_fused`), or ``=2``
+    the whole chain as one kernel (:meth:`VocabParallelHead.markov_tokens_chain`)."""
+    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") in ("1", "2")
+
+
+def markov_chain_kernel_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_MARKOV_V2=2`` selects the one-launch Markov chain."""
+    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") == "2"
 
 
 def vocab_parallel_sampling_enabled() -> bool:
@@ -391,6 +400,32 @@ def _markov_add_local_argmax_kernel(
 
 
 @triton.jit
+def _gdc_wait():
+    # griddepcontrol.wait with a memory clobber, so that no load is moved above
+    # it (tl.extra.cuda.gdc_wait has none).
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _gdc_launch_dependents():
+    tl.inline_asm_elementwise(
+        "griddepcontrol.launch_dependents; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _argmax_pairs(vals, idx, axis: tl.constexpr):
     # The (value, index) that a _argmax_combine reduction along ``axis`` returns,
     # from native reductions: NaN beats every number and the lowest index wins
@@ -462,8 +497,8 @@ def _markov_round_kernel(
             mask=rmask[:, None] & cmask[None, :],
             other=0.0,
         )
-    tl.extra.cuda.gdc_launch_dependents()
-    tl.extra.cuda.gdc_wait()
+    _gdc_launch_dependents()
+    _gdc_wait()
     if FROM_ANCHOR:
         base = tl.load(
             base_ptr + reqs[:, None].to(tl.int64) * stride_base + cols[None, :],
@@ -524,6 +559,169 @@ def _markov_round_kernel(
         tl.atomic_xchg(ticket_ptr, 0, sem="relaxed", scope="gpu")
 
 
+_NEG_ZERO_BITS = tl.constexpr(-(2**31))
+
+
+@triton.jit
+def _markov_chain_kernel(
+    anchor_ptr,
+    w1_ptr,
+    w2_ptr,
+    stride_w2,
+    base_ptr,
+    stride_base_req,
+    stride_base_step,
+    tokens_ptr,
+    stride_tokens,
+    partial_ptr,
+    ticket_ptr,
+    launch_ptr,
+    mc_ptr,
+    uc_ptr,
+    num_reqs,
+    vocab,
+    n_cols,
+    col_base,
+    tp_rank,
+    STEPS: tl.constexpr,
+    RANK: tl.constexpr,
+    TP: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    SET_FLOATS: tl.constexpr,
+):
+    # The whole DSpark Markov chain of one draft block in one launch. Every
+    # step: resolve prev, gather its markov_w1 row, compute this program's
+    # markov_w2 bias columns, add the step's shard logits and reduce to a
+    # (value, global index) candidate; the last program of the rank to finish
+    # reduces the rank's candidates and multicasts the rank's pair per request
+    # into every rank's exchange buffer; every program then polls its local copy
+    # until all ranks' pairs of the step are present (Lamport: the buffer holds
+    # -0.0 where nothing was written yet; published values never are -0.0).
+    #
+    # Exchange sets: launch L uses set L % 3 (STEPS regions of [request, rank,
+    # 2]) and clears set (L - 1) % 3, which every program of this rank finished
+    # reading in launch L - 1; another rank writes that set again only in launch
+    # L + 2, which needs this rank's pairs of launch L + 1, published after this
+    # launch completed -- so the clear needs no fence. All programs read L
+    # before their first ticket; program 0 advances it after the last step.
+    # Every program must be resident at once (the caller launches at most one
+    # per SM), since each one waits for all programs' pairs every step.
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    reqs = tl.arange(0, BLOCK_B)
+    rmask = reqs < num_reqs
+    cols = pid * BLOCK_V + tl.arange(0, BLOCK_V)
+    cmask = cols < n_cols
+    r = tl.arange(0, RANK)
+    ranks = tl.arange(0, TP)
+    launch = tl.load(launch_ptr, volatile=True)
+    cur_set = launch % 3
+    if pid == 0:
+        # The -0.0 sentinel is written as its bit pattern: a -0.0 float constant
+        # is not guaranteed to keep its sign through compilation.
+        z = tl.arange(0, SET_FLOATS)
+        tl.store(
+            uc_ptr.to(tl.pointer_type(tl.int32)) + ((launch + 2) % 3) * SET_FLOATS + z,
+            tl.full([SET_FLOATS], _NEG_ZERO_BITS, tl.int32),
+        )
+    # The step logits come from the previous grid; nothing is read before this.
+    _gdc_wait()
+    prev = tl.load(anchor_ptr + reqs, mask=rmask, other=-1).to(tl.int64)
+    xm = rmask[:, None] & (ranks[None, :] < TP)
+    for step in tl.static_range(STEPS + 1):
+        if step < STEPS:
+            # Issued before the wait for the previous step's pairs: neither
+            # depends on it.
+            w2 = tl.load(
+                w2_ptr + cols[:, None].to(tl.int64) * stride_w2 + r[None, :], mask=cmask[:, None]
+            )
+            base = tl.load(
+                base_ptr
+                + reqs[:, None].to(tl.int64) * stride_base_req
+                + step * stride_base_step
+                + cols[None, :],
+                mask=rmask[:, None] & cmask[None, :],
+                other=0.0,
+            )
+        if step > 0:
+            # Wait for every rank's pair of the previous step, then take the winner.
+            region = cur_set * SET_FLOATS + (step - 1) * (BLOCK_B * TP * 2)
+            xptr = uc_ptr + region + (reqs[:, None] * TP + ranks[None, :]) * 2
+            xv = tl.load(xptr, mask=xm, other=0.0, volatile=True)
+            xi = tl.load(xptr + 1, mask=xm, other=0.0, volatile=True)
+            dirty = xm & (
+                (xv.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
+                | (xi.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
+            )
+            while tl.max(tl.max(dirty.to(tl.int32), axis=1), axis=0) > 0:
+                xv = tl.load(xptr, mask=xm, other=0.0, volatile=True)
+                xi = tl.load(xptr + 1, mask=xm, other=0.0, volatile=True)
+                dirty = xm & (
+                    (xv.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
+                    | (xi.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS)
+                )
+            _, best = _argmax_pairs(
+                tl.where(xm, xv, float("-inf")), tl.where(xm, xi.to(tl.int32), _INT32_MAX), 1
+            )
+            prev = best.to(tl.int64)
+            if pid == 0:
+                tl.store(
+                    tokens_ptr + reqs.to(tl.int64) * stride_tokens + step - 1,
+                    prev.to(tl.int32),
+                    mask=rmask,
+                )
+        if step < STEPS:
+            valid = rmask & (prev >= 0) & (prev < vocab)
+            w1 = tl.load(
+                w1_ptr + tl.where(valid, prev, 0)[:, None] * RANK + r[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            # F.linear(markov_w1[prev], w2) rounds the FP32 dot to the weights' dtype.
+            bias = tl.dot(w1, tl.trans(w2)).to(w2.dtype).to(tl.float32)
+            vals = tl.where(
+                rmask[:, None] & cmask[None, :], base.to(tl.float32) + bias, float("-inf")
+            )
+            idx = tl.where(cmask[None, :], cols[None, :], _INT32_MAX) + tl.zeros(
+                [BLOCK_B, BLOCK_V], tl.int32
+            )
+            cand_val, cand_idx = _argmax_pairs(vals, idx, 1)
+            cand_idx = _global_index(cand_idx, col_base)
+            pbase = partial_ptr + ((step * nprog + pid) * BLOCK_B + reqs) * 2
+            tl.store(pbase, cand_val)
+            tl.store(pbase + 1, cand_idx.to(tl.float32))
+            tl.debug_barrier()
+            ticket = tl.atomic_add(ticket_ptr + step, 1, sem="acq_rel", scope="gpu")
+            if ticket == nprog - 1:
+                p = tl.arange(0, BLOCK_P)
+                pm = (p[:, None] < nprog) & rmask[None, :]
+                qptrs = partial_ptr + ((step * nprog + p[:, None]) * BLOCK_B + reqs[None, :]) * 2
+                qv = tl.load(qptrs, mask=pm, other=float("-inf"), volatile=True)
+                qi = tl.where(
+                    pm,
+                    tl.load(qptrs + 1, mask=pm, other=0.0, volatile=True).to(tl.int32),
+                    _INT32_MAX,
+                )
+                win_val, win_idx = _argmax_pairs(qv, qi, 0)
+                # -0.0 marks an empty slot; publish +0.0 instead (argmax-equal).
+                win_val = tl.where(
+                    win_val.to(tl.int32, bitcast=True) == _NEG_ZERO_BITS, 0.0, win_val
+                )
+                tl.atomic_xchg(ticket_ptr + step, 0, sem="relaxed", scope="gpu")
+                out = (
+                    mc_ptr
+                    + cur_set * SET_FLOATS
+                    + step * (BLOCK_B * TP * 2)
+                    + (reqs * TP + tp_rank) * 2
+                )
+                tl.store(out, win_val, mask=rmask)
+                tl.store(out + 1, win_idx.to(tl.float32), mask=rmask)
+    if pid == 0:
+        tl.store(launch_ptr, launch + 1)
+
+
 class _PairLayout(NamedTuple):
     """Where the local kernels publish pairs, for one exchange."""
 
@@ -570,6 +768,45 @@ class _PairExchange:
             elif backend == "mnnvl":
                 raise RuntimeError("TLLM_SPEC_VOCAB_PARALLEL_COMM=mnnvl but MNNVL is unavailable")
         self.backend = "mnnvl" if self._mnnvl is not None else "nccl"
+
+    def chain_buffers(self, device):
+        """``(multicast view, local view, set floats)`` of the one-launch Markov
+        chain's exchange: three sets of ``[steps, requests, ranks, 2]`` float32
+        pairs, -0.0 where nothing was written. Allocated collectively on first
+        use (every rank reaches it at the same point of the warmup), outside
+        graph capture. A single rank uses one local buffer for both views."""
+        if getattr(self, "_chain", None) is not None:
+            return self._chain
+        assert not torch.cuda.is_current_stream_capturing()
+        set_floats = _CHAIN_MAX_STEPS * _CHAIN_MAX_REQS * max(self.tp_size, 1) * 2
+        numel = 3 * set_floats
+        if self.tp_size == 1:
+            buf = torch.full((numel,), -0.0, dtype=torch.float32, device=device)
+            self._chain = (buf, buf, set_floats)
+            return self._chain
+        from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+
+        from ..distributed.ops import MNNVLAllReduce
+
+        assert self.backend == "mnnvl"
+        comm = MNNVLAllReduce.allreduce_mnnvl_workspaces[self.mapping]["mpi_comm"]
+        force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+        handle = McastGPUBuffer(
+            numel * 4,
+            self.tp_size,
+            self.tp_rank,
+            self.mapping.local_rank,
+            force_mn or self.mapping.is_multi_node(),
+            comm.py2f(),
+        )
+        local = handle.get_uc_buffer(self.tp_rank, [numel], torch.float32, 0)
+        mcast = handle.get_mc_buffer([numel], torch.float32, 0)
+        local.fill_(-0.0)
+        torch.cuda.synchronize()
+        comm.Barrier()
+        self._chain_handle = handle
+        self._chain = (mcast, local, set_floats)
+        return self._chain
 
     def layout(self, rows: int, n_cols: int, device) -> _PairLayout:
         # Split each row over enough programs to fill the GPU when rows are few;
@@ -855,6 +1092,81 @@ class VocabParallelHead:
             if tp > 1:
                 buf = self.exchange._mnnvl(buf, all_reduce_params=AllReduceParams())
             pairs, stride_pairs, n_slots = buf, width, tp
+        return tokens
+
+    def markov_tokens_chain(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        markov_w1: torch.Tensor,
+        markov_w2: torch.Tensor,
+    ) -> torch.Tensor:
+        """:meth:`markov_tokens_fused` with the whole chain in one launch.
+
+        Each step's per-rank pairs travel through a multicast buffer that every
+        program polls (see ``_markov_chain_kernel``) instead of an all-reduce
+        launch, and the steps share one launch. Same values as
+        :meth:`markov_tokens_fused`. Needs ``num_reqs <= 16`` and ``block <= 16``
+        (the caller falls back otherwise) and the MNNVL (or single-rank) exchange.
+        """
+        num_reqs, block_size, shard = local_block.shape
+        device = local_block.device
+        tokens = torch.empty((num_reqs, block_size), dtype=torch.int32, device=device)
+        if num_reqs == 0 or block_size == 0:
+            return tokens
+        assert num_reqs <= _CHAIN_MAX_REQS and block_size <= _CHAIN_MAX_STEPS
+        rank = markov_w1.shape[1]
+        w2_shard = self.markov_w2_shard(markov_w2)
+        assert (
+            w2_shard.stride(-1) == 1 and markov_w1.is_contiguous() and local_block.stride(-1) == 1
+        )
+        block_v = _MARKOV_BLOCK_V
+        programs = triton.cdiv(shard, block_v)
+        # Every program polls for the others' pairs: all of them must be resident.
+        assert programs <= torch.cuda.get_device_properties(device).multi_processor_count
+        mcast, local, set_floats = self.exchange.chain_buffers(device)
+        state = getattr(self, "_chain_state", None)
+        if state is None or state[0] != (programs, str(device)):
+            partial = torch.empty(
+                (_CHAIN_MAX_STEPS * programs * _CHAIN_MAX_REQS * 2,),
+                dtype=torch.float32,
+                device=device,
+            )
+            tickets = torch.zeros((_CHAIN_MAX_STEPS,), dtype=torch.int32, device=device)
+            launch = torch.zeros((1,), dtype=torch.int32, device=device)
+            self._chain_state = ((programs, str(device)), partial, tickets, launch)
+        _, partial, tickets, launch = self._chain_state
+        tp = max(self.exchange.tp_size, 1)
+        _markov_chain_kernel[(programs,)](
+            first_prev_tokens,
+            markov_w1,
+            w2_shard,
+            w2_shard.stride(0),
+            local_block,
+            local_block.stride(0),
+            local_block.stride(1),
+            tokens,
+            tokens.stride(0),
+            partial,
+            tickets,
+            launch,
+            mcast,
+            local,
+            num_reqs,
+            self.vocab_size,
+            shard,
+            self.col_base,
+            self.mapping.tp_rank if tp > 1 else 0,
+            STEPS=block_size,
+            RANK=rank,
+            TP=tp,
+            BLOCK_B=_CHAIN_MAX_REQS,
+            BLOCK_V=block_v,
+            BLOCK_P=triton.next_power_of_2(programs),
+            SET_FLOATS=set_floats,
+            num_warps=4,
+            launch_pdl=True,
+        )
         return tokens
 
     def markov_w2_shard(self, markov_w2: torch.Tensor) -> torch.Tensor:
