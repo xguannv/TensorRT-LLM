@@ -57,6 +57,15 @@ output-gated projection. The activation producer loads a BF16 gate tile next to 
 activation tile (same barrier) and the quantization warps multiply before quantizing, with
 PyTorch's BF16 multiply rounding, so it is bitwise equal to the multiply followed by the
 plain kernel.
+
+All-reduce push epilogue (:func:`run_k3_fp8w_lowm_gemm_ar_push`, low-M kernel without split-K):
+instead of storing its BF16 output, the kernel stores it into the Lamport slots of the next
+MNNVL all-reduce on a workspace (:mod:`k3_lamport_ar`): each token row goes to its owner's
+scatter slot (two-shot) or to every rank's slot (one-shot, multicast), with ``-0`` sent as
+``+0`` as the C++ all-reduce sends it. The epilogue stages the BF16 tile token-major in the dead
+weight ring and pushes 16-byte vectors; :func:`k3_lamport_ar.run_lamport_finish` completes the
+all-reduce, so the pair is bitwise equal to this GEMM followed by the MNNVL all-reduce of its
+output.
 """
 
 from __future__ import annotations
@@ -79,6 +88,8 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from . import k3_lamport_ar
+
 #: K extent of one pipeline stage (one 128x128 FP8 weight block).
 CTA_K = 128
 #: Weight rows per CTA tile (UMMA M); equals the weight scale block height.
@@ -95,6 +106,9 @@ SUPPORTED_MMA_N = (8, 16, 32, 64)
 LOW_M_MAX = 64
 #: Largest public M the op accepts (larger M than the low-M kernel's runs the mid-M path).
 MAX_M = 256
+#: ``ar_push`` modes of the all-reduce push epilogue (the C++ kernel the call stands in for).
+AR_PUSH_TWO_SHOT = 1
+AR_PUSH_ONE_SHOT = 2
 
 _TMA_WARP = 0
 _MMA_WARP = 1
@@ -760,6 +774,9 @@ class K3Fp8wLowMGemmKernel:
     ``bf16(x * gate)`` instead of ``x``. ``sigmoid`` stores ``sigmoid_bf16`` of each BF16
     output instead of the output. ``fp4_out`` replaces the BF16 store by the NVFP4 output
     epilogue (``_store_nvfp4``); it is not combined with ``gated`` or ``sigmoid``.
+    ``ar_push`` (``AR_PUSH_TWO_SHOT`` / ``AR_PUSH_ONE_SHOT``, ``ar_world`` ranks) replaces the
+    BF16 store by the all-reduce push (:meth:`call_ar_push`, ``_push_lamport``); it needs
+    ``split_k == 1`` and is not combined with ``sigmoid`` or ``fp4_out``.
     """
 
     def __init__(
@@ -771,12 +788,21 @@ class K3Fp8wLowMGemmKernel:
         gated: bool = False,
         sigmoid: bool = False,
         fp4_out: bool = False,
+        ar_push: int = 0,
+        ar_world: int = 0,
     ):
         validate_tactic(n, k, tactic, gated)
         if fp4_out and n % MMA_M:
             raise ValueError("the NVFP4 output needs whole 128-row weight tiles")
         if fp4_out and (gated or sigmoid):
             raise ValueError("the NVFP4 output epilogue is not combined with gated / sigmoid")
+        if ar_push:
+            if ar_push not in (AR_PUSH_TWO_SHOT, AR_PUSH_ONE_SHOT) or ar_world < 2:
+                raise ValueError(f"invalid all-reduce push {ar_push} over {ar_world} ranks")
+            if tactic.split_k != 1 or sigmoid or fp4_out:
+                raise ValueError("the all-reduce push needs split_k == 1, no sigmoid / NVFP4")
+        self.ar_push = ar_push
+        self.ar_world = ar_world
         self.gated = gated
         self.sigmoid = sigmoid
         self.fp4_out = fp4_out
@@ -843,6 +869,72 @@ class K3Fp8wLowMGemmKernel:
         self._launch(w_ptr, x_ptr, g_ptr, g_ld, ws_ptr, out_ptr, m, Int64(0), Int64(0), stream)
 
     @cute.jit
+    def call_ar_push(
+        self,
+        w_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        ws_ptr: cute.Pointer,
+        m: Int32,
+        peer_ptrs: Int64,
+        mc_base: Int64,
+        flags: Int64,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ):
+        """All-reduce push launch: the output ``x @ W^T`` goes into the Lamport slots of the
+        next call on the workspace (:class:`k3_lamport_ar.LamportWorkspace` addresses: peer
+        pointer table, multicast base, state flags; this is rank ``rank`` of ``ar_world``)."""
+        self._launch(
+            w_ptr,
+            x_ptr,
+            None,
+            None,
+            ws_ptr,
+            x_ptr,
+            m,
+            Int64(0),
+            Int64(0),
+            stream,
+            ar_peers=peer_ptrs,
+            ar_mc=mc_base,
+            ar_flags=flags,
+            ar_rank=rank,
+        )
+
+    @cute.jit
+    def call_ar_push_gated(
+        self,
+        w_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        g_ptr: cute.Pointer,
+        g_ld: Int32,
+        ws_ptr: cute.Pointer,
+        m: Int32,
+        peer_ptrs: Int64,
+        mc_base: Int64,
+        flags: Int64,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ):
+        """:meth:`call_ar_push` of the gated kernel: pushes ``bf16(x * g) @ W^T``."""
+        self._launch(
+            w_ptr,
+            x_ptr,
+            g_ptr,
+            g_ld,
+            ws_ptr,
+            x_ptr,
+            m,
+            Int64(0),
+            Int64(0),
+            stream,
+            ar_peers=peer_ptrs,
+            ar_mc=mc_base,
+            ar_flags=flags,
+            ar_rank=rank,
+        )
+
+    @cute.jit
     def _launch(
         self,
         w_ptr: cute.Pointer,
@@ -855,6 +947,10 @@ class K3Fp8wLowMGemmKernel:
         fp4_sf_addr: Int64,
         fp4_gsf_addr: Int64,
         stream: cuda.CUstream,
+        ar_peers=None,
+        ar_mc=None,
+        ar_flags=None,
+        ar_rank=None,
     ):
         n, k = self.n, self.k
         mW = cute.make_tensor(w_ptr, cute.make_layout((n, k, 1), stride=(k, 1, n * k)))
@@ -983,6 +1079,10 @@ class K3Fp8wLowMGemmKernel:
             fp4_gsf_addr,
             tma_atom_g,
             tma_tensor_g,
+            ar_peers,
+            ar_mc,
+            ar_flags,
+            ar_rank,
         ).launch(
             grid=(self.n_tiles * self.split_k, 1, 1),
             block=(self.threads, 1, 1),
@@ -1014,6 +1114,10 @@ class K3Fp8wLowMGemmKernel:
         fp4_gsf_addr: Int64,
         tma_atom_g: Optional[cute.CopyAtom],
         mGt: Optional[cute.Tensor],
+        ar_peers: Optional[Int64],
+        ar_mc: Optional[Int64],
+        ar_flags: Optional[Int64],
+        ar_rank: Optional[Int32],
     ):
         S = self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1223,6 +1327,10 @@ class K3Fp8wLowMGemmKernel:
                     out_addr,
                     fp4_sf_addr,
                     fp4_gsf_addr,
+                    ar_peers,
+                    ar_mc,
+                    ar_flags,
+                    ar_rank,
                 )
 
     @cute.jit
@@ -1469,6 +1577,10 @@ class K3Fp8wLowMGemmKernel:
         out_addr: Int64,
         fp4_sf_addr: Int64,
         fp4_gsf_addr: Int64,
+        ar_peers: Optional[Int64] = None,
+        ar_mc: Optional[Int64] = None,
+        ar_flags: Optional[Int64] = None,
+        ar_rank: Optional[Int32] = None,
     ):
         S = self.split_k
         gsf = cutlass.Float32(0.0)
@@ -1513,7 +1625,11 @@ class K3Fp8wLowMGemmKernel:
             row0, _ = tTR_cAcc[0]
             if n_base + row0 >= self.n:
                 m_store = Int32(0)
-        if cutlass.const_expr(S == 1):
+        if cutlass.const_expr(self.ar_push != 0):
+            self._push_lamport(
+                storage, rAcc, tTR_cAcc, m, q, n_base, ar_peers, ar_mc, ar_flags, ar_rank
+            )
+        elif cutlass.const_expr(S == 1):
             for i in cutlass.range_constexpr(nchunks * 4):
                 row, col = tTR_cAcc[i]
                 if col < m_store:
@@ -1607,6 +1723,55 @@ class K3Fp8wLowMGemmKernel:
             if q == 0:
                 # The staging buffer must stay valid until the copies have read it.
                 _bulk_wait_read()
+
+    @cute.jit
+    def _push_lamport(
+        self,
+        storage,
+        rAcc: cute.Tensor,
+        tTR_cAcc: cute.Tensor,
+        m: Int32,
+        q: Int32,
+        n_base: Int32,
+        peer_ptrs: Int64,
+        mc_base: Int64,
+        flags: Int64,
+        ar_rank: Int32,
+    ):
+        """All-reduce push of this CTA's output tile (``split_k == 1``): round every value to
+        BF16 (as the BF16 store would), stage the tile token-major in the dead weight ring, then
+        store 16-byte vectors (8 features of one token) into the Lamport slots of the next call
+        on the workspace (``k3_lamport_ar.push_slot``; ``-0`` is sent as ``+0``). The epilogue
+        has passed ``griddepcontrol.wait``: the previous call on the workspace has completed, so
+        its rotation state is final."""
+        stage_base = storage.sA.data_ptr().toint()
+        tile_row = MMA_M * 2
+        for i in cutlass.range_constexpr(cute.size(rAcc)):
+            row, col = tTR_cAcc[i]
+            _sts_u16(stage_base + col * tile_row + row * 2, _f32_to_bf16_bits(rAcc[i]))
+        cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
+        cur, _, nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(flags)
+        one_shot = self.ar_push == AR_PUSH_ONE_SHOT
+        vecs = MMA_M // 8
+        for p in cutlass.range_constexpr(self.mma_n * vecs // MMA_M):
+            j = q + p * MMA_M
+            t = j // vecs
+            c = j - t * vecs
+            if t < m and n_base + c * 8 < self.n:
+                w = _lds_v4_b32(stage_base + t * tile_row + c * 16)
+                dst = k3_lamport_ar.push_slot(
+                    peer_ptrs,
+                    mc_base,
+                    cur,
+                    nbytes,
+                    t,
+                    ar_rank,
+                    n_base + c * 8,
+                    self.ar_world,
+                    self.n,
+                    one_shot,
+                )
+                k3_lamport_ar.push_v4(dst, *w, one_shot)
 
     @cute.jit
     def _store_nvfp4(
@@ -3005,6 +3170,104 @@ def run_k3_fp8w_lowm_gemm_gated(
         stream,
     )
     return out
+
+
+@functools.cache
+def _compiled_ar_push_kernel(
+    n: int, k: int, tactic: K3LowMTactic, use_pdl: bool, ar_push: int, ar_world: int, gated: bool
+):
+    kernel = K3Fp8wLowMGemmKernel(
+        n, k, tactic, use_pdl, gated=gated, ar_push=ar_push, ar_world=ar_world
+    )
+    dummy = 1 << 20
+    w_ptr = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    x_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    ws_ptr = make_ptr(cutlass.Uint8, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    addr = Int64(dummy)
+    if gated:
+        g_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
+        return cute.compile(
+            kernel.call_ar_push_gated,
+            w_ptr,
+            x_ptr,
+            g_ptr,
+            Int32(k),
+            ws_ptr,
+            Int32(1),
+            addr,
+            addr,
+            addr,
+            Int32(0),
+            stream,
+        )
+    return cute.compile(
+        kernel.call_ar_push, w_ptr, x_ptr, ws_ptr, Int32(1), addr, addr, addr, Int32(0), stream
+    )
+
+
+def ar_push_tactic(m: int, n: int, k: int, gated: bool = False) -> Optional[K3LowMTactic]:
+    """The tactic the plain (or gated) low-M GEMM uses for this shape, if the all-reduce push
+    epilogue can run it (low-M kernel, ``split_k == 1``); else None."""
+    if not 1 <= m <= low_m_max_for(n, k) or n % 8:
+        return None
+    tactic = gated_tactic(m, n, k) if gated else default_tactic(m, n, k)
+    return tactic if tactic.split_k == 1 else None
+
+
+def run_k3_fp8w_lowm_gemm_ar_push(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    ws: "k3_lamport_ar.LamportWorkspace",
+    one_shot: bool,
+    *,
+    gate: Optional[torch.Tensor] = None,
+    tactic: K3LowMTactic | None = None,
+    use_pdl: bool = True,
+) -> None:
+    """Low-M GEMM with the all-reduce push epilogue, on the current stream.
+
+    Stores ``bf16(x @ dequant(w)^T)`` (``bf16(x * gate) @ ...`` with ``gate``) into the
+    Lamport slots of the next all-reduce on ``ws`` instead of an output tensor;
+    :func:`k3_lamport_ar.run_lamport_finish` with the same ``one_shot`` completes it. Same
+    tactic and rounding as :func:`run_k3_fp8w_lowm_gemm` (:func:`run_k3_fp8w_lowm_gemm_gated`),
+    so the pair is bitwise that GEMM followed by the MNNVL all-reduce of its output.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    if tactic is None:
+        tactic = ar_push_tactic(m, n, k, gated=gate is not None)
+        if tactic is None:
+            raise ValueError(f"no all-reduce push tactic for M={m}, N={n}, K={k}")
+    if m > tactic.mma_n:
+        raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
+    need = k3_lamport_ar.required_bytes(m, n, ws.world, one_shot)
+    if need > ws.bytes_per_buffer:
+        raise ValueError(f"Lamport buffer of {ws.bytes_per_buffer} B < {need} B")
+    mode = AR_PUSH_ONE_SHOT if one_shot else AR_PUSH_TWO_SHOT
+    compiled = _compiled_ar_push_kernel(n, k, tactic, use_pdl, mode, ws.world, gate is not None)
+    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    ptrs = (
+        make_ptr(cutlass.Float8E4M3FN, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+    )
+    ws_ptr = make_ptr(cutlass.Uint8, w_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    tail = (
+        Int32(m),
+        Int64(ws.peer_ptrs.data_ptr()),
+        Int64(ws.mc_base),
+        Int64(ws.flags.data_ptr()),
+        Int32(ws.rank),
+        stream,
+    )
+    if gate is not None:
+        g_ptr = make_ptr(
+            cutlass.BFloat16, gate.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
+        compiled(*ptrs, g_ptr, Int32(gate.stride(0)), ws_ptr, *tail)
+    else:
+        compiled(*ptrs, ws_ptr, *tail)
 
 
 def k3_fp8w_lowm_gemm_sigmoid(
