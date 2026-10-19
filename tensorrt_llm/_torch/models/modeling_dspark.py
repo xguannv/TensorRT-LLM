@@ -108,7 +108,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
-from ..speculative.dspark_draft_gemm import draft_gemm
+from ..speculative.dspark_draft_gemm import DraftL2Prefetch, draft_gemm, l2_prefetch_enabled
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
     draft_fusion_enabled,
@@ -3967,6 +3967,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # input_layernorm, or the final norm).
         fused_ar = self._draft_fused_all_reduce()
         partial = None
+        # TLLM_DSPARK_L2_PREFETCH: after each layer's [q_a | kv_a] GEMM, a side
+        # stream pulls the layer's o_proj / gate_up / down weights and the next
+        # layer's [q_a | kv_a] into L2 (hints only; joined before returning).
+        prefetch = self._draft_l2_prefetch() if l2_prefetch_enabled() else None
+        num_layers = len(self.model.layers)
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -3997,6 +4002,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             else:
                 q_a = attn.q_a_proj(hs_normed)
                 blk_latent_rows = None
+            if prefetch is not None:
+                prefetch.prefetch(
+                    self._draft_l2_prefetch_weights(layer_idx, num_layers, fused_ar is not None)
+                )
             q_a_normed = attn.q_a_layernorm(q_a)
             q = (
                 draft_gemm(q_a_normed, attn.q_b_proj.weight, "q_b")
@@ -4170,12 +4179,40 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             hidden_states_out, _ = self._fused_ar_residual_norm(
                 fused_ar, partial, residual.reshape(-1, residual.shape[-1]), self.model.norm
             )
-            return hidden_states_out
-        hidden_states_out, _ = self.model.norm(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
-            residual.reshape(-1, residual.shape[-1]),
-        )
+        else:
+            hidden_states_out, _ = self.model.norm(
+                hidden_states.reshape(-1, hidden_states.shape[-1]),
+                residual.reshape(-1, residual.shape[-1]),
+            )
+        if prefetch is not None:
+            prefetch.join()
         return hidden_states_out
+
+    def _draft_l2_prefetch(self) -> DraftL2Prefetch:
+        prefetch = self.__dict__.get("_l2_prefetch")
+        if prefetch is None:
+            prefetch = self.__dict__["_l2_prefetch"] = DraftL2Prefetch()
+        return prefetch
+
+    def _draft_l2_prefetch_weights(self, layer_idx: int, num_layers: int, fused_a: bool):
+        """Weights to prefetch after layer ``layer_idx``'s [q_a | kv_a] GEMM, in
+        the order they are read: its o_proj, gate_up and down, then the next
+        layer's [q_a | kv_a] (the fused weight when the next layer uses it)."""
+        layer = self.model.layers[layer_idx]
+        mlp = layer.mlp
+        weights = [
+            getattr(layer.self_attn.o_proj, "weight", None),
+            getattr(getattr(mlp, "gate_up_proj", None), "weight", None),
+            getattr(getattr(mlp, "down_proj", None), "weight", None),
+        ]
+        if layer_idx + 1 < num_layers:
+            nxt = self.model.layers[layer_idx + 1].self_attn
+            fused = self._draft_fused_a_proj(layer_idx + 1) if fused_a else None
+            if fused is not None:
+                weights.append(fused.weight)
+            else:
+                weights += [nxt.q_a_proj.weight, nxt.kv_a_proj_with_mqa.weight]
+        return weights
 
     def _draft_fused_all_reduce(self):
         """The all-reduce the block decode fuses with residual + RMSNorm, or None.

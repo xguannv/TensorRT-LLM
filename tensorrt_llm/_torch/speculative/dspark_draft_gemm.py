@@ -28,15 +28,19 @@ falls back to cuBLAS (8-10 us against 6.6 us).
 ``TLLM_DSPARK_DRAFT_GEMM=1`` selects them. They change the drafter's GEMM
 accumulation order (split-K partial sums), i.e. draft-token rounding only; the
 target's verification keeps the output distribution unchanged.
+
+``TLLM_DSPARK_L2_PREFETCH=1`` (:class:`DraftL2Prefetch`) prefetches the
+drafter layers' weights into L2 from a side stream; it changes no value.
 """
 
 import os
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 import torch.nn.functional as F
 
 DRAFT_GEMM_ENV_VAR = "TLLM_DSPARK_DRAFT_GEMM"
+L2_PREFETCH_ENV_VAR = "TLLM_DSPARK_L2_PREFETCH"
 
 # role -> ((max rows, kernel, split-K tactic (mma_m, mma_n, split_k, ab_stages)), ...)
 _PINS = {
@@ -104,3 +108,57 @@ def draft_gemm(x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[tor
     out = torch.empty((m, weight.shape[0]), dtype=x.dtype, device=x.device)
     run_splitk_dense(x2d, weight.t(), None, out, get_env_enable_pdl(), SplitKTactic(*tactic))
     return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def l2_prefetch_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_L2_PREFETCH=1`` prefetches the drafter's weights into L2."""
+    return os.environ.get(L2_PREFETCH_ENV_VAR, "0") == "1"
+
+
+class DraftL2Prefetch:
+    """Pulls upcoming drafter weights into L2 from a side stream.
+
+    A drafter layer streams ~80 MB of projection weights at 7-32 rows, while
+    its attention and all-reduces leave HBM idle for ~35 us. After a layer's
+    [q_a | kv_a] GEMM, :meth:`prefetch` forks a side stream that issues L2
+    prefetches (``k3_l2_prefetch``) for that layer's o_proj, gate_up and down
+    weights and the next layer's [q_a | kv_a], so those GEMMs read L2 (GB300,
+    14 rows, emulated layer: 23.3 -> 19.0 us of GEMM per layer). Prefetches are
+    hints: no value changes. The side-stream kernel depends fully on the GEMM
+    it follows, so it does not compete with that GEMM for HBM.
+
+    :meth:`join` must run on the main stream before the step (or graph capture)
+    ends; the kernel after the join loses its programmatic early launch.
+    """
+
+    def __init__(self):
+        self._stream = None
+        self._pending = False
+
+    def prefetch(self, tensors: Iterable[Optional[torch.Tensor]]) -> None:
+        from ..cute_dsl_kernels.blackwell.k3_l2_prefetch import (
+            MAX_RANGES,
+            run_k3_l2_prefetch,
+            tensor_range,
+        )
+
+        ranges = [tensor_range(t.detach()) for t in tensors if t is not None and t.is_cuda]
+        ranges = [r for r in ranges if r[1] > 0][:MAX_RANGES]
+        if not ranges:
+            return
+        if self._stream is None:
+            if torch.cuda.is_current_stream_capturing():
+                return  # first use inside a capture: skip (hints only)
+            self._stream = torch.cuda.Stream()
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        self._stream.wait_event(fork)
+        with torch.cuda.stream(self._stream):
+            run_k3_l2_prefetch(ranges)
+        self._pending = True
+
+    def join(self) -> None:
+        if self._pending:
+            torch.cuda.current_stream().wait_stream(self._stream)
+            self._pending = False

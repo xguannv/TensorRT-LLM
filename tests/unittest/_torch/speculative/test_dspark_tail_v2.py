@@ -370,3 +370,44 @@ def test_ctx_positions_match_gen_prepare(num_gens):
     )
     torch.cuda.synchronize()
     assert torch.equal(positions, prep["ctx_positions"])
+
+
+def test_draft_l2_prefetch_in_cuda_graph():
+    """The drafter's side-stream L2 prefetch forks and joins inside a CUDA graph
+    capture and leaves the results bit for bit unchanged; a first use inside a
+    capture skips the prefetch."""
+    from tensorrt_llm._torch.speculative.dspark_draft_gemm import DraftL2Prefetch
+
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    x = torch.randn(14, 1024, device="cuda", generator=gen).to(torch.bfloat16)
+    w1 = (torch.randn(2048, 1024, device="cuda", generator=gen) / 32).to(torch.bfloat16)
+    w2 = torch.nn.Parameter(
+        (torch.randn(512, 2048, device="cuda", generator=gen) / 45).to(torch.bfloat16)
+    )
+    w3 = (torch.randn(1024, 512, device="cuda", generator=gen) / 23).to(torch.bfloat16)
+
+    def body(pf):
+        y = x @ w1.t()
+        if pf is not None:
+            pf.prefetch([w2, None, w3])
+        z = (y @ w2.detach().t()) @ w3.t()
+        if pf is not None:
+            pf.join()
+        return z
+
+    with torch.inference_mode():
+        ref = body(None)
+        pf = DraftL2Prefetch()
+        eager = body(pf)  # creates the side stream outside the capture
+        late = DraftL2Prefetch()
+        outs = {}
+        for name, p in (("pf", pf), ("late", late)):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                outs[name] = body(p)
+            g.replay()
+        torch.cuda.synchronize()
+    assert late._stream is None  # first use inside a capture: nothing forked
+    assert torch.equal(eager, ref)
+    assert torch.equal(outs["pf"], ref)
+    assert torch.equal(outs["late"], ref)

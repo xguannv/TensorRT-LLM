@@ -1300,6 +1300,43 @@ def test_mla_dspark_tail_v2_is_bitwise(monkeypatch):
 
 
 @needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_l2_prefetch_is_bitwise(monkeypatch):
+    """``TLLM_DSPARK_L2_PREFETCH=1`` only adds side-stream L2 prefetches.
+
+    The block decode of a batch of two unequal requests must be bit for bit the
+    one without them, and the side stream must be joined when it returns.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    g = torch.Generator().manual_seed(43)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    monkeypatch.setenv("TLLM_SPEC_TAIL_FUSION", "1")
+    monkeypatch.setenv("TLLM_DSPARK_TAIL_V2", "1")
+    monkeypatch.setenv("TLLM_DSPARK_L2_PREFETCH", "0")
+    base = _run_mla_block_decode(drafter, requests, paged=True)
+    monkeypatch.setenv("TLLM_DSPARK_L2_PREFETCH", "1")
+    prefetched = _run_mla_block_decode(drafter, requests, paged=True)
+
+    prefetch = drafter.__dict__.get("_l2_prefetch")
+    assert prefetch is not None and prefetch._stream is not None and not prefetch._pending
+    assert torch.equal(prefetched.view(torch.int32), base.view(torch.int32))
+
+
+@needs_cuda
 def test_mla_dspark_auto_backend_resolves_to_cutedsl():
     """AUTO is the one-pass kernel, and it must reach the dispatch as such.
 
