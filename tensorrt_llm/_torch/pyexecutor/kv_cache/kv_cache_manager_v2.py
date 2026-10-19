@@ -105,7 +105,11 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
-from ..input_commit import block_offsets_triton_enabled, copy_batch_block_offsets_from_host
+from ..input_commit import (
+    block_offsets_copy_job,
+    block_offsets_triton_enabled,
+    copy_batch_block_offsets_from_host,
+)
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -6584,6 +6588,42 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales,
             self.kv_offset,
             self._stream.cuda_stream,
+        )
+
+    def block_offsets_copy_job(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> Optional[tuple]:
+        """Arguments of the Triton copy that copy_batch_block_offsets would launch, or None.
+
+        None when copy_batch_block_offsets would not take the Triton path (TRTLLM_KV_BLOCK_OFFSETS_TRITON
+        off, beam search, an overriding subclass, per-layer page tables, a cross cache, sparse
+        metadata publication, or a layout / size the Triton copy does not handle). The copy index is
+        computed here, as in copy_batch_block_offsets, into this manager's index-mapper buffer, which
+        the kernel reads when it runs.
+        """
+        if (
+            beam_width != 1
+            # A subclass that overrides copy_batch_block_offsets keeps its own copy.
+            or type(self).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets
+            or self._use_per_layer_page_tables
+            or self.kv_cache_type == CacheTypeCpp.CROSS
+            or self.sparse_metadata_batch is not None
+            or not block_offsets_triton_enabled()
+        ):
+            return None
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width, False)
+        assert copy_idx.shape[0] == num_seqs
+        return block_offsets_copy_job(
+            self.host_kv_cache_block_offsets,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
         )
 
     @staticmethod

@@ -40,7 +40,9 @@ from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.input_commit import active_input_commit
+from ...pyexecutor.input_commit import (active_input_commit,
+                                        block_offsets_pair_enabled,
+                                        copy_block_offsets_jobs)
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
@@ -981,6 +983,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.max_num_requests, self.prompt_lens_cuda_runtime,
              self.host_request_types_runtime) = saved
 
+    def _copy_target_and_draft_block_offsets(self) -> bool:
+        """Both block-offset copies of prepare() in one Triton launch.
+
+        Returns False (nothing launched) unless both KV cache managers would
+        take the Triton copy and their copy indices live in different
+        buffers (each manager's index mapper fills its own buffer, which the
+        kernel reads when it runs).
+        """
+        jobs = []
+        for manager, dst in ((self.kv_cache_manager,
+                              self.kv_cache_block_offsets),
+                             (self.draft_kv_cache_manager,
+                              self.draft_kv_cache_block_offsets)):
+            make_job = getattr(manager, "block_offsets_copy_job", None)
+            job = None if make_job is None else make_job(
+                dst, self.request_ids, self.beam_width, self.num_contexts,
+                self.num_seqs)
+            if job is None:
+                return False
+            jobs.append(job)
+        if jobs[0][2].data_ptr() == jobs[1][2].data_ptr():
+            return False
+        copy_block_offsets_jobs(jobs)
+        return True
+
     def prepare(self) -> None:
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
@@ -1112,16 +1139,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if not spec_active and self.kv_cache_manager.tokens_per_block:
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets,
-                self.request_ids,
-                self.beam_width,
-                self.num_contexts,
-                self.num_seqs,
-                max_blocks=max_blocks)
+            # TRTLLM_KV_BLOCK_OFFSETS_TRITON=2: the target and draft tables
+            # in one Triton launch (same entries as the two copies below).
+            paired = (self.draft_kv_cache_manager is not None
+                      and block_offsets_pair_enabled()
+                      and self._copy_target_and_draft_block_offsets())
+            if not paired:
+                self.kv_cache_manager.copy_batch_block_offsets(
+                    self.kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    self.num_seqs,
+                    max_blocks=max_blocks)
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
-            if self.draft_kv_cache_manager is not None:
+            if self.draft_kv_cache_manager is not None and not paired:
                 # Use the wrapper method which works for both V1 and V2
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
                     self.draft_kv_cache_block_offsets,

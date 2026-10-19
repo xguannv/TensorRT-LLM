@@ -35,7 +35,9 @@ if TYPE_CHECKING:
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
-from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    active_input_commit, copy_small_pinned_pair,
+    state_index_copy_kernel_enabled)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
@@ -4773,9 +4775,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}")
                 self._host_state_indices[i] = base_index
 
-        self._state_indices_buffer.update(self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(is_dummy)
+        if not self._upload_state_indices_and_dummy_mask(is_dummy):
+            self._state_indices_buffer.update(self._host_state_indices)
+            self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
@@ -5006,6 +5009,63 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                         device=device)
         self._record_kda_replay_acceptance(state_indices, accepted_drafts,
                                            is_dummy_request)
+
+    @torch.inference_mode()
+    def _upload_state_indices_and_dummy_mask(self,
+                                             is_dummy: List[bool]) -> bool:
+        """TRTLLM_STATE_INDEX_COPY_KERNEL=1: both uploads of _setup_state_indices in one kernel.
+
+        Same stream position, sources and destinations as the two buffer
+        updates; the kernel reads pinned host copies of the values when it
+        runs, as the DMA does, without two copy-engine handoffs in front of the
+        next step's input chain. Returns False (nothing uploaded) to fall back
+        to the buffer updates, which also covers a step where neither buffer
+        changes (both updates skip).
+        """
+        if (not state_index_copy_kernel_enabled()
+                or active_input_commit() is not None
+                or self._dummy_request_mask is None):
+            return False
+        n = len(is_dummy)
+        assert n <= self._dummy_request_mask_host.shape[0]
+        self._dummy_request_mask_host.zero_()
+        if n > 0:
+            self._dummy_request_mask_host[:n].copy_(
+                torch.tensor(is_dummy, dtype=torch.bool))
+        if (self._state_indices_buffer.holds(self._host_state_indices)
+                and self._dummy_request_mask_buffer.holds(
+                    self._dummy_request_mask_host)):
+            return False
+        # The kernel reads its sources when it runs, and the persistent host
+        # buffers are rewritten by the next step's setup, possibly before then.
+        # So, as DeviceCopyBuffer.update stages its copies, it reads private
+        # pinned copies: two alternating pairs, each reused only after the
+        # event recorded behind its last kernel.
+        ring = getattr(self, "_state_upload_ring", None)
+        if ring is None:
+            ring = [[
+                torch.empty_like(self._host_state_indices,
+                                 pin_memory=prefer_pinned()),
+                torch.empty_like(self._dummy_request_mask_host,
+                                 pin_memory=prefer_pinned()), None
+            ] for _ in range(2)]
+            self._state_upload_ring = ring
+            self._state_upload_slot = 0
+        staging = ring[self._state_upload_slot]
+        if staging[2] is not None:
+            staging[2].synchronize()
+        staging[0].copy_(self._host_state_indices)
+        staging[1].copy_(self._dummy_request_mask_host)
+        if not copy_small_pinned_pair(self.cuda_state_indices, staging[0],
+                                      self._dummy_request_mask, staging[1]):
+            return False
+        if staging[2] is None:
+            staging[2] = torch.cuda.Event()
+        staging[2].record()
+        self._state_upload_slot ^= 1
+        self._state_indices_buffer.remember(self._host_state_indices)
+        self._dummy_request_mask_buffer.remember(self._dummy_request_mask_host)
+        return True
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,

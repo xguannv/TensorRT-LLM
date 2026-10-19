@@ -31,6 +31,7 @@ from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..cute_dsl_kernels.spec_step_copies import op as spec_step_copies
+from ..pyexecutor.input_commit import scatter_spec_store, spec_sampler_fused_scatter_enabled
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -319,6 +320,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
+        # TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1, where the spec_step_copies scatter does not run: one
+        # kernel for the four store scatters, and the slot tensor reused while the batch's slots do
+        # not change.
+        self._fused_scatter = spec_sampler_fused_scatter_enabled()
+        self._slots_key: Optional[list] = None
+        self._slots_device: Optional[torch.Tensor] = None
         self.store = self.Store(
             new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor(
@@ -416,8 +423,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     ) -> None:
         """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
         num_sampling_requests = len(slots)
-        slots_device = torch.as_tensor(slots, dtype=torch.long)
-        slots_device = slots_device.to(device="cuda", non_blocking=True)
+        if self._fused_scatter and slots == self._slots_key:
+            # The previous upload of these slots; the tensor is never written after it.
+            slots_device = self._slots_device
+        else:
+            slots_device = torch.as_tensor(slots, dtype=torch.long)
+            slots_device = slots_device.to(device="cuda", non_blocking=True)
+            if self._fused_scatter:
+                self._slots_key, self._slots_device = list(slots), slots_device
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -451,6 +464,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
+        if self._fused_scatter and scatter_spec_store(
+            slots_device,
+            self.store.new_tokens.squeeze(-1),
+            self.store.next_new_tokens.squeeze(-1),
+            self.store.new_tokens_lens,
+            self.store.next_draft_tokens,
+            o_new_tokens,
+            o_next_new_tokens,
+            o_new_tokens_lens,
+            o_next_draft_tokens,
+        ):
+            return
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)
