@@ -309,6 +309,29 @@ _K3_SHARED_AR_NVLS_SLOT = os.environ.get("TRTLLM_K3_SHARED_AR_NVLS_SLOT", "main"
 # GEMMs on the main stream, so its all-reduce does not land after them.
 _K3_SHARED_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_SHARED_STREAM_PRIORITY", "0"))
 
+# Small-batch MoE front end (b1-b4 decode), each bit-identical to the path it replaces:
+#   TRTLLM_K3_LD_FP4=1: latent_down with the routed experts' NVFP4 input quantization in its epilogue
+#     (k3_fp8w_lowm_gemm_nvfp4, byte-identical to the low-M GEMM followed by fp4_quantize) wherever
+#     the low-M kernel serves latent_down and the CuteDSL NVFP4 experts would quantize it.
+#   TRTLLM_K3_ROUTER_EXACT=1: router logits of M <= 16 tokens from k3_router_exact (bit-identical
+#     to dsv3_router_gemm_op; its weight is copied into shared memory before griddepcontrol.wait).
+_K3_LD_FP4 = os.environ.get("TRTLLM_K3_LD_FP4", "0") == "1"
+_K3_ROUTER_EXACT = os.environ.get("TRTLLM_K3_ROUTER_EXACT", "0") == "1"
+# TRTLLM_K3_MOE_L2_PREFETCH: comma list of what the latent-down stream prefetches into L2 once the
+# routed FC2 is done (the latent all-reduce, latent_up and the next attention block leave HBM mostly
+# idle; k3_l2_prefetch, hints only): "lu" this layer's latent_up weight, "front" the next MoE layer's
+# router, latent_down and shared-expert weights. Up to TRTLLM_K3_MOE_L2_PREFETCH_MAX_M tokens. The
+# prefetch stays on the latent-down stream, which the next MoE layer joins after its latent_down.
+_K3_MOE_L2_PREFETCH = frozenset(
+    v for v in os.environ.get("TRTLLM_K3_MOE_L2_PREFETCH", "").split(",") if v and v != "0"
+)
+if not _K3_MOE_L2_PREFETCH <= {"lu", "front"}:
+    raise ValueError(f"TRTLLM_K3_MOE_L2_PREFETCH must list lu / front, got {_K3_MOE_L2_PREFETCH}")
+_K3_MOE_L2_PREFETCH_MAX_M = int(os.environ.get("TRTLLM_K3_MOE_L2_PREFETCH_MAX_M", "64"))
+# MoE runtimes of one model by layer index (keyed by the model's text config), for the prefetch of the
+# next MoE layer's weights.
+_K3_MOE_LAYERS: Dict[int, "weakref.WeakValueDictionary[int, KimiK3MoERuntime]"] = {}
+
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
@@ -2157,6 +2180,121 @@ class KimiK3MoERuntime(nn.Module):
         self.routed_expert_norm = RMSNorm(
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
+        # TRTLLM_K3_MOE_L2_PREFETCH: the MoE layers of this model by index, and the event after the
+        # routed FC2 that starts this layer's prefetch on the latent-down stream.
+        self._moe_group = _K3_MOE_LAYERS.setdefault(id(cfg), weakref.WeakValueDictionary())
+        self._moe_group[layer_idx] = self
+        self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
+        self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
+
+    def _next_moe_layer(self) -> Optional["KimiK3MoERuntime"]:
+        """The MoE runtime of the next MoE layer of this model, if any."""
+        later = [idx for idx in self._moe_group.keys() if idx > self.layer_idx]
+        return self._moe_group.get(min(later)) if later else None
+
+    def l2_prefetch_ranges(self, what: str) -> List[Tuple[int, int]]:
+        """``(address, bytes)`` of the weights a decode MoE block streams from HBM: ``"lu"`` the
+        latent_up weight and scale; ``"front"`` the router, latent_down and shared-expert weights
+        and scales (the front end of the block)."""
+        ranges = self._l2_ranges_cache.get(what)
+        if ranges is None:
+            from ..cute_dsl_kernels.blackwell.k3_l2_prefetch import MAX_RANGES, tensor_range
+
+            if what == "lu":
+                modules = [self.routed_expert_up_proj]
+                tensors = []
+            else:
+                modules = [
+                    self.routed_expert_down_proj,
+                    self.shared_experts.gate_up_proj,
+                    self.shared_experts.down_proj,
+                ]
+                tensors = [self.gate.weight]
+            for module in modules:
+                tensors += [getattr(module, "weight", None), getattr(module, "weight_scale", None)]
+            ranges = []
+            for tensor in tensors:
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda and tensor.numel():
+                    try:
+                        ranges.append(tensor_range(tensor))
+                    except ValueError:
+                        continue
+            ranges = ranges[:MAX_RANGES]
+            self._l2_ranges_cache[what] = ranges
+        return ranges
+
+    def _issue_l2_prefetch(self, num_tokens: int) -> None:
+        """``TRTLLM_K3_MOE_L2_PREFETCH``: once the routed FC2 is done, prefetch into L2 on the
+        latent-down stream. Only when a later MoE layer exists: its latent_down follows on this
+        stream and is joined into the main stream, so the prefetch needs no join of its own (a join
+        in front of a programmatic dependent would cost it its early launch)."""
+        if (
+            not _K3_MOE_L2_PREFETCH
+            or num_tokens > _K3_MOE_L2_PREFETCH_MAX_M
+            or self.latent_down_stream is None
+            or self.moe_fc2_event is None
+            or not do_multi_stream()
+            or torch.compiler.is_compiling()
+        ):
+            return
+        nxt = self._next_moe_layer()
+        if nxt is None or nxt.latent_down_stream is not self.latent_down_stream:
+            return
+        from ..cute_dsl_kernels.blackwell.k3_l2_prefetch import run_k3_l2_prefetch
+
+        self.moe_fc2_event.record()
+        with torch.cuda.stream(self.latent_down_stream):
+            self.moe_fc2_event.wait()
+            if "lu" in _K3_MOE_L2_PREFETCH:
+                run_k3_l2_prefetch(self.l2_prefetch_ranges("lu"))
+            if "front" in _K3_MOE_L2_PREFETCH:
+                run_k3_l2_prefetch(nxt.l2_prefetch_ranges("front"))
+
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FP32 router logits; ``TRTLLM_K3_ROUTER_EXACT`` serves ``M <= 16`` BF16 tokens with
+        ``k3_router_exact`` (bit-identical to the ``dsv3_router_gemm_op`` it replaces)."""
+        if _K3_ROUTER_EXACT and not torch.compiler.is_compiling():
+            from ..cute_dsl_kernels.blackwell import k3_router_exact
+
+            x = hidden_states.reshape(-1, self.gate.gating_dim)
+            if k3_router_exact.can_run(x, self.gate.weight):
+                return torch.ops.trtllm.k3_router_logits(x, self.gate.weight)
+        return self.gate.compute_logits(hidden_states)
+
+    def _lowm_fp4_latent_input(self, hidden_states: torch.Tensor) -> Optional[Fp4QuantizedTensor]:
+        """``TRTLLM_K3_LD_FP4``: the routed experts' NVFP4 input straight from latent_down's
+        low-M GEMM epilogue, or ``None``. Byte-identical to the low-M GEMM followed by the
+        experts' ``fp4_quantize`` (CuteDSL NVFP4, no dispatch)."""
+        if not _K3_LD_FP4 or not _K3_FP8W_LOWM_GEMM or torch.compiler.is_compiling():
+            return None
+        down = self.routed_expert_down_proj
+        if not isinstance(down, _Fp8BlockScaleWeightReadLinear) or _rubin_mxfp8_is_available():
+            return None
+        moe = self.routed_experts
+        backend = moe.backend
+        global_sf = getattr(backend, "fc31_input_scale", None)
+        if (
+            moe.comm is not None
+            or moe.apply_router_weight_on_input
+            or not getattr(backend, "has_nvfp4", False)
+            or getattr(backend, "scaling_vector_size", None) != 16
+            or not hasattr(backend, "quantize_input_async")
+            or global_sf is None
+        ):
+            return None
+        x = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if x.dtype != torch.bfloat16 or (
+            down.mid_weight_sf is not None and down.mid_gemm_applies(x)
+        ):
+            return None
+        from ..cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+        if not k3_fp8w_lowm_gemm.can_run_nvfp4(x, down.weight, down.weight_scale, global_sf):
+            return None
+        codes, scales = torch.ops.trtllm.k3_fp8w_lowm_gemm_nvfp4(
+            x, down.weight, down.weight_scale, global_sf
+        )
+        return Fp4QuantizedTensor(codes, scales, is_sf_swizzled=False)
 
     def _shared_first_applies(self, num_tokens: int) -> bool:
         """Whether ``TRTLLM_K3_SHARED_FIRST`` orders this forward's shared expert before FC1."""
@@ -2821,7 +2959,9 @@ class KimiK3MoERuntime(nn.Module):
                 self.moe_latent_fork_event.record()
                 with torch.cuda.stream(self.latent_down_stream):
                     self.moe_latent_fork_event.wait()
-                    early_routed_in = self._fused_latent_input(hidden_states)
+                    early_routed_in = self._lowm_fp4_latent_input(hidden_states)
+                    if early_routed_in is None:
+                        early_routed_in = self._fused_latent_input(hidden_states)
                     if early_routed_in is None:
                         early_routed_in = self._routed_projection(
                             hidden_states, self.routed_expert_down_proj
@@ -2848,7 +2988,7 @@ class KimiK3MoERuntime(nn.Module):
                 router_logits = router_partials[0]
             else:
                 router_logits = (
-                    None if _K3_FUSED_ROUTER != "0" else self.gate.compute_logits(hidden_states)
+                    None if _K3_FUSED_ROUTER != "0" else self._router_logits(hidden_states)
                 )
             if shared_first and _K3_SHARED_FIRST == "router":
                 self.moe_main_event.record()
@@ -2912,6 +3052,8 @@ class KimiK3MoERuntime(nn.Module):
                 all_rank_num_tokens=all_rank_num_tokens,
                 **moe_kwargs,
             )
+            if early_routed_in is not None:
+                self._issue_l2_prefetch(num_tokens)
             if route_target is not None:
                 self.routed_experts.routing_method.deferred = None
             if overlap_shared_allreduce:
