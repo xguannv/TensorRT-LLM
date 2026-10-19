@@ -44,10 +44,12 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm.logger import logger
+
 _ENABLED = os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT", "0") == "1"
 # Debug aid: after each of the first N commits (-1: all), synchronize and compare every
 # destination with the staged bytes / a torch reference of the overlap gathers (raises
-# on a mismatch).
+# on a mismatch; logs once when the first N commits have matched).
 _VERIFY_COMMITS = int(os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT_VERIFY", "0"))
 _BLOCK_OFFSETS_TRITON = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") == "1"
 
@@ -613,6 +615,8 @@ class InputCommit:
         event.record()
         if self._verifying():
             self._verify(fixup)
+            if self._num_commits + 1 == _VERIFY_COMMITS:
+                logger.info(f"InputCommit verify: the first {_VERIFY_COMMITS} commits matched")
         self._num_commits += 1
         self._entries = []
         self._fixup = None
