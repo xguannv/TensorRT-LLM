@@ -83,7 +83,13 @@ def _run_rank(world_size):
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm as lowm
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_lamport_ar as lamport
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
-    from tensorrt_llm._torch.distributed import ops as dist_ops
+
+    # Imported by name: an attribute named ``ops`` next to the global ``torch`` would make
+    # cloudpickle ship the ``torch.ops`` object with this function.
+    from tensorrt_llm._torch.distributed.ops import (
+        _MNNVL_ONE_SHOT_THRESHOLD_BYTES,
+        get_or_scale_allreduce_mnnvl_workspace,
+    )
     from tensorrt_llm.mapping import Mapping
 
     comm = MPI.COMM_WORLD
@@ -95,9 +101,9 @@ def _run_rank(world_size):
             mapping=mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.bfloat16
         )
         assert allreduce.mnnvl_allreduce is not None
-        workspace = dist_ops.get_or_scale_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
+        workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
         ws = lamport.LamportWorkspace.from_mnnvl(workspace, world_size, rank)
-        threshold = dist_ops._MNNVL_ONE_SHOT_THRESHOLD_BYTES
+        threshold = _MNNVL_ONE_SHOT_THRESHOLD_BYTES
         bad = 0
 
         def differ(ref, out):
