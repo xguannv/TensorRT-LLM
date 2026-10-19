@@ -317,3 +317,56 @@ def test_side_stream_context_latents_match(num_gens, monkeypatch):
     assert torch.equal(md._seq_lens_cuda, ref_md._seq_lens_cuda)
     for layer in range(LAYERS):
         assert torch.equal(worker._ctx_kv_buf[layer], ref_worker._ctx_kv_buf[layer]), layer
+
+
+@pytest.mark.parametrize("num_gens", [2, 16])
+def test_side_stream_context_latents_in_cuda_graph(num_gens, monkeypatch):
+    """TLLM_DSPARK_CTX_SIDE_STREAM inside a CUDA graph capture: the side stream
+    forks and joins within the capture, and one replay stores what one eager
+    step stores and advances the same bookkeeping."""
+    import tensorrt_llm._torch.speculative.private_mnnvl_allreduce as pm
+
+    monkeypatch.setattr(pm, "PrivateMNNVLAllReduce", _FakeSideAllReduce)
+    monkeypatch.setenv(SPEC_TAIL_FUSION_ENV_VAR, "1")
+    monkeypatch.setenv("TLLM_DSPARK_TAIL_V2", "1")
+    monkeypatch.setenv("TLLM_DSPARK_CTX_SIDE_STREAM", "1")
+    worker, accepted, nacc, spec_md, make_md, total = _case(0, num_gens, 300 + num_gens)
+    graph_worker = copy.deepcopy(worker)
+    drafter = _FakeShardedDrafter()
+
+    def step(w, md):
+        w._ctx_side = w._launch_ctx_side(drafter, spec_md, md, total)
+        assert w._ctx_side is not None
+        return w.prepare_1st_drafter_inputs(
+            input_ids=None,
+            position_ids=None,
+            hidden_states=torch.empty(1, HIDDEN, device="cuda"),
+            accepted_tokens=accepted,
+            num_accepted_tokens=nacc,
+            attn_metadata=md,
+            spec_metadata=spec_md,
+            draft_model=drafter,
+            total_target_tokens=total,
+        )
+
+    ref_md = make_md()
+    ref = step(worker, ref_md)
+    torch.cuda.synchronize()
+
+    # What the eager warm-up builds before any capture: the private all-reduce,
+    # the side stream and the cached pool-pointer array.
+    graph_worker._ctx_side_ar = _FakeSideAllReduce()
+    graph_worker._ctx_side_stream = torch.cuda.Stream()
+    graph_worker._ctx_kv_pool_ptrs()
+    md = make_md()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = step(graph_worker, md)
+    graph.replay()
+    torch.cuda.synchronize()
+    for key in ("noise_embedding", "query_positions", "num_ctx_per_req", "first_prev_tokens"):
+        assert torch.equal(out[key], ref[key]), key
+    assert torch.equal(graph_worker._ctx_len, worker._ctx_len)
+    assert torch.equal(md._seq_lens_cuda, ref_md._seq_lens_cuda)
+    for layer in range(LAYERS):
+        assert torch.equal(graph_worker._ctx_kv_buf[layer], worker._ctx_kv_buf[layer]), layer
