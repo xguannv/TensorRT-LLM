@@ -52,6 +52,7 @@ _ENABLED = os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT", "0") == "1"
 # on a mismatch; logs once when the first N commits have matched).
 _VERIFY_COMMITS = int(os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT_VERIFY", "0"))
 _BLOCK_OFFSETS_TRITON = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") == "1"
+_FUSED_HELIX_PREPROCESS = os.environ.get("TRTLLM_FUSED_HELIX_SPEC_PREPROCESS", "0") == "1"
 
 _ACTIVE: Optional["InputCommit"] = None
 
@@ -89,6 +90,10 @@ def batched_input_commit_enabled() -> bool:
 
 def block_offsets_triton_enabled() -> bool:
     return _BLOCK_OFFSETS_TRITON
+
+
+def fused_helix_spec_preprocess_enabled() -> bool:
+    return _FUSED_HELIX_PREPROCESS
 
 
 def active_input_commit() -> Optional["InputCommit"]:
@@ -333,6 +338,139 @@ def _input_commit_kernel(
         slot_kv = tl.load(slots_ptr + tl.where(in_kv, j_kv, 0), mask=in_kv, other=0).to(tl.int64)
         lens_kv = tl.load(new_tokens_lens_ptr + slot_kv, mask=in_kv, other=0)
         tl.store(kv_off_ptr + idx, tl.where(in_kv, lens_kv - tokens_per_req, 0), mask=m_kv)
+
+
+@triton.jit
+def _helix_local_len(g, phys, cp_size, cp_rank):
+    # Rank-local prefix length of a global length g under round-robin helix pages
+    # (page b on rank b % cp_size); same arithmetic as helix_local_len_vec for g >= 0.
+    ledger = phys * cp_size
+    full = g // ledger
+    rem = g - full * ledger
+    return full * phys + tl.minimum(tl.maximum(rem - cp_rank * phys, 0), phys)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_pos",
+        "num_helix",
+        "kv_start",
+        "kv_count",
+        "bound_start",
+        "num_bound_seqs",
+        "tokens_per_seq",
+        "phys",
+        "cp_size",
+        "cp_rank",
+    ]
+)
+def _helix_spec_preprocess_kernel(
+    pos_ptr,
+    pos_off_ptr,
+    num_pos,
+    helix_pos_ptr,
+    helix_slots_ptr,
+    helix_bounds_ptr,
+    num_helix,
+    kv_lens_ptr,
+    kv_off_ptr,
+    kv_start,
+    kv_count,
+    bound_start,
+    num_bound_seqs,
+    tokens_per_seq,
+    phys,
+    cp_size,
+    cp_rank,
+    BLOCK: tl.constexpr,
+):
+    # Every element is read and written by the lane that owns its index, so the
+    # programs need no ordering between them.
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+
+    # position_ids[i] += pos_off[i]
+    m_pos = idx < num_pos
+    pos = tl.load(pos_ptr + idx, mask=m_pos, other=0)
+    off = tl.load(pos_off_ptr + idx, mask=m_pos, other=0)
+    tl.store(pos_ptr + idx, pos + off, mask=m_pos)
+
+    # helix positions += pos_off; per-token write slot (-1 when another rank owns the
+    # page) and attention bound; the last token of group s also sets the rank-local
+    # kv length kv_lens[bound_start + s] to its bound.
+    m_hx = idx < num_helix
+    hp = tl.load(helix_pos_ptr + idx, mask=m_hx, other=0) + tl.load(
+        pos_off_ptr + idx, mask=m_hx, other=0
+    )
+    tl.store(helix_pos_ptr + idx, hp, mask=m_hx)
+    active = ((hp // phys) % cp_size) == cp_rank
+    slot = tl.where(active, _helix_local_len(hp, phys, cp_size, cp_rank), -1)
+    bound = _helix_local_len(hp + 1, phys, cp_size, cp_rank)
+    tl.store(helix_slots_ptr + idx, slot, mask=m_hx)
+    tl.store(helix_bounds_ptr + idx, bound, mask=m_hx)
+    seq = idx // tokens_per_seq
+    m_last = m_hx & (idx - seq * tokens_per_seq == tokens_per_seq - 1) & (seq < num_bound_seqs)
+    tl.store(kv_lens_ptr + bound_start + seq, bound, mask=m_last)
+
+    # kv_lens[kv_start + j] += kv_off[j] where no group bound replaces it.
+    kv_i = kv_start + idx
+    m_kv = (idx < kv_count) & ((kv_i < bound_start) | (kv_i >= bound_start + num_bound_seqs))
+    kv = tl.load(kv_lens_ptr + kv_i, mask=m_kv, other=0)
+    tl.store(kv_lens_ptr + kv_i, kv + tl.load(kv_off_ptr + idx, mask=m_kv, other=0), mask=m_kv)
+
+
+def fused_helix_spec_preprocess(
+    position_ids: torch.Tensor,
+    pos_offsets: torch.Tensor,
+    helix_positions: torch.Tensor,
+    helix_slots: torch.Tensor,
+    helix_bounds: torch.Tensor,
+    kv_lens: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    kv_start: int,
+    bound_start: int,
+    tokens_per_seq: int,
+    phys: int,
+    cp_size: int,
+    cp_rank: int,
+) -> None:
+    """One kernel for the overlap correction + helix verify-group buffers of a decode step.
+
+    Same result as, in order: ``position_ids += pos_offsets[:n]``,
+    ``kv_lens[kv_start:kv_start + len(kv_offsets)] += kv_offsets``,
+    ``helix_positions += pos_offsets[:len(helix_positions)]`` and
+    ``TrtllmAttentionMetadata.recompute_helix_spec_buffers`` (write slots, attention
+    bounds, and ``kv_lens[bound_start + s]`` = bound of the last token of group s).
+    All buffers are contiguous int32 views; positions are non-negative.
+    """
+    num_pos = position_ids.numel()
+    num_helix = helix_positions.numel()
+    kv_count = kv_offsets.numel()
+    assert num_helix % tokens_per_seq == 0
+    num_bound_seqs = num_helix // tokens_per_seq
+    assert pos_offsets.numel() >= max(num_pos, num_helix)
+    assert helix_slots.numel() >= num_helix and helix_bounds.numel() >= num_helix
+    total = max(num_pos, num_helix, kv_count, num_bound_seqs, 1)
+    block = 256
+    _helix_spec_preprocess_kernel[(_cdiv(total, block),)](
+        position_ids,
+        pos_offsets,
+        num_pos,
+        helix_positions,
+        helix_slots,
+        helix_bounds,
+        num_helix,
+        kv_lens,
+        kv_offsets,
+        kv_start,
+        kv_count,
+        bound_start,
+        num_bound_seqs,
+        tokens_per_seq,
+        phys,
+        cp_size,
+        cp_rank,
+        BLOCK=block,
+    )
 
 
 class _PinnedArena:

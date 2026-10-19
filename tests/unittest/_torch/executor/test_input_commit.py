@@ -21,15 +21,19 @@ staged host->device copies, the overlap-scheduler gather sequence of
 """
 
 import random
+import types
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.input_commit import (
     InputCommit,
     active_input_commit,
     copy_batch_block_offsets_from_host,
+    fused_helix_spec_preprocess,
     input_commit_scope,
 )
 
@@ -255,3 +259,71 @@ def test_arena_reuse_waits_and_scope_restores() -> None:
     commit.begin()
     commit.abort()
     assert not commit.is_open
+
+
+@pytest.mark.parametrize("cp_rank", [0, 5, 15])
+@pytest.mark.parametrize(
+    "tokens_per_seq,num_seqs,num_contexts", [(7, 1, 0), (7, 2, 0), (8, 4, 0), (7, 32, 0), (8, 3, 1)]
+)
+def test_fused_helix_spec_preprocess_matches_eager_sequence(
+    cp_rank: int, tokens_per_seq: int, num_seqs: int, num_contexts: int
+) -> None:
+    """Same buffers as _preprocess_inputs' overlap correction + recompute_helix_spec_buffers."""
+    g = torch.Generator().manual_seed(cp_rank * 100 + tokens_per_seq * 10 + num_seqs)
+    phys, cp_size = 64, 16
+    num_gen = num_seqs * tokens_per_seq
+    max_tokens, max_seqs = num_gen + 16, num_seqs + num_contexts + 3
+    # Per-sequence base positions with consecutive verify-group positions.
+    base = torch.randint(0, 1_000_000, (num_seqs,), generator=g, dtype=torch.int32)
+    helix_pos = (base[:, None] + torch.arange(tokens_per_seq, dtype=torch.int32)).reshape(-1)
+    accepted = torch.randint(1, tokens_per_seq + 1, (num_seqs,), generator=g, dtype=torch.int32)
+    pos_off = torch.zeros(max_tokens, dtype=torch.int32)
+    pos_off[:num_gen] = accepted.repeat_interleave(tokens_per_seq)
+    kv_off = torch.zeros(max_seqs, dtype=torch.int32)
+    kv_off[:num_seqs] = accepted - tokens_per_seq
+    position_ids = torch.randint(0, 1_000_000, (1, max_tokens), generator=g, dtype=torch.int32)
+    kv_lens = torch.randint(0, 100_000, (max_seqs,), generator=g, dtype=torch.int32)
+    slots = torch.full((max_tokens,), -7, dtype=torch.int32)
+    bounds = torch.full((max_tokens,), -7, dtype=torch.int32)
+    helix_full = torch.full((max_tokens,), 3, dtype=torch.int32)
+    helix_full[:num_gen] = helix_pos
+    tensors = [position_ids, pos_off, kv_off, kv_lens, slots, bounds, helix_full]
+    ref = [t.cuda() for t in tensors]
+    got = [t.cuda() for t in tensors]
+
+    # Reference: the eager ops of _preprocess_inputs (num_ctx_tokens = 0 in a decode step).
+    r_pos, r_pos_off, r_kv_off, r_kv, r_slots, r_bounds, r_helix = ref
+    r_pos[0, :num_gen] += r_pos_off[:num_gen]
+    r_kv[num_contexts : num_contexts + num_seqs] += r_kv_off[:num_seqs]
+    r_helix[:num_gen] += r_pos_off[:num_gen]
+    md = SimpleNamespace(
+        helix_position_offsets=r_helix,
+        helix_local_slots=r_slots,
+        helix_kv_bounds=r_bounds,
+        kv_lens_cuda=r_kv,
+        num_contexts=num_contexts,
+        kv_cache_manager=SimpleNamespace(tokens_per_block=phys),
+        mapping=SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank),
+    )
+    md.helix_local_len_vec = types.MethodType(TrtllmAttentionMetadata.helix_local_len_vec, md)
+    TrtllmAttentionMetadata.recompute_helix_spec_buffers(md, 0, num_gen, tokens_per_seq)
+
+    g_pos, g_pos_off, g_kv_off, g_kv, g_slots, g_bounds, g_helix = got
+    fused_helix_spec_preprocess(
+        position_ids=g_pos[0, :num_gen],
+        pos_offsets=g_pos_off,
+        helix_positions=g_helix[:num_gen],
+        helix_slots=g_slots[:num_gen],
+        helix_bounds=g_bounds[:num_gen],
+        kv_lens=g_kv,
+        kv_offsets=g_kv_off[:num_seqs],
+        kv_start=num_contexts,
+        bound_start=num_contexts,
+        tokens_per_seq=tokens_per_seq,
+        phys=phys,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+    torch.cuda.synchronize()
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
