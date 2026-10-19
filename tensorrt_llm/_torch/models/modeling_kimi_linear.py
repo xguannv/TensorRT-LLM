@@ -114,6 +114,7 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..distributed.nvls_allreduce import NVLSAllReduce
+from ..distributed.ops import LamportResult
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
@@ -1026,6 +1027,12 @@ _K3_ATTN_RES_PDL_MAX_M = int(os.environ.get("TRTLLM_K3_ATTN_RES_PDL_MAX_M", "64"
 # (k3_fp8w_lowm_mxfp8) instead of quantizing the BF16 rows itself: bitwise the same projection,
 # generation-only batches where the projection runs the low-M kernel.
 _K3_ATTN_RES_MXFP8 = os.environ.get("TRTLLM_K3_ATTN_RES_MXFP8", "0") == "1"
+# TRTLLM_K3_AR_PUSH_AMID=1 (with TRTLLM_K3_AR_PUSH=1): where the mix after attention (A_mid) adds
+# the attention output to the running prefix sum, the attention block finishes its pushed o_proj
+# all-reduce in place (two-shot transport, no gather) and A_mid reads the result straight from the
+# MNNVL Lamport workspace (trtllm::k3_attn_res_add_rmsnorm_lamport): the same bits, one kernel
+# boundary and one copy of the rows fewer.
+_K3_AR_PUSH_AMID = os.environ.get("TRTLLM_K3_AR_PUSH_AMID", "0") == "1"
 
 
 class _DeferredMoEResidual(NamedTuple):
@@ -1077,6 +1084,61 @@ def _k3_attn_res_pdl(
         )
     return torch.ops.trtllm.k3_attn_res_add_rmsnorm(
         prefix_sum, addend, block_residual, *weights, eps, out_eps
+    )
+
+
+def _k3_attn_res_lamport_applies(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> bool:
+    """Whether A_mid on ``prefix_sum`` can read its addend from a Lamport workspace
+    (``TRTLLM_K3_AR_PUSH_AMID``): the vectorized PDL attn_res kernel serves the ADD_PREFIX mix."""
+    if (
+        not _K3_AR_PUSH_AMID
+        or not _K3_ATTN_RES_PDL
+        or torch.compiler.is_compiling()
+        or prefix_sum.shape[0] > _K3_ATTN_RES_PDL_MAX_M
+    ):
+        return False
+    from ..cute_dsl_kernels.blackwell import k3_attn_res
+
+    if k3_attn_res._EXACT:
+        return False
+    weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
+    return k3_attn_res.can_use_k3_attn_res(prefix_sum, (prefix_sum,), block_residual, *weights)
+
+
+def _k3_attn_res_pdl_lamport(
+    prefix_sum: torch.Tensor,
+    addend: LamportResult,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """``(prefix_sum + all-reduce result, normed mix)`` with the result read from the Lamport
+    workspace (``trtllm::k3_attn_res_add_rmsnorm_lamport``), or ``None`` if that does not apply."""
+    if tuple(addend.shape) != tuple(prefix_sum.shape) or not _k3_attn_res_lamport_applies(
+        prefix_sum, block_residual, proj, norm, output_norm
+    ):
+        return None
+    M, H = prefix_sum.shape
+    _note_attn_res_fusion(
+        "add+attn_res+norm/pdl/lamport", True, M, H, int(block_residual.shape[0]) + 1
+    )
+    return torch.ops.trtllm.k3_attn_res_add_rmsnorm_lamport(
+        prefix_sum,
+        addend.workspace.uc_local,
+        addend.workspace.flags.data_ptr(),
+        block_residual,
+        proj.weight.reshape(-1),
+        norm.weight,
+        output_norm.weight,
+        float(norm.eps),
+        _rms_norm_eps(output_norm),
     )
 
 
@@ -1339,7 +1401,18 @@ def _apply_attn_res_add_and_rmsnorm(
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Add an attention output to the running residual, then select and norm."""
+    """Add an attention output to the running residual, then select and norm.
+
+    ``addend`` may be a ``LamportResult`` (``TRTLLM_K3_AR_PUSH_AMID``): the attention block's
+    all-reduce result left in the MNNVL workspace, read in place where the PDL attn_res kernel
+    serves the mix and gathered into a tensor otherwise."""
+    if isinstance(addend, LamportResult):
+        fused = _k3_attn_res_pdl_lamport(
+            prefix_sum, addend, block_residual, proj, norm, output_norm
+        )
+        if fused is not None:
+            return fused
+        addend = addend.materialize()
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_add_rmsnorm_fused(
             prefix_sum, addend, block_residual, proj, norm, output_norm
@@ -3733,6 +3806,9 @@ class KimiMLARuntime(nn.Module):
             if reduce_output
             else None
         )
+        # Set by the decoder layer for one forward (TRTLLM_K3_AR_PUSH_AMID): a pushed o_proj
+        # all-reduce may be finished in place and returned as a LamportResult.
+        self.ar_result_in_place = False
         attention_config = copy.copy(model_config)
         attention_config._frozen = False
         attention_config.quant_config_dict = {
@@ -3812,7 +3888,11 @@ class KimiMLARuntime(nn.Module):
         if ar_push is not None:
             o_proj.next_ar_push = None
         if ar_push is not None and ar_push.pushed:
-            out = self._o_allreduce.finish_lamport_push(ar_push).view(out.shape)
+            # TRTLLM_K3_AR_PUSH_AMID: the result may stay in the workspace for A_mid.
+            out_shape = out.shape
+            out = self._o_allreduce.finish_lamport_push(ar_push, in_place=self.ar_result_in_place)
+            if not isinstance(out, LamportResult):
+                out = out.view(out_shape)
         elif self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -4033,6 +4113,20 @@ class KimiLinearDecoderLayer(nn.Module):
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
 
+        # TRTLLM_K3_AR_PUSH_AMID: when A_mid below adds the attention output to the prefix sum,
+        # the attention block may hand back its all-reduce result in place (a LamportResult).
+        # A_mid must read it before the next all-reduce on the workspace re-arms that buffer:
+        # the shared expert, whose down-projection all-reduce is the next one, forks after A_mid,
+        # and its pushed finish kernel can only become resident once its producer has passed its
+        # own griddepcontrol.wait (every grid before, A_mid included, has then completed).
+        attn = self.linear_attn if self.is_kda else self.self_attn
+        attn.ar_result_in_place = prefix_sum is not None and _k3_attn_res_lamport_applies(
+            prefix_sum,
+            valid_block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.post_attention_layernorm,
+        )
         if self.is_kda:
             if attn_input_mxfp8:
                 self.linear_attn.next_input_mxfp8 = tuple(attn_input_mxfp8)
@@ -4041,6 +4135,7 @@ class KimiLinearDecoderLayer(nn.Module):
             if attn_input_mxfp8:
                 self.self_attn.mixer.next_input_mxfp8 = tuple(attn_input_mxfp8)
             hidden_states = self.self_attn(hidden_states, attn_metadata)
+        attn.ar_result_in_place = False
 
         if prefix_sum is None:
             prefix_sum = hidden_states

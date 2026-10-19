@@ -33,6 +33,7 @@ from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
+from ...distributed.ops import LamportResult
 from ...model_config import ModelConfig
 from ...modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..linear import Linear
@@ -318,6 +319,9 @@ class KimiKDALinearAttention(nn.Module):
             if self._kda_tp_size > 1
             else None
         )
+        # Set by the decoder layer for one forward (TRTLLM_K3_AR_PUSH_AMID): a pushed o_proj
+        # all-reduce may be finished in place and returned as a LamportResult.
+        self.ar_result_in_place = False
 
         num_heads = lin["num_heads"]
         if num_heads % self._kda_tp_size != 0:
@@ -680,7 +684,12 @@ class KimiKDALinearAttention(nn.Module):
         if ar_push is not None:
             self.o_proj.next_ar_push = None
         if ar_push is not None and ar_push.pushed:
-            out = self._o_allreduce.finish_lamport_push(ar_push).view(out.shape)
+            # The decoder layer sets ar_result_in_place where A_mid reads the result from the
+            # Lamport workspace (TRTLLM_K3_AR_PUSH_AMID): then this returns a LamportResult.
+            out_shape = out.shape
+            out = self._o_allreduce.finish_lamport_push(ar_push, in_place=self.ar_result_in_place)
+            if not isinstance(out, LamportResult):
+                out = out.view(out_shape)
         elif self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
