@@ -4552,3 +4552,320 @@ def test_nvfp4_moe_lowm_blackwell(num_tokens, shape, launch, monkeypatch):
         out = fc2(lowm, token_final_scales).double()
         err = (out - exact).abs()
         assert bool((err <= bound).all()), f"lowm={lowm}: max err/bound {(err / bound).max()}"
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize(
+    "shape",
+    [(3584, 768, 896, 224, 224, 16), (1024, 256, 64, 16, 0, 8)],
+    ids=["k3_tp4ep4", "small"],
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 14, 32])
+@pytest.mark.parametrize(
+    "launch",
+    [("", ""), ("100", "2"), ("8:120,16:96,32:136", "4")],
+    ids=["ctas_max", "ctas_100_chunk2", "ctas_per_tile_chunk4"],
+)
+def test_nvfp4_moe_lowm_dyn_blackwell(num_tokens, shape, launch, monkeypatch):
+    """Fused small-batch MoE kernel (TRTLLM_MOE_LOWM_DYN=1: FC1 + SiTU + FC2 + finalize in one
+    dynamically scheduled grid) vs the regular gather (FC1, SiTU) and finalize (FC2) kernels.
+    ``launch`` = (persistent CTAs, TRTLLM_MOE_LOWM_DYN_CTAS, empty = one per SM; W2 blocks per FC2
+    work unit, TRTLLM_MOE_LOWM_DYN_FC2_CHUNK).
+
+    FC1: the quantized rows and scale factors of every valid permuted row are bit-identical. FC2:
+    with one non-zero top-k scale per token every output element is one partial and must be
+    bit-identical; with all scales the partials are added in BF16 in an unspecified order, which
+    must stay within the BF16 accumulation bound of the exact sum of the partials. The kernel
+    zeroes the output itself (it starts filled with a non-zero value). The work and tile counters
+    are zero after every launch, also over CUDA graph replays.
+    """
+    hidden_size, interm_size, num_experts, num_local_experts, local_expert_offset, top_k = shape
+    ctas, chunk = launch
+    monkeypatch.setenv("TRTLLM_MOE_LOWM", "0")
+    monkeypatch.setenv("TRTLLM_MOE_LOWM_DYN_CTAS", ctas)
+    monkeypatch.setenv("TRTLLM_MOE_LOWM_DYN_FC2_CHUNK", chunk)
+    sf_vec_size = 16
+    torch.manual_seed(2000 + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    # at least one token on this rank
+    token_selected_experts[0, 0] = local_expert_offset
+    t2g, t2lim, _, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=128,
+    )
+    m = p2e.size(0)
+    num_tiles = int(nnet.item())
+    limits = t2lim[:num_tiles].tolist()
+    rows = torch.tensor(
+        [r for t in range(num_tiles) for r in range(t * 128, limits[t])], device="cuda"
+    )
+
+    def quantize(t):
+        gsf = t.abs().max().float() / (448 * 6)
+        q, sf = torch.ops.trtllm.fp4_quantize(t, 1 / gsf, sf_vec_size, False)
+        return q, sf, gsf
+
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    x, x_sf, x_gsf = quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    w1 = torch.randn(
+        num_local_experts, 2 * interm_size, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    w1, w1_sf, w1_gsf = quantize(w1)
+    w1_sf = w1_sf.view(num_local_experts, 2 * interm_size, hidden_size // sf_vec_size)
+    alpha1 = (torch.linspace(0.5, 1.5, num_local_experts, device="cuda") * (x_gsf * w1_gsf)).float()
+    fc2_input_scale = torch.tensor([448 * 6 / 4.0], dtype=torch.float32, device="cuda")
+    w2 = torch.randn(
+        num_local_experts, hidden_size, interm_size, device="cuda", dtype=torch.bfloat16
+    )
+    w2, w2_sf, w2_gsf = quantize(w2)
+    w2_sf = w2_sf.view(num_local_experts, hidden_size, interm_size // sf_vec_size)
+    alpha2 = (
+        torch.linspace(0.5, 1.5, num_local_experts, device="cuda") * (w2_gsf / fc2_input_scale[0])
+    ).float()
+
+    # reference: the regular gather (FC1) and finalize (FC2) kernels
+    c_ref, c_sf_ref = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+        x.view(torch.float4_e2m1fn_x2),
+        w1.view(torch.float4_e2m1fn_x2),
+        x_sf.view(torch.uint8),
+        w1_sf.view(torch.uint8),
+        alpha1,
+        t2g,
+        t2lim,
+        p2e,
+        nnet,
+        fc2_input_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        tile_size=128,
+        scaling_vector_size=sf_vec_size,
+        activation_type=ActivationType.SiTu,
+        situ_beta=SITU_BETA,
+        situ_linear_beta=SITU_LINEAR_BETA,
+    )
+    c_ref, c_sf_ref = c_ref.view(torch.uint8), c_sf_ref.view(torch.uint8)
+    args = (num_experts, top_k, num_local_experts, local_expert_offset)
+    out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    fc2_inputs = [
+        c_ref.view(torch.float4_e2m1fn_x2),
+        w2.view(torch.float4_e2m1fn_x2),
+        c_sf_ref.flatten(),
+        w2_sf.view(torch.uint8),
+        alpha2,
+        out,
+        t2g,
+        t2lim,
+        p2e,
+        nnet,
+    ]
+    runner = cute_dsl_custom_ops.K3MoeLowMDynRunner(top_k, SITU_BETA, SITU_LINEAR_BETA)
+    counters = runner.new_counters(torch.device("cuda"))
+    h = torch.zeros(m, interm_size // 2, dtype=torch.uint8, device="cuda")
+    h_sf = torch.zeros(m * interm_size // sf_vec_size, dtype=torch.uint8, device="cuda")
+
+    def dyn(scales):
+        out.fill_(7.0)  # the kernel zeroes the output itself
+        runner.run(
+            x.view(torch.float4_e2m1fn_x2),
+            x_sf.view(torch.uint8),
+            w1.view(torch.float4_e2m1fn_x2),
+            w1_sf.view(torch.uint8),
+            alpha1,
+            w2.view(torch.float4_e2m1fn_x2),
+            w2_sf.view(torch.uint8),
+            alpha2,
+            out,
+            t2g,
+            t2lim,
+            p2e,
+            nnet,
+            fc2_input_scale,
+            scales,
+            counters,
+            h=h,
+            h_sf=h_sf,
+        )
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0, "counters not reset"
+        return out.clone()
+
+    partials = []
+    for slot in range(top_k):
+        one_hot = torch.zeros_like(token_final_scales)
+        one_hot[:, slot] = token_final_scales[:, slot]
+        ref = _finalize_inplace(fc2_inputs + [one_hot], *args)
+        new = dyn(one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"FC2 slot {slot}"
+        partials.append(ref.double())
+        if slot == 0:
+            assert torch.equal(c_ref[rows], h[rows]), "FC1 output rows differ"
+            assert (h[rows] != 0).any(), "FC1 output is all zero"
+            sf_cols = interm_size // sf_vec_size
+            sf_ref = unswizzle_sf(c_sf_ref, m, interm_size, sf_vec_size).view(m, sf_cols)
+            sf_new = unswizzle_sf(h_sf, m, interm_size, sf_vec_size).view(m, sf_cols)
+            assert torch.equal(sf_ref[rows], sf_new[rows]), "FC1 output scale factors differ"
+    exact = torch.stack(partials).sum(0)
+    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+
+    def check(result, what):
+        err = (result.double() - exact).abs()
+        assert bool((err <= bound).all()), f"{what}: max err/bound {(err / bound).max()}"
+
+    check(dyn(token_final_scales), "runner")
+
+    # the custom op, eagerly and replayed from a CUDA graph
+    def op():
+        torch.ops.trtllm.cute_dsl_nvfp4_moe_lowm_dyn_inplace_blackwell(
+            input=x.view(torch.float4_e2m1fn_x2),
+            input_scale=x_sf.view(torch.uint8),
+            weight1=w1.view(torch.float4_e2m1fn_x2),
+            weight1_scale=w1_sf.view(torch.uint8),
+            alpha1=alpha1,
+            weight2=w2.view(torch.float4_e2m1fn_x2),
+            weight2_scale=w2_sf.view(torch.uint8),
+            alpha2=alpha2,
+            output=out,
+            tile_idx_to_group_idx=t2g,
+            tile_idx_to_mn_limit=t2lim,
+            permuted_idx_to_expanded_idx=p2e,
+            num_non_exiting_tiles=nnet,
+            global_sf=fc2_input_scale,
+            token_final_scales=token_final_scales,
+            counters=counters,
+            top_k=top_k,
+            situ_beta=SITU_BETA,
+            situ_linear_beta=SITU_LINEAR_BETA,
+        )
+
+    out.fill_(7.0)
+    op()
+    torch.cuda.synchronize()
+    check(out, "op")
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=capture_stream):
+        op()
+    for replay in range(3):
+        out.fill_(7.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(out, f"graph replay {replay}")
+        assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.parametrize("num_tokens", [7, 14, 32])
+def test_cute_dsl_moe_lowm_dyn_backend_dispatch(num_tokens, monkeypatch):
+    """``CuteDslFusedMoE.run_moe_nvfp4_impl`` with TRTLLM_MOE_LOWM_DYN (the fused kernel, which also
+    zeroes the output) vs without (output memset + small-batch FC1 + FC2): with one non-zero top-k
+    scale per token the outputs are bit-identical, with all scales within the BF16 accumulation
+    bound. Also checks the dispatch: the fused kernel's counters are created and the regular
+    memset path is not taken."""
+    hidden_size, interm_size, num_experts, num_local_experts, local_expert_offset, top_k = (
+        3584,
+        768,
+        896,
+        224,
+        224,
+        16,
+    )
+    sf_vec_size = 16
+    monkeypatch.setenv("TRTLLM_MOE_LOWM", "1")
+    torch.manual_seed(3000 + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    token_selected_experts[0, 0] = local_expert_offset
+
+    def quantize(t):
+        gsf = t.abs().max().float() / (448 * 6)
+        q, sf = torch.ops.trtllm.fp4_quantize(t, 1 / gsf, sf_vec_size, False)
+        return q, sf, gsf
+
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    x, x_sf, x_gsf = quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    w1 = torch.randn(
+        num_local_experts, 2 * interm_size, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    w1, w1_sf, w1_gsf = quantize(w1)
+    w2 = torch.randn(
+        num_local_experts, hidden_size, interm_size, device="cuda", dtype=torch.bfloat16
+    )
+    w2, w2_sf, w2_gsf = quantize(w2)
+    fc2_input_scale = torch.tensor([448 * 6 / 4.0], dtype=torch.float32, device="cuda")
+    weight_view = SimpleNamespace(
+        w3_w1_weight=w1.view(num_local_experts, 2 * interm_size, hidden_size // 2),
+        fc1_weight_scale=w1_sf.view(num_local_experts, 2 * interm_size, -1),
+        fc1_global_scale=(
+            torch.linspace(0.5, 1.5, num_local_experts, device="cuda") * (x_gsf * w1_gsf)
+        ).float(),
+        w2_weight=w2.view(num_local_experts, hidden_size, interm_size // 2),
+        fc2_weight_scale=w2_sf.view(num_local_experts, hidden_size, -1),
+        fc2_global_scale=(
+            torch.linspace(0.5, 1.5, num_local_experts, device="cuda")
+            * (w2_gsf / fc2_input_scale[0])
+        ).float(),
+        expert_size_per_partition=num_local_experts,
+        slot_start=local_expert_offset,
+    )
+
+    def run(dyn, scales):
+        backend = SimpleNamespace(
+            num_slots=num_experts,
+            use_fused_finalize=True,
+            activation_type=ActivationType.SiTu,
+            scaling_vector_size=sf_vec_size,
+            lowm_dyn_max_tokens=32 if dyn else 0,
+            _lowm_dyn_counters=None,
+            _join_pending_x_ready=lambda: None,
+            _has_moe_output_memset_aux_stream=lambda: False,
+            fc2_input_scale=fc2_input_scale,
+            situ_beta=SITU_BETA,
+            situ_linear_beta=SITU_LINEAR_BETA,
+            swiglu_limit_scalar=float("inf"),
+            post_fc1_event=None,
+            mapping=SimpleNamespace(moe_ep_size=4),
+        )
+        out = torch.full((num_tokens, hidden_size), 5.0, dtype=torch.bfloat16, device="cuda")
+        CuteDslFusedMoE.run_moe_nvfp4_impl(
+            backend, x, token_selected_experts, scales, x_sf.view(torch.uint8), out, weight_view
+        )
+        torch.cuda.synchronize()
+        assert (backend._lowm_dyn_counters is not None) == dyn
+        if dyn:
+            assert int(backend._lowm_dyn_counters.abs().sum().item()) == 0
+        return out
+
+    partials = []
+    for slot in range(top_k):
+        one_hot = torch.zeros_like(token_final_scales)
+        one_hot[:, slot] = token_final_scales[:, slot]
+        ref = run(False, one_hot)
+        new = run(True, one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"slot {slot}"
+        partials.append(ref.double())
+    exact = torch.stack(partials).sum(0)
+    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+    for dyn in (False, True):
+        err = (run(dyn, token_final_scales).double() - exact).abs()
+        assert bool((err <= bound).all()), f"dyn={dyn}: max err/bound {(err / bound).max()}"

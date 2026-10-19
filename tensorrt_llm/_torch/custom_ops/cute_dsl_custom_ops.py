@@ -131,6 +131,21 @@ _MOE_LOWM_FC2_CTAS_ENV = "TRTLLM_MOE_LOWM_FC2_CTAS"
 # "<n_tok>:<mode>,..." per token tile. Unset (or a tile not listed): "last" with
 # TRTLLM_MOE_LOWM_FC1_SMEM_KB, "wait" otherwise.
 _MOE_LOWM_FC1_TRIGGER_ENV = "TRTLLM_MOE_LOWM_FC1_TRIGGER"
+# TRTLLM_MOE_LOWM_DYN=1 (with TRTLLM_MOE_LOWM): the small-batch FC1 and FC2 run as one persistent grid
+# that hands out their work units dynamically (cute_dsl_kernels/blackwell/k3_moe_lowm_dyn.py): no wave
+# tail at the end of FC1, no grid boundary between FC1 and FC2, every SM streams weights until the end.
+# FC1's output is bit-identical and every FC2 partial is bit-identical (added in an unspecified order,
+# as with the two small-batch kernels). TRTLLM_MOE_LOWM_DYN_CTAS: its persistent CTAs ("<N>" or
+# "<n_tok>:<N>,..."; default one per SM); TRTLLM_MOE_LOWM_DYN_FC2_CHUNK: 128-row W2 blocks per FC2
+# work unit ("<N>" or "<n_tok>:<N>,..."; default 1).
+_MOE_LOWM_DYN_ENV = "TRTLLM_MOE_LOWM_DYN"
+_MOE_LOWM_DYN_CTAS_ENV = "TRTLLM_MOE_LOWM_DYN_CTAS"
+_MOE_LOWM_DYN_FC2_CHUNK_ENV = "TRTLLM_MOE_LOWM_DYN_FC2_CHUNK"
+# Weight ring stages of the fused kernel ("<N>" or "<n_tok>:<N>,..."; default 6 for up to 16 tokens:
+# fewer bytes in flight per SM shorten the latency of each unit, so FC2 finds its tiles ready sooner,
+# at the same aggregate rate; as many as fit for 32 tokens).
+_MOE_LOWM_DYN_STAGES_ENV = "TRTLLM_MOE_LOWM_DYN_STAGES"
+_MOE_LOWM_DYN_DEFAULT_STAGES = ((8, 6), (16, 6))
 
 
 def _moe_lowm_max_tokens() -> int:
@@ -138,6 +153,14 @@ def _moe_lowm_max_tokens() -> int:
     if os.environ.get(_MOE_LOWM_ENV, "0") != "1":
         return 0
     return max(0, min(int(os.environ.get(_MOE_LOWM_MAX_TOKENS_ENV, "32")), 32))
+
+
+def moe_lowm_dyn_max_tokens() -> int:
+    """Largest token count served by the fused small-batch MoE kernel (TRTLLM_MOE_LOWM_DYN; 0:
+    disabled)."""
+    if os.environ.get(_MOE_LOWM_DYN_ENV, "0") != "1":
+        return 0
+    return _moe_lowm_max_tokens()
 
 
 def _moe_lowm_fc1_smem_bytes() -> int:
@@ -722,6 +745,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                           K3MoeFc2LowMKernel)
     from ..cute_dsl_kernels.blackwell.k3_moe_lowm import \
         n_tok_for as k3_moe_lowm_n_tok_for
+    from ..cute_dsl_kernels.blackwell.k3_moe_lowm_dyn import (
+        K3MoeLowMDynKernel, counter_words)
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
@@ -4268,6 +4293,195 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=input_scale.dtype,
                                    device=input_scale.device)
         return output, output_scale
+
+    class K3MoeLowMDynRunner:
+        """TRTLLM_MOE_LOWM_DYN: the small-batch NVFP4 routed MoE (FC1 + SiTU + NVFP4 quantization
+        + FC2 + finalize) as one dynamically scheduled persistent grid (k3_moe_lowm_dyn.py)."""
+
+        kernel_cache = dict()
+        #: Tiles the counter buffer of a caller holds (``counter_words(MAX_TILES)`` int32 zeros).
+        MAX_TILES = 4096
+
+        def __init__(self, top_k: int, situ_beta: float,
+                     situ_linear_beta: float):
+            self.top_k = top_k
+            self.situ_beta = situ_beta
+            self.situ_linear_beta = situ_linear_beta
+            self.ctas = _moe_lowm_ctas(_MOE_LOWM_DYN_CTAS_ENV)
+            self.fc2_chunks = _moe_lowm_ctas(_MOE_LOWM_DYN_FC2_CHUNK_ENV)
+            self.stages = (_MOE_LOWM_DYN_DEFAULT_STAGES +
+                           _moe_lowm_ctas(_MOE_LOWM_DYN_STAGES_ENV))
+
+        @staticmethod
+        def applies(num_tokens: int, n1: int, k1: int, tile_size: int,
+                    scaling_vector_size: int, max_tokens: int) -> bool:
+            """Whether the fused kernel serves ``num_tokens`` tokens of W1 [n1, k1] experts."""
+            return (0 < num_tokens <= max_tokens and tile_size == 128
+                    and scaling_vector_size == 16 and n1 % 256 == 0
+                    and (n1 // 2) % 256 == 0 and k1 % 256 == 0)
+
+        @classmethod
+        def new_counters(cls, device: torch.device) -> torch.Tensor:
+            """A zeroed counter buffer (work, exit and per-tile counters) for one caller: every
+            launch leaves it zero again; launches that share it must be stream-ordered."""
+            return torch.zeros(counter_words(cls.MAX_TILES),
+                               dtype=torch.int32,
+                               device=device)
+
+        def _max_stages(self, n_tok: int) -> int:
+            """Cap on the weight ring stages (the kernel fits as many as shared memory allows)."""
+            stages = 16
+            for key, value in self.stages:
+                if key in (0, n_tok) and value > 0:
+                    stages = value
+            return stages
+
+        def _fc2_chunk(self, n_tok: int) -> int:
+            """Requested W2 blocks per FC2 unit (the kernel reduces it to what fits)."""
+            chunk = 1
+            for key, value in self.fc2_chunks:
+                if key in (0, n_tok) and value > 0:
+                    chunk = value
+            return chunk
+
+        def run(self, x: torch.Tensor, x_sf: torch.Tensor, w1: torch.Tensor,
+                w1_sf: torch.Tensor, alpha1: torch.Tensor, w2: torch.Tensor,
+                w2_sf: torch.Tensor, alpha2: torch.Tensor, out: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor, global_sf: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                counters: torch.Tensor,
+                h: Optional[torch.Tensor] = None,
+                h_sf: Optional[torch.Tensor] = None) -> None:
+            """``counters``: from :meth:`new_counters`; ``h`` / ``h_sf``: buffers of the FC1 output
+            (the gather kernel's ``c`` / ``c_sf`` layout), allocated here when not given."""
+            orig_m = x.size(0)
+            num_local, n1 = w1.size(0), w1.size(1)
+            k1 = w2.size(1)
+            k2 = n1 // 2
+            m = permuted_idx_to_expanded_idx.size(0)
+            assert m // 128 <= self.MAX_TILES, f"{m // 128} tiles exceed the counter buffer"
+            n_tok = k3_moe_lowm_n_tok_for(orig_m)
+            num_ctas = _moe_lowm_grid(self.ctas, n_tok)
+            chunk = self._fc2_chunk(n_tok)
+            max_stages = self._max_stages(n_tok)
+            if h is None:
+                h = torch.empty(m, k2 // 2, dtype=torch.uint8, device=x.device)
+            if h_sf is None:
+                h_sf = torch.empty(m * k2 // 16,
+                                   dtype=torch.uint8,
+                                   device=x.device)
+            assert counters.numel() >= counter_words(m // 128)
+            ctr = counters
+
+            def ptr(dtype, t, align=None):
+                if align is None:
+                    return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem)
+                return make_ptr(dtype,
+                                t.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=align)
+
+            ptrs = [
+                ptr(cutlass.Float4E2M1FN, x, 32),
+                ptr(cutlass.Float4E2M1FN, w1, 32),
+                ptr(cutlass.Float8E4M3FN, x_sf, 16),
+                ptr(cutlass.Float8E4M3FN, w1_sf, 16),
+                ptr(cutlass.Float4E2M1FN, h, 32),
+                ptr(cutlass.Float8E4M3FN, h_sf, 16),
+                ptr(cutlass.Float32, alpha1),
+                ptr(cutlass.Float4E2M1FN, w2, 32),
+                ptr(cutlass.Float8E4M3FN, w2_sf, 16),
+                ptr(cutlass.Float32, alpha2),
+                ptr(cutlass.BFloat16, out, 16),
+                ptr(cutlass.Int32, tile_idx_to_group_idx),
+                ptr(cutlass.Int32, tile_idx_to_mn_limit),
+                ptr(cutlass.Int32, permuted_idx_to_expanded_idx),
+                ptr(cutlass.Int32, num_non_exiting_tiles),
+                ptr(cutlass.Float32, global_sf),
+                ptr(cutlass.Float32, token_final_scales),
+                ptr(cutlass.Int32, ctr),
+            ]
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            cache_key = (n_tok, n1, k1, self.top_k, self.situ_beta,
+                         self.situ_linear_beta, num_ctas, chunk, max_stages)
+            compiled = self.__class__.kernel_cache.get(cache_key)
+            if compiled is None:
+                kernel = K3MoeLowMDynKernel(n_tok,
+                                            n1,
+                                            k1,
+                                            self.top_k,
+                                            self.situ_beta,
+                                            self.situ_linear_beta,
+                                            fc2_chunk=chunk,
+                                            max_ab_stage=max_stages,
+                                            use_pdl=TRTLLM_ENABLE_PDL)
+                compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m,
+                                        num_local, num_ctas, stream)
+                self.__class__.kernel_cache[cache_key] = compiled
+            compiled(*ptrs, orig_m, m, num_local, stream)
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_moe_lowm_dyn_inplace_blackwell",
+        mutates_args=("output", "counters"),
+        device_types="cuda")
+    def cute_dsl_nvfp4_moe_lowm_dyn_inplace_blackwell(
+        input: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight1: torch.Tensor,
+        weight1_scale: torch.Tensor,
+        alpha1: torch.Tensor,
+        weight2: torch.Tensor,
+        weight2_scale: torch.Tensor,
+        alpha2: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        counters: torch.Tensor,
+        top_k: int,
+        situ_beta: float,
+        situ_linear_beta: float,
+    ) -> None:
+        """Routed NVFP4 MoE of at most 32 tokens with a SiTU activation in one kernel: writes the
+        sum of this rank's experts' weighted down-projections into ``output`` (zeroed by the
+        kernel; TRTLLM_MOE_LOWM_DYN; same results as the memset + gather FC1 + finalize FC2 ops).
+        ``counters``: the caller's buffer from ``K3MoeLowMDynRunner.new_counters``."""
+        K3MoeLowMDynRunner(top_k, situ_beta, situ_linear_beta).run(
+            input, input_scale, weight1, weight1_scale, alpha1, weight2,
+            weight2_scale, alpha2, output, tile_idx_to_group_idx,
+            tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles, global_sf, token_final_scales, counters)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_moe_lowm_dyn_inplace_blackwell")
+    def _fake_moe_lowm_dyn(
+        input: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight1: torch.Tensor,
+        weight1_scale: torch.Tensor,
+        alpha1: torch.Tensor,
+        weight2: torch.Tensor,
+        weight2_scale: torch.Tensor,
+        alpha2: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        global_sf: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        counters: torch.Tensor,
+        top_k: int,
+        situ_beta: float,
+        situ_linear_beta: float,
+    ) -> None:
+        return None
 
     _INDEXER_Q_CUTEDSL_TUNING_BUCKETS = (
         4,

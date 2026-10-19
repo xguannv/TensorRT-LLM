@@ -27,11 +27,12 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
 from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
+    GroupedGemmInputsHelper, K3MoeLowMDynRunner,
     Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+    moe_lowm_dyn_max_tokens)
 from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
 from ...model_config import ModelConfig, QuantConfig
 from ...ugpu.autotune import \
@@ -790,6 +791,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # the next run_moe_nvfp4_impl call and cleared: work ordered after it
         # runs beside FC2.
         self.post_fc1_event: Optional[torch.cuda.Event] = None
+        # TRTLLM_MOE_LOWM_DYN: up to this many tokens, FC1 and FC2 run as one fused small-batch
+        # kernel (0: off), with this layer's own counter buffer (created on first use).
+        self.lowm_dyn_max_tokens = moe_lowm_dyn_max_tokens()
+        self._lowm_dyn_counters: Optional[torch.Tensor] = None
 
         self.scaling_vector_size = 16
         self.quant_config = override_quant_config if override_quant_config is not None else self.quant_config
@@ -1153,6 +1158,47 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 local_num_experts=esp,
                 tile_tokens_dim=tile_size,
             )
+
+        # TRTLLM_MOE_LOWM_DYN: FC1 + SiTU + FC2 + finalize in one dynamically scheduled grid, which
+        # also zeroes the output (no memset, no stream join before it).
+        use_lowm_dyn = (self.use_fused_finalize and not use_rubin
+                        and not enable_alltoall
+                        and self.activation_type == ActivationType.SiTu
+                        and K3MoeLowMDynRunner.applies(
+                            x.size(0), weight_view.w3_w1_weight.size(1),
+                            weight_view.w2_weight.size(1), tile_size,
+                            self.scaling_vector_size,
+                            self.lowm_dyn_max_tokens))
+        if use_lowm_dyn:
+            self._join_pending_x_ready()
+            if self._lowm_dyn_counters is None:
+                self._lowm_dyn_counters = K3MoeLowMDynRunner.new_counters(
+                    x.device)
+            torch.ops.trtllm.cute_dsl_nvfp4_moe_lowm_dyn_inplace_blackwell(
+                input=x.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight1=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+                weight1_scale=weight_view.fc1_weight_scale.view(torch.uint8),
+                alpha1=weight_view.fc1_global_scale,
+                weight2=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
+                weight2_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+                alpha2=weight_view.fc2_global_scale,
+                output=moe_output,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                global_sf=self.fc2_input_scale,
+                token_final_scales=token_final_scales,
+                counters=self._lowm_dyn_counters,
+                top_k=effective_top_k,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+            )
+            if self.post_fc1_event is not None:
+                self.post_fc1_event.record()
+                self.post_fc1_event = None
+            return moe_output
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
         if self.use_fused_finalize and has_aux_streams:
