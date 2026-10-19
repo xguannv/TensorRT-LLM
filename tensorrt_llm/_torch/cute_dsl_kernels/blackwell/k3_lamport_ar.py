@@ -465,6 +465,7 @@ class K3LamportFinishKernel:
         use_pdl: bool,
         wait_first: bool = False,
         cpp_one_shot: bool | None = None,
+        gather: bool = True,
     ):
         if hidden % 8:
             raise ValueError(f"hidden={hidden} must be a multiple of 8")
@@ -472,11 +473,14 @@ class K3LamportFinishKernel:
             cpp_one_shot = one_shot
         if cpp_one_shot and not one_shot:
             raise ValueError("the two-shot transport cannot reproduce the one-shot result")
+        if not gather and one_shot:
+            raise ValueError("only the two-shot transport leaves its result in the workspace")
         self.W = world
         self.H = hidden
         self.one_shot = one_shot
         self.use_pdl = use_pdl
         self.wait_first = wait_first
+        self.gather = gather
         self.vecs = hidden // 8
         self.cols = _ceil_div(self.vecs, THREADS)
         # Ranks per partial sum and the output sanitization of the reproduced C++ kernel.
@@ -603,7 +607,7 @@ class K3LamportFinishKernel:
                         gtid,
                         nthreads,
                     )
-            if cutlass.const_expr(not self.one_shot):
+            if cutlass.const_expr(not self.one_shot and self.gather):
                 if v < self.vecs:
                     src = (
                         stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * H + v * 8) * 2
@@ -670,6 +674,23 @@ def _stream() -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
+@cute.jit
+def poll_result_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, hidden: int):
+    """16 bytes at ``byte_off`` of row ``tok`` of the result of the two-shot all-reduce that
+    completed last on the workspace (run without the gather), polled until they arrived.
+
+    For a consumer that runs after the finish kernel (after its own ``griddepcontrol.wait``):
+    the finish kernel has then advanced the rotation, so the call's buffer is the state's dirty
+    one; the next all-reduce on the workspace clears it, so only a consumer ordered before that
+    call may read it."""
+    f = ld_volatile_v4(flags)
+    row = stage_addr(uc_local, f[1], Int32(1), 2, f[2]) + Int64(tok * hidden) * 2
+    w = ld_volatile_v4(row + Int64(byte_off))
+    while clean4(*w) == 0:
+        w = ld_volatile_v4(row + Int64(byte_off))
+    return w
+
+
 @functools.cache
 def _compiled_finish(
     world: int,
@@ -678,8 +699,11 @@ def _compiled_finish(
     use_pdl: bool,
     wait_first: bool = False,
     cpp_one_shot: bool | None = None,
+    gather: bool = True,
 ):
-    kernel = K3LamportFinishKernel(world, hidden, one_shot, use_pdl, wait_first, cpp_one_shot)
+    kernel = K3LamportFinishKernel(
+        world, hidden, one_shot, use_pdl, wait_first, cpp_one_shot, gather
+    )
     a = Int64(1 << 20)
     return cute.compile(kernel, a, a, a, a, Int32(1), Int32(0), _stream())
 
@@ -745,14 +769,33 @@ def run_lamport_finish(
     return out
 
 
+def run_lamport_finish_in_place(
+    ws: LamportWorkspace, num_tokens: int, hidden: int, use_pdl: bool = True
+) -> None:
+    """Two-shot finish without the gather: the result of the pushed call stays in every rank's
+    broadcast stage, where a consumer that runs next reads it with :func:`poll_result_v4`."""
+    _check(ws, num_tokens, hidden, False)
+    _compiled_finish(ws.world, hidden, False, use_pdl, False, False, False)(
+        Int64(ws.uc_local),
+        Int64(ws.mc_base),
+        Int64(ws.flags.data_ptr()),
+        Int64(0),
+        Int32(num_tokens),
+        Int32(ws.rank),
+        _stream(),
+    )
+
+
 __all__ = [
     "K3LamportFinishKernel",
     "K3LamportPushKernel",
     "LamportWorkspace",
     "one_shot_for",
+    "poll_result_v4",
     "push_slot",
     "push_v4",
     "required_bytes",
     "run_lamport_finish",
+    "run_lamport_finish_in_place",
     "run_lamport_push",
 ]

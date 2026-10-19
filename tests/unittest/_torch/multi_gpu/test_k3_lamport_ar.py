@@ -112,6 +112,8 @@ def _run_rank(world_size):
                 x = _input(m, h, 3 * m + kind, rank, kind)
                 ref = allreduce(x)
                 for one_shot in transports:
+                    if lamport.required_bytes(m, h, world_size, one_shot) > ws.bytes_per_buffer:
+                        continue
                     out = torch.empty_like(x)
                     lamport.run_lamport_push(ws, x, one_shot)
                     lamport.run_lamport_finish(ws, out, one_shot, cpp_one_shot=cpp_one_shot)
