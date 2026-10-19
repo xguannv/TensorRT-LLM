@@ -282,8 +282,6 @@ def test_k3_ar_push_amid(mpi_pool_executor):
     world_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
-    if not hasattr(torch.ops.trtllm, "k3_attn_res_add_rmsnorm_lamport"):
-        pytest.skip("needs trtllm::k3_attn_res_add_rmsnorm_lamport")
     results = mpi_pool_executor.map(_run_rank_amid, *zip(*[(world_size,)] * world_size))
     for r in results:
         assert r is True
