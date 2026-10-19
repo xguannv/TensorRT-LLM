@@ -2612,6 +2612,17 @@ def gated_tactic(m: int, n: int, k: int) -> K3LowMTactic:
 
 
 @functools.cache
+def _gated_tactic_fits(m: int, n: int, k: int) -> bool:
+    """Whether :func:`gated_tactic` has a tactic for this shape (the gate ring and a weight ring
+    of at least the minimum depth fit in shared memory)."""
+    try:
+        gated_tactic(m, n, k)
+    except ValueError:
+        return False
+    return True
+
+
+@functools.cache
 def _compiled_gated_kernel(n: int, k: int, tactic: K3LowMTactic, use_pdl: bool):
     kernel = K3Fp8wLowMGemmKernel(n, k, tactic, use_pdl, gated=True)
     dummy = 1 << 20
@@ -3037,10 +3048,13 @@ def can_run_gated(
     allow_partial_n_tile: bool = False,
 ) -> bool:
     """Whether :func:`k3_fp8w_lowm_gemm_gated` accepts these inputs (non-raising check):
-    :func:`can_run` with M served by the low-M kernel, and a valid ``gate``."""
+    :func:`can_run` with M served by the low-M kernel, a gated tactic that fits in shared
+    memory, and a valid ``gate``."""
     if not can_run(x, w, w_scale, allow_partial_n_tile):
         return False
     if x.shape[0] > low_m_max_for(w.shape[0], w.shape[1]):
+        return False
+    if not _gated_tactic_fits(x.shape[0], w.shape[0], w.shape[1]):
         return False
     try:
         _check_gate(x, gate)
