@@ -336,3 +336,37 @@ def test_draft_gemm_pins(monkeypatch, role, n, k, m):
     ref = x.float() @ w.float().t()
     assert out is not None and out.shape == (m, n) and out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_gens", [1, 2, 4, 16])
+def test_ctx_positions_match_gen_prepare(num_gens):
+    """The side stream's context positions are the ones dflash_gen_prepare assigns."""
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+        dflash_ctx_positions,
+        dflash_gen_prepare,
+    )
+
+    width, block, page, max_blocks = 7, 7, 32, 64
+    gen = torch.Generator(device="cuda").manual_seed(num_gens)
+    slots = torch.randperm(32, device="cuda", generator=gen)[:num_gens].long()
+    ctx_len = torch.randint(0, 1500, (33,), device="cuda", generator=gen).long()
+    positions = dflash_ctx_positions(ctx_len, slots, width)
+    prep = dflash_gen_prepare(
+        torch.randint(1, width + 1, (num_gens,), device="cuda", generator=gen).to(torch.int32),
+        torch.randint(0, 1000, (num_gens, width), device="cuda", generator=gen).to(torch.int32),
+        slots,
+        ctx_len.clone(),
+        torch.full((num_gens,), max_blocks, dtype=torch.long, device="cuda"),
+        torch.arange(num_gens * max_blocks, device="cuda", dtype=torch.int32).view(num_gens, -1),
+        torch.zeros(num_gens, dtype=torch.int32, device="cuda"),
+        0,
+        num_gens,
+        32,
+        1 << 20,
+        999,
+        page,
+        block,
+        width,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(positions, prep["ctx_positions"])

@@ -60,6 +60,13 @@ def tail_v2_enabled() -> bool:
     return spec_tail_fusion_enabled() and os.environ.get(TAIL_V2_ENV_VAR, "0") == "1"
 
 
+def ctx_side_stream_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_CTX_SIDE_STREAM=1`` (with ``TLLM_DSPARK_TAIL_V2=1``)
+    computes the drafter's context latents on a side stream, concurrently with
+    the target-token selection and acceptance."""
+    return tail_v2_enabled() and os.environ.get("TLLM_DSPARK_CTX_SIDE_STREAM", "0") == "1"
+
+
 def draft_fusion_enabled() -> bool:
     """Whether ``TLLM_DSPARK_DRAFT_FUSION=1`` selects the drafter fusions that
     change its rounding: the TP-sharded context projection (fc split along its
@@ -555,6 +562,37 @@ def decode_draft_block_table_parallel(
         BLOCK_C=triton.next_power_of_2(n_chunks),
         num_warps=4,
     )
+
+
+@triton.jit
+def _ctx_positions_kernel(
+    ctx_len_ptr, slots_ptr, out_ptr, num_gens, WIDTH: tl.constexpr, BLOCK: tl.constexpr
+):
+    i = tl.arange(0, BLOCK)
+    mask = i < num_gens * WIDTH
+    g = i // WIDTH
+    slot = tl.load(slots_ptr + g, mask=mask, other=0).to(tl.int64)
+    old = tl.load(ctx_len_ptr + slot, mask=mask, other=0).to(tl.int64)
+    tl.store(out_ptr + i, old + (i - g * WIDTH), mask=mask)
+
+
+def dflash_ctx_positions(ctx_len: torch.Tensor, slots: torch.Tensor, width: int) -> torch.Tensor:
+    """``ctx_len[slots[g]] + j`` for the ``width`` tokens ``j`` of each request
+    ``g``: the RoPE positions :func:`dflash_gen_prepare` assigns the step's
+    context latents (it reads ``ctx_len`` before advancing it)."""
+    num_gens = slots.shape[0]
+    out = torch.empty((num_gens * width,), dtype=torch.long, device=ctx_len.device)
+    if num_gens > 0:
+        _ctx_positions_kernel[(1,)](
+            ctx_len,
+            slots,
+            out,
+            num_gens,
+            WIDTH=width,
+            BLOCK=triton.next_power_of_2(num_gens * width),
+            num_warps=1,
+        )
+    return out
 
 
 @triton.jit

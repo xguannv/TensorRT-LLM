@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
@@ -34,8 +35,10 @@ from .dspark_draft_gemm import draft_gemm
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
     BLOCK_TABLE_CHUNK,
+    ctx_side_stream_enabled,
     decode_draft_block_table,
     decode_draft_block_table_parallel,
+    dflash_ctx_positions,
     dflash_gen_prepare,
     dflash_noise_embedding,
     fused_next_new_tokens,
@@ -1127,6 +1130,10 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_ctx_len = self._ctx_len.clone()
             self._ctx_len_restore_pending = True
 
+        self._ctx_side = self._launch_ctx_side(
+            draft_model, spec_metadata, attn_metadata, input_ids.shape[0]
+        )
+
         self._execute_guided_decoder_if_present(logits)
 
         fused_accept = self._fused_select_accept(logits, attn_metadata, spec_metadata)
@@ -1368,6 +1375,74 @@ class DFlashWorker(SpecWorkerBase):
             "next_new_tokens": next_new_tokens,
         }
 
+    def _launch_ctx_side(self, draft_model, spec_metadata, attn_metadata, total_target_tokens):
+        """``TLLM_DSPARK_CTX_SIDE_STREAM``: start the context-latent chain on a side stream.
+
+        The step's context latents (TP-sharded fc + all-reduce with hidden_norm,
+        the all-layer latent GEMM, RMSNorm + RoPE at ``ctx_len[slot] + j``) only
+        need the captured target hidden states, so they run concurrently with
+        the target-token selection and acceptance. The all-reduce uses a private
+        MNNVL workspace (the main stream's all-reduces run meanwhile). Same
+        kernels and inputs as the main-stream path, so the same values.
+
+        Returns ``(latents [L, N, D], positions-read event, done event)``, or None
+        when the path does not apply (then the main stream computes them).
+        """
+        if not ctx_side_stream_enabled() or draft_model is None:
+            return None
+        num_gens = attn_metadata.num_seqs
+        if attn_metadata.num_contexts != 0 or num_gens == 0:
+            return None
+        if not self._fused_gen_prepare_applies(draft_model, spec_metadata):
+            return None
+        shard = getattr(draft_model, "_fc_shard", None)
+        layer_major = getattr(draft_model, "precompute_context_kv_layer_major", None)
+        if not shard or layer_major is None:
+            return None
+        weight, begin, end, all_reduce = shard
+        if all_reduce.mnnvl_allreduce is None or draft_model.hidden_norm.eps is None:
+            return None
+        width = self._draft_tokens_per_req
+        tokens = num_gens * width
+        hidden = weight.shape[0]
+        ar = getattr(self, "_ctx_side_ar", None)
+        if ar is None or not ar.fits(tokens, hidden):
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            from .private_mnnvl_allreduce import PrivateMNNVLAllReduce
+
+            # Collective: every rank reaches this at the same warmup step.
+            ar = PrivateMNNVLAllReduce(
+                draft_model.model_config.mapping, weight.dtype, max(tokens, 256), hidden
+            )
+            self._ctx_side_ar = ar
+            self._ctx_side_stream = torch.cuda.Stream()
+        main = torch.cuda.current_stream()
+        side = self._ctx_side_stream
+        fork = torch.cuda.Event()
+        fork.record(main)
+        side.wait_event(fork)
+        positions_read = torch.cuda.Event()
+        done = torch.cuda.Event()
+        with torch.cuda.stream(side):
+            positions = dflash_ctx_positions(self._ctx_len, self._batch_to_slot[:num_gens], width)
+            positions_read.record(side)
+            captured = spec_metadata.get_hidden_states(total_target_tokens)[:tokens]
+            captured = captured.to(draft_model.fc.weight.dtype)
+            partial = F.linear(captured[:, begin:end], weight)
+            projected = ar.rms_norm(
+                partial, draft_model.hidden_norm.weight, draft_model.hidden_norm.eps
+            )
+            projected = projected.to(self._ctx_kv_buf[0].dtype)
+            latent = layer_major(projected, positions)
+            done.record(side)
+        if latent is None:
+            main.wait_event(done)
+            return None
+        # Consumed on the main stream after it waits on ``done``.
+        latent.record_stream(main)
+        return latent, positions_read, done
+
     def _fused_select_accept(self, logits, attn_metadata, spec_metadata):
         """``TLLM_DSPARK_TAIL_V2``: target selection, strict acceptance, the KDA
         replay record and the drafter's KV-length prep in one kernel.
@@ -1594,6 +1669,11 @@ class DFlashWorker(SpecWorkerBase):
         width = self._draft_tokens_per_req
         block_size = self._resolved_block_size
         slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
+        side = getattr(self, "_ctx_side", None)
+        self._ctx_side = None
+        if side is not None:
+            # The side stream has read _ctx_len before prep advances it.
+            torch.cuda.current_stream().wait_event(side[1])
         prep = dflash_gen_prepare(
             num_accepted_tokens,
             accepted_tokens,
@@ -1620,19 +1700,27 @@ class DFlashWorker(SpecWorkerBase):
             combined_embed = embed_tokens(prep["embed_ids"])
         noise_embedding = dflash_noise_embedding(combined_embed, block_size)
 
-        gen_start = attn_metadata.num_ctx_tokens
-        captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
-        gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
-        projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
-        projected = projected.to(self._ctx_kv_buf[0].dtype)
-        # Layer-major latents skip the per-layer staging copies when the
-        # drafter offers them; the values are the same either way.
-        layer_major = getattr(draft_model, "precompute_context_kv_layer_major", None)
-        latent = None if layer_major is None else layer_major(projected, prep["ctx_positions"])
-        if latent is not None:
-            latent = latent.transpose(0, 1)
+        if side is not None:
+            # Computed on the side stream from the same captured hidden states
+            # and the same positions (ctx_len[slot] + j).
+            torch.cuda.current_stream().wait_event(side[2])
+            latent = side[0].transpose(0, 1)
         else:
-            latent = draft_model.precompute_context_kv(projected, prep["ctx_positions"])[0][:, :, 0]
+            gen_start = attn_metadata.num_ctx_tokens
+            captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
+            gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
+            projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+            projected = projected.to(self._ctx_kv_buf[0].dtype)
+            # Layer-major latents skip the per-layer staging copies when the
+            # drafter offers them; the values are the same either way.
+            layer_major = getattr(draft_model, "precompute_context_kv_layer_major", None)
+            latent = None if layer_major is None else layer_major(projected, prep["ctx_positions"])
+            if latent is not None:
+                latent = latent.transpose(0, 1)
+            else:
+                latent = draft_model.precompute_context_kv(projected, prep["ctx_positions"])[0][
+                    :, :, 0
+                ]
         store_mla_context_latents(
             latent,
             self._ctx_kv_buf,
