@@ -325,6 +325,34 @@ _K3_SHARED_AR_NVLS_SLOT = os.environ.get("TRTLLM_K3_SHARED_AR_NVLS_SLOT", "main"
 # expert. Negative values let the shared-expert chain take SMs ahead of the persistent routed
 # GEMMs on the main stream, so its all-reduce does not land after them.
 _K3_SHARED_STREAM_PRIORITY = int(os.environ.get("TRTLLM_K3_SHARED_STREAM_PRIORITY", "0"))
+# TRTLLM_K3_SHARED_TAIL_PRIO=<p> (e.g. -1; unset: off): for TRTLLM_K3_SHARED_TAIL_MIN_M ..
+# TRTLLM_K3_SHARED_TAIL_MAX_M tokens, where the routed latent all-reduce runs on its own workspace
+# (TRTLLM_K3_LATENT_AR_OWN_WS), the shared expert's activation, down projection and all-reduce run
+# on a second stream of CUDA priority <p>, forked from the shared-expert stream after gate_up, and
+# the main stream joins that stream instead. At decode batch sizes the routed FC1 / FC2 kernels
+# are persistent grids whose pending CTAs (the PDL-launched FC2 waits for SMs while FC1 runs)
+# would otherwise be served before the shared expert's small kernels launched after them; with
+# the higher priority those kernels take the SMs that FC1 / FC2 leave (see
+# TRTLLM_MOE_LOWM_FC1_CTAS / _FC2_CTAS) and the first ones FC1's CTAs free. Same kernels and
+# inputs: bit-exact.
+_K3_SHARED_TAIL_PRIO = os.environ.get("TRTLLM_K3_SHARED_TAIL_PRIO", "")
+_K3_SHARED_TAIL_MIN_M = int(os.environ.get("TRTLLM_K3_SHARED_TAIL_MIN_M", "1"))
+_K3_SHARED_TAIL_MAX_M = int(os.environ.get("TRTLLM_K3_SHARED_TAIL_MAX_M", "64"))
+# The shared-expert tail streams, by (device index, priority); every MoE layer uses the same one.
+_K3_SHARED_TAIL_STREAMS: Dict[Tuple[int, int], torch.cuda.Stream] = {}
+
+
+def _k3_shared_tail_stream() -> Optional[torch.cuda.Stream]:
+    """The ``TRTLLM_K3_SHARED_TAIL_PRIO`` stream of the current device, or ``None`` if off."""
+    if not _K3_SHARED_TAIL_PRIO or not torch.cuda.is_available():
+        return None
+    key = (torch.cuda.current_device(), int(_K3_SHARED_TAIL_PRIO))
+    stream = _K3_SHARED_TAIL_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.Stream(priority=key[1])
+        _K3_SHARED_TAIL_STREAMS[key] = stream
+    return stream
+
 
 # Small-batch MoE front end (b1-b4 decode), each bit-identical to the path it replaces:
 #   TRTLLM_K3_LD_FP4=1: latent_down with the routed experts' NVFP4 input quantization in its epilogue
@@ -2595,6 +2623,12 @@ class KimiK3MoERuntime(nn.Module):
         self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
+        # TRTLLM_K3_SHARED_TAIL_PRIO: the shared expert's activation / down / all-reduce stream and
+        # the event (after gate_up) it forks from.
+        self.shared_tail_stream = _k3_shared_tail_stream()
+        self.moe_shared_act_event = (
+            torch.cuda.Event() if self.shared_tail_stream is not None else None
+        )
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
         # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
         # the latent down-projection runs there too, beside the routing chain.
@@ -3467,6 +3501,21 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _shared_tail_applies(self, num_tokens: int) -> bool:
+        """Whether ``TRTLLM_K3_SHARED_TAIL_PRIO`` splits this forward's shared expert (the
+        unfused gate_up -> activation -> down GatedMLP path only)."""
+        mlp = self.shared_experts
+        return (
+            self.shared_tail_stream is not None
+            and _K3_SHARED_TAIL_MIN_M <= num_tokens <= _K3_SHARED_TAIL_MAX_M
+            and isinstance(mlp, GatedMLP)
+            and not mlp._can_fuse_gate_up_swiglu_fp4out()
+            and not mlp._can_fuse_gate_up_swiglu()
+            and not mlp._can_fuse_swiglu_fp8_quant()
+            and do_multi_stream()
+            and not torch.compiler.is_compiling()
+        )
+
     def _issue_router(
         self,
         hidden_states: torch.Tensor,
@@ -3633,7 +3682,10 @@ class KimiK3MoERuntime(nn.Module):
             y = self.routed_expert_norm(y)
             return self._routed_projection(y, self.routed_expert_up_proj)
 
-        def _shared_output():
+        def _shared_output(tail_stream: Optional[torch.cuda.Stream] = None):
+            """The shared expert's (reduced) output. With ``tail_stream``, gate_up runs on the
+            current stream and everything after it on ``tail_stream``, which then records
+            ``moe_shared_event``."""
             down_proj = self.shared_experts.down_proj
             ar_push = None
             if isinstance(down_proj, _Fp8BlockScaleWeightReadLinear):
@@ -3650,14 +3702,35 @@ class KimiK3MoERuntime(nn.Module):
                         identity.shape[0], down_proj.out_features
                     )
                     down_proj.next_ar_push = ar_push
-            shared_out = self.shared_experts(
-                identity,
-                final_all_reduce_params=(
-                    AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce or merged is not None
-                    else None
-                ),
+            final_params = (
+                AllReduceParams(enable_allreduce=False)
+                if self._defer_shared_allreduce or merged is not None
+                else None
             )
+            if tail_stream is None:
+                return _shared_reduce(
+                    self.shared_experts(identity, final_all_reduce_params=final_params),
+                    ar_push,
+                )
+            # GatedMLP.forward's unfused path, split after gate_up (see _shared_tail_applies).
+            mlp = self.shared_experts
+            gate_up = mlp.gate_up_proj(identity)
+            self.moe_shared_act_event.record()
+            with torch.cuda.stream(tail_stream):
+                self.moe_shared_act_event.wait()
+                partial = mlp.down_proj(
+                    mlp._apply_activation(gate_up),
+                    all_reduce_params=final_params,
+                    layer_idx=mlp.layer_idx,
+                )
+                shared_out = _shared_reduce(partial, ar_push)
+                self.moe_shared_event.record()
+            return shared_out
+
+        def _shared_reduce(shared_out: torch.Tensor, ar_push) -> torch.Tensor:
+            """Reduce the shared expert's down-projection output (or hand it to the merged
+            reduction)."""
+            down_proj = self.shared_experts.down_proj
             if merged is not None:
                 # The partial joins the routed reduction (``_merged_reduce``).
                 if shared_out.data_ptr() != shared_slot.data_ptr():
@@ -3707,10 +3780,12 @@ class KimiK3MoERuntime(nn.Module):
             # known whether the latent all-reduce runs on its own workspace.
             self.moe_main_event.record()
             routed_out = _routed_output()
+            tail_stream = self.shared_tail_stream if self._shared_tail_applies(num_tokens) else None
             with torch.cuda.stream(self.shared_expert_stream):
                 self.moe_main_event.wait()
-                shared_out = _shared_output()
-                self.moe_shared_event.record()
+                shared_out = _shared_output(tail_stream)
+                if tail_stream is None:
+                    self.moe_shared_event.record()
             latent = routed_out.reshape(-1, routed_out.shape[-1])
             if latent.dtype == torch.bfloat16 and not self._latent_up_reads_shared(latent):
                 return self._own_workspace_latent_tail(
