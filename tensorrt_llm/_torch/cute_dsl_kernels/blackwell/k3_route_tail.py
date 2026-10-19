@@ -2706,21 +2706,40 @@ def replica_table(entries, rank: int, num_home: int = REP_NUM_HOME) -> list[int]
     return [w - (1 << 32) if w >= (1 << 31) else w for w in words]
 
 
+#: Rounds of disjoint EP-rank pairs of the copy choice.
+REP_ROUNDS = (((0, 2), (1, 3)), ((0, 1), (2, 3)), ((0, 3), (1, 2)))
+
+
 def replica_choice(selected_experts, entries, num_home: int = REP_NUM_HOME) -> list[bool]:
     """Reference of the kernel's copy choice for one forward step: per entry, whether its copy
-    (not its home slot) computes it. ``selected_experts``: every routed expert id of the step."""
+    (not its home slot) computes it. ``selected_experts``: every routed expert id of the step.
+
+    Every EP rank starts with its touched single-copy experts. The touched two-copy experts form
+    classes by (home rank, copy rank), each in entry (priority) order. In three rounds of
+    disjoint rank pairs (:data:`REP_ROUNDS`), a pair ``a, b`` with loads ``la = U_a + k_ab`` and
+    ``lb = U_b + k_ba`` (``k_xy``: touched entries homed on ``x`` with the copy on ``y``) moves
+    the first ``min(k, |la - lb| // 2)`` entries of the heavier side's class to their copies
+    (ties stay home) and updates both loads.
+    """
     touched = set(int(x) for x in selected_experts)
     flex = {x for x, _ in entries}
-    counts = [0] * (NUM_EXPERTS // num_home)
+    loads = [0] * (NUM_EXPERTS // num_home)
     for x in touched - flex:
-        counts[x // num_home] += 1
-    choice = []
-    for x, r in entries:
-        h = x // num_home
-        copy = x in touched and counts[r] < counts[h]
+        loads[x // num_home] += 1
+    members = {}
+    for i, (x, r) in enumerate(entries):
         if x in touched:
-            counts[r if copy else h] += 1
-        choice.append(copy)
+            members.setdefault((x // num_home, r), []).append(i)
+    choice = [False] * len(entries)
+    for rnd in REP_ROUNDS:
+        for a, b in rnd:
+            k_ab, k_ba = len(members.get((a, b), [])), len(members.get((b, a), []))
+            la, lb = loads[a] + k_ab, loads[b] + k_ba
+            m_ab = min(k_ab, (la - lb) // 2) if la >= lb else 0
+            m_ba = min(k_ba, (lb - la) // 2) if lb > la else 0
+            loads[a], loads[b] = la - m_ab + m_ba, lb - m_ba + m_ab
+            for i in members.get((a, b), [])[:m_ab] + members.get((b, a), [])[:m_ba]:
+                choice[i] = True
     return choice
 
 
@@ -2781,14 +2800,16 @@ def _replica_lane(entry, word, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ballot(value, *, loc=None, ip=None):
-    """Warp ballot of ``value != 0``."""
+def _ballot_eq(hit, value, target: int, *, loc=None, ip=None):
+    """Warp ballot of ``hit != 0 and value == target``."""
     return Int32(
         _asm(
             T.i32(),
-            [_iv(value, loc=loc, ip=ip)],
-            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nvote.sync.ballot.b32 $0, p, 0xffffffff;\n}",
-            "=r,r",
+            [_iv(hit, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+            "{\n.reg .pred p, q;\nsetp.ne.u32 p, $1, 0;\n"
+            f"setp.eq.and.u32 q, $2, {target}, p;\n"
+            "vote.sync.ballot.b32 $0, q, 0xffffffff;\n}",
+            "=r,r,r",
             loc=loc,
             ip=ip,
         )
@@ -2796,75 +2817,38 @@ def _ballot(value, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _replica_item(ranks, lane, *, loc=None, ip=None):
-    """The three walk words of a touched entry (home rank ``h``, copy rank ``r`` from ``ranks``):
-    the byte selectors of ``h`` (bits 0-15) and ``r`` (bits 16-31) for ``prmt``, the home
-    increment ``1 << 8 h`` and the copy increment ``1 << 8 r`` with the lane in bits 27-31."""
+def _pair_balance(load_a, load_b, k_ab, k_ba, *, loc=None, ip=None):
+    """One rank pair of the copy choice (see :func:`replica_choice`): returns the new loads and
+    the moved counts ``(load_a, load_b, m_ab, m_ba)``."""
     res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 3),
-        [_iv(ranks, loc=loc, ip=ip), _iv(lane, loc=loc, ip=ip)],
-        "{\n.reg .b32 h, r, t;\n"
-        "and.b32 h, $3, 255;\n"
-        "shr.b32 r, $3, 8;\n"
-        "or.b32 $0, h, 0x4440;\n"
-        "or.b32 t, r, 0x4440;\n"
-        "shl.b32 t, t, 16;\n"
-        "or.b32 $0, $0, t;\n"
-        "shl.b32 h, h, 3;\n"
-        "shl.b32 $1, 1, h;\n"
-        "shl.b32 r, r, 3;\n"
-        "shl.b32 $2, 1, r;\n"
-        "shl.b32 t, $4, 27;\n"
-        "or.b32 $2, $2, t;\n}",
-        "=&r,=&r,=&r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 3, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _replica_step(counts, picked, sel, inc_home, inc_copy, *, loc=None, ip=None):
-    """One touched entry of the copy choice (words of :func:`_replica_item`; all zero: a padding
-    item that changes nothing). ``counts`` holds per EP rank the experts touched so far (bytes);
-    the copy is chosen when its rank has fewer, the expert is counted on the chosen rank and, for
-    the copy, bit ``lane`` of ``picked`` is set. Dependent chain: ``prmt`` -> ``setp`` -> ``selp``.
-    Returns ``(counts, picked)``."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 2),
+        llvm.StructType.get_literal([T.i32()] * 4),
         [
-            _iv(counts, loc=loc, ip=ip),
-            _iv(picked, loc=loc, ip=ip),
-            _iv(sel, loc=loc, ip=ip),
-            _iv(inc_home, loc=loc, ip=ip),
-            _iv(inc_copy, loc=loc, ip=ip),
+            _iv(load_a, loc=loc, ip=ip),
+            _iv(load_b, loc=loc, ip=ip),
+            _iv(k_ab, loc=loc, ip=ip),
+            _iv(k_ba, loc=loc, ip=ip),
         ],
-        "{\n.reg .b32 z, sr, ic, ln, uh, ur, ua, ub, t;\n.reg .pred pr;\n"
-        "mov.b32 z, 0;\n"
-        "shr.b32 sr, $4, 16;\n"
-        "and.b32 ic, $6, 0x07ffffff;\n"
-        "shr.b32 ln, $6, 27;\n"
-        "prmt.b32 uh, $2, z, $4;\n"
-        "prmt.b32 ur, $2, z, sr;\n"
-        "add.u32 ua, $2, $5;\n"
-        "add.u32 ub, $2, ic;\n"
-        "setp.lt.u32 pr, ur, uh;\n"
-        "selp.b32 $0, ub, ua, pr;\n"
-        "selp.b32 t, 1, 0, pr;\n"
-        "shl.b32 t, t, ln;\n"
-        "or.b32 $1, $3, t;\n}",
-        "=&r,=&r,r,r,r,r,r",
+        "{\n.reg .b32 la, lb, d, nd, x, y;\n.reg .pred pa;\n"
+        "add.s32 la, $4, $6;\n"
+        "add.s32 lb, $5, $7;\n"
+        "sub.s32 d, la, lb;\n"
+        "setp.ge.s32 pa, d, 0;\n"
+        "shr.s32 x, d, 1;\n"
+        "min.s32 x, x, $6;\n"
+        "neg.s32 nd, d;\n"
+        "shr.s32 y, nd, 1;\n"
+        "min.s32 y, y, $7;\n"
+        "selp.b32 $2, x, 0, pa;\n"
+        "selp.b32 $3, 0, y, pa;\n"
+        "sub.s32 x, la, $2;\n"
+        "add.s32 $0, x, $3;\n"
+        "sub.s32 y, lb, $3;\n"
+        "add.s32 $1, y, $2;\n}",
+        "=&r,=&r,=&r,=&r,r,r,r,r",
         loc=loc,
         ip=ip,
     )
-    return (
-        Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
-        Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
-    )
-
-
-#: Touched entries walked per group (their loads issued together).
-_REP_GROUP = 8
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
 
 
 class K3RouteTailRepKernel(K3RouteTailKernel):
@@ -2873,14 +2857,14 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
     The routed ids stay home experts ``x``; home expert ``x`` is local slot ``x - home_offset``
     of EP rank ``x // 224``, and the two-copy experts of the replica table also have a copy slot
     ``224 + n`` on another rank. Each CTA ORs the experts its tokens selected into a bitmap that
-    the cluster shares; then every warp counts per EP rank the touched single-copy experts and
-    walks the touched entries in priority order: an entry goes to the copy whose rank has touched
-    fewer experts so far (ties: home), which then counts it. The sort serves only the chosen copy
-    of each two-copy expert. Every rank computes the same choice from the same top-k.
+    the cluster shares; then one warp counts per EP rank the touched single-copy experts and
+    balances the touched two-copy experts in three rounds of rank pairs
+    (:func:`replica_choice`). The sort serves only the chosen copy of each two-copy expert.
+    Every rank computes the same choice from the same top-k.
 
     Args:
-        num_entries: Entries walked (a compile-time bound; the table's entries after its count
-            are zero words, which change nothing).
+        num_entries: Entries examined (a compile-time bound; the table's entries after its
+            count are zero words, which change nothing).
         Others as :class:`K3RouteTailKernel` (always with the sort).
     """
 
@@ -2897,7 +2881,8 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
         super().__init__(
             num_ctas, num_warps, warps_per_token, num_splits, True, use_pdl, REP_LOCAL_CAP
         )
-        # Debug: thread 0 of every CTA stores %clock64 at 8 phase boundaries to trace_addr.
+        # Debug: thread 0 of every CTA stores %clock64 at phase boundaries to trace_addr (16
+        # slots per CTA).
         self.trace = trace
         if not 0 <= num_entries <= REP_MAX_ENTRIES:
             raise ValueError(f"num_entries={num_entries} must be in [0, {REP_MAX_ENTRIES}]")
@@ -2954,10 +2939,6 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
                 cute.struct.MemRange[cutlass.Int32, self.num_ctas * 32], 16
             ]
             moved: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 32], 16]
-            # The touched entries of a chunk in walk order (plus a group of padding).
-            walk: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, 3 * (32 + _REP_GROUP)], 16
-            ]
 
         self.shared_storage = SharedStorage
 
@@ -3023,7 +3004,7 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
         rank, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(self.trace):
             if tidx == 0:
-                _stg_u64(trace_addr + Int64(rank * 64), _clock64())
+                _stg_u64(trace_addr + Int64(rank * 128), _clock64())
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         storage = utils.SmemAllocator().allocate(self.shared_storage)
@@ -3036,7 +3017,6 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
         touched_smem = storage.touched.data_ptr().toint()
         touched_all_smem = storage.touched_all.data_ptr().toint()
         moved_smem = storage.moved.data_ptr().toint()
-        walk_smem = storage.walk.data_ptr().toint()
         team = warp // self.team_warps
         team_warp = warp - team * self.team_warps
         cand_smem = storage.cand.data_ptr().toint() + team * (
@@ -3124,10 +3104,11 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
             _cluster_arrive_release()
             _cluster_wait_acquire()
         self.stamp(tidx, rank, trace_addr, 3)
-        # One warp computes the choice into the moved bitmap (the walk is sequential; redundant
-        # copies in every warp would compete for issue slots).
+        # One warp computes the choice into the moved bitmap.
         if warp == 0:
-            self.choose(lane, touched_smem, touched_all_smem, table_smem, moved_smem, walk_smem)
+            self.choose(
+                lane, touched_smem, touched_all_smem, table_smem, moved_smem, tidx, rank, trace_addr
+            )
         cute.arch.barrier()
         self.stamp(tidx, rank, trace_addr, 4)
         self.sort_rep(
@@ -3160,7 +3141,7 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
     def stamp(self, tidx: Int32, rank: Int32, trace_addr: Int64, k: int):
         if cutlass.const_expr(self.trace):
             if tidx == 0:
-                _stg_u64(trace_addr + Int64(rank * 64 + k * 8), _clock64())
+                _stg_u64(trace_addr + Int64(rank * 128 + k * 8), _clock64())
 
     @cute.jit
     def copy_slot(self, expert: Int32, table_smem: Int32):
@@ -3236,12 +3217,14 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
         touched_all_smem: Int32,
         table_smem: Int32,
         moved_smem: Int32,
-        walk_smem: Int32,
+        tidx: Int32,
+        rank: Int32,
+        trace_addr: Int64,
     ):
-        """One warp: the step's copy choice, as the bitmap of the two-copy experts computed on
-        their copy (``moved_smem``). Lane ``l`` holds entry
-        ``32 c + l`` of chunk ``c``; the touched entries are compacted into ``walk_smem`` and
-        walked in groups whose loads are issued together."""
+        """One warp: the step's copy choice (:func:`replica_choice`), as the bitmap of the two-copy
+        experts computed on their copy (``moved_smem``). Lane ``l`` holds entry ``32 c + l`` of
+        chunk ``c``; ballots count each (home rank, copy rank) class and rank the lane's entry in
+        it, three rounds of closed-form pair balances give the moved count of every class."""
         word = Int32(0)
         packed = Int32(0)
         if lane < NUM_EXPERTS // 32:
@@ -3253,32 +3236,41 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
             single = word & (_lds_b32(table_smem + (REP_FLEX_OFF + lane) * 4) ^ Int32(-1))
             packed = _popc(single) << ((lane // self.home_words) * 8)
         counts = _redux_add_u32(packed)
-        for c in cutlass.range_constexpr((self.num_entries + 31) // 32):
-            entry = _lds_b32(table_smem + (REP_LIST_OFF + c * 32 + lane) * 4)
-            hit, ranks = _replica_lane(entry, _shfl_idx_b32(word, (entry & 1023) >> 5))
-            mask = _ballot(hit)
-            touched = _popc(mask)
-            if hit != 0:
-                pos = _popc(mask & _low_bits_mask(lane))
-                sel, inc_home, inc_copy = _replica_item(ranks, lane)
-                _sts_b32(walk_smem + pos * 12, sel)
-                _sts_b32(walk_smem + pos * 12 + 4, inc_home)
-                _sts_b32(walk_smem + pos * 12 + 8, inc_copy)
-            if lane < 3 * _REP_GROUP:
-                _sts_b32(walk_smem + touched * 12 + lane * 4, Int32(0))
-            _syncwarp()
-            picked = Int32(0)
-            for g in cutlass.range(0, (touched + _REP_GROUP - 1) // _REP_GROUP, 1, unroll=1):
-                base = walk_smem + g * (_REP_GROUP * 12)
-                items = [_lds_b32(base + k * 4) for k in range(3 * _REP_GROUP)]
-                for k in cutlass.range_constexpr(_REP_GROUP):
-                    counts, picked = _replica_step(
-                        counts, picked, items[3 * k], items[3 * k + 1], items[3 * k + 2]
+        self.stamp(tidx, rank, trace_addr, 8)
+        if cutlass.const_expr(self.num_entries > 0):
+            pairs = [(h, r) for h in range(4) for r in range(4) if h != r]
+            k = {hr: Int32(0) for hr in pairs}
+            lanes = []
+            for c in cutlass.range_constexpr((self.num_entries + 31) // 32):
+                entry = _lds_b32(table_smem + (REP_LIST_OFF + c * 32 + lane) * 4)
+                hit, ranks = _replica_lane(entry, _shfl_idx_b32(word, (entry & 1023) >> 5))
+                cls = (ranks & 255) * 4 + (ranks >> 8)
+                pos = Int32(0)
+                for h, r in pairs:
+                    mask = _ballot_eq(hit, cls, h * 4 + r)
+                    if cls == h * 4 + r:
+                        pos = k[(h, r)] + _popc(mask & _low_bits_mask(lane))
+                    k[(h, r)] = k[(h, r)] + _popc(mask)
+                lanes.append((entry, hit, cls, pos))
+            self.stamp(tidx, rank, trace_addr, 9)
+            loads = [(counts >> (8 * g)) & 255 for g in range(4)]
+            moved = {}
+            for rnd in REP_ROUNDS:
+                for a, b in rnd:
+                    loads[a], loads[b], moved[(a, b)], moved[(b, a)] = _pair_balance(
+                        loads[a], loads[b], k[(a, b)], k[(b, a)]
                     )
-            if ((picked >> lane) & 1) != 0:
-                x = entry & 1023
-                _red_shared_or(moved_smem + (x >> 5) * 4, _bit(x & 31))
+            self.stamp(tidx, rank, trace_addr, 10)
+            for entry, hit, cls, pos in lanes:
+                limit = Int32(0)
+                for h, r in pairs:
+                    if cls == h * 4 + r:
+                        limit = moved[(h, r)]
+                if hit != 0 and pos < limit:
+                    x = entry & 1023
+                    _red_shared_or(moved_smem + (x >> 5) * 4, _bit(x & 31))
             _syncwarp()
+        self.stamp(tidx, rank, trace_addr, 11)
 
     @cute.jit
     def moved(self, expert: Int32, moved_smem: Int32):
@@ -3439,8 +3431,8 @@ def _compiled_tail_rep(
     )
 
 
-def _rep_walk(num_entries: int) -> int:
-    """Compile-time entry walk of ``num_entries`` entries (a multiple of 8, so few variants)."""
+def _rep_bound(num_entries: int) -> int:
+    """Compile-time entry bound for ``num_entries`` entries (a multiple of 8, so few variants)."""
     return min(REP_MAX_ENTRIES, (num_entries + 7) // 8 * 8)
 
 
@@ -3483,7 +3475,7 @@ def run_k3_route_tail_rep(
     splits = 1 if logits.dim() == 2 else logits.shape[0]
     rows = logits.shape[0] if logits.dim() == 2 else logits.shape[1]
     compiled = _compiled_tail_rep(
-        num_ctas, num_warps, warps_per_token, splits, use_pdl, _rep_walk(num_entries),
+        num_ctas, num_warps, warps_per_token, splits, use_pdl, _rep_bound(num_entries),
         trace is not None,
     )
     tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
@@ -3654,6 +3646,7 @@ __all__ = [
     "REP_MAX_COPIES",
     "REP_MAX_ENTRIES",
     "REP_NUM_HOME",
+    "REP_ROUNDS",
     "REP_TABLE_WORDS",
     "k3_route_tail_rep",
     "replica_choice",

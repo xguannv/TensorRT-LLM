@@ -33,8 +33,9 @@ Redundant copies (``TRTLLM_K3_EXPERT_REPLICAS=1`` with a ``kimi_k3_expert_placem
     switch on, EP rank ``r`` holds ``n + S`` slots: its ``n`` home slots, then the copies placed
     on it in ascending order (the routed MoE has ``ep_size * (n + S)`` slots, rank-major). Routing
     still returns home slot ids; for every forward step the routing tail picks one copy of each
-    touched two-copy expert (in entry order, the copy whose rank has touched fewer experts so
-    far; ties go home) and computes all of that expert's tokens there. Every rank sees the same
+    touched two-copy expert (three rounds of closed-form balances between rank pairs, the first
+    entries of a class move, ties stay home; ``k3_route_tail.replica_choice``) and computes all
+    of that expert's tokens there. Every rank sees the same
     top-k, so the choice needs no communication. The expert outputs are the same; only the rank
     that adds them changes. Without the switch a v2 file acts as its v1 part.
 
