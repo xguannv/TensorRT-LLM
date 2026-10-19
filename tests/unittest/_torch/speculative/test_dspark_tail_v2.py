@@ -65,7 +65,7 @@ def test_ctx_norm_rope_matches_per_layer_kernel(num_tokens):
     table = _freqs_table(4096, gen)
     positions = torch.randint(0, 4096, (num_tokens,), device="cuda", generator=gen)
 
-    out = dspark_mla_ctx_norm_rope(latent, weight, positions, table, EPS)
+    out = dspark_mla_ctx_norm_rope(latent, torch.nn.Parameter(weight), positions, table, EPS)
 
     compiled = _compile_fused_dspark_rmsnorm_rope(
         HEAD_DIM, ROPE, 1, EPS, True, True, False, KV_LORA
@@ -105,7 +105,9 @@ def test_block_rope_matches_separate_launches(num_tokens, page_size):
 
     query = torch.full((num_tokens, heads, HEAD_DIM), 7.0, dtype=torch.bfloat16, device="cuda")
     pool_new = pool.clone()
-    dspark_mla_block_rope(q, query, kv, weight, positions, table, pool_new, pages, offsets, EPS)
+    dspark_mla_block_rope(
+        q, query, kv, torch.nn.Parameter(weight), positions, table, pool_new, pages, offsets, EPS
+    )
 
     gathered = table[positions].contiguous()
     query_ref = torch.full_like(query, 7.0)
@@ -326,7 +328,8 @@ def test_draft_gemm_pins(monkeypatch, role, n, k, m):
     monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "0")
     assert draft_gemm(x, w, role) is None
     monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
-    out = draft_gemm(x, w, role)
+    # Module weights are parameters that require grad, also in the server.
+    out = draft_gemm(x, torch.nn.Parameter(w), role)
     if m > 32:
         assert out is None
         return

@@ -885,11 +885,12 @@ def dspark_mla_ctx_norm_rope(
     if num_tokens == 0:
         return out
     compiled = _compile_dspark_mla_ctx_norm_rope(num_layers, kv_lora_rank, rope_dim, float(eps))
+    # detach(): DLPack export refuses tensors that require grad (parameters).
     compiled(
-        latent.as_strided((num_tokens, num_layers * head_dim), (latent.stride(0), 1)),
-        norm_weight,
+        latent.detach().as_strided((num_tokens, num_layers * head_dim), (latent.stride(0), 1)),
+        norm_weight.detach(),
         positions.contiguous(),
-        freqs,
+        freqs.detach(),
         out.view(num_layers * num_tokens, head_dim),
     )
     return out
@@ -999,14 +1000,15 @@ def dspark_mla_block_rope(
     compiled = _compile_dspark_mla_block_rope(
         num_heads, q_dim - rope_dim, kv_lora_rank, rope_dim, float(eps)
     )
+    # detach(): DLPack export refuses tensors that require grad (parameters).
     compiled(
-        q.as_strided((num_tokens * num_heads, q_dim), (q.stride(1), 1)),
-        query.as_strided((num_tokens * num_heads, head_dim), (query.stride(1), 1)),
-        kv,
-        norm_weight,
+        q.detach().as_strided((num_tokens * num_heads, q_dim), (q.stride(1), 1)),
+        query.detach().as_strided((num_tokens * num_heads, head_dim), (query.stride(1), 1)),
+        kv.detach(),
+        norm_weight.detach(),
         positions.reshape(-1).contiguous(),
-        freqs,
-        pool,
+        freqs.detach(),
+        pool.detach(),
         pages.reshape(-1).contiguous(),
         offsets.reshape(-1).contiguous(),
     )

@@ -95,7 +95,10 @@ def draft_gemm(x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[tor
     from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import SplitKTactic, run_splitk_dense
     from ..flashinfer_utils import get_env_enable_pdl
 
-    x2d = x.reshape(m, k)
+    # detach(): the kernel's DLPack export refuses tensors that require grad,
+    # which module parameters do even under inference mode.
+    x2d = x.detach().reshape(m, k)
+    weight = weight.detach()
     if not x2d.is_contiguous() or k % 128 or x2d.data_ptr() % 32 or weight.data_ptr() % 32:
         return None
     out = torch.empty((m, weight.shape[0]), dtype=x.dtype, device=x.device)
