@@ -22,6 +22,7 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -168,6 +169,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
+        # TRTLLM_SPEC_SAMPLER_D2H_STREAM=1: copy the store to the host on a side
+        # stream, so that the next step's input preparation (which waits for the
+        # current stream) does not also wait for these copies.
+        self._d2h_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream()
+            if os.environ.get("TRTLLM_SPEC_SAMPLER_D2H_STREAM", "0") == "1"
+            else None
+        )
+        self._d2h_done: Optional[torch.cuda.Event] = None
 
     def _request_common_handling(
         self,
@@ -325,6 +335,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
+        if self._d2h_done is not None:
+            # The previous step's side-stream copies read the store rewritten below.
+            torch.cuda.current_stream().wait_event(self._d2h_done)
+
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
@@ -338,12 +352,26 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_tensors = SampleStateTensorsSpec(
-            new_tokens=self._copy_to_host(self.store.new_tokens),
-            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-        )
-        sampler_event = self._record_sampler_event()
+        if self._d2h_stream is not None and not self._async_worker_active():
+            store_ready = torch.cuda.Event()
+            store_ready.record()
+            with torch.cuda.stream(self._d2h_stream):
+                self._d2h_stream.wait_event(store_ready)
+                host_tensors = SampleStateTensorsSpec(
+                    new_tokens=self._copy_to_host(self.store.new_tokens),
+                    new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+                    next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+                )
+                self._d2h_done = torch.cuda.Event()
+                self._d2h_done.record()
+            sampler_event = self._record_sampler_event(side_stream_event=self._d2h_done)
+        else:
+            host_tensors = SampleStateTensorsSpec(
+                new_tokens=self._copy_to_host(self.store.new_tokens),
+                new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            )
+            sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
         for request in finished_context_requests:
