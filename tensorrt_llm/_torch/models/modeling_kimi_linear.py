@@ -1907,6 +1907,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         ):
             return self.forward(x)
         out = self._take_next_output(x_flat.shape[0])
+        # The MXFP8 GEMM has no all-reduce push epilogue: the caller runs the all-reduce.
+        self.next_ar_push = None
         if out is None:
             out = torch.empty(
                 (x_flat.shape[0], self.out_features), dtype=torch.bfloat16, device=x.device
