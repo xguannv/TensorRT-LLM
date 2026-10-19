@@ -62,8 +62,18 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 NUM_THREADS = 512
 #: TRTLLM_K3_KDA_DECODE_EARLY_TRIGGER=1 (PDL builds): release the dependent grid (the o_proj GEMM)
 #: right after ``griddepcontrol.wait`` instead of at exit, so it can become resident on the SMs this
-#: grid leaves free and stream its weights during the recurrence. The trigger follows this grid's
-#: own wait, so anything a dependent reads before its wait is still older than its predecessor.
+#: grid leaves free and stream its weights during the recurrence.
+#:
+#: Why it is safe in the Kimi-K3 decode graph. The trigger follows this grid's own wait, so the
+#: projection GEMM, ``k3_kda_fab`` and everything before them have completed when a dependent starts.
+#: The grids that can start before this one completes are the o_proj GEMM (low-M or mid-M FP8
+#: kernel), which before its wait only streams its weights and weight scales into shared memory (its
+#: weight warp triggers at once), and behind it the o_proj MNNVL all-reduce, which calls
+#: ``cudaGridDependencySynchronize`` before it reads or writes anything and triggers only after it.
+#: Neither writes global memory this grid reads (state pool, conv windows, replay rows, new-token
+#: rows) before its wait, and this grid's outputs (o, the committed state and conv windows) are read
+#: only after a wait: A_mid, which reads the prefix and snapshot rows before its own wait, starts
+#: only after the all-reduce's wait, i.e. after this grid completed.
 EARLY_TRIGGER = os.environ.get("TRTLLM_K3_KDA_DECODE_EARLY_TRIGGER", "0") == "1"
 TILE_K = 128
 # Chunk length padding (MMA N granularity); NUM_SPEC <= 7 -> T_loop <= 15.

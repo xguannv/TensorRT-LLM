@@ -70,8 +70,22 @@ ADD_NONE, ADD_PREFIX, ADD_MOE = 0, 1, 2
 _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 #: TRTLLM_K3_ATTN_RES_EARLY_TRIGGER=1: release the dependent grid right after ``griddepcontrol.wait``
 #: instead of after the last store, so the next kernel (a decode projection) can become resident and
-#: stream its weights while this one finishes. The trigger still follows this kernel's own wait, so
-#: a dependent that reads data older than its predecessor before its own wait stays safe.
+#: stream its weights while this one finishes.
+#:
+#: Why it is safe in the Kimi-K3 decode graph. Since the trigger follows this kernel's own wait, every
+#: grid upstream of it has completed when a dependent starts; only this grid may still run. The grids
+#: that can start before it completes are its programmatic dependents (under stream capture that
+#: includes cross-stream event joins) and, through dependents that trigger before their own wait,
+#: theirs: the low-M / mid-M FP8 GEMMs (qkvg, q_a / kv_a, latent down, shared gate-up; weight warp),
+#: the router GEMM, ``k3_kda_fab`` (warp 0) and behind them the KDA MTP decode and the MoE routing /
+#: expert kernels. Before their wait these read only weights, weight scales, routing metadata and (KDA
+#: decode) the layer's state pool, conv windows and replay rows, and write no global memory; this
+#: kernel's outputs (normed row, updated prefix, MXFP8 copy) are read only after a wait. The next
+#: attn_res launch, which reads the prefix this kernel stores (and snapshot rows) before its wait, is
+#: separated from this one on every path by an MNNVL all-reduce (the o_proj all-reduce between A_pre
+#: and A_mid; the latent and shared-expert all-reduces of the MoE block between A_mid and the next
+#: layer's A_pre). Those kernels call ``cudaGridDependencySynchronize`` before they trigger, so the
+#: next attn_res starts only after this grid completed.
 _EARLY_TRIGGER = os.environ.get("TRTLLM_K3_ATTN_RES_EARLY_TRIGGER", "0") == "1"
 
 _THREADS = 256
