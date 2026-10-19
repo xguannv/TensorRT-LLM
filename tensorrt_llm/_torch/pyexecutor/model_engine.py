@@ -78,6 +78,8 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            update_spec_config_from_loaded_model)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.spec_head_kernels import (fused_spec_head_prep,
+                                             spec_head_fusion_enabled)
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
@@ -3814,6 +3816,11 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is not None:
             attn_meta.on_update_kv_lens()
 
+        if spec_head_fusion_enabled() and self._fused_spec_head_prep(inputs):
+            if self.guided_decoder is not None:
+                self.guided_decoder.token_event.record()
+            return inputs
+
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_total_draft_tokens. But we need to use
@@ -3886,6 +3893,65 @@ class PyTorchModelEngine(ModelEngine):
             self.guided_decoder.token_event.record()
 
         return inputs
+
+    def _fused_spec_head_prep(self, inputs: Dict[str, Any]) -> bool:
+        """The device updates of ``_preprocess_inputs`` in one kernel.
+
+        Covers the overlap-scheduler position / KV-length correction and the
+        Helix verify-group buffers (``recompute_helix_spec_buffers``) for int32
+        position ids and KV lengths; writes the same values. Returns False,
+        having changed nothing, when the step needs another path.
+        """
+        md = inputs.get('attn_metadata')
+        if (not self.enable_spec_decode or md is None
+                or md.kv_cache_manager is None
+                or not hasattr(md, 'kv_lens_cuda')):
+            return False
+        overlap = not self._disable_overlap_scheduler
+        helix = (self.mapping.has_cp_helix()
+                 and getattr(md, '_helix_spec_tokens_valid', False))
+        position_ids = inputs['position_ids']
+        if (not (overlap or helix) or position_ids.ndim != 2
+                or position_ids.dtype != torch.int32
+                or md.kv_lens_cuda.dtype != torch.int32):
+            return False
+        num_ctx_tokens = md.num_ctx_tokens
+        gen_tokens = inputs['input_ids'].shape[0] - num_ctx_tokens
+        num_ctx_requests = md.num_contexts
+        num_chunked = md.num_chunked_ctx_requests
+        if num_ctx_requests >= num_chunked and num_chunked > 0:
+            kv_start, num_kv = num_ctx_requests - num_chunked, num_chunked
+        else:
+            kv_start, num_kv = num_ctx_requests, md.num_generations
+        helix_kwargs = {}
+        if helix:
+            tokens_per_seq = self.get_runtime_tokens_per_gen_step(
+                self.runtime_draft_len)
+            assert gen_tokens % tokens_per_seq == 0, (
+                f"helix spec expects uniform verify groups: {gen_tokens} gen "
+                f"tokens not divisible by group size {tokens_per_seq}")
+            helix_kwargs = dict(
+                helix_positions=md.helix_position_offsets,
+                helix_slots=md.helix_local_slots,
+                helix_bounds=md.helix_kv_bounds,
+                num_helix=gen_tokens,
+                tokens_per_block=md.kv_cache_manager.tokens_per_block,
+                cp_size=md.mapping.cp_size,
+                cp_rank=md.mapping.cp_rank,
+                kv_bound_start=md.num_contexts,
+                tokens_per_seq=tokens_per_seq,
+            )
+        fused_spec_head_prep(position_ids[0, num_ctx_tokens:],
+                             self.previous_pos_id_offsets_cuda,
+                             gen_tokens,
+                             md.kv_lens_cuda,
+                             self.previous_kv_lens_offsets_cuda,
+                             kv_start,
+                             num_kv,
+                             has_overlap=overlap,
+                             **helix_kwargs)
+        md.on_update_kv_lens()
+        return True
 
     def _postprocess_inputs(self, inputs: Dict[str, Any]):
         """

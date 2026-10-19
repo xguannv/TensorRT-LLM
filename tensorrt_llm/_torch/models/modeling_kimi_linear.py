@@ -132,6 +132,7 @@ from ..modules.linear import TensorParallelMode
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
+from ..speculative.spec_head_kernels import embedding_gather, spec_head_fusion_enabled
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -4005,7 +4006,12 @@ class KimiLinearModel(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            weight = self.embed_tokens.weight
+            if spec_head_fusion_enabled() and input_ids.dim() == 1 and weight.is_contiguous():
+                # Same rows as nn.Embedding, copied with 16-byte accesses.
+                inputs_embeds = embedding_gather(input_ids, weight)
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
         num_tokens = attn_metadata.num_tokens
