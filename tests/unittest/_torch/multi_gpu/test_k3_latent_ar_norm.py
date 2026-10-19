@@ -16,6 +16,7 @@
 
 On every rank: the CuTe kernel (early and late PDL trigger, eagerly and under CUDA graph replay)
 must match ``mnnvl_fusion_allreduce`` (``RMS_NORM``, and ``NONE`` for the plain sum) bit for bit,
+its MXFP8 side output must be the low-M FP8 GEMM's quantization of the normalized rows,
 while it shares its Lamport workspace with the C++ one-shot and two-shot kernels in any order.
 The 16-rank chunked summation order is checked on the available GPUs by filling the other ranks'
 slots of the Lamport buffer through the multicast address (sum only, against an FP32 reference).
@@ -65,6 +66,21 @@ def _inputs(world, num_tokens, seed):
     return xs
 
 
+def _mxfp8_reference(x):
+    """``(xq, xs)`` as the low-M FP8 GEMM quantizes a BF16 ``[M, K]`` activation: per 1x32 group
+    the UE8M0 exponent of ``2^ceil(log2(amax / 448))`` (amax floored at BF16 0x38D2) and
+    ``satfinite_rn_e4m3(x * 2^(127 - e))``."""
+    m, k = x.shape
+    g = x.view(m, k // 32, 32)
+    bits = g.abs().view(torch.int16).to(torch.int32) & 0x7FFF
+    amax = bits.amax(dim=-1).clamp_min(0x38D2)
+    e = (amax >> 7) - 8 + ((amax & 0x7F) > 0x60).to(torch.int32)
+    inv = torch.pow(2.0, (127 - e).float()).to(torch.bfloat16)
+    scaled = (g * inv.unsqueeze(-1)).float()
+    xq = scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(m, k)
+    return xq, e.to(torch.uint8)
+
+
 def _ar_norm_rank(world):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -105,8 +121,14 @@ def _ar_norm_rank(world):
             )
             return out
 
-        def cute_ar(x, early=True, norm=True, world_size=world):
+        def cute_ar(x, early=True, norm=True, world_size=world, mxfp8=False):
             out = torch.empty_like(x)
+            mx = None
+            if mxfp8:
+                mx = (
+                    torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                    torch.empty((x.shape[0], HIDDEN // 32), dtype=torch.uint8, device=x.device),
+                )
             kan.run_k3_latent_ar_norm(
                 x,
                 gamma,
@@ -119,8 +141,9 @@ def _ar_norm_rank(world):
                 world_size=world_size,
                 early_trigger=early,
                 norm=norm,
+                mxfp8_out=mx,
             )
-            return out
+            return out if mx is None else (out, *mx)
 
         def same(a, b):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
@@ -137,6 +160,12 @@ def _ar_norm_rank(world):
                 same(cute_ar(x, early=False), ref)
                 same(cpp(x, AllReduceFusionOp.RMS_NORM, own), ref)
                 same(cute_ar(x, norm=False), ref_sum)
+                # MXFP8 side output: the low-M GEMM's quantization of the normalized rows.
+                out, xq, xs = cute_ar(x, mxfp8=True)
+                same(out, ref)
+                exq, exs = _mxfp8_reference(ref)
+                assert torch.equal(xq.view(torch.uint8), exq.view(torch.uint8))
+                assert torch.equal(xs, exs)
                 # Two-shot sizes on the same workspace in between (and the one-shot again).
                 big = _inputs(world, MAX_TOKENS, seed + 10)[rank]
                 same(

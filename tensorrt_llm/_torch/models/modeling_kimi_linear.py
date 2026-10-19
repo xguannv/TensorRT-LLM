@@ -346,6 +346,10 @@ _K3_LATENT_AR_OWN_WS_MAX_M = int(os.environ.get("TRTLLM_K3_LATENT_AR_OWN_WS_MAX_
 _K3_LATENT_AR_CUTE = os.environ.get("TRTLLM_K3_LATENT_AR_CUTE", "0")
 if _K3_LATENT_AR_CUTE not in ("0", "1", "late"):
     raise ValueError(f"TRTLLM_K3_LATENT_AR_CUTE must be 0, 1 or late, got {_K3_LATENT_AR_CUTE!r}")
+# TRTLLM_K3_LU_MXFP8=1 (with TRTLLM_K3_LATENT_AR_CUTE): k3_latent_ar_norm also stores the MXFP8 form
+# of the normalized latent and latent_up runs the low-M FP8 GEMM on it (forward_mxfp8) instead of
+# quantizing the BF16 rows itself: bitwise the same projection, where latent_up runs the low-M kernel.
+_K3_LU_MXFP8 = os.environ.get("TRTLLM_K3_LU_MXFP8", "0") == "1"
 # The routed latent all-reduce's own MNNVL workspaces, by all-reduce mapping.
 _K3_LATENT_AR_WORKSPACES: Dict[Mapping, Dict[str, Any]] = {}
 
@@ -2778,7 +2782,9 @@ class KimiK3MoERuntime(nn.Module):
         gamma = self.routed_expert_norm.weight
         eps = float(self.routed_expert_norm.variance_epsilon)
         latent = routed_out.reshape(-1, routed_out.shape[-1]).contiguous()
+        up = self.routed_expert_up_proj
         routed_latent = None
+        latent_mxfp8 = None
         if _K3_LATENT_AR_CUTE != "0":
             from ..cute_dsl_kernels.blackwell import k3_latent_ar_norm
             from ..distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES
@@ -2790,6 +2796,17 @@ class KimiK3MoERuntime(nn.Module):
             )
             if one_shot and k3_latent_ar_norm.can_run(latent, gamma, world_size):
                 routed_latent = torch.empty_like(latent)
+                m, k = latent.shape
+                if (
+                    _K3_LU_MXFP8
+                    and hasattr(up, "forward_mxfp8")
+                    and up.takes_mxfp8_input(m)
+                    and k % 32 == 0
+                ):
+                    latent_mxfp8 = (
+                        torch.empty((m, k), dtype=torch.float8_e4m3fn, device=latent.device),
+                        torch.empty((m, k // 32), dtype=torch.uint8, device=latent.device),
+                    )
                 k3_latent_ar_norm.run_k3_latent_ar_norm(
                     latent,
                     gamma,
@@ -2801,6 +2818,7 @@ class KimiK3MoERuntime(nn.Module):
                     rank=workspace["rank"],
                     world_size=world_size,
                     early_trigger=_K3_LATENT_AR_CUTE == "1",
+                    mxfp8_out=latent_mxfp8,
                 )
         if routed_latent is None:
             (routed_latent,) = torch.ops.trtllm.mnnvl_fusion_allreduce(
@@ -2815,7 +2833,10 @@ class KimiK3MoERuntime(nn.Module):
                 int(AllReduceFusionOp.RMS_NORM),
             )
         routed_latent = routed_latent.view(routed_out.shape)
-        routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        if latent_mxfp8 is not None:
+            routed_out = up.forward_mxfp8(routed_latent, *latent_mxfp8)
+        else:
+            routed_out = self._routed_projection(routed_latent, up)
         self.moe_shared_event.wait()
         if residual is not None:
             if defer_residual:

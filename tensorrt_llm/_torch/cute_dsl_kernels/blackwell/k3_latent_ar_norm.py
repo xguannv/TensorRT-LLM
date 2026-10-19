@@ -28,6 +28,11 @@ its own ``griddepcontrol.wait``:
   have read the flags; at the end, thread 0 of CTA (0, 0) waits for all warps of the grid, rotates
   the buffers and resets the counter.
 
+Optionally the kernel also stores the MXFP8 form of its output for latent_up
+(``k3_fp8w_lowm_mxfp8``): per 1x32 group (four consecutive threads) the low-M FP8 GEMM's own
+amax / UE8M0 exponent / E4M3 conversion, so that GEMM on it is bitwise the low-M GEMM on the BF16
+output.
+
 PDL: ``griddepcontrol.wait`` first; with ``early_trigger`` the dependents are triggered right
 after it (they may only start reading what they do not wait for, e.g. latent_up its weight),
 else after the reduction like the C++ kernel.
@@ -46,6 +51,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .k3_fp8w_lowm_gemm import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax
 from .k3_route_tail import _griddepcontrol_launch_dependents, _griddepcontrol_wait
 
 #: Row width (the latent) and values per thread (one 16-byte access).
@@ -291,6 +297,77 @@ def _shfl_bfly(value, offset: int, mask: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _amax_bf16x8(w0, w1, w2, w3, *, loc=None, ip=None):
+    """|x| max of eight BF16 values (four packed words) as a packed BF16 pair (garbage sign bit,
+    masked by ``_ue8m0_of_amax``)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(w, loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+            "{\n.reg .b32 m0, m1;\n"
+            "max.xorsign.abs.bf16x2 m0, $1, $2;\n"
+            "max.xorsign.abs.bf16x2 m1, $3, $4;\n"
+            "max.xorsign.abs.bf16x2 $0, m0, m1;\n}",
+            "=r,r,r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _amax_pair(a, b, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _shfl_bfly_b32(value, offset: int, mask: int, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(value, loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 0x1f, {mask};",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_v2(addr, v0, v1, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(v0, loc=loc, ip=ip), _iv(v1, loc=loc, ip=ip)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_u8(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "st.global.u8 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _sts_f32(addr, value, *, loc=None, ip=None):
     _asm(
         None,
@@ -398,14 +475,25 @@ def _st_u32(addr, value, *, loc=None, ip=None):
 class K3LatentArNormKernel:
     """One-shot MNNVL all-reduce + RMSNorm of ``M`` rows of 3584 BF16 (see the module docstring)."""
 
-    def __init__(self, world_size: int, use_pdl: bool, early_trigger: bool, norm: bool = True):
+    def __init__(
+        self,
+        world_size: int,
+        use_pdl: bool,
+        early_trigger: bool,
+        norm: bool = True,
+        mxfp8: bool = False,
+    ):
         if world_size not in WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
+        if mxfp8 and not norm:
+            raise ValueError("the MXFP8 output is the normalized output's")
         self.world_size = world_size
         self.use_pdl = use_pdl
         self.early_trigger = early_trigger
         # Without ``norm`` the output is the BF16 sum (``kAllReduce``), e.g. to check the rank order.
         self.norm = norm
+        # Also store the MXFP8 form of the output (E4M3 codes, one UE8M0 exponent per 1x32 group).
+        self.mxfp8 = mxfp8
         self.rank_chunk = min(RANK_CHUNK, world_size)
 
     @cute.jit
@@ -414,6 +502,8 @@ class K3LatentArNormKernel:
         x_addr: Int64,
         gamma_addr: Int64,
         out_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         uc_addr: Int64,
         mc_addr: Int64,
         flags_addr: Int64,
@@ -431,7 +521,17 @@ class K3LatentArNormKernel:
 
         self.shared_storage = SharedStorage
         self.kernel(
-            x_addr, gamma_addr, out_addr, uc_addr, mc_addr, flags_addr, rank, m, eps
+            x_addr,
+            gamma_addr,
+            out_addr,
+            xq_addr,
+            xs_addr,
+            uc_addr,
+            mc_addr,
+            flags_addr,
+            rank,
+            m,
+            eps,
         ).launch(
             grid=(m, CLUSTER, 1),
             block=(THREADS, 1, 1),
@@ -447,6 +547,8 @@ class K3LatentArNormKernel:
         x_addr: Int64,
         gamma_addr: Int64,
         out_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         uc_addr: Int64,
         mc_addr: Int64,
         flags_addr: Int64,
@@ -576,6 +678,22 @@ class K3LatentArNormKernel:
                     _pack_bf16x2(_fmul(_fmul(x_lo, scale), g_lo), _fmul(_fmul(x_hi, scale), g_hi))
                 )
             _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), ow[0], ow[1], ow[2], ow[3])
+            if cutlass.const_expr(self.mxfp8):
+                # MXFP8 form of the stored row, as the low-M FP8 GEMM quantizes its BF16
+                # activation: four consecutive threads hold one 1x32 group (the half warp's
+                # quads use its 16-lane mask).
+                amax = _amax_bf16x8(ow[0], ow[1], ow[2], ow[3])
+                if warp == WARPS - 1:
+                    amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFF))
+                    amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFF))
+                else:
+                    amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFFFFFF))
+                    amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFFFFFF))
+                e = _ue8m0_of_amax(amax)
+                q0, q1 = _quant_bf16x8_to_e4m3(ow[0], ow[1], ow[2], ow[3], _bf16x2_inv_scale(e))
+                _st_v2(xq_addr + Int64(row * HIDDEN + col), q0, q1)
+                if (tidx & 3) == 0:
+                    _st_u8(xs_addr + Int64(row * (HIDDEN // 32) + (col >> 5)), e)
         else:
             _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3])
 
@@ -597,10 +715,12 @@ class K3LatentArNormKernel:
 
 
 @functools.cache
-def _compiled(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool):
-    kernel = K3LatentArNormKernel(world_size, use_pdl, early_trigger, norm)
+def _compiled(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool, mxfp8: bool):
+    kernel = K3LatentArNormKernel(world_size, use_pdl, early_trigger, norm, mxfp8)
     return cute.compile(
         kernel,
+        Int64(0),
+        Int64(0),
         Int64(0),
         Int64(0),
         Int64(0),
@@ -652,16 +772,21 @@ def run_k3_latent_ar_norm(
     use_pdl: bool = True,
     early_trigger: bool = True,
     norm: bool = True,
+    mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Launch on the current stream: ``out`` (``[M, 3584]`` BF16) = RMSNorm(``gamma``, ``eps``) of
     the sum of every rank's ``x`` over the MNNVL Lamport workspace (local unicast base
     ``uc_addr``, multicast base ``mc_addr``, state ``flags``), bit-identical to the C++ one-shot
     kernel (``norm=False``: the BF16 sum alone). Every rank of the group launches it with its
-    ``rank``."""
-    _compiled(world_size, use_pdl, early_trigger, norm)(
+    ``rank``. ``mxfp8_out = (xq, xs)`` also stores the MXFP8 form of ``out`` (E4M3 ``xq [M, 3584]``,
+    UE8M0 ``xs [M, 112]``), bitwise the low-M FP8 GEMM's in-kernel quantization of ``out``."""
+    mxfp8 = mxfp8_out is not None
+    _compiled(world_size, use_pdl, early_trigger, norm, mxfp8)(
         Int64(x.data_ptr()),
         Int64(gamma.data_ptr()),
         Int64(out.data_ptr()),
+        Int64(mxfp8_out[0].data_ptr() if mxfp8 else 0),
+        Int64(mxfp8_out[1].data_ptr() if mxfp8 else 0),
         Int64(uc_addr),
         Int64(mc_addr),
         Int64(flags.data_ptr()),

@@ -240,6 +240,36 @@ def _own_ws_rank(world):
                 assert_same(graph_out, run(False, True, hidden, residual))
             del graph
 
+        # FP8 latent_up (low-M kernel): with TRTLLM_K3_LU_MXFP8 the CuTe all-reduce also hands it
+        # the MXFP8 form of the latent (where this build has forward_mxfp8).
+        mkl._K3_FP8W_LOWM_GEMM = True
+        dense = torch.nn.Linear(LATENT, HIDDEN, bias=False, dtype=torch.bfloat16)
+        dense.weight.data = (torch.randn_like(dense.weight) * 0.02).cuda()
+        up = mkl._Fp8BlockScaleWeightReadLinear.from_linear(dense)
+        runtime.routed_expert_up_proj = up
+        mx_calls = []
+        if hasattr(up, "forward_mxfp8"):
+            forward_mxfp8 = up.forward_mxfp8
+
+            def counting_forward_mxfp8(x, xq, xs):
+                mx_calls.append(x.shape[0])
+                return forward_mxfp8(x, xq, xs)
+
+            up.forward_mxfp8 = counting_forward_mxfp8
+        mkl._K3_LATENT_AR_CUTE = "1"
+        mkl._K3_LU_MXFP8 = True
+        for num_tokens in (1, 7, 14):
+            latents, shareds, residual = _rank_inputs(world, num_tokens, 40 + num_tokens)
+            set_inputs(latents, shareds)
+            hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+            for defer in (False, True):
+                assert_same(
+                    run(True, True, hidden, residual, defer),
+                    run(False, True, hidden, residual, defer),
+                )
+        if hasattr(up, "forward_mxfp8"):
+            assert mx_calls == [1, 1, 7, 7, 14, 14]
+        mkl._K3_LU_MXFP8 = False
         mkl._K3_LATENT_AR_CUTE = "0"
         # Above the workspace's token limit the shared workspace serves the forward.
         num_tokens = MAX_TOKENS + 1
