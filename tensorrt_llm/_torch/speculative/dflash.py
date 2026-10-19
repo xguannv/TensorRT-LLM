@@ -1402,7 +1402,7 @@ class DFlashWorker(SpecWorkerBase):
         if not ctx_side_stream_enabled() or draft_model is None:
             return None
         num_gens = attn_metadata.num_seqs
-        if attn_metadata.num_contexts != 0 or num_gens == 0:
+        if attn_metadata.num_contexts != 0 or num_gens == 0 or num_gens > TAIL_V2_MAX_GENS:
             return None
         if not self._fused_gen_prepare_applies(draft_model, spec_metadata):
             return None

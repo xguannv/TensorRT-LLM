@@ -279,11 +279,13 @@ class _FakeShardedDrafter(_FakeMLADrafter):
         return latent[:, :, 0].transpose(0, 1).contiguous()
 
 
-@pytest.mark.parametrize("num_gens", [1, 5, 32])
+@pytest.mark.parametrize("num_gens", [1, 5, 16, 32])
 def test_side_stream_context_latents_match(num_gens, monkeypatch):
     """TLLM_DSPARK_CTX_SIDE_STREAM: the latents computed on the side stream
-    store exactly what the main-stream path stores, with the same bookkeeping."""
+    store exactly what the main-stream path stores, with the same bookkeeping
+    (above TAIL_V2_MAX_GENS requests the main-stream path runs)."""
     import tensorrt_llm._torch.speculative.private_mnnvl_allreduce as pm
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import TAIL_V2_MAX_GENS
 
     monkeypatch.setattr(pm, "PrivateMNNVLAllReduce", _FakeSideAllReduce)
     monkeypatch.setenv(SPEC_TAIL_FUSION_ENV_VAR, "1")
@@ -296,7 +298,7 @@ def test_side_stream_context_latents_match(num_gens, monkeypatch):
         drafter = _FakeShardedDrafter()
         md = make_md()
         w._ctx_side = w._launch_ctx_side(drafter, spec_md, md, total)
-        assert (w._ctx_side is not None) == (side == "1")
+        assert (w._ctx_side is not None) == (side == "1" and num_gens <= TAIL_V2_MAX_GENS)
         inputs = w.prepare_1st_drafter_inputs(
             input_ids=None,
             position_ids=None,
