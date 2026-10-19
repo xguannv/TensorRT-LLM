@@ -434,30 +434,44 @@ class K3LamportFinishKernel:
 
     Ordering. The workers read the rotation state and start polling as soon as they are
     resident, without ``griddepcontrol.wait``: the rows they poll validate themselves (no
-    sentinel word), so they react the moment the last rank's data lands instead of after
-    this rank's producer has completed. Reading the state early is safe because the previous
-    call on the workspace has completed (and advanced the state) by the time this kernel can be
-    resident: this kernel becomes resident once its producer starts, the producer once its own
-    predecessor ``P`` releases it, and ``P`` releases its dependents only after its own
-    ``griddepcontrol.wait`` (the house rule), when everything before ``P`` has completed; the
-    previous all-reduce on the workspace lies before ``P`` at every call site (another
-    projection, an attention or MoE kernel, or a stream join sits between them). Every CTA
-    releases its dependents at its start; the consumers that read data before their own wait
-    (attn_res reads the prefix sum and snapshot rows, GEMMs their weights) only read data
-    older than the producer's predecessor, which is complete by the same argument. The
-    updater CTA alone waits for the producer: the producer reads the state after its own wait,
-    so the state may only change once it has completed; the updater then waits until every
-    worker has counted itself (having read the state) and writes the next call's state, like
-    ``LamportFlags::waitAndUpdate``. Its wait also makes this kernel's completion imply the
-    producer's, so dependents that wait for this kernel see everything before it.
+    sentinel word), so they react the moment the last rank's data lands instead of after this
+    rank's producer has completed. Reading the state early is safe because the producer
+    releases this kernel only after its own ``griddepcontrol.wait`` (the low-M GEMM's push
+    variant and the push kernel both do): by then every earlier grid has completed (each
+    waits for its predecessor before it completes), the previous all-reduce on the workspace
+    included, so the state is this call's. Every CTA releases its dependents at its start, so
+    they become resident once the producer has passed its wait; consumers that read data
+    before their own wait (attn_res reads the prefix sum and snapshot rows, GEMMs their
+    weights) read only data older than the producer, which is complete by the same argument.
+    The updater CTA alone waits for the producer: the producer reads the state after its own
+    wait, so the state may only change once it has completed; the updater then waits until
+    every worker has counted itself (having read the state) and writes the next call's state,
+    like ``LamportFlags::waitAndUpdate``. Its wait also makes this kernel's completion imply
+    the producer's, so dependents that wait for this kernel see everything before it.
     ``wait_first`` makes the workers wait for the producer first (no early polling).
+
+    Numerics. ``cpp_one_shot`` names the C++ kernel whose result the call reproduces (default:
+    the transport's own): the one-shot kernel sums chunks of eight ranks above eight ranks and
+    stores the rounded sum as is; the two-shot kernel sums up to sixteen ranks in one chunk and
+    replaces ``-0`` by ``+0`` (its result passes through a Lamport buffer). The one-shot
+    transport can reproduce either; the two-shot transport only the two-shot result.
     """
 
     def __init__(
-        self, world: int, hidden: int, one_shot: bool, use_pdl: bool, wait_first: bool = False
+        self,
+        world: int,
+        hidden: int,
+        one_shot: bool,
+        use_pdl: bool,
+        wait_first: bool = False,
+        cpp_one_shot: bool | None = None,
     ):
         if hidden % 8:
             raise ValueError(f"hidden={hidden} must be a multiple of 8")
+        if cpp_one_shot is None:
+            cpp_one_shot = one_shot
+        if cpp_one_shot and not one_shot:
+            raise ValueError("the two-shot transport cannot reproduce the one-shot result")
         self.W = world
         self.H = hidden
         self.one_shot = one_shot
@@ -465,9 +479,9 @@ class K3LamportFinishKernel:
         self.wait_first = wait_first
         self.vecs = hidden // 8
         self.cols = _ceil_div(self.vecs, THREADS)
-        # Ranks per partial sum: the C++ one-shot kernel sums chunks of eight above eight ranks,
-        # the two-shot kernel chunks of up to sixteen.
-        self.chunk = (world if world <= 8 else 8) if one_shot else min(world, 16)
+        # Ranks per partial sum and the output sanitization of the reproduced C++ kernel.
+        self.chunk = (world if world <= 8 else 8) if cpp_one_shot else min(world, 16)
+        self.sanitize_out = not cpp_one_shot
 
     @cute.jit
     def __call__(
@@ -560,7 +574,10 @@ class K3LamportFinishKernel:
                 buf = stage_addr(uc_local, cur, Int32(0), 1, nbytes)
                 if v < self.vecs:
                     acc = self.reduce_slots(buf + Int64(tok * W * H + v * 8) * 2, row_bytes)
-                    st_v4(out_v, *[pack_bf16x2(acc[2 * q], acc[2 * q + 1]) for q in range(4)])
+                    o = [pack_bf16x2(acc[2 * q], acc[2 * q + 1]) for q in range(4)]
+                    if cutlass.const_expr(self.sanitize_out):
+                        o = [sanitize_bf16x2(w) for w in o]
+                    st_v4(out_v, *o)
             else:
                 if v < self.vecs:
                     if tok % W == rank:
@@ -655,9 +672,14 @@ def _stream() -> cuda.CUstream:
 
 @functools.cache
 def _compiled_finish(
-    world: int, hidden: int, one_shot: bool, use_pdl: bool, wait_first: bool = False
+    world: int,
+    hidden: int,
+    one_shot: bool,
+    use_pdl: bool,
+    wait_first: bool = False,
+    cpp_one_shot: bool | None = None,
 ):
-    kernel = K3LamportFinishKernel(world, hidden, one_shot, use_pdl, wait_first)
+    kernel = K3LamportFinishKernel(world, hidden, one_shot, use_pdl, wait_first, cpp_one_shot)
     a = Int64(1 << 20)
     return cute.compile(kernel, a, a, a, a, Int32(1), Int32(0), _stream())
 
@@ -703,12 +725,15 @@ def run_lamport_finish(
     one_shot: bool,
     use_pdl: bool = True,
     wait_first: bool = False,
+    cpp_one_shot: bool | None = None,
 ) -> torch.Tensor:
     """Complete the all-reduce whose input every rank pushed for this call into ``out``
-    (contiguous BF16 ``[m, hidden]``); returns ``out``."""
+    (contiguous BF16 ``[m, hidden]``); returns ``out``. ``one_shot`` is the transport the
+    producer used; ``cpp_one_shot`` the C++ kernel whose result to reproduce (default: the
+    same; see :class:`K3LamportFinishKernel`)."""
     m, hidden = out.shape
     _check(ws, m, hidden, one_shot)
-    _compiled_finish(ws.world, hidden, one_shot, use_pdl, wait_first)(
+    _compiled_finish(ws.world, hidden, one_shot, use_pdl, wait_first, cpp_one_shot)(
         Int64(ws.uc_local),
         Int64(ws.mc_base),
         Int64(ws.flags.data_ptr()),

@@ -65,7 +65,12 @@ scatter slot (two-shot) or to every rank's slot (one-shot, multicast), with ``-0
 ``+0`` as the C++ all-reduce sends it. The epilogue stages the BF16 tile token-major in the dead
 weight ring and pushes 16-byte vectors; :func:`k3_lamport_ar.run_lamport_finish` completes the
 all-reduce, so the pair is bitwise equal to this GEMM followed by the MNNVL all-reduce of its
-output.
+output. PDL: this variant releases its dependent (the finish kernel) from the activation warp
+right after its own ``griddepcontrol.wait`` instead of from the weight warp at kernel start. The
+finish kernel reads the workspace's rotation state as soon as it is resident, which is then
+safe whatever precedes this GEMM: once this GEMM has passed its wait, every earlier grid has
+completed (each waits for its predecessor before it completes), the previous all-reduce on the
+workspace included. The weight warp still streams before the wait.
 """
 
 from __future__ import annotations
@@ -1187,8 +1192,9 @@ class K3Fp8wLowMGemmKernel:
         if warp_idx == _TMA_WARP:
             # Weight producer: never waits on the previous grid. The NVFP4 variant feeds the
             # routed experts' persistent grid, which must not become resident (and hold every SM)
-            # before this GEMM is done: its dependents launch only when it completes.
-            if cutlass.const_expr(self.use_pdl and not self.fp4_out):
+            # before this GEMM is done: its dependents launch only when it completes. The
+            # all-reduce push variant releases its dependent after its own wait (below).
+            if cutlass.const_expr(self.use_pdl and not self.fp4_out and not self.ar_push):
                 _griddepcontrol_launch_dependents()
             sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
             gA = cute.local_tile(
@@ -1219,6 +1225,11 @@ class K3Fp8wLowMGemmKernel:
             # Activation producer: the only TMA that depends on the previous grid.
             if cutlass.const_expr(self.use_pdl):
                 _griddepcontrol_wait()
+                if cutlass.const_expr(self.ar_push != 0):
+                    # The all-reduce finish kernel reads the Lamport rotation state as soon as
+                    # it is resident (k3_lamport_ar): release it only once every earlier grid
+                    # (the previous all-reduce on the workspace included) has completed.
+                    _griddepcontrol_launch_dependents()
             sX = cute.make_tensor(
                 cute.recast_ptr(storage.sXM.data_ptr(), dtype=cutlass.BFloat16), x_layout
             )
