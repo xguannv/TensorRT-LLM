@@ -35,6 +35,11 @@ TRTLLM_K3LL_CENSUS = _flag(
 TRTLLM_K3LL_NVFP4_DECODE_MOE = _flag(
     "TRTLLM_K3LL_NVFP4_DECODE_MOE", 0, "decode MoE on k3_moe_nvfp4 with the sharded head and tail"
 )
+TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
+    "TRTLLM_K3LL_DRAFTER_FC_TP",
+    0,
+    "MLA DSpark drafter: fc split by input feature over TP, hidden_norm in the MNNVL all-reduce",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
