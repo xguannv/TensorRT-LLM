@@ -114,3 +114,67 @@ def test_dspark_mla_attend_graph_replay():
         graph.replay()
         torch.cuda.synchronize()
         _check(out, _reference(q, query, pool, pt, kv_lens, k_b, v_b, scale))
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("cluster", [8, 16])
+@pytest.mark.parametrize("block", [5, 7, 8])
+@pytest.mark.parametrize("batch,heads", [(1, 4), (2, 4), (3, 2), (4, 8)])
+def test_dspark_mla_attend_variants_bitwise(monkeypatch, batch, heads, block, cluster):
+    """TLLM_DSPARK_MLA_FUSED_STAGED (operands through bulk copies and ldmatrix) and
+    TLLM_DSPARK_MLA_FUSED_ASYNC (exchanges on mbarriers) give the same bits as the base kernel."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import dspark_mla_attend as K
+
+    scale = 1.0 / math.sqrt(NOPE + ROPE)
+    for page, ctx in ((64, 0), (16, 5), (64, 57), (16, 1000), (64, 4500)):
+        q, query, pool, pt, kv_lens, k_b, v_b = _case(batch, block, heads, ctx, page, ctx + 11)
+        k_b_t = k_b.transpose(1, 2).contiguous()
+        outs = []
+        for staged, async_x in (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")):
+            monkeypatch.setenv(K.STAGED_ENV_VAR, staged)
+            monkeypatch.setenv(K.ASYNC_ENV_VAR, async_x)
+            out = torch.full(
+                (batch, block, heads, VD), float("nan"), dtype=torch.bfloat16, device="cuda"
+            )
+            K.run_dspark_mla_attend(
+                q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, cluster=cluster
+            )
+            outs.append(out)
+        for i in range(1, len(outs)):
+            assert torch.equal(outs[0].view(torch.int16), outs[i].view(torch.int16)), (
+                page,
+                ctx,
+                i,
+            )
+
+
+@skip_pre_blackwell
+def test_dspark_mla_attend_variants_graph_replay(monkeypatch):
+    """The staged / mbarrier-exchange kernel in a replayed CUDA graph with changed KV lengths."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import dspark_mla_attend as K
+
+    monkeypatch.setenv(K.STAGED_ENV_VAR, "1")
+    monkeypatch.setenv(K.ASYNC_ENV_VAR, "1")
+    batch, block, heads, page = 2, 7, 4, 64
+    scale = 1.0 / math.sqrt(NOPE + ROPE)
+    q, query, pool, pt, kv_lens, k_b, v_b = _case(batch, block, heads, 900, page, 1)
+    k_b_t = k_b.transpose(1, 2).contiguous()
+    v_b_sliced = K.v_b_slices(v_b, K.default_cluster(batch))
+    out = torch.empty((batch, block, heads, VD), dtype=torch.bfloat16, device="cuda")
+    K.run_dspark_mla_attend(
+        q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, v_b_sliced=v_b_sliced
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        K.run_dspark_mla_attend(
+            q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, v_b_sliced=v_b_sliced
+        )
+    for rep, lens in enumerate(([12, 900], [907, 300], [64, 65])):
+        kv_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        gen = torch.Generator(device="cuda").manual_seed(100 + rep)
+        q.copy_(torch.randn(q.shape, device="cuda", generator=gen).to(torch.bfloat16))
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check(out, _reference(q, query, pool, pt, kv_lens, k_b, v_b, scale))

@@ -41,6 +41,20 @@ block RoPE kernel triggers right after its wait; without PDL it triggers at comp
 kernel starts, its predecessor has passed its wait, so the q_b GEMM and everything before it
 completed. ``q_pe`` and the block rows are read after the wait; the dependents are triggered right
 after it (they read ``out`` after their own wait).
+
+Two switches change how, not what, the kernel computes (bitwise the same output):
+
+* ``TLLM_DSPARK_MLA_FUSED_ASYNC=1``: the absorbed-query exchange (``st.async``), the partial
+  outputs and row stats (one bulk shared-to-shared copy per owner from a staging copy in the idle
+  KV ring) and the up-projection partials (``st.async``) complete on mbarriers of the receiving
+  CTA, each expecting exactly the bytes it receives, instead of cluster barriers (each of which
+  costs a GPU-scope fence and waits for every CTA). The wait for the partial outputs implies every
+  CTA left its attention loop, so the score buffer can take the up-projection partials, and a
+  CTA's last wait implies every owner received its staged partial outputs.
+* ``TLLM_DSPARK_MLA_FUSED_STAGED=1``: q_nope and the CTA's k_b / v_b slices (v_b re-laid
+  ``[H, NS, 128, C]`` by :func:`v_b_slices`) arrive by a few bulk copies, issued first thing,
+  into shared memory that is idle before the loop, and the MMA fragments come from ``ldmatrix``
+  instead of ~80 four-byte loads per thread; the slices of the next layer's weights go to L2.
 """
 
 from __future__ import annotations
@@ -587,6 +601,107 @@ def _bulk_g2s(dst, src, nbytes: int, mbar, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _bulk_g2s_n(dst, src, nbytes, mbar, *, loc=None, ip=None):
+    """``nbytes`` (a multiple of 16, run-time) from global ``src`` to this CTA's shared ``dst``,
+    completing on ``mbar``."""
+    _asm(
+        None,
+        [
+            _iv(dst, loc=loc, ip=ip),
+            _lv(src, loc=loc, ip=ip),
+            _iv(nbytes, loc=loc, ip=ip),
+            _iv(mbar, loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_async_v4_b32(local_addr, local_mbar, peer, v0, v1, v2, v3, *, loc=None, ip=None):
+    """``st.async`` of four words to ``local_addr`` of cluster CTA ``peer`` (16 bytes of the
+    transaction count of its mbarrier at ``local_mbar``)."""
+    _asm(
+        None,
+        [
+            _iv(local_addr, loc=loc, ip=ip),
+            _iv(local_mbar, loc=loc, ip=ip),
+            _iv(peer, loc=loc, ip=ip),
+        ]
+        + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $2;\n"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [ra], {$3, $4, $5, $6}, [rb];\n}",
+        "r,r,r,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_async_v2_f32(local_addr, local_mbar, peer, v0, v1, *, loc=None, ip=None):
+    """``st.async`` of two FP32 values to ``local_addr`` of cluster CTA ``peer`` (8 bytes of the
+    transaction count of its mbarrier at ``local_mbar``)."""
+    _asm(
+        None,
+        [
+            _iv(local_addr, loc=loc, ip=ip),
+            _iv(local_mbar, loc=loc, ip=ip),
+            _iv(peer, loc=loc, ip=ip),
+            _fv(v0, loc=loc, ip=ip),
+            _fv(v1, loc=loc, ip=ip),
+        ],
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $2;\n"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [ra], {$3, $4}, [rb];\n}",
+        "r,r,r,f,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _bulk_s2c(local_dst, src, nbytes: int, local_mbar, peer, *, loc=None, ip=None):
+    """``nbytes`` of this CTA's shared ``src`` to ``local_dst`` of cluster CTA ``peer`` (a bulk
+    copy), completing on its mbarrier at ``local_mbar``."""
+    _asm(
+        None,
+        [
+            _iv(local_dst, loc=loc, ip=ip),
+            _iv(src, loc=loc, ip=ip),
+            _iv(local_mbar, loc=loc, ip=ip),
+            _iv(peer, loc=loc, ip=ip),
+        ],
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $3;\n"
+        "mapa.shared::cluster.u32 rb, $2, $3;\n"
+        f"cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [ra], [$1], {nbytes}, [rb];\n}}",
+        "r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _prefetch_l2_bulk(addr, nbytes: int, *, loc=None, ip=None):
+    """``cp.async.bulk.prefetch.L2`` of ``nbytes`` (a multiple of 16) at ``addr``: a hint."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)],
+        f"cp.async.bulk.prefetch.L2.global [$0], {nbytes};",
+        "l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _fence_proxy_async_shared(*, loc=None, ip=None):
+    _asm(None, [], "fence.proxy.async.shared::cta;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _lds_v4_b32(addr, *, loc=None, ip=None):
     res = _asm(
         llvm.StructType.get_literal([T.i32()] * 4),
@@ -648,7 +763,14 @@ class DSparkMlaAttendKernel:
     """The block attention of one DSpark MLA drafter layer (see the module docstring)."""
 
     def __init__(
-        self, num_heads: int, block_size: int, page_size: int, use_pdl: bool, cluster: int = 8
+        self,
+        num_heads: int,
+        block_size: int,
+        page_size: int,
+        use_pdl: bool,
+        cluster: int = 8,
+        staged: bool = False,
+        async_x: bool = False,
     ):
         if cluster not in (8, 16):
             raise ValueError(f"cluster size {cluster} (8 or 16)")
@@ -668,6 +790,14 @@ class DSparkMlaAttendKernel:
         self.lat = D_LAT // cluster
         self.vpc = D_V // cluster
         self.on_bytes = self.lat * 2 + 16
+        # Staged operands: q_nope, this CTA's k_b and v_b slices arrive by bulk copies in shared
+        # memory that is idle before the attention loop (the score buffer, KV stage STAGES - 1,
+        # the partial-output buffer), and the MMA fragments come from ldmatrix.
+        self.staged = staged
+        # Cluster exchanges (absorbed query, partial outputs, up-projection partials) by st.async
+        # on per-exchange mbarriers of the receiving CTA instead of cluster barriers (each of which
+        # costs a GPU-scope fence): a CTA waits for exactly the bytes it receives.
+        self.async_x = async_x
 
     @cute.jit
     def __call__(
@@ -686,6 +816,9 @@ class DSparkMlaAttendKernel:
         zero_addr: Int64,
         scale_log2: Float32,
         num_reqs: Int32,
+        vbs_addr: Int64,
+        pf_kb_addr: Int64,
+        pf_vb_addr: Int64,
         stream: cuda.CUstream,
     ):
         @cute.struct
@@ -707,7 +840,7 @@ class DSparkMlaAttendKernel:
             ]
             red_ml: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, self.ns * ROWS * 2], 16]
             # One mbarrier per KV stage.
-            mbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, STAGES], 16]
+            mbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, STAGES + 4], 16]
             # The first PAGE_CACHE entries of the request's page table.
             pages: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, PAGE_CACHE], 16]
 
@@ -726,6 +859,9 @@ class DSparkMlaAttendKernel:
             out_addr,
             zero_addr,
             scale_log2,
+            vbs_addr,
+            pf_kb_addr,
+            pf_vb_addr,
         ).launch(
             grid=(self.ns, self.H // HG, num_reqs),
             block=(THREADS, 1, 1),
@@ -796,6 +932,9 @@ class DSparkMlaAttendKernel:
         out_addr: Int64,
         zero_addr: Int64,
         scale_log2: Float32,
+        vbs_addr: Int64,
+        pf_kb_addr: Int64,
+        pf_vb_addr: Int64,
     ):
         H = self.H
         BLK = self.BLK
@@ -819,6 +958,78 @@ class DSparkMlaAttendKernel:
         h0 = grp * HG
         neg_inf = Float32(_NEG_INF)
 
+        # Barriers: KV stages, then the staged operands, the absorbed-query, partial-output and
+        # up-projection exchanges.
+        stg = smbar + STAGES * 8
+        q_bar = smbar + (STAGES + 1) * 8
+        o_bar = smbar + (STAGES + 2) * 8
+        v_bar = smbar + (STAGES + 3) * 8
+        # Staged operands (idle buffers until the attention loop, which starts once the query
+        # exchange completed): q_nope rows (zero rows for padding slots) in the score buffer, this
+        # CTA's k_b rows of both heads in KV stage STAGES - 1, its v_b rows in the partial-output
+        # buffer. One barrier counts all the bytes.
+        qn_s = ss
+        kb_s = skv + (STAGES - 1) * (TILE * ROW_BYTES)
+        vb_s = sred_o
+        if tidx == 0:
+            for st in cutlass.range_constexpr(STAGES + (1 if self.staged else 0)):
+                _mbar_init(smbar + st * 8, 1)
+            if cutlass.const_expr(self.async_x):
+                _mbar_init(q_bar, 1)
+                _mbar_init(o_bar, 1)
+                _mbar_init(v_bar, 1)
+            _mbar_init_fence()
+            if cutlass.const_expr(self.async_x):
+                # The bytes each exchange delivers here: the other CTAs' query slices; every
+                # CTA's partial-output slice and row stats; every CTA's up-projection partials.
+                _mbar_arrive_expect_tx(q_bar, (self.ns - 1) * ROWS * self.lat * 2)
+                _mbar_arrive_expect_tx(o_bar, self.ns * (ROWS * self.lat * 4 + ROWS * 8))
+                _mbar_arrive_expect_tx(v_bar, self.ns * ROWS * self.vpc * 4)
+            if cutlass.const_expr(self.staged):
+                # Both heads' k_b slices (rows [C s, C s + C) of k_b^T, contiguous), v_b slices
+                # (``vbs_addr``: v_b re-laid [H, NS, 128, C], CTA s's slice contiguous) and the
+                # q_nope rows, issued first thing (warp-uniform operands).
+                _mbar_arrive_expect_tx(
+                    stg, ROWS * D_NOPE * 2 + HG * self.lat * D_NOPE * 2 + HG * D_V * self.lat * 2
+                )
+                for hk in cutlass.range_constexpr(HG):
+                    _bulk_g2s(
+                        kb_s + hk * (self.lat * D_NOPE * 2),
+                        kbt_addr + Int64(((h0 + hk) * D_LAT + s * self.lat) * D_NOPE) * 2,
+                        self.lat * D_NOPE * 2,
+                        stg,
+                    )
+                for hv in cutlass.range_constexpr(HG):
+                    _bulk_g2s(
+                        vb_s + hv * (D_V * self.lat * 2),
+                        vbs_addr + Int64(((h0 + hv) * self.ns + s) * D_V * self.lat) * 2,
+                        D_V * self.lat * 2,
+                        stg,
+                    )
+                for r in cutlass.range_constexpr(ROWS):
+                    if cutlass.const_expr((r & 7) < BLK):
+                        _bulk_g2s(
+                            qn_s + r * (D_NOPE * 2),
+                            q_addr
+                            + Int64(((b * BLK + (r & 7)) * H + h0 + (r >> 3)) * (D_NOPE + D_ROPE))
+                            * 2,
+                            D_NOPE * 2,
+                            stg,
+                        )
+                    else:
+                        _bulk_g2s(qn_s + r * (D_NOPE * 2), zero_addr, D_NOPE * 2, stg)
+                # The next layer's slices of the same weights into L2 (hints; 0: none).
+                if pf_kb_addr != Int64(0):
+                    for hk in cutlass.range_constexpr(HG):
+                        _prefetch_l2_bulk(
+                            pf_kb_addr + Int64(((h0 + hk) * D_LAT + s * self.lat) * D_NOPE) * 2,
+                            self.lat * D_NOPE * 2,
+                        )
+                        _prefetch_l2_bulk(
+                            pf_vb_addr + Int64(((h0 + hk) * self.ns + s) * D_V * self.lat) * 2,
+                            D_V * self.lat * 2,
+                        )
+
         # Before the wait (data older than the predecessor): the KV length, the page table, the
         # context rows of the first STAGES - 1 tiles, the absorption (q_nope from the q_b GEMM,
         # k_b a weight) and the up-projection's v_b operands. All loads are issued up front.
@@ -830,44 +1041,44 @@ class DSparkMlaAttendKernel:
         pg_ok = Int32(tidx < pt_len)
         pg = _ld_b32_if(pt_row + Int64(tidx) * 4, pg_ok)
         vb_frag = []
-        for kk in cutlass.range_constexpr(self.lat // 16):
-            for j in cutlass.range_constexpr(2):
-                v = (2 * warp + j) * 8 + g
-                for hh in cutlass.range_constexpr(HG):
-                    vbp = (
-                        vb_addr
-                        + (
-                            Int64((h0 + hh) * D_V + v) * D_LAT
-                            + Int64(s * self.lat + kk * 16 + 2 * t)
-                        )
-                        * 2
-                    )
-                    vb_frag.append(_ld_nc_b32(vbp))
-                    vb_frag.append(_ld_nc_b32(vbp + 16))
-        tok_ok = Int32(g < BLK)
-        m_row = b * BLK + _pick_i(tok_ok, g, Int32(0))
-        qa0 = q_addr + Int64((m_row * H + h0) * (D_NOPE + D_ROPE)) * 2
-        qa1 = qa0 + (D_NOPE + D_ROPE) * 2
         a_frag = []
         b_frag = []
         # With C / 8 < 8 column tiles, the other warps repeat the first ones (without storing).
         wa = warp & (self.lat // 8 - 1)
-        n_abs = s * self.lat + wa * 8 + g
-        for ks in cutlass.range_constexpr(D_NOPE // 16):
-            k0 = ks * 16
-            a_frag.append(_ld_b32_if(qa0 + Int64((k0 + 2 * t) * 2), tok_ok))
-            a_frag.append(_ld_b32_if(qa1 + Int64((k0 + 2 * t) * 2), tok_ok))
-            a_frag.append(_ld_b32_if(qa0 + Int64((k0 + 2 * t + 8) * 2), tok_ok))
-            a_frag.append(_ld_b32_if(qa1 + Int64((k0 + 2 * t + 8) * 2), tok_ok))
-            for hh in cutlass.range_constexpr(HG):
-                kb = kbt_addr + (Int64((h0 + hh) * D_LAT + n_abs) * D_NOPE + Int64(k0 + 2 * t)) * 2
-                b_frag.append(_ld_nc_b32(kb))
-                b_frag.append(_ld_nc_b32(kb + 16))
+        if cutlass.const_expr(not self.staged):
+            for kk in cutlass.range_constexpr(self.lat // 16):
+                for j in cutlass.range_constexpr(2):
+                    v = (2 * warp + j) * 8 + g
+                    for hh in cutlass.range_constexpr(HG):
+                        vbp = (
+                            vb_addr
+                            + (
+                                Int64((h0 + hh) * D_V + v) * D_LAT
+                                + Int64(s * self.lat + kk * 16 + 2 * t)
+                            )
+                            * 2
+                        )
+                        vb_frag.append(_ld_nc_b32(vbp))
+                        vb_frag.append(_ld_nc_b32(vbp + 16))
+            tok_ok = Int32(g < BLK)
+            m_row = b * BLK + _pick_i(tok_ok, g, Int32(0))
+            qa0 = q_addr + Int64((m_row * H + h0) * (D_NOPE + D_ROPE)) * 2
+            qa1 = qa0 + (D_NOPE + D_ROPE) * 2
+            n_abs = s * self.lat + wa * 8 + g
+            for ks in cutlass.range_constexpr(D_NOPE // 16):
+                k0 = ks * 16
+                a_frag.append(_ld_b32_if(qa0 + Int64((k0 + 2 * t) * 2), tok_ok))
+                a_frag.append(_ld_b32_if(qa1 + Int64((k0 + 2 * t) * 2), tok_ok))
+                a_frag.append(_ld_b32_if(qa0 + Int64((k0 + 2 * t + 8) * 2), tok_ok))
+                a_frag.append(_ld_b32_if(qa1 + Int64((k0 + 2 * t + 8) * 2), tok_ok))
+                for hh in cutlass.range_constexpr(HG):
+                    kb = (
+                        kbt_addr
+                        + (Int64((h0 + hh) * D_LAT + n_abs) * D_NOPE + Int64(k0 + 2 * t)) * 2
+                    )
+                    b_frag.append(_ld_nc_b32(kb))
+                    b_frag.append(_ld_nc_b32(kb + 16))
 
-        if tidx == 0:
-            for st in cutlass.range_constexpr(STAGES):
-                _mbar_init(smbar + st * 8, 1)
-            _mbar_init_fence()
         if tidx < ROWS:
             _sts_f32(sstat + tidx * 4, neg_inf)
             _sts_f32(sstat + (ROWS + tidx) * 4, Float32(0.0))
@@ -896,6 +1107,31 @@ class DSparkMlaAttendKernel:
                         page_stride,
                         zero_addr,
                     )
+
+        if cutlass.const_expr(self.staged):
+            # The fragments the per-thread loads above would give, from the staged rows.
+            while _mbar_try_wait(stg, 0) == 0:
+                pass
+            # (k0: the attention loop below carries this name; give it the type the per-thread
+            # loads leave it with.)
+            k0 = 0
+            arow = (lane & 7) + ((lane >> 3) & 1) * 8
+            acol = (lane >> 4) * 8
+            brow = (lane >> 4) * self.lat + wa * 8 + (lane & 7)
+            bcol = ((lane >> 3) & 1) * 8
+            for ks in cutlass.range_constexpr(D_NOPE // 16):
+                af = _ldsm_x4(qn_s + arow * (D_NOPE * 2) + (ks * 16 + acol) * 2)
+                bf = _ldsm_x4(kb_s + brow * (D_NOPE * 2) + (ks * 16 + bcol) * 2)
+                for e in cutlass.range_constexpr(4):
+                    a_frag.append(af[e])
+                for e in cutlass.range_constexpr(4):
+                    b_frag.append(bf[e])
+            for kk in cutlass.range_constexpr(self.lat // 16):
+                for j in cutlass.range_constexpr(2):
+                    vrow = (lane >> 4) * D_V + (2 * warp + j) * 8 + (lane & 7)
+                    vf = _ldsm_x4(vb_s + vrow * (self.lat * 2) + (kk * 16 + bcol) * 2)
+                    for e in cutlass.range_constexpr(4):
+                        vb_frag.append(vf[e])
 
         acc0 = [Float32(0.0)] * 4
         acc1 = [Float32(0.0)] * 4
@@ -932,7 +1168,10 @@ class DSparkMlaAttendKernel:
         cv = _lds_v4_b32(caddr)
         for dd in cutlass.range_constexpr(1, self.ns):
             if (tidx // chunks) == (dd % groups):
-                _st_cluster_v4_b32(_mapa(caddr, (s + dd) % self.ns), cv[0], cv[1], cv[2], cv[3])
+                if cutlass.const_expr(self.async_x):
+                    _st_async_v4_b32(caddr, q_bar, (s + dd) % self.ns, cv[0], cv[1], cv[2], cv[3])
+                else:
+                    _st_cluster_v4_b32(_mapa(caddr, (s + dd) % self.ns), cv[0], cv[1], cv[2], cv[3])
 
         if cutlass.const_expr(self.use_pdl):
             _gdc_wait()
@@ -966,7 +1205,12 @@ class DSparkMlaAttendKernel:
                         zero_addr,
                     )
         _cp_async_wait_group(0)
-        _cluster_sync()
+        if cutlass.const_expr(self.async_x):
+            _bar_sync()
+            while _mbar_try_wait(q_bar, 0) == 0:
+                pass
+        else:
+            _cluster_sync()
 
         # Online-softmax attention over this CTA's tiles. Warp w: score k-steps
         # [9 (w % 4), 9 (w % 4) + 9) of the 576 dims for tokens [16 (w / 4), 16 (w / 4) + 16);
@@ -1094,30 +1338,58 @@ class DSparkMlaAttendKernel:
         # Partial outputs to the latent-slice owners (warp w's 64 columns: column tile nt goes to
         # CTA (64 w + 8 nt) / self.lat), 16 bytes per store (lanes t, t ^ 1 swap halves: even t
         # stores row g, odd t row g + 8); every CTA's row stats to every CTA.
-        odd = t & 1
-        for nt in cutlass.range_constexpr(8):
-            x = _pick_f(odd, o_acc[4 * nt], o_acc[4 * nt + 2])
-            y = _pick_f(odd, o_acc[4 * nt + 1], o_acc[4 * nt + 3])
-            xo = _shfl_bfly_xor1_f32(x)
-            yo = _shfl_bfly_xor1_f32(y)
-            w0 = _pick_f(odd, xo, o_acc[4 * nt])
-            w1 = _pick_f(odd, yo, o_acc[4 * nt + 1])
-            w2 = _pick_f(odd, o_acc[4 * nt + 2], xo)
-            w3 = _pick_f(odd, o_acc[4 * nt + 3], yo)
-            orow = g + 8 * odd
-            owner = (warp * 64 + nt * 8) // self.lat
-            ocol = (nt * 8) % self.lat + 2 * (t - odd)
-            base = sred_o + ((s * ROWS + orow) * self.lat + ocol) * 4
-            _st_cluster_v4_f32(_mapa(base, owner), w0, w1, w2, w3)
-        # Thread -> row tidx % 16, destination tidx / 16.
         srow = tidx & (ROWS - 1)
         m_fin = _lds_f32(sstat + srow * 4)
         l_fin = _lds_f32(sstat + (ROWS + srow) * 4)
-        if tidx < ROWS * self.ns:
-            _st_cluster_v2_f32(
-                _mapa(sred_ml + ((s * ROWS + srow) * 2) * 4, tidx // ROWS), m_fin, l_fin
-            )
-        _cluster_sync()
+        if cutlass.const_expr(self.async_x):
+            # Staged in KV stage 0 (idle after the loop) as [owner][row][C] FP32 and [row][2]
+            # stats, then one bulk copy per owner of each (into its slot of this CTA). The
+            # staging stays readable until this CTA's last wait: that wait needs every owner's
+            # up-projection partials, which follow its merge of these copies.
+            xo_s = skv
+            xml_s = skv + self.ns * ROWS * self.lat * 4
+            for nt in cutlass.range_constexpr(8):
+                owner = (warp * 64 + nt * 8) // self.lat
+                a0 = xo_s + ((owner * ROWS + g) * self.lat + (nt * 8) % self.lat + 2 * t) * 4
+                _sts_v2_f32(a0, o_acc[4 * nt], o_acc[4 * nt + 1])
+                _sts_v2_f32(a0 + 8 * self.lat * 4, o_acc[4 * nt + 2], o_acc[4 * nt + 3])
+            if tidx < ROWS:
+                _sts_v2_f32(xml_s + tidx * 8, m_fin, l_fin)
+            _fence_proxy_async_shared()
+            _bar_sync()
+            if tidx < self.ns:
+                _bulk_s2c(
+                    sred_o + s * (ROWS * self.lat * 4),
+                    xo_s + tidx * (ROWS * self.lat * 4),
+                    ROWS * self.lat * 4,
+                    o_bar,
+                    tidx,
+                )
+                _bulk_s2c(sred_ml + s * (ROWS * 8), xml_s, ROWS * 8, o_bar, tidx)
+            while _mbar_try_wait(o_bar, 0) == 0:
+                pass
+        else:
+            odd = t & 1
+            for nt in cutlass.range_constexpr(8):
+                x = _pick_f(odd, o_acc[4 * nt], o_acc[4 * nt + 2])
+                y = _pick_f(odd, o_acc[4 * nt + 1], o_acc[4 * nt + 3])
+                xo = _shfl_bfly_xor1_f32(x)
+                yo = _shfl_bfly_xor1_f32(y)
+                w0 = _pick_f(odd, xo, o_acc[4 * nt])
+                w1 = _pick_f(odd, yo, o_acc[4 * nt + 1])
+                w2 = _pick_f(odd, o_acc[4 * nt + 2], xo)
+                w3 = _pick_f(odd, o_acc[4 * nt + 3], yo)
+                orow = g + 8 * odd
+                owner = (warp * 64 + nt * 8) // self.lat
+                ocol = (nt * 8) % self.lat + 2 * (t - odd)
+                base = sred_o + ((s * ROWS + orow) * self.lat + ocol) * 4
+                _st_cluster_v4_f32(_mapa(base, owner), w0, w1, w2, w3)
+            # Thread -> row tidx % 16, destination tidx / 16.
+            if tidx < ROWS * self.ns:
+                _st_cluster_v2_f32(
+                    _mapa(sred_ml + ((s * ROWS + srow) * 2) * 4, tidx // ROWS), m_fin, l_fin
+                )
+            _cluster_sync()
 
         # Merge of this CTA's latent slice: thread -> row sr, columns [cpt sc, cpt sc + cpt).
         mm = neg_inf
@@ -1178,11 +1450,21 @@ class DSparkMlaAttendKernel:
             vt = 2 * warp + j
             owner = (vt * 8) // self.vpc
             base = ss + ((s * ROWS + g) * self.vpc + (vt * 8) % self.vpc + 2 * t) * 4
-            _st_cluster_v2_f32(_mapa(base, owner), vacc0[4 * j], vacc0[4 * j + 1])
-            _st_cluster_v2_f32(
-                _mapa(base + 8 * self.vpc * 4, owner), vacc1[4 * j + 2], vacc1[4 * j + 3]
-            )
-        _cluster_sync()
+            if cutlass.const_expr(self.async_x):
+                _st_async_v2_f32(base, v_bar, owner, vacc0[4 * j], vacc0[4 * j + 1])
+                _st_async_v2_f32(
+                    base + 8 * self.vpc * 4, v_bar, owner, vacc1[4 * j + 2], vacc1[4 * j + 3]
+                )
+            else:
+                _st_cluster_v2_f32(_mapa(base, owner), vacc0[4 * j], vacc0[4 * j + 1])
+                _st_cluster_v2_f32(
+                    _mapa(base + 8 * self.vpc * 4, owner), vacc1[4 * j + 2], vacc1[4 * j + 3]
+                )
+        if cutlass.const_expr(self.async_x):
+            while _mbar_try_wait(v_bar, 0) == 0:
+                pass
+        else:
+            _cluster_sync()
 
         # This CTA's self.vpc output columns: thread -> row fr, columns 2 fc + {0, 1}.
         if tidx < ROWS * (self.vpc // 2):
@@ -1204,8 +1486,18 @@ class DSparkMlaAttendKernel:
 
 
 @functools.cache
-def _compiled(num_heads: int, block_size: int, page_size: int, use_pdl: bool, cluster: int):
-    kernel = DSparkMlaAttendKernel(num_heads, block_size, page_size, use_pdl, cluster)
+def _compiled(
+    num_heads: int,
+    block_size: int,
+    page_size: int,
+    use_pdl: bool,
+    cluster: int,
+    staged: bool,
+    async_x: bool,
+):
+    kernel = DSparkMlaAttendKernel(
+        num_heads, block_size, page_size, use_pdl, cluster, staged, async_x
+    )
     a = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1223,11 +1515,42 @@ def _compiled(num_heads: int, block_size: int, page_size: int, use_pdl: bool, cl
         a,
         Float32(1.0),
         Int32(1),
+        a,
+        a,
+        a,
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
 
 
-def _default_cluster(batch: int) -> int:
+#: ``TLLM_DSPARK_MLA_FUSED_STAGED=1``: q_nope, k_b and v_b reach the MMA fragments through a few
+#: bulk copies into idle shared memory and ``ldmatrix`` instead of ~80 four-byte loads per thread
+#: (v_b read from a copy laid out [H, NS, 128, C], see :func:`v_b_slices`). The same fragment
+#: values.
+STAGED_ENV_VAR = "TLLM_DSPARK_MLA_FUSED_STAGED"
+#: ``TLLM_DSPARK_MLA_FUSED_ASYNC=1``: the three cluster exchanges complete on mbarriers of the
+#: receiving CTA (``st.async``) instead of cluster barriers. The same values.
+ASYNC_ENV_VAR = "TLLM_DSPARK_MLA_FUSED_ASYNC"
+
+
+def staged_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_MLA_FUSED_STAGED=1`` stages the attention kernel's operands."""
+    return os.environ.get(STAGED_ENV_VAR, "0") == "1"
+
+
+def async_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_MLA_FUSED_ASYNC=1`` runs the cluster exchanges on mbarriers."""
+    return os.environ.get(ASYNC_ENV_VAR, "0") == "1"
+
+
+def v_b_slices(v_b: torch.Tensor, cluster: int) -> torch.Tensor:
+    """``v_b [H, 128, 512]`` re-laid ``[H, cluster, 128, 512 / cluster]``: cluster CTA ``s``'s
+    latent rows of a head contiguous (the staged operand copy)."""
+    heads = v_b.shape[0]
+    lat = D_LAT // cluster
+    return v_b.view(heads, D_V, cluster, lat).permute(0, 2, 1, 3).contiguous()
+
+
+def default_cluster(batch: int) -> int:
     """CTAs per cluster: ``TLLM_DSPARK_MLA_FUSED_CLUSTER=<n>`` or ``<b>:<n>,...`` (requests: CTAs,
     the first entry with ``b >= batch``), else 16 up to two requests and 8 above (a 16-CTA cluster
     needs 16 free SMs of one GPC: at four requests, eight such clusters no longer find them)."""
@@ -1304,6 +1627,8 @@ def run_dspark_mla_attend(
     out: torch.Tensor,
     use_pdl: bool = True,
     cluster: int = 0,
+    v_b_sliced: torch.Tensor = None,
+    prefetch: tuple = None,
 ) -> torch.Tensor:
     """Block attention of one drafter layer (module docstring) into ``out [B, T, H, 128]``.
 
@@ -1311,12 +1636,18 @@ def run_dspark_mla_attend(
     576]``: its last 64 columns hold the rotated ``q_pe``; ``pool [pages, page_size, 576]``: the
     layer's paged latent cache, the block rows already stored; ``page_tables [>= B, pages]``
     int32; ``kv_lens [>= B]`` int32 (context + block); ``k_b_t [H, 512, 128]`` (``k_b``
-    transposed), ``v_b [H, 128, 512]``.
+    transposed), ``v_b [H, 128, 512]``; ``v_b_sliced``: :func:`v_b_slices` of ``v_b`` for this
+    cluster size (made here when None and ``TLLM_DSPARK_MLA_FUSED_STAGED=1``; callers cache it);
+    ``prefetch``: ``(k_b_t, v_b_sliced)`` of the next layer, whose slices the staged kernel pulls
+    into L2 (a hint), or None.
     """
     batch, block, heads, _ = q.shape
     if cluster == 0:
-        cluster = _default_cluster(batch)
-    _compiled(heads, block, pool.shape[1], bool(use_pdl), cluster)(
+        cluster = default_cluster(batch)
+    staged = staged_enabled()
+    if staged and v_b_sliced is None:
+        v_b_sliced = v_b_slices(v_b, cluster)
+    _compiled(heads, block, pool.shape[1], bool(use_pdl), cluster, staged, async_enabled())(
         Int64(q.data_ptr()),
         Int64(query.data_ptr()),
         Int64(pool.data_ptr()),
@@ -1331,9 +1662,19 @@ def run_dspark_mla_attend(
         Int64(_zero_row(q.device).data_ptr()),
         Float32(softmax_scale * math.log2(math.e)),
         Int32(batch),
+        Int64(v_b_sliced.data_ptr() if staged else v_b.data_ptr()),
+        Int64(prefetch[0].data_ptr() if staged and prefetch is not None else 0),
+        Int64(prefetch[1].data_ptr() if staged and prefetch is not None else 0),
         cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream),
     )
     return out
 
 
-__all__ = ["DSparkMlaAttendKernel", "can_run", "run_dspark_mla_attend"]
+__all__ = [
+    "DSparkMlaAttendKernel",
+    "async_enabled",
+    "can_run",
+    "run_dspark_mla_attend",
+    "staged_enabled",
+    "v_b_slices",
+]

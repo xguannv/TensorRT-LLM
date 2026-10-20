@@ -4072,6 +4072,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     fixup.page_tables_i32,
                     fixup.seq_lens_i32,
                     self.softmax_scale,
+                    next_attn=(
+                        self.model.layers[layer_idx + 1].self_attn
+                        if layer_idx + 1 < num_layers
+                        else None
+                    ),
                 )
                 if fused_attn_out is None:
                     torch.ops.trtllm.bmm_out(
