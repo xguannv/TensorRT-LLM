@@ -39,7 +39,7 @@ TRTLLM_K3LL_MOE_LOWM = _flag(
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
-    0,
+    1,
     "FP8-cache MLA decode attention: 0 stock, 1 CuTe DSL kernel on this rank's heads, 2 split-read DCP over TP",
 )
 
