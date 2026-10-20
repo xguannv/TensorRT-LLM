@@ -64,6 +64,7 @@ from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
+from . import mla_drafter as _mla_drafter
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .decode_mla_dcp import MlaSplitRead
@@ -3408,6 +3409,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 sites += ("moe_head", "moe_shared_gate_up", "moe_tail", "moe_up")
             if isinstance(self.draft_model, K3DSparkDrafter):
                 sites += ("drafter_qkv", "drafter_o", "drafter_gate_up", "drafter_down")
+            elif _flags.TRTLLM_K3LL_MLA_DRAFTER_NORMS and self._mla_drafter() is not None:
+                sites += ("drafter_gate_up",)
         gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head, sites=sites)
         self.model.decode_gemvs = gemvs
         self.logits_processor.gemvs = gemvs
@@ -3446,6 +3449,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             self._gate_drafter_comm(comm)
             if _flags.TRTLLM_K3LL_DRAFTER_FC_TP:
                 self._gate_mla_drafter_fc(comm)
+            if _flags.TRTLLM_K3LL_MLA_DRAFTER_NORMS:
+                self._gate_mla_drafter_norms(comm)
             self._decode_state_ready = True
             logger.info(
                 f"Kimi K3 NVFP4 SM{self.target_spec.sm[0]}{self.target_spec.sm[1]}: "
@@ -3530,6 +3535,25 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             return False
         drafter.use_decode_comm(comm)
         return True
+
+    def _mla_drafter(self) -> Optional[nn.Module]:
+        """The stock MLA DSpark drafter this target drives, or None."""
+        drafter = getattr(self, "draft_model", None)
+        if drafter is None or isinstance(drafter, K3DSparkDrafter) or self.draft_config is None:
+            return None
+        return drafter if is_mla(self.draft_config.pretrained_config) else None
+
+    def _gate_mla_drafter_norms(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
+        """Run the stock MLA DSpark drafter's block decode with each layer's residual adds and RMSNorms in its
+        all-reduces (switch ``TRTLLM_K3LL_MLA_DRAFTER_NORMS``, `mla_drafter.K3MLADrafterNorms`). Needs ``comm`` and
+        layers whose norms and projections the fused all-reduces reproduce. Collective: compiles the drafter's
+        ``k3_sandwich_plain`` forms on the group's workspace. Returns whether the drafter took it."""
+        drafter = self._mla_drafter()
+        if comm is None or drafter is None:
+            return False
+        owner = _mla_drafter.K3MLADrafterNorms.install(drafter, comm, self.model)
+        _mla_drafter.log_install(owner)
+        return owner is not None
 
     def _gate_mla_drafter_fc(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Split the stock MLA DSpark drafter's context projection over the TP group (switch

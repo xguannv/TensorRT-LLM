@@ -52,6 +52,11 @@ TRTLLM_K3LL_MLA_SPEC_WORKER = _flag(
     0,
     "MLA DSpark drafter: stock worker plus sharded draft logits and the k3_markov chain (KimiK3MLADSparkWorker)",
 )
+TRTLLM_K3LL_MLA_DRAFTER_NORMS = _flag(
+    "TRTLLM_K3LL_MLA_DRAFTER_NORMS",
+    0,
+    "MLA DSpark drafter: residual adds and RMSNorms in the o_proj / down all-reduces (k3_sandwich_plain)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
