@@ -99,14 +99,21 @@ def vocab_parallel_enabled() -> bool:
 
 def markov_v2_enabled() -> bool:
     """Whether ``TLLM_DSPARK_MARKOV_V2=1`` runs each DSpark Markov step as one
-    fused kernel (see :meth:`VocabParallelHead.markov_tokens_fused`), or ``=2``
-    the whole chain as one kernel (:meth:`VocabParallelHead.markov_tokens_chain`)."""
-    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") in ("1", "2")
+    fused kernel (see :meth:`VocabParallelHead.markov_tokens_fused`), or ``=2`` /
+    ``=3`` the whole chain as one kernel (:meth:`VocabParallelHead.markov_tokens_chain`)."""
+    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") in ("1", "2", "3")
 
 
 def markov_chain_kernel_enabled() -> bool:
-    """Whether ``TLLM_DSPARK_MARKOV_V2=2`` selects the one-launch Markov chain."""
-    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") == "2"
+    """Whether ``TLLM_DSPARK_MARKOV_V2=2`` (Triton) or ``=3`` (CuTe, cluster-reduced exchange)
+    selects the one-launch Markov chain."""
+    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") in ("2", "3")
+
+
+def markov_chain_cute_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_MARKOV_V2=3`` runs the one-launch chain as the CuTe kernel
+    (``cute_dsl_kernels/blackwell/dspark_markov_chain.py``; same tokens as ``=2``)."""
+    return vocab_parallel_enabled() and os.environ.get(MARKOV_V2_ENV_VAR, "0") == "3"
 
 
 def vocab_parallel_sampling_enabled() -> bool:
@@ -836,6 +843,46 @@ class _PairExchange:
         self._chain = (mcast, local, set_floats)
         return self._chain
 
+    def chain_cute_buffers(self, device, num_ctas: int):
+        """``(multicast address, local address, launch counter)`` of the CuTe Markov chain's
+        exchange (``dspark_markov_chain.exchange_floats`` floats, -0.0 where nothing was
+        written). Allocated collectively on first use, outside graph capture; a single rank uses
+        one local buffer for both addresses."""
+        cached = getattr(self, "_chain_cute", None)
+        if cached is not None and cached[3] == num_ctas:
+            return cached[:3]
+        assert not torch.cuda.is_current_stream_capturing()
+        from ..cute_dsl_kernels.blackwell.dspark_markov_chain import exchange_floats
+
+        numel = exchange_floats(max(self.tp_size, 1), num_ctas)
+        launch = torch.zeros((1,), dtype=torch.int32, device=device)
+        if self.tp_size == 1:
+            buf = torch.full((numel,), -0.0, dtype=torch.float32, device=device)
+            self._chain_cute = (buf.data_ptr(), buf.data_ptr(), launch, num_ctas, buf)
+            return self._chain_cute[:3]
+        from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+
+        from ..distributed.ops import MNNVLAllReduce
+
+        assert self.backend == "mnnvl"
+        comm = MNNVLAllReduce.allreduce_mnnvl_workspaces[self.mapping]["mpi_comm"]
+        force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+        handle = McastGPUBuffer(
+            numel * 4,
+            self.tp_size,
+            self.tp_rank,
+            self.mapping.local_rank,
+            force_mn or self.mapping.is_multi_node(),
+            comm.py2f(),
+        )
+        local = handle.get_uc_buffer(self.tp_rank, [numel], torch.float32, 0)
+        mcast = handle.get_mc_buffer([numel], torch.float32, 0)
+        local.fill_(-0.0)
+        torch.cuda.synchronize()
+        comm.Barrier()
+        self._chain_cute = (mcast.data_ptr(), local.data_ptr(), launch, num_ctas, handle)
+        return self._chain_cute[:3]
+
     def layout(self, rows: int, n_cols: int, device) -> _PairLayout:
         # Split each row over enough programs to fill the GPU when rows are few;
         # the per-split pairs travel as extra slots of the same exchange.
@@ -1146,6 +1193,32 @@ class VocabParallelHead:
         assert num_reqs <= _CHAIN_MAX_REQS and block_size <= _CHAIN_MAX_STEPS
         rank = markov_w1.shape[1]
         w2_shard = self.markov_w2_shard(markov_w2)
+        if markov_chain_cute_enabled() and self._chain_cute_applies(
+            local_block, first_prev_tokens, markov_w1, w2_shard
+        ):
+            from ..cute_dsl_kernels.blackwell.dspark_markov_chain import (
+                num_ctas_for,
+                run_dspark_markov_chain,
+            )
+            from ..flashinfer_utils import get_env_enable_pdl
+
+            tp = max(self.exchange.tp_size, 1)
+            mc, uc, launch = self.exchange.chain_cute_buffers(device, num_ctas_for(shard))
+            return run_dspark_markov_chain(
+                local_block,
+                first_prev_tokens,
+                markov_w1,
+                w2_shard,
+                tokens,
+                mc,
+                uc,
+                launch,
+                tp,
+                self.mapping.tp_rank if tp > 1 else 0,
+                self.col_base,
+                self.vocab_size,
+                use_pdl=get_env_enable_pdl(),
+            )
         assert (
             w2_shard.stride(-1) == 1 and markov_w1.is_contiguous() and local_block.stride(-1) == 1
         )
@@ -1197,6 +1270,36 @@ class VocabParallelHead:
             launch_pdl=True,
         )
         return tokens
+
+    def _chain_cute_applies(self, local_block, first_prev_tokens, markov_w1, w2_shard) -> bool:
+        """Whether the CuTe Markov chain serves these operands (else the Triton chain runs)."""
+        from ..cute_dsl_kernels.blackwell.dspark_markov_chain import (
+            MAX_REQS,
+            MAX_STEPS,
+            num_ctas_for,
+        )
+
+        num_reqs, steps, shard = local_block.shape
+        major, minor = torch.cuda.get_device_capability(local_block.device)
+        return (
+            (major, minor) in ((10, 0), (10, 3))
+            # Above 8 requests the per-warp polling no longer beats the Triton chain.
+            and num_reqs <= min(MAX_REQS, 8)
+            and steps <= MAX_STEPS
+            and num_ctas_for(shard) is not None
+            and local_block.dtype == torch.bfloat16
+            and local_block.stride(-1) == 1
+            and markov_w1.dtype == torch.bfloat16
+            and markov_w1.is_contiguous()
+            and markov_w1.shape[1] % 16 == 0
+            and markov_w1.shape[1] <= 512
+            and w2_shard.dtype == torch.bfloat16
+            and w2_shard.stride(-1) == 1
+            and w2_shard.stride(0) == markov_w1.shape[1]
+            and first_prev_tokens.dtype in (torch.int32, torch.int64)
+            and first_prev_tokens.is_contiguous()
+            and (self.exchange.tp_size == 1 or self.exchange.backend == "mnnvl")
+        )
 
     def markov_w2_shard(self, markov_w2: torch.Tensor) -> torch.Tensor:
         """This rank's rows of ``markov_w2`` (cached; a contiguous row slice)."""
