@@ -50,18 +50,18 @@ def _weights(attn) -> tuple:
     return cached[1], cached[2]
 
 
-def _staged_slices(attn, v_b: torch.Tensor, cluster: int) -> Optional[torch.Tensor]:
-    """``v_b`` re-laid per cluster CTA (``TLLM_DSPARK_MLA_FUSED_STAGED``), cached on the module;
-    None under CUDA graph capture before the warm-up forwards made it."""
-    from ..cute_dsl_kernels.blackwell.dspark_mla_attend import v_b_slices
+def _staged(attn, k_b_t: torch.Tensor, v_b: torch.Tensor, cluster: int) -> Optional[tuple]:
+    """The padded weight copies ``TLLM_DSPARK_MLA_FUSED_STAGED`` reads (``staged_weights``),
+    cached on the module; None under CUDA graph capture before the warm-up forwards made them."""
+    from ..cute_dsl_kernels.blackwell.dspark_mla_attend import staged_weights
 
-    key = (v_b.data_ptr(), cluster)
-    cached = attn.__dict__.get("_dspark_mla_fused_v_b_slices")
+    key = (k_b_t.data_ptr(), v_b.data_ptr(), cluster)
+    cached = attn.__dict__.get("_dspark_mla_fused_staged")
     if cached is None or cached[0] != key:
         if torch.cuda.is_current_stream_capturing():
             return None
-        cached = (key, v_b_slices(v_b, cluster))
-        attn.__dict__["_dspark_mla_fused_v_b_slices"] = cached
+        cached = (key, staged_weights(k_b_t, v_b, cluster))
+        attn.__dict__["_dspark_mla_fused_staged"] = cached
     return cached[1]
 
 
@@ -100,17 +100,16 @@ def draft_mla_attend(
         return None
     batch, block, heads, _ = q.shape
     cluster = default_cluster(batch)
-    v_b_sliced = None
+    staged = None
     prefetch = None
     if staged_enabled():
-        v_b_sliced = _staged_slices(attn, v_b, cluster)
-        if v_b_sliced is None:
+        staged = _staged(attn, k_b_t, v_b, cluster)
+        if staged is None:
             return None
         if next_attn is not None:
             next_k_b_t, next_v_b = _weights(next_attn)
-            next_sliced = _staged_slices(next_attn, next_v_b, cluster)
-            if next_sliced is not None and next_k_b_t.shape == k_b_t.shape:
-                prefetch = (next_k_b_t, next_sliced)
+            if next_k_b_t.shape == k_b_t.shape and next_v_b.shape == v_b.shape:
+                prefetch = _staged(next_attn, next_k_b_t, next_v_b, cluster)
     out = torch.empty((batch, block, heads, v_b.shape[1]), dtype=q.dtype, device=q.device)
     run_dspark_mla_attend(
         q,
@@ -124,7 +123,7 @@ def draft_mla_attend(
         out,
         use_pdl=get_env_enable_pdl(),
         cluster=cluster,
-        v_b_sliced=v_b_sliced,
+        staged=staged,
         prefetch=prefetch,
     )
     return out.view(batch * block, heads, v_b.shape[1])

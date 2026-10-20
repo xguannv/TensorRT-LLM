@@ -51,10 +51,12 @@ Two switches change how, not what, the kernel computes (bitwise the same output)
   costs a GPU-scope fence and waits for every CTA). The wait for the partial outputs implies every
   CTA left its attention loop, so the score buffer can take the up-projection partials, and a
   CTA's last wait implies every owner received its staged partial outputs.
-* ``TLLM_DSPARK_MLA_FUSED_STAGED=1``: q_nope and the CTA's k_b / v_b slices (v_b re-laid
-  ``[H, NS, 128, C]`` by :func:`v_b_slices`) arrive by a few bulk copies, issued first thing,
-  into shared memory that is idle before the loop, and the MMA fragments come from ``ldmatrix``
-  instead of ~80 four-byte loads per thread; the slices of the next layer's weights go to L2.
+* ``TLLM_DSPARK_MLA_FUSED_STAGED=1``: the CTA's k_b and v_b slices arrive by one bulk copy per
+  head, issued first thing, from padded copies of the weights (:func:`staged_weights`: rows padded
+  by 16 bytes so that ldmatrix reads them without bank conflicts, v_b re-laid per cluster CTA),
+  and the q_nope rows by one bulk copy each, into shared memory that is idle before the loop;
+  the MMA fragments come from ``ldmatrix`` instead of ~80 four-byte loads per thread, and the
+  slices of the next layer's weights go to L2.
 """
 
 from __future__ import annotations
@@ -794,6 +796,13 @@ class DSparkMlaAttendKernel:
         # memory that is idle before the attention loop (the score buffer, KV stage STAGES - 1,
         # the partial-output buffer), and the MMA fragments come from ldmatrix.
         self.staged = staged
+        # Row pitches of the staged operands in shared memory (and of the padded weight copies,
+        # see :func:`staged_weights`): 16 bytes of padding keep the ldmatrix reads conflict free
+        # (8 rows of a matrix on distinct banks); the cluster-8 v_b rows stay unpadded (their
+        # padded copy would not fit the partial-output buffer).
+        self.qn_pitch = D_NOPE * 2 + 16
+        self.kb_pitch = KB_PITCH
+        self.vb_pitch = vb_pitch(cluster)
         # Cluster exchanges (absorbed query, partial outputs, up-projection partials) by st.async
         # on per-exchange mbarriers of the receiving CTA instead of cluster barriers (each of which
         # costs a GPU-scope fence): a CTA waits for exactly the bytes it receives.
@@ -816,6 +825,7 @@ class DSparkMlaAttendKernel:
         zero_addr: Int64,
         scale_log2: Float32,
         num_reqs: Int32,
+        kbs_addr: Int64,
         vbs_addr: Int64,
         pf_kb_addr: Int64,
         pf_vb_addr: Int64,
@@ -859,6 +869,7 @@ class DSparkMlaAttendKernel:
             out_addr,
             zero_addr,
             scale_log2,
+            kbs_addr,
             vbs_addr,
             pf_kb_addr,
             pf_vb_addr,
@@ -932,6 +943,7 @@ class DSparkMlaAttendKernel:
         out_addr: Int64,
         zero_addr: Int64,
         scale_log2: Float32,
+        kbs_addr: Int64,
         vbs_addr: Int64,
         pf_kb_addr: Int64,
         pf_vb_addr: Int64,
@@ -986,49 +998,21 @@ class DSparkMlaAttendKernel:
                 _mbar_arrive_expect_tx(o_bar, self.ns * (ROWS * self.lat * 4 + ROWS * 8))
                 _mbar_arrive_expect_tx(v_bar, self.ns * ROWS * self.vpc * 4)
             if cutlass.const_expr(self.staged):
-                # Both heads' k_b slices (rows [C s, C s + C) of k_b^T, contiguous), v_b slices
-                # (``vbs_addr``: v_b re-laid [H, NS, 128, C], CTA s's slice contiguous) and the
-                # q_nope rows, issued first thing (warp-uniform operands).
-                _mbar_arrive_expect_tx(
-                    stg, ROWS * D_NOPE * 2 + HG * self.lat * D_NOPE * 2 + HG * D_V * self.lat * 2
-                )
-                for hk in cutlass.range_constexpr(HG):
-                    _bulk_g2s(
-                        kb_s + hk * (self.lat * D_NOPE * 2),
-                        kbt_addr + Int64(((h0 + hk) * D_LAT + s * self.lat) * D_NOPE) * 2,
-                        self.lat * D_NOPE * 2,
-                        stg,
-                    )
-                for hv in cutlass.range_constexpr(HG):
-                    _bulk_g2s(
-                        vb_s + hv * (D_V * self.lat * 2),
-                        vbs_addr + Int64(((h0 + hv) * self.ns + s) * D_V * self.lat) * 2,
-                        D_V * self.lat * 2,
-                        stg,
-                    )
-                for r in cutlass.range_constexpr(ROWS):
-                    if cutlass.const_expr((r & 7) < BLK):
-                        _bulk_g2s(
-                            qn_s + r * (D_NOPE * 2),
-                            q_addr
-                            + Int64(((b * BLK + (r & 7)) * H + h0 + (r >> 3)) * (D_NOPE + D_ROPE))
-                            * 2,
-                            D_NOPE * 2,
-                            stg,
-                        )
-                    else:
-                        _bulk_g2s(qn_s + r * (D_NOPE * 2), zero_addr, D_NOPE * 2, stg)
-                # The next layer's slices of the same weights into L2 (hints; 0: none).
-                if pf_kb_addr != Int64(0):
-                    for hk in cutlass.range_constexpr(HG):
-                        _prefetch_l2_bulk(
-                            pf_kb_addr + Int64(((h0 + hk) * D_LAT + s * self.lat) * D_NOPE) * 2,
-                            self.lat * D_NOPE * 2,
-                        )
-                        _prefetch_l2_bulk(
-                            pf_vb_addr + Int64(((h0 + hk) * self.ns + s) * D_V * self.lat) * 2,
-                            D_V * self.lat * 2,
-                        )
+                # This CTA's k_b and v_b slices, one bulk copy per head from the padded copies
+                # (``kbs_addr`` [H, 512, KB_PITCH / 2], ``vbs_addr`` [H, NS, 128, vb_pitch / 2]:
+                # a slice is contiguous with the shared-memory pitch), issued first thing.
+                kb_bytes = self.lat * self.kb_pitch
+                vb_bytes = D_V * self.vb_pitch
+                _mbar_arrive_expect_tx(stg, ROWS * D_NOPE * 2 + HG * (kb_bytes + vb_bytes))
+                for hh in cutlass.range_constexpr(HG):
+                    kb_off = Int64((h0 + hh) * D_LAT + s * self.lat) * self.kb_pitch
+                    vb_off = Int64((h0 + hh) * self.ns + s) * vb_bytes
+                    _bulk_g2s(kb_s + hh * kb_bytes, kbs_addr + kb_off, kb_bytes, stg)
+                    _bulk_g2s(vb_s + hh * vb_bytes, vbs_addr + vb_off, vb_bytes, stg)
+                    # The next layer's slices of the same weights into L2 (hints; 0: none).
+                    if pf_kb_addr != Int64(0):
+                        _prefetch_l2_bulk(pf_kb_addr + kb_off, kb_bytes)
+                        _prefetch_l2_bulk(pf_vb_addr + vb_off, vb_bytes)
 
         # Before the wait (data older than the predecessor): the KV length, the page table, the
         # context rows of the first STAGES - 1 tiles, the absorption (q_nope from the q_b GEMM,
@@ -1082,6 +1066,25 @@ class DSparkMlaAttendKernel:
         if tidx < ROWS:
             _sts_f32(sstat + tidx * 4, neg_inf)
             _sts_f32(sstat + (ROWS + tidx) * 4, Float32(0.0))
+        if cutlass.const_expr(self.staged):
+            # The q_nope rows (zero rows for padding slots), one bulk copy per row from lane 0 of
+            # each warp (rows w, w + 8; warp-uniform operands), once the barrier init is visible.
+            _bar_sync()
+            if lane == 0:
+                for r in cutlass.range_constexpr(ROWS // NWARPS):
+                    qr_ = warp + r * NWARPS
+                    q_ok_ = Int32((qr_ & 7) < BLK)
+                    q_src_ = (
+                        q_addr
+                        + Int64(((b * BLK + (qr_ & 7)) * H + h0 + (qr_ >> 3)) * (D_NOPE + D_ROPE))
+                        * 2
+                    )
+                    _bulk_g2s(
+                        qn_s + qr_ * self.qn_pitch,
+                        _pick_l(q_ok_, q_src_, zero_addr),
+                        D_NOPE * 2,
+                        stg,
+                    )
         _sts_b32(spages + tidx * 4, pg)
         _bar_sync()
         # Cluster residency before the first shared::cluster store (waited on below).
@@ -1120,8 +1123,8 @@ class DSparkMlaAttendKernel:
             brow = (lane >> 4) * self.lat + wa * 8 + (lane & 7)
             bcol = ((lane >> 3) & 1) * 8
             for ks in cutlass.range_constexpr(D_NOPE // 16):
-                af = _ldsm_x4(qn_s + arow * (D_NOPE * 2) + (ks * 16 + acol) * 2)
-                bf = _ldsm_x4(kb_s + brow * (D_NOPE * 2) + (ks * 16 + bcol) * 2)
+                af = _ldsm_x4(qn_s + arow * self.qn_pitch + (ks * 16 + acol) * 2)
+                bf = _ldsm_x4(kb_s + brow * self.kb_pitch + (ks * 16 + bcol) * 2)
                 for e in cutlass.range_constexpr(4):
                     a_frag.append(af[e])
                 for e in cutlass.range_constexpr(4):
@@ -1129,7 +1132,7 @@ class DSparkMlaAttendKernel:
             for kk in cutlass.range_constexpr(self.lat // 16):
                 for j in cutlass.range_constexpr(2):
                     vrow = (lane >> 4) * D_V + (2 * warp + j) * 8 + (lane & 7)
-                    vf = _ldsm_x4(vb_s + vrow * (self.lat * 2) + (kk * 16 + bcol) * 2)
+                    vf = _ldsm_x4(vb_s + vrow * self.vb_pitch + (kk * 16 + bcol) * 2)
                     for e in cutlass.range_constexpr(4):
                         vb_frag.append(vf[e])
 
@@ -1518,14 +1521,14 @@ def _compiled(
         a,
         a,
         a,
+        a,
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
 
 
 #: ``TLLM_DSPARK_MLA_FUSED_STAGED=1``: q_nope, k_b and v_b reach the MMA fragments through a few
 #: bulk copies into idle shared memory and ``ldmatrix`` instead of ~80 four-byte loads per thread
-#: (v_b read from a copy laid out [H, NS, 128, C], see :func:`v_b_slices`). The same fragment
-#: values.
+#: (k_b and v_b read from padded copies, see :func:`staged_weights`). The same fragment values.
 STAGED_ENV_VAR = "TLLM_DSPARK_MLA_FUSED_STAGED"
 #: ``TLLM_DSPARK_MLA_FUSED_ASYNC=1``: the three cluster exchanges complete on mbarriers of the
 #: receiving CTA (``st.async``) instead of cluster barriers. The same values.
@@ -1542,12 +1545,30 @@ def async_enabled() -> bool:
     return os.environ.get(ASYNC_ENV_VAR, "0") == "1"
 
 
-def v_b_slices(v_b: torch.Tensor, cluster: int) -> torch.Tensor:
-    """``v_b [H, 128, 512]`` re-laid ``[H, cluster, 128, 512 / cluster]``: cluster CTA ``s``'s
-    latent rows of a head contiguous (the staged operand copy)."""
+#: Bytes per staged k_b row (128 BF16 values + 16 bytes of padding).
+KB_PITCH = D_NOPE * 2 + 16
+
+
+def vb_pitch(cluster: int) -> int:
+    """Bytes per staged v_b row: ``512 / cluster`` BF16 values, padded by 16 bytes for 16-CTA
+    clusters."""
+    return (D_LAT // cluster) * 2 + (16 if cluster == 16 else 0)
+
+
+def staged_weights(k_b_t: torch.Tensor, v_b: torch.Tensor, cluster: int) -> tuple:
+    """The padded weight copies ``TLLM_DSPARK_MLA_FUSED_STAGED`` copies slices of: ``k_b_t [H,
+    512, 128]`` padded to ``[H, 512, KB_PITCH / 2]`` and ``v_b [H, 128, 512]`` re-laid
+    ``[H, cluster, 128, vb_pitch / 2]`` (CTA ``s``'s latent rows of a head contiguous), zero
+    padding (never read)."""
     heads = v_b.shape[0]
     lat = D_LAT // cluster
-    return v_b.view(heads, D_V, cluster, lat).permute(0, 2, 1, 3).contiguous()
+    kb = torch.zeros((heads, D_LAT, KB_PITCH // 2), dtype=k_b_t.dtype, device=k_b_t.device)
+    kb[..., :D_NOPE] = k_b_t
+    vb = torch.zeros(
+        (heads, cluster, D_V, vb_pitch(cluster) // 2), dtype=v_b.dtype, device=v_b.device
+    )
+    vb[..., :lat] = v_b.view(heads, D_V, cluster, lat).permute(0, 2, 1, 3)
+    return kb, vb
 
 
 def default_cluster(batch: int) -> int:
@@ -1627,7 +1648,7 @@ def run_dspark_mla_attend(
     out: torch.Tensor,
     use_pdl: bool = True,
     cluster: int = 0,
-    v_b_sliced: torch.Tensor = None,
+    staged: tuple = None,
     prefetch: tuple = None,
 ) -> torch.Tensor:
     """Block attention of one drafter layer (module docstring) into ``out [B, T, H, 128]``.
@@ -1636,18 +1657,18 @@ def run_dspark_mla_attend(
     576]``: its last 64 columns hold the rotated ``q_pe``; ``pool [pages, page_size, 576]``: the
     layer's paged latent cache, the block rows already stored; ``page_tables [>= B, pages]``
     int32; ``kv_lens [>= B]`` int32 (context + block); ``k_b_t [H, 512, 128]`` (``k_b``
-    transposed), ``v_b [H, 128, 512]``; ``v_b_sliced``: :func:`v_b_slices` of ``v_b`` for this
-    cluster size (made here when None and ``TLLM_DSPARK_MLA_FUSED_STAGED=1``; callers cache it);
-    ``prefetch``: ``(k_b_t, v_b_sliced)`` of the next layer, whose slices the staged kernel pulls
-    into L2 (a hint), or None.
+    transposed), ``v_b [H, 128, 512]``; ``staged``: :func:`staged_weights` of these weights for
+    this cluster size (made here when None and ``TLLM_DSPARK_MLA_FUSED_STAGED=1``; callers cache
+    it); ``prefetch``: :func:`staged_weights` of the next layer, whose slices the staged kernel
+    pulls into L2 (a hint), or None.
     """
     batch, block, heads, _ = q.shape
     if cluster == 0:
         cluster = default_cluster(batch)
-    staged = staged_enabled()
-    if staged and v_b_sliced is None:
-        v_b_sliced = v_b_slices(v_b, cluster)
-    _compiled(heads, block, pool.shape[1], bool(use_pdl), cluster, staged, async_enabled())(
+    use_staged = staged_enabled()
+    if use_staged and staged is None:
+        staged = staged_weights(k_b_t, v_b, cluster)
+    _compiled(heads, block, pool.shape[1], bool(use_pdl), cluster, use_staged, async_enabled())(
         Int64(q.data_ptr()),
         Int64(query.data_ptr()),
         Int64(pool.data_ptr()),
@@ -1662,9 +1683,10 @@ def run_dspark_mla_attend(
         Int64(_zero_row(q.device).data_ptr()),
         Float32(softmax_scale * math.log2(math.e)),
         Int32(batch),
-        Int64(v_b_sliced.data_ptr() if staged else v_b.data_ptr()),
-        Int64(prefetch[0].data_ptr() if staged and prefetch is not None else 0),
-        Int64(prefetch[1].data_ptr() if staged and prefetch is not None else 0),
+        Int64(staged[0].data_ptr() if use_staged else k_b_t.data_ptr()),
+        Int64(staged[1].data_ptr() if use_staged else v_b.data_ptr()),
+        Int64(prefetch[0].data_ptr() if use_staged and prefetch is not None else 0),
+        Int64(prefetch[1].data_ptr() if use_staged and prefetch is not None else 0),
         cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream),
     )
     return out
@@ -1676,5 +1698,5 @@ __all__ = [
     "can_run",
     "run_dspark_mla_attend",
     "staged_enabled",
-    "v_b_slices",
+    "staged_weights",
 ]

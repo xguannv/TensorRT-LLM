@@ -159,17 +159,13 @@ def test_dspark_mla_attend_variants_graph_replay(monkeypatch):
     scale = 1.0 / math.sqrt(NOPE + ROPE)
     q, query, pool, pt, kv_lens, k_b, v_b = _case(batch, block, heads, 900, page, 1)
     k_b_t = k_b.transpose(1, 2).contiguous()
-    v_b_sliced = K.v_b_slices(v_b, K.default_cluster(batch))
+    staged = K.staged_weights(k_b_t, v_b, K.default_cluster(batch))
     out = torch.empty((batch, block, heads, VD), dtype=torch.bfloat16, device="cuda")
-    K.run_dspark_mla_attend(
-        q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, v_b_sliced=v_b_sliced
-    )
+    K.run_dspark_mla_attend(q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, staged=staged)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        K.run_dspark_mla_attend(
-            q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, v_b_sliced=v_b_sliced
-        )
+        K.run_dspark_mla_attend(q, query, pool, pt, kv_lens, k_b_t, v_b, scale, out, staged=staged)
     for rep, lens in enumerate(([12, 900], [907, 300], [64, 65])):
         kv_lens.copy_(torch.tensor(lens, dtype=torch.int32))
         gen = torch.Generator(device="cuda").manual_seed(100 + rep)
