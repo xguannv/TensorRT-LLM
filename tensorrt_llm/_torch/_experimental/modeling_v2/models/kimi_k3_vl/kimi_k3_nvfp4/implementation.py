@@ -66,6 +66,7 @@ from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
 from . import spec_worker as _spec_worker
 from . import weights as _weights
+from .decode_mla_dcp import MlaSplitRead
 from .verify import k3_fp8_kda_verify
 
 if TYPE_CHECKING:
@@ -2323,6 +2324,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
         self._fp8_qb_weight = self._fp8_qb_scale = None
         self._fp8_qb_ue8m0 = False
         self._fp8_decode_ready = False
+        self._split_read: Optional[MlaSplitRead] = None
 
     def prepare_fp8_decode_weights(self) -> None:
         """Prepare FP8 Q-B codes and scales with the selected GEMM's quantization recipe."""
@@ -2349,6 +2351,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if self._fp8_qb_weight is None:
             raise RuntimeError("FP8 MLA decode weights were not prepared during checkpoint loading")
         self._fp8_decode_ready = True
+        if MlaSplitRead.applies(self.mqa, self.mapping):
+            self._split_read = MlaSplitRead.shared(self.mapping, self.num_heads_tp)
+            self._split_read.register(self.mqa.layer_idx)
 
     def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
         return self._k3_step_view(attn_metadata, step) is not None
@@ -2488,6 +2493,17 @@ class K3DecodeMLA(KimiK3MLAAttention):
             quant_q,
             fuse_fp4_q_quant=bool(self.mqa.has_fp4_kv_cache),
         )
+        if self._split_read is not None:
+            latent = self._split_read.forward(
+                self.mqa, quant_q, metadata, ag.shape[0] // metadata.num_generations, bmm1, bmm2
+            )
+            return _fp8_attention.mla_output(
+                latent,
+                self.v_b_proj,
+                self.v_b_proj_scale,
+                ag,
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+            )
         latent = self._attn_forward_gen(
             self.mqa,
             query,

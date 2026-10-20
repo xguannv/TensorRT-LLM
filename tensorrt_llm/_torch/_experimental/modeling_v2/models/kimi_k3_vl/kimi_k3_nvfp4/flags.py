@@ -37,6 +37,11 @@ TRTLLM_K3LL_MOE_LOWM = _flag(
     0,
     "MoE decode path: NVFP4-latent front + k3_moe_lowm_dyn on CuteDSL NVFP4 buffers (decode_moe_lowm.py)",
 )
+TRTLLM_K3LL_MLA_DCP = _flag(
+    "TRTLLM_K3LL_MLA_DCP",
+    0,
+    "FP8-cache MLA decode attention: 0 stock, 1 CuTe DSL kernel on this rank's heads, 2 split-read DCP over TP",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
