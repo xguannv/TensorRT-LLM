@@ -119,7 +119,10 @@ def test_route_quant_nvfp4(m, amax_frac):
     r_q, r_s = _fp4_ref(h, gsf)
     torch.cuda.synchronize()
     assert q.shape == (m, LATENT // 2) and s.shape == (m, LATENT // SF16)
-    assert _same(ids, ids8) and _same(w, w8), "routing differs from the MXFP8 call"
+    assert w.dtype == torch.float32 and torch.equal(w, w8.float()), (
+        "routing weights are not the bf16 ones in fp32"
+    )
+    assert _same(ids, ids8) and _same(w.bfloat16(), w8), "routing differs from the MXFP8 call"
     assert _same(s, r_s), f"scales: {(s != r_s).sum().item()} of {s.numel()} differ"
     assert _same(q, r_q), f"codes: {(q != r_q).sum().item()} of {q.numel()} bytes differ"
     again = _trtllm().k3_route_quant(logits, bias, h, RSF, True, gsf)
@@ -369,7 +372,8 @@ def check_front(ctx):
         gathered = ctx.comm.allgather([_bits(t).cpu() for t in (ids, w, q, s)])
         row = dict(
             op="k3_moe_front_nvfp4", case=f"tp{ctx.world}", M=m,
-            routing_as_mxfp8=_same(ids, ids8) and _same(w, w8), shared_as_mxfp8=_same(shared, shared8),
+            routing_as_mxfp8=_same(ids, ids8) and w.dtype == torch.float32 and torch.equal(w, w8.float()),
+            shared_as_mxfp8=_same(shared, shared8),
             codes_equal=(q == r_q).float().mean().item(), scales_equal=(s == r_s).float().mean().item(),
             latent_err_scale_units=err_steps, experts_vs_regular_ulp=y_err_ulp,
             det=all(_same(a, b) for a, b in zip(again, (ids, w, q, s, shared))),

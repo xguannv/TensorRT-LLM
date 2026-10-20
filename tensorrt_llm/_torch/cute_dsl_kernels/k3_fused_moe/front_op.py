@@ -162,8 +162,10 @@ def k3_moe_front(
     num_tokens, k_in = x.shape
     device = x.device
     topk_ids = torch.empty(num_tokens, TOP_K, dtype=torch.int32, device=device)
-    topk_weights = torch.empty(num_tokens, TOP_K, dtype=torch.bfloat16, device=device)
     nvfp4 = nvfp4_gsf is not None
+    # With the NVFP4 latent the routing weights come out as fp32 (the bf16 weights, exactly): what the experts read.
+    wdtype = torch.float32 if nvfp4 else torch.bfloat16
+    topk_weights = torch.empty(num_tokens, TOP_K, dtype=wdtype, device=device)
     if nvfp4 and (
         nvfp4_gsf.dtype != torch.float32 or nvfp4_gsf.numel() != 1 or nvfp4_gsf.device != device
     ):
@@ -197,7 +199,7 @@ def k3_moe_front(
         arg(ag_flags.view(-1)),
         arg(ag_ready.view(-1) if ag_ready is not None else ag_flags.view(-1)),
         arg(topk_ids.view(-1)),
-        arg(topk_weights.view(-1).view(torch.int16)),
+        arg(topk_weights.view(-1).view(torch.int32 if nvfp4 else torch.int16)),
         arg(quantized.view(-1).view(torch.int32)),
         arg(scales.view(-1)),
         arg(shared_arg.view(-1).view(torch.int16)),
@@ -257,7 +259,9 @@ def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap
         scales = x.new_empty((num_tokens, HIDDEN_SIZE // SF_VEC), dtype=torch.uint8)
     return (
         x.new_empty((num_tokens, TOP_K), dtype=torch.int32),
-        x.new_empty((num_tokens, TOP_K), dtype=torch.bfloat16),
+        x.new_empty(
+            (num_tokens, TOP_K), dtype=torch.float32 if nvfp4_gsf is not None else torch.bfloat16
+        ),
         quantized,
         scales,
         x.new_empty((num_tokens, shared_cols), dtype=torch.bfloat16),

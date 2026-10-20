@@ -40,7 +40,8 @@ def k3_moe_front(
     state (``head=workspace``) acquires; every publishing call is followed by exactly one such call.
 
     ``nvfp4_gsf`` (fp32 ``[1]``, not with ``publish``): the latent is NVFP4 on that global scale instead (``quantized``
-    uint8 ``[M, 1792]`` E2M1 pairs, ``scales`` uint8 ``[M, 224]`` E4M3, linear; ``fp4_quantize``'s recipe)."""
+    uint8 ``[M, 1792]`` E2M1 pairs, ``scales`` uint8 ``[M, 224]`` E4M3, linear; ``fp4_quantize``'s recipe), and
+    ``topk_weights`` fp32 (the bf16 weights, exactly)."""
     return torch.ops.trtllm.k3_moe_front(
         x,
         w_front,

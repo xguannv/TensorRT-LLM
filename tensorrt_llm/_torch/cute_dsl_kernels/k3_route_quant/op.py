@@ -135,8 +135,10 @@ def k3_route_quant(
     num_tokens = scores.shape[0]
     device = scores.device
     topk_ids = torch.empty(num_tokens, TOP_K, dtype=torch.int32, device=device)
-    topk_weights = torch.empty(num_tokens, TOP_K, dtype=torch.bfloat16, device=device)
     nvfp4 = nvfp4_gsf is not None
+    # With the NVFP4 latent the routing weights come out as fp32 (the bf16 weights, exactly): what the experts read.
+    wdtype = torch.float32 if nvfp4 else torch.bfloat16
+    topk_weights = torch.empty(num_tokens, TOP_K, dtype=wdtype, device=device)
     if nvfp4 and (
         nvfp4_gsf.dtype != torch.float32 or nvfp4_gsf.numel() != 1 or nvfp4_gsf.device != device
     ):
@@ -156,7 +158,7 @@ def k3_route_quant(
         _arg(bias.view(-1)),
         _arg(hidden_states.view(-1).view(torch.int32)),
         _arg(topk_ids.view(-1)),
-        _arg(topk_weights.view(-1).view(torch.int16)),
+        _arg(topk_weights.view(-1).view(torch.int32 if nvfp4 else torch.int16)),
         _arg(quantized.view(-1).view(torch.int32)),
         _arg(scales.view(-1)),
         # Without nvfp4 the kernel never reads it: any fp32 word.
@@ -186,7 +188,9 @@ def _(scores, bias, hidden_states, routed_scaling_factor, early_trigger=False, n
         )
     return (
         scores.new_empty((num_tokens, TOP_K), dtype=torch.int32),
-        scores.new_empty((num_tokens, TOP_K), dtype=torch.bfloat16),
+        scores.new_empty(
+            (num_tokens, TOP_K), dtype=torch.float32 if nvfp4_gsf is not None else torch.bfloat16
+        ),
         quantized,
         scales,
     )

@@ -33,7 +33,8 @@ def k3_route_quant(
     reading them, as ``trtllm::k3_moe`` does.
 
     ``nvfp4_gsf`` (fp32 ``[1]``): the latent as NVFP4 on that global scale instead (uint8 ``[M, 1792]`` E2M1 pairs, one
-    E4M3 scale per 16 columns, uint8 ``[M, 224]``; ``fp4_quantize``'s recipe)."""
+    E4M3 scale per 16 columns, uint8 ``[M, 224]``; ``fp4_quantize``'s recipe), and ``topk_weights`` fp32 (the bf16
+    weights, exactly)."""
     return torch.ops.trtllm.k3_route_quant(
         router_logits,
         e_score_correction_bias,

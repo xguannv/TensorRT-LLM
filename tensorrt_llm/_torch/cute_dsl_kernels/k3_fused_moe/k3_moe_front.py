@@ -492,7 +492,7 @@ def k3_moe_front_kernel(
     flags: cutlass.Array,  # int32 [0] buffer of this call, [1] unused (0), [2] epoch, [3] CTAs that read [0]
     ready: cutlass.Array,  # int32 [16] per-token ready words (publish)
     topk_ids: cutlass.Array,  # int32 [M * 16]
-    topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]
+    topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]; with nvfp4 an int32 view of fp32
     quant_words: cutlass.Array,  # int32 view of e4m3 [M, 3584]
     scales: cutlass.Array,  # uint8 [M * 112]
     shared_bits: cutlass.Array,  # int16 view of bf16 [M, shared_cols]
@@ -1140,7 +1140,13 @@ def k3_moe_front_kernel(
                             if tx < cutlass.Int32(TOP_K):
                                 out = tok * cutlass.Int32(TOP_K) + tx
                                 topk_ids.store(expert, idx=out)
-                                topk_weight_bits.store(weight_bits, idx=out)
+                                if cutlass.const_expr(nvfp4):
+                                    # fp32 of the bf16 weight (exact): what the NVFP4 experts read.
+                                    topk_weight_bits.store(
+                                        cutlass.Int32(weight_bits) << cutlass.Int32(16), idx=out
+                                    )
+                                else:
+                                    topk_weight_bits.store(weight_bits, idx=out)
                                 if cutlass.const_expr(publish):
                                     cute.arch.fence_acq_rel_gpu()
                             if cutlass.const_expr(publish):

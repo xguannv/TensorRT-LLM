@@ -438,7 +438,7 @@ def k3_route_quant_kernel(
     bias: cutlass.Array,  # fp32 [896]
     hidden_words: cutlass.Array,  # int32 view of bf16 [M, 3584]: [M * 1792]
     topk_ids: cutlass.Array,  # int32 [M * 16]
-    topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]
+    topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]; with nvfp4 an int32 view of fp32
     quant_words: cutlass.Array,  # int32 view of e4m3 [M, 3584]: [M * 896]
     scales: cutlass.Array,  # uint8 [M * 112]
     gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
@@ -478,7 +478,11 @@ def k3_route_quant_kernel(
             if tidx < cutlass.Int32(TOP_K):
                 out = bidx * cutlass.Int32(TOP_K) + tidx
                 topk_ids.store(expert, idx=out)
-                topk_weight_bits.store(weight_bits, idx=out)
+                if cutlass.const_expr(nvfp4):
+                    # fp32 of the bf16 weight (exact): what the NVFP4 experts read.
+                    topk_weight_bits.store(cutlass.Int32(weight_bits) << cutlass.Int32(16), idx=out)
+                else:
+                    topk_weight_bits.store(weight_bits, idx=out)
     else:
         row = bidx - num_tokens
         words = hidden_words.load(
