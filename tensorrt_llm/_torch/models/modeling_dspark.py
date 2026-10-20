@@ -110,6 +110,7 @@ from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.dspark_ar_norm import draft_ar_norm
 from ..speculative.dspark_draft_gemm import DraftL2Prefetch, draft_gemm, l2_prefetch_enabled
+from ..speculative.dspark_mla_fused import draft_mla_attend
 from ..speculative.dspark_norm import draft_rmsnorm
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
@@ -4022,6 +4023,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             if q is None:
                 q = attn.q_b_proj(q_a_normed)
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
+            fused_attn_out = None
             if fused_block_rope:
                 query = torch.empty(
                     (batch, block_size, num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
@@ -4043,18 +4045,29 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     fixup.offsets.reshape(-1),
                     attn.kv_a_layernorm.variance_epsilon,
                 )
-                torch.ops.trtllm.bmm_out(
-                    q[..., : self.qk_nope_head_dim]
-                    .view(num_tokens, num_heads, self.qk_nope_head_dim)
-                    .transpose(0, 1),
-                    attn._k_b_proj.to(q.dtype),
-                    query[..., : self.kv_lora_rank]
-                    .view(num_tokens, num_heads, self.kv_lora_rank)
-                    .transpose(0, 1),
+                # TLLM_DSPARK_MLA_FUSED: absorption, attention and V up-projection in one launch.
+                fused_attn_out = draft_mla_attend(
+                    attn,
+                    q,
+                    query,
+                    ctx_kv_cache[layer_idx][:, 0, 0],
+                    fixup.page_tables_i32,
+                    fixup.seq_lens_i32,
+                    self.softmax_scale,
                 )
-                ctx_out = self._cute_dsl_block_decode(
-                    query, ctx_kv_cache[layer_idx], fixup, block_size
-                )
+                if fused_attn_out is None:
+                    torch.ops.trtllm.bmm_out(
+                        q[..., : self.qk_nope_head_dim]
+                        .view(num_tokens, num_heads, self.qk_nope_head_dim)
+                        .transpose(0, 1),
+                        attn._k_b_proj.to(q.dtype),
+                        query[..., : self.kv_lora_rank]
+                        .view(num_tokens, num_heads, self.kv_lora_rank)
+                        .transpose(0, 1),
+                    )
+                    ctx_out = self._cute_dsl_block_decode(
+                        query, ctx_kv_cache[layer_idx], fixup, block_size
+                    )
             else:
                 # The 576-wide query is assembled in one buffer rather than
                 # cat([absorbed, rope]): q's rope half is a 64-slice of a 192-wide
@@ -4148,7 +4161,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     scores = scores.masked_fill(~key_valid.view(batch, 1, 1, -1), float("-inf"))
                     probs = torch.softmax(scores, dim=-1).to(kv_full.dtype)
                     ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
-            if spec_tail_fusion_enabled():
+            if fused_attn_out is not None:
+                attn_out = fused_attn_out
+            elif spec_tail_fusion_enabled():
                 # Same batched GEMM as the einsum, written straight into the
                 # [tokens, heads, v] rows o_proj reads, so no reshape copy.
                 attn_out = torch.empty(
