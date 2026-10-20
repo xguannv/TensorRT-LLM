@@ -181,7 +181,7 @@ def triton_next_pow2(x):
 
 
 @pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (0, 2), (0, 4), (2, 3), (3, 0)])
-@pytest.mark.parametrize("force", [None, "const", "frac", "state"])
+@pytest.mark.parametrize("force", [None, "const", "frac", "state", "state_ties"])
 @pytest.mark.parametrize("ties,nans", [(False, False), (True, True)])
 def test_fused_select_accept_matches_reduce_then_accept(num_contexts, num_gens, force, ties, nans):
     import types
@@ -192,6 +192,7 @@ def test_fused_select_accept_matches_reduce_then_accept(num_contexts, num_gens, 
     from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import KDAHybridCacheManagerV2
     from tensorrt_llm._torch.speculative import vocab_parallel as vp
     from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+        FORCE_ACCEPT_TIE_STRIDE,
         ForceAcceptKey,
         fused_select_accept,
         fused_strict_accept,
@@ -225,12 +226,17 @@ def test_fused_select_accept_matches_reduce_then_accept(num_contexts, num_gens, 
     kgen = torch.Generator(device="cuda").manual_seed(rows)
     key_pos = torch.randint(0, 1 << 20, (num_gens * (K + 1),), device="cuda", generator=kgen)
     key_tok = torch.randint(0, 163840, (num_gens * (K + 1),), device="cuda", generator=kgen)
+    if force == "state_ties" and num_gens > 1:
+        # The last request is in the same state as the first: told apart by the tie count.
+        key_pos[(num_gens - 1) * (K + 1)] = key_pos[0]
+        key_tok[(num_gens - 1) * (K + 1)] = key_tok[0]
     key = ForceAcceptKey(key_pos.to(torch.int32), key_tok.to(torch.int32), K + 1)
     force_args = {
         None: None,
         "const": (3,),
         "frac": (2, 0.6, K + 1, pool, torch.zeros(1, dtype=torch.int64, device="cuda"), 7, 3),
         "state": (2, 0.6, K + 1, pool, key, 7, 3),
+        "state_ties": (2, 0.6, K + 1, pool, key, 7, 3),
     }[force]
     ref_force = force_args
     if force == "frac":
@@ -284,8 +290,16 @@ def test_fused_select_accept_matches_reduce_then_accept(num_contexts, num_gens, 
     assert torch.equal(rewind, ref_rewind)
     if force == "frac":
         assert torch.equal(force_args[4], ref_force[4])
-    if force == "state" and num_gens > 0:
-        idx = (key_pos[:: K + 1] * 7 + key_tok[:: K + 1] * 3) & (pool.numel() - 1)
+    if force in ("state", "state_ties") and num_gens > 0:
+        p, t = key_pos[:: K + 1], key_tok[:: K + 1]
+        rows_ = torch.arange(num_gens, device="cuda")
+        ties = (
+            (p[:, None] == p[None, :])
+            & (t[:, None] == t[None, :])
+            & (rows_[None, :] < rows_[:, None])
+        ).sum(1)
+        assert int(ties.sum()) == (1 if force == "state_ties" and num_gens > 1 else 0)
+        idx = (p * 7 + t * 3 + ties * FORCE_ACCEPT_TIE_STRIDE) & (pool.numel() - 1)
         expected = (2 + (pool[idx] < 0.6).to(torch.int32)).clamp(max=K + 1)
         assert torch.equal(n[gen_rows], expected)
 

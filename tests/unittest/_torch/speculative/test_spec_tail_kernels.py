@@ -147,15 +147,19 @@ def test_strict_accept_cuda_graph_replay_matches_eager(monkeypatch):
         _assert_same((acc, n), ref, 0)
 
 
-def _state_key_inputs(num_contexts, num_gens, draft_len, seed):
+def _state_key_inputs(num_contexts, num_gens, draft_len, seed, ties=0):
     """Step inputs (input_ids, position_ids [1, N], num_ctx_tokens) for the state key: five
     tokens per context request, then one verify group of draft_len + 1 tokens per generation
-    request starting at a random position with a random newest committed token."""
+    request starting at a random position with a random newest committed token; the first
+    ``ties`` requests after request 0 copy its position and newest token."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     num_ctx_tokens = 5 * num_contexts
     total = num_ctx_tokens + num_gens * (draft_len + 1)
     ids = torch.randint(0, 163840, (total,), device="cuda", generator=gen).to(torch.int32)
     starts = torch.randint(0, 1 << 20, (num_gens,), device="cuda", generator=gen)
+    for g in range(1, min(ties + 1, num_gens)):
+        starts[g] = starts[0]
+        ids[num_ctx_tokens + g * (draft_len + 1)] = ids[num_ctx_tokens]
     offsets = torch.arange(draft_len + 1, device="cuda")
     pos = torch.cat(
         [
@@ -166,9 +170,12 @@ def _state_key_inputs(num_contexts, num_gens, draft_len, seed):
     return ids, pos.unsqueeze(0), num_ctx_tokens
 
 
-@pytest.mark.parametrize("num_contexts,num_gens,draft_len", [(0, 2, 6), (0, 8, 6), (2, 33, 7)])
+@pytest.mark.parametrize(
+    "num_contexts,num_gens,draft_len", [(0, 2, 6), (0, 8, 6), (2, 33, 7), (0, 128, 6)]
+)
+@pytest.mark.parametrize("ties", [0, 2])
 def test_strict_accept_forced_state_key_matches_eager(
-    num_contexts, num_gens, draft_len, monkeypatch
+    num_contexts, num_gens, draft_len, ties, monkeypatch
 ):
     monkeypatch.setenv(FORCE_ACCEPT_KEY_ENV_VAR, "state")
     logits, draft = _case(num_contexts, num_gens, draft_len)
@@ -178,7 +185,7 @@ def test_strict_accept_forced_state_key_matches_eager(
     fused_worker.force_num_accepted_tokens = 2.75
     seen = set()
     for step in range(6):
-        inputs = _state_key_inputs(num_contexts, num_gens, draft_len, seed=step)
+        inputs = _state_key_inputs(num_contexts, num_gens, draft_len, seed=step, ties=ties)
         ref_worker._force_accept_inputs = inputs
         fused_worker._force_accept_inputs = inputs
         ref = _accept(ref_worker, logits, draft, num_contexts, bs, False, monkeypatch)
