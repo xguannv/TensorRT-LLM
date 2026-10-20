@@ -483,3 +483,29 @@ def test_markov_kernels_compile_at_decode_shapes(tp):
                 BLOCK_B=16, BLOCK_SLOTS=triton.next_power_of_2(tp), BLOCK_V=vp._MARKOV_BLOCK_V,
                 BLOCK_P=triton.next_power_of_2(programs), num_warps=4, grid=(programs,),
             )  # fmt: skip
+
+
+@pytest.mark.parametrize("role,n,k", [("q_kv_a", 2112, 7168), ("gate_up", 1792, 7168),
+                                      ("lm_head", 10240, 7168)])  # fmt: skip
+@pytest.mark.parametrize("m", [7, 14, 28, 32])
+def test_draft_gemm_prefetch_matches_pins(monkeypatch, role, n, k, m):
+    """``TLLM_DSPARK_DRAFT_PREFETCH`` / ``TLLM_DSPARK_DRAFT_EXACT_SMEM`` (deeper ring, L2
+    prefetch of the following K tiles, exact shared memory) give the pinned kernels' values."""
+    from tensorrt_llm._torch.speculative.dspark_draft_gemm import (
+        DRAFT_GEMM_ENV_VAR,
+        DRAFT_PREFETCH_ENV_VAR,
+        draft_gemm,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(7 * m + n)
+    x = (torch.randn(m, k, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", generator=gen) / k**0.5).to(torch.bfloat16)
+    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
+    monkeypatch.setenv(DRAFT_PREFETCH_ENV_VAR, "0")
+    monkeypatch.setenv("TLLM_DSPARK_DRAFT_EXACT_SMEM", "0")
+    ref = draft_gemm(x, w, role)
+    monkeypatch.setenv(DRAFT_PREFETCH_ENV_VAR, "1")
+    monkeypatch.setenv("TLLM_DSPARK_DRAFT_EXACT_SMEM", "1")
+    out = draft_gemm(x, w, role)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(out), _bits(ref))

@@ -67,9 +67,45 @@ _PINS = {
 }
 
 
+#: ``TLLM_DSPARK_DRAFT_PREFETCH=1``: the pinned split-K GEMMs of these roles run with this many
+#: ring stages (None: the pin's) and prefetch up to this many further K tiles of their weight
+#: into L2 while they wait for their predecessor (PDL). Same kernels, same tiles, same split-K
+#: order, so the same values as the pins alone.
+DRAFT_PREFETCH_ENV_VAR = "TLLM_DSPARK_DRAFT_PREFETCH"
+_PREFETCH = {
+    "q_kv_a": (10, 64),
+    "gate_up": (10, 64),
+    "lm_head": (None, 16),
+}
+
+
 def draft_gemm_enabled() -> bool:
     """Whether ``TLLM_DSPARK_DRAFT_GEMM=1`` pins the drafter's GEMM kernels."""
     return os.environ.get(DRAFT_GEMM_ENV_VAR, "0") == "1"
+
+
+def _prefetch_for(role: str):
+    """``(ab_stages or None, L2 prefetch tiles)`` of ``role`` under ``TLLM_DSPARK_DRAFT_PREFETCH``.
+
+    ``1`` selects :data:`_PREFETCH`; ``role:stages:tiles[,...]`` replaces the table (stages 0:
+    the pin's).
+    """
+    value = os.environ.get(DRAFT_PREFETCH_ENV_VAR, "0")
+    if value in ("", "0"):
+        return None, 0
+    table = dict(_PREFETCH)
+    if value != "1":
+        table = {}
+        for item in value.split(","):
+            name, stages, tiles = item.split(":")
+            table[name] = (int(stages) or None, int(tiles))
+    return table.get(role, (None, 0))
+
+
+def _exact_smem_for(role: str) -> bool:
+    """Whether ``role`` launches with its exact shared memory and the max-shared carveout."""
+    value = os.environ.get("TLLM_DSPARK_DRAFT_EXACT_SMEM", "0")
+    return value == "1" or role in value.split(",")
 
 
 def draft_gemm(x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[torch.Tensor]:
@@ -96,7 +132,12 @@ def draft_gemm(x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[tor
     _, kind, tactic = pin
     if kind == "cublas":
         return F.linear(x, weight)
-    from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import SplitKTactic, run_splitk_dense
+    from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+        _SMEM_CAPACITY_BYTES,
+        SplitKTactic,
+        _max_ab_stages_for,
+        run_splitk_dense,
+    )
     from ..flashinfer_utils import get_env_enable_pdl
 
     # detach(): the kernel's DLPack export refuses tensors that require grad,
@@ -106,7 +147,24 @@ def draft_gemm(x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[tor
     if not x2d.is_contiguous() or k % 128 or x2d.data_ptr() % 32 or weight.data_ptr() % 32:
         return None
     out = torch.empty((m, weight.shape[0]), dtype=x.dtype, device=x.device)
-    run_splitk_dense(x2d, weight.t(), None, out, get_env_enable_pdl(), SplitKTactic(*tactic))
+    stages, pf_tiles = _prefetch_for(role)
+    tactic = SplitKTactic(*tactic)
+    if stages is not None:
+        # As deep as the shared memory allows for this tile shape.
+        stages = min(stages, _max_ab_stages_for(tactic, _SMEM_CAPACITY_BYTES))
+        tactic = SplitKTactic(
+            tactic.mma_m, tactic.mma_n, tactic.split_k, max(stages, tactic.ab_stages)
+        )
+    run_splitk_dense(
+        x2d,
+        weight.t(),
+        None,
+        out,
+        get_env_enable_pdl(),
+        tactic,
+        l2_prefetch_tiles=pf_tiles,
+        exact_smem=_exact_smem_for(role),
+    )
     return out.view(*x.shape[:-1], weight.shape[0])
 
 

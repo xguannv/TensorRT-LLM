@@ -286,6 +286,22 @@ def _map_shared_rank(
 
 
 @dsl_user_op
+def _bulk_prefetch_l2(addr, nbytes, *, loc=None, ip=None) -> None:
+    """``cp.async.bulk.prefetch.L2`` of ``nbytes`` (a multiple of 16) at ``addr``: a hint."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _store_shared_remote_v4(
     value0,
     value1,
@@ -323,7 +339,15 @@ OWNER_RANK = 0
 
 
 class SplitKDenseGemmKernel:
-    """Standalone BF16/FP16 GEMM with a cluster-local split-K reduction."""
+    """Standalone BF16/FP16 GEMM with a cluster-local split-K reduction.
+
+    ``l2_prefetch_tiles > 0`` (PDL only): once the weight warp has issued the loads that fill its
+    ring, it also issues ``cp.async.bulk.prefetch.L2`` for up to that many of its following K
+    tiles. With PDL the CTA is resident while the previous grid still runs, so these weight
+    rows reach L2 before this grid's dependency resolves and the ring refills from L2. Only the
+    weight operand (written by no grid of the step) is touched; the prefetch is a hint and
+    changes no value.
+    """
 
     def __init__(
         self,
@@ -331,8 +355,12 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        l2_prefetch_tiles: int = 0,
+        exact_smem: bool = False,
     ) -> None:
         self.acc_dtype = cutlass.Float32
+        self.exact_smem = exact_smem
+        self.smem_bytes = _smem_bytes(tactic, tactic.ab_stages) + _AB_BUFFER_ALIGN_BYTES
         self.cta_m = tactic.mma_m
         self.cta_n = tactic.mma_n
         self.cta_k = _CTA_K
@@ -340,6 +368,7 @@ class SplitKDenseGemmKernel:
         self.split_k = tactic.split_k
         self.use_pdl = use_pdl
         self.has_bias = has_bias
+        self.l2_prefetch_tiles = l2_prefetch_tiles if use_pdl else 0
 
         self.threads_per_cta = 256
         self.epilog_threads = 128
@@ -376,7 +405,10 @@ class SplitKDenseGemmKernel:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(
+                self.smem_bytes if self.exact_smem else utils.get_smem_capacity_in_bytes("sm_100")
+            ),
+            preferred_smem_carveout=100 if self.exact_smem else None,
             stream=stream,
             use_pdl=self.use_pdl,
         )
@@ -511,6 +543,23 @@ class SplitKDenseGemmKernel:
 
         # Warp 3 is idle; warps 4-7 run the epilogue.
         if warp_idx == 0:
+            # Weight rows of this CTA for the optional L2 prefetch: base address of the first
+            # row at K = 0, row pitch in bytes, rows inside the tensor.
+            pf_base = cutlass.Int64(0)
+            pf_pitch = cutlass.Int64(0)
+            pf_rows = Int32(0)
+            if cutlass.const_expr(self.l2_prefetch_tiles > 0):
+                elem_bytes = ab_dtype.width // 8
+                row0 = bidx * self.cta_m
+                pf_rows = cute.size(mA, mode=[0]) - row0
+                if pf_rows > self.cta_m:
+                    pf_rows = Int32(self.cta_m)
+                pf_pitch = cutlass.Int64(mA.layout.stride[0]) * elem_bytes
+                pf_base = (
+                    mA.iterator.toint()
+                    + cutlass.Int64(row0) * pf_pitch
+                    + cutlass.Int64(l_idx) * cutlass.Int64(mA.layout.stride[2]) * elem_bytes
+                )
             self.dma_warp(
                 bar_full,
                 bar_empty,
@@ -521,6 +570,9 @@ class SplitKDenseGemmKernel:
                 k_tile_start,
                 k_tile_count,
                 True,
+                pf_base,
+                pf_pitch,
+                pf_rows,
             )
         elif warp_idx == 1:
             self.dma_warp(
@@ -533,6 +585,9 @@ class SplitKDenseGemmKernel:
                 k_tile_start,
                 k_tile_count,
                 False,
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                Int32(0),
             )
         elif warp_idx == 2:
             self.mma_warp(
@@ -577,11 +632,20 @@ class SplitKDenseGemmKernel:
         k_tile_start: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         is_a: cutlass.Constexpr,
+        pf_base: cutlass.Int64,
+        pf_pitch: cutlass.Int64,
+        pf_rows: cutlass.Int32,
     ):
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
+        ring = Int32(0)
+        if cutlass.const_expr(is_a and self.l2_prefetch_tiles > 0):
+            # K tiles the ring holds before the first MMA frees a stage.
+            ring = k_tile_count
+            if ring > stages:
+                ring = Int32(stages)
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % stages
@@ -602,6 +666,20 @@ class SplitKDenseGemmKernel:
                 tma_operation_type=self.tma_op,
                 update_expect_tx=False,
             )
+            if cutlass.const_expr(is_a and self.l2_prefetch_tiles > 0):
+                if k_tile == ring - 1:
+                    # The ring is full: the K tiles after it go to L2 (one bulk prefetch per
+                    # weight row and lane, contiguous along K).
+                    pf_end = k_tile_count
+                    if pf_end > ring + self.l2_prefetch_tiles:
+                        pf_end = ring + Int32(self.l2_prefetch_tiles)
+                    if pf_end > ring:
+                        tile_bytes = self.cta_k * (s_tile.element_type.width // 8)
+                        off = cutlass.Int64(k_tile_start + ring) * tile_bytes
+                        nbytes = (pf_end - ring) * tile_bytes
+                        lane = cute.arch.lane_idx()
+                        for r in cutlass.range(lane, pf_rows, 32, unroll=1):
+                            _bulk_prefetch_l2(pf_base + cutlass.Int64(r) * pf_pitch + off, nbytes)
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
@@ -930,6 +1008,8 @@ def _get_compiled_splitk_kernel(
     use_pdl: bool,
     has_bias: bool,
     leading_dims: tuple[int, int, int],
+    l2_prefetch_tiles: int = 0,
+    exact_smem: bool = False,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -938,6 +1018,8 @@ def _get_compiled_splitk_kernel(
         tactic=tactic,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        l2_prefetch_tiles=l2_prefetch_tiles,
+        exact_smem=exact_smem,
     )
     compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
@@ -998,6 +1080,8 @@ def run_splitk_dense(
     out: _torch.Tensor,
     pdl: bool,
     tactic: SplitKTactic,
+    l2_prefetch_tiles: int = 0,
+    exact_smem: bool = False,
 ) -> _torch.Tensor:
     """Run ``A[M,K] @ B[K,N]`` with the split-K BF16/FP16 GEMM kernel.
 
@@ -1009,6 +1093,11 @@ def run_splitk_dense(
         out: Pre-allocated output tensor of shape ``[M, N]``, BF16/FP16.
         pdl: Whether to use Programmatic Dependent Launch.
         tactic: The ``SplitKTactic`` specifying tile and pipeline parameters.
+        l2_prefetch_tiles: With ``pdl``, the weight warp prefetches up to this many K tiles
+           beyond its ring into L2 before the dependency resolves (0: off). Same values.
+        exact_smem: Launch with the shared memory the tactic uses (instead of all of it) and
+           the max-shared carveout, so a CTA can become resident next to small CTAs of the
+           previous grid. Same values.
 
     Returns:
         The ``out`` tensor, filled with the GEMM result.
@@ -1022,6 +1111,8 @@ def run_splitk_dense(
         use_pdl=pdl,
         has_bias=has_bias,
         leading_dims=cute_tensors[4],
+        l2_prefetch_tiles=int(l2_prefetch_tiles) if pdl else 0,
+        exact_smem=bool(exact_smem),
     )
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
     if has_bias:
