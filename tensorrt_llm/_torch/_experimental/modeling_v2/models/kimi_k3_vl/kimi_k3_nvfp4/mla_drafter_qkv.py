@@ -15,6 +15,8 @@ rounded to bf16, bf16 GEMMs with fp32 accumulation rounded to bf16, the adjacent
 Shapes are the K3 drafter's: q_lora_rank 1536, kv_lora_rank 512, rope 64, nope 128.
 """
 
+from typing import List
+
 import torch
 import triton
 import triton.language as tl
@@ -190,3 +192,84 @@ def drafter_mla_qkv(
 @drafter_mla_qkv.register_fake
 def _drafter_mla_qkv_fake(a, qa_norm, q_b, k_b, kv_norm, freqs, pool, slots, qa_eps, kv_eps):
     return a.new_empty((a.shape[0], q_b.shape[0] // (NOPE + ROPE), KV_LORA + ROPE))
+
+
+@triton.jit
+def _drafter_mla_ctx_kv(
+    LATENT,
+    NORM,
+    FREQS,
+    POS,
+    PAGES,
+    OFFSETS,
+    PTRS,
+    LAT_STRIDE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    row, layer = tl.program_id(0), tl.program_id(1)
+    latent = tl.arange(0, 512)
+    half = tl.arange(0, 32)
+    src = LATENT + row * LAT_STRIDE + layer * 576
+    x = tl.load(src + latent).to(tl.float32)
+    x = x * tl.rsqrt(tl.sum(x * x, 0) / 512 + EPS)
+    x = tl.load(NORM + layer * 512 + latent).to(tl.float32) * x
+    pos = tl.load(POS + row).to(tl.int64)
+    page = tl.load(PAGES + row).to(tl.int64)
+    offset = tl.load(OFFSETS + row).to(tl.int64)
+    dst = (
+        tl.load(PTRS + layer).to(tl.pointer_type(tl.bfloat16))
+        + page * PAGE_STRIDE
+        + offset * ROW_STRIDE
+    )
+    tl.store(dst + latent, x.to(tl.bfloat16))
+    k_even = tl.load(src + 512 + 2 * half).to(tl.float32)
+    k_odd = tl.load(src + 513 + 2 * half).to(tl.float32)
+    cos = tl.load(FREQS + pos * 64 + 2 * half)
+    sin = tl.load(FREQS + pos * 64 + 2 * half + 1)
+    tl.store(dst + 512 + 2 * half, (k_even * cos - k_odd * sin).to(tl.bfloat16))
+    tl.store(dst + 513 + 2 * half, (k_even * sin + k_odd * cos).to(tl.bfloat16))
+
+
+@torch.library.custom_op("trtllm::k3_drafter_mla_ctx_kv", mutates_args=("pools",))
+def drafter_mla_ctx_kv(
+    latent: torch.Tensor,
+    norm: torch.Tensor,
+    freqs: torch.Tensor,
+    positions: torch.Tensor,
+    pages: torch.Tensor,
+    offsets: torch.Tensor,
+    pointers: torch.Tensor,
+    pools: List[torch.Tensor],
+    eps: float,
+) -> None:
+    """Store the drafter's context latents into its paged pools: for every row of ``latent`` (``[rows, L x 576]``,
+    the raw ``[kv_a | k_pe]`` of each layer) and layer, ``RMSNorm(kv_a) * norm[layer]`` and ``k_pe`` rotated at
+    ``positions[row]`` (``freqs``: fp32 ``[max_pos, 32, 2]``), written to page ``pages[row]``, row ``offsets[row]`` of
+    ``pools[layer]``. ``pointers``: int64 ``[L]``, each pool's data pointer; ``pools``: the pools (all of one layout,
+    ``[pages, 1, 1, page_size, 576]`` bf16), named so the op records the write."""
+    rows = latent.shape[0]
+    if rows == 0:
+        return
+    pool = pools[0]
+    _drafter_mla_ctx_kv[(rows, len(pools))](
+        latent,
+        norm,
+        freqs,
+        positions,
+        pages,
+        offsets,
+        pointers,
+        latent.stride(0),
+        pool.stride(0),
+        pool.stride(3),
+        eps,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+
+
+@drafter_mla_ctx_kv.register_fake
+def _drafter_mla_ctx_kv_fake(latent, norm, freqs, positions, pages, offsets, pointers, pools, eps):
+    return None

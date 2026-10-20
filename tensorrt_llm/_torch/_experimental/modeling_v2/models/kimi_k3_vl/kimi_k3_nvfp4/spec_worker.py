@@ -1381,6 +1381,10 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     (``_gate_spec_worker_kernels``)."""
 
     k3_decode = False
+    # The target sets it (switch TRTLLM_K3LL_MLA_DRAFTER_CTX): the context latents go through one
+    # trtllm::k3_drafter_mla_ctx_kv call (`_k3_install_ctx`).
+    k3_mla_ctx = False
+    _k3_ctx = None
     _k3_sharded_block_logits = False
     _k3_markov = None
     _k3_markov_next = None
@@ -1390,6 +1394,128 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     _keep_draft_logits_sharded = KimiK3DSparkWorker._keep_draft_logits_sharded
     _k3_markov_chain = KimiK3DSparkWorker._k3_markov_chain
     _apply_dspark_markov_bias = KimiK3DSparkWorker._apply_dspark_markov_bias
+
+    def _lazy_init_ctx_buffers(
+        self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
+    ):
+        """The stock buffers; then, once they are paged, the context latent path (`_k3_install_ctx`)."""
+        result = super()._lazy_init_ctx_buffers(
+            draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
+        )
+        if self.k3_mla_ctx and self._k3_ctx is None:
+            self._k3_install_ctx(draft_model)
+        return result
+
+    def _k3_install_ctx(self, draft_model) -> None:
+        """Store the drafter's context latents with one ``trtllm::k3_drafter_mla_ctx_kv`` call (all layers' RMSNorm,
+        RoPE and paged write) instead of the stock per-layer RMSNorm + RoPE in ``precompute_context_kv`` and the
+        per-layer scatter in ``_store_context_kv_paged``: ``precompute_context_kv`` then returns the raw latents of
+        its one GEMM (``[N, L, 1, 576]``; the stock mask multiply between the two leaves a masked row zero either
+        way), and `_store_context_kv_paged` finishes them. Needs the paged bf16 context pool and the kernel's
+        latent shape; otherwise the stock path stays."""
+        from . import mla_drafter_qkv as _qkv
+
+        self._k3_ctx = False
+        layers = getattr(getattr(draft_model, "model", None), "layers", None)
+        pools = self._ctx_kv_buf
+        if (
+            not self._ctx_paged
+            or not layers
+            or pools is None
+            or not hasattr(draft_model, "_build_fused_kv_buffers")
+            or getattr(draft_model, "kv_lora_rank", None) != _qkv.KV_LORA
+            or getattr(draft_model, "qk_rope_head_dim", None) != _qkv.ROPE
+        ):
+            logger.info("Kimi K3 MLA DSpark drafter: context latents on the stock path")
+            return
+        pool = pools[0]
+        if (
+            pool.dtype != torch.bfloat16
+            or tuple(pool.shape[1:3]) != (1, 1)
+            or pool.shape[-1] != 576
+        ):
+            logger.info(
+                "Kimi K3 MLA DSpark drafter: context latents on the stock path (pool layout)"
+            )
+            return
+        if draft_model._fused_kv_weight is None:
+            draft_model._build_fused_kv_buffers()
+        num_layers = len(layers)
+        weight = draft_model._fused_kv_weight
+
+        def raw_context_latents(projected_hidden: torch.Tensor, positions: torch.Tensor):
+            del (
+                positions
+            )  # applied at the store (`_store_context_kv_paged`), at the same slot-local positions
+            latent = torch.nn.functional.linear(projected_hidden.to(weight.dtype), weight)
+            return latent.view(latent.shape[0], num_layers, 1, -1), None
+
+        draft_model.precompute_context_kv = raw_context_latents
+        self._k3_ctx = {
+            "drafter": draft_model,
+            "norm": draft_model._kv_a_norm_stacked.contiguous(),
+            "eps": float(draft_model._kv_a_norm_eps),
+            "freqs": None,
+            "pointers": None,
+            "key": None,
+        }
+        logger.info(
+            f"Kimi K3 MLA DSpark drafter: context latents of {num_layers} layers in one k3_drafter_mla_ctx_kv call"
+        )
+
+    def _store_context_kv_paged(self, k, v, rows, positions) -> None:
+        """With the context latent path on (`_k3_install_ctx`), ``k`` holds raw latents: one
+        ``trtllm::k3_drafter_mla_ctx_kv`` call normalizes, rotates and stores all layers; otherwise the stock store."""
+        ctx = self._k3_ctx
+        if not ctx or v is not None:
+            return super()._store_context_kv_paged(k, v, rows, positions)
+        table = (
+            self._ctx_block_tables if self._ctx_block_tables is not None else self._ctx_page_table
+        )
+        page_size = self._ctx_page_size
+        positions = positions.long()
+        pages = table[rows.long(), positions // page_size].long()
+        offsets = positions % page_size
+        pools = list(self._ctx_kv_buf)
+        key = tuple(p.data_ptr() for p in pools)
+        drafter = ctx["drafter"]
+        capturing = torch.cuda.is_current_stream_capturing()
+        if ctx["key"] != key or ctx["freqs"] is None:
+            if capturing or any(p.stride() != pools[0].stride() for p in pools):
+                self._k3_store_stock(k, pools, pages, offsets, positions)
+                return
+            ctx["pointers"] = torch.tensor(key, dtype=torch.int64, device=k.device)
+            ctx["freqs"] = torch.view_as_real(drafter._mla_freqs_cis(k.device)).contiguous()
+            ctx["key"] = key
+        torch.ops.trtllm.k3_drafter_mla_ctx_kv(
+            k.reshape(k.shape[0], -1),
+            ctx["norm"],
+            ctx["freqs"],
+            positions,
+            pages,
+            offsets,
+            ctx["pointers"],
+            pools,
+            ctx["eps"],
+        )
+
+    def _k3_store_stock(self, k, pools, pages, offsets, positions) -> None:
+        """The stock drafter's RMSNorm + RoPE of raw latents ``k`` and the stock per-layer scatter."""
+        from tensorrt_llm._torch.models.modeling_dspark import _rmsnorm_rope_batched
+
+        ctx = self._k3_ctx
+        drafter = ctx["drafter"]
+        freqs = drafter._mla_freqs_cis(k.device)[positions]
+        for layer_idx, pool in enumerate(pools):
+            out = _rmsnorm_rope_batched(
+                k[:, layer_idx, 0].unsqueeze(0).contiguous(),
+                ctx["norm"][layer_idx],
+                ctx["eps"],
+                drafter.qk_rope_head_dim,
+                freqs.unsqueeze(0),
+                norm_dim=drafter.kv_lora_rank,
+            ).squeeze(0)
+            pool[pages, 0, 0, offsets] = out
 
     def wrap_draft_logits(self, draft_model) -> None:
         """Let the drafter's logits processor return the vocabulary shard on the steps this worker shards. The target

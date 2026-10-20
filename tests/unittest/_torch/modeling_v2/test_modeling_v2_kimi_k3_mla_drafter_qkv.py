@@ -114,3 +114,54 @@ def test_supports_rejects_other_shapes():
     assert not qkv.supports(a[:, :-1], q_b, k_b, pool)
     assert not qkv.supports(a, q_b.float(), k_b, pool)
     assert not qkv.supports(a, q_b, k_b[:3], pool)
+
+
+@needs_cuda
+def test_drafter_mla_ctx_kv_matches_the_stock_store():
+    """``trtllm::k3_drafter_mla_ctx_kv`` against the stock context path: per layer, the latent RMSNorm + RoPE of
+    ``precompute_context_kv`` and the paged scatter of ``_store_context_kv_paged``; masked (zero) rows stay zero."""
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(1)
+    layers, rows, page, max_pos = 5, 24, 64, 4096
+    latent = _bf16(rows, layers * (qkv.KV_LORA + qkv.ROPE), scale=1.0, gen=g)
+    latent.view(rows, layers, -1)[-3:] = (
+        0  # the stock mask multiply zeroes the rows past the accepted ones
+    )
+    norm = _bf16(layers, qkv.KV_LORA, gen=g).abs() + 1.0
+    angles = torch.rand(max_pos, qkv.ROPE // 2, generator=g, device=dev) * 6.28
+    table = torch.polar(torch.ones_like(angles), angles)
+    positions = torch.randperm(max_pos, generator=g, device=dev)[:rows]
+    # Distinct (page, offset) targets; the RoPE position of a row is independent of where it is stored.
+    pages = torch.arange(rows, device=dev) // 2
+    offsets = (torch.arange(rows, device=dev) % 2) * 32 + positions % 32
+    pools = [_bf16(16, 1, 1, page, qkv.KV_LORA + qkv.ROPE, gen=g) for _ in range(layers)]
+    expected = [p.clone() for p in pools]
+    pointers = torch.tensor([p.data_ptr() for p in pools], dtype=torch.int64, device=dev)
+
+    torch.ops.trtllm.k3_drafter_mla_ctx_kv(
+        latent,
+        norm,
+        torch.view_as_real(table).contiguous(),
+        positions,
+        pages,
+        offsets,
+        pointers,
+        pools,
+        1e-5,
+    )
+
+    freqs = table[positions]
+    for layer in range(layers):
+        out = _rmsnorm_rope_batched(
+            latent.view(rows, layers, -1)[:, layer].unsqueeze(0).contiguous(),
+            norm[layer],
+            1e-5,
+            qkv.ROPE,
+            freqs.unsqueeze(0),
+            norm_dim=qkv.KV_LORA,
+        ).squeeze(0)
+        expected[layer][pages, 0, 0, offsets] = out
+    for layer in range(layers):
+        err = (pools[layer].float() - expected[layer].float()).abs()
+        tol = 2**-7 * expected[layer].float().abs() + 1e-3
+        assert (err > tol).sum().item() == 0, f"layer {layer}: max err {err.max().item()}"

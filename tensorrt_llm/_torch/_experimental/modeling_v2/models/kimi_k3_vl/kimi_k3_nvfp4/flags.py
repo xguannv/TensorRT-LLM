@@ -62,6 +62,11 @@ TRTLLM_K3LL_MLA_DRAFTER_QKV = _flag(
     0,
     "MLA DSpark drafter (with TRTLLM_K3LL_MLA_DRAFTER_NORMS): [q_a | kv_a] GEMV + k3_drafter_mla_qkv per layer",
 )
+TRTLLM_K3LL_MLA_DRAFTER_CTX = _flag(
+    "TRTLLM_K3LL_MLA_DRAFTER_CTX",
+    0,
+    "MLA DSpark drafter (with TRTLLM_K3LL_MLA_SPEC_WORKER): context latents of all layers in one k3_drafter_mla_ctx_kv",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
