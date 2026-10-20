@@ -656,3 +656,47 @@ def test_rmsnorm_early_trigger_matches_flashinfer(monkeypatch, m, h, row_stride)
     torch.cuda.synchronize()
     assert out is not None
     assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("m", [1, 7, 14, 16, 28, 32])
+def test_gate_up_swiglu_matches(monkeypatch, m):
+    """``TLLM_DSPARK_GATE_UP_SWIGLU``: the pinned gate_up GEMM with the SwiGLU epilogue gives the
+    values of the pinned GEMM followed by ``trtllm::silu_and_mul`` (signed zeros, large and tiny
+    gate values included)."""
+    import torch.nn.functional as F
+
+    from tensorrt_llm._torch.speculative.dspark_draft_gemm import (
+        DRAFT_GEMM_ENV_VAR,
+        GATE_UP_SWIGLU_ENV_VAR,
+        draft_gemm,
+        draft_gemm_swiglu,
+    )
+
+    class _Lin:
+        def __init__(self, w):
+            self.weight = w
+
+    class _Mlp:
+        def __init__(self, w):
+            self.gate_up_proj = _Lin(w)
+            self.activation = F.silu
+            self.swiglu_limit = None
+            self.swiglu_alpha = None
+            self.swiglu_beta = None
+
+    gen = torch.Generator(device="cuda").manual_seed(m)
+    hidden, inter = 7168, 896
+    x = (torch.randn(m, hidden, device="cuda", generator=gen) * 2).to(torch.bfloat16)
+    w = (torch.randn(2 * inter, hidden, device="cuda", generator=gen) * 0.02).to(torch.bfloat16)
+    w[:8] *= 64  # large gate values (saturating sigmoid)
+    w[inter : inter + 8] = 0  # up rows of exact zeros
+    mlp = _Mlp(w)
+    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
+    monkeypatch.setenv(GATE_UP_SWIGLU_ENV_VAR, "0")
+    assert draft_gemm_swiglu(x, mlp) is None
+    ref = torch.ops.trtllm.silu_and_mul(draft_gemm(x, w, "gate_up"))
+    monkeypatch.setenv(GATE_UP_SWIGLU_ENV_VAR, "1")
+    out = draft_gemm_swiglu(x, mlp)
+    torch.cuda.synchronize()
+    assert out is not None
+    assert torch.equal(_bits(out), _bits(ref))

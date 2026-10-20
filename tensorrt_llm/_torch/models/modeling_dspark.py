@@ -110,7 +110,12 @@ from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.dspark_ar_norm import draft_ar_norm
 from ..speculative.dspark_ar_push import PushedPartial, draft_ar_finish_norm, draft_gemm_push
-from ..speculative.dspark_draft_gemm import DraftL2Prefetch, draft_gemm, l2_prefetch_enabled
+from ..speculative.dspark_draft_gemm import (
+    DraftL2Prefetch,
+    draft_gemm,
+    draft_gemm_swiglu,
+    l2_prefetch_enabled,
+)
 from ..speculative.dspark_mla_fused import draft_mla_attend
 from ..speculative.dspark_norm import draft_rmsnorm
 from ..speculative.interface import SpeculativeDecodingMode
@@ -421,6 +426,7 @@ def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params, push_all_reduce=Non
     all-reduce instead; then this returns a ``PushedPartial``."""
     gate_up, down = getattr(mlp, "gate_up_proj", None), getattr(mlp, "down_proj", None)
     h1 = None
+    h2 = None
     if (
         gate_up is not None
         and down is not None
@@ -431,10 +437,14 @@ def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params, push_all_reduce=Non
         and not mlp._can_fuse_gate_up_swiglu_fp4out()
         and not mlp._can_fuse_swiglu_fp8_quant()
     ):
-        h1 = draft_gemm(x, gate_up.weight, "gate_up")
-    if h1 is None:
-        return mlp(x, final_all_reduce_params=down_all_reduce_params)
-    h2 = mlp._apply_activation(h1)
+        # TLLM_DSPARK_GATE_UP_SWIGLU: the activation in the gate_up GEMM's epilogue.
+        h2 = draft_gemm_swiglu(x, mlp)
+        if h2 is None:
+            h1 = draft_gemm(x, gate_up.weight, "gate_up")
+    if h2 is None:
+        if h1 is None:
+            return mlp(x, final_all_reduce_params=down_all_reduce_params)
+        h2 = mlp._apply_activation(h1)
     if push_all_reduce is not None:
         pushed = draft_gemm_push(push_all_reduce, h2, down.weight)
         if pushed is not None:

@@ -168,6 +168,80 @@ def draft_gemm(x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[tor
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+#: ``TLLM_DSPARK_GATE_UP_SWIGLU=1``: the pinned gate_up GEMM also applies the SwiGLU in its
+#: epilogue (``low_m_bf16_splitk.run_splitk_dense_swiglu``, on a copy of the weight whose rows are
+#: reordered gate / up per 64-row tile), so the separate ``silu_and_mul`` kernel goes away. Same
+#: tiles, same split-K order and ``silu_and_mul``'s arithmetic: the same values.
+GATE_UP_SWIGLU_ENV_VAR = "TLLM_DSPARK_GATE_UP_SWIGLU"
+
+
+def draft_gemm_swiglu(x: torch.Tensor, mlp) -> Optional[torch.Tensor]:
+    """``silu_and_mul(x @ mlp.gate_up_proj.weight.T)`` with the pinned gate_up kernel and the SwiGLU
+    epilogue, or None (the caller runs the GEMM and the activation) when the switch is off, the
+    activation is not plain SwiGLU, or the operands do not fit."""
+    if os.environ.get(GATE_UP_SWIGLU_ENV_VAR, "0") != "1" or not draft_gemm_enabled():
+        return None
+    if (
+        getattr(mlp, "activation", None) is not F.silu
+        or (getattr(mlp, "swiglu_limit", None) or 0) > 0
+        or getattr(mlp, "swiglu_alpha", None) not in (None, 1.0)
+        or getattr(mlp, "swiglu_beta", None) not in (None, 0.0)
+    ):
+        return None
+    weight = mlp.gate_up_proj.weight
+    k = x.shape[-1]
+    m = x.numel() // k if k else 0
+    pin = next((p for p in _PINS["gate_up"] if 0 < m <= p[0]), None)
+    if (
+        pin is None
+        or pin[1] != "splitk"
+        or pin[2][0] != 64
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or weight.dim() != 2
+        or weight.shape[1] != k
+        or weight.shape[0] % 64
+        or not weight.is_contiguous()
+    ):
+        return None
+    from ..cute_dsl_kernels.blackwell.low_m_bf16_splitk import (
+        _SMEM_CAPACITY_BYTES,
+        SplitKTactic,
+        _max_ab_stages_for,
+        run_splitk_dense_swiglu,
+        swiglu_permuted_weight,
+    )
+    from ..flashinfer_utils import get_env_enable_pdl
+
+    x2d = x.detach().reshape(m, k)
+    if not x2d.is_contiguous() or k % 128 or x2d.data_ptr() % 32:
+        return None
+    key = (weight.data_ptr(), tuple(weight.shape))
+    cached = mlp.__dict__.get("_dspark_swiglu_weight")
+    if cached is None or cached[0] != key:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        cached = (key, swiglu_permuted_weight(weight.detach()))
+        mlp.__dict__["_dspark_swiglu_weight"] = cached
+    permuted = cached[1]
+    n = weight.shape[0]
+    shapes = mlp.__dict__.setdefault("_dspark_swiglu_shape", {})
+    shape_out = shapes.get((m, str(x.device)))
+    if shape_out is None:
+        shape_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        shapes[(m, str(x.device))] = shape_out
+    out = torch.empty((m, n // 2), dtype=x.dtype, device=x.device)
+    stages, _ = _prefetch_for("gate_up")
+    tactic = SplitKTactic(*pin[2])
+    if stages is not None:
+        stages = min(stages, _max_ab_stages_for(tactic, _SMEM_CAPACITY_BYTES))
+        tactic = SplitKTactic(
+            tactic.mma_m, tactic.mma_n, tactic.split_k, max(stages, tactic.ab_stages)
+        )
+    run_splitk_dense_swiglu(x2d, permuted.t(), shape_out, out, tactic, get_env_enable_pdl())
+    return out.view(*x.shape[:-1], n // 2)
+
+
 def l2_prefetch_enabled() -> bool:
     """Whether ``TLLM_DSPARK_L2_PREFETCH=1`` prefetches the drafter's weights into L2."""
     return os.environ.get(L2_PREFETCH_ENV_VAR, "0") == "1"
