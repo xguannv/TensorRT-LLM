@@ -43,6 +43,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 def _load(name: str):
     spec = importlib.util.spec_from_file_location(name, os.path.join(_HERE, name + ".py"))
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = (
+        mod  # test_k3_moe_push registers itself with cloudpickle by its sys.modules entry
+    )
     spec.loader.exec_module(mod)
     return mod
 
