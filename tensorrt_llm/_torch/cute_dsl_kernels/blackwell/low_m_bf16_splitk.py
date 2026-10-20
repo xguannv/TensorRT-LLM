@@ -461,6 +461,7 @@ class SplitKDenseGemmKernel:
         ar_push: bool = False,
         ar_world: int = 0,
         ar_hidden: int = 0,
+        ar_state_early: bool = False,
         swiglu: bool = False,
     ) -> None:
         if swiglu and (tactic.mma_m != 64 or has_bias or ar_push):
@@ -475,6 +476,7 @@ class SplitKDenseGemmKernel:
         self.ar_push = ar_push
         self.ar_world = ar_world
         self.ar_hidden = ar_hidden
+        self.ar_state_early = ar_push and ar_state_early
         self.acc_dtype = cutlass.Float32
         self.exact_smem = exact_smem
         self.smem_bytes = _smem_bytes(tactic, tactic.ab_stages) + _AB_BUFFER_ALIGN_BYTES
@@ -1008,6 +1010,16 @@ class SplitKDenseGemmKernel:
                 )
                 rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
+        # All-reduce push with ar_state_early: the workspace's rotation state, read while the main
+        # loop runs, after this warp's own griddepcontrol.wait (every earlier grid, the previous
+        # call on the workspace included, has then completed) instead of after the accumulator.
+        ar_cur = Int32(0)
+        ar_nbytes = Int32(0)
+        if cutlass.const_expr(self.ar_state_early):
+            if cutlass.const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
+            ar_cur, _, ar_nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(ar_flags)
+
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         # Make tcgen05.ld visible before TMEM release and RMEM use.
@@ -1084,6 +1096,8 @@ class SplitKDenseGemmKernel:
                     ar_mc,
                     ar_flags,
                     ar_rank,
+                    ar_cur,
+                    ar_nbytes,
                 )
             else:
                 # Preserve TMEM coordinates; the copy predicates output tails.
@@ -1146,10 +1160,13 @@ class SplitKDenseGemmKernel:
         ar_mc: cutlass.Int64,
         ar_flags: cutlass.Int64,
         ar_rank: cutlass.Int32,
+        ar_cur: cutlass.Int32,
+        ar_nbytes: cutlass.Int32,
     ):
         """All-reduce push epilogue: stage the BF16 tile token-major (kernel-M contiguous) in the
         dead weight ring, then push 16-byte vectors of each token row segment into the owner's
-        scatter slot of the next two-shot call on the workspace (``-0`` sent as ``+0``)."""
+        scatter slot of the next two-shot call on the workspace (``-0`` sent as ``+0``).
+        ``ar_cur`` / ``ar_nbytes``: the workspace state if ``ar_state_early`` read it already."""
         stage = cute.make_tensor(
             cute.recast_ptr(ring.iterator, dtype=c_dtype),
             cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
@@ -1158,7 +1175,10 @@ class SplitKDenseGemmKernel:
             thr_t2r, rD, cute.flat_divide(stage, epi_tile)[None, None, 0, 0]
         )
         cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
-        cur, _, nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(ar_flags)
+        cur = ar_cur
+        nbytes = ar_nbytes
+        if cutlass.const_expr(not self.ar_state_early):
+            cur, _, nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(ar_flags)
         stage_addr = ring.iterator.toint()
         vecs = self.cta_m // 8
         for p in cutlass.range_constexpr(0, self.cta_n * vecs, self.epilog_threads):
@@ -1358,6 +1378,7 @@ def _get_compiled_ar_push_kernel(
     world: int,
     hidden: int,
     exact_smem: bool = False,
+    state_early: bool = False,
 ):
     kernel = SplitKDenseGemmKernel(
         tactic=tactic,
@@ -1367,6 +1388,7 @@ def _get_compiled_ar_push_kernel(
         ar_push=True,
         ar_world=world,
         ar_hidden=hidden,
+        ar_state_early=state_early,
     )
     compile_tensors = _make_compile_repr_tensors(dtype, False, *leading_dims)
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
@@ -1501,13 +1523,15 @@ def run_splitk_dense_ar_push(
     workspace,
     pdl: bool,
     exact_smem: bool = False,
+    state_early: bool = False,
 ) -> None:
     """``A[M,K] @ B[K,N]`` (as :func:`run_splitk_dense`, split-K 1) pushed into the Lamport slots
     of the next two-shot all-reduce on ``workspace`` (a ``k3_lamport_ar.LamportWorkspace``)
     instead of stored; ``k3_lamport_ar`` style finish kernels complete the all-reduce.
     ``shape_out``: a BF16/FP16 ``[M, N]`` row-major tensor that gives the output's shape and
     layout (not written). ``exact_smem`` as in :func:`run_splitk_dense` (lets the finish
-    kernel's CTAs become resident next to this grid's)."""
+    kernel's CTAs become resident next to this grid's). ``state_early``: the epilogue reads the
+    workspace's rotation state while the main loop runs instead of after it."""
     if tactic.split_k != 1:
         raise ValueError(f"all-reduce push needs split-K 1, got {tactic}")
     m, n, _ = _validate_runtime_tensors(a, b, None, shape_out)
@@ -1519,7 +1543,14 @@ def run_splitk_dense_ar_push(
         )
     cute_tensors = _to_cute_swap(a, b, shape_out, None)
     compiled = _get_compiled_ar_push_kernel(
-        a.dtype, tactic, pdl, cute_tensors[4], workspace.world, n, bool(exact_smem)
+        a.dtype,
+        tactic,
+        pdl,
+        cute_tensors[4],
+        workspace.world,
+        n,
+        bool(exact_smem),
+        bool(state_early),
     )
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
     compiled(

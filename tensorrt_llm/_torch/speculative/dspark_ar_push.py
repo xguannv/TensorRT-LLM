@@ -52,6 +52,27 @@ def finish_async_enabled() -> bool:
     return os.environ.get(FINISH_ASYNC_ENV_VAR, "0") == "1"
 
 
+#: ``TLLM_DSPARK_AR_FINISH_POLL``: how the finish kernel's row owner polls its slots, ``wait``
+#: (default), ``fast`` or ``serial`` (``k3_draft_ar_norm.K3DraftArFinishNormKernel``).
+FINISH_POLL_ENV_VAR = "TLLM_DSPARK_AR_FINISH_POLL"
+
+
+def finish_poll() -> str:
+    """The finish kernel's poll mode (``TLLM_DSPARK_AR_FINISH_POLL``, default ``wait``)."""
+    return os.environ.get(FINISH_POLL_ENV_VAR, "wait")
+
+
+#: ``TLLM_DSPARK_AR_PUSH_STATE_EARLY`` (default 1): the push GEMM's epilogue reads the workspace
+#: state while the main loop runs (``run_splitk_dense_ar_push(state_early=True)``); 0 reads it
+#: after the accumulator, on the push's critical path.
+STATE_EARLY_ENV_VAR = "TLLM_DSPARK_AR_PUSH_STATE_EARLY"
+
+
+def state_early_enabled() -> bool:
+    """Whether the push GEMM reads the workspace state early (default; ``=0`` disables)."""
+    return os.environ.get(STATE_EARLY_ENV_VAR, "1") != "0"
+
+
 @dataclasses.dataclass
 class PushedPartial:
     """A projection output that every rank pushed into the next two-shot all-reduce on
@@ -148,6 +169,7 @@ def draft_gemm_push(
         view,
         get_env_enable_pdl(),
         exact_smem=bool(role) and _exact_smem_for(role),
+        state_early=state_early_enabled(),
     )
     return PushedPartial(view, cpp_one_shot, (*x.shape[:-1], n), x.dtype)
 
@@ -168,5 +190,6 @@ def draft_ar_finish_norm(
         pushed.cpp_one_shot,
         use_pdl=get_env_enable_pdl(),
         async_sum=finish_async_enabled(),
+        poll=finish_poll(),
     )
     return out.view(pushed.shape), res_out.view(residual.shape)

@@ -82,6 +82,11 @@ TWO_SHOT_RANK_CHUNK = 16
 WORLD_SIZES = (2, 4, 8, 16, 32, 64)
 
 
+#: How the finish kernel's row owner polls its ``W`` scatter slots
+#: (:class:`K3DraftArFinishNormKernel`).
+POLL_MODES = ("wait", "fast", "serial")
+
+
 def _asm(res, operands, text, constraints, *, loc=None, ip=None):
     return llvm.inline_asm(
         res,
@@ -672,26 +677,38 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
 
     Same CTAs, arithmetic and Lamport state as :class:`K3DraftArNormKernel`, without the scatter:
 
-    * The CTAs do not wait for the producer. They release their dependents, read the rotation
-      state, the residual and ``gamma`` and start polling as soon as they are resident. That is
-      safe because the producer releases this kernel only after its own ``griddepcontrol.wait``
-      (see ``low_m_bf16_splitk``): every earlier grid, the previous all-reduce on the workspace
-      and the writer of the residual included, has then completed.
-    * The owner polls its ``W`` scatter slots, re-loading only the slots that have not arrived,
-      sums them in the reproduced kernel's order and multicasts the row; every rank polls the
-      broadcast row and runs the norm.
+    * The CTAs release their dependents and read the rotation state, the residual and ``gamma``
+      as soon as they are resident. That is safe because the producer releases this kernel only
+      after its own ``griddepcontrol.wait`` (see ``low_m_bf16_splitk``): every earlier grid, the
+      previous all-reduce on the workspace and the writer of the residual included, has then
+      completed.
+    * The owner of a row polls its ``W`` scatter slots, sums them in the reproduced kernel's
+      order and multicasts the row; every rank polls the broadcast row (rows it does not own
+      after waiting for the producer: they cannot arrive earlier) and runs the norm.
     * Thread 0 of CTA (0, 0) alone waits for the producer (which reads the state after its own
       wait) and then for every CTA's arrival before it rotates the state; its wait also makes
       this kernel's completion imply the producer's.
+
+    ``poll`` (:data:`POLL_MODES`), how the owner polls: ``wait`` (default) waits for the producer
+    to complete, then loads all ``W`` slots per pass before it checks any (like the C++ two-shot
+    kernel, which polls after its own wait); ``fast`` polls the same way from the start, while the
+    producer GEMM still runs; ``serial`` (the first version) re-loads only the missing slots with
+    a mask updated slot by slot, so each load waits for the previous slot's check: ``W`` round
+    trips per pass. In situ at ``W = 16`` the serial poll cost about 2 us per all-reduce over the
+    C++ path; on 4 GPUs ``fast`` costs 0.3-0.9 us per all-reduce over ``wait`` (the spinning slows
+    the producer GEMM).
 
     ``async_sum``: the row's CTA sums reach every cluster CTA by ``st.async`` on an mbarrier that
     expects exactly them, instead of a cluster barrier (whose release fence waits for this CTA's
     outstanding global stores, the residual output among them). Same sums in the same order.
     """
 
-    def __init__(self, *args, async_sum: bool = False, **kwargs):
+    def __init__(self, *args, async_sum: bool = False, poll: str = "wait", **kwargs):
         super().__init__(*args, **kwargs)
+        if poll not in POLL_MODES:
+            raise ValueError(f"poll must be one of {POLL_MODES}, got {poll!r}")
         self.async_sum = async_sum
+        self.poll = poll
 
     @cute.jit
     def __call__(
@@ -790,9 +807,11 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
         if tidx == 0:
             red_release_add(counter, Int32(1))
 
-        # Owner: poll the W slots of the row (only the missing ones again), then sum them in the
+        # Owner: poll the W slots of the row until none holds the sentinel, then sum them in the
         # reproduced kernel's order, round and multicast.
         if row % W == rank:
+            if cutlass.const_expr(self.poll == "wait" and self.use_pdl):
+                griddepcontrol_wait()
             base = (
                 uc_addr
                 + (cur * Int64(2)) * stage_bytes
@@ -800,15 +819,27 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
                 + Int64(col) * 2
             )
             words = cute.make_rmem_tensor((W * 4,), Int32)
-            pending = Int32((1 << W) - 1) if W < 32 else Int32(-1)
-            while pending != 0:
-                for r in cutlass.range_constexpr(W):
-                    if ((pending >> r) & 1) != 0:
+            if cutlass.const_expr(self.poll == "serial"):
+                # Only the missing slots again; the mask chains each load to the previous check.
+                pending = Int32((1 << W) - 1) if W < 32 else Int32(-1)
+                while pending != 0:
+                    for r in cutlass.range_constexpr(W):
+                        if ((pending >> r) & 1) != 0:
+                            w = ld_volatile_v4(base + Int64(r) * row_bytes)
+                            for e in cutlass.range_constexpr(4):
+                                words[r * 4 + e] = w[e]
+                            if clean4(w[0], w[1], w[2], w[3]) != 0:
+                                pending = pending & Int32(~(1 << r))
+            else:
+                # All W loads of a pass in flight at once.
+                ready = Int32(0)
+                while ready == 0:
+                    ready = Int32(1)
+                    for r in cutlass.range_constexpr(W):
                         w = ld_volatile_v4(base + Int64(r) * row_bytes)
                         for e in cutlass.range_constexpr(4):
                             words[r * 4 + e] = w[e]
-                        if clean4(w[0], w[1], w[2], w[3]) != 0:
-                            pending = pending & Int32(~(1 << r))
+                        ready = ready & clean4(w[0], w[1], w[2], w[3])
             acc = [Float32(0.0)] * ELTS
             for rb in cutlass.range_constexpr(0, W, self.rank_chunk):
                 chunk = [Float32(0.0)] * ELTS
@@ -916,9 +947,10 @@ def _compiled_finish_norm(
     cpp_one_shot: bool,
     use_pdl: bool,
     async_sum: bool = False,
+    poll: str = "wait",
 ):
     kernel = K3DraftArFinishNormKernel(
-        world, hidden, threads, cluster, cpp_one_shot, use_pdl, async_sum=async_sum
+        world, hidden, threads, cluster, cpp_one_shot, use_pdl, async_sum=async_sum, poll=poll
     )
     a = Int64(1 << 20)
     return cute.compile(
@@ -1037,12 +1069,14 @@ def run_k3_draft_ar_finish_norm(
     cpp_one_shot: bool,
     use_pdl: bool = True,
     async_sum: bool = False,
+    poll: str = "wait",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(RMSNorm(gamma, eps)(all_reduce(x) + residual), all_reduce(x) + residual)`` where every
     rank's producer pushed its ``x`` (``[m, H]``, ``m, H = residual.shape``) into the next two-shot
     call on ``ws`` (``low_m_bf16_splitk.run_splitk_dense_ar_push``): bitwise the C++
     ``RESIDUAL_RMS_NORM`` fusion of ``x`` (``cpp_one_shot``: the one-shot kernel's result).
-    ``async_sum``: the cluster sums on an mbarrier (see :class:`K3DraftArFinishNormKernel`)."""
+    ``async_sum``: the cluster sums on an mbarrier; ``poll``: how the owner polls its slots (see
+    :class:`K3DraftArFinishNormKernel`)."""
     m, hidden = residual.shape
     cfg = grid_config(m, hidden, _sm_count(residual.device.index))
     assert cfg is not None
@@ -1052,7 +1086,14 @@ def run_k3_draft_ar_finish_norm(
     out = torch.empty_like(residual)
     res_out = torch.empty_like(residual)
     _compiled_finish_norm(
-        ws.world, hidden, cfg[0], cfg[1], bool(cpp_one_shot), bool(use_pdl), bool(async_sum)
+        ws.world,
+        hidden,
+        cfg[0],
+        cfg[1],
+        bool(cpp_one_shot),
+        bool(use_pdl),
+        bool(async_sum),
+        poll,
     )(
         Int64(residual.data_ptr()),
         Int64(gamma.data_ptr()),
@@ -1072,6 +1113,7 @@ def run_k3_draft_ar_finish_norm(
 __all__ = [
     "K3DraftArFinishNormKernel",
     "K3DraftArNormKernel",
+    "POLL_MODES",
     "can_run",
     "grid_config",
     "required_bytes",
