@@ -320,3 +320,154 @@ def test_graph_replay_pdl_chain(n: int, exact: bool):
         if exact:
             for i, ((u, o), (ru, ro)) in enumerate(zip(outs, chain(cpp, cpp, cpp, cpp))):
                 assert _mismatches(o, ro) == 0, f"replay {seed} stage {i} output vs C++"
+
+
+@pytest.mark.parametrize("trigger", ["start", "wait", "end"])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_trigger_placement(mode: int, trigger: str):
+    """Where the fast kernel releases its dependents changes no bit: eagerly, and in a CUDA graph
+    chain of three PDL launches that all trigger there, each consuming its predecessor's output as
+    an input read after ``griddepcontrol.wait`` (the layer row without addends, else the first
+    addend; the prefix sum and the snapshots are read before the wait)."""
+    m, n = 14, 7
+    t = _inputs(m, n, 1.0, seed=11 + mode)
+    k3 = _k3()
+
+    def run(prev, trig):
+        layer = prev if mode == 0 else t["layer"]
+        addends = ((), (prev,), (prev, t["shared"]))[mode]
+        out = torch.empty_like(layer)
+        updated = torch.empty_like(layer) if mode else None
+        k3.run_k3_attn_res(
+            layer, addends, t["block"], *_weights(t), out, updated, exact=False, trigger=trig
+        )
+        return updated, out
+
+    ref = run(t["addend"], None)
+    got = run(t["addend"], trigger)
+    for a, b in zip(ref, got):
+        if a is not None:
+            assert _mismatches(b, a) == 0
+
+    layer = torch.empty_like(t["layer"])
+    outs = []
+
+    def body():
+        r1 = run(layer, trigger)
+        r2 = run(r1[1], trigger)
+        r3 = run(r2[1], trigger)
+        outs[:] = [r1, r2, r3]
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        layer.copy_(t["layer"])
+        body()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+    for seed in range(3):
+        gen = torch.Generator(device="cuda").manual_seed(100 + seed)
+        layer.copy_(torch.randn(m, HIDDEN, device="cuda", generator=gen).to(torch.bfloat16))
+        graph.replay()
+        torch.cuda.synchronize()
+        r1 = run(layer, None)
+        r2 = run(r1[1], None)
+        r3 = run(r2[1], None)
+        for i, ((u, o), (ru, ro)) in enumerate(zip(outs, (r1, r2, r3))):
+            assert _mismatches(o, ro) == 0, f"replay {seed} stage {i} output"
+            if ru is not None:
+                assert _mismatches(u, ru) == 0, f"replay {seed} stage {i} updated prefix"
+
+
+def _kernel_deps(graph, name_part: str):
+    """Function names of the dependencies of every kernel node of ``graph`` (captured with
+    ``keep_graph=True``) whose function name contains ``name_part``."""
+    import cuda.bindings.driver as cu
+
+    g = cu.CUgraph(graph.raw_cuda_graph())
+    count = cu.cuGraphGetNodes(g, 0)[-1]
+    nodes = cu.cuGraphGetNodes(g, count)[1]
+
+    def name(node):
+        err, kind = cu.cuGraphNodeGetType(node)
+        if kind != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            return str(kind)
+        _, params = cu.cuGraphKernelNodeGetParams(node)
+        err, fname = cu.cuFuncGetName(params.func)
+        return fname.decode() if err == cu.CUresult.CUDA_SUCCESS else "?"
+
+    found = []
+    for node in nodes:
+        if name_part not in name(node):
+            continue
+        nd = cu.cuGraphNodeGetDependencies(node, 0)[-1]
+        deps = cu.cuGraphNodeGetDependencies(node, nd)[1] if nd else []
+        found.append([name(d) for d in deps])
+    return found
+
+
+@pytest.mark.parametrize("marker", [False, True])
+def test_join_marker(marker: bool):
+    """A side stream joined into a PDL attn_res launch (directly, or through ``run_join_marker``
+    issued after the main stream's previous kernel): in a CUDA graph the consumer sees the side
+    stream's late write, and with the marker it depends on the marker, not on the side kernel."""
+    m, n = 14, 7
+    t = _inputs(m, n, 1.0, seed=21)
+    k3 = _k3()
+    src = torch.empty_like(t["addend"])
+    addend = torch.empty_like(t["addend"])
+    side = torch.cuda.Stream()
+    joined = torch.cuda.Event()
+    fork = torch.cuda.Event()
+    outs = []
+
+    def body():
+        fork.record()
+        with torch.cuda.stream(side):
+            fork.wait()
+            torch.cuda._sleep(1_000_000)
+            addend.copy_(src)
+            if not marker:
+                joined.record()
+        # the main stream's own PDL kernel, captured after the side stream's work
+        first = torch.empty_like(t["layer"])
+        k3.run_k3_attn_res(t["layer"], (), t["block"], *_weights(t), first, None, exact=False)
+        if marker:
+            with torch.cuda.stream(side):
+                k3.run_join_marker()
+                joined.record()
+        joined.wait()
+        out = torch.empty_like(t["layer"])
+        upd = torch.empty_like(t["layer"])
+        k3.run_k3_attn_res(first, (addend,), t["block"], *_weights(t), out, upd, exact=False)
+        outs[:] = [upd, out]
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        src.copy_(t["addend"])
+        body()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        body()
+    deps = _kernel_deps(graph, "K3AttnResFastKernel")
+    consumer_deps = [d for d in deps if len(d) == 2]
+    assert len(consumer_deps) == 1, deps
+    assert any("K3JoinMarkerKernel" in d for d in consumer_deps[0]) == marker, consumer_deps
+    for seed in range(3):
+        gen = torch.Generator(device="cuda").manual_seed(200 + seed)
+        src.copy_(torch.randn(m, HIDDEN, device="cuda", generator=gen).to(torch.bfloat16))
+        addend.zero_()
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        first = torch.empty_like(t["layer"])
+        k3.run_k3_attn_res(t["layer"], (), t["block"], *_weights(t), first, None, exact=False)
+        out = torch.empty_like(t["layer"])
+        upd = torch.empty_like(t["layer"])
+        k3.run_k3_attn_res(first, (src,), t["block"], *_weights(t), out, upd, exact=False)
+        assert _mismatches(outs[0], upd) == 0, f"replay {seed} updated prefix"
+        assert _mismatches(outs[1], out) == 0, f"replay {seed} output"

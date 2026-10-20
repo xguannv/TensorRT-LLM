@@ -87,6 +87,12 @@ _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 #: layer's A_pre). Those kernels call ``cudaGridDependencySynchronize`` before they trigger, so the
 #: next attn_res starts only after this grid completed.
 _EARLY_TRIGGER = os.environ.get("TRTLLM_K3_ATTN_RES_EARLY_TRIGGER", "0") == "1"
+#: Where :class:`K3AttnResFastKernel` releases its dependent grid: at its entry, before the prologue
+#: (``TRIGGER_START``, see :func:`run_k3_attn_res`), right after ``griddepcontrol.wait``
+#: (``TRIGGER_WAIT``) or after its last store (``TRIGGER_END``).
+TRIGGER_START, TRIGGER_WAIT, TRIGGER_END = "start", "wait", "end"
+TRIGGERS = (TRIGGER_START, TRIGGER_WAIT, TRIGGER_END)
+_DEFAULT_TRIGGER = TRIGGER_WAIT if _EARLY_TRIGGER else TRIGGER_END
 
 _THREADS = 256
 _WARPS = _THREADS // 32
@@ -1088,6 +1094,7 @@ class K3AttnResFastKernel:
         cluster: int = 4,
         mxfp8: bool = False,
         lamport: bool = False,
+        trigger: str | None = None,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -1095,6 +1102,11 @@ class K3AttnResFastKernel:
             raise ValueError(f"add_mode={add_mode} cluster={cluster}")
         if lamport and add_mode != ADD_PREFIX:
             raise ValueError("the Lamport addend is an ADD_PREFIX variant")
+        if trigger is None:
+            trigger = _DEFAULT_TRIGGER
+        if trigger not in TRIGGERS:
+            raise ValueError(f"trigger={trigger!r} not in {TRIGGERS}")
+        self.trigger = trigger
         self.mxfp8 = mxfp8
         self.lamport = lamport
         self.n = num_candidates
@@ -1233,6 +1245,9 @@ class K3AttnResFastKernel:
                 out.append(hi)
             return out
 
+        if cutlass.const_expr(self.use_pdl and self.trigger == TRIGGER_START):
+            _griddepcontrol_launch_dependents()
+
         # ---- prologue: everything that does not depend on the previous grid ----
         res_w = unpack(load(res_addr + col, True))
         rms_w = unpack(load(rms_addr + col, True))
@@ -1300,7 +1315,7 @@ class K3AttnResFastKernel:
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
-            if cutlass.const_expr(_EARLY_TRIGGER):
+            if cutlass.const_expr(self.trigger == TRIGGER_WAIT):
                 _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
@@ -1410,9 +1425,22 @@ class K3AttnResFastKernel:
                 e_a,
             )
 
-        if cutlass.const_expr(self.use_pdl and not _EARLY_TRIGGER):
+        if cutlass.const_expr(self.use_pdl and self.trigger == TRIGGER_END):
             _bar_sync(4, self.threads)
             _griddepcontrol_launch_dependents()
+
+
+class K3JoinMarkerKernel:
+    """One thread that does nothing, launched without programmatic dependent launch: a kernel node
+    that carries a cross-stream join into the stream of a PDL kernel (see :func:`run_join_marker`)."""
+
+    @cute.jit
+    def __call__(self, stream: cuda.CUstream):
+        self.kernel().launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream, use_pdl=False)
+
+    @cute.kernel
+    def kernel(self):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1443,11 +1471,14 @@ def _compiled(
     exact: bool,
     mxfp8: bool = False,
     lamport: bool = False,
+    trigger: str | None = None,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
-        kernel = K3AttnResFastKernel(num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport)
+        kernel = K3AttnResFastKernel(
+            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, trigger
+        )
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1516,6 +1547,7 @@ def run_k3_attn_res(
     exact: bool | None = None,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     lamport_addend: tuple[int, int] | None = None,
+    trigger: str | None = None,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1548,9 +1580,18 @@ def run_k3_attn_res(
             (vectorized kernel only). The next all-reduce on the workspace re-arms that buffer:
             it must not start before this kernel completed (its producer must trigger only
             after its own ``griddepcontrol.wait``, as the push producers and the C++ kernels do).
+        trigger: Where the vectorized kernel releases its dependent grid (``TRIGGERS``; default
+            ``TRTLLM_K3_ATTN_RES_EARLY_TRIGGER``: after the wait if set, else after the last
+            store). With ``TRIGGER_START`` the dependents may become resident before this kernel's
+            predecessor has completed: they must not read, before their own
+            ``griddepcontrol.wait``, anything that grid or an earlier one still writes, and every
+            later grid that does must wait (directly or through a chain of grids that wait before
+            they trigger) for this one.
     """
     if exact is None:
         exact = _EXACT
+    if trigger is not None and exact:
+        raise ValueError("the trigger placement is a vectorized-kernel option")
     if (mxfp8_out is not None or lamport_addend is not None) and exact:
         raise ValueError("the MXFP8 side output and the Lamport addend need the vectorized kernel")
     lamport = lamport_addend is not None
@@ -1560,7 +1601,9 @@ def run_k3_attn_res(
     if cluster is None and not exact:
         cluster = fast_cluster_size(layer.shape[0], block.shape[0] + 1)
     mxfp8 = mxfp8_out is not None
-    compiled = _compiled(block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8, lamport)
+    compiled = _compiled(
+        block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8, lamport, trigger
+    )
     if lamport:
         add_addr, add2_addr = lamport_addend
     else:
@@ -1583,6 +1626,28 @@ def run_k3_attn_res(
         Float32(out_eps),
         cuda.CUstream(torch.cuda.current_stream(layer.device).cuda_stream),
     )
+
+
+@functools.cache
+def _compiled_join_marker():
+    return cute.compile(
+        K3JoinMarkerKernel(), cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+
+
+def run_join_marker() -> None:
+    """Launch :class:`K3JoinMarkerKernel` on the current stream.
+
+    For a side stream that a PDL kernel ``C`` on another stream must wait for: record the join
+    event after this launch, issued once ``C``'s stream-order predecessor ``P`` has been captured,
+    instead of after the side stream's own last kernel. Under CUDA graph capture a PDL kernel whose
+    dependencies include a kernel captured before ``P`` on another stream is not launched before
+    ``P`` completes (measured on GB300: it enters ~0.7 us after ``P`` ends instead of during
+    ``P``); with the marker captured after ``P`` as that dependency, ``C`` keeps its early launch
+    from ``P``. The marker runs once its stream predecessors have completed (it is launched
+    without PDL), so ``C``'s ``griddepcontrol.wait`` still covers everything before the join.
+    """
+    _compiled_join_marker()(cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
 
 @torch.library.custom_op("trtllm::k3_attn_res_rmsnorm", mutates_args=())
@@ -1894,7 +1959,12 @@ __all__ = [
     "MAX_CANDIDATES",
     "MAX_TOKENS",
     "MIN_CANDIDATES",
+    "TRIGGERS",
+    "TRIGGER_END",
+    "TRIGGER_START",
+    "TRIGGER_WAIT",
     "K3AttnResKernel",
+    "K3JoinMarkerKernel",
     "can_use_k3_attn_res",
     "cluster_size",
     "k3_attn_res_add_rmsnorm",
@@ -1905,5 +1975,6 @@ __all__ = [
     "k3_attn_res_moe_add_rmsnorm_mx",
     "k3_attn_res_rmsnorm",
     "k3_attn_res_rmsnorm_mx",
+    "run_join_marker",
     "run_k3_attn_res",
 ]
