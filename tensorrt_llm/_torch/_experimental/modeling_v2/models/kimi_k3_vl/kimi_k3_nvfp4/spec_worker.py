@@ -1600,7 +1600,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         ):
             return False
         embed = draft_model.draft_model_full.model.embed_tokens
-        return embed.weight.dtype == torch.bfloat16 and embed.weight.dim() == 2
+        return isinstance(getattr(embed, "num_embeddings", None), int)
 
     def target_logits(
         self, hidden_states, lm_head, logits_processor, attn_metadata, spec_metadata, draft_model
@@ -1652,8 +1652,8 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     def _k3_accept_mla(self, logits, attn_metadata, spec_metadata, draft_model, shard):
         """``trtllm::k3_spec_accept`` on this rank's vocabulary shard of the target logits: the acceptance (the argmax,
         or a temperature sample), the block table, the KDA replay record and kv_lens + 1. Its drafter-input outputs are
-        not used here (the MLA drafter's embedding is column-split; the stock ``prepare_1st_drafter_inputs`` builds
-        them): it gets this rank's embedding columns. Returns (accepted tokens, num accepted, rewind)."""
+        not used here (the MLA drafter's embedding is vocabulary-split; the stock ``prepare_1st_drafter_inputs`` builds
+        them): it gets a zero placeholder table. Returns (accepted tokens, num accepted, rewind)."""
         num_gens = attn_metadata.num_seqs
         K = spec_metadata.runtime_draft_len
         rows = num_gens * (K + 1)
@@ -1678,12 +1678,21 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         if not spec_metadata.is_all_greedy_sample:
             seed, offset = self._rng_state_per_token(spec_metadata, rows)
             sampling = (spec_metadata.temperatures[:rows], seed, offset)
-        embed = draft_model.draft_model_full.model.embed_tokens.weight
-        mask_row = getattr(self, "_k3_mla_mask_row", None)
-        if mask_row is None:
-            mask_row = embed[0].contiguous()
-            if not torch.cuda.is_current_stream_capturing():
-                self._k3_mla_mask_row = mask_row
+        # The kernel's noise embedding reads row ``bonus`` of a [vocabulary, hidden] table. The MLA drafter's own
+        # embedding is vocabulary-split over the ranks, and the stock path builds the drafter inputs anyway, so the
+        # kernel gets an 8-column placeholder of the full vocabulary (its noise output is not read).
+        placeholder = getattr(self, "_k3_mla_noise_table", None)
+        vocab = draft_model.draft_model_full.model.embed_tokens.num_embeddings
+        if placeholder is None or placeholder[0].shape[0] != vocab:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "k3_spec_accept: the noise placeholder must be built outside CUDA-graph capture"
+                )
+            placeholder = self._k3_mla_noise_table = (
+                torch.zeros(vocab, 8, dtype=torch.bfloat16, device=logits.device),
+                torch.zeros(8, dtype=torch.bfloat16, device=logits.device),
+            )
+        embed, mask_row = placeholder
         ws, first_column = shard
         accepted, num_acc, rewind, *_ = torch.ops.trtllm.k3_spec_accept(
             logits,
