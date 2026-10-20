@@ -34,6 +34,7 @@ TOP_K = 16
 HIDDEN_SIZE = 3584
 NUM_EXPERTS = 896
 SF_VEC = 32
+NVFP4_SF_VEC = 16
 MAX_TOKENS = 8
 DEFAULT_RING = 4
 
@@ -129,12 +130,17 @@ def k3_moe_front(
     ag_world: int,
     ring: int = DEFAULT_RING,
     ag_ready: Optional[torch.Tensor] = None,
+    nvfp4_gsf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 8, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
     ``(topk_ids, topk_weights, quantized, scales, shared)``: what ``trtllm::k3_route_quant`` returns for the gathered
     head's router logits and latent, and the shared experts' activation bf16 ``[M, shared_cols]``. With ``ag_ready``
-    it also releases the per-token ready words a ``head_flags`` build of k3_moe acquires."""
+    it also releases the per-token ready words a ``head_flags`` build of k3_moe acquires.
+
+    With ``nvfp4_gsf`` (fp32 ``[1]``, the routed experts' input global scale) the latent is NVFP4 instead of MXFP8:
+    ``quantized`` uint8 ``[M, 1792]`` (E2M1 pairs, low nibble first) and ``scales`` uint8 ``[M, 224]`` (E4M3, linear),
+    ``fp4_quantize``'s recipe with ``sf_vec_size`` 16 on the gathered bf16 latent."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -157,8 +163,21 @@ def k3_moe_front(
     device = x.device
     topk_ids = torch.empty(num_tokens, TOP_K, dtype=torch.int32, device=device)
     topk_weights = torch.empty(num_tokens, TOP_K, dtype=torch.bfloat16, device=device)
-    quantized = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.float8_e4m3fn, device=device)
-    scales = torch.empty(num_tokens, HIDDEN_SIZE // SF_VEC, dtype=torch.uint8, device=device)
+    nvfp4 = nvfp4_gsf is not None
+    if nvfp4 and (
+        nvfp4_gsf.dtype != torch.float32 or nvfp4_gsf.numel() != 1 or nvfp4_gsf.device != device
+    ):
+        raise ValueError("k3_moe_front: nvfp4_gsf must be one fp32 value on the input's device")
+    if nvfp4 and ag_ready is not None:
+        raise ValueError("k3_moe_front: the NVFP4 latent has no head_flags consumer (ag_ready)")
+    if nvfp4:
+        quantized = torch.empty(num_tokens, HIDDEN_SIZE // 2, dtype=torch.uint8, device=device)
+        scales = torch.empty(
+            num_tokens, HIDDEN_SIZE // NVFP4_SF_VEC, dtype=torch.uint8, device=device
+        )
+    else:
+        quantized = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.float8_e4m3fn, device=device)
+        scales = torch.empty(num_tokens, HIDDEN_SIZE // SF_VEC, dtype=torch.uint8, device=device)
     shared = torch.empty(num_tokens, shared_cols, dtype=torch.bfloat16, device=device)
     # Head-only fronts (shared_cols 0) still hand the kernel an aligned shared-output argument it never writes.
     shared_arg = shared if shared_cols else ag_flags.view(torch.int16).view(-1)
@@ -182,6 +201,8 @@ def k3_moe_front(
         arg(quantized.view(-1).view(torch.int32)),
         arg(scales.view(-1)),
         arg(shared_arg.view(-1).view(torch.int16)),
+        # Without nvfp4 the kernel never reads it: any aligned fp32 word.
+        arg(nvfp4_gsf.view(-1) if nvfp4 else bias.view(-1)[:1]),
     )
     capacity = max_clusters(device)
     # One round with the head in 64-row half-tiles when it fits (TP16): every head k-tile on chip before the wait.
@@ -204,6 +225,7 @@ def k3_moe_front(
         publish,
         use_pdl,
         head_half,
+        nvfp4,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -217,7 +239,7 @@ def k3_moe_front(
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), ag_world,
                     shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap), float(linear_cap), publish,
-                    use_pdl, head_half, stream,
+                    use_pdl, head_half, nvfp4, stream,
                 )  # fmt: skip
     fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), stream)
     return topk_ids, topk_weights, quantized, scales, shared
@@ -225,12 +247,18 @@ def k3_moe_front(
 
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
-      ag_world, ring=DEFAULT_RING, ag_ready=None):  # fmt: skip
+      ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None):  # fmt: skip
     num_tokens = x.shape[0]
+    if nvfp4_gsf is not None:
+        quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)
+        scales = x.new_empty((num_tokens, HIDDEN_SIZE // NVFP4_SF_VEC), dtype=torch.uint8)
+    else:
+        quantized = x.new_empty((num_tokens, HIDDEN_SIZE), dtype=torch.float8_e4m3fn)
+        scales = x.new_empty((num_tokens, HIDDEN_SIZE // SF_VEC), dtype=torch.uint8)
     return (
         x.new_empty((num_tokens, TOP_K), dtype=torch.int32),
         x.new_empty((num_tokens, TOP_K), dtype=torch.bfloat16),
-        x.new_empty((num_tokens, HIDDEN_SIZE), dtype=torch.float8_e4m3fn),
-        x.new_empty((num_tokens, HIDDEN_SIZE // SF_VEC), dtype=torch.uint8),
+        quantized,
+        scales,
         x.new_empty((num_tokens, shared_cols), dtype=torch.bfloat16),
     )

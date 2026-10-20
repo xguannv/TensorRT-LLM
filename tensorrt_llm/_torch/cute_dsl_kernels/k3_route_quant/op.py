@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -32,10 +32,11 @@ NUM_EXPERTS = 896
 TOP_K = 16
 HIDDEN_SIZE = 3584
 SF_VEC_SIZE = 32
+NVFP4_SF_VEC = 16
 MAX_TOKENS = 64
 
 _lock = threading.Lock()
-_compiled: Dict[Tuple[bool, bool], object] = {}
+_compiled: Dict[Tuple[bool, bool, bool], object] = {}
 
 
 def _arg(t: torch.Tensor):
@@ -71,8 +72,16 @@ def _check(scores: torch.Tensor, bias: torch.Tensor, hidden_states: torch.Tensor
         raise ValueError(f"k3_route_quant: M must be in [1, {MAX_TOKENS}]")
 
 
-def _kernel(early_trigger: bool, use_pdl: bool, args, num_tokens: int, scale: float, stream):
-    key = (early_trigger, use_pdl)
+def _kernel(
+    early_trigger: bool,
+    use_pdl: bool,
+    args,
+    num_tokens: int,
+    scale: float,
+    stream,
+    nvfp4: bool = False,
+):
+    key = (early_trigger, use_pdl, nvfp4)
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -88,7 +97,14 @@ def _kernel(early_trigger: bool, use_pdl: bool, args, num_tokens: int, scale: fl
             fn = _compiled.get(key)
             if fn is None:
                 fn = _compiled[key] = cute.compile(
-                    kernel.k3_route_quant, *args, num_tokens, scale, early_trigger, use_pdl, stream
+                    kernel.k3_route_quant,
+                    *args,
+                    num_tokens,
+                    scale,
+                    early_trigger,
+                    use_pdl,
+                    nvfp4,
+                    stream,
                 )
     return fn
 
@@ -100,6 +116,7 @@ def k3_route_quant(
     hidden_states: torch.Tensor,
     routed_scaling_factor: float,
     early_trigger: bool = False,
+    nvfp4_gsf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Kimi K3 top-16 routing of ``scores`` (fp32 [M, 896]) with ``bias`` (fp32 [896]) and MXFP8
     quantization of ``hidden_states`` (bf16 [M, 3584]); M <= 64.
@@ -107,6 +124,10 @@ def k3_route_quant(
     Returns ``(topk_ids, topk_weights, quantized, scales)`` as ``kimi_k3_noaux_tc_mxfp8_quant``.
     ``early_trigger`` lets the dependent grid launch once every CTA has passed its own dependency
     wait (for dependents that wait for this whole grid before reading its outputs).
+
+    ``nvfp4_gsf`` (fp32 ``[1]``): quantize to NVFP4 on that global scale instead, ``fp4_quantize``'s recipe with
+    ``sf_vec_size`` 16 and linear scales: ``quantized`` uint8 ``[M, 1792]`` (E2M1 pairs, low nibble first) and
+    ``scales`` uint8 ``[M, 224]`` (E4M3).
     """
     import cuda.bindings.driver as cuda_driver
 
@@ -115,8 +136,21 @@ def k3_route_quant(
     device = scores.device
     topk_ids = torch.empty(num_tokens, TOP_K, dtype=torch.int32, device=device)
     topk_weights = torch.empty(num_tokens, TOP_K, dtype=torch.bfloat16, device=device)
-    quantized = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.float8_e4m3fn, device=device)
-    scales = torch.empty(num_tokens, HIDDEN_SIZE // SF_VEC_SIZE, dtype=torch.uint8, device=device)
+    nvfp4 = nvfp4_gsf is not None
+    if nvfp4 and (
+        nvfp4_gsf.dtype != torch.float32 or nvfp4_gsf.numel() != 1 or nvfp4_gsf.device != device
+    ):
+        raise ValueError("k3_route_quant: nvfp4_gsf must be one fp32 value on the inputs' device")
+    if nvfp4:
+        quantized = torch.empty(num_tokens, HIDDEN_SIZE // 2, dtype=torch.uint8, device=device)
+        scales = torch.empty(
+            num_tokens, HIDDEN_SIZE // NVFP4_SF_VEC, dtype=torch.uint8, device=device
+        )
+    else:
+        quantized = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.float8_e4m3fn, device=device)
+        scales = torch.empty(
+            num_tokens, HIDDEN_SIZE // SF_VEC_SIZE, dtype=torch.uint8, device=device
+        )
     args = (
         _arg(scores.view(-1)),
         _arg(bias.view(-1)),
@@ -125,22 +159,34 @@ def k3_route_quant(
         _arg(topk_weights.view(-1).view(torch.int16)),
         _arg(quantized.view(-1).view(torch.int32)),
         _arg(scales.view(-1)),
+        # Without nvfp4 the kernel never reads it: any fp32 word.
+        _arg(nvfp4_gsf.view(-1) if nvfp4 else bias.view(-1)[:1]),
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     use_pdl = _use_pdl()
     scale = float(routed_scaling_factor)
-    fn = _kernel(early_trigger, use_pdl, args, num_tokens, scale, stream)
+    fn = _kernel(early_trigger, use_pdl, args, num_tokens, scale, stream, nvfp4)
     # The compiled function takes the runtime arguments only (the Constexpr ones are baked in).
     fn(*args, num_tokens, scale, stream)
     return topk_ids, topk_weights, quantized, scales
 
 
 @k3_route_quant.register_fake
-def _(scores, bias, hidden_states, routed_scaling_factor, early_trigger=False):
+def _(scores, bias, hidden_states, routed_scaling_factor, early_trigger=False, nvfp4_gsf=None):
     num_tokens = scores.shape[0]
+    if nvfp4_gsf is not None:
+        quantized = hidden_states.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)
+        scales = hidden_states.new_empty(
+            (num_tokens, HIDDEN_SIZE // NVFP4_SF_VEC), dtype=torch.uint8
+        )
+    else:
+        quantized = hidden_states.new_empty((num_tokens, HIDDEN_SIZE), dtype=torch.float8_e4m3fn)
+        scales = hidden_states.new_empty(
+            (num_tokens, HIDDEN_SIZE // SF_VEC_SIZE), dtype=torch.uint8
+        )
     return (
         scores.new_empty((num_tokens, TOP_K), dtype=torch.int32),
         scores.new_empty((num_tokens, TOP_K), dtype=torch.bfloat16),
-        hidden_states.new_empty((num_tokens, HIDDEN_SIZE), dtype=torch.float8_e4m3fn),
-        hidden_states.new_empty((num_tokens, HIDDEN_SIZE // SF_VEC_SIZE), dtype=torch.uint8),
+        quantized,
+        scales,
     )
