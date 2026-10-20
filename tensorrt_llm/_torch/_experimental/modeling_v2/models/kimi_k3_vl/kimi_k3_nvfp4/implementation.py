@@ -3423,6 +3423,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 sites += ("drafter_qkv", "drafter_o", "drafter_gate_up", "drafter_down")
             elif _flags.TRTLLM_K3LL_MLA_DRAFTER_NORMS and self._mla_drafter() is not None:
                 sites += ("drafter_gate_up",)
+                if _flags.TRTLLM_K3LL_MLA_DRAFTER_QKV:
+                    sites += ("kv_a",)
         gemvs = _decode_gemv.K3DecodeGemvs.create(self.lm_head, sites=sites)
         self.model.decode_gemvs = gemvs
         self.logits_processor.gemvs = gemvs
@@ -3572,14 +3574,17 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
 
     def _gate_mla_drafter_norms(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Run the stock MLA DSpark drafter's block decode with each layer's residual adds and RMSNorms in its
-        all-reduces (switch ``TRTLLM_K3LL_MLA_DRAFTER_NORMS``, `mla_drafter.K3MLADrafterNorms`). Needs ``comm`` and
+        all-reduces (switch ``TRTLLM_K3LL_MLA_DRAFTER_NORMS``, `mla_drafter.K3MLADrafterNorms`; with
+        ``TRTLLM_K3LL_MLA_DRAFTER_QKV`` also each layer's query and block latent on one GEMV and
+        ``trtllm::k3_drafter_mla_a_post``). Needs ``comm`` and
         layers whose norms and projections the fused all-reduces reproduce. Collective: compiles the drafter's
         ``k3_sandwich_plain`` forms on the group's workspace. Returns whether the drafter took it."""
         drafter = self._mla_drafter()
         if comm is None or drafter is None:
             return False
-        owner = _mla_drafter.K3MLADrafterNorms.install(drafter, comm, self.model)
-        _mla_drafter.log_install(owner)
+        qkv = bool(_flags.TRTLLM_K3LL_MLA_DRAFTER_QKV)
+        owner = _mla_drafter.K3MLADrafterNorms.install(drafter, comm, self.model, qkv=qkv)
+        _mla_drafter.log_install(owner, qkv)
         return owner is not None
 
     def _gate_mla_drafter_fc(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
