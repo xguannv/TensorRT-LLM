@@ -59,6 +59,18 @@ TRTLLM_K3LL_MLA_DRAFTER_NORMS = _flag(
 )
 
 
+TRTLLM_K3LL_FP8W_LOWM = _flag(
+    "TRTLLM_K3LL_FP8W_LOWM",
+    0,
+    "FP8 attention projections in DeepGEMM layout (weight reads) and on k3_fp8w_lowm_gemm at decode size",
+)
+TRTLLM_K3LL_FP8W_LOWM_FUSED_A = _flag(
+    "TRTLLM_K3LL_FP8W_LOWM_FUSED_A",
+    0,
+    "with FP8W_LOWM, also the weight reads whose N is not a multiple of 128 (MLA fused q_a/kv_a, partial row tile)",
+)
+
+
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""
     return dict(_FLAGS)

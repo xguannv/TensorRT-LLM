@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import math
 import os
@@ -64,6 +65,7 @@ from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
+from . import fp8w_lowm as _fp8w_lowm
 from . import mla_drafter as _mla_drafter
 from . import spec_worker as _spec_worker
 from . import weights as _weights
@@ -1324,6 +1326,9 @@ class KimiMLARuntime(nn.Module):
         attention_config.use_cute_dsl_blockscaling_bmm = True
         if torch.cuda.get_device_capability() == (10, 7):
             attention_config.use_cute_dsl_blockscaling_mm = True
+        elif _flags.TRTLLM_K3LL_FP8W_LOWM:
+            # DeepGEMM layout (FP8 weight-read modules), which fp8w_lowm routes to k3_fp8w_lowm_gemm.
+            attention_config.use_cute_dsl_blockscaling_mm = False
         attention_config.quant_config = QuantConfig(
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
             if model_config.quant_config is not None
@@ -2140,6 +2145,13 @@ class K3DecodeKDA(KimiKDALinearAttention):
             config = copy.copy(config)
             config._frozen = False
             config.use_cute_dsl_blockscaling_mm = True
+            config._frozen = kwargs["model_config"]._frozen
+            kwargs["model_config"] = config
+        elif config is not None and _flags.TRTLLM_K3LL_FP8W_LOWM:
+            # DeepGEMM layout (FP8 weight-read modules), which fp8w_lowm routes to k3_fp8w_lowm_gemm.
+            config = copy.copy(config)
+            config._frozen = False
+            config.use_cute_dsl_blockscaling_mm = False
             config._frozen = kwargs["model_config"]._frozen
             kwargs["model_config"] = config
         super().__init__(*args, **kwargs)
@@ -3445,6 +3457,18 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             moe_layers = 0
             if comm is not None and _flags.TRTLLM_K3LL_MOE_LOWM:
                 moe_layers = self._build_decode_moe_lowm(comm)
+            if _flags.TRTLLM_K3LL_FP8W_LOWM:
+                skipped = collections.Counter()
+                routed = _fp8w_lowm.install(
+                    (m for layer in layers for m in layer.modules()),
+                    skipped,
+                    partial_n_tile=bool(_flags.TRTLLM_K3LL_FP8W_LOWM_FUSED_A),
+                )
+                logger.info(
+                    f"Kimi K3 NVFP4: TRTLLM_K3LL_FP8W_LOWM=1 (FUSED_A={_flags.TRTLLM_K3LL_FP8W_LOWM_FUSED_A}): "
+                    f"{routed} FP8 projections on k3_fp8w_lowm_gemm at decode size; FP8 modules left on their own "
+                    f"GEMM: {dict(skipped)}"
+                )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
             if _flags.TRTLLM_K3LL_DRAFTER_FC_TP:
