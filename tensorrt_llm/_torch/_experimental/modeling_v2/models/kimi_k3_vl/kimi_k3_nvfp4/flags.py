@@ -44,7 +44,7 @@ TRTLLM_K3LL_MLA_DCP = _flag(
 )
 TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
     "TRTLLM_K3LL_DRAFTER_FC_TP",
-    0,
+    1,
     "MLA DSpark drafter: fc split by input feature over TP, hidden_norm in the MNNVL all-reduce",
 )
 TRTLLM_K3LL_MLA_SPEC_WORKER = _flag(
