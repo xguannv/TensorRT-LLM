@@ -818,8 +818,9 @@ ROW_GROUPS = CLUSTER
 ROW_GROUP_THREADS = 128
 ROW_THREADS = ROW_GROUPS * ROW_GROUP_THREADS
 ROW_WARPS = ROW_THREADS // 32
-#: Largest row count of the row kernel (one CTA per row).
-ROW_MAX_M = 64
+#: Largest row count of the row kernel (one CTA per row): the C++ one-shot sums the RMSNorm in the
+#: 4 x 112 cluster order only up to :data:`MAX_M` rows (above that it launches 2 x 224).
+ROW_MAX_M = MAX_M
 #: World sizes of the row kernel (one bit per rank of the arrival mask).
 ROW_WORLD_SIZES = (2, 4, 8, 16)
 #: CTAs x threads of :class:`K3LamportClearKernel`.
