@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The NVFP4 MoE decode path of the Kimi K3 NVFP4 target (decode_moe_nvfp4.py), op by op, on SM100 / SM103.
+"""The NVFP4 MoE decode path of the Kimi K3 NVFP4 target (decode_moe_lowm.py), op by op, on SM100 / SM103.
 
   route_quant : trtllm::k3_route_quant with nvfp4_gsf against trtllm::fp4_quantize (sf_vec_size 16, linear scales)
                 on the same bf16 latent, bit for bit, and the routing bit for bit the MXFP8 call's;
@@ -29,8 +29,8 @@
                 front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs.
 
 Run under pytest (the front check takes a pool of 4 MPI workers) or directly:
-  python3 test_k3_moe_nvfp4.py route_quant lowm
-  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_nvfp4.py front
+  python3 test_k3_moe_lowm.py route_quant lowm
+  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_lowm.py front
 """
 
 import pickle

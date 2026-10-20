@@ -20,12 +20,12 @@ Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_l
 
 `K3DecodeMoeNvfp4` holds what every MoE layer shares (the head workspace, the expert kernel's counters);
 `K3DecodeMoeNvfp4Layer` holds one layer's decode weights and handles. The target builds both in
-`post_load_weights`, before any CUDA-graph capture, and runs every kernel once there so none compiles under a capture.
+`post_load_weights` when ``TRTLLM_K3LL_MOE_LOWM`` (flags.py) is set, before any CUDA-graph capture, and runs
+every kernel once there so none compiles under a capture.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -55,10 +55,6 @@ MAX_TOKENS = 8
 # A wide decode step's most tokens: the expert kernel's limit.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
 NUM_EXPERTS = 896
-
-#: The switch (default off): with it off the target never builds this path and every MoE layer runs as before.
-FLAG = "TRTLLM_K3LL_NVFP4_DECODE_MOE"
-ENABLED = os.environ.get(FLAG, "0") == "1"
 
 
 @dataclass(eq=False)
