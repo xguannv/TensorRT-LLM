@@ -112,8 +112,31 @@ def supports(
     )
 
 
+def sort_layout(num_tokens: int, num_local: int) -> Tuple[int, int, int, int]:
+    """``(tiles, weight offset, row offset, words)`` of ``sort_out`` (int32) for ``num_tokens`` tokens over
+    ``num_local`` local experts: ``[0, tiles)`` the tiles' local experts, ``[tiles, 2 tiles)`` their mn limits,
+    ``[2 tiles]`` the tile count, fp32 ``[M, 16]`` routing weights from the weight offset, ``tiles * 128`` permuted
+    rows from the row offset (``moe_sort``'s outputs for 128-row tiles)."""
+    return _kernel().sort_layout(num_tokens, num_local)
+
+
+def sort_views(sort_out: torch.Tensor, num_tokens: int, num_local: int) -> Tuple[torch.Tensor, ...]:
+    """``(tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+    token_final_scales)`` views of ``sort_out`` (`sort_layout`)."""
+    tiles, w0, p0, words = sort_layout(num_tokens, num_local)
+    flat = sort_out.view(-1)[:words]
+    return (
+        flat[:tiles],
+        flat[tiles : 2 * tiles],
+        flat[p0:words],
+        flat[2 * tiles : 2 * tiles + 1],
+        flat[w0:p0].view(torch.float32).view(num_tokens, TOP_K),
+    )
+
+
 @torch.library.custom_op(
-    "trtllm::k3_moe_front", mutates_args=("ag_uc", "ag_mc", "ag_flags", "ag_ready")
+    "trtllm::k3_moe_front",
+    mutates_args=("ag_uc", "ag_mc", "ag_flags", "ag_ready", "sort_out", "sort_ctr"),
 )
 def k3_moe_front(
     x: torch.Tensor,
@@ -131,6 +154,10 @@ def k3_moe_front(
     ring: int = DEFAULT_RING,
     ag_ready: Optional[torch.Tensor] = None,
     nvfp4_gsf: Optional[torch.Tensor] = None,
+    sort_out: Optional[torch.Tensor] = None,
+    sort_ctr: Optional[torch.Tensor] = None,
+    sort_offset: int = 0,
+    sort_local: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 8, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -140,7 +167,12 @@ def k3_moe_front(
 
     With ``nvfp4_gsf`` (fp32 ``[1]``, the routed experts' input global scale) the latent is NVFP4 instead of MXFP8:
     ``quantized`` uint8 ``[M, 1792]`` (E2M1 pairs, low nibble first) and ``scales`` uint8 ``[M, 224]`` (E4M3, linear),
-    ``fp4_quantize``'s recipe with ``sf_vec_size`` 16 on the gathered bf16 latent."""
+    ``fp4_quantize``'s recipe with ``sf_vec_size`` 16 on the gathered bf16 latent.
+
+    With ``sort_out`` (int32, at least `sort_layout`'s words; with ``nvfp4_gsf``) the kernel also writes ``moe_sort``
+    of the routing over the local experts ``[sort_offset, sort_offset + sort_local)`` with 128-row tiles and the
+    routing weights in fp32 there (`sort_views`). ``sort_ctr``: int32 ``[1]``, zero, which every call leaves zero;
+    calls that share it must be stream-ordered."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -178,6 +210,20 @@ def k3_moe_front(
     else:
         quantized = torch.empty(num_tokens, HIDDEN_SIZE, dtype=torch.float8_e4m3fn, device=device)
         scales = torch.empty(num_tokens, HIDDEN_SIZE // SF_VEC, dtype=torch.uint8, device=device)
+    sort = sort_out is not None
+    if sort and (
+        not nvfp4
+        or sort_ctr is None
+        or sort_ctr.dtype != torch.int32
+        or sort_out.dtype != torch.int32
+        or not sort_out.is_contiguous()
+        or not 0 < sort_local <= NUM_EXPERTS
+        or sort_out.numel() < sort_layout(num_tokens, sort_local)[3]
+    ):
+        raise ValueError(
+            "k3_moe_front: the sort needs the NVFP4 latent, an int32 sort_ctr and a contiguous int32 sort_out of "
+            "sort_layout's words over 1 to 896 local experts"
+        )
     shared = torch.empty(num_tokens, shared_cols, dtype=torch.bfloat16, device=device)
     # Head-only fronts (shared_cols 0) still hand the kernel an aligned shared-output argument it never writes.
     shared_arg = shared if shared_cols else ag_flags.view(torch.int16).view(-1)
@@ -203,6 +249,9 @@ def k3_moe_front(
         arg(shared_arg.view(-1).view(torch.int16)),
         # Without nvfp4 the kernel never reads it: any aligned fp32 word.
         arg(nvfp4_gsf.view(-1) if nvfp4 else bias.view(-1)[:1]),
+        # Without the sort the kernel never touches them: any aligned int32 words.
+        arg(sort_out.view(-1) if sort else ag_flags.view(-1)),
+        arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
     )
     capacity = max_clusters(device)
     # One round with the head in 64-row half-tiles when it fits (TP16): every head k-tile on chip before the wait.
@@ -226,6 +275,7 @@ def k3_moe_front(
         use_pdl,
         head_half,
         nvfp4,
+        sort,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -237,17 +287,18 @@ def k3_moe_front(
             fn = _compiled.get(key)
             if fn is None:
                 fn = _compiled[key] = cute.compile(
-                    kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), ag_world,
-                    shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap), float(linear_cap), publish,
-                    use_pdl, head_half, nvfp4, stream,
+                    kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
+                    sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
+                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, stream,
                 )  # fmt: skip
-    fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), stream)
+    fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
     return topk_ids, topk_weights, quantized, scales, shared
 
 
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
-      ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None):  # fmt: skip
+      ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
+      sort_local=0):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

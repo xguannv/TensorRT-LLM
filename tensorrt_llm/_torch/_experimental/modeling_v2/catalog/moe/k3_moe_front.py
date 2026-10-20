@@ -11,11 +11,20 @@ import torch
 # weight_supported reads metadata only.
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.front_op import (
     front_weight,
+    sort_layout,
+    sort_views,
     weight_supported,
 )
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op import K3MoeHeadWorkspace
 
-__all__ = ["K3MoeHeadWorkspace", "front_weight", "k3_moe_front", "weight_supported"]
+__all__ = [
+    "K3MoeHeadWorkspace",
+    "front_weight",
+    "k3_moe_front",
+    "sort_layout",
+    "sort_views",
+    "weight_supported",
+]
 
 
 def k3_moe_front(
@@ -29,6 +38,10 @@ def k3_moe_front(
     workspace: K3MoeHeadWorkspace,
     publish: bool = False,
     nvfp4_gsf: Optional[torch.Tensor] = None,
+    sort_out: Optional[torch.Tensor] = None,
+    sort_ctr: Optional[torch.Tensor] = None,
+    sort_offset: int = 0,
+    sort_local: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(topk_ids, topk_weights, quantized, scales, shared)`` for the MoE input ``x`` (bf16 ``[M <= 8, 7168]``,
     the same on every rank): the top-16 routing of the gathered router logits with ``e_score_correction_bias`` and the
@@ -40,7 +53,10 @@ def k3_moe_front(
     state (``head=workspace``) acquires; every publishing call is followed by exactly one such call.
 
     ``nvfp4_gsf`` (fp32 ``[1]``, not with ``publish``): the latent is NVFP4 on that global scale instead (``quantized``
-    uint8 ``[M, 1792]`` E2M1 pairs, ``scales`` uint8 ``[M, 224]`` E4M3, linear; ``fp4_quantize``'s recipe)."""
+    uint8 ``[M, 1792]`` E2M1 pairs, ``scales`` uint8 ``[M, 224]`` E4M3, linear; ``fp4_quantize``'s recipe).
+
+    ``sort_out`` / ``sort_ctr`` / ``sort_offset`` / ``sort_local`` (with ``nvfp4_gsf``): also ``moe_sort`` of the
+    routing over the local experts and the fp32 weights into ``sort_out`` (``sort_layout``, ``sort_views``)."""
     return torch.ops.trtllm.k3_moe_front(
         x,
         w_front,
@@ -56,4 +72,8 @@ def k3_moe_front(
         workspace.world_size,
         ag_ready=workspace.ready if publish else None,
         nvfp4_gsf=nvfp4_gsf,
+        sort_out=sort_out,
+        sort_ctr=sort_ctr,
+        sort_offset=sort_offset,
+        sort_local=sort_local,
     )

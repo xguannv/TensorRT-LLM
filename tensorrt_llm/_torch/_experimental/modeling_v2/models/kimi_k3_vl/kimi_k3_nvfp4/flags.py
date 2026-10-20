@@ -37,6 +37,11 @@ TRTLLM_K3LL_MOE_LOWM = _flag(
     1,
     "MoE decode path: NVFP4-latent front + k3_moe_lowm_dyn on CuteDSL NVFP4 buffers (decode_moe_lowm.py)",
 )
+TRTLLM_K3LL_MOE_FRONT_SORT = _flag(
+    "TRTLLM_K3LL_MOE_FRONT_SORT",
+    0,
+    "with TRTLLM_K3LL_MOE_LOWM: the routing's moe_sort over the local experts in k3_moe_front, not its own kernel",
+)
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
     1,
