@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """CuTe DSpark Markov chain (TLLM_DSPARK_MARKOV_V2=3) against the Triton one-launch chain (=2):
-the same draft tokens over random and adversarial inputs, eager and in a replayed CUDA graph."""
+the same draft tokens over random and adversarial inputs, eager and in a replayed CUDA graph, with
+the bias MMA's fragments by ldmatrix (default) and by 4-byte loads (TLLM_DSPARK_MARKOV_LDSM=0)."""
 
 import os
 import pickle
@@ -57,7 +58,8 @@ def _case(b, k, kind, tp, w1, w2, seed):
     return local, anchors, w1, w2
 
 
-def _run_rank(world_size):
+def _run_rank(world_size, ldsm):
+    os.environ["TLLM_DSPARK_MARKOV_LDSM"] = "1" if ldsm else "0"
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     os.environ["TLLM_SPEC_VOCAB_PARALLEL"] = "1"
@@ -137,11 +139,12 @@ def _run_rank(world_size):
 
 
 @skip_pre_blackwell
+@pytest.mark.parametrize("ldsm", [True, False])
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
-def test_dspark_markov_chain_cute(mpi_pool_executor):
+def test_dspark_markov_chain_cute(mpi_pool_executor, ldsm):
     world_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
-    results = mpi_pool_executor.map(_run_rank, *zip(*[(world_size,)] * world_size))
+    results = mpi_pool_executor.map(_run_rank, *zip(*[(world_size, ldsm)] * world_size))
     for r in results:
         assert r is True

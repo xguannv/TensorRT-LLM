@@ -42,6 +42,7 @@ completed; other successors read the tokens after their own wait.
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -229,6 +230,20 @@ def _gdc_wait(*, loc=None, ip=None):
 @dsl_user_op
 def _gdc_launch(*, loc=None, ip=None):
     _asm(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ldsm_x4(addr, *, loc=None, ip=None):
+    """``ldmatrix.x4``: four 8x8 BF16 matrices (lane ``8 i + r`` gives row ``r`` of matrix ``i``)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_iv(addr, loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -602,6 +617,7 @@ class DSparkMarkovChainKernel:
         use_pdl: bool,
         anchor_64: bool,
         num_reqs: int,
+        ldsm: bool = True,
     ):
         if rank % 16 or rank > 512:
             raise ValueError(f"markov rank {rank} must be a multiple of 16 (<= 512)")
@@ -612,6 +628,8 @@ class DSparkMarkovChainKernel:
         if not 1 <= num_reqs <= MAX_REQS:
             raise ValueError(f"{num_reqs} requests (1..{MAX_REQS})")
         self.B = num_reqs
+        # The bias MMA's fragments by ldmatrix (else one 4-byte shared load per register).
+        self.ldsm = ldsm
         self.steps = steps
         self.R = rank
         self.tp = tp
@@ -879,16 +897,40 @@ class DSparkMarkovChainKernel:
 
                 # bias = A (w1 rows, 16 x R) * B (w2 rows of the warp's 32 columns, R x 32).
                 acc = [Float32(0.0)] * (nt_per_warp * 4)
+                # With ldsm, the fragments by ldmatrix (one x4 for A, one per two n8 tiles for B;
+                # lane 8 i + r addresses row r of matrix i), else one 4-byte load per register.
+                lm_row = (lane & 7) + ((lane >> 3) & 1) * 8
+                lm_col = (lane >> 4) * 8
+                lm_brow = warp * 32 + (lane >> 4) * 8 + (lane & 7)
+                lm_bcol = ((lane >> 3) & 1) * 8
                 for ks in cutlass.range_constexpr(R // 16):
                     k0 = ks * 16
-                    a0 = _lds_b32(w1s + g * RB + (k0 + 2 * t) * 2)
-                    a1 = _lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t) * 2)
-                    a2 = _lds_b32(w1s + g * RB + (k0 + 2 * t + 8) * 2)
-                    a3 = _lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t + 8) * 2)
+                    afr = []
+                    bfr = []
+                    if cutlass.const_expr(self.ldsm):
+                        af = _ldsm_x4(w1s + lm_row * RB + (k0 + lm_col) * 2)
+                        for e in cutlass.range_constexpr(4):
+                            afr.append(af[e])
+                        for np_ in cutlass.range_constexpr(nt_per_warp // 2):
+                            bq = _ldsm_x4(w2s + (lm_brow + np_ * 16) * RB + (k0 + lm_bcol) * 2)
+                            for e in cutlass.range_constexpr(4):
+                                bfr.append(bq[e])
+                    else:
+                        afr.append(_lds_b32(w1s + g * RB + (k0 + 2 * t) * 2))
+                        afr.append(_lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t) * 2))
+                        afr.append(_lds_b32(w1s + g * RB + (k0 + 2 * t + 8) * 2))
+                        afr.append(_lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t + 8) * 2))
+                        for nt in cutlass.range_constexpr(nt_per_warp):
+                            n = warp * 32 + nt * 8 + g
+                            bfr.append(_lds_b32(w2s + n * RB + (k0 + 2 * t) * 2))
+                            bfr.append(_lds_b32(w2s + n * RB + (k0 + 2 * t + 8) * 2))
+                    a0 = afr[0]
+                    a1 = afr[1]
+                    a2 = afr[2]
+                    a3 = afr[3]
                     for nt in cutlass.range_constexpr(nt_per_warp):
-                        n = warp * 32 + nt * 8 + g
-                        b0 = _lds_b32(w2s + n * RB + (k0 + 2 * t) * 2)
-                        b1 = _lds_b32(w2s + n * RB + (k0 + 2 * t + 8) * 2)
+                        b0 = bfr[2 * nt]
+                        b1 = bfr[2 * nt + 1]
                         d = _mma_bf16(
                             acc[4 * nt],
                             acc[4 * nt + 1],
@@ -983,9 +1025,16 @@ class DSparkMarkovChainKernel:
 
 @functools.cache
 def _compiled(
-    steps: int, rank: int, tp: int, num_ctas: int, use_pdl: bool, anchor_64: bool, num_reqs: int
+    steps: int,
+    rank: int,
+    tp: int,
+    num_ctas: int,
+    use_pdl: bool,
+    anchor_64: bool,
+    num_reqs: int,
+    ldsm: bool = True,
 ):
-    kernel = DSparkMarkovChainKernel(steps, rank, tp, num_ctas, use_pdl, anchor_64, num_reqs)
+    kernel = DSparkMarkovChainKernel(steps, rank, tp, num_ctas, use_pdl, anchor_64, num_reqs, ldsm)
     a = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1007,6 +1056,11 @@ def _compiled(
         Int32(0),
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
+
+
+#: ``TLLM_DSPARK_MARKOV_LDSM=0``: the bias MMA's fragments by one 4-byte shared load per register
+#: instead of ldmatrix (the same values; ldmatrix is the default).
+LDSM_ENV_VAR = "TLLM_DSPARK_MARKOV_LDSM"
 
 
 def num_ctas_for(shard: int) -> Optional[int]:
@@ -1051,7 +1105,16 @@ def run_dspark_markov_chain(
     assert markov_w1.dtype == torch.bfloat16 and markov_w1.is_contiguous()
     assert w2_shard.dtype == torch.bfloat16 and w2_shard.stride(-1) == 1
     assert w2_shard.stride(0) == rank and tokens.dtype == torch.int32 and tokens.stride(-1) == 1
-    _compiled(steps, rank, tp, num_ctas, bool(use_pdl), anchors.dtype == torch.int64, num_reqs)(
+    _compiled(
+        steps,
+        rank,
+        tp,
+        num_ctas,
+        bool(use_pdl),
+        anchors.dtype == torch.int64,
+        num_reqs,
+        os.environ.get(LDSM_ENV_VAR, "1") != "0",
+    )(
         Int64(local_block.data_ptr()),
         Int32(local_block.stride(0)),
         Int32(local_block.stride(1)),
