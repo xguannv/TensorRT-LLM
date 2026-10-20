@@ -58,9 +58,11 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import resmooth_to_fp8_e8m0
 
 from . import attention as _fp8_attention
+from . import census as _census
 from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
+from . import flags as _flags
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .verify import k3_fp8_kda_verify
@@ -3269,6 +3271,11 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             "text_config"
         )
         _check_construction(model_config, self.target_spec)
+        _flags.log_flags()
+        _census.install_model(KimiLinearModel, decode_step)
+        _census.install(
+            KimiLinearDecoderLayer, KimiK3MoERuntime, KimiMLARuntime, K3DecodeKDA, K3DecodeMLA
+        )
         text = _text_model_config(model_config)
         spec_config = getattr(text, "spec_config", None)
         assert (
