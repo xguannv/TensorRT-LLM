@@ -109,6 +109,7 @@ from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.dspark_ar_norm import draft_ar_norm
+from ..speculative.dspark_ar_push import PushedPartial, draft_ar_finish_norm, draft_gemm_push
 from ..speculative.dspark_draft_gemm import DraftL2Prefetch, draft_gemm, l2_prefetch_enabled
 from ..speculative.dspark_mla_fused import draft_mla_attend
 from ..speculative.dspark_norm import draft_rmsnorm
@@ -412,10 +413,12 @@ def _plain(linear) -> bool:
     )
 
 
-def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params) -> torch.Tensor:
+def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params, push_all_reduce=None):
     """``mlp(x, final_all_reduce_params=down_all_reduce_params)`` for the MLA
     drafter, with the gate_up / down GEMMs pinned by ``TLLM_DSPARK_DRAFT_GEMM``
-    when it applies (same activation kernel in between)."""
+    when it applies (same activation kernel in between). With ``push_all_reduce``
+    (``TLLM_DSPARK_AR_PUSH``) the down GEMM may push its output into that
+    all-reduce instead; then this returns a ``PushedPartial``."""
     gate_up, down = getattr(mlp, "gate_up_proj", None), getattr(mlp, "down_proj", None)
     h1 = None
     if (
@@ -432,6 +435,10 @@ def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params) -> torch.Tensor:
     if h1 is None:
         return mlp(x, final_all_reduce_params=down_all_reduce_params)
     h2 = mlp._apply_activation(h1)
+    if push_all_reduce is not None:
+        pushed = draft_gemm_push(push_all_reduce, h2, down.weight)
+        if pushed is not None:
+            return pushed
     out = draft_gemm(h2, down.weight, "down")
     if out is None:
         out = down(h2, all_reduce_params=down_all_reduce_params, layer_idx=mlp.layer_idx)
@@ -3977,8 +3984,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         num_layers = len(self.model.layers)
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
+                hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
                 residual = hidden_states.clone()
                 hs_normed = draft_rmsnorm(layer.input_layernorm, hs_flat)
                 if hs_normed is None:
@@ -3990,6 +3997,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 )
                 residual = res_flat.reshape(batch, block_size, -1)
             else:
+                hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
@@ -4182,13 +4190,22 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             res_flat = residual.reshape(-1, residual.shape[-1])
             if fused_ar is not None:
                 no_reduce = AllReduceParams(enable_allreduce=False)
-                hidden_out = attn.o_proj(
-                    attn_out.reshape(batch * block_size, -1), all_reduce_params=no_reduce
+                # TLLM_DSPARK_AR_PUSH: o_proj pushes its rows into the all-reduce.
+                hidden_out = (
+                    draft_gemm_push(
+                        fused_ar, attn_out.reshape(batch * block_size, -1), attn.o_proj.weight
+                    )
+                    if _plain(attn.o_proj)
+                    else None
                 )
+                if hidden_out is None:
+                    hidden_out = attn.o_proj(
+                        attn_out.reshape(batch * block_size, -1), all_reduce_params=no_reduce
+                    )
                 hidden_out, res_flat = self._fused_ar_residual_norm(
                     fused_ar, hidden_out, res_flat, layer.post_attention_layernorm
                 )
-                partial = _draft_mlp(layer.mlp, hidden_out, no_reduce)
+                partial = _draft_mlp(layer.mlp, hidden_out, no_reduce, push_all_reduce=fused_ar)
                 hidden_states = partial
             else:
                 hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
@@ -4289,7 +4306,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     @staticmethod
     def _fused_ar_residual_norm(all_reduce, partial, residual, norm):
         """``norm(all_reduce(partial) + residual)`` and the new residual, in one kernel
-        (``TLLM_DSPARK_AR_NORM``: the CuTe all-reduce + norm, same values)."""
+        (``TLLM_DSPARK_AR_NORM``: the CuTe all-reduce + norm, same values; a
+        ``PushedPartial`` of ``TLLM_DSPARK_AR_PUSH``: the finish + norm kernel)."""
+        if isinstance(partial, PushedPartial):
+            return draft_ar_finish_norm(partial, residual, norm)
         fused = draft_ar_norm(all_reduce, partial, residual, norm)
         if fused is not None:
             return fused

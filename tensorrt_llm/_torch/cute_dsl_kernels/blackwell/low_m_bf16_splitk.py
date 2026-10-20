@@ -15,6 +15,17 @@ Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
 to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
 ``A[M, K] @ B[K, N]`` problem is swapped internally, so tile dimensions below
 use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
+
+All-reduce push (:func:`run_splitk_dense_ar_push`, split-K 1 only): instead of storing its BF16
+output, the kernel stores each token row segment into the Lamport scatter slot of the row's owner
+of the next two-shot MNNVL all-reduce on a workspace (:mod:`k3_lamport_ar`, ``-0`` sent as
+``+0``), staging the tile token-major in the dead weight ring and pushing 16-byte vectors. PDL:
+that variant releases its dependent (the all-reduce's finish kernel) from the activation warp
+right after its own ``griddepcontrol.wait`` instead of from the weight warp; the finish kernel
+reads the workspace's rotation state as soon as it is resident, which is then safe whatever
+precedes this GEMM (once this GEMM has passed its wait, every earlier grid has completed, the
+previous all-reduce on the workspace included). The epilogue reads the state after the
+activation warp's wait (its MMAs consumed the activations).
 """
 
 from __future__ import annotations
@@ -34,6 +45,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from . import k3_lamport_ar
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -256,6 +269,7 @@ __all__ = [
     "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
+    "run_splitk_dense_ar_push",
     "validate_tactic",
 ]
 
@@ -299,6 +313,23 @@ def _bulk_prefetch_l2(addr, nbytes, *, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def _lds_v4_b32(addr, *, loc=None, ip=None):
+    """16 bytes of shared memory at the 32-bit shared address ``addr``."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
 
 
 @dsl_user_op
@@ -357,7 +388,19 @@ class SplitKDenseGemmKernel:
         has_bias: bool,
         l2_prefetch_tiles: int = 0,
         exact_smem: bool = False,
+        ar_push: bool = False,
+        ar_world: int = 0,
+        ar_hidden: int = 0,
     ) -> None:
+        if ar_push and (tactic.split_k != 1 or has_bias or ar_world < 2 or ar_hidden % 8):
+            raise ValueError(
+                f"all-reduce push needs split-K 1, no bias, >= 2 ranks and hidden % 8 == 0 "
+                f"(split_k={tactic.split_k}, bias={has_bias}, world={ar_world}, "
+                f"hidden={ar_hidden})"
+            )
+        self.ar_push = ar_push
+        self.ar_world = ar_world
+        self.ar_hidden = ar_hidden
         self.acc_dtype = cutlass.Float32
         self.exact_smem = exact_smem
         self.smem_bytes = _smem_bytes(tactic, tactic.ab_stages) + _AB_BUFFER_ALIGN_BYTES
@@ -397,7 +440,38 @@ class SplitKDenseGemmKernel:
         stream: _cuda.CUstream,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(
+            a, b, c, bias, cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0), Int32(0)
+        ).launch(
+            grid=(
+                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
+                c.layout.shape[2],
+            ),
+            block=(self.threads_per_cta, 1, 1),
+            cluster=self.cluster_shape,
+            smem=cute.Int64(
+                self.smem_bytes if self.exact_smem else utils.get_smem_capacity_in_bytes("sm_100")
+            ),
+            preferred_smem_carveout=100 if self.exact_smem else None,
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.experimental.jit
+    def call_push(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        ar_peers: cutlass.Int64,
+        ar_mc: cutlass.Int64,
+        ar_flags: cutlass.Int64,
+        ar_rank: Int32,
+        stream: _cuda.CUstream,
+    ):
+        """Launch of the all-reduce push variant (``c`` only gives the output shape)."""
+        self.kernel(a, b, c, c, ar_peers, ar_mc, ar_flags, ar_rank).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -420,6 +494,10 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        ar_peers: cutlass.Int64,  # all-reduce push: every rank's workspace mapping
+        ar_mc: cutlass.Int64,  # all-reduce push: the workspace's multicast address
+        ar_flags: cutlass.Int64,  # all-reduce push: the workspace's rotation state
+        ar_rank: Int32,  # all-reduce push: this rank
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -618,6 +696,14 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                sA,
+                bidx * self.cta_m,
+                n_idx * self.cta_n,
+                cute.size(mB, mode=[0]),
+                ar_peers,
+                ar_mc,
+                ar_flags,
+                ar_rank,
             )
 
     @cute.experimental.jit
@@ -639,6 +725,10 @@ class SplitKDenseGemmKernel:
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.ar_push):
+                # The all-reduce finish kernel reads the workspace's rotation state as soon as
+                # it is resident: release it only once every earlier grid has completed.
+                cute.arch.griddepcontrol_launch_dependents()
 
         ring = Int32(0)
         if cutlass.const_expr(is_a and self.l2_prefetch_tiles > 0):
@@ -683,7 +773,7 @@ class SplitKDenseGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        if cutlass.const_expr(is_a and self.use_pdl):
+        if cutlass.const_expr(is_a and self.use_pdl and not self.ar_push):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not is_a and self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
@@ -768,6 +858,14 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        ring: cute.Tensor,
+        n_base: cutlass.Int32,
+        tok_base: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        ar_peers: cutlass.Int64,
+        ar_mc: cutlass.Int64,
+        ar_flags: cutlass.Int64,
+        ar_rank: cutlass.Int32,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -881,10 +979,78 @@ class SplitKDenseGemmKernel:
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
             rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.ar_push):
+                self._push_lamport(
+                    thr_t2r,
+                    rD,
+                    ring,
+                    c_dtype,
+                    epi_tile,
+                    epi_tid,
+                    n_base,
+                    tok_base,
+                    num_tokens,
+                    ar_peers,
+                    ar_mc,
+                    ar_flags,
+                    ar_rank,
+                )
+            else:
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
+
+    @cute.experimental.jit
+    def _push_lamport(
+        self,
+        thr_t2r,
+        rD: cute.Tensor,
+        ring: cute.Tensor,
+        c_dtype: cutlass.Constexpr,
+        epi_tile: cutlass.Constexpr,
+        epi_tid: cutlass.Int32,
+        n_base: cutlass.Int32,
+        tok_base: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        ar_peers: cutlass.Int64,
+        ar_mc: cutlass.Int64,
+        ar_flags: cutlass.Int64,
+        ar_rank: cutlass.Int32,
+    ):
+        """All-reduce push epilogue: stage the BF16 tile token-major (kernel-M contiguous) in the
+        dead weight ring, then push 16-byte vectors of each token row segment into the owner's
+        scatter slot of the next two-shot call on the workspace (``-0`` sent as ``+0``)."""
+        stage = cute.make_tensor(
+            cute.recast_ptr(ring.iterator, dtype=c_dtype),
+            cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
+        )
+        cute_ext.partition_and_copy(
+            thr_t2r, rD, cute.flat_divide(stage, epi_tile)[None, None, 0, 0]
+        )
+        cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
+        cur, _, nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(ar_flags)
+        stage_addr = ring.iterator.toint()
+        vecs = self.cta_m // 8
+        for p in cutlass.range_constexpr(0, self.cta_n * vecs, self.epilog_threads):
+            j = epi_tid + p
+            t = j // vecs
+            c = j - t * vecs
+            if t < self.cta_n and tok_base + t < num_tokens and n_base + c * 8 < self.ar_hidden:
+                w = _lds_v4_b32(stage_addr + (t * self.cta_m + c * 8) * 2)
+                dst = k3_lamport_ar.push_slot(
+                    ar_peers,
+                    ar_mc,
+                    cur,
+                    nbytes,
+                    tok_base + t,
+                    ar_rank,
+                    n_base + c * 8,
+                    self.ar_world,
+                    self.ar_hidden,
+                    False,
+                )
+                k3_lamport_ar.push_v4(dst, w[0], w[1], w[2], w[3], False)
 
 
 _SUPPORTED_TORCH_DTYPES = (_torch.bfloat16, _torch.float16)
@@ -922,6 +1088,30 @@ def _bmm_bias(
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
         cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0])),
+        stream,
+    )
+
+
+@cute.experimental.jit
+def _bmm_ar_push(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    ar_peers: cutlass.Int64,
+    ar_mc: cutlass.Int64,
+    ar_flags: cutlass.Int64,
+    ar_rank: Int32,
+    stream: _cuda.CUstream,
+):
+    gemm_op.call_push(
+        cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
+        ar_peers,
+        ar_mc,
+        ar_flags,
+        ar_rank,
         stream,
     )
 
@@ -1030,6 +1220,31 @@ def _get_compiled_splitk_kernel(
     return compiled
 
 
+@functools.cache
+def _get_compiled_ar_push_kernel(
+    dtype,
+    tactic: SplitKTactic,
+    use_pdl: bool,
+    leading_dims: tuple[int, int, int],
+    world: int,
+    hidden: int,
+):
+    kernel = SplitKDenseGemmKernel(
+        tactic=tactic,
+        use_pdl=use_pdl,
+        has_bias=False,
+        ar_push=True,
+        ar_world=world,
+        ar_hidden=hidden,
+    )
+    compile_tensors = _make_compile_repr_tensors(dtype, False, *leading_dims)
+    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
+    addr = cutlass.Int64(0)
+    return cute_ext.compile(
+        _bmm_ar_push, kernel, *compile_tensors[:3], addr, addr, addr, Int32(0), stream
+    )
+
+
 def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
     tensors = (a, b, out) + ((bias,) if bias is not None else ())
     if any(not isinstance(tensor, _torch.Tensor) for tensor in tensors):
@@ -1120,3 +1335,40 @@ def run_splitk_dense(
     else:
         compiled(*cute_tensors[:3], stream)
     return out
+
+
+def run_splitk_dense_ar_push(
+    a: _torch.Tensor,
+    b: _torch.Tensor,
+    shape_out: _torch.Tensor,
+    tactic: SplitKTactic,
+    workspace,
+    pdl: bool,
+) -> None:
+    """``A[M,K] @ B[K,N]`` (as :func:`run_splitk_dense`, split-K 1) pushed into the Lamport slots
+    of the next two-shot all-reduce on ``workspace`` (a ``k3_lamport_ar.LamportWorkspace``)
+    instead of stored; ``k3_lamport_ar`` style finish kernels complete the all-reduce.
+    ``shape_out``: a BF16/FP16 ``[M, N]`` row-major tensor that gives the output's shape and
+    layout (not written)."""
+    if tactic.split_k != 1:
+        raise ValueError(f"all-reduce push needs split-K 1, got {tactic}")
+    m, n, _ = _validate_runtime_tensors(a, b, None, shape_out)
+    validate_tactic(tactic, m, n, a.shape[1])
+    need = k3_lamport_ar.required_bytes(m, n, workspace.world, False)
+    if need > workspace.bytes_per_buffer:
+        raise ValueError(
+            f"Lamport buffer of {workspace.bytes_per_buffer} B too small for {m} x {n} ({need} B)"
+        )
+    cute_tensors = _to_cute_swap(a, b, shape_out, None)
+    compiled = _get_compiled_ar_push_kernel(
+        a.dtype, tactic, pdl, cute_tensors[4], workspace.world, n
+    )
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(
+        *cute_tensors[:3],
+        cutlass.Int64(workspace.peer_ptrs.data_ptr()),
+        cutlass.Int64(workspace.mc_base),
+        cutlass.Int64(workspace.flags.data_ptr()),
+        Int32(workspace.rank),
+        stream,
+    )

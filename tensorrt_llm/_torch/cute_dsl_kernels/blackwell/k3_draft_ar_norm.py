@@ -589,6 +589,245 @@ class K3DraftArNormKernel:
                     st_u32(counter, Int32(0))
 
 
+class K3DraftArFinishNormKernel(K3DraftArNormKernel):
+    """The rest of a two-shot all-reduce whose input the producer GEMM pushed
+    (``low_m_bf16_splitk.run_splitk_dense_ar_push``), then residual add + RMSNorm: the result is
+    bitwise that of the producer followed by the C++ ``RESIDUAL_RMS_NORM`` fusion.
+
+    Same CTAs, arithmetic and Lamport state as :class:`K3DraftArNormKernel`, without the scatter:
+
+    * The CTAs do not wait for the producer. They release their dependents, read the rotation
+      state, the residual and ``gamma`` and start polling as soon as they are resident. That is
+      safe because the producer releases this kernel only after its own ``griddepcontrol.wait``
+      (see ``low_m_bf16_splitk``): every earlier grid, the previous all-reduce on the workspace
+      and the writer of the residual included, has then completed.
+    * The owner polls its ``W`` scatter slots, re-loading only the slots that have not arrived,
+      sums them in the reproduced kernel's order and multicasts the row; every rank polls the
+      broadcast row and runs the norm.
+    * Thread 0 of CTA (0, 0) alone waits for the producer (which reads the state after its own
+      wait) and then for every CTA's arrival before it rotates the state; its wait also makes
+      this kernel's completion imply the producer's.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        res_addr: Int64,
+        gamma_addr: Int64,
+        out_addr: Int64,
+        res_out_addr: Int64,
+        uc_addr: Int64,
+        mc_addr: Int64,
+        flags_addr: Int64,
+        rank: Int32,
+        m: Int32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        @cute.struct
+        class SharedStorage:
+            warp_sum: cute.struct.MemRange[cutlass.Float32, 32]
+            block_sum: cute.struct.MemRange[cutlass.Float32, 1]
+            cta_sum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8], 16]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            res_addr,
+            gamma_addr,
+            out_addr,
+            res_out_addr,
+            uc_addr,
+            mc_addr,
+            flags_addr,
+            rank,
+            m,
+            eps,
+        ).launch(
+            grid=(m, self.cluster, 1),
+            block=(self.threads, 1, 1),
+            cluster=(1, self.cluster, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            stream=stream,
+            use_pdl=self.use_pdl,
+            preferred_smem_carveout=100,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        res_addr: Int64,
+        gamma_addr: Int64,
+        out_addr: Int64,
+        res_out_addr: Int64,
+        uc_addr: Int64,
+        mc_addr: Int64,
+        flags_addr: Int64,
+        rank: Int32,
+        m: Int32,
+        eps: Float32,
+    ):
+        W, H = self.W, self.H
+        tidx, _, _ = cute.arch.thread_idx()
+        row, cy, _ = cute.arch.block_idx()
+        crank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        warp_sum = storage.warp_sum.data_ptr().toint()
+        block_sum = storage.block_sum.data_ptr().toint()
+        cta_sum = storage.cta_sum.data_ptr().toint()
+
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_launch_dependents()
+        col = (crank * self.threads + tidx) * ELTS
+        row_bytes = Int64(H * 2)
+        # LamportFlags: [current, dirty, bytes per buffer, dirty stages], bytes to clear x4.
+        f0, f1, f2, f3 = ld_volatile_v4(flags_addr)
+        c0, c1, c2, c3 = ld_volatile_v4(flags_addr + Int64(16))
+        gw = ld_v4(gamma_addr + Int64(col) * 2)
+        rw = ld_v4(res_addr + Int64(row * H + col) * 2)
+        cur = Int64(f0)
+        dirty = Int64(f1)
+        buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
+        stage_bytes = buf_bytes // Int64(2)
+        # One arrival per CTA once all its threads read the flags.
+        counter = flags_addr + Int64(32)
+        _bar_sync()
+        if tidx == 0:
+            red_release_add(counter, Int32(1))
+
+        # Owner: poll the W slots of the row (only the missing ones again), then sum them in the
+        # reproduced kernel's order, round and multicast.
+        if row % W == rank:
+            base = (
+                uc_addr
+                + (cur * Int64(2)) * stage_bytes
+                + Int64((row // W) * W) * row_bytes
+                + Int64(col) * 2
+            )
+            words = cute.make_rmem_tensor((W * 4,), Int32)
+            pending = Int32((1 << W) - 1) if W < 32 else Int32(-1)
+            while pending != 0:
+                for r in cutlass.range_constexpr(W):
+                    if ((pending >> r) & 1) != 0:
+                        w = ld_volatile_v4(base + Int64(r) * row_bytes)
+                        for e in cutlass.range_constexpr(4):
+                            words[r * 4 + e] = w[e]
+                        if clean4(w[0], w[1], w[2], w[3]) != 0:
+                            pending = pending & Int32(~(1 << r))
+            acc = [Float32(0.0)] * ELTS
+            for rb in cutlass.range_constexpr(0, W, self.rank_chunk):
+                chunk = [Float32(0.0)] * ELTS
+                for rr in cutlass.range_constexpr(self.rank_chunk):
+                    for j in cutlass.range_constexpr(4):
+                        lo, hi = _bf16x2_f32(words[(rb + rr) * 4 + j])
+                        chunk[2 * j] = _fadd(chunk[2 * j], lo)
+                        chunk[2 * j + 1] = _fadd(chunk[2 * j + 1], hi)
+                for i in cutlass.range_constexpr(ELTS):
+                    acc[i] = _fadd(acc[i], chunk[i])
+            red = [sanitize_bf16x2(_pack_bf16x2(acc[2 * j], acc[2 * j + 1])) for j in range(4)]
+            bcast = mc_addr + (cur * Int64(2) + Int64(1)) * stage_bytes + Int64(row) * row_bytes
+            multimem_st_v4(bcast + Int64(col) * 2, red[0], red[1], red[2], red[3])
+
+        # Re-arm this rank's dirty buffer (every stage the previous call used) while rows travel.
+        n_threads = m * self.cluster * self.threads
+        gtid = (row * self.cluster + cy) * self.threads + tidx
+        clear = (c0, c1, c2, c3)
+        for s in cutlass.range_constexpr(4):
+            if s < f3:
+                d_stage = buf_bytes // Int64(f3)
+                cbase = uc_addr + (dirty * Int64(f3) + Int64(s)) * d_stage
+                n_vec = (clear[s] + 15) >> 4
+                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                    st_sentinel_v4(cbase + Int64(p) * Int64(16))
+
+        # The reduced row from the broadcast stage. Rows this rank does not own cannot arrive
+        # before the producer completed: their CTAs wait for it instead of spinning while it runs.
+        if cutlass.const_expr(self.use_pdl):
+            if row % W != rank:
+                griddepcontrol_wait()
+        src = uc_addr + (cur * Int64(2) + Int64(1)) * stage_bytes + Int64(row) * row_bytes
+        src = src + Int64(col) * 2
+        xr = ld_volatile_v4(src)
+        while clean4(xr[0], xr[1], xr[2], xr[3]) == 0:
+            xr = ld_volatile_v4(src)
+
+        s4 = [_add_bf16x2(xr[j], rw[j]) for j in range(4)]
+        st_v4(res_out_addr + Int64(row * H + col) * 2, s4[0], s4[1], s4[2], s4[3])
+        thread_sum = Float32(0.0)
+        for j in cutlass.range_constexpr(4):
+            lo, hi = _bf16x2_f32(_sq_bf16x2(s4[j]))
+            thread_sum = _fadd(thread_sum, lo)
+            thread_sum = _fadd(thread_sum, hi)
+        bsum = self._block_sum(thread_sum, warp, lane, warp_sum, block_sum)
+        if tidx < self.cluster:
+            _st_cluster_f32(cta_sum + crank * 4, tidx, bsum)
+        _cluster_sync()
+        total = Float32(0.0)
+        for c in cutlass.range_constexpr(self.cluster):
+            total = _fadd(total, _lds_f32(cta_sum + c * 4))
+        scale = _rms_scale(total, self.dim_bits, eps)
+
+        ow = []
+        for j in cutlass.range_constexpr(4):
+            x_lo, x_hi = _bf16x2_f32(s4[j])
+            g_lo, g_hi = _bf16x2_f32(gw[j])
+            if cutlass.const_expr(self.cpp_one_shot):
+                ow.append(
+                    _pack_bf16x2(_fmul(_fmul(x_lo, scale), g_lo), _fmul(_fmul(x_hi, scale), g_hi))
+                )
+            else:
+                ow.append(
+                    _pack_bf16x2(_fmul(_fmul(g_lo, x_lo), scale), _fmul(_fmul(g_hi, x_hi), scale))
+                )
+        st_v4(out_addr + Int64(row * H + col) * 2, ow[0], ow[1], ow[2], ow[3])
+
+        # CTA (0, 0): once the producer completed and every CTA read the state, rotate it as the
+        # C++ two-shot call leaves it.
+        if crank == 0:
+            if tidx == 0:
+                if row == 0:
+                    if cutlass.const_expr(self.use_pdl):
+                        griddepcontrol_wait()
+                    arrived = ld_acquire_u32(counter)
+                    while arrived < m * self.cluster:
+                        arrived = ld_acquire_u32(counter)
+                    nxt = f0 + 1
+                    if nxt == NUM_LAMPORT_BUFFERS:
+                        nxt = Int32(0)
+                    st_v4(flags_addr, nxt, f0, f2, Int32(2))
+                    st_v4(
+                        flags_addr + Int64(16),
+                        ((m + (W - 1)) // W) * (W * H * 2),
+                        m * (H * 2),
+                        Int32(0),
+                        Int32(0),
+                    )
+                    st_u32(counter, Int32(0))
+
+
+@functools.cache
+def _compiled_finish_norm(
+    world: int, hidden: int, threads: int, cluster: int, cpp_one_shot: bool, use_pdl: bool
+):
+    kernel = K3DraftArFinishNormKernel(world, hidden, threads, cluster, cpp_one_shot, use_pdl)
+    a = Int64(1 << 20)
+    return cute.compile(
+        kernel,
+        a,
+        a,
+        a,
+        a,
+        a,
+        a,
+        a,
+        Int32(0),
+        Int32(1),
+        Float32(1e-6),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
 @functools.cache
 def _compiled(
     world: int, hidden: int, threads: int, cluster: int, cpp_one_shot: bool, use_pdl: bool
@@ -681,10 +920,48 @@ def run_k3_draft_ar_norm(
     return out, res_out
 
 
+def run_k3_draft_ar_finish_norm(
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    ws: LamportWorkspace,
+    cpp_one_shot: bool,
+    use_pdl: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(RMSNorm(gamma, eps)(all_reduce(x) + residual), all_reduce(x) + residual)`` where every
+    rank's producer pushed its ``x`` (``[m, H]``, ``m, H = residual.shape``) into the next two-shot
+    call on ``ws`` (``low_m_bf16_splitk.run_splitk_dense_ar_push``): bitwise the C++
+    ``RESIDUAL_RMS_NORM`` fusion of ``x`` (``cpp_one_shot``: the one-shot kernel's result)."""
+    m, hidden = residual.shape
+    cfg = grid_config(m, hidden, _sm_count(residual.device.index))
+    assert cfg is not None
+    if required_bytes(m, hidden, ws.world) > ws.bytes_per_buffer:
+        raise ValueError(f"Lamport buffer of {ws.bytes_per_buffer} B too small for {m} x {hidden}")
+    residual = residual.contiguous()
+    out = torch.empty_like(residual)
+    res_out = torch.empty_like(residual)
+    _compiled_finish_norm(ws.world, hidden, cfg[0], cfg[1], bool(cpp_one_shot), bool(use_pdl))(
+        Int64(residual.data_ptr()),
+        Int64(gamma.data_ptr()),
+        Int64(out.data_ptr()),
+        Int64(res_out.data_ptr()),
+        Int64(ws.uc_local),
+        Int64(ws.mc_base),
+        Int64(ws.flags.data_ptr()),
+        Int32(ws.rank),
+        Int32(m),
+        Float32(eps),
+        cuda.CUstream(torch.cuda.current_stream(residual.device).cuda_stream),
+    )
+    return out, res_out
+
+
 __all__ = [
+    "K3DraftArFinishNormKernel",
     "K3DraftArNormKernel",
     "can_run",
     "grid_config",
     "required_bytes",
+    "run_k3_draft_ar_finish_norm",
     "run_k3_draft_ar_norm",
 ]
