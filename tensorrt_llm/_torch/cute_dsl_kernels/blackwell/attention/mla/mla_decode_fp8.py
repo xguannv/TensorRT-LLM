@@ -55,6 +55,10 @@ from .mla_helpers import (LOG2_E, MAX_SPLITS, MLABalancedTileScheduler,
                           create_mla_static_tile_scheduler,
                           create_mla_static_tile_scheduler_params)
 
+#: L2 eviction hint of the KV cache loads with ``kv_evict_first``
+#: (CacheHintSm90::EVICT_FIRST).
+_EVICT_FIRST = 0x12F0000000000000
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, "../.."))
@@ -162,6 +166,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_stages: int = 2,
         p_stages: int = 3,
         tile_reduction: Optional[bool] = None,
+        kv_evict_first: str = "",
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -255,6 +260,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             slot) (False); None picks the former for the register schedule
             (``balanced_max_requests`` 32). The result does not depend on it.
         :type tile_reduction: Optional[bool]
+        :param kv_evict_first: L2 evict-first hint on the KV cache TMA loads:
+            "k" on the K (latent + rope) tiles, "v" on the V (latent
+            transpose) tiles, "kv" on both, "" on none. The result does not
+            depend on it.
+        :type kv_evict_first: str
         """
 
         self.latent_dim = 512
@@ -297,6 +307,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                              f"{k_stages}, {p_stages}.")
         self.k_stages = k_stages
         self.p_stages = p_stages
+        if kv_evict_first not in ("", "k", "v", "kv"):
+            raise ValueError(
+                f"kv_evict_first must be '', 'k', 'v' or 'kv', got {kv_evict_first!r}.")
+        self.k_evict_first = "k" in kv_evict_first
+        self.v_evict_first = "v" in kv_evict_first
         self.reduction_unroll = reduction_unroll
         self.is_persistent = is_persistent or balanced_split
         self.page_size = page_size
@@ -2722,6 +2737,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
             load_k_producer_state)
         common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
+        k_policy = {}
+        if cutlass.const_expr(self.k_evict_first):
+            k_policy = {"cache_policy": cutlass.Int64(_EVICT_FIRST)}
         for i in range(self.iterations_qk_latent):
             for k in range(page_per_tile):
                 # load k latent
@@ -2731,6 +2749,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     qk_params.tKCsKC[None, k, 0,
                                      (i, load_k_producer_state.index)],
                     tma_bar_ptr=tma_bar_ptr,
+                    **k_policy,
                 )
 
         for i in cutlass.range_constexpr(self.iterations_qk_rope):
@@ -2742,6 +2761,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     qk_params.tKCsKC_rope[None, k, 0,
                                           load_k_producer_state.index],
                     tma_bar_ptr=tma_bar_ptr,
+                    **k_policy,
                 )
         load_k_producer_state.advance()
 
@@ -2781,6 +2801,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
             load_v_producer_state)
         common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
+        v_policy = {}
+        if cutlass.const_expr(self.v_evict_first):
+            v_policy = {"cache_policy": cutlass.Int64(_EVICT_FIRST)}
         for j in cutlass.range_constexpr(self.iterations_pv_n):
             for i in cutlass.range_constexpr(self.iterations_pv_k):
                 if cutlass.const_expr(page_per_tile > 1):
@@ -2793,6 +2816,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                             ((j, i),
                                              load_v_producer_state.index)],
                             tma_bar_ptr=tma_bar_ptr,
+                            **v_policy,
                         )
                 else:
                     cute.copy(
@@ -2801,6 +2825,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         v_params.tVCsVC[None, 0, 0,
                                         ((j, i), load_v_producer_state.index)],
                         tma_bar_ptr=tma_bar_ptr,
+                        **v_policy,
                     )
         load_v_producer_state.advance()
         return load_v_producer_state

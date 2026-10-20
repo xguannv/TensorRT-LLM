@@ -9046,6 +9046,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             * bf16_partials (balanced split): TRTLLM_MLA_PARTIAL_BF16=1 stores
               the split-KV partial O in BF16 (half the partial traffic; one
               more BF16 rounding of the partials). Default 0: FP32.
+            * kv_evict_first: TRTLLM_MLA_KV_EVICT_FIRST = k | v | kv, the KV
+              cache TMA loads (K tiles, V tiles or both) carry an L2
+              evict-first hint, so the decode's KV stream does not push the
+              small kernels after it out of L2. Default "": none. The result
+              does not depend on it.
             * k_stages, p_stages (balanced split): shared-memory stages of the
               K tiles and of P. 3 and 2 while the schedule table holds at most
               ``_DEEP_K_MAX_REQUESTS`` requests (the third K stage then fits
@@ -9097,6 +9102,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                  os.environ.get("TRTLLM_MLA_PREFETCH_WORK", "1") == "1"),
                 ("skip_correction_threshold", threshold),
                 ("reduction_unroll", unroll),
+                ("kv_evict_first",
+                 os.environ.get("TRTLLM_MLA_KV_EVICT_FIRST", "")),
             )
             if balanced_split:
                 kernel = BlackwellMultiHeadLatentAttentionForwardFP8
