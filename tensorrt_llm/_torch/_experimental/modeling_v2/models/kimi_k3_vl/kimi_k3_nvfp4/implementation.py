@@ -3428,6 +3428,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
+            if _flags.TRTLLM_K3LL_DRAFTER_FC_TP:
+                self._gate_mla_drafter_fc(comm)
             self._decode_state_ready = True
             logger.info(
                 f"Kimi K3 NVFP4 SM{self.target_spec.sm[0]}{self.target_spec.sm[1]}: "
@@ -3556,6 +3558,65 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         if comm is None or not isinstance(drafter, K3DSparkDrafter):
             return False
         drafter.use_decode_comm(comm)
+        return True
+
+    def _gate_mla_drafter_fc(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
+        """Split the stock MLA DSpark drafter's context projection over the TP group (switch
+        ``TRTLLM_K3LL_DRAFTER_FC_TP``): ``fc`` (``[hidden, captured layers x hidden]``, read whole on every rank
+        otherwise) becomes this rank's block of input columns (`K3FcSlice`), and the drafter's
+        ``project_target_hidden`` sums the ranks' partial products with ``hidden_norm`` applied in one
+        ``comm/mnnvl_fusion_allreduce`` call, as `K3DSparkDrafter`'s does; rows the MNNVL workspace does not hold (a
+        prefill) go through the drafter's TP all-reduce, then ``hidden_norm``. Needs ``comm``, a bias-free bf16 ``fc``
+        whose input columns split evenly over the group, and a row-parallel output projection with its all-reduce.
+        Returns whether the drafter took it."""
+        drafter = getattr(self, "draft_model", None)
+        if comm is None or drafter is None or isinstance(drafter, K3DSparkDrafter):
+            return False
+        if self.draft_config is None or not is_mla(self.draft_config.pretrained_config):
+            return False
+        fc = getattr(drafter, "fc", None)
+        weight = getattr(fc, "weight", None)
+        layers = getattr(getattr(drafter, "model", None), "layers", None)
+        o_proj = getattr(getattr(layers[0], "self_attn", None), "o_proj", None) if layers else None
+        tp_all_reduce = (
+            getattr(o_proj, "all_reduce", None)
+            if getattr(getattr(o_proj, "tp_mode", None), "name", None) == "ROW"
+            else None
+        )
+        mapping = self.model_config.mapping
+        sliced = None
+        if (
+            isinstance(weight, torch.Tensor)
+            and weight.dim() == 2
+            and weight.dtype == torch.bfloat16
+            and getattr(fc, "bias", None) is None
+            and tp_all_reduce is not None
+            and hasattr(drafter, "hidden_norm")
+        ):
+            sliced = K3FcSlice.of(weight, mapping.tp_size, mapping.tp_rank)
+        if sliced is None:
+            logger.info(
+                "Kimi K3 MLA DSpark drafter: fc stays replicated (not a splittable bf16 projection)"
+            )
+            return False
+        zeros = weight.new_zeros(MAX_REQUESTS * MAX_TOKENS_PER_REQUEST, weight.shape[0])
+        drafter.fc = sliced
+
+        def project_target_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
+            partial = sliced(hidden_states.to(sliced.weight.dtype))
+            rows = partial.shape[0]
+            if rows <= zeros.shape[0] and comm.takes_allreduce_norm(rows, partial.shape[1]):
+                normed, _ = comm.allreduce_norm(partial, zeros[:rows], drafter.hidden_norm)
+                return normed
+            if rows == 0:
+                return drafter.hidden_norm(partial)
+            return drafter.hidden_norm(tp_all_reduce(partial))
+
+        drafter.project_target_hidden = project_target_hidden
+        logger.info(
+            f"Kimi K3 MLA DSpark drafter: fc split by input feature over TP{mapping.tp_size}: rank {mapping.tp_rank} "
+            f"holds columns [{sliced.start}, {sliced.end}), hidden_norm in the all-reduce"
+        )
         return True
 
     def _check_step_contract(self, attn_metadata: AttentionMetadata) -> None:

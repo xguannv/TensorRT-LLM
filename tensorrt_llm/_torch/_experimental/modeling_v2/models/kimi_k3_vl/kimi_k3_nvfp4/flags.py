@@ -45,6 +45,11 @@ TRTLLM_K3LL_MOE_LOWM = _flag(
     0,
     "MoE decode path: NVFP4-latent front + k3_moe_lowm_dyn on CuteDSL NVFP4 buffers (decode_moe_lowm.py)",
 )
+TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
+    "TRTLLM_K3LL_DRAFTER_FC_TP",
+    0,
+    "MLA DSpark drafter: fc split by input feature over TP, hidden_norm in the MNNVL all-reduce",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
