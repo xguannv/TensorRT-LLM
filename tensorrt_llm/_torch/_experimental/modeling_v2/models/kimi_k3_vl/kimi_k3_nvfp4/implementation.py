@@ -3414,7 +3414,11 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 moe_path = "lowm"
             elif comm is not None and _flags.TRTLLM_K3LL_NVFP4_DECODE_MOE:
                 moe_layers = self._build_nvfp4_decode_moe(comm)
-                moe_path = "k3_moe_nvfp4"
+                moe_path = (
+                    "k3_moe_front+k3_moe_nvfp4"
+                    if _flags.TRTLLM_K3LL_NVFP4_MOE_FRONT
+                    else "k3_moe_nvfp4"
+                )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
             self._decode_state_ready = True
@@ -3434,8 +3438,17 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         from . import decode_moe_nvfp4 as decode_moe
 
         mapping = self.model_config.mapping
+        use_front = bool(_flags.TRTLLM_K3LL_NVFP4_MOE_FRONT)
         moes = [layer.block_sparse_moe for layer in self.model.layers if layer.is_moe]
-        gaps = {id(moe): decode_moe.layout_gaps(moe, mapping.tp_size) for moe in moes}
+        gaps = {
+            id(moe): decode_moe.layout_gaps(moe, mapping.tp_size)
+            or (
+                decode_moe.front_gaps(moe, mapping.tp_size, self.model.num_attn_res_snapshots)
+                if use_front
+                else []
+            )
+            for moe in moes
+        }
         takes = [moe for moe in moes if not gaps[id(moe)]]
         for reason in sorted({gap for moe in moes for gap in gaps[id(moe)]}):
             logger.info_once(
@@ -3450,6 +3463,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             backend.w3_w1_weight.shape[1] // 2,
             backend.expert_size_per_partition,
             comm.mnnvl,
+            mapping if use_front else None,
         )
         for moe in takes:
             decode_moe.fold_latent_norm(moe)
@@ -3457,7 +3471,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 moe, state, mapping.tp_rank, mapping.tp_size
             )
             moe.decode_gemvs = self.model.decode_gemvs
-        takes[0].decode_moe.warm_up(takes[0])
+        first = takes[0].decode_moe
+        first.warm_up(takes[0])
+        if use_front:
+            comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         return len(takes)
 
     def _build_decode_moe_lowm(self, comm: _decode_comm.K3DecodeComm) -> int:

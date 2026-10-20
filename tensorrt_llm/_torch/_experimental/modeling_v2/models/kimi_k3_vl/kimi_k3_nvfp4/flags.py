@@ -35,6 +35,11 @@ TRTLLM_K3LL_CENSUS = _flag(
 TRTLLM_K3LL_NVFP4_DECODE_MOE = _flag(
     "TRTLLM_K3LL_NVFP4_DECODE_MOE", 0, "decode MoE on k3_moe_nvfp4 with the sharded head and tail"
 )
+TRTLLM_K3LL_NVFP4_MOE_FRONT = _flag(
+    "TRTLLM_K3LL_NVFP4_MOE_FRONT",
+    0,
+    "with TRTLLM_K3LL_NVFP4_DECODE_MOE: steps of <= 8 tokens run k3_moe_front (NVFP4 latent) and the sandwich tail",
+)
 TRTLLM_K3LL_MOE_LOWM = _flag(
     "TRTLLM_K3LL_MOE_LOWM",
     0,

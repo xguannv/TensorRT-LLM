@@ -19,12 +19,18 @@ For every decode step of at most `WIDE_MAX_TOKENS` tokens a MoE layer runs:
 
 So the router and the latent projections are read 1/TP per rank instead of replicated, the shared experts' all-reduce
 merges into the output's, and the routed experts are one kernel. Built by the target in ``post_load_weights``.
+
+With the front (switch ``TRTLLM_K3LL_NVFP4_MOE_FRONT``), a step of at most `MAX_TOKENS` tokens runs instead:
+``moe/k3_moe_front`` with the NVFP4 latent (head GEMV, its all-gather over the TP group's ``K3MoeHeadWorkspace``, the
+routing, the latent on ``fc31_input_scale`` and the shared gate_up + SiTU in one kernel), ``trtllm::k3_moe_nvfp4``,
+the routed experts' latent all-reduce, and the tail as a ``PendingTail`` for the consumer's ``comm/k3_sandwich_tail``
+(else the replicated tail). Wider steps keep the path above.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -35,18 +41,30 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
     MnnvlWorkspace,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front import (
+    K3MoeHeadWorkspace,
+    front_weight,
+    k3_moe_front,
+    weight_supported,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op_nvfp4
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
-from .decode_comm import wide_all_reduce
+from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv, fold_latent_norm
 
 MAX_TOKENS = op_nvfp4.MAX_TOKENS
 WIDE_MAX_TOKENS = op_nvfp4.WIDE_MAX_TOKENS
 SF_VEC = 16
 
-__all__ = ["K3DecodeMoeNvfp4", "K3DecodeMoeNvfp4Layer", "fold_latent_norm", "layout_gaps"]
+__all__ = [
+    "K3DecodeMoeNvfp4",
+    "K3DecodeMoeNvfp4Layer",
+    "fold_latent_norm",
+    "front_gaps",
+    "layout_gaps",
+]
 
 
 def _experts(moe: nn.Module) -> tuple:
@@ -115,6 +133,25 @@ def layout_gaps(moe: nn.Module, tp_size: int) -> list:
     return []
 
 
+def front_gaps(moe: nn.Module, tp_size: int, max_snapshots: int) -> list:
+    """Why the front variant does not take MoE layer ``moe`` (``layout_gaps`` empty), empty when it takes it: the
+    front's weight packing at this TP size and shared width, and a tail the sandwich tail kernel takes."""
+    gate_up = moe.shared_experts.gate_up_proj.weight
+    shared_cols, width = gate_up.shape[0] // 2, moe.moe_hidden_size // tp_size
+    if not weight_supported(tp_size, shared_cols, gate_up.shape[1], gate_up.device):
+        return ["a MoE front of this TP size and shared width"]
+    probe = gate_up.new_empty
+    tail_cols = width + (-width % TAIL_K_TILE) + shared_cols
+    if not K3DecodeComm.takes_tail(
+        probe(1, moe.moe_hidden_size),
+        probe(1, shared_cols),
+        probe(moe.hidden_size, tail_cols),
+        max_snapshots,
+    ):
+        return ["a row-parallel tail the sandwich tail kernel does not take"]
+    return []
+
+
 @dataclass(eq=False)
 class K3DecodeMoeNvfp4:
     """What every MoE layer's NVFP4 decode path shares on one device: the ``k3_moe_nvfp4`` builds for up to 8 and up to
@@ -124,13 +161,19 @@ class K3DecodeMoeNvfp4:
     small: op_nvfp4.K3MoeNvfp4State
     wide: op_nvfp4.K3MoeNvfp4WideState
     mnnvl: MnnvlWorkspace
+    head: Optional[K3MoeHeadWorkspace] = None
 
     @classmethod
-    def create(cls, device, i_tp: int, num_local: int, mnnvl: MnnvlWorkspace) -> "K3DecodeMoeNvfp4":
+    def create(
+        cls, device, i_tp: int, num_local: int, mnnvl: MnnvlWorkspace, mapping=None
+    ) -> "K3DecodeMoeNvfp4":
+        """With ``mapping``, also the front's head workspace: collective, every rank of the TP group calls it at the
+        same point, eagerly, before any CUDA-graph capture."""
         return cls(
             op_nvfp4.K3MoeNvfp4State(device, i_tp, num_local),
             op_nvfp4.K3MoeNvfp4WideState(device, i_tp, num_local),
             mnnvl,
+            K3MoeHeadWorkspace.create(mapping) if mapping is not None else None,
         )
 
 
@@ -150,6 +193,8 @@ class K3DecodeMoeNvfp4Layer:
     width: int
     small: op_nvfp4.K3MoeNvfp4Layer
     wide: op_nvfp4.K3MoeNvfp4Layer
+    front_weight: Optional[torch.Tensor] = None
+    shared_cols: int = 0
 
     @classmethod
     def create(
@@ -168,6 +213,12 @@ class K3DecodeMoeNvfp4Layer:
                     moe.gate.weight[tp_rank * experts : (tp_rank + 1) * experts],
                 ]
             ).contiguous()
+            front = None
+            gate_up = moe.shared_experts.gate_up_proj.weight
+            if state.head is not None:
+                # The front packs the head rows first; the wide path's head GEMV reads them in place.
+                front = front_weight(head, gate_up)
+                head = front[: head.shape[0]]
             parts = [up[:, lo : lo + width]]
             if pad:
                 parts.append(up.new_zeros(up.shape[0], pad))
@@ -191,6 +242,8 @@ class K3DecodeMoeNvfp4Layer:
             width=width,
             small=state.small.layer(*weights, *scales),
             wide=state.wide.layer(*weights, *scales),
+            front_weight=front,
+            shared_cols=gate_up.shape[0] // 2,
         )
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
@@ -200,8 +253,13 @@ class K3DecodeMoeNvfp4Layer:
         )
 
     def warm_up(self, moe: nn.Module) -> None:
-        """One call of each ``k3_moe_nvfp4`` build on zero inputs (M = 1), so none compiles under a capture."""
+        """One call of each ``k3_moe_nvfp4`` build on zero inputs (M = 1), so none compiles under a capture; with the
+        front, one front call too (collective: every rank makes the same call)."""
         device = self.head_weight.device
+        if self.front_weight is not None:
+            x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
+            ids, weights, x_q, x_sf, _ = self._front(moe, x)
+            self.small(x_q, x_sf.reshape(-1), ids, weights, moe.routed_experts.backend.slot_start)
         latent = torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
         logits = torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device)
         for build in (self.small, self.wide):
@@ -222,13 +280,47 @@ class K3DecodeMoeNvfp4Layer:
         x_sf = x_sf.view(torch.uint8).reshape(-1)[: rows * (moe.moe_hidden_size // SF_VEC)]
         return build(x_fp4, x_sf, ids, weights, moe.routed_experts.backend.slot_start)
 
+    def _front(self, moe: nn.Module, x: torch.Tensor):
+        return k3_moe_front(
+            x.contiguous(), self.front_weight, self.bias, float(moe.gate.routed_scaling_factor), self.shared_cols,
+            *moe._situ_betas, self.state.head, nvfp4_gsf=self.fc31_input_scale,
+        )  # fmt: skip
+
+    def _forward_front(
+        self, moe: nn.Module, x: torch.Tensor, gemvs, partial_tail: bool
+    ) -> Union[torch.Tensor, PendingTail]:
+        ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
+        routed = self.small(
+            x_q, x_sf.reshape(-1), ids, weights, moe.routed_experts.backend.slot_start
+        )
+        latent = moe.routed_experts.all_reduce(routed)
+        if partial_tail:
+            return PendingTail(
+                latent.contiguous(),
+                shared_act.contiguous(),
+                self.tail_weight,
+                self.lo,
+                float(moe.routed_expert_norm.variance_epsilon),
+            )
+        # The replicated tail: the latent RMS on the fp32 output of the folded latent up projection, plus the shared
+        # experts' reduced output, rounded to bf16 once.
+        shared = moe.shared_experts
+        shared_out = shared.down_proj(shared_act, layer_idx=shared.layer_idx)
+        up = _gemv(gemvs, "moe_up", latent, moe.routed_expert_up_proj.weight, out_fp32=True)
+        scale = torch.rsqrt(
+            latent.float().pow(2).mean(-1, keepdim=True) + moe.routed_expert_norm.variance_epsilon
+        )
+        return (up * scale + shared_out.float()).bfloat16()
+
     def forward(self, moe: nn.Module, hidden_states: torch.Tensor, gemvs, partial_tail: bool,
-                push: bool = False) -> torch.Tensor:  # fmt: skip
+                push: bool = False) -> Union[torch.Tensor, PendingTail]:  # fmt: skip
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail`` this rank's unreduced share
         ``[M, hidden]`` (the next layer's pre-attention step reduces it), else the reduced output. ``push`` is unused
         (no latent exchange on this path)."""
         x = hidden_states.contiguous()
         rows = x.shape[0]
+        if self.front_weight is not None and rows <= MAX_TOKENS:
+            return self._forward_front(moe, x, gemvs, partial_tail)
         head = _gemv(gemvs, "moe_head", x, self.head_weight, out_fp32=True)
         routed_in, router_logits = mnnvl_allgather_split(head, self.width, self.state.mnnvl)
         shared = moe.shared_experts
