@@ -2677,17 +2677,19 @@ class KimiK3MoERuntime(nn.Module):
         self.expert_of_slot = expert_placement_for_layer(
             layer_idx, self.num_experts, routed_moe_model_config.mapping.moe_ep_size
         )
-        self.ckpt_expert_ids = (
-            self.local_expert_ids
-            if self.expert_of_slot is None
-            else tuple(self.expert_of_slot[slot] for slot in self.local_expert_ids)
-        )
         if self.expert_replicas is not None:
             # Local slots: the rank's home slots, then its copies (each holds a home slot's
-            # checkpoint expert).
+            # checkpoint expert). The routed slot ids run past the home slots (224 + S per
+            # rank), so they map to checkpoint experts through the home slots only.
             homes = self.expert_replicas.home_slots_of_local(self.replica_rank)
             self.ckpt_expert_ids = tuple(
                 homes if self.expert_of_slot is None else (self.expert_of_slot[x] for x in homes)
+            )
+        else:
+            self.ckpt_expert_ids = (
+                self.local_expert_ids
+                if self.expert_of_slot is None
+                else tuple(self.expert_of_slot[slot] for slot in self.local_expert_ids)
             )
         routing_recorder = get_routing_recorder(
             rank=model_config.mapping.rank,

@@ -350,7 +350,7 @@ def test_routing_recorder_counts_graph_replays(tmp_path, every):
 _HIDDEN, _LATENT, _INTER, _EXPERTS, _TOPK = 1024, 512, 256, 32, 4
 
 
-def _tiny_k3_model(moe_backend: str):
+def _tiny_k3_model(moe_backend: str, num_experts: int = _EXPERTS, top_k: int = _TOPK, mapping=None):
     pytest.importorskip("fla")
     from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -377,8 +377,8 @@ def _tiny_k3_model(moe_backend: str):
             max_position_embeddings=128,
             torch_dtype=torch.bfloat16,
             linear_attn_config={"kda_layers": [], "full_attn_layers": [1, 2], "num_heads": 8},
-            num_experts=_EXPERTS,
-            num_experts_per_token=_TOPK,
+            num_experts=num_experts,
+            num_experts_per_token=top_k,
             moe_intermediate_size=_INTER,
             num_shared_experts=1,
             first_k_dense_replace=1,
@@ -386,7 +386,7 @@ def _tiny_k3_model(moe_backend: str):
             latent_moe_use_norm=True,
             hidden_act="situ",
         ),
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        mapping=mapping if mapping is not None else Mapping(world_size=1, tp_size=1, rank=0),
         quant_config=QuantConfig(),
         quant_config_dict={
             "model.layers.1.block_sparse_moe.experts": QuantConfig(
@@ -506,3 +506,56 @@ def test_model_load_with_placement_relabels_experts(tmp_path, monkeypatch, moe_b
         f"{moe_backend}: bitwise equal {torch.equal(out_placed, out_base)}, "
         f"max abs diff {(out_placed.float() - out_base.float()).abs().max().item():.3e}"
     )
+
+
+@_needs_sm100
+@pytest.mark.parametrize("ep_rank", [0, 1, 2, 3])
+def test_model_with_expert_copies_builds_and_loads(tmp_path, monkeypatch, ep_rank):
+    """TRTLLM_K3_EXPERT_REPLICAS with a v2 placement (S = 8 copies per rank) in the full model on EP4
+    rank ``ep_rank`` (one process; nothing communicates before a forward): the runtime builds
+    (the routed slot ids of the last rank run past the 896 home slots), names the checkpoint expert
+    of every local slot through its home slot, and ``load_weights`` puts that expert into each home
+    and copy slot (compared with the single-rank model, where slot e holds checkpoint expert e)."""
+    from tensorrt_llm.mapping import Mapping
+
+    num_home, slots, ep = NUM_EXPERTS // 4, 8, 4
+    perm = _permutation(NUM_EXPERTS, 11)
+    # Rank g holds copies of the first eight home slots of rank (g + 1) % 4.
+    entries = [(((g + 1) % ep) * num_home + i, g) for g in range(ep) for i in range(slots)]
+    path = _write_v2(tmp_path / "p2.json", {1: perm}, {1: entries}, slots=slots)
+
+    _clear_placement_caches()
+    monkeypatch.delenv(placement.EXPERT_PLACEMENT_ENV, raising=False)
+    monkeypatch.delenv(placement.EXPERT_REPLICAS_ENV, raising=False)
+    ref = _tiny_k3_model("CUTEDSL", NUM_EXPERTS, TOP_K)
+    weights = _synthetic_k3_checkpoint(ref)
+    ref.load_weights(dict(weights))
+
+    monkeypatch.setenv(placement.EXPERT_PLACEMENT_ENV, path)
+    monkeypatch.setenv(placement.EXPERT_REPLICAS_ENV, "1")
+    _clear_placement_caches()
+    mapping = Mapping(
+        world_size=ep, rank=ep_rank, gpus_per_node=ep, tp_size=ep, moe_ep_size=ep, moe_tp_size=1
+    )
+    model = _tiny_k3_model("CUTEDSL", NUM_EXPERTS, TOP_K, mapping=mapping)
+    moe = model.model.layers[1].block_sparse_moe
+    reps = moe.expert_replicas
+    assert reps is not None and (reps.num_home, reps.num_local) == (num_home, num_home + slots)
+    assert moe.local_expert_ids == tuple(
+        range(ep_rank * reps.num_local, (ep_rank + 1) * reps.num_local)
+    )
+    homes = reps.home_slots_of_local(ep_rank)
+    assert homes[num_home:] == [((ep_rank + 1) % ep) * num_home + i for i in range(slots)]
+    assert moe.ckpt_expert_ids == tuple(perm[h] for h in homes)
+
+    model.load_weights(dict(weights))
+    moe_ref = ref.model.layers[1].block_sparse_moe
+    ckpt = torch.tensor(moe.ckpt_expert_ids, device="cuda")
+    for attr in ("w3_w1_weight", "w2_weight"):
+        got = getattr(moe.routed_experts.backend, attr).data.view(torch.uint8)
+        want = getattr(moe_ref.routed_experts.backend, attr).data.view(torch.uint8)[ckpt]
+        assert got.shape[0] == num_home + slots, attr
+        assert torch.equal(got, want), attr
+    # The router is permuted into home-slot order (copies are chosen per step by the routing tail).
+    perm_t = torch.tensor(perm, device="cuda")
+    torch.testing.assert_close(moe.gate.weight, moe_ref.gate.weight[perm_t], rtol=0, atol=0)
