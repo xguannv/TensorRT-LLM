@@ -108,6 +108,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
+from ..speculative.dspark_ar_norm import draft_ar_norm
 from ..speculative.dspark_draft_gemm import DraftL2Prefetch, draft_gemm, l2_prefetch_enabled
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
@@ -4266,7 +4267,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
     @staticmethod
     def _fused_ar_residual_norm(all_reduce, partial, residual, norm):
-        """``norm(all_reduce(partial) + residual)`` and the new residual, in one kernel."""
+        """``norm(all_reduce(partial) + residual)`` and the new residual, in one kernel
+        (``TLLM_DSPARK_AR_NORM``: the CuTe all-reduce + norm, same values)."""
+        fused = draft_ar_norm(all_reduce, partial, residual, norm)
+        if fused is not None:
+            return fused
         return all_reduce(
             partial,
             all_reduce_params=AllReduceParams(
