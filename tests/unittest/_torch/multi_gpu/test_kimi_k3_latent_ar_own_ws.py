@@ -20,7 +20,8 @@ its output on the shared MNNVL workspace), the real latent RMSNorm and a BF16 la
 With the latent all-reduce on its own workspace (C++ kernels, or with ``TRTLLM_K3_LATENT_AR_CUTE``
 ``k3_latent_ar_norm`` for the one-shot sizes; with ``TRTLLM_K3_LATENT_AR_ROW`` its row kernel, with
 ``TRTLLM_K3_LATENT_AR_SIDE_CLEAR`` the Lamport buffer re-armed on the latent-down stream, at once
-or ("ld") by the next MoE layer after its latent_down, with
+or ("ld") by the next MoE layer after its latent_down and joined before its all-reduce, also where
+the routed experts fork no output memset onto that stream (TRTLLM_MOE_LOWM_DYN), with
 ``TRTLLM_K3_LU_MX_STAGES`` latent_up's MXFP8 GEMM on other stages) the result (and the deferred
 residual) must be bit-identical to the shared-workspace path, eagerly and under CUDA graph replay,
 and the own workspace must serve exactly the forwards it applies to.
@@ -60,7 +61,10 @@ SEQ_LENS = (1, 7, 14, 18, 19, 32, 64)
 
 
 class _RoutedStandIn:
-    """Returns this rank's latent partial."""
+    """Returns this rank's latent partial. Joins ``input_ready_event`` (the latent-down stream) as
+    FC1 does; with ``memset_stream``, forks an output memset onto that stream and joins it before
+    returning, as ``CuteDslFusedMoE`` does before FC2, except for the token counts of
+    ``backend.lowm_dyn_token_range`` (the fused small-batch kernel) or with ``skip_memset``."""
 
     def __init__(self, all_reduce):
         self.all_reduce = all_reduce
@@ -68,8 +72,24 @@ class _RoutedStandIn:
         self.routing_method = None
         self.use_dp = False
         self.backend = SimpleNamespace()
+        self.memset_stream = None
+        self.skip_memset = False
+        self.memset_out = None
 
-    def __call__(self, x, router_logits, *, all_rank_num_tokens=None, **kwargs):
+    def __call__(
+        self, x, router_logits, *, all_rank_num_tokens=None, input_ready_event=None, **kwargs
+    ):
+        if input_ready_event is not None:
+            input_ready_event.wait()
+        lo, hi = getattr(self.backend, "lowm_dyn_token_range", (1, 0))
+        if self.memset_stream is not None and not self.skip_memset and not lo <= x.shape[0] <= hi:
+            fork, done = torch.cuda.Event(), torch.cuda.Event()
+            fork.record()
+            with torch.cuda.stream(self.memset_stream):
+                fork.wait()
+                self.memset_out.zero_()
+                done.record()
+            done.wait()
         return self.partial.clone()
 
 
@@ -158,6 +178,8 @@ def _own_ws_rank(world):
         runtime.routed_expert_up_proj.weight.data.normal_(0, 0.02)
         runtime._routed_projection = lambda x, projection: projection(x)
         runtime._can_fuse_router_down = lambda h: False
+        # The stand-in router: never k3_router_exact (TRTLLM_K3_ROUTER_EXACT, where the runtime has it).
+        runtime._router_exact = False
         runtime._reduce_routed_output = True
         runtime._defer_shared_allreduce = False
         runtime._merge_moe_allreduce = False
@@ -334,99 +356,108 @@ def _own_ws_rank(world):
                 assert_same(first, ref)
                 assert_same(second, ref)
             del graph
-        # TRTLLM_K3_LATENT_AR_SIDE_CLEAR=ld: the clear is left to the next MoE layer, which issues it
-        # on the latent-down stream right after its latent_down (emulated here) and joins that stream
-        # before its all-reduce (through its output memset; emulated by joining before the next
-        # forward). Where the next layer's backend gives no such join, it is issued at once ("1").
+        # TRTLLM_K3_LATENT_AR_SIDE_CLEAR=ld, through forward's latent-down stream path (latent_down is
+        # an identity here; the routed stand-in joins it like FC1 and emulates CuteDslFusedMoE's
+        # output memset fork / join on that stream with TRTLLM_MOE_LOWM_DYN=1 for 9..16 tokens, the
+        # fused small-batch kernel's range, where there is no memset). The runtime is its own next
+        # MoE layer. Out of that range the clear of one forward's all-reduce is issued by the next
+        # forward right after its latent_down and joined before its all-reduce; in range it is
+        # issued after latent_up ("1"). Every clear is slowed by a sleep in front of it and bumps a
+        # marker that the main stream reads right before each all-reduce: the all-reduce must see
+        # the clear it depends on. "skip" drops the memset although the range says it runs: the
+        # all-reduce's own join must still order the clear. Eagerly and under CUDA graph replay.
         mkl._K3_LATENT_AR_SIDE_CLEAR = "ld"
         mkl._K3_LU_MX_STAGES = "12:8"
+        routed = runtime.routed_experts
+        routed.memset_stream = latent_stream
+        routed.memset_out = torch.empty((MAX_TOKENS, LATENT), dtype=torch.bfloat16, device="cuda")
+        routed.backend = SimpleNamespace(lowm_dyn_token_range=(9, 16))
+        runtime.latent_down_stream = latent_stream
+        runtime.latent_ar_clear_stream = latent_stream
+        runtime.moe_latent_fork_event = torch.cuda.Event()
+        runtime.moe_latent_ready_event = torch.cuda.Event()
         runtime.moe_lu_event = torch.cuda.Event()
-        for joined in (True, False):
-            next_layer = SimpleNamespace(
-                latent_down_stream=latent_stream,
-                _latent_ar_ws=workspace,
-                _latent_stream_joins_before_fc2=lambda joined=joined: joined,
-                _latent_ar_clear_pending=None,
-            )
-            runtime._next_moe_layer = lambda next_layer=next_layer: next_layer
-            for num_tokens in (1, 7, 14):
-                latents, shareds, residual = _rank_inputs(world, num_tokens, 70 + num_tokens)
-                set_inputs(latents, shareds)
-                hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
-                ref = run(False, True, hidden, residual)
+        runtime.moe_clear_event = torch.cuda.Event()
+        runtime._next_moe_layer = lambda: runtime
+        runtime._latent_stream_memset_joined = True
+        marker = torch.zeros(1, dtype=torch.int64, device="cuda")
+        seen = torch.zeros(1, dtype=torch.int64, device="cuda")
+        run_clear = runtime._run_latent_ar_clear
+        join_clear = runtime._join_latent_ar_clear
+
+        def slow_clear(after):
+            after.wait()
+            torch.cuda._sleep(200_000)
+            run_clear(after)
+            marker.add_(1)
+
+        def join_then_read():
+            join_clear()
+            seen.copy_(marker)
+
+        runtime._run_latent_ar_clear = slow_clear
+        runtime._join_latent_ar_clear = join_then_read
+
+        def check_order(num_tokens):
+            # "ld": the last forward's own clear is still pending; "1": it ran after latent_up.
+            torch.cuda.synchronize()
+            lag = 1 if 9 <= num_tokens <= 16 else 0
+            assert int(marker.item()) - int(seen.item()) == lag
+
+        for num_tokens, skip in ((7, False), (14, False), (7, True), (1, False)):
+            routed.skip_memset = skip
+            runtime._latent_ar_clear_pending = None
+            latents, shareds, residual = _rank_inputs(world, num_tokens, 110 + num_tokens)
+            set_inputs(latents, shareds)
+            hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+            ref = run(False, True, hidden, residual)
+            torch.cuda.current_stream().wait_stream(latent_stream)
+            for _ in range(6):
                 out = run(True, True, hidden, residual)
-                pending = next_layer._latent_ar_clear_pending
-                assert (pending is runtime.moe_lu_event) == joined
-                if joined:
-                    torch.cuda.synchronize()
-                    assert int(flags[3].item()) != 0
-                    with torch.cuda.stream(latent_stream):
-                        runtime._issue_pending_latent_ar_clear(pending)
-                    next_layer._latent_ar_clear_pending = None
+                expected = 9 <= num_tokens <= 16
+                assert (runtime._latent_ar_clear_pending is None) == expected
                 torch.cuda.current_stream().wait_stream(latent_stream)
                 assert_same(out, ref)
-                torch.cuda.synchronize()
-                assert int(flags[3].item()) == 0
-            # A clear left to a forward that has no latent-down stream to issue it on is dropped:
-            # the all-reduce clears the buffer itself.
-            runtime._latent_ar_clear_pending = torch.cuda.Event()
-            out = run(True, True, hidden, residual)
-            assert runtime._latent_ar_clear_pending is None
-            pending = next_layer._latent_ar_clear_pending
-            if pending is not None:
-                with torch.cuda.stream(latent_stream):
-                    runtime._issue_pending_latent_ar_clear(pending)
-                next_layer._latent_ar_clear_pending = None
-            torch.cuda.current_stream().wait_stream(latent_stream)
-            assert_same(out, ref)
-            torch.cuda.synchronize()
-            assert int(flags[3].item()) == 0
-            if not joined:
-                continue
-            # CUDA graph: two forwards per replay, each followed by the clear it left (issued on the
-            # latent-down stream, which is then joined).
-            num_tokens = 14
-            latents, shareds, residual = _rank_inputs(world, num_tokens, 85)
+                check_order(num_tokens)
+            # CUDA graph: three forwards per replay.
+            runtime._latent_ar_clear_pending = None
             static_lat = latents[rank].clone()
             static_sh = shareds[rank].clone()
             static_res = residual.clone()
-            runtime.routed_experts.partial = static_lat
+            routed.partial = static_lat
             runtime.shared_experts.partial = static_sh
-            hidden = torch.zeros((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
             runtime._latent_ar_ws = workspace
-
-            def forward_then_clear():
-                out = runtime(hidden, residual=static_res)
-                pending = next_layer._latent_ar_clear_pending
-                next_layer._latent_ar_clear_pending = None
-                assert pending is runtime.moe_lu_event
-                with torch.cuda.stream(latent_stream):
-                    runtime._issue_pending_latent_ar_clear(pending)
-                torch.cuda.current_stream().wait_stream(latent_stream)
-                return out
-
-            with with_multi_stream(True), torch.inference_mode():
-                for _ in range(2):
-                    forward_then_clear()
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with with_multi_stream(True), torch.inference_mode(), torch.cuda.graph(graph):
-                first = forward_then_clear()
-                second = forward_then_clear()
+                outs = [runtime(hidden, residual=static_res) for _ in range(3)]
+                torch.cuda.current_stream().wait_stream(latent_stream)
+            runtime._latent_ar_clear_pending = None
             for step in range(3):
-                latents, shareds, residual = _rank_inputs(world, num_tokens, 95 + 7 * step)
+                latents, shareds, residual = _rank_inputs(world, num_tokens, 120 + 7 * step)
                 static_lat.copy_(latents[rank])
                 static_sh.copy_(shareds[rank])
                 static_res.copy_(residual)
                 before = int(flags[0].item())
                 graph.replay()
-                check_rotated(before, 2)
-                assert int(flags[3].item()) == 0
+                check_rotated(before, 3)
+                check_order(num_tokens)
                 set_inputs(latents, shareds)
                 ref = run(False, True, hidden, residual)
-                assert_same(first, ref)
-                assert_same(second, ref)
+                torch.cuda.current_stream().wait_stream(latent_stream)
+                for out in outs:
+                    assert_same(out, ref)
             del graph
+        del runtime._run_latent_ar_clear
+        del runtime._join_latent_ar_clear
+        del runtime._latent_stream_memset_joined
+        runtime._latent_ar_clear_pending = None
+        runtime.latent_down_stream = None
+        runtime.moe_latent_fork_event = runtime.moe_latent_ready_event = None
+        runtime.moe_clear_event = None
+        routed.memset_stream = None
+        routed.skip_memset = False
+        routed.backend = SimpleNamespace()
         mkl._K3_LATENT_AR_SIDE_CLEAR = "0"
         runtime.moe_lu_event = None
         runtime.latent_ar_clear_stream = None
