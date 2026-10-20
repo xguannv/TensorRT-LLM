@@ -456,13 +456,25 @@ _K3_LU_MXFP8 = os.environ.get("TRTLLM_K3_LU_MXFP8", "0") == "1"
 # four; the rank's own slot is summed from registers instead of being polled back from the
 # multicast loopback; slots that arrived are not reloaded): the same result, bit for bit.
 _K3_LATENT_AR_ROW = os.environ.get("TRTLLM_K3_LATENT_AR_ROW", "0") == "1"
-# TRTLLM_K3_LATENT_AR_SIDE_CLEAR=1 (with TRTLLM_K3_LATENT_AR_CUTE): once latent_up is issued, the
-# latent-down stream re-arms the Lamport buffer the latent all-reduce just used
-# (k3_latent_ar_norm.run_k3_lamport_clear) and marks the workspace state clean, so the next layer's
-# all-reduce skips the clear (the M x ranks x 7 KB of sentinel stores) on its critical path. Only
-# where a later MoE layer exists: its latent_down follows on that stream and is joined into the main
-# stream before its routed GEMMs. The data is unchanged.
-_K3_LATENT_AR_SIDE_CLEAR = os.environ.get("TRTLLM_K3_LATENT_AR_SIDE_CLEAR", "0") == "1"
+# TRTLLM_K3_LATENT_AR_SIDE_CLEAR (with TRTLLM_K3_LATENT_AR_CUTE): the latent-down stream re-arms the
+# Lamport buffer the latent all-reduce used (k3_latent_ar_norm.run_k3_lamport_clear) and marks the
+# workspace state clean, so the next layer's all-reduce skips the clear (the M x ranks x 7 KB of
+# sentinel stores) on its critical path. Only where a later MoE layer exists. The data is unchanged.
+#   "1":  once latent_up is issued; the next layer's latent_down follows the clear on that stream
+#         and is joined into the main stream before its routed GEMMs. A kernel right before
+#         latent_down on that stream turns latent_down's programmatic edge from the attention block
+#         into a full one, so latent_down loses its early launch (weight streaming before its
+#         griddepcontrol.wait).
+#   "ld": in the next MoE layer, right after its latent_down on that stream (which keeps the
+#         backend's output memset of the previous layer as its stream predecessor, as without the
+#         clear); the clear then reaches the main stream through that layer's output memset, which
+#         the CuteDSL backend forks onto the same stream after the routing and joins before FC2,
+#         i.e. before the layer's all-reduce. Used only where the backend does so; elsewhere "1".
+_K3_LATENT_AR_SIDE_CLEAR = os.environ.get("TRTLLM_K3_LATENT_AR_SIDE_CLEAR", "0")
+if _K3_LATENT_AR_SIDE_CLEAR not in ("0", "1", "ld"):
+    raise ValueError(
+        f"TRTLLM_K3_LATENT_AR_SIDE_CLEAR must be 0, 1 or ld, got {_K3_LATENT_AR_SIDE_CLEAR!r}"
+    )
 # TRTLLM_K3_LU_MX_STAGES=<a>:<b> (with TRTLLM_K3_LU_MXFP8): latent_up's MXFP8 GEMM runs with <a> weight
 # stages and <b> activation stages (k3_fp8w_lowm_mxfp8.K3LowMMxTactic; same split-K and K-tile order,
 # so bitwise the default tactic's result) instead of the default (deepest weight ring next to an
@@ -2420,6 +2432,12 @@ class KimiK3MoERuntime(nn.Module):
     # re-arms the latent all-reduce's Lamport buffer (the latent-down stream; ``None``: no side clear).
     moe_lu_event: Optional[torch.cuda.Event] = None
     latent_ar_clear_stream: Optional[torch.cuda.Stream] = None
+    # TRTLLM_K3_LATENT_AR_SIDE_CLEAR=ld: the previous MoE layer's ``moe_lu_event`` when this layer's
+    # forward is to re-arm the workspace after its latent_down (set by that layer, taken by this one).
+    _latent_ar_clear_pending: Optional[torch.cuda.Event] = None
+    # Whether the routed backend joins the latent-down stream into the main stream before FC2
+    # (``None``: not checked yet).
+    _latent_stream_joined_before_fc2: Optional[bool] = None
     # TRTLLM_K3_EXPERT_L2_PREFETCH: the model's shared state (``None``: off), this layer's routing
     # record (allocated outside graph capture), the routing-tail outputs of the current forward,
     # whether a routing of this layer was ever recorded, and this layer's expert weight ranges with
@@ -2796,7 +2814,7 @@ class KimiK3MoERuntime(nn.Module):
         self._layers_key = id(cfg)
         self._l2_ranges_cache: Dict[str, List[Tuple[int, int]]] = {}
         self.moe_fc2_event = torch.cuda.Event() if has_latent_stream else None
-        if _K3_LATENT_AR_SIDE_CLEAR and has_latent_stream:
+        if _K3_LATENT_AR_SIDE_CLEAR != "0" and has_latent_stream:
             self.moe_lu_event = torch.cuda.Event()
             self.latent_ar_clear_stream = self.latent_down_stream
         if _K3_EXPERT_L2_PREFETCH and self.expert_replicas is None:
@@ -2886,13 +2904,17 @@ class KimiK3MoERuntime(nn.Module):
                 run_k3_l2_prefetch(mla_ranges)
 
     def _issue_latent_ar_clear(self, num_tokens: int) -> None:
-        """``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``: once latent_up is issued, re-arm the Lamport buffer of
-        the latent all-reduce that just ran on the latent-down stream (``run_k3_lamport_clear``),
-        which also marks the workspace state clean, so the next latent all-reduce on the workspace
-        skips its own clear. Only when a later MoE layer exists: its latent_down follows on this
-        stream and is joined into the main stream before its routed GEMMs (and with them that
-        layer's all-reduce), so the clear needs no join of its own; the next call on the workspace
-        writes into the cleared buffer only after its push of the call after it (three buffers)."""
+        """``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``: once latent_up is issued, have the Lamport buffer of
+        the latent all-reduce that just ran re-armed on the latent-down stream
+        (``run_k3_lamport_clear``), which also marks the workspace state clean, so the next latent
+        all-reduce on the workspace skips its own clear. Only when a later MoE layer exists: its
+        latent_down runs on this stream and is joined into the main stream before its routed GEMMs
+        (and with them that layer's all-reduce). The next call on the workspace writes into the
+        cleared buffer only after its push of the call after it (three buffers).
+
+        "1": the clear is issued now, ahead of the next layer's latent_down on that stream. "ld":
+        the next layer issues it right after its latent_down (``_issue_pending_latent_ar_clear``),
+        where that layer's output memset carries it into the main stream before FC2."""
         workspace = self._latent_ar_ws
         stream = self.latent_ar_clear_stream
         if (
@@ -2907,14 +2929,64 @@ class KimiK3MoERuntime(nn.Module):
         nxt = self._next_moe_layer()
         if nxt is None or nxt.latent_down_stream is not stream:
             return
+        self.moe_lu_event.record()
+        if (
+            _K3_LATENT_AR_SIDE_CLEAR == "ld"
+            and nxt._latent_ar_ws is workspace
+            and nxt._latent_stream_joins_before_fc2()
+        ):
+            nxt._latent_ar_clear_pending = self.moe_lu_event
+            return
+        with torch.cuda.stream(stream):
+            self._run_latent_ar_clear(self.moe_lu_event)
+
+    def _run_latent_ar_clear(self, after: torch.cuda.Event) -> None:
+        """On the current stream: wait for ``after`` (a latent_up of this workspace), then re-arm
+        the workspace's dirty Lamport buffer and mark the state clean."""
         from ..cute_dsl_kernels.blackwell.k3_latent_ar_norm import run_k3_lamport_clear
 
-        self.moe_lu_event.record()
-        with torch.cuda.stream(stream):
-            self.moe_lu_event.wait()
-            run_k3_lamport_clear(
-                workspace["buffer"].data_ptr(), workspace["flags"], workspace["clear_ctr"]
+        workspace = self._latent_ar_ws
+        after.wait()
+        run_k3_lamport_clear(
+            workspace["buffer"].data_ptr(), workspace["flags"], workspace["clear_ctr"]
+        )
+
+    def _latent_stream_joins_before_fc2(self) -> bool:
+        """Whether the routed backend forks its output memset onto the latent-down stream after the
+        routing and joins it into the main stream before FC2 (``CuteDslFusedMoE`` NVFP4 with the
+        fused finalize and its MoeOutputMemset aux stream): then work issued on that stream after
+        latent_down completes before this layer's all-reduce."""
+        if self._latent_stream_joined_before_fc2 is None:
+            from ..modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+
+            backend = getattr(self.routed_experts, "backend", None)
+            joined = (
+                type(backend) is CuteDslFusedMoE
+                and bool(getattr(backend, "has_nvfp4", False))
+                and bool(getattr(backend, "use_fused_finalize", False))
+                and backend._has_moe_output_memset_aux_stream()
+                and backend._moe_output_memset_run_stream() is self.latent_down_stream
             )
+            self._latent_stream_joined_before_fc2 = joined
+            logger.info_once(
+                "TRTLLM_K3_LATENT_AR_SIDE_CLEAR=ld: "
+                + (
+                    "clears issued after the next layer's latent_down"
+                    if joined
+                    else "no output-memset join before FC2 on the latent-down stream, "
+                    "clears issued after latent_up as with 1"
+                ),
+                key=f"k3_latent_ar_side_clear_ld_{joined}",
+            )
+        return self._latent_stream_joined_before_fc2
+
+    def _issue_pending_latent_ar_clear(self, pending: Optional[torch.cuda.Event]) -> None:
+        """``TRTLLM_K3_LATENT_AR_SIDE_CLEAR=ld``, on the latent-down stream right after this layer's
+        latent_down: the clear the previous MoE layer left to this one (``pending``: its
+        ``moe_lu_event``). It reaches the main stream through this layer's output memset (see
+        ``_latent_stream_joins_before_fc2``), i.e. before this layer's all-reduce."""
+        if pending is not None:
+            self._run_latent_ar_clear(pending)
 
     def _latent_up_mxfp8(
         self, routed_latent: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor
@@ -3982,6 +4054,10 @@ class KimiK3MoERuntime(nn.Module):
         ``_DeferredMoEResidual`` instead where that update would be the separate BF16 add.
         """
         identity = hidden_states
+        # TRTLLM_K3_LATENT_AR_SIDE_CLEAR=ld: issued after this layer's latent_down, else dropped (the
+        # all-reduce then clears the buffer itself).
+        pending_clear = self._latent_ar_clear_pending
+        self._latent_ar_clear_pending = None
         projected_input = None
         early_routed_in = None
         shared_first = False
@@ -4028,6 +4104,7 @@ class KimiK3MoERuntime(nn.Module):
                             # Quantized here, the routed input does not wait for the routing.
                             early_routed_in = self._quantize_routed_input(early_routed_in)
                     self.moe_latent_ready_event.record()
+                    self._issue_pending_latent_ar_clear(pending_clear)
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
