@@ -490,6 +490,9 @@ def test_moe_runtime_routes_with_tail(monkeypatch, m, offset, num_local):
             return value
 
     class _Identity(nn.Module):
+        # The runtime reads the shared expert's down_proj (MoE residual / shared-tail paths).
+        down_proj = None
+
         def forward(self, value, **kwargs):
             return value
 
@@ -725,6 +728,9 @@ def test_moe_runtime_routes_with_umma_gemm(monkeypatch, m, offset, num_local):
             return value
 
     class _Identity(nn.Module):
+        # The runtime reads the shared expert's down_proj (MoE residual / shared-tail paths).
+        down_proj = None
+
         def forward(self, value, **kwargs):
             return value
 
