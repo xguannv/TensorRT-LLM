@@ -1450,6 +1450,11 @@ class SpecWorkerBase(nn.Module, ABC):
         the attn-metadata state saved by prepare_for_spec_dec: a stale save
         fails every subsequent forward at the pairing assert.
         https://nvbugs/6442074
+
+        With ``TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY=state`` and a forced
+        acceptance it also holds the step's ``input_ids``, ``position_ids``
+        and context token count while ``_forward_impl`` runs: the key of the
+        forced draws (:meth:`_force_accept_state_key`).
         """
         attn_metadata = kwargs.get("attn_metadata")
         spec_metadata = kwargs.get("spec_metadata")
@@ -1771,8 +1776,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 key = self._force_accept_state_key(num_gens)
                 positions = key.positions[::key.stride].to(torch.int64)
                 tokens = key.tokens[::key.stride].to(torch.int64)
-                rows = torch.arange(num_gens,
-                                    device=num_accepted_tokens.device)
+                rows = torch.arange(num_gens, device=num_accepted_tokens.device)
                 ties = ((positions[:, None] == positions[None, :]) &
                         (tokens[:, None] == tokens[None, :]) &
                         (rows[None, :] < rows[:, None])).sum(dim=1)
