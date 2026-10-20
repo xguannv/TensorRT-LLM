@@ -69,8 +69,10 @@ def _experts(seed: int = 20261020):
 
     i_full = I_TP * MOE_TP
     method = NVFP4TRTLLMGenFusedMoEMethod()
-    module = SimpleNamespace(tp_size=MOE_TP, tp_rank=TP_RANK, intermediate_size_per_partition=I_TP,
-                             is_gated_activation=True)  # fmt: skip
+    module = SimpleNamespace(tp_size=MOE_TP, tp_rank=TP_RANK, intermediate_size=i_full,
+                             intermediate_size_per_partition=I_TP, hidden_size=H, scaling_vector_size=SV,
+                             intermediate_size_expand_ratio=2, is_gated_activation=True,
+                             expert_size_per_partition=E_LOCAL, bias=False)  # fmt: skip
     kw = dict(dtype=torch.uint8, device="cuda")
     proc = dict(
         w31=torch.empty(E_LOCAL, 2 * I_TP, H // 2, **kw),
