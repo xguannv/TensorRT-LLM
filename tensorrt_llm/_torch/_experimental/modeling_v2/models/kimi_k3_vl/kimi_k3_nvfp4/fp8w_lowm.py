@@ -11,6 +11,12 @@ weight streamed before the grid-dependency wait. Everything else (bias, LoRA, la
 all-reduce and NCCL-window paths, which never call ``apply_linear``) runs the module's own GEMM. The module's
 all-reduce, where it has one, is untouched: only ``apply_linear`` is replaced.
 
+`install` runs from the target's ``post_load_weights``, which the model loader calls before the ones of the target's
+child ``Linear`` modules (``model.modules()`` is pre-order): at that point each weight is still the checkpoint's E4M3
+with raw FP32 block scales, and the module's own ``post_load_weights`` resmooths it to UE8M0 and packs the scale
+afterwards. So `takes` only checks what the transform keeps (dtype, shape, the GEMM backend choice) and the packed
+INT32 scale is checked on every call (``can_run``), where a module still holding raw scales keeps its own GEMM.
+
 The kernel (``cute_dsl_kernels/blackwell/k3_fp8w_lowm_gemm.py``) comes from Dongxu Yang's ``user/dongxuy/k3_lowlat``,
 where it replaces ``fp8_swap_ab_gemm`` on the same weights in the ll4 AgentX point. It compiles on its first call
 for each shape and token tile, which must happen outside CUDA-graph capture (the engine's warm-up steps do it).
@@ -32,12 +38,24 @@ def _kernel():
 
 
 def takes(module: nn.Module) -> bool:
-    """Whether ``module`` is an FP8 block-scale projection in DeepGEMM's layout this path can serve."""
+    """Whether ``module`` is an FP8 block-scale projection whose GEMM is (or, after its own ``post_load_weights``,
+    will be) DeepGEMM's ``fp8_swap_ab_gemm``, with a shape this path can serve."""
     weight = getattr(module, "weight", None)
     scale = getattr(module, "weight_scale", None)
     if weight is None or scale is None or not callable(getattr(module, "apply_linear", None)):
         return False
-    if weight.dtype != torch.float8_e4m3fn or weight.dim() != 2 or scale.dtype != torch.int32:
+    if weight.dtype != torch.float8_e4m3fn or weight.dim() != 2:
+        return False
+    method = getattr(module, "quant_method", None)
+    if method is not None:
+        from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
+
+        if not isinstance(method, FP8BlockScalesLinearMethod):
+            return False
+    n, k = weight.shape
+    # Raw 128x128 block scales (not yet transformed) or DeepGEMM's packed UE8M0 scale.
+    raw = scale.dtype == torch.float32 and tuple(scale.shape) == (-(-n // 128), -(-k // 128))
+    if not raw and scale.dtype != torch.int32:
         return False
     if getattr(module, "use_cute_dsl_blockscaling_mm", False) or getattr(
         module, "disable_deep_gemm", False
@@ -46,7 +64,6 @@ def takes(module: nn.Module) -> bool:
     if getattr(module, "_locality_domain_weight_shards", None) is not None:
         return False
     kernel = _kernel()
-    n, k = weight.shape
     return n % kernel.MMA_M == 0 and k % kernel.CTA_K == 0
 
 
@@ -55,6 +72,7 @@ def _apply(module: nn.Module, stock: Callable, input, bias, lora_params=None, la
     if (
         bias is None
         and not lora_params
+        and getattr(module, "_locality_domain_weight_shards", None) is None
         and isinstance(input, torch.Tensor)
         and input.dtype == torch.bfloat16
         and kernel.can_run(input, module.weight, module.weight_scale)

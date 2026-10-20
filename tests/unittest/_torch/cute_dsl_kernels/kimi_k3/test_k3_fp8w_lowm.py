@@ -285,3 +285,51 @@ def test_target_dispatch(m):
         x[:1], torch.zeros(n, device="cuda", dtype=torch.bfloat16)
     )  # a bias keeps the stock GEMM
     assert lin.stock_calls == (1 if lowm else 2)
+
+
+@pytest.mark.parametrize("m", [1, 300])
+def test_target_dispatch_before_transform(m):
+    """The loader's order: install on real FP8 block-scale Linears that still hold raw scales, then their own
+    post_load_weights (UE8M0 resmooth + packed scale), then forward. The DeepGEMM-layout module takes the low-M
+    kernel at decode size; the CuTe DSL one (raw scales kept) and the non-FP8 one are left alone."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        fp8w_lowm,
+    )
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    mod = _kernel_module()
+    n, k = 3072, 7168
+    w, scale = _make_weight(n, k, seed=31)
+    qc = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+
+    def make(cute_dsl):
+        lin = Linear(k, n, bias=False, dtype=torch.bfloat16, quant_config=qc,
+                     use_cute_dsl_blockscaling_mm=cute_dsl).cuda()  # fmt: skip
+        lin.weight.data.copy_(w)
+        lin.weight_scale.data.copy_(scale)
+        return lin
+
+    deep, cute = make(False), make(True)
+    plain = Linear(k, n, bias=False, dtype=torch.bfloat16).cuda()
+    assert (
+        deep.weight_scale.dtype == torch.float32
+    )  # what install sees in the target's post_load_weights
+    assert fp8w_lowm.install([deep, cute, plain]) == 1
+    for lin in (deep, cute, plain):
+        lin.post_load_weights()
+    assert deep.weight_scale.dtype == torch.int32 and cute.weight_scale.dtype == torch.float32
+    x = _make_activation(m, k, seed=m)
+    out = deep(x)
+    lowm = mod.can_run(x, deep.weight, deep.weight_scale)
+    assert lowm == (m <= mod.max_m_for(n, k))
+    expected = (
+        torch.ops.trtllm.k3_fp8w_lowm_gemm(x, deep.weight, deep.weight_scale)
+        if lowm
+        else torch.ops.trtllm.fp8_swap_ab_gemm(
+            x, deep.weight, deep.weight_scale, disable_ue8m0_cast=True
+        )
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
