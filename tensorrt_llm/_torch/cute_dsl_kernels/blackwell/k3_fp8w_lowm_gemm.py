@@ -795,8 +795,11 @@ class K3Fp8wLowMGemmKernel:
         fp4_out: bool = False,
         ar_push: int = 0,
         ar_world: int = 0,
+        smem_request: int = 0,
     ):
         validate_tactic(n, k, tactic, gated)
+        if smem_request > _SMEM_CAPACITY:
+            raise ValueError(f"smem_request={smem_request} exceeds {_SMEM_CAPACITY} B")
         if fp4_out and n % MMA_M:
             raise ValueError("the NVFP4 output needs whole 128-row weight tiles")
         if fp4_out and (gated or sigmoid):
@@ -837,6 +840,9 @@ class K3Fp8wLowMGemmKernel:
         self.quant_threads = 32 * tactic.quant_warps
         self.threads = 32 * _QUANT_WARP0 + self.quant_threads
         self.sf_slots = _sf_slots(self.mma_n, self.b_stages, self.kt_max, self.a_stages)
+        # Dynamic shared memory requested at launch where larger than the kernel's own storage:
+        # only the launch footprint (which other CTAs fit on the same SM) changes.
+        self.smem_request = smem_request
 
     @cute.jit
     def __call__(
@@ -1092,7 +1098,7 @@ class K3Fp8wLowMGemmKernel:
             grid=(self.n_tiles * self.split_k, 1, 1),
             block=(self.threads, 1, 1),
             cluster=(self.split_k, 1, 1),
-            smem=self.shared_storage.size_in_bytes(),
+            smem=max(self.shared_storage.size_in_bytes(), self.smem_request),
             min_blocks_per_mp=1,
             stream=stream,
             use_pdl=self.use_pdl,
@@ -2826,8 +2832,11 @@ def _compiled_kernel(
     use_pdl: bool,
     fp4_out: bool = False,
     sigmoid: bool = False,
+    smem_request: int = 0,
 ):
-    kernel = K3Fp8wLowMGemmKernel(n, k, tactic, use_pdl, sigmoid=sigmoid, fp4_out=fp4_out)
+    kernel = K3Fp8wLowMGemmKernel(
+        n, k, tactic, use_pdl, sigmoid=sigmoid, fp4_out=fp4_out, smem_request=smem_request
+    )
     dummy = 1 << 20
     w_ptr = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
     x_ptr = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
@@ -3282,13 +3291,20 @@ def run_k3_fp8w_lowm_gemm_ar_push(
 
 
 def k3_fp8w_lowm_gemm_sigmoid(
-    x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor, out: Optional[torch.Tensor] = None
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    smem_request: int = 0,
 ) -> torch.Tensor:
     """``torch.sigmoid(k3_fp8w_lowm_gemm(x, w, w_scale))`` in one launch, bit for bit.
 
     Low-M kernel only (``M <= low_m_max_for(N, K)``, same tactic as the plain GEMM); the
     epilogue applies :func:`sigmoid_bf16` to each BF16 output. ``out`` (contiguous BF16
-    ``[M, N]``) is optional.
+    ``[M, N]``) is optional. ``smem_request`` (bytes, at most the per-block shared memory
+    capacity) launches the kernel with that much dynamic shared memory where it exceeds the
+    kernel's own (0: its own): the same computation, with fewer or no other CTAs sharing an SM
+    with a CTA of this launch.
     """
     _check_inputs(x, w, w_scale)
     m, k = x.shape
@@ -3299,7 +3315,9 @@ def k3_fp8w_lowm_gemm_sigmoid(
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     elif out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n) or not out.is_contiguous():
         raise ValueError("out must be a contiguous bf16 [M, N] tensor")
-    compiled = _compiled_kernel(n, k, default_tactic(m, n, k), True, sigmoid=True)
+    compiled = _compiled_kernel(
+        n, k, default_tactic(m, n, k), True, sigmoid=True, smem_request=smem_request
+    )
     compiled(
         make_ptr(cutlass.Float8E4M3FN, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),

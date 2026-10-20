@@ -18,9 +18,10 @@ One Helix CP rank (16-way group) on one GPU: the real ``KimiK3MLAAttention`` (FP
 FP8 KV cache, CuTe FP8 MLA decode, V up-projection before the all-to-all) with the all-to-all
 replaced by a local stand-in, run eagerly and in CUDA graphs with multi-stream enabled. Every
 combination of ``TRTLLM_K3_MLA_GATE_SIDE``, ``TRTLLM_K3_MLA_Q_NORM_PDL``,
-``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``), ``TRTLLM_K3_MLA_KV_FUSED``, ``TRTLLM_K3_MLA_GATE_EARLY`` and
-``TRTLLM_K3_MLA_KV_JOIN_EARLY`` must give the default path's output bit for bit; the fused KV
-kernel must also write the same cache bytes and decode buffers as the kernels it replaces.
+``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``), ``TRTLLM_K3_MLA_KV_FUSED``, ``TRTLLM_K3_MLA_GATE_EARLY``,
+``TRTLLM_K3_MLA_KV_JOIN_EARLY``, ``TRTLLM_K3_MLA_GATE_EXCLUSIVE`` and ``TRTLLM_K3_MLA_GATE_SIDE_PRIO``
+must give the default path's output bit for bit; the fused KV kernel must also write the same cache
+bytes and decode buffers as the kernels it replaces.
 """
 
 import math
@@ -496,6 +497,108 @@ def test_fused_v_up_matches_bmm(batch, monkeypatch):
         assert torch.isfinite(graph).all() and graph.abs().max() > 0
         assert torch.equal(eager_f, eager), f"eager {cfg}"
         assert torch.equal(graph_f, graph), f"graph {cfg}"
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_gate_exclusive_and_side_prio_match_default(batch, monkeypatch):
+    """``TRTLLM_K3_MLA_GATE_EXCLUSIVE`` (the output-gate GEMM launched with the full per-block
+    shared memory) and ``TRTLLM_K3_MLA_GATE_SIDE_PRIO`` (the gate side work on a high-priority
+    stream of its own): the layer output is bitwise the default path's, eagerly and in CUDA
+    graphs, with the fused V up-projection (gate enqueued late, and early with
+    TRTLLM_K3_MLA_GATE_EARLY) and with the BMM V up-projection."""
+    import weakref
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    monkeypatch.setenv("TRTLLM_MLA_PARTIAL_BF16", "1")
+    q_len = 8 if batch == 4 else 7
+    model, mixer, manager, md, x = _build(batch, q_len, 448, monkeypatch)
+    extra = {
+        "attention_metadata": weakref.ref(md),
+        "mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)},
+    }
+    pool = manager.get_buffers(0)
+    pool_init = pool.clone()
+    requests = []
+    sigmoid = mixer.g_proj.forward_sigmoid
+
+    def counted(*args, **kwargs):
+        requests.append(kwargs.get("smem_request", 0))
+        return sigmoid(*args, **kwargs)
+
+    monkeypatch.setattr(mixer.g_proj, "forward_sigmoid", counted)
+    streams = set()
+    side_stream = k3mla._gate_side_stream
+
+    def recorded(*args, **kwargs):
+        stream = side_stream(*args, **kwargs)
+        streams.add((kwargs.get("role", "side"), stream.priority))
+        return stream
+
+    monkeypatch.setattr(k3mla, "_gate_side_stream", recorded)
+    base = (True,) * 4 + (True, False, True)
+    configs = [
+        ((False,) * 7, False, False),
+        (base, False, False),
+        (base, True, False),
+        (base, False, True),
+        (base, True, True),
+        ((True,) * 7, True, True),
+    ]
+    results = {}
+    try:
+        with torch.inference_mode():
+            for fused in (True, False):
+                mixer.helix_v_up_in_attention = fused
+                for cfg, exclusive, prio in configs:
+                    _set(monkeypatch, k3mla, *cfg)
+                    monkeypatch.setattr(k3mla, "_K3_MLA_GATE_EXCLUSIVE", exclusive)
+                    monkeypatch.setattr(k3mla, "_K3_MLA_GATE_SIDE_PRIO", prio)
+                    requests.clear()
+                    streams.clear()
+                    pool.copy_(pool_init)
+                    with model_extra_attrs(extra):
+                        eager = mixer(x, md).clone()
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    with with_multi_stream(True), torch.cuda.stream(s), model_extra_attrs(extra):
+                        mixer(x, md)
+                    torch.cuda.current_stream().wait_stream(s)
+                    graph = torch.cuda.CUDAGraph()
+                    with (
+                        with_multi_stream(True),
+                        torch.cuda.graph(graph, stream=s),
+                        model_extra_attrs(extra),
+                    ):
+                        out = mixer(x, md)
+                    replays = []
+                    for _ in range(2):
+                        pool.copy_(pool_init)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        replays.append(out.clone())
+                    results[fused, cfg, exclusive, prio] = (eager, replays)
+                    if cfg[0]:
+                        want = k3_fp8w_lowm_gemm._SMEM_CAPACITY if exclusive else 0
+                        assert requests and set(requests) == {want}, (fused, cfg, requests)
+                        gate_streams = {p for role, p in streams if role == "gate"}
+                        high = torch.cuda.Stream.priority_range()[1]
+                        assert gate_streams == ({high} if prio else set()), (cfg, streams)
+    finally:
+        manager.shutdown()
+    for fused in (True, False):
+        ref_eager, ref_replays = results[fused, (False,) * 7, False, False]
+        assert torch.isfinite(ref_replays[0]).all() and ref_replays[0].abs().max() > 0
+        for cfg, exclusive, prio in configs:
+            eager, replays = results[fused, cfg, exclusive, prio]
+            assert torch.equal(eager, ref_eager), f"eager fused={fused} {cfg} {exclusive} {prio}"
+            for r in replays:
+                assert torch.equal(r, ref_replays[0]), (
+                    f"graph fused={fused} {cfg} {exclusive} {prio}"
+                )
 
 
 def _kv_half_inputs(num_tokens, seed):

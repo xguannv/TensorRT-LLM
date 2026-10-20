@@ -753,6 +753,49 @@ def test_sigmoid_epilogue_matches_torch(m, n, k):
     assert torch.equal(out, torch.sigmoid(plain))
 
 
+@pytest.mark.parametrize("n, k", [(768, 7168), (2112, 7168)])
+@pytest.mark.parametrize("m", [1, 7, 14, 16, 28, 32])
+def test_sigmoid_smem_request_matches_default(m, n, k):
+    """``smem_request`` only changes the launch footprint: bitwise the default launch's output,
+    in eager launches and CUDA graph replays."""
+    mod = _kernel_module()
+    w_pad, scale = _make_padded_weight(n, k, seed=n + k + 1)
+    w, packed = mod.prepare_k3_fp8w_lowm_weight(w_pad[:n].contiguous(), scale)
+    x = _make_activation(m, k, seed=m + 1) * 0.05
+    ref = mod.k3_fp8w_lowm_gemm_sigmoid(x, w, packed)
+    out = mod.k3_fp8w_lowm_gemm_sigmoid(x, w, packed, smem_request=mod._SMEM_CAPACITY)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    graph_out = torch.empty_like(ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        mod.k3_fp8w_lowm_gemm_sigmoid(x, w, packed, graph_out, smem_request=mod._SMEM_CAPACITY)
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        mod.k3_fp8w_lowm_gemm_sigmoid(x, w, packed, graph_out, smem_request=mod._SMEM_CAPACITY)
+    graph_out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(graph_out, ref)
+
+
+def test_sigmoid_smem_request_capacity():
+    """An ``smem_request`` above the per-block shared memory capacity is refused."""
+    mod = _kernel_module()
+    n, k, m = 768, 7168, 32
+    with pytest.raises(ValueError, match="smem_request"):
+        mod.K3Fp8wLowMGemmKernel(
+            n,
+            k,
+            mod.default_tactic(m, n, k),
+            True,
+            sigmoid=True,
+            smem_request=mod._SMEM_CAPACITY + 1,
+        )
+
+
 @pytest.mark.parametrize("m", [7, 14, 64, 65])
 def test_weight_read_linear_forward_sigmoid(m, monkeypatch):
     """``forward_sigmoid`` equals ``forward(x).sigmoid()`` bitwise on every path."""
@@ -767,8 +810,10 @@ def test_weight_read_linear_forward_sigmoid(m, monkeypatch):
     )
     x = _make_activation(m, k, seed=m)
     out = linear.forward_sigmoid(x)
+    exclusive = linear.forward_sigmoid(x, smem_request=_kernel_module()._SMEM_CAPACITY)
     torch.cuda.synchronize()
     assert torch.equal(out, linear(x).sigmoid())
+    assert torch.equal(exclusive, out)
 
 
 # Kimi-K3 low-M projections (N, K): latent down / up, KDA qkvg, KDA / MLA o_proj, MLA q_a+kv_a,

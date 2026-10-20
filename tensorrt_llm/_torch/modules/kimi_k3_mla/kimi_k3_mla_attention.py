@@ -80,17 +80,33 @@ _K3_MLA_GATE_EARLY = os.environ.get("TRTLLM_K3_MLA_GATE_EARLY", "0") == "1"
 # q absorb on its own stream (a programmatic dependent that also waits for another stream loses
 # its early launch). The fused KV half ends long before q_b does. Scheduling only, bit-exact.
 _K3_MLA_KV_JOIN_EARLY = os.environ.get("TRTLLM_K3_MLA_KV_JOIN_EARLY", "0") == "1"
-# One side stream per device, shared by all MLA layers (their side work never overlaps).
-_GATE_SIDE_STREAMS: dict[tuple[int, bool], torch.cuda.Stream] = {}
+# TRTLLM_K3_MLA_GATE_EXCLUSIVE=1 (with TRTLLM_K3_MLA_GATE_SIDE): the output-gate GEMM (low-M sigmoid
+# GEMM, k3_fp8w_lowm_gemm_sigmoid) launches with the full per-block shared memory, so no CTA of
+# another kernel shares an SM with one of its CTAs: it runs beside the Helix all-to-all on SMs of
+# its own instead of on SMs that also hold all-to-all CTAs. The same GEMM, bit for bit. Meant for
+# the fused all-to-all (TRTLLM_HELIX_A2A_FUSED, fewer CTAs than SMs); beside the FIFO all-to-all
+# (one CTA on every SM) its CTAs would wait for the all-to-all to end.
+_K3_MLA_GATE_EXCLUSIVE = os.environ.get("TRTLLM_K3_MLA_GATE_EXCLUSIVE", "0") == "1"
+# TRTLLM_K3_MLA_GATE_SIDE_PRIO=1 (with TRTLLM_K3_MLA_GATE_SIDE): the zero-KV mask and the output
+# gate run on a high-priority stream of their own, so the gate GEMM's CTAs are dispatched ahead
+# of grids that are launched early (PDL) and wait for SMs (o_proj behind the all-to-all).
+# Scheduling only: bit-exact.
+_K3_MLA_GATE_SIDE_PRIO = os.environ.get("TRTLLM_K3_MLA_GATE_SIDE_PRIO", "0") == "1"
+# One side stream per device and role, shared by all MLA layers (their side work never
+# overlaps).
+_GATE_SIDE_STREAMS: dict[tuple[int, bool, str], torch.cuda.Stream] = {}
 
 
-def _gate_side_stream(device: torch.device, high_priority: bool = False) -> torch.cuda.Stream:
+def _gate_side_stream(
+    device: torch.device, high_priority: bool = False, role: str = "side"
+) -> torch.cuda.Stream:
     index = device.index if device.index is not None else torch.cuda.current_device()
-    stream = _GATE_SIDE_STREAMS.get((index, high_priority))
+    key = (index, high_priority, role)
+    stream = _GATE_SIDE_STREAMS.get(key)
     if stream is None:
         priority = torch.cuda.Stream.priority_range()[1] if high_priority else 0
         stream = torch.cuda.Stream(device=index, priority=priority)
-        _GATE_SIDE_STREAMS[(index, high_priority)] = stream
+        _GATE_SIDE_STREAMS[key] = stream
     return stream
 
 
@@ -802,13 +818,23 @@ class KimiK3MLAAttention(MLA):
         num_tokens = hidden_states.shape[0]
         mask_fork, mask_ready, gate_fork, gate_ready = self._gate_events
         multi_stream = do_multi_stream()
-        side = _gate_side_stream(hidden_states.device) if multi_stream else None
+        side = None
+        if multi_stream:
+            side = (
+                _gate_side_stream(hidden_states.device, high_priority=True, role="gate")
+                if _K3_MLA_GATE_SIDE_PRIO
+                else _gate_side_stream(hidden_states.device)
+            )
         gates = []
         mask_joined = [not multi_stream]
 
         def gate_of(x):
             forward_sigmoid = getattr(self.g_proj, "forward_sigmoid", None)
             if forward_sigmoid is not None:
+                if _K3_MLA_GATE_EXCLUSIVE:
+                    from ...cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
+
+                    return forward_sigmoid(x, smem_request=k3_fp8w_lowm_gemm._SMEM_CAPACITY)
                 return forward_sigmoid(x)
             return self.g_proj(x).sigmoid()
 
