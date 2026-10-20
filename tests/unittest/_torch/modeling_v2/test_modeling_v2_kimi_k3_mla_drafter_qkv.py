@@ -68,7 +68,7 @@ def test_drafter_mla_qkv_matches_the_stock_chain(batch):
     )
 
     # The stock drafter's chain.
-    q_a = _rmsnorm(a[:, : qkv.Q_LORA], qa_norm, 1e-5)
+    q_a = _rmsnorm(a[:, : qkv.Q_LORA].contiguous(), qa_norm, 1e-5)
     q = F.linear(q_a, q_b).view(batch, block, heads, qkv.NOPE + qkv.ROPE)
     q = _rmsnorm_rope_batched(
         q, None, 0.0, qkv.ROPE, freqs, num_heads=heads, apply_weight=False, apply_rmsnorm=False
@@ -78,7 +78,7 @@ def test_drafter_mla_qkv_matches_the_stock_chain(batch):
     ).transpose(0, 1)
     expected = torch.cat([absorbed, q[..., qkv.NOPE :].reshape(rows, heads, qkv.ROPE)], -1)
     blk_kv = _rmsnorm_rope_batched(
-        a[:, qkv.Q_LORA :].reshape(batch, block, -1),
+        a[:, qkv.Q_LORA :].contiguous().reshape(batch, block, -1),
         kv_norm,
         1e-5,
         qkv.ROPE,
