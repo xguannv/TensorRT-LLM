@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import math
 import os
@@ -3432,10 +3433,13 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             if comm is not None and _flags.TRTLLM_K3LL_MOE_LOWM:
                 moe_layers = self._build_decode_moe_lowm(comm)
             if _flags.TRTLLM_K3LL_FP8W_LOWM:
-                routed = _fp8w_lowm.install(m for layer in layers for m in layer.modules())
+                skipped = collections.Counter()
+                routed = _fp8w_lowm.install(
+                    (m for layer in layers for m in layer.modules()), skipped
+                )
                 logger.info(
                     f"Kimi K3 NVFP4: TRTLLM_K3LL_FP8W_LOWM=1: {routed} FP8 projections on k3_fp8w_lowm_gemm at decode "
-                    "size (0 when use_cute_dsl_blockscaling_mm keeps the raw-scale CuTe DSL GEMM)"
+                    f"size; FP8 modules left on their own GEMM: {dict(skipped)}"
                 )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
