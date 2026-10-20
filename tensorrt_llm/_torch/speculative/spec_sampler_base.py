@@ -62,10 +62,10 @@ class _StreamLog:
     """Fingerprints of the token stream each request generates (benchmark aid, host side only).
 
     With ``TLLM_SPEC_DECODE_STREAM_LOG=<dir>`` every rank appends, when a request finishes, its
-    prompt length (global under helix), its number of steps, the number and the first ids of its
-    generated tokens and digests of the generated ids and of the per-step accepted counts to
-    ``<dir>/rank<rank>.jsonl``. Two runs, or the ranks of one run, generated the same streams when
-    the records match; no output has to be saved by the client.
+    prompt length (global under helix), its number of steps, its generated token ids and per-step
+    accepted counts and digests of both to ``<dir>/rank<rank>.jsonl``. Two runs, or the ranks of
+    one run, generated the same streams when the digests match; the lists locate the first
+    difference. No output has to be saved by the client.
     """
 
     def __init__(self, directory: str):
@@ -88,6 +88,8 @@ class _StreamLog:
             "first_tokens": tokens[:8],
             "token_digest": _digest(tokens),
             "accept_digest": _digest(accepted),
+            "token_ids": tokens,
+            "accepted": accepted,
         }
         with open(self._path, "a") as f:
             f.write(json.dumps(record) + "\n")

@@ -798,4 +798,5 @@ def test_stream_log_records_finished_requests(tmp_path, monkeypatch):
     assert record["first_tokens"] == tokens[:8]
     assert record["token_digest"] == spec_sampler_base._digest(tokens)
     assert record["accept_digest"] == spec_sampler_base._digest([4, 3, 3])
+    assert record["token_ids"] == tokens and record["accepted"] == [4, 3, 3]
     assert 42 not in log._accepted
