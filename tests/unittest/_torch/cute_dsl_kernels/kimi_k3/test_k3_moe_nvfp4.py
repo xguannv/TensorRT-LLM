@@ -213,15 +213,22 @@ def _layer(wide: bool):
                        scales["fc2_alpha"], scales["fc2_input_scale"])  # fmt: skip
 
 
-def _scratch_rearmed(layer):
+def _scratch_state(layer):
+    """Which parts of the per-launch scratch are not back in their armed state (empty when all are)."""
     st = layer.state
     mod = st.mod
     cs = st.cs.view(mod.G_CAP, 8, mod.K2_TILES, mod.SFB_GROUP_BYTES)
-    return (
-        bool((st.c == mod.C_SENTINEL_I8).all())
-        and bool((cs[..., :4] == -1).all())
-        and bool((layer.counters == 0).all())
-    )
+    bad = []
+    c_bad = (st.c.view(mod.G_CAP, -1) != mod.C_SENTINEL_I8).any(-1)
+    if bool(c_bad.any()):
+        bad.append(f"c groups {c_bad.nonzero().flatten()[:8].tolist()} of {int(c_bad.sum())}")
+    cs_bad = (cs[..., :4] != -1).flatten(1).any(-1)
+    if bool(cs_bad.any()):
+        bad.append(f"cs groups {cs_bad.nonzero().flatten()[:8].tolist()} of {int(cs_bad.sum())}")
+    ctr_bad = layer.counters != 0
+    if bool(ctr_bad.any()):
+        bad.append(f"counters {ctr_bad.nonzero().flatten()[:8].tolist()} of {int(ctr_bad.sum())}")
+    return bad
 
 
 def _tokens(case: str, m: int, seed: int = 7):
@@ -262,16 +269,22 @@ def test_k3_moe_nvfp4(case, wide, m):
     layer = _layer(wide)
     x, ids, w = _tokens(case, m)
     x_fp4, x_sf = _quant_x(x, scales)
-    y = layer(x_fp4, x_sf, ids, w, OFFSET)
-    y2 = layer(x_fp4, x_sf, ids, w, OFFSET)
+    y = layer(x_fp4, x_sf, ids, w, OFFSET).clone()
     torch.cuda.synchronize()
-    assert torch.isfinite(y.float()).all()
-    assert torch.equal(y.view(torch.int16), y2.view(torch.int16)), "not run-to-run identical"
-    assert _scratch_rearmed(layer), "scratch not re-armed"
+    bad1 = _scratch_state(layer)
+    y2 = layer(x_fp4, x_sf, ids, w, OFFSET).clone()
+    torch.cuda.synchronize()
+    bad2 = _scratch_state(layer)
     if case == "none_local":
-        assert bool((y == 0).all())
+        assert not bad1 and not bad2, (bad1, bad2)
+        assert bool((y == 0).all()) and bool((y2 == 0).all())
         return
     ref = _reference(raw, scales, _deq_x(x_fp4, x_sf), ids, w)
+    print(f"[k3_moe_nvfp4] case={case} wide={wide} m={m}: call1 rel_rms {_rel_rms(y, ref):.4g} not re-armed {bad1}; "
+          f"call2 rel_rms {_rel_rms(y2, ref):.4g} not re-armed {bad2}")  # fmt: skip
+    assert not bad1 and not bad2, (bad1, bad2)
+    assert torch.isfinite(y.float()).all()
+    assert torch.equal(y.view(torch.int16), y2.view(torch.int16)), "not run-to-run identical"
     stock = _stock(proc, scales, x_fp4, x_sf, ids, w)
     e_k = _rel_rms(y, ref)
     e_s = _rel_rms(stock, ref)
