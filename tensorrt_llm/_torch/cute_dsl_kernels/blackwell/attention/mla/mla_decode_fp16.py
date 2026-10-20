@@ -143,6 +143,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         seq_len_q: int = 1,
         fold_sq: bool = False,
         emit_softmax_stats: bool = False,
+        use_pdl: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -180,6 +181,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
             stores into the attention epilogue.
         :type emit_softmax_stats: bool
+        :param use_pdl: Launch the split-KV kernel and its reduction as programmatic
+            dependents: each waits for the previous grid after its prologue (barrier, shared
+            and tensor memory setup) and before any global access, then triggers its own
+            dependents. Same values.
+        :type use_pdl: bool
         """
 
         self.latent_dim = 512
@@ -208,6 +214,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # is taken with F=1 (a no-op transform).
         self.fold_sq = fold_sq
         self.emit_softmax_stats = emit_softmax_stats
+        self.use_pdl = use_pdl
         self.fold_sq_ratio = (
             BlackwellMultiHeadLatentAttentionForwardFP16.compute_fold_sq_ratio(
                 num_heads, seq_len_q, mma_qk_tiler_mn[0]))
@@ -864,6 +871,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             smem=SplitKVKernelSharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.emit_softmax_stats):
@@ -893,6 +901,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=self.use_pdl,
             )
 
     @cute.jit
@@ -1142,6 +1151,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
+        if cutlass.const_expr(self.use_pdl):
+            # Nothing above touched global memory: the q / KV / page-table reads and the
+            # workspace writes below happen after the previous grid completed.
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
@@ -1501,6 +1515,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         if cutlass.const_expr(self.emit_softmax_stats):
             mLSE, mSoftmaxStats = mLSE
 
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord = (bidx, bidy, bidz)

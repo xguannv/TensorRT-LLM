@@ -573,3 +573,61 @@ def test_block_logit_window(monkeypatch):
     # Slots 1..K of a K-slot block overrun the block: not a window.
     ids = dflash_draft_slot_ids(3, 6, 6, False).clamp(max=17)
     assert window(ids, 3, 6, 6) is None
+
+
+@pytest.mark.parametrize("batch,ctx", [(1, 300), (2, 1024), (4, 2500)])
+def test_mla_decode_fp16_pdl_matches(monkeypatch, batch, ctx):
+    """``TRTLLM_MLA_FP16_PDL=1`` (split-KV kernel and reduction as programmatic dependents)
+    gives the drafter's block decode the same output, eagerly and in a CUDA graph."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+
+    heads, block, page = 4, 7, 64
+    gen = torch.Generator(device="cuda").manual_seed(batch * 1000 + ctx)
+    pages_per_req = (ctx + block + page - 1) // page + 1
+    pool = (torch.randn(batch * pages_per_req + 1, page, HEAD_DIM, device="cuda", generator=gen)
+            * 0.5).to(torch.bfloat16)  # fmt: skip
+    tables = torch.arange(batch * pages_per_req, device="cuda").view(batch, pages_per_req)
+    ctx_len = torch.full((batch,), ctx, dtype=torch.long, device="cuda")
+    fixup = _build_mla_block_fixup(ctx_len, tables, block, page)
+    query = (torch.randn(batch, block, heads, HEAD_DIM, device="cuda", generator=gen)).to(
+        torch.bfloat16
+    )
+    ws_numel = CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
+        heads, block, KV_LORA, batch, __import__("cutlass").Float32
+    )
+    workspace = torch.zeros(max(ws_numel, 1 << 20), dtype=torch.uint8, device="cuda")
+
+    def decode(pdl: str):
+        monkeypatch.setenv("TRTLLM_MLA_FP16_PDL", pdl)
+        out = torch.empty(batch, block, heads, KV_LORA, dtype=torch.bfloat16, device="cuda")
+        torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell(
+            query[..., :KV_LORA].permute(2, 3, 1, 0),
+            query[..., KV_LORA:].permute(2, 3, 1, 0),
+            pool[..., :KV_LORA].permute(1, 2, 0),
+            pool[..., KV_LORA:].permute(1, 2, 0),
+            fixup.page_tables_i32.t(),
+            fixup.seq_lens_i32,
+            out.permute(2, 3, 1, 0),
+            workspace,
+            heads,
+            block,
+            page,
+            0.07,
+            1.0,
+            batch,
+            None,
+            fixup.kv_bounds_i32,
+        )
+        return out
+
+    ref = decode("0")
+    out = decode("1")
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(out), _bits(ref))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = decode("1")
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(g_out), _bits(ref))

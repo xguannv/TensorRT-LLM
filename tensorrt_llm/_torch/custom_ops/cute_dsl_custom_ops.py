@@ -9807,6 +9807,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.kernel_class is BlackwellMultiHeadLatentAttentionForwardFP8:
                 fp8_options = self._fp8_kernel_options(batch_size,
                                                        balanced_split)
+            # TRTLLM_MLA_FP16_PDL=1: the BF16/FP16 split-KV kernel and its
+            # reduction launch as programmatic dependents (same values).
+            fp16_pdl = (self.kernel_class
+                        is BlackwellMultiHeadLatentAttentionForwardFP16
+                        and os.environ.get("TRTLLM_MLA_FP16_PDL", "0") == "1"
+                        and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
             # Helix V up-projection (kwargs v_weight / v_out): fused into the
             # balanced split's reduction where it applies, else a BMM after
             # the kernel (see _v_up_rows).
@@ -9825,7 +9831,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 rows_per_request,
                 balanced_split,
                 fp8_options,
-            ) + ((("v_rows", v_rows), ) if v_rows else ())
+            ) + ((("v_rows", v_rows), ) if v_rows else
+                 ()) + ((("fp16_pdl", True), ) if fp16_pdl else ())
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
                 # for seconds -- always log enough to identify the variant.
@@ -9853,6 +9860,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_kwargs.update(fp8_options)
                     skip_correction_threshold = kernel_kwargs.pop(
                         "skip_correction_threshold")
+                if fp16_pdl:
+                    kernel_kwargs["use_pdl"] = True
                 kernel_class = self.kernel_class
                 if v_rows:
                     kernel_class = BlackwellMlaDecodeFP8VUp
