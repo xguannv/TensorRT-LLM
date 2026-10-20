@@ -49,7 +49,7 @@ TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
 )
 TRTLLM_K3LL_MLA_SPEC_WORKER = _flag(
     "TRTLLM_K3LL_MLA_SPEC_WORKER",
-    0,
+    1,
     "MLA DSpark drafter: stock worker plus sharded draft logits and the k3_markov chain (KimiK3MLADSparkWorker)",
 )
 TRTLLM_K3LL_MLA_DRAFTER_NORMS = _flag(
