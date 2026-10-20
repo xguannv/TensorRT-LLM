@@ -9,8 +9,9 @@ head logits. ``vocab_parallel._markov_chain_kernel`` (Triton) runs the same chai
 bitwise its tokens with fewer synchronizations per step:
 
 * Each CTA owns ``BV = 128`` shard columns and keeps their ``markov_w2`` rows in shared memory for
-  the whole chain (loaded before the PDL wait). Per step it gathers the ``markov_w1`` rows of every
-  request's ``prev`` into shared memory and computes the bias with the instruction the Triton
+  the whole chain (``cp.async`` copies issued before the PDL wait, all in flight at once: the rows
+  are cold in L2 after the LM head's weight stream). Per step it gathers the ``markov_w1`` rows of
+  every request's ``prev`` into shared memory and computes the bias with the instruction the Triton
   ``tl.dot`` lowers to (``mma.sync.m16n8k16`` BF16 -> FP32, requests padded to 16 rows, the rank
   dimension in K steps of 16 in order), rounds it to BF16 like ``F.linear`` and adds the shard
   logits (loaded before the step's exchange wait).
@@ -30,10 +31,12 @@ rank's pairs of launch ``L + 1``, published after this launch completed. All CTA
 their ``griddepcontrol.wait`` and before the first exchange; CTA 0 advances it after the last one.
 Every CTA must be resident at once (each step waits for every cluster's pair).
 
-PDL: shared-memory staging of ``markov_w2`` (a weight) happens before ``griddepcontrol.wait``; the
-counter, the clear, the anchors and the shard logits come after it, and the dependents are triggered
-right after it: a next chain launch can become resident early but touches the counter and the
-exchange only once this launch completed; other successors read the tokens after their own wait.
+PDL: shared-memory staging of ``markov_w2`` (a weight) happens before ``griddepcontrol.wait``, as do
+L2 prefetches of the counter and of the anchors' ``markov_w1`` rows (addresses from an L2-only read
+of the anchors; a prefetch changes no value). The counter, the clear, the anchors and the shard
+logits come after the wait, and the dependents are triggered right after it: a next chain launch
+can become resident early but touches the counter and the exchange only once this launch
+completed; other successors read the tokens after their own wait.
 """
 
 from __future__ import annotations
@@ -377,22 +380,6 @@ def _pick_i(flag, a, b, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ld_nc_v4_if(addr, valid, *, loc=None, ip=None):
-    """16 bytes at ``addr`` if ``valid`` else zeros (no access when not valid)."""
-    res = _asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [_lv(addr, loc=loc, ip=ip), _iv(valid, loc=loc, ip=ip)],
-        "{\n.reg .pred p;\nsetp.ne.s32 p, $5, 0;\n"
-        "mov.b32 $0, 0;\nmov.b32 $1, 0;\nmov.b32 $2, 0;\nmov.b32 $3, 0;\n"
-        "@p ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];\n}",
-        "=r,=r,=r,=r,l,r",
-        loc=loc,
-        ip=ip,
-    )
-    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _ld_b32_if(addr, valid, *, loc=None, ip=None):
     """4 bytes at ``addr`` if ``valid`` else 0."""
     return Int32(
@@ -404,6 +391,79 @@ def _ld_b32_if(addr, valid, *, loc=None, ip=None):
             loc=loc,
             ip=ip,
         )
+    )
+
+
+@dsl_user_op
+def _ld_cg_b32(addr, *, loc=None, ip=None):
+    """4 bytes at ``addr`` through L2 only (no L1 line that a later load could hit)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_lv(addr, loc=loc, ip=ip)],
+            "ld.global.cg.b32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_cg_b64(addr, *, loc=None, ip=None):
+    """8 bytes at ``addr`` through L2 only (no L1 line that a later load could hit)."""
+    return Int64(
+        _asm(
+            T.i64(),
+            [_lv(addr, loc=loc, ip=ip)],
+            "ld.global.cg.b64 $0, [$1];",
+            "=l,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _cp_async_16_if(smem, addr, valid, *, loc=None, ip=None):
+    """Copy 16 bytes from global ``addr`` to shared ``smem`` through L2, without registers; zeros
+    when not ``valid`` (no bytes are read then). Complete after ``_cp_async_wait_all``."""
+    _asm(
+        None,
+        [_iv(smem, loc=loc, ip=ip), _lv(addr, loc=loc, ip=ip), _iv(valid, loc=loc, ip=ip)],
+        "{\n.reg .pred p;\n.reg .b32 n;\nsetp.ne.s32 p, $2, 0;\nselp.b32 n, 16, 0, p;\n"
+        "cp.async.cg.shared.global [$0], [$1], 16, n;\n}",
+        "r,l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _cp_async_commit(*, loc=None, ip=None):
+    _asm(None, [], "cp.async.commit_group;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _cp_async_wait_all(*, loc=None, ip=None):
+    _asm(None, [], "cp.async.wait_all;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _prefetch_l2(addr, *, loc=None, ip=None):
+    _asm(None, [_lv(addr, loc=loc, ip=ip)], "prefetch.global.L2 [$0];", "l", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _prefetch_l2_bulk(addr, nbytes: int, *, loc=None, ip=None):
+    """Bring ``nbytes`` (a multiple of 16) at 16-byte aligned ``addr`` into L2."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip)],
+        f"cp.async.bulk.prefetch.L2.global [$0], {nbytes};",
+        "l",
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -683,19 +743,34 @@ class DSparkMarkovChainKernel:
                 for s in cutlass.range_constexpr(self.steps):
                     _mbar_init(mbar + s * 8, 1)
 
-        # markov_w2 rows of this CTA's columns (a weight: before the wait); zero rows past the shard.
+        # markov_w2 rows of this CTA's columns (a weight: before the wait), all copies in flight at
+        # once; zero rows past the shard. Complete at the first step's _cp_async_wait_all.
         vec_per_row = R // 8
         for p in cutlass.range(tidx, BV * vec_per_row, THREADS, unroll=1):
             r = p // vec_per_row
             q = p - r * vec_per_row
             ok = Int32(c0 + r < n_cols)
-            w = _ld_nc_v4_if(w2_addr + Int64((c0 + r) * R + q * 8) * 2, ok)
-            _sts_v4(w2s + r * RB + q * 16, w[0], w[1], w[2], w[3])
+            rr = _pick_i(ok, c0 + r, Int32(0))
+            _cp_async_16_if(w2s + r * RB + q * 16, w2_addr + Int64(rr * R + q * 8) * 2, ok)
+        _cp_async_commit()
         # The markov_w1 rows of padding requests stay zero.
         for p in cutlass.range(tidx, MAX_REQS * vec_per_row, THREADS, unroll=1):
             r = p // vec_per_row
             q = p - r * vec_per_row
             _sts_v4(w1s + r * RB + q * 16, Int32(0), Int32(0), Int32(0), Int32(0))
+        # L2 prefetches only (no value is used): the launch counter, and the markov_w1 rows of the
+        # anchors as they read now (normally final; read through L2 only, so the anchors read
+        # after the wait cannot hit a stale L1 line).
+        if tidx == 0:
+            _prefetch_l2(launch_addr)
+        if tidx < B:
+            pa = Int32(0)
+            if cutlass.const_expr(self.anchor_64):
+                pa = Int32(_ld_cg_b64(anchor_addr + Int64(tidx) * 8))
+            else:
+                pa = _ld_cg_b32(anchor_addr + Int64(tidx) * 4)
+            if (Int32(pa >= 0) & Int32(pa < vocab)) != 0:
+                _prefetch_l2_bulk(w1_addr + Int64(pa) * Int64(R * 2), R * 2)
 
         _mbar_init_fence_cluster_sync()
 
@@ -788,15 +863,18 @@ class DSparkMarkovChainKernel:
                                     )
                 _bar_sync()
             if cutlass.const_expr(s < self.steps):
-                # markov_w1 rows of the requests' prev tokens (zero for an out-of-vocab prev).
+                # markov_w1 rows of the requests' prev tokens (zero for an out-of-vocab prev); at the
+                # first step the wait also completes the markov_w2 staging.
                 for p in cutlass.range(tidx, B * vec_per_row, THREADS, unroll=1):
                     r = p // vec_per_row
                     q = p - r * vec_per_row
                     pr = _lds_b32(prev_s + r * 4)
                     ok = Int32(pr >= 0) & Int32(pr < vocab)
                     prc = _pick_i(ok, pr, Int32(0))
-                    w = _ld_nc_v4_if(w1_addr + (Int64(prc) * R + Int64(q * 8)) * 2, ok)
-                    _sts_v4(w1s + r * RB + q * 16, w[0], w[1], w[2], w[3])
+                    _cp_async_16_if(
+                        w1s + r * RB + q * 16, w1_addr + (Int64(prc) * R + Int64(q * 8)) * 2, ok
+                    )
+                _cp_async_wait_all()
                 _bar_sync()
 
                 # bias = A (w1 rows, 16 x R) * B (w2 rows of the warp's 32 columns, R x 32).
