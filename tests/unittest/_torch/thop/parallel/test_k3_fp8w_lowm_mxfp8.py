@@ -109,6 +109,35 @@ def test_sf_slots_bitwise(m, monkeypatch):
     assert _bitwise(outs[0], outs[1])
 
 
+@pytest.mark.parametrize("n, k", SHAPES)
+@pytest.mark.parametrize("m", [1, 7, 14, 32, 64])
+def test_sf_early_release_bitwise(m, n, k, monkeypatch):
+    """``TRTLLM_K3_MX_SF_EARLY_RELEASE`` (each K tile released once its scales are folded) gives
+    the low-M kernel's bits, for the default tactic and one with a shorter activation ring."""
+    lowm, mx = _modules()
+    if m > lowm.low_m_max_for(n, k):
+        pytest.skip("M is served by the mid-M path")
+    w, ws = _weight(n, k, seed=n + 2 * k)
+    x = _activation(m, k, seed=5 * m + 1)
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    lowm.run_k3_fp8w_lowm_gemm(x, w, ws, ref)
+    xq, xs = mx.mxfp8_quantize_reference(x)
+    monkeypatch.setattr(mx, "_SF_EARLY_RELEASE", True)
+    monkeypatch.setattr(mx, "_compiled_kernel", functools.cache(mx._compiled_kernel.__wrapped__))
+    base = mx.default_mx_tactic(m, n, k)
+    tactics = [None]
+    if base.b_stages > 2:
+        short = mx.K3LowMMxTactic(
+            mma_n=base.mma_n, split_k=base.split_k, a_stages=base.a_stages, b_stages=2
+        )
+        tactics.append(short)
+    for tactic in tactics:
+        out = torch.empty_like(ref)
+        mx.run_k3_fp8w_lowm_gemm_mxfp8(xq, xs, w, ws, out, tactic=tactic)
+        torch.cuda.synchronize()
+        assert _bitwise(out, ref), tactic
+
+
 def test_deep_k_tactic_fits_shared_memory():
     """Long K slices at mma_n >= 32 shorten the activation ring instead of failing."""
     lowm, mx = _modules()

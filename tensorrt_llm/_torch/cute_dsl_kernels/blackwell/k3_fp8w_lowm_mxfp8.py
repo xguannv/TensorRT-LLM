@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -145,6 +146,12 @@ def validate_tactic(n: int, k: int, t: K3LowMMxTactic) -> None:
 
 #: Weight-ring depth :func:`default_mx_tactic` keeps before it shortens the activation ring.
 _MIN_A_STAGES = 6
+#: TRTLLM_K3_MX_SF_EARLY_RELEASE=1: where every K tile has its own activation stage, the scale warp
+#: releases each K tile to the MMA warp as soon as that tile's scales are folded (one proxy fence
+#: per tile) instead of after folding every tile (one fence for all). The MMA warp then starts on
+#: K tile 0 ~0.7 us earlier at M = 14 (14 K tiles; the fold runs ahead of the MMAs). Same scale
+#: bytes and MMAs: bit-exact.
+_SF_EARLY_RELEASE = os.environ.get("TRTLLM_K3_MX_SF_EARLY_RELEASE", "0") == "1"
 
 
 @functools.cache
@@ -547,7 +554,23 @@ class K3Fp8wLowMMxGemmKernel:
                     v = _ldg_b32(xs_ptr.toint() + Int64(r * self.groups + (kt_start + kt) * 4))
                 row_words.append(v)
             acts.append(row_words)
-        if cutlass.const_expr(self.b_stages >= self.kt_max):
+        if cutlass.const_expr(self.b_stages >= self.kt_max and _SF_EARLY_RELEASE):
+            # Every K tile has its own stage: release each tile once its scales are written.
+            for kt in cutlass.range_constexpr(self.kt_max):
+                if kt < kt_count:
+                    e_w = cute.arch.shuffle_sync(w_exps[kt // 32], kt % 32)
+                    for i in cutlass.range_constexpr(rows_per_lane):
+                        r = lane + 32 * i
+                        if r < self.mma_n:
+                            _sts_b32(
+                                sf_base + kt * 512 + (r & 31) * 16 + (r >> 5) * 4,
+                                _fold_scales_x4(acts[i][kt], e_w),
+                            )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(b_full + kt)
+        elif cutlass.const_expr(self.b_stages >= self.kt_max):
             # Every K tile has its own stage: write all scales, fence once, release all tiles.
             for kt in cutlass.range_constexpr(self.kt_max):
                 if kt < kt_count:
