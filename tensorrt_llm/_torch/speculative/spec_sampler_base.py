@@ -22,12 +22,16 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+import hashlib
+import json
 import os
+from array import array
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.input_commit import scatter_spec_store, spec_sampler_fused_scatter_enabled
@@ -44,6 +48,49 @@ from ..pyexecutor.sampler import (
     int_tensor,
 )
 from ..pyexecutor.scheduler import ScheduledRequests
+
+#: A directory: every rank appends one JSON line per finished request to ``rank<rank>.jsonl`` in it
+#: with fingerprints of the request's generated tokens (see :class:`_StreamLog`).
+STREAM_LOG_ENV_VAR = "TLLM_SPEC_DECODE_STREAM_LOG"
+
+
+def _digest(values: list[int]) -> str:
+    return hashlib.sha1(array("q", values).tobytes()).hexdigest()[:16]
+
+
+class _StreamLog:
+    """Fingerprints of the token stream each request generates (benchmark aid, host side only).
+
+    With ``TLLM_SPEC_DECODE_STREAM_LOG=<dir>`` every rank appends, when a request finishes, its
+    prompt length (global under helix), its number of steps, the number and the first ids of its
+    generated tokens and digests of the generated ids and of the per-step accepted counts to
+    ``<dir>/rank<rank>.jsonl``. Two runs, or the ranks of one run, generated the same streams when
+    the records match; no output has to be saved by the client.
+    """
+
+    def __init__(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        self._path = os.path.join(directory, f"rank{mpi_rank()}.jsonl")
+        self._accepted: dict[int, list[int]] = {}
+
+    def on_step(self, request: LlmRequest, num_new_tokens: int) -> None:
+        accepted = self._accepted.setdefault(request.py_request_id, [])
+        accepted.append(num_new_tokens)
+        if request.state != LlmRequestState.GENERATION_COMPLETE:
+            return
+        del self._accepted[request.py_request_id]
+        tokens = request.get_tokens(DEFAULT_BEAM_IDX)[request.py_prompt_len :]
+        record = {
+            "request_id": request.py_request_id,
+            "prompt_len": getattr(request, "total_input_len_cp", request.py_prompt_len),
+            "steps": len(accepted),
+            "tokens": len(tokens),
+            "first_tokens": tokens[:8],
+            "token_digest": _digest(tokens),
+            "accept_digest": _digest(accepted),
+        }
+        with open(self._path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 @dataclass(kw_only=True)
@@ -184,6 +231,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._fused_scatter = spec_sampler_fused_scatter_enabled()
         self._slots_key: Optional[list] = None
         self._slots_device: Optional[torch.Tensor] = None
+        stream_log_dir = os.environ.get(STREAM_LOG_ENV_VAR)
+        self._stream_log = _StreamLog(stream_log_dir) if stream_log_dir else None
 
     def _request_common_handling(
         self,
@@ -251,6 +300,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
+            if self._stream_log is not None:
+                self._stream_log.on_step(req, num_new_tokens)
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             # Pair the acceptance count with the draft count of the SAME step,
             # snapshotted at sample_async time: _request_common_handling below

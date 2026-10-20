@@ -767,3 +767,35 @@ def test_forward_holds_the_step_inputs_only_with_state_key(key):
     else:
         assert seen == [None]
         assert int(worker._force_accept_rng_counter.item()) == 1
+
+
+def test_stream_log_records_finished_requests(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+    from tensorrt_llm._torch.speculative import spec_sampler_base
+
+    log = spec_sampler_base._StreamLog(str(tmp_path / "streams"))
+    tokens = list(range(100, 110))
+    req = SimpleNamespace(
+        py_request_id=42,
+        py_prompt_len=3,
+        total_input_len_cp=163840,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        get_tokens=lambda beam: [1, 2, 3] + tokens,
+    )
+    log.on_step(req, 4)
+    log.on_step(req, 3)
+    assert not list((tmp_path / "streams").glob("*.jsonl"))
+    req.state = LlmRequestState.GENERATION_COMPLETE
+    log.on_step(req, 3)
+    (path,) = list((tmp_path / "streams").glob("rank*.jsonl"))
+    (record,) = [json.loads(line) for line in path.read_text().splitlines()]
+    assert record["request_id"] == 42
+    assert record["prompt_len"] == 163840
+    assert record["steps"] == 3 and record["tokens"] == 10
+    assert record["first_tokens"] == tokens[:8]
+    assert record["token_digest"] == spec_sampler_base._digest(tokens)
+    assert record["accept_digest"] == spec_sampler_base._digest([4, 3, 3])
+    assert 42 not in log._accepted
