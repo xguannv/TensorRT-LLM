@@ -41,6 +41,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .op import (
+    _EXCHANGE_SLOT_WORDS,
     _OPTIONAL_ARGS,
     _TOKEN_SLOTS,
     HIDDEN_SIZE,
@@ -131,8 +132,12 @@ def is_supported(w3_w1_weight: torch.Tensor, w3_w1_weight_scale: torch.Tensor, w
     return True, ""
 
 
-def _config(i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool) -> dict:
-    return {
+def _config(
+    i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool, push_world: int = 0
+) -> dict:
+    """The kernel options of one build (trace-time constants). ``push_world``: the push build for a latent exchange of
+    that many slots (the fused all-reduce's push-only mode)."""
+    config = {
         "i_tp": i_tp,
         "num_ctas": num_ctas,
         "num_local": num_local,
@@ -141,6 +146,9 @@ def _config(i_tp: int, num_ctas: int, num_local: int, m_max: int, use_pdl: bool)
         "head_flags": 0,
         "lat_slab": 0,
     }
+    if push_world:
+        config.update(ar_world=push_world, ar_push_only=1)
+    return config
 
 
 class _K3MoeNvfp4Scratch:
@@ -239,6 +247,18 @@ class K3MoeNvfp4Layer:
         )  # fmt: skip
         return y if out is None else out[: topk_ids.shape[0]]
 
+    def push(self, x_fp4: torch.Tensor, x_sf: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+             local_expert_offset: int, exchange, slot: Optional[int] = None) -> None:  # fmt: skip
+        """The push build on this layer (an M <= 8 state): the routed partial goes into slot ``slot`` (default
+        ``exchange.rank``) of every rank's ``exchange`` (a ``K3LatentExchange``) instead of a returned tensor, for
+        ``trtllm::k3_latent_reduce``. See the op."""
+        st = self.state
+        torch.ops.trtllm.k3_moe_nvfp4(
+            x_fp4, x_sf, topk_ids, topk_weights, *self.weights, *self.scales, st.c, st.cs, st.part, self.counters,
+            local_expert_offset, st.num_local, st.num_ctas, st.m_max, st.use_pdl, None,
+            exchange.uc, exchange.mc, exchange.flags, exchange.rank if slot is None else slot,
+        )  # fmt: skip
+
 
 def _compile(mod, args, scalars):
     import cutlass.cute as cute
@@ -255,7 +275,8 @@ def _compile(mod, args, scalars):
 
 
 @torch.library.custom_op(
-    "trtllm::k3_moe_nvfp4", mutates_args=("c", "cs", "part", "counters", "out")
+    "trtllm::k3_moe_nvfp4",
+    mutates_args=("c", "cs", "part", "counters", "out", "exchange_uc", "exchange_mc"),
 )
 def k3_moe_nvfp4(
     x_fp4: torch.Tensor,
@@ -279,10 +300,16 @@ def k3_moe_nvfp4(
     m_max: int,
     use_pdl: bool,
     out: Optional[torch.Tensor] = None,
+    exchange_uc: Optional[torch.Tensor] = None,
+    exchange_mc: Optional[torch.Tensor] = None,
+    exchange_flags: Optional[torch.Tensor] = None,
+    exchange_slot: int = 0,
 ) -> torch.Tensor:
     """This rank's routed partial ``[M, 3584]`` bf16 over NVFP4 experts (module docstring). ``c``, ``cs``, ``part``:
     the scratch of a :class:`K3MoeNvfp4State` (``m_max`` 8) or :class:`K3MoeNvfp4WideState` (``m_max`` 64);
-    ``counters``: the layer's. ``out``: as ``trtllm::k3_moe``'s."""
+    ``counters``: the layer's. ``out``: as ``trtllm::k3_moe``'s. ``exchange_*``: the push build, exactly as
+    ``trtllm::k3_moe``'s (``m_max`` 8, no ``out``; the partial goes into slot ``exchange_slot`` of every rank's
+    ``K3LatentExchange`` and the call returns an empty ``[0, 3584]``)."""
     num_tokens = topk_ids.shape[0]
     if m_max not in (MAX_TOKENS, WIDE_MAX_TOKENS):
         raise ValueError(f"k3_moe_nvfp4: m_max is {MAX_TOKENS} or {WIDE_MAX_TOKENS}, got {m_max}")
@@ -311,7 +338,30 @@ def k3_moe_nvfp4(
             raise ValueError(f"k3_moe_nvfp4: {name} must be contiguous fp32 with {n} elements")
     e, two_i, _ = w3_w1_weight.shape
     i_tp = two_i // 2
-    config = _config(i_tp, num_ctas, num_local, m_max, use_pdl)
+    push = exchange_uc is not None
+    if push != (exchange_mc is not None) or push != (exchange_flags is not None):
+        raise ValueError("k3_moe_nvfp4: exchange_uc, exchange_mc and exchange_flags come together")
+    push_world = 0
+    if push:
+        push_world = exchange_uc.numel() // _EXCHANGE_SLOT_WORDS
+        if (
+            exchange_uc.dtype != torch.int32
+            or exchange_mc.dtype != torch.int32
+            or push_world == 0
+            or exchange_uc.numel() != push_world * _EXCHANGE_SLOT_WORDS
+            or exchange_mc.numel() != exchange_uc.numel()
+            or exchange_flags.dtype != torch.int32
+        ):
+            raise ValueError(
+                "k3_moe_nvfp4: the exchange is not a K3LatentExchange's words and flags"
+            )
+        if not 0 <= exchange_slot < push_world:
+            raise ValueError(
+                f"k3_moe_nvfp4: slot {exchange_slot} outside the exchange's {push_world} slots"
+            )
+        if m_max != MAX_TOKENS or out is not None:
+            raise ValueError("k3_moe_nvfp4: the push build is the m_max 8 build and takes no out")
+    config = _config(i_tp, num_ctas, num_local, m_max, use_pdl, push_world)
     mod = _kernel_module(config)
     g_cap = mod.G_CAP
     if (
@@ -346,6 +396,11 @@ def k3_moe_nvfp4(
         .permute(3, 2, 1, 0)
     )
     unused = counters
+    ar_args = (
+        (exchange_uc.view(-1), exchange_mc.view(-1), exchange_flags.view(-1))
+        if push
+        else (unused,) * 3
+    )
     args = (
         _u8(w3_w1_weight).permute(2, 1, 0),
         x_fp4.permute(1, 0),
@@ -356,10 +411,11 @@ def k3_moe_nvfp4(
         c.view(torch.uint8).permute(2, 1, 0),
         _u8(w2_weight_scale).view(e, HIDDEN_SIZE // 128, i_tp // 64, 512).permute(3, 2, 1, 0),
         sfb2, y, y.view(torch.int32), part, topk_ids, topk_weights, counters,
-        *((unused,) * _OPTIONAL_ARGS),
+        *ar_args,  # the fused all-reduce's buffers: the exchange's words and flags (push build)
+        *((unused,) * (_OPTIONAL_ARGS - 3)),  # the fold's inputs, the ready words and head flags, the latent slab
         fc31_alpha.view(-1), fc2_alpha.view(-1), fc2_input_scale.view(-1),
     )  # fmt: skip
-    scalars = (num_tokens, local_expert_offset, num_local, 0, 1.0, 0, 0)
+    scalars = (num_tokens, local_expert_offset, num_local, exchange_slot if push else 0, 1.0, 0, 0)
     key = _compile_key(x_fp4.device, config)
     fn = _compiled.get(key)
     if fn is None:
@@ -369,7 +425,7 @@ def k3_moe_nvfp4(
             )
         fn = _compiled[key] = _compile(mod, args, scalars)
     fn(*args, *scalars, torch.cuda.current_stream(x_fp4.device).cuda_stream)
-    if out is not None:
+    if out is not None or push:
         return y.new_empty((0, HIDDEN_SIZE))
     return y
 
@@ -377,6 +433,6 @@ def k3_moe_nvfp4(
 @k3_moe_nvfp4.register_fake
 def _(x_fp4, x_sf, topk_ids, topk_weights, w3_w1_weight, w3_w1_weight_scale, w2_weight, w2_weight_scale, fc31_alpha,
       fc2_alpha, fc2_input_scale, c, cs, part, counters, local_expert_offset, num_local, num_ctas, m_max, use_pdl,
-      out=None):  # fmt: skip
-    rows = 0 if out is not None else topk_ids.shape[0]
+      out=None, exchange_uc=None, exchange_mc=None, exchange_flags=None, exchange_slot=0):  # fmt: skip
+    rows = 0 if out is not None or exchange_uc is not None else topk_ids.shape[0]
     return x_fp4.new_empty((rows, HIDDEN_SIZE), dtype=torch.bfloat16)
