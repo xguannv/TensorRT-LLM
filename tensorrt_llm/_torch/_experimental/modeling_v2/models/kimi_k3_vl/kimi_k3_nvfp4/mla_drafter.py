@@ -17,7 +17,7 @@ Where the sandwich does not take a call (more rows than one token tile), the pro
 the MNNVL workspace, an eager drafter backend, no page table) runs the stock forward.
 """
 
-from typing import Callable, FrozenSet, Optional, Tuple
+from typing import Callable, FrozenSet, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -30,6 +30,7 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 from tensorrt_llm.logger import logger
 
 from . import decode_comm as _decode_comm
+from . import mla_drafter_qkv as _qkv
 
 
 def _plain_norm(norm: nn.Module, hidden: int) -> bool:
@@ -61,7 +62,9 @@ class K3MLADrafterNorms:
 
     ``drafter``: the drafter; ``comm``: the group's state; ``gemvs_owner``: the module whose ``decode_gemvs`` (the
     target's decode GEMVs, ``drafter_gate_up``; None until built) is read at each call; ``stock``: the drafter's own
-    ``dflash_forward``; ``forms``: the ``k3_sandwich_plain`` forms that compiled (``o_proj``, ``down``)."""
+    ``dflash_forward``; ``forms``: the ``k3_sandwich_plain`` forms that compiled (``o_proj``, ``down``);
+    ``a_weights``: with the fused query / latent path (`install`'s ``qkv``), each layer's ``[q_a_proj | kv_a_proj]``
+    weight, else None."""
 
     def __init__(
         self,
@@ -70,12 +73,14 @@ class K3MLADrafterNorms:
         gemvs_owner: nn.Module,
         stock: Callable[..., torch.Tensor],
         forms: FrozenSet[str],
+        a_weights: Optional[List[torch.Tensor]] = None,
     ):
         self.drafter = drafter
         self.comm = comm
         self.gemvs_owner = gemvs_owner
         self.stock = stock
         self.forms = forms
+        self.a_weights = a_weights
 
     @staticmethod
     def layers_take(drafter: nn.Module) -> bool:
@@ -101,12 +106,20 @@ class K3MLADrafterNorms:
 
     @classmethod
     def install(
-        cls, drafter: nn.Module, comm: _decode_comm.K3DecodeComm, gemvs_owner: nn.Module
+        cls,
+        drafter: nn.Module,
+        comm: _decode_comm.K3DecodeComm,
+        gemvs_owner: nn.Module,
+        qkv: bool = False,
     ) -> Optional["K3MLADrafterNorms"]:
         """Bind the fused block decode as ``drafter.dflash_forward`` where its layers take it (`layers_take`); returns
         the installed object, or None (the drafter keeps its stock forward). Collective: every rank of the group calls
         it at the same point, before any CUDA-graph capture; it compiles each ``k3_sandwich_plain`` form every layer's
-        shape shares with one call on a zero row of a zero weight, a form that does not compile is not used."""
+        shape shares with one call on a zero row of a zero weight, a form that does not compile is not used.
+
+        ``qkv``: also run each layer's query and block latent as one GEMV over ``[q_a_proj | kv_a_proj]`` (the
+        ``kv_a`` decode site) and ``trtllm::k3_drafter_mla_qkv``, where the layers' shapes are the kernel's; the two
+        projections' weights then become views of the concatenated one (no extra memory)."""
         if isinstance(getattr(drafter, "dflash_forward", None), _Bound):
             return drafter.dflash_forward.owner
         if not cls.layers_take(drafter):
@@ -121,9 +134,38 @@ class K3MLADrafterNorms:
                 weights[0], swiglu=swiglu
             ):
                 forms.add(form)
-        owner = cls(drafter, comm, gemvs_owner, drafter.dflash_forward, frozenset(forms))
+        a_weights = cls._fuse_a_weights(layers) if qkv else None
+        owner = cls(drafter, comm, gemvs_owner, drafter.dflash_forward, frozenset(forms), a_weights)
         drafter.dflash_forward = _Bound(owner)
         return owner
+
+    @staticmethod
+    def _fuse_a_weights(layers) -> Optional[List[torch.Tensor]]:
+        """Each layer's ``[q_a_proj | kv_a_proj_with_mqa]`` weight ``[2112, hidden]``, the two projections' weights
+        re-pointed at its rows; None where a layer's shapes or norms are not the kernel's."""
+        for layer in layers:
+            attn = layer.self_attn
+            if (
+                attn.q_lora_rank != _qkv.Q_LORA
+                or attn.kv_lora_rank != _qkv.KV_LORA
+                or attn.qk_rope_head_dim != _qkv.ROPE
+                or attn.qk_nope_head_dim != _qkv.NOPE
+                or attn.v_head_dim != _qkv.NOPE
+                or attn.q_a_proj.weight.dtype != torch.bfloat16
+                or attn.kv_a_proj_with_mqa.weight.dtype != torch.bfloat16
+                or getattr(attn.q_a_proj, "bias", None) is not None
+                or getattr(attn.kv_a_proj_with_mqa, "bias", None) is not None
+                or not attn.q_b_proj.weight.is_contiguous()
+            ):
+                return None
+        fused = []
+        for layer in layers:
+            attn = layer.self_attn
+            weight = torch.cat([attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight]).contiguous()
+            attn.q_a_proj.weight.data = weight[: _qkv.Q_LORA]
+            attn.kv_a_proj_with_mqa.weight.data = weight[_qkv.Q_LORA :]
+            fused.append(weight)
+        return fused
 
     def takes(
         self,
@@ -180,21 +222,46 @@ class K3MLADrafterNorms:
         capacity = page_tables.shape[1] * page_size
         fixup = _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block, page_size)
         layers = drafter.model.layers
+        qkv = None
+        if (
+            self.a_weights is not None
+            and drafter._mla_block_decode_variant(paged=True) == "cute_dsl"
+        ):
+            pool = ctx_kv_cache[0]
+            if (
+                all(c.stride() == pool.stride() for c in ctx_kv_cache)
+                and pool.dtype == torch.bfloat16
+            ):
+                slots = (fixup.pages * pool.stride(0) + fixup.offsets * pool.stride(3)).reshape(-1)
+                qkv = (slots, torch.view_as_real(blk_freqs).reshape(rows, -1).contiguous())
         # The fused all-reduces read the residual and return the updated one: the block's input serves as the first
         # residual, uncopied.
         residual = noise_embedding.reshape(rows, -1)
         normed = layers[0].input_layernorm(residual)
         for layer_idx, layer in enumerate(layers):
-            attn_out = self._attention(
-                layer.self_attn,
-                normed,
-                blk_freqs,
-                ctx_kv_cache[layer_idx],
-                fixup,
-                batch,
-                block,
-                capacity,
-            )
+            attn_out = None
+            if qkv is not None:
+                attn_out = self._attention_qkv(
+                    layer.self_attn,
+                    self.a_weights[layer_idx],
+                    normed,
+                    qkv,
+                    ctx_kv_cache[layer_idx],
+                    fixup,
+                    batch,
+                    block,
+                )
+            if attn_out is None:
+                attn_out = self._attention(
+                    layer.self_attn,
+                    normed,
+                    blk_freqs,
+                    ctx_kv_cache[layer_idx],
+                    fixup,
+                    batch,
+                    block,
+                    capacity,
+                )
             next_norm = (
                 layers[layer_idx + 1].input_layernorm
                 if layer_idx + 1 < len(layers)
@@ -205,6 +272,47 @@ class K3MLADrafterNorms:
             )
             normed, residual = self._mlp_norm(layer.mlp, normed, residual, next_norm)
         return normed
+
+    def _attention_qkv(
+        self,
+        attn: nn.Module,
+        a_weight: torch.Tensor,
+        normed: torch.Tensor,
+        qkv: Tuple[torch.Tensor, torch.Tensor],
+        layer_cache: torch.Tensor,
+        fixup,
+        batch: int,
+        block: int,
+    ) -> Optional[torch.Tensor]:
+        """`_attention` with the query and the block latent from one GEMV over ``[q_a | kv_a]`` and
+        ``trtllm::k3_drafter_mla_qkv`` (which also stores the block latent into the pool), then the cute-dsl decode;
+        None where the kernel does not take the operands."""
+        drafter = self.drafter
+        gemvs = getattr(self.gemvs_owner, "decode_gemvs", None)
+        a = None if gemvs is None else gemvs.project("kv_a", normed, a_weight)
+        if a is None:
+            a = torch.nn.functional.linear(normed, a_weight)
+        if not _qkv.supports(a, attn.q_b_proj.weight, attn._k_b_proj, layer_cache):
+            return None
+        slots, freqs = qkv
+        query = torch.ops.trtllm.k3_drafter_mla_qkv(
+            a,
+            attn.q_a_layernorm.weight,
+            attn.q_b_proj.weight,
+            attn._k_b_proj,
+            attn.kv_a_layernorm.weight,
+            freqs,
+            layer_cache,
+            slots,
+            attn.q_a_layernorm.variance_epsilon,
+            attn.kv_a_layernorm.variance_epsilon,
+        )
+        num_heads = drafter._num_heads
+        ctx_out = drafter._cute_dsl_block_decode(
+            query.view(batch, block, num_heads, -1), layer_cache, fixup, block
+        )
+        attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
+        return attn_out.reshape(batch * block, -1)
 
     def _attention(
         self,
@@ -303,12 +411,22 @@ class _Bound:
         return self.owner.forward(*args, **kwargs)
 
 
-def log_install(owner: Optional[K3MLADrafterNorms]) -> None:
+def log_install(owner: Optional[K3MLADrafterNorms], qkv: bool = False) -> None:
     logger.info(
         "Kimi K3 MLA DSpark drafter: residual adds and RMSNorms "
         + (
             f"in the all-reduces (k3_sandwich_plain: {sorted(owner.forms) or 'none'}, else mnnvl_fusion_allreduce)"
             if owner is not None
             else "on the stock modules (a layer norm or projection the fused all-reduces do not reproduce)"
+        )
+        + (
+            ""
+            if not qkv
+            else "; query and block latent "
+            + (
+                "on the [q_a | kv_a] GEMV and k3_drafter_mla_qkv (cute-dsl decode)"
+                if owner is not None and owner.a_weights is not None
+                else "on the stock projections (shapes the kernel does not take)"
+            )
         )
     )
