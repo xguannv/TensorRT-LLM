@@ -143,7 +143,7 @@ def gumbel_reference(
     )
     key = _fmix32_ref(a ^ b)
     bits = _fmix32_ref(key ^ ((columns.long().view(1, -1) * 0x9E3779B1) & _M32))
-    u = ((bits >> 8).float() + 0.5) * 2.0**-24
+    u = ((bits >> 9).float() + 0.5) * 2.0**-23
     e = -torch.log2(u) * 0.6931471805599453
     return -torch.log2(e) * 0.6931471805599453
 

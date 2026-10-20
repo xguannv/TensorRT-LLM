@@ -131,11 +131,12 @@ def _sample_key(seed, offset):
 
 
 def _gumbel(key, column):
-    """Gumbel(0, 1) noise of (row key, global column): u = (fmix32(key ^ column * golden) >> 8 + 1/2) / 2^24 in (0, 1),
-    then -ln(-ln u), from log2."""
+    """Gumbel(0, 1) noise of (row key, global column): u = (fmix32(key ^ column * golden) >> 9 + 1/2) / 2^23 in (0, 1),
+    then -ln(-ln u), from log2. 23 bits keep u's largest value, 1 - 2^-24, exactly representable below 1 in fp32 (a
+    24-bit u rounds its top value to 1, whose noise is +inf)."""
     bits = _fmix32(key ^ (cutlass.Uint32(column) * cutlass.Uint32(0x9E3779B1)))
-    u = (cutlass.Float32(bits >> cutlass.Uint32(8)) + cutlass.Float32(0.5)) * cutlass.Float32(
-        2.0**-24
+    u = (cutlass.Float32(bits >> cutlass.Uint32(9)) + cutlass.Float32(0.5)) * cutlass.Float32(
+        2.0**-23
     )
     e = -cute.math.log2(u) * cutlass.Float32(LN2)
     return -cute.math.log2(e) * cutlass.Float32(LN2)
