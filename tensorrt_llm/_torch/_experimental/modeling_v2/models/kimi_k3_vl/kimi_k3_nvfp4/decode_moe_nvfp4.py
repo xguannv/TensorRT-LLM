@@ -80,6 +80,16 @@ def _experts(backend) -> tuple:
     )
 
 
+def _scalar(value) -> float:
+    """A SiTU constant of the backend (a float, or a tensor holding one value per expert, all equal) as a float."""
+    if not torch.is_tensor(value):
+        return float(value)
+    flat = value.detach().reshape(-1).float()
+    if not bool((flat == flat[0]).all()):
+        raise ValueError("the NVFP4 decode MoE takes one SiTU constant for every expert")
+    return float(flat[0])
+
+
 def layout_gaps(moe: nn.Module, tp_size: int, max_snapshots: int) -> list:
     """Why this decode path does not take MoE layer ``moe`` (empty when it takes it), read once the routed experts'
     buffers exist: the checks in order, up to the first that fails."""
@@ -204,7 +214,7 @@ class K3DecodeMoeNvfp4Layer:
             input_scale=backend.fc31_input_scale.detach().reshape(1),
             fc2_input_scale=backend.fc2_input_scale.detach().reshape(1),
             offset=int(backend.slot_start),
-            situ=(float(backend.act_alpha), float(backend.act_beta)),
+            situ=(_scalar(backend.act_alpha), _scalar(backend.act_beta)),
         )
 
     def warm_up(self, moe: nn.Module) -> None:
