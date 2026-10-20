@@ -341,6 +341,18 @@ _K3_SHARED_TAIL_MIN_M = int(os.environ.get("TRTLLM_K3_SHARED_TAIL_MIN_M", "1"))
 _K3_SHARED_TAIL_MAX_M = int(os.environ.get("TRTLLM_K3_SHARED_TAIL_MAX_M", "64"))
 # The shared-expert tail streams, by (device index, priority); every MoE layer uses the same one.
 _K3_SHARED_TAIL_STREAMS: Dict[Tuple[int, int], torch.cuda.Stream] = {}
+# TRTLLM_K3_SHARED_JOIN_AFTER_LU=1: where the routed latent all-reduce runs on its own workspace
+# (TRTLLM_K3_LATENT_AR_OWN_WS), the main stream joins the shared-expert stream through a one-thread
+# marker kernel launched on that stream after latent_up has been issued
+# (k3_attn_res.run_join_marker), instead of through the event recorded after the shared expert's
+# last kernel. The next layer's attention-residual mix (A_pre, PDL) depends on latent_up and on
+# that join; under CUDA graph capture, when the join's kernel was captured before latent_up, A_pre
+# is not launched before latent_up completes (measured on GB300: its CTAs enter ~0.9 us after
+# latent_up ends, so its snapshot prologue runs on the critical path), while with the join carried
+# by a kernel captured after latent_up it becomes resident during latent_up as PDL intends (-1.4 us
+# per KDA layer in a single-GPU in-graph replica at b2). The marker runs after the shared expert
+# completed, so A_pre still waits for it. Same kernels and inputs: bit-exact.
+_K3_SHARED_JOIN_AFTER_LU = os.environ.get("TRTLLM_K3_SHARED_JOIN_AFTER_LU", "0") == "1"
 
 
 def _k3_shared_tail_stream() -> Optional[torch.cuda.Stream]:
@@ -2783,6 +2795,8 @@ class KimiK3MoERuntime(nn.Module):
         self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
+        # TRTLLM_K3_SHARED_JOIN_AFTER_LU: recorded after the join marker on the shared-expert stream.
+        self.moe_shared_join_event = torch.cuda.Event() if _K3_SHARED_JOIN_AFTER_LU else None
         # TRTLLM_K3_SHARED_TAIL_PRIO: the shared expert's activation / down / all-reduce stream and
         # the event (after gate_up) it forks from.
         self.shared_tail_stream = _k3_shared_tail_stream()
@@ -3754,7 +3768,7 @@ class KimiK3MoERuntime(nn.Module):
             routed_out = self._routed_projection(routed_latent, up)
         self._issue_latent_ar_clear(latent.shape[0])
         self._join_expert_l2_prefetch()
-        self.moe_shared_event.wait()
+        self._join_shared_stream()
         if residual is not None:
             if defer_residual:
                 return _DeferredMoEResidual(residual, routed_out, shared_out)
@@ -3762,6 +3776,28 @@ class KimiK3MoERuntime(nn.Module):
 
             return _fused_moe_residual_add(routed_out, shared_out, residual)
         return routed_out + shared_out
+
+    def _join_shared_stream(self) -> None:
+        """Make the current (main) stream wait for the shared expert (``moe_shared_event``); with
+        ``TRTLLM_K3_SHARED_JOIN_AFTER_LU`` through a marker kernel issued on the shared-expert stream
+        now, i.e. after latent_up, so that the next PDL kernel on the main stream keeps its early
+        launch from latent_up (see the switch)."""
+        join_event = getattr(self, "moe_shared_join_event", None)
+        if (
+            join_event is None
+            or self.shared_expert_stream is None
+            or not do_multi_stream()
+            or torch.compiler.is_compiling()
+        ):
+            self.moe_shared_event.wait()
+            return
+        from ..cute_dsl_kernels.blackwell.k3_attn_res import run_join_marker
+
+        with torch.cuda.stream(self.shared_expert_stream):
+            self.moe_shared_event.wait()
+            run_join_marker()
+            join_event.record()
+        join_event.wait()
 
     def _latent_up_from_quantized_all_reduce(
         self,
