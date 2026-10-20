@@ -49,7 +49,8 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
-from .spec_tail_kernels import fused_strict_accept, spec_tail_fusion_enabled
+from .spec_tail_kernels import (FORCE_ACCEPT_TIE_STRIDE, ForceAcceptKey,
+                                fused_strict_accept, spec_tail_fusion_enabled)
 from .vocab_parallel import VocabShardedLogits
 
 
@@ -94,6 +95,13 @@ def rejection_sampling_one_model(
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+# What keys the fractional part of the forced acceptance draw (see
+# SpecWorkerBase._apply_force_accepted_tokens): "counter" (default), a device
+# counter bumped by every verify step plus the request's batch row; "state",
+# the request's newest committed (global position, token) pair.
+FORCE_ACCEPT_KEY_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY"
+FORCE_ACCEPT_KEY_COUNTER = "counter"
+FORCE_ACCEPT_KEY_STATE = "state"
 
 # RNG pool configuration for the fractional (probabilistic) component of the
 # synthetic acceptance rate. Pool size MUST be a power of two so we can use
@@ -362,6 +370,24 @@ def get_force_num_accepted_tokens_float() -> float:
             f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid number "
             f"(int or float), got '{env_value}'. Using default value 0.0.")
         return 0.0
+
+
+def get_force_accept_key() -> str:
+    """
+    Read the TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY environment variable: what keys
+    the fractional draw of the forced acceptance override.
+
+    Returns:
+        str: ``"counter"`` (default, also for unknown values) or ``"state"``.
+    """
+    env_value = os.environ.get(FORCE_ACCEPT_KEY_ENV_VAR,
+                               FORCE_ACCEPT_KEY_COUNTER).strip().lower()
+    if env_value in (FORCE_ACCEPT_KEY_COUNTER, FORCE_ACCEPT_KEY_STATE):
+        return env_value
+    logger.warning(f"{FORCE_ACCEPT_KEY_ENV_VAR} must be "
+                   f"'{FORCE_ACCEPT_KEY_COUNTER}' or '{FORCE_ACCEPT_KEY_STATE}'"
+                   f", got '{env_value}'. Using '{FORCE_ACCEPT_KEY_COUNTER}'.")
+    return FORCE_ACCEPT_KEY_COUNTER
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -1400,6 +1426,12 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        # TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY: "state" keys the fractional draw
+        # by each request's newest committed position and token instead.
+        # forward() holds the step's (input_ids, position_ids,
+        # num_ctx_tokens) while it runs, for _force_accept_state_key.
+        self.force_accept_key: str = get_force_accept_key()
+        self._force_accept_inputs: Optional[tuple] = None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -1427,9 +1459,17 @@ class SpecWorkerBase(nn.Module, ABC):
                     attn_metadata = a
                 elif spec_metadata is None and isinstance(a, SpecMetadata):
                     spec_metadata = a
+        if (self.force_accept_key == FORCE_ACCEPT_KEY_STATE
+                and self.force_num_accepted_tokens != 0.0
+                and attn_metadata is not None):
+            self._force_accept_inputs = (
+                kwargs.get("input_ids", args[0] if len(args) > 0 else None),
+                kwargs.get("position_ids", args[1] if len(args) > 1 else None),
+                attn_metadata.num_ctx_tokens)
         try:
             return self._forward_impl(*args, **kwargs)
         finally:
+            self._force_accept_inputs = None
             self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
 
     @abstractmethod
@@ -1604,6 +1644,47 @@ class SpecWorkerBase(nn.Module, ABC):
                                                      dtype=torch.int64,
                                                      device=device)
 
+    def _force_accept_state_key(self, num_gens: int) -> ForceAcceptKey:
+        """The :class:`ForceAcceptKey` of this step's generation requests.
+
+        Element ``g * stride`` of the returned views is the first token of
+        generation request ``g``'s verify group in the target step's inputs
+        (the token list is the context tokens followed by one equal-width
+        group per generation request): the request's newest committed token
+        and its global position (helix packs global positions; the overlap
+        scheduler's position correction runs before the forward).
+        """
+        if self._force_accept_inputs is None:
+            raise RuntimeError(
+                f"{FORCE_ACCEPT_KEY_ENV_VAR}={FORCE_ACCEPT_KEY_STATE} needs "
+                "the step's input ids and position ids: call the worker "
+                "through forward().")
+        input_ids, position_ids, num_ctx_tokens = self._force_accept_inputs
+        if input_ids is None or position_ids is None:
+            raise RuntimeError(
+                f"{FORCE_ACCEPT_KEY_ENV_VAR}={FORCE_ACCEPT_KEY_STATE} needs "
+                "the target's input_ids and position_ids.")
+        if position_ids.dim() == 3:  # mrope [3, 1, N]: the temporal row.
+            position_ids = position_ids[0, 0]
+        elif position_ids.dim() == 2:
+            position_ids = position_ids[0]
+        if input_ids.dim() == 2:
+            input_ids = input_ids[0]
+        gen_tokens = position_ids.shape[0] - num_ctx_tokens
+        if num_gens == 0:
+            return ForceAcceptKey(position_ids[:0], input_ids[:0], 1)
+        width = gen_tokens // num_gens
+        if (width < 1 or width * num_gens != gen_tokens
+                or input_ids.shape[0] != position_ids.shape[0]):
+            raise RuntimeError(
+                f"{FORCE_ACCEPT_KEY_ENV_VAR}={FORCE_ACCEPT_KEY_STATE} needs "
+                f"one equal-width verify group per generation request: "
+                f"{gen_tokens} generation tokens for {num_gens} requests, "
+                f"{input_ids.shape[0]} input ids for "
+                f"{position_ids.shape[0]} positions.")
+        return ForceAcceptKey(position_ids[num_ctx_tokens:],
+                              input_ids[num_ctx_tokens:], width)
+
     def _apply_force_accepted_tokens(self,
                                      num_accepted_tokens,
                                      num_contexts,
@@ -1629,6 +1710,16 @@ class SpecWorkerBase(nn.Module, ABC):
         identically and increments the counter on the same captured ops,
         every rank draws the same uniform values and therefore agrees on the
         accepted-token count for every request in every iteration.
+
+        With ``TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY=state`` the pool index is
+        keyed by the request's own state instead of the counter and its batch
+        row: the global position and the id of its newest committed token
+        (:meth:`_force_accept_state_key`), plus the number of earlier rows in
+        the same state (see ``ForceAcceptKey``). A request then replays the
+        same acceptance sequence whatever its batch row, the step it was
+        admitted at or the number of earlier replays, so runs of a bit-exact
+        configuration generate the same token streams. The counter is not
+        used.
 
         Args:
             num_accepted_tokens: Tensor of shape [batch_size] with current
@@ -1672,22 +1763,41 @@ class SpecWorkerBase(nn.Module, ABC):
             # typically 0), so all of the ops below have static shapes.
             num_gens = num_accepted_tokens.shape[0] - num_contexts
 
-            # In-place counter bump is captured by the graph and replayed on
-            # every iteration, so each replay yields fresh draws from the
-            # pool. All TP ranks bump in lock-step → identical indices.
-            self._force_accept_rng_counter += 1
+            if self.force_accept_key == FORCE_ACCEPT_KEY_STATE:
+                # Hash each request's newest committed (position, token)
+                # and the number of earlier rows in the same state into the
+                # pool (ForceAcceptKey); the inputs are identical on every
+                # rank.
+                key = self._force_accept_state_key(num_gens)
+                positions = key.positions[::key.stride].to(torch.int64)
+                tokens = key.tokens[::key.stride].to(torch.int64)
+                rows = torch.arange(num_gens,
+                                    device=num_accepted_tokens.device)
+                ties = ((positions[:, None] == positions[None, :]) &
+                        (tokens[:, None] == tokens[None, :]) &
+                        (rows[None, :] < rows[:, None])).sum(dim=1)
+                indices = (positions * _FORCE_ACCEPT_RNG_COUNTER_STRIDE +
+                           tokens * _FORCE_ACCEPT_RNG_SLOT_STRIDE +
+                           ties * FORCE_ACCEPT_TIE_STRIDE) & (
+                               _FORCE_ACCEPT_RNG_POOL_SIZE - 1)
+            else:
+                # In-place counter bump is captured by the graph and
+                # replayed on every iteration, so each replay yields fresh
+                # draws from the pool. All TP ranks bump in lock-step →
+                # identical indices.
+                self._force_accept_rng_counter += 1
 
-            slot_ids = torch.arange(num_gens,
-                                    device=num_accepted_tokens.device,
-                                    dtype=torch.int64)
-            # Hash (counter, slot) → pool index. ``& (pool_size - 1)`` is a
-            # cheap power-of-two modulo. The two stride primes are coprime
-            # to ``pool_size`` so consecutive calls and consecutive slots
-            # land on decorrelated pool entries.
-            indices = (self._force_accept_rng_counter *
-                       _FORCE_ACCEPT_RNG_COUNTER_STRIDE +
-                       slot_ids * _FORCE_ACCEPT_RNG_SLOT_STRIDE) & (
-                           _FORCE_ACCEPT_RNG_POOL_SIZE - 1)
+                slot_ids = torch.arange(num_gens,
+                                        device=num_accepted_tokens.device,
+                                        dtype=torch.int64)
+                # Hash (counter, slot) → pool index. ``& (pool_size - 1)``
+                # is a cheap power-of-two modulo. The two stride primes are
+                # coprime to ``pool_size`` so consecutive calls and
+                # consecutive slots land on decorrelated pool entries.
+                indices = (self._force_accept_rng_counter *
+                           _FORCE_ACCEPT_RNG_COUNTER_STRIDE +
+                           slot_ids * _FORCE_ACCEPT_RNG_SLOT_STRIDE) & (
+                               _FORCE_ACCEPT_RNG_POOL_SIZE - 1)
             rand = self._force_accept_rng_pool[indices]
             extra = (rand < frac_part).to(num_accepted_tokens.dtype)
             # ``base_total + extra`` is at most ``int_part + 2``; clamp so we
@@ -1700,9 +1810,11 @@ class SpecWorkerBase(nn.Module, ABC):
         return num_accepted_tokens
 
     def _force_accept_kernel_args(self, runtime_draft_len: int, spec_metadata,
-                                  device: torch.device) -> Optional[tuple]:
+                                  device: torch.device,
+                                  num_gens: int) -> Optional[tuple]:
         """The ``force`` argument of ``fused_strict_accept`` that reproduces
-        :meth:`_apply_force_accepted_tokens` (same warmup skip and draws)."""
+        :meth:`_apply_force_accepted_tokens` (same warmup skip and draws) for
+        a batch with ``num_gens`` generation requests."""
         if self.force_num_accepted_tokens == 0.0:
             return None
         if (spec_metadata is not None and spec_metadata.is_cuda_graph
@@ -1714,9 +1826,12 @@ class SpecWorkerBase(nn.Module, ABC):
         base_total = min(int_part + 1, max_total)
         if frac_part > 0.0 and base_total < max_total:
             self._ensure_force_accept_rng_state(device)
+            if self.force_accept_key == FORCE_ACCEPT_KEY_STATE:
+                source = self._force_accept_state_key(num_gens)
+            else:
+                source = self._force_accept_rng_counter
             return (base_total, frac_part, max_total,
-                    self._force_accept_rng_pool,
-                    self._force_accept_rng_counter,
+                    self._force_accept_rng_pool, source,
                     _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
                     _FORCE_ACCEPT_RNG_SLOT_STRIDE)
         return (base_total, )
@@ -1761,9 +1876,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 logits, spec_metadata, num_contexts, batch_size)
             return fused_strict_accept(
                 target_tokens, draft_tokens, num_contexts, batch_size,
-                self._force_accept_kernel_args(runtime_draft_len,
-                                               spec_metadata,
-                                               target_tokens.device))
+                self._force_accept_kernel_args(runtime_draft_len, spec_metadata,
+                                               target_tokens.device, num_gens))
 
         # Allocate return buffers
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),

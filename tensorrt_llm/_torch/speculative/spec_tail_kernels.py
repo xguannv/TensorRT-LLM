@@ -19,7 +19,10 @@ produces bit-identical results:
 
 * :func:`fused_strict_accept` -- strict (token-equality) acceptance of the
   previous draft against the sampled target tokens, including the optional
-  synthetic acceptance override of ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS``.
+  synthetic acceptance override of ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS``
+  (draws keyed by a step counter and the batch row, or with
+  ``TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY=state`` by each request's newest committed
+  position and token, see :class:`ForceAcceptKey`).
 * :func:`decode_draft_block_table` -- the DFlash draft-KV block-table decode
   (count of allocated blocks per request, clamped and divided block offsets).
 
@@ -28,7 +31,7 @@ batch sizes, so they are CUDA-graph capturable.
 """
 
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import triton
@@ -81,6 +84,114 @@ def draft_fusion_enabled() -> bool:
     return os.environ.get(DRAFT_FUSION_ENV_VAR, "0") == "1"
 
 
+#: Multiplier of the tie count in the state-keyed draw index (see :class:`ForceAcceptKey`).
+FORCE_ACCEPT_TIE_STRIDE = 4093
+_TIE_STRIDE = tl.constexpr(FORCE_ACCEPT_TIE_STRIDE)
+#: Columns per pass of the tie count (rows x this many earlier rows are compared at once).
+_TIE_CHUNK = 16
+
+
+class ForceAcceptKey(NamedTuple):
+    """Per-request key of the state-keyed synthetic acceptance draw.
+
+    With ``TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY=state`` the fractional draw of
+    generation request ``g`` reads the fixed uniform pool at
+    ``(p * a + t * b + k * FORCE_ACCEPT_TIE_STRIDE) & (pool size - 1)``, with
+    ``p = positions[g * stride]`` and ``t = tokens[g * stride]`` the global
+    position and the id of the request's newest committed token (the first
+    token of its verify group in the target step's inputs) and ``k`` the number
+    of earlier generation rows with the same ``(p, t)``. The draw then depends
+    only on the request's own state, so the same request replays the same
+    acceptance whatever its batch row, its admission step or the number of
+    earlier replays, and every rank (all see the same input ids and global
+    positions) draws the same value. Requests in the same state (the same
+    position and newest token, e.g. two copies of a prompt) are told apart by
+    ``k``; which of them gets which draw depends on their rows, but swapping
+    two requests in the same state leaves the batch's content unchanged.
+    """
+
+    positions: torch.Tensor
+    tokens: torch.Tensor
+    stride: int
+
+
+def _force_launch_args(force: Optional[tuple], dummy: torch.Tensor) -> tuple:
+    """``(FORCE, base_total, frac, max_total, pool, counter, key positions, key
+    tokens, key stride, stride a, stride b, pool mask)`` of a ``force`` override
+    (see :func:`fused_strict_accept`); ``dummy`` fills the unused pointers."""
+    if force is None:
+        return 0, 0, 0.0, 0, dummy, dummy, dummy, dummy, 0, 1, 1, 0
+    if len(force) == 1:
+        return 1, int(force[0]), 0.0, 0, dummy, dummy, dummy, dummy, 0, 1, 1, 0
+    base_total, frac, max_total, pool, source, stride_a, stride_b = force
+    pool_mask = pool.numel() - 1
+    if isinstance(source, ForceAcceptKey):
+        assert source.positions.stride(-1) == 1 and source.tokens.stride(-1) == 1
+        return (
+            3,
+            base_total,
+            frac,
+            max_total,
+            pool,
+            dummy,
+            source.positions,
+            source.tokens,
+            source.stride,
+            stride_a,
+            stride_b,
+            pool_mask,
+        )
+    return (
+        2,
+        base_total,
+        frac,
+        max_total,
+        pool,
+        source,
+        dummy,
+        dummy,
+        0,
+        stride_a,
+        stride_b,
+        pool_mask,
+    )
+
+
+@triton.jit
+def _state_keyed_draw(
+    pool_ptr,
+    key_pos_ptr,
+    key_tok_ptr,
+    key_stride,
+    num_rows,
+    POS_STRIDE: tl.constexpr,
+    TOK_STRIDE: tl.constexpr,
+    POOL_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    # ForceAcceptKey: the pool entry of each request's newest committed
+    # (global position, token) pair and its tie count; rows at or past
+    # num_rows draw 1.0 (no extra token).
+    rows = tl.arange(0, BLOCK)
+    mask = rows < num_rows
+    pos = tl.load(key_pos_ptr + rows.to(tl.int64) * key_stride, mask=mask, other=0).to(tl.int64)
+    tok = tl.load(key_tok_ptr + rows.to(tl.int64) * key_stride, mask=mask, other=0).to(tl.int64)
+    ties = tl.zeros([BLOCK], dtype=tl.int32)
+    for c0 in tl.static_range(0, BLOCK, CHUNK):
+        cols = c0 + tl.arange(0, CHUNK)
+        cmask = cols < num_rows
+        cpos = tl.load(key_pos_ptr + cols.to(tl.int64) * key_stride, mask=cmask, other=0)
+        ctok = tl.load(key_tok_ptr + cols.to(tl.int64) * key_stride, mask=cmask, other=0)
+        same = (pos[:, None] == cpos.to(tl.int64)[None, :]) & (
+            tok[:, None] == ctok.to(tl.int64)[None, :]
+        )
+        earlier = cmask[None, :] & (cols[None, :] < rows[:, None])
+        ties += tl.sum((same & earlier).to(tl.int32), axis=1)
+    idx = (pos * POS_STRIDE + tok * TOK_STRIDE + ties.to(tl.int64) * _TIE_STRIDE) & POOL_MASK
+    return tl.load(pool_ptr + idx, mask=mask, other=1.0)
+
+
 @triton.jit
 def _strict_accept_kernel(
     target_ptr,
@@ -95,6 +206,9 @@ def _strict_accept_kernel(
     base_total,
     frac,
     max_total,
+    key_pos_ptr,
+    key_tok_ptr,
+    key_stride,
     DRAFT_LEN: tl.constexpr,
     FORCE: tl.constexpr,
     COUNTER_STRIDE: tl.constexpr,
@@ -102,7 +216,11 @@ def _strict_accept_kernel(
     POOL_MASK: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    TIE_CHUNK: tl.constexpr,
 ):
+    # FORCE: 0 none, 1 constant, 2 counter-keyed draw (COUNTER_STRIDE x counter
+    # + SLOT_STRIDE x row), 3 state-keyed draw (the same multipliers on the
+    # ForceAcceptKey position and token).
     width = DRAFT_LEN + 1
     rows = tl.arange(0, BLOCK_B)
     cols = tl.arange(0, BLOCK_K)
@@ -143,6 +261,21 @@ def _strict_accept_kernel(
         rand = tl.load(pool_ptr + idx, mask=gen_mask, other=1.0)
         extra = (rand < frac).to(tl.int32)
         n = tl.minimum(base_total + extra, max_total)
+    elif FORCE == 3:
+        rand = _state_keyed_draw(
+            pool_ptr,
+            key_pos_ptr,
+            key_tok_ptr,
+            key_stride,
+            num_gen,
+            COUNTER_STRIDE,
+            SLOT_STRIDE,
+            POOL_MASK,
+            BLOCK_B,
+            TIE_CHUNK,
+        )
+        extra = (rand < frac).to(tl.int32)
+        n = tl.minimum(base_total + extra, max_total)
     tl.store(num_accepted_ptr + num_ctx + rows, n.to(tl.int32), mask=gen_mask)
 
 
@@ -162,7 +295,10 @@ def fused_strict_accept(
         num_contexts, batch_size: request counts.
         force: ``None`` for no override, ``(base_total,)`` for a constant
             accepted length, or ``(base_total, frac, max_total, pool, counter,
-            counter_stride, slot_stride)`` for the fractional override.
+            counter_stride, slot_stride)`` for the fractional override, whose
+            draw is keyed by the device ``counter`` (bumped in place) and the
+            batch row, or by a :class:`ForceAcceptKey` in place of the counter
+            (the strides then multiply its position and token).
     Returns:
         ``accepted_tokens [batch_size, K + 1]`` int32 and
         ``num_accepted_tokens [batch_size]`` int32, matching
@@ -177,14 +313,21 @@ def fused_strict_accept(
     if batch_size == 0:
         return accepted, num_accepted
     assert draft_tokens.dim() == 2 and (num_gens == 0 or draft_tokens.stride(-1) == 1)
-    force_mode, base_total, frac, max_total = 0, 0, 0.0, 0
-    pool, counter, counter_stride, slot_stride, pool_mask = target_tokens, target_tokens, 1, 1, 0
-    if force is not None and len(force) == 1:
-        force_mode, base_total = 1, int(force[0])
-    elif force is not None:
-        base_total, frac, max_total, pool, counter, counter_stride, slot_stride = force
-        force_mode = 2
-        pool_mask = pool.numel() - 1
+    (
+        force_mode,
+        base_total,
+        frac,
+        max_total,
+        pool,
+        counter,
+        key_pos,
+        key_tok,
+        key_stride,
+        counter_stride,
+        slot_stride,
+        pool_mask,
+    ) = _force_launch_args(force, target_tokens)
+    block_b = triton.next_power_of_2(max(num_contexts, num_gens, 1))
     _strict_accept_kernel[(1,)](
         target_tokens,
         draft_tokens,
@@ -198,13 +341,17 @@ def fused_strict_accept(
         base_total,
         float(frac),
         max_total,
+        key_pos,
+        key_tok,
+        key_stride,
         DRAFT_LEN=draft_len,
         FORCE=force_mode,
         COUNTER_STRIDE=counter_stride,
         SLOT_STRIDE=slot_stride,
         POOL_MASK=pool_mask,
-        BLOCK_B=triton.next_power_of_2(max(num_contexts, num_gens, 1)),
+        BLOCK_B=block_b,
         BLOCK_K=triton.next_power_of_2(draft_len + 1),
+        TIE_CHUNK=min(block_b, _TIE_CHUNK),
         num_warps=4,
     )
     return accepted, num_accepted
@@ -242,6 +389,9 @@ def _select_accept_kernel(
     base_total,
     frac,
     max_total,
+    key_pos_ptr,
+    key_tok_ptr,
+    key_stride,
     prev_ptr,
     state_idx_ptr,
     dummy_ptr,
@@ -258,6 +408,7 @@ def _select_accept_kernel(
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_SLOTS: tl.constexpr,
+    TIE_CHUNK: tl.constexpr,
 ):
     # Pairs are (value, index) float32 couples, slot s of a row at columns
     # [2 s, 2 s + 1]; a row is loaded as one contiguous run and split.
@@ -285,6 +436,19 @@ def _select_accept_kernel(
         # Every warp reads the old value before any warp writes the new one.
         tl.debug_barrier()
         tl.store(counter_ptr, counter)
+    elif FORCE == 3:
+        rand = _state_keyed_draw(
+            pool_ptr,
+            key_pos_ptr,
+            key_tok_ptr,
+            key_stride,
+            num_gen,
+            COUNTER_STRIDE,
+            SLOT_STRIDE,
+            POOL_MASK,
+            BLOCK_B,
+            TIE_CHUNK,
+        )
 
     lanes = tl.arange(0, 2 * BLOCK_SLOTS)
     lane_ok = lanes < 2 * n_slots
@@ -327,7 +491,7 @@ def _select_accept_kernel(
     n = 1 + first_mismatch
     if FORCE == 1:
         n = tl.full([BLOCK_B], 0, tl.int32) + base_total
-    elif FORCE == 2:
+    elif FORCE >= 2:
         extra = (rand < frac).to(tl.int32)
         n = tl.minimum(base_total + extra, max_total)
     n = n.to(tl.int32)
@@ -385,19 +549,26 @@ def fused_select_accept(
     if batch_size == 0:
         return accepted, num_accepted, rewind
     assert draft_tokens.dim() == 2 and (num_gens == 0 or draft_tokens.stride(-1) == 1)
-    force_mode, base_total, frac, max_total = 0, 0, 0.0, 0
-    pool, counter, counter_stride, slot_stride, pool_mask = pair_buf, pair_buf, 1, 1, 0
-    if force is not None and len(force) == 1:
-        force_mode, base_total = 1, int(force[0])
-    elif force is not None:
-        base_total, frac, max_total, pool, counter, counter_stride, slot_stride = force
-        force_mode = 2
-        pool_mask = pool.numel() - 1
+    (
+        force_mode,
+        base_total,
+        frac,
+        max_total,
+        pool,
+        counter,
+        key_pos,
+        key_tok,
+        key_stride,
+        counter_stride,
+        slot_stride,
+        pool_mask,
+    ) = _force_launch_args(force, pair_buf)
     prev, state_idx, dummy = kda_replay if kda_replay is not None else (accepted,) * 3
     if kda_replay is not None:
         assert prev.dim() == 1 and state_idx.stride(-1) == 1 and dummy.stride(-1) == 1
     # Interleaved (value, index) slots, as the MNNVL / single-rank exchange lays them out.
     assert stride_slot == 2 and pair_buf.stride(-1) == 1
+    block_b = triton.next_power_of_2(max(num_gens, 1))
     _select_accept_kernel[(1,)](
         pair_buf,
         stride_row,
@@ -413,6 +584,9 @@ def fused_select_accept(
         base_total,
         float(frac),
         max_total,
+        key_pos,
+        key_tok,
+        key_stride,
         prev,
         state_idx,
         dummy,
@@ -426,9 +600,10 @@ def fused_select_accept(
         KDA_REPLAY=kda_replay is not None,
         KV_REWIND=kv_lens is not None,
         BLOCK_C=triton.next_power_of_2(max(num_contexts, 1)),
-        BLOCK_B=triton.next_power_of_2(max(num_gens, 1)),
+        BLOCK_B=block_b,
         BLOCK_K=triton.next_power_of_2(draft_len + 1),
         BLOCK_SLOTS=triton.next_power_of_2(n_slots),
+        TIE_CHUNK=min(block_b, _TIE_CHUNK),
         num_warps=4,
     )
     return accepted, num_accepted, rewind

@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.speculative import interface as interface_module
-from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.interface import FORCE_ACCEPT_KEY_ENV_VAR, SpecWorkerBase
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
     SPEC_TAIL_FUSION_ENV_VAR,
     decode_draft_block_table,
@@ -143,6 +143,80 @@ def test_strict_accept_cuda_graph_replay_matches_eager(monkeypatch):
         graph.replay()
         ref = _accept(ref_worker, logits, draft, 0, num_gens, False, monkeypatch)
         monkeypatch.setenv(SPEC_TAIL_FUSION_ENV_VAR, "1")
+        torch.cuda.synchronize()
+        _assert_same((acc, n), ref, 0)
+
+
+def _state_key_inputs(num_contexts, num_gens, draft_len, seed):
+    """Step inputs (input_ids, position_ids [1, N], num_ctx_tokens) for the state key: five
+    tokens per context request, then one verify group of draft_len + 1 tokens per generation
+    request starting at a random position with a random newest committed token."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    num_ctx_tokens = 5 * num_contexts
+    total = num_ctx_tokens + num_gens * (draft_len + 1)
+    ids = torch.randint(0, 163840, (total,), device="cuda", generator=gen).to(torch.int32)
+    starts = torch.randint(0, 1 << 20, (num_gens,), device="cuda", generator=gen)
+    offsets = torch.arange(draft_len + 1, device="cuda")
+    pos = torch.cat(
+        [
+            torch.arange(num_ctx_tokens, device="cuda"),
+            (starts[:, None] + offsets[None, :]).flatten(),
+        ]
+    ).to(torch.int32)
+    return ids, pos.unsqueeze(0), num_ctx_tokens
+
+
+@pytest.mark.parametrize("num_contexts,num_gens,draft_len", [(0, 2, 6), (0, 8, 6), (2, 33, 7)])
+def test_strict_accept_forced_state_key_matches_eager(
+    num_contexts, num_gens, draft_len, monkeypatch
+):
+    monkeypatch.setenv(FORCE_ACCEPT_KEY_ENV_VAR, "state")
+    logits, draft = _case(num_contexts, num_gens, draft_len)
+    bs = num_contexts + num_gens
+    ref_worker, fused_worker = _StubSpecWorker(), _StubSpecWorker()
+    ref_worker.force_num_accepted_tokens = 2.75
+    fused_worker.force_num_accepted_tokens = 2.75
+    seen = set()
+    for step in range(6):
+        inputs = _state_key_inputs(num_contexts, num_gens, draft_len, seed=step)
+        ref_worker._force_accept_inputs = inputs
+        fused_worker._force_accept_inputs = inputs
+        ref = _accept(ref_worker, logits, draft, num_contexts, bs, False, monkeypatch)
+        fused = _accept(fused_worker, logits, draft, num_contexts, bs, True, monkeypatch)
+        _assert_same(fused, ref, num_contexts)
+        seen.update(ref[1][num_contexts:].tolist())
+    assert seen == {3, 4}
+    # The state key leaves the counter alone.
+    assert int(fused_worker._force_accept_rng_counter.item()) == 0
+
+
+def test_strict_accept_state_key_cuda_graph_replay_matches_eager(monkeypatch):
+    monkeypatch.setenv(FORCE_ACCEPT_KEY_ENV_VAR, "state")
+    num_gens, draft_len = 2, 6
+    logits, draft = _case(0, num_gens, draft_len)
+    ref_worker, fused_worker = _StubSpecWorker(), _StubSpecWorker()
+    ref_worker.force_num_accepted_tokens = 2.75
+    fused_worker.force_num_accepted_tokens = 2.75
+    ids, pos, _ = _state_key_inputs(0, num_gens, draft_len, seed=0)
+    fused_worker._force_accept_inputs = (ids, pos, 0)
+    monkeypatch.setenv(SPEC_TAIL_FUSION_ENV_VAR, "1")
+    fused_worker._ensure_force_accept_rng_state(torch.device("cuda"))
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        fused_worker._sample_and_accept_draft_tokens_base(logits, draft, 0, num_gens, _metadata())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        acc, n = fused_worker._sample_and_accept_draft_tokens_base(
+            logits, draft, 0, num_gens, _metadata()
+        )
+    for step in range(1, 7):
+        new_ids, new_pos, _ = _state_key_inputs(0, num_gens, draft_len, seed=step)
+        ids.copy_(new_ids)
+        pos.copy_(new_pos)
+        graph.replay()
+        ref_worker._force_accept_inputs = (new_ids, new_pos, 0)
+        ref = _accept(ref_worker, logits, draft, 0, num_gens, False, monkeypatch)
         torch.cuda.synchronize()
         _assert_same((acc, n), ref, 0)
 

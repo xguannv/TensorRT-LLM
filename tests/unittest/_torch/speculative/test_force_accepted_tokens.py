@@ -37,8 +37,11 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.speculative.interface import (
+    FORCE_ACCEPT_KEY_ENV_VAR,
+    FORCE_ACCEPT_KEY_STATE,
     FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR,
     SpecWorkerBase,
+    get_force_accept_key,
     get_force_num_accepted_tokens,
     get_force_num_accepted_tokens_float,
 )
@@ -392,3 +395,375 @@ def test_forward_restores_spec_dec_state_on_failure() -> None:
         with pytest.raises(RuntimeError, match="simulated draft failure"):
             worker(attn_metadata=attn_metadata, spec_metadata=None)
         assert not attn_metadata.has_spec_dec_saved_state
+
+
+# ---------------- state-keyed draws (TLLM_SPEC_DECODE_FORCE_ACCEPT_KEY) ------
+
+_WIDTH = 7  # MTP6: the newest committed token + 6 drafts per verify group
+
+
+def _make_state_worker(value: float = 2.75) -> _StubSpecWorker:
+    with patch.dict(os.environ, {FORCE_ACCEPT_KEY_ENV_VAR: FORCE_ACCEPT_KEY_STATE}):
+        worker = _StubSpecWorker()
+    worker.force_num_accepted_tokens = value
+    return worker
+
+
+def _step_inputs(positions, tokens, num_ctx_tokens=0, width=_WIDTH, draft_seed=0):
+    """``input_ids`` and ``position_ids`` ``[1, N]`` of a target step: ``num_ctx_tokens`` context
+    tokens, then generation request ``g``'s verify group, its newest committed token
+    ``tokens[g]`` at ``positions[g]`` followed by ``width - 1`` drafts."""
+    n = len(positions)
+    total = num_ctx_tokens + n * width
+    pos = torch.empty(total, dtype=torch.int32)
+    ids = torch.empty(total, dtype=torch.int32)
+    pos[:num_ctx_tokens] = torch.arange(num_ctx_tokens, dtype=torch.int32)
+    ids[:num_ctx_tokens] = 7
+    drafts = torch.randint(
+        0, 163840, (n, width - 1), generator=torch.Generator().manual_seed(draft_seed)
+    )
+    for g in range(n):
+        start = num_ctx_tokens + g * width
+        pos[start : start + width] = torch.arange(positions[g], positions[g] + width)
+        ids[start] = tokens[g]
+        ids[start + 1 : start + width] = drafts[g]
+    return ids.cuda(), pos.cuda().unsqueeze(0)
+
+
+def _apply_state(worker, positions, tokens, num_contexts=0, num_ctx_tokens=0, draft_seed=0):
+    """``_apply_force_accepted_tokens`` with the step inputs forward() would hold."""
+    ids, pos = _step_inputs(positions, tokens, num_ctx_tokens, draft_seed=draft_seed)
+    worker._force_accept_inputs = (ids, pos, num_ctx_tokens)
+    try:
+        return worker._apply_force_accepted_tokens(
+            _make_input(num_contexts + len(positions)),
+            num_contexts=num_contexts,
+            runtime_draft_len=_WIDTH - 1,
+        )
+    finally:
+        worker._force_accept_inputs = None
+
+
+def _expected_state(positions, tokens, value=2.75):
+    """Reference: entry (position * 6007 + token * 1009 + ties * 4093) mod 2^16 of the fixed-seed
+    pool, ties = the number of earlier rows with the same (position, token)."""
+    from tensorrt_llm._torch.speculative import interface as itf
+
+    gen = torch.Generator(device="cpu").manual_seed(itf._FORCE_ACCEPT_RNG_SEED)
+    pool = torch.rand(itf._FORCE_ACCEPT_RNG_POOL_SIZE, dtype=torch.float32, generator=gen)
+    keys = list(zip(positions, tokens))
+    ties = [keys[:g].count(keys[g]) for g in range(len(keys))]
+    idx = [
+        (
+            p * itf._FORCE_ACCEPT_RNG_COUNTER_STRIDE
+            + t * itf._FORCE_ACCEPT_RNG_SLOT_STRIDE
+            + k * 4093
+        )
+        & (itf._FORCE_ACCEPT_RNG_POOL_SIZE - 1)
+        for (p, t), k in zip(keys, ties)
+    ]
+    base_total = min(int(value) + 1, _WIDTH)
+    extra = (pool[idx] < value - int(value)).to(torch.int32)
+    return (base_total + extra).clamp(max=_WIDTH)
+
+
+@pytest.mark.parametrize(
+    "env_value, expected",
+    [
+        (None, "counter"),
+        ("counter", "counter"),
+        ("state", "state"),
+        (" State ", "state"),
+        ("x", "counter"),
+    ],
+)
+def test_get_force_accept_key(env_value, expected, monkeypatch):
+    if env_value is None:
+        monkeypatch.delenv(FORCE_ACCEPT_KEY_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(FORCE_ACCEPT_KEY_ENV_VAR, env_value)
+    assert get_force_accept_key() == expected
+
+
+def test_state_key_draws_from_newest_committed_position_and_token():
+    _require_cuda()
+    worker = _make_state_worker()
+    positions = [163840, 163840, 5, 1000003, 77]
+    tokens = [11, 12, 163000, 0, 11]
+    out = _apply_state(worker, positions, tokens)
+    assert torch.equal(out.cpu(), _expected_state(positions, tokens))
+    # The drafts of the verify groups do not enter the key.
+    assert torch.equal(_apply_state(worker, positions, tokens, draft_seed=9), out)
+    # The counter is neither used nor advanced.
+    assert torch.equal(worker._force_accept_rng_counter.cpu(), torch.zeros(1, dtype=torch.int64))
+
+
+def test_state_key_invariant_to_batch_row_and_counter():
+    _require_cuda()
+    worker = _make_state_worker()
+    positions = [163840 + 3 * i for i in range(9)]
+    tokens = [(i * 7919) % 163840 for i in range(9)]
+    ref = _apply_state(worker, positions, tokens)
+    perm = torch.randperm(9, generator=torch.Generator().manual_seed(3)).tolist()
+    permuted = _apply_state(worker, [positions[i] for i in perm], [tokens[i] for i in perm])
+    assert torch.equal(permuted, ref[perm])
+    # Earlier replays (a different counter) do not change the draws.
+    worker._force_accept_rng_counter.fill_(12345)
+    assert torch.equal(_apply_state(worker, positions, tokens), ref)
+
+
+def test_state_key_tells_apart_requests_in_the_same_state():
+    """Rows with the same (position, token) draw the entries of their tie counts 0, 1, ...; the
+    other rows do not change, and permuting the batch permutes the draws of distinct requests and
+    keeps the multiset of the tied ones."""
+    _require_cuda()
+    worker = _make_state_worker(0.5)
+    positions = [163840, 900, 163840, 163840, 4242, 900]
+    tokens = [17, 3, 17, 17, 8, 3]
+    out = _apply_state(worker, positions, tokens)
+    assert torch.equal(out.cpu(), _expected_state(positions, tokens, 0.5))
+    alone = _apply_state(worker, [163840, 4242], [17, 8])
+    assert torch.equal(out[[0, 4]], alone)
+    perm = [4, 3, 5, 0, 2, 1]
+    permuted = _apply_state(worker, [positions[i] for i in perm], [tokens[i] for i in perm])
+    assert permuted[0] == out[4]
+    assert sorted(permuted[[1, 3, 4]].tolist()) == sorted(out[[0, 2, 3]].tolist())
+    assert sorted(permuted[[2, 5]].tolist()) == sorted(out[[1, 5]].tolist())
+
+
+def test_state_key_identical_on_independent_ranks():
+    _require_cuda()
+    rank0, rank1 = _make_state_worker(), _make_state_worker()
+    torch.cuda.manual_seed(11)
+    positions = [10_000 + 37 * i for i in range(33)]
+    tokens = [(i * 104729) % 163840 for i in range(33)]
+    out0 = _apply_state(rank0, positions, tokens)
+    torch.cuda.manual_seed(999)
+    _ = torch.rand(128, device="cuda")
+    out1 = _apply_state(rank1, positions, tokens)
+    assert torch.equal(out0, out1)
+
+
+def test_state_key_skips_context_rows():
+    _require_cuda()
+    worker = _make_state_worker()
+    num_contexts, num_ctx_tokens = 2, 19
+    positions, tokens = [4096, 333, 90001], [1, 2, 3]
+    ids, pos = _step_inputs(positions, tokens, num_ctx_tokens)
+    worker._force_accept_inputs = (ids, pos, num_ctx_tokens)
+    base = _make_input(num_contexts + 3)
+    base[:num_contexts] = 1
+    out = worker._apply_force_accepted_tokens(base, num_contexts, runtime_draft_len=_WIDTH - 1)
+    assert torch.all(out[:num_contexts] == 1)
+    assert torch.equal(out[num_contexts:].cpu(), _expected_state(positions, tokens))
+
+
+def test_state_key_rejects_uneven_layout():
+    _require_cuda()
+    worker = _make_state_worker()
+    ids, pos = _step_inputs([100, 200], [5, 6])
+    worker._force_accept_inputs = (ids[:-1], pos[:, :-1], 0)
+    with pytest.raises(RuntimeError, match="equal-width"):
+        worker._apply_force_accepted_tokens(_make_input(2), 0, runtime_draft_len=_WIDTH - 1)
+    worker._force_accept_inputs = None
+    with pytest.raises(RuntimeError, match="forward"):
+        worker._apply_force_accepted_tokens(_make_input(2), 0, runtime_draft_len=_WIDTH - 1)
+
+
+def _toy_next_token(position: int, token: int) -> int:
+    """A deterministic stand-in for the model: the newest committed token after a step."""
+    return (position * 2654435761 + token * 40503) % 163840
+
+
+def _simulate_run(
+    worker, admit_step, order, num_steps, prompt_len=163840, warmup_calls=0, first_token=None
+):
+    """Per-request accepted counts of a run of a toy batch-invariant model.
+
+    Request ``r`` joins the batch at step ``admit_step[r]`` with ``first_token(r)`` (default
+    ``1000 + r``) as its newest token and generates ``num_steps`` steps; ``order(step, active)``
+    gives the batch rows; ``warmup_calls`` replays happen first."""
+    for _ in range(warmup_calls):
+        if worker.force_accept_key == "state":
+            _apply_state(worker, [1, 2], [3, 4])
+        else:
+            worker._apply_force_accepted_tokens(_make_input(2), 0, runtime_draft_len=_WIDTH - 1)
+    first_token = first_token or (lambda r: 1000 + r)
+    state = {r: (prompt_len, first_token(r)) for r in admit_step}
+    history = {r: [] for r in admit_step}
+    step = 0
+    while any(len(h) < num_steps for h in history.values()):
+        active = [r for r in admit_step if admit_step[r] <= step and len(history[r]) < num_steps]
+        if active:
+            rows = order(step, active)
+            positions = [state[r][0] for r in rows]
+            tokens = [state[r][1] for r in rows]
+            if worker.force_accept_key == "state":
+                out = _apply_state(worker, positions, tokens).tolist()
+            else:
+                out = worker._apply_force_accepted_tokens(
+                    _make_input(len(rows)), 0, runtime_draft_len=_WIDTH - 1
+                ).tolist()
+            for r, n in zip(rows, out):
+                history[r].append(n)
+                pos = state[r][0] + n
+                state[r] = (pos, _toy_next_token(pos, state[r][1]))
+        step += 1
+    return history
+
+
+@pytest.mark.parametrize("key", ["counter", "state"])
+def test_runs_replay_the_same_streams_only_with_state_key(key):
+    """Two runs of the same requests whose admission step, batch rows and replay count differ:
+    with the state key every request accepts the same sequence (so a bit-exact configuration
+    generates the same tokens); with the counter key the sequences differ."""
+    _require_cuda()
+
+    def make():
+        if key == "state":
+            return _make_state_worker()
+        return _make_worker(2.75)
+
+    run_a = _simulate_run(make(), {0: 0, 1: 0, 2: 0, 3: 0}, lambda s, a: a, num_steps=60)
+    run_b = _simulate_run(
+        make(),
+        {0: 3, 1: 0, 2: 1, 3: 0},
+        lambda s, a: list(reversed(a)) if s % 2 else a,
+        num_steps=60,
+        warmup_calls=5,
+    )
+    if key == "state":
+        assert run_a == run_b
+    else:
+        assert run_a != run_b
+
+
+def test_state_key_runs_with_identical_requests():
+    """Two requests in the same state (a duplicated prompt: same position, same newest token) do
+    not run in lockstep: the tie count gives them different draws. Which one gets which draw
+    depends on the rows, so runs agree on the multiset of streams."""
+    _require_cuda()
+
+    def first_token(r):  # requests 0 and 2 are copies of one prompt
+        return 1000 + (r % 2)
+
+    def run(order, admit):
+        worker = _make_state_worker()
+        hist = _simulate_run(worker, admit, order, num_steps=60, first_token=first_token)
+        return hist
+
+    run_a = run(lambda s, a: a, {0: 0, 1: 0, 2: 0})
+    run_b = run(lambda s, a: list(reversed(a)), {0: 0, 1: 0, 2: 0})
+    assert run_a[0] != run_a[2]  # the copies diverge
+    assert run_a[1] == run_b[1]  # the distinct request is unaffected
+    assert sorted([run_a[0], run_a[2]]) == sorted([run_b[0], run_b[2]])
+
+
+@pytest.mark.parametrize("value", [2.75, 2.6, 0.5])
+def test_state_key_mean_matches_target(value):
+    """Mean accepted drafts over long toy streams match the forced value."""
+    _require_cuda()
+    worker = _make_state_worker(value)
+    num_requests, num_steps = 64, 300
+    positions = [163840 + 17 * r for r in range(num_requests)]
+    tokens = [(r * 7919) % 163840 for r in range(num_requests)]
+    total = 0
+    for _ in range(num_steps):
+        out = _apply_state(worker, positions, tokens).tolist()
+        total += sum(out) - num_requests
+        for r, n in enumerate(out):
+            positions[r] += n
+            tokens[r] = _toy_next_token(positions[r], tokens[r])
+    mean = total / (num_requests * num_steps)
+    # Bernoulli(frac) over 19200 draws: std of the mean <= 0.0036.
+    assert abs(mean - value) < 0.02, f"mean accepted drafts {mean:.4f} vs {value}"
+
+
+def test_state_key_cuda_graph_replay_matches_eager():
+    _require_cuda()
+    eager, graphed = _make_state_worker(), _make_state_worker()
+    num_gens = 4
+    ids, pos = _step_inputs([0] * num_gens, [0] * num_gens)
+    static_in = _make_input(num_gens)
+    graphed._ensure_force_accept_rng_state(torch.device("cuda"))
+    graphed._force_accept_inputs = (ids, pos, 0)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        graphed._apply_force_accepted_tokens(static_in, 0, runtime_draft_len=_WIDTH - 1)
+    torch.cuda.synchronize()
+    out = torch.empty_like(static_in)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graphed._apply_force_accepted_tokens(static_in, 0, runtime_draft_len=_WIDTH - 1)
+        out.copy_(static_in)
+    graphed._force_accept_inputs = None
+    for step in range(6):
+        positions = [163840 + 4 * step + g for g in range(num_gens)]
+        tokens = [(step * 31 + g * 7) % 163840 for g in range(num_gens)]
+        new_ids, new_pos = _step_inputs(positions, tokens, draft_seed=step)
+        ids.copy_(new_ids)
+        pos.copy_(new_pos)
+        static_in.fill_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, _apply_state(eager, positions, tokens))
+        assert torch.equal(out.cpu(), _expected_state(positions, tokens))
+
+
+class _ForwardStateWorker(_StubSpecWorker):
+    """Forced acceptance from inside forward(), as every one-model worker does."""
+
+    def _forward_impl(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        return self._apply_force_accepted_tokens(
+            _make_input(attn_metadata.num_seqs),
+            attn_metadata.num_contexts,
+            runtime_draft_len=_WIDTH - 1,
+        )
+
+
+@pytest.mark.parametrize("key", ["counter", "state"])
+def test_forward_holds_the_step_inputs_only_with_state_key(key):
+    from types import SimpleNamespace
+
+    _require_cuda()
+    with patch.dict(os.environ, {FORCE_ACCEPT_KEY_ENV_VAR: key}):
+        worker = _ForwardStateWorker()
+    worker.force_num_accepted_tokens = 2.75
+    positions, tokens = [163840, 163841, 9], [5, 5, 160000]
+    ids, pos = _step_inputs(positions, tokens, num_ctx_tokens=0)
+    md = SimpleNamespace(
+        num_seqs=3, num_contexts=0, num_ctx_tokens=0, has_spec_dec_saved_state=False
+    )
+    seen = []
+    original = worker._apply_force_accepted_tokens
+
+    def spy(*args, **kwargs):
+        seen.append(worker._force_accept_inputs)
+        return original(*args, **kwargs)
+
+    worker._apply_force_accepted_tokens = spy
+    out = worker(
+        input_ids=ids,
+        position_ids=pos,
+        hidden_states=None,
+        logits=None,
+        attn_metadata=md,
+        spec_metadata=None,
+        draft_model=None,
+    )
+    assert worker._force_accept_inputs is None
+    if key == "state":
+        assert seen[0][0] is ids and seen[0][1] is pos and seen[0][2] == 0
+        assert torch.equal(out.cpu(), _expected_state(positions, tokens))
+    else:
+        assert seen == [None]
+        assert int(worker._force_accept_rng_counter.item()) == 1

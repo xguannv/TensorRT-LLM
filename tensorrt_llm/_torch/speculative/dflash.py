@@ -1505,7 +1505,9 @@ class DFlashWorker(SpecWorkerBase):
             draft_tokens,
             num_contexts,
             batch_size,
-            self._force_accept_kernel_args(draft_tokens.shape[-1], spec_metadata, logits.device),
+            self._force_accept_kernel_args(
+                draft_tokens.shape[-1], spec_metadata, logits.device, num_gens
+            ),
             kda_replay=kda_replay,
             kv_lens=kv_lens,
         )
