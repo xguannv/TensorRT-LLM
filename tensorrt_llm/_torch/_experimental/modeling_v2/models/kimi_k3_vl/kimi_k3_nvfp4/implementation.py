@@ -1906,14 +1906,21 @@ class KimiLinearModel(DecoderModel):
             return False
         kda = [layer.linear_attn for layer in self.layers if layer.is_kda]
         mla = [layer.self_attn for layer in self.layers if not layer.is_kda]
-        return latent_push(
-            step,
-            capturing=True,
+        inputs = dict(
             breakable=is_in_breakable_cuda_graph(),
             kda_draft_records=self.kda_draft_records,
             kda_decode_kernels=all(m.takes_k3_kernels and m.fp8_decode_ready for m in kda),
             mla_decode_branch=all(m.will_run_decode_branch(attn_metadata, step) for m in mla[:1]),
         )
+        push = latent_push(step, capturing=True, **inputs)
+        logger.info_once(
+            f"Kimi K3 latent push on a captured step of {step.num_tokens} tokens: {push} (decode={step.decode} "
+            f"small={step.small} tokens_per_request={step.tokens_per_request} "
+            + " ".join(f"{k}={v}" for k, v in inputs.items())
+            + ")",
+            key=f"k3_latent_push_{step.num_tokens}",
+        )
+        return push
 
     def _defer_moe_tail(
         self,
