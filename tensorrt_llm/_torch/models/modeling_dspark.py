@@ -110,6 +110,7 @@ from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.dspark_ar_norm import draft_ar_norm
 from ..speculative.dspark_draft_gemm import DraftL2Prefetch, draft_gemm, l2_prefetch_enabled
+from ..speculative.dspark_norm import draft_rmsnorm
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
     draft_fusion_enabled,
@@ -3978,7 +3979,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
                 residual = hidden_states.clone()
-                hs_normed = layer.input_layernorm(hs_flat)
+                hs_normed = draft_rmsnorm(layer.input_layernorm, hs_flat)
+                if hs_normed is None:
+                    hs_normed = layer.input_layernorm(hs_flat)
             elif partial is not None:
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed, res_flat = self._fused_ar_residual_norm(
@@ -4007,7 +4010,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 prefetch.prefetch(
                     self._draft_l2_prefetch_weights(layer_idx, num_layers, fused_ar is not None)
                 )
-            q_a_normed = attn.q_a_layernorm(q_a)
+            # TLLM_DSPARK_NORM_EARLY_TRIGGER: the same norm, q_b resident while it runs.
+            q_a_normed = draft_rmsnorm(attn.q_a_layernorm, q_a)
+            if q_a_normed is None:
+                q_a_normed = attn.q_a_layernorm(q_a)
             q = (
                 draft_gemm(q_a_normed, attn.q_b_proj.weight, "q_b")
                 if _plain(attn.q_b_proj)

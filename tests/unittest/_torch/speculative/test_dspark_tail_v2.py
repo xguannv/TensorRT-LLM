@@ -631,3 +631,28 @@ def test_mla_decode_fp16_pdl_matches(monkeypatch, batch, ctx):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(_bits(g_out), _bits(ref))
+
+
+@pytest.mark.parametrize("m", [7, 14, 28, 32])
+@pytest.mark.parametrize("h,row_stride", [(1536, 2112), (1536, 1536), (7168, 7168)])
+def test_rmsnorm_early_trigger_matches_flashinfer(monkeypatch, m, h, row_stride):
+    """``TLLM_DSPARK_NORM_EARLY_TRIGGER``: the early-trigger RMSNorm gives the values of the
+    RMSNorm module's FlashInfer kernel (also on the strided q_a rows of [q_a | kv_a])."""
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm._torch.speculative.dspark_norm import (
+        NORM_EARLY_TRIGGER_ENV_VAR,
+        draft_rmsnorm,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(m * h + row_stride)
+    x = _rows(m, h, gen, row_stride=row_stride)
+    norm = RMSNorm(hidden_size=h, eps=1e-6, dtype=torch.bfloat16).cuda()
+    norm.weight.data.copy_(1 + 0.3 * torch.randn(h, device="cuda", generator=gen))
+    monkeypatch.setenv(NORM_EARLY_TRIGGER_ENV_VAR, "0")
+    assert draft_rmsnorm(norm, x) is None
+    ref = norm(x)
+    monkeypatch.setenv(NORM_EARLY_TRIGGER_ENV_VAR, "1")
+    out = draft_rmsnorm(norm, x)
+    torch.cuda.synchronize()
+    assert out is not None
+    assert torch.equal(_bits(out), _bits(ref))
