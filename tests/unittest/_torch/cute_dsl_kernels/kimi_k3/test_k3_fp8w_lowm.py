@@ -245,7 +245,10 @@ class _FakeFp8Linear(torch.nn.Module):
 
     def __init__(self, w, packed):
         super().__init__()
+        from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
+
         self.weight, self.weight_scale = w, packed
+        self.quant_method = FP8BlockScalesLinearMethod()
         self.use_cute_dsl_blockscaling_mm = False
         self.disable_deep_gemm = False
         self.stock_calls = 0
@@ -333,3 +336,46 @@ def test_target_dispatch_before_transform(m):
     )
     torch.cuda.synchronize()
     assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("m", [1, 8, 300])
+def test_weight_read_module_dispatch(m):
+    """The K3 attention projections: _Fp8BlockScaleWeightReadLinear built from a checkpoint FP8 Linear (raw scales),
+    install, then its own post_load_weights (UE8M0 resmooth + packed scale), then forward on a 3D input."""
+    from collections import Counter
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        fp8w_lowm,
+    )
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    mod = _kernel_module()
+    n, k = 3072, 7168
+    w, scale = _make_weight(n, k, seed=41)
+    lin = Linear(k, n, bias=False, dtype=torch.bfloat16,
+                 quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)).cuda()  # fmt: skip
+    lin.weight.data.copy_(w)
+    lin.weight_scale.data.copy_(scale)
+    wr = _Fp8BlockScaleWeightReadLinear.from_linear(lin)
+    assert wr.weight_scale.dtype == torch.float32
+    skipped = Counter()
+    assert fp8w_lowm.install([wr], skipped) == 1 and not skipped
+    wr.post_load_weights()
+    assert wr.weight_scale.dtype == torch.int32
+    x = _make_activation(m, k, seed=m).unsqueeze(0)
+    out = wr(x)
+    x2d = x.reshape(m, k)
+    lowm = mod.can_run(x2d, wr.weight, wr.weight_scale)
+    assert lowm == (m <= mod.max_m_for(n, k))
+    expected = (
+        torch.ops.trtllm.k3_fp8w_lowm_gemm(x2d, wr.weight, wr.weight_scale)
+        if lowm
+        else torch.ops.trtllm.fp8_swap_ab_gemm(
+            x2d, wr.weight, wr.weight_scale, output_dtype=torch.bfloat16, disable_ue8m0_cast=True
+        )
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (1, m, n) and torch.equal(out.reshape(m, n), expected)
