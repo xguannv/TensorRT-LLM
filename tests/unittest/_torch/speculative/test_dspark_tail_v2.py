@@ -509,3 +509,47 @@ def test_draft_gemm_prefetch_matches_pins(monkeypatch, role, n, k, m):
     out = draft_gemm(x, w, role)
     torch.cuda.synchronize()
     assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("num_tokens", [7, 14, 32])
+def test_block_rope_pdl_matches(monkeypatch, num_tokens):
+    """``TLLM_DSPARK_ROPE_PDL=1`` writes what the plain launch writes, also when it follows a
+    PDL GEMM in a CUDA graph."""
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import dspark_mla_block_rope
+    from tensorrt_llm._torch.speculative.dspark_draft_gemm import DRAFT_GEMM_ENV_VAR, draft_gemm
+
+    heads = 4
+    gen = torch.Generator(device="cuda").manual_seed(31 * num_tokens)
+    x = (torch.randn(num_tokens, 1536, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    w = (torch.randn(heads * (NOPE + ROPE), 1536, device="cuda", generator=gen) / 40).to(
+        torch.bfloat16
+    )
+    kv = _rows(num_tokens, HEAD_DIM, gen, row_stride=1536 + HEAD_DIM)
+    weight = (1.0 + 0.5 * torch.randn(KV_LORA, device="cuda", generator=gen)).to(torch.bfloat16)
+    table = _freqs_table(4096, gen)
+    positions = torch.randint(0, 4096, (num_tokens,), device="cuda", generator=gen)
+    pool = torch.randn(48, 64, HEAD_DIM, device="cuda", generator=gen).to(torch.bfloat16)
+    pages = torch.randperm(48, device="cuda", generator=gen)[:num_tokens].long()
+    offsets = torch.randint(0, 64, (num_tokens,), device="cuda", generator=gen)
+    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
+
+    def run(pdl: str):
+        monkeypatch.setenv("TLLM_DSPARK_ROPE_PDL", pdl)
+        q = draft_gemm(x, w, "q_b").view(num_tokens, heads, NOPE + ROPE)
+        query = torch.zeros((num_tokens, heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+        out_pool = pool.clone()
+        dspark_mla_block_rope(q, query, kv, weight, positions, table, out_pool, pages, offsets, EPS)
+        return query, out_pool
+
+    ref_query, ref_pool = run("0")
+    query, out_pool = run("1")
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(query), _bits(ref_query))
+    assert torch.equal(_bits(out_pool), _bits(ref_pool))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_query, g_pool = run("1")
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(g_query), _bits(ref_query))
+    assert torch.equal(_bits(g_pool), _bits(ref_pool))

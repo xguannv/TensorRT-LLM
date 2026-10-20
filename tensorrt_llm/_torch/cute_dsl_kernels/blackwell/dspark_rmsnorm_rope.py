@@ -663,7 +663,13 @@ class DSparkMlaBlockRoPEKernel:
     num_threads = num_warps * cute.arch.WARP_SIZE
 
     def __init__(
-        self, num_heads: int, qk_nope_dim: int, kv_lora_rank: int, rope_dim: int, eps: float
+        self,
+        num_heads: int,
+        qk_nope_dim: int,
+        kv_lora_rank: int,
+        rope_dim: int,
+        eps: float,
+        use_pdl: bool = False,
     ):
         warp = cute.arch.WARP_SIZE
         if kv_lora_rank % warp != 0 or (rope_dim // 2) % warp != 0 or rope_dim % 2 != 0:
@@ -671,6 +677,9 @@ class DSparkMlaBlockRoPEKernel:
                 f"kv_lora_rank ({kv_lora_rank}) and rope_dim / 2 ({rope_dim // 2}) must be "
                 f"multiples of {warp}"
             )
+        # PDL: launched as a programmatic dependent; every CTA waits for the previous grid
+        # before its first load and then triggers its own dependents.
+        self.use_pdl = use_pdl
         self.num_heads = num_heads
         self.qk_nope_dim = qk_nope_dim
         self.norm_dim = kv_lora_rank
@@ -697,6 +706,7 @@ class DSparkMlaBlockRoPEKernel:
             grid=[cute.ceil_div(rows, self.num_warps), 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -717,6 +727,9 @@ class DSparkMlaBlockRoPEKernel:
         lane = tidx % cute.arch.WARP_SIZE
         row = bidx * self.num_warps + tidx // cute.arch.WARP_SIZE
         num_q_rows = q.shape[0]
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
         reals = cute.make_rmem_tensor((self.pair_items,), cutlass.Float32)
         imags = cute.make_rmem_tensor((self.pair_items,), cutlass.Float32)
         coss = cute.make_rmem_tensor((self.pair_items,), cutlass.Float32)

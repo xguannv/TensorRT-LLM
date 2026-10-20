@@ -3,6 +3,7 @@
 """Torch custom op for fused DSpark RMSNorm and RoPE."""
 
 import functools
+import os
 
 import cutlass
 import cutlass.cute as cute
@@ -898,7 +899,12 @@ def dspark_mla_ctx_norm_rope(
 
 @functools.cache
 def _compile_dspark_mla_block_rope(
-    num_heads: int, qk_nope_dim: int, kv_lora_rank: int, rope_dim: int, eps: float
+    num_heads: int,
+    qk_nope_dim: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    eps: float,
+    use_pdl: bool = False,
 ):
     head_dim = kv_lora_rank + rope_dim
     q_rows = cute.sym_int()
@@ -931,7 +937,7 @@ def _compile_dspark_mla_block_rope(
         cutlass.Int64, (tokens,), stride_order=(0,)
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    kernel = DSparkMlaBlockRoPEKernel(num_heads, qk_nope_dim, kv_lora_rank, rope_dim, eps)
+    kernel = DSparkMlaBlockRoPEKernel(num_heads, qk_nope_dim, kv_lora_rank, rope_dim, eps, use_pdl)
     return cute.compile(
         kernel,
         q_fake,
@@ -946,6 +952,16 @@ def _compile_dspark_mla_block_rope(
         stream_fake,
         options="--opt-level 2 --enable-tvm-ffi",
     )
+
+
+def _block_rope_pdl() -> bool:
+    """``TLLM_DSPARK_ROPE_PDL=1``: launch the block RoPE kernel with PDL (it waits for the q_b
+    GEMM before its first load, so it becomes resident while that GEMM runs). Same values."""
+    if os.environ.get("TLLM_DSPARK_ROPE_PDL", "0") != "1":
+        return False
+    from ..flashinfer_utils import get_env_enable_pdl
+
+    return get_env_enable_pdl()
 
 
 def dspark_mla_block_rope(
@@ -998,7 +1014,7 @@ def dspark_mla_block_rope(
     if num_tokens == 0:
         return
     compiled = _compile_dspark_mla_block_rope(
-        num_heads, q_dim - rope_dim, kv_lora_rank, rope_dim, float(eps)
+        num_heads, q_dim - rope_dim, kv_lora_rank, rope_dim, float(eps), _block_rope_pdl()
     )
     # detach(): DLPack export refuses tensors that require grad (parameters).
     compiled(
