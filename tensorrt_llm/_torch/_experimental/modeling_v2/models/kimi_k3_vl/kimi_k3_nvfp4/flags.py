@@ -57,6 +57,11 @@ TRTLLM_K3LL_MLA_DRAFTER_NORMS = _flag(
     0,
     "MLA DSpark drafter: residual adds and RMSNorms in the o_proj / down all-reduces (k3_sandwich_plain)",
 )
+TRTLLM_K3LL_MLA_DRAFTER_CTX = _flag(
+    "TRTLLM_K3LL_MLA_DRAFTER_CTX",
+    0,
+    "MLA DSpark drafter (with TRTLLM_K3LL_MLA_SPEC_WORKER): context latents of all layers in one k3_drafter_mla_ctx_kv",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
