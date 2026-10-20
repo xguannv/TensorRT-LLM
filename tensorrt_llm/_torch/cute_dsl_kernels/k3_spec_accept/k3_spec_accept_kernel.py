@@ -75,6 +75,9 @@ BUF_WORDS = (
 EMPTY_WORD = -(2**31)  # 0x80000000: fp32 -0.0, never a pushed word
 RNG_COUNTER_STRIDE = 6007
 RNG_SLOT_STRIDE = 1009
+# Sampled acceptance (SAMPLE): rows with a temperature below this are greedy, as the stock sampler treats them.
+GREEDY_TEMPERATURE = 1e-4
+LN2 = 0.6931471805599453
 
 
 def supports_columns(vocab: int, slots: int = 1) -> bool:
@@ -105,6 +108,38 @@ def _atomic_add_acq_rel(addr_i64, val, *, loc=None, ip=None):
             is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
         )
     )  # fmt: skip
+
+
+def _fmix32(h):
+    """murmur3's 32-bit finalizer (a bijection of uint32)."""
+    h = h ^ (h >> cutlass.Uint32(16))
+    h = h * cutlass.Uint32(0x85EBCA6B)
+    h = h ^ (h >> cutlass.Uint32(13))
+    h = h * cutlass.Uint32(0xC2B2AE35)
+    return h ^ (h >> cutlass.Uint32(16))
+
+
+def _sample_key(seed, offset):
+    """The row's noise key from its sampling seed and offset (int64 each); see ``op.gumbel_reference``."""
+    seed_lo = cutlass.Uint32(seed & cutlass.Int64(0xFFFFFFFF))
+    seed_hi = cutlass.Uint32((seed >> cutlass.Int64(32)) & cutlass.Int64(0xFFFFFFFF))
+    off_lo = cutlass.Uint32(offset & cutlass.Int64(0xFFFFFFFF))
+    off_hi = cutlass.Uint32((offset >> cutlass.Int64(32)) & cutlass.Int64(0xFFFFFFFF))
+    a = _fmix32(seed_lo ^ cutlass.Uint32(0x9E3779B9)) ^ (seed_hi * cutlass.Uint32(0x27D4EB2F))
+    b = _fmix32(off_lo + cutlass.Uint32(0x165667B1)) ^ (off_hi * cutlass.Uint32(0x85EBCA77))
+    return _fmix32(a ^ b)
+
+
+def _gumbel(key, column):
+    """Gumbel(0, 1) noise of (row key, global column): u = (fmix32(key ^ column * golden) >> 9 + 1/2) / 2^23 in (0, 1),
+    then -ln(-ln u), from log2. 23 bits keep u's largest value, 1 - 2^-24, exactly representable below 1 in fp32 (a
+    24-bit u rounds its top value to 1, whose noise is +inf)."""
+    bits = _fmix32(key ^ (cutlass.Uint32(column) * cutlass.Uint32(0x9E3779B1)))
+    u = (cutlass.Float32(bits >> cutlass.Uint32(9)) + cutlass.Float32(0.5)) * cutlass.Float32(
+        2.0**-23
+    )
+    e = -cute.math.log2(u) * cutlass.Float32(LN2)
+    return -cute.math.log2(e) * cutlass.Float32(LN2)
 
 
 def _is_nan(x):
@@ -155,6 +190,9 @@ def k3_spec_accept_kernel(
     mask_row: cutlass.Array,  # int32 words of the bf16 mask embedding [H]
     rng_pool: cutlass.Array,  # fp32 [65536] (FORCE_FRAC)
     rng_counter: cutlass.Array,  # int64 [1], in / out (FORCE_FRAC)
+    samp_temp: cutlass.Array,  # fp32 [R]: each row's temperature (SAMPLE)
+    samp_seed: cutlass.Array,  # int64 [R]: each row's sampling seed (SAMPLE)
+    samp_off: cutlass.Array,  # int64 [R]: each row's sampling offset (SAMPLE)
     accepted: cutlass.Array,  # int32 [B * (K + 1)], out
     num_acc: cutlass.Array,  # int32 [B], out
     rewind: cutlass.Array,  # int32 [B], out
@@ -189,6 +227,9 @@ def k3_spec_accept_kernel(
     push_copies: cutlass.Constexpr[
         int
     ],  # slots each rank fills (tests emulate a larger group with > 1)
+    sample: cutlass.Constexpr[
+        bool
+    ],  # each row's token is a temperature sample (Gumbel-max), else its argmax
 ):
     rows = batch * (drafts + 1)
     row_words = hidden // 2  # int32 words per embedding row
@@ -242,6 +283,23 @@ def k3_spec_accept_kernel(
             v = logits.load(idx=cutlass.Int32(r * vocab) + col0, vector_size=4, alignment=16)
             for q in cutlass.range_constexpr(4):
                 vals.append(cutlass.Float32(v[q]))
+        if cutlass.const_expr(sample):
+            # Gumbel-max: argmax(logit / T + g) samples softmax(logit / T); g depends on the row's key and the global
+            # column only, so every rank's shard draws its own columns' noise and the exchange is unchanged. A row
+            # below the greedy temperature keeps its logits (v * 1 + 0 is v).
+            samp_t = samp_temp.load(idx=cutlass.Int32(r))
+            samp_hot = samp_t >= cutlass.Float32(GREEDY_TEMPERATURE)
+            samp_inv = cutlass.Float32(
+                cutlass.select_(samp_hot, cutlass.Float32(1.0) / samp_t, cutlass.Float32(1.0))
+            )
+            samp_key = _sample_key(
+                samp_seed.load(idx=cutlass.Int32(r)), samp_off.load(idx=cutlass.Int32(r))
+            )
+            for q in cutlass.range_constexpr(4):
+                samp_g = _gumbel(samp_key, shard_offset + col0 + cutlass.Int32(q))
+                vals[q] = vals[q] * samp_inv + cutlass.Float32(
+                    cutlass.select_(samp_hot, samp_g, cutlass.Float32(0.0))
+                )
         best_value = vals[0]
         best_index = col0
         for q in cutlass.range_constexpr(1, 4):
@@ -540,6 +598,9 @@ def k3_spec_accept(
     mask_row: cute.Tensor,
     rng_pool: cute.Tensor,
     rng_counter: cute.Tensor,
+    samp_temp: cute.Tensor,
+    samp_seed: cute.Tensor,
+    samp_off: cute.Tensor,
     accepted: cute.Tensor,
     num_acc: cute.Tensor,
     rewind: cute.Tensor,
@@ -570,14 +631,16 @@ def k3_spec_accept(
     max_blocks: cutlass.Constexpr[int],
     slots: cutlass.Constexpr[int],
     push_copies: cutlass.Constexpr[int],
+    sample: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     k3_spec_accept_kernel(
         logits, draft, block_off, block_counts, block_tables, prev_acc, state_idx, dummy, kv_lens, batch_to_slot,
-        ctx_len, embed, mask_row, rng_pool, rng_counter, accepted, num_acc, rewind, bonus, qpos, cpos, noise, partials,
-        counter, buf_uc, buf_mc, flags, off_base, off_stride, divisor, max_ctx, force_total, force_frac, force_mode,
-        rank, shard_offset, grid, vocab, batch, drafts, block, hidden, max_blocks, slots, push_copies,
+        ctx_len, embed, mask_row, rng_pool, rng_counter, samp_temp, samp_seed, samp_off, accepted, num_acc, rewind,
+        bonus, qpos, cpos, noise, partials, counter, buf_uc, buf_mc, flags, off_base, off_stride, divisor, max_ctx,
+        force_total, force_frac, force_mode, rank, shard_offset, grid, vocab, batch, drafts, block, hidden, max_blocks,
+        slots, push_copies, sample,
     ).launch(
         grid=[grid, 1, 1],
         block=[THREADS, 1, 1],

@@ -1385,6 +1385,13 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     # trtllm::k3_drafter_mla_ctx_kv call (`_k3_install_ctx`).
     k3_mla_ctx = False
     _k3_ctx = None
+    # The target sets it (switch TRTLLM_K3LL_MLA_SPEC_ACCEPT): on a decode step trtllm::k3_spec_accept takes, the
+    # target logits stay vocabulary-sharded and the acceptance runs in that kernel (`_k3_accept_mla`).
+    k3_mla_accept = False
+    _k3_step_shard = None
+    _k3_prep = None
+    _k3_meta_prepared = False
+    _k3_shard_returned = False
     _k3_sharded_block_logits = False
     _k3_markov = None
     _k3_markov_next = None
@@ -1392,6 +1399,9 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     _k3_spec_metadata = None
 
     _keep_draft_logits_sharded = KimiK3DSparkWorker._keep_draft_logits_sharded
+    _k3_logits_shard = KimiK3DFlashWorker._k3_logits_shard
+    _k3_logits_shard_reason = KimiK3DFlashWorker._k3_logits_shard_reason
+    _k3_shard_args = staticmethod(KimiK3DFlashWorker._k3_shard_args)
     _k3_markov_chain = KimiK3DSparkWorker._k3_markov_chain
     _apply_dspark_markov_bias = KimiK3DSparkWorker._apply_dspark_markov_bias
 
@@ -1524,11 +1534,233 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         if processor is not None and not isinstance(processor, _K3ShardableDraftLogits):
             draft_model.logits_processor = _K3ShardableDraftLogits(processor, self)
 
-    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
-        """The stock acceptance; under ``k3_decode`` its outputs are kept for ``k3_markov``'s next_new_tokens."""
-        accepted_tokens, num_accepted_tokens = super().sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
+    # -- the fused acceptance (TRTLLM_K3LL_MLA_SPEC_ACCEPT) ------------------------------------------------------
+
+    def _k3_accept_step_applies(
+        self, attn_metadata, spec_metadata, draft_model, num_contexts: int, num_gens: int
+    ) -> bool:
+        """Whether ``trtllm::k3_spec_accept`` runs this step's acceptance: a decode step (no context requests, at most 8
+        requests) with the stock strict acceptance (no rejection sampling, penalties, guided decoding or ragged
+        verification), greedy or pure temperature sampling (the deploy-time ``no_topk_no_topp`` sampling mode, which
+        the kernel's Gumbel-max samples exactly), the KDA replay record on the V2 hybrid cache manager, and the
+        manager's block tables for the drafter's context pool. Every condition is the batch's or the configuration's,
+        so every rank decides alike (the sharded exchange is collective)."""
+        if not (self.k3_decode and self.k3_mla_accept):
+            return False
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            MambaHybridCacheManagerV2,
         )
+        from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+
+        if num_contexts != 0 or not 0 < num_gens <= 8 or self.guided_decoder is not None:
+            return False
+        if (
+            self._can_use_rejection_sampling(spec_metadata)
+            or getattr(spec_metadata, "enable_penalty", False)
+            or getattr(spec_metadata, "is_ragged_verify", False)
+            or type(self)._reshape_draft_tokens_for_accept
+            is not SpecWorkerBase._reshape_draft_tokens_for_accept
+            or type(self)._reshape_logits_for_accept
+            is not SpecWorkerBase._reshape_logits_for_accept
+        ):
+            return False
+        if not spec_metadata.is_all_greedy_sample and (
+            spec_metadata.advanced_sampling_mode != AdvancedSamplingMode.NO_TOPK_NO_TOPP
+            or getattr(spec_metadata, "temperatures", None) is None
+            or getattr(spec_metadata, "seeds", None) is None
+            or getattr(spec_metadata, "offsets", None) is None
+        ):
+            return False
+        K = spec_metadata.runtime_draft_len
+        draft_tokens = spec_metadata.draft_tokens
+        if (
+            K <= 0
+            or draft_tokens is None
+            or draft_tokens.dtype != torch.int32
+            or draft_tokens.numel() != num_gens * K
+        ):
+            return False
+        mgr = attn_metadata.kv_cache_manager
+        mamba_metadata = getattr(attn_metadata, "mamba_metadata", None)
+        if (
+            not isinstance(mgr, MambaHybridCacheManagerV2)
+            or type(mgr).update_mamba_states is not MambaHybridCacheManagerV2.update_mamba_states
+            or not mgr.use_kda_replay_update
+            or getattr(mgr, "prev_num_accepted_tokens", None) is None
+            or getattr(mgr, "_dummy_request_mask", None) is None
+            or mamba_metadata is None
+            or mamba_metadata.state_indices.dtype != torch.int32
+        ):
+            return False
+        if (
+            self._ctx_block_tables is None
+            or self._batch_to_slot_buffer is None
+            or getattr(attn_metadata, "draft_kv_cache_block_offsets", None) is None
+            or getattr(attn_metadata, "kv_lens_cuda", None) is None
+        ):
+            return False
+        embed = draft_model.draft_model_full.model.embed_tokens
+        return isinstance(getattr(embed, "num_embeddings", None), int)
+
+    def target_logits(
+        self, hidden_states, lm_head, logits_processor, attn_metadata, spec_metadata, draft_model
+    ) -> torch.Tensor:
+        """This rank's bf16 vocabulary shard of the target logits for a step ``trtllm::k3_spec_accept`` takes (its only
+        reader), else the gathered fp32 logits (``KimiK3DFlashWorker.target_logits``)."""
+        self._k3_step_shard = None
+        shard = None
+        if self.k3_mla_accept:
+            shard = self._k3_logits_shard(
+                hidden_states, lm_head, attn_metadata, spec_metadata, draft_model
+            )
+        if shard is None:
+            return super().target_logits(
+                hidden_states, lm_head, logits_processor, attn_metadata, spec_metadata, draft_model
+            )
+        logits = KimiK3DFlashWorker._k3_head_shard(logits_processor, lm_head, hidden_states)
+        self._k3_step_shard = (logits, shard, draft_model)
+        return logits
+
+    def _refresh_ctx_block_tables(self, attn_metadata, batch_size):
+        """The stock refresh, except on a fused step: ``trtllm::k3_spec_accept`` decodes the block table."""
+        if self._k3_step_shard is not None:
+            return True
+        return super()._refresh_ctx_block_tables(attn_metadata, batch_size)
+
+    def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
+        """Once per step: a fused step runs it before the kernel (the warmup kv_lens snapshot precedes its update)."""
+        if self._k3_meta_prepared:
+            self._k3_meta_prepared = False
+            return
+        super()._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+
+    def _prepare_kv_for_draft_forward(
+        self, attn_metadata, num_accepted_tokens, num_contexts, batch_size
+    ):
+        """On a fused step the kernel advanced kv_lens and returned the rewind; otherwise the stock update."""
+        prep, self._k3_prep = self._k3_prep, None
+        if prep is None:
+            return super()._prepare_kv_for_draft_forward(
+                attn_metadata, num_accepted_tokens, num_contexts, batch_size
+            )
+        self._kv_rewind_amount = prep["rewind"]
+        self._kv_rewind_nc = num_contexts
+        self._kv_rewind_bs = batch_size
+        self._kv_rewind_pending = True
+        attn_metadata.update_for_spec_dec()
+
+    def _k3_accept_mla(self, logits, attn_metadata, spec_metadata, draft_model, shard):
+        """``trtllm::k3_spec_accept`` on this rank's vocabulary shard of the target logits: the acceptance (the argmax,
+        or a temperature sample), the block table, the KDA replay record and kv_lens + 1. Its drafter-input outputs are
+        not used here (the MLA drafter's embedding is vocabulary-split; the stock ``prepare_1st_drafter_inputs`` builds
+        them): it gets a zero placeholder table. Returns (accepted tokens, num accepted, rewind)."""
+        num_gens = attn_metadata.num_seqs
+        K = spec_metadata.runtime_draft_len
+        rows = num_gens * (K + 1)
+        mgr = attn_metadata.kv_cache_manager
+        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        force = 0.0 if is_warmup else float(self.force_num_accepted_tokens)
+        from tensorrt_llm._torch.cute_dsl_kernels.k3_spec_accept import op as accept_op
+
+        mode, _, _ = accept_op.force_mode(force, K)
+        if mode == accept_op._kernel_module().FORCE_FRAC:
+            self._ensure_force_accept_rng_state(logits.device)
+            pool, counter = self._force_accept_rng_pool, self._force_accept_rng_counter
+        else:
+            dummy_rng = getattr(self, "_k3_dummy_rng", None)
+            if dummy_rng is None:
+                dummy_rng = self._k3_dummy_rng = (
+                    torch.zeros(4, dtype=torch.float32, device=logits.device),
+                    torch.zeros(2, dtype=torch.int64, device=logits.device),
+                )
+            pool, counter = dummy_rng
+        sampling = ()
+        if not spec_metadata.is_all_greedy_sample:
+            seed, offset = self._rng_state_per_token(spec_metadata, rows)
+            sampling = (spec_metadata.temperatures[:rows], seed, offset)
+        # The kernel's noise embedding reads row ``bonus`` of a [vocabulary, hidden] table. The MLA drafter's own
+        # embedding is vocabulary-split over the ranks, and the stock path builds the drafter inputs anyway, so the
+        # kernel gets an 8-column placeholder of the full vocabulary (its noise output is not read).
+        placeholder = getattr(self, "_k3_mla_noise_table", None)
+        vocab = draft_model.draft_model_full.model.embed_tokens.num_embeddings
+        if placeholder is None or placeholder[0].shape[0] != vocab:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "k3_spec_accept: the noise placeholder must be built outside CUDA-graph capture"
+                )
+            placeholder = self._k3_mla_noise_table = (
+                torch.zeros(vocab, 8, dtype=torch.bfloat16, device=logits.device),
+                torch.zeros(8, dtype=torch.bfloat16, device=logits.device),
+            )
+        embed, mask_row = placeholder
+        ws, first_column = shard
+        accepted, num_acc, rewind, *_ = torch.ops.trtllm.k3_spec_accept(
+            logits,
+            spec_metadata.draft_tokens.reshape(num_gens, K),
+            attn_metadata.draft_kv_cache_block_offsets,
+            self._ctx_pool_idx,
+            self._ctx_block_divisor,
+            self._ctx_block_counts,
+            self._ctx_block_tables,
+            mgr.prev_num_accepted_tokens,
+            attn_metadata.mamba_metadata.state_indices,
+            mgr._dummy_request_mask,
+            attn_metadata.kv_lens_cuda,
+            self._batch_to_slot_buffer.tensor,
+            self._ctx_len,
+            self._max_ctx,
+            embed,
+            mask_row,
+            pool,
+            counter,
+            force,
+            self._compute_block_size,
+            ws["uc"],
+            ws["mc"],
+            ws["flags"],
+            ws["rank"],
+            ws["slots"],
+            ws["push_copies"],
+            first_column,
+            *sampling,
+        )
+        return accepted, num_acc, rewind
+
+    def _forward_impl(self, input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata,
+                      draft_model, resource_manager=None):  # fmt: skip
+        """The stock forward; a step whose target logits stayed vocabulary-sharded says so to the engine."""
+        self._k3_shard_returned = False
+        outputs = super()._forward_impl(
+            input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata, draft_model,
+            resource_manager,
+        )  # fmt: skip
+        if self._k3_shard_returned:
+            outputs["logits_vocab_shard"] = True
+            self._k3_shard_returned = False
+        return outputs
+
+    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
+        """``trtllm::k3_spec_accept`` on a step whose target logits stayed sharded (`target_logits`), else the stock
+        acceptance; under ``k3_decode`` the outputs are kept for ``k3_markov``'s next_new_tokens."""
+        step_shard, self._k3_step_shard = self._k3_step_shard, None
+        if step_shard is not None:
+            if step_shard[0] is not logits:
+                raise RuntimeError(
+                    "DSpark: the target logits are not the vocabulary shard target_logits returned"
+                )
+            draft_model = step_shard[2]
+            # Before the kernel updates kv_lens (warmup snapshots kv_lens_cuda here); the stock call later is skipped.
+            self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+            self._k3_meta_prepared = True
+            accepted_tokens, num_accepted_tokens, rewind = self._k3_accept_mla(
+                logits, attn_metadata, spec_metadata, draft_model, step_shard[1]
+            )
+            self._k3_prep = {"rewind": rewind}
+            self._k3_shard_returned = True
+        else:
+            accepted_tokens, num_accepted_tokens = super().sample_and_accept_draft_tokens(
+                logits, attn_metadata, spec_metadata
+            )
         if self.k3_decode:
             self._k3_acceptance = (
                 accepted_tokens, num_accepted_tokens, attn_metadata.num_contexts, spec_metadata, attn_metadata
