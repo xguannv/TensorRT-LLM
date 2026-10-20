@@ -280,6 +280,82 @@ def _cluster_sync(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def _cluster_arrive_relaxed(*, loc=None, ip=None):
+    _asm(None, [], "barrier.cluster.arrive.relaxed.aligned;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _cluster_wait(*, loc=None, ip=None):
+    _asm(None, [], "barrier.cluster.wait.aligned;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _mbar_init(addr, count: int, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip)],
+        f"mbarrier.init.shared::cta.b64 [$0], {count};",
+        "r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_init_fence(*, loc=None, ip=None):
+    _asm(None, [], "fence.mbarrier_init.release.cluster;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _mbar_arrive_expect_tx(addr, tx: int, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip)],
+        f"mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], {tx};",
+        "r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_try_wait(addr, parity, *, loc=None, ip=None):
+    """1 once the phase of ``parity`` of the mbarrier at ``addr`` completed."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(addr, loc=loc, ip=ip), _iv(parity, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n"
+            "selp.u32 $0, 1, 0, p;\n}",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_async_f32(local_addr, local_mbar, peer, value, *, loc=None, ip=None):
+    """``st.async`` of ``value`` to ``local_addr`` of cluster CTA ``peer``, completing 4 bytes of
+    the transaction count of its mbarrier at ``local_mbar``."""
+    _asm(
+        None,
+        [
+            _iv(local_addr, loc=loc, ip=ip),
+            _iv(local_mbar, loc=loc, ip=ip),
+            _iv(peer, loc=loc, ip=ip),
+            _fv(value, loc=loc, ip=ip),
+        ],
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $2;\n"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], $3, [rb];\n}",
+        "r,r,r,f",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _bar_sync(*, loc=None, ip=None):
     _asm(None, [], "bar.sync 0;", "", loc=loc, ip=ip)
 
@@ -607,7 +683,15 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
     * Thread 0 of CTA (0, 0) alone waits for the producer (which reads the state after its own
       wait) and then for every CTA's arrival before it rotates the state; its wait also makes
       this kernel's completion imply the producer's.
+
+    ``async_sum``: the row's CTA sums reach every cluster CTA by ``st.async`` on an mbarrier that
+    expects exactly them, instead of a cluster barrier (whose release fence waits for this CTA's
+    outstanding global stores, the residual output among them). Same sums in the same order.
     """
+
+    def __init__(self, *args, async_sum: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.async_sum = async_sum
 
     @cute.jit
     def __call__(
@@ -629,6 +713,7 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
             warp_sum: cute.struct.MemRange[cutlass.Float32, 32]
             block_sum: cute.struct.MemRange[cutlass.Float32, 1]
             cta_sum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8], 16]
+            sum_bar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, 1], 8]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -676,6 +761,15 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
         warp_sum = storage.warp_sum.data_ptr().toint()
         block_sum = storage.block_sum.data_ptr().toint()
         cta_sum = storage.cta_sum.data_ptr().toint()
+        sum_bar = storage.sum_bar.data_ptr().toint()
+        if cutlass.const_expr(self.async_sum):
+            # The barrier of the row's CTA sums: armed for all of them before any peer can send
+            # (peers send only after the cluster wait below).
+            if tidx == 0:
+                _mbar_init(sum_bar, 1)
+                _mbar_init_fence()
+                _mbar_arrive_expect_tx(sum_bar, self.cluster * 4)
+            _cluster_arrive_relaxed()
 
         if cutlass.const_expr(self.use_pdl):
             griddepcontrol_launch_dependents()
@@ -760,9 +854,16 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
             thread_sum = _fadd(thread_sum, lo)
             thread_sum = _fadd(thread_sum, hi)
         bsum = self._block_sum(thread_sum, warp, lane, warp_sum, block_sum)
-        if tidx < self.cluster:
-            _st_cluster_f32(cta_sum + crank * 4, tidx, bsum)
-        _cluster_sync()
+        if cutlass.const_expr(self.async_sum):
+            _cluster_wait()
+            if tidx < self.cluster:
+                _st_async_f32(cta_sum + crank * 4, sum_bar, tidx, bsum)
+            while _mbar_try_wait(sum_bar, 0) == 0:
+                pass
+        else:
+            if tidx < self.cluster:
+                _st_cluster_f32(cta_sum + crank * 4, tidx, bsum)
+            _cluster_sync()
         total = Float32(0.0)
         for c in cutlass.range_constexpr(self.cluster):
             total = _fadd(total, _lds_f32(cta_sum + c * 4))
@@ -808,9 +909,17 @@ class K3DraftArFinishNormKernel(K3DraftArNormKernel):
 
 @functools.cache
 def _compiled_finish_norm(
-    world: int, hidden: int, threads: int, cluster: int, cpp_one_shot: bool, use_pdl: bool
+    world: int,
+    hidden: int,
+    threads: int,
+    cluster: int,
+    cpp_one_shot: bool,
+    use_pdl: bool,
+    async_sum: bool = False,
 ):
-    kernel = K3DraftArFinishNormKernel(world, hidden, threads, cluster, cpp_one_shot, use_pdl)
+    kernel = K3DraftArFinishNormKernel(
+        world, hidden, threads, cluster, cpp_one_shot, use_pdl, async_sum=async_sum
+    )
     a = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -927,11 +1036,13 @@ def run_k3_draft_ar_finish_norm(
     ws: LamportWorkspace,
     cpp_one_shot: bool,
     use_pdl: bool = True,
+    async_sum: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(RMSNorm(gamma, eps)(all_reduce(x) + residual), all_reduce(x) + residual)`` where every
     rank's producer pushed its ``x`` (``[m, H]``, ``m, H = residual.shape``) into the next two-shot
     call on ``ws`` (``low_m_bf16_splitk.run_splitk_dense_ar_push``): bitwise the C++
-    ``RESIDUAL_RMS_NORM`` fusion of ``x`` (``cpp_one_shot``: the one-shot kernel's result)."""
+    ``RESIDUAL_RMS_NORM`` fusion of ``x`` (``cpp_one_shot``: the one-shot kernel's result).
+    ``async_sum``: the cluster sums on an mbarrier (see :class:`K3DraftArFinishNormKernel`)."""
     m, hidden = residual.shape
     cfg = grid_config(m, hidden, _sm_count(residual.device.index))
     assert cfg is not None
@@ -940,7 +1051,9 @@ def run_k3_draft_ar_finish_norm(
     residual = residual.contiguous()
     out = torch.empty_like(residual)
     res_out = torch.empty_like(residual)
-    _compiled_finish_norm(ws.world, hidden, cfg[0], cfg[1], bool(cpp_one_shot), bool(use_pdl))(
+    _compiled_finish_norm(
+        ws.world, hidden, cfg[0], cfg[1], bool(cpp_one_shot), bool(use_pdl), bool(async_sum)
+    )(
         Int64(residual.data_ptr()),
         Int64(gamma.data_ptr()),
         Int64(out.data_ptr()),

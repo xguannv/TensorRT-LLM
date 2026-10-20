@@ -42,6 +42,16 @@ def ar_push_enabled() -> bool:
     return os.environ.get(AR_PUSH_ENV_VAR, "0") == "1"
 
 
+#: ``TLLM_DSPARK_AR_FINISH_ASYNC=1``: the finish kernel's cluster sums go by ``st.async`` on an
+#: mbarrier instead of a cluster barrier (``K3DraftArFinishNormKernel(async_sum=True)``).
+FINISH_ASYNC_ENV_VAR = "TLLM_DSPARK_AR_FINISH_ASYNC"
+
+
+def finish_async_enabled() -> bool:
+    """Whether ``TLLM_DSPARK_AR_FINISH_ASYNC=1`` exchanges the finish kernel's sums by mbarrier."""
+    return os.environ.get(FINISH_ASYNC_ENV_VAR, "0") == "1"
+
+
 @dataclasses.dataclass
 class PushedPartial:
     """A projection output that every rank pushed into the next two-shot all-reduce on
@@ -157,5 +167,6 @@ def draft_ar_finish_norm(
         pushed.workspace,
         pushed.cpp_one_shot,
         use_pdl=get_env_enable_pdl(),
+        async_sum=finish_async_enabled(),
     )
     return out.view(pushed.shape), res_out.view(residual.shape)

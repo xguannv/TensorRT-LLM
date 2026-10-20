@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """DSpark drafter projections pushed into their all-reduce (TLLM_DSPARK_AR_PUSH): the low-M GEMM
-push epilogue + the finish / residual / RMSNorm kernel are bitwise equal to F.linear followed by
-the C++ RESIDUAL_RMS_NORM fusion, with C++ calls interleaved on the workspace and inside a CUDA
-graph."""
+push epilogue + the finish / residual / RMSNorm kernel (with its cluster sums on a cluster barrier
+or, TLLM_DSPARK_AR_FINISH_ASYNC, on an mbarrier) are bitwise equal to F.linear followed by the C++
+RESIDUAL_RMS_NORM fusion, with C++ calls interleaved on the workspace and inside a CUDA graph."""
 
 import os
 import pickle
@@ -54,10 +54,11 @@ def _rnd(shape, seed, scale):
     return (torch.randn(*shape, device="cuda", generator=gen) * scale).to(torch.bfloat16)
 
 
-def _run_rank(world_size):
+def _run_rank(world_size, finish_async):
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     os.environ["TLLM_DSPARK_AR_PUSH"] = "1"
+    os.environ["TLLM_DSPARK_AR_FINISH_ASYNC"] = "1" if finish_async else "0"
     import torch.nn.functional as F
 
     from tensorrt_llm._torch.distributed import (
@@ -160,11 +161,12 @@ def _run_rank(world_size):
 
 
 @skip_pre_blackwell
+@pytest.mark.parametrize("finish_async", [False, True])
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
-def test_dspark_ar_push(mpi_pool_executor):
+def test_dspark_ar_push(mpi_pool_executor, finish_async):
     world_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
-    results = mpi_pool_executor.map(_run_rank, *zip(*[(world_size,)] * world_size))
+    results = mpi_pool_executor.map(_run_rank, *zip(*[(world_size, finish_async)] * world_size))
     for r in results:
         assert r is True
