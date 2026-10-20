@@ -32,6 +32,11 @@ def _flag(name: str, default: int, doc: str) -> int:
 TRTLLM_K3LL_CENSUS = _flag(
     "TRTLLM_K3LL_CENSUS", 0, "count and log generic fallbacks in decode steps"
 )
+TRTLLM_K3LL_MOE_LOWM = _flag(
+    "TRTLLM_K3LL_MOE_LOWM",
+    0,
+    "MoE decode path: NVFP4-latent front + k3_moe_lowm_dyn on CuteDSL NVFP4 buffers (decode_moe_lowm.py)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
