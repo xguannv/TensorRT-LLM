@@ -47,6 +47,11 @@ TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
     0,
     "MLA DSpark drafter: fc split by input feature over TP, hidden_norm in the MNNVL all-reduce",
 )
+TRTLLM_K3LL_MLA_SPEC_WORKER = _flag(
+    "TRTLLM_K3LL_MLA_SPEC_WORKER",
+    0,
+    "MLA DSpark drafter: stock worker plus sharded draft logits and the k3_markov chain (KimiK3MLADSparkWorker)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

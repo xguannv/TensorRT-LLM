@@ -1341,3 +1341,118 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         return super()._prepare_next_new_tokens(
             accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size, num_accepted_tokens
         )
+
+
+class _K3ShardableDraftLogits:
+    """The MLA drafter's logits processor, returning this rank's bf16 vocabulary shard (``_k3_head_shard``) instead of
+    the gathered fp32 logits on the steps its worker keeps the block logits sharded (``_k3_sharded_block_logits``);
+    otherwise the processor itself. Everything else is the wrapped processor's."""
+
+    def __init__(self, processor, worker: "KimiK3MLADSparkWorker"):
+        self._processor = processor
+        self._worker = worker
+
+    def __call__(
+        self, hidden_states, lm_head, attn_metadata, return_context_logits=False, *args, **kwargs
+    ):
+        if self._worker._k3_sharded_block_logits:
+            return KimiK3DFlashWorker._k3_head_shard(self._processor, lm_head, hidden_states)
+        return self._processor(
+            hidden_states, lm_head, attn_metadata, return_context_logits, *args, **kwargs
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._processor, name)
+
+
+class KimiK3MLADSparkWorker(DSparkWorker):
+    """The stock DSpark worker for the MLA drafter (whose compressed context cache it keeps), with the Kimi K3 decode
+    path's draft-side kernels (switch ``TRTLLM_K3LL_MLA_SPEC_WORKER``): on a decode step whose block the kernel takes,
+    the drafter's block logits stay vocabulary-sharded (no all-gather of the full logits) and the Markov chain runs as
+    one ``trtllm::k3_markov`` call, which also returns the greedy draft tokens and next_new_tokens; any other step is
+    the stock worker's. The checks and the chain are `KimiK3DSparkWorker`'s (``_keep_draft_logits_sharded``,
+    ``_k3_markov_chain``, ``_apply_dspark_markov_bias``); the target turns ``k3_decode`` on
+    (``_gate_spec_worker_kernels``)."""
+
+    k3_decode = False
+    _k3_sharded_block_logits = False
+    _k3_markov = None
+    _k3_markov_next = None
+    _k3_acceptance = None
+    _k3_spec_metadata = None
+
+    _keep_draft_logits_sharded = KimiK3DSparkWorker._keep_draft_logits_sharded
+    _k3_markov_chain = KimiK3DSparkWorker._k3_markov_chain
+    _apply_dspark_markov_bias = KimiK3DSparkWorker._apply_dspark_markov_bias
+
+    def wrap_draft_logits(self, draft_model) -> None:
+        """Let the drafter's logits processor return the vocabulary shard on the steps this worker shards. The target
+        calls it once the drafter holds its final processor (the target's `K3LogitsProcessor`)."""
+        processor = getattr(draft_model, "logits_processor", None)
+        if processor is not None and not isinstance(processor, _K3ShardableDraftLogits):
+            draft_model.logits_processor = _K3ShardableDraftLogits(processor, self)
+
+    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
+        """The stock acceptance; under ``k3_decode`` its outputs are kept for ``k3_markov``'s next_new_tokens."""
+        accepted_tokens, num_accepted_tokens = super().sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
+        )
+        if self.k3_decode:
+            self._k3_acceptance = (
+                accepted_tokens, num_accepted_tokens, attn_metadata.num_contexts, spec_metadata, attn_metadata
+            )  # fmt: skip
+            self._k3_spec_metadata = spec_metadata
+        return accepted_tokens, num_accepted_tokens
+
+    def _draft_slot_ids(self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int):
+        """The stock slots; also decides, right before the block logits are computed from them, whether this step's
+        block logits stay sharded for ``k3_markov``."""
+        spec_metadata = self._k3_spec_metadata
+        self._k3_sharded_block_logits = bool(
+            self.k3_decode
+            and spec_metadata is not None
+            and self._k3_acceptance is not None
+            and self._keep_draft_logits_sharded(draft_model, spec_metadata, num_gens)
+        )
+        return super()._draft_slot_ids(draft_model, num_gens, block_size, num_draft_tokens)
+
+    def sample_draft_tokens(self, logits, spec_metadata, batch_size, *, num_contexts=0, draft_step=None,
+                            mapping_lm_head_tp=None):  # fmt: skip
+        """Greedy block drafts straight from ``k3_markov`` when ``logits`` are the corrected logits it just returned;
+        anything else goes to the stock sampler."""
+        chain = self._k3_markov
+        if (
+            chain is not None
+            and chain[0] is logits
+            and mapping_lm_head_tp is None
+            and not spec_metadata.wants_advanced_draft_sampling
+        ):
+            self._k3_markov_next = (chain[1], chain[2], chain[3], chain[4])
+            return chain[1]
+        self._k3_markov_next = None
+        return super().sample_draft_tokens(
+            logits, spec_metadata, batch_size, num_contexts=num_contexts, draft_step=draft_step,
+            mapping_lm_head_tp=mapping_lm_head_tp,
+        )  # fmt: skip
+
+    def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size,
+                                 num_accepted_tokens):  # fmt: skip
+        """``k3_markov``'s next_new_tokens when the drafts are its tokens for the whole batch; otherwise the stock
+        assembly. Ends the step's state."""
+        chain = self._k3_markov_next
+        self._k3_markov_next = None
+        self._k3_acceptance = None
+        self._k3_markov = None
+        self._k3_spec_metadata = None
+        self._k3_sharded_block_logits = False
+        if (
+            chain is not None
+            and chain[0] is next_draft_tokens
+            and chain[2] is accepted_tokens
+            and chain[3] is num_accepted_tokens
+            and next_draft_tokens.shape[0] == batch_size
+        ):
+            return chain[1]
+        return super()._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size, num_accepted_tokens
+        )

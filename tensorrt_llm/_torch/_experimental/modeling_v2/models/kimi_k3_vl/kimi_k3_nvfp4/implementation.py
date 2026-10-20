@@ -3324,6 +3324,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         draft_model = getattr(self, "draft_model", None)
         if getattr(draft_model, "logits_processor", None) is stock_logits_processor:
             draft_model.logits_processor = self.logits_processor
+        if isinstance(getattr(self, "spec_worker", None), _spec_worker.KimiK3MLADSparkWorker):
+            self.spec_worker.wrap_draft_logits(draft_model)
         # The executor reads generation settings (eos_token_id, ...) off the model config the engine holds, which
         # must therefore be the text config, as the built-in wrapper leaves it.
         model_config._frozen = False
@@ -3344,7 +3346,17 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             and self.draft_config is not None
             and is_mla(self.draft_config.pretrained_config)
         ):
-            # The MLA drafter's compressed context cache requires its stock worker.
+            # The MLA drafter's compressed context cache requires the stock worker's context path; with
+            # TRTLLM_K3LL_MLA_SPEC_WORKER it runs as KimiK3MLADSparkWorker, the stock worker plus the draft-side
+            # kernels (sharded block logits, k3_markov).
+            if not _flags.TRTLLM_K3LL_MLA_SPEC_WORKER:
+                return
+            worker = _spec_worker.KimiK3MLADSparkWorker(
+                spec_config, model_config.mapping, self.use_separate_draft_kv_cache
+            )
+            worker.set_draft_model(self.draft_model)
+            self.epilogue[self.epilogue.index(self.spec_worker)] = worker
+            self.spec_worker = worker
             return
         if (
             standalone_dspark
