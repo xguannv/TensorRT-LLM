@@ -42,6 +42,11 @@ TRTLLM_K3LL_MLA_DCP = _flag(
     1,
     "FP8-cache MLA decode attention: 0 stock, 1 CuTe DSL kernel on this rank's heads, 2 split-read DCP over TP",
 )
+TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
+    "TRTLLM_K3LL_DRAFTER_FC_TP",
+    0,
+    "MLA DSpark drafter: fc split by input feature over TP, hidden_norm in the MNNVL all-reduce",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
