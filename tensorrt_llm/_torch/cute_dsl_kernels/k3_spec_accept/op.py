@@ -119,6 +119,35 @@ def workspace(mapping, push_copies: int = 1) -> dict:
     return ws
 
 
+_M32 = 0xFFFFFFFF
+
+
+def _fmix32_ref(h: torch.Tensor) -> torch.Tensor:
+    h = h & _M32
+    h = h ^ (h >> 16)
+    h = (h * 0x85EBCA6B) & _M32
+    h = h ^ (h >> 13)
+    h = (h * 0xC2B2AE35) & _M32
+    return h ^ (h >> 16)
+
+
+def gumbel_reference(
+    seed: torch.Tensor, offset: torch.Tensor, columns: torch.Tensor
+) -> torch.Tensor:
+    """The kernel's Gumbel noise in torch, fp32 ``[rows, columns]``: ``seed`` / ``offset`` int64 ``[rows]``,
+    ``columns`` the global column indices. For tests and reference samplers."""
+    seed, offset = seed.long().view(-1, 1), offset.long().view(-1, 1)
+    a = _fmix32_ref((seed & _M32) ^ 0x9E3779B9) ^ ((((seed >> 32) & _M32) * 0x27D4EB2F) & _M32)
+    b = _fmix32_ref(((offset & _M32) + 0x165667B1) & _M32) ^ (
+        (((offset >> 32) & _M32) * 0x85EBCA77) & _M32
+    )
+    key = _fmix32_ref(a ^ b)
+    bits = _fmix32_ref(key ^ ((columns.long().view(1, -1) * 0x9E3779B1) & _M32))
+    u = ((bits >> 8).float() + 0.5) * 2.0**-24
+    e = -torch.log2(u) * 0.6931471805599453
+    return -torch.log2(e) * 0.6931471805599453
+
+
 def force_mode(force: float, drafts: int):
     """(mode, base total, fraction) of ``_apply_force_accepted_tokens`` for the forced value ``force`` (0: off)."""
     kern = _kernel_module()
@@ -170,6 +199,9 @@ def k3_spec_accept(
     slots: int = 1,
     push_copies: int = 1,
     shard_offset: int = 0,
+    samp_temp: Optional[torch.Tensor] = None,
+    samp_seed: Optional[torch.Tensor] = None,
+    samp_off: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """Returns ``[accepted [B, K + 1] int32, num_accepted [B] int32, rewind [B] int32, bonus [B] int64,
     query_positions [B, block] int64, ctx_positions [B, K + 1] int64, noise [B, block, H] bf16]`` and updates
@@ -177,7 +209,13 @@ def k3_spec_accept(
     0]`` / ``divisor``), ``prev_acc`` (the KDA replay record), ``kv_lens[:B]`` (+ 1) and ``rng_counter`` (forced
     fractional acceptance). ``logits``: fp32 [B (K + 1), V]; or, with ``slots`` > 1 and a :func:`workspace`
     (``ws_*``, ``rank`` and ``push_copies`` from it), this rank's bf16 columns [B (K + 1), V / TP] starting at
-    ``shard_offset``. ``draft``: int32 [B, K]."""
+    ``shard_offset``. ``draft``: int32 [B, K].
+
+    ``samp_temp`` / ``samp_seed`` / ``samp_off`` (fp32 / int64 / int64 [B (K + 1)], one per logits row): each row's
+    target token is a temperature sample instead of the argmax, by the Gumbel-max trick on noise that depends on the
+    row's seed and offset and the global column only (:func:`gumbel_reference`), so a sharded call needs no extra
+    exchange. Exact for pure temperature sampling (no top-k, top-p or min-p); a row below ``GREEDY_TEMPERATURE`` stays
+    greedy."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
 
@@ -193,6 +231,8 @@ def k3_spec_accept(
         or draft.dtype != torch.int32
         or not kern.supports(vocab, batch, block, drafts, hidden, slots)
         or (sharded and (ws_uc is None or ws_mc is None or ws_flags is None))
+        or (samp_temp is None) != (samp_seed is None)
+        or (samp_temp is None) != (samp_off is None)
     ):
         raise ValueError(
             f"k3_spec_accept: unsupported call: logits {tuple(logits.shape)} {logits.dtype}, draft "
@@ -229,6 +269,23 @@ def k3_spec_accept(
             torch.empty(kern.MAX_ROWS * grid * 2, dtype=torch.int32, device=device),
             torch.zeros(1, dtype=torch.int32, device=device),
         )
+    sample = samp_temp is not None
+    if sample:
+        if (
+            samp_temp.dtype != torch.float32
+            or samp_seed.dtype != torch.int64
+            or samp_off.dtype != torch.int64
+            or min(samp_temp.numel(), samp_seed.numel(), samp_off.numel()) < rows
+        ):
+            raise ValueError(
+                "k3_spec_accept: sampling inputs are fp32 / int64 / int64 with one value per logits row"
+            )
+        samp_temp, samp_seed, samp_off = (
+            t.contiguous().view(-1)[:rows] for t in (samp_temp, samp_seed, samp_off)
+        )
+    else:
+        samp_temp = rng_pool[:1]
+        samp_seed = samp_off = rng_counter[:1]
     mode, total, frac = force_mode(force, drafts)
     accepted = torch.empty(batch, drafts + 1, dtype=torch.int32, device=device)
     num_acc = torch.empty(batch, dtype=torch.int32, device=device)
@@ -258,6 +315,9 @@ def k3_spec_accept(
         _arg(mask_row.contiguous().view(-1).view(torch.int32)),
         _arg(rng_pool.view(-1)),
         _arg(rng_counter.view(-1)),
+        _arg(samp_temp),
+        _arg(samp_seed),
+        _arg(samp_off),
         _arg(accepted.view(-1)),
         _arg(num_acc.view(-1)),
         _arg(rewind.view(-1)),
@@ -275,7 +335,18 @@ def k3_spec_accept(
     scalars = (int(pool_idx) * n_seq * 2 * max_blocks, 2 * max_blocks, int(divisor), int(max_ctx), int(total),
                float(frac), int(mode), int(rank), int(shard_offset))  # fmt: skip
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-    consts = (grid, vocab, batch, drafts, block, hidden, max_blocks, int(slots), int(push_copies))
+    consts = (
+        grid,
+        vocab,
+        batch,
+        drafts,
+        block,
+        hidden,
+        max_blocks,
+        int(slots),
+        int(push_copies),
+        sample,
+    )
     key = consts + (use_pdl,)
     fn = _compiled.get(key)
     if fn is None:
@@ -297,7 +368,8 @@ def k3_spec_accept(
 @k3_spec_accept.register_fake
 def _(logits, draft, block_off, pool_idx, divisor, block_counts, block_tables, prev_acc, state_idx, dummy, kv_lens,
       batch_to_slot, ctx_len, max_ctx, embed, mask_row, rng_pool, rng_counter, force, block, ws_uc=None, ws_mc=None,
-      ws_flags=None, rank=0, slots=1, push_copies=1, shard_offset=0):  # fmt: skip
+      ws_flags=None, rank=0, slots=1, push_copies=1, shard_offset=0, samp_temp=None, samp_seed=None,
+      samp_off=None):  # fmt: skip
     batch, drafts = draft.shape
     hidden = embed.shape[1]
     return [
