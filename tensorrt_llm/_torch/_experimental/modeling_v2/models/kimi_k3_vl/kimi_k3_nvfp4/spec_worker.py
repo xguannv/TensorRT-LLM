@@ -1343,26 +1343,32 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         )
 
 
-class _K3ShardableDraftLogits:
+class _K3ShardableDraftLogits(nn.Module):
     """The MLA drafter's logits processor, returning this rank's bf16 vocabulary shard (``_k3_head_shard``) instead of
     the gathered fp32 logits on the steps its worker keeps the block logits sharded (``_k3_sharded_block_logits``);
-    otherwise the processor itself. Everything else is the wrapped processor's."""
+    otherwise the processor itself. Every other attribute is the wrapped processor's. A module, as the drafter holds
+    its processor as a child module."""
 
-    def __init__(self, processor, worker: "KimiK3MLADSparkWorker"):
-        self._processor = processor
-        self._worker = worker
+    def __init__(self, processor: nn.Module, worker: "KimiK3MLADSparkWorker"):
+        super().__init__()
+        self.processor = processor
+        # Not a child module: the worker is not part of the drafter.
+        object.__setattr__(self, "_k3_worker", worker)
 
-    def __call__(
+    def forward(
         self, hidden_states, lm_head, attn_metadata, return_context_logits=False, *args, **kwargs
     ):
-        if self._worker._k3_sharded_block_logits:
-            return KimiK3DFlashWorker._k3_head_shard(self._processor, lm_head, hidden_states)
-        return self._processor(
+        if self._k3_worker._k3_sharded_block_logits:
+            return KimiK3DFlashWorker._k3_head_shard(self.processor, lm_head, hidden_states)
+        return self.processor(
             hidden_states, lm_head, attn_metadata, return_context_logits, *args, **kwargs
         )
 
     def __getattr__(self, name):
-        return getattr(self._processor, name)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._modules["processor"], name)
 
 
 class KimiK3MLADSparkWorker(DSparkWorker):
