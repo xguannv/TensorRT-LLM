@@ -446,7 +446,7 @@ def _draft_mlp(mlp, x: torch.Tensor, down_all_reduce_params, push_all_reduce=Non
             return mlp(x, final_all_reduce_params=down_all_reduce_params)
         h2 = mlp._apply_activation(h1)
     if push_all_reduce is not None:
-        pushed = draft_gemm_push(push_all_reduce, h2, down.weight)
+        pushed = draft_gemm_push(push_all_reduce, h2, down.weight, "down")
         if pushed is not None:
             return pushed
     out = draft_gemm(h2, down.weight, "down")
@@ -4203,7 +4203,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 # TLLM_DSPARK_AR_PUSH: o_proj pushes its rows into the all-reduce.
                 hidden_out = (
                     draft_gemm_push(
-                        fused_ar, attn_out.reshape(batch * block_size, -1), attn.o_proj.weight
+                        fused_ar,
+                        attn_out.reshape(batch * block_size, -1),
+                        attn.o_proj.weight,
+                        "o_proj",
                     )
                     if _plain(attn.o_proj)
                     else None

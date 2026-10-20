@@ -74,10 +74,15 @@ def _shape_out(m: int, n: int, device) -> torch.Tensor:
     return t
 
 
-def draft_gemm_push(all_reduce, x: torch.Tensor, weight: torch.Tensor) -> Optional[PushedPartial]:
+def draft_gemm_push(
+    all_reduce, x: torch.Tensor, weight: torch.Tensor, role: str = ""
+) -> Optional[PushedPartial]:
     """``x @ weight.T`` pushed into the two-shot MNNVL all-reduce that ``all_reduce`` runs next
     (a ``RESIDUAL_RMS_NORM`` fusion that ``draft_ar_finish_norm`` completes), or None (the caller
     keeps its GEMM and all-reduce) when the switch is off or the call does not fit.
+
+    ``role`` (``"o_proj"`` / ``"down"``) selects the GEMM's exact shared-memory launch under
+    ``TLLM_DSPARK_DRAFT_EXACT_SMEM`` (``dspark_draft_gemm``).
 
     The workspace view is built on the first call, which must not be under CUDA graph capture
     (the warm-up forwards make it); under capture without it this returns None.
@@ -95,6 +100,7 @@ def draft_gemm_push(all_reduce, x: torch.Tensor, weight: torch.Tensor) -> Option
         get_or_scale_allreduce_mnnvl_workspace,
     )
     from ..flashinfer_utils import get_env_enable_pdl
+    from .dspark_draft_gemm import _exact_smem_for
 
     n, k = weight.shape
     x2 = x.reshape(-1, k)
@@ -131,6 +137,7 @@ def draft_gemm_push(all_reduce, x: torch.Tensor, weight: torch.Tensor) -> Option
         _tactic(m, k),
         view,
         get_env_enable_pdl(),
+        exact_smem=bool(role) and _exact_smem_for(role),
     )
     return PushedPartial(view, cpp_one_shot, (*x.shape[:-1], n), x.dtype)
 

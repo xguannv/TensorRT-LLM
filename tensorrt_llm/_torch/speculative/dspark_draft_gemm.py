@@ -231,14 +231,23 @@ def draft_gemm_swiglu(x: torch.Tensor, mlp) -> Optional[torch.Tensor]:
         shape_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
         shapes[(m, str(x.device))] = shape_out
     out = torch.empty((m, n // 2), dtype=x.dtype, device=x.device)
-    stages, _ = _prefetch_for("gate_up")
+    stages, pf_tiles = _prefetch_for("gate_up")
     tactic = SplitKTactic(*pin[2])
     if stages is not None:
         stages = min(stages, _max_ab_stages_for(tactic, _SMEM_CAPACITY_BYTES))
         tactic = SplitKTactic(
             tactic.mma_m, tactic.mma_n, tactic.split_k, max(stages, tactic.ab_stages)
         )
-    run_splitk_dense_swiglu(x2d, permuted.t(), shape_out, out, tactic, get_env_enable_pdl())
+    run_splitk_dense_swiglu(
+        x2d,
+        permuted.t(),
+        shape_out,
+        out,
+        tactic,
+        get_env_enable_pdl(),
+        l2_prefetch_tiles=pf_tiles,
+        exact_smem=_exact_smem_for("gate_up"),
+    )
     return out.view(*x.shape[:-1], n // 2)
 
 

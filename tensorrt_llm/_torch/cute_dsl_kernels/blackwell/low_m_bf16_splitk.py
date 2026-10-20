@@ -1357,11 +1357,13 @@ def _get_compiled_ar_push_kernel(
     leading_dims: tuple[int, int, int],
     world: int,
     hidden: int,
+    exact_smem: bool = False,
 ):
     kernel = SplitKDenseGemmKernel(
         tactic=tactic,
         use_pdl=use_pdl,
         has_bias=False,
+        exact_smem=exact_smem,
         ar_push=True,
         ar_world=world,
         ar_hidden=hidden,
@@ -1380,8 +1382,17 @@ def _get_compiled_swiglu_kernel(
     tactic: SplitKTactic,
     use_pdl: bool,
     leading_dims: tuple[int, int, int],
+    l2_prefetch_tiles: int = 0,
+    exact_smem: bool = False,
 ):
-    kernel = SplitKDenseGemmKernel(tactic=tactic, use_pdl=use_pdl, has_bias=False, swiglu=True)
+    kernel = SplitKDenseGemmKernel(
+        tactic=tactic,
+        use_pdl=use_pdl,
+        has_bias=False,
+        swiglu=True,
+        l2_prefetch_tiles=l2_prefetch_tiles,
+        exact_smem=exact_smem,
+    )
     compile_tensors = _make_compile_repr_tensors(dtype, False, *leading_dims)
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
     addr = cutlass.Int64(0)
@@ -1489,12 +1500,14 @@ def run_splitk_dense_ar_push(
     tactic: SplitKTactic,
     workspace,
     pdl: bool,
+    exact_smem: bool = False,
 ) -> None:
     """``A[M,K] @ B[K,N]`` (as :func:`run_splitk_dense`, split-K 1) pushed into the Lamport slots
     of the next two-shot all-reduce on ``workspace`` (a ``k3_lamport_ar.LamportWorkspace``)
     instead of stored; ``k3_lamport_ar`` style finish kernels complete the all-reduce.
     ``shape_out``: a BF16/FP16 ``[M, N]`` row-major tensor that gives the output's shape and
-    layout (not written)."""
+    layout (not written). ``exact_smem`` as in :func:`run_splitk_dense` (lets the finish
+    kernel's CTAs become resident next to this grid's)."""
     if tactic.split_k != 1:
         raise ValueError(f"all-reduce push needs split-K 1, got {tactic}")
     m, n, _ = _validate_runtime_tensors(a, b, None, shape_out)
@@ -1506,7 +1519,7 @@ def run_splitk_dense_ar_push(
         )
     cute_tensors = _to_cute_swap(a, b, shape_out, None)
     compiled = _get_compiled_ar_push_kernel(
-        a.dtype, tactic, pdl, cute_tensors[4], workspace.world, n
+        a.dtype, tactic, pdl, cute_tensors[4], workspace.world, n, bool(exact_smem)
     )
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
     compiled(
@@ -1544,18 +1557,28 @@ def run_splitk_dense_swiglu(
     out: _torch.Tensor,
     tactic: SplitKTactic,
     pdl: bool,
+    l2_prefetch_tiles: int = 0,
+    exact_smem: bool = False,
 ) -> _torch.Tensor:
     """``silu_and_mul(a @ gate_up.T)`` into ``out [M, I]`` (contiguous BF16), bitwise the GEMM
     (:func:`run_splitk_dense`, same tactic) on the original weight followed by
     ``trtllm::silu_and_mul``. ``b_permuted``: :func:`swiglu_permuted_weight` of the gate_up
     weight, transposed to ``[K, 2 I]``; ``shape_out``: a ``[M, 2 I]`` row-major tensor that gives
-    the GEMM's output layout (not written). Tiles of 64 weight rows (``tactic.mma_m == 64``)."""
+    the GEMM's output layout (not written). Tiles of 64 weight rows (``tactic.mma_m == 64``).
+    ``l2_prefetch_tiles`` and ``exact_smem`` as in :func:`run_splitk_dense`."""
     m, n, _ = _validate_runtime_tensors(a, b_permuted, None, shape_out)
     validate_tactic(tactic, m, n, a.shape[1])
     if tactic.mma_m != 64 or out.shape != (m, n // 2) or not out.is_contiguous():
         raise ValueError(f"SwiGLU epilogue: tactic {tactic}, out {tuple(out.shape)}")
     cute_tensors = _to_cute_swap(a, b_permuted, shape_out, None)
-    compiled = _get_compiled_swiglu_kernel(a.dtype, tactic, pdl, cute_tensors[4])
+    compiled = _get_compiled_swiglu_kernel(
+        a.dtype,
+        tactic,
+        pdl,
+        cute_tensors[4],
+        int(l2_prefetch_tiles) if pdl else 0,
+        bool(exact_smem),
+    )
     stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
     compiled(
         *cute_tensors[:3],
