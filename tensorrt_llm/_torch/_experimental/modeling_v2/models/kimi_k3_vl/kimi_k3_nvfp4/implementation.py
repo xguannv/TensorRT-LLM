@@ -3484,7 +3484,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 "BF16 decode GEMVs and DSpark specializations; "
                 f"attention-residual MNNVL fusion={comm is not None}; "
                 f"TRTLLM_K3LL_MOE_LOWM={_flags.TRTLLM_K3LL_MOE_LOWM}: MoE decode path on k3_moe_front (NVFP4 "
-                f"latent), moe_sort + k3_moe_nvfp4_lowm and the row-parallel tail ({moe_layers} layers)"
+                f"latent), moe_sort + k3_moe_nvfp4_lowm and the row-parallel tail ({moe_layers} layers); "
+                f"TRTLLM_K3LL_MOE_FRONT_SORT={_flags.TRTLLM_K3LL_MOE_FRONT_SORT}: moe_sort in k3_moe_front"
             )
             return
 
@@ -3510,7 +3511,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         if not takes:
             return 0
         state = _decode_moe_lowm.K3DecodeMoeNvfp4.create(
-            mapping, takes[0].routed_experts.backend.w3_w1_weight.device, comm.mnnvl
+            mapping,
+            takes[0].routed_experts.backend.w3_w1_weight.device,
+            comm.mnnvl,
+            front_sort=bool(_flags.TRTLLM_K3LL_MOE_FRONT_SORT),
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)

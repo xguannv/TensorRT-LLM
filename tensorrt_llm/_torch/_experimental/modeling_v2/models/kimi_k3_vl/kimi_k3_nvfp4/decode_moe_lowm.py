@@ -11,7 +11,8 @@ runs:
   experts' input global scale (``fp4_quantize``'s recipe), and the shared experts' gate_up + SiTU;
 * ``moe_sort`` of the routing over this rank's experts (128-row tiles), then `trtllm::k3_moe_nvfp4_lowm`
   (`cute_dsl_kernels/k3_fused_moe/nvfp4_lowm_op.py`): FC1 + SiTU + FC2 + the routing-weighted combine of this rank's
-  experts in one persistent kernel, its output zeroed by the kernel;
+  experts in one persistent kernel, its output zeroed by the kernel; with ``front_sort``
+  (``TRTLLM_K3LL_MOE_FRONT_SORT``) the front writes the sorted routing itself (``sort_out``) and no ``moe_sort`` runs;
 * the routed experts' latent all-reduce (one-shot, as `decode_comm.use_decode_one_shot` sets);
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
   residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
@@ -42,6 +43,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front impo
     K3MoeHeadWorkspace,
     front_weight,
     k3_moe_front,
+    sort_layout,
+    sort_views,
     weight_supported,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
@@ -60,17 +63,25 @@ NUM_EXPERTS = 896
 @dataclass(eq=False)
 class K3DecodeMoeNvfp4:
     """What every MoE layer's NVFP4 decode path shares on one device: the TP group's ``K3MoeHeadWorkspace`` (the
-    front's all-gather) and the expert kernel's counter buffer (the layers run one at a time on one stream)."""
+    front's all-gather), the expert kernel's counter buffer and, with the front's sort, its counter word (the layers
+    run one at a time on one stream)."""
 
     head: K3MoeHeadWorkspace
     counters: torch.Tensor
     mnnvl: MnnvlWorkspace
+    sort_ctr: Optional[torch.Tensor] = None
 
     @classmethod
-    def create(cls, mapping, device, mnnvl: MnnvlWorkspace) -> "K3DecodeMoeNvfp4":
+    def create(
+        cls, mapping, device, mnnvl: MnnvlWorkspace, front_sort: bool = False
+    ) -> "K3DecodeMoeNvfp4":
         """Collective (the head workspace): every rank of the TP group calls it at the same point, eagerly, before
-        any CUDA-graph capture. ``mnnvl``: the TP group's MNNVL workspace, for a wide step's head all-gather."""
-        return cls(K3MoeHeadWorkspace.create(mapping), nvfp4_lowm_op.new_counters(device), mnnvl)
+        any CUDA-graph capture. ``mnnvl``: the TP group's MNNVL workspace, for a wide step's head all-gather.
+        ``front_sort``: the front sorts the routing over the local experts (``k3_moe_front``'s ``sort_out``)."""
+        sort_ctr = torch.zeros(1, dtype=torch.int32, device=device) if front_sort else None
+        return cls(
+            K3MoeHeadWorkspace.create(mapping), nvfp4_lowm_op.new_counters(device), mnnvl, sort_ctr
+        )
 
 
 def _experts(backend) -> tuple:
@@ -243,8 +254,7 @@ class K3DecodeMoeNvfp4Layer:
         32 tokens."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
-        ids, weights, x_q, x_sf, _ = self._front(moe, x)
-        self._routed(ids, weights, x_q, x_sf)
+        self._front_routed(moe, x)
         for rows in (9, WIDE_MAX_TOKENS):
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
@@ -257,7 +267,7 @@ class K3DecodeMoeNvfp4Layer:
             nvfp4_gsf=self.input_scale,
         )  # fmt: skip
 
-    def _front(self, moe: nn.Module, x: torch.Tensor):
+    def _front(self, moe: nn.Module, x: torch.Tensor, sort_out: Optional[torch.Tensor] = None):
         return k3_moe_front(
             x.contiguous(),
             self.front_weight,
@@ -267,13 +277,39 @@ class K3DecodeMoeNvfp4Layer:
             *moe._situ_betas,
             self.state.head,
             nvfp4_gsf=self.input_scale,
+            sort_out=sort_out,
+            sort_ctr=self.state.sort_ctr if sort_out is not None else None,
+            sort_offset=self.offset,
+            sort_local=self.num_local,
         )
+
+    @property
+    def num_local(self) -> int:
+        """This rank's routed experts."""
+        return self.experts[0].shape[0]
 
     def _routed(self, ids, weights, x_q, x_sf) -> torch.Tensor:
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
             self.state.counters, *self.situ,
         )  # fmt: skip
+
+    def _front_routed(self, moe: nn.Module, x: torch.Tensor):
+        """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows): ``(routed, shared_act)``.
+        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
+        if self.state.sort_ctr is None:
+            ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
+            return self._routed(ids, weights, x_q, x_sf), shared_act
+        rows = x.shape[0]
+        sort_out = torch.empty(
+            sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
+        )
+        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
+        routed = nvfp4_lowm_op.run_sorted(
+            x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
+            self.state.counters, *self.situ,
+        )  # fmt: skip
+        return routed, shared_act
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
@@ -296,8 +332,8 @@ class K3DecodeMoeNvfp4Layer:
         experts' all-reduce."""
         if hidden_states.shape[0] > MAX_TOKENS:
             return self._wide(moe, hidden_states, gemvs)
-        ids, weights, x_q, x_sf, shared_act = self._front(moe, hidden_states)
-        latent = moe.routed_experts.all_reduce(self._routed(ids, weights, x_q, x_sf))
+        routed, shared_act = self._front_routed(moe, hidden_states)
+        latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
                 latent.contiguous(),
