@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -1261,14 +1262,6 @@ class DFlashWorker(SpecWorkerBase):
                     # of the block logits, bit-identical to refining the
                     # gathered logits and taking the per-position argmax.
                     markov_w1, markov_w2 = self._vocab_parallel_markov_weights(draft_model)
-                    block_hidden = hidden_states_out[gen_gather_ids]
-                    local_block = (
-                        draft_gemm(block_hidden, draft_head.lm_head.weight, "lm_head")
-                        if getattr(draft_head.lm_head, "bias", None) is None
-                        else None
-                    )
-                    if local_block is None:
-                        local_block = draft_head.local_logits(block_hidden)
                     markov = draft_head.markov_tokens
                     if (
                         markov_v2_enabled()
@@ -1282,8 +1275,33 @@ class DFlashWorker(SpecWorkerBase):
                         markov = draft_head.markov_tokens_fused
                         if markov_chain_kernel_enabled() and num_gens <= 16 and K <= 16:
                             markov = draft_head.markov_tokens_chain
+                    no_bias = getattr(draft_head.lm_head, "bias", None) is None
+                    window = (
+                        self._block_logit_window(gen_gather_ids, num_gens, block_size, K)
+                        if markov == draft_head.markov_tokens_chain and no_bias
+                        else None
+                    )
+                    if window is not None:
+                        # TLLM_DSPARK_LMHEAD_ALL_ROWS: the LM head on every block row (each
+                        # row's logits do not depend on the others), and the chain reads the
+                        # K rows of each request through a strided view: no gather kernel, so
+                        # the head follows the drafter's last all-reduce directly.
+                        full = draft_gemm(hidden_states_out, draft_head.lm_head.weight, "lm_head")
+                        if full is None:
+                            full = draft_head.local_logits(hidden_states_out)
+                        local_block = full.view(num_gens, block_size, -1)[:, window : window + K]
+                    else:
+                        block_hidden = hidden_states_out[gen_gather_ids]
+                        local_block = (
+                            draft_gemm(block_hidden, draft_head.lm_head.weight, "lm_head")
+                            if no_bias
+                            else None
+                        )
+                        if local_block is None:
+                            local_block = draft_head.local_logits(block_hidden)
+                        local_block = local_block.view(num_gens, K, -1)
                     gen_draft_tokens = markov(
-                        local_block.view(num_gens, K, -1),
+                        local_block,
                         inputs["first_prev_tokens"],
                         markov_w1,
                         markov_w2,
@@ -1559,6 +1577,30 @@ class DFlashWorker(SpecWorkerBase):
         if spec_tail_fusion_enabled() and not torch.cuda.is_current_stream_capturing():
             self._block_gather_id_cache[key] = ids
         return ids
+
+    def _block_logit_window(
+        self, gather_ids: torch.Tensor, num_gens: int, block_size: int, num_draft_tokens: int
+    ) -> Optional[int]:
+        """With ``TLLM_DSPARK_LMHEAD_ALL_ROWS=1``: the first block slot of the K consecutive
+        slots per request that ``gather_ids`` selects, or None (other layouts, the switch off,
+        or the layout not yet known under capture). Checked once per shape, eagerly."""
+        if os.environ.get("TLLM_DSPARK_LMHEAD_ALL_ROWS", "0") != "1":
+            return None
+        key = (num_gens, block_size, num_draft_tokens)
+        cache = self.__dict__.setdefault("_block_logit_windows", {})
+        if key not in cache:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            ids = gather_ids.view(num_gens, num_draft_tokens).cpu()
+            first = int(ids[0, 0]) if num_gens > 0 else 0
+            expect = (
+                torch.arange(num_gens).view(-1, 1) * block_size
+                + first
+                + torch.arange(num_draft_tokens).view(1, -1)
+            )
+            ok = 0 <= first and first + num_draft_tokens <= block_size and torch.equal(ids, expect)
+            cache[key] = first if ok else None
+        return cache[key]
 
     def _prepare_next_new_tokens(
         self,

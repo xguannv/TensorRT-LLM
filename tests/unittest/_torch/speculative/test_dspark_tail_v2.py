@@ -485,32 +485,6 @@ def test_markov_kernels_compile_at_decode_shapes(tp):
             )  # fmt: skip
 
 
-@pytest.mark.parametrize("role,n,k", [("q_kv_a", 2112, 7168), ("gate_up", 1792, 7168),
-                                      ("lm_head", 10240, 7168)])  # fmt: skip
-@pytest.mark.parametrize("m", [7, 14, 28, 32])
-def test_draft_gemm_prefetch_matches_pins(monkeypatch, role, n, k, m):
-    """``TLLM_DSPARK_DRAFT_PREFETCH`` / ``TLLM_DSPARK_DRAFT_EXACT_SMEM`` (deeper ring, L2
-    prefetch of the following K tiles, exact shared memory) give the pinned kernels' values."""
-    from tensorrt_llm._torch.speculative.dspark_draft_gemm import (
-        DRAFT_GEMM_ENV_VAR,
-        DRAFT_PREFETCH_ENV_VAR,
-        draft_gemm,
-    )
-
-    gen = torch.Generator(device="cuda").manual_seed(7 * m + n)
-    x = (torch.randn(m, k, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
-    w = (torch.randn(n, k, device="cuda", generator=gen) / k**0.5).to(torch.bfloat16)
-    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
-    monkeypatch.setenv(DRAFT_PREFETCH_ENV_VAR, "0")
-    monkeypatch.setenv("TLLM_DSPARK_DRAFT_EXACT_SMEM", "0")
-    ref = draft_gemm(x, w, role)
-    monkeypatch.setenv(DRAFT_PREFETCH_ENV_VAR, "1")
-    monkeypatch.setenv("TLLM_DSPARK_DRAFT_EXACT_SMEM", "1")
-    out = draft_gemm(x, w, role)
-    torch.cuda.synchronize()
-    assert torch.equal(_bits(out), _bits(ref))
-
-
 @pytest.mark.parametrize("num_tokens", [7, 14, 32])
 def test_block_rope_pdl_matches(monkeypatch, num_tokens):
     """``TLLM_DSPARK_ROPE_PDL=1`` writes what the plain launch writes, also when it follows a
@@ -553,3 +527,49 @@ def test_block_rope_pdl_matches(monkeypatch, num_tokens):
     torch.cuda.synchronize()
     assert torch.equal(_bits(g_query), _bits(ref_query))
     assert torch.equal(_bits(g_pool), _bits(ref_pool))
+
+
+@pytest.mark.parametrize("role,n,k", [("q_kv_a", 2112, 7168), ("gate_up", 1792, 7168),
+                                      ("lm_head", 10240, 7168)])  # fmt: skip
+@pytest.mark.parametrize("m", [7, 14, 28, 32])
+def test_draft_gemm_prefetch_matches_pins(monkeypatch, role, n, k, m):
+    """``TLLM_DSPARK_DRAFT_PREFETCH`` / ``TLLM_DSPARK_DRAFT_EXACT_SMEM`` (deeper ring, L2
+    prefetch of the following K tiles, exact shared memory) give the pinned kernels' values."""
+    from tensorrt_llm._torch.speculative.dspark_draft_gemm import (
+        DRAFT_GEMM_ENV_VAR,
+        DRAFT_PREFETCH_ENV_VAR,
+        draft_gemm,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(7 * m + n)
+    x = (torch.randn(m, k, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", generator=gen) / k**0.5).to(torch.bfloat16)
+    monkeypatch.setenv(DRAFT_GEMM_ENV_VAR, "1")
+    monkeypatch.setenv(DRAFT_PREFETCH_ENV_VAR, "0")
+    monkeypatch.setenv("TLLM_DSPARK_DRAFT_EXACT_SMEM", "0")
+    ref = draft_gemm(x, w, role)
+    monkeypatch.setenv(DRAFT_PREFETCH_ENV_VAR, "1")
+    monkeypatch.setenv("TLLM_DSPARK_DRAFT_EXACT_SMEM", "1")
+    out = draft_gemm(x, w, role)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(out), _bits(ref))
+
+
+def test_block_logit_window(monkeypatch):
+    """``TLLM_DSPARK_LMHEAD_ALL_ROWS``: the per-request slot window of the draft gather ids."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker, dflash_draft_slot_ids
+
+    def window(ids, num_gens, block, k):
+        return DFlashWorker._block_logit_window(SimpleNamespace(), ids, num_gens, block, k)
+
+    monkeypatch.setenv("TLLM_DSPARK_LMHEAD_ALL_ROWS", "0")
+    assert window(dflash_draft_slot_ids(2, 7, 6, True), 2, 7, 6) is None
+    monkeypatch.setenv("TLLM_DSPARK_LMHEAD_ALL_ROWS", "1")
+    assert window(dflash_draft_slot_ids(2, 7, 6, True), 2, 7, 6) == 0
+    assert window(dflash_draft_slot_ids(4, 8, 7, True), 4, 8, 7) == 0
+    assert window(dflash_draft_slot_ids(2, 8, 6, False), 2, 8, 6) == 1
+    # Slots 1..K of a K-slot block overrun the block: not a window.
+    ids = dflash_draft_slot_ids(3, 6, 6, False).clamp(max=17)
+    assert window(ids, 3, 6, 6) is None
