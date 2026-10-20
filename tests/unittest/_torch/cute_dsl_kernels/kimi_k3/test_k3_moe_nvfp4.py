@@ -202,15 +202,23 @@ def _stock(proc, scales, x_fp4, x_sf, ids, w):
 
 
 @functools.lru_cache(maxsize=None)
-def _layer(wide: bool):
+def _state(wide: bool):
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op_nvfp4
 
     _ops()
-    proc, _, scales = _experts()
     dev = torch.device("cuda", torch.cuda.current_device())
-    state = (op_nvfp4.K3MoeNvfp4WideState if wide else op_nvfp4.K3MoeNvfp4State)(dev, I_TP, E_LOCAL)
-    return state.layer(proc["w31"], proc["w31s"], proc["w2"], proc["w2s"], scales["fc31_alpha"],
-                       scales["fc2_alpha"], scales["fc2_input_scale"])  # fmt: skip
+    return (op_nvfp4.K3MoeNvfp4WideState if wide else op_nvfp4.K3MoeNvfp4State)(dev, I_TP, E_LOCAL)
+
+
+def _new_layer(wide: bool):
+    proc, _, scales = _experts()
+    return _state(wide).layer(proc["w31"], proc["w31s"], proc["w2"], proc["w2s"], scales["fc31_alpha"],
+                              scales["fc2_alpha"], scales["fc2_input_scale"])  # fmt: skip
+
+
+@functools.lru_cache(maxsize=None)
+def _layer(wide: bool):
+    return _new_layer(wide)
 
 
 def _scratch_state(layer):
@@ -261,7 +269,7 @@ CASES = ["random", "4_local", "16_local", "none_local"]
 
 
 @pytest.mark.parametrize(
-    "wide,m", [(False, 1), (False, 3), (False, 8), (True, 8), (True, 16), (True, 32)]
+    "wide,m", [(False, 1), (False, 3), (False, 8), (True, 8), (True, 16), (True, 32), (True, 64)]
 )
 @pytest.mark.parametrize("case", CASES)
 def test_k3_moe_nvfp4(case, wide, m):
@@ -269,6 +277,8 @@ def test_k3_moe_nvfp4(case, wide, m):
     layer = _layer(wide)
     x, ids, w = _tokens(case, m)
     x_fp4, x_sf = _quant_x(x, scales)
+    # A layer claims its first tile before griddepcontrol.wait, so the same layer must not run twice with nothing in
+    # between (the model calls a layer once per step); test_k3_moe_nvfp4_mixed_sequence covers back-to-back layers.
     y = layer(x_fp4, x_sf, ids, w, OFFSET).clone()
     torch.cuda.synchronize()
     bad1 = _scratch_state(layer)
@@ -292,3 +302,60 @@ def test_k3_moe_nvfp4(case, wide, m):
     print(f"[k3_moe_nvfp4] case={case} wide={wide} m={m}: rel_rms kernel/ref {e_k:.4g} stock/ref {e_s:.4g} "
           f"kernel/stock {e_ks:.4g}")  # fmt: skip
     assert e_k <= max(2.0 * e_s, 1e-3) and e_k < 0.05, (e_k, e_s)
+
+
+def test_k3_moe_nvfp4_mixed_sequence():
+    """Two layers of one wide state at M 64, 16, 1, 40, 8, 64, 23 back to back on one stream, then the same calls
+    replayed from one CUDA graph with refilled inputs: each call the bits of the same call alone, the scratch
+    re-armed."""
+    _, _, scales = _experts()
+    layer_a, layer_b = _new_layer(True), _new_layer(True)
+    x, ids, w = _tokens("random", 64)
+    x_fp4, x_sf = _quant_x(x, scales)
+    calls = [
+        (layer_a, 64),
+        (layer_b, 16),
+        (layer_a, 1),
+        (layer_b, 40),
+        (layer_a, 8),
+        (layer_b, 64),
+        (layer_a, 23),
+    ]
+
+    def run(layer, m, xq=x_fp4, xs=x_sf, i=ids, wt=w):
+        return layer(xq[:m], xs[:m], i[:m], wt[:m], OFFSET)
+
+    alone = {}
+    for layer, m in calls:
+        key = (id(layer), m)
+        if key not in alone:
+            alone[key] = run(layer, m).clone()
+            torch.cuda.synchronize()
+    seq = [run(layer, m) for layer, m in calls]
+    torch.cuda.synchronize()
+    for (layer, m), y in zip(calls, seq):
+        assert torch.equal(y.view(torch.int16), alone[(id(layer), m)].view(torch.int16)), (
+            "eager",
+            m,
+        )
+    bad = _scratch_state(layer_a) + _scratch_state(layer_b)
+    assert not bad, bad
+
+    static = [torch.zeros_like(t) for t in (x_fp4, x_sf, ids, w)]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph, stream=stream):
+            outs = [run(layer, m, *static) for layer, m in calls]
+    for dst, src in zip(static, (x_fp4, x_sf, ids, w)):
+        dst.copy_(src)
+    graph.replay()
+    torch.cuda.synchronize()
+    for (layer, m), y in zip(calls, outs):
+        assert torch.equal(y.view(torch.int16), alone[(id(layer), m)].view(torch.int16)), (
+            "graph",
+            m,
+        )
+    bad = _scratch_state(layer_a) + _scratch_state(layer_b)
+    assert not bad, bad
