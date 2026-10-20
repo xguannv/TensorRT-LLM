@@ -24,7 +24,10 @@ With the front (switch ``TRTLLM_K3LL_NVFP4_MOE_FRONT``), a step of at most `MAX_
 ``moe/k3_moe_front`` with the NVFP4 latent (head GEMV, its all-gather over the TP group's ``K3MoeHeadWorkspace``, the
 routing, the latent on ``fc31_input_scale`` and the shared gate_up + SiTU in one kernel), ``trtllm::k3_moe_nvfp4``,
 the routed experts' latent all-reduce, and the tail as a ``PendingTail`` for the consumer's ``comm/k3_sandwich_tail``
-(else the replicated tail). Wider steps keep the path above.
+(else the replicated tail). Wider steps keep the path above. On a pushing step (``DecodeStep.latent_push``, the same
+rule as ``decode_moe.py``'s) the expert kernel is its push build into the state's ``K3LatentExchange`` and
+``comm/k3_latent_reduce`` sums the partials (the same bits as the all-reduce); see ``decode_moe.py`` for the exchange's
+call-order invariant.
 """
 
 from __future__ import annotations
@@ -35,6 +38,10 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_latent_reduce import (
+    K3LatentExchange,
+    k3_latent_reduce,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
@@ -50,6 +57,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front impo
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op_nvfp4
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm.logger import logger
 
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv, fold_latent_norm
@@ -162,18 +170,28 @@ class K3DecodeMoeNvfp4:
     wide: op_nvfp4.K3MoeNvfp4WideState
     mnnvl: MnnvlWorkspace
     head: Optional[K3MoeHeadWorkspace] = None
+    exchange: Optional[K3LatentExchange] = None
 
     @classmethod
     def create(
         cls, device, i_tp: int, num_local: int, mnnvl: MnnvlWorkspace, mapping=None
     ) -> "K3DecodeMoeNvfp4":
-        """With ``mapping``, also the front's head workspace: collective, every rank of the TP group calls it at the
-        same point, eagerly, before any CUDA-graph capture."""
+        """With ``mapping``, also the front's head workspace and the latent exchange (where it takes the TP size):
+        collective, every rank of the TP group calls it at the same point, eagerly, before any CUDA-graph capture."""
+        head = exchange = None
+        if mapping is not None:
+            head = K3MoeHeadWorkspace.create(mapping)
+            try:
+                exchange = K3LatentExchange.create(mapping)
+            # Raised before any collective step, on every rank alike: a TP size the exchange does not take.
+            except ValueError:
+                exchange = None
         return cls(
             op_nvfp4.K3MoeNvfp4State(device, i_tp, num_local),
             op_nvfp4.K3MoeNvfp4WideState(device, i_tp, num_local),
             mnnvl,
-            K3MoeHeadWorkspace.create(mapping) if mapping is not None else None,
+            head,
+            exchange,
         )
 
 
@@ -254,12 +272,20 @@ class K3DecodeMoeNvfp4Layer:
 
     def warm_up(self, moe: nn.Module) -> None:
         """One call of each ``k3_moe_nvfp4`` build on zero inputs (M = 1), so none compiles under a capture; with the
-        front, one front call too (collective: every rank makes the same call)."""
+        front, one front call too and, with the latent exchange, one push + reduce pair (collective: every rank makes
+        the same calls)."""
         device = self.head_weight.device
         if self.front_weight is not None:
             x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
             ids, weights, x_q, x_sf, _ = self._front(moe, x)
-            self.small(x_q, x_sf.reshape(-1), ids, weights, moe.routed_experts.backend.slot_start)
+            offset = moe.routed_experts.backend.slot_start
+            self.small(x_q, x_sf.reshape(-1), ids, weights, offset)
+            exchange = self.state.exchange
+            if exchange is not None:
+                # The same layer must not run twice back to back: the push build starts once the call above ended.
+                torch.cuda.synchronize(device)
+                self.small.push(x_q, x_sf.reshape(-1), ids, weights, offset, exchange)
+                k3_latent_reduce(1, exchange)
         latent = torch.zeros(1, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
         logits = torch.zeros(1, moe.num_experts, dtype=torch.float32, device=device)
         for build in (self.small, self.wide):
@@ -287,13 +313,18 @@ class K3DecodeMoeNvfp4Layer:
         )  # fmt: skip
 
     def _forward_front(
-        self, moe: nn.Module, x: torch.Tensor, gemvs, partial_tail: bool
+        self, moe: nn.Module, x: torch.Tensor, gemvs, partial_tail: bool, push: bool
     ) -> Union[torch.Tensor, PendingTail]:
         ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
-        routed = self.small(
-            x_q, x_sf.reshape(-1), ids, weights, moe.routed_experts.backend.slot_start
-        )
-        latent = moe.routed_experts.all_reduce(routed)
+        offset = moe.routed_experts.backend.slot_start
+        exchange = self.state.exchange
+        if push and exchange is not None:
+            logger.info_once("Kimi K3 NVFP4 decode MoE: latent push on", key="k3_nvfp4_moe_push")
+            self.small.push(x_q, x_sf.reshape(-1), ids, weights, offset, exchange)
+            latent = k3_latent_reduce(x.shape[0], exchange)
+        else:
+            routed = self.small(x_q, x_sf.reshape(-1), ids, weights, offset)
+            latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
                 latent.contiguous(),
@@ -320,7 +351,7 @@ class K3DecodeMoeNvfp4Layer:
         x = hidden_states.contiguous()
         rows = x.shape[0]
         if self.front_weight is not None and rows <= MAX_TOKENS:
-            return self._forward_front(moe, x, gemvs, partial_tail)
+            return self._forward_front(moe, x, gemvs, partial_tail, push)
         head = _gemv(gemvs, "moe_head", x, self.head_weight, out_fp32=True)
         routed_in, router_logits = mnnvl_allgather_split(head, self.width, self.state.mnnvl)
         shared = moe.shared_experts
