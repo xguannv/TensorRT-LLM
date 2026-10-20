@@ -19,9 +19,9 @@ Inputs: the latent quantized to NVFP4 with the layer's ``fc31_input_scale`` (``x
 uint8, ``x_sf`` UE4M3 ``[M, 224]`` in linear layout: ``trtllm::fp4_quantize`` with ``sfUseUE8M0=False`` and
 ``isSfSwizzledLayout=False``), the routing (``topk_ids`` int32, ``topk_weights`` bf16, ``[M, 16]``), and per layer
 the experts' ``fc31_alpha`` and ``fc2_alpha`` (fp32 ``[num_local]``) and ``fc2_input_scale`` (fp32, one element): the
-scalars the TRTLLM-Gen runner takes as ``output1_scale_gate_scalar``, ``output2_scale_scalar`` and (for SiTU, whose
-``fc31_scale_c`` is ``fc2_input_scale`` times the up alpha, equal to ``fc31_alpha`` on Kimi K3) the quantization scale
-of the intermediate. Per token ``t``::
+scalars the TRTLLM-Gen runner takes as ``output1_scale_gate_scalar``, ``output2_scale_scalar`` and
+``output1_scale_scalar`` (for SiTU that is ``fc2_input_scale`` alone, the quantization scale of the intermediate).
+Per token ``t``::
 
     y[t] = bf16( sum over t's local experts e of  w[t, e] * fc2_alpha[e] * (q4(fc2_input_scale *
                  SiTU(fc31_alpha[e] * x @ W_gate[e]^T, fc31_alpha[e] * x @ W_up[e]^T)) @ W_down[e]^T) )

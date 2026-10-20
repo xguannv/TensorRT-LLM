@@ -26,8 +26,8 @@ weights) and its MXFP8 activations, and computes this rank's routed partial [M, 
 - Prologue: every CTA derives the same (local expert, <= 8 token slots) groups in shared
   memory: a token bitmask per local expert, a ballot prefix over the experts present, and
   each token's slots in top-k order for the combine.
-- FC1 (gate_up, MXFP4 x MXFP8) + SiTU + MXFP8 requantization -> FC2 (down) through an
-  FC1->FC2 Lamport handoff (the intermediate slab holds FP8 -0.0 / E8M0 NaN sentinels until
+- FC1 (gate_up, NVFP4 x NVFP4) + SiTU + NVFP4 requantization -> FC2 (down) through an
+  FC1->FC2 Lamport handoff (the intermediate slab holds E2M1 -0 / UE4M3 NaN sentinels until
   FC1 writes it) or, with FC2_SYNC counter, per-group counts of the FC1 tiles done (hint:
   both, the count only deciding when to load), then a deterministic routing-weighted combine.
 - The last FC2 tile that reads a group's intermediate re-arms it, so the slab is armed
@@ -106,8 +106,6 @@ assert I_TP % 128 == 0, "I_TP must be a multiple of 128"
 NUM_LOCAL = int(_cfg("num_local", 256))  # this rank's experts
 SITU_GATE_CAP = float(_cfg("gate_cap", 4.0))
 SITU_LINEAR_CAP = float(_cfg("linear_cap", 25.0))
-SF_RECIPE = str(_cfg("sf_recipe", "ceil"))
-assert SF_RECIPE in ("ceil", "ocp")
 # Tile schedule. dynamic: every tile is claimed from one global cursor, in queue order.
 # static: tile = CTA + k * grid. hybrid: each CTA's first tile is its own index, the rest are
 # claimed. Only the dynamic queue makes progress with any number of resident CTAs.
@@ -332,8 +330,7 @@ SF_SENTINEL_I8 = -1  # 0xFF = E4M3 NaN (satfinite never produces it)
 C_ARM_WORD = -2004318072  # 0x88888888
 DYN_RING = 8
 
-# A k-tile is 64 elements: one UE4M3 scale atom (4 scales x 16) per tile, as the MXFP4 kernel's 128-element tile was
-# one UE8M0 atom (4 x 32); one mxf4nvf4 instruction (K 64) per tile.
+# A k-tile is 64 elements: one UE4M3 scale atom (4 scales x 16) and one mxf4nvf4 instruction (K 64).
 MMA_M, MMA_TILER_N, MMA_TILE_K, MMA_INST_K = 128, 8, 64, 64
 _mma_tiler_mnk = [MMA_M, MMA_TILER_N, MMA_TILE_K]
 _mma_inst_mnk = [MMA_M, MMA_TILER_N, MMA_INST_K]
@@ -937,26 +934,6 @@ def _block_e4m3(amax):
     byte = _cvt_e4m3_byte(amax * cutlass.Float32(1.0 / NVFP4_MAX))
     sf = _e4m3_byte_to_f32(byte)
     inv = cutlass.select_(sf > cutlass.Float32(0.0), cute.arch.rcp_approx(sf), cutlass.Float32(0.0))
-    return byte, inv
-
-
-def _block_e8m0(amax):
-    """E8M0 byte of an MX block and 2^(127-byte) as f32 (ceil: trtllm-gen's SiTU cubin
-    on sm_100; ocp: floor(log2(amax)) - 8, saturated by the caller)."""
-    bits = cutlass.Int32(amax.bitcast(cutlass.Int32))
-    expf = (bits >> cutlass.Int32(23)) & cutlass.Int32(0xFF)
-    if cutlass.const_expr(SF_RECIPE == "ocp"):
-        byte = expf - cutlass.Int32(8)
-        byte = cutlass.select_(byte < cutlass.Int32(0), cutlass.Int32(0), byte)
-    else:
-        sf = amax * cutlass.Float32(1.0 / 448.0)
-        sbits = cutlass.Int32(sf.bitcast(cutlass.Int32))
-        sexp = (sbits >> cutlass.Int32(23)) & cutlass.Int32(0xFF)
-        mant = sbits & cutlass.Int32(0x7FFFFF)
-        byte = sexp + cutlass.select_(mant != cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(0))
-        byte = cutlass.select_(byte > cutlass.Int32(0xFE), cutlass.Int32(0xFE), byte)
-        byte = cutlass.select_(amax > cutlass.Float32(0.0), byte, cutlass.Int32(0))
-    inv = cutlass.Int32((cutlass.Int32(254) - byte) << cutlass.Int32(23)).bitcast(cutlass.Float32)
     return byte, inv
 
 

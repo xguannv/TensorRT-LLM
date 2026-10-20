@@ -188,13 +188,17 @@ def _stock(proc, scales, x_fp4, x_sf, ids, w):
 
     alpha = torch.full((E_LOCAL,), GATE_CAP, dtype=torch.float32, device="cuda")
     beta = (LINEAR_CAP / scales["fc31_alpha"]).float().contiguous()
-    scale_c = (scales["fc2_input_scale"] * scales["fc31_alpha"]).float().contiguous()
+    # SiTU is not linear in the gate, so trtllm-gen's FC1 scaleC is the intermediate's quantization scale alone
+    # (fc31_alpha reaches the activation through the gate scalar); see quantization._fc31_scale_c_omits_dequant.
+    scale_c = scales["fc2_input_scale"].float().reshape(1).expand(E_LOCAL).contiguous()
+    w31s = proc["w31s"].view(torch.float8_e4m3fn)
+    w2s = proc["w2s"].view(torch.float8_e4m3fn)
     return _ops().fp4_block_scale_moe_runner(
-        None, None, x_fp4, x_sf.view(torch.float8_e4m3fn).reshape(-1), proc["w31"], proc["w31s"], None, alpha,
-        beta, None, proc["w2"], proc["w2s"], None, scale_c, scales["fc31_alpha"], scales["fc2_alpha"], NUM_EXPERTS,
+        None, None, x_fp4, x_sf.view(torch.float8_e4m3fn).reshape(-1), proc["w31"], w31s, None, alpha,
+        beta, None, proc["w2"], w2s, None, scale_c, scales["fc31_alpha"], scales["fc2_alpha"], NUM_EXPERTS,
         TOP_K, 1, 1, I_TP, OFFSET, E_LOCAL, 1.0, int(RoutingMethodType.DeepSeekV3), True,
         int(ActType_TrtllmGen.SiTu), topk_weights=w, topk_ids=ids,
-    )  # fmt: skip
+    )[0]  # fmt: skip
 
 
 @functools.lru_cache(maxsize=None)
