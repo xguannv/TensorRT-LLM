@@ -37,6 +37,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .force_replay import ForceReplay, replay_lookup
 from .vocab_parallel import _INT32_MAX as _VP_INT32_MAX
 
 SPEC_TAIL_FUSION_ENV_VAR = "TLLM_SPEC_TAIL_FUSION"
@@ -158,25 +159,34 @@ def _force_launch_args(force: Optional[tuple], dummy: torch.Tensor) -> tuple:
 
 
 @triton.jit
+def _state_key(key_pos_ptr, key_tok_ptr, key_stride, num_rows, BLOCK: tl.constexpr):
+    # ForceAcceptKey: each request's newest committed (global position, token).
+    rows = tl.arange(0, BLOCK)
+    mask = rows < num_rows
+    pos = tl.load(key_pos_ptr + rows.to(tl.int64) * key_stride, mask=mask, other=0).to(tl.int64)
+    tok = tl.load(key_tok_ptr + rows.to(tl.int64) * key_stride, mask=mask, other=0).to(tl.int64)
+    return pos, tok
+
+
+@triton.jit
 def _state_keyed_draw(
     pool_ptr,
     key_pos_ptr,
     key_tok_ptr,
     key_stride,
     num_rows,
+    pos,
+    tok,
     POS_STRIDE: tl.constexpr,
     TOK_STRIDE: tl.constexpr,
     POOL_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
 ):
-    # ForceAcceptKey: the pool entry of each request's newest committed
-    # (global position, token) pair and its tie count; rows at or past
-    # num_rows draw 1.0 (no extra token).
+    # The pool entry of each request's key (pos, tok from _state_key) and its
+    # tie count; rows at or past num_rows draw 1.0 (no extra token).
     rows = tl.arange(0, BLOCK)
     mask = rows < num_rows
-    pos = tl.load(key_pos_ptr + rows.to(tl.int64) * key_stride, mask=mask, other=0).to(tl.int64)
-    tok = tl.load(key_tok_ptr + rows.to(tl.int64) * key_stride, mask=mask, other=0).to(tl.int64)
     ties = tl.zeros([BLOCK], dtype=tl.int32)
     for c0 in tl.static_range(0, BLOCK, CHUNK):
         cols = c0 + tl.arange(0, CHUNK)
@@ -262,12 +272,15 @@ def _strict_accept_kernel(
         extra = (rand < frac).to(tl.int32)
         n = tl.minimum(base_total + extra, max_total)
     elif FORCE == 3:
+        kpos, ktok = _state_key(key_pos_ptr, key_tok_ptr, key_stride, num_gen, BLOCK_B)
         rand = _state_keyed_draw(
             pool_ptr,
             key_pos_ptr,
             key_tok_ptr,
             key_stride,
             num_gen,
+            kpos,
+            ktok,
             COUNTER_STRIDE,
             SLOT_STRIDE,
             POOL_MASK,
@@ -392,6 +405,14 @@ def _select_accept_kernel(
     key_pos_ptr,
     key_tok_ptr,
     key_stride,
+    ref_base_ptr,
+    ref_len_ptr,
+    ref_tok_ptr,
+    ref_stride,
+    num_refs,
+    replay_drafts_ptr,
+    replay_flags_ptr,
+    replay_stride,
     prev_ptr,
     state_idx_ptr,
     dummy_ptr,
@@ -409,6 +430,8 @@ def _select_accept_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_SLOTS: tl.constexpr,
     TIE_CHUNK: tl.constexpr,
+    REPLAY: tl.constexpr,
+    BLOCK_R: tl.constexpr,
 ):
     # Pairs are (value, index) float32 couples, slot s of a row at columns
     # [2 s, 2 s + 1]; a row is loaded as one contiguous run and split.
@@ -437,18 +460,46 @@ def _select_accept_kernel(
         tl.debug_barrier()
         tl.store(counter_ptr, counter)
     elif FORCE == 3:
+        kpos, ktok = _state_key(key_pos_ptr, key_tok_ptr, key_stride, num_gen, BLOCK_B)
         rand = _state_keyed_draw(
             pool_ptr,
             key_pos_ptr,
             key_tok_ptr,
             key_stride,
             num_gen,
+            kpos,
+            ktok,
             COUNTER_STRIDE,
             SLOT_STRIDE,
             POOL_MASK,
             BLOCK_B,
             TIE_CHUNK,
         )
+        if REPLAY:
+            # force_replay: a row that follows a recorded stream commits the
+            # stream's next tokens instead of the selected ones.
+            rk, rj, rlen = replay_lookup(
+                ref_base_ptr,
+                ref_len_ptr,
+                ref_tok_ptr,
+                ref_stride,
+                num_refs,
+                kpos,
+                key_tok_ptr,
+                key_stride,
+                num_gen,
+                DRAFT_LEN + 1,
+                BLOCK_B,
+                BLOCK_R,
+                BLOCK_K,
+            )
+            rk = tl.where(gen_mask, rk, -1)
+            rrow = tl.maximum(rk, 0).to(tl.int64)[:, None] * ref_stride
+            commit_idx = rj[:, None] + 1 + cols[None, :]
+            commit_mask = tile_mask & (rk[:, None] >= 0) & (commit_idx < rlen[:, None])
+            recorded = tl.load(
+                ref_tok_ptr + rrow + tl.where(commit_mask, commit_idx, 0), mask=commit_mask, other=0
+            )
 
     lanes = tl.arange(0, 2 * BLOCK_SLOTS)
     lane_ok = lanes < 2 * n_slots
@@ -483,6 +534,8 @@ def _select_accept_kernel(
     t_gen = _pair_argmax(
         tl.where(gok, gvals, float("-inf")), tl.where(gok, gidxf.to(tl.int32), _VP_INT32_MAX), 2
     )
+    if FORCE == 3 and REPLAY:
+        t_gen = tl.where(commit_mask, recorded, t_gen)
     tl.store(
         accepted_ptr + (num_ctx + rows[:, None]) * width + cols[None, :], t_gen, mask=tile_mask
     )
@@ -496,6 +549,18 @@ def _select_accept_kernel(
         n = tl.minimum(base_total + extra, max_total)
     n = n.to(tl.int32)
     tl.store(num_accepted_ptr + num_ctx + rows, n, mask=gen_mask)
+    if FORCE == 3 and REPLAY:
+        # The recorded continuation after the n committed tokens: the next
+        # step's drafts (the next-new-tokens kernel puts them in).
+        replay_mask = draft_mask & (rk[:, None] >= 0)
+        didx = rj[:, None] + n[:, None] + 1 + cols[None, :]
+        nxt = tl.load(
+            ref_tok_ptr + rrow + tl.where(replay_mask, didx, 0), mask=replay_mask, other=0
+        )
+        tl.store(
+            replay_drafts_ptr + rows[:, None] * replay_stride + cols[None, :], nxt, mask=replay_mask
+        )
+        tl.store(replay_flags_ptr + rows, (rk >= 0).to(tl.int32), mask=gen_mask)
 
     if KDA_REPLAY:
         # KDAHybridCacheManagerV2.update_mamba_states: record the accepted draft
@@ -518,6 +583,7 @@ def fused_select_accept(
     force: Optional[tuple] = None,
     kda_replay: Optional[tuple] = None,
     kv_lens: Optional[torch.Tensor] = None,
+    replay: Optional[ForceReplay] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Vocab-parallel target selection, strict acceptance and the per-step
     bookkeeping that follows it, in one launch.
@@ -531,6 +597,9 @@ def fused_select_accept(
             also apply ``KDAHybridCacheManagerV2.update_mamba_states``, or None.
         kv_lens: ``attn_metadata.kv_lens_cuda`` to also apply
             ``DFlashWorker._prepare_kv_for_draft_forward`` (its gen rows += 1), or None.
+        replay: with a state-keyed ``force``, the :class:`ForceReplay` tables: matching
+            generation rows commit their recorded tokens, and their next drafts and replay
+            flags go to ``replay.drafts`` / ``replay.flags`` (see ``force_replay``).
     Returns:
         ``accepted_tokens [batch_size, K + 1]`` int32, ``num_accepted_tokens
         [batch_size]`` int32 (the values of the reduce + :func:`fused_strict_accept`
@@ -566,6 +635,14 @@ def fused_select_accept(
     prev, state_idx, dummy = kda_replay if kda_replay is not None else (accepted,) * 3
     if kda_replay is not None:
         assert prev.dim() == 1 and state_idx.stride(-1) == 1 and dummy.stride(-1) == 1
+    if replay is not None:
+        assert force_mode == 3, "force_replay needs the state-keyed forced acceptance"
+        assert num_gens <= replay.flags.shape[0] and draft_len <= replay.drafts.shape[1]
+        ref_operands = (replay.ref_base, replay.ref_len, replay.ref_tok, replay.ref_tok.stride(0))
+        replay_operands = (replay.num_refs, replay.drafts, replay.flags, replay.drafts.stride(0))
+    else:
+        ref_operands = (accepted, accepted, accepted, 0)
+        replay_operands = (0, accepted, accepted, 0)
     # Interleaved (value, index) slots, as the MNNVL / single-rank exchange lays them out.
     assert stride_slot == 2 and pair_buf.stride(-1) == 1
     block_b = triton.next_power_of_2(max(num_gens, 1))
@@ -587,6 +664,8 @@ def fused_select_accept(
         key_pos,
         key_tok,
         key_stride,
+        *ref_operands,
+        *replay_operands,
         prev,
         state_idx,
         dummy,
@@ -604,6 +683,8 @@ def fused_select_accept(
         BLOCK_K=triton.next_power_of_2(draft_len + 1),
         BLOCK_SLOTS=triton.next_power_of_2(n_slots),
         TIE_CHUNK=min(block_b, _TIE_CHUNK),
+        REPLAY=replay is not None,
+        BLOCK_R=triton.next_power_of_2(replay.num_refs) if replay is not None else 1,
         num_warps=4,
     )
     return accepted, num_accepted, rewind
@@ -1108,6 +1189,37 @@ def scatter_rows_to_pool(
 
 
 @triton.jit
+def _replayed_drafts(
+    d,
+    rows,
+    cols,
+    dmask,
+    draft_ptr,
+    stride_draft,
+    replay_drafts_ptr,
+    replay_flags_ptr,
+    replay_stride,
+    replay_row0,
+    replay_rows,
+):
+    # force_replay: the rows the accept kernel replayed take its recorded
+    # drafts, also written back into the drafter's output.
+    g = rows - replay_row0
+    gmask = (g >= 0) & (g < replay_rows) & (rows < replay_row0 + replay_rows)
+    gsafe = tl.where(gmask, g, 0)
+    flag = tl.load(replay_flags_ptr + gsafe, mask=gmask, other=0) != 0
+    rmask = dmask & gmask[:, None] & flag[:, None]
+    rd = tl.load(
+        replay_drafts_ptr + gsafe[:, None].to(tl.int64) * replay_stride + cols[None, :],
+        mask=rmask,
+        other=0,
+    )
+    d = tl.where(rmask, rd.to(d.dtype), d)
+    tl.store(draft_ptr + rows[:, None].to(tl.int64) * stride_draft + cols[None, :], d, mask=rmask)
+    return d
+
+
+@triton.jit
 def _next_new_tokens_kernel(
     accepted_ptr,
     stride_accepted,
@@ -1116,9 +1228,15 @@ def _next_new_tokens_kernel(
     stride_draft,
     out_ptr,
     batch_size,
+    replay_drafts_ptr,
+    replay_flags_ptr,
+    replay_stride,
+    replay_row0,
+    replay_rows,
     DRAFT_LEN: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    REPLAY: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
     cols = tl.arange(0, BLOCK_K)
@@ -1129,6 +1247,20 @@ def _next_new_tokens_kernel(
     tl.store(out_ptr + rows * width, last.to(out_ptr.dtype.element_ty), mask=rmask)
     dmask = rmask[:, None] & (cols[None, :] < DRAFT_LEN)
     d = tl.load(draft_ptr + rows[:, None].to(tl.int64) * stride_draft + cols[None, :], mask=dmask)
+    if REPLAY:
+        d = _replayed_drafts(
+            d,
+            rows,
+            cols,
+            dmask,
+            draft_ptr,
+            stride_draft,
+            replay_drafts_ptr,
+            replay_flags_ptr,
+            replay_stride,
+            replay_row0,
+            replay_rows,
+        )
     tl.store(
         out_ptr + rows[:, None] * width + 1 + cols[None, :],
         d.to(out_ptr.dtype.element_ty),
@@ -1149,9 +1281,15 @@ def _next_new_tokens_rewind_kernel(
     rewind_ptr,
     num_ctx,
     num_gen,
+    replay_drafts_ptr,
+    replay_flags_ptr,
+    replay_stride,
+    replay_row0,
+    replay_rows,
     DRAFT_LEN: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    REPLAY: tl.constexpr,
 ):
     # _next_new_tokens_kernel for a batch in one program, plus
     # DFlashWorker._apply_kv_rewind_after_draft on the gen rows.
@@ -1164,6 +1302,20 @@ def _next_new_tokens_rewind_kernel(
     tl.store(out_ptr + rows * width, last.to(out_ptr.dtype.element_ty), mask=rmask)
     dmask = rmask[:, None] & (cols[None, :] < DRAFT_LEN)
     d = tl.load(draft_ptr + rows[:, None].to(tl.int64) * stride_draft + cols[None, :], mask=dmask)
+    if REPLAY:
+        d = _replayed_drafts(
+            d,
+            rows,
+            cols,
+            dmask,
+            draft_ptr,
+            stride_draft,
+            replay_drafts_ptr,
+            replay_flags_ptr,
+            replay_stride,
+            replay_row0,
+            replay_rows,
+        )
     tl.store(
         out_ptr + rows[:, None] * width + 1 + cols[None, :],
         d.to(out_ptr.dtype.element_ty),
@@ -1175,6 +1327,15 @@ def _next_new_tokens_rewind_kernel(
     tl.store(kv_lens_ptr + num_ctx + rows, tl.maximum(kv - amount, 0), mask=gmask)
 
 
+def _replay_draft_operands(replay: Optional[tuple], dummy: torch.Tensor) -> tuple:
+    """``(drafts, flags, row stride, first row, rows)`` of a ``(ForceReplay, first batch row,
+    generation rows)`` triple, or unused placeholders."""
+    if replay is None:
+        return dummy, dummy, 0, 0, 0
+    tables, row0, rows = replay
+    return tables.drafts, tables.flags, tables.drafts.stride(0), row0, rows
+
+
 def fused_next_new_tokens_rewind(
     accepted_tokens: torch.Tensor,
     next_draft_tokens: torch.Tensor,
@@ -1182,6 +1343,7 @@ def fused_next_new_tokens_rewind(
     kv_lens: torch.Tensor,
     rewind: torch.Tensor,
     num_contexts: int,
+    replay: Optional[tuple] = None,
 ) -> torch.Tensor:
     """:func:`fused_next_new_tokens` and ``kv_lens[num_contexts:][:num_gens] =
     (kv_lens - rewind).clamp(min=0)`` in one launch (one program)."""
@@ -1205,9 +1367,11 @@ def fused_next_new_tokens_rewind(
         rewind,
         num_contexts,
         num_gens,
+        *_replay_draft_operands(replay, out),
         DRAFT_LEN=draft_len,
         BLOCK_B=triton.next_power_of_2(max(batch_size, num_gens, 1)),
         BLOCK_K=triton.next_power_of_2(max(draft_len, 1)),
+        REPLAY=replay is not None,
         num_warps=4,
     )
     return out
@@ -1217,9 +1381,14 @@ def fused_next_new_tokens(
     accepted_tokens: torch.Tensor,
     next_draft_tokens: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
+    replay: Optional[tuple] = None,
 ) -> torch.Tensor:
     """``cat([accepted[b, nacc[b] - 1], next_draft[b]])`` per request, in one launch
-    (``SpecWorkerBase._prepare_next_new_tokens`` with identity batch indices)."""
+    (``SpecWorkerBase._prepare_next_new_tokens`` with identity batch indices).
+
+    ``replay``: ``(ForceReplay, first generation row, generation rows)`` of a replaying
+    :func:`fused_select_accept` launch of this step; the rows it flagged take (and write back
+    into ``next_draft_tokens``) its recorded drafts."""
     batch_size, draft_len = next_draft_tokens.shape
     dtype = torch.promote_types(accepted_tokens.dtype, next_draft_tokens.dtype)
     out = torch.empty((batch_size, draft_len + 1), dtype=dtype, device=accepted_tokens.device)
@@ -1235,9 +1404,11 @@ def fused_next_new_tokens(
         next_draft_tokens.stride(0),
         out,
         batch_size,
+        *_replay_draft_operands(replay, out),
         DRAFT_LEN=draft_len,
         BLOCK_B=block_b,
         BLOCK_K=triton.next_power_of_2(max(draft_len, 1)),
+        REPLAY=replay is not None,
         num_warps=4,
     )
     return out

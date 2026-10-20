@@ -34,6 +34,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
 from .dspark_draft_gemm import draft_gemm
+from .force_replay import apply_replay_drafts
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_tail_kernels import (
     BLOCK_TABLE_CHUNK,
@@ -1380,6 +1381,7 @@ class DFlashWorker(SpecWorkerBase):
                 next_draft_tokens,
                 num_accepted_tokens[:batch_size],
                 *fused_rewind,
+                replay=self._take_force_replay(),
             )
         else:
             self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
@@ -1518,16 +1520,22 @@ class DFlashWorker(SpecWorkerBase):
         pairs = logits.select_pairs(spec_metadata)
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
         kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
+        force = self._force_accept_kernel_args(
+            draft_tokens.shape[-1], spec_metadata, logits.device, num_gens
+        )
+        replay = self._force_replay_tables(force, num_gens)
         accepted, num_accepted, rewind = fused_select_accept(
             pairs,
             draft_tokens,
             num_contexts,
             batch_size,
-            self._force_accept_kernel_args(
-                draft_tokens.shape[-1], spec_metadata, logits.device, num_gens
-            ),
+            force,
             kda_replay=kda_replay,
             kv_lens=kv_lens,
+            replay=replay,
+        )
+        self._force_replay_pending = (
+            (replay, num_contexts, num_gens) if replay is not None else None
         )
         if kv_lens is not None:
             self._kv_rewind_amount = rewind
@@ -1611,6 +1619,7 @@ class DFlashWorker(SpecWorkerBase):
         num_accepted_tokens,
     ):
         # batch_indices_cuda is the identity here (DFlashSpecMetadata.prepare).
+        replay = self._take_force_replay()
         if (
             spec_tail_fusion_enabled()
             and next_draft_tokens.shape[0] == batch_size
@@ -1618,8 +1627,13 @@ class DFlashWorker(SpecWorkerBase):
             and accepted_tokens.stride(-1) == 1
         ):
             return fused_next_new_tokens(
-                accepted_tokens[:batch_size], next_draft_tokens, num_accepted_tokens[:batch_size]
+                accepted_tokens[:batch_size],
+                next_draft_tokens,
+                num_accepted_tokens[:batch_size],
+                replay=replay,
             )
+        if replay is not None:
+            apply_replay_drafts(next_draft_tokens, *replay)
         return super()._prepare_next_new_tokens(
             accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size, num_accepted_tokens
         )

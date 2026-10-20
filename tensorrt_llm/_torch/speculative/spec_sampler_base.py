@@ -48,6 +48,7 @@ from ..pyexecutor.sampler import (
     int_tensor,
 )
 from ..pyexecutor.scheduler import ScheduledRequests
+from .force_replay import force_replay_path, load_reference_streams, start_reference
 
 #: A directory: every rank appends one JSON line per finished request to ``rank<rank>.jsonl`` in it
 #: with fingerprints of the request's generated tokens (see :class:`_StreamLog`).
@@ -65,13 +66,17 @@ class _StreamLog:
     prompt length (global under helix), its number of steps, its generated token ids and per-step
     accepted counts and digests of both to ``<dir>/rank<rank>.jsonl``. Two runs, or the ranks of
     one run, generated the same streams when the digests match; the lists locate the first
-    difference. No output has to be saved by the client.
+    difference. No output has to be saved by the client. With ``TLLM_SPEC_DECODE_FORCE_REPLAY`` a
+    record also names the recorded stream the request started replaying (``replay_ref``, -1 for
+    none) and how many of its leading tokens equal that stream (``replay_match``).
     """
 
     def __init__(self, directory: str):
         os.makedirs(directory, exist_ok=True)
         self._path = os.path.join(directory, f"rank{mpi_rank()}.jsonl")
         self._accepted: dict[int, list[int]] = {}
+        replay_path = force_replay_path()
+        self._replay_streams = load_reference_streams(replay_path) if replay_path else None
 
     def on_step(self, request: LlmRequest, num_new_tokens: int) -> None:
         accepted = self._accepted.setdefault(request.py_request_id, [])
@@ -91,6 +96,18 @@ class _StreamLog:
             "token_ids": tokens,
             "accepted": accepted,
         }
+        if self._replay_streams is not None:
+            ref = start_reference(
+                self._replay_streams, record["prompt_len"], tokens[0] if tokens else -1
+            )
+            match = 0
+            if ref >= 0:
+                for got, want in zip(tokens, self._replay_streams[ref][1]):
+                    if got != want:
+                        break
+                    match += 1
+            record["replay_ref"] = ref
+            record["replay_match"] = match
         with open(self._path, "a") as f:
             f.write(json.dumps(record) + "\n")
 

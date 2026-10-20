@@ -49,8 +49,11 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
-from .spec_tail_kernels import (FORCE_ACCEPT_TIE_STRIDE, ForceAcceptKey,
-                                fused_strict_accept, spec_tail_fusion_enabled)
+from .force_replay import (FORCE_REPLAY_ENV_VAR, ForceReplay, force_replay_path,
+                           load_reference_streams)
+from .spec_tail_kernels import (FORCE_ACCEPT_TIE_STRIDE, TAIL_V2_MAX_GENS,
+                                ForceAcceptKey, fused_strict_accept,
+                                spec_tail_fusion_enabled)
 from .vocab_parallel import VocabShardedLogits
 
 
@@ -1432,6 +1435,26 @@ class SpecWorkerBase(nn.Module, ABC):
         # num_ctx_tokens) while it runs, for _force_accept_state_key.
         self.force_accept_key: str = get_force_accept_key()
         self._force_accept_inputs: Optional[tuple] = None
+        # TLLM_SPEC_DECODE_FORCE_REPLAY (force_replay.py): recorded streams to
+        # commit instead of the target's tokens; the device tables are built
+        # with the RNG pool. _force_replay_pending carries a replaying accept
+        # launch's tables to the step's next-new-tokens launch.
+        self._force_replay_streams = None
+        self._force_replay: Optional[ForceReplay] = None
+        self._force_replay_pending: Optional[tuple] = None
+        replay_path = force_replay_path()
+        if replay_path is not None and self.force_num_accepted_tokens != 0.0:
+            if self.force_accept_key != FORCE_ACCEPT_KEY_STATE:
+                logger.warning(
+                    f"{FORCE_REPLAY_ENV_VAR} needs "
+                    f"{FORCE_ACCEPT_KEY_ENV_VAR}={FORCE_ACCEPT_KEY_STATE}; "
+                    "not replaying.")
+            else:
+                self._force_replay_streams = load_reference_streams(replay_path)
+                logger.info(
+                    f"{FORCE_REPLAY_ENV_VAR}: replaying "
+                    f"{len(self._force_replay_streams)} recorded streams "
+                    f"from {replay_path}")
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -1475,6 +1498,7 @@ class SpecWorkerBase(nn.Module, ABC):
             return self._forward_impl(*args, **kwargs)
         finally:
             self._force_accept_inputs = None
+            self._force_replay_pending = None
             self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
 
     @abstractmethod
@@ -1648,6 +1672,10 @@ class SpecWorkerBase(nn.Module, ABC):
         self._force_accept_rng_counter = torch.zeros(1,
                                                      dtype=torch.int64,
                                                      device=device)
+        if self._force_replay_streams:
+            self._force_replay = ForceReplay.build(self._force_replay_streams,
+                                                   device, TAIL_V2_MAX_GENS,
+                                                   self.max_draft_len)
 
     def _force_accept_state_key(self, num_gens: int) -> ForceAcceptKey:
         """The :class:`ForceAcceptKey` of this step's generation requests.
@@ -1762,6 +1790,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         if frac_part > 0.0 and base_total < max_total:
             self._ensure_force_accept_rng_state(num_accepted_tokens.device)
+            self._warn_force_replay_unsupported()
 
             # ``num_gens`` is fixed at CUDA-graph capture time (graphs are
             # captured for a specific batch shape with ``num_contexts``
@@ -1840,6 +1869,33 @@ class SpecWorkerBase(nn.Module, ABC):
                     _FORCE_ACCEPT_RNG_SLOT_STRIDE)
         return (base_total, )
 
+    def _force_replay_tables(self, force: Optional[tuple],
+                             num_gens: int) -> Optional[ForceReplay]:
+        """The :class:`ForceReplay` tables a state-keyed ``force`` argument
+        replays with (``TLLM_SPEC_DECODE_FORCE_REPLAY``), or None."""
+        if (self._force_replay is None or force is None or len(force) != 7
+                or not isinstance(force[4], ForceAcceptKey)
+                or num_gens > self._force_replay.flags.shape[0]):
+            return None
+        return self._force_replay
+
+    def _warn_force_replay_unsupported(self) -> None:
+        """Once: a forced-acceptance step outside the replaying accept path."""
+        if self._force_replay_streams and not getattr(
+                self, "_force_replay_warned", False):
+            self._force_replay_warned = True
+            logger.warning(
+                f"{FORCE_REPLAY_ENV_VAR}: only the DSpark / DFlash fused "
+                "select-accept path (TLLM_DSPARK_TAIL_V2, at most "
+                f"{TAIL_V2_MAX_GENS} generation requests) replays; this "
+                "worker or batch forces the accepted counts only.")
+
+    def _take_force_replay(self) -> Optional[tuple]:
+        """``(ForceReplay, first generation row, generation rows)`` of this
+        step's replaying accept launch, for its next-new-tokens launch (once)."""
+        pending, self._force_replay_pending = self._force_replay_pending, None
+        return pending
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -1878,6 +1934,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if spec_tail_fusion_enabled():
             target_tokens = self._sample_tokens_for_batch(
                 logits, spec_metadata, num_contexts, batch_size)
+            self._warn_force_replay_unsupported()
             return fused_strict_accept(
                 target_tokens, draft_tokens, num_contexts, batch_size,
                 self._force_accept_kernel_args(runtime_draft_len, spec_metadata,
