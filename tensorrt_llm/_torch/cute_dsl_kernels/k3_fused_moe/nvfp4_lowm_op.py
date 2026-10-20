@@ -253,6 +253,37 @@ def run(
         local_num_experts=w1.shape[0],
         tile_tokens_dim=TILE,
     )
+    return run_sorted(
+        x_fp4, x_sf, (tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+                      num_non_exiting_tiles, scales),
+        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas,
+    )  # fmt: skip
+
+
+def run_sorted(
+    x_fp4: torch.Tensor,
+    x_sf: torch.Tensor,
+    sorted_routing: tuple,
+    weights,
+    fc2_input_scale: torch.Tensor,
+    counters: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+    out: Optional[torch.Tensor] = None,
+    num_ctas: int = 0,
+) -> torch.Tensor:
+    """`k3_moe_nvfp4_lowm` on a routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
+    tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales)``, ``moe_sort``'s
+    outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``)."""
+    w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        scales,
+    ) = sorted_routing
+    num_tokens, top_k = scales.shape
     if out is None:
         out = torch.empty(num_tokens, w2.shape[1], dtype=torch.bfloat16, device=x_fp4.device)
     torch.ops.trtllm.k3_moe_nvfp4_lowm(

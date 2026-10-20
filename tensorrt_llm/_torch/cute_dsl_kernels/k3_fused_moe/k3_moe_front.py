@@ -46,6 +46,8 @@
 # buffer index (the 2 M role CTAs and every GEMV CTA) signs in on flags[3] right after the read; thread 0 of token 0's
 # quantization CTA waits for all of them and flips the index for the next call, long before the data it polls arrives,
 # so no count sits on the role CTAs' output path. With `publish`, per-token ready words as route_quant_ag's.
+# With `sort`, each route CTA also writes its token's weights in fp32 and counts itself in on sort_ctr; the last one
+# runs moe_sort of every token's routing over this rank's local experts (`_sort_local`) and rearms the counter.
 #
 # Warps of a GEMV CTA: 0 weight TMA (+ early dependent trigger), 1 grid-dependency wait, head workspace flags,
 # activation TMA, 2 TMEM allocation + MMA, 3 idle, 4-7 epilogue, 8-13 exit after setup. Role CTAs: all 14 warps
@@ -341,6 +343,117 @@ def _tree_sum(vals):
     return vals[0]
 
 
+@dsl_user_op
+def _atom_add_acq_rel(addr_i64, val, *, loc=None, ip=None):
+    """atom.acq_rel.gpu.global.add.u32; returns the old value."""
+    from cutlass._mlir.dialects import llvm as _llvm
+    from cutlass._mlir.extras import types as _T
+
+    return cutlass.Int32(
+        _llvm.inline_asm(
+            _T.i32(), [addr_i64.ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;", "=r,l,r", has_side_effects=True,
+            is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _popc(v, *, loc=None, ip=None):
+    """popc.b32."""
+    from cutlass._mlir.dialects import llvm as _llvm
+    from cutlass._mlir.extras import types as _T
+
+    return cutlass.Int32(
+        _llvm.inline_asm(
+            _T.i32(), [cutlass.Int32(v).ir_value(loc=loc, ip=ip)], "popc.b32 $0, $1;", "=r,r",
+            has_side_effects=False, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+# The sort's output words (`sort_layout`): with T = min(16 M, local experts) tiles at most, [0, T) the tiles' local
+# experts, [T, 2 T) their mn limits, [2 T] the tile count, from SORT_W (2 T + 1 rounded up to 4) the fp32 routing
+# weights [M, 16], then [T * 128] permuted rows. moe_sort's outputs for 128-row tiles, as k3_moe_nvfp4_lowm reads them.
+SORT_WORDS = NUM_EXPERTS // 32  # bitmap words of the experts
+# _sort_local's scratch in s_key (int32 [896]): the ids, the tokens' expert bitmaps, their union, its prefix counts.
+SORT_IDS = 0
+SORT_BITS = SORT_IDS + M_MAX * TOP_K
+SORT_UNION = SORT_BITS + M_MAX * SORT_WORDS
+SORT_PREFIX = SORT_UNION + SORT_WORDS
+assert SORT_PREFIX + SORT_WORDS <= NUM_EXPERTS
+
+
+def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
+    """``(tiles, weight offset, row offset, words)`` of the sort's output for ``num_tokens`` tokens over
+    ``num_local`` local experts (`SORT_WORDS`' layout)."""
+    tiles = min(num_tokens * TOP_K, num_local)
+    w0 = (2 * tiles + 1 + 3) // 4 * 4
+    p0 = w0 + num_tokens * TOP_K
+    return tiles, w0, p0, p0 + tiles * CTA_M
+
+
+@cute.jit
+def _sort_local(s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx):
+    """moe_sort of the M tokens' top-16 over the local experts [offset, offset + num_local), 128-row tiles, by all
+    THREADS threads of one CTA, into ``sort_words`` (`sort_layout`): one tile per local expert some token selected, in
+    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order."""
+    n = num_tokens * cutlass.Int32(TOP_K)
+    tiles = cutlass.min(n, num_local)
+    w0 = (cutlass.Int32(2) * tiles + cutlass.Int32(4)) // cutlass.Int32(4) * cutlass.Int32(4)
+    p0 = w0 + n
+    if tx < n:
+        s_key.store(topk_ids.load(idx=tx, is_volatile=True), idx=SORT_IDS + tx)
+    cute.arch.barrier()
+    if tx < num_tokens * cutlass.Int32(SORT_WORDS):
+        t = tx // cutlass.Int32(SORT_WORDS)
+        w = tx - t * cutlass.Int32(SORT_WORDS)
+        word = cutlass.Int32(0)
+        for k in cutlass.range_constexpr(TOP_K):
+            lx = s_key.load(idx=SORT_IDS + t * cutlass.Int32(TOP_K) + k) - offset
+            hit = (lx >= cutlass.Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
+            word = word | cutlass.select_(hit, cutlass.Int32(1) << (lx & 31), cutlass.Int32(0))
+        s_key.store(word, idx=SORT_BITS + tx)
+    cute.arch.barrier()
+    if tx < cutlass.Int32(SORT_WORDS):
+        u = cutlass.Int32(0)
+        for t in cutlass.range_constexpr(M_MAX):
+            if cutlass.Int32(t) < num_tokens:
+                u = u | s_key.load(idx=SORT_BITS + t * SORT_WORDS + tx)
+        s_key.store(u, idx=SORT_UNION + tx)
+    cute.arch.barrier()
+    if tx < cutlass.Int32(SORT_WORDS + 1):
+        before = cutlass.Int32(0)
+        for w in cutlass.range_constexpr(SORT_WORDS):
+            if cutlass.Int32(w) < tx:
+                before = before + _popc(s_key.load(idx=SORT_UNION + w))
+        if tx < cutlass.Int32(SORT_WORDS):
+            s_key.store(before, idx=SORT_PREFIX + tx)
+        else:
+            sort_words.store(before, idx=cutlass.Int32(2) * tiles)
+    cute.arch.barrier()
+    if tx < n:
+        t = tx // cutlass.Int32(TOP_K)
+        lx = s_key.load(idx=SORT_IDS + tx) - offset
+        if (lx >= cutlass.Int32(0)) & (lx < num_local):
+            w = lx >> 5
+            b = lx & 31
+            below = s_key.load(idx=SORT_UNION + w) & ((cutlass.Int32(1) << b) - cutlass.Int32(1))
+            tile = s_key.load(idx=SORT_PREFIX + w) + _popc(below)
+            row = cutlass.Int32(0)
+            count = cutlass.Int32(0)
+            for q in cutlass.range_constexpr(M_MAX):
+                if cutlass.Int32(q) < num_tokens:
+                    bit = (s_key.load(idx=SORT_BITS + q * SORT_WORDS + w) >> b) & cutlass.Int32(1)
+                    count = count + bit
+                    if cutlass.Int32(q) < t:
+                        row = row + bit
+            sort_words.store(tx, idx=p0 + tile * cutlass.Int32(CTA_M) + row)
+            if row == cutlass.Int32(0):
+                sort_words.store(lx, idx=tile)
+                sort_words.store(tile * cutlass.Int32(CTA_M) + count, idx=tiles + tile)
+
+
 @cute.jit
 def _top16_cta(
     s_key, s_sigmoid, s_top2, s_cnt, s_cand, s_csig, s_win, s_wsig, tx, routed_scaling_factor
@@ -497,9 +610,13 @@ def k3_moe_front_kernel(
     scales: cutlass.Array,  # uint8 [M * 112]
     shared_bits: cutlass.Array,  # int16 view of bf16 [M, shared_cols]
     gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
+    sort_words: cutlass.Array,  # int32 [sort_layout words] (sort)
+    sort_ctr: cutlass.Array,  # int32 [1], zero between calls: the route CTAs done (sort)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
+    sort_offset: cutlass.Int32,
+    sort_local: cutlass.Int32,
     world: cutlass.Constexpr[int],
     shared_cols: cutlass.Constexpr[int],
     n_head_tiles: cutlass.Constexpr[int],
@@ -512,6 +629,7 @@ def k3_moe_front_kernel(
     publish: cutlass.Constexpr[bool],
     head_half: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
+    sort: cutlass.Constexpr[bool],
 ):
     WL = HIDDEN_SIZE // world
     WE = NUM_EXPERTS // world
@@ -1141,6 +1259,25 @@ def k3_moe_front_kernel(
                                 out = tok * cutlass.Int32(TOP_K) + tx
                                 topk_ids.store(expert, idx=out)
                                 topk_weight_bits.store(weight_bits, idx=out)
+                                if cutlass.const_expr(sort):
+                                    # The weight in fp32 (the bf16 bits widened), after the sort's tile words.
+                                    w_off = (
+                                        (
+                                            cutlass.Int32(2)
+                                            * cutlass.min(
+                                                num_tokens * cutlass.Int32(TOP_K), sort_local
+                                            )
+                                            + cutlass.Int32(4)
+                                        )
+                                        // cutlass.Int32(4)
+                                        * cutlass.Int32(4)
+                                    )
+                                    sort_words.store(
+                                        (cutlass.Int32(weight_bits) & cutlass.Int32(0xFFFF)) << 16,
+                                        idx=w_off + out,
+                                    )
+                                    # The last route CTA reads these ids.
+                                    cute.arch.fence_acq_rel_gpu()
                                 if cutlass.const_expr(publish):
                                     cute.arch.fence_acq_rel_gpu()
                             if cutlass.const_expr(publish):
@@ -1151,6 +1288,19 @@ def k3_moe_front_kernel(
                                     )
                     # Pass 0's readers of the keys and of the selection's scratch are done before pass 1 rewrites them.
                     cute.arch.barrier()
+                if cutlass.const_expr(sort):
+                    # The last route CTA to finish sorts every token's routing over the local experts.
+                    if tx == 0:
+                        s_cnt.store(
+                            _atom_add_acq_rel(sort_ctr.data_ptr(0).toint(), cutlass.Int32(1)), idx=0
+                        )
+                    cute.arch.barrier()
+                    if s_cnt.load(idx=0) == num_tokens - cutlass.Int32(1):
+                        _sort_local(
+                            s_key, topk_ids, sort_words, num_tokens, sort_offset, sort_local, tx
+                        )
+                        if tx == 0:
+                            sort_ctr.store(cutlass.Int32(0), idx=0)
             else:
                 addr = (
                     tok_base
@@ -1283,9 +1433,13 @@ def k3_moe_front(
     scales: cute.Tensor,
     shared_bits: cute.Tensor,
     gsf: cute.Tensor,
+    sort_words: cute.Tensor,
+    sort_ctr: cute.Tensor,
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
+    sort_offset: cutlass.Int32,
+    sort_local: cutlass.Int32,
     world: cutlass.Constexpr[int],
     shared_cols: cutlass.Constexpr[int],
     n_head_tiles: cutlass.Constexpr[int],
@@ -1299,6 +1453,7 @@ def k3_moe_front(
     use_pdl: cutlass.Constexpr[bool],
     head_half: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
+    sort: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1307,8 +1462,9 @@ def k3_moe_front(
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
-        quant_words, scales, shared_bits, gsf, num_tokens, tp_rank, routed_scaling_factor, world, shared_cols,
-        n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half, nvfp4,
+        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
+        sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
+        linear_cap, publish, head_half, nvfp4, sort,
     ).launch(
         grid=((gemv_clusters + ROLE_CLUSTERS) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),
