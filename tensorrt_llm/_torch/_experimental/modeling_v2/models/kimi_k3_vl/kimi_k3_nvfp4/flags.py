@@ -44,6 +44,13 @@ TRTLLM_K3LL_MLA_DCP = _flag(
 )
 
 
+TRTLLM_K3LL_FP8W_LOWM = _flag(
+    "TRTLLM_K3LL_FP8W_LOWM",
+    0,
+    "FP8 attention projections on k3_fp8w_lowm_gemm at decode size (needs use_cute_dsl_blockscaling_mm off)",
+)
+
+
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""
     return dict(_FLAGS)

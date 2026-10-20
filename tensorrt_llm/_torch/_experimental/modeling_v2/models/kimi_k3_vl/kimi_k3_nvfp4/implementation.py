@@ -64,6 +64,7 @@ from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
+from . import fp8w_lowm as _fp8w_lowm
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .decode_mla_dcp import MlaSplitRead
@@ -3430,6 +3431,12 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             moe_layers = 0
             if comm is not None and _flags.TRTLLM_K3LL_MOE_LOWM:
                 moe_layers = self._build_decode_moe_lowm(comm)
+            if _flags.TRTLLM_K3LL_FP8W_LOWM:
+                routed = _fp8w_lowm.install(m for layer in layers for m in layer.modules())
+                logger.info(
+                    f"Kimi K3 NVFP4: TRTLLM_K3LL_FP8W_LOWM=1: {routed} FP8 projections on k3_fp8w_lowm_gemm at decode "
+                    "size (0 when use_cute_dsl_blockscaling_mm keeps the raw-scale CuTe DSL GEMM)"
+                )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
             self._decode_state_ready = True
