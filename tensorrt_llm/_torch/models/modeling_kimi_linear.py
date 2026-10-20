@@ -2427,6 +2427,8 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
+    # TRTLLM_K3_ROUTER_EXACT: whether k3_router_exact serves this layer's router (set in __init__).
+    _router_exact: bool = False
     # TRTLLM_K3_LATENT_AR_OWN_WS: the routed latent all-reduce's own MNNVL workspace (``None``: it
     # shares the one of the shared expert's all-reduce).
     _latent_ar_ws: Optional[Dict[str, Any]] = None
