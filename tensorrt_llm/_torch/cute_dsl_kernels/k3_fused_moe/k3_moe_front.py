@@ -17,7 +17,8 @@
 #
 #   head   = x @ [latent-down slice; router slice]^T       (fp32; this rank's 3584/W latent columns, 896/W logits)
 #   gather = every rank's head slice, through the multicast mapping of the head workspace (Lamport buffers)
-#   route  = top-16 of sigmoid(logits) + bias per token; MXFP8 latent + UE8M0 scales per token
+#   route  = top-16 of sigmoid(logits) + bias per token; MXFP8 latent + UE8M0 scales per token, or with `nvfp4` the
+#            NVFP4 latent (E2M1 codes + E4M3 scales per 16 columns, fp4_quantize's recipe on the global scale gsf)
 #   shared = SiTU(bf16(x @ gate^T)) * SiTU_lin(bf16(x @ up^T))  (the shared experts' gate_up and activation)
 #
 # One weight W [N, K = 7168] bf16 in 128-row tiles: the head rows (latent slice, then router slice, then zero rows
@@ -70,6 +71,7 @@ TOP_K = 16
 HIDDEN_SIZE = 3584  # the routed latent
 MODEL_HIDDEN = 7168  # K
 SF_VEC_SIZE = 32
+NVFP4_SF_VEC = 16  # the NVFP4 latent's scale group (nvfp4)
 M_MAX = 8
 EMPTY_WORD = _ag.EMPTY_WORD
 
@@ -494,6 +496,7 @@ def k3_moe_front_kernel(
     quant_words: cutlass.Array,  # int32 view of e4m3 [M, 3584]
     scales: cutlass.Array,  # uint8 [M * 112]
     shared_bits: cutlass.Array,  # int16 view of bf16 [M, shared_cols]
+    gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -508,6 +511,7 @@ def k3_moe_front_kernel(
     linear_cap: cutlass.Constexpr[float],
     publish: cutlass.Constexpr[bool],
     head_half: cutlass.Constexpr[bool],
+    nvfp4: cutlass.Constexpr[bool],
 ):
     WL = HIDDEN_SIZE // world
     WE = NUM_EXPERTS // world
@@ -1155,18 +1159,35 @@ def k3_moe_front_kernel(
                 )
                 w0, w1, w2, w3 = _ag._poll4(buf_uc, addr)
                 buf_uc.store((empty, empty, empty, empty), idx=addr, alignment=16)
-                q_lo, q_hi, sf_byte = _rq.mxfp8_quant_vec8([w0, w1, w2, w3])
-                quant_words.store(
-                    (q_lo, q_hi),
-                    idx=tok * cutlass.Int32(HIDDEN_SIZE // 4) + tx * cutlass.Int32(2),
-                    alignment=8,
-                )
-                if tx % cutlass.Int32(SF_VEC_SIZE // 8) == cutlass.Int32(0):
-                    scales.store(
-                        cutlass.Uint8(sf_byte),
-                        idx=tok * cutlass.Int32(HIDDEN_SIZE // SF_VEC_SIZE)
-                        + tx // cutlass.Int32(SF_VEC_SIZE // 8),
+                if cutlass.const_expr(nvfp4):
+                    # NVFP4 (fp4_quantize's recipe): 8 E2M1 codes per thread, one E4M3 scale per thread pair.
+                    g = gsf.load(idx=0)
+                    codes, sf_byte = _rq.nvfp4_quant_vec8(
+                        [w0, w1, w2, w3],
+                        g,
+                        _rq.rcp_approx_ftz(g),
+                        _rq.rcp_approx_ftz(cutlass.Float32(6.0)),
                     )
+                    quant_words.store(codes, idx=tok * cutlass.Int32(HIDDEN_SIZE // 8) + tx)
+                    if tx % cutlass.Int32(NVFP4_SF_VEC // 8) == cutlass.Int32(0):
+                        scales.store(
+                            cutlass.Uint8(sf_byte),
+                            idx=tok * cutlass.Int32(HIDDEN_SIZE // NVFP4_SF_VEC)
+                            + tx // cutlass.Int32(NVFP4_SF_VEC // 8),
+                        )
+                else:
+                    q_lo, q_hi, sf_byte = _rq.mxfp8_quant_vec8([w0, w1, w2, w3])
+                    quant_words.store(
+                        (q_lo, q_hi),
+                        idx=tok * cutlass.Int32(HIDDEN_SIZE // 4) + tx * cutlass.Int32(2),
+                        alignment=8,
+                    )
+                    if tx % cutlass.Int32(SF_VEC_SIZE // 8) == cutlass.Int32(0):
+                        scales.store(
+                            cutlass.Uint8(sf_byte),
+                            idx=tok * cutlass.Int32(HIDDEN_SIZE // SF_VEC_SIZE)
+                            + tx // cutlass.Int32(SF_VEC_SIZE // 8),
+                        )
                 if cutlass.const_expr(publish):
                     prims.fence_proxy("async_global")
                     cute.arch.fence_acq_rel_gpu()
@@ -1261,6 +1282,7 @@ def k3_moe_front(
     quant_words: cute.Tensor,
     scales: cute.Tensor,
     shared_bits: cute.Tensor,
+    gsf: cute.Tensor,
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -1276,6 +1298,7 @@ def k3_moe_front(
     publish: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
     head_half: cutlass.Constexpr[bool],
+    nvfp4: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1284,8 +1307,8 @@ def k3_moe_front(
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
-        quant_words, scales, shared_bits, num_tokens, tp_rank, routed_scaling_factor, world, shared_cols,
-        n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half,
+        quant_words, scales, shared_bits, gsf, num_tokens, tp_rank, routed_scaling_factor, world, shared_cols,
+        n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half, nvfp4,
     ).launch(
         grid=((gemv_clusters + ROLE_CLUSTERS) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),

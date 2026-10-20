@@ -35,6 +35,11 @@ TRTLLM_K3LL_CENSUS = _flag(
 TRTLLM_K3LL_NVFP4_DECODE_MOE = _flag(
     "TRTLLM_K3LL_NVFP4_DECODE_MOE", 0, "decode MoE on k3_moe_nvfp4 with the sharded head and tail"
 )
+TRTLLM_K3LL_MOE_LOWM = _flag(
+    "TRTLLM_K3LL_MOE_LOWM",
+    0,
+    "MoE decode path: NVFP4-latent front + k3_moe_lowm_dyn on CuteDSL NVFP4 buffers (decode_moe_lowm.py)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

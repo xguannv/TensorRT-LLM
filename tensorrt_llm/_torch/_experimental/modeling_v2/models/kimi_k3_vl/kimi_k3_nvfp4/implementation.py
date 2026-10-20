@@ -62,6 +62,7 @@ from . import census as _census
 from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
+from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
 from . import spec_worker as _spec_worker
 from . import weights as _weights
@@ -3407,14 +3408,19 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     layer.sandwich_oproj = False
                 _decode_comm.use_decode_one_shot(self)
             moe_layers = 0
-            if comm is not None and _flags.TRTLLM_K3LL_NVFP4_DECODE_MOE:
+            moe_path = "stock"
+            if comm is not None and _flags.TRTLLM_K3LL_MOE_LOWM:
+                moe_layers = self._build_decode_moe_lowm(comm)
+                moe_path = "lowm"
+            elif comm is not None and _flags.TRTLLM_K3LL_NVFP4_DECODE_MOE:
                 moe_layers = self._build_nvfp4_decode_moe(comm)
+                moe_path = "k3_moe_nvfp4"
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
             self._decode_state_ready = True
             logger.info(
                 f"Kimi K3 NVFP4 SM{self.target_spec.sm[0]}{self.target_spec.sm[1]}: "
-                f"decode MoE on k3_moe_nvfp4 on {moe_layers} layers; "
+                f"decode MoE path {moe_path} on {moe_layers} layers; "
                 "fused FP8 attention and NVFP4 experts; "
                 "BF16 decode GEMVs and DSpark specializations; "
                 f"attention-residual MNNVL fusion={comm is not None}"
@@ -3452,6 +3458,41 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             )
             moe.decode_gemvs = self.model.decode_gemvs
         takes[0].decode_moe.warm_up(takes[0])
+        return len(takes)
+
+    def _build_decode_moe_lowm(self, comm: _decode_comm.K3DecodeComm) -> int:
+        """The NVFP4 MoE decode path (``decode_moe_lowm.py``) on every MoE layer it takes: the shared state
+        (collective: the front's head workspace), each layer's decode weights with its latent norm folded into the
+        latent up projection, the decode GEMVs' state; then one call of every kernel of the path (collective: the
+        front and the sandwich tail). Every rank builds it here. Returns the number of MoE layers it takes."""
+        mapping = self.model_config.mapping
+        moes = [layer.block_sparse_moe for layer in self.model.layers if layer.is_moe]
+        gaps = {
+            id(moe): _decode_moe_lowm.layout_gaps(
+                moe, mapping.tp_size, self.model.num_attn_res_snapshots
+            )
+            for moe in moes
+        }
+        takes = [moe for moe in moes if not gaps[id(moe)]]
+        for reason in sorted({gap for moe in moes for gap in gaps[id(moe)]}):
+            logger.info_once(
+                f"Kimi K3 lowm MoE decode path off on some layers: {reason}",
+                key=f"k3_decode_moe_lowm_off_{reason}",
+            )
+        if not takes:
+            return 0
+        state = _decode_moe_lowm.K3DecodeMoeNvfp4.create(
+            mapping, takes[0].routed_experts.backend.w3_w1_weight.device, comm.mnnvl
+        )
+        for moe in takes:
+            _decode_moe.fold_latent_norm(moe)
+            moe.decode_moe = _decode_moe_lowm.K3DecodeMoeNvfp4Layer.create(
+                moe, state, mapping.tp_rank, mapping.tp_size
+            )
+            moe.decode_gemvs = self.model.decode_gemvs
+        first = takes[0].decode_moe
+        first.warm_up(takes[0])
+        comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         return len(takes)
 
     def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:

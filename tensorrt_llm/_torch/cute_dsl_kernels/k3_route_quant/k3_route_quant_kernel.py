@@ -21,7 +21,9 @@ Computes exactly what ``trtllm::kimi_k3_noaux_tc_mxfp8_quant`` computes, bit for
   ``bf16(sigmoid * scale / (sum of the 16 sigmoids + 1e-20))`` evaluated in fp64, the sum being the
   xor-butterfly warp reduction ``cg::reduce`` performs over lanes 0..15;
 * quantization: MXFP8 (e4m3) with one UE8M0 scale per 32 elements in the linear [M, 112] layout,
-  the recipe of ``cvt_warp_fp16_to_mxfp8`` (scale rounded up from ``amax / 448``).
+  the recipe of ``cvt_warp_fp16_to_mxfp8`` (scale rounded up from ``amax / 448``); or, with ``nvfp4``,
+  NVFP4 (E2M1) with one E4M3 scale per 16 elements in the linear [M, 224] layout on a global scale,
+  the recipe of ``cvt_warp_fp16_to_fp4`` (``fp4_quantize``).
 
 The selection differs from the C++ kernel's: one warp holds 28 keys per lane, each lane sorts its
 six largest, and the 16 winners come out of 16 rounds of ``redux.sync.max`` over the lanes' heads
@@ -45,6 +47,7 @@ NUM_EXPERTS = 896
 TOP_K = 16
 HIDDEN_SIZE = 3584
 SF_VEC_SIZE = 32
+NVFP4_SF_VEC = 16  # the NVFP4 latent's scale group (nvfp4)
 THREADS = HIDDEN_SIZE // 8  # one 8-element vector per thread in a quantization CTA
 KEYS_PER_LANE = NUM_EXPERTS // 32
 FULL_MASK = 0xFFFFFFFF
@@ -118,6 +121,81 @@ def cvt_rn_satfinite_e4m3x2(hi, lo, *, loc=None, ip=None):
         )
     )
     return cutlass.Int32(pair) & cutlass.Int32(0xFFFF)
+
+
+@dsl_user_op
+def nvfp4_scale(amax, gsf, rgsf, rcp6, *, loc=None, ip=None):
+    """The NVFP4 scale of one 16-element group with ``cvt_warp_fp16_to_fp4``'s arithmetic (E4M3 scale):
+    ``sf = e4m3(gsf * (amax * rcp6))``, ``out_scale = amax != 0 ? rcp(f32(sf) * rgsf) : 0``, where ``rcp`` is
+    ``rcp.approx.ftz.f32``, ``rgsf = rcp(gsf)`` and ``rcp6 = rcp(6)``. Returns ``(sf_byte, out_scale)``."""
+    from cutlass._mlir.dialects import llvm as _llvm
+    from cutlass._mlir.extras import types as _T
+
+    res = _asm(
+        _llvm.StructType.get_literal([_T.i32(), _T.f32()]),
+        [cutlass.Float32(amax), cutlass.Float32(gsf), cutlass.Float32(rgsf), cutlass.Float32(rcp6)],
+        "{\n"
+        ".reg .f32 s, f, z;\n"
+        ".reg .b16 h, l16, h16;\n"
+        ".reg .b32 hw;\n"
+        ".reg .pred p;\n"
+        "mov.f32 z, 0f00000000;\n"
+        "mul.rn.f32 s, $2, $5;\n"
+        "mul.rn.f32 s, $3, s;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 h, z, s;\n"
+        "cvt.rn.f16x2.e4m3x2 hw, h;\n"
+        "mov.b32 {l16, h16}, hw;\n"
+        "cvt.f32.f16 f, l16;\n"
+        "mul.rn.f32 f, f, $4;\n"
+        "rcp.approx.ftz.f32 f, f;\n"
+        "setp.eq.f32 p, $2, 0f00000000;\n"
+        "selp.f32 $1, 0f00000000, f, p;\n"
+        "cvt.u32.u16 $0, h;\n"
+        "and.b32 $0, $0, 255;\n"
+        "}",
+        "=r,=f,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Int32(_llvm.extractvalue(_T.i32(), res, [0], loc=loc, ip=ip)),
+        cutlass.Float32(_llvm.extractvalue(_T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def cvt_e2m1x8(values, scale, *, loc=None, ip=None):
+    """Eight E2M1 codes of ``values[i] * scale`` (``mul.rn``, then ``cvt.rn.satfinite.e2m1x2.f32``) packed into
+    one Int32: byte ``i`` holds element ``2 i`` in its low nibble and ``2 i + 1`` in its high nibble
+    (``fp32_vec_to_e2m1``)."""
+    from cutlass._mlir.extras import types as _T
+
+    return cutlass.Int32(
+        _asm(
+            _T.i32(),
+            [cutlass.Float32(v) for v in values] + [cutlass.Float32(scale)],
+            "{\n"
+            ".reg .f32 a<8>;\n"
+            ".reg .b8 c<4>;\n"
+            "mul.rn.f32 a0, $1, $9;\n"
+            "mul.rn.f32 a1, $2, $9;\n"
+            "mul.rn.f32 a2, $3, $9;\n"
+            "mul.rn.f32 a3, $4, $9;\n"
+            "mul.rn.f32 a4, $5, $9;\n"
+            "mul.rn.f32 a5, $6, $9;\n"
+            "mul.rn.f32 a6, $7, $9;\n"
+            "mul.rn.f32 a7, $8, $9;\n"
+            "cvt.rn.satfinite.e2m1x2.f32 c0, a1, a0;\n"
+            "cvt.rn.satfinite.e2m1x2.f32 c1, a3, a2;\n"
+            "cvt.rn.satfinite.e2m1x2.f32 c2, a5, a4;\n"
+            "cvt.rn.satfinite.e2m1x2.f32 c3, a7, a6;\n"
+            "mov.b32 $0, {c0, c1, c2, c3};\n"
+            "}",
+            "=r,f,f,f,f,f,f,f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -331,6 +409,26 @@ def mxfp8_quant_vec8(words):
     return q_lo, q_hi, sf_byte
 
 
+def nvfp4_quant_vec8(words, gsf, rgsf, rcp6):
+    """NVFP4 of eight bf16 values given as four Int32 words (element 2i in the low half of word i), the recipe of
+    ``cvt_warp_fp16_to_fp4`` with the E4M3 scale (``fp4_quantize`` with ``sf_vec_size`` 16, global scale ``gsf``).
+
+    The two consecutive lanes that share one 16-element scale must call it together. ``rgsf`` is
+    ``rcp_approx_ftz(gsf)``, ``rcp6`` is ``rcp_approx_ftz(6.0)``. Returns ``(codes, sf_byte)``: the eight E2M1 codes
+    as one Int32 (element order, two per byte, low nibble first) and the E4M3 scale byte of the lane's group.
+    """
+    values = []
+    for w in words:
+        values.append((w << cutlass.Int32(16)).bitcast(cutlass.Float32))
+        values.append((w & cutlass.Int32(-65536)).bitcast(cutlass.Float32))
+    amax = cute.arch.fmax(cute.math.abs(values[0]), cute.math.abs(values[1]))
+    for v in values[2:]:
+        amax = cute.arch.fmax(amax, cute.math.abs(v))
+    amax = cute.arch.fmax(cute.arch.shuffle_sync_bfly(amax, offset=1), amax)
+    sf_byte, out_scale = nvfp4_scale(amax, gsf, rgsf, rcp6)
+    return cvt_e2m1x8(values, out_scale), sf_byte
+
+
 # =============================================================================
 # Kernel: CTAs [0, M) route token b, CTAs [M, 2M) quantize row b - M (the C++ kernel's split).
 # =============================================================================
@@ -343,9 +441,11 @@ def k3_route_quant_kernel(
     topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]
     quant_words: cutlass.Array,  # int32 view of e4m3 [M, 3584]: [M * 896]
     scales: cutlass.Array,  # uint8 [M * 112]
+    gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
     num_tokens: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
     early_trigger: cutlass.Constexpr[bool],
+    nvfp4: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -386,18 +486,34 @@ def k3_route_quant_kernel(
             vector_size=4,
             alignment=16,
         )
-        q_lo, q_hi, sf_byte = mxfp8_quant_vec8([words[0], words[1], words[2], words[3]])
-        quant_words.store(
-            (q_lo, q_hi),
-            idx=row * cutlass.Int32(HIDDEN_SIZE // 4) + tidx * cutlass.Int32(2),
-            alignment=8,
-        )
-        if tidx % cutlass.Int32(SF_VEC_SIZE // 8) == cutlass.Int32(0):
-            scales.store(
-                cutlass.Uint8(sf_byte),
-                idx=row * cutlass.Int32(HIDDEN_SIZE // SF_VEC_SIZE)
-                + tidx // cutlass.Int32(SF_VEC_SIZE // 8),
+        if cutlass.const_expr(nvfp4):
+            g = gsf.load(idx=0)
+            codes, sf_byte = nvfp4_quant_vec8(
+                [words[0], words[1], words[2], words[3]],
+                g,
+                rcp_approx_ftz(g),
+                rcp_approx_ftz(cutlass.Float32(6.0)),
             )
+            quant_words.store(codes, idx=row * cutlass.Int32(HIDDEN_SIZE // 8) + tidx)
+            if tidx % cutlass.Int32(NVFP4_SF_VEC // 8) == cutlass.Int32(0):
+                scales.store(
+                    cutlass.Uint8(sf_byte),
+                    idx=row * cutlass.Int32(HIDDEN_SIZE // NVFP4_SF_VEC)
+                    + tidx // cutlass.Int32(NVFP4_SF_VEC // 8),
+                )
+        else:
+            q_lo, q_hi, sf_byte = mxfp8_quant_vec8([words[0], words[1], words[2], words[3]])
+            quant_words.store(
+                (q_lo, q_hi),
+                idx=row * cutlass.Int32(HIDDEN_SIZE // 4) + tidx * cutlass.Int32(2),
+                alignment=8,
+            )
+            if tidx % cutlass.Int32(SF_VEC_SIZE // 8) == cutlass.Int32(0):
+                scales.store(
+                    cutlass.Uint8(sf_byte),
+                    idx=row * cutlass.Int32(HIDDEN_SIZE // SF_VEC_SIZE)
+                    + tidx // cutlass.Int32(SF_VEC_SIZE // 8),
+                )
 
     if cutlass.const_expr(not early_trigger):
         cute.arch.fence_acq_rel_gpu()
@@ -414,15 +530,17 @@ def k3_route_quant(
     topk_weight_bits: cute.Tensor,
     quant_words: cute.Tensor,
     scales: cute.Tensor,
+    gsf: cute.Tensor,
     num_tokens: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
     early_trigger: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
+    nvfp4: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     k3_route_quant_kernel(
-        scores, bias, hidden_words, topk_ids, topk_weight_bits, quant_words, scales, num_tokens,
-        routed_scaling_factor, early_trigger,
+        scores, bias, hidden_words, topk_ids, topk_weight_bits, quant_words, scales, gsf, num_tokens,
+        routed_scaling_factor, early_trigger, nvfp4,
     ).launch(
         grid=[num_tokens * 2, 1, 1],
         block=[THREADS, 1, 1],
