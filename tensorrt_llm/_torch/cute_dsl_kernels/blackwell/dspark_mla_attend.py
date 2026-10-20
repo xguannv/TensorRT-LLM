@@ -1360,15 +1360,20 @@ class DSparkMlaAttendKernel:
                 _sts_v2_f32(xml_s + tidx * 8, m_fin, l_fin)
             _fence_proxy_async_shared()
             _bar_sync()
-            if tidx < self.ns:
-                _bulk_s2c(
-                    sred_o + s * (ROWS * self.lat * 4),
-                    xo_s + tidx * (ROWS * self.lat * 4),
-                    ROWS * self.lat * 4,
-                    o_bar,
-                    tidx,
-                )
-                _bulk_s2c(sred_ml + s * (ROWS * 8), xml_s, ROWS * 8, o_bar, tidx)
+            # Lane 0 of warp w sends to owners w, w + 8, ...: the copies are issued in parallel
+            # (a warp issues its bulk copies one after another).
+            if lane == 0:
+                for r in cutlass.range_constexpr((self.ns + NWARPS - 1) // NWARPS):
+                    dst = warp + r * NWARPS
+                    if dst < self.ns:
+                        _bulk_s2c(
+                            sred_o + s * (ROWS * self.lat * 4),
+                            xo_s + dst * (ROWS * self.lat * 4),
+                            ROWS * self.lat * 4,
+                            o_bar,
+                            dst,
+                        )
+                        _bulk_s2c(sred_ml + s * (ROWS * 8), xml_s, ROWS * 8, o_bar, dst)
             while _mbar_try_wait(o_bar, 0) == 0:
                 pass
         else:
