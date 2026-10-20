@@ -29,8 +29,9 @@ falls back to cuBLAS (8-10 us against 6.6 us).
 accumulation order (split-K partial sums), i.e. draft-token rounding only; the
 target's verification keeps the output distribution unchanged.
 
-``TLLM_DSPARK_L2_PREFETCH=1`` (:class:`DraftL2Prefetch`) prefetches the
-drafter layers' weights into L2 from a side stream; it changes no value.
+``TLLM_DSPARK_L2_PREFETCH=1`` or ``=qb[:<CTAs>]`` (:class:`DraftL2Prefetch`,
+:func:`l2_prefetch_mode`) prefetches the drafter layers' weights into L2 from a
+side stream; it changes no value.
 """
 
 import os
@@ -251,9 +252,34 @@ def draft_gemm_swiglu(x: torch.Tensor, mlp) -> Optional[torch.Tensor]:
     return out.view(*x.shape[:-1], n // 2)
 
 
+def l2_prefetch_mode() -> Optional[tuple]:
+    """``(fork point, CTAs)`` of the drafter's side-stream L2 prefetch, or None (off).
+
+    ``TLLM_DSPARK_L2_PREFETCH=1``: after each layer's [q_a | kv_a] GEMM, its o_proj, gate_up and
+    down weights and the next layer's [q_a | kv_a] weight, from up to 64 CTAs (``("q_kv_a", 64)``).
+    ``TLLM_DSPARK_L2_PREFETCH=qb[:<CTAs>]``: after each layer's q_b GEMM (while the block RoPE and
+    the attention leave HBM idle), the weights its gate_up GEMM (the SwiGLU copy once built) and
+    down GEMM and the next layer's [q_a | kv_a] GEMM read, from 16 (or ``<CTAs>``) CTAs: a rate
+    the latency-bound kernels around it do not feel (``("q_b", n)``).
+    """
+    value = os.environ.get(L2_PREFETCH_ENV_VAR, "0")
+    if value == "1":
+        return ("q_kv_a", 64)
+    if value == "qb" or value.startswith("qb:"):
+        ctas = int(value[3:]) if value.startswith("qb:") else 16
+        return ("q_b", max(1, ctas))
+    return None
+
+
 def l2_prefetch_enabled() -> bool:
-    """Whether ``TLLM_DSPARK_L2_PREFETCH=1`` prefetches the drafter's weights into L2."""
-    return os.environ.get(L2_PREFETCH_ENV_VAR, "0") == "1"
+    """Whether ``TLLM_DSPARK_L2_PREFETCH`` prefetches the drafter's weights into L2."""
+    return l2_prefetch_mode() is not None
+
+
+def swiglu_weight_copy(mlp) -> Optional[torch.Tensor]:
+    """The reordered gate_up weight ``TLLM_DSPARK_GATE_UP_SWIGLU`` built for ``mlp``, if any."""
+    cached = mlp.__dict__.get("_dspark_swiglu_weight")
+    return None if cached is None else cached[1]
 
 
 class DraftL2Prefetch:
@@ -283,7 +309,9 @@ class DraftL2Prefetch:
         self._stream = None
         self._pending = False
 
-    def prefetch(self, tensors: Iterable[Optional[torch.Tensor]]) -> None:
+    def prefetch(self, tensors: Iterable[Optional[torch.Tensor]], max_ctas: int = 64) -> None:
+        """Fork the side stream from the current one and prefetch ``tensors`` there, from at most
+        ``max_ctas`` CTAs (the prefetch rate grows with them)."""
         from ..cute_dsl_kernels.blackwell.k3_l2_prefetch import (
             MAX_RANGES,
             run_k3_l2_prefetch,
@@ -303,7 +331,7 @@ class DraftL2Prefetch:
         fork.record(main)
         self._stream.wait_event(fork)
         with torch.cuda.stream(self._stream):
-            run_k3_l2_prefetch(ranges)
+            run_k3_l2_prefetch(ranges, max_ctas=max_ctas)
         self._pending = True
 
     def join(self) -> None:

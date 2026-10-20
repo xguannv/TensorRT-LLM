@@ -397,7 +397,54 @@ def test_ctx_positions_match_gen_prepare(num_gens):
     assert torch.equal(positions, prep["ctx_positions"])
 
 
-def test_draft_l2_prefetch_in_cuda_graph():
+def test_draft_l2_prefetch_mode(monkeypatch):
+    """TLLM_DSPARK_L2_PREFETCH: ``1`` forks after [q_a | kv_a] from 64 CTAs, ``qb[:<CTAs>]`` after
+    q_b from 16 (or the given) CTAs."""
+    from tensorrt_llm._torch.speculative import dspark_draft_gemm as m
+
+    for value, mode in (
+        ("0", None),
+        ("", None),
+        ("1", ("q_kv_a", 64)),
+        ("qb", ("q_b", 16)),
+        ("qb:12", ("q_b", 12)),
+    ):
+        monkeypatch.setenv(m.L2_PREFETCH_ENV_VAR, value)
+        assert m.l2_prefetch_mode() == mode
+        assert m.l2_prefetch_enabled() == (mode is not None)
+
+
+def test_draft_l2_prefetch_weights_after_qb():
+    """The weights prefetched after q_b: gate_up (the SwiGLU copy once built), down, then the next
+    layer's fused [q_a | kv_a] weight (or its two weights)."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    def lin(rows):
+        return SimpleNamespace(weight=torch.empty(rows, 8))
+
+    layers = []
+    for _ in range(2):
+        mlp = SimpleNamespace(gate_up_proj=lin(4), down_proj=lin(2))
+        attn = SimpleNamespace(q_a_proj=lin(3), kv_a_proj_with_mqa=lin(5))
+        layers.append(SimpleNamespace(mlp=mlp, self_attn=attn))
+    fused = lin(8)
+    stub = SimpleNamespace(
+        model=SimpleNamespace(layers=layers), _draft_fused_a_proj=lambda idx: fused
+    )
+    fn = MLADSparkForCausalLM._draft_l2_prefetch_weights_after_qb
+    got = fn(stub, 0, 2, True)
+    assert [w.shape[0] for w in got] == [4, 2, 8]
+    got = fn(stub, 0, 2, False)
+    assert [w.shape[0] for w in got] == [4, 2, 3, 5]
+    layers[1].mlp.__dict__["_dspark_swiglu_weight"] = (None, torch.empty(6, 8))
+    got = fn(stub, 1, 2, True)
+    assert [w.shape[0] for w in got] == [6, 2]
+
+
+@pytest.mark.parametrize("max_ctas", [64, 16])
+def test_draft_l2_prefetch_in_cuda_graph(max_ctas):
     """The drafter's side-stream L2 prefetch forks and joins inside a CUDA graph
     capture and leaves the results bit for bit unchanged; a first use inside a
     capture skips the prefetch."""
@@ -414,7 +461,7 @@ def test_draft_l2_prefetch_in_cuda_graph():
     def body(pf):
         y = x @ w1.t()
         if pf is not None:
-            pf.prefetch([w2, None, w3])
+            pf.prefetch([w2, None, w3], max_ctas=max_ctas)
         z = (y @ w2.detach().t()) @ w3.t()
         if pf is not None:
             pf.join()

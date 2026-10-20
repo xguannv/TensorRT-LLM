@@ -115,6 +115,8 @@ from ..speculative.dspark_draft_gemm import (
     draft_gemm,
     draft_gemm_swiglu,
     l2_prefetch_enabled,
+    l2_prefetch_mode,
+    swiglu_weight_copy,
 )
 from ..speculative.dspark_mla_fused import draft_mla_attend
 from ..speculative.dspark_norm import draft_rmsnorm
@@ -3991,6 +3993,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # stream pulls the layer's o_proj / gate_up / down weights and the next
         # layer's [q_a | kv_a] into L2 (hints only; joined before returning).
         prefetch = self._draft_l2_prefetch() if l2_prefetch_enabled() else None
+        prefetch_mode = l2_prefetch_mode() if prefetch is not None else None
         num_layers = len(self.model.layers)
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
@@ -4025,9 +4028,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             else:
                 q_a = attn.q_a_proj(hs_normed)
                 blk_latent_rows = None
-            if prefetch is not None:
+            if prefetch is not None and prefetch_mode[0] == "q_kv_a":
                 prefetch.prefetch(
-                    self._draft_l2_prefetch_weights(layer_idx, num_layers, fused_ar is not None)
+                    self._draft_l2_prefetch_weights(layer_idx, num_layers, fused_ar is not None),
+                    max_ctas=prefetch_mode[1],
                 )
             # TLLM_DSPARK_NORM_EARLY_TRIGGER: the same norm, q_b resident while it runs.
             q_a_normed = draft_rmsnorm(attn.q_a_layernorm, q_a)
@@ -4040,6 +4044,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
             if q is None:
                 q = attn.q_b_proj(q_a_normed)
+            if prefetch is not None and prefetch_mode[0] == "q_b":
+                prefetch.prefetch(
+                    self._draft_l2_prefetch_weights_after_qb(
+                        layer_idx, num_layers, fused_ar is not None
+                    ),
+                    max_ctas=prefetch_mode[1],
+                )
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             fused_attn_out = None
             if fused_block_rope:
@@ -4262,6 +4273,25 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             getattr(getattr(mlp, "gate_up_proj", None), "weight", None),
             getattr(getattr(mlp, "down_proj", None), "weight", None),
         ]
+        if layer_idx + 1 < num_layers:
+            nxt = self.model.layers[layer_idx + 1].self_attn
+            fused = self._draft_fused_a_proj(layer_idx + 1) if fused_a else None
+            if fused is not None:
+                weights.append(fused.weight)
+            else:
+                weights += [nxt.q_a_proj.weight, nxt.kv_a_proj_with_mqa.weight]
+        return weights
+
+    def _draft_l2_prefetch_weights_after_qb(self, layer_idx: int, num_layers: int, fused_a: bool):
+        """Weights to prefetch after layer ``layer_idx``'s q_b GEMM
+        (``TLLM_DSPARK_L2_PREFETCH=qb``), in the order they are read: its gate_up (the SwiGLU
+        copy once ``TLLM_DSPARK_GATE_UP_SWIGLU`` built it) and down, then the next layer's
+        [q_a | kv_a] (the fused weight when the next layer uses it)."""
+        mlp = self.model.layers[layer_idx].mlp
+        gate_up = swiglu_weight_copy(mlp)
+        if gate_up is None:
+            gate_up = getattr(getattr(mlp, "gate_up_proj", None), "weight", None)
+        weights = [gate_up, getattr(getattr(mlp, "down_proj", None), "weight", None)]
         if layer_idx + 1 < num_layers:
             nxt = self.model.layers[layer_idx + 1].self_attn
             fused = self._draft_fused_a_proj(layer_idx + 1) if fused_a else None
