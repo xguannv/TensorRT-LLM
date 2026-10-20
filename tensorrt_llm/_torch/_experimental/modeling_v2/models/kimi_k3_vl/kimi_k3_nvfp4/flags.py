@@ -68,6 +68,12 @@ TRTLLM_K3LL_MLA_SPEC_ACCEPT = _flag(
     "MLA DSpark worker: vocab-sharded target logits + k3_spec_accept (greedy, or temperature via no_topk_no_topp)",
 )
 
+TRTLLM_K3LL_MLA_DRAFTER_QKV = _flag(
+    "TRTLLM_K3LL_MLA_DRAFTER_QKV",
+    0,
+    "MLA DSpark drafter (with TRTLLM_K3LL_MLA_DRAFTER_NORMS): [q_a | kv_a] GEMV + k3_drafter_mla_a_post per layer",
+)
+
 
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
