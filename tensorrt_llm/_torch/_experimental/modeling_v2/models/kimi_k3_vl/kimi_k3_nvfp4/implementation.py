@@ -3537,6 +3537,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         )
         if isinstance(worker, _spec_worker.KimiK3MLADSparkWorker):
             worker.k3_mla_ctx = bool(_flags.TRTLLM_K3LL_MLA_DRAFTER_CTX)
+            worker.k3_mla_accept = bool(_flags.TRTLLM_K3LL_MLA_SPEC_ACCEPT)
         logger.info(
             f"Kimi K3 decode kernels: {type(worker).__name__} k3_spec_accept, k3_ctx_kv and k3_markov "
             + (

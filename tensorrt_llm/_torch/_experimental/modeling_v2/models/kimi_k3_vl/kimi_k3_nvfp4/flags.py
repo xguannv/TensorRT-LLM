@@ -62,6 +62,11 @@ TRTLLM_K3LL_MLA_DRAFTER_CTX = _flag(
     0,
     "MLA DSpark drafter (with TRTLLM_K3LL_MLA_SPEC_WORKER): context latents of all layers in one k3_drafter_mla_ctx_kv",
 )
+TRTLLM_K3LL_MLA_SPEC_ACCEPT = _flag(
+    "TRTLLM_K3LL_MLA_SPEC_ACCEPT",
+    0,
+    "MLA DSpark worker: vocab-sharded target logits + k3_spec_accept (greedy, or temperature via no_topk_no_topp)",
+)
 
 
 TRTLLM_K3LL_FP8W_LOWM = _flag(
