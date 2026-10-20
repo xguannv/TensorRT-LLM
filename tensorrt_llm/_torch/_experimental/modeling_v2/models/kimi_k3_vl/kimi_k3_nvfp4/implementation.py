@@ -3406,16 +3406,53 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     layer.decode_comm = comm
                     layer.sandwich_oproj = False
                 _decode_comm.use_decode_one_shot(self)
+            moe_layers = 0
+            if comm is not None and _flags.TRTLLM_K3LL_NVFP4_DECODE_MOE:
+                moe_layers = self._build_nvfp4_decode_moe(comm)
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
             self._decode_state_ready = True
             logger.info(
                 f"Kimi K3 NVFP4 SM{self.target_spec.sm[0]}{self.target_spec.sm[1]}: "
+                f"decode MoE on k3_moe_nvfp4 on {moe_layers} layers; "
                 "fused FP8 attention and NVFP4 experts; "
                 "BF16 decode GEMVs and DSpark specializations; "
                 f"attention-residual MNNVL fusion={comm is not None}"
             )
             return
+
+    def _build_nvfp4_decode_moe(self, comm: _decode_comm.K3DecodeComm) -> int:
+        """The NVFP4 MoE decode path (``decode_moe_nvfp4.py``) on every MoE layer it takes: the shared state, each
+        layer's decode weights with its latent norm folded into the latent up projection, the decode GEMVs' state;
+        then one call of each ``k3_moe_nvfp4`` build so none compiles under capture. Returns the number of layers."""
+        from . import decode_moe_nvfp4 as decode_moe
+
+        mapping = self.model_config.mapping
+        moes = [layer.block_sparse_moe for layer in self.model.layers if layer.is_moe]
+        gaps = {id(moe): decode_moe.layout_gaps(moe, mapping.tp_size) for moe in moes}
+        takes = [moe for moe in moes if not gaps[id(moe)]]
+        for reason in sorted({gap for moe in moes for gap in gaps[id(moe)]}):
+            logger.info_once(
+                f"Kimi K3 NVFP4 MoE decode path off on some layers: {reason}",
+                key=f"k3_nvfp4_decode_moe_off_{reason}",
+            )
+        if not takes:
+            return 0
+        backend = takes[0].routed_experts.backend
+        state = decode_moe.K3DecodeMoeNvfp4.create(
+            backend.w3_w1_weight.device,
+            backend.w3_w1_weight.shape[1] // 2,
+            backend.expert_size_per_partition,
+            comm.mnnvl,
+        )
+        for moe in takes:
+            decode_moe.fold_latent_norm(moe)
+            moe.decode_moe = decode_moe.K3DecodeMoeNvfp4Layer.create(
+                moe, state, mapping.tp_rank, mapping.tp_size
+            )
+            moe.decode_gemvs = self.model.decode_gemvs
+        takes[0].decode_moe.warm_up(takes[0])
+        return len(takes)
 
     def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Turn the DFlash / DSpark worker's Kimi K3 decode kernels (its ``k3_decode``: ``trtllm::k3_spec_accept``,
