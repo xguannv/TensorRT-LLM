@@ -30,7 +30,11 @@ only pays an attribute check per mark.
 
 Line format::
 
-    [phase] rank=<r> iter=<n> t0=<unix s> total=<ms> busy=<ms> <mark>=<ms> ... [admitted=<k>] [first=<k>] [finished=<k>]
+    [phase] rank=<r> iter=<n> t0=<unix s> total=<ms> busy=<ms> <mark>=<ms> ...
+        [admitted=<k>] [first=<k>] [finished=<k>] [deferred=<k>]
+
+``deferred`` counts transmission-complete requests kept out of the batch because
+no sequence slot was free yet (KV prefetch, ``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS``).
 
 ``iter`` is the executor's iteration counter during the iteration; the
 ``print_iter_log`` line that reports this iteration carries ``iter = <n + 1>``.
@@ -106,7 +110,7 @@ class ExecutorPhaseLog:
         self._last = now
 
     def count(self, event: str, num: int) -> None:
-        """Add ``num`` occurrences of a request event (admitted, first, finished)."""
+        """Add ``num`` occurrences of a request event (admitted, first, finished, deferred)."""
         if num > 0:
             self._events[event] = self._events.get(event, 0) + num
 

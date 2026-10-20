@@ -3659,6 +3659,52 @@ class PyExecutor:
 
         return can_queue, can_queue_this_rank
 
+    def _defer_joins_without_seq_slot(self, scheduled_batch) -> int:
+        """Keep joining requests that would find no free sequence slot out of this batch.
+
+        With KV prefetch (``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS``) a request admitted while the
+        batch was full finishes its KV transfer and waits, transmission-complete, for a seat. When
+        a running request is set to ``GENERATION_TO_COMPLETE`` (its step in flight is its last),
+        the scheduler no longer counts it and gives its seat to the waiting request, but the
+        finishing request holds its sequence slot until that step is processed later in this
+        iteration; the pool holds ``max_batch_size`` slots, so the joining request would get
+        none. Joining requests beyond the free slots stay out of the batch for this iteration
+        (the KV-cache growth the scheduler gave them is undone) and join in a later one. New
+        context requests of the batch take their slots after the joining requests, so their
+        slots are kept for them.
+
+        Args:
+            scheduled_batch: The batch the scheduler returned; its generation requests are
+                filtered in place.
+
+        Returns:
+            The number of requests removed from the batch.
+        """
+        joining = [
+            req for req in scheduled_batch.generation_requests
+            if req.is_disagg_generation_transmission_complete
+        ]
+        if not joining:
+            return 0
+        num_new_context = sum(1 for req in scheduled_batch.context_requests
+                              if req.seq_slot is None)
+        num_free_slots = self.resource_manager.resource_managers[
+            ResourceManagerType.SEQ_SLOT_MANAGER].num_free_slots()
+        deferred = joining[max(0, num_free_slots - num_new_context):]
+        if not deferred:
+            return 0
+        deferred_ids = {id(req) for req in deferred}
+        scheduled_batch.generation_requests = [
+            req for req in scheduled_batch.generation_requests
+            if id(req) not in deferred_ids
+        ]
+        if self._is_kv_manager_v2:
+            for req in deferred:
+                self.kv_cache_manager.revert_allocate_generation(req)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.revert_allocate_generation(req)
+        return len(deferred)
+
     def _revert_gen_alloc(self, scheduled_batch):
         """Revert KV cache capacity growth when the batch is skipped.
 
@@ -4117,6 +4163,12 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+        if self._disagg_gen_prefetch_limit > 0:
+            num_deferred_joins = self._defer_joins_without_seq_slot(
+                scheduled_batch)
+            num_fitting_reqs -= num_deferred_joins
+            if self._phase_log is not None:
+                self._phase_log.count("deferred", num_deferred_joins)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.

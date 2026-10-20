@@ -16,6 +16,7 @@
 (TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS)."""
 
 import collections
+import types
 
 import pytest
 
@@ -201,3 +202,175 @@ def test_executor_pop_from_waiting_queue_prefetch(monkeypatch, limit, active, qu
     popped = py_executor.PyExecutor._pop_from_waiting_queue(stub, waiting_queue, len(active))
     assert [item.name for item in popped] == expected
     assert [item.name for item in waiting_queue] == [n for n in queue if n not in expected]
+
+
+class _FakeRequest:
+    """Request with the fields the sequence-slot path reads; ``state`` is "context",
+    "generating", "to_complete" (GENERATION_TO_COMPLETE), "trans_complete"
+    (DISAGG_GENERATION_TRANS_COMPLETE) or "complete"."""
+
+    def __init__(self, request_id, state="generating"):
+        self.request_id = request_id
+        self.py_request_id = request_id
+        self.state = state
+        self.seq_slot = None
+        self.py_seq_slot = None
+        self.return_perf_metrics = False
+
+    @property
+    def is_disagg_generation_transmission_complete(self):
+        return self.state == "trans_complete"
+
+    @property
+    def is_disagg_generation_init_state(self):
+        return False
+
+
+class _FakeKvCacheManager:
+    def __init__(self):
+        self.reverted = []
+
+    def revert_allocate_generation(self, req):
+        self.reverted.append(req.request_id)
+
+
+class _JoinStub:
+    """The attributes PyExecutor._defer_joins_without_seq_slot reads."""
+
+    def __init__(self, seq_slot_manager, resource_manager_type):
+        self.resource_manager = types.SimpleNamespace(
+            resource_managers={resource_manager_type: seq_slot_manager}
+        )
+        self._is_kv_manager_v2 = True
+        self.kv_cache_manager = _FakeKvCacheManager()
+        self.enable_joint_kv_cache_reuse = False
+        self.draft_kv_cache_manager = None
+
+
+def _schedule(requests, max_batch_size):
+    """V2-scheduler seat rule: a request whose step in flight is its last
+    (GENERATION_TO_COMPLETE) is not scheduled and leaves its seat to the next request."""
+    seats = [r for r in requests if r.state in ("context", "generating", "trans_complete")]
+    return seats[:max_batch_size]
+
+
+def _batch(scheduled_batch_type, requests):
+    batch = scheduled_batch_type()
+    batch.context_requests_last_chunk = [r for r in requests if r.state == "context"]
+    batch.generation_requests = [r for r in requests if r.state != "context"]
+    return batch
+
+
+def _take_seq_slots(seq_slots, batch, scheduled_batch_type):
+    """The slot allocations of one iteration: joining requests first
+    (_prepare_disagg_gen_transmission_complete), then the rest of the batch
+    (ResourceManager.prepare_resources)."""
+    joining = scheduled_batch_type()
+    joining.context_requests_last_chunk = [
+        r for r in batch.generation_requests if r.is_disagg_generation_transmission_complete
+    ]
+    seq_slots.prepare_resources(joining)
+    for r in joining.context_requests_last_chunk:
+        r.state = "generating"
+    seq_slots.prepare_resources(batch)
+
+
+def test_prefetched_request_waits_for_the_finishing_requests_slot():
+    """Full batch (A, B) plus one prefetched request C whose KV transfer completed before a
+    slot freed. A's step in flight is its last (GENERATION_TO_COMPLETE): the scheduler gives
+    its seat to C while A still holds its sequence slot. Without the deferral the slot
+    allocation of C's first step fails (the e2e crash, NoFreeSlotsError); with it, C stays
+    out of this batch, its KV growth is reverted, and it joins once A is terminated."""
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    from tensorrt_llm._torch.pyexecutor.resource_manager import (
+        NoFreeSlotsError,
+        ResourceManagerType,
+    )
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+    from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+
+    def full_batch_and_prefetched_join():
+        a, b = _FakeRequest(1), _FakeRequest(2)
+        c = _FakeRequest(3, "trans_complete")
+        seq_slots = SeqSlotManager(2)
+        _take_seq_slots(seq_slots, _batch(ScheduledRequests, [a, b]), ScheduledRequests)
+        a.state = "to_complete"
+        batch = _batch(ScheduledRequests, _schedule([a, b, c], 2))
+        assert [r.request_id for r in batch.generation_requests] == [2, 3]
+        return a, b, c, seq_slots, batch
+
+    # Reproduction: A's seat goes to C while A keeps its slot.
+    _, _, _, seq_slots, batch = full_batch_and_prefetched_join()
+    with pytest.raises(NoFreeSlotsError):
+        _take_seq_slots(seq_slots, batch, ScheduledRequests)
+
+    # Fix: C is deferred in this iteration and joins after A's termination.
+    a, b, c, seq_slots, batch = full_batch_and_prefetched_join()
+    a_slot = a.seq_slot
+    stub = _JoinStub(seq_slots, ResourceManagerType.SEQ_SLOT_MANAGER)
+    assert py_executor.PyExecutor._defer_joins_without_seq_slot(stub, batch) == 1
+    assert [r.request_id for r in batch.generation_requests] == [2]
+    assert batch.batch_size == 1
+    assert stub.kv_cache_manager.reverted == [3]
+    _take_seq_slots(seq_slots, batch, ScheduledRequests)
+    assert c.seq_slot is None and c.is_disagg_generation_transmission_complete
+    # A's last step is processed later in the iteration and A is terminated.
+    a.state = "complete"
+    seq_slots.free_resources(a)
+    # Next iteration: C joins on A's former slot.
+    batch = _batch(ScheduledRequests, _schedule([b, c], 2))
+    assert py_executor.PyExecutor._defer_joins_without_seq_slot(stub, batch) == 0
+    assert [r.request_id for r in batch.generation_requests] == [2, 3]
+    _take_seq_slots(seq_slots, batch, ScheduledRequests)
+    assert c.seq_slot == a_slot and c.py_seq_slot == a_slot
+    assert stub.kv_cache_manager.reverted == [3]
+    assert seq_slots.num_free_slots() == 0
+
+
+def test_defer_joins_keeps_joins_that_fit_and_drops_the_rest_in_order():
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+    from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+
+    seq_slots = SeqSlotManager(4)
+    held = [_FakeRequest(i) for i in (1, 2, 3)]
+    _take_seq_slots(seq_slots, _batch(ScheduledRequests, held), ScheduledRequests)
+    joins = [_FakeRequest(i, "trans_complete") for i in (7, 8)]
+    batch = _batch(ScheduledRequests, [held[2], *joins])
+    stub = _JoinStub(seq_slots, ResourceManagerType.SEQ_SLOT_MANAGER)
+    # One free slot: the first joining request stays, the second waits.
+    assert py_executor.PyExecutor._defer_joins_without_seq_slot(stub, batch) == 1
+    assert [r.request_id for r in batch.generation_requests] == [3, 7]
+    assert stub.kv_cache_manager.reverted == [8]
+    _take_seq_slots(seq_slots, batch, ScheduledRequests)
+    assert joins[0].seq_slot is not None and joins[1].seq_slot is None
+    # No joining request: nothing to do, whatever the slot count.
+    batch = _batch(ScheduledRequests, held[:2])
+    assert py_executor.PyExecutor._defer_joins_without_seq_slot(stub, batch) == 0
+    assert [r.request_id for r in batch.generation_requests] == [1, 2]
+
+
+def test_defer_joins_keeps_the_slots_new_context_requests_take():
+    """A new context request of the batch takes its slot after the joining requests took
+    theirs; the join waits instead of the context request finding no slot."""
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+    from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+
+    seq_slots = SeqSlotManager(2)
+    finishing = _FakeRequest(1)
+    _take_seq_slots(seq_slots, _batch(ScheduledRequests, [finishing]), ScheduledRequests)
+    finishing.state = "to_complete"
+    new_context = _FakeRequest(4, "context")
+    joining = _FakeRequest(3, "trans_complete")
+    batch = _batch(ScheduledRequests, _schedule([finishing, new_context, joining], 2))
+    assert batch.batch_size == 2
+    stub = _JoinStub(seq_slots, ResourceManagerType.SEQ_SLOT_MANAGER)
+    assert py_executor.PyExecutor._defer_joins_without_seq_slot(stub, batch) == 1
+    assert batch.generation_requests == []
+    assert stub.kv_cache_manager.reverted == [3]
+    _take_seq_slots(seq_slots, batch, ScheduledRequests)
+    assert new_context.seq_slot is not None and joining.seq_slot is None
+    assert seq_slots.num_free_slots() == 0
