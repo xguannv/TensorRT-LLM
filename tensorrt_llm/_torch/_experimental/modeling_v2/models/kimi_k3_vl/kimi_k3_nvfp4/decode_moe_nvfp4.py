@@ -27,23 +27,33 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
+    mnnvl_allgather_split,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
+    MnnvlWorkspace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front import (
     K3MoeHeadWorkspace,
     front_weight,
     k3_moe_front,
     weight_supported,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
-from .decode_comm import K3DecodeComm, PendingTail
+from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
 
 MAX_TOKENS = 8
+# A wide decode step's most tokens: the expert kernel's limit.
+WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
 NUM_EXPERTS = 896
 
 #: The switch (default off): with it off the target never builds this path and every MoE layer runs as before.
@@ -58,12 +68,13 @@ class K3DecodeMoeNvfp4:
 
     head: K3MoeHeadWorkspace
     counters: torch.Tensor
+    mnnvl: MnnvlWorkspace
 
     @classmethod
-    def create(cls, mapping, device) -> "K3DecodeMoeNvfp4":
+    def create(cls, mapping, device, mnnvl: MnnvlWorkspace) -> "K3DecodeMoeNvfp4":
         """Collective (the head workspace): every rank of the TP group calls it at the same point, eagerly, before
-        any CUDA-graph capture."""
-        return cls(K3MoeHeadWorkspace.create(mapping), nvfp4_lowm_op.new_counters(device))
+        any CUDA-graph capture. ``mnnvl``: the TP group's MNNVL workspace, for a wide step's head all-gather."""
+        return cls(K3MoeHeadWorkspace.create(mapping), nvfp4_lowm_op.new_counters(device), mnnvl)
 
 
 def _experts(backend) -> tuple:
@@ -165,7 +176,9 @@ class K3DecodeMoeNvfp4Layer:
 
     state: K3DecodeMoeNvfp4
     front_weight: torch.Tensor
+    head_weight: torch.Tensor
     tail_weight: torch.Tensor
+    tail_pad: Optional[torch.Tensor]
     bias: torch.Tensor
     lo: int
     width: int
@@ -205,7 +218,9 @@ class K3DecodeMoeNvfp4Layer:
         return cls(
             state=state,
             front_weight=front,
+            head_weight=front[: head.shape[0]],
             tail_weight=tail,
+            tail_pad=up.new_zeros(WIDE_MAX_TOKENS, pad) if pad else None,
             bias=moe.gate.e_score_correction_bias.detach(),
             lo=lo,
             width=width,
@@ -219,12 +234,23 @@ class K3DecodeMoeNvfp4Layer:
 
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
-        (collective: every rank makes the same call) and the expert kernel (one build serves 1 to 8 tokens)."""
+        (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
+        32 tokens."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         ids, weights, x_q, x_sf, _ = self._front(moe, x)
         self._routed(ids, weights, x_q, x_sf)
+        for rows in (9, WIDE_MAX_TOKENS):
+            logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
+            latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
+            self._routed(*self._route_quant(moe, logits, latent))
         torch.cuda.synchronize(device)
+
+    def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):
+        return k3_route_quant(
+            logits, self.bias, latent.contiguous(), float(moe.gate.routed_scaling_factor),
+            nvfp4_gsf=self.input_scale,
+        )  # fmt: skip
 
     def _front(self, moe: nn.Module, x: torch.Tensor):
         return k3_moe_front(
@@ -246,8 +272,11 @@ class K3DecodeMoeNvfp4Layer:
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
-        `MAX_TOKENS` tokens."""
-        return hidden_states.dtype == torch.bfloat16 and 0 < hidden_states.shape[0] <= MAX_TOKENS
+        `MAX_TOKENS` tokens; with ``partial_tail``, also a wide decode step of at most `WIDE_MAX_TOKENS`."""
+        rows = hidden_states.shape[0]
+        if hidden_states.dtype != torch.bfloat16:
+            return False
+        return 0 < rows <= MAX_TOKENS or (partial_tail and step.wide and rows <= WIDE_MAX_TOKENS)
 
     def forward(
         self,
@@ -260,6 +289,8 @@ class K3DecodeMoeNvfp4Layer:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
         (a ``PendingTail``); else the reduced output. ``push`` is ignored: the latent all-reduce is always the routed
         experts' all-reduce."""
+        if hidden_states.shape[0] > MAX_TOKENS:
+            return self._wide(moe, hidden_states, gemvs)
         ids, weights, x_q, x_sf, shared_act = self._front(moe, hidden_states)
         latent = moe.routed_experts.all_reduce(self._routed(ids, weights, x_q, x_sf))
         if partial_tail:
@@ -277,3 +308,36 @@ class K3DecodeMoeNvfp4Layer:
             latent.float().pow(2).mean(-1, keepdim=True) + moe.routed_expert_norm.variance_epsilon
         )
         return (up * scale + shared_out.float()).bfloat16()
+
+    def _wide(self, moe: nn.Module, hidden_states: torch.Tensor, gemvs) -> torch.Tensor:
+        """A wide decode step's MoE (`MAX_TOKENS` < M <= `WIDE_MAX_TOKENS`): this rank's unreduced share of the
+        output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts."""
+        x = hidden_states.contiguous()
+        head = _gemv(gemvs, "moe_head", x, self.head_weight, out_fp32=True)
+        routed_in, router_logits = mnnvl_allgather_split(head, self.width, self.state.mnnvl)
+        shared = moe.shared_experts
+
+        def _routed_partial():
+            return self._routed(*self._route_quant(moe, router_logits, routed_in))
+
+        def _shared_activation():
+            return shared._apply_activation(
+                _gemv(gemvs, "moe_shared_gate_up", x, shared.gate_up_proj.weight)
+            )
+
+        routed, shared_act = maybe_execute_in_parallel(
+            _routed_partial,
+            _shared_activation,
+            moe.moe_main_event,
+            moe.moe_shared_event,
+            moe.shared_expert_stream,
+            disable_on_compile=True,
+        )
+        # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
+        # columns.
+        normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
+        parts = [normed[:, self.lo : self.lo + self.width]]
+        if self.tail_pad is not None:
+            parts.append(self.tail_pad[: x.shape[0]])
+        parts.append(shared_act)
+        return _gemv(gemvs, "moe_tail", torch.cat(parts, dim=1), self.tail_weight)

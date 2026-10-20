@@ -3,7 +3,7 @@
 """Kimi K3's top-16 routing and MXFP8 latent quantization at decode size, ``trtllm::k3_route_quant``: the CuTe DSL
 form of ``trtllm::kimi_k3_noaux_tc_mxfp8_quant``, the same four outputs bit for bit, for up to 64 tokens."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -21,6 +21,7 @@ def k3_route_quant(
     latent: torch.Tensor,
     routed_scaling_factor: float,
     early_trigger: bool = False,
+    nvfp4_gsf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(topk_ids, topk_weights, quantized, scales)`` for ``router_logits`` (fp32 ``[M, 896]``) and ``latent`` (bf16
     ``[M, 3584]``), 1 <= M <= 64: the 16 experts with the largest sigmoid + ``e_score_correction_bias`` (int32
@@ -29,11 +30,15 @@ def k3_route_quant(
 
     ``early_trigger``: let the next kernel launch (as a programmatic dependent) as soon as every CTA has passed its own
     grid-dependency wait, before the outputs are written; for a dependent that waits for this whole grid before
-    reading them, as ``trtllm::k3_moe`` does."""
+    reading them, as ``trtllm::k3_moe`` does.
+
+    ``nvfp4_gsf`` (fp32 ``[1]``): the latent as NVFP4 on that global scale instead (uint8 ``[M, 1792]`` E2M1 pairs, one
+    E4M3 scale per 16 columns, uint8 ``[M, 224]``; ``fp4_quantize``'s recipe)."""
     return torch.ops.trtllm.k3_route_quant(
         router_logits,
         e_score_correction_bias,
         latent,
         routed_scaling_factor,
         early_trigger=early_trigger,
+        nvfp4_gsf=nvfp4_gsf,
     )

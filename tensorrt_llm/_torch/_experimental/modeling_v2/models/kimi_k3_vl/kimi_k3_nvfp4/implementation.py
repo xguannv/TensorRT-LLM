@@ -3445,7 +3445,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         if not takes:
             return 0
         state = _decode_moe_nvfp4.K3DecodeMoeNvfp4.create(
-            mapping, takes[0].routed_experts.backend.w3_w1_weight.device
+            mapping, takes[0].routed_experts.backend.w3_w1_weight.device, comm.mnnvl
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)
