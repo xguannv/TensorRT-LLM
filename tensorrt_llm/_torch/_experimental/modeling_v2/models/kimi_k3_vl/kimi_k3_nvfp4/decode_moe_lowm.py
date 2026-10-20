@@ -133,8 +133,17 @@ def layout_gaps(moe: nn.Module, tp_size: int, max_snapshots: int) -> list:
         return ["a shared expert other than bf16 and unbiased"]
     names = ("w3_w1_weight", "w2_weight", "quant_scales", "fc31_input_scale", "fc2_input_scale", "slot_start",
              "act_alpha", "act_beta")  # fmt: skip
-    if not getattr(backend, "has_nvfp4", False) or not all(
-        hasattr(backend, name) for name in names
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+
+    # The expert kernel reads the CuteDSL backend's buffers; another backend (TRTLLM-Gen: other layouts, quant_scales
+    # a tuple) keeps the generic path.
+    if not isinstance(backend, CuteDslFusedMoE):
+        return [f"routed experts on {type(backend).__name__}, not the CuteDSL backend"]
+    scale_fields = ("fc1_weight_block", "fc1_global", "fc2_weight_block", "fc2_global")
+    if (
+        not getattr(backend, "has_nvfp4", False)
+        or not all(hasattr(backend, name) for name in names)
+        or not all(hasattr(backend.quant_scales, f) for f in scale_fields)
     ):
         return ["routed experts other than the CuteDSL NVFP4 backend"]
     if getattr(backend, "scaling_vector_size", 16) != 16:
