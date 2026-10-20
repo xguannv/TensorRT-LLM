@@ -286,18 +286,18 @@ def k3_spec_accept_kernel(
             # Gumbel-max: argmax(logit / T + g) samples softmax(logit / T); g depends on the row's key and the global
             # column only, so every rank's shard draws its own columns' noise and the exchange is unchanged. A row
             # below the greedy temperature keeps its logits (v * 1 + 0 is v).
-            t = samp_temp.load(idx=cutlass.Int32(r))
-            hot = t >= cutlass.Float32(GREEDY_TEMPERATURE)
-            inv_t = cutlass.Float32(
-                cutlass.select_(hot, cutlass.Float32(1.0) / t, cutlass.Float32(1.0))
+            samp_t = samp_temp.load(idx=cutlass.Int32(r))
+            samp_hot = samp_t >= cutlass.Float32(GREEDY_TEMPERATURE)
+            samp_inv = cutlass.Float32(
+                cutlass.select_(samp_hot, cutlass.Float32(1.0) / samp_t, cutlass.Float32(1.0))
             )
-            key = _sample_key(
+            samp_key = _sample_key(
                 samp_seed.load(idx=cutlass.Int32(r)), samp_off.load(idx=cutlass.Int32(r))
             )
             for q in cutlass.range_constexpr(4):
-                g = _gumbel(key, shard_offset + col0 + cutlass.Int32(q))
-                vals[q] = vals[q] * inv_t + cutlass.Float32(
-                    cutlass.select_(hot, g, cutlass.Float32(0.0))
+                samp_g = _gumbel(samp_key, shard_offset + col0 + cutlass.Int32(q))
+                vals[q] = vals[q] * samp_inv + cutlass.Float32(
+                    cutlass.select_(samp_hot, samp_g, cutlass.Float32(0.0))
                 )
         best_value = vals[0]
         best_index = col0
