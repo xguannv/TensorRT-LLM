@@ -70,31 +70,59 @@ class K3L2Prefetcher:
     """The side stream of the prefetch launches, and whether it holds work the main stream has not joined."""
 
     def __init__(self, device: torch.device):
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_l2_prefetch
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+            k3_expert_l2_prefetch,
+            k3_l2_prefetch,
+        )
 
-        self._kernel = k3_l2_prefetch
+        self._dense = k3_l2_prefetch
+        self._experts = k3_expert_l2_prefetch
         self.stream = torch.cuda.Stream(device=device)
         self.pending = False
 
-    def issue(self, ranges: Sequence[Tuple[int, int]]) -> None:
-        """Prefetch ``ranges`` on the side stream once the main stream's work so far is done."""
-        if not ranges:
-            return
+    def new_record(self, device: torch.device) -> torch.Tensor:
+        """A routing record (``k3_expert_l2_prefetch``) for one MoE layer."""
+        return self._experts.new_record(device)
+
+    def expert_ranges(self, tensors: Sequence[torch.Tensor], num_local: int) -> list:
+        """``(base, stride, bytes)`` of every local expert's slice of each of ``tensors``."""
+        return self._experts.expert_ranges(tensors, num_local)
+
+    def _fork(self) -> None:
         self.stream.wait_stream(torch.cuda.current_stream())
-        per_launch = self._kernel.MAX_RANGES
+        self.pending = True
+
+    def issue(self, ranges: Sequence[Tuple[int, int]], record=None) -> None:
+        """Once the main stream's work so far is done, on the side stream: prefetch ``ranges``, and with ``record`` =
+        ``(routing record, moe_sort outputs, local experts)`` copy that routing into the record."""
+        if not ranges and record is None:
+            return
+        self._fork()
+        per_launch = self._dense.MAX_RANGES
         with torch.cuda.stream(self.stream):
             for i in range(0, len(ranges), per_launch):
-                self._kernel.run_k3_l2_prefetch(list(ranges[i : i + per_launch]))
-        self.pending = True
+                self._dense.run_k3_l2_prefetch(list(ranges[i : i + per_launch]))
+            if record is not None:
+                rec, sort_outputs, num_local = record
+                for t in sort_outputs:
+                    t.record_stream(self.stream)
+                self._experts.run_k3_expert_l2_prefetch(
+                    num_local=num_local, record_out=rec, sort_outputs=sort_outputs
+                )
+
+    def prefetch_experts(
+        self, record: torch.Tensor, ranges: Sequence, num_local: int, budget: int
+    ) -> None:
+        """Once the main stream's work so far is done, on the side stream: prefetch the weights (``ranges``) of the
+        ``budget`` experts with the most tokens in ``record``."""
+        self._fork()
+        with torch.cuda.stream(self.stream):
+            self._experts.run_k3_expert_l2_prefetch(
+                num_local=num_local, record_in=record, ranges=ranges, budget=budget
+            )
 
     def join(self) -> None:
         """Make the main stream wait for the side stream's launches (once per forward)."""
         if self.pending:
             torch.cuda.current_stream().wait_stream(self.stream)
             self.pending = False
-
-    def warm_up(self, ranges: Sequence[Tuple[int, int]]) -> None:
-        """Compile the launch shapes ``ranges`` needs outside any capture."""
-        self.issue(ranges)
-        self.join()
-        torch.cuda.current_stream().synchronize()

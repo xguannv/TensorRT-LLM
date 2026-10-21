@@ -316,10 +316,13 @@ class K3DecodeMoeNvfp4Layer:
         return self.experts[0].shape[0]
 
     def _routed(self, ids, weights, x_q, x_sf) -> torch.Tensor:
-        return nvfp4_lowm_op.run(
+        sink = []
+        out = nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, sort_sink=sink,
         )  # fmt: skip
+        self.last_sort = tuple(sink)
+        return out
 
     def _front_routed(self, moe: nn.Module, x: torch.Tensor):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows): ``(routed, shared_act)``.
@@ -332,19 +335,36 @@ class K3DecodeMoeNvfp4Layer:
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
         _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
+        views = sort_views(sort_out, rows, self.num_local)
         routed = nvfp4_lowm_op.run_sorted(
-            x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            x_q, x_sf, views, self.experts, self.fc2_input_scale, self.state.counters, *self.situ,
         )  # fmt: skip
+        self.last_sort = (views[0], views[1], views[3])
         return routed, shared_act
 
     def _l2_prefetch_next(self) -> None:
-        """With TRTLLM_K3LL_L2_PREFETCH, the next decoder layer's attention weights into L2 once the routed experts
-        issued so far are done (l2_prefetch.py); l2_next and state.l2 are set by the target's build."""
-        ranges = getattr(self, "l2_next", None)
+        """Once the routed experts issued so far are done (``l2_prefetch.py``; ``state.l2`` and the layer's ``l2_*``
+        are set by the target's build): with ``TRTLLM_K3LL_L2_PREFETCH``, the next decoder layer's attention weights
+        into L2; with ``TRTLLM_K3LL_L2_PREFETCH_EXPERTS``, this call's routing into the layer's routing record."""
         prefetcher = getattr(self.state, "l2", None)
-        if ranges and prefetcher is not None and _flags.TRTLLM_K3LL_L2_PREFETCH:
-            prefetcher.issue(ranges)
+        if prefetcher is None:
+            return
+        ranges = getattr(self, "l2_next", None) if _flags.TRTLLM_K3LL_L2_PREFETCH else None
+        record = None
+        if _flags.TRTLLM_K3LL_L2_PREFETCH_EXPERTS and getattr(self, "l2_record", None) is not None:
+            record = (self.l2_record, self.last_sort, self.num_local)
+        prefetcher.issue(ranges or (), record=record)
+
+    def l2_prefetch_experts(self) -> None:
+        """With ``TRTLLM_K3LL_L2_PREFETCH_EXPERTS`` (a budget), the experts with the most tokens in this layer's routing
+        record (its previous call) into L2, once the main stream's work so far is done: the layer's attention calls
+        it after its weight-heavy projections are issued."""
+        prefetcher = getattr(self.state, "l2", None)
+        budget = int(_flags.TRTLLM_K3LL_L2_PREFETCH_EXPERTS)
+        if prefetcher is not None and budget > 0 and getattr(self, "l2_record", None) is not None:
+            prefetcher.prefetch_experts(
+                self.l2_record, self.l2_expert_ranges, self.num_local, budget
+            )
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most

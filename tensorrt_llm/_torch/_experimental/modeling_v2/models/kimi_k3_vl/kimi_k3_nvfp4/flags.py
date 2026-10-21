@@ -118,6 +118,11 @@ TRTLLM_K3LL_L2_PREFETCH = _flag(
     0,
     "lowm MoE decode: the next layer's attention weights into L2 on a side stream behind the routed experts",
 )
+TRTLLM_K3LL_L2_PREFETCH_EXPERTS = _flag(
+    "TRTLLM_K3LL_L2_PREFETCH_EXPERTS",
+    0,
+    "lowm MoE decode: L2 prefetch of this many likely experts (previous step's routing) during the layer's attention",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

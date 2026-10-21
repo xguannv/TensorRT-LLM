@@ -2177,6 +2177,14 @@ class KimiLinearModel(DecoderModel):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
+def _l2_prefetch_experts_hook(attention: nn.Module) -> None:
+    """The layer's expert L2 prefetch (``K3DecodeMoeNvfp4Layer.l2_prefetch_experts``, set by the target's build), called
+    once the attention's weight-heavy projections are issued."""
+    prefetch = attention.__dict__.get("l2_prefetch_experts")
+    if prefetch is not None:
+        prefetch()
+
+
 class K3DecodeKDA(KimiKDALinearAttention):
     """FP8 QKVG projection followed by fused gate, convolution and delta recurrence.
 
@@ -2296,6 +2304,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         qkvg = self.qkvg_proj(x)
         bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+        _l2_prefetch_experts_hook(self)
         core = _fp8_attention.kda_decode(
             qkvg,
             bfa,
@@ -2352,6 +2361,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         rows = torch.cat(
             (self.qkvg_proj(x), torch.nn.functional.linear(x, self._bfa_proj_weight)), dim=-1
         )
+        _l2_prefetch_experts_hook(self)
         out = k3_fp8_kda_verify(
             rows,
             self.f_b_proj.weight,
@@ -2470,6 +2480,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
         x = hidden_states[: step.num_tokens]
         ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
         if view.get("quantized_cache", False):
+            _l2_prefetch_experts_hook(self)
             core = self._quantized_decode(ag, position_ids, attn_metadata)
             if not project_output:
                 return core
@@ -2492,6 +2503,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             float(self.kv_a_layernorm.variance_epsilon),
             self._fp8_qb_ue8m0,
         )
+        _l2_prefetch_experts_hook(self)
         core = _fp8_attention.mla_attn(
             fused_q,
             view["pool"],
@@ -3613,9 +3625,17 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             moe.decode_moe.l2_next = _l2_prefetch.module_ranges(
                 nxt.linear_attn if nxt.is_kda else nxt.self_attn
             )
-        state.l2.warm_up(
-            next(m.decode_moe.l2_next for m in takes if getattr(m.decode_moe, "l2_next", None))
-        )
+        for i, layer in enumerate(layers):
+            moe = layer.block_sparse_moe if layer.is_moe else None
+            lowm = getattr(moe, "decode_moe", None) if moe is not None else None
+            if not isinstance(lowm, _decode_moe_lowm.K3DecodeMoeNvfp4Layer):
+                continue
+            w1, w1_sf, _, w2, w2_sf, _ = lowm.experts
+            lowm.l2_record = state.l2.new_record(w1.device)
+            lowm.l2_expert_ranges = state.l2.expert_ranges((w1, w1_sf, w2, w2_sf), lowm.num_local)
+            attention = layer.linear_attn if layer.is_kda else layer.self_attn
+            attention.l2_prefetch_experts = lowm.l2_prefetch_experts
+        self._warm_up_l2_prefetch(state.l2, takes)
         self.model.l2_prefetcher = state.l2
         sizes = [
             sum(n for _, n in m.decode_moe.l2_next)
@@ -3630,6 +3650,25 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         first.warm_up(takes[0])
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         return len(takes)
+
+    @staticmethod
+    def _warm_up_l2_prefetch(prefetcher, moes) -> None:
+        """Compile the L2 prefetch launches the decode issues, outside any capture: each MoE layer's dense ranges, a
+        routing record (of an empty routing), and the expert prefetch at budgets 8 and 16 (another budget, as the
+        switch is read at dispatch, compiles on first use)."""
+        lowm = [m.decode_moe for m in moes]
+        for layer in lowm:
+            prefetcher.issue(getattr(layer, "l2_next", None) or ())
+        first = lowm[0]
+        tiles = torch.zeros(1, dtype=torch.int32, device=first.l2_record.device)
+        prefetcher.issue((), record=(first.l2_record, (tiles, tiles, tiles), first.num_local))
+        for budget in (8, 16):
+            prefetcher.prefetch_experts(
+                first.l2_record, first.l2_expert_ranges, first.num_local, budget
+            )
+        prefetcher.join()
+        torch.cuda.current_stream().synchronize()
+        first.l2_record.zero_()
 
     def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Turn the DFlash / DSpark worker's Kimi K3 decode kernels (its ``k3_decode``: ``trtllm::k3_spec_accept``,

@@ -230,10 +230,12 @@ def run(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    sort_sink: Optional[list] = None,
 ) -> torch.Tensor:
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
-    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32)."""
+    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``sort_sink``: a list that receives
+    ``(tile_idx_to_group_idx, tile_idx_to_mn_limit, num_non_exiting_tiles)``."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
@@ -253,6 +255,8 @@ def run(
         local_num_experts=w1.shape[0],
         tile_tokens_dim=TILE,
     )
+    if sort_sink is not None:
+        sort_sink[:] = [tile_idx_to_group_idx, tile_idx_to_mn_limit, num_non_exiting_tiles]
     return run_sorted(
         x_fp4, x_sf, (tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                       num_non_exiting_tiles, scales),
