@@ -64,7 +64,7 @@ TRTLLM_K3LL_MLA_DRAFTER_NORMS = _flag(
 )
 TRTLLM_K3LL_MLA_DRAFTER_CTX = _flag(
     "TRTLLM_K3LL_MLA_DRAFTER_CTX",
-    0,
+    1,
     "MLA DSpark drafter (with TRTLLM_K3LL_MLA_SPEC_WORKER): context latents of all layers in one k3_drafter_mla_ctx_kv",
 )
 TRTLLM_K3LL_MLA_SPEC_ACCEPT = _flag(
