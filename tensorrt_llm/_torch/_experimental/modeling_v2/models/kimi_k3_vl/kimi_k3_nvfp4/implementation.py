@@ -2177,10 +2177,17 @@ class KimiLinearModel(DecoderModel):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
+def _decode_attention(layer: nn.Module) -> nn.Module:
+    """A decoder layer's attention module that runs the decode (an MLA layer's ``self_attn`` wraps it as ``mixer``)."""
+    if layer.is_kda:
+        return layer.linear_attn
+    return getattr(layer.self_attn, "mixer", layer.self_attn)
+
+
 def _l2_attention_weights(layer: nn.Module) -> list:
     """The weights a decoder layer's decode attention reads first and in bulk (``l2_prefetch.tensor_ranges``): the KDA
     QKVG projection, or the MLA layer's Q-B weight as the fused q path reads it, and the output projection."""
-    attention = layer.linear_attn if layer.is_kda else layer.self_attn
+    attention = _decode_attention(layer)
     o_proj = getattr(attention, "o_proj", None)
     tensors = [getattr(o_proj, "weight", None), getattr(o_proj, "weight_scale", None)]
     if layer.is_kda:
@@ -3652,8 +3659,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             w1, w1_sf, _, w2, w2_sf, _ = lowm.experts
             lowm.l2_record = state.l2.new_record(w1.device)
             lowm.l2_expert_ranges = state.l2.expert_ranges((w1, w1_sf, w2, w2_sf), lowm.num_local)
-            attention = layer.linear_attn if layer.is_kda else layer.self_attn
-            attention.l2_prefetch_experts = lowm.l2_prefetch_experts
+            _decode_attention(layer).l2_prefetch_experts = lowm.l2_prefetch_experts
         self._warm_up_l2_prefetch(state.l2, takes)
         self.model.l2_prefetcher = state.l2
         sizes = [
