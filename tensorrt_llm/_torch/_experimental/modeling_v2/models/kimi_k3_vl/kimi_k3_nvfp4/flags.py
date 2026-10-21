@@ -85,6 +85,11 @@ TRTLLM_K3LL_MLA_QKV_SPLIT = _flag(
     1,
     "target MLA decode: q_a prep, Q-B in 32-column slices and the absorption as three launches, not one per head",
 )
+TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
+    "TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL",
+    0,
+    "MLA DSpark drafter: block decode on its cute-dsl implementation when speculative_config leaves it at AUTO",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

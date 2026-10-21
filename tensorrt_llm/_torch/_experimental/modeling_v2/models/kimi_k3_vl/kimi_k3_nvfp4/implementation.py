@@ -3345,6 +3345,32 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         model_config.pretrained_config = self.config
         model_config._frozen = True
 
+    def _prefer_cute_dsl_drafter_attention(self, spec_config) -> None:
+        """With ``TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL``, the MLA DSpark drafter's block decode on its cute-dsl
+        implementation when ``speculative_config`` leaves ``attention_backend`` at AUTO (which that drafter resolves
+        to the trtllm-gen absorbed-MLA decode). The name only selects the drafter's own implementation at run time
+        (``_mla_block_decode_variant``; it loads no worker op set), so the built drafter can switch."""
+        drafter = self.draft_model
+        if not _flags.TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL or drafter is None:
+            return
+        if getattr(spec_config, "attention_backend", None) != "AUTO":
+            return
+        if getattr(drafter, "dflash_attention_backend", None) != "TRTLLM":
+            return
+        reason = drafter._attention_backend_unavailability_reason("CUTEDSL")
+        if reason is not None:
+            logger.info_once(
+                f"Kimi K3 MLA DSpark drafter attention stays on TRTLLM: CUTEDSL is unavailable ({reason})",
+                key="k3_drafter_attn_cutedsl_unavailable",
+            )
+            return
+        drafter.dflash_attention_backend = "CUTEDSL"
+        logger.info_once(
+            "Kimi K3 MLA DSpark drafter attention: CUTEDSL (TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL; speculative_config "
+            "attention_backend AUTO)",
+            key="k3_drafter_attn_cutedsl",
+        )
+
     def _own_spec_branch(self, model_config: ModelConfig) -> None:
         """Put this target's drafter and worker in place of the shell's stock ones: DSpark's drafter from a
         standalone GQA checkpoint is `K3DSparkDrafter`, and the DFlash / standalone DSpark worker is
@@ -3362,6 +3388,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             # The MLA drafter's compressed context cache requires the stock worker's context path; with
             # TRTLLM_K3LL_MLA_SPEC_WORKER it runs as KimiK3MLADSparkWorker, the stock worker plus the draft-side
             # kernels (sharded block logits, k3_markov).
+            self._prefer_cute_dsl_drafter_attention(spec_config)
             if not _flags.TRTLLM_K3LL_MLA_SPEC_WORKER:
                 return
             worker = _spec_worker.KimiK3MLADSparkWorker(
