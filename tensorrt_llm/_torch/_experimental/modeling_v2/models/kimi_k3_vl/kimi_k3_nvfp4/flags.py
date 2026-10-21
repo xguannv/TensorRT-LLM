@@ -97,6 +97,12 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
     "lowm MoE on 9-16 token steps: the head, routing, NVFP4 latent and shared gate_up in k3_moe_front's 16-token build",
 )
 
+TRTLLM_K3LL_WIDE_LATENT_NORM = _flag(
+    "TRTLLM_K3LL_WIDE_LATENT_NORM",
+    0,
+    "lowm MoE on wide steps: the latent all-reduce and its RMSNorm as one two-shot MNNVL all-reduce + RMSNorm",
+)
+
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""

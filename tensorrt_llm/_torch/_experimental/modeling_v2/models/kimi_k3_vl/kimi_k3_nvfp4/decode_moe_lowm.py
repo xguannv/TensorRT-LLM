@@ -36,6 +36,9 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_fusion_allreduce import (
+    mnnvl_fusion_allreduce,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
     MnnvlWorkspace,
 )
@@ -51,7 +54,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant im
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
-from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
+from . import flags as _flags
+from .decode_comm import WIDE_AR_ONE_SHOT_MAX_BYTES, K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
 
 MAX_TOKENS = 8
@@ -227,6 +231,8 @@ class K3DecodeMoeNvfp4Layer:
     fc2_input_scale: torch.Tensor
     offset: int
     situ: tuple
+    #: A zero bf16 latent [WIDE_MAX_TOKENS, moe_hidden_size]: the residual of the wide latent all-reduce + RMSNorm.
+    zero_latent: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -269,6 +275,9 @@ class K3DecodeMoeNvfp4Layer:
             fc2_input_scale=backend.fc2_input_scale.detach().reshape(1),
             offset=int(backend.slot_start),
             situ=(_scalar(backend.act_alpha), _scalar(backend.act_beta)),
+            zero_latent=up.new_zeros(WIDE_MAX_TOKENS, moe.moe_hidden_size)
+            if _flags.TRTLLM_K3LL_WIDE_LATENT_NORM
+            else None,
         )
 
     def warm_up(self, moe: nn.Module) -> None:
@@ -411,7 +420,20 @@ class K3DecodeMoeNvfp4Layer:
             routed, shared_act = self._wide_head(moe, x, gemvs)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
         # columns.
-        normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
+        norm = moe.routed_expert_norm
+        if _flags.TRTLLM_K3LL_WIDE_LATENT_NORM:
+            # Two-shot, the RMSNorm in the all-reduce's epilogue (a zero residual: the norm alone).
+            rows = routed.shape[0]
+            normed, _ = mnnvl_fusion_allreduce(
+                routed.contiguous(),
+                self.state.mnnvl,
+                WIDE_AR_ONE_SHOT_MAX_BYTES,
+                residual=self.zero_latent[:rows],
+                norm_weight=norm.weight,
+                eps=float(norm.variance_epsilon),
+            )
+        else:
+            normed = norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
         parts = [normed[:, self.lo : self.lo + self.width]]
         if self.tail_pad is not None:
             parts.append(self.tail_pad[: x.shape[0]])
