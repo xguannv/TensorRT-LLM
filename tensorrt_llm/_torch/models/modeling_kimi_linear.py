@@ -384,6 +384,14 @@ _K3_LD_FP4_MAX_M = int(os.environ.get("TRTLLM_K3_LD_FP4_MAX_M", "32"))
 _K3_ROUTER_EXACT_MODE = os.environ.get("TRTLLM_K3_ROUTER_EXACT", "0")
 if _K3_ROUTER_EXACT_MODE not in ("0", "1", "kda"):
     raise ValueError(f"TRTLLM_K3_ROUTER_EXACT must be 0, 1 or kda, got {_K3_ROUTER_EXACT_MODE!r}")
+# TRTLLM_K3_ROUTE_TAIL_PREFETCH=1: the CuTe routing tail of each MoE layer (TRTLLM_K3_ROUTE_TAIL,
+# cluster kernel, up to 256 tokens) also prefetches into L2 the bias, and with expert copies the
+# replica table, of the next MoE layer's tail (the first MoE layer's after the last one): a few KB,
+# from one thread. A tail stages them before its griddepcontrol.wait, but its CTAs become resident
+# only when the router's CTAs leave their SMs, so that staging lies on the routing chain and, with
+# the data a decode step old, reads HBM under latent_down's weight stream (b2 replica, dsv3 router:
+# staging 1.0 -> 0.4 us). Hints only: bit-exact.
+_K3_ROUTE_TAIL_PREFETCH = os.environ.get("TRTLLM_K3_ROUTE_TAIL_PREFETCH", "0") == "1"
 # TRTLLM_K3_MOE_L2_PREFETCH: comma list of what the latent-down stream prefetches into L2 once the
 # routed FC2 is done (the latent all-reduce, latent_up and the next attention block leave HBM mostly
 # idle; k3_l2_prefetch, hints only): "lu" this layer's latent_up weight, "front" the next MoE layer's
@@ -3465,9 +3473,26 @@ class KimiK3MoERuntime(nn.Module):
             self._expl2_route = outs
         return topk_ids, outs[1]
 
+    def _tail_prefetch_targets(
+        self,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """``TRTLLM_K3_ROUTE_TAIL_PREFETCH``: ``(bias, replica table)`` of the next MoE layer's
+        routing tail (the first MoE layer after the last one) for this layer's tail to prefetch
+        into L2; ``None`` where there is nothing to prefetch."""
+        if not _K3_ROUTE_TAIL_PREFETCH:
+            return None, None
+        group = getattr(self, "_moe_group", None)
+        nxt = self._next_moe_layer() if group is not None else None
+        if nxt is None and group:
+            nxt = group.get(min(group.keys()))
+        if nxt is None:
+            return None, None
+        return nxt.gate.e_score_correction_bias, nxt._replica_table
+
     def _tail_route(
         self, logits: torch.Tensor, target: Tuple[int, int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pf_bias, pf_table = self._tail_prefetch_targets()
         if self.expert_replicas is not None:
             outs = torch.ops.trtllm.k3_route_tail_rep(
                 logits,
@@ -3479,6 +3504,8 @@ class KimiK3MoERuntime(nn.Module):
                 self._replica_table,
                 len(self.expert_replicas.entries),
                 128,
+                prefetch_bias=pf_bias,
+                prefetch_table=pf_table,
             )
             return self._attach_route(outs, target)
         outs = torch.ops.trtllm.k3_route_tail(
@@ -3488,6 +3515,7 @@ class KimiK3MoERuntime(nn.Module):
             target[0],
             target[1],
             128,
+            prefetch_bias=pf_bias,
         )
         return self._attach_route(outs, target)
 

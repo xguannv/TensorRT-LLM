@@ -226,6 +226,93 @@ def test_tail_split_partials(m):
     _check_outputs(outs, logits, bias, 1.0, 0, 224)
 
 
+@pytest.mark.parametrize("m", MS)
+@pytest.mark.parametrize("mode", ["rand", "skew", "ties"])
+def test_tail_fast_matches_noaux_and_sort(m, mode):
+    """``fast`` mode (rolled tie fallback, top-k stored after the cluster barrier): same outputs."""
+    rt = _module()
+    logits, bias = _logits(m, seed=m, mode=mode)
+    for offset, num_local in LAYOUTS:
+        outs = rt._route_tail_outputs(logits, m, bias, num_local, TILE)
+        rt.run_k3_route_tail(
+            logits, m, bias, 1.0, outs[0], outs[1], outs[2:], offset, num_local, fast=True
+        )
+        _check_outputs(outs, logits, bias, 1.0, offset, num_local)
+
+
+@pytest.mark.parametrize("m", [1, 7, 14, 16, 32, 64, 128])
+@pytest.mark.parametrize(
+    "num_ctas,warps_per_token,num_warps",
+    [(1, 1, 16), (2, 2, 16), (8, 1, 8), (8, 2, 8), (8, 4, 8), (4, 2, 4), (8, 1, 1)],
+)
+@pytest.mark.parametrize("mode", ["realistic", "ties"])
+def test_tail_fast_configs(m, num_ctas, warps_per_token, num_warps, mode):
+    rt = _module()
+    if (m + num_ctas - 1) // num_ctas > 32:
+        pytest.skip("more than 32 tokens per CTA")
+    logits, bias = _logits(m, seed=11 * m + num_ctas, mode=mode)
+    outs = rt._route_tail_outputs(logits, m, bias, 224, TILE)
+    rt.run_k3_route_tail(
+        logits,
+        m,
+        bias,
+        1.0,
+        outs[0],
+        outs[1],
+        outs[2:],
+        224,
+        224,
+        num_ctas=num_ctas,
+        warps_per_token=warps_per_token,
+        num_warps=num_warps,
+        fast=True,
+    )
+    _check_outputs(outs, logits, bias, 1.0, 224, 224)
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_tail_prefetch_next_bias(fast):
+    """The next layer's bias prefetch is a hint: same outputs, also replayed in a CUDA graph;
+    tensors that are not a 16-byte aligned fp32 [896] are not prefetched."""
+    rt = _module()
+    m = 14
+    logits, bias = _logits(m, seed=21, mode="realistic")
+    next_bias = torch.randn((NUM_EXPERTS,), device="cuda") * 0.01
+    outs = torch.ops.trtllm.k3_route_tail(logits, bias, 1.0, 224, 224, TILE, -1, next_bias)
+    _check_outputs(outs, logits, bias, 1.0, 224, 224)
+    assert rt._prefetch_ptr(next_bias, NUM_EXPERTS * 4) == next_bias.data_ptr()
+    assert rt._prefetch_ptr(next_bias[1:], NUM_EXPERTS * 4) == 0
+    assert rt._prefetch_ptr(None, NUM_EXPERTS * 4) == 0
+    static = logits.clone()
+    out_static = rt._route_tail_outputs(static, m, bias, 224, TILE)
+
+    def launch():
+        rt.run_k3_route_tail(
+            static,
+            m,
+            bias,
+            1.0,
+            out_static[0],
+            out_static[1],
+            out_static[2:],
+            224,
+            224,
+            fast=fast,
+            prefetch_bias=next_bias,
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for seed in range(3):
+        fresh, _ = _logits(m, seed=60 + seed, mode="realistic")
+        static.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_outputs(out_static, static, bias, 1.0, 224, 224)
+
+
 def test_tail_cuda_graph_replay():
     _module()
     m = 32
@@ -857,9 +944,13 @@ def _check_sort(sort_outs, sel, vals, offset, num_local, num_slots):
         assert int(p2e_cpu[perm]) == expanded, f"permuted_idx_to_expanded_idx[{perm}]"
 
 
-def _run_replicas(logits, bias, entries, slots, scale=1.0, num_tokens=-1):
+def _run_replicas(
+    logits, bias, entries, slots, scale=1.0, num_tokens=-1, fast=None, shape=None, prefetch=False
+):
     """``k3_route_tail_rep`` of every EP rank; checks top-k, the sort and that every selection is
-    computed on exactly one rank. Returns the reference slots."""
+    computed on exactly one rank. Returns the reference slots. ``fast`` / ``shape`` (``(ctas,
+    warps per token, warps)``) / ``prefetch`` (a next-layer bias and table to prefetch) launch
+    through ``run_k3_route_tail_rep``."""
     rt = _module()
     m = logits.shape[0] if num_tokens < 0 else num_tokens
     num_local = REP_HOME + slots
@@ -867,10 +958,46 @@ def _run_replicas(logits, bias, entries, slots, scale=1.0, num_tokens=-1):
     sel = None
     for rank in range(REP_EP):
         table = torch.tensor(rt.replica_table(entries, rank), dtype=torch.int32, device="cuda")
-        outs = torch.ops.trtllm.k3_route_tail_rep(
-            logits, bias, scale, rank * num_local, num_local, rank * REP_HOME, table,
-            len(entries), TILE, num_tokens,
-        )
+        if fast is None and shape is None and not prefetch:
+            outs = torch.ops.trtllm.k3_route_tail_rep(
+                logits,
+                bias,
+                scale,
+                rank * num_local,
+                num_local,
+                rank * REP_HOME,
+                table,
+                len(entries),
+                TILE,
+                num_tokens,
+            )
+        else:
+            outs = rt._route_tail_outputs(logits, m, bias, num_local, TILE)
+            kwargs = {}
+            if shape is not None:
+                kwargs = dict(num_ctas=shape[0], warps_per_token=shape[1], num_warps=shape[2])
+            if prefetch:
+                kwargs["prefetch_bias"] = torch.randn((NUM_EXPERTS,), device="cuda")
+                kwargs["prefetch_table"] = torch.tensor(
+                    rt.replica_table(entries[::-1], (rank + 1) % REP_EP),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            rt.run_k3_route_tail_rep(
+                logits,
+                m,
+                bias,
+                scale,
+                outs[0],
+                outs[1],
+                outs[2:],
+                num_local,
+                rank * REP_HOME,
+                table,
+                len(entries),
+                fast=fast,
+                **kwargs,
+            )
         if sel is None:
             if logits.dim() == 2:
                 flat = logits[:m]
@@ -974,6 +1101,108 @@ def test_tail_replicas_rejects_bad_arguments():
         torch.ops.trtllm.k3_route_tail_rep(big, big_bias, 1.0, 0, 232, 0, table, 0, TILE)
 
 
+@pytest.mark.parametrize("m", [1, 7, 14, 16, 28, 32, 64, 112, 256])
+@pytest.mark.parametrize("slots", [4, 8, 16])
+@pytest.mark.parametrize("mode", ["realistic", "rand", "skew"])
+def test_tail_replicas_fast(m, slots, mode):
+    """``fast`` copy choice (class masks of the table, top-k stored after the barrier): same
+    choice and outputs as the reference."""
+    logits, bias = _logits(m, seed=31 * m + slots, mode=mode)
+    hot = range(224, 232) if mode == "skew" else ()
+    _run_replicas(logits, bias, _copy_entries(slots, seed=m + slots, hot=hot), slots, fast=True)
+
+
+@pytest.mark.parametrize("m", [7, 14, 32])
+@pytest.mark.parametrize(
+    "shape", [(8, 2, 8), (8, 4, 8), (8, 1, 4), (4, 2, 8), (2, 2, 16), (1, 1, 16)]
+)
+def test_tail_replicas_fast_configs(m, shape):
+    if (m + shape[0] - 1) // shape[0] > 32:
+        pytest.skip("more than 32 tokens per CTA")
+    logits, bias = _logits(m, seed=5 * m + shape[0], mode="realistic")
+    _run_replicas(logits, bias, _copy_entries(8, seed=m), 8, fast=True, shape=shape)
+
+
+def test_tail_replicas_fast_many_entries_and_ties():
+    """Two chunks of entries (64 two-copy experts) and heavy ties (the exact fallback) in fast
+    mode, and the hot-expert case of :func:`test_tail_replicas_move_load_off_the_busiest_rank`."""
+    m = 14
+    logits, bias = _logits(m, seed=5)
+    logits[:, 224:264] += 6
+    entries = _copy_entries(16, seed=3, hot=range(224, 264))
+    assert len(entries) == 64
+    _run_replicas(logits, bias, entries, 16, fast=True)
+    ties, tie_bias = _logits(m, seed=8, mode="ties")
+    _run_replicas(ties, tie_bias, _copy_entries(8, seed=8), 8, fast=True)
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_tail_replicas_prefetch_next_layer(fast):
+    """Prefetching the next layer's bias and table changes nothing."""
+    logits, bias = _logits(14, seed=17, mode="realistic")
+    _run_replicas(logits, bias, _copy_entries(8, seed=17), 8, fast=fast, prefetch=True)
+
+
+def test_tail_replicas_fast_cuda_graph_replay():
+    rt = _module()
+    m, slots = 14, 8
+    entries = _copy_entries(slots, seed=21)
+    num_local = REP_HOME + slots
+    logits, bias = _logits(m, seed=4, mode="realistic")
+    static = logits.clone()
+    rank = 1
+    table = torch.tensor(rt.replica_table(entries, rank), dtype=torch.int32, device="cuda")
+    next_table = torch.tensor(rt.replica_table(entries, 2), dtype=torch.int32, device="cuda")
+    outs = rt._route_tail_outputs(static, m, bias, num_local, TILE)
+
+    def launch():
+        rt.run_k3_route_tail_rep(
+            static,
+            m,
+            bias,
+            1.0,
+            outs[0],
+            outs[1],
+            outs[2:],
+            num_local,
+            rank * REP_HOME,
+            table,
+            len(entries),
+            fast=True,
+            prefetch_bias=bias,
+            prefetch_table=next_table,
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for seed in range(4):
+        fresh, _ = _logits(m, seed=40 + seed, mode="realistic" if seed % 2 else "skew")
+        static.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_ids, ref_vals = _noaux(static, bias, 1.0)
+        _assert_bit_equal(outs[0], ref_ids, "topk_ids")
+        _assert_bit_equal(outs[1], ref_vals, "topk_weights")
+        sel = _copy_slots(ref_ids, entries, slots)
+        _check_sort(outs[2:], sel, ref_vals, rank * num_local, num_local, REP_EP * num_local)
+
+
+def test_replica_table_class_masks():
+    """Class masks: entry ``i`` sets bit ``i % 32`` of word ``2 (4 h + r) + i // 32``."""
+    rt = _module()
+    entries = _copy_entries(16, seed=2)
+    t = rt.replica_table(entries, 0)
+    assert len(t) == rt.REP_TABLE_WORDS and rt.REP_TABLE_WORDS % 4 == 0
+    want = [0] * 32
+    for i, (x, r) in enumerate(entries):
+        want[2 * (4 * (x // REP_HOME) + r) + i // 32] |= 1 << (i % 32)
+    got = [w & 0xFFFFFFFF for w in t[rt.REP_CLASS_OFF : rt.REP_CLASS_OFF + 32]]
+    assert got == want
+    assert all(got[2 * (5 * h)] == 0 and got[2 * (5 * h) + 1] == 0 for h in range(4))
+
+
 def test_replica_table_and_choice_reference():
     rt = _module()
     entries = [(5, 1), (300, 0), (700, 1), (230, 3)]
@@ -1065,3 +1294,63 @@ def test_moe_runtime_routes_with_expert_copies(monkeypatch):
     )
     monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "gemv")
     assert not runtime._can_gemv_route(torch.zeros(m, HIDDEN, device="cuda"))
+
+
+def test_moe_runtime_tail_prefetch_targets(monkeypatch):
+    """``TRTLLM_K3_ROUTE_TAIL_PREFETCH``: a layer's tail prefetches the next MoE layer's bias and
+    replica table, the last layer's the first layer's; off, nothing; the routing is unchanged."""
+    import weakref
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _KimiK3RoutingMethod
+
+    _module()
+    group = weakref.WeakValueDictionary()
+    layers = []
+    for idx in (1, 2, 3):
+        runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(
+            modeling_kimi_linear.KimiK3MoERuntime
+        )
+        nn.Module.__init__(runtime)
+        runtime.layer_idx = idx
+        runtime._moe_group = group
+        bias = torch.randn((NUM_EXPERTS,), device="cuda") * 0.01
+        runtime.gate = SimpleNamespace(
+            e_score_correction_bias=bias, num_experts=NUM_EXPERTS, routed_scaling_factor=1.0
+        )
+        runtime.routed_experts = SimpleNamespace(
+            routing_method=_KimiK3RoutingMethod(
+                top_k=TOP_K,
+                n_group=1,
+                topk_group=1,
+                routed_scaling_factor=1.0,
+                callable_e_score_correction_bias=lambda b=bias: b,
+                is_fused=True,
+            ),
+            use_dp=False,
+            backend=SimpleNamespace(slot_start=224, expert_size_per_partition=224, num_slots=896),
+        )
+        group[idx] = runtime
+        layers.append(runtime)
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL_PREFETCH", False)
+    assert layers[0]._tail_prefetch_targets() == (None, None)
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL_PREFETCH", True)
+    assert layers[0]._tail_prefetch_targets()[0] is layers[1].gate.e_score_correction_bias
+    assert layers[1]._tail_prefetch_targets()[0] is layers[2].gate.e_score_correction_bias
+    assert layers[2]._tail_prefetch_targets()[0] is layers[0].gate.e_score_correction_bias
+    assert layers[0]._tail_prefetch_targets()[1] is None
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", "1")
+    m = 14
+    logits, _ = _logits(m, seed=23, mode="realistic")
+    bias = layers[0].gate.e_score_correction_bias
+    target = layers[0]._route_tail_target(m)
+    assert target == (224, 224)
+    ids, weights = layers[0]._tail_route(logits, target)
+    ref_ids, ref_vals = _noaux(logits, bias, 1.0)
+    _assert_bit_equal(ids, ref_ids, "topk_ids")
+    _assert_bit_equal(weights, ref_vals, "topk_weights")
+    key, sort_outputs = ids._k3_presorted
+    _check_outputs((ids, weights, *sort_outputs), logits, bias, 1.0, 224, 224)
