@@ -15,6 +15,7 @@
  */
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kimiK3Mnnvl/mnnvlAllreduceAttnRes.h"
+#include <algorithm>
 #include <cfloat>
 #include <cooperative_groups.h>
 #include <cstddef>
@@ -853,6 +854,203 @@ void oneshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilo
 void twoshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue)
 {
     allreduceAttnResOp(params, epilogue, /*twoShot=*/true);
+}
+
+namespace detail
+{
+constexpr int kRmsSliceEltsPerPacket = 8;
+constexpr int kRmsSliceMaxThreads = 1024;
+} // namespace detail
+
+// See allreduceRmsNormSliceOp. One CTA per token. Scatter: thread p sends packet p (eight columns) of this rank's row
+// to the rank owning those columns. Warp 0 then reduces this rank's slice, one packet per lane, multicasts the slice's
+// sum of squares and, once every rank's sum has arrived, scales and writes the slice; the other warps write the
+// padding and the tail meanwhile.
+template <uint8_t WorldSize>
+__global__ void __launch_bounds__(detail::kRmsSliceMaxThreads)
+    allreduceRmsNormSliceKernel(AllreduceRmsNormSliceParams params)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    using T = __nv_bfloat16;
+    using PackedType = float4;
+    using Packed = PackedVec<PackedType, T>;
+    constexpr int kELTS = detail::kRmsSliceEltsPerPacket;
+    constexpr int kScatter = 0;
+    constexpr int kSums = 1;
+    constexpr int kStages = 2;
+    // twoshotAllreduceKernel's reduction order, so the reduced slice has that op's bits.
+    constexpr int kRankChunk = WorldSize < 16 ? WorldSize : 16;
+    static_assert(WorldSize % 4 == 0, "the sums are polled four ranks per 16-byte load");
+
+    int const token = blockIdx.x;
+    int const hidden = params.hidden;
+    int const sliceCols = hidden / WorldSize;
+    int const slicePackets = sliceCols / kELTS;
+    int const rowPackets = hidden / kELTS;
+    int const outCols = sliceCols + params.padCols + params.tailCols;
+    void* const* ucPtrs = params.bufferPtrsDev;
+    T const* input = static_cast<T const*>(params.input);
+    T* outRow = static_cast<T*>(params.output) + static_cast<size_t>(token) * outCols;
+
+    cudaGridDependencySynchronize();
+    // Every consumer of the output waits for this whole grid, so triggering here only lets the next kernel launch and
+    // stream its weights while the ranks exchange.
+    cudaTriggerProgrammaticLaunchCompletion();
+
+    LamportFlags<PackedType> flag(params.bufferFlags, kStages);
+    T const* scatterLocal = reinterpret_cast<T const*>(flag.getCurLamportBuf(ucPtrs[params.rank], kScatter));
+    float* sumsMcast = reinterpret_cast<float*>(flag.getCurLamportBuf(params.multicastPtr, kSums));
+    float const* sumsLocal = reinterpret_cast<float const*>(flag.getCurLamportBuf(ucPtrs[params.rank], kSums));
+
+    // ==================== Scatter: columns [d * w, (d + 1) * w) to rank d, at [token][rank]
+    // =============================
+    for (int p = static_cast<int>(threadIdx.x); p < rowPackets; p += static_cast<int>(blockDim.x))
+    {
+        int const dest = p / slicePackets;
+        Packed val;
+        val.packed = loadPacked<PackedType>(&input[static_cast<size_t>(token) * hidden + p * kELTS]);
+        sanitizeLamportPayload(val);
+        T* scatterDest = reinterpret_cast<T*>(flag.getCurLamportBuf(ucPtrs[dest], kScatter));
+        reinterpret_cast<PackedType*>(
+            &scatterDest[(static_cast<size_t>(token) * WorldSize + params.rank) * sliceCols])[p - dest * slicePackets]
+            = val.packed;
+    }
+    flag.clearDirtyLamportBuf(ucPtrs[params.rank], kScatter);
+
+    // ==================== Warp 0: reduce this rank's slice, multicast its sum of squares
+    // ================================
+    bool const sliceLane = threadIdx.x < detail::kWARP_SIZE;
+    float values[kELTS] = {};
+    if (sliceLane)
+    {
+        float sumSq = 0.F;
+        if (static_cast<int>(threadIdx.x) < slicePackets)
+        {
+            float accum[kELTS];
+            detail::accumulateLamportRanksChunked<WorldSize, kRankChunk, T, PackedType, kELTS>(
+                accum, scatterLocal, token, sliceCols, static_cast<int>(threadIdx.x));
+#pragma unroll
+            for (int i = 0; i < kELTS; i++)
+            {
+                values[i] = cuda_cast<float, T>(cuda_cast<T, float>(accum[i]));
+                sumSq += values[i] * values[i];
+            }
+        }
+        // A butterfly: every lane ends with the same bits. A sum of squares is never -0.0, the Lamport sentinel.
+#pragma unroll
+        for (int offset = detail::kWARP_SIZE / 2; offset > 0; offset /= 2)
+        {
+            sumSq += __shfl_xor_sync(0xffffffffU, sumSq, offset);
+        }
+        if (threadIdx.x == 0)
+        {
+            sumsMcast[static_cast<size_t>(token) * WorldSize + params.rank] = sumSq;
+        }
+    }
+    else
+    {
+        // ==================== The other warps: padding and tail =====================================================
+        T const* tail = static_cast<T const*>(params.tail);
+        int const padPackets = params.padCols / kELTS;
+        int const extraPackets = padPackets + params.tailCols / kELTS;
+        int const warpThreads = static_cast<int>(detail::kWARP_SIZE);
+        for (int p = static_cast<int>(threadIdx.x) - warpThreads; p < extraPackets;
+             p += static_cast<int>(blockDim.x) - warpThreads)
+        {
+            PackedType v = make_float4(0.F, 0.F, 0.F, 0.F);
+            if (p >= padPackets)
+            {
+                v = loadPacked<PackedType>(
+                    &tail[static_cast<size_t>(token) * params.tailCols + (p - padPackets) * kELTS]);
+            }
+            reinterpret_cast<PackedType*>(&outRow[sliceCols])[p] = v;
+        }
+    }
+    flag.clearDirtyLamportBuf(ucPtrs[params.rank], kSums);
+    flag.ctaArrive();
+
+    // ==================== Warp 0: every rank's sum, in rank order; the scaled slice
+    // ===================================
+    if (sliceLane)
+    {
+        float const* sums = &sumsLocal[static_cast<size_t>(token) * WorldSize];
+        float total = 0.F;
+        bool ready = false;
+        while (!ready)
+        {
+            ready = true;
+            total = 0.F;
+#pragma unroll
+            for (int g = 0; g < WorldSize / 4; g++)
+            {
+                auto const loaded = loadPackedVolatile<PackedType>(&sums[g * 4]);
+                ready &= !isLamportDirty(loaded);
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+                    total += __uint_as_float(loaded.words[j]);
+                }
+            }
+        }
+        float const rcpRms = rsqrtf(total / static_cast<float>(hidden) + params.eps);
+        if (static_cast<int>(threadIdx.x) < slicePackets)
+        {
+            Packed out;
+#pragma unroll
+            for (int i = 0; i < kELTS; i++)
+            {
+                out.elements[i] = cuda_cast<T, float>(values[i] * rcpRms);
+            }
+            reinterpret_cast<PackedType*>(outRow)[threadIdx.x] = out.packed;
+        }
+    }
+    flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * hidden * sizeof(T)),
+        static_cast<uint32_t>(params.numTokens * WorldSize * sizeof(float)), 0, 0});
+#endif
+}
+
+void allreduceRmsNormSliceOp(AllreduceRmsNormSliceParams const& params)
+{
+    static int const kSMVersion = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL AllReduceRmsNormSlice] requires SM 90 or newer.");
+    constexpr int kELTS = detail::kRmsSliceEltsPerPacket;
+    int const nRanks = params.nRanks;
+    TLLM_CHECK_WITH_INFO(nRanks == 4 || nRanks == 8 || nRanks == 16,
+        "[MNNVL AllReduceRmsNormSlice] unsupported world size %d (4, 8 or 16).", nRanks);
+    int const sliceCols = params.hidden / nRanks;
+    TLLM_CHECK_WITH_INFO(params.hidden % nRanks == 0 && sliceCols % kELTS == 0
+            && sliceCols / kELTS <= static_cast<int>(detail::kWARP_SIZE),
+        "[MNNVL AllReduceRmsNormSlice] hidden %d over %d ranks must give a multiple of %d columns, at most %d.",
+        params.hidden, nRanks, kELTS, kELTS * static_cast<int>(detail::kWARP_SIZE));
+    TLLM_CHECK_WITH_INFO(
+        params.padCols % kELTS == 0 && params.tailCols % kELTS == 0 && params.padCols >= 0 && params.tailCols >= 0,
+        "[MNNVL AllReduceRmsNormSlice] padCols %d and tailCols %d must be non-negative multiples of %d.",
+        params.padCols, params.tailCols, kELTS);
+    TLLM_CHECK_WITH_INFO(params.numTokens > 0, "[MNNVL AllReduceRmsNormSlice] needs at least one token.");
+
+    int const rowPackets = params.hidden / kELTS;
+    int const warp = static_cast<int>(detail::kWARP_SIZE);
+    // Warp 0 reduces the slice; at least one more warp writes the padding and the tail.
+    int const threads
+        = std::min(std::max((rowPackets + warp - 1) / warp * warp, 2 * warp), detail::kRmsSliceMaxThreads);
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    cudaLaunchConfig_t config{
+        .gridDim = dim3(params.numTokens, 1, 1),
+        .blockDim = dim3(threads, 1, 1),
+        .dynamicSmemBytes = 0,
+        .stream = params.stream,
+        .attrs = attrs,
+        .numAttrs = 1U,
+    };
+    switch (nRanks)
+    {
+    case 4: TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &allreduceRmsNormSliceKernel<4>, params)); break;
+    case 8: TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &allreduceRmsNormSliceKernel<8>, params)); break;
+    case 16: TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &allreduceRmsNormSliceKernel<16>, params)); break;
+    default: break;
+    }
 }
 } // namespace kernels::kimiK3Mnnvl
 

@@ -64,6 +64,47 @@ void oneshotAllreduceAttnResOp(mnnvl::AllReduceFusionParams const& params, AttnR
  */
 void twoshotAllreduceAttnResOp(mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
 
+/**
+ * \brief Parameters of allreduceRmsNormSliceOp (BF16 tensors).
+ */
+struct AllreduceRmsNormSliceParams
+{
+    void const* input; //!< [numTokens, hidden], this rank's addend
+    void const* tail;  //!< [numTokens, tailCols], appended to every output row; unused when tailCols == 0
+    void* output;      //!< [numTokens, hidden / nRanks + padCols + tailCols]
+    int numTokens;
+    int hidden;
+    int padCols;
+    int tailCols;
+    float eps;
+
+    int nRanks;
+    int rank;
+    void** bufferPtrsDev;
+    void* multicastPtr;
+    uint32_t* bufferFlags;
+    cudaStream_t stream;
+};
+
+/**
+ * \brief This rank's column slice of RMSNorm(allreduce(input)) (a norm without a weight), laid out as the input of a
+ * row-parallel GEMM: with w = hidden / nRanks, s = rank * w and r = bf16(allreduce(input)), per token
+ *   output[:, 0:w]           = bf16(r[s:s+w] * rsqrt(mean(r * r) + eps))
+ *   output[:, w:w+padCols]   = 0
+ *   output[:, w+padCols:]    = tail
+ *
+ * Two exchanges on the MNNVL workspace (one turn of its Lamport rotation, two stages): a reduce-scatter by columns, in
+ * which every rank sums only its own w columns of every token, in the two-shot all-reduce's rank order (so r has that
+ * op's bits); then every rank multicasts each token's sum of squares over its w columns, and every rank adds the
+ * nRanks partial sums in rank order, so the scale is identical on every rank. The mean of squares is summed in a
+ * different order from a whole-row RMSNorm, so the slice may differ from RMSNorm(r) in the last bit.
+ *
+ * Requirements: SM 90 or newer; nRanks in {4, 8, 16}; w a multiple of 8 and at most 256; padCols and tailCols
+ * multiples of 8; each stage, half a Lamport buffer, holds numTokens * hidden bf16 elements (scatter) and
+ * numTokens * nRanks floats (sums).
+ */
+void allreduceRmsNormSliceOp(AllreduceRmsNormSliceParams const& params);
+
 } // namespace kernels::kimiK3Mnnvl
 
 TRTLLM_NAMESPACE_END
