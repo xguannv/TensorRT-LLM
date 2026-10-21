@@ -52,16 +52,24 @@ def _weights(attn) -> tuple:
 
 def _staged(attn, k_b_t: torch.Tensor, v_b: torch.Tensor, cluster: int) -> Optional[tuple]:
     """The padded weight copies ``TLLM_DSPARK_MLA_FUSED_STAGED`` reads (``staged_weights``),
-    cached on the module; None under CUDA graph capture before the warm-up forwards made them."""
+    cached on the module per cluster size; None under CUDA graph capture before the warm-up
+    forwards made them.
+
+    A captured graph keeps the addresses of the copies it was captured with, and graphs of
+    different batch sizes use different cluster sizes (16 CTAs up to two requests, 8 above), so a
+    cluster's copies are only ever replaced when the weights themselves change. (One shared entry
+    flipped between the sizes during the per-batch-size warm-ups and freed the copies of the
+    graphs captured before: at b4 the 4-request graph read freed memory.)"""
     from ..cute_dsl_kernels.blackwell.dspark_mla_attend import staged_weights
 
-    key = (k_b_t.data_ptr(), v_b.data_ptr(), cluster)
-    cached = attn.__dict__.get("_dspark_mla_fused_staged")
+    key = (k_b_t.data_ptr(), v_b.data_ptr())
+    by_cluster = attn.__dict__.setdefault("_dspark_mla_fused_staged", {})
+    cached = by_cluster.get(cluster)
     if cached is None or cached[0] != key:
         if torch.cuda.is_current_stream_capturing():
             return None
         cached = (key, staged_weights(k_b_t, v_b, cluster))
-        attn.__dict__["_dspark_mla_fused_staged"] = cached
+        by_cluster[cluster] = cached
     return cached[1]
 
 

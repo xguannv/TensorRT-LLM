@@ -174,3 +174,68 @@ def test_dspark_mla_attend_variants_graph_replay(monkeypatch):
         graph.replay()
         torch.cuda.synchronize()
         _check(out, _reference(q, query, pool, pt, kv_lens, k_b, v_b, scale))
+
+
+class _DraftAttn:
+    """The two projection buffers ``draft_mla_attend`` reads from a drafter attention module."""
+
+    def __init__(self, k_b, v_b):
+        self._k_b_proj = k_b
+        self._v_b_proj = v_b
+
+
+@skip_pre_blackwell
+def test_dspark_mla_fused_staged_graphs_across_batch_sizes(monkeypatch):
+    """The b4 MTP7 decode set: graphs of 4 requests (8-CTA clusters), 2 and 1 requests (16-CTA
+    clusters), block 8, captured the way the CUDA graph runner does (an eager warm-up right before
+    each capture, the greedy and the advanced-sampling pass in turn) with the staged / mbarrier
+    kernel through ``draft_mla_attend`` and the next layer's prefetch. Every graph must keep the
+    staged weight copies it was captured with: after the freed memory is reused for garbage, each
+    replay gives the bits of its eager call."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import dspark_mla_attend as K
+    from tensorrt_llm._torch.speculative.dspark_mla_fused import MLA_FUSED_ENV_VAR, draft_mla_attend
+
+    monkeypatch.setenv(MLA_FUSED_ENV_VAR, "1")
+    monkeypatch.setenv(K.STAGED_ENV_VAR, "1")
+    monkeypatch.setenv(K.ASYNC_ENV_VAR, "1")
+    monkeypatch.delenv("TLLM_DSPARK_MLA_FUSED_CLUSTER", raising=False)
+    block, heads, page, ctx = 8, 4, 64, 700
+    assert K.default_cluster(4) == 8 and K.default_cluster(2) == 16
+    scale = 1.0 / math.sqrt(NOPE + ROPE)
+    # Two drafter layers: layer 0's call also stages (and prefetches) layer 1's slices.
+    layers = [_DraftAttn(*_case(1, block, heads, 0, page, seed)[5:]) for seed in (5, 6)]
+    inputs = {b: _case(b, block, heads, ctx, page, 100 + b)[:5] for b in (4, 2, 1)}
+
+    def step(b):
+        q, query, pool, pt, kv_lens = inputs[b]
+        return draft_mla_attend(layers[0], q, query, pool, pt, kv_lens, scale, next_attn=layers[1])
+
+    runs = []
+    for _ in range(2):
+        for b in (4, 2, 1):
+            expected = step(b)
+            assert expected is not None
+            expected = expected.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = step(b)
+            assert out is not None
+            runs.append((b, graph, out, expected))
+    torch.cuda.synchronize()
+    # Fill every block the allocator can hand out again with NaN: a graph whose staged copies
+    # were freed reads them.
+    sizes = {heads * K.D_LAT * K.KB_PITCH // 2} | {
+        heads * c * K.D_V * K.vb_pitch(c) // 2 for c in (8, 16)
+    }
+    junk = [
+        torch.full((n,), float("nan"), dtype=torch.bfloat16, device="cuda")
+        for n in sorted(sizes)
+        for _ in range(16)
+    ]
+    torch.cuda.synchronize()
+    for b, graph, out, expected in runs:
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16)), b
+    del junk
