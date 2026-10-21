@@ -90,6 +90,11 @@ TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
     1,
     "MLA DSpark drafter: block decode on its cute-dsl implementation when speculative_config leaves it at AUTO",
 )
+TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
+    "TRTLLM_K3LL_KDA_BFA_OVERLAP",
+    0,
+    "KDA decode / verify: the bf16 [f_a | b] projection on the projection stream beside the FP8 QKVG projection",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

@@ -2302,8 +2302,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             slots = mamba_metadata.state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
-        qkvg = self.qkvg_proj(x)
-        bfa = self._k3_bfa(x)
+        qkvg, bfa = self._k3_projections(x)
         core = _fp8_attention.kda_decode(
             qkvg,
             bfa,
@@ -2346,6 +2345,20 @@ class K3DecodeKDA(KimiKDALinearAttention):
         core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
         return self._store_core(core, output)
 
+    def _k3_projections(self, x: torch.Tensor):
+        """``(qkvg, bfa)``: the FP8 QKVG projection and the bf16 ``[f_a | b]`` projection of ``x``. With
+        ``TRTLLM_K3LL_KDA_BFA_OVERLAP`` the bf16 one runs on the module's projection stream while the FP8 one runs
+        (the built-in decode's fork / join events), the same kernels on the same inputs."""
+        aux = self._projection_aux_stream if _flags.TRTLLM_K3LL_KDA_BFA_OVERLAP else None
+        return maybe_execute_in_parallel(
+            lambda: self.qkvg_proj(x),
+            lambda: self._k3_bfa(x),
+            self._projection_fork_event,
+            self._projection_join_event,
+            aux,
+            disable_on_compile=True,
+        )
+
     def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
         """Verify N requests of T tokens from FP8 QKVG and BF16 gate projections.
 
@@ -2357,8 +2370,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = slot_indices[:num_requests]
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
-        qkvg = self.qkvg_proj(x)
-        bfa = self._k3_bfa(x)
+        qkvg, bfa = self._k3_projections(x)
         if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
             # The kernel reads f_a and b from their own rows.
             rows, bfa_rows = qkvg, bfa
