@@ -3691,6 +3691,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     layer.decode_comm = comm
                     layer.sandwich_oproj = False
                 _decode_comm.use_decode_one_shot(self)
+            self._build_helix_decode_comm(comm)
             moe_layers = 0
             if comm is not None and _flags.TRTLLM_K3LL_MOE_LOWM:
                 moe_layers = self._build_decode_moe_lowm(comm)
@@ -3723,6 +3724,28 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 f"TRTLLM_K3LL_MOE_FRONT_SORT={_flags.TRTLLM_K3LL_MOE_FRONT_SORT}: moe_sort in k3_moe_front"
             )
             return
+
+    def _build_helix_decode_comm(self, comm: Optional[_decode_comm.K3DecodeComm]) -> None:
+        """Under Helix, the MLA split read's MNNVL exchange state (``MlaSplitRead.build_helix_comm``): the query
+        all-gather on ``comm``'s workspace and the fused exchange + combine, as the load-time switches ask. Collective
+        over the CP group, before any capture; every rank builds the shared split reads in the same (module) order."""
+        if not self.model_config.mapping.has_cp_helix():
+            return
+        reads = {}
+        for module in self.modules():
+            split_read = getattr(module, "_split_read", None)
+            if isinstance(module, K3DecodeMLA) and split_read is not None:
+                reads.setdefault(id(split_read), split_read)
+        for split_read in reads.values():
+            built = split_read.build_helix_comm(
+                None if comm is None else comm.mnnvl, self.tp_mapping
+            )
+            if split_read.rank == 0:
+                logger.info(
+                    f"Kimi K3 NVFP4 Helix MLA decode exchange: {built} (TRTLLM_K3LL_HELIX_Q_AG_MNNVL="
+                    f"{_flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL}, TRTLLM_K3LL_HELIX_A2A_FUSED="
+                    f"{_flags.TRTLLM_K3LL_HELIX_A2A_FUSED})"
+                )
 
     def _build_decode_moe_lowm(self, comm: _decode_comm.K3DecodeComm) -> int:
         """The NVFP4 MoE decode path (``decode_moe_lowm.py``) on every MoE layer it takes: the shared state
