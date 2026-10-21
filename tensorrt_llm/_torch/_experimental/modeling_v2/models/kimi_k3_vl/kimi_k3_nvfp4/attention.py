@@ -594,6 +594,15 @@ def mla_project_qkv(
         rq2, rl2 = orig()
         _dbg_check("project", [query, latent], [rq1, rl1], [ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qb_ue8m0])
         _dbg_where(query, rq1, rq2, ag, ag0, h)
+        import os
+
+        dump = os.environ.get("K3LL_DBG_MLA_DUMP")
+        if dump and not torch.cuda.is_current_stream_capturing() and not os.path.exists(dump):
+            if not torch.equal(query.view(torch.int16), rq1.view(torch.int16)):
+                torch.save(dict(ag=ag.cpu(), qa_norm=qa_norm.cpu(), qb=qb.cpu(), qb_scale=qb_scale.cpu(), kb=kb.cpu(),
+                                kb_scale=kb_scale.cpu(), kv_norm=kv_norm.cpu(), qa_eps=qa_eps, kv_eps=kv_eps,
+                                ue8m0=qb_ue8m0, query=query.cpu(), ref=rq1.cpu()), dump)
+                print(f"[k3dbg] dumped {dump}", flush=True)
         return query, latent
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
         ag,
