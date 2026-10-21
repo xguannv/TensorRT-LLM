@@ -36,6 +36,10 @@ epilogue takes ``max.f32(acc, -448)`` (NaN -> -448) and converts with ``cvt.rn.s
 nearest even, so the bytes are identical. Four more warps per CTA copy ``q_pe`` (grid-stride
 over 16-byte chunks, overlapping the GEMM). With PDL the TMA warp issues the weight stages of
 its first tile before ``griddepcontrol.wait``.
+
+For up to :data:`TILE_MAX_TOKENS` tokens, :class:`K3MlaQAbsorbTileKernel`
+(:func:`k3_mla_q_absorb_tiles`) writes the same bytes with one small CTA per (head, 128 lora rows)
+tile, swap-AB (lora rows as UMMA M, the tokens as N), all tiles at once.
 """
 
 from __future__ import annotations
@@ -48,10 +52,12 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -904,6 +910,424 @@ def k3_mla_q_absorb(
         num_tokens,
         q.stride(0),
         out.stride(0),
+        _gmem_ptr(cutlass.BFloat16, q),
+        _gmem_ptr(cutlass.BFloat16, w_kc),
+        _gmem_ptr(cutlass.Float8E4M3FN, out),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decode token counts: one CTA per (head, 128 lora rows), swap-AB.
+# ---------------------------------------------------------------------------
+
+#: Largest token count of the tile kernel (UMMA N = the tokens, padded to 16 or 32).
+TILE_MAX_TOKENS = 32
+#: K extent of one shared-memory stage (128-byte swizzled BF16 rows).
+_TILE_K_BLOCK = 64
+_TILE_EPI_WARPS = 4
+_TILE_TMA_WARP = 4
+_TILE_MMA_WARP = 5
+
+
+@dsl_user_op
+def _e4m3_byte(x, *, loc=None, ip=None):
+    """``e4m3(max.f32(x, -448))`` with ``cvt.rn.satfinite`` (the epilogue conversion of
+    :class:`K3MlaQAbsorbKernel`), in the low byte of an Int32."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Float32(x).ir_value(loc=loc, ip=ip)],
+            "{\n"
+            ".reg .f32 v;\n"
+            ".reg .b16 h;\n"
+            "max.f32 v, $1, 0fC3E00000;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 h, v, v;\n"
+            "cvt.u32.u16 $0, h;\n"
+            "and.b32 $0, $0, 0xFF;\n"
+            "}",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_u8(addr, value, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(value).ir_value(loc=loc, ip=ip)],
+        "st.global.u8 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+class K3MlaQAbsorbTileKernel:
+    """The :class:`K3MlaQAbsorbKernel` contract for up to :data:`TILE_MAX_TOKENS` tokens with one
+    CTA per (head, 128 lora rows) tile, swap-AB: ``out[t, h, rows]^T = w_kc[h, rows] @ q_nope[t,
+    h]^T`` as one tcgen05 ``kind::f16`` MMA of M = 128 lora rows, N = ``n_tok`` (the tokens, TMA
+    zero-filled past the token count), K = nope in ascending 16-wide steps, with the FP32
+    accumulator in tensor memory. Every output element is the same K-ordered chain of 16-wide MMA
+    steps as the persistent kernel's (only the operand roles differ) and the epilogue applies the
+    same ``max.f32(acc, -448)`` and ``cvt.rn.satfinite`` conversion, so the bytes are identical.
+
+    All tiles run at once (several small CTAs per SM) instead of two or three in turn per
+    persistent CTA. Warp 4 loads the tile of ``w_kc`` with TMA before ``griddepcontrol.wait`` (a
+    weight: it does not depend on the previous grid), then releases the dependent grid and loads
+    ``q_nope[:, h]``; warp 5 issues the MMA; warps 0-3 wait for the previous grid, copy ``q_pe``
+    of their head (the CTAs of the first row tile of each head), then read the accumulator (lane
+    = lora row) and store the E4M3 bytes. The dependent grid is released only after a wait, so
+    its launch implies that every CTA of this grid has passed one.
+    """
+
+    def __init__(
+        self, num_heads: int, nope_dim: int, rope_dim: int, lora_dim: int, n_tok: int, use_pdl: bool
+    ):
+        if n_tok not in (16, 32) or nope_dim % _TILE_K_BLOCK or lora_dim % CTA_M:
+            raise ValueError(f"unsupported q absorb tile shape {n_tok} {nope_dim} {lora_dim}")
+        if rope_dim % PE_VEC:
+            raise ValueError(f"rope_dim {rope_dim} is not a multiple of {PE_VEC}")
+        self.num_heads = num_heads
+        self.nope_dim = nope_dim
+        self.rope_dim = rope_dim
+        self.lora_dim = lora_dim
+        self.n_tok = n_tok
+        self.use_pdl = use_pdl
+        self.m_tiles = lora_dim // CTA_M
+        self.k_blocks = nope_dim // _TILE_K_BLOCK
+        self.mma_tiler = (CTA_M, n_tok, _TILE_K_BLOCK)
+        self.tmem_cols = max(32, 1 << (n_tok - 1).bit_length())
+        self.threads = 32 * (_TILE_MMA_WARP + 1)
+
+    @cute.jit
+    def run(
+        self,
+        num_tokens: Int32,
+        q_tok_stride: Int32,
+        out_tok_stride: Int32,
+        q_ptr: cute.Pointer,
+        w_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        stream: cuda.CUstream,
+    ):
+        head_dim = self.nope_dim + self.rope_dim
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            cutlass.BFloat16,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float32,
+            tcgen05.CtaGroup.ONE,
+            self.mma_tiler[:2],
+        )
+        a_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma, self.mma_tiler, cutlass.BFloat16, self.k_blocks
+        )
+        b_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma, self.mma_tiler, cutlass.BFloat16, self.k_blocks
+        )
+        # w_kc as (M = lora, K = nope, L = head); q_nope as (N = token, K = nope, L = head).
+        mW = cute.make_tensor(
+            w_ptr,
+            cute.make_layout(
+                (self.lora_dim, self.nope_dim, self.num_heads),
+                stride=(self.nope_dim, 1, self.lora_dim * self.nope_dim),
+            ),
+        )
+        mQ = cute.make_tensor(
+            q_ptr,
+            cute.make_layout(
+                (num_tokens, self.nope_dim, self.num_heads), stride=(q_tok_stride, 1, head_dim)
+            ),
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma.thr_id.shape,)
+        )
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mW,
+            cute.slice_(a_layout, (None, None, None, 0)),
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mQ,
+            cute.slice_(b_layout, (None, None, None, 0)),
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        self.a_bytes = cute.size_in_bytes(cutlass.BFloat16, a_layout)
+        self.b_bytes = cute.size_in_bytes(cutlass.BFloat16, b_layout)
+
+        @cute.struct
+        class TileStorage:
+            sA: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(a_layout)], 1024
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(b_layout)], 1024
+            ]
+            a_full: cutlass.Int64
+            b_full: cutlass.Int64
+            acc_full: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+
+        self.storage = TileStorage
+        self.tile_kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            a_layout,
+            b_layout,
+            q_ptr,
+            out_ptr,
+            num_tokens,
+            q_tok_stride,
+            out_tok_stride,
+        ).launch(
+            grid=(self.num_heads * self.m_tiles, 1, 1),
+            block=[self.threads, 1, 1],
+            smem=TileStorage.size_in_bytes(),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def tile_kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB: cute.Tensor,
+        a_layout: cute.ComposedLayout,
+        b_layout: cute.ComposedLayout,
+        q_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        num_tokens: Int32,
+        q_tok_stride: Int32,
+        out_tok_stride: Int32,
+    ):
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        head = bidx // self.m_tiles
+        mt = bidx - head * self.m_tiles
+        storage = utils.SmemAllocator().allocate(self.storage)
+        a_full = storage.a_full
+        b_full = storage.b_full
+        acc_full = storage.acc_full
+        if warp_idx == _TILE_TMA_WARP:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(a_full, 1)
+                cute.arch.mbarrier_init(b_full, 1)
+                cute.arch.mbarrier_init(acc_full, 1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+
+        sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+        sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
+        if warp_idx == _TILE_TMA_WARP:
+            gA = cute.local_tile(
+                mA, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            )
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(tiled_mma.get_slice(0).partition_A(gA), 0, 3),
+            )
+            gB = cute.local_tile(
+                mB, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(tiled_mma.get_slice(0).partition_B(gB), 0, 3),
+            )
+            # The weight does not depend on the previous grid: load it before the wait.
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(a_full, self.a_bytes)
+            for kb in cutlass.range_constexpr(self.k_blocks):
+                cute.copy(
+                    tma_atom_a, tAgA[(None, mt, kb, head)], tAsA[(None, kb)], tma_bar_ptr=a_full
+                )
+            if cutlass.const_expr(self.use_pdl):
+                griddepcontrol_wait()
+                griddepcontrol_launch_dependents()
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(b_full, self.b_bytes)
+            for kb in cutlass.range_constexpr(self.k_blocks):
+                cute.copy(
+                    tma_atom_b, tBgB[(None, 0, kb, head)], tBsB[(None, kb)], tma_bar_ptr=b_full
+                )
+        elif warp_idx == _TILE_MMA_WARP:
+            cute.arch.alloc_tmem(self.tmem_cols, storage.tmem_holding_buf)
+            cute.arch.relinquish_tmem_alloc_permit()
+
+        cute.arch.barrier()
+        acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
+            cutlass.Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
+        )
+        acc_shape = tiled_mma.partition_shape_C((CTA_M, self.n_tok))
+        tCtAcc = cute.make_tensor(acc_tmem_ptr, tiled_mma.make_fragment_C(acc_shape).layout)
+        if warp_idx == _TILE_MMA_WARP:
+            tCrA = tiled_mma.make_fragment_A(sA)
+            tCrB = tiled_mma.make_fragment_B(sB)
+            num_kphases = cute.size(tCrA, mode=[2])
+            cute.arch.mbarrier_wait(a_full, 0)
+            cute.arch.mbarrier_wait(b_full, 0)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+            for kb in cutlass.range_constexpr(self.k_blocks):
+                for kp in cutlass.range_constexpr(num_kphases):
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[(None, None, kp, kb)],
+                        tCrB[(None, None, kp, kb)],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            with cute.arch.elect_one():
+                tcgen05.commit(acc_full)
+        elif warp_idx < _TILE_EPI_WARPS:
+            head_dim = self.nope_dim + self.rope_dim
+            out_head_dim = self.lora_dim + self.rope_dim
+            q_base = q_ptr.toint()
+            out_base = out_ptr.toint()
+            if cutlass.const_expr(self.use_pdl):
+                # q_pe comes from the previous grid; ``out`` may still be read by earlier ones.
+                griddepcontrol_wait()
+            if mt == 0:
+                # q_pe: out[t, h, lora:] = e4m3(clamp(q[t, h, nope:])), one 16-byte chunk per
+                # thread.
+                chunks_per_row = self.rope_dim // PE_VEC
+                for idx in cutlass.range(
+                    tidx, num_tokens * chunks_per_row, 32 * _TILE_EPI_WARPS, unroll=1
+                ):
+                    tok = idx // chunks_per_row
+                    col = (idx - tok * chunks_per_row) * PE_VEC
+                    w = _ldg_nc_v4(
+                        q_base
+                        + (Int64(tok) * q_tok_stride + head * head_dim + self.nope_dim + col) * 2
+                    )
+                    _stg_v2(
+                        out_base
+                        + Int64(tok) * out_tok_stride
+                        + head * out_head_dim
+                        + self.lora_dim
+                        + col,
+                        _bf16x4_to_e4m3x4(w[0], w[1]),
+                        _bf16x4_to_e4m3x4(w[2], w[3]),
+                    )
+            tAcc = tCtAcc[((None, None), 0, 0)]
+            copy_atom_t2r = cute.make_copy_atom(
+                tcgen05.Ld32x32bOp(tcgen05.Repetition(self.n_tok)), cutlass.Float32
+            )
+            tiled_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc)
+            thr_t2r = tiled_t2r.get_slice(tidx)
+            tTR_tAcc = thr_t2r.partition_S(tAcc)
+            tTR_cAcc = thr_t2r.partition_D(cute.make_identity_tensor((CTA_M, self.n_tok)))
+            rAcc = cute.make_rmem_tensor(tTR_cAcc.shape, cutlass.Float32)
+            cute.arch.mbarrier_wait(acc_full, 0)
+            cute.copy(tiled_t2r, tTR_tAcc, rAcc)
+            cute.arch.fence_view_async_tmem_load()
+            for i in cutlass.range_constexpr(cute.size(rAcc)):
+                row, tok = tTR_cAcc[i]
+                if tok < num_tokens:
+                    _stg_u8(
+                        out_base
+                        + Int64(tok) * out_tok_stride
+                        + head * out_head_dim
+                        + mt * CTA_M
+                        + row,
+                        _e4m3_byte(rAcc[i]),
+                    )
+        cute.arch.barrier()
+        if warp_idx == _TILE_MMA_WARP:
+            cute.arch.dealloc_tmem(acc_tmem_ptr, self.tmem_cols)
+
+
+@functools.cache
+def _compiled_tile(
+    num_heads: int, nope_dim: int, rope_dim: int, lora_dim: int, n_tok: int, use_pdl: bool
+):
+    kernel = K3MlaQAbsorbTileKernel(num_heads, nope_dim, rope_dim, lora_dim, n_tok, use_pdl)
+    dummy = 1 << 20
+    bf = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    f8 = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
+    return cute.compile(
+        kernel.run,
+        Int32(n_tok),
+        Int32(num_heads * (nope_dim + rope_dim)),
+        Int32(num_heads * (lora_dim + rope_dim)),
+        bf,
+        bf,
+        f8,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        options="--opt-level 2",
+    )
+
+
+def tile_n_tok(num_tokens: int) -> int:
+    """UMMA N of the tile kernel for ``num_tokens`` (``0`` past :data:`TILE_MAX_TOKENS`)."""
+    if not 0 < num_tokens <= TILE_MAX_TOKENS:
+        return 0
+    return 16 if num_tokens <= 16 else 32
+
+
+def can_run_tiles(
+    q: torch.Tensor, w_kc: torch.Tensor, out: torch.Tensor, nope_dim: int, rope_dim: int
+) -> bool:
+    """Whether :func:`k3_mla_q_absorb_tiles` serves these operands: :func:`can_run` with at most
+    :data:`TILE_MAX_TOKENS` tokens and a lora dimension of whole 128-row tiles."""
+    return (
+        can_run(q, w_kc, out, nope_dim, rope_dim)
+        and tile_n_tok(q.shape[0]) > 0
+        and w_kc.shape[1] % CTA_M == 0
+        and nope_dim % _TILE_K_BLOCK == 0
+    )
+
+
+def k3_mla_q_absorb_tiles(
+    q: torch.Tensor,
+    w_kc: torch.Tensor,
+    out: torch.Tensor,
+    nope_dim: int,
+    rope_dim: int,
+    *,
+    use_pdl: bool = True,
+) -> None:
+    """:func:`k3_mla_q_absorb` with :class:`K3MlaQAbsorbTileKernel` (same bytes); check
+    :func:`can_run_tiles`."""
+    num_tokens, num_heads, _ = q.shape
+    lora_dim = w_kc.shape[1]
+    # Both token tiles at the first (eager) call, so a later CUDA graph capture never compiles.
+    for n_tok in (16, 32):
+        _compiled_tile(num_heads, nope_dim, rope_dim, lora_dim, n_tok, use_pdl)
+    fn = _compiled_tile(num_heads, nope_dim, rope_dim, lora_dim, tile_n_tok(num_tokens), use_pdl)
+    fn(
+        Int32(num_tokens),
+        Int32(q.stride(0)),
+        Int32(out.stride(0)),
         _gmem_ptr(cutlass.BFloat16, q),
         _gmem_ptr(cutlass.BFloat16, w_kc),
         _gmem_ptr(cutlass.Float8E4M3FN, out),

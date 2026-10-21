@@ -153,3 +153,70 @@ def test_can_run_rejects():
     assert not cq.can_run(q, w.transpose(1, 2).contiguous().transpose(1, 2), out, NOPE, ROPE)
     assert not cq.can_run(q[:, :, :], w, out[:4], NOPE, ROPE)
     assert not cq.can_run(q.cpu(), w, out, NOPE, ROPE)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 16, 17, 28, 32])
+@pytest.mark.parametrize("use_pdl", [True, False])
+def test_tiles_kernel_matches_persistent_and_triton(num_tokens, use_pdl):
+    """The one-CTA-per-tile swap-AB kernel writes the persistent kernel's (and Triton's) bytes."""
+    cq = _cute()
+    q, w = _inputs(num_tokens, 200 + num_tokens)
+    ref, out = _outs(num_tokens)
+    _triton(q, w, ref)
+    persistent = torch.full_like(ref, 0x33)
+    cq.k3_mla_q_absorb(q, w, persistent, NOPE, ROPE)
+    assert cq.can_run_tiles(q, w, out, NOPE, ROPE)
+    cq.k3_mla_q_absorb_tiles(q, w, out, NOPE, ROPE, use_pdl=use_pdl)
+    torch.cuda.synchronize()
+    assert torch.equal(persistent, ref)
+    assert torch.equal(out, ref)
+
+
+def test_tiles_q_b_output_view_and_graph(monkeypatch):
+    """q as the q_b output viewed per head (the decode path), through the env-gated dispatch,
+    captured and replayed in a CUDA graph after a producer kernel."""
+    from tensorrt_llm._torch.modules import mla_fp8_q_absorb as mod
+
+    monkeypatch.setattr(mod, "_USE_CUTE", True)
+    monkeypatch.setattr(mod, "_USE_TILES", True)
+    num_tokens = 14
+    src, w = _inputs(num_tokens, 31)
+    q_b_out = torch.zeros(num_tokens, H * (NOPE + ROPE), dtype=torch.bfloat16, device="cuda")
+    q = q_b_out.view(num_tokens, H, NOPE + ROPE)
+    ref, out = _outs(num_tokens)
+    calls = []
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_mla_q_absorb as cq
+
+    real = cq.k3_mla_q_absorb_tiles
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cq, "k3_mla_q_absorb_tiles", spy)
+
+    def step():
+        q_b_out.copy_(src.view(num_tokens, -1))
+        mod.mla_fp8_q_absorb_nope(q, w, out, NOPE, ROPE)
+
+    step()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        step()
+    assert len(calls) == 2
+    q_b_out.zero_()
+    out.fill_(0)
+    graph.replay()
+    torch.cuda.synchronize()
+    _triton(src, w, ref)
+    assert torch.equal(out, ref)
+
+
+def test_tiles_reject_large_token_counts():
+    cq = _cute()
+    q, w = _inputs(33, 0, special=False)
+    _, out = _outs(33)
+    assert cq.can_run(q, w, out, NOPE, ROPE)
+    assert not cq.can_run_tiles(q, w, out, NOPE, ROPE)

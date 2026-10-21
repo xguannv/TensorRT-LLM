@@ -38,6 +38,11 @@ import triton
 import triton.language as tl
 
 _USE_CUTE = os.environ.get("TRTLLM_K3_MLA_FP8_Q_ABSORB_CUTE", "0") == "1"
+# TRTLLM_K3_MLA_QABS_TILES=1 (with TRTLLM_K3_MLA_FP8_Q_ABSORB_CUTE): up to 32 tokens, the CuTe DSL
+# kernel runs one small CTA per (head, 128 kv_lora_rank rows) tile as a swap-AB MMA, all tiles at
+# once, instead of the persistent token-tile kernel's two or three tiles in turn per CTA; same
+# bytes.
+_USE_TILES = os.environ.get("TRTLLM_K3_MLA_QABS_TILES", "0") == "1"
 
 
 @triton.jit
@@ -131,6 +136,9 @@ def mla_fp8_q_absorb_nope(
     if _USE_CUTE:
         from ..cute_dsl_kernels.blackwell import k3_mla_q_absorb
 
+        if _USE_TILES and k3_mla_q_absorb.can_run_tiles(q, w_kc, out, nope_dim, rope_dim):
+            k3_mla_q_absorb.k3_mla_q_absorb_tiles(q, w_kc, out, nope_dim, rope_dim)
+            return
         if k3_mla_q_absorb.can_run(q, w_kc, out, nope_dim, rope_dim):
             k3_mla_q_absorb.k3_mla_q_absorb(q, w_kc, out, nope_dim, rope_dim)
             return
