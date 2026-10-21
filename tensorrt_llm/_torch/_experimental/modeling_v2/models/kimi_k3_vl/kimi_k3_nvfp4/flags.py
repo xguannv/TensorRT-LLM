@@ -59,7 +59,7 @@ TRTLLM_K3LL_MLA_SPEC_WORKER = _flag(
 )
 TRTLLM_K3LL_MLA_DRAFTER_NORMS = _flag(
     "TRTLLM_K3LL_MLA_DRAFTER_NORMS",
-    0,
+    1,
     "MLA DSpark drafter: residual adds and RMSNorms in the o_proj / down all-reduces (k3_sandwich_plain)",
 )
 TRTLLM_K3LL_MLA_DRAFTER_CTX = _flag(
