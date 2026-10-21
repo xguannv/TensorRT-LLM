@@ -509,6 +509,54 @@ def test_kimi_k3_nvfp4_routes(monkeypatch, mode, quant_method, sm):
     )
 
 
+def _helix16(**overrides):
+    kwargs = dict(
+        world_size=16,
+        tp_size=1,
+        cp_size=16,
+        cp_config={"cp_type": "HELIX"},
+        moe_tp_size=4,
+        moe_ep_size=4,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("sm", [103, 107])
+def test_kimi_k3_nvfp4_helix16_routes(monkeypatch, mode, sm):
+    """Helix tp 1 x cp 16 with the experts split moe_tp 4 x moe_ep 4 lands on the Helix staircase target."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (sm // 10, sm % 10))
+    config = _model_config(_k3_config(quantization=_k3_nvfp4_mixed_config()), **_helix16())
+    target = modeling_v2_resolve(config, _llm_args(mode))
+    assert _qualified(target) == (
+        f"models.kimi_k3_vl.kimi_k3_nvfp4__sm_{sm}__helix16_moetp4ep4.modeling."
+        f"ModelingV2KimiK3Nvfp4Sm{sm}Helix16Moetp4ep4"
+    )
+    assert target.target_spec.cp == 16
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # the expert split left unset (EP 16 by the built-in model's reading)
+        (
+            dict(world_size=16, tp_size=1, cp_size=16, cp_config={"cp_type": "HELIX"}),
+            "split_set=False",
+        ),
+        (_helix16(moe_tp_size=1, moe_ep_size=16), "moe_ep=16"),
+        (_helix16(enable_attention_dp=True), "attention_dp=True"),
+        # Helix over 8 ranks next to TP 2
+        (_helix16(tp_size=2, cp_size=8), "cp=8"),
+    ],
+)
+def test_kimi_k3_nvfp4_helix_near_misses_do_not_match(mapping_kwargs, missed):
+    config = _model_config(_k3_config(quantization=_k3_nvfp4_mixed_config()), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
 @pytest.mark.parametrize("bad_layer", ["missing", "mxfp4", "wrong_group_size"])
 @pytest.mark.parametrize("sm", [103, 107])
 def test_kimi_k3_nvfp4_rejects_incomplete_expert_declarations(monkeypatch, bad_layer, sm):

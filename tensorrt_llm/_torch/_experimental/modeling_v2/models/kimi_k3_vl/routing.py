@@ -101,7 +101,29 @@ def _parallel(m) -> Optional[str]:
     mapping with no expert split resolves to the same sizes, but the built-in
     Kimi K3 model reads that default as expert parallelism over the 16 ranks
     (`moe_tp_ep_user_specified`), and so does this tree: no target serves it.
+
+    Helix context parallelism over the 16 ranks (tensor parallel 1, context
+    parallel 16, ``cp_type`` HELIX) splits the MLA KV cache by page instead of
+    the MLA heads; everything else runs on the same 16-way tensor split. Its
+    experts are split moe_tp 4 x moe_ep 4, set explicitly.
     """
+    has_cp_helix = getattr(m, "has_cp_helix", None)
+    if (
+        callable(has_cp_helix)
+        and has_cp_helix()
+        and m.world_size == 16
+        and m.tp_size == 1
+        and m.cp_size == 16
+        and m.pp_size == 1
+        and not m.enable_attention_dp
+    ):
+        if (
+            m.moe_tp_size == 4
+            and m.moe_ep_size == 4
+            and getattr(m, "moe_tp_ep_user_specified", False)
+        ):
+            return "helix16_moetp4ep4"
+        return None
     if not (
         m.world_size == 16 and m.tp_size == 16 and m.pp_size == 1 and not m.enable_attention_dp
     ):
@@ -170,6 +192,30 @@ def route(
 
         return ModelingV2KimiK3Nvfp4Sm107Tp16Moetp4ep4
 
+    if (
+        compute_capability == (10, 3)
+        and shape == _SHAPE
+        and parallel == "helix16_moetp4ep4"
+        and _has_nvfp4_experts(pretrained_config)
+    ):
+        from .kimi_k3_nvfp4__sm_103__helix16_moetp4ep4.modeling import (
+            ModelingV2KimiK3Nvfp4Sm103Helix16Moetp4ep4,
+        )
+
+        return ModelingV2KimiK3Nvfp4Sm103Helix16Moetp4ep4
+
+    if (
+        compute_capability == (10, 7)
+        and shape == _SHAPE
+        and parallel == "helix16_moetp4ep4"
+        and _has_nvfp4_experts(pretrained_config)
+    ):
+        from .kimi_k3_nvfp4__sm_107__helix16_moetp4ep4.modeling import (
+            ModelingV2KimiK3Nvfp4Sm107Helix16Moetp4ep4,
+        )
+
+        return ModelingV2KimiK3Nvfp4Sm107Helix16Moetp4ep4
+
     if mxfp4_on_blackwell and compute_capability == (10, 3) and parallel == "tp16_moetp4ep4":
         from .kimi_k3_mxfp4__sm_103__tp16_moetp4ep4.modeling import (
             ModelingV2KimiK3Mxfp4Sm103Tp16Moetp4ep4,
@@ -201,11 +247,13 @@ def route(
     raise NoTarget(
         f"compute capability {compute_capability}, text_config shape {shape}, "
         f"quantization {quant_algo.name if quant_algo is not None else 'none'}, parallel "
-        f"ws={mapping.world_size} tp={mapping.tp_size} pp={mapping.pp_size} "
+        f"ws={mapping.world_size} tp={mapping.tp_size} cp={getattr(mapping, 'cp_size', 1)} "
+        f"helix={bool(getattr(mapping, 'has_cp_helix', lambda: False)())} pp={mapping.pp_size} "
         f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} "
         f"split_set={getattr(mapping, 'moe_tp_ep_user_specified', False)} "
         f"attention_dp={mapping.enable_attention_dp}; the kimi_k3_vl targets are the MXFP4 "
         "Kimi K3 checkpoint on sm100/sm103, 16 ranks of tensor-parallel attention, with the "
         "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1; "
-        "and group-size-16 NVFP4 Kimi K3 on sm103/sm107 with tp16 attention and moe_tp 4 x moe_ep 4"
+        "and group-size-16 NVFP4 Kimi K3 on sm103/sm107 with moe_tp 4 x moe_ep 4 and either tp16 attention "
+        "or Helix context parallelism tp 1 x cp 16 (experts split set explicitly)"
     )

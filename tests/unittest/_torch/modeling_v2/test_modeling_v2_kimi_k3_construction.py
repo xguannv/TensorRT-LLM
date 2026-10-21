@@ -133,3 +133,58 @@ def test_tp16_moetp16ep1_keeps_no_per_token_kda_states(monkeypatch):
     object.__setattr__(model, "layers", [kda, mla])
     assert model._latent_push(None, shared.DecodeStep(1, 1, 1))
     assert not model._latent_push(None, shared.DecodeStep(8, 1, 8))
+
+
+def _helix_config(spec_config=None, **overrides):
+    """The ModelConfig fields the Helix target's construction checks read: tp 1 x cp 16 HELIX, experts 4 x 4."""
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    kwargs = dict(
+        world_size=16,
+        tp_size=1,
+        cp_size=16,
+        cp_config={"cp_type": "HELIX"},
+        moe_tp_size=4,
+        moe_ep_size=4,
+    )
+    kwargs.update(overrides)
+    config = _config(4, 4, spec_config=spec_config)
+    config.mapping = Mapping(**kwargs)
+    config.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=QuantAlgo.FP8
+    )
+    config.quant_config_dict = {
+        f"model.layers.{i}.mlp.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+        for i in range(1, 93)
+    }
+    return config
+
+
+def test_helix16_requires_its_layout(monkeypatch):
+    target = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "kimi_k3_nvfp4__sm_103__helix16_moetp4ep4.modeling"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 3))
+    target._check_construction(_helix_config())
+    with pytest.raises(AssertionError, match="the helix16_moetp4ep4 target needs"):
+        target._check_construction(_helix_config(tp_size=2, cp_size=8))
+    with pytest.raises(AssertionError, match="the helix16_moetp4ep4 target needs"):
+        target._check_construction(_helix_config(moe_tp_size=-1, moe_ep_size=-1))
+    with pytest.raises(AssertionError, match="speculates only with DSpark"):
+        target._check_construction(
+            _helix_config(
+                spec_config=types.SimpleNamespace(
+                    spec_dec_mode=types.SimpleNamespace(is_dspark=lambda: False),
+                    decoding_type="DFlash",
+                )
+            )
+        )
+    # the TP16 target refuses a Helix engine
+    tp16 = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "kimi_k3_nvfp4__sm_103__tp16_moetp4ep4.modeling"
+    )
+    with pytest.raises(AssertionError, match="without context parallelism"):
+        tp16._check_construction(_helix_config())

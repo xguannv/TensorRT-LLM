@@ -16,6 +16,13 @@ Page ownership is the Helix round-robin ledger (page ``b`` belongs to rank ``b %
 per-token visible bounds are ``helix_local_len_tensor`` of the global causal bound. Only attention
 reads are split; the KV cache manager, the cache write and disaggregated KV transfer are unchanged.
 
+Under Helix context parallelism (``tp 1 x cp 16``, ``CpType.HELIX``) the same exchange runs over the CP
+group, but the cache itself is sharded: the KV cache manager gives each rank only its round-robin pages
+(``kv_cache_block_offsets`` lists them in order, ``kv_lens_cuda`` is the rank-local length) and the new
+tokens' KV lands on their owner rank only (inside ``mla_rope_generation``). The page table is then read as
+is, and the per-token bounds come from the global positions of the step's tokens
+(``helix_position_offsets``); see ``make_helix_plan``.
+
 This module only holds the per-rank pieces (page-table slicing, bounds, the kernel call and the
 combine). The caller owns the collectives so the pieces can be tested on one GPU.
 """
@@ -87,6 +94,30 @@ def make_split_read_plan(
     token_ends = (seq_lens.view(-1, 1) - (q_len - 1) + offsets.view(1, -1)).reshape(-1)
     kv_bounds = helix_local_len_tensor(token_ends, page_size, cp_size, cp_rank).to(torch.int32)
     return SplitReadPlan(page_table, cache_seqs, kv_bounds, kv_bounds == 0)
+
+
+def make_helix_plan(
+    local_block_rows: torch.Tensor,
+    local_lens: torch.Tensor,
+    positions: torch.Tensor,
+    page_size: int,
+    cp_size: int,
+    cp_rank: int,
+) -> SplitReadPlan:
+    """This rank's page table and bounds when the cache is Helix-sharded (only this rank's pages stored).
+
+    Args:
+        local_block_rows: ``[batch, local_blocks]`` page ids of this rank's pages of each request, in order (page
+            ``j`` of the row holds the request's global page ``j * cp_size + cp_rank``).
+        local_lens: ``[batch]`` number of tokens of each request held on this rank, the step's new tokens this
+            rank owns included.
+        positions: ``[batch * q_len]`` global position of every query token of the step.
+    """
+    page_table = local_block_rows.to(torch.int32).contiguous().t()
+    kv_bounds = helix_local_len_tensor(
+        positions.to(torch.int32) + 1, page_size, cp_size, cp_rank
+    ).to(torch.int32)
+    return SplitReadPlan(page_table, local_lens.to(torch.int32), kv_bounds, kv_bounds == 0)
 
 
 def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:
@@ -189,24 +220,46 @@ class MlaSplitRead:
       this rank are built once per step, by the first MLA layer, and reused by the others (every MLA layer of a step
       sees the same requests and lengths). Every rank of the group must make the same calls in the same order (the
       collectives are NCCL, graph-capturable).
+    * Helix (``mapping`` has Helix CP; any nonzero mode): mode 2's exchange over the CP group on the Helix-sharded
+      cache (``make_helix_plan``). ``gather_mapping`` is a TP mapping over the same ranks (the MLA's row-parallel
+      output mapping), whose TP rank equals the CP rank, for the query all-gather.
     """
 
     _shared: dict = {}
 
     @classmethod
-    def shared(cls, mapping, heads_per_rank: int) -> "MlaSplitRead":
+    def shared(cls, mapping, heads_per_rank: int, gather_mapping=None) -> "MlaSplitRead":
         key = (id(mapping), heads_per_rank)
         if key not in cls._shared:
-            cls._shared[key] = cls(mapping, heads_per_rank)
+            cls._shared[key] = cls(mapping, heads_per_rank, gather_mapping=gather_mapping)
         return cls._shared[key]
 
-    def __init__(self, mapping, heads_per_rank: int, mode: int = TRTLLM_K3LL_MLA_DCP):
+    def __init__(
+        self, mapping, heads_per_rank: int, mode: int = TRTLLM_K3LL_MLA_DCP, gather_mapping=None
+    ):
         if mode not in (1, 2):
             raise ValueError(f"TRTLLM_K3LL_MLA_DCP must be 0, 1 or 2, got {mode}")
         self.mode = mode
-        self.cp = int(mapping.tp_size) if mode == 2 else 1
-        self.rank = int(mapping.tp_rank) if mode == 2 else 0
-        self.group = list(mapping.tp_group)
+        self.helix = bool(mapping.has_cp_helix())
+        if self.helix:
+            if gather_mapping is None or (gather_mapping.tp_size, gather_mapping.tp_rank) != (
+                mapping.cp_size,
+                mapping.cp_rank,
+            ):
+                raise ValueError(
+                    "Helix MLA decode needs a TP mapping over the CP group whose TP rank is the CP rank; got "
+                    f"cp {mapping.cp_rank}/{mapping.cp_size}, gather mapping "
+                    f"{None if gather_mapping is None else (gather_mapping.tp_rank, gather_mapping.tp_size)}"
+                )
+            self.cp = int(mapping.cp_size)
+            self.rank = int(mapping.cp_rank)
+            self.group = list(mapping.cp_group)
+            self.gather_mapping = gather_mapping
+        else:
+            self.cp = int(mapping.tp_size) if mode == 2 else 1
+            self.rank = int(mapping.tp_rank) if mode == 2 else 0
+            self.group = list(mapping.tp_group)
+            self.gather_mapping = mapping
         self.mapping = mapping
         self.heads_per_rank = heads_per_rank
         self.heads = heads_per_rank * self.cp
@@ -222,7 +275,7 @@ class MlaSplitRead:
     def applies(mqa, mapping) -> bool:
         return bool(
             TRTLLM_K3LL_MLA_DCP
-            and (TRTLLM_K3LL_MLA_DCP == 1 or mapping.tp_size > 1)
+            and (TRTLLM_K3LL_MLA_DCP == 1 or mapping.tp_size > 1 or mapping.has_cp_helix())
             and getattr(mqa, "has_fp8_kv_cache", False)
             and not getattr(mqa, "has_fp4_kv_cache", False)
         )
@@ -280,8 +333,19 @@ class MlaSplitRead:
             self._scales[layer_idx] = scales
         return scales
 
-    def _step_plan(self, layer_idx, block_rows, lens, q_len) -> SplitReadPlan:
+    def _step_plan(self, layer_idx, block_rows, lens, q_len, meta=None) -> SplitReadPlan:
         if self._plan is None or layer_idx == self._first_layer:
+            if self.helix:
+                tokens = block_rows.shape[0] * q_len
+                self._plan = make_helix_plan(
+                    block_rows,
+                    lens,
+                    meta.helix_position_offsets[:tokens],
+                    PAGE_SIZE,
+                    self.cp,
+                    self.rank,
+                )
+                return self._plan
             index = self._block_index.get(block_rows.shape[1])
             if index is None:
                 index = local_block_index(
@@ -326,11 +390,12 @@ class MlaSplitRead:
             dtype=torch.bfloat16,
             device=quant_q.device,
         )
-        if not self._logged and self.mapping.tp_rank == 0:
+        if not self._logged and self.rank == 0:
             from tensorrt_llm.logger import logger
 
             logger.info(
-                f"K3 MLA decode TRTLLM_K3LL_MLA_DCP={self.mode}: cp={cp} heads={self.heads} ({hp}/rank) "
+                f"K3 MLA decode TRTLLM_K3LL_MLA_DCP={self.mode} helix={self.helix}: cp={cp} heads={self.heads} "
+                f"({hp}/rank) "
                 f"layers={sorted(self._layers)} requests={num_requests} q_len={q_len}"
             )
             self._logged = True
@@ -356,9 +421,11 @@ class MlaSplitRead:
 
         from tensorrt_llm._torch.distributed.ops import allgather, alltoall_helix
 
-        q_all = allgather(q_local.view(torch.uint8), self.mapping, dim=1).view(torch.float8_e4m3fn)
+        q_all = allgather(q_local.view(torch.uint8), self.gather_mapping, dim=1).view(
+            torch.float8_e4m3fn
+        )
         q_all = q_all.view(num_requests, q_len, self.heads, KV_LORA_RANK + QK_ROPE_DIM)
-        plan = self._step_plan(mqa.layer_idx, block_rows, lens, q_len)
+        plan = self._step_plan(mqa.layer_idx, block_rows, lens, q_len, meta)
         if layer_in_pool:
             plan = SplitReadPlan(
                 plan.page_table + layer_in_pool, plan.cache_seqs, plan.kv_bounds, plan.empty
