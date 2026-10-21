@@ -55,6 +55,14 @@ from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
                           create_mla_static_tile_scheduler_params,
                           get_variable_query_tile_info)
 
+# Softmax probabilities p = exp2(s - row_max) in (0, 1] are cast to the FP8 input type for the P @ V MMA. e4m3 is
+# subnormal below 2^-6 and rounds to zero below 2^-10, so a cast of p itself drops the attention tail (many keys far
+# below the row max, together a sizable share of the softmax mass) from P @ V, while row_sum keeps it in fp32: the
+# output shrinks by the dropped mass. The exponent is biased by P_EXP2_BIAS so the MMA sees p * 2^P_EXP2_BIAS (at most
+# 256, inside e4m3's 448); row_sum carries the same factor, so O = acc / row_sum is unchanged, and the LSE subtracts
+# it back. A power of two keeps the rounding of every normal value exactly as before.
+P_EXP2_BIAS = 8.0
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, "../.."))
@@ -3657,7 +3665,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # softmax
         fma_b = softmax_params.softmax_scale_log2
-        fma_c = (0.0 - row_max_new) * softmax_params.softmax_scale_log2
+        fma_c = ((0.0 - row_max_new) * softmax_params.softmax_scale_log2 +
+                 P_EXP2_BIAS)
 
         for i in cutlass.range(cute.size(tTR_rAcc),
                                vectorize=True,
@@ -4192,7 +4201,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                     (1, 1, 1),
                 )
-            lse = (cute.math.log2(row_sum, fastmath=True) +
+            # row_sum carries the 2^P_EXP2_BIAS of the softmax's probabilities
+            lse = (cute.math.log2(row_sum, fastmath=True) - P_EXP2_BIAS +
                    epilogue_params.softmax_scale_log2 * row_max)
             if cutlass.const_expr(self.warps_in_n == 2):
                 if cute.elem_less(cLSE[tidx][0], common_params.H):
