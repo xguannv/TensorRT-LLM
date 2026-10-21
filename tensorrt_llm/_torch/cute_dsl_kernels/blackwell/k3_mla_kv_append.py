@@ -256,6 +256,18 @@ def _rotate_bf16x2(word, c, s, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _bulk_prefetch_l2(addr, nbytes, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(nbytes, loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _griddepcontrol_wait(*, loc=None, ip=None):
     _asm(None, [], "griddepcontrol.wait;", "", loc=loc, ip=ip)
 
@@ -274,9 +286,18 @@ class _K3MlaKvAppendKernel(RMSNormKernel):
     """
 
     def __init__(
-        self, sm_version: int, ld_x: int, ld_kpe: int, helix_mode: int, has_positions: bool
+        self,
+        sm_version: int,
+        ld_x: int,
+        ld_kpe: int,
+        helix_mode: int,
+        has_positions: bool,
+        prefetch_decode: bool = False,
     ):
         super().__init__(cutlass.BFloat16, KV_LORA_RANK, 0.0, sm_version=sm_version)
+        # Block 0 brings the page-table rows of the batch's KV and the KV lengths into L2 for the
+        # decode that follows (bulk prefetches stay in L2 until their first read).
+        self.prefetch_decode = prefetch_decode
         if self.cluster_n != 1 or self.threads_per_row != 32 or self.vec_size != 8:
             raise ValueError("unexpected FlashInfer RMSNorm configuration for H = 512")
         if ld_x % 8 or ld_kpe % 8:
@@ -416,6 +437,20 @@ class _K3MlaKvAppendKernel(RMSNormKernel):
         # GEMM's predecessor (the A_pre attn_res kernel, which releases only after its own wait)
         # is running, hence every grid before A_pre is complete, the step's input preparation
         # included. Nothing written by the GEMM or later is read here.
+        if cutlass.const_expr(self.prefetch_decode):
+            if bidx == 0:
+                for pb in cutlass.range(tidx, batch, self.num_threads, unroll=1):
+                    pages = (_ldg_s32(kv_lens_addr + Int64(pb) * 4) + page_size - 1) // page_size
+                    first = page_table_addr + Int64(pb) * Int64(page_table_ld) * 4
+                    lo = first & Int64(-16)
+                    hi = (first + Int64(pages) * 4 + 15) & Int64(-16)
+                    if hi > lo:
+                        _bulk_prefetch_l2(lo, Int32(hi - lo))
+                if tidx == 0:
+                    lo = kv_lens_addr & Int64(-16)
+                    _bulk_prefetch_l2(
+                        lo, Int32(((kv_lens_addr + Int64(batch) * 4 + 15) & Int64(-16)) - lo)
+                    )
         valid = row < num_tokens
         b = Int32(0)
         local = Int32(0)
@@ -631,8 +666,17 @@ class _K3MlaKvAppendKernel(RMSNormKernel):
 
 
 @functools.cache
-def _compiled(sm_version: int, ld_x: int, ld_kpe: int, helix_mode: int, has_positions: bool):
-    kernel = _K3MlaKvAppendKernel(sm_version, ld_x, ld_kpe, helix_mode, has_positions)
+def _compiled(
+    sm_version: int,
+    ld_x: int,
+    ld_kpe: int,
+    helix_mode: int,
+    has_positions: bool,
+    prefetch_decode: bool = False,
+):
+    kernel = _K3MlaKvAppendKernel(
+        sm_version, ld_x, ld_kpe, helix_mode, has_positions, prefetch_decode
+    )
     dummy = 1 << 20
 
     def bf16_ptr():
@@ -727,6 +771,7 @@ def k3_mla_kv_append(
     cu_kv_seqlens: torch.Tensor,
     host_bmm1: float,
     kv_scale: float = 1.0,
+    prefetch_decode: bool = False,
 ) -> None:
     """One launch of the fused KV half on the current stream (see the module docstring).
 
@@ -734,7 +779,9 @@ def k3_mla_kv_append(
     stride along the row; cache row of token slot ``s`` of request ``b`` =
     ``kv_pages[page_table[b, s // page_size] + page_offset, s % page_size]``. ``page_table``:
     ``[batch, max_pages]`` int32 with unit column stride. ``helix_slots`` (per token, -1 = not
-    owned) and ``helix_inactive`` (per request) are mutually exclusive.
+    owned) and ``helix_inactive`` (per request) are mutually exclusive. ``prefetch_decode``:
+    also bring the page-table rows of the batch's KV and ``kv_lens`` into L2 for the decode
+    (a hint only; the bytes written do not change).
     """
     num_tokens = compressed_kv.shape[0]
     batch = kv_lens.shape[0]
@@ -772,6 +819,7 @@ def k3_mla_kv_append(
         k_pe.stride(0),
         helix_mode,
         positions is not None,
+        prefetch_decode,
     )
 
     def bf16_ptr(t):

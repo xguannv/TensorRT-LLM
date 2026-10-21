@@ -92,6 +92,10 @@ _K3_MLA_GATE_EXCLUSIVE = os.environ.get("TRTLLM_K3_MLA_GATE_EXCLUSIVE", "0") == 
 # of grids that are launched early (PDL) and wait for SMs (o_proj behind the all-to-all).
 # Scheduling only: bit-exact.
 _K3_MLA_GATE_SIDE_PRIO = os.environ.get("TRTLLM_K3_MLA_GATE_SIDE_PRIO", "0") == "1"
+# TRTLLM_K3_MLA_PT_PREFETCH=1 (with TRTLLM_K3_MLA_KV_FUSED): the fused KV append also brings the
+# page-table rows of the batch's KV and the KV lengths into L2 (bulk prefetches) for the decode,
+# whose first loads read them. A hint only: bit-exact.
+_K3_MLA_PT_PREFETCH = os.environ.get("TRTLLM_K3_MLA_PT_PREFETCH", "0") == "1"
 # One side stream per device and role, shared by all MLA layers (their side work never
 # overlaps).
 _GATE_SIDE_STREAMS: dict[tuple[int, bool, str], torch.cuda.Stream] = {}
@@ -679,6 +683,7 @@ class KimiK3MLAAttention(MLA):
             host_bmm1=kv_append.host_bmm1_scale(
                 mqa.q_scaling, mqa.qk_nope_head_dim + mqa.qk_rope_head_dim
             ),
+            prefetch_decode=_K3_MLA_PT_PREFETCH,
         )
         return latent
 
