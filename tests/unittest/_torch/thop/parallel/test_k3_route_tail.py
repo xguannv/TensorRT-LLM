@@ -226,16 +226,18 @@ def test_tail_split_partials(m):
     _check_outputs(outs, logits, bias, 1.0, 0, 224)
 
 
+@pytest.mark.parametrize("fast", [1, 2])
 @pytest.mark.parametrize("m", MS)
 @pytest.mark.parametrize("mode", ["rand", "skew", "ties"])
-def test_tail_fast_matches_noaux_and_sort(m, mode):
-    """``fast`` mode (rolled tie fallback, top-k stored after the cluster barrier): same outputs."""
+def test_tail_fast_matches_noaux_and_sort(m, mode, fast):
+    """``fast`` mode (rolled tie fallback, top-k stored after the cluster barrier; level 2 also
+    exchanges the masks with ``st.async``): same outputs."""
     rt = _module()
     logits, bias = _logits(m, seed=m, mode=mode)
     for offset, num_local in LAYOUTS:
         outs = rt._route_tail_outputs(logits, m, bias, num_local, TILE)
         rt.run_k3_route_tail(
-            logits, m, bias, 1.0, outs[0], outs[1], outs[2:], offset, num_local, fast=True
+            logits, m, bias, 1.0, outs[0], outs[1], outs[2:], offset, num_local, fast=fast
         )
         _check_outputs(outs, logits, bias, 1.0, offset, num_local)
 
@@ -246,7 +248,8 @@ def test_tail_fast_matches_noaux_and_sort(m, mode):
     [(1, 1, 16), (2, 2, 16), (8, 1, 8), (8, 2, 8), (8, 4, 8), (4, 2, 4), (8, 1, 1)],
 )
 @pytest.mark.parametrize("mode", ["realistic", "ties"])
-def test_tail_fast_configs(m, num_ctas, warps_per_token, num_warps, mode):
+@pytest.mark.parametrize("fast", [1, 2])
+def test_tail_fast_configs(m, num_ctas, warps_per_token, num_warps, mode, fast):
     rt = _module()
     if (m + num_ctas - 1) // num_ctas > 32:
         pytest.skip("more than 32 tokens per CTA")
@@ -265,12 +268,12 @@ def test_tail_fast_configs(m, num_ctas, warps_per_token, num_warps, mode):
         num_ctas=num_ctas,
         warps_per_token=warps_per_token,
         num_warps=num_warps,
-        fast=True,
+        fast=fast,
     )
     _check_outputs(outs, logits, bias, 1.0, 224, 224)
 
 
-@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("fast", [0, 1, 2])
 def test_tail_prefetch_next_bias(fast):
     """The next layer's bias prefetch is a hint: same outputs, also replayed in a CUDA graph;
     tensors that are not a 16-byte aligned fp32 [896] are not prefetched."""
@@ -1102,28 +1105,31 @@ def test_tail_replicas_rejects_bad_arguments():
 
 
 @pytest.mark.parametrize("m", [1, 7, 14, 16, 28, 32, 64, 112, 256])
-@pytest.mark.parametrize("slots", [4, 8, 16])
+@pytest.mark.parametrize("slots", [1, 4, 8, 16])
 @pytest.mark.parametrize("mode", ["realistic", "rand", "skew"])
-def test_tail_replicas_fast(m, slots, mode):
+@pytest.mark.parametrize("fast", [1, 2])
+def test_tail_replicas_fast(m, slots, mode, fast):
     """``fast`` copy choice (class masks of the table, top-k stored after the barrier): same
     choice and outputs as the reference."""
     logits, bias = _logits(m, seed=31 * m + slots, mode=mode)
     hot = range(224, 232) if mode == "skew" else ()
-    _run_replicas(logits, bias, _copy_entries(slots, seed=m + slots, hot=hot), slots, fast=True)
+    _run_replicas(logits, bias, _copy_entries(slots, seed=m + slots, hot=hot), slots, fast=fast)
 
 
 @pytest.mark.parametrize("m", [7, 14, 32])
 @pytest.mark.parametrize(
     "shape", [(8, 2, 8), (8, 4, 8), (8, 1, 4), (4, 2, 8), (2, 2, 16), (1, 1, 16)]
 )
-def test_tail_replicas_fast_configs(m, shape):
+@pytest.mark.parametrize("fast", [1, 2])
+def test_tail_replicas_fast_configs(m, shape, fast):
     if (m + shape[0] - 1) // shape[0] > 32:
         pytest.skip("more than 32 tokens per CTA")
     logits, bias = _logits(m, seed=5 * m + shape[0], mode="realistic")
-    _run_replicas(logits, bias, _copy_entries(8, seed=m), 8, fast=True, shape=shape)
+    _run_replicas(logits, bias, _copy_entries(8, seed=m), 8, fast=fast, shape=shape)
 
 
-def test_tail_replicas_fast_many_entries_and_ties():
+@pytest.mark.parametrize("fast", [1, 2])
+def test_tail_replicas_fast_many_entries_and_ties(fast):
     """Two chunks of entries (64 two-copy experts) and heavy ties (the exact fallback) in fast
     mode, and the hot-expert case of :func:`test_tail_replicas_move_load_off_the_busiest_rank`."""
     m = 14
@@ -1131,19 +1137,20 @@ def test_tail_replicas_fast_many_entries_and_ties():
     logits[:, 224:264] += 6
     entries = _copy_entries(16, seed=3, hot=range(224, 264))
     assert len(entries) == 64
-    _run_replicas(logits, bias, entries, 16, fast=True)
+    _run_replicas(logits, bias, entries, 16, fast=fast)
     ties, tie_bias = _logits(m, seed=8, mode="ties")
-    _run_replicas(ties, tie_bias, _copy_entries(8, seed=8), 8, fast=True)
+    _run_replicas(ties, tie_bias, _copy_entries(8, seed=8), 8, fast=fast)
 
 
-@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("fast", [0, 1, 2])
 def test_tail_replicas_prefetch_next_layer(fast):
     """Prefetching the next layer's bias and table changes nothing."""
     logits, bias = _logits(14, seed=17, mode="realistic")
     _run_replicas(logits, bias, _copy_entries(8, seed=17), 8, fast=fast, prefetch=True)
 
 
-def test_tail_replicas_fast_cuda_graph_replay():
+@pytest.mark.parametrize("fast", [1, 2])
+def test_tail_replicas_fast_cuda_graph_replay(fast):
     rt = _module()
     m, slots = 14, 8
     entries = _copy_entries(slots, seed=21)
@@ -1168,7 +1175,7 @@ def test_tail_replicas_fast_cuda_graph_replay():
             rank * REP_HOME,
             table,
             len(entries),
-            fast=True,
+            fast=fast,
             prefetch_bias=bias,
             prefetch_table=next_table,
         )

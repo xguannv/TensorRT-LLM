@@ -48,6 +48,11 @@ weight stream and each L2 round trip and instruction fetch is slow:
   touched entries with one ballot and the per-class entry masks of the replica table instead of one
   ballot per class.
 
+``fast`` level 2 (``TRTLLM_K3_ROUTE_TAIL_FAST=2``) also exchanges the token masks (and selected-expert
+bitmaps) with ``st.async`` on an mbarrier of each receiving CTA, armed before
+``griddepcontrol.wait``, instead of distributed-shared-memory stores and a cluster barrier whose
+release is a GPU-scope memory barrier.
+
 Either kernel can also prefetch into L2 the bias (and replica table) of the next MoE layer (a few
 KB, ``cp.async.bulk.prefetch.L2`` from one thread): the next tail then stages them from L2. Where the
 tail's CTAs only become resident once the router exits (the dsv3 router fills the register file),
@@ -91,6 +96,7 @@ from .k3_fused_router import (
     _iv,
     _lds_b32,
     _lds_f32,
+    _lds_v4_b32,
     _ldsm_x4,
     _lv,
     _mma_bf16,
@@ -124,8 +130,11 @@ if ROUTER_GEMV not in ("mma", "umma"):
 GEMV_ROUTE_MAX_M = int(os.environ.get("TRTLLM_K3_ROUTE_GEMV_MAX_M", "32"))
 #: Largest cluster (portable cluster size).
 MAX_CTAS = 8
-#: Default of the cluster kernels' ``fast`` mode (see the module docstring); bit-identical outputs.
-FAST = os.environ.get("TRTLLM_K3_ROUTE_TAIL_FAST", "0") == "1"
+#: Default level of the cluster kernels' ``fast`` mode (0: off; 1, 2: see the module docstring);
+#: bit-identical outputs.
+FAST = int(os.environ.get("TRTLLM_K3_ROUTE_TAIL_FAST", "0"))
+if FAST not in (0, 1, 2):
+    raise ValueError(f"TRTLLM_K3_ROUTE_TAIL_FAST must be 0, 1 or 2, got {FAST}")
 #: Tokens per CTA are capped by the 32-bit token mask of the sort.
 _MAX_TOKENS_PER_CTA = 32
 #: Expert slots per lane: 7 blocks of 128 experts x 4 consecutive experts.
@@ -519,6 +528,86 @@ def _prefetch_l2(addr, num_bytes, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _cluster_arrive_relaxed(*, loc=None, ip=None):
+    _asm(None, [], "barrier.cluster.arrive.relaxed.aligned;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _cluster_wait(*, loc=None, ip=None):
+    _asm(None, [], "barrier.cluster.wait.aligned;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _mbar_init(addr, count: int, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip)],
+        f"mbarrier.init.shared::cta.b64 [$0], {count};",
+        "r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_init_fence(*, loc=None, ip=None):
+    _asm(None, [], "fence.mbarrier_init.release.cluster;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _mbar_arrive_expect_tx(addr, tx, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _iv(tx, loc=loc, ip=ip)],
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;",
+        "r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbar_try_wait(addr, parity: int, *, loc=None, ip=None):
+    """1 once the phase of ``parity`` of the mbarrier at ``addr`` completed."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(addr, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\n"
+            f"mbarrier.try_wait.parity.shared::cta.b64 p, [$1], {parity};\n"
+            "selp.u32 $0, 1, 0, p;\n}",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_async_v4_b32(local_addr, local_mbar, peer, v0, v1, v2, v3, *, loc=None, ip=None):
+    """``st.async`` of four words to ``local_addr`` of cluster CTA ``peer``, completing 16 bytes of
+    the transaction count of its mbarrier at ``local_mbar``."""
+    _asm(
+        None,
+        [
+            _iv(local_addr, loc=loc, ip=ip),
+            _iv(local_mbar, loc=loc, ip=ip),
+            _iv(peer, loc=loc, ip=ip),
+            _iv(v0, loc=loc, ip=ip),
+            _iv(v1, loc=loc, ip=ip),
+            _iv(v2, loc=loc, ip=ip),
+            _iv(v3, loc=loc, ip=ip),
+        ],
+        "{\n.reg .b32 ra, rb;\nmapa.shared::cluster.u32 ra, $0, $2;\n"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [ra], {$3, $4, $5, $6}, [rb];\n}",
+        "r,r,r,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _sts_f32(addr, value, *, loc=None, ip=None):
     _asm(
         None,
@@ -575,7 +664,7 @@ class K3RouteTailKernel:
         use_pdl: Launch with programmatic dependent launch (the logits come from the
             previous kernel).
         local_cap: Largest number of local experts served.
-        fast: The module docstring's ``fast`` mode (same outputs).
+        fast: Level of the module docstring's ``fast`` mode (0, 1, 2; same outputs).
     """
 
     def __init__(
@@ -617,9 +706,11 @@ class K3RouteTailKernel:
         self.max_tiles_per_expert = (MAX_M + TILE - 1) // TILE
         # Skip candidate-ranking rounds in which the warp has no candidate.
         self.skip_empty_rank_rounds = False
-        self.fast = fast
+        self.fast = int(fast)
         # Top-k ids / weights staged in shared memory and stored after the cluster barrier.
-        self.delay_stores = fast and with_sort and num_ctas > 1
+        self.delay_stores = self.fast >= 1 and with_sort and num_ctas > 1
+        # Token masks exchanged with st.async on an mbarrier (no cluster barrier after the top-k).
+        self.async_exchange = self.fast >= 2 and with_sort and num_ctas > 1
 
     @cute.jit
     def __call__(
@@ -652,6 +743,8 @@ class K3RouteTailKernel:
             mask: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.local_cap], 16]
             # Top-k weights of this CTA's tokens (``delay_stores``).
             vals: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, vals_words], 16]
+            # mbarrier of the incoming token masks (``async_exchange``).
+            xbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, 1], 8]
             # Every CTA's masks, broadcast over distributed shared memory.
             masks: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, self.num_ctas * self.local_cap], 16
@@ -739,6 +832,7 @@ class K3RouteTailKernel:
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         bias_smem = storage.bias.data_ptr().toint()
         vals_smem = storage.vals.data_ptr().toint()
+        xbar = storage.xbar.data_ptr().toint()
         mask_smem = storage.mask.data_ptr().toint()
         masks_smem = storage.masks.data_ptr().toint()
         base_smem = storage.base.data_ptr().toint()
@@ -762,9 +856,19 @@ class K3RouteTailKernel:
             for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
                 _sts_b32(mask_smem + j * 4, Int32(0))
         # The bias is a weight: stage it in shared memory before waiting on the previous grid.
-        for e4 in cutlass.range(tidx, NUM_EXPERTS // 4, self.threads, unroll=1):
-            v = _ld_nc_v4_f32(bias_addr + Int64(e4 * 16))
-            _sts_v4_f32(bias_smem + e4 * 16, v[0], v[1], v[2], v[3])
+        if cutlass.const_expr(self.async_exchange and self.threads >= NUM_EXPERTS // 4):
+            # One load per thread; the exchange's mbarrier is armed while it is in flight.
+            b0, b1, b2, b3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+            if tidx < NUM_EXPERTS // 4:
+                b0, b1, b2, b3 = _ld_nc_v4_f32(bias_addr + Int64(tidx * 16))
+            self.arm_exchange(tidx, xbar, local_num, 0)
+            if tidx < NUM_EXPERTS // 4:
+                _sts_v4_f32(bias_smem + tidx * 16, b0, b1, b2, b3)
+        else:
+            for e4 in cutlass.range(tidx, NUM_EXPERTS // 4, self.threads, unroll=1):
+                v = _ld_nc_v4_f32(bias_addr + Int64(e4 * 16))
+                _sts_v4_f32(bias_smem + e4 * 16, v[0], v[1], v[2], v[3])
+            self.arm_exchange(tidx, xbar, local_num, 0)
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
         cute.arch.barrier()
@@ -797,7 +901,11 @@ class K3RouteTailKernel:
 
         if cutlass.const_expr(self.with_sort):
             cute.arch.barrier()
-            if cutlass.const_expr(self.num_ctas > 1):
+            if cutlass.const_expr(self.async_exchange):
+                self.exchange_async(
+                    tidx, rank, local_num, mask_smem, masks_smem, xbar, Int32(0), Int32(0), False
+                )
+            elif cutlass.const_expr(self.num_ctas > 1):
                 # Broadcast this CTA's token masks into every CTA of the cluster.
                 for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
                     word = _lds_b32(mask_smem + j * 4)
@@ -829,6 +937,50 @@ class K3RouteTailKernel:
                 local_offset,
                 local_num,
             )
+
+    @cute.jit
+    def arm_exchange(self, tidx: Int32, xbar: Int32, local_num: Int32, extra_bytes: int):
+        """``async_exchange``, before ``griddepcontrol.wait``: arm this CTA's mbarrier for the masks
+        (and ``extra_bytes``) of every cluster CTA, then arrive (relaxed) on the cluster barrier that
+        orders it before any peer's ``st.async``."""
+        if cutlass.const_expr(self.async_exchange):
+            if tidx == 0:
+                _mbar_init(xbar, 1)
+                _mbar_init_fence()
+                per_cta = ((local_num + 3) >> 2) * 16 + extra_bytes
+                _mbar_arrive_expect_tx(xbar, per_cta * self.num_ctas)
+            _cluster_arrive_relaxed()
+
+    @cute.jit
+    def exchange_async(
+        self,
+        tidx: Int32,
+        rank: Int32,
+        local_num: Int32,
+        mask_smem: Int32,
+        masks_smem: Int32,
+        xbar: Int32,
+        touched_smem: Int32,
+        touched_all_smem: Int32,
+        with_touched: bool,
+    ):
+        """``async_exchange``: send this CTA's token masks (16-byte groups; the words after
+        ``local_num`` are never read) and, ``with_touched``, its selected-expert bitmap to every
+        cluster CTA with ``st.async``, then wait until all CTAs' have arrived here."""
+        _cluster_wait()
+        row = masks_smem + rank * (self.local_cap * 4)
+        for q in cutlass.range(tidx, (local_num + 3) >> 2, self.threads, unroll=1):
+            w0, w1, w2, w3 = _lds_v4_b32(mask_smem + q * 16)
+            for c in cutlass.range_constexpr(self.num_ctas):
+                _st_async_v4_b32(row + q * 16, xbar, Int32(c), w0, w1, w2, w3)
+        if cutlass.const_expr(with_touched):
+            if tidx < NUM_EXPERTS // 128:
+                w0, w1, w2, w3 = _lds_v4_b32(touched_smem + tidx * 16)
+                dst = touched_all_smem + rank * 128 + tidx * 16
+                for c in cutlass.range_constexpr(self.num_ctas):
+                    _st_async_v4_b32(dst, xbar, Int32(c), w0, w1, w2, w3)
+        while _mbar_try_wait(xbar, 0) == 0:
+            pass
 
     @cute.jit
     def store_topk(
@@ -2128,7 +2280,7 @@ def _compiled_tail(
     with_sort: bool,
     use_pdl: bool,
     local_cap: int,
-    fast: bool = False,
+    fast: int = 0,
 ):
     kernel = K3RouteTailKernel(
         num_ctas, num_warps, warps_per_token, num_splits, with_sort, use_pdl, local_cap, fast
@@ -2215,7 +2367,7 @@ def run_k3_route_tail(
     warps_per_token: int | None = None,
     num_warps: int | None = None,
     use_pdl: bool = True,
-    fast: bool | None = None,
+    fast: int | None = None,
     prefetch_bias: torch.Tensor | None = None,
 ) -> None:
     """Launch the routing tail on the current stream (inputs are not re-validated).
@@ -2238,7 +2390,7 @@ def run_k3_route_tail(
         warps_per_token: Warps routing one token (default from :func:`default_config`).
         num_warps: Warps per CTA (default from :func:`default_config`).
         use_pdl: Launch with programmatic dependent launch.
-        fast: ``fast`` mode (default :data:`FAST`); same outputs.
+        fast: ``fast`` mode level (default :data:`FAST`); same outputs.
         prefetch_bias: The next MoE layer's ``fp32 [896]`` bias, prefetched into L2 (optional).
     """
     m = num_tokens
@@ -2258,7 +2410,7 @@ def run_k3_route_tail(
     with_sort = sort_outputs is not None
     local_cap = _SMALL_LOCAL_CAP if local_num_experts <= _SMALL_LOCAL_CAP else NUM_EXPERTS
     compiled = _compiled_tail(
-        num_ctas, num_warps, warps_per_token, splits, with_sort, use_pdl, local_cap, bool(fast)
+        num_ctas, num_warps, warps_per_token, splits, with_sort, use_pdl, local_cap, int(fast)
     )
     if with_sort:
         tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
@@ -3037,7 +3189,7 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
         use_pdl: bool,
         num_entries: int,
         trace: bool = False,
-        fast: bool = False,
+        fast: int = 0,
     ):
         super().__init__(
             num_ctas, num_warps, warps_per_token, num_splits, True, use_pdl, REP_LOCAL_CAP, fast
@@ -3083,6 +3235,7 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
             bias: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, NUM_EXPERTS], 16]
             table: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, REP_TABLE_WORDS], 16]
             vals: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, vals_words], 16]
+            xbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, 1], 8]
             mask: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, self.local_cap], 16]
             masks: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, self.num_ctas * self.local_cap], 16
@@ -3187,6 +3340,7 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
         bias_smem = storage.bias.data_ptr().toint()
         table_smem = storage.table.data_ptr().toint()
         vals_smem = storage.vals.data_ptr().toint()
+        xbar = storage.xbar.data_ptr().toint()
         mask_smem = storage.mask.data_ptr().toint()
         masks_smem = storage.masks.data_ptr().toint()
         base_smem = storage.base.data_ptr().toint()
@@ -3223,6 +3377,9 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
                 b0, b1, b2, b3 = _ld_nc_v4_f32(bias_addr + Int64(tidx * 16))
             if tidx < REP_TABLE_WORDS // 4:
                 t0, t1, t2, t3 = _ld_nc_v4_f32(table_addr + Int64(tidx * 16))
+            # The selected-expert bitmap travels with the masks (28 words); armed while the
+            # loads are in flight.
+            self.arm_exchange(tidx, xbar, local_num, NUM_EXPERTS // 8)
             if tidx < NUM_EXPERTS // 4:
                 _sts_v4_f32(bias_smem + tidx * 16, b0, b1, b2, b3)
             if tidx < REP_TABLE_WORDS // 4:
@@ -3234,6 +3391,7 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
             for q in cutlass.range(tidx, REP_TABLE_WORDS // 4, self.threads, unroll=1):
                 v = _ld_nc_v4_f32(table_addr + Int64(q * 16))
                 _sts_v4_f32(table_smem + q * 16, v[0], v[1], v[2], v[3])
+            self.arm_exchange(tidx, xbar, local_num, NUM_EXPERTS // 8)
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
         cute.arch.barrier()
@@ -3267,7 +3425,19 @@ class K3RouteTailRepKernel(K3RouteTailKernel):
 
         cute.arch.barrier()
         self.stamp(tidx, rank, trace_addr, 2)
-        if cutlass.const_expr(self.num_ctas > 1):
+        if cutlass.const_expr(self.async_exchange):
+            self.exchange_async(
+                tidx,
+                rank,
+                local_num,
+                mask_smem,
+                masks_smem,
+                xbar,
+                touched_smem,
+                touched_all_smem,
+                True,
+            )
+        elif cutlass.const_expr(self.num_ctas > 1):
             # Broadcast this CTA's token masks and selected-expert bitmap into every CTA.
             for j in cutlass.range(tidx, local_num, self.threads, unroll=1):
                 word = _lds_b32(mask_smem + j * 4)
@@ -3695,7 +3865,7 @@ def _compiled_tail_rep(
     use_pdl: bool,
     num_entries: int,
     trace: bool = False,
-    fast: bool = False,
+    fast: int = 0,
 ):
     kernel = K3RouteTailRepKernel(
         num_ctas, num_warps, warps_per_token, num_splits, use_pdl, num_entries, trace, fast
@@ -3740,7 +3910,7 @@ def run_k3_route_tail_rep(
     num_warps: int | None = None,
     use_pdl: bool = True,
     trace: torch.Tensor | None = None,
-    fast: bool | None = None,
+    fast: int | None = None,
     prefetch_bias: torch.Tensor | None = None,
     prefetch_table: torch.Tensor | None = None,
 ) -> None:
@@ -3775,7 +3945,7 @@ def run_k3_route_tail_rep(
         use_pdl,
         _rep_bound(num_entries),
         trace is not None,
-        bool(fast),
+        int(fast),
     )
     tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
     scale_bits = struct.unpack("<q", struct.pack("<d", float(routed_scaling_factor)))[0]
