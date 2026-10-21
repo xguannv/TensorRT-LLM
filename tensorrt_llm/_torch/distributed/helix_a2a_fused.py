@@ -122,6 +122,7 @@ class HelixAllToAllFused:
         head_dim: int,
         zero_kv_mask: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        pair_stats: bool = False,
     ) -> torch.Tensor:
         """Exchange and combine.
 
@@ -134,6 +135,8 @@ class HelixAllToAllFused:
             zero_kv_mask: Optional bool ``[T]``, True where this rank owns no KV of the token;
                 those rows contribute nothing.
             out: Optional BF16 ``[T, num_heads * head_dim]`` output.
+            pair_stats: Heads ``2i`` and ``2i + 1`` share one ``(max, sum)``; ``softmax_stats`` is then
+                ``[T, cp_size * num_heads / 2, 2]``.
 
         Returns:
             The combined BF16 ``[T, num_heads * head_dim]`` output of this rank's heads.
@@ -148,7 +151,7 @@ class HelixAllToAllFused:
         softmax_stats = softmax_stats.reshape(num_tokens, -1)
         assert partial_o.is_contiguous() and softmax_stats.is_contiguous()
         assert partial_o.shape[1] == cp_size * num_heads * head_dim
-        assert softmax_stats.shape[1] == cp_size * num_heads * 2
+        assert softmax_stats.shape[1] == cp_size * num_heads * (1 if pair_stats else 2)
         if zero_kv_mask is not None:
             zero_kv_mask = zero_kv_mask[:num_tokens].contiguous()
         chunk = self.half_bytes // (cp_size * record_bytes(num_heads, head_dim))
@@ -173,6 +176,7 @@ class HelixAllToAllFused:
                     self.max_send_ctas,
                     self.max_recv_ctas,
                     int(self.use_pdl),
+                    int(pair_stats),
                 ],
             )
         return out
@@ -188,12 +192,13 @@ def _helix_a2a_fused_op(
     params: List[int],
 ) -> None:
     """One launch of the fused kernel into ``out``; ``params`` = (cp_rank, cp_size, num_heads,
-    head_dim, ws_addr, rank_stride, half_bytes, max_send_ctas, max_recv_ctas, use_pdl)."""
+    head_dim, ws_addr, rank_stride, half_bytes, max_send_ctas, max_recv_ctas, use_pdl[, pair_stats])."""
     from ..cute_dsl_kernels.blackwell.helix_a2a_fused import helix_a2a_fused
 
     cp_rank, cp_size, num_heads, head_dim, ws_addr, rank_stride, half_bytes, n_send, n_recv, pdl = (
-        params
+        params[:10]
     )
+    pair_stats = bool(params[10]) if len(params) > 10 else False
     helix_a2a_fused(
         partial_o,
         softmax_stats,
@@ -210,6 +215,7 @@ def _helix_a2a_fused_op(
         max_send_ctas=n_send,
         max_recv_ctas=n_recv,
         use_pdl=bool(pdl),
+        pair_stats=pair_stats,
     )
 
 

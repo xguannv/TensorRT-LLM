@@ -17,7 +17,9 @@ mapping (tp 1 x cp W) and checks:
   ``trtllm::helix_post_process`` on the same partials, every rank holding every rank's data from one seed) and against
   an fp64 reference, with tokens empty on some ranks (the combine's identity) and tokens seen by one rank only;
 * a decode step's call sequence (gather, combine per layer) captured in a CUDA graph and replayed with new inputs,
-  eager calls of other token counts between replays, a random rank late before each.
+  eager calls of other token counts between replays, a random rank late before each;
+* ``TRTLLM_K3LL_HELIX_STATS_PAIRS``: the fused kernel reading each head's statistics once for both halves
+  (``pair_stats``) gives the bits of the call on the per-half copy.
 
     srun -N 4 --ntasks-per-node 4 --mpi=pmix python _kimi_k3_helix_mla_comm_matrix.py --launcher srun --world-size 16
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _kimi_k3_helix_mla_comm_matrix.py            # W = 4, mpirun
@@ -44,7 +46,7 @@ REPLAYS = 4
 WORKSPACE_BYTES = 4 << 20  # decode_comm.MNNVL_BUFFER_BYTES
 INT32_MIN = torch.iinfo(torch.int32).min
 STATS = {"q_neg_zero_words": 0, "fused_vs_stock_max": 0.0, "fused_vs_stock_bitwise": [0, 0],
-         "fused_err": 0.0, "stock_err": 0.0}  # fmt: skip
+         "fused_err": 0.0, "stock_err": 0.0, "pair_stats_bitwise": [0, 0]}  # fmt: skip
 
 R = None
 MOD = None  # decode_mla_dcp
@@ -171,6 +173,28 @@ def check_fused_combine() -> None:
         compare_combine(got, out, stats, empty, f"T={tokens}")
 
 
+def check_pair_stats() -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
+
+    try:
+        for i, tokens in enumerate(TOKENS):
+            out, stats, empty = all_ranks_partials(300 + i, tokens)
+            flags.TRTLLM_K3LL_HELIX_STATS_PAIRS = 0
+            R.late(random.Random(3000 + i).randrange(R.world))
+            want = run_fused(out, stats, empty)
+            flags.TRTLLM_K3LL_HELIX_STATS_PAIRS = 1
+            R.late(random.Random(4000 + i).randrange(R.world))
+            got = run_fused(out, stats, empty)
+            torch.cuda.synchronize()
+            same = torch.equal(got.view(torch.int16), want.view(torch.int16))
+            STATS["pair_stats_bitwise"][0] += int(same)
+            STATS["pair_stats_bitwise"][1] += 1
+            assert same, f"pair_stats differs at T={tokens}"
+            compare_combine(got, out, stats, empty, f"pair_stats T={tokens}")
+    finally:
+        flags.TRTLLM_K3LL_HELIX_STATS_PAIRS = 0
+
+
 def check_graph_sequence() -> None:
     """One captured decode step: per layer the query all-gather then the fused exchange + combine, both on their
     workspaces; replayed with new inputs, an eager call of another token count between replays."""
@@ -267,14 +291,16 @@ def rank_main(args) -> int:
     WS = MnnvlWorkspace.create(TP_MAPPING, WORKSPACE_BYTES, fabric_handle=R.fabric)
     SR = decode_mla_dcp.MlaSplitRead(cp_mapping, HP, 1, gather_mapping=TP_MAPPING)
     code = ls.run_checks(
-        R, [check_build, check_q_gather, check_fused_combine, check_graph_sequence]
+        R,
+        [check_build, check_q_gather, check_fused_combine, check_graph_sequence, check_pair_stats],
     )
     if R.rank == 0:
         hit, total = STATS["fused_vs_stock_bitwise"]
         print(
             f"[rank 0] W={R.world}: q -0.0 words rewritten {STATS['q_neg_zero_words']}; fused vs NCCL-path combine: "
             f"bitwise {hit}/{total} calls, max |diff| {STATS['fused_vs_stock_max']:.3e} (relative); vs fp64: "
-            f"fused {STATS['fused_err']:.3e}, NCCL path {STATS['stock_err']:.3e}",
+            f"fused {STATS['fused_err']:.3e}, NCCL path {STATS['stock_err']:.3e}; pair_stats vs per-half copy: "
+            f"bitwise {STATS['pair_stats_bitwise'][0]}/{STATS['pair_stats_bitwise'][1]}",
             flush=True,
         )
     return code

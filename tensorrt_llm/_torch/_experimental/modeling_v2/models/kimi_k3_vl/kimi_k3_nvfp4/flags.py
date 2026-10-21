@@ -143,6 +143,12 @@ TRTLLM_K3LL_HELIX_Q_LOCAL = _flag(
     "Helix MLA decode: every rank projects, absorbs and quantizes all heads' queries itself (the module's full Q-B / "
     "K-B), no query all-gather",
 )
+TRTLLM_K3LL_HELIX_STATS_PAIRS = _flag(
+    "TRTLLM_K3LL_HELIX_STATS_PAIRS",
+    0,
+    "with TRTLLM_K3LL_HELIX_A2A_FUSED: the fused exchange reads each head's (max, sum) once for its two 256-wide "
+    "halves (pair_stats), not from a copy that repeats it per half",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

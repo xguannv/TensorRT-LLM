@@ -259,6 +259,16 @@ def exchange_combine_fused(
     """
     tokens = out.shape[0]
     heads = softmax_stats.shape[1]
+    if _HALVES == 2 and _flags.TRTLLM_K3LL_HELIX_STATS_PAIRS:
+        # the kernel writes each head's pair into both halves' slots of the record itself
+        return fused(
+            out.view(tokens, -1),
+            softmax_stats.view(tokens, -1),
+            heads_per_rank * _HALVES,
+            FUSED_HEAD_DIM,
+            zero_kv_mask=empty,
+            pair_stats=True,
+        )
     halves = (
         softmax_stats.view(tokens, heads, 1, 2)
         .expand(tokens, heads, _HALVES, 2)

@@ -158,6 +158,20 @@ def _ld_nc_v4(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_nc_v2(addr, *, loc=None, ip=None):
+    """8 bytes of a tensor the kernel does not write."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [_lv(addr, loc=loc, ip=ip)],
+        "ld.global.nc.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 2, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _ld_vol_v4(addr, *, loc=None, ip=None):
     """16 bytes of the receive buffer, read past L1 (peers write it over NVLink)."""
     res = _asm(
@@ -501,14 +515,26 @@ class HelixA2AFusedKernel:
         head_dim: ``D``, values per head (128 or 256).
         has_mask: Apply a per-token ``zero_kv_mask`` (uint8) on the sender side.
         use_pdl: Launch with programmatic dependent launch.
+        pair_stats: Heads ``2i`` and ``2i + 1`` share one ``(max, sum)`` (a wider head sent as two halves): the
+            statistics input holds one pair per head pair, ``[T, P * H / 2, 2]``, and the sender writes it into
+            both heads' slots of the record (the record and the output are those of the duplicated statistics).
     """
 
-    def __init__(self, cp_size: int, num_heads: int, head_dim: int, has_mask: bool, use_pdl: bool):
+    def __init__(
+        self,
+        cp_size: int,
+        num_heads: int,
+        head_dim: int,
+        has_mask: bool,
+        use_pdl: bool,
+        pair_stats: bool = False,
+    ):
         if not supports(cp_size, num_heads, head_dim):
             raise ValueError(f"cp_size={cp_size}, num_heads={num_heads}, head_dim={head_dim}")
         self.P = cp_size
         self.has_mask = has_mask
         self.use_pdl = use_pdl
+        self.pair_stats = pair_stats
         # 16-byte vectors of a record: partial output, then statistics.
         self.DV = num_heads * head_dim // 8
         self.SV = num_heads // 2
@@ -659,12 +685,25 @@ class HelixA2AFusedKernel:
                     k = j - rl * RV
                     rec = rec0 + rl
                     if rec < n_rec:
-                        src = o_addr + Int64(rec * DV + k) * 16
-                        if k >= DV:
-                            src = s_addr + Int64(rec * SV + k - DV) * 16
-                        w = _ld_nc_v4(src)
-                        for e in cutlass.range_constexpr(4):
-                            words[u * 4 + e] = w[e]
+                        if cutlass.const_expr(self.pair_stats):
+                            # A statistics vector is the two heads of one pair: one 8-byte pair, twice.
+                            if k >= DV:
+                                sv = _ld_nc_v2(s_addr + Int64(rec * SV + k - DV) * 8)
+                                words[u * 4] = sv[0]
+                                words[u * 4 + 1] = sv[1]
+                                words[u * 4 + 2] = sv[0]
+                                words[u * 4 + 3] = sv[1]
+                            else:
+                                w = _ld_nc_v4(o_addr + Int64(rec * DV + k) * 16)
+                                for e in cutlass.range_constexpr(4):
+                                    words[u * 4 + e] = w[e]
+                        else:
+                            src = o_addr + Int64(rec * DV + k) * 16
+                            if k >= DV:
+                                src = s_addr + Int64(rec * SV + k - DV) * 16
+                            w = _ld_nc_v4(src)
+                            for e in cutlass.range_constexpr(4):
+                                words[u * 4 + e] = w[e]
                         if cutlass.const_expr(self.has_mask):
                             zero_kv[u] = _ld_nc_u8(mask_addr + Int64(rec // P))
             for u in cutlass.range_constexpr(UL):
@@ -800,8 +839,15 @@ def record_bytes(num_heads: int, head_dim: int) -> int:
 
 
 @functools.cache
-def _compiled(cp_size: int, num_heads: int, head_dim: int, has_mask: bool, use_pdl: bool):
-    kernel = HelixA2AFusedKernel(cp_size, num_heads, head_dim, has_mask, use_pdl)
+def _compiled(
+    cp_size: int,
+    num_heads: int,
+    head_dim: int,
+    has_mask: bool,
+    use_pdl: bool,
+    pair_stats: bool = False,
+):
+    kernel = HelixA2AFusedKernel(cp_size, num_heads, head_dim, has_mask, use_pdl, pair_stats)
     addr = Int64(1 << 20)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(
@@ -840,11 +886,13 @@ def helix_a2a_fused(
     max_send_ctas: int,
     max_recv_ctas: int,
     use_pdl: bool = True,
+    pair_stats: bool = False,
 ) -> None:
     """Launch the exchange + combine of ``num_tokens = partial_o.shape[0]`` tokens into ``out``.
 
     ``partial_o``: BF16 ``[T, P * H * D]`` (destination-rank major), ``softmax_stats``: FP32
-    ``[T, P * H * 2]``, ``zero_kv_mask``: bool ``[T]`` or None, ``out``: BF16 ``[T, H * D]``.
+    ``[T, P * H * 2]`` (with ``pair_stats``, ``[T, P * H]``: one pair per two heads), ``zero_kv_mask``: bool
+    ``[T]`` or None, ``out``: BF16 ``[T, H * D]``.
     ``ws_addr`` is rank 0's receive buffer in this process's address space, rank ``r``'s at
     ``ws_addr + r * rank_stride``; each holds two halves of ``half_bytes``, every word armed
     with the sentinel. ``state`` is the int64 launch counter shared by all launches on the
@@ -853,7 +901,9 @@ def helix_a2a_fused(
     num_tokens = partial_o.shape[0]
     if num_tokens == 0:
         return
-    kernel, compiled = _compiled(cp_size, num_heads, head_dim, zero_kv_mask is not None, use_pdl)
+    kernel, compiled = _compiled(
+        cp_size, num_heads, head_dim, zero_kv_mask is not None, use_pdl, pair_stats
+    )
     # Up to max_send_ctas senders once there are that many chunks; fewer, larger senders below
     # (half the cap) send small messages faster.
     n_chunks = _ceil_div(num_tokens * cp_size, _CHUNK_RECORDS)
