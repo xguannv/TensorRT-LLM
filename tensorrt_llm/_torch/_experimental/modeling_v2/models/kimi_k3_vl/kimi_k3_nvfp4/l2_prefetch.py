@@ -29,10 +29,12 @@ MAX_TOTAL_BYTES = 64 << 20
 
 
 def _weights(sub: nn.Module):
-    """The weights a module's forward reads: its parameters and its weight / scale tensor attributes (not buffers such
-    as a rotary cos / sin cache, which can exceed L2)."""
+    """The weights a module's forward reads: its parameters, and its buffers and tensor attributes named like a weight
+    or a scale (FP8 weight-read linears keep ``weight`` / ``weight_scale`` as buffers); not other buffers such as a
+    rotary cos / sin cache, which can exceed L2."""
     yield from sub._parameters.values()
-    for name, v in vars(sub).items():
+    named = list(sub._buffers.items()) + list(vars(sub).items())
+    for name, v in named:
         if isinstance(v, torch.Tensor) and ("weight" in name or "scale" in name):
             yield v
 

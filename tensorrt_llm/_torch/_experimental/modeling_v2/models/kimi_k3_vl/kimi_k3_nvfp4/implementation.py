@@ -2179,7 +2179,8 @@ class KimiLinearModel(DecoderModel):
 
 def _l2_prefetch_experts_hook(attention: nn.Module) -> None:
     """The layer's expert L2 prefetch (``K3DecodeMoeNvfp4Layer.l2_prefetch_experts``, set by the target's build), called
-    once the attention's weight-heavy projections are issued."""
+    once the attention core is issued: the prefetch then overlaps the output projection, the all-reduce and the MoE
+    front, not the latency-bound recurrence / MLA decode on the critical path."""
     prefetch = attention.__dict__.get("l2_prefetch_experts")
     if prefetch is not None:
         prefetch()
@@ -2304,7 +2305,6 @@ class K3DecodeKDA(KimiKDALinearAttention):
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         qkvg = self.qkvg_proj(x)
         bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
-        _l2_prefetch_experts_hook(self)
         core = _fp8_attention.kda_decode(
             qkvg,
             bfa,
@@ -2322,6 +2322,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             self.head_k_dim**-0.5,
             float(self.o_norm.eps),
         )
+        _l2_prefetch_experts_hook(self)
         self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
         return core
 
@@ -2361,7 +2362,6 @@ class K3DecodeKDA(KimiKDALinearAttention):
         rows = torch.cat(
             (self.qkvg_proj(x), torch.nn.functional.linear(x, self._bfa_proj_weight)), dim=-1
         )
-        _l2_prefetch_experts_hook(self)
         out = k3_fp8_kda_verify(
             rows,
             self.f_b_proj.weight,
@@ -2381,6 +2381,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             num_steps - 1,
             *constants,
         )
+        _l2_prefetch_experts_hook(self)
         return out.view(-1, self.num_heads, self.head_dim)
 
 
@@ -2476,12 +2477,15 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if view is None:
             if not project_output:
                 raise ValueError("project_output=False requires fused MLA decode")
-            return self.forward_generic(position_ids, hidden_states, attn_metadata)
+            out = self.forward_generic(position_ids, hidden_states, attn_metadata)
+            if step is not None and step.decode:
+                _l2_prefetch_experts_hook(self)
+            return out
         x = hidden_states[: step.num_tokens]
         ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
         if view.get("quantized_cache", False):
-            _l2_prefetch_experts_hook(self)
             core = self._quantized_decode(ag, position_ids, attn_metadata)
+            _l2_prefetch_experts_hook(self)
             if not project_output:
                 return core
             return self._project_output([core], position_ids, attn_metadata, None)
@@ -2503,7 +2507,6 @@ class K3DecodeMLA(KimiK3MLAAttention):
             float(self.kv_a_layernorm.variance_epsilon),
             self._fp8_qb_ue8m0,
         )
-        _l2_prefetch_experts_hook(self)
         core = _fp8_attention.mla_attn(
             fused_q,
             view["pool"],
@@ -2518,6 +2521,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             view["softmax_scale"],
             self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
         )
+        _l2_prefetch_experts_hook(self)
         if not project_output:
             return core
         return self._project_output([core], position_ids, attn_metadata, None)
