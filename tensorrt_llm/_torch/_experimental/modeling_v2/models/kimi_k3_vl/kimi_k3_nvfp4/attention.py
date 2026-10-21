@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import flags as _flags
+
 
 @triton.jit
 def _kda_decode(
@@ -248,6 +250,181 @@ def _mla_qkv(
         )
 
 
+# TRTLLM_K3LL_MLA_QKV_SPLIT: _mla_qkv's work in three launches that spread over the SMs (_mla_qkv runs one program a
+# local head, each streaming its head's Q-B rows and K-B through one SM): _mla_qa_prep normalizes and quantizes q_a
+# once per 128-column block; _mla_qb_split computes Q-B in QB_SPLIT_N-column slices of each head (the NoPE slices into
+# a bf16 scratch, the PE slice into the output) plus one program for the latent; _mla_absorb absorbs the NoPE query
+# into each quarter of the latent. Every value is computed with _mla_qkv's operations in its order: the outputs are
+# bit-identical.
+QB_SPLIT_N = 32
+# _mla_qkv's warps. The split's q_a RMSNorm (_mla_qa_prep) and latent RMSNorm (_mla_qb_split's last program) sum
+# their rows with this many warps too: the reduction order follows the warp layout, and a one-ulp rms moves an FP8
+# code of a row near a rounding boundary (an in-model call of row 5, column 408 did with 4 warps).
+MLA_QKV_WARPS = 8
+
+
+@triton.jit
+def _mla_qa_prep(
+    AG,
+    QA_NORM,
+    A8,
+    ASC,
+    M,
+    AG_STRIDE: tl.constexpr,
+    QA_EPS: tl.constexpr,
+    QB_UE8M0: tl.constexpr,
+):
+    block, chunk = tl.program_id(0), tl.program_id(1)
+    rows = chunk * 16 + tl.arange(0, 16)
+    qa_cols = tl.arange(0, 2048)
+    qa = tl.load(
+        AG + rows[:, None] * AG_STRIDE + qa_cols[None, :],
+        (rows[:, None] < M) & (qa_cols[None, :] < 1536),
+        0,
+    ).to(tl.float32)
+    rms = tl.rsqrt(tl.sum(qa * qa, 1) / 1536 + QA_EPS)
+    cols = block * 128 + tl.arange(0, 128)
+    a = tl.load(AG + rows[:, None] * AG_STRIDE + cols[None, :], rows[:, None] < M, 0).to(tl.float32)
+    a *= rms[:, None] * tl.load(QA_NORM + cols)[None, :].to(tl.float32)
+    a = a.to(tl.bfloat16).to(tl.float32)
+    a_scale = tl.maximum(tl.max(tl.abs(a), 1) / 448.0, 1.0e-12)
+    if QB_UE8M0:
+        a_scale = tl.exp2(tl.ceil(tl.log2(a_scale)))
+    a8 = (a / a_scale[:, None]).to(tl.float8e4nv)
+    tl.store(A8 + rows[:, None] * 1536 + cols[None, :], a8, rows[:, None] < M)
+    tl.store(ASC + rows * 12 + block, a_scale, rows < M)
+
+
+@triton.jit
+def _mla_qb_split(
+    AG,
+    A8,
+    ASC,
+    QB,
+    QB_SCALE,
+    KV_NORM,
+    QN,
+    OUT,
+    POOL,
+    PAGES,
+    LENGTHS,
+    M,
+    H: tl.constexpr,
+    AG_STRIDE: tl.constexpr,
+    QB_SCALE_STRIDE: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    PAGE_OFFSET: tl.constexpr,
+    T: tl.constexpr,
+    KV_EPS: tl.constexpr,
+    BN: tl.constexpr,
+    STORE_PAGED: tl.constexpr,
+):
+    pid, chunk = tl.program_id(0), tl.program_id(1)
+    NS: tl.constexpr = 192 // BN
+    rows = chunk * 16 + tl.arange(0, 16)
+    if pid == H * NS:
+        latent = tl.arange(0, 512)
+        pe = tl.arange(0, 64)
+        if STORE_PAGED:
+            seq = rows // T
+            length = tl.load(LENGTHS + seq, rows < M, 0)
+            pos = length - T + rows % T
+            page = tl.load(PAGES + seq * PAGE_STRIDE + pos // 64, (rows < M) & (pos >= 0), 0)
+            cache_row = ((page.to(tl.int64) + PAGE_OFFSET) * 64 + pos % 64) * ROW_STRIDE
+            valid = (rows < M) & (pos >= 0)
+        else:
+            cache_row = rows * 576
+            valid = rows < M
+        ckv = tl.load(
+            AG + rows[:, None] * AG_STRIDE + 1536 + latent[None, :], rows[:, None] < M, 0
+        ).to(tl.float32)
+        kv_rms = tl.rsqrt(tl.sum(ckv * ckv, 1) / 512 + KV_EPS)
+        ckv *= kv_rms[:, None] * tl.load(KV_NORM + latent)[None, :].to(tl.float32)
+        tl.store(POOL + cache_row[:, None] + latent[None, :], ckv, valid[:, None])
+        kpe = tl.load(AG + rows[:, None] * AG_STRIDE + 2048 + pe[None, :], rows[:, None] < M, 0)
+        tl.store(POOL + cache_row[:, None] + 512 + pe[None, :], kpe, valid[:, None])
+    else:
+        head = pid // NS
+        s = pid % NS
+        n = s * BN + tl.arange(0, BN)
+        qb_rows = head * 192 + n
+        k = tl.arange(0, 128)
+        q = tl.full((16, BN), 0, tl.float32)
+        for block in range(12):
+            cols = block * 128 + k
+            a8 = tl.load(A8 + rows[:, None] * 1536 + cols[None, :], rows[:, None] < M, 0.0)
+            a_scale = tl.load(ASC + rows * 12 + block, rows < M, 1.0)
+            b = tl.load(QB + qb_rows[None, :] * 1536 + cols[:, None])
+            bs = tl.load(QB_SCALE + (qb_rows // 128) * QB_SCALE_STRIDE + block)
+            q += tl.dot(a8, b) * a_scale[:, None] * bs[None, :]
+        q = q.to(tl.bfloat16)
+        if s * BN < 128:
+            tl.store(QN + rows[:, None] * (H * 128) + head * 128 + n[None, :], q, rows[:, None] < M)
+        else:
+            tl.store(
+                OUT + rows[:, None] * (H * 576) + head * 576 + 512 + (n - 128)[None, :],
+                q,
+                rows[:, None] < M,
+            )
+
+
+@triton.jit
+def _mla_absorb(
+    QN,
+    KB,
+    KB_SCALE,
+    OUT,
+    M,
+    H: tl.constexpr,
+    KB_S0: tl.constexpr,
+    KB_S1: tl.constexpr,
+    KB_S2: tl.constexpr,
+    KS_S0: tl.constexpr,
+    KS_S1: tl.constexpr,
+):
+    head, quarter, chunk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    rows = chunk * 16 + tl.arange(0, 16)
+    k = tl.arange(0, 128)
+    qn = tl.load(QN + rows[:, None] * (H * 128) + head * 128 + k[None, :], rows[:, None] < M, 0).to(
+        tl.float32
+    )
+    q_scale = tl.maximum(tl.max(tl.abs(qn), 1) / 448.0, 1.0e-12)
+    q8 = (qn / q_scale[:, None]).to(tl.float8e4nv)
+    latent = quarter * 128 + tl.arange(0, 128)
+    kb = tl.load(KB + head * KB_S0 + latent[None, :] * KB_S1 + k[:, None] * KB_S2)
+    ks = tl.load(KB_SCALE + head * KS_S0 + (latent // 128) * KS_S1)
+    absorbed = tl.dot(q8, kb) * q_scale[:, None] * ks[None, :]
+    tl.store(
+        OUT + rows[:, None] * (H * 576) + head * 576 + latent[None, :], absorbed, rows[:, None] < M
+    )
+
+
+def _mla_qkv_split(
+    ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, out, pool, pages, lengths, row_stride,
+    page_offset, tokens_per_request, qa_eps, kv_eps, qb_ue8m0, store_paged,
+):  # fmt: skip
+    """``_mla_qkv``'s outputs (``out``, and the latent into ``pool``) by the three split kernels."""
+    m, h = ag.shape[0], kb.shape[0]
+    chunks = triton.cdiv(m, 16)
+    a8 = torch.empty((m, 1536), dtype=torch.float8_e4m3fn, device=ag.device)
+    asc = torch.empty((m, 12), dtype=torch.float32, device=ag.device)
+    qn = torch.empty((m, h * 128), dtype=torch.bfloat16, device=ag.device)
+    _mla_qa_prep[(12, chunks)](
+        ag, qa_norm, a8, asc, m, ag.stride(0), qa_eps, QB_UE8M0=qb_ue8m0, num_warps=MLA_QKV_WARPS
+    )
+    _mla_qb_split[(h * (192 // QB_SPLIT_N) + 1, chunks)](
+        ag, a8, asc, qb, qb_scale, kv_norm, qn, out, pool, pages, lengths, m, h, ag.stride(0),
+        qb_scale.stride(0), row_stride, pages.stride(0), page_offset, tokens_per_request, kv_eps,
+        QB_SPLIT_N, STORE_PAGED=store_paged, num_warps=MLA_QKV_WARPS,
+    )  # fmt: skip
+    s0, s1, s2 = kb.stride()
+    _mla_absorb[(h, 4, chunks)](
+        qn, kb, kb_scale, out, m, h, s0, s1, s2, kb_scale.stride(0), kb_scale.stride(1),
+        num_warps=4,
+    )  # fmt: skip
+
+
 @torch.library.custom_op("trtllm::k3_fp8_mla_qkv", mutates_args=("pool",))
 def mla_qkv(
     ag: torch.Tensor,
@@ -270,6 +447,12 @@ def mla_qkv(
     """Fuse Q-A norm, FP8 Q-B/absorption and the paged latent-cache update."""
     h = kb.shape[0]
     out = ag.new_empty((ag.shape[0], h * 576))
+    if _flags.TRTLLM_K3LL_MLA_QKV_SPLIT:
+        _mla_qkv_split(
+            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, out, pool, pages, lengths, row_stride,
+            page_offset, tokens_per_request, qa_eps, kv_eps, qb_ue8m0, True,
+        )  # fmt: skip
+        return out
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
         ag,
         qa_norm,
@@ -295,7 +478,7 @@ def mla_qkv(
         qa_eps,
         kv_eps,
         QB_UE8M0=qb_ue8m0,
-        num_warps=8,
+        num_warps=MLA_QKV_WARPS,
     )
     return out
 
@@ -339,6 +522,12 @@ def mla_project_qkv(
     h = kb.shape[0]
     query = ag.new_empty((ag.shape[0], h * 576))
     latent = ag.new_empty((ag.shape[0], 576))
+    if _flags.TRTLLM_K3LL_MLA_QKV_SPLIT:
+        _mla_qkv_split(
+            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, query, latent, ag, ag, 576, 0, 1, qa_eps,
+            kv_eps, qb_ue8m0, False,
+        )  # fmt: skip
+        return query, latent
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
         ag,
         qa_norm,
@@ -365,7 +554,7 @@ def mla_project_qkv(
         kv_eps,
         STORE_PAGED=False,
         QB_UE8M0=qb_ue8m0,
-        num_warps=8,
+        num_warps=MLA_QKV_WARPS,
     )
     return query, latent
 
