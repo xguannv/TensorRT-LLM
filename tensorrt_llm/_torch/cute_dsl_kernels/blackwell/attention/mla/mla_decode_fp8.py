@@ -168,6 +168,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tile_reduction: Optional[bool] = None,
         kv_evict_first: str = "",
         early_prologue: bool = False,
+        v_stages: int = 2,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -279,6 +280,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             FP8 q absorb triggers its dependents after its own wait). The
             result does not depend on it.
         :type early_prologue: bool
+        :param v_stages: Shared-memory stages of the V tiles (P*V operands),
+            >= 2; a third stage lets the load-V warp run one K tile further
+            ahead (it takes the shared memory of one K stage). The result does
+            not depend on it.
+        :type v_stages: int
         """
 
         self.latent_dim = 512
@@ -316,10 +322,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if bf16_partials and not balanced_split:
             raise ValueError("bf16_partials needs the balanced split.")
         self.partial_dtype = cutlass.BFloat16 if bf16_partials else acc_dtype
-        if k_stages < 2 or p_stages not in (2, 3):
-            raise ValueError("k_stages must be >= 2 and p_stages 2 or 3, got "
-                             f"{k_stages}, {p_stages}.")
+        if k_stages < 2 or p_stages not in (2, 3) or v_stages < 2:
+            raise ValueError("k_stages must be >= 2, p_stages 2 or 3 and "
+                             "v_stages >= 2, got "
+                             f"{k_stages}, {p_stages}, {v_stages}.")
         self.k_stages = k_stages
+        # (not ``v_stages``: the fused V-up subclass uses that name for its
+        # reduction's stages)
+        self.split_v_stages = v_stages
         self.p_stages = p_stages
         if kv_evict_first not in ("", "k", "v", "kv"):
             raise ValueError(
@@ -461,7 +471,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         self.load_q_stage = 1
         self.load_k_stage = self.k_stages
-        self.load_v_stage = 2
+        self.load_v_stage = self.split_v_stages
         # The MMA warp issues Q*K^T of K tile j + mma_lookahead before P*V of
         # tile j, so the softmax and the O rescale of tile j overlap two
         # Q*K^T/P*V pairs of tensor work; S, P and the correction metadata
@@ -1122,6 +1132,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError(
                 f"MLA decode shared storage of {smem_bytes} bytes exceeds the "
                 f"{smem_capacity} available (k_stages={self.k_stages}, "
+                f"v_stages={self.split_v_stages}, "
                 f"p_stages={self.p_stages}, balanced_max_requests="
                 f"{self.balanced_max_requests}).")
         if cutlass.const_expr(self.emit_softmax_stats):

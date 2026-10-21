@@ -9057,6 +9057,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
               in shared memory), else 2 and 3; TRTLLM_MLA_K_STAGES and
               TRTLLM_MLA_P_STAGES override them. The result does not depend
               on them.
+            * v_stages (balanced split): TRTLLM_MLA_V_STAGES, shared-memory
+              stages of the V tiles (default 2). A third V stage takes the
+              shared memory of the third K stage, so k_stages then defaults
+              to 2. The result does not depend on it.
             * early_prologue (balanced split with PDL):
               TRTLLM_MLA_EARLY_PROLOGUE=1 builds the schedule and loads the
               first K tile of KV older than this step before the PDL wait,
@@ -9118,8 +9122,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel.BALANCED_MAX_REQUESTS,
                     max(64, 1 << (batch_size - 1).bit_length())))
                 deep_k = max_requests <= cls._DEEP_K_MAX_REQUESTS
+                v_stages = int(os.environ.get("TRTLLM_MLA_V_STAGES", "2"))
                 k_stages = int(
-                    os.environ.get("TRTLLM_MLA_K_STAGES", 3 if deep_k else 2))
+                    os.environ.get("TRTLLM_MLA_K_STAGES",
+                                   3 if deep_k and v_stages < 3 else 2))
                 p_stages = int(
                     os.environ.get("TRTLLM_MLA_P_STAGES", 2 if deep_k else 3))
                 options += (
@@ -9135,7 +9141,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ("tile_reduction", tile_reduction),
                     ("early_prologue",
                      os.environ.get("TRTLLM_MLA_EARLY_PROLOGUE", "0") == "1"),
-                )
+                ) + ((("v_stages", v_stages), ) if v_stages != 2 else ())
             return options
 
         def __init__(

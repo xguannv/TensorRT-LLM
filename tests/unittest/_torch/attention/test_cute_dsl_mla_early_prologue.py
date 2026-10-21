@@ -19,7 +19,9 @@ segment before ``griddepcontrol.wait`` (only a tile that holds no KV this step c
 loads the query first. That only reorders loads: O, LSE, the Helix softmax statistics and the
 fused V up-projection must be BITWISE identical to the default kernel, for batches 1 to 33,
 short KV (where a cluster's first tile is among the last ones of its request), a request
-without KV, eagerly and in a CUDA graph; without PDL the option changes nothing.
+without KV, eagerly and in a CUDA graph; without PDL the option changes nothing. A third V-tile
+stage (TRTLLM_MLA_V_STAGES=3, the third K stage's shared memory) is pipelining only as well:
+bitwise the default, with and without the early prologue.
 
 Requires 1 SM100/SM103 GPU and nvidia-cutlass-dsl.
 """
@@ -68,9 +70,10 @@ _CASES = {
 }
 
 
-def _run(x, H, S, monkeypatch, early, pdl="1"):
+def _run(x, H, S, monkeypatch, early, pdl="1", v_stages=2):
     monkeypatch.setenv("TRTLLM_MLA_PDL", pdl)
     monkeypatch.setenv("TRTLLM_MLA_EARLY_PROLOGUE", "1" if early else "0")
+    monkeypatch.setenv("TRTLLM_MLA_V_STAGES", str(v_stages))
     return _run_guarded(x, H, S, _BALANCED, True, monkeypatch, persistent=True)
 
 
@@ -93,6 +96,14 @@ def test_option(monkeypatch):
     assert "early_prologue" not in dict(
         CuteDSLNVMlaDecodeBlackwellRunner._fp8_kernel_options(2, False)
     )
+    # V stages: the default adds no option; three take the third K stage
+    monkeypatch.delenv("TRTLLM_MLA_V_STAGES", raising=False)
+    monkeypatch.delenv("TRTLLM_MLA_K_STAGES", raising=False)
+    opts = dict(CuteDSLNVMlaDecodeBlackwellRunner._fp8_kernel_options(2, True))
+    assert "v_stages" not in opts and opts["k_stages"] == 3
+    monkeypatch.setenv("TRTLLM_MLA_V_STAGES", "3")
+    opts = dict(CuteDSLNVMlaDecodeBlackwellRunner._fp8_kernel_options(2, True))
+    assert opts["v_stages"] == 3 and opts["k_stages"] == 2
 
 
 @pytest.mark.parametrize("helix", [True, False], ids=["helix", "plain"])
@@ -122,10 +133,22 @@ def test_without_pdl_the_option_is_inert(case, monkeypatch):
     _assert_same(_run(x, H, S, monkeypatch, early=True, pdl="1"), ref)
 
 
+@pytest.mark.parametrize("early", [False, True], ids=["plain", "early"])
+@pytest.mark.parametrize("case", ["b1_long", "b2_long", "b4_mtp7", "b2_short", "b33_ragged"])
+def test_v_stages_are_bitwise_identical(case, early, monkeypatch):
+    H, S, lens = _CASES[case]
+    monkeypatch.setattr(flat_fold, "_MAX_BATCH", 64)
+    x = _padded_inputs(lens, S, H, helix=True, seed=64)
+    ref = _run(x, H, S, monkeypatch, early=early)
+    _assert_same(_run(x, H, S, monkeypatch, early=early, v_stages=3), ref)
+
+
+@pytest.mark.parametrize("v_stages", [2, 3], ids=["v2", "v3"])
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 @pytest.mark.parametrize("case", ["b1_long", "b2_long", "b4_mtp7", "b2_short", "b3_no_kv"])
-def test_fused_v_up_is_bitwise_identical(case, graph, monkeypatch):
-    """The Helix decode with the V up-projection fused into its reduction (the K3 GEN path)."""
+def test_fused_v_up_is_bitwise_identical(case, graph, v_stages, monkeypatch):
+    """The Helix decode with the V up-projection fused into its reduction (the K3 GEN path); the
+    early-prologue run also with three V stages."""
     monkeypatch.setattr(flat_fold, "_MAX_BATCH", fused_v_up.MAX_BATCH)
     monkeypatch.setenv("TRTLLM_MLA_PARTIAL_BF16", "1")
     monkeypatch.setenv("TRTLLM_MLA_RESCALE_THRESHOLD", "8")
@@ -136,6 +159,7 @@ def test_fused_v_up_is_bitwise_identical(case, graph, monkeypatch):
     monkeypatch.setenv("TRTLLM_MLA_EARLY_PROLOGUE", "0")
     _, stats_ref, v_ref = fused_v_up._run(x, S, w, fused=True, graph=graph)
     monkeypatch.setenv("TRTLLM_MLA_EARLY_PROLOGUE", "1")
+    monkeypatch.setenv("TRTLLM_MLA_V_STAGES", str(v_stages))
     _, stats, v = fused_v_up._run(x, S, w, fused=True, graph=graph)
     assert not torch.isnan(v_ref).any()
     assert torch.equal(v, v_ref)
