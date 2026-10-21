@@ -37,6 +37,7 @@ import torch
 
 from tensorrt_llm._torch.utils import helix_local_len_tensor
 
+from . import flags as _flags
 from .flags import TRTLLM_K3LL_MLA_DCP
 
 #: Latent and rope widths of Kimi-K3's absorbed MLA.
@@ -192,6 +193,86 @@ def combine(gathered_o: torch.Tensor, gathered_stats: torch.Tensor) -> torch.Ten
     return torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats, 1.0)
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Helix: the exchange on MNNVL Lamport buffers (TRTLLM_K3LL_HELIX_Q_AG_MNNVL, TRTLLM_K3LL_HELIX_A2A_FUSED).
+# ----------------------------------------------------------------------------------------------------------------------
+
+#: Bytes of one rank's FP8 absorbed queries per token and head.
+Q_BYTES = KV_LORA_RANK + QK_ROPE_DIM
+#: Values per head of the fused exchange: a 512-wide latent head travels as two 256-wide halves that carry the same
+#: (max, sum), which the fused kernel combines exactly as one head (its weights depend on the statistics only).
+FUSED_HEAD_DIM = 256
+_HALVES = KV_LORA_RANK // FUSED_HEAD_DIM
+
+
+def gather_q_mnnvl(q_local: torch.Tensor, workspace) -> torch.Tensor:
+    """All-gather of every rank's FP8 absorbed queries over ``workspace`` (the TP group's ``MnnvlWorkspace``, rank i
+    = CP rank i): one ``comm/mnnvl_allgather_split`` call that carries the bytes as fp32 words.
+
+    Args:
+        q_local: ``[tokens, heads_per_rank, 576]`` FP8 (or uint8) bytes of this rank's heads, contiguous.
+    Returns:
+        ``[tokens, world * heads_per_rank, 576]`` uint8, the ranks' heads in rank order (``allgather`` along dim 1),
+        except that a 4-byte group whose word is the fp32 ``-0.0`` (FP8 bytes ``0, 0, 0, -0.0``) arrives as zeros:
+        the Lamport buffers' empty word never travels. That is one FP8 ``-0.0`` made ``+0.0``, the same value.
+    """
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
+        mnnvl_allgather_split,
+    )
+
+    tokens, heads = q_local.shape[:2]
+    words = q_local.reshape(tokens, heads * Q_BYTES).view(torch.uint8).view(torch.float32)
+    _, gathered = mnnvl_allgather_split(words, 0, workspace)
+    return gathered.view(torch.uint8).view(tokens, workspace.world_size * heads, Q_BYTES)
+
+
+def fused_supports(cp_size: int, heads_per_rank: int) -> bool:
+    """Whether ``exchange_combine_fused`` takes this split (the fused kernel's support at 256-wide halves)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.helix_a2a_fused import supports
+
+    return supports(cp_size, heads_per_rank * _HALVES, FUSED_HEAD_DIM)
+
+
+def fused_buffer_bytes(cp_size: int, heads_per_rank: int, max_tokens: int) -> int:
+    """Receive buffer per rank (two halves) that holds a step of ``max_tokens`` tokens in one launch."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.helix_a2a_fused import record_bytes
+
+    half = max_tokens * cp_size * record_bytes(heads_per_rank * _HALVES, FUSED_HEAD_DIM)
+    return 2 * (-(-half // (1 << 20)) << 20)
+
+
+def exchange_combine_fused(
+    out: torch.Tensor, softmax_stats: torch.Tensor, empty: torch.Tensor, fused, heads_per_rank: int
+) -> torch.Tensor:
+    """The exchange of every head group's partials to its owner and their combine, in one ``helix_a2a_fused`` launch.
+
+    Args:
+        out: ``[tokens, cp * heads_per_rank * 512]`` bf16 normalized partials of every head (head group s, the heads
+            of rank s, at columns ``[s * heads_per_rank * 512, ...)``), contiguous.
+        softmax_stats: ``[tokens, cp * heads_per_rank, 2]`` fp32 ``(max, sum)``.
+        empty: ``[tokens]`` bool, tokens that see no key on this rank; their partials need not be sanitized (the
+            sender sends the combine's identity for them).
+        fused: the CP group's ``HelixAllToAllFused``.
+    Returns:
+        ``[tokens, heads_per_rank * 512]`` bf16, the combined output of this rank's heads (what ``combine`` returns
+        after the all-to-all).
+    """
+    tokens = out.shape[0]
+    heads = softmax_stats.shape[1]
+    halves = (
+        softmax_stats.view(tokens, heads, 1, 2)
+        .expand(tokens, heads, _HALVES, 2)
+        .reshape(tokens, -1)
+    )
+    return fused(
+        out.view(tokens, -1),
+        halves,
+        heads_per_rank * _HALVES,
+        FUSED_HEAD_DIM,
+        zero_kv_mask=empty,
+    )
+
+
 def default_softmax_scale(qk_nope_head_dim: int = 128, q_scaling: float = 1.0) -> float:
     return 1.0 / (math.sqrt(qk_nope_head_dim + QK_ROPE_DIM) * q_scaling)
 
@@ -270,6 +351,9 @@ class MlaSplitRead:
         self._first_layer = -1
         self._plan: Optional[SplitReadPlan] = None
         self._logged = False
+        # Helix exchange state on MNNVL (build_helix_comm); None: the NCCL collectives.
+        self._q_gather_ws = None
+        self._a2a_fused = None
 
     @staticmethod
     def applies(mqa, mapping) -> bool:
@@ -279,6 +363,48 @@ class MlaSplitRead:
             and getattr(mqa, "has_fp8_kv_cache", False)
             and not getattr(mqa, "has_fp4_kv_cache", False)
         )
+
+    def build_helix_comm(self, mnnvl_workspace, tp_mapping) -> str:
+        """Build the Helix exchange's MNNVL state the load-time switches ask for. Collective over the CP group, eager,
+        before any capture; every rank of the group calls it at the same point. Returns what it built (for the log).
+
+        * ``TRTLLM_K3LL_HELIX_Q_AG_MNNVL``: the query all-gather runs on ``mnnvl_workspace``, the decode collectives'
+          workspace over ``tp_mapping`` (the repurposed TP16 mapping), when its group and ranks are the CP group's.
+        * ``TRTLLM_K3LL_HELIX_A2A_FUSED``: a ``HelixAllToAllFused`` of the CP mapping sized for the decode step
+          contract's ceiling.
+
+        The forward reads the switches at run time and falls back to NCCL where one is 0 (or its state was not
+        built)."""
+        if not self.helix:
+            return "not Helix"
+        built = []
+        if _flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL and mnnvl_workspace is not None:
+            from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
+                required_buffer_bytes,
+            )
+
+            need = required_buffer_bytes(
+                MAX_REQUESTS * MAX_Q_LEN, 0, self.heads_per_rank * Q_BYTES // 4, self.cp
+            )
+            if (
+                mnnvl_workspace.world_size == self.cp
+                and mnnvl_workspace.rank == self.rank
+                and list(tp_mapping.tp_group) == self.group
+                and need <= mnnvl_workspace.buffer_bytes
+            ):
+                self._q_gather_ws = mnnvl_workspace
+                built.append("q all-gather on MNNVL")
+        if _flags.TRTLLM_K3LL_HELIX_A2A_FUSED and fused_supports(self.cp, self.heads_per_rank):
+            from tensorrt_llm._torch.distributed.helix_a2a_fused import HelixAllToAllFused
+
+            self._a2a_fused = HelixAllToAllFused.get(
+                self.mapping,
+                fused_buffer_bytes(self.cp, self.heads_per_rank, MAX_REQUESTS * MAX_Q_LEN),
+            )
+            built.append(
+                f"fused exchange + combine ({self._a2a_fused.half_bytes >> 20} MiB halves)"
+            )
+        return ", ".join(built) or "NCCL only"
 
     def register(self, layer_idx: int) -> None:
         self._layers.add(layer_idx)
@@ -421,10 +547,13 @@ class MlaSplitRead:
 
         from tensorrt_llm._torch.distributed.ops import allgather, alltoall_helix
 
-        q_all = allgather(q_local.view(torch.uint8), self.gather_mapping, dim=1).view(
-            torch.float8_e4m3fn
+        if self._q_gather_ws is not None and _flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL:
+            q_all = gather_q_mnnvl(q_local.view(torch.uint8), self._q_gather_ws)
+        else:
+            q_all = allgather(q_local.view(torch.uint8), self.gather_mapping, dim=1)
+        q_all = q_all.view(torch.float8_e4m3fn).view(
+            num_requests, q_len, self.heads, KV_LORA_RANK + QK_ROPE_DIM
         )
-        q_all = q_all.view(num_requests, q_len, self.heads, KV_LORA_RANK + QK_ROPE_DIM)
         plan = self._step_plan(mqa.layer_idx, block_rows, lens, q_len, meta)
         if layer_in_pool:
             plan = SplitReadPlan(
@@ -442,6 +571,10 @@ class MlaSplitRead:
             output_scale,
             MAX_REQUESTS,
         )
+        if self._a2a_fused is not None and _flags.TRTLLM_K3LL_HELIX_A2A_FUSED:
+            return exchange_combine_fused(
+                out.view(tokens, -1), stats, plan.empty, self._a2a_fused, hp
+            )
         sanitize_empty(out, stats, plan.empty)
         # head group s -> rank s: [cp, tokens, hp * 512] partials and [cp, tokens, hp, 2] stats, one chunk per rank
         o_chunks = out.view(tokens, cp, hp * KV_LORA_RANK).transpose(0, 1).contiguous()

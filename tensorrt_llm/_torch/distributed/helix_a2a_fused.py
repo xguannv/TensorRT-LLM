@@ -59,12 +59,13 @@ class HelixAllToAllFused:
 
     _cache: Dict[Mapping, "HelixAllToAllFused"] = {}
 
-    def __init__(self, mapping: Mapping):
+    def __init__(self, mapping: Mapping, nbytes: Optional[int] = None):
         from ..cute_dsl_kernels.blackwell.helix_a2a_fused import SENTINEL
 
         self.mapping = mapping
         MnnvlMemory.initialize()
-        nbytes = _env_int("TRTLLM_HELIX_A2A_FUSED_MB", 128) << 20
+        if nbytes is None:
+            nbytes = _env_int("TRTLLM_HELIX_A2A_FUSED_MB", 128) << 20
         logger.info(
             f"Rank {mapping.cp_rank} allocating a {nbytes >> 20} MiB fused Helix all-to-all buffer"
         )
@@ -95,9 +96,11 @@ class HelixAllToAllFused:
         HelixCpMnnvlMemory.get_comm(mapping).barrier()
 
     @staticmethod
-    def get(mapping: Mapping) -> "HelixAllToAllFused":
+    def get(mapping: Mapping, nbytes: Optional[int] = None) -> "HelixAllToAllFused":
+        """The instance of ``mapping`` (collective over its CP group on first use). ``nbytes``: the receive buffer
+        per rank of a new instance (default ``TRTLLM_HELIX_A2A_FUSED_MB``); an existing instance keeps its own."""
         if mapping not in HelixAllToAllFused._cache:
-            HelixAllToAllFused._cache[mapping] = HelixAllToAllFused(mapping)
+            HelixAllToAllFused._cache[mapping] = HelixAllToAllFused(mapping, nbytes)
         return HelixAllToAllFused._cache[mapping]
 
     @staticmethod
