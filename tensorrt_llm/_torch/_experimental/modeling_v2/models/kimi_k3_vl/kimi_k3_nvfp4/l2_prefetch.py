@@ -20,52 +20,24 @@ from __future__ import annotations
 from typing import List, Sequence, Tuple
 
 import torch
-from torch import nn
-
-#: Smallest tensor worth a prefetch range (norm weights and biases are not).
-MIN_BYTES = 64 << 10
-#: Most bytes prefetched for one layer: well inside L2, and inside the MoE tail's idle HBM time at ~4 TB/s.
-MAX_TOTAL_BYTES = 64 << 20
 
 
-def _weights(sub: nn.Module):
-    """The weights a module's forward reads: its parameters, and its buffers and tensor attributes named like a weight
-    or a scale (FP8 weight-read linears keep ``weight`` / ``weight_scale`` as buffers); not other buffers such as a
-    rotary cos / sin cache, which can exceed L2."""
-    yield from sub._parameters.values()
-    named = list(sub._buffers.items()) + list(vars(sub).items())
-    for name, v in named:
-        if isinstance(v, torch.Tensor) and ("weight" in name or "scale" in name):
-            yield v
+def tensor_ranges(tensors) -> List[Tuple[int, int]]:
+    """``(address, bytes)`` of each CUDA tensor of ``tensors`` (None skipped), 16-byte aligned.
 
-
-def module_ranges(
-    module: nn.Module, min_bytes: int = MIN_BYTES, max_total: int = MAX_TOTAL_BYTES
-) -> List[Tuple[int, int]]:
-    """``(address, bytes)`` of every CUDA weight of at least ``min_bytes`` that ``module`` or a submodule holds
-    (``_weights``), each once, largest first, 16-byte aligned, at most ``max_total`` bytes in all."""
-    seen = set()
+    Prefetch only tensors the next kernels certainly read: a line brought in by a bulk L2 prefetch stays in L2 until its
+    first read, so prefetching a tensor nothing reads (e.g. a weight kept beside its re-laid-out copy) pins that part of
+    L2 for every other kernel (measured: +13-15 ms per decode step with every attention-module weight prefetched)."""
     ranges = []
-    for sub in module.modules():
-        for t in _weights(sub):
-            if t is None or not t.is_cuda or not t.is_contiguous():
-                continue
-            addr = t.data_ptr()
-            nbytes = t.numel() * t.element_size()
-            if addr in seen or nbytes < min_bytes:
-                continue
-            seen.add(addr)
-            start = (addr + 15) & ~15
-            end = (addr + nbytes) & ~15
-            if end > start:
-                ranges.append((start, end - start))
-    ranges.sort(key=lambda r: -r[1])
-    kept, total = [], 0
-    for r in ranges:
-        if total + r[1] <= max_total:
-            kept.append(r)
-            total += r[1]
-    return kept
+    for t in tensors:
+        if t is None or not t.is_cuda or not t.is_contiguous():
+            continue
+        addr = t.data_ptr()
+        start = (addr + 15) & ~15
+        end = (addr + t.numel() * t.element_size()) & ~15
+        if end > start:
+            ranges.append((start, end - start))
+    return ranges
 
 
 class K3L2Prefetcher:

@@ -2177,6 +2177,23 @@ class KimiLinearModel(DecoderModel):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
+def _l2_attention_weights(layer: nn.Module) -> list:
+    """The weights a decoder layer's decode attention reads first and in bulk (``l2_prefetch.tensor_ranges``): the KDA
+    QKVG projection, or the MLA layer's Q-B weight as the fused q path reads it, and the output projection."""
+    attention = layer.linear_attn if layer.is_kda else layer.self_attn
+    o_proj = getattr(attention, "o_proj", None)
+    tensors = [getattr(o_proj, "weight", None), getattr(o_proj, "weight_scale", None)]
+    if layer.is_kda:
+        qkvg = getattr(attention, "qkvg_proj", None)
+        tensors += [getattr(qkvg, "weight", None), getattr(qkvg, "weight_scale", None)]
+    else:
+        tensors += [
+            getattr(attention, "_fp8_qb_weight", None),
+            getattr(attention, "_fp8_qb_scale", None),
+        ]
+    return tensors
+
+
 def _l2_prefetch_experts_hook(attention: nn.Module) -> None:
     """The layer's expert L2 prefetch (``K3DecodeMoeNvfp4Layer.l2_prefetch_experts``, set by the target's build), called
     once the attention core is issued: the prefetch then overlaps the output projection, the all-reduce and the MoE
@@ -3626,9 +3643,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             if moe is None or getattr(moe, "decode_moe", None) is None:
                 continue
             nxt = layers[i + 1]
-            moe.decode_moe.l2_next = _l2_prefetch.module_ranges(
-                nxt.linear_attn if nxt.is_kda else nxt.self_attn
-            )
+            moe.decode_moe.l2_next = _l2_prefetch.tensor_ranges(_l2_attention_weights(nxt))
         for i, layer in enumerate(layers):
             moe = layer.block_sparse_moe if layer.is_moe else None
             lowm = getattr(moe, "decode_moe", None) if moe is not None else None
