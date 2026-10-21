@@ -197,6 +197,24 @@ def check_interleaved_with_the_other_mnnvl_ops() -> None:
             )
 
 
+def check_repeats_are_bitwise() -> None:
+    """The same call repeated, other shapes and a random late rank in between, returns the same bits every time (a
+    decode replay must not depend on timing)."""
+    rng = random.Random(11)
+    for t in (32, 16, 9):
+        call = Call(4500 + t, t)
+        first = call.run(WS_A).clone()
+        for rep in range(12):
+            other = Call(4600 + rep, (1, 64, 17, 8)[rep % 4])
+            R.barrier()
+            R.late(rng.randrange(R.world))
+            other.run(WS_A)
+            got = call.run(WS_A)
+            assert torch.equal(got, first), (
+                f"T {t} repeat {rep}: the output changed between identical calls"
+            )
+
+
 def check_graph_capture_and_replay() -> None:
     """A captured step of LAYERS calls (T 16) replayed with rewritten inputs, eager calls of other shapes on the same
     workspace between replays."""
@@ -236,6 +254,7 @@ CHECKS = [
     check_unsupported_calls_raise_on_every_rank,
     check_dip_and_regrow_sequence,
     check_interleaved_with_the_other_mnnvl_ops,
+    check_repeats_are_bitwise,
     check_graph_capture_and_replay,
 ]
 
