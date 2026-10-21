@@ -1,0 +1,5720 @@
+# Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import argparse
+import math
+import os
+import sys
+from types import SimpleNamespace
+from typing import Optional, Tuple, Type
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.cute.nvgpu.cpasync as cpasync
+import cutlass.cute.testing as testing
+import cutlass.pipeline as pipeline
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.arch import Arch
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import BaseDSL
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+from .mla_helpers import (
+    LOG2_E,
+    MAX_SPLITS,
+    MLABalancedTileScheduler,
+    MLAStaticTileScheduler,
+    MLAStaticTileSchedulerParams,
+    build_mla_balanced_schedule,
+    ceil_div,
+    create_mla_balanced_tile_scheduler,
+    create_mla_static_tile_scheduler,
+    create_mla_static_tile_scheduler_params,
+)
+
+#: L2 eviction hint of the KV cache loads with ``kv_evict_first``
+#: (CacheHintSm90::EVICT_FIRST).
+_EVICT_FIRST = 0x12F0000000000000
+
+if __name__ == "__main__":
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(current_dir, "../.."))
+"""
+A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture
+using CUTE DSL
+
+This example demonstrates an implementation of inference of multi-head latent attention using a TMA + Blackwell
+SM100 TensorCore warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
+matrix multiplication, softmax normalization, and softmax((Qc + Qr)*(Kc + Kr)^T)*Vc into a single kernel.
+The kernel provides support for page table storage and variable-length KV cache sequences. It implements KV splitting
+functionality to minimize latency when processing long KV sequences.
+
+The kernel implements key optimizations including:
+- Warp specialization for different computation phases (load, MMA, softmax, correction, epilogue)
+- Pipeline stages between different warps for overlapping computation and memory access
+- Support for different precision data types
+- Two sub-kernels (split KV kernel and reduction kernel) that enable split KV processing
+
+To run this example:
+
+.. code-block:: bash
+
+    python examples/blackwell/mla_fp8.py                                 \
+      --batch_size 4 --latent_dim 512 --rope_dim 64                      \
+      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \
+      --in_dtype Float8E4M3FN --out_dtype Float8E4M3FN                   \
+      --acc_dtype Float32 --lse_dtype Float32                            \
+      --is_var_seq --is_var_split_kv                                     \
+      --is_persistent
+
+The above example runs Multi-Head Latent Attention (MLA) with the following configuration:
+- Batch size: 4
+- Sequence length of Q: 1
+- Sequence length of K: 1024
+- Latent dimension: 512
+- RoPE dimension: 64
+- Number of heads: 128
+- Data types: Float8E4M3FN (input), Float8E4M3FN (output), Float32 (accumulation and LSE)
+
+It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
+and variable split KV processing with persistent scheduling.
+
+To collect performance with NCU profiler:
+
+.. code-block:: bash
+
+    ncu python examples/blackwell/mla_fp8.py                             \
+      --batch_size 4 --latent_dim 512 --rope_dim 64                      \
+      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \
+      --in_dtype Float8E4M3FN --out_dtype Float8E4M3FN                   \
+      --acc_dtype Float32 --lse_dtype Float32                            \
+      --is_var_seq --is_var_split_kv                                     \
+      --is_persistent --warmup_iterations 3                              \
+      --iterations 10 --skip_ref_check
+
+Constraints for this example:
+* Data type requirements:
+  - Input/output: Float8E4M3FN
+  - Accumulation and LSE: Float32
+* Fixed architecture parameters:
+  - Number of attention heads: 128
+  - Latent dimension: 512
+  - RoPE dimension: 64
+* Input query modes should be (NumHeads, LatentDim/RopeDim, SeqLenQ, BatchSize)
+* Input kv latent/rope modes should be (SeqLenK, LatentDim/RopeDim, BatchSize)
+* Query sequence length must be 1-4
+* Only supports 2-CTA instructions
+* Variable sequence length requires page table storage enabled
+"""
+
+
+class BlackwellMultiHeadLatentAttentionForwardFP8:
+    # Balanced split (balanced_split=True): largest batch the smem prefix table
+    # holds, the fewest K tiles a cluster is given, and the M-tile rows one
+    # reduction CTA combines.
+    BALANCED_MAX_REQUESTS = 1024
+    BALANCED_MIN_UNITS = 4
+    BALANCED_REDUCTION_ROWS = 4
+
+    def __init__(
+        self,
+        acc_dtype: Type[cutlass.Numeric],
+        lse_dtype: Type[cutlass.Numeric],
+        mma_qk_tiler_mn: Tuple[int, int],
+        mma_pv_tiler_mn: Tuple[int, int],
+        max_active_clusters: int,
+        page_size: int,
+        skip_correction_threshold: float,
+        is_persistent: bool,
+        is_var_seq: bool,
+        is_var_split_kv: bool,
+        num_heads: int = 128,
+        seq_len_q: int = 1,
+        fold_sq: bool = False,
+        emit_softmax_stats: bool = False,
+        balanced_split: bool = False,
+        use_pdl: bool = False,
+        prefetch_next_work: bool = False,
+        reduction_unroll: int = 1,
+        balanced_max_requests: int = BALANCED_MAX_REQUESTS,
+        reduction_col_split: int = 1,
+        aligned_segment_cost: int = -1,
+        bf16_partials: bool = False,
+        k_stages: int = 2,
+        p_stages: int = 3,
+        tile_reduction: Optional[bool] = None,
+        kv_evict_first: str = "",
+    ):
+        """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
+
+        :param acc_dtype: Data type for accumulation S and O
+        :type acc_dtype: Type[cutlass.Numeric]
+        :param lse_dtype: Data type for output LSE
+        :type lse_dtype: Type[cutlass.Numeric]
+        :param mma_s_tiler: The (H, K) tile shape of the MMA instruction for S
+        :type mma_s_tiler: Tuple[int, int]
+        :param mma_p_tiler: The (H, D) tile shape of the MMA instruction for P
+        :type mma_p_tiler: Tuple[int, int]
+        :param max_active_clusters: Maximum number of active clusters
+        :type max_active_clusters: int
+        :param page_size: The page size
+        :type page_size: int
+        :param skip_correction_threshold: Threshold to skip correction
+        :type skip_correction_threshold: float
+        :param is_persistent: Whether to use persistent kernel mode
+        :type is_persistent: bool
+        :param is_var_seq: Whether to use variable sequence length
+        :type is_var_seq: bool
+        :param is_var_split_kv: Whether to use variable split KV
+        :type is_var_split_kv: bool
+        :param num_heads: Number of attention heads (pre-fold). Used for the
+            per-row spec-decoding (MTP) causal mask q_token_index computation.
+        :type num_heads: int
+        :param seq_len_q: Query sequence length (pre-fold). Combined with
+            ``num_heads`` to derive the per-row q_token used by the causal mask.
+        :type seq_len_q: int
+        :param fold_sq: Whether to fold tokens of ``seq_len_q`` into the head
+            dimension so the M tile becomes [F sub_q_tok][num_heads heads].
+            Required when ``num_heads < mma_qk_tiler_mn[0]`` and ``seq_len_q > 1``
+            so the M tile is fully populated.
+        :type fold_sq: bool
+        :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
+            stores into the attention epilogue.
+        :type emit_softmax_stats: bool
+        :param balanced_split: Run ``max_active_clusters`` persistent clusters
+            that split the batch's KV work evenly (``MLABalancedTileScheduler``)
+            instead of one (or ``split_kv``) cluster per M tile. M tiles cut
+            across clusters are combined by ``balanced_reduction_kernel``; the
+            ``split_kv`` argument is ignored and the workspace holds the
+            partial slots (``get_balanced_workspace_size``).
+        :type balanced_split: bool
+        :param use_pdl: Launch the split kernel and the reduction with
+            programmatic dependent launch: their prologues overlap the
+            preceding kernel, which they wait for before touching memory.
+        :type use_pdl: bool
+        :param prefetch_next_work: The MMA, softmax and correction warps ask
+            the tile scheduler for their next work tile when they start the
+            current one, not after finishing it (the load warps always ask
+            after issuing the current tile's loads).
+        :type prefetch_next_work: bool
+        :param reduction_unroll: Balanced split: partial slots whose O rows
+            ``balanced_reduction_kernel`` loads before accumulating them (in
+            slot order, so the result does not depend on it). Pays off when
+            the M tiles are cut into many partials (batch 1-2).
+        :type reduction_unroll: int
+        :param balanced_max_requests: Balanced split: largest batch the
+            shared-memory schedule holds (a multiple of 32, at most
+            ``BALANCED_MAX_REQUESTS``). Up to 32 requests the schedule is built
+            and looked up within one warp's registers.
+        :type balanced_max_requests: int
+        :param reduction_col_split: Balanced split with up to 32 requests:
+            CTAs that share each row group of an M tile in the reduction, each
+            combining ``latent_dim / reduction_col_split`` columns (more CTAs
+            and fewer registers per partial when the tiles have many
+            partials). The result does not depend on it.
+        :type reduction_col_split: int
+        :param aligned_segment_cost: Balanced split with up to 32 requests:
+            when >= 0, the clusters of a chunk may be aligned to requests (one
+            segment each, see ``build_mla_balanced_schedule``) if that costs at
+            most this many K tiles more per cluster than the even split. -1
+            keeps the even split.
+        :type aligned_segment_cost: int
+        :param bf16_partials: Balanced split: store the split-KV partial O in
+            BF16 instead of the accumulator type (half the partial traffic;
+            the partials then carry one BF16 rounding, like the per-rank O
+            the Helix merge combines). The partial LSE stays FP32.
+        :type bf16_partials: bool
+        :param k_stages: Shared-memory stages of the K tiles (Q*K^T
+            operands). With 3 the load warp runs one K tile further ahead, and
+            a segment's first K tiles load during the previous segment.
+        :type k_stages: int
+        :param p_stages: Shared-memory stages of P (softmax output, P*V
+            operand), 2 or ``mma_lookahead + 1`` (3). With 2 the softmax
+            writes P once P*V has read the stage two K tiles back.
+        :type p_stages: int
+        :param tile_reduction: Balanced split: run the reduction with one CTA
+            group per (row group, M tile) (True) or per (row group, partial
+            slot) (False); None picks the former for the register schedule
+            (``balanced_max_requests`` 32). The result does not depend on it.
+        :type tile_reduction: Optional[bool]
+        :param kv_evict_first: L2 evict-first hint on the KV cache TMA loads:
+            "k" on the K (latent + rope) tiles, "v" on the V (latent
+            transpose) tiles, "kv" on both, "" on none. The result does not
+            depend on it.
+        :type kv_evict_first: str
+        """
+
+        self.latent_dim = 512
+        self.rope_dim = 64
+        self.acc_dtype = acc_dtype
+        self.lse_dtype = lse_dtype
+        self.mma_qk_tiler_mn = mma_qk_tiler_mn
+        self.mma_pv_tiler_mn = mma_pv_tiler_mn
+        self.max_active_clusters = max_active_clusters
+        self.skip_correction_threshold = skip_correction_threshold
+        self.balanced_split = balanced_split
+        self.use_pdl = use_pdl
+        self.prefetch_next_work = prefetch_next_work
+        if (
+            balanced_max_requests % 32 != 0
+            or balanced_max_requests
+            > BlackwellMultiHeadLatentAttentionForwardFP8.BALANCED_MAX_REQUESTS
+        ):
+            raise ValueError(
+                "balanced_max_requests must be a multiple of 32 up to "
+                f"{BlackwellMultiHeadLatentAttentionForwardFP8.BALANCED_MAX_REQUESTS}, "
+                f"got {balanced_max_requests}."
+            )
+        self.balanced_max_requests = balanced_max_requests
+        # Small batches: one reduction CTA per (row group, M tile) instead of
+        # per (row group, partial slot).
+        self.balanced_tile_reduction = balanced_split and (
+            balanced_max_requests <= 32 if tile_reduction is None else tile_reduction
+        )
+        if self.latent_dim % (32 * reduction_col_split) != 0 or (
+            reduction_col_split > 1 and not self.balanced_tile_reduction
+        ):
+            raise ValueError(
+                "reduction_col_split must divide latent_dim / 32 and needs "
+                f"the tile-indexed reduction, got {reduction_col_split}."
+            )
+        self.reduction_col_split = reduction_col_split
+        self.aligned_segment_cost = aligned_segment_cost if self.balanced_tile_reduction else -1
+        if bf16_partials and not balanced_split:
+            raise ValueError("bf16_partials needs the balanced split.")
+        self.partial_dtype = cutlass.BFloat16 if bf16_partials else acc_dtype
+        if k_stages < 2 or p_stages not in (2, 3):
+            raise ValueError(
+                f"k_stages must be >= 2 and p_stages 2 or 3, got {k_stages}, {p_stages}."
+            )
+        self.k_stages = k_stages
+        self.p_stages = p_stages
+        if kv_evict_first not in ("", "k", "v", "kv"):
+            raise ValueError(
+                f"kv_evict_first must be '', 'k', 'v' or 'kv', got {kv_evict_first!r}."
+            )
+        self.k_evict_first = "k" in kv_evict_first
+        self.v_evict_first = "v" in kv_evict_first
+        self.reduction_unroll = reduction_unroll
+        self.is_persistent = is_persistent or balanced_split
+        self.page_size = page_size
+        self.is_var_seq = is_var_seq
+        self.is_var_split_kv = is_var_split_kv
+        # Original (pre-fold) num_heads and seq_len_q used for per-row
+        # spec-decoding (MTP) causal q_token_index computation. When fold_sq is
+        # True the M tile is laid out as [F sub_q_tok][num_heads heads]; the
+        # full q_tok for row r is blk_coord[1] * F + (r // num_heads).
+        self.num_heads = num_heads
+        self.seq_len_q = seq_len_q
+        # fold_sq (caller-controlled): whether the folding code path is enabled.
+        # fold_sq_ratio (derived): fold factor F >= 1; the largest divisor of
+        # seq_len_q with num_heads * F <= M_tile and F <= seq_len_q. When the
+        # caller passes fold_sq=False, the kernel ignores the ratio.
+        # When fold_sq=True but the derived ratio is 1, the folding branch
+        # is taken with F=1 (a no-op transform).
+        self.fold_sq = fold_sq
+        self.emit_softmax_stats = emit_softmax_stats
+        self.fold_sq_ratio = BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
+            num_heads, seq_len_q, mma_qk_tiler_mn[0]
+        )
+        # fold_rows: rows of the folded head dimension, i.e. the (q_tok, head)
+        # pairs one M tile holds; fold_chunks: M tiles per request. With an
+        # integer fold they are num_heads * F and seq_len_q / F. When that
+        # leaves the M tile partly empty, fold "flat" instead (see
+        # get_fold_layout): every M tile is a contiguous run of 128 (q_tok,
+        # head) rows. Row r of folded tile c is global row c * fold_rows + r,
+        # i.e. q_tok = (c * fold_rows + r) // num_heads, head = (c * fold_rows
+        # + r) % num_heads; the per-row math is unchanged.
+        # flat_fold_padded: num_heads * seq_len_q is not a multiple of the M
+        # tile, so the last tile of a request ends in padding rows (global row
+        # >= num_heads * seq_len_q). Their Q is TMA zero-fill and their
+        # output, LSE and softmax stats are never stored.
+        if fold_sq:
+            self.fold_rows, self.fold_chunks = (
+                BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout(
+                    num_heads, seq_len_q, mma_qk_tiler_mn[0]
+                )
+            )
+        else:
+            self.fold_rows = num_heads * self.fold_sq_ratio
+            self.fold_chunks = seq_len_q // self.fold_sq_ratio
+        self.flat_fold = self.fold_rows != num_heads * self.fold_sq_ratio
+        self.flat_fold_padded = self.flat_fold and (num_heads * seq_len_q) % self.fold_rows != 0
+        # M tiles per request (the chunk mode of the folded Q / O views).
+        self.num_m_chunks = self.fold_chunks if fold_sq else seq_len_q
+        # Balanced split: one persistent cluster per active cluster slot.
+        self.balanced_num_clusters = max_active_clusters
+        self.balanced_slots_per_spare = MLABalancedTileScheduler.default_slots_per_spare(
+            self.num_m_chunks
+        )
+        self.balanced_num_slots = MLABalancedTileScheduler.num_slots(
+            max_active_clusters, self.num_m_chunks, self.balanced_slots_per_spare
+        )
+        self.balanced_min_units = self.BALANCED_MIN_UNITS
+        self.cluster_shape_mnk = (2, 1, 1)
+        self.use_2cta_instrs = True
+        # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
+        # while warps 2-3 handle accumulation for second half [n/2, n)
+        self.warps_in_n = 2
+        self.num_compute_warps = 4
+        self.threads_per_warp = 32
+        mma_qk_tiler_k = self.rope_dim * 2
+        self.mma_qk_tiler = (
+            self.mma_qk_tiler_mn[0],
+            self.mma_qk_tiler_mn[1],
+            mma_qk_tiler_k,
+        )
+        self.mma_qk_rope_tiler = (
+            self.mma_qk_tiler_mn[0],
+            self.mma_qk_tiler_mn[1],
+            self.rope_dim,
+        )
+        self.mma_pv_tiler = (
+            self.mma_pv_tiler_mn[0],
+            self.mma_pv_tiler_mn[1],
+            self.mma_qk_tiler[1] * self.mma_qk_tiler[2] // self.mma_pv_tiler_mn[1],
+        )
+        self.iterations_qk_latent = self.latent_dim // self.mma_qk_tiler[2]
+        self.iterations_qk_rope = 1
+        self.iterations_qk = self.iterations_qk_latent + self.iterations_qk_rope
+        self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
+        self.iterations_pv_n = self.latent_dim // self.mma_pv_tiler[1]
+
+        # Set specialized warp ids
+        self.compute_warp_ids = (0, 1, 2, 3)
+        self.correction_warp_ids = (4, 5, 6, 7)
+        self.mma_warp_id = 8
+        self.load_tma_k_warp_id = 9
+        self.load_tma_v_warp_id = 10
+        self.empty_warp_ids = (11,)
+        self.threads_per_cta = self.threads_per_warp * len(
+            (
+                self.mma_warp_id,
+                self.load_tma_k_warp_id,
+                self.load_tma_v_warp_id,
+                *self.compute_warp_ids,
+                *self.correction_warp_ids,
+                *self.empty_warp_ids,
+            )
+        )
+
+        # register settings
+        self.softmax_reg_num = 192
+        self.correction_reg_num = 248
+        self.other_reg_num = 64
+        # Named barriers
+        self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=(
+                self.threads_per_warp + self.threads_per_warp * self.num_compute_warps * 2
+            ),
+        )
+        self.softmax_exchange_sync_bar = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=(self.threads_per_warp * self.num_compute_warps)
+        )
+        self.epilogue_exchange_sync_bar = pipeline.NamedBarrier(
+            barrier_id=3, num_threads=(self.threads_per_warp * self.num_compute_warps)
+        )
+
+    def _setup_attributes(self):
+        """Set up configurations and parameters for the MLA kernel operation.
+
+        This method initializes and configures various attributes required for the
+        execution of the multi-head latent attention kernel, mainly about the pipeline stages:
+
+        - Sets up staging parameters for Q, K, V inputs and accumulator data
+        - Configures pipeline stages for softmax, correction, and epilogue operations
+        """
+
+        self.load_q_stage = 1
+        self.load_k_stage = self.k_stages
+        self.load_v_stage = 2
+        # The MMA warp issues Q*K^T of K tile j + mma_lookahead before P*V of
+        # tile j, so the softmax and the O rescale of tile j overlap two
+        # Q*K^T/P*V pairs of tensor work; S, P and the correction metadata
+        # need one buffer per tile in flight.
+        self.mma_lookahead = 2
+        self.mma_s_stage = self.mma_lookahead + 1
+        self.p_mma_stage = self.p_stages
+        self.p_cor_stage = self.mma_lookahead + 1
+        self.mma_o_stage = 2
+
+        self.tmem_o_offset = self.mma_s_stage * self.mma_qk_tiler[1] // self.warps_in_n
+        self.correction_factor_offset = self.tmem_o_offset + self.latent_dim // self.warps_in_n
+
+    @cute.jit
+    def __call__(
+        self,
+        q_latent: cute.Tensor,
+        q_rope: cute.Tensor,
+        c_latent: cute.Tensor,
+        c_rope: cute.Tensor,
+        page_table: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        workspace: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self._run(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            None,
+            workspace,
+            split_kv,
+            cache_seqs,
+            kv_bounds,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
+
+    @cute.jit
+    def run_with_softmax_stats(
+        self,
+        q_latent: cute.Tensor,
+        q_rope: cute.Tensor,
+        c_latent: cute.Tensor,
+        c_rope: cute.Tensor,
+        page_table: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        softmax_stats: cute.Tensor,
+        workspace: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self._run(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            softmax_stats,
+            workspace,
+            split_kv,
+            cache_seqs,
+            kv_bounds,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
+
+    @cute.jit
+    def _run(
+        self,
+        q_latent: cute.Tensor,
+        q_rope: cute.Tensor,
+        c_latent: cute.Tensor,
+        c_rope: cute.Tensor,
+        page_table: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        softmax_stats: Optional[cute.Tensor],
+        workspace: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        """Execute the Multi-Head Latent Attention operation on the provided tensors.
+
+        kv_bounds (helix speculative verify groups): optional int32 tensor of
+        shape [batch_size * seq_len_q]; entry b*seq_len_q + q gives the number
+        of this rank's local KV entries query token q of sequence b may attend
+        to. When present it replaces the implicit causal bound
+        K - (seq_len_q - 1) + q_tok.
+
+        The method handles:
+        1. Initialization of workspace for temporary split KV buffers
+        2. Validation of tensor data types
+        3. Initialization of hardware-specific parameters and memory layouts
+        4. Configuration of TMA (Tensor Memory Access) operations
+        5. Grid and work scheduling computation
+        6. Kernel launch(split KV kernel and reduction kernel) with appropriate parameters
+
+        :param q_latent: The query tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
+        :type q_latent: cute.Tensor
+        :param q_rope: The query RoPE tensor with shape [num_head, rope_dim, seq_len_q, batch_size]
+        :type q_rope: cute.Tensor
+        :param c_latent: The key tensor with shape [seq_len_k, latent_dim, batch_size]
+        :type c_latent: cute.Tensor
+        :param c_rope: The key RoPE tensor with shape [seq_len_k, rope_dim, batch_size]
+        :type c_rope: cute.Tensor
+        :param page_table: The page table tensor with shape [page_count, batch_size]
+        :type page_table: cute.Tensor
+        :param o: The output tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
+        :type o: cute.Tensor
+        :param lse: The LSE tensor with shape [num_head, seq_len_q, batch_size]
+        :type lse: cute.Tensor
+        :param softmax_stats: Optional Helix softmax statistics tensor with shape
+            [num_head, seq_len_q, batch_size, 2]
+        :type softmax_stats: cute.Tensor
+        :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_lse
+        :type workspace: cute.Tensor
+        :param split_kv: The scalar factor for split KV
+        :type split_kv: cutlass.Int32
+        :param cache_seqs: The cache sequences tensor with shape [batch_size]
+        :type cache_seqs: cute.Tensor
+        :param block_split_kvs: The block split KV tensor with shape [batch_size]
+        :type block_split_kvs: cute.Tensor
+        :param softmax_scale: Device tensor containing the scale factor for softmax
+        :type softmax_scale: cute.Tensor
+        :param output_scale: Device tensor containing the scale factor for the output
+        :type output_scale: cute.Tensor
+        :param stream: The CUDA stream to execute the kernel on
+        :type stream: cuda.CUstream
+
+        :raises TypeError: If tensor data types don't match or aren't supported
+        """
+
+        # setup static attributes before smem/grid/tma computation
+        self.q_dtype = q_latent.element_type
+        self.k_dtype = c_latent.element_type
+        self.v_dtype = c_latent.element_type
+        self.o_dtype = o.element_type
+
+        # check type consistency
+        if cutlass.const_expr(self.q_dtype != self.k_dtype or self.q_dtype != self.v_dtype):
+            raise TypeError(
+                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
+            )
+        # check leading dimensions of input/output
+        if cutlass.const_expr(q_latent.stride[1] != 1 or q_rope.stride[1] != 1):
+            raise ValueError("q_latent and q_rope must have leading dimension 1")
+        if cutlass.const_expr(c_latent.stride[1] != 1 or c_rope.stride[1] != 1):
+            raise ValueError("c_latent and c_rope must have leading dimension 1")
+        if cutlass.const_expr(o.stride[1] != 1):
+            raise ValueError("o must have leading dimension 1")
+        if cutlass.const_expr(lse.stride[0] != 1):
+            raise ValueError("lse must have leading dimension 0")
+        if cutlass.const_expr(self.emit_softmax_stats and softmax_stats.stride[3] != 1):
+            raise ValueError("softmax_stats must have leading dimension 3")
+
+        # When num_heads < M tile, fold up to F = fold_sq_ratio tokens of
+        # seq_len_q into the head dimension so M_eff = num_heads * F (<= M_tile).
+        # E.g., H=32, S_q=4 -> F=4, M_eff=128, S_q_eff=1
+        # E.g., H=32, S_q=8 -> F=4, M_eff=128, S_q_eff=2
+        # This works because MLA shares KV across all heads/queries independently.
+        # Tensor layout: [H, D, S_q, B] -> [H*F, D, S_q/F, B]; relies on
+        # stride_S == stride_H * H (always true for contiguous [B, S_q, H, D]
+        # tensors after the host-side permute).
+        if cutlass.const_expr(self.fold_sq and self.flat_fold):
+            # Flat fold: [H, D, S_q, B] -> [rows, D, ceil(H * S_q / rows), B].
+            # Same stride requirement as the integer fold (stride_S == H *
+            # stride_H), so the folded rows have the uniform stride stride_H.
+            rows = self.fold_rows
+            chunks = self.fold_chunks
+
+            def _fold_sq_4d(t):
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (rows, t.shape[1], chunks, t.shape[3]),
+                        stride=(
+                            t.stride[0],
+                            t.stride[1],
+                            t.stride[0] * rows,
+                            t.stride[3],
+                        ),
+                    ),
+                )
+
+            if cutlass.const_expr(self.flat_fold_padded):
+                # In the chunked view the padded rows of the last tile would
+                # alias the next request's Q (or run past the tensor), so Q
+                # keeps one row mode of the H * S_q real rows per request:
+                # [H*S_q, D, 1, B]. Tile c is M tile c of that mode, and TMA
+                # zero-fills its rows past H * S_q. O, LSE and the softmax
+                # stats use the chunked view with the padded rows masked off
+                # at the stores.
+                def _flat_rows_4d(t):
+                    return cute.make_tensor(
+                        t.iterator,
+                        cute.make_layout(
+                            (
+                                self.num_heads * self.seq_len_q,
+                                t.shape[1],
+                                1,
+                                t.shape[3],
+                            ),
+                            stride=(
+                                t.stride[0],
+                                t.stride[1],
+                                t.stride[2],
+                                t.stride[3],
+                            ),
+                        ),
+                    )
+
+                q_latent = _flat_rows_4d(q_latent)
+                q_rope = _flat_rows_4d(q_rope)
+            else:
+                q_latent = _fold_sq_4d(q_latent)
+                q_rope = _fold_sq_4d(q_rope)
+            o = _fold_sq_4d(o)
+            lse = cute.make_tensor(
+                lse.iterator,
+                cute.make_layout(
+                    (rows, chunks, lse.shape[2]),
+                    stride=(lse.stride[0], lse.stride[0] * rows, lse.stride[2]),
+                ),
+            )
+            if cutlass.const_expr(self.emit_softmax_stats):
+                softmax_stats = cute.make_tensor(
+                    softmax_stats.iterator,
+                    cute.make_layout(
+                        (
+                            rows,
+                            chunks,
+                            softmax_stats.shape[2],
+                            softmax_stats.shape[3],
+                        ),
+                        stride=(
+                            softmax_stats.stride[0],
+                            softmax_stats.stride[0] * rows,
+                            softmax_stats.stride[2],
+                            softmax_stats.stride[3],
+                        ),
+                    ),
+                )
+        elif cutlass.const_expr(self.fold_sq):
+            F = self.fold_sq_ratio
+
+            def _fold_sq_4d(t):
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (
+                            t.shape[0] * F,
+                            t.shape[1],
+                            t.shape[2] // F,
+                            t.shape[3],
+                        ),
+                        stride=(
+                            t.stride[0],
+                            t.stride[1],
+                            t.stride[2] * F,
+                            t.stride[3],
+                        ),
+                    ),
+                )
+
+            q_latent = _fold_sq_4d(q_latent)
+            q_rope = _fold_sq_4d(q_rope)
+            o = _fold_sq_4d(o)
+            # LSE: [H, S_q, B] -> [H*F, S_q/F, B]
+            lse = cute.make_tensor(
+                lse.iterator,
+                cute.make_layout(
+                    (lse.shape[0] * F, lse.shape[1] // F, lse.shape[2]),
+                    stride=(lse.stride[0], lse.stride[1] * F, lse.stride[2]),
+                ),
+            )
+            if cutlass.const_expr(self.emit_softmax_stats):
+                softmax_stats = cute.make_tensor(
+                    softmax_stats.iterator,
+                    cute.make_layout(
+                        (
+                            softmax_stats.shape[0] * F,
+                            softmax_stats.shape[1] // F,
+                            softmax_stats.shape[2],
+                            softmax_stats.shape[3],
+                        ),
+                        stride=(
+                            softmax_stats.stride[0],
+                            softmax_stats.stride[1] * F,
+                            softmax_stats.stride[2],
+                            softmax_stats.stride[3],
+                        ),
+                    ),
+                )
+
+        # Split-KV intermediates follow the (rows, chunks) tiling of O; with a
+        # padded flat fold that is not the Q TMA view.
+        if cutlass.const_expr(self.flat_fold_padded):
+            ws_rows, ws_chunks = self.fold_rows, self.fold_chunks
+        else:
+            ws_rows, ws_chunks = q_latent.shape[0], q_latent.shape[2]
+        part_desc = None
+        if cutlass.const_expr(self.balanced_split):
+            acc_o, acc_lse, part_desc = self.initialize_balanced_workspace(
+                ws_rows, q_latent.shape[1], self.acc_dtype, workspace
+            )
+        else:
+            acc_o, acc_lse = self.initialize_workspace(
+                ws_rows,
+                q_latent.shape[1],
+                ws_chunks,
+                q_latent.shape[3],
+                split_kv,
+                self.acc_dtype,
+                workspace,
+            )
+
+        c_latent_tranpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
+        c_latent_transpose = cute.make_tensor(c_latent.iterator, c_latent_tranpose_layout)
+
+        self.q_major_mode = OperandMajorMode.K
+        self.k_major_mode = OperandMajorMode.K
+        self.v_major_mode = OperandMajorMode.MN
+
+        self._setup_attributes()
+
+        cta_group = tcgen05.CtaGroup.TWO
+        # the intermediate tensor p is from smem & k-major
+        p_major_mode = OperandMajorMode.K
+        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
+            self.q_major_mode,
+            self.k_major_mode,
+            self.acc_dtype,
+            cta_group,
+            self.mma_qk_tiler[:2],
+        )
+        pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
+            p_major_mode,
+            self.v_major_mode,
+            self.acc_dtype,
+            cta_group,
+            self.mma_pv_tiler[:2],
+        )
+
+        cta_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk),
+            (qk_tiled_mma.thr_id.shape,),
+        )
+
+        self.epi_tile = self.mma_pv_tiler[:2]
+
+        q_latent_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            qk_tiled_mma,
+            self.mma_qk_tiler,
+            self.q_dtype,
+            (self.iterations_qk_latent * self.load_q_stage),
+        )
+        q_latent_smem_layout_staged = cute.logical_divide(
+            q_latent_smem_layout_staged, (None, None, None, self.iterations_qk_latent)
+        )
+        q_rope_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            qk_tiled_mma,
+            self.mma_qk_rope_tiler,
+            self.q_dtype,
+            self.load_q_stage,
+        )
+
+        kc_latent_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            qk_tiled_mma,
+            self.mma_qk_tiler,
+            self.k_dtype,
+            (self.iterations_qk_latent * self.load_k_stage),
+        )
+        kc_page_tile_size = min(
+            self.page_size, qk_tiled_mma.op.shape_mnk[0] // qk_tiled_mma.thr_id.shape
+        )
+        kc_latent_smem_layout_staged = cute.logical_divide(
+            kc_latent_smem_layout_staged, (None, None, None, self.iterations_qk_latent)
+        )
+
+        kc_latent_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.K,
+            (self.mma_qk_tiler[0] // qk_tiled_mma.thr_id.shape, self.mma_qk_tiler[2]),
+            self.k_dtype,
+            (self.iterations_qk_latent * self.load_k_stage),
+        )
+        kc_latent_smem_layout_for_tma = cute.tiled_divide(
+            kc_latent_smem_layout_for_tma, (kc_page_tile_size, self.mma_qk_tiler[2])
+        )
+        kc_latent_smem_layout_for_tma = cute.logical_divide(
+            kc_latent_smem_layout_for_tma, (None, None, None, self.iterations_qk_latent)
+        )
+
+        kc_rope_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            qk_tiled_mma,
+            self.mma_qk_rope_tiler,
+            self.k_dtype,
+            self.load_k_stage,
+        )
+        kc_rope_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.K,
+            (
+                self.mma_qk_rope_tiler[0] // qk_tiled_mma.thr_id.shape,
+                self.mma_qk_rope_tiler[2],
+            ),
+            self.k_dtype,
+            (self.iterations_qk_rope * self.load_k_stage),
+        )
+        kc_rope_smem_layout_for_tma = cute.tiled_divide(
+            kc_rope_smem_layout_for_tma, (kc_page_tile_size, self.mma_qk_rope_tiler[2])
+        )
+
+        p_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            pv_tiled_mma,
+            self.mma_pv_tiler,
+            self.q_dtype,
+            (self.iterations_pv_k * self.p_mma_stage),
+        )
+        p_smem_layout_staged = cute.logical_divide(
+            p_smem_layout_staged, (None, None, None, self.iterations_pv_k)
+        )
+
+        vc_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            pv_tiled_mma,
+            self.mma_pv_tiler,
+            self.v_dtype,
+            (self.iterations_pv_k * self.iterations_pv_n * self.load_v_stage),
+        )
+        vc_smem_layout_staged = cute.logical_divide(
+            cute.logical_divide(
+                vc_smem_layout_staged,
+                (None, None, None, self.iterations_pv_k * self.iterations_pv_n),
+            ),
+            (None, None, None, (self.iterations_pv_n, None)),
+        )
+        vc_page_tile_size = min(self.page_size, self.mma_pv_tiler[2])
+        vc_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.MN,
+            (self.mma_pv_tiler[1] // pv_tiled_mma.thr_id.shape, self.mma_pv_tiler[2]),
+            self.v_dtype,
+            (self.iterations_pv_k * self.iterations_pv_n * self.load_v_stage),
+        )
+        vc_smem_layout_for_tma = cute.tiled_divide(
+            vc_smem_layout_for_tma,
+            (
+                pv_tiled_mma.op.shape_mnk[1] // pv_tiled_mma.thr_id.shape,
+                vc_page_tile_size,
+            ),
+        )
+        vc_smem_layout_for_tma = cute.logical_divide(
+            cute.logical_divide(
+                vc_smem_layout_for_tma,
+                (None, None, None, self.iterations_pv_k * self.iterations_pv_n),
+            ),
+            (None, None, None, (self.iterations_pv_n, None)),
+        )
+        # TMA load for Q latent and rope
+        tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
+
+        q_smem_layout = cute.select(q_latent_smem_layout_staged, mode=[0, 1, 2])
+
+        tma_atom_q_latent, tma_tensor_q_latent = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            q_latent,
+            q_smem_layout,
+            self.mma_qk_tiler,
+            qk_tiled_mma,
+            cta_layout_vmnk.shape,
+        )
+        q_rope_smem_layout = cute.select(q_rope_smem_layout_staged, mode=[0, 1, 2])
+        tma_atom_q_rope, tma_tensor_q_rope = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            q_rope,
+            q_rope_smem_layout,
+            self.mma_qk_rope_tiler,
+            qk_tiled_mma,
+            cta_layout_vmnk.shape,
+        )
+        # TMA load for c latent and k rope
+        kc_smem_layout = cute.select(kc_latent_smem_layout_for_tma, mode=[0])
+        tma_atom_c_latent, tma_tensor_c_latent = self.make_paged_tiled_tma_atom(
+            tma_load_op,
+            c_latent,
+            kc_smem_layout,
+            (self.mma_qk_tiler[1], self.mma_qk_tiler[2]),
+            qk_tiled_mma,
+            is_k_load=True,
+        )
+        kc_rope_smem_layout = cute.select(kc_rope_smem_layout_for_tma, mode=[0])
+        tma_atom_c_rope, tma_tensor_c_rope = self.make_paged_tiled_tma_atom(
+            tma_load_op,
+            c_rope,
+            kc_rope_smem_layout,
+            (self.mma_qk_rope_tiler[1], self.mma_qk_rope_tiler[2]),
+            qk_tiled_mma,
+            is_k_load=True,
+        )
+
+        # TMA load for c latent transpose
+        vc_smem_layout = cute.select(vc_smem_layout_for_tma, mode=[0])
+        tma_atom_c_latent_transpose, tma_tensor_c_latent_transpose = self.make_paged_tiled_tma_atom(
+            tma_load_op,
+            c_latent_transpose,
+            vc_smem_layout,
+            (self.mma_pv_tiler[1], self.mma_pv_tiler[2]),
+            pv_tiled_mma,
+            is_k_load=False,
+        )
+
+        q_latent_copy_size = (
+            cute.size_in_bytes(self.q_dtype, q_smem_layout)
+            * cute.size(qk_tiled_mma.thr_id.shape)
+            * self.iterations_qk_latent
+        )
+        q_rope_copy_size = (
+            cute.size_in_bytes(self.q_dtype, q_rope_smem_layout)
+            * cute.size(qk_tiled_mma.thr_id.shape)
+            * self.iterations_qk_rope
+        )
+        kc_latent_copy_size = (
+            cute.size_in_bytes(
+                self.k_dtype,
+                cute.select(kc_latent_smem_layout_staged, mode=[0, 1, 2]),
+            )
+            * cute.size(qk_tiled_mma.thr_id.shape)
+            * self.iterations_qk_latent
+        )
+        kc_rope_copy_size = (
+            cute.size_in_bytes(
+                self.k_dtype,
+                cute.select(kc_rope_smem_layout_staged, mode=[0, 1, 2]),
+            )
+            * cute.size(qk_tiled_mma.thr_id.shape)
+            * self.iterations_qk_rope
+        )
+        vc_copy_size = (
+            cute.size_in_bytes(self.v_dtype, cute.select(vc_smem_layout_staged, mode=[0, 1, 2]))
+            * cute.size(pv_tiled_mma.thr_id.shape)
+            * self.iterations_pv_n
+            * self.iterations_pv_k
+        )
+
+        self.tma_copy_q_bytes = q_latent_copy_size + q_rope_copy_size
+        self.tma_copy_kc_bytes = kc_latent_copy_size + kc_rope_copy_size
+        self.tma_copy_vc_bytes = vc_copy_size
+
+        tile_sched_params, grid = self._compute_grid(
+            o,
+            split_kv,
+            self.cluster_shape_mnk,
+            self.max_active_clusters,
+            self.is_persistent,
+        )
+        if cutlass.const_expr(self.balanced_split):
+            grid = (self.cluster_shape_mnk[0] * self.balanced_num_clusters, 1, 1)
+
+        @cute.struct
+        class SplitKVKernelSharedStorage:
+            # Smem tensors (the 1024-byte aligned buffers first: the members
+            # after them need no alignment padding)
+            smem_p: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
+                1024,
+            ]
+            smem_kc_latent: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, cute.cosize(kc_latent_smem_layout_staged)],
+                1024,
+            ]
+
+            smem_kc_rope: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, cute.cosize(kc_rope_smem_layout_staged)],
+                1024,
+            ]
+            smem_q_latent: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(q_latent_smem_layout_staged)],
+                1024,
+            ]
+            smem_q_rope: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(q_rope_smem_layout_staged)],
+                1024,
+            ]
+            smem_vc: cute.struct.Align[
+                cute.struct.MemRange[self.v_dtype, cute.cosize(vc_smem_layout_staged)],
+                1024,
+            ]
+
+            # Pipeline barriers
+            load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_q_stage * 2]
+            load_k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_k_stage * 2]
+            load_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_v_stage * 2]
+            mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_s_stage * 2]
+            p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
+            p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
+            mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_o_stage * 2]
+
+            softmax_smem_exchange: cute.struct.MemRange[
+                self.acc_dtype, self.num_compute_warps * self.threads_per_warp
+            ]
+            epilogue_smem_exchange: cute.struct.MemRange[
+                self.acc_dtype, self.num_compute_warps * self.threads_per_warp
+            ]
+
+            # Balanced split: per-request K-tile prefix table and the
+            # cluster's schedule parameters
+            tile_table: cute.struct.MemRange[
+                cutlass.Int32, self.balanced_max_requests + 1 if self.balanced_split else 1
+            ]
+            sched_params: cute.struct.MemRange[cutlass.Int32, MLABalancedTileScheduler.NUM_PARAMS]
+
+            # Tmem dealloc cluster barrier
+            tmem_dealloc_mbar_ptr: cutlass.Int64
+
+            # Tmem holding buffer
+            tmem_holding_buf: cutlass.Int32
+
+        smem_bytes = SplitKVKernelSharedStorage.size_in_bytes()
+        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        if cutlass.const_expr(smem_bytes > smem_capacity):
+            raise ValueError(
+                f"MLA decode shared storage of {smem_bytes} bytes exceeds the "
+                f"{smem_capacity} available (k_stages={self.k_stages}, "
+                f"p_stages={self.p_stages}, balanced_max_requests="
+                f"{self.balanced_max_requests})."
+            )
+        if cutlass.const_expr(self.emit_softmax_stats):
+            split_kv_kernel = self.split_kv_kernel(
+                qk_tiled_mma,
+                pv_tiled_mma,
+                tma_atom_q_latent,
+                tma_tensor_q_latent,
+                tma_atom_q_rope,
+                tma_tensor_q_rope,
+                tma_atom_c_latent,
+                tma_tensor_c_latent,
+                tma_atom_c_rope,
+                tma_tensor_c_rope,
+                tma_atom_c_latent_transpose,
+                tma_tensor_c_latent_transpose,
+                page_table,
+                o,
+                (lse, softmax_stats),
+                acc_o,
+                acc_lse,
+                part_desc,
+                split_kv,
+                cache_seqs,
+                kv_bounds,
+                block_split_kvs,
+                softmax_scale,
+                output_scale,
+                q_latent_smem_layout_staged,
+                q_rope_smem_layout_staged,
+                kc_latent_smem_layout_staged,
+                kc_rope_smem_layout_staged,
+                p_smem_layout_staged,
+                vc_smem_layout_staged,
+                kc_latent_smem_layout_for_tma,
+                kc_rope_smem_layout_for_tma,
+                vc_smem_layout_for_tma,
+                cta_layout_vmnk,
+                tile_sched_params,
+                SplitKVKernelSharedStorage,
+            )
+        else:
+            split_kv_kernel = self.split_kv_kernel(
+                qk_tiled_mma,
+                pv_tiled_mma,
+                tma_atom_q_latent,
+                tma_tensor_q_latent,
+                tma_atom_q_rope,
+                tma_tensor_q_rope,
+                tma_atom_c_latent,
+                tma_tensor_c_latent,
+                tma_atom_c_rope,
+                tma_tensor_c_rope,
+                tma_atom_c_latent_transpose,
+                tma_tensor_c_latent_transpose,
+                page_table,
+                o,
+                lse,
+                acc_o,
+                acc_lse,
+                part_desc,
+                split_kv,
+                cache_seqs,
+                kv_bounds,
+                block_split_kvs,
+                softmax_scale,
+                output_scale,
+                q_latent_smem_layout_staged,
+                q_rope_smem_layout_staged,
+                kc_latent_smem_layout_staged,
+                kc_rope_smem_layout_staged,
+                p_smem_layout_staged,
+                vc_smem_layout_staged,
+                kc_latent_smem_layout_for_tma,
+                kc_rope_smem_layout_for_tma,
+                vc_smem_layout_for_tma,
+                cta_layout_vmnk,
+                tile_sched_params,
+                SplitKVKernelSharedStorage,
+            )
+        split_kv_kernel.launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            cluster=self.cluster_shape_mnk,
+            smem=SplitKVKernelSharedStorage.size_in_bytes(),
+            stream=stream,
+            min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
+        )
+        if cutlass.const_expr(self.balanced_split):
+            self._launch_balanced_reduction(
+                o,
+                lse,
+                softmax_stats,
+                acc_o,
+                acc_lse,
+                part_desc,
+                cache_seqs,
+                kv_bounds,
+                ws_rows,
+                q_latent.shape[3],
+                stream,
+            )
+        elif cutlass.const_expr(acc_o is not None):
+            if cutlass.const_expr(self.emit_softmax_stats):
+                reduction_kernel = self.reduction_kernel(
+                    o,
+                    (lse, softmax_stats),
+                    acc_o,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    block_split_kvs,
+                    kv_bounds,
+                )
+            else:
+                reduction_kernel = self.reduction_kernel(
+                    o,
+                    lse,
+                    acc_o,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    block_split_kvs,
+                )
+            # One CTA per (row, chunk, batch); a padded flat fold launches only
+            # the H * S_q real rows of each request (see reduction_kernel).
+            if cutlass.const_expr(self.flat_fold_padded):
+                reduction_grid = (self.num_heads * self.seq_len_q, 1, q_latent.shape[3])
+            else:
+                reduction_grid = (q_latent.shape[0], q_latent.shape[2], q_latent.shape[3])
+            reduction_kernel.launch(
+                grid=reduction_grid,
+                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
+                smem=MAX_SPLITS * self.acc_dtype.width // 8,
+                stream=stream,
+                min_blocks_per_mp=1,
+                use_pdl=self.use_pdl,
+            )
+
+    @cute.jit
+    def _launch_balanced_reduction(
+        self,
+        o,
+        lse,
+        softmax_stats,
+        acc_o,
+        acc_lse,
+        part_desc,
+        cache_seqs,
+        kv_bounds,
+        ws_rows,
+        batch_size,
+        stream,
+    ):
+        """Launch the balanced split's reduction after the split kernel (the
+        folded O / LSE / softmax-stats views and the workspace views of
+        ``_run``)."""
+        red_lse = lse
+        if cutlass.const_expr(self.emit_softmax_stats):
+            red_lse = (lse, softmax_stats)
+        # (row groups, M tiles), or (row groups, partial slots +
+        # requests / 4) past 32 requests: see balanced_reduction_kernel.
+        self.balanced_reduction_kernel(
+            o,
+            red_lse,
+            acc_o,
+            acc_lse,
+            part_desc,
+            cache_seqs,
+            kv_bounds,
+        ).launch(
+            grid=(
+                cute.ceil_div(ws_rows, self.BALANCED_REDUCTION_ROWS),
+                (
+                    batch_size * self.num_m_chunks * self.reduction_col_split
+                    if self.balanced_tile_reduction
+                    else self.balanced_num_slots + cute.ceil_div(batch_size, self.num_compute_warps)
+                ),
+                1,
+            ),
+            block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
+            smem=(self.balanced_num_slots + 1) * 4,
+            stream=stream,
+            min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.jit
+    def make_paged_tiled_tma_atom(
+        self,
+        tma_load_op: cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp,
+        gmem: cute.Tensor,
+        smem_layout: cute.Layout,
+        mma_tiler,
+        tiled_mma: cute.TiledMma,
+        is_k_load: bool,
+    ):
+        ident = cute.make_identity_layout(gmem.shape)
+        g_tile = cute.composition(ident, mma_tiler)
+        cta_mn = mma_tiler[0] // tiled_mma.thr_id.shape
+        cta_v_map = cute.flat_divide(g_tile, (cta_mn,))
+        cta_v_map = cute.select(cta_v_map, mode=[0, 2])
+        page_tile_size = (
+            min(self.page_size, cta_mn) if is_k_load else min(self.page_size, mma_tiler[1])
+        )
+        cta_v_map = cute.zipped_divide(
+            cta_v_map,
+            (page_tile_size, mma_tiler[1]) if is_k_load else (cta_mn, page_tile_size),
+        )
+        cta_v_map = cute.select(cta_v_map, mode=[0])
+        from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+
+        res = _cute_nvgpu_ir.atom_make_non_exec_tiled_tma_load(
+            gmem.value,
+            smem_layout.value,
+            cta_v_map,
+            tma_load_op._to_ir(),
+            num_multicast=1,
+        )
+        return (
+            cute.CopyAtom(tma_load_op, cpasync.CopyBulkTensorTileG2SNonExecTrait(res[0])),
+            res[1],
+        )
+
+    @cute.kernel
+    def split_kv_kernel(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        tma_atom_q_latent: Optional[cute.CopyAtom],
+        mQL: cute.Tensor,
+        tma_atom_q_rope: Optional[cute.CopyAtom],
+        mQR: cute.Tensor,
+        tma_atom_c_latent: Optional[cute.CopyAtom],
+        mCL: cute.Tensor,
+        tma_atom_c_rope: Optional[cute.CopyAtom],
+        mKR: cute.Tensor,
+        tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
+        mCLT: cute.Tensor,
+        mPT: cute.Tensor,
+        mO: Optional[cute.Tensor],
+        mLSE,
+        mAccO: Optional[cute.Tensor],
+        mAccLSE: Optional[cute.Tensor],
+        mDesc: Optional[cute.Tensor],
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: cute.Tensor,
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
+        q_latent_smem_layout_staged: cute.ComposedLayout,
+        q_rope_smem_layout_staged: cute.ComposedLayout,
+        kc_latent_smem_layout_staged: cute.ComposedLayout,
+        kc_rope_smem_layout_staged: cute.ComposedLayout,
+        p_smem_layout_staged: cute.ComposedLayout,
+        vc_smem_layout_staged: cute.ComposedLayout,
+        kc_latent_smem_layout_for_tma: Optional[cute.ComposedLayout],
+        kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
+        vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
+        cta_layout_vmnk: cute.Layout,
+        tile_sched_params: MLAStaticTileSchedulerParams,
+        SharedStorage: cutlass.Constexpr,
+    ):
+        """The device split_kv kernel implementation of the Multi-Head Latent Attention.
+
+        This kernel coordinates multiple specialized warps to perform different phases of the MLA computation:
+        1. Load warp: Loads Q/C latent/rope data from global memory to shared memory using TMA
+        2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
+        3. Compute warps: Compute softmax and do rescaling on accumulators, and store the intermediate/final results
+        to global memory
+
+        The kernel produces either intermediate or final results of the MLA computation based on the split_kv parameter.
+        When split_kv is 1, the kernel generates the final results directly. Otherwise, it produces intermediate results
+        that will later be combined by a reduction kernel.
+
+        The kernel implements a complex pipeline with overlapping computation and memory operations,
+        using tensor memory access (TMA) for efficient data loading, warp specialization for different
+        computation phases.
+
+        :param tiled_mma_qk: Tiled MMA for Q*K^T
+        :type tiled_mma_qk: cute.TiledMma
+        :param tiled_mma_pv: Tiled MMA for P*V
+        :type tiled_mma_pv: cute.TiledMma
+        :param tma_atom_q_latent: TMA copy atom for query latent tensor
+        :type tma_atom_q_latent: cute.CopyAtom
+        :param mQL: query latent tensor
+        :type mQL: cute.Tensor
+        :param tma_atom_q_rope: TMA copy atom for query rope tensor
+        :type tma_atom_q_rope: cute.CopyAtom
+        :param mKR: Compressed rope tensor
+        :type mKR: cute.Tensor
+        :param tma_atom_c_latent: TMA copy atom for c latent tensor
+        :type tma_atom_c_latent: cute.CopyAtom
+        :param mCL: Compressed latent tensor
+        :type mCL: cute.Tensor
+        :param tma_atom_c_rope: TMA copy atom for c rope tensor
+        :type tma_atom_c_rope: cute.CopyAtom
+        :param mCLT: Compressed latent transpose tensor
+        :type mCLT: cute.Tensor
+        :param mPT: Page table tensor
+        :type mPT: cute.Tensor
+        :param mO: Output tensor
+        :type mO: cute.Tensor
+        :param mLSE: Log-sum-exp tensor, or the compile-time tuple
+            ``(lse, softmax_stats)`` for the Helix variant.
+        :param mAccO: Intermediate accumulator output tensor
+        :type mAccO: cute.Tensor
+        :param mAccLSE: Intermediate accumulator log-sum-exp tensor
+        :type mAccLSE: cute.Tensor
+        :param mDesc: Balanced split: (M tile, first K tile) of each partial
+            slot, -1 for an unused slot
+        :type mDesc: cute.Tensor
+        :param split_kv: The split_kv parameter
+        :type split_kv: cutlass.Int32
+        :param cache_seqs: The variable sequence length tensor
+        :type cache_seqs: cute.Tensor
+        :param block_split_kvs: The per-block split_kv values tensor
+        :type block_split_kvs: cute.Tensor
+        :param softmax_scale: Device tensor containing the scale factor for softmax
+        :type softmax_scale: cute.Tensor
+        :param output_scale: Device tensor containing the scale factor for the output
+        :type output_scale: cute.Tensor
+        :param q_latent_smem_layout_staged: Shared memory layout for query tensor
+        :type q_latent_smem_layout_staged: cute.ComposedLayout
+        :param q_rope_smem_layout_staged: Shared memory layout for query rope tensor
+        :type q_rope_smem_layout_staged: cute.ComposedLayout
+        :param kc_latent_smem_layout_staged: Shared memory layout for key tensor
+        :type kc_latent_smem_layout_staged: cute.ComposedLayout
+        :param kc_rope_smem_layout_staged: Shared memory layout for key rope tensor
+        :type kc_rope_smem_layout_staged: cute.ComposedLayout
+        :param p_smem_layout_staged: Shared memory layout for probability matrix
+        :type p_smem_layout_staged: cute.ComposedLayout
+        :param vc_smem_layout_staged: Shared memory layout for value tensor
+        :type vc_smem_layout_staged: cute.ComposedLayout
+        :param cta_layout_vmnk: Layout for compute threads
+        :type cta_layout_vmnk: cute.Layout
+        :param tile_sched_params: Scheduling parameters for work distribution
+        :type tile_sched_params: MLAStaticTileSchedulerParams
+        :param SharedStorage: Shared storage for the kernel
+        :type SharedStorage: cutlass.Constexpr
+        """
+
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats):
+            mLSE, mSoftmaxStats = mLSE
+
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        mma_tile_coord_v = bidx % cute.size(tiled_mma_qk.thr_id.shape)
+        is_leader_cta = mma_tile_coord_v == 0
+
+        # Prefetch tma descriptor
+        if warp_idx == self.mma_warp_id:
+            cpasync.prefetch_descriptor(tma_atom_q_latent)
+            cpasync.prefetch_descriptor(tma_atom_q_rope)
+            cpasync.prefetch_descriptor(tma_atom_c_latent)
+            cpasync.prefetch_descriptor(tma_atom_c_rope)
+            cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
+
+        # Alloc
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+
+        # Tensor memory dealloc barrier init
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=self.tmem_ptr_sync_bar,
+            allocator_warp_id=self.mma_warp_id,
+            is_two_cta=self.use_2cta_instrs,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+        )
+
+        load_q_pipeline = self.make_and_init_load_qkv_pipeline(
+            storage.load_q_mbar_ptr.data_ptr(),
+            cta_layout_vmnk,
+            self.load_q_stage,
+            self.tma_copy_q_bytes,
+        )
+        load_k_pipeline = self.make_and_init_load_qkv_pipeline(
+            storage.load_k_mbar_ptr.data_ptr(),
+            cta_layout_vmnk,
+            self.load_k_stage,
+            self.tma_copy_kc_bytes,
+        )
+        load_v_pipeline = self.make_and_init_load_qkv_pipeline(
+            storage.load_v_mbar_ptr.data_ptr(),
+            cta_layout_vmnk,
+            self.load_v_stage,
+            self.tma_copy_vc_bytes,
+        )
+        mma_s_pipeline = self.make_and_init_mma_s_pipeline(
+            storage.mma_s_mbar_ptr.data_ptr(), cta_layout_vmnk
+        )
+        p_mma_pipeline = self.make_and_init_p_mma_pipeline(
+            storage.p_mma_mbar_ptr.data_ptr(), cta_layout_vmnk
+        )
+        p_cor_pipeline = self.make_and_init_p_cor_pipeline(storage.p_cor_mbar_ptr.data_ptr())
+        mma_o_pipeline = self.make_and_init_mma_o_pipeline(
+            storage.mma_o_mbar_ptr.data_ptr(), cta_layout_vmnk
+        )
+
+        # Cluster arrive after barrier init
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk, is_relaxed=True)
+
+        # Generate smem tensor Q/KC/VC/exchange
+        # (MMA, MMA_H, MMA_R, PIPE)
+        sQ = storage.smem_q_latent.get_tensor(
+            q_latent_smem_layout_staged.outer, swizzle=q_latent_smem_layout_staged.inner
+        )
+        sQ_rope = storage.smem_q_rope.get_tensor(
+            q_rope_smem_layout_staged.outer, swizzle=q_rope_smem_layout_staged.inner
+        )
+        # (MMA, MMA_K, MMA_R, PIPE)
+        sKC = storage.smem_kc_latent.get_tensor(
+            kc_latent_smem_layout_staged.outer,
+            swizzle=kc_latent_smem_layout_staged.inner,
+        )
+        sKC_rope = storage.smem_kc_rope.get_tensor(
+            kc_rope_smem_layout_staged.outer, swizzle=kc_rope_smem_layout_staged.inner
+        )
+        sKC_for_tma = storage.smem_kc_latent.get_tensor(
+            kc_latent_smem_layout_for_tma.outer,
+            swizzle=kc_latent_smem_layout_for_tma.inner,
+        )
+        sKC_rope_for_tma = storage.smem_kc_rope.get_tensor(
+            kc_rope_smem_layout_for_tma.outer, swizzle=kc_rope_smem_layout_for_tma.inner
+        )
+        # (MMA, MMA_D, MMA_K, PIPE)
+        sVC = storage.smem_vc.get_tensor(
+            vc_smem_layout_staged.outer, swizzle=vc_smem_layout_staged.inner
+        )
+        sVC_for_tma = storage.smem_vc.get_tensor(
+            vc_smem_layout_for_tma.outer, swizzle=vc_smem_layout_for_tma.inner
+        )
+        # (MMA, MMA_H, MMA_K)
+        sP = storage.smem_p.get_tensor(
+            p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
+        )
+        # (compute_threads,)
+        softmax_smem_exchange = storage.softmax_smem_exchange.get_tensor(
+            cute.make_layout(self.num_compute_warps * self.threads_per_warp)
+        )
+        epilogue_smem_exchange = storage.epilogue_smem_exchange.get_tensor(
+            cute.make_layout(self.num_compute_warps * self.threads_per_warp)
+        )
+
+        #
+        # Cluster wait before tensor memory alloc
+        #
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
+        if cutlass.const_expr(self.use_pdl):
+            # Everything above only touched this CTA's shared memory; inputs
+            # (the scales too: the preceding RoPE kernel writes them) and
+            # outputs are accessed after the preceding kernel completed.
+            # The reduction is released by the CTAs' exits (no early trigger:
+            # its CTAs would wait on the SMs of running clusters, and slow
+            # them down).
+            cute.arch.griddepcontrol_wait()
+
+        # Balanced split: the cluster's schedule, in shared memory.
+        tile_table = None
+        if cutlass.const_expr(self.balanced_split):
+            tile_table = (
+                storage.tile_table.get_tensor(cute.make_layout(self.balanced_max_requests + 1)),
+                storage.sched_params.get_tensor(
+                    cute.make_layout(MLABalancedTileScheduler.NUM_PARAMS)
+                ),
+            )
+            if warp_idx == self.empty_warp_ids[0]:
+                build_mla_balanced_schedule(
+                    cache_seqs,
+                    tile_table[0],
+                    tile_table[1],
+                    self.mma_qk_tiler[1],
+                    self.balanced_max_requests,
+                    self.balanced_num_clusters,
+                    self.num_m_chunks,
+                    self.balanced_min_units,
+                    self.aligned_segment_cost,
+                )
+            cute.arch.barrier()
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Load warps, including page table and data tensors
+        # ///////////////////////////////////////////////////////////////////////////////
+        if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
+
+        # The load warps look up their next work tile after issuing the
+        # current one's loads (prefetch_next_work applies to the other roles),
+        # so the first Q / K loads leave as early as possible.
+        if warp_idx == self.load_tma_k_warp_id:
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            load_q_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.load_q_stage
+            )
+            load_k_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.load_k_stage
+            )
+            tile_sched = self._make_tile_scheduler(tile_sched_params, tile_table, cache_seqs)
+            work_tile = tile_sched.initial_work_tile_info()
+            while work_tile.is_valid_tile:
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs
+                )
+                if k_tile_count > 0:
+                    # Construct fixed common/tma_qk/tma_pv params for load_tma
+                    tma_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        local_split_kv=local_split_kv,
+                        load_q_pipeline=load_q_pipeline,
+                        load_k_pipeline=load_k_pipeline,
+                        load_v_pipeline=load_v_pipeline,
+                        mPT=mPT,
+                    )
+                    tma_qk_params = SimpleNamespace(
+                        tiled_mma_qk=tiled_mma_qk,
+                        tma_atom_q_latent=tma_atom_q_latent,
+                        tma_atom_q_rope=tma_atom_q_rope,
+                        tma_atom_c_latent=tma_atom_c_latent,
+                        tma_atom_c_rope=tma_atom_c_rope,
+                        mQL=mQL,
+                        mQR=mQR,
+                        mCL=mCL,
+                        mKR=mKR,
+                        sQ=sQ,
+                        sQ_rope=sQ_rope,
+                        sKC=sKC_for_tma,
+                        sKC_rope=sKC_rope_for_tma,
+                    )
+                    # Load tma
+                    load_q_producer_state, load_k_producer_state = self.load_tma_qk(
+                        tma_common_params,
+                        tma_qk_params,
+                        k_index,
+                        k_tile_count,
+                        load_q_producer_state,
+                        load_k_producer_state,
+                    )
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+
+            load_q_pipeline.producer_tail(load_q_producer_state)
+            load_k_pipeline.producer_tail(load_k_producer_state)
+
+        if warp_idx == self.load_tma_v_warp_id:
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            load_v_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.load_v_stage
+            )
+            tile_sched = self._make_tile_scheduler(tile_sched_params, tile_table, cache_seqs)
+            work_tile = tile_sched.initial_work_tile_info()
+            while work_tile.is_valid_tile:
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs
+                )
+                if k_tile_count > 0:
+                    # Construct fixed common/tma_qk/tma_pv params for load_tma
+                    tma_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        local_split_kv=local_split_kv,
+                        load_v_pipeline=load_v_pipeline,
+                        mPT=mPT,
+                    )
+                    tma_pv_params = SimpleNamespace(
+                        tiled_mma_pv=tiled_mma_pv,
+                        tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
+                        mCLT=mCLT,
+                        sVC=sVC_for_tma,
+                    )
+                    # Load tma
+                    load_v_producer_state = self.load_tma_v(
+                        tma_common_params,
+                        tma_pv_params,
+                        k_index,
+                        k_tile_count,
+                        load_v_producer_state,
+                    )
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+            load_v_pipeline.producer_tail(load_v_producer_state)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  MMA warp
+        # ///////////////////////////////////////////////////////////////////////////////
+        if warp_idx == self.mma_warp_id:
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            # Alloc tensor memory buffer
+            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            load_q_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.load_q_stage
+            )
+            load_k_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.load_k_stage
+            )
+            load_v_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.load_v_stage
+            )
+            mma_s_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.mma_s_stage
+            )
+            p_mma_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.p_mma_stage
+            )
+            mma_o_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.mma_o_stage
+            )
+            tile_sched = self._make_tile_scheduler(tile_sched_params, tile_table, cache_seqs)
+            work_tile = tile_sched.initial_work_tile_info()
+            while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs
+                )
+                if k_tile_count > 0:
+                    mma_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        local_split_kv=local_split_kv,
+                        load_q_pipeline=load_q_pipeline,
+                        load_k_pipeline=load_k_pipeline,
+                        load_v_pipeline=load_v_pipeline,
+                        tmem_ptr=tmem_ptr,
+                        is_leader_cta=is_leader_cta,
+                        L=mCL.shape[1],
+                    )
+                    mma_qk_params = SimpleNamespace(
+                        mma_s_pipeline=mma_s_pipeline,
+                        sQ=sQ,
+                        sQ_rope=sQ_rope,
+                        sKC=sKC,
+                        sKC_rope=sKC_rope,
+                    )
+                    mma_pv_params = SimpleNamespace(
+                        p_mma_pipeline=p_mma_pipeline,
+                        mma_o_pipeline=mma_o_pipeline,
+                        sP=sP,
+                        sVC=sVC,
+                    )
+                    (
+                        tiled_mma_qk,
+                        tiled_mma_pv,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        load_v_consumer_state,
+                        mma_s_producer_state,
+                        p_mma_consumer_state,
+                        mma_o_producer_state,
+                    ) = self.mma(
+                        mma_common_params,
+                        mma_qk_params,
+                        mma_pv_params,
+                        k_tile_count,
+                        tiled_mma_qk,
+                        tiled_mma_pv,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        load_v_consumer_state,
+                        mma_s_producer_state,
+                        p_mma_consumer_state,
+                        mma_o_producer_state,
+                    )
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+
+            mma_s_pipeline.producer_tail(mma_s_producer_state)
+            mma_o_pipeline.producer_tail(mma_o_producer_state)
+
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Compute warp
+        # ///////////////////////////////////////////////////////////////////////////////
+        if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
+            cute.arch.setmaxregister_increase(self.softmax_reg_num)
+            # The scales are read by the warps that use them only: a warp
+            # whose register count drops (setmaxnreg) first waits for its
+            # outstanding loads.
+            softmax_scale_log2 = softmax_scale[0] * LOG2_E
+            mma_s_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.mma_s_stage
+            )
+            p_mma_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.p_mma_stage
+            )
+            p_cor_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.p_cor_stage
+            )
+            mma_o_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.mma_o_stage
+            )
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            tile_sched = self._make_tile_scheduler(tile_sched_params, tile_table, cache_seqs)
+            work_tile = tile_sched.initial_work_tile_info()
+            while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs
+                )
+                if k_tile_count > 0:
+                    compute_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        split_kv=split_kv,
+                        local_split_kv=local_split_kv,
+                        smem_exchange=softmax_smem_exchange,
+                        mAccO=mAccO,
+                        mO=mO,
+                        K=cache_seqs[blk_coord[2]],
+                        k_tile_total=self._work_k_total(work_tile, cache_seqs),
+                        kv_bounds=kv_bounds,
+                        L=mCL.shape[1],
+                        tmem_ptr=tmem_ptr,
+                        tidx=tidx,
+                        p_cor_pipeline=p_cor_pipeline,
+                    )
+                    compute_softmax_params = SimpleNamespace(
+                        tiled_mma_qk=tiled_mma_qk,
+                        sP=sP,
+                        mma_s_pipeline=mma_s_pipeline,
+                        p_mma_pipeline=p_mma_pipeline,
+                        softmax_scale_log2=softmax_scale_log2,
+                    )
+                    mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state = self.compute(
+                        compute_common_params,
+                        compute_softmax_params,
+                        k_index=k_index,
+                        k_tile_count=k_tile_count,
+                        mma_s_consumer_state=mma_s_consumer_state,
+                        p_mma_producer_state=p_mma_producer_state,
+                        p_cor_producer_state=p_cor_producer_state,
+                    )
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+            p_cor_pipeline.producer_tail(p_cor_producer_state)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Correction warp
+        # ///////////////////////////////////////////////////////////////////////////////
+        if warp_idx >= self.correction_warp_ids[0] and warp_idx <= self.correction_warp_ids[-1]:
+            cute.arch.setmaxregister_increase(self.correction_reg_num)
+            softmax_scale_log2 = softmax_scale[0] * LOG2_E
+            output_scale_value = output_scale[0]
+            p_cor_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.p_cor_stage
+            )
+            mma_o_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.mma_o_stage
+            )
+            # sync with mma warp before retrieving tmem ptr
+            tmem.wait_for_alloc()
+
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            tile_sched = self._make_tile_scheduler(tile_sched_params, tile_table, cache_seqs)
+            if cutlass.const_expr(self.balanced_split):
+                # Mark this cluster's partial slots unused; the epilogue of
+                # each partial segment fills in its slot.
+                if is_leader_cta:
+                    if tidx % (self.num_compute_warps * self.threads_per_warp) == 0:
+                        slot_base, slot_count = tile_sched.owned_slots()
+                        for i in range(slot_count):
+                            mDesc[slot_base + i, 0] = -1
+            work_tile = tile_sched.initial_work_tile_info()
+            while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.prefetch_next_work):
+                    tile_sched.advance_to_next_work()
+                    next_work_tile = tile_sched.get_current_work()
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self._work_k_range(
+                    work_tile, split_kv, cache_seqs, block_split_kvs
+                )
+                if k_tile_count > 0:
+                    # H bounds the stored rows of this tile; with a padded
+                    # flat fold the rows from H on are M-tile padding.
+                    if cutlass.const_expr(self.flat_fold_padded):
+                        stored_rows = (
+                            self.num_heads * self.seq_len_q - blk_coord[1] * self.fold_rows
+                        )
+                    else:
+                        stored_rows = mQL.shape[0]
+                    compute_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        split_kv=split_kv,
+                        local_split_kv=local_split_kv,
+                        smem_exchange=epilogue_smem_exchange,
+                        mAccO=mAccO,
+                        mO=mO,
+                        K=cache_seqs[blk_coord[2]],
+                        L=mCL.shape[1],
+                        H=stored_rows,
+                        tmem_ptr=tmem_ptr,
+                        tidx=tidx,
+                        tiled_mma_pv=tiled_mma_pv,
+                        p_cor_pipeline=p_cor_pipeline,
+                        mma_o_pipeline=mma_o_pipeline,
+                        is_partial=self._work_is_partial(work_tile),
+                        is_leader_cta=is_leader_cta,
+                        mDesc=mDesc,
+                        k_index=k_index,
+                    )
+                    if cutlass.const_expr(self.emit_softmax_stats):
+                        compute_epilogue_params = SimpleNamespace(
+                            output_scale=output_scale_value,
+                            softmax_scale_log2=softmax_scale_log2,
+                            mAccLSE=mAccLSE,
+                            mLSE=mLSE,
+                            mSoftmaxStats=mSoftmaxStats,
+                        )
+                    else:
+                        compute_epilogue_params = SimpleNamespace(
+                            output_scale=output_scale_value,
+                            softmax_scale_log2=softmax_scale_log2,
+                            mAccLSE=mAccLSE,
+                            mLSE=mLSE,
+                        )
+                    p_cor_consumer_state, mma_o_consumer_state = self.correction(
+                        compute_common_params,
+                        compute_epilogue_params,
+                        k_tile_count=k_tile_count,
+                        p_cor_consumer_state=p_cor_consumer_state,
+                        mma_o_consumer_state=mma_o_consumer_state,
+                    )
+                if cutlass.const_expr(self.prefetch_next_work):
+                    work_tile = next_work_tile
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+
+        return
+
+    @cute.kernel
+    def reduction_kernel(
+        self,
+        mO: cute.Tensor,
+        mLSE,
+        mAccO: cute.Tensor,
+        mAccLSE: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        block_split_kvs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor] = None,
+    ):
+        """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
+        from multiple split_kv blocks into final outputs.
+
+        :param mO: Output tensor for storing final results
+        :type mO: cute.Tensor
+        :param mLSE: Log-sum-exp tensor, or the compile-time tuple
+            ``(lse, softmax_stats)`` for the Helix variant.
+        :param mAccO: Accumulated output tensor from split_kv blocks
+        :type mAccO: cute.Tensor
+        :param mAccLSE: Accumulated LSE tensor from split_kv blocks
+        :type mAccLSE: cute.Tensor
+        :param split_kv: Number of split_kv blocks
+        :type split_kv: cutlass.Int32
+        :param cache_seqs: Cache sequence lengths tensor
+        :type cache_seqs: cute.Tensor
+        :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
+        :type block_split_kvs: cute.Tensor
+        """
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats):
+            mLSE, mSoftmaxStats = mLSE
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.flat_fold_padded):
+            # Grid (H * S_q, 1, B): blockIdx.x is the global (q_tok, head) row,
+            # so no CTA lands on an M-tile padding row.
+            blk_coord = (bidx % self.fold_rows, bidx // self.fold_rows, bidz)
+        else:
+            blk_coord = (bidx, bidy, bidz)
+        local_split_kv = block_split_kvs[blk_coord[2]] if self.is_var_split_kv else split_kv
+        k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.mma_qk_tiler[1])
+        # A request without KV has no K tiles; keep the divisor nonzero.
+        k_tile_per_cta = max(cute.ceil_div(k_tile_total, local_split_kv), 1)
+        local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
+
+        # Alloc shared memory
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
+        lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
+        smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
+
+        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            # calculate the global lse and exp ^ (local_lse - global_lse)
+            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.threads_per_warp)
+
+            local_lse = cute.make_rmem_tensor(cute.make_layout(lse_per_thread), self.lse_dtype)
+            lse_max = -self.lse_dtype.inf
+            # find the max lse
+            for i in cutlass.range_constexpr(lse_per_thread):
+                split_kv_idx = tidx + i * self.threads_per_warp
+                local_lse[i] = (
+                    gLSE[split_kv_idx]
+                    if cute.elem_less(split_kv_idx, local_split_kv)
+                    else -self.lse_dtype.inf
+                )
+                # reduce the local lse
+                lse_max = cute.arch.fmax(lse_max, local_lse[i])
+            lse_max = cute.arch.warp_reduction_max(lse_max)
+            lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
+            # calculate sum_lse
+            sum_lse = 0.0
+            for i in cutlass.range_constexpr(lse_per_thread):
+                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
+            sum_lse = cute.arch.warp_reduction_sum(sum_lse)
+            # calculate the global_lse
+            global_lse = (
+                lse_max + cute.math.log2(sum_lse, fastmath=True)
+                if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse
+                else self.lse_dtype.inf
+            )
+            if tidx == 0:
+                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
+                if cutlass.const_expr(self.emit_softmax_stats):
+                    # A rank joins the CP merge only for tokens with at least
+                    # one visible local KV entry; with verify groups that is
+                    # per-token. blk_coord runs over the folded grid
+                    # (H*F, S_q/F, B): true token = chunk * F + row // H.
+                    if cutlass.const_expr(kv_bounds is not None):
+                        if cutlass.const_expr(self.fold_sq):
+                            q_tok = (blk_coord[1] * self.fold_rows + blk_coord[0]) // self.num_heads
+                        else:
+                            q_tok = blk_coord[1]
+                        has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q + q_tok] > 0
+                    else:
+                        has_local_kv = cache_seqs[blk_coord[2]] > 0
+                    if has_local_kv:
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2], 0] = (
+                            global_lse / LOG2_E
+                        )
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2], 1] = 1.0
+                    else:
+                        mSoftmaxStats[
+                            blk_coord[0], blk_coord[1], blk_coord[2], 0
+                        ] = -self.lse_dtype.inf
+                        mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2], 1] = 0.0
+            # store the scale to shared memory
+            for i in cutlass.range_constexpr(lse_per_thread):
+                split_kv_idx = tidx + i * self.threads_per_warp
+                if cute.elem_less(split_kv_idx, local_split_kv):
+                    smem_lse_scale[split_kv_idx] = cute.math.exp2(
+                        local_lse[i] - global_lse, fastmath=True
+                    )
+
+        pipeline.sync(barrier_id=4)
+
+        elements_per_thread = cute.ceil_div(
+            self.latent_dim, self.threads_per_warp * self.num_compute_warps
+        )
+        gAccO = mAccO[blk_coord[0], None, None, blk_coord[1], blk_coord[2]]
+        rAccO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread), self.acc_dtype)
+        rO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread), self.o_dtype)
+        rAccO.fill(0.0)
+        for i in range(local_split_kv):
+            for j in cutlass.range_constexpr(elements_per_thread):
+                element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+                rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+        rO.store(rAccO.load().to(self.o_dtype))
+        for j in cutlass.range_constexpr(elements_per_thread):
+            element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+            mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
+        return
+
+    @cute.kernel
+    def balanced_reduction_kernel(
+        self,
+        mO: cute.Tensor,
+        mLSE,
+        mAccO: cute.Tensor,
+        mAccLSE: cute.Tensor,
+        mDesc: cute.Tensor,
+        cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor] = None,
+    ):
+        """Combine the partials of the M tiles a balanced split cut across
+        clusters, and write the empty result of requests without KV.
+
+        4 warps per CTA; each warp combines ``BALANCED_REDUCTION_ROWS / 4``
+        rows of an M tile, loading them together. The partials of a tile are
+        the slots whose descriptor names it, combined in slot order
+        (LSE-weighted, as ``reduction_kernel``) into O, LSE and the softmax
+        stats. A request without KV gets what ``reduction_kernel`` stores for
+        it (O = 0, LSE = +inf, stats (-inf, 0)). Grid:
+
+        * ``balanced_tile_reduction``: ``(row groups, M tiles *
+          reduction_col_split)``; CTA ``(g, t * reduction_col_split + j)``
+          combines column block ``j`` of row group ``g`` of M tile ``t``
+          (nothing when a single segment covered the tile) or, for a request
+          without KV, writes its empty rows.
+        * otherwise ``(row groups, partial slots + requests / 4)``: for
+          ``y < num_slots``, the CTA combines the M tile whose first K tile
+          slot ``y`` holds; for ``y >= num_slots``, warp w checks request
+          ``4 * (y - num_slots) + w``.
+
+        :param mO: Output tensor (folded view)
+        :param mLSE: LSE tensor (folded view), or ``(lse, softmax_stats)``
+        :param mAccO: Partial O slots, (rows, slots, D, 1, 1)
+        :param mAccLSE: Partial LSE slots, (rows, slots, 1, 1)
+        :param mDesc: (M tile, first K tile) of each slot, -1 when unused
+        :param cache_seqs: Per-request KV lengths
+        :param kv_bounds: Optional per-token KV bounds (Helix verify groups)
+        """
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats):
+            mLSE, mSoftmaxStats = mLSE
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        row_group, y, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        num_slots = self.balanced_num_slots
+        num_chunks = self.num_m_chunks
+        rows = mAccO.shape[0]
+        rpw = self.BALANCED_REDUCTION_ROWS // self.num_compute_warps
+        vec = self.latent_dim // self.threads_per_warp
+        row0 = row_group * self.BALANCED_REDUCTION_ROWS + warp_idx * rpw
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate((num_slots + 1) * 4, 16)
+        # [0]: number of slots of the M tile, [1:]: the slots
+        tile_slots = cute.make_tensor(
+            cute.recast_ptr(storage, dtype=cutlass.Int32), cute.make_layout(num_slots + 1)
+        )
+
+        if cutlass.const_expr(self.balanced_tile_reduction):
+            tile = y // self.reduction_col_split
+            col = y % self.reduction_col_split
+            b = tile // num_chunks
+            c = tile % num_chunks
+            if warp_idx == 0:
+                self._gather_tile_slots(mDesc, tile, tile_slots, lane)
+            pipeline.sync(barrier_id=4)
+            if tile_slots[0] > 0:
+                self._combine_tile_rows(
+                    mO,
+                    mLSE,
+                    mSoftmaxStats,
+                    mAccO,
+                    mAccLSE,
+                    cache_seqs,
+                    kv_bounds,
+                    tile_slots,
+                    row0,
+                    b,
+                    c,
+                    lane,
+                    col,
+                )
+            elif cache_seqs[b] <= 0:
+                rZero = cute.make_rmem_tensor(
+                    cute.make_layout(vec // self.reduction_col_split), self.acc_dtype
+                )
+                rZero.fill(0.0)
+                for i in cutlass.range_constexpr(rpw):
+                    r = row0 + i
+                    if r < rows and self._is_stored_row(r, c):
+                        self._store_reduced_row(
+                            mO,
+                            mLSE,
+                            mSoftmaxStats,
+                            cache_seqs,
+                            kv_bounds,
+                            rZero,
+                            self.lse_dtype.inf,
+                            r,
+                            c,
+                            b,
+                            lane,
+                            col,
+                        )
+        else:
+            if y < num_slots:
+                tile = mDesc[y, 0]
+                if tile >= 0 and mDesc[y, 1] == 0:
+                    if warp_idx == 0:
+                        self._gather_tile_slots(mDesc, tile, tile_slots, lane)
+                    pipeline.sync(barrier_id=4)
+                    self._combine_tile_rows(
+                        mO,
+                        mLSE,
+                        mSoftmaxStats,
+                        mAccO,
+                        mAccLSE,
+                        cache_seqs,
+                        kv_bounds,
+                        tile_slots,
+                        row0,
+                        tile // num_chunks,
+                        tile % num_chunks,
+                        lane,
+                        0,
+                    )
+            else:
+                b = (y - num_slots) * self.num_compute_warps + warp_idx
+                if b < cache_seqs.shape[0]:
+                    if cache_seqs[b] <= 0:
+                        rZero = cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
+                        rZero.fill(0.0)
+                        for c in cutlass.range_constexpr(num_chunks):
+                            for i in range(self.BALANCED_REDUCTION_ROWS):
+                                r = row_group * self.BALANCED_REDUCTION_ROWS + i
+                                if r < rows and self._is_stored_row(r, c):
+                                    self._store_reduced_row(
+                                        mO,
+                                        mLSE,
+                                        mSoftmaxStats,
+                                        cache_seqs,
+                                        kv_bounds,
+                                        rZero,
+                                        self.lse_dtype.inf,
+                                        r,
+                                        c,
+                                        b,
+                                        lane,
+                                        0,
+                                    )
+
+    @cute.jit
+    def _gather_tile_slots(self, mDesc, tile, tile_slots, lane):
+        """One warp lists the partial slots of M tile ``tile`` in slot order:
+        ``tile_slots[0]`` is their count, ``tile_slots[1:]`` the slots."""
+        num_slots = self.balanced_num_slots
+        groups = ceil_div(num_slots, self.threads_per_warp)
+        # all descriptor loads first (clamped, unconditional)
+        rTile = cute.make_rmem_tensor(cute.make_layout(groups), cutlass.Int32)
+        for g in cutlass.range_constexpr(groups):
+            rTile[g] = mDesc[cutlass.min(g * self.threads_per_warp + lane, num_slots - 1), 0]
+        count = cutlass.Int32(0)
+        for g in cutlass.range_constexpr(groups):
+            q = g * self.threads_per_warp + lane
+            match = False
+            if q < num_slots:
+                match = rTile[g] == tile
+            ballot = cute.arch.vote_ballot_sync(match)
+            if match:
+                below = cute.arch.popc(ballot & cutlass.Int32(cute.arch.lanemask_lt()))
+                tile_slots[1 + count + below] = q
+            count = count + cute.arch.popc(ballot)
+        if lane == 0:
+            tile_slots[0] = count
+
+    @cute.jit
+    def _combine_tile_rows(
+        self,
+        mO,
+        mLSE,
+        mSoftmaxStats,
+        mAccO,
+        mAccLSE,
+        cache_seqs,
+        kv_bounds,
+        tile_slots,
+        row0,
+        b,
+        c,
+        lane,
+        col,
+    ):
+        """One warp combines rows ``[row0, row0 + rpw)`` of M tile (b, c),
+        column block ``col`` of ``reduction_col_split``, from the partial
+        slots listed in ``tile_slots`` and stores them.
+
+        The first ``reduction_unroll`` partials are loaded together with the
+        LSEs, before the global LSE is reduced; every element accumulates the
+        partials in slot order."""
+        rows = mAccO.shape[0]
+        rpw = self.BALANCED_REDUCTION_ROWS // self.num_compute_warps
+        vec = self.latent_dim // (self.threads_per_warp * self.reduction_col_split)
+        col_tile = col * self.threads_per_warp + lane
+        unroll = self.reduction_unroll
+        n_parts = tile_slots[0]
+        # rows past the M tile read row rows - 1 and are not stored
+        rr = cute.make_rmem_tensor(cute.make_layout(rpw), cutlass.Int32)
+        for i in cutlass.range_constexpr(rpw):
+            rr[i] = cutlass.min(row0 + i, rows - 1)
+        rLSE = cute.make_rmem_tensor(cute.make_layout(rpw), self.lse_dtype)  # codespell:ignore
+        lse_max = cute.make_rmem_tensor(cute.make_layout(rpw), self.lse_dtype)
+        sum_lse = cute.make_rmem_tensor(cute.make_layout(rpw), self.lse_dtype)
+        rPart = cute.make_rmem_tensor(cute.make_layout((vec, rpw, unroll)), self.acc_dtype)
+        rPartLSE = cute.make_rmem_tensor(cute.make_layout((rpw, unroll)), self.lse_dtype)
+        # partials in partial_dtype: loaded here, widened into rPart
+        rPartIn = rPart
+        if cutlass.const_expr(self.partial_dtype != self.acc_dtype):
+            rPartIn = cute.make_rmem_tensor(
+                cute.make_layout((vec, rpw, unroll)), self.partial_dtype
+            )
+        rLSE.fill(-self.lse_dtype.inf)  # codespell:ignore
+        if lane < n_parts:
+            q = tile_slots[1 + lane]
+            for i in cutlass.range_constexpr(rpw):
+                rLSE[i] = mAccLSE[rr[i], q, 0, 0]  # codespell:ignore
+        # O of the first partials (the global LSE does not gate the loads)
+        for u in cutlass.range_constexpr(unroll):
+            if u < n_parts:
+                q = tile_slots[1 + u]
+                for i in cutlass.range_constexpr(rpw):
+                    cute.autovec_copy(
+                        cute.local_tile(mAccO[rr[i], q, None, 0, 0], (vec,), (col_tile,)),
+                        rPartIn[None, i, u],
+                    )
+                    rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
+        # global LSE of each row: lanes take the partials (first the
+        # max, then the sum of the partials' LSEs, both lane-parallel)
+        for i in cutlass.range_constexpr(rpw):
+            lse_max[i] = rLSE[i]  # codespell:ignore
+        for j0 in range(self.threads_per_warp, n_parts, self.threads_per_warp):
+            if j0 + lane < n_parts:
+                q = tile_slots[1 + j0 + lane]
+                for i in cutlass.range_constexpr(rpw):
+                    lse_max[i] = cute.arch.fmax(lse_max[i], mAccLSE[rr[i], q, 0, 0])
+        for i in cutlass.range_constexpr(rpw):
+            m = cute.arch.warp_reduction_max(lse_max[i])
+            lse_max[i] = m if m != -self.lse_dtype.inf else 0.0
+            sum_lse[i] = cute.math.exp2(rLSE[i] - lse_max[i], fastmath=True)  # codespell:ignore
+        for j0 in range(self.threads_per_warp, n_parts, self.threads_per_warp):
+            if j0 + lane < n_parts:
+                q = tile_slots[1 + j0 + lane]
+                for i in cutlass.range_constexpr(rpw):
+                    sum_lse[i] += cute.math.exp2(
+                        mAccLSE[rr[i], q, 0, 0] - lse_max[i], fastmath=True
+                    )
+        for i in cutlass.range_constexpr(rpw):
+            sm = cute.arch.warp_reduction_sum(sum_lse[i])
+            sum_lse[i] = (
+                lse_max[i] + cute.math.log2(sm, fastmath=True)
+                if not sm == self.lse_dtype(0.0) or sm != sm
+                else self.lse_dtype.inf
+            )
+        # O: reduction_unroll partials at a time, accumulated in slot order
+        rAcc = cute.make_rmem_tensor(cute.make_layout((vec, rpw)), self.acc_dtype)
+        rAcc.fill(0.0)
+        if cutlass.const_expr(self.partial_dtype != self.acc_dtype):
+            rPart.store(rPartIn.load().to(self.acc_dtype))
+        for u in cutlass.range_constexpr(unroll):
+            if u < n_parts:
+                for i in cutlass.range_constexpr(rpw):
+                    scale = cute.math.exp2(rPartLSE[i, u] - sum_lse[i], fastmath=True)
+                    for e in cutlass.range_constexpr(vec):
+                        rAcc[e, i] += rPart[e, i, u] * scale
+        for j0 in range(unroll, n_parts, unroll):
+            for u in cutlass.range_constexpr(unroll):
+                if j0 + u < n_parts:
+                    q = tile_slots[1 + j0 + u]
+                    for i in cutlass.range_constexpr(rpw):
+                        cute.autovec_copy(
+                            cute.local_tile(mAccO[rr[i], q, None, 0, 0], (vec,), (col_tile,)),
+                            rPartIn[None, i, u],
+                        )
+                        rPartLSE[i, u] = mAccLSE[rr[i], q, 0, 0]
+            if cutlass.const_expr(self.partial_dtype != self.acc_dtype):
+                rPart.store(rPartIn.load().to(self.acc_dtype))
+            for u in cutlass.range_constexpr(unroll):
+                if j0 + u < n_parts:
+                    for i in cutlass.range_constexpr(rpw):
+                        scale = cute.math.exp2(rPartLSE[i, u] - sum_lse[i], fastmath=True)
+                        for e in cutlass.range_constexpr(vec):
+                            rAcc[e, i] += rPart[e, i, u] * scale
+        for i in cutlass.range_constexpr(rpw):
+            if row0 + i < rows and self._is_stored_row(row0 + i, c):
+                self._store_reduced_row(
+                    mO,
+                    mLSE,
+                    mSoftmaxStats,
+                    cache_seqs,
+                    kv_bounds,
+                    rAcc[None, i],
+                    sum_lse[i],
+                    row0 + i,
+                    c,
+                    b,
+                    lane,
+                    col,
+                )
+
+    def _is_stored_row(self, r, c):
+        """Whether row r of chunk c is a real (q_tok, head) row."""
+        if cutlass.const_expr(self.flat_fold_padded):
+            return c * self.fold_rows + r < self.num_heads * self.seq_len_q
+        return True
+
+    @cute.jit
+    def _store_reduced_row(
+        self, mO, mLSE, mSoftmaxStats, cache_seqs, kv_bounds, rAcc, global_lse, r, c, b, lane, col
+    ):
+        """One warp stores a combined row, column block ``col`` of
+        ``reduction_col_split``: O (``vec`` values per lane) and, from block
+        0, the LSE and, for Helix, the softmax stats (as
+        ``reduction_kernel``)."""
+        vec = self.latent_dim // (self.threads_per_warp * self.reduction_col_split)
+        rO = cute.make_rmem_tensor(cute.make_layout(vec), self.o_dtype)
+        rO.store(rAcc.load().to(self.o_dtype))
+        gO = cute.local_tile(mO[r, None, c, b], (vec,), (col * self.threads_per_warp + lane,))
+        cute.autovec_copy(rO, gO)
+        if lane == 0 and col == 0:
+            mLSE[r, c, b] = global_lse
+            if cutlass.const_expr(self.emit_softmax_stats):
+                if cutlass.const_expr(kv_bounds is not None):
+                    if cutlass.const_expr(self.fold_sq):
+                        q_tok = (c * self.fold_rows + r) // self.num_heads
+                    else:
+                        q_tok = c
+                    has_local_kv = kv_bounds[b * self.seq_len_q + q_tok] > 0
+                else:
+                    has_local_kv = cache_seqs[b] > 0
+                if has_local_kv:
+                    mSoftmaxStats[r, c, b, 0] = global_lse / LOG2_E
+                    mSoftmaxStats[r, c, b, 1] = 1.0
+                else:
+                    mSoftmaxStats[r, c, b, 0] = -self.lse_dtype.inf
+                    mSoftmaxStats[r, c, b, 1] = 0.0
+
+    @staticmethod
+    def get_split_kv(B: int, S: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int) -> int:
+        """Get the proper split_kv value for the MLA kernel based on parameters.
+
+        :param B: Batch size
+        :type B: int
+        :param S: Sequence length
+        :type S: int
+        :param K: Sequence length
+        :type K: int
+        :param mma_qk_tiler_mn: MLA tiling parameters
+        :type mma_qk_tiler_mn: tuple
+        :param max_active_blocks: Maximum number of active blocks
+        :type max_active_blocks: int
+        :return: Split_kv value
+        :rtype: int
+        """
+        max_splits = ceil_div(K, mma_qk_tiler_mn[1])
+        blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+        split_heur = min(max_splits, blocks_per_batch)
+        k_waves = ceil_div(max_splits, split_heur)
+        split_wave_aware = ceil_div(max_splits, k_waves)
+        max_split_kv = 32
+        return min(split_wave_aware, max_split_kv)
+
+    @staticmethod
+    def get_split_kv_simplified(B: int, S: int, max_active_blocks: int) -> int:
+        """Occupancy-only split_kv heuristic.
+
+        Unlike ``get_split_kv`` this does NOT depend on the KV length: it picks
+        the split count purely from how many CTA slots are free per batch entry,
+        capped at 32. The kernel's per-sequence ``get_k_tile_count`` then divides
+        each request's actual K tiles by this uniform scalar, so short sequences
+        simply leave the higher split indices empty. CUDA-graph-safe by
+        construction (B, S and ``max_active_blocks`` are all host scalars).
+
+        ``S`` is the post-fold ``seq_len_q_eff`` (= seq_len_q // fold_sq_ratio).
+        """
+        blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+        max_split_kv = 32
+        return min(blocks_per_batch, max_split_kv)
+
+    def _make_tile_scheduler(self, tile_sched_params, tile_table, cache_seqs):
+        """Work scheduler of this CTA: balanced split or (persistent) static."""
+        if cutlass.const_expr(self.balanced_split):
+            return create_mla_balanced_tile_scheduler(
+                tile_table[0],
+                tile_table[1],
+                self.balanced_num_clusters,
+                self.num_m_chunks,
+                self.balanced_slots_per_spare,
+            )
+        return create_mla_static_tile_scheduler(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+
+    def _work_k_range(self, work_tile, split_kv, cache_seqs, block_split_kvs):
+        """(k_index, k_tile_count, local split_kv) of a work tile."""
+        if cutlass.const_expr(self.balanced_split):
+            return work_tile.k_index, work_tile.k_count, cutlass.Int32(1)
+        return self.get_k_tile_count(split_kv, cache_seqs, block_split_kvs, work_tile.tile_idx)
+
+    def _work_k_total(self, work_tile, cache_seqs):
+        """K tiles of the request of a work tile (the balanced schedule
+        carries it; else from the request's KV length)."""
+        if cutlass.const_expr(self.balanced_split):
+            return work_tile.k_total
+        return cute.ceil_div(cache_seqs[work_tile.tile_idx[2]], self.mma_qk_tiler[1])
+
+    def _work_is_partial(self, work_tile):
+        """Balanced split: whether the work tile is a partial of its M tile."""
+        if cutlass.const_expr(self.balanced_split):
+            return work_tile.is_partial
+        return None
+
+    @cute.jit
+    def get_k_tile_count(
+        self,
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        block_split_kvs: cute.Tensor,
+        blk_coord: cute.Coord,
+    ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+        """Get the current k_index, k_tile_count, and local split_kv value for the MLA kernel.
+
+        :param split_kv: Split_kv value
+        :type split_kv: cutlass.Int32
+        :param cache_seqs: Cache sequence lengths tensor
+        :type cache_seqs: cute.Tensor
+        :param block_split_kvs: Per-block split_kv values tensor
+        :type block_split_kvs: cute.Tensor
+        :param blk_coord: Block coordinate
+        :type blk_coord: cute.Coord
+        :return: k_index, k_tile_count, split_kv
+        :rtype: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
+        """
+        K = cache_seqs[blk_coord[2]]
+        if cutlass.const_expr(self.is_var_split_kv):
+            split_kv = block_split_kvs[blk_coord[2]]
+
+        k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
+        k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
+        k_index = blk_coord[3] * k_tile_per_cta
+        k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
+        return k_index, k_tile_count, split_kv
+
+    @cute.jit
+    def load_tma_qk(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+        load_q_producer_state: pipeline.PipelineState | None = None,
+        load_k_producer_state: pipeline.PipelineState | None = None,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        """Load wrap to load Q/K tensors. Updates the load qk producer state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param qk_params: The qk parameters
+        :type qk_params: SimpleNamespace
+        :param k_index: The k index
+        :type k_index: cutlass.Int32
+        :param k_tile_count: The k tile count
+        :type k_tile_count: cutlass.Int32
+        :param load_q_producer_state: The load q producer state
+        :type load_q_producer_state: pipeline.PipelineState
+        :param load_k_producer_state: The load k producer state
+        :type load_k_producer_state: pipeline.PipelineState
+
+        :return: The load q producer state and load k producer state
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
+        """
+        # page table
+        mPT = common_params.mPT[None, common_params.blk_coord[2]]
+
+        # Flatten divide and partition global tensors for QK TMA load
+        # (bM, bK, rM, rK, rL)
+        mma_qk_tiler_mk = cute.select(self.mma_qk_tiler, mode=[0, 2])
+        gQL = cute.flat_divide(qk_params.mQL, mma_qk_tiler_mk)
+        mma_qk_tiler_mk_rope = cute.select(self.mma_qk_rope_tiler, mode=[0, 2])
+        gQR = cute.flat_divide(qk_params.mQR, mma_qk_tiler_mk_rope)
+
+        thr_mma_qk = qk_params.tiled_mma_qk.get_slice(
+            common_params.blk_coord[0] % cute.size(qk_params.tiled_mma_qk.thr_id)
+        )
+        tSgQL = thr_mma_qk.partition_A(gQL)
+        tSgQR = thr_mma_qk.partition_A(gQR)
+
+        cta_m = min(
+            qk_params.tiled_mma_qk.op.shape_mnk[0] // qk_params.tiled_mma_qk.thr_id.shape,
+            self.page_size,
+        )
+        page_tile_size = min(self.page_size, cta_m)
+        gCL = cute.tiled_divide(qk_params.mCL, (page_tile_size, self.mma_qk_tiler[2]))
+        tSgCL = (
+            gCL[
+                None,
+                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
+                None,
+                None,
+            ]
+            if cta_m < self.page_size
+            else gCL[None, 0, None, None]
+        )
+        gKR = cute.tiled_divide(qk_params.mKR, (page_tile_size, self.mma_qk_rope_tiler[2]))
+        tSgKR = (
+            gKR[
+                None,
+                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
+                None,
+                None,
+            ]
+            if cta_m < self.page_size
+            else gKR[None, 0, None, None]
+        )
+        # tma partition for q, k latent/rope
+
+        # smem: ((atom_v, rest_v), STAGE)
+        # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
+        tQsQ, tQLgQL_mkl = cpasync.tma_partition(
+            qk_params.tma_atom_q_latent,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(qk_params.sQ, 0, 3),
+            cute.group_modes(tSgQL, 0, 3),
+        )
+
+        tQsQ_rope, tQRgQR_mkl = cpasync.tma_partition(
+            qk_params.tma_atom_q_rope,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(qk_params.sQ_rope, 0, 3),
+            cute.group_modes(tSgQR, 0, 3),
+        )
+        tKCsKC, tCLgCL = cpasync.tma_partition(
+            qk_params.tma_atom_c_latent,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC,
+            tSgCL,
+        )
+
+        tKCsKC_rope, tKRgKR = cpasync.tma_partition(
+            qk_params.tma_atom_c_rope,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC_rope,
+            tSgKR,
+        )
+
+        if cutlass.const_expr(self.flat_fold_padded):
+            # Q view [H*S_q, D, 1, B]: chunk c is M tile c of the row mode.
+            tQLgQL = tQLgQL_mkl[None, None, None, 0, common_params.blk_coord[2]]
+            tQRgQR = tQRgQR_mkl[None, None, None, 0, common_params.blk_coord[2]]
+            q_m_tile = common_params.blk_coord[1]
+        else:
+            tQLgQL = tQLgQL_mkl[
+                None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
+            ]
+            tQRgQR = tQRgQR_mkl[
+                None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
+            ]
+            q_m_tile = 0
+
+        # set extra params
+        common_params.mPT = mPT
+        qk_params.tQLgQL = tQLgQL
+        qk_params.tQRgQR = tQRgQR
+        qk_params.q_m_tile = q_m_tile
+        qk_params.tCLgCL = tCLgCL
+        qk_params.tKRgKR = tKRgKR
+        qk_params.tQsQ = tQsQ
+        qk_params.tQsQ_rope = tQsQ_rope
+        qk_params.tKCsKC = tKCsKC
+        qk_params.tKCsKC_rope = tKCsKC_rope
+
+        k_tile_count_init = k_tile_count
+        while k_tile_count > 0:
+            load_q_producer_state, load_k_producer_state = self.load_tma_qk_one_k_tile(
+                common_params,
+                qk_params,
+                k_index,
+                k_tile_count,
+                load_q_producer_state,
+                load_k_producer_state,
+                load_q=k_tile_count_init == k_tile_count,
+            )
+            k_index += 1
+            k_tile_count -= 1
+
+        return load_q_producer_state, load_k_producer_state
+
+    @cute.jit
+    def load_tma_v(
+        self,
+        common_params: SimpleNamespace,
+        v_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+        load_v_producer_state: pipeline.PipelineState,
+    ) -> pipeline.PipelineState:
+        """Load wrap to load V tensors. Updates the load v producer state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param v_params: The v parameters
+        :type v_params: SimpleNamespace
+        :param k_index: The k index
+        :type k_index: cutlass.Int32
+        :param k_tile_count: The k tile count
+        :type k_tile_count: cutlass.Int32
+        :param load_v_producer_state: The load v producer state
+        :type load_v_producer_state: pipeline.PipelineState
+
+        :return: The load v producer state
+        :rtype: pipeline.PipelineState
+        """
+        # page table
+        mPT = common_params.mPT[None, common_params.blk_coord[2]]
+
+        # Flatten divide and partition global tensors for V TMA load
+        page_tile_size = min(self.page_size, self.mma_pv_tiler[2])
+        gCLT = cute.flat_divide(v_params.mCLT, (self.mma_pv_tiler[1], page_tile_size))
+        cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
+        gCLT = cute.logical_divide(gCLT, (cta_n,))[
+            (None, common_params.blk_coord[0]), None, None, None, None
+        ]
+        tOgCLT = cute.tiled_divide(gCLT, (cta_n, page_tile_size))
+        tOgCLT = tOgCLT[None, 0, 0, None, None, None]
+        # tma partition for vc
+        # smem: ((atom_v, rest_v), STAGE)
+        # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
+        tVCsVC, tCLTgCLT = cpasync.tma_partition(
+            v_params.tma_atom_c_latent_transpose,
+            0,
+            cute.make_layout(1),
+            v_params.sVC,
+            tOgCLT,
+        )
+
+        # set extra params
+        common_params.mPT = mPT
+        v_params.tCLTgCLT = tCLTgCLT
+        v_params.tVCsVC = tVCsVC
+
+        while k_tile_count > 0:
+            load_v_producer_state = self.load_tma_v_one_k_tile(
+                common_params,
+                v_params,
+                k_index,
+                load_v_producer_state,
+            )
+            k_index += 1
+            k_tile_count -= 1
+        return load_v_producer_state
+
+    @cute.jit
+    def load_tma_qk_one_k_tile(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+        load_q_producer_state: pipeline.PipelineState,
+        load_k_producer_state: pipeline.PipelineState,
+        load_q: bool,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        """Load one k-tile of Q/C latent/rope tensors. Updates the load qkv producer state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param qk_params: The qk parameters
+        :type qk_params: SimpleNamespace
+        :param k_index: The k index
+        :type k_index: cutlass.Int32
+        :param k_tile_count: The k tile count
+        :type k_tile_count: cutlass.Int32
+        :param load_q_producer_state: The load q producer state
+        :type load_q_producer_state: pipeline.PipelineState
+        :param load_k_producer_state: The load kv producer state
+        :type load_k_producer_state: pipeline.PipelineState
+        :param load_q: Whether to load q
+        :type load_q: bool
+
+        :return: The load q producer state and load kv producer state
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
+        """
+        page_per_tile = ceil_div(
+            self.mma_qk_tiler[1] // self.page_size, qk_params.tiled_mma_qk.thr_id.shape
+        )
+        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
+        for i in cutlass.range_constexpr(page_per_tile):
+            k_idx[i] = (
+                common_params.mPT[k_index]
+                if self.mma_qk_tiler[1] // self.page_size == 1
+                else common_params.mPT[
+                    (k_index * qk_params.tiled_mma_qk.thr_id.shape + common_params.blk_coord[0])
+                    * page_per_tile
+                    + i
+                ]
+            )
+        # load q once at first iteration
+        load_q_pipeline = common_params.load_q_pipeline
+        if load_q:
+            # get the mbar ptr from pipeline.
+            tma_bar_ptr = load_q_pipeline.producer_get_barrier(load_q_producer_state)
+            # expect the extra bytes for q.
+            load_q_pipeline.producer_acquire(load_q_producer_state)
+            for i in cutlass.range_constexpr(self.iterations_qk_latent):
+                # load q latent
+                cute.copy(
+                    qk_params.tma_atom_q_latent,
+                    qk_params.tQLgQL[None, qk_params.q_m_tile, i],
+                    qk_params.tQsQ[None, (i, 0)],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
+            for i in cutlass.range_constexpr(self.iterations_qk_rope):
+                # load q rope
+                cute.copy(
+                    qk_params.tma_atom_q_rope,
+                    qk_params.tQRgQR[None, qk_params.q_m_tile, i],
+                    qk_params.tQsQ_rope[None, i],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
+            load_q_producer_state.advance()
+        # get the mbar ptr from pipeline.
+        tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(load_k_producer_state)
+        common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
+        k_policy = {}
+        if cutlass.const_expr(self.k_evict_first):
+            k_policy = {"cache_policy": cutlass.Int64(_EVICT_FIRST)}
+        for i in range(self.iterations_qk_latent):
+            for k in range(page_per_tile):
+                # load k latent
+                cute.copy(
+                    qk_params.tma_atom_c_latent,
+                    qk_params.tCLgCL[None, i, k_idx[k]],
+                    qk_params.tKCsKC[None, k, 0, (i, load_k_producer_state.index)],
+                    tma_bar_ptr=tma_bar_ptr,
+                    **k_policy,
+                )
+
+        for i in cutlass.range_constexpr(self.iterations_qk_rope):
+            for k in cutlass.range_constexpr(page_per_tile):
+                # load k rope
+                cute.copy(
+                    qk_params.tma_atom_c_rope,
+                    qk_params.tKRgKR[None, i, k_idx[k]],
+                    qk_params.tKCsKC_rope[None, k, 0, load_k_producer_state.index],
+                    tma_bar_ptr=tma_bar_ptr,
+                    **k_policy,
+                )
+        load_k_producer_state.advance()
+
+        return load_q_producer_state, load_k_producer_state
+
+    @cute.jit
+    def load_tma_v_one_k_tile(
+        self,
+        common_params: SimpleNamespace,
+        v_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        load_v_producer_state: pipeline.PipelineState,
+    ) -> pipeline.PipelineState:
+        """Load one k-tile of compressed latent transpose tensor(v). Updates the load qkv producer state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param v_params: The load tma v parameters
+        :type v_params: SimpleNamespace
+        :param k_index: The k index
+        :type k_index: cutlass.Int32
+        :param load_v_producer_state: The load v producer state
+        :type load_v_producer_state: pipeline.PipelineState
+
+        :return: The load qkv producer state
+        :rtype: pipeline.PipelineState
+        """
+        page_per_tile = self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size
+        page_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
+        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
+        for i in cutlass.range_constexpr(page_per_tile):
+            k_idx[i] = (
+                common_params.mPT[k_index]
+                if page_per_tile == 1
+                else common_params.mPT[k_index * page_per_tile + i]
+            )
+        # get the mbar ptr from pipeline.
+        tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(load_v_producer_state)
+        common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
+        v_policy = {}
+        if cutlass.const_expr(self.v_evict_first):
+            v_policy = {"cache_policy": cutlass.Int64(_EVICT_FIRST)}
+        for j in cutlass.range_constexpr(self.iterations_pv_n):
+            for i in cutlass.range_constexpr(self.iterations_pv_k):
+                if cutlass.const_expr(page_per_tile > 1):
+                    for k in cutlass.range_constexpr(page_per_subtile):
+                        k_idx_i = k_idx[k + i * page_per_subtile]
+                        cute.copy(
+                            v_params.tma_atom_c_latent_transpose,
+                            v_params.tCLTgCLT[None, j, 0, k_idx_i],
+                            v_params.tVCsVC[None, 0, k, ((j, i), load_v_producer_state.index)],
+                            tma_bar_ptr=tma_bar_ptr,
+                            **v_policy,
+                        )
+                else:
+                    cute.copy(
+                        v_params.tma_atom_c_latent_transpose,
+                        v_params.tCLTgCLT[None, j, i, k_idx[0]],
+                        v_params.tVCsVC[None, 0, 0, ((j, i), load_v_producer_state.index)],
+                        tma_bar_ptr=tma_bar_ptr,
+                        **v_policy,
+                    )
+        load_v_producer_state.advance()
+        return load_v_producer_state
+
+    @cute.jit
+    def mma(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        pv_params: SimpleNamespace,
+        k_tile_count: cutlass.Int32,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        load_q_consumer_state: pipeline.PipelineState,
+        load_k_consumer_state: pipeline.PipelineState,
+        load_v_consumer_state: pipeline.PipelineState,
+        mma_s_producer_state: pipeline.PipelineState,
+        p_mma_consumer_state: pipeline.PipelineState,
+        mma_o_producer_state: pipeline.PipelineState,
+    ) -> tuple[
+        cute.TiledMma,
+        cute.TiledMma,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+    ]:
+        """MMA warp to compute the result of Q*K^T and P*V. Updates the tiled mma and pipeline states.
+
+        :param common_params: The common parameters for mma qk and pv
+        :type common_params: SimpleNamespace
+        :param qk_params: The mma qk parameters
+        :type qk_params: SimpleNamespace
+        :param pv_params: The mma pv parameters
+        :type pv_params: SimpleNamespace
+        :param k_tile_count: The k tile count
+        :type k_tile_count: cutlass.Int32
+        :param tiled_mma_qk: The tiled mma qk
+        :type tiled_mma_qk: cute.TiledMma
+        :param tiled_mma_pv: The tiled mma pv
+        :type tiled_mma_pv: cute.TiledMma
+        :param load_q_consumer_state: The load q consumer state
+        :type load_q_consumer_state: pipeline.PipelineState
+        :param load_k_consumer_state: The load k consumer state
+        :type load_k_consumer_state: pipeline.PipelineState
+        :param load_v_consumer_state: The load v consumer state
+        :type load_v_consumer_state: pipeline.PipelineState
+        :param mma_s_producer_state: The mma s producer state
+        :type mma_s_producer_state: pipeline.PipelineState
+        :param p_mma_consumer_state: The p mma consumer state
+        :type p_mma_consumer_state: pipeline.PipelineState
+        :param mma_o_producer_state: The mma o producer state
+        :type mma_o_producer_state: pipeline.PipelineState
+
+        :return: The tiled mma qk, the tiled mma pv, the load q consumer state, the load k consumer state, the load v
+            consumer state, the mma s producer state, the p mma consumer state, and the mma o producer state
+        :rtype: tuple[cute.TiledMma, cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState,
+            pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        """
+
+        tSrQ = tiled_mma_qk.make_fragment_A(qk_params.sQ)
+        tSrQ_rope = tiled_mma_qk.make_fragment_A(qk_params.sQ_rope)
+        tSrKC = tiled_mma_qk.make_fragment_B(qk_params.sKC)
+        tSrKC_rope = tiled_mma_qk.make_fragment_B(qk_params.sKC_rope)
+        tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
+        tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
+
+        tStS_shape = tiled_mma_qk.partition_shape_C(cute.select(self.mma_qk_tiler, mode=[0, 1]))
+        tStS_staged_fake = tiled_mma_qk.make_fragment_C(cute.append(tStS_shape, self.mma_s_stage))
+        # use real tmem ptr for tStS
+        tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
+        tOtO_shape = tiled_mma_pv.partition_shape_C(cute.select(self.mma_pv_tiler, mode=[0, 1]))
+        # mma O has 1 stage.
+        tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
+        tOtO_layout = cute.append(
+            tOtO.layout,
+            cute.make_layout(
+                common_params.L // self.mma_pv_tiler[1],
+                stride=self.mma_pv_tiler[1] // self.warps_in_n,
+            ),
+        )
+        tOtO_staged = cute.make_tensor(tStS_staged.iterator + self.tmem_o_offset, tOtO_layout)
+
+        # set more parameters
+        qk_params.tSrQ = tSrQ
+        qk_params.tSrQ_rope = tSrQ_rope
+        qk_params.tSrKC = tSrKC
+        qk_params.tSrKC_rope = tSrKC_rope
+        qk_params.tStS_staged = tStS_staged
+        pv_params.tOrP = tOrP
+        pv_params.tOrVC = tOrVC
+        pv_params.tOtO_staged = tOtO_staged
+
+        # mma O accumulates on K, so the accumulate flag is set to False once before all K blocks.
+        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
+        load_q_pipeline = common_params.load_q_pipeline
+        if common_params.is_leader_cta:
+            load_q_release_state = load_q_consumer_state.clone()
+            (
+                tiled_mma_qk,
+                load_q_consumer_state,
+                load_k_consumer_state,
+                mma_s_producer_state,
+            ) = self.mma_qk(
+                common_params,
+                qk_params,
+                tiled_mma_qk,
+                load_q_consumer_state,
+                load_k_consumer_state,
+                mma_s_producer_state,
+                wait_q=True,
+            )
+            k_tile_count -= 1
+            # Q*K^T runs mma_lookahead K tiles ahead of P*V.
+            pending_pv = cutlass.Int32(1)
+            for _ in cutlass.range_constexpr(self.mma_lookahead - 1):
+                if k_tile_count > 0:
+                    (
+                        tiled_mma_qk,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        mma_s_producer_state,
+                    ) = self.mma_qk(
+                        common_params,
+                        qk_params,
+                        tiled_mma_qk,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        mma_s_producer_state,
+                        wait_q=False,
+                    )
+                    k_tile_count -= 1
+                    pending_pv += 1
+
+            # Q is released once the segment's last Q*K^T is issued (the
+            # release completes with it), so the next segment's Q loads while
+            # the remaining P*V run.
+            if k_tile_count == 0:
+                load_q_pipeline.consumer_release(load_q_release_state)
+            while k_tile_count > 0:
+                (
+                    tiled_mma_qk,
+                    load_q_consumer_state,
+                    load_k_consumer_state,
+                    mma_s_producer_state,
+                ) = self.mma_qk(
+                    common_params,
+                    qk_params,
+                    tiled_mma_qk,
+                    load_q_consumer_state,
+                    load_k_consumer_state,
+                    mma_s_producer_state,
+                    wait_q=False,
+                )
+                k_tile_count -= 1
+                if k_tile_count == 0:
+                    load_q_pipeline.consumer_release(load_q_release_state)
+                (
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                ) = self.mma_pv(
+                    common_params,
+                    pv_params,
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                )
+            load_q_release_state.advance()
+            while pending_pv > 0:
+                (
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                ) = self.mma_pv(
+                    common_params,
+                    pv_params,
+                    tiled_mma_pv,
+                    load_v_consumer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                )
+                pending_pv -= 1
+
+        return (
+            tiled_mma_qk,
+            tiled_mma_pv,
+            load_q_consumer_state,
+            load_k_consumer_state,
+            load_v_consumer_state,
+            mma_s_producer_state,
+            p_mma_consumer_state,
+            mma_o_producer_state,
+        )
+
+    @cute.jit
+    def mma_qk(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        tiled_mma_qk: cute.TiledMma,
+        load_q_consumer_state: pipeline.PipelineState,
+        load_k_consumer_state: pipeline.PipelineState,
+        mma_s_producer_state: pipeline.PipelineState,
+        wait_q: bool,
+    ) -> tuple[
+        cute.TiledMma,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+    ]:
+        """Compute one k-tile of mma for Q*K^T. Updates the tiled MMA QK and pipeline states.
+
+        :param qk_params: The qk parameters
+        :type qk_params: SimpleNamespace
+        :param tiled_mma_qk: The tiled mma qk
+        :type tiled_mma_qk: cute.TiledMma
+        :param load_q_consumer_state: The load q consumer state
+        :type load_q_consumer_state: pipeline.PipelineState
+        :param load_k_consumer_state: The load k consumer state
+        :type load_k_consumer_state: pipeline.PipelineState
+        :param mma_s_producer_state: The mma s producer state
+        :type mma_s_producer_state: pipeline.PipelineState
+
+        :return: The tiled mma qk, the load q consumer state, the load k consumer state, and the mma s producer state
+        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        """
+        tStS = qk_params.tStS_staged[None, None, None, mma_s_producer_state.index]
+
+        qk_params.mma_s_pipeline.producer_acquire(mma_s_producer_state)
+        tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, False)
+        load_q_pipeline = common_params.load_q_pipeline
+        load_k_pipeline = common_params.load_k_pipeline
+        if cutlass.const_expr(wait_q):
+            load_q_pipeline.consumer_wait(load_q_consumer_state)
+        load_k_pipeline.consumer_wait(load_k_consumer_state)
+        for q_stage in range(self.iterations_qk_latent):
+            kc_stage = load_k_consumer_state.index
+            for k_block in cutlass.range_constexpr(cute.size(qk_params.tSrQ.shape[2])):
+                cute.gemm(
+                    tiled_mma_qk,
+                    tStS,
+                    qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
+                    qk_params.tSrKC[None, None, k_block, (q_stage, kc_stage)],
+                    tStS,
+                )
+                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+
+        for q_stage in range(self.iterations_qk_rope):
+            kc_stage = load_k_consumer_state.index
+            for k_block in cutlass.range_constexpr(self.rope_dim // tiled_mma_qk.shape_mnk[2]):
+                cute.gemm(
+                    tiled_mma_qk,
+                    tStS,
+                    qk_params.tSrQ_rope[None, None, k_block, q_stage],
+                    qk_params.tSrKC_rope[None, None, k_block, kc_stage],
+                    tStS,
+                )
+                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+        load_k_pipeline.consumer_release(load_k_consumer_state)
+        load_k_consumer_state.advance()
+        if cutlass.const_expr(wait_q):
+            load_q_consumer_state.advance()
+
+        qk_params.mma_s_pipeline.producer_commit(mma_s_producer_state)
+        mma_s_producer_state.advance()
+        return (
+            tiled_mma_qk,
+            load_q_consumer_state,
+            load_k_consumer_state,
+            mma_s_producer_state,
+        )
+
+    @cute.jit
+    def mma_pv(
+        self,
+        common_params: SimpleNamespace,
+        pv_params: SimpleNamespace,
+        tiled_mma_pv: cute.TiledMma,
+        load_v_consumer_state: pipeline.PipelineState,
+        p_mma_consumer_state: pipeline.PipelineState,
+        mma_o_producer_state: pipeline.PipelineState,
+    ) -> tuple[
+        cute.TiledMma,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+    ]:
+        """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline states.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param pv_params: The pv parameters
+        :type pv_params: SimpleNamespace
+        :param tiled_mma_pv: The tiled mma pv
+        :type tiled_mma_pv: cute.TiledMma
+        :param load_v_consumer_state: The load v consumer state
+        :type load_v_consumer_state: pipeline.PipelineState
+        :param p_mma_consumer_state: The P MMA consumer state
+        :type p_mma_consumer_state: pipeline.PipelineState
+        :param mma_o_producer_state: The MMA o producer state
+        :type mma_o_producer_state: pipeline.PipelineState
+
+        :return: The tiled mma pv, the load v consumer state, the P MMA consumer state, and the MMA o producer state
+        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        """
+
+        pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
+        load_v_pipeline = common_params.load_v_pipeline
+        accumulate_flag = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
+        mma_o_pipeline = pv_params.mma_o_pipeline
+
+        load_v_pipeline.consumer_wait(load_v_consumer_state)
+        vc_stage = load_v_consumer_state.index
+        for acc_stage in range(self.iterations_pv_n):
+            mma_o_pipeline.producer_acquire(mma_o_producer_state)
+            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
+            for p_stage in range(self.iterations_pv_k):
+                tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
+                for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
+                    cute.gemm(
+                        tiled_mma_pv,
+                        tOtO,
+                        pv_params.tOrP[
+                            None,
+                            None,
+                            k_block,
+                            (p_stage, p_mma_consumer_state.index),
+                        ],
+                        pv_params.tOrVC[None, None, k_block, ((acc_stage, p_stage), vc_stage)],
+                        tOtO,
+                    )
+                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+
+            mma_o_pipeline.producer_commit(mma_o_producer_state)
+            mma_o_producer_state.advance()
+        load_v_pipeline.consumer_release(load_v_consumer_state)
+        load_v_consumer_state.advance()
+        pv_params.p_mma_pipeline.consumer_release(p_mma_consumer_state)
+        p_mma_consumer_state.advance()
+
+        return (
+            tiled_mma_pv,
+            load_v_consumer_state,
+            p_mma_consumer_state,
+            mma_o_producer_state,
+        )
+
+    @cute.jit
+    def compute(
+        self,
+        common_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+        mma_s_consumer_state: pipeline.PipelineState,
+        p_mma_producer_state: pipeline.PipelineState,
+        p_cor_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
+        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param softmax_params: The softmax parameters
+        :type softmax_params: SimpleNamespace
+        :param k_index: The index of the k-tile
+        :type k_index: cutlass.Int32
+        :param k_tile_count: The number of k-tiles
+        :type k_tile_count: cutlass.Int32
+        :param mma_s_consumer_state: The MMA s consumer state
+        :type mma_s_consumer_state: pipeline.PipelineState
+        :param p_mma_producer_state: The P MMA producer state
+        :type p_mma_producer_state: pipeline.PipelineState
+        :param p_cor_producer_state: The P correction producer state
+        :type p_cor_producer_state: pipeline.PipelineState
+
+        :return: The MMA s consumer state, the P MMA producer state, and the P correction producer state
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        """
+
+        k_tile_total = common_params.k_tile_total
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            # The KV bound of this thread's S row (one row per thread), read
+            # once per segment ahead of the masked tiles.
+            common_params.row_k_bound = common_params.kv_bounds[
+                common_params.blk_coord[2] * self.seq_len_q
+                + self._row_q_token(common_params, softmax_params)
+            ]
+
+        row_max = -self.acc_dtype.inf
+        row_sum = self.acc_dtype(0)
+        correction_factor = self.acc_dtype(1)
+        common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
+
+        # Number of tiles from the global-K end that may contain causal-masked
+        # positions. Min k_bound = K - (S_q-1), which can span up to
+        # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
+        # S_q=1 this reduces to 1 tile -- identical to a plain K-bound check.
+        tile_n = self.mma_qk_tiler[1]
+        # With helix per-token bounds the minimum bound is K - S_q (a rank
+        # owning none of the group's tokens), one position deeper than the
+        # causal minimum, so widen the masked span by one.
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+        else:
+            mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
+
+        # first_mask_tile_idx is the global index of the first tile that may
+        # need masking. Runtime because it depends on K (per-batch in
+        # var-seq / split-KV).
+        first_mask_tile_idx = k_tile_total - mask_tile_count
+
+        # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
+        while k_tile_count > 1 and k_index < first_mask_tile_idx:
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                False,
+                False,
+            )
+            k_index = k_index + 1
+            k_tile_count = k_tile_count - 1
+
+        # Phase 2: intermediate tiles that overlap the causal/K-bound region
+        # but are not this work-split's final tile.
+        while k_tile_count > 1:
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                True,
+                False,
+            )
+            k_index = k_index + 1
+            k_tile_count = k_tile_count - 1
+
+        # Phase 3: this work-split's final tile.
+        if cutlass.const_expr(common_params.mAccO is not None):
+            # Split-KV: only apply mask when this final tile is globally in
+            # the mask region (covers both last-split last-tile and straddling
+            # splits). Runtime comparison.
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                k_index >= first_mask_tile_idx,
+                True,
+            )
+        else:
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                True,
+                True,
+            )
+
+        return mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state
+
+    @cute.jit
+    def correction(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        k_tile_count: cutlass.Int32,
+        p_cor_consumer_state: pipeline.PipelineState,
+        mma_o_consumer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param epilogue_params: The epilogue parameters
+        :type epilogue_params: SimpleNamespace
+        :param k_index: The index of the k-tile
+        :type k_index: cutlass.Int32
+        :param k_tile_count: The number of k-tiles
+        :type k_tile_count: cutlass.Int32
+        :param p_cor_consumer_state: The P correction consumer state
+        :type p_cor_consumer_state: pipeline.PipelineState
+        :param mma_o_consumer_state: The MMA o consumer state
+        :type mma_o_consumer_state: pipeline.PipelineState
+
+        :return: The P correction consumer state, and the MMA o consumer state
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
+        """
+
+        k_tile_count_init = k_tile_count
+        while k_tile_count > 0:
+            p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction = (
+                self.get_correction_factor(common_params, p_cor_consumer_state)
+            )
+            if k_tile_count_init != k_tile_count:
+                mma_o_consumer_state = self.rescale(
+                    common_params,
+                    mma_o_consumer_state,
+                    correction_factor,
+                    no_correction,
+                )
+            k_tile_count = k_tile_count - 1
+            if k_tile_count == 0:
+                mma_o_consumer_state = self.epilogue(
+                    common_params,
+                    epilogue_params,
+                    mma_o_consumer_state,
+                    row_sum,
+                    row_max,
+                )
+        return p_cor_consumer_state, mma_o_consumer_state
+
+    @cute.jit
+    def exchange_p_cor_metadata(
+        self,
+        common_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        correction_factor: cutlass.Float32,
+        row_sum: cutlass.Float32,
+        row_max: cutlass.Float32,
+        row_max_new: cutlass.Float32,
+        tAcc: cute.Tensor,
+        tidx: cutlass.Int32,
+        p_cor_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, cutlass.Float32]:
+        """Compute the correction factor for the last k tile."""
+        no_correction = 0
+        if (
+            row_max_new - row_max
+        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+            no_correction = 1
+            row_max_new = row_max
+
+        # pad for 4x32b
+        corr_layout = cute.make_layout(
+            (tAcc.shape[0], (4, tAcc.shape[1][1]), self.mma_s_stage),
+            stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
+        )
+        tCor = cute.make_tensor(
+            common_params.tmem_ptr + self.correction_factor_offset,
+            corr_layout,
+        )
+        cCor = cute.make_identity_tensor(tCor.shape)
+        corr_tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
+        )
+        corr_tmem_store_tiled_copy = tcgen05.make_tmem_copy(corr_tmem_store_atom, tCor)
+        corr_tmem_store_thr_copy = corr_tmem_store_tiled_copy.get_slice(tidx)
+        cCor_for_copy = corr_tmem_store_thr_copy.partition_S(cCor)
+        tCor_for_copy = corr_tmem_store_thr_copy.partition_D(tCor)
+        rCor = cute.make_fragment_like(cCor_for_copy[None, None, None, 0], self.acc_dtype)
+        rCor_int = cute.make_tensor(
+            cute.recast_ptr(rCor.iterator, dtype=cutlass.Int32), rCor.layout
+        )
+        rCor[0] = row_sum
+        rCor[1] = row_max_new
+        rCor[2] = correction_factor
+        rCor_int[3] = no_correction
+
+        cute.copy(
+            corr_tmem_store_tiled_copy,
+            rCor,
+            tCor_for_copy[None, None, None, p_cor_producer_state.index],
+        )
+        # fence between tmem store and correction warp
+        cute.arch.fence_view_async_tmem_store()
+        common_params.p_cor_pipeline.producer_commit(p_cor_producer_state)
+        p_cor_producer_state.advance()
+        return p_cor_producer_state, row_max_new
+
+    @cute.jit
+    def softmax(
+        self,
+        common_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        mma_s_consumer_state: pipeline.PipelineState,
+        p_mma_producer_state: pipeline.PipelineState,
+        p_cor_producer_state: pipeline.PipelineState,
+        row_max: cutlass.Float32,
+        row_sum: cutlass.Float32,
+        correction_factor: cutlass.Float32,
+        apply_mask: bool,
+        is_local_last_tile: cutlass.Boolean,
+    ) -> tuple[
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        pipeline.PipelineState,
+        cutlass.Float32,
+        cutlass.Float32,
+        cutlass.Float32,
+    ]:
+        """Softmax for one k-tile. Updates the related pipeline states and returns the computed results.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param softmax_params: The softmax parameters
+        :type softmax_params: SimpleNamespace
+        :param k_index: The index of the k-tile
+        :type k_index: cutlass.Int32
+        :param mma_s_consumer_state: The MMA s consumer state
+        :type mma_s_consumer_state: pipeline.PipelineState
+        :param p_mma_producer_state: The P MMA producer state
+        :type p_mma_producer_state: pipeline.PipelineState
+        :param p_cor_producer_state: The P correction producer state
+        :type p_cor_producer_state: pipeline.PipelineState
+        :param row_max: The row max
+        :type row_max: cutlass.Float32
+        :param row_sum: The row sum
+        :type row_sum: cutlass.Float32
+        :param correction_factor: The correction factor
+        :type correction_factor: cutlass.Float32
+        :param apply_mask: Whether the tile needs K-bound / causal masking (Python bool
+            for the unmasked/masked bulk loops; runtime cutlass.Boolean for the
+            split-KV final iter where mask only applies on the global last tile).
+        :type apply_mask: bool | cutlass.Boolean
+        :param is_local_last_tile: Whether the last tile is local
+        :type is_local_last_tile: cutlass.Boolean
+
+        :return: The MMA s consumer state, the P MMA producer state, the P correction producer state, the row max, the
+            row sum, and the correction factor
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32,
+            cutlass.Float32, cutlass.Float32]
+        """
+
+        # With fewer P stages than K tiles in flight, the stage is acquired
+        # just before P is written.
+        late_p_acquire = self.p_mma_stage < self.mma_lookahead + 1
+        if cutlass.const_expr(not late_p_acquire):
+            softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
+        softmax_params.mma_s_pipeline.consumer_wait(mma_s_consumer_state)
+
+        # load S from tmem
+        tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
+            cute.select(self.mma_qk_tiler, mode=[0, 1])
+        )
+        tStS_staged_fake = softmax_params.tiled_mma_qk.make_fragment_C(
+            cute.append(tStS_shape, self.mma_s_stage)
+        )
+        tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
+        tStS = tStS_staged[None, None, None, mma_s_consumer_state.index]
+
+        tAcc = tStS[(None, None), 0, 0]
+        cta_qk_tiler = (
+            self.mma_qk_tiler[0] // self.cluster_shape_mnk[0],
+            self.mma_qk_tiler[1],
+            self.mma_qk_tiler[2],
+        )
+        cS = cute.make_identity_tensor(cute.select(cta_qk_tiler, mode=[0, 1]))
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+        )
+        tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
+
+        tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+
+        tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
+        tTR_tAcc = tmem_thr_copy.partition_S(tAcc)
+        tTR_tS = tmem_thr_copy.partition_D(cS)
+
+        tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
+
+        row_max_new = row_max
+        # Spec-decoding (MTP) causal mask: each row represents one (q_token, head)
+        # pair; row r's effective K bound is K - (S_q - 1 - q_tok(r)).
+        # With fold factor F = self.fold_sq_ratio (fold_sq=True), the M tile is
+        # laid out as [F sub_q_tok][num_heads heads] and there are S_q/F outer
+        # chunks indexed by blk_coord[1]:
+        #   q_tok(r) = blk_coord[1] * F + (r_global // num_heads)
+        # r_global = row_in_cta + cluster_idx * (M_tile / cluster_m)
+        # When fold_sq=False this reduces to q_tok = blk_coord[1]. For S_q=1
+        # this further reduces to k_bound = K (plain K-bound check).
+        # Masked positions are filled with a large negative sentinel (not -inf)
+        # to avoid NaN propagation when an entire row becomes masked.
+        cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
+            cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
+            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                if apply_mask:
+                    if cutlass.const_expr(self.fold_sq):
+                        # == chunk * F + row // H for an integer fold
+                        q_tok = (
+                            common_params.blk_coord[1] * self.fold_rows
+                            + tTR_tS[i][0]
+                            + common_params.blk_coord[0] * cta_m_rows
+                        ) // self.num_heads
+                    else:
+                        q_tok = common_params.blk_coord[1]
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Per-token rank-local bound (compute reads it for
+                        # the thread's row); subsumes the causal offset and
+                        # non-owner ranks.
+                        k_bound = common_params.row_k_bound
+                    else:
+                        if cutlass.const_expr(self.flat_fold_padded):
+                            # Padding rows past H * S_q derive q_tok >= S_q;
+                            # clamp so they never see columns >= K.
+                            q_tok = (
+                                q_tok
+                                if cute.elem_less(q_tok, self.seq_len_q)
+                                else self.seq_len_q - 1
+                            )
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    tTR_rAcc[i] = (
+                        tTR_rAcc[i]
+                        if cute.elem_less(
+                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                            k_bound,
+                        )
+                        else self.acc_dtype(-1.0e6)
+                    )
+            # reduction for row_max
+            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
+        elif cutlass.const_expr(
+            (arch >= Arch.sm_101 and arch <= Arch.sm_101f)
+            or (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
+            # {$nv-internal-release begin}
+            or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)
+            # {$nv-internal-release end}
+            or (arch >= Arch.sm_110 and arch <= Arch.sm_110f)
+        ):
+            tmem_load_red_atom = cute.make_copy_atom(
+                tcgen05.copy.LdRed32x32bOp(
+                    tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
+                ),
+                self.acc_dtype,
+            )
+            tmem_red_tiled_copy = tcgen05.make_tmem_copy(tmem_load_red_atom, tAcc)
+            tmem_red_thr_copy = tmem_red_tiled_copy.get_slice(tidx)
+            tTR_tAcc_red = tmem_red_thr_copy.partition_S(tAcc)
+            tTR_tS_red = tmem_red_thr_copy.partition_D(cS)
+            tTR_rAcc_red = cute.make_fragment_like(tTR_tS_red, self.acc_dtype)
+            tTR_rMax = cute.make_rmem_tensor(
+                cute.make_layout((1, tTR_tS_red.shape[1], tTR_tS_red.shape[2])),
+                self.acc_dtype,
+            )
+            cute.copy(
+                tmem_red_tiled_copy,
+                tTR_tAcc_red,
+                (tTR_rAcc_red, tTR_rMax),
+            )
+            tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
+            if apply_mask:
+                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                    if cutlass.const_expr(self.fold_sq):
+                        # == chunk * F + row // H for an integer fold
+                        q_tok = (
+                            common_params.blk_coord[1] * self.fold_rows
+                            + tTR_tS[i][0]
+                            + common_params.blk_coord[0] * cta_m_rows
+                        ) // self.num_heads
+                    else:
+                        q_tok = common_params.blk_coord[1]
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Per-token rank-local bound (compute reads it for
+                        # the thread's row); subsumes the causal offset and
+                        # non-owner ranks.
+                        k_bound = common_params.row_k_bound
+                    else:
+                        if cutlass.const_expr(self.flat_fold_padded):
+                            # Padding rows past H * S_q derive q_tok >= S_q;
+                            # clamp so they never see columns >= K.
+                            q_tok = (
+                                q_tok
+                                if cute.elem_less(q_tok, self.seq_len_q)
+                                else self.seq_len_q - 1
+                            )
+                        k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    tTR_rAcc[i] = (
+                        tTR_rAcc[i]
+                        if cute.elem_less(
+                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                            k_bound,
+                        )
+                        else self.acc_dtype(-1.0e6)
+                    )
+                # reduction for row_max after manual masking
+                row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
+            else:
+                row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
+
+        # if warps in N is 2, reduce row_max across warps (0, 1) and (2, 3)
+        if cutlass.const_expr(self.warps_in_n == 2):
+            common_params.smem_exchange[tidx] = row_max_new
+            self.softmax_exchange_sync_bar.wait()
+            row_max_new = cute.arch.fmax(
+                row_max_new,
+                common_params.smem_exchange[
+                    (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
+                ],
+            )
+
+        if cutlass.const_expr(self.skip_correction_threshold > 0.0):
+            # Keep the running max while this tile raises it by at most
+            # 2**threshold: P stays below 2**threshold and O, row_sum need no
+            # rescale (correction factor 1).
+            if (
+                row_max_new - row_max
+            ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+                row_max_new = row_max
+        # find correction factor
+        correction_factor = cute.math.exp2(
+            (row_max - row_max_new) * softmax_params.softmax_scale_log2, fastmath=True
+        )
+        # split kv case
+        if cutlass.const_expr(not is_local_last_tile):
+            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+                common_params,
+                softmax_params,
+                correction_factor,
+                row_sum,
+                row_max,
+                row_max_new,
+                tAcc,
+                tidx,
+                p_cor_producer_state,
+            )
+
+        # softmax
+        fma_b = softmax_params.softmax_scale_log2
+        fma_c = (0.0 - row_max_new) * softmax_params.softmax_scale_log2
+        if cutlass.const_expr(self.flat_fold_padded):
+            # M-tile padding rows (never stored): P = 0, so with their
+            # zero-filled Q both GEMMs multiply zeros there (less power).
+            pad_row = (
+                common_params.blk_coord[1] * self.fold_rows
+                + tTR_tS[0][0]
+                + common_params.blk_coord[0] * cta_m_rows
+            )
+            if pad_row >= self.num_heads * self.seq_len_q:
+                fma_c = -self.acc_dtype.inf
+
+        for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
+            tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
+            tTR_rAcc[i] = cute.math.exp2(tTR_rAcc[i], fastmath=True)
+
+        tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
+
+        # quantize
+        tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
+
+        if cutlass.const_expr(late_p_acquire):
+            softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
+        # create sP
+        sP = softmax_params.sP[None, None, None, (None, p_mma_producer_state.index)]
+        sP_mk_view = cute.make_tensor(
+            sP.iterator,
+            cute.make_layout(
+                (
+                    (sP.shape[0][0], sP.shape[1]),
+                    (sP.shape[0][1], sP.shape[2], sP.shape[3]),
+                ),
+                stride=(
+                    (sP.stride[0][0], sP.stride[1]),
+                    (sP.stride[0][1], sP.stride[2], sP.stride[3]),
+                ),
+            ),
+        )
+        # change to PISL
+        sP_wo_swizzle_iter = cute.recast_ptr(sP.iterator, swizzle_=None)
+        swizzle_bits = int(math.log2(self.mma_pv_tiler[2] * self.q_dtype.width // 8 // 32)) + 1
+        swizzle_base = 3 if self.q_dtype.width == 16 else 4
+        sP_swizzle = cute.make_swizzle(swizzle_bits, swizzle_base, 3)
+        sP_mk_view = cute.make_tensor(
+            sP_wo_swizzle_iter,
+            cute.make_composed_layout(sP_swizzle, 0, sP_mk_view.layout),
+        )
+        universal_copy_bits = 128
+        smem_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.q_dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        smem_tiled_copy = cute.make_tiled_copy_D(smem_copy_atom, tmem_tiled_copy)
+        smem_thr_copy = smem_tiled_copy.get_slice(tidx)
+        rP_copy_view = smem_thr_copy.retile(tTR_rS)
+        sP_copy_view = smem_thr_copy.partition_D(sP_mk_view)
+        cute.copy(smem_tiled_copy, rP_copy_view, sP_copy_view)
+
+        # fence between smem store and mma o
+        cute.arch.fence_view_async_shared()
+        softmax_params.p_mma_pipeline.producer_commit(p_mma_producer_state)
+        p_mma_producer_state.advance()
+
+        # row_sum, using `add_packed_f32x2` to reduce the number of instructions
+        row_sum = row_sum * correction_factor
+        row_sum_vec = (0.0, 0.0)
+        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+            row_sum_vec = cute.arch.add_packed_f32x2(row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1]))
+        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
+
+        # split kv case
+        if cutlass.const_expr(is_local_last_tile):
+            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+                common_params,
+                softmax_params,
+                correction_factor,
+                row_sum,
+                row_max,
+                row_max_new,
+                tAcc,
+                tidx,
+                p_cor_producer_state,
+            )
+
+        # store correction factor/row_sum/row_max to tmem for correction warp
+        common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
+
+        # fence between tmem load and mma s
+        cute.arch.fence_view_async_tmem_load()
+
+        softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
+        mma_s_consumer_state.advance()
+
+        return (
+            mma_s_consumer_state,
+            p_mma_producer_state,
+            p_cor_producer_state,
+            row_max_new,
+            row_sum,
+            correction_factor,
+        )
+
+    @cute.jit
+    def _row_q_token(
+        self, common_params: SimpleNamespace, softmax_params: SimpleNamespace
+    ) -> cutlass.Int32:
+        """Query token of this softmax thread's S row (the TMEM lane it
+        loads), clamped to seq_len_q - 1 for M-tile padding rows."""
+        tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
+            cute.select(self.mma_qk_tiler, mode=[0, 1])
+        )
+        tStS_fake = softmax_params.tiled_mma_qk.make_fragment_C(
+            cute.append(tStS_shape, self.mma_s_stage)
+        )
+        tStS = cute.make_tensor(common_params.tmem_ptr, tStS_fake.layout)[None, None, None, 0]
+        tAcc = tStS[(None, None), 0, 0]
+        cS = cute.make_identity_tensor(
+            (self.mma_qk_tiler[0] // self.cluster_shape_mnk[0], self.mma_qk_tiler[1])
+        )
+        tmem_tiled_copy = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            ),
+            tAcc,
+        )
+        tTR_tS = tmem_tiled_copy.get_slice(
+            common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+        ).partition_D(cS)
+        cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
+        if cutlass.const_expr(self.fold_sq):
+            q_tok = (
+                common_params.blk_coord[1] * self.fold_rows
+                + tTR_tS[0][0]
+                + common_params.blk_coord[0] * cta_m_rows
+            ) // self.num_heads
+        else:
+            q_tok = common_params.blk_coord[1]
+        return q_tok if cute.elem_less(q_tok, self.seq_len_q) else self.seq_len_q - 1
+
+    @cute.jit
+    def _o_gmem_tile(self, common_params: SimpleNamespace, iter_n: int, target: cutlass.Constexpr):
+        """(64-row x N) CTA tile of the O target and its coordinates."""
+        cta_pv_tiler_mn = (
+            self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
+            self.mma_pv_tiler[1],
+        )
+        blk_coord = common_params.blk_coord
+        if cutlass.const_expr(target == "final"):
+            mTarget = common_params.mO
+            coord = (blk_coord[0], iter_n, blk_coord[1], blk_coord[2])
+        elif cutlass.const_expr(target == "split"):
+            mTarget = common_params.mAccO[None, blk_coord[3], None, None, None]
+            coord = (blk_coord[0], iter_n, blk_coord[1], blk_coord[2])
+        else:
+            # balanced partial slot: (rows, D, 1, 1)
+            mTarget = common_params.mAccO[None, blk_coord[3], None, None, None]
+            coord = (blk_coord[0], iter_n, 0, 0)
+        gO = cute.local_tile(mTarget, cta_pv_tiler_mn, coord)
+        cO = cute.local_tile(cute.make_identity_tensor(mTarget.shape), cta_pv_tiler_mn, coord)
+        return gO, cO
+
+    @cute.jit
+    def _tmem_load_partition(
+        self,
+        common_params: SimpleNamespace,
+        tiled_mma_pv: cute.TiledMma,
+        iter_n: int,
+        target: cutlass.Constexpr = None,
+    ) -> tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]:
+        """Tensor memory load partition for rescale and epilogue.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param tiled_mma_pv: The tiled mma pv
+        :type tiled_mma_pv: cute.TiledMma
+        :param iter_n: The iteration number
+        :type iter_n: int
+        :param target: O destination partitioned for the store ("final",
+            "split" or "slot"); None picks "split" with a split-KV workspace
+            and "final" otherwise.
+
+        :return: The tmem load tiled copy, the TMEM accumulator view, its
+            per-thread partition, the per-thread destination partition and its
+            coordinates, and the register fragment
+        """
+
+        tOtO_shape = tiled_mma_pv.partition_shape_C(cute.select(self.mma_pv_tiler, mode=[0, 1]))
+        tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
+        tOtO_layout = cute.append(
+            tOtO.layout,
+            cute.make_layout(
+                common_params.L // self.mma_pv_tiler[1],
+                stride=self.mma_pv_tiler[1] // self.warps_in_n,
+            ),
+        )
+        tOtO = cute.make_tensor(common_params.tmem_ptr + self.tmem_o_offset, tOtO_layout)
+        tOtO = tOtO[None, None, None, iter_n]
+
+        tAcc = tOtO[(None, None), 0, 0]
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+        )
+        tmem_load_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
+        tmem_load_thr_copy = tmem_load_tiled_copy.get_slice(
+            common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+        )
+
+        if cutlass.const_expr(target is None):
+            gO, cO = self._o_gmem_tile(
+                common_params, iter_n, "final" if common_params.mAccO is None else "split"
+            )
+        else:
+            gO, cO = self._o_gmem_tile(common_params, iter_n, target)
+        tTR_tAcc = tmem_load_thr_copy.partition_S(tAcc)
+        tTR_gO = tmem_load_thr_copy.partition_D(gO)
+        tTR_cO = tmem_load_thr_copy.partition_D(cO)
+        tTR_rAcc = cute.make_fragment_like(tTR_gO, self.acc_dtype)
+        return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc
+
+    def get_correction_factor(
+        self,
+        common_params: SimpleNamespace,
+        p_cor_consumer_state: pipeline.PipelineState,
+    ) -> tuple[
+        pipeline.PipelineState,
+        cutlass.Float32,
+        cutlass.Float32,
+        cutlass.Float32,
+        cutlass.Int32,
+    ]:
+        """Get the correction factor from the P correction consumer state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param p_cor_consumer_state: The P correction consumer state
+        :type p_cor_consumer_state: pipeline.PipelineState
+
+        :return: The P correction consumer state, the row_sum, the row_max, and the correction factor
+        :rtype: tuple[pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Int32]
+        """
+        common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
+        tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+        # load correction factor
+        _, tAcc, _, _, _, _ = self._tmem_load_partition(
+            common_params, common_params.tiled_mma_pv, 0, "final"
+        )
+        corr_layout = cute.make_layout(
+            (tAcc.shape[0], (4, tAcc.shape[1][1]), self.p_cor_stage),
+            stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
+        )
+        tCor = cute.make_tensor(common_params.tmem_ptr + self.correction_factor_offset, corr_layout)
+        cCor = cute.make_identity_tensor(tCor.shape)
+        corr_tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
+        )
+        corr_tmem_load_tiled_copy = tcgen05.make_tmem_copy(corr_tmem_load_atom, tCor)
+        corr_tmem_load_thr_copy = corr_tmem_load_tiled_copy.get_slice(tidx)
+        tCor_for_copy = corr_tmem_load_thr_copy.partition_S(tCor)
+        cCor_for_copy = corr_tmem_load_thr_copy.partition_D(cCor)
+        rCor = cute.make_fragment_like(cCor_for_copy[None, None, None, 0], self.acc_dtype)
+        rCor_int = cute.make_tensor(
+            cute.recast_ptr(rCor.iterator, dtype=cutlass.Int32), rCor.layout
+        )
+        cute.copy(
+            corr_tmem_load_tiled_copy,
+            tCor_for_copy[None, None, None, p_cor_consumer_state.index],
+            rCor,
+        )
+        row_sum = rCor[0]
+        row_max = rCor[1]
+        correction_factor = rCor[2]
+        no_correction = rCor_int[3]
+
+        common_params.p_cor_pipeline.consumer_release(p_cor_consumer_state)
+        p_cor_consumer_state.advance()
+        return p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction
+
+    @cute.jit
+    def rescale(
+        self,
+        common_params: SimpleNamespace,
+        mma_o_consumer_state: pipeline.PipelineState,
+        correction_factor: cutlass.Float32,
+        no_correction: cutlass.Int32,
+    ) -> pipeline.PipelineState:
+        """Rescale for one k-tile. Updates the related pipeline state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param mma_o_consumer_state: The mma o consumer state
+        :type mma_o_consumer_state: pipeline.PipelineState
+        :param correction_factor: The correction factor
+        :type correction_factor: cutlass.Float32
+        :param no_correction: Whether to apply correction factor
+        :type no_correction: cutlass.Int32
+
+        :return: The MMA o consumer state
+        :rtype: pipeline.PipelineState
+        """
+        skip_correction = cute.arch.vote_all_sync(no_correction == 1)
+        for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
+            common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
+            if not skip_correction:
+                # tmem load tiled copy and partition results.
+                tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
+                    self._tmem_load_partition(
+                        common_params, common_params.tiled_mma_pv, iter_n, "final"
+                    )
+                )
+
+                # tmem store tiled copy
+                tmem_store_atom = cute.make_copy_atom(
+                    tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+                )
+                tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
+
+                # load o
+                cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+                # rescale, using `mul_packed_f32x2` to reduce the number of instructions
+                for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
+                    tTR_rAcc[i] = tTR_rAcc[i] * correction_factor
+
+                # store o to tensor memory for next k tile
+                cute.copy(tmem_store_tiled_copy, tTR_rAcc, tTR_tAcc)
+
+            cute.arch.fence_view_async_tmem_store()
+            common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
+            mma_o_consumer_state.advance()
+
+        return mma_o_consumer_state
+
+    @cute.jit
+    def _store_o_and_lse(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        iter_n: int,
+        tTR_rAcc: cute.Tensor,
+        lse: cutlass.Float32,
+        target: cutlass.Constexpr,
+    ):
+        """Store one normalized O column block and (once) the rows' LSE."""
+        tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+        _, _, _, tTR_gO, tTR_cO, _ = self._tmem_load_partition(
+            common_params, common_params.tiled_mma_pv, iter_n, target
+        )
+        if cutlass.const_expr(target == "final"):
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+        elif cutlass.const_expr(target == "slot" and self.partial_dtype != self.acc_dtype):
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.partial_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.partial_dtype))
+        else:
+            tR2G_rO_src = tTR_rAcc
+        if cute.elem_less(tTR_cO[0][0], common_params.H):
+            cute.autovec_copy(
+                tR2G_rO_src,
+                tTR_gO,
+                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+            )
+
+        blk_coord = common_params.blk_coord
+        if cutlass.const_expr(target == "final"):
+            mLSE = epilogue_params.mLSE
+            lse_coord = (blk_coord[0], blk_coord[1], blk_coord[2])
+        elif cutlass.const_expr(target == "split"):
+            mLSE = epilogue_params.mAccLSE[None, blk_coord[3], None, None]
+            lse_coord = (blk_coord[0], blk_coord[1], blk_coord[2])
+        else:
+            mLSE = epilogue_params.mAccLSE[None, blk_coord[3], None, None]
+            lse_coord = (blk_coord[0], 0, 0)
+        cta_rows = self.mma_pv_tiler[0] // self.cluster_shape_mnk[0]
+        gLSE = cute.local_tile(mLSE, (cta_rows, 1, 1), lse_coord, (1, 1, 1))
+        cLSE = cute.local_tile(
+            cute.make_identity_tensor(mLSE.shape), (cta_rows, 1, 1), lse_coord, (1, 1, 1)
+        )
+        # Warps (0, 1) and (2, 3) hold the same rows; (0, 1) store them.
+        # (Tensors written under a runtime `if` are bound to locals first.)
+        mSoftmaxStats = None
+        if cutlass.const_expr(self.emit_softmax_stats and target == "final"):
+            mSoftmaxStats = epilogue_params.mSoftmaxStats
+        if cutlass.const_expr(self.warps_in_n == 2 and iter_n == 0):
+            if tidx < cta_rows and cute.elem_less(cLSE[tidx][0], common_params.H):
+                gLSE[tidx] = lse
+                if cutlass.const_expr(mSoftmaxStats is not None):
+                    head_idx = cLSE[tidx][0]
+                    mSoftmaxStats[head_idx, blk_coord[1], blk_coord[2], 0] = lse / LOG2_E
+                    mSoftmaxStats[head_idx, blk_coord[1], blk_coord[2], 1] = 1.0
+        if cutlass.const_expr(target == "slot" and iter_n == 0):
+            # Describe the partial for the reduction: (M tile, first K tile).
+            mDesc = common_params.mDesc
+            k_index = common_params.k_index
+            if common_params.is_leader_cta and tidx == 0:
+                mDesc[blk_coord[3], 0] = blk_coord[2] * self.num_m_chunks + blk_coord[1]
+                mDesc[blk_coord[3], 1] = k_index
+
+    @cute.jit
+    def epilogue(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        mma_o_consumer_state: pipeline.PipelineState,
+        row_sum: cutlass.Float32,
+        row_max: cutlass.Float32,
+    ) -> pipeline.PipelineState:
+        """Epilogue for one k-tile. Updates the related pipeline state.
+
+        :param common_params: The common parameters
+        :type common_params: SimpleNamespace
+        :param epilogue_params: The epilogue parameters
+        :type epilogue_params: SimpleNamespace
+        :param mma_o_consumer_state: The mma o consumer state
+        :type mma_o_consumer_state: pipeline.PipelineState
+        :param row_sum: The row sum
+        :type row_sum: cutlass.Float32
+        :param row_max: The row max
+        :type row_max: cutlass.Float32
+
+        :return: The MMA o consumer state
+        :rtype: pipeline.PipelineState
+        """
+
+        tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
+
+        # exchange row_sum between warps (0, 1) and (2, 3)
+        if cutlass.const_expr(self.warps_in_n == 2):
+            common_params.smem_exchange[tidx] = row_sum
+            self.epilogue_exchange_sync_bar.wait()
+            # (64, 2)
+            row_sum = (
+                row_sum
+                + common_params.smem_exchange[
+                    (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
+                ]
+            )
+        lse = cute.math.log2(row_sum, fastmath=True) + epilogue_params.softmax_scale_log2 * row_max
+        for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
+            common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
+            # tmem load tiled copy and partition results.
+            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
+                self._tmem_load_partition(
+                    common_params, common_params.tiled_mma_pv, iter_n, "final"
+                )
+            )
+
+            # load o, then hand its TMEM columns back to the MMA warp
+            cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+            cute.arch.fence_view_async_tmem_load()
+            common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
+            mma_o_consumer_state.advance()
+
+            # apply output scale and normalize by row_sum
+            for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
+                tTR_rAcc[i] = (
+                    tTR_rAcc[i] * epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)
+                )
+
+            # O goes to the final O, a uniform split-KV slice of the
+            # workspace, or (balanced split, M tile cut across clusters) the
+            # segment's partial slot.
+            if cutlass.const_expr(common_params.mAccO is None):
+                self._store_o_and_lse(
+                    common_params, epilogue_params, iter_n, tTR_rAcc, lse, "final"
+                )
+            elif cutlass.const_expr(self.balanced_split):
+                if common_params.is_partial != 0:
+                    self._store_o_and_lse(
+                        common_params, epilogue_params, iter_n, tTR_rAcc, lse, "slot"
+                    )
+                else:
+                    self._store_o_and_lse(
+                        common_params, epilogue_params, iter_n, tTR_rAcc, lse, "final"
+                    )
+            else:
+                self._store_o_and_lse(
+                    common_params, epilogue_params, iter_n, tTR_rAcc, lse, "split"
+                )
+
+        return mma_o_consumer_state
+
+    def make_and_init_load_qkv_pipeline(
+        self, load_qkv_mbar_ptr, cta_layout_vmnk, load_stages, tx_count
+    ) -> pipeline.PipelineTmaUmma:
+        """Create and initialize the tma load qkv pipeline.
+
+        :param load_qkv_mbar_ptr: The load qkv mbar pointer
+        :type load_qkv_mbar_ptr: cute.Tensor
+        :param cta_layout_vmnk: The cta layout vmnk
+        :type cta_layout_vmnk: tuple[int, int, int]
+        :param load_stages: The load stages
+        :type load_stages: list[int]
+        :param tx_count: The tx count
+        :type tx_count: int
+
+        :return: The tma load qkv pipeline
+        :rtype: pipeline.PipelineTmaUmma
+        """
+        load_qkv_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.load_tma_k_warp_id])
+        )
+        load_qkv_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.mma_warp_id])
+        )
+        return pipeline.PipelineTmaUmma.create(
+            barrier_storage=load_qkv_mbar_ptr,
+            num_stages=load_stages,
+            producer_group=load_qkv_producer_group,
+            consumer_group=load_qkv_consumer_group,
+            tx_count=tx_count,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
+        )
+
+    def make_and_init_mma_s_pipeline(
+        self, mma_s_mbar_ptr, cta_layout_vmnk
+    ) -> pipeline.PipelineUmmaAsync:
+        """Create and initialize the mma s pipeline.
+
+        :param mma_s_mbar_ptr: The mma s mbar pointer
+        :type mma_s_mbar_ptr: cute.Tensor
+        :param cta_layout_vmnk: The cta layout vmnk
+        :type cta_layout_vmnk: tuple[int, int, int]
+
+        :return: The mma s pipeline
+        :rtype: pipeline.PipelineUmmaAsync
+        """
+
+        mma_s_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.mma_warp_id])
+        )
+        consumer_thread_size = (
+            self.threads_per_warp * len(self.compute_warp_ids) * self.cluster_shape_mnk[0]
+        )
+        mma_s_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            consumer_thread_size,
+        )
+        return pipeline.PipelineUmmaAsync.create(
+            barrier_storage=mma_s_mbar_ptr,
+            num_stages=self.mma_s_stage,
+            producer_group=mma_s_producer_group,
+            consumer_group=mma_s_consumer_group,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
+        )
+
+    def make_and_init_p_mma_pipeline(
+        self, p_mma_mbar_ptr, cta_layout_vmnk
+    ) -> pipeline.PipelineAsyncUmma:
+        """Create and initialize the p mma pipeline.
+
+        :param p_mma_mbar_ptr: The p mma mbar pointer
+        :type p_mma_mbar_ptr: cute.Tensor
+        :param cta_layout_vmnk: The cta layout vmnk
+        :type cta_layout_vmnk: tuple[int, int, int]
+
+        :return: The p mma pipeline
+        :rtype: pipeline.PipelineAsyncUmma
+        """
+
+        producer_thread_size = (
+            self.threads_per_warp * len(self.compute_warp_ids) * self.cluster_shape_mnk[0]
+        )
+        p_mma_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            producer_thread_size,
+        )
+        p_mma_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.mma_warp_id])
+        )
+        return pipeline.PipelineAsyncUmma.create(
+            barrier_storage=p_mma_mbar_ptr,
+            num_stages=self.p_mma_stage,
+            producer_group=p_mma_producer_group,
+            consumer_group=p_mma_consumer_group,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
+        )
+
+    def make_and_init_p_cor_pipeline(self, p_cor_mbar_ptr) -> pipeline.PipelineAsyncUmma:
+        """Create and initialize the p correction pipeline.
+
+        :param p_cor_mbar_ptr: The p correction mbar pointer
+        :type p_cor_mbar_ptr: cute.Tensor
+
+        :return: The p correction pipeline
+        :rtype: pipeline.PipelineAsyncUmma
+        """
+
+        producer_thread_size = self.threads_per_warp * len(self.compute_warp_ids)
+        p_cor_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            producer_thread_size,
+        )
+        p_cor_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            producer_thread_size,
+        )
+        return pipeline.PipelineAsync.create(
+            barrier_storage=p_cor_mbar_ptr,
+            num_stages=self.p_cor_stage,
+            producer_group=p_cor_producer_group,
+            consumer_group=p_cor_consumer_group,
+            defer_sync=True,
+        )
+
+    def make_and_init_mma_o_pipeline(
+        self, mma_o_mbar_ptr, cta_layout_vmnk
+    ) -> pipeline.PipelineUmmaAsync:
+        """Create and initialize the mma o pipeline.
+
+        :param mma_o_mbar_ptr: The mma o mbar pointer
+        :type mma_o_mbar_ptr: cute.Tensor
+        :param cta_layout_vmnk: The cta layout vmnk
+        :type cta_layout_vmnk: tuple[int, int, int]
+
+        :return: The mma o pipeline
+        :rtype: pipeline.PipelineUmmaAsync
+        """
+
+        mma_o_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.mma_warp_id])
+        )
+        consumer_thread_size = (
+            self.threads_per_warp * len(self.compute_warp_ids) * self.cluster_shape_mnk[0]
+        )
+        mma_o_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            consumer_thread_size,
+        )
+        return pipeline.PipelineUmmaAsync.create(
+            barrier_storage=mma_o_mbar_ptr,
+            num_stages=self.mma_o_stage,
+            producer_group=mma_o_producer_group,
+            consumer_group=mma_o_consumer_group,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
+        )
+
+    @staticmethod
+    def _compute_grid(
+        o: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cluster_shape_mnk: Tuple[int, int, int],
+        max_active_clusters: int,
+        is_persistent: bool,
+    ) -> Tuple[MLAStaticTileSchedulerParams, Tuple[int, int, int]]:
+        """Compute grid shape for the output tensor C.
+
+        :param c: The output tensor C
+        :type c: cute.Tensor
+        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
+        :type cta_tile_shape_mnk: tuple[int, int, int]
+        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
+        :type cluster_shape_mn: tuple[int, int]
+
+        :return: Tile scheduler parameters and grid shape.
+        :rtype: tuple[MLAStaticTileSchedulerParams, tuple[int, int, int]]
+        """
+        o_shape = o.shape
+        tile_sched_params = create_mla_static_tile_scheduler_params(
+            is_persistent,
+            cute.size(o_shape[3]),
+            cute.size(o_shape[2]),
+            cluster_shape_mnk,
+            split_kv,
+        )
+        grid = MLAStaticTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+
+        return tile_sched_params, grid
+
+    @staticmethod
+    def compute_fold_sq_ratio(num_heads: int, seq_len_q: int, m_tile: int) -> int:
+        """Derive the seq_len_q-into-heads fold factor F.
+
+        Returns the largest integer F such that:
+          - F divides seq_len_q evenly
+          - num_heads * F <= m_tile
+          - 1 <= F <= seq_len_q
+
+        F=1 means no folding (i.e. ``fold_sq`` should be False at the caller).
+        """
+        if num_heads >= m_tile:
+            return 1
+        max_fold = min(seq_len_q, m_tile // num_heads)
+        for f in range(max_fold, 0, -1):
+            if seq_len_q % f == 0:
+                return f
+        return 1
+
+    @staticmethod
+    def get_fold_layout(num_heads: int, seq_len_q: int, m_tile: int) -> Tuple[int, int]:
+        """(rows per M tile, M tiles per request) of the fold_sq=True tiling.
+
+        The integer fold F (``compute_fold_sq_ratio``) gives num_heads * F rows
+        in seq_len_q / F tiles. When that leaves the M tile partly empty and
+        the flattened [seq_len_q][num_heads] rows fit in fewer full tiles, fold
+        them flat instead: ceil(num_heads * seq_len_q / m_tile) tiles of
+        m_tile contiguous (q_tok, head) rows, the last one ending in padding
+        rows when num_heads * seq_len_q is not a multiple of m_tile (e.g. Kimi
+        K3's H=96: S_q=4 -> 3 full tiles instead of 4, S_q=7 -> 6 tiles, the
+        last holding 32 rows, instead of 7). Every tile reads the request's
+        KV once. TRTLLM_MLA_FLAT_FOLD=0 keeps the integer fold.
+        """
+        fold = BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
+            num_heads, seq_len_q, m_tile
+        )
+        rows, chunks = num_heads * fold, seq_len_q // fold
+        if rows < m_tile and os.environ.get("TRTLLM_MLA_FLAT_FOLD", "1") != "0":
+            flat_chunks = ceil_div(num_heads * seq_len_q, m_tile)
+            if flat_chunks < chunks:
+                return m_tile, flat_chunks
+        return rows, chunks
+
+    @staticmethod
+    def get_workspace_size(
+        H: int,
+        S: int,
+        D: int,
+        B: int,
+        split_kv: int,
+        acc_dtype: Type[cutlass.Numeric],
+    ) -> int:
+        """Get the extra workspace(device memory) size for the MLA kernel when split_kv is not 1.
+
+        :param H: The height of the output tensor C
+        :type H: int
+        :param S: The sequence length of the output tensor C
+        :type S: int
+        :param D: The depth of the output tensor C
+        :type D: int
+        :param B: The batch size of the output tensor C
+        :type B: int
+        :param split_kv: The split key-value of the output tensor C
+        :type split_kv: int
+        :param acc_dtype: The data type of the output tensor C
+        :type acc_dtype: Type[cutlass.Numeric]
+
+        :return: The workspace size for the MLA kernel
+        :rtype: int
+        """
+        if split_kv == 1:
+            return 0
+        return B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
+
+    @staticmethod
+    def get_balanced_workspace_size(
+        num_heads: int,
+        seq_len_q: int,
+        D: int,
+        max_active_clusters: int,
+        acc_dtype: Type[cutlass.Numeric],
+        m_tile: int = 128,
+    ) -> int:
+        """Workspace bytes of a balanced split: per partial slot an M tile of
+        O and LSE in ``acc_dtype``, plus the slot descriptors."""
+        cls = BlackwellMultiHeadLatentAttentionForwardFP8
+        if num_heads < m_tile and seq_len_q > 1:
+            rows, chunks = cls.get_fold_layout(num_heads, seq_len_q, m_tile)
+        else:
+            rows, chunks = num_heads, seq_len_q
+        slots = MLABalancedTileScheduler.num_slots(
+            max_active_clusters, chunks, MLABalancedTileScheduler.default_slots_per_spare(chunks)
+        )
+        return rows * slots * (D + 1) * acc_dtype.width // 8 + slots * 2 * 4
+
+    @cute.jit
+    def initialize_balanced_workspace(
+        self,
+        H: cutlass.Int32,
+        D: cutlass.Int32,
+        acc_dtype: Type[cutlass.Numeric],
+        workspace: cute.Tensor,
+    ) -> tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
+        """Views of the balanced-split workspace: partial O (H, slots, D, 1,
+        1) in ``partial_dtype``, partial LSE (H, slots, 1, 1) and slot
+        descriptors (slots, 2)."""
+        slots = self.balanced_num_slots
+        align = 256 // self.q_dtype.width
+        acc_o_layout = cute.make_layout(
+            (H, slots, D, 1, 1),
+            stride=(cute.assume(D, align), cute.assume(H * D, align), 1, 0, 0),
+        )
+        acc_o = cute.make_tensor(
+            cute.recast_ptr(workspace.iterator, dtype=self.partial_dtype), acc_o_layout
+        )
+        acc_lse_layout = cute.make_layout((H, slots, 1, 1), stride=(1, H, 0, 0))
+        o_bytes = cute.cosize(acc_o_layout) * (self.partial_dtype.width // 8)
+        acc_lse = cute.make_tensor(
+            cute.recast_ptr(
+                workspace.iterator + o_bytes,
+                dtype=acc_dtype,
+            ),
+            acc_lse_layout,
+        )
+        desc = cute.make_tensor(
+            cute.recast_ptr(
+                workspace.iterator + o_bytes + cute.cosize(acc_lse_layout) * (acc_dtype.width // 8),
+                dtype=cutlass.Int32,
+            ),
+            cute.make_layout((slots, 2), stride=(2, 1)),
+        )
+        return acc_o, acc_lse, desc
+
+    @cute.jit
+    def initialize_workspace(
+        self,
+        H: cutlass.Int32,
+        D: cutlass.Int32,
+        S: cutlass.Int32,
+        B: cutlass.Int32,
+        split_kv: cutlass.Int32,
+        acc_dtype: Type[cutlass.Numeric],
+        workspace: cute.Tensor,
+    ) -> tuple[cute.Tensor, cute.Tensor]:
+        """Initialize the workspace for the MLA kernel. Construct the intermediate tensors
+        acc_o and acc_lse.
+
+        :param H: The height of the output tensor C
+        :type H: cutlass.Int32
+        :param D: The depth of the output tensor C
+        :type D: cutlass.Int32
+        :param S: The sequence length of the output tensor C
+        :type S: cutlass.Int32
+        :param B: The batch size of the output tensor C
+        :type B: cutlass.Int32
+        :param split_kv: The split key-value of the output tensor C
+        :type split_kv: cutlass.Int32
+        :param acc_dtype: The data type of the output tensor C
+        :type acc_dtype: Type[cutlass.Numeric]
+        :param workspace: The workspace tensor
+        :type workspace: cute.Tensor
+
+        :return: The output tensor C and the workspace tensor
+        :rtype: tuple[cute.Tensor, cute.Tensor]
+        """
+        acc_o, acc_lse = None, None
+        if cutlass.const_expr(workspace is not None):
+            align = 256 // self.q_dtype.width
+            acc_o_layout = cute.make_layout(
+                (H, split_kv, D, S, B),
+                stride=(
+                    cute.assume(split_kv * D, align),
+                    cute.assume(D, align),
+                    1,
+                    cute.assume(split_kv * H * D, align),
+                    cute.assume(H * split_kv * S * D, align),
+                ),
+            )
+            acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
+            acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
+            acc_lse_layout = cute.make_layout(
+                (H, split_kv, S, B),
+                stride=(split_kv, 1, H * split_kv, H * split_kv * S),
+            )
+            # Bytes first: cosize * width in bits overflows Int32 past 2**26 elements.
+            acc_lse_iter = cute.recast_ptr(
+                workspace.iterator + cute.cosize(acc_o_layout) * (acc_dtype.width // 8),
+                dtype=acc_dtype,
+            )
+            acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
+        return acc_o, acc_lse
+
+    @staticmethod
+    def can_implement(
+        B: int,
+        S: int,
+        K: int,
+        H: int,
+        L: int,
+        R: int,
+        in_dtype: Type[cutlass.Numeric],
+        out_dtype: Type[cutlass.Numeric],
+        acc_dtype: Type[cutlass.Numeric],
+        lse_dtype: Type[cutlass.Numeric],
+        mma_qk_tiler_mn: Tuple[int, int],
+        mma_pv_tiler_mn: Tuple[int, int],
+        split_kv: int,
+        is_persistent: bool,
+        is_var_seq: bool,
+        is_var_split_kv: bool,
+        page_size: int,
+    ) -> bool:
+        """Check if the MLA kernel can be implemented.
+
+        :param B: The batch size of the output tensor C
+        :type B: int
+        :param S: The sequence length of the output tensor C
+        :type S: int
+        :param K: The width of the output tensor KV
+        :type K: int
+        :param H: The number of heads of the output tensor C
+        :type H: int
+        :param L: The number of latent dimensions of the tensor KV
+        :type L: int
+        :param R: The number of rope dimensions of the tensor C_rope
+        :type R: int
+        :param in_dtype: The data type of the input tensor
+        :type in_dtype: Type[cutlass.Numeric]
+        :param out_dtype: The data type of the output tensor
+        :type out_dtype: Type[cutlass.Numeric]
+        :param acc_dtype: The data type of the accumulator
+        :type acc_dtype: Type[cutlass.Numeric]
+        :param lse_dtype: The data type of the log-sum-exp
+        :type lse_dtype: Type[cutlass.Numeric]
+        :param mma_qk_tiler_mn: The tile shape of the query-key matrix multiplication
+        :type mma_qk_tiler_mn: Tuple[int, int]
+        :param mma_pv_tiler_mn: The tile shape of the probability-value matrix multiplication
+        :type mma_pv_tiler_mn: Tuple[int, int]
+        :param split_kv: The split key-value of the output tensor C
+        :type split_kv: int
+        :param is_persistent: Whether to use persistent kernel optimization
+        :type is_persistent: bool
+        :param is_var_seq: Whether to use variable sequence length
+        :type is_var_seq: bool
+        :param is_var_split_kv: Whether to use variable split_kv
+        :type is_var_split_kv: bool
+        :param page_size: The page size of the page table
+        :type page_size: int
+
+        :return: Whether the MLA kernel can be implemented
+        :rtype: bool
+        """
+        if L != 512 or R != 64:
+            return False
+        if in_dtype not in [cutlass.Float8E4M3FN]:
+            return False
+        # The epilogue stores through ``self.o_dtype`` (= o.element_type) with a
+        # width-adaptive autovec copy, so a bf16 output is supported alongside
+        # fp8 (matches flashinfer's mla_decode_fp8 can_implement). Inputs stay
+        # fp8; only the attention output dtype is widened.
+        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
+            return False
+        if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
+            return False
+        # page size equals 1 is prohibited by tma specification, not 128B aligned.
+        if mma_qk_tiler_mn[1] % page_size != 0 or page_size == 1:
+            return False
+        if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0] or mma_qk_tiler_mn[0] != 128:
+            return False
+        if is_var_split_kv and not is_var_seq:
+            return False
+        if mma_qk_tiler_mn[0] < H:
+            return False
+        # When H < M tile, fold up to F tokens of S into H (M_eff = H*F <= M_tile).
+        # F is auto-picked as the largest divisor of S with H*F <= M_tile.
+        # F=1 always works, so any (H <= M_tile, S >= 1) is implementable.
+        if S < 1:
+            return False
+        if K <= 0:
+            return False
+
+        # The performance is not good when split_kv is not in [1, 32].
+        if split_kv < 1 or split_kv > 32:
+            return False
+
+        return True
+
+
+def run(
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_k: int,
+    num_heads: int,
+    latent_dim: int,
+    rope_dim: int,
+    in_dtype: Type[cutlass.Numeric],
+    out_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+    lse_dtype: Type[cutlass.Numeric],
+    mma_qk_tiler_mn: Tuple[int, int],
+    mma_pv_tiler_mn: Tuple[int, int],
+    split_kv: int,
+    is_persistent: bool,
+    is_var_seq: bool,
+    is_var_split_kv: bool,
+    page_size: int,
+    softmax_scale: float,
+    output_scale: float,
+    skip_correction_threshold: float,
+    tolerance: float,
+    warmup_iterations: int,
+    iterations: int,
+    skip_ref_check: bool,
+    use_cold_l2: bool,
+    **kwargs,
+):
+    """Execute Multi-Head Latent Attention (MLA) on Blackwell architecture and validate results.
+
+    This function creates random input tensors for query latent/rope, compressed latent/rope, and value,
+    then performs the complete MLA computation pipeline. It supports configurable data types, tiling parameters,
+    page table, variable sequence length, and variable split_kv. Results can be validated against a PyTorch reference
+    implementation or run multiple times for performance measurement.
+
+    :param batch_size: Batch size
+    :type batch_size: int
+    :param seq_len_q: Sequence length of Q
+    :type seq_len_q: int
+    :param seq_len_k: Sequence length of K
+    :type seq_len_k: int
+    :param num_heads: Number of heads
+    :type num_heads: int
+    :param latent_dim: dimension of query/compressed latent
+    :type latent_dim: int
+    :param rope_dim: dimension of query/compressed rope
+    :type rope_dim: int
+    :param in_dtype: Input data type for query/compressed latent/rope tensors
+    :type in_dtype: Type[cutlass.Numeric]
+    :param out_dtype: Output data type for attention output
+    :type out_dtype: Type[cutlass.Numeric]
+    :param acc_dtype: Accumulator data type for query-key matrix multiplication
+    :type acc_dtype: Type[cutlass.Numeric]
+    :param lse_dtype: Accumulator data type for log-sum-exp
+    :type lse_dtype: Type[cutlass.Numeric]
+    :param mma_qk_tiler_mn: Matrix multiply accumulate tile shape (M, N) for query-key matrix multiplication
+    :type mma_qk_tiler_mn: Tuple[int, int]
+    :param mma_pv_tiler_mn: Matrix multiply accumulate tile shape (M, N) for probability-value matrix multiplication
+    :type mma_pv_tiler_mn: Tuple[int, int]
+    :param split_kv: Split key-value
+    :type split_kv: int
+    :param is_persistent: Whether to use persistent kernel optimization
+    :type is_persistent: bool
+    :param is_var_seq: Whether to use variable sequence length
+    :type is_var_seq: bool
+    :param is_var_split_kv: Whether to use variable split_kv
+    :type is_var_split_kv: bool
+    :param page_size: Page size of the page table
+    :type page_size: int
+    :param softmax_scale: Attention score scaling factor
+    :type softmax_scale: float
+    :param output_scale: Output scaling factor
+    :type output_scale: float
+    :param skip_correction_threshold: Threshold to skip correction
+    :type skip_correction_threshold: float
+    :param tolerance: Maximum acceptable error for validation
+    :type tolerance: float
+    :param warmup_iterations: Number of warmup iterations
+    :type warmup_iterations: int
+    :param iterations: Number of iterations to run for performance testing
+    :type iterations: int
+    :param skip_ref_check: Skip validation against reference implementation
+    :type skip_ref_check: bool
+    :param use_cold_l2: Whether to use cold L2 cache
+    :type use_cold_l2: bool
+
+    :raises ValueError: If input shapes are incompatible or head dimension is unsupported
+    :raises RuntimeError: If GPU is unavailable for computation
+    """
+
+    print("Running Blackwell MLA test with:")
+    print(f"  batch_size: {batch_size}")
+    print(f"  seq_len_q: {seq_len_q}")
+    print(f"  seq_len_k: {seq_len_k}")
+    print(f"  num_heads: {num_heads}")
+    print(f"  latent_dim: {latent_dim}")
+    print(f"  rope_dim: {rope_dim}")
+    print(f"  in_dtype: {in_dtype}")
+    print(f"  out_dtype: {out_dtype}")
+    print(f"  acc_dtype: {acc_dtype}")
+    print(f"  mma_qk_tiler_mn: {mma_qk_tiler_mn}")
+    print(f"  mma_pv_tiler_mn: {mma_pv_tiler_mn}")
+    print(f"  split_kv: {split_kv}")
+    print(f"  is_persistent: {is_persistent}")
+    print(f"  is_var_seq: {is_var_seq}")
+    print(f"  is_var_split_kv: {is_var_split_kv}")
+    print(f"  page_size: {page_size}")
+    print(f"  softmax_scale: {softmax_scale}")
+    print(f"  output_scale: {output_scale}")
+    print(f"  skip_correction_threshold: {skip_correction_threshold}")
+    print(f"  tolerance: {tolerance}")
+    print(f"  warmup_iterations: {warmup_iterations}")
+    print(f"  iterations: {iterations}")
+    print(f"  skip_ref_check: {skip_ref_check}")
+    print(f"  use_cold_l2: {use_cold_l2}")
+
+    import cutlass.torch as cutlass_torch
+    import torch
+
+    # Prepare pytorch tensors: Q, K, V (random from 0 to 2) and O (all zero)
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU is required to run this example!")
+
+    if not BlackwellMultiHeadLatentAttentionForwardFP8.can_implement(
+        batch_size,
+        seq_len_q,
+        seq_len_k,
+        num_heads,
+        latent_dim,
+        rope_dim,
+        in_dtype,
+        out_dtype,
+        acc_dtype,
+        lse_dtype,
+        mma_qk_tiler_mn,
+        mma_pv_tiler_mn,
+        split_kv,
+        is_persistent,
+        is_var_seq,
+        is_var_split_kv,
+        page_size,
+    ):
+        raise TypeError(
+            f"Unsupported testcase {batch_size}, {seq_len_q}, {seq_len_k}, {num_heads}, {latent_dim}, {rope_dim}, {in_dtype}, {out_dtype}, {acc_dtype}, {lse_dtype}, {mma_qk_tiler_mn}, {mma_pv_tiler_mn}, {split_kv}, {is_persistent}, {is_var_seq}, {is_var_split_kv}, {page_size}"  # noqa: E501
+        )
+
+    torch.manual_seed(1111)
+
+    def create_data_tensor(
+        B,
+        HK,
+        D,
+        dtype,
+        is_dynamic_layout=True,
+        page_table=None,
+        cache_seqs=None,
+        is_lse=False,
+        seq_len_q=None,
+    ):
+        shape = (B, HK, D)
+        if page_table is not None:
+            if cache_seqs is not None:
+                max_seq_len = torch.max(cache_seqs)
+                shape = (B * ceil_div(max_seq_len, page_size), page_size, D)
+            else:
+                shape = (B * ceil_div(HK, page_size), page_size, D)
+
+        if seq_len_q is not None:
+            shape = (B, seq_len_q, HK, D)
+
+        permute_order = (1, 2, 0)
+        stride_order = (2, 0, 1)
+        leading_dim = 1
+        if is_lse:
+            shape = (B, seq_len_q, HK)
+            permute_order = (2, 1, 0)
+            stride_order = (2, 1, 0)
+            leading_dim = 0
+        elif seq_len_q is not None:
+            permute_order = (2, 3, 1, 0)
+            stride_order = (3, 2, 0, 1)
+            leading_dim = 1
+
+        init_config = cutlass.torch.RandomInitConfig(min_val=-2, max_val=2)
+
+        torch_dtype = cutlass_torch.dtype(dtype) if dtype != cutlass.Float8E4M3FN else torch.int8
+
+        # Create dtype torch tensor (cpu)
+        torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
+            shape,
+            torch_dtype,
+            permute_order=permute_order,
+            init_type=cutlass.torch.TensorInitType.RANDOM,
+            init_config=init_config,
+        )
+
+        # Create dtype torch tensor (gpu)
+        torch_tensor_gpu = torch_tensor_cpu.cuda()
+
+        # Create f32 torch tensor (cpu)
+        f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
+
+        # Create dtype cute tensor (gpu)
+        cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
+        cute_tensor.element_type = dtype
+        if is_dynamic_layout:
+            cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+            if not is_lse:
+                cute_tensor = cute_tensor.mark_compact_shape_dynamic(
+                    mode=leading_dim,
+                    stride_order=stride_order,
+                    divisibility=(128 // dtype.width),
+                )
+
+        cute_tensor = cutlass_torch.convert_cute_tensor(
+            f32_torch_tensor,
+            cute_tensor,
+            dtype,
+            is_dynamic_layout=is_dynamic_layout,
+        )
+
+        return f32_torch_tensor, cute_tensor, torch_tensor_gpu
+
+    def create_cache_seqs(batch_size, seq_len_k, is_var_seq):
+        cache_seqs_ref = torch.ones(batch_size, dtype=torch.int32) * seq_len_k
+        cache_seqs_gpu = cache_seqs_ref.cuda()
+        cache_seqs = from_dlpack(cache_seqs_gpu, assumed_align=16).mark_layout_dynamic()
+        if is_var_seq:
+            max_seq_len = seq_len_k
+            min_seq_len = int(seq_len_k * 0.8)
+            cache_seqs_ref = cutlass_torch.create_and_permute_torch_tensor(
+                (batch_size,),
+                torch.int32,
+                init_type=cutlass.torch.TensorInitType.RANDOM,
+                init_config=cutlass.torch.RandomInitConfig(
+                    min_val=min_seq_len, max_val=max_seq_len + 1
+                ),
+            )
+            cache_seqs_gpu = cache_seqs_ref.cuda()
+            cache_seqs = from_dlpack(
+                cache_seqs_gpu,
+                assumed_align=16,
+            ).mark_layout_dynamic()
+        return cache_seqs_ref, cache_seqs, cache_seqs_gpu
+
+    def create_page_table(batch_size, seq_len_k, is_var_seq, page_size):
+        max_seq_len = seq_len_k if not is_var_seq else torch.max(cache_seqs_ref)
+        page_count = ceil_div(max_seq_len, page_size)
+        page_table_ref = torch.empty([batch_size, page_count], dtype=torch.int32)
+        # use transposed index for page table to make sure the value is in bound of `batch_size * seq_len_block`. In
+        # practice, the value could be any positive values. This setting is only for testing purpose.
+        for b in range(batch_size):
+            for j in range(page_count):
+                page_table_ref[b, j] = b + j * batch_size
+        page_table_gpu = page_table_ref.permute(1, 0).cuda()
+        page_table = from_dlpack(page_table_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=0
+        )
+        return page_table_ref, page_table, page_table_gpu
+
+    def create_block_split_kvs(
+        batch_size,
+        split_kv,
+        cache_seqs_ref,
+        is_var_split_kv,
+        mma_qk_tiler_mn,
+        cluster_shape_mnk,
+        max_active_clusters,
+    ):
+        block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = None, None, None
+        # check if split_kv is valid otherwise do auto setting of split_kv
+        if is_var_split_kv:
+            block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
+            for b in range(batch_size):
+                block_split_kvs_ref[b] = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
+                    batch_size,
+                    seq_len_q,
+                    cache_seqs_ref[b].item(),
+                    mma_qk_tiler_mn,
+                    max_active_clusters * cluster_shape_mnk[0],
+                )
+            split_kv = torch.max(block_split_kvs_ref).item()
+            block_split_kvs_gpu = block_split_kvs_ref.cuda()
+            block_split_kvs = from_dlpack(
+                block_split_kvs_gpu, assumed_align=16
+            ).mark_layout_dynamic()
+        elif split_kv <= 0:
+            split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
+                batch_size,
+                seq_len_q,
+                cache_seqs_ref[0].item(),
+                mma_qk_tiler_mn,
+                max_active_clusters * cluster_shape_mnk[0],
+            )
+        return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
+
+    def create_workspace(num_heads, seq_len_q, latent_dim, batch_size, split_kv, acc_dtype):
+        # When folding S_q into heads, the kernel allocates the per-split
+        # workspace using the effective (folded) dims [rows, tiles] of
+        # get_fold_layout. Mirror that here so the host-allocated workspace
+        # matches: rows * tiles == H * S_q, except for a padded flat fold,
+        # whose last tile also holds padding rows.
+        fold_ratio = BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
+            num_heads, seq_len_q, mma_qk_tiler_mn[0]
+        )
+        num_heads_eff, seq_len_q_eff = num_heads, seq_len_q
+        if fold_ratio > 1:
+            num_heads_eff, seq_len_q_eff = (
+                BlackwellMultiHeadLatentAttentionForwardFP8.get_fold_layout(
+                    num_heads, seq_len_q, mma_qk_tiler_mn[0]
+                )
+            )
+        workspace_size = BlackwellMultiHeadLatentAttentionForwardFP8.get_workspace_size(
+            num_heads_eff,
+            seq_len_q_eff,
+            latent_dim,
+            batch_size,
+            split_kv,
+            acc_dtype,
+        )
+
+        workspace, workspace_torch = None, None
+        if workspace_size > 0:
+            workspace_torch = torch.empty([workspace_size], dtype=torch.int8).cuda()
+            workspace = from_dlpack(workspace_torch, assumed_align=32)
+        return workspace, workspace_torch
+
+    cache_seqs_ref, cache_seqs, cache_seqs_torch = create_cache_seqs(
+        batch_size, seq_len_k, is_var_seq
+    )
+    page_table_ref, page_table, page_table_torch = create_page_table(
+        batch_size, seq_len_k, is_var_seq, page_size
+    )
+    cluster_shape_mnk = (2, 1, 1)
+    hardware_info = utils.HardwareInfo()
+    max_active_clusters = hardware_info.get_max_active_clusters(
+        cluster_shape_mnk[0] * cluster_shape_mnk[1]
+    )
+    split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_torch = create_block_split_kvs(
+        batch_size,
+        split_kv,
+        cache_seqs_ref,
+        is_var_split_kv,
+        mma_qk_tiler_mn,
+        cluster_shape_mnk,
+        max_active_clusters,
+    )
+
+    q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
+        batch_size,
+        num_heads,
+        latent_dim,
+        in_dtype,
+        is_dynamic_layout=True,
+        seq_len_q=seq_len_q,
+    )
+    q_rope_ref, q_rope, q_rope_torch = create_data_tensor(
+        batch_size,
+        num_heads,
+        rope_dim,
+        in_dtype,
+        is_dynamic_layout=True,
+        seq_len_q=seq_len_q,
+    )
+
+    c_latent_ref, c_latent, c_latent_torch = create_data_tensor(
+        batch_size,
+        seq_len_k,
+        latent_dim,
+        in_dtype,
+        is_dynamic_layout=True,
+        page_table=page_table,
+        cache_seqs=cache_seqs_ref,
+    )
+    c_rope_ref, c_rope, c_rope_torch = create_data_tensor(
+        batch_size,
+        seq_len_k,
+        rope_dim,
+        in_dtype,
+        is_dynamic_layout=True,
+        page_table=page_table,
+        cache_seqs=cache_seqs_ref,
+    )
+    o_ref, o, o_torch = create_data_tensor(
+        batch_size,
+        num_heads,
+        latent_dim,
+        out_dtype,
+        is_dynamic_layout=True,
+        seq_len_q=seq_len_q,
+    )
+    lse_ref, lse, lse_torch = create_data_tensor(
+        batch_size,
+        num_heads,
+        1,
+        lse_dtype,
+        is_dynamic_layout=True,
+        is_lse=True,
+        seq_len_q=seq_len_q,
+    )
+    workspace, workspace_torch = create_workspace(
+        num_heads, seq_len_q, latent_dim, batch_size, split_kv, acc_dtype
+    )
+
+    # Derive the seq_len_q-into-heads fold factor. F > 1 means the kernel
+    # repacks the [H, S_q] tile to [H*F, S_q/F] internally so MTP / spec-decoding
+    # with H < 128 fully populates the 128-wide MMA-M tile.
+    fold_sq_ratio = BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
+        num_heads, seq_len_q, mma_qk_tiler_mn[0]
+    )
+    fold_sq = fold_sq_ratio > 1
+
+    mla = BlackwellMultiHeadLatentAttentionForwardFP8(
+        acc_dtype,
+        lse_dtype,
+        mma_qk_tiler_mn,
+        mma_pv_tiler_mn,
+        max_active_clusters,
+        page_size,
+        skip_correction_threshold,
+        is_persistent,
+        is_var_seq,
+        is_var_split_kv,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        fold_sq=fold_sq,
+    )
+
+    # Benchmark with CUDA graphs (opt-in via CUTEDSL_BENCH_CUDA_GRAPH=1). Graph
+    # capture removes per-launch host overhead, but cudaStreamBeginCapture is not
+    # permitted on the legacy default stream, so allocate a dedicated non-default
+    # stream and use it for compile / launch / capture alike. Off by default keeps
+    # the validated CUDA-event timing path (and its measurements) unchanged.
+    use_cuda_graphs = os.environ.get("CUTEDSL_BENCH_CUDA_GRAPH", "0") == "1"
+    if use_cuda_graphs:
+        torch_stream = torch.cuda.Stream()
+    else:
+        torch_stream = torch.cuda.current_stream()
+    # Get the raw stream pointer as a CUstream
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+
+    # compile mla kernel
+    compiled_mla = cute.compile(
+        mla,
+        q_latent,
+        q_rope,
+        c_latent,
+        c_rope,
+        page_table,
+        o,
+        lse,
+        workspace,
+        split_kv,
+        cache_seqs,
+        block_split_kvs,
+        softmax_scale,
+        output_scale,
+        stream,
+        options="--opt-level 2",
+    )
+
+    def torch_reference_mla(
+        q_latent,
+        q_rope,
+        c_latent,
+        c_rope,
+        page_table,
+        cache_seqs,
+        softmax_scale=1.0,
+        output_scale=1.0,
+        apply_mtp_mask=False,
+    ):
+        # When apply_mtp_mask is True, applies the spec-decoding (MTP) causal
+        # mask the monolithic kernel uses: for q_token qi in [0, q_len), valid
+        # KV positions are [0, seq_len - q_len + 1 + qi). For q_len == 1 this
+        # reduces to the plain K-bound check (no-op).
+        # expand and concat q_latent and q_rope to have the dimension of sequence length for q
+        q_ref = torch.cat([q_latent, q_rope], dim=1).permute(3, 2, 0, 1)
+        # expand and concat c_latent and c_rope to have the dimension of num_heads for k and v
+        page_count = page_table_ref.shape[1]
+        k_ref_paged = (
+            torch.cat([c_latent, c_rope], dim=1)
+            .permute(2, 0, 1)
+            .reshape(batch_size * page_count, page_size, latent_dim + rope_dim)
+        )
+        v_ref_paged = c_latent.permute(2, 0, 1).reshape(
+            batch_size * page_count, page_size, latent_dim
+        )
+
+        if is_var_seq:
+            max_seq_len = torch.max(cache_seqs_ref)
+        else:
+            max_seq_len = seq_len_k
+
+        k_ref = torch.zeros([batch_size, 1, max_seq_len, latent_dim + rope_dim])
+        v_ref = torch.zeros([batch_size, 1, max_seq_len, latent_dim])
+        k_ref = torch.index_select(k_ref_paged, 0, torch.flatten(page_table_ref)).reshape(
+            batch_size, 1, -1, latent_dim + rope_dim
+        )[:, :, :max_seq_len, :]
+        v_ref = torch.index_select(v_ref_paged, 0, torch.flatten(page_table_ref)).reshape(
+            batch_size, 1, -1, latent_dim
+        )[:, :, :max_seq_len, :]
+        for b in range(batch_size):
+            k_ref[b, :, cache_seqs_ref[b] :, :] = 0
+            v_ref[b, :, cache_seqs_ref[b] :, :] = 0
+        import torch.nn.functional as F
+
+        # Spec-decoding (MTP) causal mask. q_ref is [B, S_q, H, D] (the SDPA
+        # batch dims are [B, S_q]; head dim H is the query length). Row q-token
+        # qi's effective K bound is seq_len - (S_q - 1) + qi. Build an additive
+        # mask of shape [B, S_q, 1, K] that broadcasts across heads.
+        attn_mask = None
+        if apply_mtp_mask and seq_len_q > 1:
+            attn_mask = torch.zeros(
+                [batch_size, seq_len_q, 1, max_seq_len],
+                dtype=torch.float32,
+            )
+            for b in range(batch_size):
+                seq_len_b = int(cache_seqs_ref[b])
+                for qi in range(seq_len_q):
+                    upper = max(0, seq_len_b - seq_len_q + 1 + qi)
+                    if upper < max_seq_len:
+                        attn_mask[b, qi, 0, upper:] = float("-inf")
+
+        o_ref = F.scaled_dot_product_attention(
+            q_ref,
+            k_ref,
+            v_ref,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            scale=softmax_scale,
+            is_causal=False,
+        )
+        s_ref = torch.einsum("bhld,bhsd->bhls", q_ref, k_ref)
+        # Apply the same MTP mask before the LSE reduction. s_ref is
+        # [B, S_q, H, K]; attn_mask [B, S_q, 1, K] broadcasts across heads.
+        if attn_mask is not None:
+            s_ref = s_ref + attn_mask
+        s_ref_max, s_ref_max_pos = torch.max(s_ref, dim=-1, keepdim=True)
+        softmax_scale_log2 = LOG2_E * softmax_scale
+        s_ref_sum = torch.sum(
+            torch.exp2((s_ref - s_ref_max) * softmax_scale_log2), dim=-1, keepdim=True
+        )
+
+        lse_ref = s_ref_max * softmax_scale_log2 + torch.log2(s_ref_sum)
+        lse_ref = lse_ref.squeeze(3).permute(2, 1, 0)
+        o_ref = o_ref * output_scale
+        o_ref = o_ref.permute(2, 3, 1, 0)
+
+        return o_ref, lse_ref
+
+    if skip_correction_threshold > 0.0:
+        print(
+            "Skipping correction verification since skip_correction_threshold is greater than 0.0..."
+        )
+        skip_ref_check = True
+    if not skip_ref_check:
+        # Execute kernel once for reference checking
+        compiled_mla(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            workspace,
+            split_kv,
+            cache_seqs,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
+        torch.cuda.synchronize()
+
+        print("Verifying results...")
+        if in_dtype == cutlass.Float8E4M3FN:
+            tolerance = 0.13
+        o_ref, lse_ref = torch_reference_mla(
+            q_latent_ref,
+            q_rope_ref,
+            c_latent_ref,
+            c_rope_ref,
+            page_table,
+            cache_seqs,
+            softmax_scale,
+            output_scale,
+            apply_mtp_mask=True,
+        )
+
+        if out_dtype in [cutlass.Float8E5M2, cutlass.Float8E4M3FN]:
+            # convert o back to f32 for comparison
+            o_fp32, o_fp32_torch = cutlass_torch.cute_tensor_like(
+                torch.empty(*o_torch.shape, dtype=torch.float32),
+                cutlass.Float32,
+                is_dynamic_layout=True,
+                assumed_align=16,
+            )
+            cute.testing.convert(o, o_fp32)
+            o = o_fp32_torch.cpu()
+            ref_fp8, _ = cutlass_torch.cute_tensor_like(
+                torch.empty(*o_ref.permute(3, 2, 0, 1).shape, dtype=torch.uint8).permute(
+                    2, 3, 1, 0
+                ),
+                out_dtype,
+                is_dynamic_layout=True,
+                assumed_align=16,
+            )
+            o_ref_gpu = o_ref.cuda()
+            o_ref_f32 = from_dlpack(o_ref_gpu).mark_layout_dynamic(leading_dim=1)
+
+            # convert ref : f32 -> fp8 -> f32
+            cute.testing.convert(o_ref_f32, ref_fp8)
+            cute.testing.convert(ref_fp8, o_ref_f32)
+
+            o_ref = o_ref_gpu.cpu()
+        else:
+            o = o_torch.cpu().to(torch.float32)
+        lse = lse_torch.cpu()
+        lse_ref = lse_ref.to(cutlass.torch.dtype(lse_dtype))
+        # Assert close results
+        torch.testing.assert_close(o, o_ref, atol=tolerance, rtol=1e-05)
+        torch.testing.assert_close(lse, lse_ref, atol=tolerance, rtol=1e-05)
+        print("Results verified successfully!")
+
+    def generate_tensors():
+        _, cache_seqs, _ = create_cache_seqs(batch_size, seq_len_k, is_var_seq)
+        _, page_table, _ = create_page_table(batch_size, seq_len_k, is_var_seq, page_size)
+        _split_kv, _, block_split_kvs, _ = create_block_split_kvs(
+            batch_size,
+            split_kv,
+            cache_seqs_ref,
+            is_var_split_kv,
+            mma_qk_tiler_mn,
+            cluster_shape_mnk,
+            max_active_clusters,
+        )
+
+        _, q_latent, _ = create_data_tensor(
+            batch_size,
+            num_heads,
+            latent_dim,
+            in_dtype,
+            is_dynamic_layout=True,
+            seq_len_q=seq_len_q,
+        )
+        _, q_rope, _ = create_data_tensor(
+            batch_size,
+            num_heads,
+            rope_dim,
+            in_dtype,
+            is_dynamic_layout=True,
+            seq_len_q=seq_len_q,
+        )
+
+        _, c_latent, _ = create_data_tensor(
+            batch_size,
+            seq_len_k,
+            latent_dim,
+            in_dtype,
+            is_dynamic_layout=True,
+            page_table=page_table,
+            cache_seqs=cache_seqs_ref,
+        )
+        _, c_rope, _ = create_data_tensor(
+            batch_size,
+            seq_len_k,
+            rope_dim,
+            in_dtype,
+            is_dynamic_layout=True,
+            page_table=page_table,
+            cache_seqs=cache_seqs_ref,
+        )
+        _, o, _ = create_data_tensor(
+            batch_size,
+            num_heads,
+            latent_dim,
+            out_dtype,
+            is_dynamic_layout=True,
+            seq_len_q=seq_len_q,
+        )
+        _, lse, _ = create_data_tensor(
+            batch_size,
+            num_heads,
+            1,
+            lse_dtype,
+            is_dynamic_layout=True,
+            is_lse=True,
+            seq_len_q=seq_len_q,
+        )
+        workspace, workspace_torch = create_workspace(
+            num_heads, seq_len_q, latent_dim, batch_size, _split_kv, acc_dtype
+        )
+        return testing.JitArguments(
+            q_latent,
+            q_rope,
+            c_latent,
+            c_rope,
+            page_table,
+            o,
+            lse,
+            workspace,
+            _split_kv,
+            cache_seqs,
+            block_split_kvs,
+            softmax_scale,
+            output_scale,
+            stream,
+        )
+
+    workspace_count = 1
+    if use_cold_l2:
+        one_workspace_bytes = (
+            q_latent_torch.numel() * q_latent_torch.element_size()
+            + q_rope_torch.numel() * q_rope_torch.element_size()
+            + c_latent_torch.numel() * c_latent_torch.element_size()
+            + c_rope_torch.numel() * c_rope_torch.element_size()
+            + o_torch.numel() * o_torch.element_size()
+            + lse_torch.numel() * lse_torch.element_size()
+            + cache_seqs_torch.numel() * cache_seqs_torch.element_size()
+        )
+        one_workspace_bytes += page_table_torch.numel() * page_table_torch.element_size()
+        if is_var_split_kv:
+            one_workspace_bytes += (
+                block_split_kvs_torch.numel() * block_split_kvs_torch.element_size()
+            )
+        if workspace_torch is not None:
+            one_workspace_bytes += workspace_torch.numel() * workspace_torch.element_size()
+        workspace_count = testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations
+        )
+
+    avg_time_us = testing.benchmark(
+        compiled_mla,
+        workspace_generator=generate_tensors,
+        workspace_count=workspace_count,
+        stream=stream,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+        use_cuda_graphs=use_cuda_graphs,
+    )
+
+    return avg_time_us  # Return execution time in microseconds
+
+
+if __name__ == "__main__":
+
+    def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
+        try:
+            return tuple(int(x.strip()) for x in s.split(","))
+        except ValueError:
+            raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+
+    def parse_mma_tiler(s: str) -> Tuple[int, int, Tuple[int, int]]:
+        ret = parse_comma_separated_ints(s)
+        if len(ret) != 2:
+            raise argparse.ArgumentTypeError("Invalid format. Expected 2 comma-separated integers.")
+        return (ret[0], ret[1])
+
+    parser = argparse.ArgumentParser(description="Example of MLA on Blackwell.")
+
+    parser.add_argument(
+        "--in_dtype",
+        type=cutlass.dtype,
+        default=cutlass.Float8E4M3FN,
+        help="Input data type",
+    )
+
+    parser.add_argument(
+        "--out_dtype",
+        type=cutlass.dtype,
+        default=cutlass.Float8E4M3FN,
+        help="Output data type",
+    )
+
+    parser.add_argument(
+        "--acc_dtype",
+        type=cutlass.dtype,
+        default=cutlass.Float32,
+        help="Accumulator data type",
+    )
+
+    parser.add_argument(
+        "--lse_dtype",
+        type=cutlass.dtype,
+        default=cutlass.Float32,
+        help="LSE data type",
+    )
+    parser.add_argument(
+        "--mma_qk_tiler_mn",
+        type=parse_mma_tiler,
+        default=(128, 128),
+        help="MMA tile shape (H, K)",
+    )
+    parser.add_argument(
+        "--mma_pv_tiler_mn",
+        type=parse_mma_tiler,
+        default=(128, 256),
+        help="MMA tile shape (H, D)",
+    )
+
+    parser.add_argument(
+        "--is_persistent",
+        action="store_true",
+        help="Is persistent",
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size",
+    )
+
+    parser.add_argument(
+        "--seq_len_q",
+        type=int,
+        default=1,
+        help="Sequence length of Q",
+    )
+
+    parser.add_argument(
+        "--seq_len_k",
+        type=int,
+        default=128,
+        help="Sequence length of K/V",
+    )
+
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=128,
+        help="Number of heads of Q",
+    )
+
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=512,
+        help="Latent dimension of Q/C",
+    )
+
+    parser.add_argument(
+        "--rope_dim",
+        type=int,
+        default=64,
+        help="Rope dimension of Q/C",
+    )
+
+    parser.add_argument(
+        "--is_var_seq",
+        action="store_true",
+        help="Use variable length of sequence length or not",
+    )
+
+    parser.add_argument(
+        "--is_var_split_kv",
+        action="store_true",
+        help="Use variable length of split kv or not",
+    )
+
+    parser.add_argument(
+        "--page_size",
+        type=int,
+        default=128,
+        help="Page size of page table",
+    )
+
+    parser.add_argument(
+        "--split_kv",
+        type=int,
+        default=-1,
+        help="Split KV setting",
+    )
+
+    parser.add_argument(
+        "--softmax_scale",
+        type=float,
+        default=0.0416,
+        help="Scaling factor to scale softmax",
+    )
+
+    parser.add_argument(
+        "--output_scale",
+        type=float,
+        default=1.0,
+        help="Scaling factor to scale output",
+    )
+    parser.add_argument(
+        "--skip_correction_threshold",
+        type=float,
+        default=0.0,
+        help="Threshold to skip correction",
+    )
+
+    parser.add_argument("--tolerance", type=float, default=1e-02, help="Tolerance for validation")
+
+    parser.add_argument(
+        "--warmup_iterations",
+        type=int,
+        default=0,
+        help="Number of iterations for warmup",
+    )
+
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of iterations after warmup",
+    )
+
+    parser.add_argument(
+        "--skip_ref_check",
+        action="store_true",
+        help="Skip reference check",
+    )
+
+    parser.add_argument(
+        "--use_cold_l2",
+        action="store_true",
+        help="Use cold L2 cache",
+    )
+
+    args = parser.parse_args()
+
+    time_us = run(
+        args.batch_size,
+        args.seq_len_q,
+        args.seq_len_k,
+        args.num_heads,
+        args.latent_dim,
+        args.rope_dim,
+        args.in_dtype,
+        args.out_dtype,
+        args.acc_dtype,
+        args.lse_dtype,
+        args.mma_qk_tiler_mn,
+        args.mma_pv_tiler_mn,
+        args.split_kv,
+        args.is_persistent,
+        args.is_var_seq,
+        args.is_var_split_kv,
+        args.page_size,
+        args.softmax_scale,
+        args.output_scale,
+        args.skip_correction_threshold,
+        args.tolerance,
+        args.warmup_iterations,
+        args.iterations,
+        args.skip_ref_check,
+        args.use_cold_l2,
+    )
+
+    print(f"PASS, time_us: {time_us}")
