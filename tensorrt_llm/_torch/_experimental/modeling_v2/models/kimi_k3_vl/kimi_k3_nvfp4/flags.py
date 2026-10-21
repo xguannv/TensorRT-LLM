@@ -85,6 +85,11 @@ TRTLLM_K3LL_MLA_QKV_SPLIT = _flag(
     1,
     "target MLA decode: q_a prep, Q-B in 32-column slices and the absorption as three launches, not one per head",
 )
+TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
+    "TRTLLM_K3LL_KDA_BFA_OVERLAP",
+    0,
+    "KDA decode / verify: the bf16 [f_a | b] projection on the projection stream beside the FP8 QKVG projection",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,
