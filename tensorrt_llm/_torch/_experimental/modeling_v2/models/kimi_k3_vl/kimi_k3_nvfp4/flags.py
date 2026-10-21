@@ -92,7 +92,7 @@ TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
 )
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",
-    0,
+    1,
     "KDA decode / verify: the bf16 [f_a | b] projection on the projection stream beside the FP8 QKVG projection",
 )
 TRTLLM_K3LL_FP8W_LOWM = _flag(
