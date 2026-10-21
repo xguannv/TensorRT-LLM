@@ -446,6 +446,30 @@ def _dbg_check(tag, outs, refs, inputs):
         print(f"[k3dbg] {tag} bad_total={bad} this_call={d} inputs={meta}", flush=True)
 
 
+def _dbg_where(q, r1, r2, ag, ag0, h):
+    import os
+
+    if os.environ.get("K3LL_DBG_MLA_SPLIT") != "1" or torch.cuda.is_current_stream_capturing():
+        if os.environ.get("K3LL_DBG_MLA_SPLIT") == "1":
+            _DBG["captured"] = _DBG.get("captured", 0) + 1
+        return
+    n = _DBG.get("where", 0)
+    d1 = (q.view(torch.int16) != r1.view(torch.int16)).view(q.shape[0], h, 576)
+    if not d1.any() or n >= 12:
+        return
+    _DBG["where"] = n + 1
+    d12 = int((r1.view(torch.int16) != r2.view(torch.int16)).sum())
+    dq2 = int((q.view(torch.int16) != r2.view(torch.int16)).sum())
+    agd = int((ag.view(torch.int16) != ag0.view(torch.int16)).sum())
+    rows = d1.any(-1).any(-1).nonzero().flatten().tolist()
+    nope = int(d1[..., :512].sum())
+    pe = int(d1[..., 512:].sum())
+    heads = d1.any(0).any(-1).nonzero().flatten().tolist()
+    print(f"[k3dbg-where] split_vs_orig1={int(d1.sum())} (absorbed {nope}, pe {pe}) rows={rows} heads={heads} "
+          f"orig1_vs_orig2={d12} split_vs_orig2={dq2} ag_changed={agd} captured_calls={_DBG.get('captured', 0)} "
+          f"ag_rows_absmax={ag[:, :1536].float().abs().amax(1).tolist()}", flush=True)
+
+
 @torch.library.custom_op("trtllm::k3_fp8_mla_qkv", mutates_args=("pool",))
 def mla_qkv(
     ag: torch.Tensor,
@@ -552,17 +576,24 @@ def mla_project_qkv(
     query = ag.new_empty((ag.shape[0], h * 576))
     latent = ag.new_empty((ag.shape[0], 576))
     if _flags.TRTLLM_K3LL_MLA_QKV_SPLIT:
-        rq, rl = query.clone(), latent.clone()
-        _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
-            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, rl, ag, ag, rq, ag.shape[0], h, ag.stride(0),
-            qb_scale.stride(0), *kb.stride(), *kb_scale.stride(), 576, 0, 0, 1, qa_eps, kv_eps, STORE_PAGED=False,
-            QB_UE8M0=qb_ue8m0, num_warps=8,
-        )  # fmt: skip
+        def orig():
+            rq, rl = query.clone(), latent.clone()
+            _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
+                ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, rl, ag, ag, rq, ag.shape[0], h, ag.stride(0),
+                qb_scale.stride(0), *kb.stride(), *kb_scale.stride(), 576, 0, 0, 1, qa_eps, kv_eps,
+                STORE_PAGED=False, QB_UE8M0=qb_ue8m0, num_warps=8,
+            )  # fmt: skip
+            return rq, rl
+
+        ag0 = ag.clone()
+        rq1, rl1 = orig()
         _mla_qkv_split(
             ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, query, latent, ag, ag, 576, 0, 1, qa_eps,
             kv_eps, qb_ue8m0, False,
         )  # fmt: skip
-        _dbg_check("project", [query, latent], [rq, rl], [ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qb_ue8m0])
+        rq2, rl2 = orig()
+        _dbg_check("project", [query, latent], [rq1, rl1], [ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qb_ue8m0])
+        _dbg_where(query, rq1, rq2, ag, ag0, h)
         return query, latent
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
         ag,
