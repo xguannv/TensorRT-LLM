@@ -3296,6 +3296,7 @@ def k3_fp8w_lowm_gemm_sigmoid(
     w_scale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     smem_request: int = 0,
+    use_pdl: bool = True,
 ) -> torch.Tensor:
     """``torch.sigmoid(k3_fp8w_lowm_gemm(x, w, w_scale))`` in one launch, bit for bit.
 
@@ -3304,7 +3305,9 @@ def k3_fp8w_lowm_gemm_sigmoid(
     ``[M, N]``) is optional. ``smem_request`` (bytes, at most the per-block shared memory
     capacity) launches the kernel with that much dynamic shared memory where it exceeds the
     kernel's own (0: its own): the same computation, with fewer or no other CTAs sharing an SM
-    with a CTA of this launch.
+    with a CTA of this launch. ``use_pdl=False`` launches it as an ordinary kernel (no
+    programmatic dependency on the previous grid, no early release of the next): it then starts
+    only once everything it depends on has completed. The same computation.
     """
     _check_inputs(x, w, w_scale)
     m, k = x.shape
@@ -3316,7 +3319,7 @@ def k3_fp8w_lowm_gemm_sigmoid(
     elif out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n) or not out.is_contiguous():
         raise ValueError("out must be a contiguous bf16 [M, N] tensor")
     compiled = _compiled_kernel(
-        n, k, default_tactic(m, n, k), True, sigmoid=True, smem_request=smem_request
+        n, k, default_tactic(m, n, k), use_pdl, sigmoid=True, smem_request=smem_request
     )
     compiled(
         make_ptr(cutlass.Float8E4M3FN, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),

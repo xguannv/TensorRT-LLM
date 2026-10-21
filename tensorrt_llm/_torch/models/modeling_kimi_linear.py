@@ -2117,11 +2117,13 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             allow_partial_n_tile=_K3_FP8W_LOWM_FUSED_A and self.fp8w_lowm_partial_n_tile,
         )
 
-    def forward_sigmoid(self, x: torch.Tensor, smem_request: int = 0) -> torch.Tensor:
+    def forward_sigmoid(
+        self, x: torch.Tensor, smem_request: int = 0, use_pdl: bool = True
+    ) -> torch.Tensor:
         """``forward(x).sigmoid()``, bit for bit; one low-M GEMM launch with a sigmoid
         epilogue where :meth:`forward` would run the low-M GEMM. ``smem_request``: dynamic
-        shared memory of that launch where larger than the kernel's own (see
-        ``k3_fp8w_lowm_gemm_sigmoid``)."""
+        shared memory of that launch where larger than the kernel's own; ``use_pdl=False``:
+        launch it without programmatic dependent launch (see ``k3_fp8w_lowm_gemm_sigmoid``)."""
         x_flat = x.reshape(-1, x.shape[-1])
         if (
             _K3_FP8W_LOWM_GEMM
@@ -2144,7 +2146,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 self.next_output = None
                 self.next_ar_push = None
                 out = k3_fp8w_lowm_gemm.k3_fp8w_lowm_gemm_sigmoid(
-                    x_flat, self.weight, self.weight_scale, smem_request=smem_request
+                    x_flat,
+                    self.weight,
+                    self.weight_scale,
+                    smem_request=smem_request,
+                    use_pdl=use_pdl,
                 )
                 return out.reshape(x.shape[:-1] + (self.out_features,))
         return self.forward(x).sigmoid()

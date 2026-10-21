@@ -96,6 +96,16 @@ _K3_MLA_GATE_SIDE_PRIO = os.environ.get("TRTLLM_K3_MLA_GATE_SIDE_PRIO", "0") == 
 # page-table rows of the batch's KV and the KV lengths into L2 (bulk prefetches) for the decode,
 # whose first loads read them. A hint only: bit-exact.
 _K3_MLA_PT_PREFETCH = os.environ.get("TRTLLM_K3_MLA_PT_PREFETCH", "0") == "1"
+# TRTLLM_K3_MLA_GATE_PRE_DECODE=1 (with TRTLLM_K3_MLA_GATE_SIDE, TRTLLM_K3_MLA_KV_FUSED and
+# TRTLLM_K3_MLA_KV_JOIN_EARLY, so that the decode's only dependency is the q absorb): fork the
+# output-gate GEMM right before the decode is enqueued instead of before the all-to-all, and launch
+# it without programmatic dependent launch, so it starts only once the q absorb has completed. The
+# decode, launched early by the q absorb, holds every SM by then, so the gate's CTAs take the SMs
+# the decode leaves as it ends and run beside the reduction (which needs fewer CTAs than SMs)
+# instead of beside the all-to-all, where both slow down. The mask and the gate then stay on the
+# normal-priority side stream (TRTLLM_K3_MLA_GATE_SIDE_PRIO is not applied): a high-priority gate
+# could be placed ahead of decode CTAs still waiting for an SM. Scheduling only, bit-exact.
+_K3_MLA_GATE_PRE_DECODE = os.environ.get("TRTLLM_K3_MLA_GATE_PRE_DECODE", "0") == "1"
 # One side stream per device and role, shared by all MLA layers (their side work never
 # overlaps).
 _GATE_SIDE_STREAMS: dict[tuple[int, bool, str], torch.cuda.Stream] = {}
@@ -417,6 +427,9 @@ class KimiK3MLAAttention(MLA):
         self.fp8_nope_q_absorb = os.environ.get("TRTLLM_K3_MLA_FP8_Q_ABSORB", "0") == "1"
         # TRTLLM_K3_MLA_GATE_SIDE: side-stream fork / join of the zero-KV mask and the gate.
         self._gate_events = tuple(torch.cuda.Event() for _ in range(4))
+        # Set by the side-gate forward around the attention call: forks the gate GEMM right
+        # before the decode is enqueued (TRTLLM_K3_MLA_GATE_PRE_DECODE).
+        self.helix_pre_decode_fn: Optional[Callable[[], None]] = None
         # TRTLLM_K3_MLA_KV_SIDE: fork of the KV half after q_a, join before the decode.
         self._kv_events = (torch.cuda.Event(), torch.cuda.Event())
         self.helix_v_up_in_attention = _K3_MLA_FUSED_V_UP
@@ -783,6 +796,8 @@ class KimiK3MLAAttention(MLA):
             self.expert_l2_prefetch_hook(num_tokens)
         if not join_early:
             kv_ready.wait()
+        if join_early and self.helix_pre_decode_fn is not None:
+            self.helix_pre_decode_fn()
         attn_out = self._attn_forward_gen(
             self.mqa,
             fused_q.view([num_tokens, heads * (lora + rope)]),
@@ -817,8 +832,11 @@ class KimiK3MLAAttention(MLA):
         is enqueued only after the all-to-all and its combine (still depending only on the
         attention): enqueued before them, it takes the SMs the fused reduction leaves free and
         the all-to-all launches later. TRTLLM_K3_MLA_GATE_EARLY enqueues it where it is forked
-        in that case too. The main stream waits for the mask where the all-to-all reads it and
-        for the gate just before o_proj, where both are long done.
+        in that case too. With TRTLLM_K3_MLA_GATE_PRE_DECODE and the KV side path joined before
+        the q absorb, the gate is forked and enqueued right before the decode instead
+        (``helix_pre_decode_fn``), as an ordinary launch that waits for the q absorb to
+        complete. The main stream waits for the mask where the all-to-all reads it and for the
+        gate just before o_proj, where both are long done.
         """
         num_tokens = hidden_states.shape[0]
         mask_fork, mask_ready, gate_fork, gate_ready = self._gate_events
@@ -827,20 +845,21 @@ class KimiK3MLAAttention(MLA):
         if multi_stream:
             side = (
                 _gate_side_stream(hidden_states.device, high_priority=True, role="gate")
-                if _K3_MLA_GATE_SIDE_PRIO
+                if _K3_MLA_GATE_SIDE_PRIO and not _K3_MLA_GATE_PRE_DECODE
                 else _gate_side_stream(hidden_states.device)
             )
         gates = []
         mask_joined = [not multi_stream]
 
-        def gate_of(x):
+        def gate_of(x, use_pdl=True):
             forward_sigmoid = getattr(self.g_proj, "forward_sigmoid", None)
             if forward_sigmoid is not None:
+                kwargs = {} if use_pdl else {"use_pdl": False}
                 if _K3_MLA_GATE_EXCLUSIVE:
                     from ...cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
 
-                    return forward_sigmoid(x, smem_request=k3_fp8w_lowm_gemm._SMEM_CAPACITY)
-                return forward_sigmoid(x)
+                    kwargs["smem_request"] = k3_fp8w_lowm_gemm._SMEM_CAPACITY
+                return forward_sigmoid(x, **kwargs)
             return self.g_proj(x).sigmoid()
 
         if multi_stream:
@@ -860,13 +879,21 @@ class KimiK3MLAAttention(MLA):
 
         late_enqueue = [False]
 
-        def enqueue_gate():
+        def enqueue_gate(use_pdl=True):
             with torch.cuda.stream(side):
                 gate_fork.wait()
-                gates.append(gate_of(hidden_states))
+                gates.append(gate_of(hidden_states, use_pdl))
                 gate_ready.record()
 
+        def pre_decode():
+            # Called by _forward_gen_kv_side right before it enqueues the decode. Without PDL
+            # the gate's only dependency (the q absorb, through gate_fork) is a full one.
+            gate_fork.record()
+            enqueue_gate(use_pdl=False)
+
         def pre_exchange(v_up_in_attention: bool):
+            if gates:
+                return  # forked before the decode
             if multi_stream:
                 gate_fork.record()
                 if v_up_in_attention and not _K3_MLA_GATE_EARLY:
@@ -879,6 +906,7 @@ class KimiK3MLAAttention(MLA):
         attn_outputs = None
         self.helix_zero_kv_mask_fn = zero_kv_mask_fn
         self.helix_pre_exchange_fn = pre_exchange
+        self.helix_pre_decode_fn = pre_decode if multi_stream and _K3_MLA_GATE_PRE_DECODE else None
         self.defer_helix_gen_output = True
         try:
             attn_out = None
@@ -891,6 +919,7 @@ class KimiK3MLAAttention(MLA):
         finally:
             self.helix_zero_kv_mask_fn = None
             self.helix_pre_exchange_fn = None
+            self.helix_pre_decode_fn = None
             self.defer_helix_gen_output = False
             self.helix_gen_output = None
         if late_enqueue[0]:

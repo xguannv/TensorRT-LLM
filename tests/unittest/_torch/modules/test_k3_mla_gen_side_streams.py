@@ -19,9 +19,10 @@ FP8 KV cache, CuTe FP8 MLA decode, V up-projection before the all-to-all) with t
 replaced by a local stand-in, run eagerly and in CUDA graphs with multi-stream enabled. Every
 combination of ``TRTLLM_K3_MLA_GATE_SIDE``, ``TRTLLM_K3_MLA_Q_NORM_PDL``,
 ``TRTLLM_K3_MLA_KV_SIDE`` (``_PRIO``), ``TRTLLM_K3_MLA_KV_FUSED``, ``TRTLLM_K3_MLA_GATE_EARLY``,
-``TRTLLM_K3_MLA_KV_JOIN_EARLY``, ``TRTLLM_K3_MLA_GATE_EXCLUSIVE`` and ``TRTLLM_K3_MLA_GATE_SIDE_PRIO``
-must give the default path's output bit for bit; the fused KV kernel must also write the same cache
-bytes and decode buffers as the kernels it replaces.
+``TRTLLM_K3_MLA_KV_JOIN_EARLY``, ``TRTLLM_K3_MLA_GATE_EXCLUSIVE``,
+``TRTLLM_K3_MLA_GATE_SIDE_PRIO`` and ``TRTLLM_K3_MLA_GATE_PRE_DECODE`` must give the default
+path's output bit for bit; the fused KV kernel must also write the same cache bytes and decode
+buffers as the kernels it replaces.
 """
 
 import math
@@ -598,6 +599,131 @@ def test_gate_exclusive_and_side_prio_match_default(batch, monkeypatch):
             for r in replays:
                 assert torch.equal(r, ref_replays[0]), (
                     f"graph fused={fused} {cfg} {exclusive} {prio}"
+                )
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_gate_pre_decode_matches_default(batch, monkeypatch):
+    """``TRTLLM_K3_MLA_GATE_PRE_DECODE``: with the fused KV half joined before the q absorb, the
+    output-gate GEMM is enqueued right before the decode, without PDL, on the normal-priority side
+    stream (also with ``TRTLLM_K3_MLA_GATE_SIDE_PRIO``); without the early join it keeps its place
+    after the decode. The layer output is bitwise the default path's, eagerly and in CUDA graphs,
+    with the fused V up-projection and the BMM, and with ``TRTLLM_K3_MLA_GATE_EXCLUSIVE``."""
+    import weakref
+
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention as k3mla
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    monkeypatch.setenv("TRTLLM_MLA_PARTIAL_BF16", "1")
+    q_len = 8 if batch == 4 else 7
+    model, mixer, manager, md, x = _build(batch, q_len, 448, monkeypatch)
+    extra = {
+        "attention_metadata": weakref.ref(md),
+        "mla_layers": {mixer.layer_idx_str: weakref.ref(mixer)},
+    }
+    pool = manager.get_buffers(0)
+    pool_init = pool.clone()
+    log = []
+    sigmoid = mixer.g_proj.forward_sigmoid
+
+    def logged_sigmoid(*args, **kwargs):
+        log.append(("gate", kwargs.get("use_pdl", True), kwargs.get("smem_request", 0)))
+        return sigmoid(*args, **kwargs)
+
+    monkeypatch.setattr(mixer.g_proj, "forward_sigmoid", logged_sigmoid)
+    attn_gen = mixer._attn_forward_gen
+
+    def logged_attn(*args, **kwargs):
+        log.append(("decode",))
+        return attn_gen(*args, **kwargs)
+
+    monkeypatch.setattr(mixer, "_attn_forward_gen", logged_attn)
+    streams = set()
+    side_stream = k3mla._gate_side_stream
+
+    def recorded(*args, **kwargs):
+        stream = side_stream(*args, **kwargs)
+        streams.add((kwargs.get("role", "side"), stream.priority))
+        return stream
+
+    monkeypatch.setattr(k3mla, "_gate_side_stream", recorded)
+    joined = (True,) * 4 + (True, False, True)
+    unjoined = (True,) * 4 + (True, False, False)
+    # (switches, pre_decode, exclusive, side_prio)
+    configs = [
+        ((False,) * 7, False, False, False),
+        (joined, False, False, False),
+        (joined, True, False, False),
+        (joined, True, True, False),
+        (joined, True, True, True),
+        (unjoined, True, False, False),
+    ]
+    results = {}
+    try:
+        with torch.inference_mode():
+            for fused in (True, False):
+                mixer.helix_v_up_in_attention = fused
+                for cfg, pre, exclusive, prio in configs:
+                    _set(monkeypatch, k3mla, *cfg)
+                    monkeypatch.setattr(k3mla, "_K3_MLA_GATE_PRE_DECODE", pre)
+                    monkeypatch.setattr(k3mla, "_K3_MLA_GATE_EXCLUSIVE", exclusive)
+                    monkeypatch.setattr(k3mla, "_K3_MLA_GATE_SIDE_PRIO", prio)
+                    pool.copy_(pool_init)
+                    with model_extra_attrs(extra):
+                        eager = mixer(x, md).clone()
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    log.clear()
+                    streams.clear()
+                    with with_multi_stream(True), torch.cuda.stream(s), model_extra_attrs(extra):
+                        mixer(x, md)
+                    warm_log = list(log)
+                    torch.cuda.current_stream().wait_stream(s)
+                    graph = torch.cuda.CUDAGraph()
+                    with (
+                        with_multi_stream(True),
+                        torch.cuda.graph(graph, stream=s),
+                        model_extra_attrs(extra),
+                    ):
+                        out = mixer(x, md)
+                    replays = []
+                    for _ in range(2):
+                        pool.copy_(pool_init)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        replays.append(out.clone())
+                    results[fused, cfg, pre, exclusive, prio] = (eager, replays)
+                    if cfg[0]:
+                        early = pre and cfg[4] and cfg[6]
+                        gate = ("gate", not early, 0)
+                        if exclusive:
+                            from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+                                k3_fp8w_lowm_gemm,
+                            )
+
+                            gate = gate[:2] + (k3_fp8w_lowm_gemm._SMEM_CAPACITY,)
+                        want = [gate, ("decode",)] if early else [("decode",), gate]
+                        assert warm_log == want, (fused, cfg, pre, warm_log)
+                        gate_streams = {p for role, p in streams if role == "gate"}
+                        high = torch.cuda.Stream.priority_range()[1]
+                        assert gate_streams == ({high} if prio and not pre else set()), (
+                            cfg,
+                            pre,
+                            prio,
+                            streams,
+                        )
+    finally:
+        manager.shutdown()
+    for fused in (True, False):
+        ref_eager, ref_replays = results[fused, (False,) * 7, False, False, False]
+        assert torch.isfinite(ref_replays[0]).all() and ref_replays[0].abs().max() > 0
+        for cfg, pre, exclusive, prio in configs:
+            eager, replays = results[fused, cfg, pre, exclusive, prio]
+            assert torch.equal(eager, ref_eager), f"eager fused={fused} {cfg} {pre} {exclusive}"
+            for r in replays:
+                assert torch.equal(r, ref_replays[0]), (
+                    f"graph fused={fused} {cfg} {pre} {exclusive}"
                 )
 
 
