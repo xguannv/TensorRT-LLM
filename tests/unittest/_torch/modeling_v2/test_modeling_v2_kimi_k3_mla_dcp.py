@@ -124,6 +124,121 @@ def test_split_read_equals_full_attention(seq_lens, q_len, cp):
         torch.testing.assert_close(ref_out.float(), torch_ref, rtol=5e-2, atol=5e-2)
 
 
+def _helix_shard(pool, block_rows, seq_lens, cp, rank, device, seed):
+    """Rank ``rank``'s Helix storage: a fresh pool holding only its round-robin pages (global page ``j * cp + rank``
+    of a request is its ``j``-th local page) at new page ids, every other page garbage, and its local block table."""
+    g = torch.Generator(device="cpu").manual_seed(seed * 100 + rank)
+    local_counts = [len(range(rank, math.ceil(n / PAGE), cp)) for n in seq_lens]
+    num_local = sum(local_counts)
+    num_pages = num_local + 7
+    perm = torch.randperm(num_pages, generator=g)
+    local_pool = (torch.randn(num_pages, PAGE, LATENT + ROPE, generator=g) * 50).to(device)
+    local_pool = local_pool.to(torch.float8_e4m3fn)
+    width = max(1, max(local_counts))
+    local_rows = torch.zeros(len(seq_lens), width, dtype=torch.int32)
+    k = 0
+    for b, count in enumerate(local_counts):
+        for j in range(count):
+            page = int(perm[k])
+            local_rows[b, j] = page
+            local_pool[page] = pool[int(block_rows[b, j * cp + rank])]
+            k += 1
+    return local_pool, local_rows.to(device)
+
+
+@pytest.mark.parametrize(
+    "seq_lens,q_len",
+    [
+        ([3 * 16 * PAGE + 37], 7),
+        ([16 * PAGE * 2], 8),
+        (
+            [PAGE * 5 + 3, 16 * PAGE + 70, 9000],
+            7,
+        ),  # short request: most ranks hold none of its pages
+        ([20000, 300], 1),
+        ([PAGE * 16 + 2], 8),  # the q_len tokens straddle a page boundary across two ranks
+        ([153600, 153600 + 9], 8),
+    ],
+)
+def test_helix_sharded_storage_equals_full_attention(seq_lens, q_len):
+    """Helix: each rank stores only its pages (KV manager layout), reads its local table / local lengths, bounds
+    from the tokens' global positions; the combined partials equal full attention over the whole sequence."""
+    dcp = _dcp()
+    from tensorrt_llm._torch.utils import helix_local_len_tensor
+
+    cp = 16
+    device = torch.device("cuda")
+    pool, block_rows, q = _make_cache(seq_lens, q_len, device)
+    lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    batch = len(seq_lens)
+    scale = dcp.default_softmax_scale()
+    ref_out, _ = _run(
+        dcp, q, pool, dcp.make_split_read_plan(block_rows, lens, q_len, PAGE, 1, 0), batch, scale
+    )
+
+    positions = (lens.view(-1, 1) - q_len + torch.arange(q_len, device=device)).reshape(-1)
+    outs, stats, bounds = [], [], []
+    for r in range(cp):
+        local_pool, local_rows = _helix_shard(pool, block_rows, seq_lens, cp, r, device, seed=5)
+        local_lens = helix_local_len_tensor(lens, PAGE, cp, r)
+        plan = dcp.make_helix_plan(local_rows, local_lens, positions, PAGE, cp, r)
+        # the same bounds the full-table split read derives
+        twin = dcp.make_split_read_plan(block_rows, lens, q_len, PAGE, cp, r)
+        torch.testing.assert_close(plan.kv_bounds, twin.kv_bounds)
+        torch.testing.assert_close(plan.cache_seqs, twin.cache_seqs)
+        o, s = _run(dcp, q, local_pool, plan, batch, scale)
+        dcp.sanitize_empty(o, s, plan.empty)
+        outs.append(o.view(batch * q_len, HEADS * LATENT))
+        stats.append(s)
+        bounds.append(plan.kv_bounds)
+    torch.testing.assert_close(sum(bounds), (positions + 1).to(torch.int32))
+
+    combined = dcp.combine(torch.stack(outs), torch.stack(stats)).view(batch, q_len, HEADS, LATENT)
+    torch.testing.assert_close(combined.float(), ref_out.float(), rtol=2e-2, atol=2e-2)
+    if max(seq_lens) <= 20000:
+        torch_ref = _torch_reference(q, pool, block_rows, lens, scale)
+        torch.testing.assert_close(combined.float(), torch_ref, rtol=5e-2, atol=5e-2)
+
+
+def test_helix_step_plan_reads_the_helix_metadata():
+    """Under a Helix mapping the split read's group is the CP group, the query all-gather runs on the TP mapping
+    over the same ranks, and the step plan reads the local table as is with bounds from helix_position_offsets."""
+    import types
+
+    dcp = _dcp()
+    device = torch.device("cuda")
+    cp, rank, q_len = 16, 3, 8
+    helix = types.SimpleNamespace(
+        has_cp_helix=lambda: True, cp_size=cp, cp_rank=rank, cp_group=list(range(cp)), tp_rank=0
+    )
+    gather = types.SimpleNamespace(tp_size=cp, tp_rank=rank)
+    split = dcp.MlaSplitRead(helix, 6, mode=1, gather_mapping=gather)
+    assert (split.helix, split.cp, split.rank, split.heads) == (True, cp, rank, 96)
+    assert split.gather_mapping is gather
+    with pytest.raises(ValueError, match="TP rank is the CP rank"):
+        dcp.MlaSplitRead(
+            helix, 6, mode=1, gather_mapping=types.SimpleNamespace(tp_size=cp, tp_rank=0)
+        )
+    split.register(7)
+    lens = torch.tensor([153600 + 8, 70000 + 8], dtype=torch.int32, device=device)
+    positions = (
+        (lens.view(-1, 1) - q_len + torch.arange(q_len, device=device)).reshape(-1).to(torch.int32)
+    )
+    meta = types.SimpleNamespace(
+        helix_position_offsets=torch.cat([positions, positions.new_full((5,), -7)])
+    )
+    local_rows = torch.arange(2 * 200, dtype=torch.int32, device=device).view(2, 200)
+    from tensorrt_llm._torch.utils import helix_local_len_tensor
+
+    local_lens = helix_local_len_tensor(lens, PAGE, cp, rank)
+    plan = split._step_plan(7, local_rows, local_lens, q_len, meta)
+    torch.testing.assert_close(plan.page_table, local_rows.t())
+    torch.testing.assert_close(plan.cache_seqs, local_lens)
+    torch.testing.assert_close(
+        plan.kv_bounds, helix_local_len_tensor(positions + 1, PAGE, cp, rank)
+    )
+
+
 @pytest.mark.parametrize(
     "seq_lens,q_len,heads", [([5000, 300], 7, 6), ([PAGE * 16 + 2], 8, 6), ([9000], 1, 96)]
 )

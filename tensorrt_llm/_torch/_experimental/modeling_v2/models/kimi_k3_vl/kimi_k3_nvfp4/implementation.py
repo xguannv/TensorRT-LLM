@@ -751,6 +751,13 @@ class K3TargetSpec:
     quant_algo: QuantAlgo
     moe_tp: int = 4
     moe_ep: int = 4
+    #: Helix context parallelism of the MLA KV cache: 1 (attention TP16) or 16 (tp 1 x cp 16, the rest on TP16).
+    cp: int = 1
+
+    @property
+    def parallel(self) -> str:
+        attention = "tp16" if self.cp == 1 else f"helix{self.cp}"
+        return f"{attention}_moetp{self.moe_tp}ep{self.moe_ep}"
 
 
 def _uses_nvfp4(config: ModelConfig) -> bool:
@@ -1351,6 +1358,9 @@ class KimiMLARuntime(nn.Module):
             max_position_embeddings=max_positions,
             model_config=attention_config,
             aux_stream_dict=aux_stream_dict,
+            # Helix: the CP original `ModelingV2KimiK3` stashed (None outside Helix); this wrapper's all-reduce stays on
+            # the repurposed TP mapping, summing the row-parallel o_proj partials of the 16 head groups.
+            mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
         )
 
     def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
@@ -2387,8 +2397,35 @@ class K3DecodeKDA(KimiKDALinearAttention):
         return out.view(-1, self.num_heads, self.head_dim)
 
 
+def _head_view_attention(mqa, num_heads: int):
+    """``mqa`` as a backend of ``num_heads`` heads, for its ``mla_rope_generation`` on a head subset.
+
+    Under Helix the MLA backend is built for every head (each rank attends with all of them), while the decode path
+    projects only this rank's head group before ``mla_rope_generation`` (which appends the cache on the owner rank and
+    quantizes the queries) and all-gathers the quantized queries afterwards. The view shares every tensor with
+    ``mqa``; its rope-table resize defers to ``mqa`` and picks up the table it regrows."""
+    if mqa.num_heads == num_heads:
+        return mqa
+    view = copy.copy(mqa)
+    view.num_heads = num_heads
+
+    def ensure_rope_table_size(required_max_positions: int) -> None:
+        mqa._ensure_rope_table_size(required_max_positions)
+        view.rotary_cos_sin = mqa.rotary_cos_sin
+
+    view._ensure_rope_table_size = ensure_rope_table_size
+    return view
+
+
 class K3DecodeMLA(KimiK3MLAAttention):
-    """FP8 projections with fused query/cache and attention/V-B/gate decode."""
+    """FP8 projections with fused query/cache and attention/V-B/gate decode.
+
+    Under Helix (``mapping_with_cp``: tp 1 x cp 16) the module holds the stock Helix layout -- every head's Q-B and
+    K-B, this CP rank's V-B / gate / o_proj head group -- and its generic path is the stock Helix MLA. The decode path
+    keeps the TP16 head split: it projects this rank's head group only (``num_heads_tp_cp`` heads, Q-B rows and K-B
+    heads of group ``cp_rank``), and ``MlaSplitRead`` all-gathers the absorbed queries over the CP group, attends with
+    every head over this rank's pages and returns this rank's head group, as the TP16 split read does.
+    """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -2396,6 +2433,19 @@ class K3DecodeMLA(KimiK3MLAAttention):
         self._fp8_qb_ue8m0 = False
         self._fp8_decode_ready = False
         self._split_read: Optional[MlaSplitRead] = None
+        # This rank's K-B heads (a view; all of them outside Helix) and the backend view of that many heads.
+        self._decode_k_b = self._decode_k_b_scale = None
+        self._decode_mqa = None
+
+    @property
+    def _decode_heads(self) -> int:
+        """Heads the decode path projects on this rank: the TP head shard, or under Helix this CP rank's group."""
+        return self.num_heads_tp_cp
+
+    def _decode_head_rows(self) -> slice:
+        """This rank's decode heads among the module's ``num_heads_tp`` heads."""
+        lo = self.mapping.cp_rank * self.num_heads_tp_cp if self.mapping.has_cp_helix() else 0
+        return slice(lo, lo + self.num_heads_tp_cp)
 
     def prepare_fp8_decode_weights(self) -> None:
         """Prepare FP8 Q-B codes and scales with the selected GEMM's quantization recipe."""
@@ -2408,8 +2458,16 @@ class K3DecodeMLA(KimiK3MLAAttention):
             raise ValueError(
                 f"FP8 Q-B requires raw 128x128 block scales, got {scale.shape} {scale.dtype}"
             )
-        self._fp8_qb_weight = linear.weight.detach().clone().contiguous()
-        self._fp8_qb_scale = scale.detach().clone().contiguous()
+        heads = self._decode_head_rows()
+        rows = slice(heads.start * self.qk_head_dim, heads.stop * self.qk_head_dim)
+        if rows.start % 128 or rows.stop % 128:
+            raise ValueError(
+                f"FP8 Q-B rows {rows} of the decode head group are not 128-row block aligned"
+            )
+        self._fp8_qb_weight = linear.weight.detach()[rows].clone().contiguous()
+        self._fp8_qb_scale = (
+            scale.detach()[rows.start // 128 : rows.stop // 128].clone().contiguous()
+        )
         self._fp8_qb_ue8m0 = not (
             getattr(linear, "use_cute_dsl_blockscaling_mm", False)
             or getattr(linear, "disable_deep_gemm", False)
@@ -2422,8 +2480,16 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if self._fp8_qb_weight is None:
             raise RuntimeError("FP8 MLA decode weights were not prepared during checkpoint loading")
         self._fp8_decode_ready = True
+        heads = self._decode_head_rows()
+        self._decode_k_b = self.k_b_proj_trans.detach()[heads]
+        self._decode_k_b_scale = (
+            None if self.k_b_proj_trans_scale is None else self.k_b_proj_trans_scale.detach()[heads]
+        )
+        self._decode_mqa = _head_view_attention(self.mqa, self._decode_heads)
         if MlaSplitRead.applies(self.mqa, self.mapping):
-            self._split_read = MlaSplitRead.shared(self.mapping, self.num_heads_tp)
+            self._split_read = MlaSplitRead.shared(
+                self.mapping, self._decode_heads, gather_mapping=self.mapping_o
+            )
             self._split_read.register(self.mqa.layer_idx)
 
     def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
@@ -2432,7 +2498,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
     def _k3_step_view(self, metadata: AttentionMetadata, step: DecodeStep) -> Optional[dict]:
         if not (step.decode and self._fp8_decode_ready and not is_in_breakable_cuda_graph()):
             return None
-        if not self.fuse_qkv_a_proj or self.apply_rotary_emb or self.mapping.has_cp_helix():
+        if not self.fuse_qkv_a_proj or self.apply_rotary_emb:
+            return None
+        # Under Helix only the quantized-cache decode with the split read over the CP group takes the step.
+        helix = self.mapping.has_cp_helix()
+        if helix and self._split_read is None:
             return None
         if (
             not self.use_output_gate
@@ -2464,6 +2534,8 @@ class K3DecodeMLA(KimiK3MLAAttention):
             ):
                 return None
             return {"quantized_cache": True}
+        if helix:
+            return None
         view = k3_mla_decode_view(self.mqa, metadata, step.num_tokens)
         return None if isinstance(view, str) else view
 
@@ -2530,29 +2602,28 @@ class K3DecodeMLA(KimiK3MLAAttention):
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
         """Keep FP8 projections around the native FP4/FP8 cache and attention kernels."""
+        heads = self._decode_heads
         query, latent_cache = _fp8_attention.mla_project_qkv(
             ag,
             self.q_a_layernorm.weight,
             self._fp8_qb_weight,
             self._fp8_qb_scale,
-            self.k_b_proj_trans,
-            self.k_b_proj_trans_scale,
+            self._decode_k_b,
+            self._decode_k_b_scale,
             self.kv_a_layernorm.weight,
             float(self.q_a_layernorm.variance_epsilon),
             float(self.kv_a_layernorm.variance_epsilon),
             self._fp8_qb_ue8m0,
         )
-        q_pe = query.view(-1, self.num_heads_tp, 576)[..., 512:]
+        q_pe = query.view(-1, heads, 576)[..., 512:]
         cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)
         cu_kv = torch.empty_like(cu_q)
         scheduler = torch.empty(1, dtype=torch.uint32, device=ag.device)
         bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
         bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
-        quant_q = torch.empty(
-            (ag.shape[0], self.num_heads_tp, 576), dtype=torch.uint8, device=ag.device
-        )
-        self.mqa.mla_rope_generation(
-            query.view(-1, self.num_heads_tp, 576),
+        quant_q = torch.empty((ag.shape[0], heads, 576), dtype=torch.uint8, device=ag.device)
+        self._decode_mqa.mla_rope_generation(
+            query.view(-1, heads, 576),
             q_pe,
             latent_cache,
             metadata,
@@ -3285,15 +3356,20 @@ def _check_construction(model_config: ModelConfig, target: K3TargetSpec) -> None
         f"sm_{capability[0]}{capability[1]}"
     )
     mapping = model_config.mapping
+    parallel = target.parallel
+    if target.cp > 1:
+        _check_helix_construction(model_config, target)
     topology = (
         mapping.world_size,
-        mapping.tp_size,
+        mapping.tp_size * getattr(mapping, "cp_size", 1),
         mapping.pp_size,
         mapping.moe_tp_size,
         mapping.moe_ep_size,
         mapping.enable_attention_dp,
     )
-    parallel = f"tp16_moetp{target.moe_tp}ep{target.moe_ep}"
+    assert target.cp > 1 or getattr(mapping, "cp_size", 1) == 1, (
+        f"the {parallel} target runs without context parallelism; the engine built cp_size {mapping.cp_size}"
+    )
     assert topology == (16, 16, 1, target.moe_tp, target.moe_ep, False), (
         f"the {parallel} target needs world_size 16, tensor_parallel_size 16, "
         f"pipeline_parallel_size 1, moe_tensor_parallel_size {target.moe_tp}, "
@@ -3337,6 +3413,36 @@ def _check_construction(model_config: ModelConfig, target: K3TargetSpec) -> None
     )
 
 
+def _check_helix_construction(model_config: ModelConfig, target: K3TargetSpec) -> None:
+    """The Helix target's layout: tp 1 x cp ``target.cp`` HELIX over the 16 ranks, the expert split set explicitly,
+    the NVFP4 checkpoint, and no speculation but DSpark (the built-in model's ``_setup_helix_mappings`` checks the
+    rest of the speculative configuration)."""
+    mapping = model_config.mapping
+    layout = (
+        mapping.world_size,
+        mapping.tp_size,
+        mapping.cp_size,
+        bool(mapping.has_cp_helix()),
+        mapping.pp_size,
+        mapping.moe_tp_size,
+        mapping.moe_ep_size,
+        bool(mapping.moe_tp_ep_user_specified),
+        mapping.enable_attention_dp,
+    )
+    assert layout == (16, 1, target.cp, True, 1, target.moe_tp, target.moe_ep, True, False), (
+        f"the {target.parallel} target needs world_size 16, tensor_parallel_size 1, context_parallel_size "
+        f"{target.cp} with cp_config cp_type HELIX, pipeline_parallel_size 1, moe_tensor_parallel_size "
+        f"{target.moe_tp} and moe_expert_parallel_size {target.moe_ep} set explicitly, and enable_attention_dp "
+        "false; the engine built (world, tp, cp, helix, pp, moe_tp, moe_ep, split_set, attention_dp) = "
+        f"{layout}"
+    )
+    assert target.quant_algo == QuantAlgo.NVFP4, "the Helix targets serve the NVFP4 checkpoint"
+    spec_config = getattr(model_config, "spec_config", None)
+    assert spec_config is None or spec_config.spec_dec_mode.is_dspark(), (
+        f"the {target.parallel} target speculates only with DSpark; got {spec_config.decoding_type!r}"
+    )
+
+
 class ModelingV2KimiK3(KimiLinearForCausalLM):
     """The class ``route`` returns: this target's text model (`KimiLinearModel` above) behind its checks.
 
@@ -3359,6 +3465,12 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             "text_config"
         )
         _check_construction(model_config, self.target_spec)
+        # Helix: every module but the MLA layers is built on the repurposed TP16 mapping, the MLA layers on the CP
+        # original (`_helix_mapping_with_cp`); the CP original is restored below, as the built-in model does, since
+        # the executor's Helix bookkeeping keys off ``has_cp_helix()``. Both stay None outside Helix.
+        self._setup_helix_mappings(
+            model_config, config.text_config, getattr(model_config, "spec_config", None)
+        )
         _flags.log_flags()
         _census.install_model(KimiLinearModel, decode_step)
         _census.install(
@@ -3372,11 +3484,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             or spec_config.spec_dec_mode.is_dflash()
             or spec_config.spec_dec_mode.is_dspark()
         ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
-        # The inherited loader reads these: this target has neither helix context parallelism nor the fp8
-        # weight-read conversion of the shared / latent MLPs.
+        # The inherited loader reads this: this target has no fp8 weight-read conversion of the shared / latent MLPs.
         self._fp8_weight_read_moe_mlp = False
-        self.mapping_with_cp = None
-        self._repurposed_tp_mapping = None
         cfg = text.pretrained_config
         SpecDecOneEngineForCausalLM.__init__(
             self,
@@ -3401,7 +3510,20 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         # must therefore be the text config, as the built-in wrapper leaves it.
         model_config._frozen = False
         model_config.pretrained_config = self.config
+        if self.mapping_with_cp is not None:
+            model_config.mapping = self.mapping_with_cp
+            text._frozen = False
+            text.mapping = self.mapping_with_cp
+            text._frozen = True
         model_config._frozen = True
+
+    @property
+    def tp_mapping(self) -> Mapping:
+        """The TP16 mapping KDA, MoE, the dense layers, the LM head and the decode collectives run on: the model's
+        mapping, or under Helix the repurposed one (the model's mapping is then the CP original)."""
+        if self._repurposed_tp_mapping is not None:
+            return self._repurposed_tp_mapping
+        return self.model_config.mapping
 
     def _prefer_cute_dsl_drafter_attention(self, spec_config) -> None:
         """With ``TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL``, the MLA DSpark drafter's block decode on its cute-dsl
@@ -3552,7 +3674,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     layer.linear_attn.fp8_decode_ready = True
             comm = None
             if all(layer._mnnvl_allreduce() is not None for layer in layers):
-                comm = _decode_comm.K3DecodeComm.create(self.model_config.mapping, None)
+                comm = _decode_comm.K3DecodeComm.create(self.tp_mapping, None)
                 for layer in layers:
                     layer.decode_comm = comm
                     layer.sandwich_oproj = False
@@ -3595,7 +3717,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         (collective: the front's head workspace), each layer's decode weights with its latent norm folded into the
         latent up projection, the decode GEMVs' state; then one call of every kernel of the path (collective: the
         front and the sandwich tail). Every rank builds it here. Returns the number of MoE layers it takes."""
-        mapping = self.model_config.mapping
+        mapping = self.tp_mapping
         moes = [layer.block_sparse_moe for layer in self.model.layers if layer.is_moe]
         gaps = {
             id(moe): _decode_moe_lowm.layout_gaps(
@@ -3723,7 +3845,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             if getattr(getattr(o_proj, "tp_mode", None), "name", None) == "ROW"
             else None
         )
-        mapping = self.model_config.mapping
+        mapping = self.tp_mapping
         sliced = None
         if (
             isinstance(weight, torch.Tensor)
