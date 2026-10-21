@@ -33,7 +33,7 @@ import _lockstep as ls  # noqa: E402
 assert torch.cuda.is_available(), "mnnvl_allreduce_rmsnorm_slice requires CUDA devices"
 
 DEADLINE_S = 900
-LATENT = 3584  # Kimi K3's MoE latent
+SLICE = 224  # Kimi K3's MoE latent columns per rank (3584 over 16 ranks)
 BUFFER_BYTES = 4 << 20  # the Lamport buffer size Kimi K3 decodes with
 EPS = 1e-6
 PAD = 32
@@ -54,7 +54,8 @@ STATS = {"ulp_mismatch": 0, "elements": 0}
 class Call:
     """One call's arguments on every rank and its reference."""
 
-    def __init__(self, seed, tokens, hidden=LATENT, pad=PAD, tail=TAIL):
+    def __init__(self, seed, tokens, hidden=None, pad=PAD, tail=TAIL):
+        hidden = SLICE * R.world if hidden is None else hidden
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.inputs = [
             (torch.randn(tokens, hidden, generator=g, device="cuda") * 0.5).bfloat16()
@@ -119,8 +120,8 @@ def check_other_hidden_sizes() -> None:
 def check_unsupported_calls_raise_on_every_rank() -> None:
     """``fits`` refuses a call over half a Lamport buffer or a slice that is not whole packets; the op itself raises on
     such a call on every rank and the rotation does not move."""
-    big = BUFFER_BYTES // 2 // (LATENT * 2) + 1
-    assert not fits(big, LATENT, PAD, TAIL, WS_A)
+    big = BUFFER_BYTES // 2 // (SLICE * R.world * 2) + 1
+    assert not fits(big, SLICE * R.world, PAD, TAIL, WS_A)
     assert not fits(4, 4 * R.world, PAD, TAIL, WS_A)  # 4-column slices
     assert not fits(4, 512 * R.world, PAD, TAIL, WS_A)  # 512-column slices
     call = Call(1900, big)
