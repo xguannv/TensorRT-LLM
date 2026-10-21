@@ -2436,7 +2436,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
     K-B, this CP rank's V-B / gate / o_proj head group -- and its generic path is the stock Helix MLA. The decode path
     keeps the TP16 head split: it projects this rank's head group only (``num_heads_tp_cp`` heads, Q-B rows and K-B
     heads of group ``cp_rank``), and ``MlaSplitRead`` all-gathers the absorbed queries over the CP group, attends with
-    every head over this rank's pages and returns this rank's head group, as the TP16 split read does.
+    every head over this rank's pages and returns this rank's head group, as the TP16 split read does. With
+    ``TRTLLM_K3LL_HELIX_Q_LOCAL`` at load, the decode path can instead project every head on every rank (the module
+    holds every head's Q-B and K-B) and skip the all-gather; the switch selects it at run time.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -2448,6 +2450,10 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # This rank's K-B heads (a view; all of them outside Helix) and the backend view of that many heads.
         self._decode_k_b = self._decode_k_b_scale = None
         self._decode_mqa = None
+        # Helix with TRTLLM_K3LL_HELIX_Q_LOCAL at load: every head's FP8 Q-B codes / scales (the decode group's
+        # ``_fp8_qb_weight`` / ``_fp8_qb_scale`` are then row views of them) and K-B. None otherwise.
+        self._fp8_qb_weight_all = self._fp8_qb_scale_all = None
+        self._decode_k_b_all = self._decode_k_b_scale_all = None
 
     @property
     def _decode_heads(self) -> int:
@@ -2476,14 +2482,24 @@ class K3DecodeMLA(KimiK3MLAAttention):
             raise ValueError(
                 f"FP8 Q-B rows {rows} of the decode head group are not 128-row block aligned"
             )
-        self._fp8_qb_weight = linear.weight.detach()[rows].clone().contiguous()
-        self._fp8_qb_scale = (
-            scale.detach()[rows.start // 128 : rows.stop // 128].clone().contiguous()
-        )
         self._fp8_qb_ue8m0 = not (
             getattr(linear, "use_cute_dsl_blockscaling_mm", False)
             or getattr(linear, "disable_deep_gemm", False)
         ) or (linear.weight.is_cuda and torch.cuda.get_device_capability() == (10, 7))
+        if self.mapping.has_cp_helix() and _flags.TRTLLM_K3LL_HELIX_Q_LOCAL:
+            # Every head's codes; the e8m0 resmoothing is per 128 x 128 block and the group's rows are block
+            # aligned, so the group's view holds the bits the group's own copy would.
+            self._fp8_qb_weight_all = linear.weight.detach().clone().contiguous()
+            self._fp8_qb_scale_all = scale.detach().clone().contiguous()
+            if self._fp8_qb_ue8m0:
+                resmooth_to_fp8_e8m0(self._fp8_qb_weight_all, self._fp8_qb_scale_all)
+            self._fp8_qb_weight = self._fp8_qb_weight_all[rows]
+            self._fp8_qb_scale = self._fp8_qb_scale_all[rows.start // 128 : rows.stop // 128]
+            return
+        self._fp8_qb_weight = linear.weight.detach()[rows].clone().contiguous()
+        self._fp8_qb_scale = (
+            scale.detach()[rows.start // 128 : rows.stop // 128].clone().contiguous()
+        )
         if self._fp8_qb_ue8m0:
             resmooth_to_fp8_e8m0(self._fp8_qb_weight, self._fp8_qb_scale)
 
@@ -2497,6 +2513,19 @@ class K3DecodeMLA(KimiK3MLAAttention):
         self._decode_k_b_scale = (
             None if self.k_b_proj_trans_scale is None else self.k_b_proj_trans_scale.detach()[heads]
         )
+        if self._fp8_qb_weight_all is not None:
+            if (
+                self.mqa.num_heads != self.num_heads_tp
+                or self.k_b_proj_trans.shape[0] != self.num_heads_tp
+            ):
+                raise RuntimeError(
+                    f"TRTLLM_K3LL_HELIX_Q_LOCAL needs every head's K-B and an every-head backend; got K-B "
+                    f"{tuple(self.k_b_proj_trans.shape)}, backend heads {self.mqa.num_heads}, heads {self.num_heads_tp}"
+                )
+            self._decode_k_b_all = self.k_b_proj_trans.detach()
+            self._decode_k_b_scale_all = (
+                None if self.k_b_proj_trans_scale is None else self.k_b_proj_trans_scale.detach()
+            )
         self._decode_mqa = _head_view_attention(self.mqa, self._decode_heads)
         self.attach_split_read()
 
@@ -2620,14 +2649,26 @@ class K3DecodeMLA(KimiK3MLAAttention):
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
         """Keep FP8 projections around the native FP4/FP8 cache and attention kernels."""
-        heads = self._decode_heads
+        # TRTLLM_K3LL_HELIX_Q_LOCAL: every head's queries on this rank (the split read then needs no all-gather);
+        # the projection, absorption and quantization of each head are the group path's, bit for bit.
+        all_heads = bool(
+            self._split_read is not None
+            and self._decode_k_b_all is not None
+            and _flags.TRTLLM_K3LL_HELIX_Q_LOCAL
+        )
+        if all_heads:
+            heads, qb, qb_scale = self.num_heads_tp, self._fp8_qb_weight_all, self._fp8_qb_scale_all
+            kb, kb_scale, mqa = self._decode_k_b_all, self._decode_k_b_scale_all, self.mqa
+        else:
+            heads, qb, qb_scale = self._decode_heads, self._fp8_qb_weight, self._fp8_qb_scale
+            kb, kb_scale, mqa = self._decode_k_b, self._decode_k_b_scale, self._decode_mqa
         query, latent_cache = _fp8_attention.mla_project_qkv(
             ag,
             self.q_a_layernorm.weight,
-            self._fp8_qb_weight,
-            self._fp8_qb_scale,
-            self._decode_k_b,
-            self._decode_k_b_scale,
+            qb,
+            qb_scale,
+            kb,
+            kb_scale,
             self.kv_a_layernorm.weight,
             float(self.q_a_layernorm.variance_epsilon),
             float(self.kv_a_layernorm.variance_epsilon),
@@ -2640,7 +2681,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
         bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
         bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
         quant_q = torch.empty((ag.shape[0], heads, 576), dtype=torch.uint8, device=ag.device)
-        self._decode_mqa.mla_rope_generation(
+        mqa.mla_rope_generation(
             query.view(-1, heads, 576),
             q_pe,
             latent_cache,
@@ -2655,7 +2696,13 @@ class K3DecodeMLA(KimiK3MLAAttention):
         )
         if self._split_read is not None:
             latent = self._split_read.forward(
-                self.mqa, quant_q, metadata, ag.shape[0] // metadata.num_generations, bmm1, bmm2
+                self.mqa,
+                quant_q,
+                metadata,
+                ag.shape[0] // metadata.num_generations,
+                bmm1,
+                bmm2,
+                all_heads=all_heads,
             )
             return _fp8_attention.mla_output(
                 latent,
@@ -3739,20 +3786,23 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         if not self.model_config.mapping.has_cp_helix():
             return
         reads = {}
+        q_local_layers = 0
         for module in self.modules():
             if isinstance(module, K3DecodeMLA):
                 split_read = module.attach_split_read()
                 if split_read is not None:
                     reads.setdefault(id(split_read), split_read)
+                    q_local_layers += int(module._fp8_qb_weight_all is not None)
         for split_read in reads.values():
             built = split_read.build_helix_comm(
                 None if comm is None else comm.mnnvl, self.tp_mapping
             )
             if split_read.rank == 0:
                 logger.info(
-                    f"Kimi K3 NVFP4 Helix MLA decode exchange: {built} (TRTLLM_K3LL_HELIX_Q_AG_MNNVL="
-                    f"{_flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL}, TRTLLM_K3LL_HELIX_A2A_FUSED="
-                    f"{_flags.TRTLLM_K3LL_HELIX_A2A_FUSED})"
+                    f"Kimi K3 NVFP4 Helix MLA decode exchange: {built}; every-head local queries on "
+                    f"{q_local_layers} layers (TRTLLM_K3LL_HELIX_Q_AG_MNNVL={_flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL}, "
+                    f"TRTLLM_K3LL_HELIX_A2A_FUSED={_flags.TRTLLM_K3LL_HELIX_A2A_FUSED}, "
+                    f"TRTLLM_K3LL_HELIX_Q_LOCAL={_flags.TRTLLM_K3LL_HELIX_Q_LOCAL})"
                 )
 
     def _build_decode_moe_lowm(self, comm: _decode_comm.K3DecodeComm) -> int:

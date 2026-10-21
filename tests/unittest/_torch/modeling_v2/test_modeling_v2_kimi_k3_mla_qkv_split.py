@@ -103,3 +103,53 @@ def test_paged_qkv_split_bits(monkeypatch, seqs, tokens, ue8m0):
     assert _bits_equal(out, ref_out)
     assert _bits_equal(pool, ref_pool)
     assert bool((ref_pool != 0).any())
+
+
+@pytest.mark.parametrize("split", [0, 1])
+@pytest.mark.parametrize("ue8m0", [False, True])
+@pytest.mark.parametrize("m", [1, 8, 16])
+def test_project_qkv_every_head_equals_head_groups(monkeypatch, m, ue8m0, split):
+    """TRTLLM_K3LL_HELIX_Q_LOCAL: one projection of all 96 heads with every head's Q-B (e8m0-resmoothed whole) gives,
+    for each Helix group of 6 heads, the bits of that group's own projection with its own resmoothed Q-B rows."""
+    from tensorrt_llm.quantization.utils.fp8_utils import resmooth_to_fp8_e8m0
+
+    attention = _attention()
+    monkeypatch.setattr(attention._flags, "TRTLLM_K3LL_MLA_QKV_SPLIT", split)
+    heads, cp = 96, 16
+    group = heads // cp
+    gen = torch.Generator(device="cuda").manual_seed(500 + m)
+    qb = (torch.randn(heads * (NOPE + ROPE), QA, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    qb_scale = (
+        torch.rand(heads * (NOPE + ROPE) // 128, QA // 128, device="cuda", generator=gen) * 1e-2
+        + 1e-3
+    )
+    kb = (torch.randn(heads, KVL, NOPE, device="cuda", generator=gen) * 0.5).to(torch.float8_e4m3fn)
+    kb_scale = torch.rand(heads, KVL // 128, 1, device="cuda", generator=gen) * 1e-2 + 1e-3
+    qa_norm = (1 + 0.1 * torch.randn(QA, device="cuda", generator=gen)).bfloat16()
+    kv_norm = (1 + 0.1 * torch.randn(KVL, device="cuda", generator=gen)).bfloat16()
+    ag = torch.randn(m, AG_COLS, device="cuda", generator=gen).bfloat16()
+
+    qb_all, qs_all = qb.clone(), qb_scale.clone()
+    if ue8m0:
+        resmooth_to_fp8_e8m0(qb_all, qs_all)
+    query, latent = attention.mla_project_qkv(
+        ag, qa_norm, qb_all, qs_all, kb, kb_scale, kv_norm, 1e-6, 1e-6, ue8m0
+    )
+    query = query.view(m, heads, 576)
+    for rank in range(cp):
+        rows = slice(rank * group * (NOPE + ROPE), (rank + 1) * group * (NOPE + ROPE))
+        qb_g = qb[rows].clone()
+        qs_g = qb_scale[rows.start // 128 : rows.stop // 128].clone()
+        if ue8m0:
+            resmooth_to_fp8_e8m0(qb_g, qs_g)
+            assert torch.equal(qb_g.view(torch.uint8), qb_all[rows].view(torch.uint8))
+            assert torch.equal(qs_g, qs_all[rows.start // 128 : rows.stop // 128])
+        heads_g = slice(rank * group, (rank + 1) * group)
+        ref_query, ref_latent = attention.mla_project_qkv(
+            ag, qa_norm, qb_g, qs_g, kb[heads_g], kb_scale[heads_g], kv_norm, 1e-6, 1e-6, ue8m0
+        )
+        torch.cuda.synchronize()
+        assert _bits_equal(query[:, heads_g].contiguous(), ref_query.view(m, group, 576))
+        assert _bits_equal(latent, ref_latent)

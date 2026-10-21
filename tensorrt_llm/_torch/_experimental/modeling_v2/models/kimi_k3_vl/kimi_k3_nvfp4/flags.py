@@ -137,6 +137,12 @@ TRTLLM_K3LL_HELIX_A2A_FUSED = _flag(
     "Helix MLA decode: the partials' exchange and combine in one Lamport kernel (helix_a2a_fused), not NCCL "
     "alltoall_helix + helix_post_process",
 )
+TRTLLM_K3LL_HELIX_Q_LOCAL = _flag(
+    "TRTLLM_K3LL_HELIX_Q_LOCAL",
+    0,
+    "Helix MLA decode: every rank projects, absorbs and quantizes all heads' queries itself (the module's full Q-B / "
+    "K-B), no query all-gather",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
