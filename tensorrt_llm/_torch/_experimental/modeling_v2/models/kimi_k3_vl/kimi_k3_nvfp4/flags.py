@@ -87,7 +87,7 @@ TRTLLM_K3LL_MLA_QKV_SPLIT = _flag(
 )
 TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
     "TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL",
-    0,
+    1,
     "MLA DSpark drafter: block decode on its cute-dsl implementation when speculative_config leaves it at AUTO",
 )
 TRTLLM_K3LL_FP8W_LOWM = _flag(
