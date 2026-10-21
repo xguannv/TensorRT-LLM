@@ -39,7 +39,7 @@ TRTLLM_K3LL_MOE_LOWM = _flag(
 )
 TRTLLM_K3LL_MOE_FRONT_SORT = _flag(
     "TRTLLM_K3LL_MOE_FRONT_SORT",
-    0,
+    1,
     "with TRTLLM_K3LL_MOE_LOWM: the routing's moe_sort over the local experts in k3_moe_front, not its own kernel",
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
