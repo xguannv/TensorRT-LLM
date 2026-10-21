@@ -220,7 +220,9 @@ def validate_tactic(n: int, k: int, tactic: K3LowMTactic, gated: bool = False) -
         if getattr(tactic, name) < 1:
             raise ValueError(f"{name} must be >= 1")
     groups, warps = tactic.quant_groups, tactic.quant_warps
-    if warps < 1 or groups < 1 or warps % groups or (warps // groups) * 32 > tactic.mma_n * 4:
+    # The epilogue is the first four quantization warps (TMEM lanes 0-127) on a 128-thread barrier: fewer than four
+    # quantization warps never complete it (the kernel hangs).
+    if warps < 4 or groups < 1 or warps % groups or (warps // groups) * 32 > tactic.mma_n * 4:
         raise ValueError(f"invalid quant_warps={warps} / quant_groups={groups}")
     if 32 * (4 + warps) > 1024:
         raise ValueError(f"quant_warps={warps} exceeds the CTA size limit")
