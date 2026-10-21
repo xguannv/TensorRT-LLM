@@ -262,3 +262,75 @@ def test_direct_local_heads_without_stats(seq_lens, q_len, heads):
         torch.testing.assert_close(out.float(), torch_ref, rtol=5e-2, atol=5e-2)
     finally:
         HEADS = saved
+
+
+@pytest.mark.parametrize("heads,helix_form", [(6, False), (96, True)])
+def test_softmax_tail_below_fp8_normal_range_is_kept(heads, helix_form):
+    """A sink key every 256 positions of a 9600-token request and keys whose probabilities sit below e4m3's flush
+    point relative to a sink (2^-10.2), with value rows that differ between the two (latent dim 1: -1 on the sinks,
+    +1 on the tail). The kernel's P @ V runs on FP8 probabilities relative to the running row max; the tail must
+    count there and not only in the fp32 row sum, otherwise the output loses the tail's share. Each KV split
+    normalizes by its own max, so only splits that see a sink lose their tail; with this spacing the error was ~4.4 %
+    per (token, head) (the fix: ~0.2 %). Checked in both call forms the staircase uses (mode 1: own heads, no stats,
+    built-in causal mask; Helix: stats + per-token bounds), and the Helix form's exported log-sum-exp."""
+    global HEADS
+    dcp = _dcp()
+    device = torch.device("cuda")
+    n, q_len, every = 9600, 8, 256
+    saved, HEADS = HEADS, heads
+    try:
+        g = torch.Generator(device="cpu").manual_seed(5)
+        blocks = math.ceil(n / PAGE)
+        num_pages = blocks + 3
+        block_rows = torch.randperm(num_pages, generator=g)[:blocks].view(1, -1).to(torch.int32)
+        pool = torch.randn(num_pages, PAGE, LATENT + ROPE, generator=g) * 0.05
+        # logits come from latent dim 0 only (q is zero elsewhere): 16 * 1.875 on the tail, 16 * 8 on the sinks, i.e.
+        # a tail probability of 2^(-98 * scale * log2 e) = 2^-10.2 of a sink's
+        pool[..., 0] = 1.875
+        pool[..., 1] = 1.0
+        for pos in range(0, n, every):
+            page, row = int(block_rows[0, pos // PAGE]), pos % PAGE
+            pool[page, row, 0] = 8.0
+            pool[page, row, 1] = -1.0
+        pool = pool.to(device).to(torch.float8_e4m3fn)
+        block_rows = block_rows.to(device)
+        q = torch.zeros(1, q_len, heads, LATENT + ROPE)
+        q[..., 0] = 16.0
+        q = q.to(device).to(torch.float8_e4m3fn)
+        lens = torch.tensor([n], dtype=torch.int32, device=device)
+        scale = dcp.default_softmax_scale()
+
+        out = torch.empty(1, q_len, heads, LATENT, dtype=torch.bfloat16, device=device)
+        ws = torch.empty(
+            dcp.workspace_bytes(heads, dcp.MAX_Q_LEN, dcp.MAX_REQUESTS),
+            dtype=torch.uint8,
+            device=device,
+        )
+        stats = None
+        if helix_form:
+            bounds = (lens.view(-1, 1) - q_len + 1 + torch.arange(q_len, device=device)).reshape(-1)
+            bounds = bounds.to(torch.int32)
+            plan = dcp.SplitReadPlan(block_rows.contiguous().t(), lens, bounds, bounds == 0)
+            stats = torch.empty(q_len, heads, 2, dtype=torch.float32, device=device)
+        else:
+            plan = dcp.SplitReadPlan(block_rows.t(), lens, None, None)
+        dcp.split_read_attention(q, pool, plan, out, stats, ws, scale, 1.0, dcp.MAX_REQUESTS)
+
+        ref = _torch_reference(q, pool, block_rows, lens, scale)
+        err = (out.float() - ref).norm(dim=-1) / ref.norm(dim=-1)
+        assert float(err.max()) < 0.015, (
+            f"per-(token, head) relative error up to {float(err.max()):.3f}"
+        )
+        if helix_form:
+            kv = pool[block_rows[0].long()].float().reshape(-1, LATENT + ROPE)[:n]
+            scores = torch.einsum("qhd,nd->qhn", q[0].float(), kv) * scale
+            limit = n - q_len + 1 + torch.arange(q_len, device=device)
+            pos = torch.arange(n, device=device)
+            scores = scores.masked_fill(pos.view(1, 1, -1) >= limit.view(-1, 1, 1), float("-inf"))
+            # stats = (log-sum-exp in natural log, 1)
+            torch.testing.assert_close(
+                stats[..., 0], torch.logsumexp(scores, -1), rtol=0, atol=2e-2
+            )
+            torch.testing.assert_close(stats[..., 1], torch.ones_like(stats[..., 1]))
+    finally:
+        HEADS = saved
