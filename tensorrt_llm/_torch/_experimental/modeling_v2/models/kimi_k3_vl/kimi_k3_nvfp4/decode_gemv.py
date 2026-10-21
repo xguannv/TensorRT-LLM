@@ -100,6 +100,9 @@ SITES: Dict[str, Site] = {
     "mla_ag": Site(2880, 7168, "long", wide=True, sig_col0=2112, split=6, ring=6, push=True),
     # KDA's [q | k | v | g | f_a | b] on a decode step (6 heads x 128 each, then 128 and 6, padded to 3208 rows).
     "kda_proj": Site(3208, 7168, "long", wide=True, split=5, ring=6, push=True),
+    # KDA's bf16 [f_a | b] beside the FP8 [q | k | v | g] projection (128 and 6 heads' b, padded to 136 rows;
+    # TRTLLM_K3LL_KDA_BFA_GEMV): a decode step's 1..64 rows on k3_ctm_gemv_wide.
+    "kda_bfa": Site(136, 7168, "wide", wide=True),
     # The attention output projection (row parallel; 6 heads x 128 in).
     "o_proj": Site(7168, 768, "decode", wide=True),
     # The built-in MLA path's projections: kv_a_proj_with_mqa, q_b_proj and the output gate.

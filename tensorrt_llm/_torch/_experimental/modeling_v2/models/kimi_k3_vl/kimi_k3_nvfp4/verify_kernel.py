@@ -220,6 +220,7 @@ def k3_fp8_kda_verify_kernel(
     ],  # the projection rows' f_a columns, box 8 tokens x 64
     proj: cutlass.Array,  # int32 words of the fused projection rows, bf16 [T, 2 * proj_words]
     g_ext: cutlass.Array,  # int32 words of bf16 [T, H * K], the unfused f_b output (FOLD_FB False only)
+    bfa: cutlass.Array,  # int32 words of the rows holding [f_a | b]: proj itself, or (SEP_BFA) bf16 [T, 2 * bfa_words]
     w_q: cutlass.Array,  # fp32 [H * K, CONV_W]
     w_k: cutlass.Array,
     w_v: cutlass.Array,
@@ -235,6 +236,7 @@ def k3_fp8_kda_verify_kernel(
     pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [T][H][V]
     proj_words: cutlass.Int32,
+    bfa_words: cutlass.Int32,  # int32 words per row of bfa
     ssm_stride: cutlass.Int64,  # elements between the pool's slots (the manager interleaves conv states)
     H: cutlass.Constexpr[int],
     NUM_SPEC: cutlass.Constexpr[int],
@@ -242,6 +244,7 @@ def k3_fp8_kda_verify_kernel(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     FOLD_FB: cutlass.Constexpr[bool],
+    SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
@@ -257,6 +260,10 @@ def k3_fp8_kda_verify_kernel(
     OG_W = 3 * HK // 2
     FA_W = 2 * HK
     B_COL = 4 * HK + K  # bf16 column
+    # Where f_a and b sit in the bfa rows: after [q | k | v | onorm gate] in the fused row, or (SEP_BFA)
+    # at the start of a separate [f_a | b] row.
+    FA_COL = 0 if SEP_BFA else FA_W * 2  # bf16 column
+    B_SRC = K if SEP_BFA else B_COL  # bf16 column
     assert NT <= WARPS and NT % 2 == 0
 
     tidx, _, _ = cute.arch.thread_idx()
@@ -443,7 +450,7 @@ def k3_fp8_kda_verify_kernel(
                 for half in cutlass.range_constexpr(TMA_COPY_ITERS):
                     prims.cp_async_bulk_tensor_shared_cta_global(
                         smem_b.subview(half * B_HALF_ELEMS), tma_ptr_x,
-                        (cutlass.Int32(FA_W * 2 + half * TMA_K_BOX), row0), x_full,
+                        (cutlass.Int32(FA_COL + half * TMA_K_BOX), row0), x_full,
                     )  # fmt: skip
     CH = K // CHUNK  # 16-byte chunks per 128-channel row
     for it in cutlass.range_constexpr((2 * NT * CH + THREADS - 1) // THREADS):
@@ -479,9 +486,9 @@ def k3_fp8_kda_verify_kernel(
             _store8(s_og, words_og, t_og * V_CTA + j_og * CHUNK)
         elif item < 2 * n_v + NT:
             t_b = item - 2 * n_v
-            word_b = proj.load(idx=(row0 + t_b) * proj_words + (B_COL + h) // 2)
+            word_b = bfa.load(idx=(row0 + t_b) * bfa_words + (B_SRC + h) // 2)
             b_in = _lo(word_b)
-            if (B_COL + h) % 2 == 1:
+            if (B_SRC + h) % 2 == 1:
                 b_in = _hi(word_b)
             s_braw.store(b_in, idx=t_b)
         elif item < 2 * n_v + NT + n_g:
@@ -775,6 +782,7 @@ def k3_fp8_kda_verify(
     w_fb: cute.Tensor,  # bf16 [H * K, K]: the f_b weight (out, in)
     proj: cute.Tensor,  # int32 words of the fused projection [T, proj_words]
     g_ext: cute.Tensor,  # int32 words of the unfused f_b output [T, H * K / 2] (FOLD_FB False)
+    bfa: cute.Tensor,  # int32 words of the [f_a | b] rows: proj, or (SEP_BFA) the separate [T, bfa_words] rows
     w_q: cute.Tensor,
     w_k: cute.Tensor,
     w_v: cute.Tensor,
@@ -790,6 +798,7 @@ def k3_fp8_kda_verify(
     pending: cute.Tensor,
     out: cute.Tensor,
     proj_words: cutlass.Int32,
+    bfa_words: cutlass.Int32,
     n_req: cutlass.Int32,
     ssm_stride: cutlass.Int64,
     H: cutlass.Constexpr[int],
@@ -798,6 +807,7 @@ def k3_fp8_kda_verify(
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
     FOLD_FB: cutlass.Constexpr[bool],
+    SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -813,18 +823,19 @@ def k3_fp8_kda_verify(
         box_dims=[TMA_K_BOX, CTA_M, TMA_COPY_ITERS, 1, 1],
         swizzle=cuda.TensorMapSwizzle.s128b,
     )  # fmt: skip
-    # The projection rows as bf16 [T, 2 proj_words]: an 8-token x 64-column box of f_a per call.
+    # The [f_a | b] rows as bf16 [T, 2 bfa_words]: an 8-token x 64-column box of f_a per call.
     tma_fa = cuda.create_tensor_map_tiled(
-        global_address=proj.iterator.toint(),
+        global_address=bfa.iterator.toint(),
         dtype=cutlass.BFloat16,
-        global_dims=[proj_words * 2, n_req * (NUM_SPEC + 1)],
-        global_strides=[(proj_words * 4) // 16],
+        global_dims=[bfa_words * 2, n_req * (NUM_SPEC + 1)],
+        global_strides=[(bfa_words * 4) // 16],
         box_dims=[TMA_K_BOX, MMA_N],
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     k3_fp8_kda_verify_kernel(
-        tma_wfb, tma_fa, proj, g_ext, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots,
-        pending, out, proj_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB, USE_PDL,
+        tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
+        slots, pending, out, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB, SEP_BFA,
+        USE_PDL,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip

@@ -106,6 +106,12 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
     1,
     "lowm MoE on 9-16 token steps: the head, routing, NVFP4 latent and shared gate_up in k3_moe_front's 16-token build",
 )
+TRTLLM_K3LL_KDA_BFA_GEMV = _flag(
+    "TRTLLM_K3LL_KDA_BFA_GEMV",
+    0,
+    "KDA decode / verify: the bf16 [f_a | b] projection on k3_ctm_gemv_wide (decode_gemv site kda_bfa), and the "
+    "verify kernel reading it beside the FP8 QKVG rows instead of a concatenated copy",
+)
 
 
 TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(

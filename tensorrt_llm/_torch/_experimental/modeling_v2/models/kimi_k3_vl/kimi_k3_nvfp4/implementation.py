@@ -2198,10 +2198,22 @@ class K3DecodeKDA(KimiKDALinearAttention):
         super().__init__(*args, **kwargs)
         self.fp8_decode_ready = False
         self.decode_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
+        # The decode GEMVs' state for the bf16 [f_a | b] projection (site kda_bfa), set by the target's
+        # cache_derived_state under TRTLLM_K3LL_KDA_BFA_GEMV.
+        self._bfa_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
 
     @property
     def takes_k3_kernels(self) -> bool:
         return self.qkvg_proj is not None
+
+    def _k3_bfa(self, x: torch.Tensor) -> torch.Tensor:
+        """The bf16 ``[f_a | b]`` projection of ``x``: on the ``kda_bfa`` decode GEMV where it takes the rows, else
+        ``F.linear``."""
+        if self._bfa_gemvs is not None:
+            y = self._bfa_gemvs.project("kda_bfa", x, self._bfa_proj_weight)
+            if y is not None:
+                return y
+        return torch.nn.functional.linear(x, self._bfa_proj_weight)
 
     def finalize_decode_weights(self) -> None:
         super().finalize_decode_weights()
@@ -2291,7 +2303,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         qkvg = self.qkvg_proj(x)
-        bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+        bfa = self._k3_bfa(x)
         core = _fp8_attention.kda_decode(
             qkvg,
             bfa,
@@ -2345,9 +2357,13 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = slot_indices[:num_requests]
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
-        rows = torch.cat(
-            (self.qkvg_proj(x), torch.nn.functional.linear(x, self._bfa_proj_weight)), dim=-1
-        )
+        qkvg = self.qkvg_proj(x)
+        bfa = self._k3_bfa(x)
+        if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
+            # The kernel reads f_a and b from their own rows.
+            rows, bfa_rows = qkvg, bfa
+        else:
+            rows, bfa_rows = torch.cat((qkvg, bfa), dim=-1), None
         out = k3_fp8_kda_verify(
             rows,
             self.f_b_proj.weight,
@@ -2366,6 +2382,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             layer_cache.prev_num_accepted_tokens,
             num_steps - 1,
             *constants,
+            bfa=bfa_rows,
         )
         return out.view(-1, self.num_heads, self.head_dim)
 
@@ -3487,6 +3504,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 # The lowm MoE decode path's bf16 GEMVs (decode_moe_lowm.py): a wide step's head, shared gate_up
                 # and tail, and the replicated tail's latent up projection.
                 sites += ("moe_head", "moe_shared_gate_up", "moe_tail", "moe_up")
+            if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
+                sites += ("kda_bfa",)
             if isinstance(self.draft_model, K3DSparkDrafter):
                 sites += ("drafter_qkv", "drafter_o", "drafter_gate_up", "drafter_down")
             elif _flags.TRTLLM_K3LL_MLA_DRAFTER_NORMS and self._mla_drafter() is not None:
@@ -3501,6 +3520,20 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 layer.decode_gemvs = gemvs
         if isinstance(self.draft_model, K3DSparkDrafter):
             self.draft_model.decode_gemvs = gemvs
+        if "kda_bfa" in sites:
+            kda = [
+                layer.linear_attn
+                for layer in self.model.layers
+                if layer.is_kda and isinstance(layer.linear_attn, K3DecodeKDA)
+            ]
+            for attn in kda:
+                attn._bfa_gemvs = gemvs
+            warmed = sorted(key[2] for key in gemvs._ran if key[0] == "kda_bfa")
+            if self.model_config.mapping.tp_rank == 0:
+                logger.info(
+                    f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_GEMV=1: {len(kda)} KDA layers' [f_a | b] projection on "
+                    f"k3_ctm_gemv_wide (row tiles warmed: {warmed}); verify reads it beside the QKVG rows"
+                )
 
     def post_load_weights(self) -> None:
         """Enable fused FP8 decode after weight preparation and build the TP collective state.

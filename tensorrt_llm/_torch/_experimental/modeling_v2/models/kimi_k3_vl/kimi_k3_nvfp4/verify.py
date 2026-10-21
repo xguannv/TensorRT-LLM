@@ -102,6 +102,7 @@ def k3_fp8_kda_verify(
     scale: float,
     eps: float,
     g_ext: Optional[torch.Tensor] = None,
+    bfa: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Gated-norm KDA core output [T, H, V] bf16 for T = N * (1 + num_spec) verify tokens.
 
@@ -110,7 +111,9 @@ def k3_fp8_kda_verify(
     ``dt_bias`` fp32 [H K]; ``onorm_w`` fp32 [V]; ``cs_*`` fp32 [pool, H K, 3 + num_spec] (dim-contiguous);
     ``ssm`` fp32 or bf16 [pool, H, V, K] (each slot dense, slots at any stride); ``state_tok`` fp32
     [pool, 3, num_spec, H, K], the drafts' records (vn, beta * k, decay); ``slots`` int32 [N]; ``pending`` int32
-    [pool]. With ``g_ext`` (bf16 [T, H K], the unfused f_b output) the gate is read instead of computed from f_a."""
+    [pool]. With ``g_ext`` (bf16 [T, H K], the unfused f_b output) the gate is read instead of computed from f_a.
+    With ``bfa`` (bf16 [T, K + H + pad], the [f_a | b] rows of a separate projection), ``proj`` holds only
+    [q | k | v | onorm gate | ...] (at least 4 H K columns) and f_a and b are read from ``bfa``."""
     import cuda.bindings.driver as cuda_driver
 
     from . import verify_kernel as kernel
@@ -119,13 +122,25 @@ def k3_fp8_kda_verify(
     num_heads = w_fb.shape[0] // K
     tokens = n_req * (1 + num_spec)
     v_dim = onorm_w.shape[0]
+    sep_bfa = bfa is not None
     if (
         proj.dtype != torch.bfloat16
         or proj.dim() != 2
         or proj.shape[0] != tokens
         or proj.shape[1] % 8 != 0
-        or proj.shape[1] < 4 * num_heads * K + K + num_heads
+        or proj.shape[1] < 4 * num_heads * K + (0 if sep_bfa else K + num_heads)
         or not proj.is_contiguous()
+        or (
+            sep_bfa
+            and (
+                bfa.dtype != torch.bfloat16
+                or bfa.dim() != 2
+                or bfa.shape[0] != tokens
+                or bfa.shape[1] % 8 != 0
+                or bfa.shape[1] < K + num_heads
+                or not bfa.is_contiguous()
+            )
+        )
         or tuple(w_fb.shape) != (num_heads * K, K)
         or w_fb.dtype != torch.bfloat16
         or not w_fb.is_contiguous()
@@ -151,7 +166,8 @@ def k3_fp8_kda_verify(
             f"w_fb {tuple(w_fb.shape)} {w_fb.dtype} contiguous {w_fb.is_contiguous()}, onorm_w {tuple(onorm_w.shape)}, "
             f"ssm {tuple(ssm.shape)} {ssm.dtype} strides {ssm.stride()}, state_tok {tuple(state_tok.shape)} "
             f"{state_tok.dtype} contiguous {state_tok.is_contiguous()}, cs_q {tuple(cs_q.shape)}, num_spec {num_spec}, "
-            f"slots {tuple(slots.shape)} {slots.dtype}, pending {pending.dtype} (tokens expected {tokens})"
+            f"slots {tuple(slots.shape)} {slots.dtype}, pending {pending.dtype} (tokens expected {tokens}), "
+            f"bfa {None if bfa is None else (tuple(bfa.shape), bfa.dtype, bfa.is_contiguous())}"
         )
     fold_fb = g_ext is None
     out = torch.empty(tokens, num_heads, v_dim, dtype=torch.bfloat16, device=proj.device)
@@ -159,6 +175,7 @@ def k3_fp8_kda_verify(
         _arg(w_fb),
         _arg(_words(proj)),
         _arg(_words(proj if fold_fb else g_ext)),
+        _arg(_words(bfa if sep_bfa else proj)),
         _arg(_flat(w_q)),
         _arg(_flat(w_k)),
         _arg(_flat(w_v)),
@@ -174,7 +191,7 @@ def k3_fp8_kda_verify(
         _index_arg(pending),
         _arg(_flat(out)),
     )
-    runtime = (proj.shape[1] // 2, n_req, ssm.stride(0))
+    runtime = (proj.shape[1] // 2, (bfa if sep_bfa else proj).shape[1] // 2, n_req, ssm.stride(0))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
     pdl = use_pdl()
     key = (
@@ -185,6 +202,7 @@ def k3_fp8_kda_verify(
         float(scale),
         float(eps),
         fold_fb,
+        sep_bfa,
         pdl,
     )
     fn = _compiled.get(key)
@@ -201,7 +219,7 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, pdl, stream,
+                    float(eps), fold_fb, sep_bfa, pdl, stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
     return out
@@ -209,7 +227,7 @@ def k3_fp8_kda_verify(
 
 @k3_fp8_kda_verify.register_fake
 def _(proj, w_fb, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots, pending,
-      num_spec, lower_bound, scale, eps, g_ext=None):  # fmt: skip
+      num_spec, lower_bound, scale, eps, g_ext=None, bfa=None):  # fmt: skip
     return proj.new_empty(
         (proj.shape[0], w_fb.shape[0] // K, onorm_w.shape[0]), dtype=torch.bfloat16
     )
