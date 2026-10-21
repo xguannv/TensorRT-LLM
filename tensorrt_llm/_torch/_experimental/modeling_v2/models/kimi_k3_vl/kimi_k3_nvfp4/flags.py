@@ -93,7 +93,7 @@ TRTLLM_K3LL_FP8W_LOWM_FUSED_A = _flag(
 
 TRTLLM_K3LL_MOE_FRONT16 = _flag(
     "TRTLLM_K3LL_MOE_FRONT16",
-    0,
+    1,
     "lowm MoE on 9-16 token steps: the head, routing, NVFP4 latent and shared gate_up in k3_moe_front's 16-token build",
 )
 
