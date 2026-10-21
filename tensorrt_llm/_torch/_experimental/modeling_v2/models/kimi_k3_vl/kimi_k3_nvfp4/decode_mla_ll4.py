@@ -37,7 +37,10 @@ _TILERS = ((128, 128), (128, 256))
 _CLUSTER_SIZE = 2
 _WORKSPACE_ALIGN = 128
 _ACC_BYTES = 4  # Float32 partial O / LSE
-_MAX_SPLIT_KV = 32  # the kernel's can_implement bound for the uniform split
+_MAX_SPLIT_KV = (
+    32  # ll4's default-split ceiling, and the per-request splits the workspace is sized for
+)
+_MAX_REDUCTION_SPLITS = 256  # the uniform split's reduction kernel (mla_helpers.MAX_SPLITS)
 #: ll4's uniform split targets this many CTA waves (TRTLLM_MLA_SPLIT_KV_WAVES default).
 _SPLIT_KV_WAVES = 8.0
 #: Largest batch of the register-schedule (small-batch) balanced variant.
@@ -203,9 +206,9 @@ class MlaLl4Decode:
     ):
         if num_heads > _MMA_TILE_M:
             raise ValueError(f"MLA ll4 decode: at most {_MMA_TILE_M} heads, got {num_heads}")
-        if split_kv is not None and not 1 <= split_kv <= _MAX_SPLIT_KV:
+        if split_kv is not None and not 1 <= split_kv <= _MAX_REDUCTION_SPLITS:
             raise ValueError(
-                f"MLA ll4 decode: split_kv must be in [1, {_MAX_SPLIT_KV}], got {split_kv}"
+                f"MLA ll4 decode: split_kv must be in [1, {_MAX_REDUCTION_SPLITS}], got {split_kv}"
             )
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
@@ -303,6 +306,11 @@ class MlaLl4Decode:
             stats_k = softmax_stats.view(batch, seq_len_q, heads, 2).permute(2, 1, 0, 3)
 
         balanced, split_kv, persistent = self.tactic(batch)
+        if not balanced and batch * split_kv > self.max_batch * _MAX_SPLIT_KV:
+            raise ValueError(
+                f"MLA ll4 decode: {batch} requests x split {split_kv} exceed the workspace "
+                f"({self.max_batch} x {_MAX_SPLIT_KV})"
+            )
         use_ws = balanced or split_kv > 1
         opts = kernel_options(batch, balanced, **self.options)
         key = (heads, seq_len_q, self.page_size, self.emit_softmax_stats, kv_bounds is not None, balanced,
