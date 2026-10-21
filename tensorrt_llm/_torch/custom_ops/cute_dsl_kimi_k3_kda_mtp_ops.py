@@ -51,7 +51,8 @@ Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 ``HV == H``, one V pass (TILE_V=128, 512 threads). ``num_spec`` is a
 compile-time constant per cache allocation; every shape compiles the same
 kernel structure (the drop's benchmark-only setmaxreg / register-weight
-specializations were retired with the latency restructuring).
+specializations were retired with the latency restructuring). ``num_spec <= 7``
+on every kernel; ``num_spec == 8`` only on the v2 contract (below).
 
 Kernel selection: calls on the runtime contract (packed token rows, fused gated
 RMSNorm with a bf16 output, 3xTF32 recurrence, vector-aligned operands) run
@@ -88,7 +89,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode_2cta import (
         kda_decode_mtp_2cta_kernel,
     )
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode_v2 import kda_decode_mtp_v2_kernel
+    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode_v2 import (
+        MAX_NUM_SPEC,
+        kda_decode_mtp_v2_kernel,
+    )
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
@@ -1482,7 +1486,7 @@ def kda_mtp_decode_impl(
         and fuse_output_norm
         and not quantize_output
         and not bf16_math
-        and num_spec <= 7
+        and num_spec <= MAX_NUM_SPEC
         and _v2_operands_ok(
             w_q=w_q,
             w_k=w_k,
@@ -1493,6 +1497,11 @@ def kda_mtp_decode_impl(
     )
     if mxfp8_out is not None and not use_v2:
         raise ValueError("the MXFP8 side output needs the v2 kernel contract")
+    if num_spec > 7 and not use_v2:
+        raise ValueError(
+            f"num_spec={num_spec} needs the v2 kernel contract (packed rows, fused output norm, "
+            "bf16 output, 3xTF32, vector-aligned operands); the other kernels support up to 7"
+        )
     if (fused_fb or use_pdl) and not use_v2:
         raise ValueError(
             "the fused forget gate and PDL launch need the v2 kernel contract (packed rows, "
@@ -1505,6 +1514,7 @@ def kda_mtp_decode_impl(
         w_fb_arg = w_fb if fused_fb else w_q
         use_2cta = (
             two_cta
+            and num_spec <= 7
             and not fused_fb
             and mxfp8_out is None
             and split_v == 1

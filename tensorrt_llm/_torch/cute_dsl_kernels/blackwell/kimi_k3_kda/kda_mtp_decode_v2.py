@@ -20,8 +20,8 @@ recurrence, fp32 or bf16 state, K = V = 128, conv width 4, NUM_SPEC <= 7 -- with
 arithmetic in the same order, so outputs, committed state, conv pools and replay caches are
 bitwise identical. See that module for the math (replay of accepted drafts, chunk WY form,
 GEMM1/GEMM3/forward substitution/GEMM2, in-place state commit after the golden token, the
-cluster-pair ``SPLIT_V == 2`` form). The difference is the schedule of the latency-bound
-CTA:
+cluster-pair ``SPLIT_V == 2`` form). It also runs NUM_SPEC = 8, which that kernel does not
+(see "NUM_SPEC = 8" below). The difference is the schedule of the latency-bound CTA:
 
 * **Load phase.** The state slot is the first load. The slot-independent operands (new-token
   projections, conv weights, per-head constants, output-norm operands) are issued under it; the
@@ -53,6 +53,31 @@ Optional (compile-time) variants, both bitwise identical to the plain kernel fed
   per 1x32 group ``[T, HV * V / 32]``. A group is one 32-channel column block of a token row, one
   value per lane of the token's warp; amax, exponent and E4M3 conversion are the low-M GEMM's own,
   so the codes are bitwise what it would quantize the BF16 output to.
+
+**NUM_SPEC = 8** (nine new tokens, up to 17 chunk tokens; every NUM_SPEC <= 7 instantiation is
+unchanged). The work of the ninth new token and of the eighth replay entry goes to warps that hold
+the register arrays of that role anyway: the TMA warp loads new token 8, warp 7 replay entry 7; the
+f_b MMA warps run a second n8 tile for token 8 (same column, operands and k order as
+``k3_kda_fab``'s tail, so the gate stays bitwise the fab kernel's; token 8's f_a row arrives in
+shared memory by one bulk copy on the W_fb mbarrier); in the precompute token 8 rides along on warp
+0 (q / k) and warp 9 (gate, beta, v), its dependency chains interleaved with the warp's own token,
+and the norm epilogue walks the tokens in steps of its eight warps. The chunk stage runs tokens
+``cb .. T_loop - 1``, whose q / k / gate / v / beta rows are staged at their chunk index ``t - cb``
+(the raw conv inputs keep their sequence rows), so it is the NUM_SPEC <= 7 code on static
+shared-memory addresses: ``cb = 0`` while at most 7 drafts were accepted (``T_loop <= 16``); after
+a fully accepted round (``T_loop = 17``) ``cb = 1``, the first replayed draft is staged in the
+spare row 16 and a pre-step folds it into the initial state with the exact single-token recurrence
+in fp32 on CUDA cores (``S1 = S0 diag(e^g0) + beta0 (v0 - S0 diag(e^g0) k0) k0^T``, one row of S
+per thread group, partial row sums exchanged through shared memory), so the 16-token chunk then
+starts from ``S1``. With a bf16 state pool, GEMM1 reads ``S1`` truncated to tf32 (no lo sweep;
+relative error below 2^-10, under the 2^-9 rounding of the bf16 state that the round commits); the
+GEMM2 seed uses it in fp32.
+
+The NUM_SPEC = 8 paths keep their code small (a dynamic loop over a warpgroup's output tokens, only
+a thread's own four chunk tokens in the gate stage): the kernel is straight-line code, and with
+every token unrolled it outgrew the instruction cache (warps then stall on instruction fetch in
+every phase). The conv weights arrive by one load per thread from the quad's row (three loads
+predicated on the quad may share their registers and wait for each other).
 """
 
 import os
@@ -83,8 +108,11 @@ NUM_THREADS = 512
 #: only after the all-reduce's wait, i.e. after this grid completed.
 EARLY_TRIGGER = os.environ.get("TRTLLM_K3_KDA_DECODE_EARLY_TRIGGER", "0") == "1"
 TILE_K = 128
-# Chunk length padding (MMA N granularity); NUM_SPEC <= 7 -> T_loop <= 15.
+# Chunk length padding (MMA N granularity); NUM_SPEC <= 7 -> T_loop <= 15. NUM_SPEC = 8 -> T_loop
+# <= 17: the chunk takes the last 16 tokens, a pre-step the first one (T_loop = 17).
 T_PAD = 16
+#: Largest draft count (NUM_SPEC) the kernel supports.
+MAX_NUM_SPEC = 8
 # TMEM columns: D4 (16) + D2 halves (2 x 64) + S0 hi (128) + S0 lo (128) + D1 (48) + D3 (16)
 TMEM_COLS = 512
 # One 114 KB scratch region hosts, at different times, the TMA boxes of S0 / the committed state
@@ -333,6 +361,24 @@ def st_shared_f32x4(addr, a, b, c, d):
 
 
 @dsl_user_op
+def bulk_g2s(dst, src, nbytes, mbar, *, loc=None, ip=None):
+    """``nbytes`` (a multiple of 16) from global ``src`` to this CTA's shared ``dst``, completing
+    on the mbarrier at shared address ``mbar`` (``cp.async.bulk``)."""
+    _st_asm(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+        f"[$0], [$1], {nbytes}, [$2];",
+        "r,l,r",
+        [
+            cutlass.Int32(dst).ir_value(loc=loc, ip=ip),
+            Int64(src).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(mbar).ir_value(loc=loc, ip=ip),
+        ],
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def griddepcontrol_wait(*, loc=None, ip=None):
     _st_asm("griddepcontrol.wait;", "", [], loc=loc, ip=ip)
 
@@ -436,6 +482,102 @@ def _load_new_token_row(
         ld_row4(g, (0, tok_row, i_hv, k4), r_new, 12)
     ld_row4(onorm_g, (0, tok_row, i_hv, k4), r_new, 16)
     r_newb[0] = cutlass.Float32(beta[0, tok_row, i_hv])
+
+
+def _precompute_qk(ts, rows, lane, sXQ, sXK, sConvW, sQ, sK, k_weight_base, K, W, scale):
+    """q and k of the new tokens whose raw conv inputs start at sequence rows ``ts``, into chunk
+    rows ``rows``: conv + SiLU + L2 norm (the arithmetic of the inline precompute), the chains
+    of all tokens interleaved so that one warp overlaps their latencies."""
+    vec = K // 32
+    n = len(ts)
+    r_q = [[None] * vec for _ in range(n)]
+    r_k = [[None] * vec for _ in range(n)]
+    for i in range(vec):
+        k_idx = i * 32 + lane
+        for a in range(n):
+            t = ts[a]
+            r_conv_0 = cutlass.Float32(0.0)
+            for w in range(W):
+                r_conv_0 += sXQ[(t + w) * K + k_idx] * sConvW[w * K + k_idx]
+            r_conv = sXK[t * K + k_idx] * sConvW[k_weight_base + 0 * K + k_idx]
+            for w in range(1, W):
+                r_conv += sXK[(t + w) * K + k_idx] * sConvW[k_weight_base + w * K + k_idx]
+            e0 = cute.math.exp(-r_conv_0, fastmath=True)
+            r_q[a][i] = r_conv_0 * cute.arch.rcp_approx(cutlass.Float32(1.0) + e0)
+            r_k[a][i] = r_conv * cute.arch.rcp_approx(
+                cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
+            )
+    sum_q = [cutlass.Float32(0.0)] * n
+    sum_k = [cutlass.Float32(0.0)] * n
+    for i in range(vec):
+        for a in range(n):
+            sum_q[a] += r_q[a][i] * r_q[a][i]
+            sum_k[a] += r_k[a][i] * r_k[a][i]
+    for offset in [16, 8, 4, 2, 1]:
+        for a in range(n):
+            sum_q[a] += cute.arch.shuffle_sync_bfly(
+                sum_q[a], offset=offset, mask=-1, mask_and_clamp=31
+            )
+            sum_k[a] += cute.arch.shuffle_sync_bfly(
+                sum_k[a], offset=offset, mask=-1, mask_and_clamp=31
+            )
+    for a in range(n):
+        rnorm_q_scaled = cute.math.rsqrt(sum_q[a] + 1e-06, fastmath=True) * scale
+        rnorm_k = cute.math.rsqrt(sum_k[a] + 1e-06, fastmath=True)
+        for i in range(vec):
+            k_idx = i * 32 + lane
+            sQ[rows[a], k_idx] = r_q[a][i] * rnorm_q_scaled
+            sK[rows[a], k_idx] = r_k[a][i] * rnorm_k
+
+
+def _precompute_gbv(
+    ts,
+    rows,
+    lane,
+    sGin,
+    sDtBias,
+    sAlog,
+    sG,
+    sBetaRaw,
+    sBeta,
+    sXV,
+    sConvW,
+    sVall,
+    v_weight_base,
+    K,
+    V,
+    W,
+    lower_bound,
+):
+    """Gate, beta and v of the new tokens at sequence rows ``ts`` into chunk rows ``rows`` (the
+    arithmetic of the inline precompute, the tokens interleaved). Every lane stores the token's
+    beta (the same value)."""
+    vec = K // 32
+    n = len(ts)
+    r_exp_A = cute.math.exp(sAlog[0], fastmath=True)
+    for i in range(vec):
+        k_idx = i * 32 + lane
+        for a in range(n):
+            r_g_raw = sGin[ts[a] * K + k_idx]
+            r_g_raw = r_g_raw + sDtBias[k_idx]
+            exp_A_x = r_exp_A * r_g_raw
+            sigmoid_val = cute.arch.rcp_approx(
+                cutlass.Float32(1.0) + cute.math.exp(-exp_A_x, fastmath=True)
+            )
+            sG[rows[a], k_idx] = lower_bound * sigmoid_val
+    for a in range(n):
+        sBeta[rows[a]] = cute.arch.rcp_approx(
+            cutlass.Float32(1.0) + cute.math.exp(-sBetaRaw[ts[a]], fastmath=True)
+        )
+    for i in range(vec):
+        v_idx = i * 32 + lane
+        for a in range(n):
+            _v_conv = cutlass.Float32(0.0)
+            for w in range(W):
+                _v_conv += sXV[(ts[a] + w) * V + v_idx] * sConvW[v_weight_base + w * V + v_idx]
+            sVall[rows[a] * V + v_idx] = _v_conv * cute.arch.rcp_approx(
+                cutlass.Float32(1.0) + cute.math.exp(-_v_conv, fastmath=True)
+            )
 
 
 def gaddr(tensor, coord):
@@ -601,11 +743,18 @@ def kda_decode_mtp_v2_kernel(
     vec_size = TILE_K // 32
     # Load-phase warp roles: warp j < NEW_TOK stages new token j, warp REPLAY_WARP0 + r the
     # pending draft r (all NUM_SPEC entries are loaded, the accepted ones placed), the last warp
-    # the committed conv windows and the S0 TMA.
+    # the committed conv windows and the S0 TMA. WIDE (NUM_SPEC = 8): new token 8 also goes to
+    # the last warp and replay entry 7 to warp 7.
     REPLAY_WARP0 = NUM_THREADS // 64
     TMA_WARP = NUM_THREADS // 32 - 1
-    assert NUM_SPEC <= 7 and t_max <= T_PAD, "chunk form pads the token axis to 16"
-    assert NEW_TOK <= REPLAY_WARP0 and REPLAY_WARP0 + NUM_SPEC <= TMA_WARP
+    WIDE = NUM_SPEC == MAX_NUM_SPEC
+    if cutlass.const_expr(WIDE):
+        assert NEW_TOK == REPLAY_WARP0 + 1 and REPLAY_WARP0 + NUM_SPEC - 1 == TMA_WARP
+    else:
+        assert NUM_SPEC <= 7 and t_max <= T_PAD, "chunk form pads the token axis to 16"
+        assert NEW_TOK <= REPLAY_WARP0 and REPLAY_WARP0 + NUM_SPEC <= TMA_WARP
+    # Bound of the staged token rows inside the 16-row chunk loops (all 16 exist when WIDE).
+    t_lim = T_PAD if WIDE else t_max
     assert K == 128 and V == 128 and KERNEL_WIDTH == 4 and NUM_THREADS == 512, (
         "the thread mappings assume K = V = 128, conv width 4 and 512 threads"
     )
@@ -709,12 +858,30 @@ def kda_decode_mtp_v2_kernel(
     #     dt_bias / output-norm weight / A_log (threads [384, 512)), new token j = warp
     #     (warps < NEW_TOK)
     r_w = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.Int32)
-    if quad == 0:
-        ld_row4(w_q, (hk_off + ch, 0), r_w, 0)
-    if quad == 1:
-        ld_row4(w_k, (hk_off + ch, 0), r_w, 0)
-    if quad == 2:
-        ld_row4(w_v, (hv_off + ch, 0), r_w, 0)
+    if cutlass.const_expr(WIDE):
+        # one load from the quad's weight row: three loads predicated on the quad can share
+        # their destination registers and then wait for each other
+        w_addr = gaddr(w_q, (hk_off + ch, 0))
+        if quad == 1:
+            w_addr = gaddr(w_k, (hk_off + ch, 0))
+        if quad == 2:
+            w_addr = gaddr(w_v, (hv_off + ch, 0))
+        if quad < 3:
+            if cutlass.const_expr(w_q.element_type.width == 16):
+                w2 = ld_global_b32x2(w_addr)
+                r_w[0] = w2[0]
+                r_w[1] = w2[1]
+            else:
+                w4 = ld_global_b32x4(w_addr)
+                for i in cutlass.range_constexpr(4):
+                    r_w[i] = w4[i]
+    else:
+        if quad == 0:
+            ld_row4(w_q, (hk_off + ch, 0), r_w, 0)
+        if quad == 1:
+            ld_row4(w_k, (hk_off + ch, 0), r_w, 0)
+        if quad == 2:
+            ld_row4(w_v, (hv_off + ch, 0), r_w, 0)
     r_c = cute.make_rmem_tensor(cute.make_layout((3,)), cutlass.Float32)
     if quad == 3:
         r_c[0] = cutlass.Float32(dt_bias[hk_off + ch])
@@ -722,13 +889,24 @@ def kda_decode_mtp_v2_kernel(
         r_c[2] = cutlass.Float32(A_log[i_h])
     r_new = cute.make_rmem_tensor(cute.make_layout((5 * 4,)), cutlass.Int32)
     r_newb = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Float32)
-    tok_row = i_n * NEW_TOK + warp_idx
+    if cutlass.const_expr(WIDE):
+        # new token tok_j of this warp: warps 0..7 tokens 0..7, the TMA warp token 8
+        is_tok = (warp_idx < REPLAY_WARP0) | (warp_idx == TMA_WARP)
+        tok_j = warp_idx
+        if warp_idx == TMA_WARP:
+            tok_j = cutlass.Int32(NEW_TOK - 1)
+    else:
+        is_tok = warp_idx < NEW_TOK
+        tok_j = warp_idx
+    tok_row = i_n * NEW_TOK + tok_j
     new_rows = (x_q, x_k, x_v, g, onorm_g, beta)
     # FUSED_FB: warp REPLAY_WARP0 + mi computes the forget gate of W_fb rows [16 mi, 16 mi + 16)
-    # of this head; its f_a B fragments are loaded with the other new-token rows.
+    # of this head; its f_a B fragments are loaded with the other new-token rows. WIDE: the TMA
+    # warp also loads token 8's f_a row (four channels per lane into the gate words of r_new, which
+    # FUSED_FB leaves unused) for the second f_b tile.
     r_fb_b = cute.make_rmem_tensor(cute.make_layout((16,)), cutlass.Int32)
     if cutlass.const_expr(not PDL):
-        if warp_idx < NEW_TOK:
+        if is_tok:
             _load_new_token_row(
                 *new_rows,
                 tok_row,
@@ -771,19 +949,43 @@ def kda_decode_mtp_v2_kernel(
         )
         if warp_idx == TMA_WARP:
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(mbar_fb, TILE_K * TILE_K * 2)
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    mbar_fb, TILE_K * TILE_K * 2 + (TILE_K * 2 if WIDE else 0)
+                )
             for b in cutlass.range_constexpr(TILE_K // FB_BOX_COLS):
                 cute.copy(tma_atom_fb, tFbg[(None, i_hv, b)], tFbs[(None, b)], tma_bar_ptr=mbar_fb)
+        if cutlass.const_expr(WIDE):
+            # token 8's f_a row (128 raw BF16 = 64 words) for the second f_b tile, one bulk copy
+            # into the Kbar staging words (unused until the chunk stage) on mbar_fb; with PDL it
+            # is issued after griddepcontrol.wait (it is the previous grid's output)
+            sFa8w = cute.make_tensor(
+                cute.recast_ptr(sKbT.iterator, dtype=cutlass.Int32),
+                cute.make_layout((TILE_K // 2,)),
+            )
+            fa8_src = gaddr(fa, (0, i_n * NEW_TOK + (NEW_TOK - 1), 0))
+            if cutlass.const_expr(not PDL):
+                if warp_idx == TMA_WARP:
+                    with cute.arch.elect_one():
+                        bulk_g2s(saddr(sKbT, 0), fa8_src, TILE_K * 2, mbar_fb.toint())
     # V2 state views may place many layer pages between adjacent slots. Widen
     # the slot before indexing: slot * state stride can exceed INT32_MAX.
     slot = Int64(slot32)
     h0_idx = slot * HV + i_hv
     # (2) slot-dependent: replay entry r = warp - REPLAY_WARP0 (every pending entry, accepted or
-    #     not), the committed conv windows (TMA warp: three columns of q, k and v)
+    #     not; WIDE: entry 7 on warp 7), the committed conv windows (TMA warp: three columns of q,
+    #     k and v)
     rep = warp_idx - REPLAY_WARP0
+    if cutlass.const_expr(WIDE):
+        is_rep = ((warp_idx >= REPLAY_WARP0) & (warp_idx < TMA_WARP)) | (
+            warp_idx == REPLAY_WARP0 - 1
+        )
+        if warp_idx == REPLAY_WARP0 - 1:
+            rep = cutlass.Int32(NUM_SPEC - 1)
+    else:
+        is_rep = (warp_idx >= REPLAY_WARP0) & (rep < NUM_SPEC)
     r_rep = cute.make_rmem_tensor(cute.make_layout((6 * 4,)), cutlass.Int32)
     r_repb = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Float32)
-    if (warp_idx >= REPLAY_WARP0) & (rep < NUM_SPEC):
+    if is_rep:
         ld_row4(k_cache, (slot, rep, hk_off + k4), r_rep, 0)
         ld_row4(g_cache, (slot, rep, hk_off + k4), r_rep, 4)
         ld_row4(v_cache, (slot, rep, hv_off + k4), r_rep, 8)
@@ -832,7 +1034,11 @@ def kda_decode_mtp_v2_kernel(
         griddepcontrol_wait()
         if cutlass.const_expr(EARLY_TRIGGER):
             griddepcontrol_launch_dependents()
-        if warp_idx < NEW_TOK:
+        if cutlass.const_expr(WIDE and FUSED_FB):
+            if warp_idx == TMA_WARP:
+                with cute.arch.elect_one():
+                    bulk_g2s(saddr(sKbT, 0), fa8_src, TILE_K * 2, mbar_fb.toint())
+        if is_tok:
             _load_new_token_row(
                 *new_rows,
                 tok_row,
@@ -865,8 +1071,8 @@ def kda_decode_mtp_v2_kernel(
         sOnW[ch] = r_c[1]
         if ch == 0:
             sAlog[0] = r_c[2]
-    if warp_idx < NEW_TOK:
-        st_shared_f32x4(saddr(sOnG, warp_idx * V + k4), *unpack4(onorm_g.element_type, r_new, 16))
+    if is_tok:
+        st_shared_f32x4(saddr(sOnG, tok_j * V + k4), *unpack4(onorm_g.element_type, r_new, 16))
     if warp_idx == TMA_WARP:
         for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
             st_shared_f32x4(saddr(sXQ, w * K + k4), *unpack4(CONV_DTYPE, r_win, 4 * w))
@@ -883,8 +1089,22 @@ def kda_decode_mtp_v2_kernel(
     if commit_len > NUM_SPEC:
         commit_len = cutlass.Int32(NUM_SPEC)
     T_loop = commit_len + NEW_TOK
-    if warp_idx < NEW_TOK:
-        t_new = commit_len + warp_idx
+    # Chunk window: the chunk stage runs tokens cb .. T_loop - 1 as chunk tokens 0 .. Tc - 1 with
+    # the golden token at chunk index cl. The q / k / gate / v / beta rows of the precompute and
+    # of the replayed drafts are staged at their chunk index (WIDE: cb = 1 after a fully accepted
+    # round, T_loop = 17; the first replayed draft then goes to the spare row T_PAD, which the
+    # pre-step folds into S0); the raw conv inputs keep their sequence positions.
+    if cutlass.const_expr(WIDE):
+        cb = cutlass.Int32(0)
+        if T_loop > T_PAD:
+            cb = T_loop - T_PAD
+        cl = commit_len - cb
+        Tc = T_loop - cb
+    else:
+        cl = commit_len
+        Tc = T_loop
+    if is_tok:
+        t_new = commit_len + tok_j
         st_shared_f32x4(saddr(sXQ, (t_new + 3) * K + k4), *unpack4(x_q.element_type, r_new, 0))
         st_shared_f32x4(saddr(sXK, (t_new + 3) * K + k4), *unpack4(x_k.element_type, r_new, 4))
         st_shared_f32x4(saddr(sXV, (t_new + 3) * V + k4), *unpack4(x_v.element_type, r_new, 8))
@@ -892,27 +1112,38 @@ def kda_decode_mtp_v2_kernel(
             st_shared_f32x4(saddr(sGin, t_new * K + k4), *unpack4(g.element_type, r_new, 12))
         if in_warp_tid == 0:
             sBetaRaw[t_new] = r_newb[0]
-    if (warp_idx >= REPLAY_WARP0) & (rep < commit_len):
+    if cutlass.const_expr(WIDE):
+        place_rep = is_rep & (rep < commit_len)
+    else:
+        place_rep = (warp_idx >= REPLAY_WARP0) & (rep < commit_len)
+    if place_rep:
         # replayed drafts produce no output: their q rows are unused
+        if cutlass.const_expr(WIDE):
+            crow = rep - cb
+            if crow < 0:
+                crow = cutlass.Int32(T_PAD)
+        else:
+            crow = rep
         z = cutlass.Float32(0.0)
-        st_shared_f32x4(saddr(sQ, rep * K + k4), z, z, z, z)
-        st_shared_f32x4(saddr(sK, rep * K + k4), *unpack4(K_CACHE_DTYPE, r_rep, 0))
-        st_shared_f32x4(saddr(sG, rep * K + k4), *unpack4(g_cache.element_type, r_rep, 4))
-        st_shared_f32x4(saddr(sVall, rep * V + k4), *unpack4(V_CACHE_DTYPE, r_rep, 8))
+        st_shared_f32x4(saddr(sQ, crow * K + k4), z, z, z, z)
+        st_shared_f32x4(saddr(sK, crow * K + k4), *unpack4(K_CACHE_DTYPE, r_rep, 0))
+        st_shared_f32x4(saddr(sG, crow * K + k4), *unpack4(g_cache.element_type, r_rep, 4))
+        st_shared_f32x4(saddr(sVall, crow * V + k4), *unpack4(V_CACHE_DTYPE, r_rep, 8))
         st_shared_f32x4(saddr(sXQ, (rep + 3) * K + k4), *unpack4(CONV_DTYPE, r_rep, 12))
         st_shared_f32x4(saddr(sXK, (rep + 3) * K + k4), *unpack4(CONV_DTYPE, r_rep, 16))
         st_shared_f32x4(saddr(sXV, (rep + 3) * V + k4), *unpack4(CONV_DTYPE, r_rep, 20))
         if in_warp_tid == 0:
-            sBeta[rep] = r_repb[0]
+            sBeta[crow] = r_repb[0]
     if cutlass.const_expr(FUSED_FB):
         # ---- forget gate of the new tokens, gate[t, row] = bf16(f_a[t] @ W_fb[h * 128 + row]^T)
         #      (MMA M = this warp's 16 W_fb rows, N = the token columns, K = 128 in eight
         #      sequential k16 steps from zero) into the raw-gate rows read by the precompute.
         if warp_idx >= REPLAY_WARP0:
             col0 = (i_n * NEW_TOK) % 8
-            if (in_warp_tid // 4 - col0 + 8) % 8 >= NEW_TOK:
-                for i in cutlass.range_constexpr(16):
-                    r_fb_b[i] = cutlass.Int32(0)
+            if cutlass.const_expr(not WIDE):
+                if (in_warp_tid // 4 - col0 + 8) % 8 >= NEW_TOK:
+                    for i in cutlass.range_constexpr(16):
+                        r_fb_b[i] = cutlass.Int32(0)
             # A fragments: W_fb rows 16 mi + {0..7, 8..15} x k16 chunk kk through ldmatrix.x4 on
             # the 128B-swizzled boxes (row r & 7 == lane & 7 selects the 16 B unit XOR)
             mi = warp_idx - REPLAY_WARP0
@@ -921,20 +1152,42 @@ def kda_decode_mtp_v2_kernel(
             a_row = saddr(sScratch, OFF_FB) + (mi * 16 + (mat & 1) * 8 + r8) * 128
             cute.arch.mbarrier_wait(mbar_fb, 0)
             acc = [cutlass.Float32(0.0)] * 4
+            if cutlass.const_expr(WIDE):
+                # WIDE: a second n8 tile holds token 8 in column col0 (its packed row i_n * 9 + 8
+                # is col0 mod 8, the column k3_kda_fab's tail gives it); the lanes of that column
+                # take its f_a words from shared memory (bulk-copied on mbar_fb with W_fb), the
+                # others zero.
+                fb_mask = cutlass.Int32(0) - cutlass.Int32((in_warp_tid >> 2) == col0)
+                acc_b = [cutlass.Float32(0.0)] * 4
             for kk in cutlass.range_constexpr(TILE_K // 16):
                 a = ldmatrix_x4(
                     a_row + (kk // 4) * (TILE_K * 128) + ((((kk % 4) * 2 + (mat >> 1)) ^ r8) << 4)
                 )
                 acc = mma_bf16_16816(a, r_fb_b[2 * kk], r_fb_b[2 * kk + 1], acc)
+                if cutlass.const_expr(WIDE):
+                    b8_0 = sFa8w[8 * kk + (in_warp_tid & 3)] & fb_mask
+                    b8_1 = sFa8w[8 * kk + 4 + (in_warp_tid & 3)] & fb_mask
+                    acc_b = mma_bf16_16816(a, b8_0, b8_1, acc_b)
             for e in cutlass.range_constexpr(4):
                 jt = (2 * (in_warp_tid & 3) + (e & 1) - col0 + 8) % 8
                 if jt < NEW_TOK:
                     row = mi * 16 + (in_warp_tid >> 2) + (e >> 1) * 8
                     sGin[(commit_len + jt) * K + row] = round_bf16(acc[e])
+            if cutlass.const_expr(WIDE):
+                for e in cutlass.range_constexpr(4):
+                    if 2 * (in_warp_tid & 3) + (e & 1) == col0:
+                        row = mi * 16 + (in_warp_tid >> 2) + (e >> 1) * 8
+                        sGin[(commit_len + NEW_TOK - 1) * K + row] = round_bf16(acc_b[e])
     # Padding rows [T_loop, t_max) of the gates, values and betas are zeroed so the chunk
     # stage's r_Y / cumulative-gate / V' loops are branch-free.
+    if cutlass.const_expr(WIDE):
+        pad_lo = Tc
+        pad_hi = T_PAD
+    else:
+        pad_lo = T_loop
+        pad_hi = t_max
     if tidx < K:
-        for _z in cutlass.range(T_loop, t_max, 1):
+        for _z in cutlass.range(pad_lo, pad_hi, 1):
             sG[_z, tidx] = cutlass.Float32(0.0)
             sVall[_z * V + tidx] = cutlass.Float32(0.0)
             if tidx == 0:
@@ -949,70 +1202,104 @@ def kda_decode_mtp_v2_kernel(
     # ---- per-token-parallel precompute (smem only; the new tokens' cache and conv-window writes
     #      are issued from smem while the tensor cores run GEMM1/GEMM3): warp j < NEW_TOK computes
     #      the q and k conv + SiLU + L2 norm of new token j (the two chains interleaved), warp 8 + j
-    #      its gate, beta and v conv.
+    #      its gate, beta and v conv. WIDE: token 8 rides along on warp 0 (q / k) and warp 9 (gate,
+    #      beta, v), its dependency chains interleaved with the warp's own token; the q / k / gate
+    #      / v / beta rows go to the tokens' chunk rows.
     half = NUM_THREADS // 64
     role = warp_idx // half
     j = warp_idx % half
-    if j < NEW_TOK:
-        t = commit_len + j
+    if cutlass.const_expr(WIDE):
+        pc_t8 = commit_len + (NEW_TOK - 1)
+        pc_r8 = cl + (NEW_TOK - 1)
+        qk_args = (in_warp_tid, sXQ, sXK, sConvW, sQ, sK, k_weight_base, K, KERNEL_WIDTH, scale)
+        gbv_args = (
+            in_warp_tid,
+            sGin,
+            sDtBias,
+            sAlog,
+            sG,
+            sBetaRaw,
+            sBeta,
+            sXV,
+            sConvW,
+            sVall,
+            v_weight_base,
+            K,
+            V,
+            KERNEL_WIDTH,
+            lower_bound,
+        )
         if role == 0:
-            for i in cutlass.range(vec_size, unroll_full=True):
-                k_idx = i * 32 + in_warp_tid
-                r_conv_0 = cutlass.Float32(0.0)
-                for w in cutlass.range(KERNEL_WIDTH, unroll_full=True):
-                    r_conv_0 += sXQ[(t + w) * K + k_idx] * sConvW[w * K + k_idx]
-                r_conv = sXK[t * K + k_idx] * sConvW[k_weight_base + 0 * K + k_idx]
-                for w in cutlass.range(1, KERNEL_WIDTH, unroll_full=True):
-                    r_conv += sXK[(t + w) * K + k_idx] * sConvW[k_weight_base + w * K + k_idx]
-                e0 = cute.math.exp(-r_conv_0, fastmath=True)
-                r_q[i] = r_conv_0 * cute.arch.rcp_approx(cutlass.Float32(1.0) + e0)
-                r_conv = r_conv * cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
-                )
-                r_k[i] = r_conv
-            sum_q = 0.0
-            sum_k = 0.0
-            for i in cutlass.range(vec_size, unroll_full=True):
-                sum_q += r_q[i] * r_q[i]
-                sum_k += r_k[i] * r_k[i]
-            for offset in [16, 8, 4, 2, 1]:
-                sum_q += cute.arch.shuffle_sync_bfly(
-                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                sum_k += cute.arch.shuffle_sync_bfly(
-                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                )
-            rnorm_q_scaled = cute.math.rsqrt(sum_q + 1e-06, fastmath=True) * scale
-            rnorm_k = cute.math.rsqrt(sum_k + 1e-06, fastmath=True)
-            for i in cutlass.range(vec_size, unroll_full=True):
-                k_idx = i * 32 + in_warp_tid
-                sQ[t, k_idx] = r_q[i] * rnorm_q_scaled
-                sK[t, k_idx] = r_k[i] * rnorm_k
+            if j == 0:
+                _precompute_qk([commit_len + j, pc_t8], [cl + j, pc_r8], *qk_args)
+            else:
+                _precompute_qk([commit_len + j], [cl + j], *qk_args)
         else:
-            r_exp_A = cute.math.exp(sAlog[0], fastmath=True)
-            for i in cutlass.range(vec_size, unroll_full=True):
-                k_idx = i * 32 + in_warp_tid
-                r_g_raw = sGin[t * K + k_idx]
-                r_g_raw = r_g_raw + sDtBias[k_idx]
-                exp_A_x = r_exp_A * r_g_raw
-                sigmoid_val = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-exp_A_x, fastmath=True)
+            if j == 1:
+                _precompute_gbv([commit_len + j, pc_t8], [cl + j, pc_r8], *gbv_args)
+            else:
+                _precompute_gbv([commit_len + j], [cl + j], *gbv_args)
+    else:
+        if j < NEW_TOK:
+            t = commit_len + j
+            if role == 0:
+                for i in cutlass.range(vec_size, unroll_full=True):
+                    k_idx = i * 32 + in_warp_tid
+                    r_conv_0 = cutlass.Float32(0.0)
+                    for w in cutlass.range(KERNEL_WIDTH, unroll_full=True):
+                        r_conv_0 += sXQ[(t + w) * K + k_idx] * sConvW[w * K + k_idx]
+                    r_conv = sXK[t * K + k_idx] * sConvW[k_weight_base + 0 * K + k_idx]
+                    for w in cutlass.range(1, KERNEL_WIDTH, unroll_full=True):
+                        r_conv += sXK[(t + w) * K + k_idx] * sConvW[k_weight_base + w * K + k_idx]
+                    e0 = cute.math.exp(-r_conv_0, fastmath=True)
+                    r_q[i] = r_conv_0 * cute.arch.rcp_approx(cutlass.Float32(1.0) + e0)
+                    r_conv = r_conv * cute.arch.rcp_approx(
+                        cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
+                    )
+                    r_k[i] = r_conv
+                sum_q = 0.0
+                sum_k = 0.0
+                for i in cutlass.range(vec_size, unroll_full=True):
+                    sum_q += r_q[i] * r_q[i]
+                    sum_k += r_k[i] * r_k[i]
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_q += cute.arch.shuffle_sync_bfly(
+                        sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    sum_k += cute.arch.shuffle_sync_bfly(
+                        sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                rnorm_q_scaled = cute.math.rsqrt(sum_q + 1e-06, fastmath=True) * scale
+                rnorm_k = cute.math.rsqrt(sum_k + 1e-06, fastmath=True)
+                for i in cutlass.range(vec_size, unroll_full=True):
+                    k_idx = i * 32 + in_warp_tid
+                    sQ[t, k_idx] = r_q[i] * rnorm_q_scaled
+                    sK[t, k_idx] = r_k[i] * rnorm_k
+            else:
+                r_exp_A = cute.math.exp(sAlog[0], fastmath=True)
+                for i in cutlass.range(vec_size, unroll_full=True):
+                    k_idx = i * 32 + in_warp_tid
+                    r_g_raw = sGin[t * K + k_idx]
+                    r_g_raw = r_g_raw + sDtBias[k_idx]
+                    exp_A_x = r_exp_A * r_g_raw
+                    sigmoid_val = cute.arch.rcp_approx(
+                        cutlass.Float32(1.0) + cute.math.exp(-exp_A_x, fastmath=True)
+                    )
+                    sG[t, k_idx] = lower_bound * sigmoid_val
+                r_beta_t = cute.arch.rcp_approx(
+                    cutlass.Float32(1.0) + cute.math.exp(-sBetaRaw[t], fastmath=True)
                 )
-                sG[t, k_idx] = lower_bound * sigmoid_val
-            r_beta_t = cute.arch.rcp_approx(
-                cutlass.Float32(1.0) + cute.math.exp(-sBetaRaw[t], fastmath=True)
-            )
-            if in_warp_tid == 0:
-                sBeta[t] = r_beta_t
-            for i in cutlass.range(vec_size, unroll_full=True):
-                v_idx = i * 32 + in_warp_tid
-                _v_conv = 0.0
-                for w in cutlass.range(KERNEL_WIDTH, unroll_full=True):
-                    _v_conv += sXV[(t + w) * V + v_idx] * sConvW[v_weight_base + w * V + v_idx]
-                _v_conv = _v_conv * cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-_v_conv, fastmath=True)
-                )
-                sVall[t * V + v_idx] = _v_conv
+                if in_warp_tid == 0:
+                    sBeta[t] = r_beta_t
+                for i in cutlass.range(vec_size, unroll_full=True):
+                    v_idx = i * 32 + in_warp_tid
+                    _v_conv = 0.0
+                    for w in cutlass.range(KERNEL_WIDTH, unroll_full=True):
+                        _v_conv += sXV[(t + w) * V + v_idx] * sConvW[v_weight_base + w * V + v_idx]
+                    _v_conv = _v_conv * cute.arch.rcp_approx(
+                        cutlass.Float32(1.0) + cute.math.exp(-_v_conv, fastmath=True)
+                    )
+                    sVall[t * V + v_idx] = _v_conv
     cute.arch.barrier()
 
     # =================================================================
@@ -1079,6 +1366,13 @@ def kda_decode_mtp_v2_kernel(
     r_hi_flat = cute.make_tensor(r_hi.iterator, cute.make_layout((32,)))
     r_lo_flat = cute.make_tensor(r_lo.iterator, cute.make_layout((32,)))
 
+    if cutlass.const_expr(WIDE):
+        # pre-step operands in the V'^T staging words (unused until the forward substitution):
+        # e^{g} of the pre-step token per k column, and the four partial row sums of
+        # S0 diag(e^g0) k0
+        sE0 = cute.make_tensor(sVpT.iterator, cute.make_layout((K,)))
+        sPart = cute.make_tensor(sVpT.iterator + K, cute.make_layout((4 * V,)))
+
     # ---- cumulative gates per k column (thread kq, quarter q owns tokens t = q mod 4):
     #      G_t -> sE, the T x T coupling factors, and the operand rows written with closed-form
     #      128B-swizzle offsets (lanes = consecutive k: conflict-free). The GEMM3 rows (A3 =
@@ -1087,13 +1381,16 @@ def kda_decode_mtp_v2_kernel(
     #      registers until the S0 boxes have been read.
     kq = tidx % K
     quarter = tidx // K
-    t_mid = T_loop // 2
+    t_mid = Tc // 2
     r_G = cute.make_rmem_tensor(cute.make_layout((T_PAD,)), cutlass.Float32)
     g_run = cutlass.Float32(0.0)
     for t in cutlass.range(T_PAD, unroll_full=True):
-        if t < t_max:
+        if t < t_lim:
             g_run = g_run + sG[t, kq]
         r_G[t] = g_run
+    if cutlass.const_expr(WIDE):
+        if (cb > 0) & (quarter == 0):
+            sE0[kq] = cute.math.exp(sG[T_PAD, kq], fastmath=True)
     g_mid = cutlass.Float32(0.0)
     for t in cutlass.range(T_PAD, unroll_full=True):
         if t == t_mid:
@@ -1110,47 +1407,95 @@ def kda_decode_mtp_v2_kernel(
     b1k_base = ka * (T_PAD * 32)
     # GEMM1 rows of this thread's tokens t = quarter + 4 i: (K~ hi, Q~, K~ lo) per token
     r_b1 = cute.make_rmem_tensor(cute.make_layout((3 * (T_PAD // 4),)), cutlass.Float32)
-    for t in cutlass.range(T_PAD, unroll_full=True):
-        if quarter == t % 4:
-            kt_hi = cutlass.Float32(0.0)
-            kt_lo = cutlass.Float32(0.0)
-            qt_r = cutlass.Float32(0.0)
-            kf = cutlass.Float32(0.0)
-            qf_hi = cutlass.Float32(0.0)
-            qf_lo = cutlass.Float32(0.0)
-            kb_hi = cutlass.Float32(0.0)
-            kb_lo = cutlass.Float32(0.0)
-            if t < T_loop:
-                d_t = r_G[t] - g_mid
-                e_t = cute.math.exp(-cute.arch.fmax(-d_t, -exp_clamp), fastmath=True)
-                e_bt = cute.math.exp(-cute.arch.fmax(d_t, -exp_clamp), fastmath=True)
-                eg_t = cute.math.exp(r_G[t], fastmath=True)
-                sE[t * K + kq] = r_G[t]
-                if t == commit_len:
-                    sEc[kq] = eg_t
-                k_t = sK[t, kq]
-                q_t = sQ[t, kq]
-                kt = k_t * eg_t
-                kt_hi = round_tf32(kt)
-                qt_r = round_tf32(q_t * eg_t)
-                kf = round_tf32(k_t * e_t)
-                qf = q_t * e_t
-                qf_hi = round_tf32(qf)
-                kb = k_t * e_bt
-                kb_hi = round_tf32(kb)
-                kt_lo = kt - kt_hi
-                qf_lo = qf - qf_hi
-                kb_lo = kb - kb_hi
-            # rows t, 16+t, 32+t share t % 8 -> the same 16-byte-chunk XOR
-            xc = kc ^ (4 * (t % 8))
-            sA3f[a3_base + 32 * t + xc] = kf
-            sA3f[a3_base + 32 * (T_PAD + t) + xc] = qf_hi
-            sA3f[a3_base + 32 * (2 * T_PAD + t) + xc] = qf_lo
-            sB3hif[b3_base + 32 * t + xc] = kb_hi
-            sB3lof[b3_base + 32 * t + xc] = kb_lo
-            r_b1[3 * (t // 4)] = kt_hi
-            r_b1[3 * (t // 4) + 1] = qt_r
-            r_b1[3 * (t // 4) + 2] = kt_lo
+    if cutlass.const_expr(WIDE):
+        # the thread's four tokens only (G_t picked from r_G by quarter): a quarter of the code
+        for i in cutlass.range_constexpr(T_PAD // 4):
+            tw = quarter + 4 * i
+            g_t_w = r_G[4 * i]
+            for qq_w in cutlass.range_constexpr(1, 4):
+                if quarter == qq_w:
+                    g_t_w = r_G[4 * i + qq_w]
+            kt_hi_w = cutlass.Float32(0.0)
+            kt_lo_w = cutlass.Float32(0.0)
+            qt_r_w = cutlass.Float32(0.0)
+            kf_w = cutlass.Float32(0.0)
+            qf_hi_w = cutlass.Float32(0.0)
+            qf_lo_w = cutlass.Float32(0.0)
+            kb_hi_w = cutlass.Float32(0.0)
+            kb_lo_w = cutlass.Float32(0.0)
+            if tw < Tc:
+                d_t_w = g_t_w - g_mid
+                e_t_w = cute.math.exp(-cute.arch.fmax(-d_t_w, -exp_clamp), fastmath=True)
+                e_bt_w = cute.math.exp(-cute.arch.fmax(d_t_w, -exp_clamp), fastmath=True)
+                eg_t_w = cute.math.exp(g_t_w, fastmath=True)
+                sE[tw * K + kq] = g_t_w
+                if tw == cl:
+                    sEc[kq] = eg_t_w
+                k_t_w = sK[tw, kq]
+                q_t_w = sQ[tw, kq]
+                kt_w = k_t_w * eg_t_w
+                kt_hi_w = round_tf32(kt_w)
+                qt_r_w = round_tf32(q_t_w * eg_t_w)
+                kf_w = round_tf32(k_t_w * e_t_w)
+                qf_w = q_t_w * e_t_w
+                qf_hi_w = round_tf32(qf_w)
+                kb_w = k_t_w * e_bt_w
+                kb_hi_w = round_tf32(kb_w)
+                kt_lo_w = kt_w - kt_hi_w
+                qf_lo_w = qf_w - qf_hi_w
+                kb_lo_w = kb_w - kb_hi_w
+            # rows tw, 16+tw, 32+tw share tw % 8 -> the same 16-byte-chunk XOR
+            xc_w = kc ^ (4 * (tw % 8))
+            sA3f[a3_base + 32 * tw + xc_w] = kf_w
+            sA3f[a3_base + 32 * (T_PAD + tw) + xc_w] = qf_hi_w
+            sA3f[a3_base + 32 * (2 * T_PAD + tw) + xc_w] = qf_lo_w
+            sB3hif[b3_base + 32 * tw + xc_w] = kb_hi_w
+            sB3lof[b3_base + 32 * tw + xc_w] = kb_lo_w
+            r_b1[3 * i] = kt_hi_w
+            r_b1[3 * i + 1] = qt_r_w
+            r_b1[3 * i + 2] = kt_lo_w
+    else:
+        for t in cutlass.range(T_PAD, unroll_full=True):
+            if quarter == t % 4:
+                kt_hi = cutlass.Float32(0.0)
+                kt_lo = cutlass.Float32(0.0)
+                qt_r = cutlass.Float32(0.0)
+                kf = cutlass.Float32(0.0)
+                qf_hi = cutlass.Float32(0.0)
+                qf_lo = cutlass.Float32(0.0)
+                kb_hi = cutlass.Float32(0.0)
+                kb_lo = cutlass.Float32(0.0)
+                if t < Tc:
+                    d_t = r_G[t] - g_mid
+                    e_t = cute.math.exp(-cute.arch.fmax(-d_t, -exp_clamp), fastmath=True)
+                    e_bt = cute.math.exp(-cute.arch.fmax(d_t, -exp_clamp), fastmath=True)
+                    eg_t = cute.math.exp(r_G[t], fastmath=True)
+                    sE[t * K + kq] = r_G[t]
+                    if t == cl:
+                        sEc[kq] = eg_t
+                    k_t = sK[t, kq]
+                    q_t = sQ[t, kq]
+                    kt = k_t * eg_t
+                    kt_hi = round_tf32(kt)
+                    qt_r = round_tf32(q_t * eg_t)
+                    kf = round_tf32(k_t * e_t)
+                    qf = q_t * e_t
+                    qf_hi = round_tf32(qf)
+                    kb = k_t * e_bt
+                    kb_hi = round_tf32(kb)
+                    kt_lo = kt - kt_hi
+                    qf_lo = qf - qf_hi
+                    kb_lo = kb - kb_hi
+                # rows t, 16+t, 32+t share t % 8 -> the same 16-byte-chunk XOR
+                xc = kc ^ (4 * (t % 8))
+                sA3f[a3_base + 32 * t + xc] = kf
+                sA3f[a3_base + 32 * (T_PAD + t) + xc] = qf_hi
+                sA3f[a3_base + 32 * (2 * T_PAD + t) + xc] = qf_lo
+                sB3hif[b3_base + 32 * t + xc] = kb_hi
+                sB3lof[b3_base + 32 * t + xc] = kb_lo
+                r_b1[3 * (t // 4)] = kt_hi
+                r_b1[3 * (t // 4) + 1] = qt_r
+                r_b1[3 * (t // 4) + 2] = kt_lo
     cute.arch.fence_view_async_shared()
     tcgen05_fence_before_thread_sync()
     cute.arch.barrier()
@@ -1203,16 +1548,44 @@ def kda_decode_mtp_v2_kernel(
             off_l = (wg // 2) * (V * 64) + 64 * wg_tidx + 8 * chunk
             for i in cutlass.range(8, unroll_full=True):
                 r_state[8 * c + i] = cutlass.Float32(sBoxh[off_l + i])
+    else:
+        for c in cutlass.range(8, unroll_full=True):
+            off_l = wg * (V * 32) + 32 * wg_tidx + ((4 * c) ^ vx)
+            for i in cutlass.range(4, unroll_full=True):
+                r_state[4 * c + i] = sBoxf[off_l + i]
+    if cutlass.const_expr(WIDE):
+        if cb > 0:
+            # pre-step (T_loop = 17): fold the first replayed draft (staged in row T_PAD) into the
+            # state,
+            # S1 = S0 diag(e^g0) + beta0 (v0 - S0 diag(e^g0) k0) k0^T, for row v = wg_tidx and
+            # columns [32 wg, +32); the row sum over all 128 columns adds the four warpgroups'
+            # partial sums (exchanged through shared memory) in a fixed order.
+            pre_part = cutlass.Float32(0.0)
+            for c in cutlass.range_constexpr(8):
+                pre_e = ld_shared_f32x4(saddr(sE0, 32 * wg + 4 * c))
+                pre_k = ld_shared_f32x4(saddr(sK, T_PAD * K + 32 * wg + 4 * c))
+                for i in cutlass.range_constexpr(4):
+                    pre_d = r_state[4 * c + i] * pre_e[i]
+                    r_state[4 * c + i] = pre_d
+                    pre_part = pre_part + pre_d * pre_k[i]
+            sPart[wg * V + wg_tidx] = pre_part
+            cute.arch.barrier()
+            pre_u = (sPart[wg_tidx] + sPart[V + wg_tidx]) + (
+                sPart[2 * V + wg_tidx] + sPart[3 * V + wg_tidx]
+            )
+            pre_vn = sBeta[T_PAD] * (sVall[T_PAD * V + wg_tidx] - pre_u)
+            for c in cutlass.range_constexpr(8):
+                pre_k = ld_shared_f32x4(saddr(sK, T_PAD * K + 32 * wg + 4 * c))
+                for i in cutlass.range_constexpr(4):
+                    r_state[4 * c + i] = r_state[4 * c + i] + pre_vn * pre_k[i]
+    if cutlass.const_expr(STATE_BF16):
+        # (WIDE pre-step: S1 is fp32; the tf32 MMA reads it truncated to tf32)
         for i in cutlass.range(32, unroll_full=True):
             r_hi_flat[i] = r_state[i]
         for jj in cutlass.range_constexpr(4):
             if wg == jj:
                 cute.copy(st32, r_hi, tAhi_st[(None, None, None, jj)])
     else:
-        for c in cutlass.range(8, unroll_full=True):
-            off_l = wg * (V * 32) + 32 * wg_tidx + ((4 * c) ^ vx)
-            for i in cutlass.range(4, unroll_full=True):
-                r_state[4 * c + i] = sBoxf[off_l + i]
         for i in cutlass.range(32, unroll_full=True):
             s_hi = round_tf32(r_state[i])
             r_hi_flat[i] = s_hi
@@ -1224,14 +1597,24 @@ def kda_decode_mtp_v2_kernel(
     cute.arch.fence_view_async_tmem_store()
     # the S0 boxes have been read: the GEMM1 operand rows go over them
     cute.arch.barrier()
-    for t in cutlass.range(T_PAD, unroll_full=True):
-        if quarter == t % 4:
-            xc = kc ^ (4 * (t % 8))
-            sB1f[b1_base + 32 * t + xc] = r_b1[3 * (t // 4)]
+    if cutlass.const_expr(WIDE):
+        for i in cutlass.range_constexpr(T_PAD // 4):
+            tw = quarter + 4 * i
+            xc_w = kc ^ (4 * (tw % 8))
+            sB1f[b1_base + 32 * tw + xc_w] = r_b1[3 * i]
             if cutlass.const_expr(S0_LO):
-                sB1kf[b1k_base + 32 * t + xc] = r_b1[3 * (t // 4)]
-            sB1f[b1_base + 32 * (T_PAD + t) + xc] = r_b1[3 * (t // 4) + 1]
-            sB1f[b1_base + 32 * (2 * T_PAD + t) + xc] = r_b1[3 * (t // 4) + 2]
+                sB1kf[b1k_base + 32 * tw + xc_w] = r_b1[3 * i]
+            sB1f[b1_base + 32 * (T_PAD + tw) + xc_w] = r_b1[3 * i + 1]
+            sB1f[b1_base + 32 * (2 * T_PAD + tw) + xc_w] = r_b1[3 * i + 2]
+    else:
+        for t in cutlass.range(T_PAD, unroll_full=True):
+            if quarter == t % 4:
+                xc = kc ^ (4 * (t % 8))
+                sB1f[b1_base + 32 * t + xc] = r_b1[3 * (t // 4)]
+                if cutlass.const_expr(S0_LO):
+                    sB1kf[b1k_base + 32 * t + xc] = r_b1[3 * (t // 4)]
+                sB1f[b1_base + 32 * (T_PAD + t) + xc] = r_b1[3 * (t // 4) + 1]
+                sB1f[b1_base + 32 * (2 * T_PAD + t) + xc] = r_b1[3 * (t // 4) + 2]
     cute.arch.fence_view_async_shared()
     tcgen05_fence_before_thread_sync()
     cute.arch.barrier()
@@ -1268,9 +1651,9 @@ def kda_decode_mtp_v2_kernel(
                 k_kb = e_kb % K
                 s_idx = e_kb // K
                 b_val = cutlass.Float32(0.0)
-                if s_idx <= commit_len:
+                if s_idx <= cl:
                     b_val = sK[s_idx, k_kb] * cute.math.exp(
-                        sE[commit_len * K + k_kb] - sE[s_idx * K + k_kb], fastmath=True
+                        sE[cl * K + k_kb] - sE[s_idx * K + k_kb], fastmath=True
                     )
                 sKbT[k_kb * TP_STRIDE + s_idx] = b_val
     if warp_idx == 0:
@@ -1335,15 +1718,21 @@ def kda_decode_mtp_v2_kernel(
             sB2lof[o_b20] = b_val0 - b_hi0
     # ---- the new tokens' replay-cache rows and conv-window commits, from smem: warp 1 + p
     #      writes draft p's k / gate / v cache rows, its raw conv columns and beta, warps
-    #      REPLAY_WARP0 + {0, 1, 2} commit the q / k / v conv windows (the raw inputs after the
+    #      CONV_WARP0 + {0, 1, 2} commit the q / k / v conv windows (the raw inputs after the
     #      golden token). One CTA of a pair writes them.
+    CONV_WARP0 = NUM_SPEC + 1 if WIDE else REPLAY_WARP0
     if vh == 0:
         if (warp_idx >= 1) & (warp_idx <= NUM_SPEC):
             p = warp_idx - 1
             t_c = commit_len + 1 + p
-            st_row4(k_cache, (slot, p, hk_off + k4), ld_shared_f32x4(saddr(sK, t_c * K + k4)))
-            st_row4(g_cache, (slot, p, hk_off + k4), ld_shared_f32x4(saddr(sG, t_c * K + k4)))
-            st_row4(v_cache, (slot, p, hv_off + k4), ld_shared_f32x4(saddr(sVall, t_c * V + k4)))
+            # the chunk row of draft p (its sequence row t_c holds the raw conv inputs)
+            if cutlass.const_expr(WIDE):
+                q_c = cl + 1 + p
+            else:
+                q_c = t_c
+            st_row4(k_cache, (slot, p, hk_off + k4), ld_shared_f32x4(saddr(sK, q_c * K + k4)))
+            st_row4(g_cache, (slot, p, hk_off + k4), ld_shared_f32x4(saddr(sG, q_c * K + k4)))
+            st_row4(v_cache, (slot, p, hv_off + k4), ld_shared_f32x4(saddr(sVall, q_c * V + k4)))
             st_row4(
                 cs_q,
                 (slot, hk_off + k4, KERNEL_WIDTH - 1 + p),
@@ -1360,22 +1749,22 @@ def kda_decode_mtp_v2_kernel(
                 ld_shared_f32x4(saddr(sXV, (t_c + 3) * V + k4)),
             )
             if in_warp_tid == 0:
-                beta_cache[slot, p, i_hv] = sBeta[t_c].to(BETA_CACHE_DTYPE)
-        if warp_idx == REPLAY_WARP0:
+                beta_cache[slot, p, i_hv] = sBeta[q_c].to(BETA_CACHE_DTYPE)
+        if warp_idx == CONV_WARP0:
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 st_row4(
                     cs_q,
                     (slot, hk_off + k4, w),
                     ld_shared_f32x4(saddr(sXQ, (commit_len + 1 + w) * K + k4)),
                 )
-        if warp_idx == REPLAY_WARP0 + 1:
+        if warp_idx == CONV_WARP0 + 1:
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 st_row4(
                     cs_k,
                     (slot, hk_off + k4, w),
                     ld_shared_f32x4(saddr(sXK, (commit_len + 1 + w) * K + k4)),
                 )
-        if warp_idx == REPLAY_WARP0 + 2:
+        if warp_idx == CONV_WARP0 + 2:
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 st_row4(
                     cs_v,
@@ -1416,14 +1805,14 @@ def kda_decode_mtp_v2_kernel(
         r_Y = cute.make_rmem_tensor(cute.make_layout((T_PAD,)), cutlass.Float32)
         for s in cutlass.range(T_PAD, unroll_full=True):
             y = cutlass.Float32(0.0)
-            if s < t_max:
+            if s < t_lim:
                 u0 = rD1_flat[s] + rD1_flat[2 * T_PAD + s]
                 y = sBeta[s] * (sVall[s * V + v_row] - u0)
             r_Y[s] = y
         r_V = cute.make_rmem_tensor(cute.make_layout((T_PAD,)), cutlass.Float32)
         for t in cutlass.range(T_PAD, unroll_full=True):
             vp = cutlass.Float32(0.0)
-            if t < t_max:
+            if t < t_lim:
                 acc0 = cutlass.Float32(0.0)
                 acc1 = cutlass.Float32(0.0)
                 acc2 = cutlass.Float32(0.0)
@@ -1446,7 +1835,7 @@ def kda_decode_mtp_v2_kernel(
             t4 = (tidx - 128) // T_PAD
             s4 = (tidx - 128) % T_PAD
             bc = cutlass.Float32(0.0)
-            if (t4 < T_loop) & (s4 <= t4):
+            if (t4 < Tc) & (s4 <= t4):
                 bc = sLB[T_PAD + t4, s4] + sLB[2 * T_PAD + t4, s4]
             bc_hi = round_tf32(bc)
             o_b4 = swz64_k16(t4, s4)
@@ -1580,14 +1969,23 @@ def kda_decode_mtp_v2_kernel(
     cute.copy(ld16, thr_ld4.partition_S(tD4), rD4)
     cute.arch.fence_view_async_tmem_load()
     rD4_flat = cute.make_tensor(rD4.iterator, cute.make_layout((T_PAD,)))
-    for j_new in cutlass.range(NEW_TOK, unroll_full=True):
-        if wg == j_new % 4:
-            t_out = commit_len + j_new
-            o_val = cutlass.Float32(0.0)
-            for tt in cutlass.range(T_PAD, unroll_full=True):
-                if tt == t_out:
-                    o_val = rD1_flat[T_PAD + tt] + rD4_flat[tt]
-            sVall[j_new * V + v_row] = cutlass.Float32(cutlass.BFloat16(o_val))
+    if cutlass.const_expr(WIDE):
+        for j_w in cutlass.range(wg, NEW_TOK, 4):
+            t_out_w = cl + j_w
+            o_val_w = cutlass.Float32(0.0)
+            for tt_w in cutlass.range(T_PAD, unroll_full=True):
+                if tt_w == t_out_w:
+                    o_val_w = rD1_flat[T_PAD + tt_w] + rD4_flat[tt_w]
+            sVall[j_w * V + v_row] = cutlass.Float32(cutlass.BFloat16(o_val_w))
+    else:
+        for j_new in cutlass.range(NEW_TOK, unroll_full=True):
+            if wg == j_new % 4:
+                t_out = cl + j_new
+                o_val = cutlass.Float32(0.0)
+                for tt in cutlass.range(T_PAD, unroll_full=True):
+                    if tt == t_out:
+                        o_val = rD1_flat[T_PAD + tt] + rD4_flat[tt]
+                sVall[j_new * V + v_row] = cutlass.Float32(cutlass.BFloat16(o_val))
     # ---- committed-state store through TMA: D2 slab -> swizzled smem box (row per thread,
     #      16 B chunks land in distinct banks under the 128B swizzle) -> one bulk tensor store
     if cutlass.const_expr(SPLIT_V == 2):
@@ -1707,7 +2105,7 @@ def kda_decode_mtp_v2_kernel(
                 if in_warp_tid == 0:
                     row_s = xs_addr + Int64(output_row) * (HV * V // 32) + i_hv * (V // 32)
                     st_global_u32(row_s, packed_e)
-            token_idx = token_idx + NUM_THREADS // 32
+            token_idx = token_idx + (NUM_THREADS // 64 if WIDE else NUM_THREADS // 32)
     # the state stores must have read their smem boxes before the CTA exits
     if (tidx == st_tid0) | (tidx == 256 + st_tid0):
         cute.arch.cp_async_bulk_wait_group(0, read=True)
