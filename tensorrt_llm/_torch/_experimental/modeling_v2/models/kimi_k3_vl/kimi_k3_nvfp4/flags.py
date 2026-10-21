@@ -80,6 +80,11 @@ TRTLLM_K3LL_MLA_DRAFTER_QKV = _flag(
 )
 
 
+TRTLLM_K3LL_MLA_QKV_SPLIT = _flag(
+    "TRTLLM_K3LL_MLA_QKV_SPLIT",
+    0,
+    "target MLA decode: q_a prep, Q-B in 32-column slices and the absorption as three launches, not one per head",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     0,
