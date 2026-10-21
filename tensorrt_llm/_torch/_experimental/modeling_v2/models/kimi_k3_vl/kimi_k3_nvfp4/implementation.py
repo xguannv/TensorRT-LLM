@@ -2498,11 +2498,17 @@ class K3DecodeMLA(KimiK3MLAAttention):
             None if self.k_b_proj_trans_scale is None else self.k_b_proj_trans_scale.detach()[heads]
         )
         self._decode_mqa = _head_view_attention(self.mqa, self._decode_heads)
-        if MlaSplitRead.applies(self.mqa, self.mapping):
+        self.attach_split_read()
+
+    def attach_split_read(self) -> Optional[MlaSplitRead]:
+        """This layer's shared ``MlaSplitRead`` where it applies (idempotent). The target calls it from its own
+        ``post_load_weights``, which the loader runs before its layers', to build the split read's exchange state."""
+        if self._split_read is None and MlaSplitRead.applies(self.mqa, self.mapping):
             self._split_read = MlaSplitRead.shared(
                 self.mapping, self._decode_heads, gather_mapping=self.mapping_o
             )
             self._split_read.register(self.mqa.layer_idx)
+        return self._split_read
 
     def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
         return self._k3_step_view(attn_metadata, step) is not None
@@ -3728,14 +3734,16 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
     def _build_helix_decode_comm(self, comm: Optional[_decode_comm.K3DecodeComm]) -> None:
         """Under Helix, the MLA split read's MNNVL exchange state (``MlaSplitRead.build_helix_comm``): the query
         all-gather on ``comm``'s workspace and the fused exchange + combine, as the load-time switches ask. Collective
-        over the CP group, before any capture; every rank builds the shared split reads in the same (module) order."""
+        over the CP group, before any capture; every rank builds the shared split reads in the same (module) order.
+        The loader runs this before the MLA layers' own ``post_load_weights``, so the split reads are attached here."""
         if not self.model_config.mapping.has_cp_helix():
             return
         reads = {}
         for module in self.modules():
-            split_read = getattr(module, "_split_read", None)
-            if isinstance(module, K3DecodeMLA) and split_read is not None:
-                reads.setdefault(id(split_read), split_read)
+            if isinstance(module, K3DecodeMLA):
+                split_read = module.attach_split_read()
+                if split_read is not None:
+                    reads.setdefault(id(split_read), split_read)
         for split_read in reads.values():
             built = split_read.build_helix_comm(
                 None if comm is None else comm.mnnvl, self.tp_mapping
