@@ -9057,6 +9057,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
               in shared memory), else 2 and 3; TRTLLM_MLA_K_STAGES and
               TRTLLM_MLA_P_STAGES override them. The result does not depend
               on them.
+            * early_prologue (balanced split with PDL):
+              TRTLLM_MLA_EARLY_PROLOGUE=1 builds the schedule and loads the
+              first K tile of KV older than this step before the PDL wait,
+              then the query first (see the kernel's ``early_prologue``; it
+              relies on ``cache_seqs`` and the page table being complete when
+              the kernel launches, as they are behind the K3 FP8 q absorb).
+              Default 0. The result does not depend on it.
             """
             threshold = float(
                 os.environ.get("TRTLLM_MLA_RESCALE_THRESHOLD", "0"))
@@ -9126,6 +9133,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ("k_stages", k_stages),
                     ("p_stages", p_stages),
                     ("tile_reduction", tile_reduction),
+                    ("early_prologue",
+                     os.environ.get("TRTLLM_MLA_EARLY_PROLOGUE", "0") == "1"),
                 )
             return options
 
