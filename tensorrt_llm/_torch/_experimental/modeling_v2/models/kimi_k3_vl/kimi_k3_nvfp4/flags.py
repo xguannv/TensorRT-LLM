@@ -121,7 +121,7 @@ TRTLLM_K3LL_KDA_BFA_GEMV = _flag(
 
 TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(
     "TRTLLM_K3LL_WIDE_AR_ATTN_RES",
-    0,
+    1,
     "wide decode steps: post-attention / MoE-tail all-reduce + residual add + attn_res + RMSNorm in one two-shot call",
 )
 
