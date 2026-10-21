@@ -60,7 +60,7 @@ GATE_CAP, LINEAR_CAP = 4.0, 25.0
 RSF = 2.827
 E_LOCAL = 224
 TILE = 128
-M_ALL = list(range(1, 9))
+M_ALL = list(range(1, 17))  # 9-16: the 16-token build, on its own workspace
 
 
 def _supported() -> bool:
@@ -98,12 +98,14 @@ def _context():
     gen = torch.Generator(device="cuda").manual_seed(13)  # the same on every rank
     bias = (torch.randn(EXPERTS, device="cuda", generator=gen) * 0.05).float()
     x8 = torch.randn(8, HIDDEN, device="cuda", generator=gen).bfloat16()
+    x8 = torch.cat([x8, torch.randn(8, HIDDEN, device="cuda", generator=gen).bfloat16()])  # 16 rows
     wgen = torch.Generator(device="cuda").manual_seed(131 + rank)
     head = (torch.randn(wl + we, HIDDEN, device="cuda", generator=wgen) * 0.02).bfloat16()
     head[wl:] *= 8.0  # router rows: logits of a few units
     gate_up = (torch.randn(2 * inter, HIDDEN, device="cuda", generator=wgen) * 0.02).bfloat16()
     ws = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True)
-    return dict(
+    ws16 = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True, m_max=16)
+    return dict(ws16=ws16,
         comm=comm, rank=rank, world=world, inter=inter, bias=bias, x8=x8, front=front_op.front_weight(head, gate_up),
         ws=ws, gsf=torch.tensor([448.0 * 6.0 / 8.0], dtype=torch.float32, device="cuda"),
         ctr=torch.zeros(1, dtype=torch.int32, device="cuda"),
@@ -111,7 +113,7 @@ def _context():
 
 
 def _front(ctx, x, sort_out=None, offset=0, num_local=0):
-    ws = ctx["ws"]
+    ws = ctx["ws16"] if x.shape[0] > 8 else ctx["ws"]
     return _trtllm().k3_moe_front(
         x, ctx["front"], ctx["bias"], RSF, ctx["inter"], GATE_CAP, LINEAR_CAP, ws.uc, ws.mc, ws.flags, ws.rank,
         ctx["world"], nvfp4_gsf=ctx["gsf"], sort_out=sort_out, sort_ctr=ctx["ctr"] if sort_out is not None else None,

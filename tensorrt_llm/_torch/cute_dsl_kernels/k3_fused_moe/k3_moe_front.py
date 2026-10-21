@@ -74,7 +74,8 @@ HIDDEN_SIZE = 3584  # the routed latent
 MODEL_HIDDEN = 7168  # K
 SF_VEC_SIZE = 32
 NVFP4_SF_VEC = 16  # the NVFP4 latent's scale group (nvfp4)
-M_MAX = 8
+M_MAX = 8  # the default build's token tile; M_BUILDS also has the 16-token build
+M_BUILDS = (8, 16)
 EMPTY_WORD = _ag.EMPTY_WORD
 
 CTA_M = 128
@@ -125,6 +126,36 @@ STAGE_B = (MMA_N * CTA_K * ELEM_BYTES) >> 4
 io_dtype = cutlass.BFloat16
 
 
+def role_clusters(m_max: int = M_MAX) -> int:
+    """Clusters of role CTAs: CTA t < M routes token t, CTA M + t quantizes it."""
+    return 2 * m_max // SPLIT
+
+
+def tmem_cols(m_max: int = M_MAX) -> int:
+    """TMEM columns of a streaming GEMV CTA: one m_max-column accumulator per round, rounded up to a power of 2."""
+    cols = 32
+    while cols < MAX_ROUNDS * m_max:
+        cols *= 2
+    return cols
+
+
+def smem_bytes(m_max: int, k_in: int, ring: int) -> int:
+    """Shared memory of a CTA: the weight ring, x's resident k-tiles, the split-K mailbox, the owner rows, the routing
+    keys and sigmoids, and 4 KB for the small arrays and alignment."""
+    my_tiles = k_in // CTA_K // SPLIT
+    return (
+        ring * CTA_M * CTA_K * ELEM_BYTES
+        + my_tiles * m_max * CTA_K * ELEM_BYTES
+        + MAX_ROUNDS * SPLIT * ROWS_PER_WARP * m_max * 4
+        + OWNERS * ROWS_PER_WARP * m_max * 4
+        + 2 * NUM_EXPERTS * 4
+        + 4096
+    )
+
+
+SMEM_LIMIT = 227 * 1024
+
+
 def head_rows(world: int) -> int:
     return HIDDEN_SIZE // world + NUM_EXPERTS // world
 
@@ -133,7 +164,9 @@ def head_tiles(world: int) -> int:
     return (head_rows(world) + CTA_M - 1) // CTA_M
 
 
-def geometry(world: int, shared_cols: int, max_clusters: int) -> tuple[int, int, int]:
+def geometry(
+    world: int, shared_cols: int, max_clusters: int, m_max: int = M_MAX
+) -> tuple[int, int, int]:
     """(head tiles, shared tiles, GEMV clusters) for this TP world and shared activation width.
 
     ``max_clusters``: how many clusters of SPLIT CTAs (one CTA per SM) the GPU holds at once. The role clusters and
@@ -143,18 +176,20 @@ def geometry(world: int, shared_cols: int, max_clusters: int) -> tuple[int, int,
     ht = head_tiles(world)
     st = shared_cols // 64
     tiles = ht + st
-    clusters = min(tiles, max(1, max_clusters - ROLE_CLUSTERS))
+    clusters = min(tiles, max(1, max_clusters - role_clusters(m_max)))
     return ht, st, clusters
 
 
-def half_geometry(world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int):
+def half_geometry(
+    world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int, m_max: int = M_MAX
+):
     """(head half-tiles, shared tiles, GEMV clusters) when the head fits as 64-row half-tiles in one round next to the
     shared tiles, each head CTA holding all its k-tiles in shared memory (the ring's space); else None."""
     hh = (head_rows(world) + HALF_M - 1) // HALF_M
     st = shared_cols // 64
     my_tiles = k_in // CTA_K // SPLIT
     fits = (
-        hh + st <= max_clusters - ROLE_CLUSTERS
+        hh + st <= max_clusters - role_clusters(m_max)
         and my_tiles * HALF_M * CTA_K + HALF_M * TMA_K_BOX <= ring * CTA_M * CTA_K
         and my_tiles <= MAX_HALF_TILES
         and A_TMEM_BASE + my_tiles * A_TMEM_COLS <= HALF_TMEM_COLS
@@ -178,8 +213,10 @@ def _half_plan(
     return (head_tiles(world) - n_head_tiles) * CTA_M, max(ring, my_tiles)
 
 
-def supports(world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int) -> bool:
-    ht, st, clusters = geometry(world, shared_cols, max_clusters)
+def supports(
+    world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int, m_max: int = M_MAX
+) -> bool:
+    ht, st, clusters = geometry(world, shared_cols, max_clusters, m_max)
     k_tiles = k_in // CTA_K
     return (
         world in (4, 8, 16)
@@ -187,8 +224,10 @@ def supports(world: int, shared_cols: int, max_clusters: int, k_in: int, ring: i
         and shared_cols % 64 == 0
         and ht + st <= MAX_ROUNDS * clusters
         and 1 <= ring <= k_tiles // SPLIT
-        and ring * CTA_M * CTA_K * ELEM_BYTES + (k_tiles // SPLIT) * MMA_N * CTA_K * ELEM_BYTES
+        and m_max in M_BUILDS
+        and ring * CTA_M * CTA_K * ELEM_BYTES + (k_tiles // SPLIT) * m_max * CTA_K * ELEM_BYTES
         <= 176 * 1024
+        and smem_bytes(m_max, k_in, ring) <= SMEM_LIMIT
     )
 
 
@@ -378,10 +417,19 @@ def _popc(v, *, loc=None, ip=None):
 SORT_WORDS = NUM_EXPERTS // 32  # bitmap words of the experts
 # _sort_local's scratch in s_key (int32 [896]): the ids, the tokens' expert bitmaps, their union, its prefix counts.
 SORT_IDS = 0
-SORT_BITS = SORT_IDS + M_MAX * TOP_K
-SORT_UNION = SORT_BITS + M_MAX * SORT_WORDS
-SORT_PREFIX = SORT_UNION + SORT_WORDS
-assert SORT_PREFIX + SORT_WORDS <= NUM_EXPERTS
+
+
+def sort_scratch(m_max: int = M_MAX) -> tuple[int, int, int]:
+    """(bitmaps, union, prefix) offsets of _sort_local's scratch in s_key for an m_max-token build."""
+    bits = SORT_IDS + m_max * TOP_K
+    union = bits + m_max * SORT_WORDS
+    prefix = union + SORT_WORDS
+    assert prefix + SORT_WORDS <= NUM_EXPERTS and m_max * SORT_WORDS <= THREADS
+    return bits, union, prefix
+
+
+for _m in M_BUILDS:
+    sort_scratch(_m)
 
 
 def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
@@ -394,10 +442,13 @@ def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
 
 
 @cute.jit
-def _sort_local(s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx):
+def _sort_local(
+    s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx, m_max: cutlass.Constexpr[int]
+):
     """moe_sort of the M tokens' top-16 over the local experts [offset, offset + num_local), 128-row tiles, by all
     THREADS threads of one CTA, into ``sort_words`` (`sort_layout`): one tile per local expert some token selected, in
     expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order."""
+    SORT_BITS, SORT_UNION, SORT_PREFIX = sort_scratch(m_max)
     n = num_tokens * cutlass.Int32(TOP_K)
     tiles = cutlass.min(n, num_local)
     w0 = (cutlass.Int32(2) * tiles + cutlass.Int32(4)) // cutlass.Int32(4) * cutlass.Int32(4)
@@ -417,7 +468,7 @@ def _sort_local(s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx):
     cute.arch.barrier()
     if tx < cutlass.Int32(SORT_WORDS):
         u = cutlass.Int32(0)
-        for t in cutlass.range_constexpr(M_MAX):
+        for t in cutlass.range_constexpr(m_max):
             if cutlass.Int32(t) < num_tokens:
                 u = u | s_key.load(idx=SORT_BITS + t * SORT_WORDS + tx)
         s_key.store(u, idx=SORT_UNION + tx)
@@ -442,7 +493,7 @@ def _sort_local(s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx):
             tile = s_key.load(idx=SORT_PREFIX + w) + _popc(below)
             row = cutlass.Int32(0)
             count = cutlass.Int32(0)
-            for q in cutlass.range_constexpr(M_MAX):
+            for q in cutlass.range_constexpr(m_max):
                 if cutlass.Int32(q) < num_tokens:
                     bit = (s_key.load(idx=SORT_BITS + q * SORT_WORDS + w) >> b) & cutlass.Int32(1)
                     count = count + bit
@@ -630,13 +681,21 @@ def k3_moe_front_kernel(
     head_half: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
+    m_max: cutlass.Constexpr[int],
 ):
+    # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (2 per token).
+    MMA_N_ = m_max
+    ROLE_CLUSTERS_ = role_clusters(m_max)
+    TMEM_COLS_ = tmem_cols(m_max)
+    B_HALF_ELEMS_ = MMA_N_ * TMA_K_BOX
+    B_BOX_ = B_HALF_ELEMS_ >> 3
+    STAGE_B_ = (MMA_N_ * CTA_K * ELEM_BYTES) >> 4
     WL = HIDDEN_SIZE // world
     WE = NUM_EXPERTS // world
     LV = WL // 8
     EV = WE // 4
     SLOT = (LV + EV) * 4
-    BUF = M_MAX * world * SLOT
+    BUF = m_max * world * SLOT
     PBASE = (
         _ag.BUFFERS * BUF
     )  # the router logits' split-K partials, after the buffers: [buffer][token][rank][q][WE]
@@ -655,8 +714,8 @@ def k3_moe_front_kernel(
     # The role clusters come first, so they are resident before any GEMV cluster (they spin; the GEMV CTAs never
     # wait on them).
     role_or_gemv = bx // cutlass.Int32(SPLIT)
-    is_gemv = role_or_gemv >= cutlass.Int32(ROLE_CLUSTERS)
-    cluster = role_or_gemv - cutlass.Int32(ROLE_CLUSTERS)
+    is_gemv = role_or_gemv >= cutlass.Int32(ROLE_CLUSTERS_)
+    cluster = role_or_gemv - cutlass.Int32(ROLE_CLUSTERS_)
     tma_ptr_w = tma_desc_w.get_ptr()
     tma_ptr_w64 = tma_desc_w64.get_ptr()
     # A GEMV CTA of a head half-tile (head_half: one round, the head in 64-row tiles on the first clusters).
@@ -671,7 +730,7 @@ def k3_moe_front_kernel(
         io_dtype, ring * CTA_M * CTA_K, space=cutlass.AddressSpace.smem, alignment=1024
     )
     smem_b = cutlass.Array(
-        io_dtype, my_tiles * MMA_N * CTA_K, space=cutlass.AddressSpace.smem, alignment=1024
+        io_dtype, my_tiles * MMA_N_ * CTA_K, space=cutlass.AddressSpace.smem, alignment=1024
     )
     tma_full = cutlass.Array(cutlass.Int64, nbar, space=cutlass.AddressSpace.smem, alignment=8)
     mma_done = cutlass.Array(cutlass.Int64, nbar, space=cutlass.AddressSpace.smem, alignment=8)
@@ -687,7 +746,7 @@ def k3_moe_front_kernel(
     # [round][source rank][row of the owned slice][token] fp32 partials.
     mailbox = cutlass.Array(
         cutlass.Float32,
-        MAX_ROUNDS * SPLIT * ROWS_PER_WARP * MMA_N,
+        MAX_ROUNDS * SPLIT * ROWS_PER_WARP * MMA_N_,
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
@@ -695,7 +754,7 @@ def k3_moe_front_kernel(
     # The owner warp's reduced rows [row][token], for the vector pushes.
     s_rows = cutlass.Array(
         cutlass.Float32,
-        OWNERS * ROWS_PER_WARP * MMA_N,
+        OWNERS * ROWS_PER_WARP * MMA_N_,
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
@@ -731,10 +790,10 @@ def k3_moe_front_kernel(
                     # st.async; the phase completes on their bytes (expected here, before the cluster forms).
                     prims.mbarrier_init(mail_full.subview(r), 1)
                     prims.mbarrier_arrive_expect_tx(
-                        mail_full.subview(r), (SPLIT - 1) * ROWS_PER_WARP * MMA_N * 4
+                        mail_full.subview(r), (SPLIT - 1) * ROWS_PER_WARP * MMA_N_ * 4
                     )
         if warp_id == 2:
-            prims.tcgen05_alloc(tmem_ptr_i32, HALF_TMEM_COLS if head_half else TMEM_COLS)
+            prims.tcgen05_alloc(tmem_ptr_i32, HALF_TMEM_COLS if head_half else TMEM_COLS_)
             prims.tcgen05_relinquish_alloc_permit()
     prims.fence_mbarrier_init()
     # Cluster formation: the peers' shared memory and barriers are addressable from here on.
@@ -838,14 +897,14 @@ def k3_moe_front_kernel(
             # =================================================================
             prims.griddepcontrol(prims.GridDepAction.WAIT)
             if prims.elect_sync():
-                prims.mbarrier_arrive_expect_tx(act_full, my_tiles * MMA_N * CTA_K * ELEM_BYTES)
+                prims.mbarrier_arrive_expect_tx(act_full, my_tiles * MMA_N_ * CTA_K * ELEM_BYTES)
                 for i in range(my_tiles):
                     k = crank + i * cutlass.Int32(SPLIT)
                     for half in cutlass.range_constexpr(TMA_COPY_ITERS):
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             smem_b.subview(
-                                i * cutlass.Int32(MMA_N * CTA_K)
-                                + cutlass.Int32(half * B_HALF_ELEMS)
+                                i * cutlass.Int32(MMA_N_ * CTA_K)
+                                + cutlass.Int32(half * B_HALF_ELEMS_)
                             ),
                             tma_ptr_x,
                             (
@@ -867,7 +926,7 @@ def k3_moe_front_kernel(
                 c_dtype=cutlass.Float32,
                 a_dtype=io_dtype,
                 b_dtype=io_dtype,
-                n_dim=MMA_N,
+                n_dim=MMA_N_,
                 m_dim=CTA_M,
             )
             desc_a_base = prims.Tcgen05SmemDesc.build(
@@ -919,9 +978,9 @@ def k3_moe_front_kernel(
                             cutlass.Int32,
                         )
                         desc_bh = desc_b_base + (
-                            hi * cutlass.Int32(STAGE_B)
+                            hi * cutlass.Int32(STAGE_B_)
                             + cutlass.Int32(
-                                (kh // K_BLOCKS_PER_HALF) * B_BOX + (kh % K_BLOCKS_PER_HALF) * STEP
+                                (kh // K_BLOCKS_PER_HALF) * B_BOX_ + (kh % K_BLOCKS_PER_HALF) * STEP
                             )
                         )
                         accumulate_h = cutlass.Boolean(True)
@@ -941,7 +1000,7 @@ def k3_moe_front_kernel(
                     tile = cluster + cutlass.Int32(rd * gemv_clusters)
                     if tile < cutlass.Int32(n_tiles):
                         acc = cutlass.inttoptr(
-                            tmem_ptr_i32.load() + cutlass.Int32(rd * MMA_N), 6, cutlass.Int32
+                            tmem_ptr_i32.load() + cutlass.Int32(rd * MMA_N_), 6, cutlass.Int32
                         )
                         for i in range(my_tiles):
                             while not cute.arch.mbarrier_try_wait(
@@ -957,8 +1016,8 @@ def k3_moe_front_kernel(
                                     + cutlass.Int32(box * A_BOX + within * STEP)
                                 )
                                 desc_b = desc_b_base + (
-                                    i * cutlass.Int32(STAGE_B)
-                                    + cutlass.Int32(box * B_BOX + within * STEP)
+                                    i * cutlass.Int32(STAGE_B_)
+                                    + cutlass.Int32(box * B_BOX_ + within * STEP)
                                 )
                                 accumulate = cutlass.Boolean(True)
                                 if cutlass.const_expr(kb == 0):
@@ -989,7 +1048,7 @@ def k3_moe_front_kernel(
             while not cute.arch.mbarrier_try_wait(flags_ready.data_ptr(), 0):
                 pass
             b = s_flags.load(idx=0)
-            slot_row = lane * cutlass.Int32(MMA_N)
+            slot_row = lane * cutlass.Int32(MMA_N_)
             # A head half-tile's rows are TMEM lanes 0-63 (warps 4-5); warps 6-7 hold garbage rows and sit out.
             live = cutlass.Boolean(True)
             if cutlass.const_expr(head_half):
@@ -1003,13 +1062,13 @@ def k3_moe_front_kernel(
                     acc = prims.tcgen05_ld(
                         "32x32b",
                         cutlass.inttoptr(
-                            tmem_ptr_i32.load() + cutlass.Int32(rd * MMA_N), 6, cutlass.Float32
+                            tmem_ptr_i32.load() + cutlass.Int32(rd * MMA_N_), 6, cutlass.Float32
                         ),
-                        num=MMA_N,
+                        num=MMA_N_,
                     )
                     prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    box_base = cutlass.Int32(rd * SPLIT * ROWS_PER_WARP * MMA_N)
+                    box_base = cutlass.Int32(rd * SPLIT * ROWS_PER_WARP * MMA_N_)
                     tile_row = cutlass.select_(
                         head_cta, tile * cutlass.Int32(HALF_M), tile * cutlass.Int32(CTA_M)
                     )
@@ -1020,14 +1079,14 @@ def k3_moe_front_kernel(
                         # into slot [crank] of the partials region; the route CTAs add the 8 in rank order.
                         pe0 = row0 - cutlass.Int32(WL)
                         if pe0 < cutlass.Int32(WE):
-                            for tt in cutlass.range_constexpr(MMA_N):
+                            for tt in cutlass.range_constexpr(MMA_N_):
                                 s_rows.store(
                                     cutlass.Float32(acc[tt]),
-                                    idx=(srow0 + lane) * cutlass.Int32(MMA_N) + cutlass.Int32(tt),
+                                    idx=(srow0 + lane) * cutlass.Int32(MMA_N_) + cutlass.Int32(tt),
                                 )
                             cute.arch.sync_warp()
-                            # 8 router vectors (4 logits each) per token: two (token, vector) pairs per lane.
-                            for ph in cutlass.range_constexpr(2):
+                            # 8 router vectors (4 logits each) per token: m_max / 4 (token, vector) pairs per lane.
+                            for ph in cutlass.range_constexpr(MMA_N_ // 4):
                                 ppair = lane + cutlass.Int32(ph * 32)
                                 ptok = ppair // cutlass.Int32(8)
                                 pvec = ppair % cutlass.Int32(8)
@@ -1043,7 +1102,7 @@ def k3_moe_front_kernel(
                                                         + pvec * cutlass.Int32(4)
                                                         + cutlass.Int32(pp)
                                                     )
-                                                    * cutlass.Int32(MMA_N)
+                                                    * cutlass.Int32(MMA_N_)
                                                     + ptok
                                                 )
                                             )
@@ -1053,7 +1112,7 @@ def k3_moe_front_kernel(
                                         pdst = (
                                             cutlass.Int32(PBASE)
                                             + (
-                                                (b * cutlass.Int32(M_MAX) + ptok)
+                                                (b * cutlass.Int32(m_max) + ptok)
                                                 * cutlass.Int32(world)
                                                 + tp_rank
                                             )
@@ -1067,9 +1126,9 @@ def k3_moe_front_kernel(
                                             alignment=16,
                                         )
                     elif w != crank:
-                        base = box_base + crank * cutlass.Int32(ROWS_PER_WARP * MMA_N) + slot_row
+                        base = box_base + crank * cutlass.Int32(ROWS_PER_WARP * MMA_N_) + slot_row
                         bar = _mapa_u32(mail_full.subview(rd).data_ptr(), w)
-                        for h in cutlass.range_constexpr(MMA_N // 4):
+                        for h in cutlass.range_constexpr(MMA_N_ // 4):
                             _st_async_v4_f32(
                                 _mapa_u32(mailbox.subview(base + cutlass.Int32(4 * h)).data_ptr(), w),
                                 cutlass.Float32(acc[4 * h]), cutlass.Float32(acc[4 * h + 1]),
@@ -1079,13 +1138,13 @@ def k3_moe_front_kernel(
                         # Completed by the peers' st.async: acquire at cluster scope.
                         while not _test_wait_cluster(mail_full.subview(rd).data_ptr(), 0):
                             pass
-                        tot = [cutlass.Float32(0.0)] * MMA_N
-                        for t in cutlass.range_constexpr(MMA_N):
+                        tot = [cutlass.Float32(0.0)] * MMA_N_
+                        for t in cutlass.range_constexpr(MMA_N_):
                             total = cutlass.Float32(0.0)
                             for q in cutlass.range_constexpr(SPLIT):
                                 part = mailbox.load(
                                     idx=box_base
-                                    + cutlass.Int32(q * ROWS_PER_WARP * MMA_N)
+                                    + cutlass.Int32(q * ROWS_PER_WARP * MMA_N_)
                                     + slot_row
                                     + cutlass.Int32(t)
                                 )
@@ -1097,40 +1156,43 @@ def k3_moe_front_kernel(
                             tot[t] = total
                         if tile < cutlass.Int32(n_head_tiles):
                             # Head: stage the warp's 32 rows x 8 tokens, then 16-byte vectors to every rank.
-                            for t in cutlass.range_constexpr(MMA_N):
+                            for t in cutlass.range_constexpr(MMA_N_):
                                 s_rows.store(
                                     tot[t],
                                     idx=(w * cutlass.Int32(ROWS_PER_WARP) + lane)
-                                    * cutlass.Int32(MMA_N)
+                                    * cutlass.Int32(MMA_N_)
                                     + cutlass.Int32(t),
                                 )
                             cute.arch.sync_warp()
                             # Latent rows (router rows push their partials above).
-                            # 4 latent vectors (8 columns each) per token: lane = token * 4 + vector.
-                            t = lane // cutlass.Int32(4)
-                            v = lane % cutlass.Int32(4)
-                            if t < num_tokens:
-                                words = []
-                                for p in cutlass.range_constexpr(4):
-                                    c0 = srow0 + v * cutlass.Int32(8) + cutlass.Int32(2 * p)
-                                    lo = cutlass.Float32(
-                                        s_rows.load(idx=c0 * cutlass.Int32(MMA_N) + t)
-                                    )
-                                    hi = cutlass.Float32(
-                                        s_rows.load(
-                                            idx=(c0 + cutlass.Int32(1)) * cutlass.Int32(MMA_N) + t
+                            # 4 latent vectors (8 columns each) per token: (token, vector) = lane + 32 lp, m_max / 8
+                            # pairs per lane.
+                            for lp in cutlass.range_constexpr(MMA_N_ // 8):
+                                lt = (lane + cutlass.Int32(lp * 32)) // cutlass.Int32(4)
+                                v = lane % cutlass.Int32(4)
+                                if lt < num_tokens:
+                                    words = []
+                                    for p in cutlass.range_constexpr(4):
+                                        c0 = srow0 + v * cutlass.Int32(8) + cutlass.Int32(2 * p)
+                                        lo = cutlass.Float32(
+                                            s_rows.load(idx=c0 * cutlass.Int32(MMA_N_) + lt)
                                         )
+                                        hi = cutlass.Float32(
+                                            s_rows.load(
+                                                idx=(c0 + cutlass.Int32(1)) * cutlass.Int32(MMA_N_)
+                                                + lt
+                                            )
+                                        )
+                                        words.append(_ag._sanitize_bf16x2(_ag._pack_bf16x2(hi, lo)))
+                                    dst = b * cutlass.Int32(BUF) + (
+                                        lt * cutlass.Int32(world) + tp_rank
+                                    ) * cutlass.Int32(SLOT)
+                                    dst = dst + ((row0 // cutlass.Int32(8)) + v) * cutlass.Int32(4)
+                                    buf_mc.store(
+                                        (words[0], words[1], words[2], words[3]),
+                                        idx=dst,
+                                        alignment=16,
                                     )
-                                    words.append(_ag._sanitize_bf16x2(_ag._pack_bf16x2(hi, lo)))
-                                dst = b * cutlass.Int32(BUF) + (
-                                    t * cutlass.Int32(world) + tp_rank
-                                ) * cutlass.Int32(SLOT)
-                                dst = dst + ((row0 // cutlass.Int32(8)) + v) * cutlass.Int32(4)
-                                buf_mc.store(
-                                    (words[0], words[1], words[2], words[3]),
-                                    idx=dst,
-                                    alignment=16,
-                                )
                         else:
                             # Shared: lane l < 16 holds gate column j, lane l + 16 its up row.
                             col = (
@@ -1138,7 +1200,7 @@ def k3_moe_front_kernel(
                                 + w * cutlass.Int32(16)
                                 + lane
                             )
-                            for t in cutlass.range_constexpr(MMA_N):
+                            for t in cutlass.range_constexpr(MMA_N_):
                                 up = cutlass.Float32(cute.arch.shuffle_sync_bfly(tot[t], offset=16))
                                 if lane < cutlass.Int32(16):
                                     if cutlass.Int32(t) < num_tokens:
@@ -1153,7 +1215,7 @@ def k3_moe_front_kernel(
                                         )
             prims.barrier_cta_sync(1, thread_count=128)
             if warp_id == 4:
-                prims.tcgen05_dealloc(tmem_ptr, HALF_TMEM_COLS if head_half else TMEM_COLS)
+                prims.tcgen05_dealloc(tmem_ptr, HALF_TMEM_COLS if head_half else TMEM_COLS_)
     else:
         # =====================================================================
         # Role CTAs: route (CTA t < M) or quantize (CTA M + t) token t from
@@ -1219,7 +1281,7 @@ def k3_moe_front_kernel(
                             addr = (
                                 cutlass.Int32(PBASE)
                                 + (
-                                    (b * cutlass.Int32(M_MAX) + tok) * cutlass.Int32(world)
+                                    (b * cutlass.Int32(m_max) + tok) * cutlass.Int32(world)
                                     + tx // cutlass.Int32(EV)
                                 )
                                 * cutlass.Int32(SPLIT * WE)
@@ -1297,7 +1359,14 @@ def k3_moe_front_kernel(
                     cute.arch.barrier()
                     if s_cnt.load(idx=0) == num_tokens - cutlass.Int32(1):
                         _sort_local(
-                            s_key, topk_ids, sort_words, num_tokens, sort_offset, sort_local, tx
+                            s_key,
+                            topk_ids,
+                            sort_words,
+                            num_tokens,
+                            sort_offset,
+                            sort_local,
+                            tx,
+                            m_max,
                         )
                         if tx == 0:
                             sort_ctr.store(cutlass.Int32(0), idx=0)
@@ -1344,7 +1413,7 @@ def k3_moe_front_kernel(
                     cute.arch.barrier()
                     if tx == cutlass.Int32(0):
                         _ag._store_release(
-                            ready.data_ptr(tok + cutlass.Int32(M_MAX)).toint(),
+                            ready.data_ptr(tok + cutlass.Int32(m_max)).toint(),
                             epoch + cutlass.Int32(1),
                         )
             cute.arch.barrier()
@@ -1406,14 +1475,14 @@ def _weight_tensor_map(w, n_out, k_in, box_rows=CTA_M):
     )
 
 
-def _activation_tensor_map(x, cols, num_tokens):
-    """x [M, cols] as (cols, M) with an 8-row box: rows past num_tokens arrive as zeros."""
+def _activation_tensor_map(x, cols, num_tokens, m_max=M_MAX):
+    """x [M, cols] as (cols, M) with an m_max-row box: rows past num_tokens arrive as zeros."""
     return cuda.create_tensor_map_tiled(
         global_address=x.iterator.toint(),
         dtype=cutlass.BFloat16,
         global_dims=[cols, num_tokens],
         global_strides=[(cols * ELEM_BYTES) // 16],
-        box_dims=[TMA_K_BOX, MMA_N],
+        box_dims=[TMA_K_BOX, m_max],
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
 
@@ -1454,19 +1523,20 @@ def k3_moe_front(
     head_half: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
+    m_max: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
     tma_desc_w = _weight_tensor_map(w, rows, k_in)
     tma_desc_w64 = _weight_tensor_map(w, rows, k_in, box_rows=HALF_M)
-    tma_desc_x = _activation_tensor_map(x, k_in, num_tokens)
+    tma_desc_x = _activation_tensor_map(x, k_in, num_tokens, m_max)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
         quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
         sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort,
+        linear_cap, publish, head_half, nvfp4, sort, m_max,
     ).launch(
-        grid=((gemv_clusters + ROLE_CLUSTERS) * SPLIT, 1, 1),
+        grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),
         cluster=(SPLIT, 1, 1),
         stream=stream,

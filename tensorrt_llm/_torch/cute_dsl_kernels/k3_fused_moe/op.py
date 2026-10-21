@@ -201,13 +201,18 @@ class K3MoeHeadWorkspace:
     """The ``McastGPUBuffer`` that owns the memory; the workspace is valid while this object lives."""
     comm: Any
     """The TP-group communicator the handles were exchanged over."""
+    m_max: int = 8
+    """The front build whose buffer layout the words follow (8, or 16)."""
 
     @classmethod
-    def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3MoeHeadWorkspace":
+    def create(
+        cls, mapping, fabric_handle: Optional[bool] = None, m_max: int = 8
+    ) -> "K3MoeHeadWorkspace":
         """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at the
         same point, eagerly (not under CUDA-graph capture); the failure model is :func:`create_mcast_state`'s.
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
-        descriptor; default ``mapping.is_multi_node()``."""
+        descriptor; default ``mapping.is_multi_node()``. ``m_max``: the front build it serves (8, or 16 for the
+        16-token build, whose buffers are laid out for 16 tokens: a workspace serves one build only)."""
         from . import k3_route_quant_ag as layout
 
         def build(uc, mc, handle, comm):
@@ -220,9 +225,10 @@ class K3MoeHeadWorkspace:
                 world_size=mapping.tp_size,
                 handle=handle,
                 comm=comm,
+                m_max=m_max,
             )
 
-        words = layout.workspace_words(mapping.tp_size)
+        words = layout.workspace_words(mapping.tp_size, m_max)
         return create_mcast_state("K3MoeHeadWorkspace", mapping, words, fabric_handle, build)
 
 

@@ -305,6 +305,9 @@ def _context():
     head[wl:] *= 8.0
     gate_up = (torch.randn(2 * inter, HIDDEN, device="cuda", generator=wgen) * 0.02).bfloat16()
     ws = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True)
+    # The 16-token build's own workspace, and 8 more rows for it (drawn after x8, which stays as it was).
+    ws16 = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True, m_max=16)
+    x16 = torch.cat([x8, torch.randn(8, HIDDEN, device="cuda", generator=gen).bfloat16()])
     # The latent's calibrated global scale: the largest latent value of a few calls maps to 448 * 6.
     gsf = torch.tensor([448.0 * 6.0 / 0.5], device="cuda")
     ex = _nvfp4_experts(E_LOCAL, LATENT, I_TP, 4000 + rank)
@@ -312,13 +315,15 @@ def _context():
     return SimpleNamespace(
         comm=comm, rank=rank, world=world, wl=wl, inter=inter, bias=bias, x8=x8, head=head, gate_up=gate_up,
         front=front_op.front_weight(head, gate_up), ws=ws, ag=(ws.uc, ws.mc, ws.flags, ws.rank), gsf=gsf, ex=ex,
+        x16=x16, ag16=(ws16.uc, ws16.mc, ws16.flags, ws16.rank), ws16=ws16,
         weights=(ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2), offset=(rank % 4) * E_LOCAL,
         counters=nvfp4_lowm_op.new_counters(torch.device("cuda", torch.cuda.current_device())),
     )  # fmt: skip
 
 
 def _front(ctx, x, nvfp4):
-    return _trtllm().k3_moe_front(x, ctx.front, ctx.bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag, ctx.world,
+    ag = ctx.ag16 if x.shape[0] > 8 else ctx.ag
+    return _trtllm().k3_moe_front(x, ctx.front, ctx.bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ag, ctx.world,
                                   nvfp4_gsf=ctx.gsf if nvfp4 else None)  # fmt: skip
 
 
@@ -385,11 +390,40 @@ def check_front(ctx):
     return results
 
 
+def check_front16(ctx):
+    """The 16-token build on 9-16 rows: every output bit for bit as the 8-token build's on rows [0, 8) and [8, M)
+    (each token's head is its own dot products in the same split-K order, its routing and quantization its own)."""
+    results = []
+    for m in range(9, 17):
+        x = ctx.x16[:m].contiguous()
+        for nvfp4 in (True, False):
+            out = _front(ctx, x, nvfp4)
+            lo = _front(ctx, x[:8].contiguous(), nvfp4)
+            hi = _front(ctx, x[8:].contiguous(), nvfp4)
+            torch.cuda.synchronize()
+            ref = [torch.cat([a, b]) for a, b in zip(lo, hi)]
+            again = _front(ctx, x, nvfp4)
+            # The routing and the latent are the same on every rank; the shared activation is this rank's shard.
+            gathered = ctx.comm.allgather([_bits(t).cpu() for t in out[:4]])
+            names = ("ids", "weights", "latent", "scales", "shared")
+            row = dict(
+                op="k3_moe_front16", case=f"tp{ctx.world}_{'nvfp4' if nvfp4 else 'mxfp8'}", M=m,
+                **{f"{n}_as_8": _same(a, b) for n, a, b in zip(names, out, ref)},
+                det=all(_same(a, b) for a, b in zip(again, out)),
+                ranks_agree=all(all(torch.equal(a, b) for a, b in zip(g, gathered[0])) for g in gathered),
+            )  # fmt: skip
+            good = all(v for k, v in row.items() if k not in ("op", "case", "M"))
+            row["rank"], row["good"] = ctx.rank, bool(good)
+            row["ok"] = all(ctx.comm.allgather(bool(good)))
+            results.append(row)
+    return results
+
+
 def _run_front(_=None):
     try:
         ctx = _context()
         with torch.inference_mode():
-            return check_front(ctx)
+            return check_front(ctx) + check_front16(ctx)
     except Exception:
         traceback.print_exc()
         raise
