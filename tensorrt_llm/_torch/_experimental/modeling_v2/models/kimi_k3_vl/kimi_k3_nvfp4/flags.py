@@ -85,6 +85,11 @@ TRTLLM_K3LL_MLA_QKV_SPLIT = _flag(
     1,
     "target MLA decode: q_a prep, Q-B in 32-column slices and the absorption as three launches, not one per head",
 )
+TRTLLM_K3LL_MLA_AG_SPLIT = _flag(
+    "TRTLLM_K3LL_MLA_AG_SPLIT",
+    0,
+    "target MLA decode: the fused q_a/kv_a rows and the output gate rows as two tensors, not one torch.cat",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

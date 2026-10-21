@@ -2422,10 +2422,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
             if not project_output:
                 raise ValueError("project_output=False requires fused MLA decode")
             return self.forward_generic(position_ids, hidden_states, attn_metadata)
-        x = hidden_states[: step.num_tokens]
-        ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
+        ag, gate, gate_col = self._k3_mla_rows(hidden_states[: step.num_tokens])
         if view.get("quantized_cache", False):
-            core = self._quantized_decode(ag, position_ids, attn_metadata)
+            core = self._quantized_decode(ag, position_ids, attn_metadata, gate, gate_col)
             if not project_output:
                 return core
             return self._project_output([core], position_ids, attn_metadata, None)
@@ -2454,24 +2453,47 @@ class K3DecodeMLA(KimiK3MLAAttention):
             view["seq_len"],
             self.v_b_proj,
             self.v_b_proj_scale,
-            ag,
+            gate,
             view["row_stride"],
             view["page_offset"],
             view["tokens_per_request"],
             view["softmax_scale"],
-            self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+            gate_col,
         )
         if not project_output:
             return core
         return self._project_output([core], position_ids, attn_metadata, None)
+
+    def _k3_mla_rows(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """``(ag, gate, gate_col)`` of the decode rows ``x``: ``ag`` holds the fused ``[q_a | kv_a | k_pe]`` rows
+        the decode kernels read at row stride ``ag.stride(0)``; the output gate's rows start at column ``gate_col``
+        of ``gate``. With ``TRTLLM_K3LL_MLA_AG_SPLIT`` they are the two projections' own outputs (``gate_col`` 0),
+        else ``ag`` is their concatenation and ``gate`` is ``ag``. The kernels read the same values either way."""
+        a = self.kv_a_proj_with_mqa(x)
+        g = self.g_proj(x)
+        a_cols = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        if (
+            _flags.TRTLLM_K3LL_MLA_AG_SPLIT
+            and a.dim() == 2
+            and g.dim() == 2
+            and a.shape[1] == a_cols
+            and a.stride(1) == 1
+            and g.stride(1) == 1
+        ):
+            return a, g, 0
+        ag = torch.cat((a, g), dim=-1)
+        return ag, ag, a_cols
 
     def _quantized_decode(
         self,
         ag: torch.Tensor,
         position_ids: torch.Tensor | None,
         metadata: AttentionMetadata,
+        gate: torch.Tensor,
+        gate_col: int,
     ) -> torch.Tensor:
-        """Keep FP8 projections around the native FP4/FP8 cache and attention kernels."""
+        """Keep FP8 projections around the native FP4/FP8 cache and attention kernels; ``gate`` / ``gate_col`` as
+        ``_k3_mla_rows`` returns them."""
         query, latent_cache = _fp8_attention.mla_project_qkv(
             ag,
             self.q_a_layernorm.weight,
@@ -2511,11 +2533,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 self.mqa, quant_q, metadata, ag.shape[0] // metadata.num_generations, bmm1, bmm2
             )
             return _fp8_attention.mla_output(
-                latent,
-                self.v_b_proj,
-                self.v_b_proj_scale,
-                ag,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                latent, self.v_b_proj, self.v_b_proj_scale, gate, gate_col
             )
         latent = self._attn_forward_gen(
             self.mqa,
@@ -2535,13 +2553,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             mla_bmm2_scale=bmm2,
             quant_q_buffer=quant_q,
         )
-        return _fp8_attention.mla_output(
-            latent,
-            self.v_b_proj,
-            self.v_b_proj_scale,
-            ag,
-            self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-        )
+        return _fp8_attention.mla_output(latent, self.v_b_proj, self.v_b_proj_scale, gate, gate_col)
 
     def forward_generic(
         self,
