@@ -45,6 +45,12 @@ _SMALL_BATCH = 32
 _TILE_REDUCTION_MAX_BATCH = 24
 _DEEP_K_MAX_REQUESTS = 256
 
+#: Kernel options ``kernel_options`` sets for the balanced split only; the uniform split takes the stage counts too.
+_BALANCED_OPTIONS = frozenset(
+    ("balanced_max_requests", "reduction_col_split", "aligned_segment_cost", "bf16_partials", "k_stages",
+     "p_stages", "tile_reduction")
+)  # fmt: skip
+
 _max_active_clusters: Optional[int] = None
 
 
@@ -122,7 +128,7 @@ def kernel_options(batch: int, balanced: bool, **overrides) -> Tuple[Tuple[str, 
             p_stages=2 if deep_k else 3,
             tile_reduction=tile_reduction,
         )
-    unknown = set(overrides) - set(opts)
+    unknown = set(overrides) - set(opts) - _BALANCED_OPTIONS
     if unknown:
         raise ValueError(f"MLA ll4 decode: unknown kernel options {sorted(unknown)}")
     opts.update(overrides)
@@ -176,6 +182,7 @@ class MlaLl4Decode:
         split_kv: uniform split; None picks ll4's default for the batch. 1 runs without split-KV partials.
         max_batch: requests the workspace is sized for.
         options: kernel option overrides (see ``kernel_options``).
+        num_clusters: persistent clusters of the kernel (the balanced split's cluster count); None: all resident.
     """
 
     _compiled: dict = {}
@@ -190,6 +197,7 @@ class MlaLl4Decode:
         split_kv: Optional[int] = None,
         emit_softmax_stats: bool = False,
         options: Optional[dict] = None,
+        num_clusters: Optional[int] = None,
     ):
         if num_heads > _MMA_TILE_M:
             raise ValueError(f"MLA ll4 decode: at most {_MMA_TILE_M} heads, got {num_heads}")
@@ -205,6 +213,7 @@ class MlaLl4Decode:
         self.split_kv = split_kv
         self.emit_softmax_stats = emit_softmax_stats
         self.options = dict(options or {})
+        self.num_clusters = num_clusters
         self.layout = workspace_layout(num_heads, seq_len_q, max_batch)
 
     def workspace_bytes(self) -> int:
@@ -294,7 +303,7 @@ class MlaLl4Decode:
         use_ws = balanced or split_kv > 1
         opts = kernel_options(batch, balanced, **self.options)
         key = (heads, seq_len_q, self.page_size, self.emit_softmax_stats, kv_bounds is not None, balanced,
-               use_ws, persistent, opts)  # fmt: skip
+               use_ws, persistent, opts, self.num_clusters)  # fmt: skip
         compiled = self._compiled.get(key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
@@ -310,7 +319,7 @@ class MlaLl4Decode:
                 cutlass.Float32,
                 _TILERS[0],
                 _TILERS[1],
-                max_active_clusters(),
+                self.num_clusters or max_active_clusters(),
                 self.page_size,
                 threshold,
                 persistent,
