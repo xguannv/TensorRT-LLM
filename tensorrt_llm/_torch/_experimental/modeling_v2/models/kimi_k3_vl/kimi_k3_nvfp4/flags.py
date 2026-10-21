@@ -124,6 +124,11 @@ TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(
     1,
     "wide decode steps: post-attention / MoE-tail all-reduce + residual add + attn_res + RMSNorm in one two-shot call",
 )
+TRTLLM_K3LL_WIDE_LATENT_TAIL = _flag(
+    "TRTLLM_K3LL_WIDE_LATENT_TAIL",
+    0,
+    "wide decode steps: MoE latent all-reduce + latent RMSNorm + the tail GEMV's input concat in one MNNVL call",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

@@ -125,6 +125,62 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     return {normOut, prefixOut};
 }
 
+// This rank's column slice of RMSNorm(allreduce(input)) (no weight), then pad_cols zero columns, then tail; see
+// tensorrt_llm::kernels::kimiK3Mnnvl::allreduceRmsNormSliceOp. Returns [num_tokens, hidden / world + pad_cols +
+// tail_cols].
+torch::Tensor mnnvlAllReduceRmsNormSlice(torch::Tensor const& input, torch::optional<torch::Tensor> const& tail,
+    int64_t pad_cols, double eps, int64_t world_size, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(
+        mcast_mem != nullptr, "[mnnvlAllReduceRmsNormSlice] comm_buffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlAllReduceRmsNormSlice] MNNVL workspace handles are not attached.");
+    auto const checkBf16 = [](torch::Tensor const& tensor, char const* name)
+    {
+        TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == torch::kBFloat16 && tensor.is_contiguous()
+                && tensor.dim() == 2 && reinterpret_cast<uintptr_t>(tensor.const_data_ptr()) % 16 == 0,
+            "[mnnvlAllReduceRmsNormSlice] ", name, " must be a contiguous 16-byte aligned 2-D CUDA bfloat16 tensor");
+    };
+    checkBf16(input, "input");
+    int64_t const numTokens = input.size(0);
+    int64_t const hiddenDim = input.size(1);
+    int64_t tailCols = 0;
+    if (tail.has_value())
+    {
+        checkBf16(tail.value(), "tail");
+        TORCH_CHECK(tail.value().size(0) == numTokens, "[mnnvlAllReduceRmsNormSlice] tail must have input's rows");
+        tailCols = tail.value().size(1);
+    }
+    int64_t const nRanks = mcast_mem->getWorldSize();
+    TORCH_CHECK(world_size == nRanks, "[mnnvlAllReduceRmsNormSlice] world_size ", world_size,
+        " is not the workspace's ", nRanks, " ranks");
+    TORCH_CHECK(hiddenDim % nRanks == 0, "[mnnvlAllReduceRmsNormSlice] hidden ", hiddenDim, " is not a multiple of ",
+        nRanks, " ranks");
+    int64_t const stageBytes = comm_buffer.numel() / comm_buffer.size(0) * comm_buffer.element_size() / 2;
+    TORCH_CHECK(numTokens * hiddenDim * 2 <= stageBytes && numTokens * nRanks * 4 <= stageBytes,
+        "[mnnvlAllReduceRmsNormSlice] the stages of ", numTokens * hiddenDim * 2, " and ", numTokens * nRanks * 4,
+        " bytes exceed half a Lamport buffer of ", stageBytes, " bytes");
+
+    torch::Tensor out = torch::empty({numTokens, hiddenDim / nRanks + pad_cols + tailCols}, input.options());
+    tensorrt_llm::kernels::kimiK3Mnnvl::AllreduceRmsNormSliceParams params{};
+    params.input = input.const_data_ptr();
+    params.tail = tail.has_value() ? tail.value().const_data_ptr() : nullptr;
+    params.output = out.mutable_data_ptr();
+    params.numTokens = static_cast<int>(numTokens);
+    params.hidden = static_cast<int>(hiddenDim);
+    params.padCols = static_cast<int>(pad_cols);
+    params.tailCols = static_cast<int>(tailCols);
+    params.eps = static_cast<float>(eps);
+    params.nRanks = static_cast<int>(nRanks);
+    params.rank = mcast_mem->getRank();
+    params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    params.multicastPtr = mcast_mem->getMulticastPtr();
+    params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
+    params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    tensorrt_llm::kernels::kimiK3Mnnvl::allreduceRmsNormSliceOp(params);
+    return out;
+}
+
 // One-shot all-gather over the MNNVL workspace of this rank's fp32 rows [num_tokens, columns]:
 // the first bf16_columns columns of every rank are gathered as bf16 into [num_tokens, nRanks *
 // bf16_columns], the rest as fp32 into [num_tokens, nRanks * (columns - bf16_columns)]; see
@@ -202,10 +258,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "mnnvl_allgather_split(Tensor input, int bf16_columns, int world_size, Tensor(a!) comm_buffer, "
         "Tensor(b!) buffer_flags) -> Tensor[]");
+    m.def(
+        "mnnvl_allreduce_rmsnorm_slice(Tensor input, Tensor? tail, int pad_cols, float eps, int world_size, "
+        "Tensor(a!) comm_buffer, Tensor(b!) buffer_flags) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_allreduce_attn_res", &tensorrt_llm::torch_ext::mnnvlAllReduceAttnRes);
     m.impl("mnnvl_allgather_split", &tensorrt_llm::torch_ext::mnnvlAllGatherSplit);
+    m.impl("mnnvl_allreduce_rmsnorm_slice", &tensorrt_llm::torch_ext::mnnvlAllReduceRmsNormSlice);
 }

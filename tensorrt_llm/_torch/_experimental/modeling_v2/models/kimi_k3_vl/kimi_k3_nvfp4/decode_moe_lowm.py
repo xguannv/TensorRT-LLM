@@ -36,6 +36,12 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce_rmsnorm_slice import (
+    fits as rmsnorm_slice_fits,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce_rmsnorm_slice import (
+    mnnvl_allreduce_rmsnorm_slice,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
     MnnvlWorkspace,
 )
@@ -51,6 +57,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant im
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
+from . import flags as _flags
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
 
@@ -410,7 +417,20 @@ class K3DecodeMoeNvfp4Layer:
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
-        # columns.
+        # columns. With TRTLLM_K3LL_WIDE_LATENT_TAIL one MNNVL call builds the tail's input: each rank reduces only its
+        # own latent columns, and the ranks exchange the per-token sums of squares.
+        pad = 0 if self.tail_pad is None else self.tail_pad.shape[1]
+        if _flags.TRTLLM_K3LL_WIDE_LATENT_TAIL and rmsnorm_slice_fits(
+            x.shape[0], routed.shape[1], pad, shared_act.shape[1], self.state.mnnvl
+        ):
+            tail_in = mnnvl_allreduce_rmsnorm_slice(
+                routed,
+                shared_act,
+                pad,
+                float(moe.routed_expert_norm.variance_epsilon),
+                self.state.mnnvl,
+            )
+            return _gemv(gemvs, "moe_tail", tail_in, self.tail_weight)
         normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
         parts = [normed[:, self.lo : self.lo + self.width]]
         if self.tail_pad is not None:
