@@ -1588,6 +1588,21 @@ class KimiLinearDecoderLayer(nn.Module):
                 tap=tap_view,
                 tap_updated=not _AUX_ATTN_RES_STREAM_ENABLED,
             )
+        elif (
+            pending_moe_partial is not None
+            and _flags.TRTLLM_K3LL_WIDE_ONESHOT
+            and self.decode_comm is not None
+            and self.decode_comm.takes_post_attention(pending_moe_partial, step)
+        ):
+            # A wide step's MoE partial: one-shot all-reduce + residual update + attn_res + input norm in one call.
+            hidden_states, prefix_sum = self.decode_comm.allreduce_attn_res(
+                pending_moe_partial,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+            )
         elif pending_moe_partial is not None:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
                 prefix_sum,
@@ -2014,6 +2029,22 @@ class KimiLinearModel(DecoderModel):
 
         if isinstance(pending_moe_partial, _decode_comm.PendingTail):
             normed, _ = self.layers[-1].decode_comm.sandwich_tail(
+                pending_moe_partial,
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
+            return normed
+        last_comm = self.layers[-1].decode_comm
+        if (
+            pending_moe_partial is not None
+            and _flags.TRTLLM_K3LL_WIDE_ONESHOT
+            and last_comm is not None
+            and last_comm.takes_post_attention(pending_moe_partial, step)
+        ):
+            normed, _ = last_comm.allreduce_attn_res(
                 pending_moe_partial,
                 hidden_states,
                 block_residual[:num_snapshots],
