@@ -127,13 +127,13 @@ TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",
-    0,
+    1,
     "Helix MLA decode: the FP8 absorbed-query all-gather on the decode collectives' MNNVL workspace "
     "(mnnvl_allgather_split), not NCCL",
 )
 TRTLLM_K3LL_HELIX_A2A_FUSED = _flag(
     "TRTLLM_K3LL_HELIX_A2A_FUSED",
-    0,
+    1,
     "Helix MLA decode: the partials' exchange and combine in one Lamport kernel (helix_a2a_fused), not NCCL "
     "alltoall_helix + helix_post_process",
 )
