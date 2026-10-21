@@ -113,7 +113,7 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
 )
 TRTLLM_K3LL_KDA_BFA_GEMV = _flag(
     "TRTLLM_K3LL_KDA_BFA_GEMV",
-    0,
+    1,
     "KDA decode / verify: the bf16 [f_a | b] projection on k3_ctm_gemv_wide (decode_gemv site kda_bfa), and the "
     "verify kernel reading it beside the FP8 QKVG rows instead of a concatenated copy",
 )
