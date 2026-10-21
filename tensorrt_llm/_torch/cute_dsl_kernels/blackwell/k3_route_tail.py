@@ -43,7 +43,9 @@ weight stream and each L2 round trip and instruction fetch is slow:
   copies (about 79 KB of SASS between the top-k and the rest of the kernel);
 * with the sort on a cluster, the top-k ids and weights are staged in shared memory and stored after
   the cluster barrier: the barrier's release (a GPU-scope memory barrier) then waits only for the
-  distributed-shared-memory stores, not for the global stores in flight;
+  distributed-shared-memory stores, not for the global stores in flight. These stores now follow
+  ``griddepcontrol.launch_dependents`` (as the sort outputs always did): the dependents read the
+  routing only after their own ``griddepcontrol.wait``, i.e. after this grid completed;
 * the copy choice of :class:`K3RouteTailRepKernel` sizes the (home rank, copy rank) classes of the
   touched entries with one ballot and the per-class entry masks of the replica table instead of one
   ballot per class.
