@@ -13,7 +13,11 @@ runs:
   (`cute_dsl_kernels/k3_fused_moe/nvfp4_lowm_op.py`): FC1 + SiTU + FC2 + the routing-weighted combine of this rank's
   experts in one persistent kernel, its output zeroed by the kernel; with ``front_sort``
   (``TRTLLM_K3LL_MOE_FRONT_SORT``) the front writes the sorted routing itself (``sort_out``) and no ``moe_sort`` runs;
-* the routed experts' latent all-reduce (one-shot, as `decode_comm.use_decode_one_shot` sets);
+* the latent all-reduce. On a pushing step (`DecodeStep.latent_push`) with the state's `K3LatentExchange`
+  (``TRTLLM_K3LL_MOE_LATENT_PUSH``) the expert kernel's push build stores this rank's partial into every rank's
+  exchange and `comm/k3_latent_reduce` sums the partials in the MNNVL one-shot's order (the same bits as the one-shot
+  of the same partial); on every other step it is the routed experts' all-reduce (one-shot, as
+  `decode_comm.use_decode_one_shot` sets);
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
   residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
 
@@ -33,6 +37,10 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_latent_reduce import (
+    K3LatentExchange,
+    k3_latent_reduce,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
@@ -81,6 +89,9 @@ class K3DecodeMoeNvfp4:
     sort_ctr: Optional[torch.Tensor] = None
     #: The 16-token front build's own head workspace (a step of 9-16 tokens), or None: such steps keep the wide head.
     head16: Optional[K3MoeHeadWorkspace] = None
+    #: The latent exchange of a pushing step's latent all-reduce, or None (every step keeps the routed experts'
+    #: all-reduce).
+    exchange: Optional[K3LatentExchange] = None
 
     @classmethod
     def create(
@@ -90,19 +101,29 @@ class K3DecodeMoeNvfp4:
         mnnvl: MnnvlWorkspace,
         front_sort: bool = False,
         front16: bool = False,
+        push: bool = False,
     ) -> "K3DecodeMoeNvfp4":
         """Collective (the head workspace): every rank of the TP group calls it at the same point, eagerly, before
         any CUDA-graph capture. ``mnnvl``: the TP group's MNNVL workspace, for a wide step's head all-gather.
         ``front_sort``: the front sorts the routing over the local experts (``k3_moe_front``'s ``sort_out``).
-        ``front16``: steps of 9-16 tokens run the front's 16-token build (its own head workspace)."""
+        ``front16``: steps of 9-16 tokens run the front's 16-token build (its own head workspace). ``push``: build the
+        latent exchange (collective; where it takes the TP size: 4, 8 or 16 ranks)."""
         sort_ctr = torch.zeros(1, dtype=torch.int32, device=device) if front_sort else None
         head16 = K3MoeHeadWorkspace.create(mapping, m_max=FRONT16_TOKENS) if front16 else None
+        exchange = None
+        if push:
+            try:
+                exchange = K3LatentExchange.create(mapping)
+            # Raised before any collective step, on every rank of the group alike: a TP size the exchange does not take.
+            except ValueError:
+                exchange = None
         return cls(
             K3MoeHeadWorkspace.create(mapping),
             nvfp4_lowm_op.new_counters(device),
             mnnvl,
             sort_ctr,
             head16,
+            exchange,
         )
 
 
@@ -281,10 +302,14 @@ class K3DecodeMoeNvfp4Layer:
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
         (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens."""
+        32 tokens; with the latent exchange also the push build and ``k3_latent_reduce`` (one collective pair)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         self._front_routed(moe, x)
+        if self.state.exchange is not None:
+            # the push build and the reduce: one push + reduce pair (collective, the exchange's call order)
+            self._front_routed(moe, x, self.state.exchange)
+            k3_latent_reduce(1, self.state.exchange)
         if self.state.head16 is not None:
             self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]))
         for rows in (9, WIDE_MAX_TOKENS):
@@ -321,18 +346,19 @@ class K3DecodeMoeNvfp4Layer:
         """This rank's routed experts."""
         return self.experts[0].shape[0]
 
-    def _routed(self, ids, weights, x_q, x_sf) -> torch.Tensor:
+    def _routed(self, ids, weights, x_q, x_sf, exchange=None) -> torch.Tensor:
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, exchange=exchange,
         )  # fmt: skip
 
-    def _front_routed(self, moe: nn.Module, x: torch.Tensor):
+    def _front_routed(self, moe: nn.Module, x: torch.Tensor, exchange=None):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows): ``(routed, shared_act)``.
-        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
+        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it. With
+        ``exchange`` the expert kernel also pushes the partial into it (its push build)."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
-            return self._routed(ids, weights, x_q, x_sf), shared_act
+            return self._routed(ids, weights, x_q, x_sf, exchange), shared_act
         rows = x.shape[0]
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
@@ -340,7 +366,7 @@ class K3DecodeMoeNvfp4Layer:
         _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
         routed = nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, exchange=exchange,
         )  # fmt: skip
         return routed, shared_act
 
@@ -361,12 +387,18 @@ class K3DecodeMoeNvfp4Layer:
         push: bool = False,
     ) -> Union[torch.Tensor, PendingTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
-        (a ``PendingTail``); else the reduced output. ``push`` is ignored: the latent all-reduce is always the routed
-        experts' all-reduce."""
+        (a ``PendingTail``); else the reduced output. ``push`` (the step's ``DecodeStep.latent_push``): with the
+        state's exchange and ``TRTLLM_K3LL_MOE_LATENT_PUSH``, the latent all-reduce is the expert kernel's push build
+        plus ``comm/k3_latent_reduce`` (the bits of the routed experts' all-reduce of the same partial)."""
         if hidden_states.shape[0] > MAX_TOKENS:
             return self._wide(moe, hidden_states, gemvs)
-        routed, shared_act = self._front_routed(moe, hidden_states)
-        latent = moe.routed_experts.all_reduce(routed)
+        exchange = self.state.exchange
+        if push and exchange is not None and _flags.TRTLLM_K3LL_MOE_LATENT_PUSH:
+            _, shared_act = self._front_routed(moe, hidden_states, exchange)
+            latent = k3_latent_reduce(hidden_states.shape[0], exchange)
+        else:
+            routed, shared_act = self._front_routed(moe, hidden_states)
+            latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
                 latent.contiguous(),

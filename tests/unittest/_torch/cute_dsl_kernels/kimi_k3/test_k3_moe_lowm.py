@@ -26,11 +26,17 @@
                 bit for bit the MXFP8 call's; the NVFP4 latent against fp4_quantize of the unfused chain's bf16
                 latent (> 99.9 % equal codes and scales: the front sums the head in its own split-K order, so a code
                 may move at a rounding tie), within one E2M1 step of the reference; then the routed experts on the
-                front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs.
+                front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs;
+  push (4 GPUs, one process each) : the expert kernel's push build into a K3LatentExchange, then
+                trtllm::k3_latent_reduce: bit for bit the MNNVL one-shot's order sum (rank 0 first, fp32, one bf16
+                rounding) of every rank's own ``out`` of the same call, at 1-8 tokens, with a rank that has no routed
+                token (it pushes zeros), push calls between non-push calls, and from CUDA-graph replays of a push +
+                reduce pair; the counters (the push's per-block ones included) zero after every launch.
 
 Run under pytest (the front check takes a pool of 4 MPI workers) or directly:
   python3 test_k3_moe_lowm.py route_quant lowm
   srun -N1 -n4 --mpi=pmix python3 test_k3_moe_lowm.py front
+  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_lowm.py push
 """
 
 import pickle
@@ -419,6 +425,121 @@ def check_front16(ctx):
     return results
 
 
+def check_push(ctx):
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_latent_reduce import (
+        K3LatentExchange,
+        k3_latent_reduce,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+    from tensorrt_llm._torch.utils import unswizzle_sf
+    from tensorrt_llm.mapping import Mapping
+
+    gpus = torch.cuda.device_count()
+    mapping = Mapping(world_size=ctx.world, rank=ctx.rank, gpus_per_node=gpus, tp_size=ctx.world)
+    exchange = K3LatentExchange.create(mapping, fabric_handle=True)
+    ex = ctx.ex
+    # every rank draws the same routing and latent (as in the model: the front's outputs agree on every rank)
+    gen = torch.Generator(device="cuda").manual_seed(500)
+
+    def inputs(m, idle=None):
+        logits = torch.randn(m, EXPERTS, device="cuda", generator=gen)
+        if idle is not None:  # no token routed to rank ``idle``'s experts
+            lo = (idle % 4) * E_LOCAL
+            logits[:, lo : lo + E_LOCAL] = -1e9
+        scales, ids = logits.topk(TOP_K, dim=-1)
+        x = (torch.randn(m, LATENT, device="cuda", generator=gen) * 0.5).bfloat16()
+        x_q, x_sf, x_gsf = _quantize(x)
+        x_sf = unswizzle_sf(x_sf, (m + 127) // 128 * 128, LATENT)[:m].contiguous()
+        weights = (
+            ex.w1,
+            ex.w1_sf,
+            (ex.spread * (x_gsf * ex.w1_gsf)).float(),
+            ex.w2,
+            ex.w2_sf,
+            ex.alpha2,
+        )
+        return [
+            _bits(x_q),
+            _bits(x_sf),
+            ids.to(torch.int32),
+            scales.softmax(dim=-1).float(),
+        ], weights
+
+    def experts(args, weights, out, push):
+        nvfp4_lowm_op.run(*args, weights, ctx.offset, EXPERTS, ex.fc2_input_scale, ctx.counters, GATE_CAP,
+                          LINEAR_CAP, out=out, exchange=exchange if push else None)  # fmt: skip
+
+    def one_shot_order_sum(out):
+        acc = torch.zeros(out.shape, dtype=torch.float32)
+        for part in ctx.comm.allgather(out.float().cpu()):
+            acc = acc + part
+        return acc.bfloat16()
+
+    results = []
+
+    def record(case, m, latent, out):
+        torch.cuda.synchronize()
+        want = one_shot_order_sum(out)
+        got = latent.cpu()
+        row = dict(
+            op="k3_moe_nvfp4_lowm_push", case=case, M=m,
+            reduce_is_one_shot_sum=torch.equal(got, want), nonzero=bool((got != 0).any()),
+            counters_zero=int(ctx.counters.abs().sum().item()) == 0,
+        )  # fmt: skip
+        good = row["reduce_is_one_shot_sum"] and row["nonzero"] and row["counters_zero"]
+        row["rank"], row["good"] = ctx.rank, bool(good)
+        row["ok"] = all(ctx.comm.allgather(bool(good)))
+        results.append(row)
+
+    for m in (1, 3, 8):
+        args, weights = inputs(m)
+        out = torch.empty(m, LATENT, dtype=torch.bfloat16, device="cuda")
+        experts(args, weights, out, push=True)
+        record("eager", m, k3_latent_reduce(m, exchange), out)
+    # a rank with no routed token pushes zeros; push calls between non-push calls on the same counters
+    args, weights = inputs(8, idle=1)
+    out = torch.empty(8, LATENT, dtype=torch.bfloat16, device="cuda")
+    experts(args, weights, out, push=True)
+    record("idle_rank_1", 8, k3_latent_reduce(8, exchange), out)
+    for m in (5, 8):
+        args, weights = inputs(m)
+        out = torch.empty(m, LATENT, dtype=torch.bfloat16, device="cuda")
+        experts(args, weights, torch.empty_like(out), push=False)
+        experts(args, weights, out, push=True)
+        record("after_non_push", m, k3_latent_reduce(m, exchange), out)
+    # CUDA-graph replays of a push + reduce pair with rewritten inputs
+    m = 8
+    args, weights = inputs(m)
+    static = [a.clone() for a in args]
+    out = torch.empty(m, LATENT, dtype=torch.bfloat16, device="cuda")
+    ctx.comm.Barrier()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        experts(static, weights, out, push=True)
+        latent = k3_latent_reduce(m, exchange)
+    for rep in range(3):
+        fresh, _ = inputs(m)
+        for dst, src in zip(static, fresh):
+            dst.copy_(src)
+        torch.cuda.synchronize()
+        ctx.comm.Barrier()
+        graph.replay()
+        record(f"graph_replay_{rep}", m, latent, out)
+    return results
+
+
+def _run_push(_=None):
+    try:
+        ctx = _context()
+        with torch.inference_mode():
+            return check_push(ctx)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
 def _run_front(_=None):
     try:
         ctx = _context()
@@ -448,10 +569,21 @@ def test_k3_moe_front_nvfp4(mpi_pool_executor):
     assert all(row["ok"] for rows in per_rank for row in rows)
 
 
+@pytest.mark.skipif(
+    MPI is None or not torch.cuda.is_available() or torch.cuda.device_count() < WORLD,
+    reason=f"needs {WORLD} GPUs with MNNVL and mpi4py",
+)
+@pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
+def test_k3_moe_lowm_push(mpi_pool_executor):
+    per_rank = list(mpi_pool_executor.map(_run_push, [None] * WORLD))
+    _report(per_rank)
+    assert all(row["ok"] for rows in per_rank for row in rows)
+
+
 def main() -> int:
     names = sys.argv[1:] or ["route_quant", "lowm"]
-    if "front" in names:
-        rows = _run_front()
+    if "front" in names or "push" in names:
+        rows = _run_front() if "front" in names else _run_push()
         per_rank = MPI.COMM_WORLD.gather(rows, root=0)
         if MPI.COMM_WORLD.Get_rank() == 0:
             _report(per_rank)

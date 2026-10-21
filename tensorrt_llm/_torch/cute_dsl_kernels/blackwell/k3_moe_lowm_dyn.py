@@ -53,7 +53,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import Float32, Int32, Int64
-from cutlass._mlir.dialects import math
+from cutlass._mlir.dialects import llvm, math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -89,8 +89,13 @@ from .utils import fmin, griddepcontrol_launch_dependents, griddepcontrol_wait
 _SACC_PAD = 4
 #: Named barrier of epilogue warpgroup ``wg``: ``_EPI_BARRIER_BASE + wg``.
 _EPI_BARRIER_BASE = 1
-#: int32 words of the counter buffer before the per-tile counters: [0] work, [1] exited CTAs.
-CTR_TILE_BASE = 16
+#: int32 words of the counter buffer before the per-tile counters: [0] work, [1] exited CTAs,
+#: [CTR_PUSH_BASE, CTR_PUSH_BASE + n2 / 128) the push build's per-output-block counters.
+CTR_PUSH_BASE = 16
+CTR_TILE_BASE = 64
+#: The push build's exchange (``k3_fused_moe.latent_op.K3LatentExchange``): int32 [2][PUSH_TOKENS][world][n2 / 2].
+PUSH_TOKENS = 8
+PUSH_HIDDEN = 3584
 #: Bytes of the weight part of one ring stage (128 x 256 NVFP4).
 _SLOT_BYTES = _MMA_M * _KBLK // 2
 #: Slices of the output zeroed by the kernel (the CTAs that run FC1 units 0 .. _ZERO_SLICES - 1).
@@ -164,6 +169,59 @@ def _red_add_release(addr, value, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _fence_acq_rel_gpu(*, loc=None, ip=None):
+    _asm(None, [], "fence.acq_rel.gpu;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ldv_v4_b32(addr, *, loc=None, ip=None):
+    """16 bytes from global memory, read past the (non-coherent) L1."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _ldv_u32(addr, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.volatile.global.b32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_v4_b32(addr, v0, v1, v2, v3, *, loc=None, ip=None):
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)] + [_iv(v, loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _no_neg_zero(w: Int32) -> Int32:
+    """A pair of bf16 values with -0.0 written as +0.0, so the word is never the exchange's empty pattern."""
+    hi_mask = Int32(-65536)  # 0xFFFF0000
+    w = cutlass.select_((w & Int32(0xFFFF)) == Int32(0x8000), w & hi_mask, w)
+    return cutlass.select_((w & hi_mask) == Int32(-2147483648), w & Int32(0xFFFF), w)
+
+
 def _align(v: int, a: int) -> int:
     return (v + a - 1) // a * a
 
@@ -185,6 +243,13 @@ class K3MoeLowMDynKernel:
     :param queue_depth: Entries of the shared-memory unit queue.
     :param max_ab_stage: Cap on the weight ring depth (the rest of shared memory sizes it).
     :param use_pdl: Launch with programmatic dependent launch and wait on the previous grid.
+    :param push_world: 0, or the TP size (4, 8 or 16) of the push build: besides ``out``, the kernel stores
+        this rank's partial (at most 8 tokens, n2 = 3584) through the multicast mapping of a
+        ``K3LatentExchange`` into every rank's slot ``rank`` of the half ``flags[0] & 1``, for the
+        exchange's ``k3_latent_reduce``. An output block is pushed by the epilogue warpgroup of its last
+        FC2 add: after a block's reds a warpgroup counts it in (``CTR_PUSH_BASE + block``, GPU-scope
+        acquire-release); the one that brings the count to the tile count re-reads the block from L2,
+        pushes it and stores zero to the counter. With no local expert, CTA 0 pushes zeros.
     """
 
     def __init__(
@@ -202,6 +267,7 @@ class K3MoeLowMDynKernel:
         max_ab_stage: int = 16,
         use_pdl: bool = True,
         trace: bool = False,
+        push_world: int = 0,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -220,6 +286,13 @@ class K3MoeLowMDynKernel:
         self.queue_depth = queue_depth
         self.use_pdl = use_pdl
         self.trace = trace
+        assert push_world in (0, 4, 8, 16), f"push_world {push_world}"
+        if push_world:
+            assert n_tok == PUSH_TOKENS and k1 == PUSH_HIDDEN, (
+                "the push build serves 8 tokens of 3584"
+            )
+            assert CTR_PUSH_BASE + k1 // _MMA_M <= CTR_TILE_BASE
+        self.push_world = push_world
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
         self.acc_cols = n_tok * num_acc
         self.sfa_cols = 16
@@ -312,6 +385,9 @@ class K3MoeLowMDynKernel:
         token_final_scales: cute.Tensor,
         ctr_ptr: cute.Pointer,
         orig_m: Int32,
+        push_mc_ptr: cute.Pointer,
+        push_flags: cute.Pointer,
+        push_rank: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
         trace_ptr: Optional[cute.Pointer] = None,
@@ -402,6 +478,7 @@ class K3MoeLowMDynKernel:
             ]
             sTok: cute.struct.Align[cute.struct.MemRange[Int32, NWG * self.n_tok], 16]
             sScale: cute.struct.Align[cute.struct.MemRange[Float32, NWG * self.n_tok], 16]
+            sPush: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -432,6 +509,9 @@ class K3MoeLowMDynKernel:
             token_final_scales,
             ctr_ptr,
             orig_m,
+            push_mc_ptr,
+            push_flags,
+            push_rank,
             trace_ptr,
             a_layout,
             b_layout,
@@ -529,6 +609,9 @@ class K3MoeLowMDynKernel:
         token_final_scales: cute.Tensor,
         ctr_ptr: cute.Pointer,
         orig_m: Int32,
+        push_mc_ptr: cute.Pointer,
+        push_flags: cute.Pointer,
+        push_rank: Int32,
         trace_ptr: Optional[cute.Pointer],
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
@@ -632,6 +715,9 @@ class K3MoeLowMDynKernel:
                 orig_m,
                 nt,
                 w1,
+                push_mc_ptr,
+                push_flags,
+                push_rank,
                 trace_ptr,
                 bid,
             )
@@ -665,6 +751,10 @@ class K3MoeLowMDynKernel:
                 w1,
                 et,
                 wg,
+                orig_m,
+                push_mc_ptr,
+                push_flags,
+                push_rank,
                 trace_ptr,
                 bid,
             )
@@ -867,6 +957,9 @@ class K3MoeLowMDynKernel:
         orig_m: Int32,
         nt: Int32,
         w1: Int32,
+        push_mc_ptr,
+        push_flags,
+        push_rank: Int32,
         trace_ptr,
         bid,
     ):
@@ -907,10 +1000,19 @@ class K3MoeLowMDynKernel:
         slice_bytes = (out_bytes + _ZERO_SLICES * 16 - 1) // (_ZERO_SLICES * 16) * 16
         out_base = out_ptr.toint()
         if nt == 0:
-            # no local expert: no FC2 adds, CTA 0 zeroes the whole output
+            # no local expert: no FC2 adds, CTA 0 zeroes the whole output (and pushes zeros)
             if bid == 0:
                 for off in cutlass.range(lane * 16, out_bytes, 32 * 16, unroll=1):
                     _stg_v4_zero(out_base + Int64(off))
+                if cutlass.const_expr(self.push_world > 0):
+                    half = _ldv_u32(push_flags.toint()) & Int32(1)
+                    packets = PUSH_HIDDEN // 8
+                    mc = push_mc_ptr.toint()
+                    for idx in cutlass.range(lane, orig_m * packets, 32, unroll=1):
+                        tok = idx // packets
+                        slot = (half * PUSH_TOKENS + tok) * self.push_world + push_rank
+                        word = slot * (PUSH_HIDDEN // 2) + (idx - tok * packets) * 4
+                        _stg_v4_zero(mc + Int64(word) * 4)
         e = Int32(0)
         u, slot = self._q_read(st, e)
         while u >= 0:
@@ -1220,6 +1322,10 @@ class K3MoeLowMDynKernel:
         w1: Int32,
         et: Int32,
         wg: Int32,
+        orig_m: Int32,
+        push_mc_ptr,
+        push_flags,
+        push_rank: Int32,
         trace_ptr,
         bid,
     ):
@@ -1433,6 +1539,11 @@ class K3MoeLowMDynKernel:
                             )
                             qq += 128
                         nb += 1
+                        if cutlass.const_expr(self.push_world > 0):
+                            self._push_block(
+                                st, wg, et, blk, w1 // self.nblk1, orig_m, out_base, out_row_bytes, ctr,
+                                push_mc_ptr, push_flags, push_rank,
+                            )  # fmt: skip
                     f2 += 1
                     j += 1
             e += 1
@@ -1443,6 +1554,51 @@ class K3MoeLowMDynKernel:
                     self._stamp(trace_ptr, bid, 9)
                 else:
                     self._stamp(trace_ptr, bid, 11)
+
+    @cute.jit
+    def _push_block(
+        self,
+        st,
+        wg: Int32,
+        et: Int32,
+        blk: Int32,
+        nt: Int32,
+        orig_m: Int32,
+        out_base,
+        out_row_bytes: int,
+        ctr,
+        push_mc_ptr,
+        push_flags,
+        push_rank: Int32,
+    ):
+        """After warpgroup ``wg``'s reds of output block ``blk``: count the block in; the warpgroup of the
+        block's last (``nt``-th) add pushes it, one 16-byte chunk (8 channels of one token) per thread."""
+        spush = st.sPush.get_tensor(cute.make_layout(4))
+        # every thread's reds of the block happen-before the release of the count
+        self._wg_barrier(wg)
+        if et == 0:
+            cnt_addr = ctr + Int64(CTR_PUSH_BASE + blk) * 4
+            old = _atom_add_acq_rel(cnt_addr, 1)
+            last = Int32(0)
+            if old + 1 == nt:
+                last = Int32(1)
+                # every add of this launch is in: the next launch starts from zero
+                _st_relaxed_u32(cnt_addr, 0)
+            spush[wg] = last
+        self._wg_barrier(wg)
+        if spush[wg] == 1:
+            _fence_acq_rel_gpu()
+            tok = et // 16
+            if tok < orig_m:
+                col = blk * _MMA_M + (et - tok * 16) * 8
+                v0, v1, v2, v3 = _ldv_v4_b32(out_base + Int64(tok) * out_row_bytes + col * 2)
+                half = _ldv_u32(push_flags.toint()) & Int32(1)
+                slot = (half * PUSH_TOKENS + tok) * self.push_world + push_rank
+                word = slot * (PUSH_HIDDEN // 2) + col // 2
+                _stg_v4_b32(
+                    push_mc_ptr.toint() + Int64(word) * 4,
+                    _no_neg_zero(v0), _no_neg_zero(v1), _no_neg_zero(v2), _no_neg_zero(v3),
+                )  # fmt: skip
 
     # ------------------------------------------------------------------ wrapper
     @cute.jit
@@ -1469,13 +1625,18 @@ class K3MoeLowMDynKernel:
         orig_m: Int32,
         m: Int32,
         num_local: Int32,
+        push_mc_ptr: cute.Pointer,
+        push_flags_ptr: cute.Pointer,
+        push_rank: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
         trace_ptr: Optional[cute.Pointer] = None,
     ):
         """``x`` [orig_m, k1] tokens and ``x_sf`` their linear scales; ``h`` / ``h_sf`` the FC1
         output buffers in the permuted layout ([m, k2] rows, 128x4-blocked scales); ``out`` the
-        zeroed BF16 [orig_m, k1] output; ``ctr`` int32 [counter_words(m // 128)] zeros."""
+        zeroed BF16 [orig_m, k1] output; ``ctr`` int32 [counter_words(m // 128)] zeros. Push build
+        (``push_world``): ``push_mc`` the exchange's int32 words through its multicast mapping,
+        ``push_flags`` its int32 [4] flags, ``push_rank`` this rank; other builds ignore the three."""
         n1, k1, n2, k2 = self.n1, self.k1, self.n2, self.k2
         L = num_local
         num_tiles = m // _MMA_M
@@ -1517,6 +1678,9 @@ class K3MoeLowMDynKernel:
             ),
             ctr_ptr,
             orig_m,
+            push_mc_ptr,
+            push_flags_ptr,
+            push_rank,
             num_ctas,
             stream,
             trace_ptr,

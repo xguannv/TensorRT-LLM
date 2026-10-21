@@ -119,6 +119,12 @@ TRTLLM_K3LL_KDA_BFA_GEMV = _flag(
 )
 
 
+TRTLLM_K3LL_MOE_LATENT_PUSH = _flag(
+    "TRTLLM_K3LL_MOE_LATENT_PUSH",
+    0,
+    "with TRTLLM_K3LL_MOE_LOWM, pushing decode steps (<= 8 tokens, graph-captured): the expert kernel pushes its "
+    "partial into the latent exchange and k3_latent_reduce replaces the latent one-shot all-reduce",
+)
 TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(
     "TRTLLM_K3LL_WIDE_AR_ATTN_RES",
     1,

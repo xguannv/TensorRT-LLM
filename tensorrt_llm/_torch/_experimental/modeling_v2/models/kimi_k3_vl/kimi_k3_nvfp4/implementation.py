@@ -3789,6 +3789,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             comm.mnnvl,
             front_sort=bool(_flags.TRTLLM_K3LL_MOE_FRONT_SORT),
             front16=front16,
+            push=bool(_flags.TRTLLM_K3LL_MOE_LATENT_PUSH),
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)

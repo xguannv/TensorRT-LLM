@@ -98,7 +98,8 @@ def new_counters(device: torch.device) -> torch.Tensor:
 
 
 @torch.library.custom_op(
-    "trtllm::k3_moe_nvfp4_lowm", mutates_args=("output", "counters", "h", "h_sf")
+    "trtllm::k3_moe_nvfp4_lowm",
+    mutates_args=("output", "counters", "h", "h_sf", "exchange_uc", "exchange_mc"),
 )
 def k3_moe_nvfp4_lowm(
     x_fp4: torch.Tensor,
@@ -123,6 +124,10 @@ def k3_moe_nvfp4_lowm(
     num_ctas: int = 0,
     h: Optional[torch.Tensor] = None,
     h_sf: Optional[torch.Tensor] = None,
+    exchange_uc: Optional[torch.Tensor] = None,
+    exchange_mc: Optional[torch.Tensor] = None,
+    exchange_flags: Optional[torch.Tensor] = None,
+    exchange_slot: int = 0,
 ) -> None:
     """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 32`` tokens.
 
@@ -132,7 +137,13 @@ def k3_moe_nvfp4_lowm(
     (the FC1 output's NVFP4 global scale); ``token_final_scales`` fp32 ``[M, top_k]``; ``counters`` from
     `new_counters`. ``num_ctas``: persistent CTAs (0: one per SM). ``h`` / ``h_sf``: uint8 buffers for the FC1 output
     (``[m, n1 / 4]`` E2M1 pairs and ``m * n1 / 32`` scale bytes in the 128x4 blocked layout, ``m`` the permuted rows),
-    allocated here when not given."""
+    allocated here when not given.
+
+    ``exchange_uc`` / ``exchange_mc`` / ``exchange_flags``: a ``K3LatentExchange``'s words (this rank's, and the same
+    words through the multicast mapping) and flags. With them the call is the push build (``M <= 8``, ``k1`` 3584):
+    besides ``output``, the partial goes into slot ``exchange_slot`` (this rank) of half ``exchange_flags[0] & 1`` of
+    every rank's exchange, for ``trtllm::k3_latent_reduce``; every rank pushes, then reduces, the same token count on
+    the exchange in the same order (``latent_op``'s call-order invariant)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -149,6 +160,26 @@ def k3_moe_nvfp4_lowm(
         raise ValueError(f"k3_moe_nvfp4_lowm: {m // TILE} tiles exceed the counter buffer")
     n_tok = lowm.n_tok_for(orig_m)
     device = x_fp4.device
+    push_world = 0
+    if exchange_mc is not None:
+        if exchange_uc is None or exchange_flags is None:
+            raise ValueError(
+                "k3_moe_nvfp4_lowm: the push build needs exchange_uc, exchange_mc and exchange_flags"
+            )
+        push_world = exchange_uc.numel() // (2 * dyn.PUSH_TOKENS * dyn.PUSH_HIDDEN // 2)
+        if (
+            orig_m > dyn.PUSH_TOKENS
+            or k1 != dyn.PUSH_HIDDEN
+            or push_world not in (4, 8, 16)
+            or exchange_uc.numel() != 2 * dyn.PUSH_TOKENS * push_world * dyn.PUSH_HIDDEN // 2
+            or not 0 <= exchange_slot < push_world
+        ):
+            raise ValueError(
+                f"k3_moe_nvfp4_lowm: the push build serves at most {dyn.PUSH_TOKENS} tokens of {dyn.PUSH_HIDDEN} "
+                f"over a [2][{dyn.PUSH_TOKENS}][4 / 8 / 16][{dyn.PUSH_HIDDEN // 2}] exchange; got {orig_m} tokens, "
+                f"k1 {k1}, {exchange_uc.numel()} words, slot {exchange_slot}"
+            )
+        n_tok = dyn.PUSH_TOKENS
     sms = _num_sms(_device_index(device))
     ctas = min(num_ctas, sms) if num_ctas > 0 else sms
     stages = _DEFAULT_STAGES.get(n_tok, 16)
@@ -186,10 +217,16 @@ def k3_moe_nvfp4_lowm(
         ptr(cutlass.Float32, token_final_scales),
         ptr(cutlass.Int32, counters),
     ]
+    # the push build's exchange; other builds ignore the three arguments (any valid pointers)
+    ptrs_push = [
+        ptr(cutlass.Int32, exchange_mc if push_world else counters, 16),
+        ptr(cutlass.Int32, exchange_flags if push_world else counters),
+    ]
+    push_rank = int(exchange_slot) if push_world else 0
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (_device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas, stages,
-           use_pdl)  # fmt: skip
+           use_pdl, push_world)  # fmt: skip
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -201,18 +238,19 @@ def k3_moe_nvfp4_lowm(
             if fn is None:
                 kernel = dyn.K3MoeLowMDynKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), fc2_chunk=1,
-                    max_ab_stage=stages, use_pdl=use_pdl,
+                    max_ab_stage=stages, use_pdl=use_pdl, push_world=push_world,
                 )  # fmt: skip
                 fn = _compiled[key] = cute.compile(
-                    kernel.wrapper, *ptrs, orig_m, m, num_local, ctas, stream
+                    kernel.wrapper, *ptrs, orig_m, m, num_local, *ptrs_push, push_rank, ctas, stream
                 )
-    fn(*ptrs, orig_m, m, num_local, stream)
+    fn(*ptrs, orig_m, m, num_local, *ptrs_push, push_rank, stream)
 
 
 @k3_moe_nvfp4_lowm.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, counters, top_k,
-      situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None):  # fmt: skip
+      situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, exchange_uc=None, exchange_mc=None,
+      exchange_flags=None, exchange_slot=0):  # fmt: skip
     return None
 
 
@@ -230,10 +268,11 @@ def run(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    exchange=None,
 ) -> torch.Tensor:
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
-    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32)."""
+    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``exchange``: as `run_sorted`'s."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
@@ -256,7 +295,7 @@ def run(
     return run_sorted(
         x_fp4, x_sf, (tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                       num_non_exiting_tiles, scales),
-        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas,
+        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas, exchange,
     )  # fmt: skip
 
 
@@ -271,10 +310,12 @@ def run_sorted(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    exchange=None,
 ) -> torch.Tensor:
     """`k3_moe_nvfp4_lowm` on a routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
     tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales)``, ``moe_sort``'s
-    outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``)."""
+    outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``).
+    ``exchange``: a ``K3LatentExchange`` for the push build (see `k3_moe_nvfp4_lowm`), or None."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     (
         tile_idx_to_group_idx,
@@ -289,6 +330,7 @@ def run_sorted(
     torch.ops.trtllm.k3_moe_nvfp4_lowm(
         x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, counters, top_k,
-        float(situ_beta), float(situ_linear_beta), num_ctas,
+        float(situ_beta), float(situ_linear_beta), num_ctas, None, None,
+        *(() if exchange is None else (exchange.uc, exchange.mc, exchange.flags, exchange.rank)),
     )  # fmt: skip
     return out
