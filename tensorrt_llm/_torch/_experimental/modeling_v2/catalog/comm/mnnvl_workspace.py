@@ -69,6 +69,14 @@ class MnnvlWorkspace:
         itemsize = torch.empty((), dtype=dtype).element_size()
         return self.buffer_bytes // (hidden * self.world_size * itemsize)
 
+    def max_two_shot_tokens(self, hidden: int, dtype: torch.dtype = torch.bfloat16) -> int:
+        """The most tokens of ``hidden`` columns a two-shot ``mnnvl_allreduce_attn_res`` call fits in one buffer: each
+        of its two stages (half a buffer) holds the tokens rounded up to the world size (scatter) and twice the tokens
+        (results)."""
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        stage = self.buffer_bytes // 2 // (hidden * itemsize)
+        return min(stage // 2, stage // self.world_size * self.world_size)
+
     @classmethod
     def create(
         cls, mapping, buffer_bytes: int, fabric_handle: Optional[bool] = None

@@ -51,6 +51,19 @@ struct AttnResEpilogueParams
  */
 void oneshotAllreduceAttnResOp(mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
 
+/**
+ * \brief oneshotAllreduceAttnResOp's statement, with a two-shot exchange: every rank sends each token's row to the
+ * token's owner rank (token % nRanks); the owner sums the rows in the one-shot op's order, runs the epilogue on the
+ * full row and multicasts both outputs back. Returns the one-shot op's bits, except that a -0.0 output is returned as
+ * +0.0 (the Lamport sentinel). Per rank it receives about 3 * numTokens * tokenDim elements instead of the one-shot's
+ * numTokens * tokenDim * nRanks, so it is the cheaper exchange for more tokens.
+ *
+ * Requirements: those of oneshotAllreduceAttnResOp, except the footprint: each of the two stages, half a Lamport
+ * buffer, holds ceil(numTokens / nRanks) * nRanks * tokenDim elements (scatter) and 2 * numTokens * tokenDim
+ * elements (results).
+ */
+void twoshotAllreduceAttnResOp(mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
+
 } // namespace kernels::kimiK3Mnnvl
 
 TRTLLM_NAMESPACE_END

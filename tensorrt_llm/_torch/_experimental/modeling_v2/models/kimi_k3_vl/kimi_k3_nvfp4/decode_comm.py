@@ -68,6 +68,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace 
 from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
+from . import flags as _flags
+
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
 
@@ -223,6 +225,21 @@ class K3DecodeComm:
             and 0 < rows <= min(AR_ATTN_RES_MAX_TOKENS, self.mnnvl.max_one_shot_tokens(hidden))
         )
 
+    def takes_wide(self, x: torch.Tensor, step) -> bool:
+        """Whether allreduce_attn_res(..., two_shot=True) takes a wide decode step's (step.wide)
+        post-attention or MoE-tail update of the bf16 partial x (TRTLLM_K3LL_WIDE_AR_ATTN_RES): a hidden size the
+        MNNVL entry takes and at most max_two_shot_tokens rows. Every rank decides alike (shapes and the flag)."""
+        if not _flags.TRTLLM_K3LL_WIDE_AR_ATTN_RES or step is None or not step.wide:
+            return False
+        if x.dim() != 2 or x.dtype != torch.bfloat16:
+            return False
+        rows, hidden = x.shape
+        return (
+            hidden % 1024 == 0
+            and hidden <= 8192
+            and 0 < rows <= self.mnnvl.max_two_shot_tokens(hidden)
+        )
+
     @staticmethod
     def takes_oproj(o_proj: nn.Module, max_snapshots: int) -> bool:
         """Whether ``sandwich_oproj`` takes the layer of output projection ``o_proj`` on a step of at most
@@ -255,8 +272,10 @@ class K3DecodeComm:
         res_proj: nn.Module,
         res_norm: nn.Module,
         out_norm: nn.Module,
+        two_shot: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``(normed, updated)`` in one ``comm/mnnvl_allreduce_attn_res`` call: ``updated = prefix_sum +
+        """``(normed, updated)`` in one ``comm/mnnvl_allreduce_attn_res`` call (two-shot with ``two_shot``, see
+        ``takes_wide``): ``updated = prefix_sum +
         allreduce(partial)`` (the sum alone without ``prefix_sum``), ``normed = out_norm(attn_res(block_residual...,
         updated))``, the attention residual selected with ``res_proj`` and ``res_norm``. ``block_residual`` holds the
         valid snapshots, ``[S, T, H]``."""
@@ -266,6 +285,7 @@ class K3DecodeComm:
             block_residual,
             *_res_args(res_proj, res_norm, out_norm),
             self.mnnvl,
+            two_shot=two_shot,
         )
 
     def sandwich_tail(

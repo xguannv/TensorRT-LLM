@@ -32,12 +32,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Kimi K3 pre-MoE residual update in the MNNVL one-shot all-reduce epilogue; see
-// tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp. Returns {normed, updated_prefix_sum}.
+// Kimi K3 pre-MoE residual update in the MNNVL all-reduce epilogue; see
+// tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp, or twoshotAllreduceAttnResOp with two_shot.
+// Returns {normed, updated_prefix_sum}.
 std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     torch::optional<torch::Tensor> const& prefix_sum, torch::Tensor const& block_residual,
     torch::Tensor const& res_weight, torch::Tensor const& rms_weight, torch::Tensor const& output_rms_weight,
-    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
+    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags, bool two_shot)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -70,9 +71,20 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
             "[mnnvlAllReduceAttnRes] res_weight, rms_weight and output_rms_weight must be [hidden]");
     }
     int64_t const nRanks = mcast_mem->getWorldSize();
-    TORCH_CHECK(numTokens * hiddenDim * nRanks <= comm_buffer.size(-1),
-        "[mnnvlAllReduceAttnRes] the one-shot footprint of ", numTokens * hiddenDim * nRanks,
-        " elements exceeds one Lamport buffer of ", comm_buffer.size(-1), " elements");
+    if (two_shot)
+    {
+        int64_t const stageElements = comm_buffer.size(-1) / 2;
+        int64_t const scatterElements = (numTokens + nRanks - 1) / nRanks * nRanks * hiddenDim;
+        TORCH_CHECK(scatterElements <= stageElements && 2 * numTokens * hiddenDim <= stageElements,
+            "[mnnvlAllReduceAttnRes] the two-shot stages of ", scatterElements, " and ", 2 * numTokens * hiddenDim,
+            " elements exceed half a Lamport buffer of ", stageElements, " elements");
+    }
+    else
+    {
+        TORCH_CHECK(numTokens * hiddenDim * nRanks <= comm_buffer.size(-1),
+            "[mnnvlAllReduceAttnRes] the one-shot footprint of ", numTokens * hiddenDim * nRanks,
+            " elements exceeds one Lamport buffer of ", comm_buffer.size(-1), " elements");
+    }
 
     torch::Tensor normOut = torch::empty_like(input);
     torch::Tensor prefixOut = torch::empty_like(input);
@@ -102,7 +114,14 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     epilogue.outputRmsEps = static_cast<float>(output_rms_eps);
     epilogue.numCandidates = static_cast<int>(block_residual.size(0)) + 1;
 
-    tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
+    if (two_shot)
+    {
+        tensorrt_llm::kernels::kimiK3Mnnvl::twoshotAllreduceAttnResOp(params, epilogue);
+    }
+    else
+    {
+        tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
+    }
     return {normOut, prefixOut};
 }
 
@@ -179,7 +198,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "mnnvl_allreduce_attn_res(Tensor input, Tensor? prefix_sum, Tensor block_residual, Tensor res_weight, "
         "Tensor rms_weight, Tensor output_rms_weight, float rms_eps, float output_rms_eps, Tensor(a!) comm_buffer, "
-        "Tensor(b!) buffer_flags) -> Tensor[]");
+        "Tensor(b!) buffer_flags, bool two_shot=False) -> Tensor[]");
     m.def(
         "mnnvl_allgather_split(Tensor input, int bf16_columns, int world_size, Tensor(a!) comm_buffer, "
         "Tensor(b!) buffer_flags) -> Tensor[]");

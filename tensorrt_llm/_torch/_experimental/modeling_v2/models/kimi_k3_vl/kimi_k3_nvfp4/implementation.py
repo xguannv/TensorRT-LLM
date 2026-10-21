@@ -1588,6 +1588,20 @@ class KimiLinearDecoderLayer(nn.Module):
                 tap=tap_view,
                 tap_updated=not _AUX_ATTN_RES_STREAM_ENABLED,
             )
+        elif (
+            pending_moe_partial is not None
+            and self.decode_comm is not None
+            and self.decode_comm.takes_wide(pending_moe_partial, step)
+        ):
+            hidden_states, prefix_sum = self.decode_comm.allreduce_attn_res(
+                pending_moe_partial,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                two_shot=True,
+            )
         elif pending_moe_partial is not None:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
                 prefix_sum,
@@ -1676,6 +1690,17 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.mlp_res_norm,
                     self.post_attention_layernorm,
                 )
+        elif comm is not None and comm.takes_wide(hidden_states, step):
+            partial = attention(hidden_states, attn_metadata, step=step, reduce_output=False)
+            hidden_states, prefix_sum = comm.allreduce_attn_res(
+                partial,
+                prefix_sum,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+                two_shot=True,
+            )
         else:
             if comm is not None and step.wide:
                 partial = attention(hidden_states, attn_metadata, step=step, reduce_output=False)
@@ -2020,6 +2045,22 @@ class KimiLinearModel(DecoderModel):
                 self.output_attn_res_proj,
                 self.output_attn_res_norm,
                 self.norm,
+            )
+            return normed
+        last_comm = self.layers[-1].decode_comm
+        if (
+            pending_moe_partial is not None
+            and last_comm is not None
+            and last_comm.takes_wide(pending_moe_partial, step)
+        ):
+            normed, _ = last_comm.allreduce_attn_res(
+                pending_moe_partial,
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+                two_shot=True,
             )
             return normed
         if pending_moe_partial is not None:

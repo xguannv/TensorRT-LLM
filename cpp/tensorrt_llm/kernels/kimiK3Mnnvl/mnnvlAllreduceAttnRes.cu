@@ -348,6 +348,213 @@ constexpr int kAttnResEltsPerThread = 8;
 constexpr int kAttnResEltsPerCta = kAttnResThreads * kAttnResEltsPerThread;
 constexpr int kAttnResMaxClusterSize = 8;
 constexpr int kAttnResMaxCandidates = 12;
+
+// The attention-residual epilogue of one token's reduced row (oneshotAllreduceAttnResOp's statement), shared by the
+// one-shot and two-shot kernels. A cluster of tokenDim / 1024 CTAs owns the token and each thread eight contiguous
+// elements of it. The per-token statistics are summed in a fixed order: within a thread, over lanes, over the four
+// warps, then over the cluster's CTAs in rank order through distributed shared memory. Every CTA of the cluster must
+// have executed barrier.cluster.arrive before the call; the call waits on it before writing to its peers.
+template <int N, bool AddPrefix>
+__device__ __forceinline__ void attnResEpilogue(PackedVec<float4, __nv_bfloat16> const& reduced,
+    PackedVec<float4, __nv_bfloat16> const& prefix,
+    PackedVec<float4, __nv_bfloat16> const (&snapshot)[N > 1 ? N - 1 : 1],
+    PackedVec<float4, __nv_bfloat16> const& resWeight, PackedVec<float4, __nv_bfloat16> const& rmsWeight,
+    PackedVec<float4, __nv_bfloat16> const& outputRmsWeight, AttnResEpilogueParams const& epilogue, int tokenDim,
+    PackedVec<float4, __nv_bfloat16>& updated, PackedVec<float4, __nv_bfloat16>& output)
+{
+    using T = __nv_bfloat16;
+    using PackedType = float4;
+    using Packed = PackedVec<PackedType, T>;
+    constexpr int kELTS = kAttnResEltsPerThread;
+    constexpr int kWarps = kAttnResThreads / kWARP_SIZE;
+    constexpr int kStats = 2 * N; // Sum of squares and residual-projection dot product per candidate.
+    constexpr float kLog2E = 1.4426950408889634F;
+    static_assert(sizeof(PackedType) / sizeof(T) == kELTS);
+    static_assert(N >= 1 && N <= kAttnResMaxCandidates && N <= 32, "one lane per candidate");
+
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    int const clusterRank = static_cast<int>(cluster.block_rank());
+    int const clusterSize = static_cast<int>(cluster.num_blocks());
+    int const lane = threadIdx.x & kLANE_ID_MASK;
+    int const warp = threadIdx.x >> kLOG2_WARP_SIZE;
+
+    __shared__ float warpStats[kWarps][kStats];
+    __shared__ float clusterStats[kAttnResMaxClusterSize][kStats];
+    __shared__ float clusterOutputSq[kAttnResMaxClusterSize];
+    __shared__ float candidateWeights[N];
+
+    // ======================= Residual add: bf16(prefix + bf16(sum)) =============================
+#pragma unroll
+    for (int i = 0; i < kELTS; i++)
+    {
+        if constexpr (AddPrefix)
+        {
+            updated.elements[i]
+                = __float2bfloat16_rn(__bfloat162float(prefix.elements[i]) + __bfloat162float(reduced.elements[i]));
+        }
+        else
+        {
+            updated.elements[i] = reduced.elements[i];
+        }
+    }
+
+    // ======================= Attention-residual scores =============================
+    // Candidates are the snapshots followed by the updated prefix sum.
+    float q[kELTS];
+#pragma unroll
+    for (int i = 0; i < kELTS; i++)
+    {
+        q[i] = __bfloat162float(resWeight.elements[i]) * __bfloat162float(rmsWeight.elements[i]);
+    }
+    float stats[kStats];
+#pragma unroll
+    for (int n = 0; n < N; n++)
+    {
+        Packed const& candidate = n < N - 1 ? snapshot[n] : updated;
+        float sumSq = 0.F;
+        float dot = 0.F;
+#pragma unroll
+        for (int i = 0; i < kELTS; i++)
+        {
+            float const v = __bfloat162float(candidate.elements[i]);
+            sumSq = fmaf(v, v, sumSq);
+            dot = fmaf(v, q[i], dot);
+        }
+        stats[2 * n] = sumSq;
+        stats[2 * n + 1] = dot;
+    }
+#pragma unroll
+    for (int offset = kWARP_SIZE / 2; offset > 0; offset >>= 1)
+    {
+#pragma unroll
+        for (int s = 0; s < kStats; s++)
+        {
+            stats[s] += __shfl_down_sync(0xffffffffU, stats[s], offset);
+        }
+    }
+    if (lane == 0)
+    {
+#pragma unroll
+        for (int s = 0; s < kStats; s++)
+        {
+            warpStats[warp][s] = stats[s];
+        }
+    }
+    __syncthreads();
+
+    // Each CTA's partial goes into slot clusterRank of every CTA, so all of them sum the same values in the same
+    // order.
+    asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+    for (int i = threadIdx.x; i < clusterSize * kStats; i += blockDim.x)
+    {
+        int const peer = i / kStats;
+        int const s = i % kStats;
+        float partial = 0.F;
+#pragma unroll
+        for (int w = 0; w < kWarps; w++)
+        {
+            partial += warpStats[w][s];
+        }
+        *cluster.map_shared_rank(&clusterStats[clusterRank][s], peer) = partial;
+    }
+    cluster.sync();
+
+    // Warp 0 turns the cluster totals into the softmax weights; lane n owns candidate n.
+    if (warp == 0)
+    {
+        float logit = -FLT_MAX;
+        if (lane < N)
+        {
+            float sumSq = 0.F;
+            float dot = 0.F;
+            for (int r = 0; r < clusterSize; r++)
+            {
+                sumSq += clusterStats[r][2 * lane];
+                dot += clusterStats[r][2 * lane + 1];
+            }
+            logit = dot * rsqrtf(sumSq / tokenDim + epilogue.rmsEps);
+        }
+        float maxLogit = logit;
+#pragma unroll
+        for (int offset = kWARP_SIZE / 2; offset > 0; offset >>= 1)
+        {
+            maxLogit = fmaxf(maxLogit, __shfl_xor_sync(0xffffffffU, maxLogit, offset));
+        }
+        float const weight = lane < N ? exp2f((logit - maxLogit) * kLog2E) : 0.F;
+        float denominator = weight;
+#pragma unroll
+        for (int offset = kWARP_SIZE / 2; offset > 0; offset >>= 1)
+        {
+            denominator += __shfl_xor_sync(0xffffffffU, denominator, offset);
+        }
+        if (lane < N)
+        {
+            candidateWeights[lane] = weight * (1.F / denominator);
+        }
+    }
+    __syncthreads();
+
+    // ======================= Selection and its RMSNorm =============================
+    float weights[N];
+#pragma unroll
+    for (int n = 0; n < N; n++)
+    {
+        weights[n] = candidateWeights[n];
+    }
+    Packed mixed;
+    float outputSq = 0.F;
+#pragma unroll
+    for (int i = 0; i < kELTS; i++)
+    {
+        float value = 0.F;
+#pragma unroll
+        for (int n = 0; n < N; n++)
+        {
+            Packed const& candidate = n < N - 1 ? snapshot[n] : updated;
+            value = fmaf(weights[n], __bfloat162float(candidate.elements[i]), value);
+        }
+        mixed.elements[i] = __float2bfloat16_rn(value);
+        float const rounded = __bfloat162float(mixed.elements[i]);
+        outputSq = fmaf(rounded, rounded, outputSq);
+    }
+#pragma unroll
+    for (int offset = kWARP_SIZE / 2; offset > 0; offset >>= 1)
+    {
+        outputSq += __shfl_down_sync(0xffffffffU, outputSq, offset);
+    }
+    // Every thread has read warpStats before the cluster barrier above, so it can be reused.
+    if (lane == 0)
+    {
+        warpStats[warp][0] = outputSq;
+    }
+    __syncthreads();
+    if (threadIdx.x < clusterSize)
+    {
+        float partial = 0.F;
+#pragma unroll
+        for (int w = 0; w < kWarps; w++)
+        {
+            partial += warpStats[w][0];
+        }
+        *cluster.map_shared_rank(&clusterOutputSq[clusterRank], threadIdx.x) = partial;
+    }
+    cluster.sync();
+    float totalSq = 0.F;
+    for (int r = 0; r < clusterSize; r++)
+    {
+        totalSq += clusterOutputSq[r];
+    }
+    float const outputRsigma = rsqrtf(totalSq / tokenDim + epilogue.outputRmsEps);
+#pragma unroll
+    for (int i = 0; i < kELTS; i++)
+    {
+        // KimiK3RMSNorm: normalize in fp32, round to bf16, then apply the bf16 weight.
+        T const normalized = __float2bfloat16_rn(__bfloat162float(mixed.elements[i]) * outputRsigma);
+        output.elements[i]
+            = __float2bfloat16_rn(__bfloat162float(normalized) * __bfloat162float(outputRmsWeight.elements[i]));
+    }
+}
 } // namespace detail
 
 using detail::PackedVec;
@@ -357,8 +564,7 @@ using detail::sanitizeLamportPayload;
 using detail::reduceOneshotLamport;
 
 // See oneshotAllreduceAttnResOp. A cluster of tokenDim / 1024 CTAs owns one token and each thread eight contiguous
-// elements of it. The per-token statistics are summed in a fixed order: within a thread, over lanes, over the four
-// warps, then over the cluster's CTAs in rank order through distributed shared memory.
+// elements of it; the epilogue is detail::attnResEpilogue.
 template <uint8_t WorldSize, int N, bool AddPrefix>
 __global__ void __launch_bounds__(detail::kAttnResThreads)
     oneshotAllreduceAttnResKernel(MnnvlAllReduceKernelParams<__nv_bfloat16> params, AttnResEpilogueParams epilogue)
@@ -368,26 +574,11 @@ __global__ void __launch_bounds__(detail::kAttnResThreads)
     using PackedType = float4;
     using Packed = PackedVec<PackedType, T>;
     constexpr int kELTS = detail::kAttnResEltsPerThread;
-    constexpr int kWarps = detail::kAttnResThreads / detail::kWARP_SIZE;
-    constexpr int kStats = 2 * N; // Sum of squares and residual-projection dot product per candidate.
-    constexpr float kLog2E = 1.4426950408889634F;
-    static_assert(sizeof(PackedType) / sizeof(T) == kELTS);
-    static_assert(N >= 1 && N <= detail::kAttnResMaxCandidates && N <= 32, "one lane per candidate");
 
     namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-    int const clusterRank = static_cast<int>(cluster.block_rank());
-    int const clusterSize = static_cast<int>(cluster.num_blocks());
-    int const packedIdx = static_cast<int>(cluster.thread_rank());
+    int const packedIdx = static_cast<int>(cg::this_cluster().thread_rank());
     int const token = blockIdx.x;
     int const threadOffset = token * params.tokenDim + packedIdx * kELTS;
-    int const lane = threadIdx.x & detail::kLANE_ID_MASK;
-    int const warp = threadIdx.x >> detail::kLOG2_WARP_SIZE;
-
-    __shared__ float warpStats[kWarps][kStats];
-    __shared__ float clusterStats[detail::kAttnResMaxClusterSize][kStats];
-    __shared__ float clusterOutputSq[detail::kAttnResMaxClusterSize];
-    __shared__ float candidateWeights[N];
 
     // Peers write into this CTA's shared memory only after the matching wait, which also guarantees
     // that every CTA of the cluster has started.
@@ -438,181 +629,137 @@ __global__ void __launch_bounds__(detail::kAttnResThreads)
     Packed const reduced = reduceOneshotLamport<WorldSize, T, PackedType, kELTS>(
         val, stagePtrLocal, token, params.tokenDim, packedIdx, params.rank);
 
-    // ======================= Residual add: bf16(prefix + bf16(sum)) =============================
     Packed updated;
-#pragma unroll
-    for (int i = 0; i < kELTS; i++)
+    Packed output;
+    detail::attnResEpilogue<N, AddPrefix>(
+        reduced, prefix, snapshot, resWeight, rmsWeight, outputRmsWeight, epilogue, params.tokenDim, updated, output);
+    reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset])[0] = updated.packed;
+    reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = output.packed;
+    flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * sizeof(T)), 0, 0, 0});
+#endif
+}
+
+// See twoshotAllreduceAttnResOp. A cluster of tokenDim / 1024 CTAs per token, each thread eight contiguous elements
+// of it, as in the one-shot kernel. Scatter: every cluster pushes its token's row to the token's owner rank
+// (token % WorldSize). The owner sums the WorldSize rows in the one-shot kernel's order, runs detail::attnResEpilogue
+// on the full row and multicasts the two result rows (normed, updated) to every rank. Every cluster then waits for
+// its token's result rows and writes them out.
+template <uint8_t WorldSize, int N, bool AddPrefix>
+__global__ void __launch_bounds__(detail::kAttnResThreads)
+    twoshotAllreduceAttnResKernel(MnnvlAllReduceKernelParams<__nv_bfloat16> params, AttnResEpilogueParams epilogue)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    using T = __nv_bfloat16;
+    using PackedType = float4;
+    using Packed = PackedVec<PackedType, T>;
+    constexpr int kELTS = detail::kAttnResEltsPerThread;
+    constexpr int kScatter = 0;
+    constexpr int kBroadcast = 1;
+    constexpr int kStages = 2;
+    // The one-shot kernel's reduction order, so both kernels return the same bits.
+    constexpr int kRankChunk = WorldSize <= 8 ? WorldSize : 8;
+
+    namespace cg = cooperative_groups;
+    int const packedIdx = static_cast<int>(cg::this_cluster().thread_rank());
+    int const token = blockIdx.x;
+    int const tokenDim = params.tokenDim;
+    int const threadOffset = token * tokenDim + packedIdx * kELTS;
+    int const owner = token % WorldSize;
+    int const localToken = token / WorldSize;
+    bool const owned = owner == params.rank;
+
+    // Peers write into this CTA's shared memory only after the matching wait, which also guarantees
+    // that every CTA of the cluster has started.
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+
+    cudaGridDependencySynchronize();
+    // Every consumer of the outputs waits for this whole grid, so triggering here only lets the next
+    // kernel launch and stream its weights while the ranks exchange their contributions.
+    cudaTriggerProgrammaticLaunchCompletion();
+
+    LamportFlags<PackedType> flag(params.bufferFlags, kStages);
+    T* scatterLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], kScatter));
+    T* scatterOwner = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[owner], kScatter));
+    T* broadcastMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(params.mcastPtr, kBroadcast));
+    T* broadcastLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], kBroadcast));
+
+    // ==================== Scatter: this rank's row to the token's owner =============================
+    Packed val;
+    val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
+    sanitizeLamportPayload(val);
+    reinterpret_cast<PackedType*>(&scatterOwner[localToken * tokenDim * WorldSize + params.rank * tokenDim])[packedIdx]
+        = val.packed;
+    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], kScatter);
+
+    // ==================== Owner: reduce, epilogue, broadcast =============================
+    if (owned)
     {
+        // The epilogue operands do not depend on the peers; load them while the peers' rows are in flight.
+        auto const* blockResidual = static_cast<T const*>(epilogue.blockResidual);
+        Packed snapshot[N > 1 ? N - 1 : 1];
+#pragma unroll
+        for (int n = 0; n < N - 1; n++)
+        {
+            snapshot[n].packed = loadPacked<PackedType>(
+                &blockResidual[static_cast<size_t>(n) * params.numTokens * tokenDim + threadOffset]);
+        }
+        [[maybe_unused]] Packed prefix;
         if constexpr (AddPrefix)
         {
-            updated.elements[i]
-                = __float2bfloat16_rn(__bfloat162float(prefix.elements[i]) + __bfloat162float(reduced.elements[i]));
+            prefix.packed = loadPacked<PackedType>(&params.residualInPtr[threadOffset]);
         }
-        else
-        {
-            updated.elements[i] = reduced.elements[i];
-        }
-    }
-    reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset])[0] = updated.packed;
+        Packed resWeight;
+        Packed rmsWeight;
+        Packed outputRmsWeight;
+        resWeight.packed = loadPacked<PackedType>(&static_cast<T const*>(epilogue.resWeight)[packedIdx * kELTS]);
+        rmsWeight.packed = loadPacked<PackedType>(&static_cast<T const*>(epilogue.rmsWeight)[packedIdx * kELTS]);
+        outputRmsWeight.packed
+            = loadPacked<PackedType>(&static_cast<T const*>(epilogue.outputRmsWeight)[packedIdx * kELTS]);
 
-    // ======================= Attention-residual scores =============================
-    // Candidates are the snapshots followed by the updated prefix sum.
-    float q[kELTS];
-#pragma unroll
-    for (int i = 0; i < kELTS; i++)
-    {
-        q[i] = __bfloat162float(resWeight.elements[i]) * __bfloat162float(rmsWeight.elements[i]);
-    }
-    float stats[kStats];
-#pragma unroll
-    for (int n = 0; n < N; n++)
-    {
-        Packed const& candidate = n < N - 1 ? snapshot[n] : updated;
-        float sumSq = 0.F;
-        float dot = 0.F;
+        float accum[kELTS];
+        detail::accumulateLamportRanksChunked<WorldSize, kRankChunk, T, PackedType, kELTS>(
+            accum, scatterLocal, localToken, tokenDim, packedIdx);
+        Packed reduced;
 #pragma unroll
         for (int i = 0; i < kELTS; i++)
         {
-            float const v = __bfloat162float(candidate.elements[i]);
-            sumSq = fmaf(v, v, sumSq);
-            dot = fmaf(v, q[i], dot);
+            reduced.elements[i] = cuda_cast<T, float>(accum[i]);
         }
-        stats[2 * n] = sumSq;
-        stats[2 * n + 1] = dot;
-    }
-#pragma unroll
-    for (int offset = detail::kWARP_SIZE / 2; offset > 0; offset >>= 1)
-    {
-#pragma unroll
-        for (int s = 0; s < kStats; s++)
-        {
-            stats[s] += __shfl_down_sync(0xffffffffU, stats[s], offset);
-        }
-    }
-    if (lane == 0)
-    {
-#pragma unroll
-        for (int s = 0; s < kStats; s++)
-        {
-            warpStats[warp][s] = stats[s];
-        }
-    }
-    __syncthreads();
 
-    // Each CTA's partial goes into slot clusterRank of every CTA, so all of them sum the same values in the same
-    // order.
-    asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
-    for (int i = threadIdx.x; i < clusterSize * kStats; i += blockDim.x)
-    {
-        int const peer = i / kStats;
-        int const s = i % kStats;
-        float partial = 0.F;
-#pragma unroll
-        for (int w = 0; w < kWarps; w++)
-        {
-            partial += warpStats[w][s];
-        }
-        *cluster.map_shared_rank(&clusterStats[clusterRank][s], peer) = partial;
+        Packed updated;
+        Packed output;
+        detail::attnResEpilogue<N, AddPrefix>(
+            reduced, prefix, snapshot, resWeight, rmsWeight, outputRmsWeight, epilogue, tokenDim, updated, output);
+        sanitizeLamportPayload(output);
+        sanitizeLamportPayload(updated);
+        T* results = &broadcastMcast[static_cast<size_t>(token) * 2 * tokenDim];
+        reinterpret_cast<PackedType*>(results)[packedIdx] = output.packed;
+        reinterpret_cast<PackedType*>(results + tokenDim)[packedIdx] = updated.packed;
     }
-    cluster.sync();
+    else
+    {
+        asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+    }
+    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], kBroadcast);
+    flag.ctaArrive();
 
-    // Warp 0 turns the cluster totals into the softmax weights; lane n owns candidate n.
-    if (warp == 0)
+    // ==================== Every rank: the token's result rows =============================
+    T const* results = &broadcastLocal[static_cast<size_t>(token) * 2 * tokenDim + packedIdx * kELTS];
+    auto output = loadPackedVolatile<PackedType>(results);
+    while (isLamportDirty(output))
     {
-        float logit = -FLT_MAX;
-        if (lane < N)
-        {
-            float sumSq = 0.F;
-            float dot = 0.F;
-            for (int r = 0; r < clusterSize; r++)
-            {
-                sumSq += clusterStats[r][2 * lane];
-                dot += clusterStats[r][2 * lane + 1];
-            }
-            logit = dot * rsqrtf(sumSq / params.tokenDim + epilogue.rmsEps);
-        }
-        float maxLogit = logit;
-#pragma unroll
-        for (int offset = detail::kWARP_SIZE / 2; offset > 0; offset >>= 1)
-        {
-            maxLogit = fmaxf(maxLogit, __shfl_xor_sync(0xffffffffU, maxLogit, offset));
-        }
-        float const weight = lane < N ? exp2f((logit - maxLogit) * kLog2E) : 0.F;
-        float denominator = weight;
-#pragma unroll
-        for (int offset = detail::kWARP_SIZE / 2; offset > 0; offset >>= 1)
-        {
-            denominator += __shfl_xor_sync(0xffffffffU, denominator, offset);
-        }
-        if (lane < N)
-        {
-            candidateWeights[lane] = weight * (1.F / denominator);
-        }
+        output = loadPackedVolatile<PackedType>(results);
     }
-    __syncthreads();
-
-    // ======================= Selection and its RMSNorm =============================
-    float weights[N];
-#pragma unroll
-    for (int n = 0; n < N; n++)
+    auto updated = loadPackedVolatile<PackedType>(results + tokenDim);
+    while (isLamportDirty(updated))
     {
-        weights[n] = candidateWeights[n];
-    }
-    Packed mixed;
-    float outputSq = 0.F;
-#pragma unroll
-    for (int i = 0; i < kELTS; i++)
-    {
-        float value = 0.F;
-#pragma unroll
-        for (int n = 0; n < N; n++)
-        {
-            Packed const& candidate = n < N - 1 ? snapshot[n] : updated;
-            value = fmaf(weights[n], __bfloat162float(candidate.elements[i]), value);
-        }
-        mixed.elements[i] = __float2bfloat16_rn(value);
-        float const rounded = __bfloat162float(mixed.elements[i]);
-        outputSq = fmaf(rounded, rounded, outputSq);
-    }
-#pragma unroll
-    for (int offset = detail::kWARP_SIZE / 2; offset > 0; offset >>= 1)
-    {
-        outputSq += __shfl_down_sync(0xffffffffU, outputSq, offset);
-    }
-    // Every thread has read warpStats before the cluster barrier above, so it can be reused.
-    if (lane == 0)
-    {
-        warpStats[warp][0] = outputSq;
-    }
-    __syncthreads();
-    if (threadIdx.x < clusterSize)
-    {
-        float partial = 0.F;
-#pragma unroll
-        for (int w = 0; w < kWarps; w++)
-        {
-            partial += warpStats[w][0];
-        }
-        *cluster.map_shared_rank(&clusterOutputSq[clusterRank], threadIdx.x) = partial;
-    }
-    cluster.sync();
-    float totalSq = 0.F;
-    for (int r = 0; r < clusterSize; r++)
-    {
-        totalSq += clusterOutputSq[r];
-    }
-    float const outputRsigma = rsqrtf(totalSq / params.tokenDim + epilogue.outputRmsEps);
-    Packed output;
-#pragma unroll
-    for (int i = 0; i < kELTS; i++)
-    {
-        // KimiK3RMSNorm: normalize in fp32, round to bf16, then apply the bf16 weight.
-        T const normalized = __float2bfloat16_rn(__bfloat162float(mixed.elements[i]) * outputRsigma);
-        output.elements[i]
-            = __float2bfloat16_rn(__bfloat162float(normalized) * __bfloat162float(outputRmsWeight.elements[i]));
+        updated = loadPackedVolatile<PackedType>(results + tokenDim);
     }
     reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = output.packed;
-    flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * sizeof(T)), 0, 0, 0});
+    reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset])[0] = updated.packed;
+    flag.waitAndUpdate(
+        {static_cast<uint32_t>((params.numTokens + WorldSize - 1) / WorldSize * WorldSize * tokenDim * sizeof(T)),
+            static_cast<uint32_t>(2 * params.numTokens * tokenDim * sizeof(T)), 0, 0});
 #endif
 }
 
@@ -620,30 +767,25 @@ namespace
 {
 
 template <uint8_t WorldSize, int N>
-void launchOneshotAllreduceAttnRes(cudaLaunchConfig_t const& config,
+void launchAllreduceAttnRes(cudaLaunchConfig_t const& config,
     MnnvlAllReduceKernelParams<__nv_bfloat16> const& kernelParams, AttnResEpilogueParams const& epilogue,
-    bool addPrefix)
+    bool addPrefix, bool twoShot)
 {
-    if (addPrefix)
-    {
-        TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&config, &oneshotAllreduceAttnResKernel<WorldSize, N, true>, kernelParams, epilogue));
-    }
-    else
-    {
-        TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&config, &oneshotAllreduceAttnResKernel<WorldSize, N, false>, kernelParams, epilogue));
-    }
+    auto const kernel = twoShot ? (addPrefix ? &twoshotAllreduceAttnResKernel<WorldSize, N, true>
+                                             : &twoshotAllreduceAttnResKernel<WorldSize, N, false>)
+                                : (addPrefix ? &oneshotAllreduceAttnResKernel<WorldSize, N, true>
+                                             : &oneshotAllreduceAttnResKernel<WorldSize, N, false>);
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, kernelParams, epilogue));
 }
 
 template <uint8_t WorldSize, int... CandidateIdx>
-void dispatchOneshotAllreduceAttnRes(cudaLaunchConfig_t const& config,
+void dispatchAllreduceAttnRes(cudaLaunchConfig_t const& config,
     MnnvlAllReduceKernelParams<__nv_bfloat16> const& kernelParams, AttnResEpilogueParams const& epilogue,
-    bool addPrefix, std::integer_sequence<int, CandidateIdx...>)
+    bool addPrefix, bool twoShot, std::integer_sequence<int, CandidateIdx...>)
 {
     bool const launched
         = ((epilogue.numCandidates == CandidateIdx + 1 ? (
-                launchOneshotAllreduceAttnRes<WorldSize, CandidateIdx + 1>(config, kernelParams, epilogue, addPrefix),
+                launchAllreduceAttnRes<WorldSize, CandidateIdx + 1>(config, kernelParams, epilogue, addPrefix, twoShot),
                 true)
                                                        : false)
             || ...);
@@ -651,9 +793,7 @@ void dispatchOneshotAllreduceAttnRes(cudaLaunchConfig_t const& config,
         epilogue.numCandidates, detail::kAttnResMaxCandidates);
 }
 
-} // namespace
-
-void oneshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue)
+void allreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue, bool twoShot)
 {
     static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL AllReduceAttnRes] requires SM 90 or newer.");
@@ -693,14 +833,26 @@ void oneshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilo
 
     switch (params.nRanks)
     {
-    case 2: dispatchOneshotAllreduceAttnRes<2>(config, kernelParams, epilogue, addPrefix, kCandidates); break;
-    case 4: dispatchOneshotAllreduceAttnRes<4>(config, kernelParams, epilogue, addPrefix, kCandidates); break;
-    case 8: dispatchOneshotAllreduceAttnRes<8>(config, kernelParams, epilogue, addPrefix, kCandidates); break;
-    case 16: dispatchOneshotAllreduceAttnRes<16>(config, kernelParams, epilogue, addPrefix, kCandidates); break;
+    case 2: dispatchAllreduceAttnRes<2>(config, kernelParams, epilogue, addPrefix, twoShot, kCandidates); break;
+    case 4: dispatchAllreduceAttnRes<4>(config, kernelParams, epilogue, addPrefix, twoShot, kCandidates); break;
+    case 8: dispatchAllreduceAttnRes<8>(config, kernelParams, epilogue, addPrefix, twoShot, kCandidates); break;
+    case 16: dispatchAllreduceAttnRes<16>(config, kernelParams, epilogue, addPrefix, twoShot, kCandidates); break;
     default:
         TLLM_CHECK_WITH_INFO(
             false, "[MNNVL AllReduceAttnRes] unsupported world size %d (2, 4, 8 or 16).", params.nRanks);
     }
+}
+
+} // namespace
+
+void oneshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue)
+{
+    allreduceAttnResOp(params, epilogue, /*twoShot=*/false);
+}
+
+void twoshotAllreduceAttnResOp(AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue)
+{
+    allreduceAttnResOp(params, epilogue, /*twoShot=*/true);
 }
 } // namespace kernels::kimiK3Mnnvl
 

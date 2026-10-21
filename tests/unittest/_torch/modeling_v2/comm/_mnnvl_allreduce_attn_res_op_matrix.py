@@ -4,9 +4,10 @@
 
 The op's correctness depends on state that outlives a call (the workspace's Lamport rotation), so beyond single
 calls this drives call *sequences*: layers x steps with the token count dipping and growing back and a random rank
-late, two workspaces interleaved, CUDA-graph capture and replay mixed with eager calls, and a negative control in
-which one rank swaps two calls and every rank gets a wrong answer without an error -- the failure the sequence tests
-exist to catch.
+late, two workspaces interleaved, CUDA-graph capture and replay mixed with eager calls, one-shot and two-shot calls
+mixed on one workspace, and a negative control in which one rank swaps two calls and every rank gets a wrong answer
+without an error -- the failure the sequence tests exist to catch. Two-shot calls are also compared bit for bit with
+the one-shot call of the same inputs.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _mnnvl_allreduce_attn_res_op_matrix.py [--world-size 4]
     srun -n 16 --mpi=pmix python _mnnvl_allreduce_attn_res_op_matrix.py --launcher srun --world-size 16
@@ -41,6 +42,8 @@ TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
 SNAPSHOTS = (0, 1, 5, 8, 11)  # candidates 1..12
 LAYERS = 12
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 16, 3, 8)
+TWO_SHOT_TOKENS = (1, 3, 8, 9, 16, 17, 32, 48, 64)  # capped at the workspace's max_two_shot_tokens
+TWO_SHOT_DIP_STEPS = (16, 32, 8, 64, 2, 16, 1, 48, 16)
 
 R = None
 entry = None
@@ -74,9 +77,9 @@ class Call:
         )
         return normed, updated
 
-    def run(self, ws):
+    def run(self, ws, two_shot=False):
         return entry(self.inputs[R.rank], self.prefix, self.block, self.res_w, self.rms_w, self.out_w, RMS_EPS,
-                     OUT_EPS, ws)  # fmt: skip
+                     OUT_EPS, ws, two_shot=two_shot)  # fmt: skip
 
 
 def verify(call: Call, got, where: str) -> None:
@@ -193,8 +196,9 @@ def check_a_call_over_one_buffer_raises_on_every_rank() -> None:
     verify(call, call.run(WS_A), "after the rejected call")
 
 
-def run_step(ws, seed, tokens, layers=LAYERS, late_rng=None):
-    """One decode step: ``layers`` calls, each layer's prefix the previous layer's ``updated``; verified."""
+def run_step(ws, seed, tokens, layers=LAYERS, late_rng=None, two_shot=lambda layer: False):
+    """One decode step: ``layers`` calls, each layer's prefix the previous layer's ``updated``; verified. Layer
+    ``layer`` runs two-shot when ``two_shot(layer)``."""
     prefix = ls.exact_bf16(
         torch.Generator(device="cuda").manual_seed(seed), (tokens, H), -32, 33, 1 / 16
     )
@@ -202,8 +206,8 @@ def run_step(ws, seed, tokens, layers=LAYERS, late_rng=None):
         call = Call(seed + 1 + layer, tokens, (layer * 5) % 12, prefix=prefix)
         R.barrier()
         R.late(late_rng.randrange(R.world) if late_rng is not None else None)
-        got = call.run(ws)
-        verify(call, got, f"step seed {seed} T {tokens} layer {layer}")
+        got = call.run(ws, two_shot=two_shot(layer))
+        verify(call, got, f"step seed {seed} T {tokens} layer {layer} two-shot {two_shot(layer)}")
         prefix = got[1]
 
 
@@ -214,6 +218,58 @@ def check_dip_and_regrow_sequence() -> None:
     late = random.Random(7)
     for i, t in enumerate(DIP_STEPS):
         run_step(WS_A, 3000 + 100 * i, t, late_rng=late)
+
+
+def _two_shot_tokens():
+    return [t for t in TWO_SHOT_TOKENS if t <= WS_A.max_two_shot_tokens(H)]
+
+
+def check_two_shot_single_calls() -> None:
+    """Two-shot calls against the reference and, where a one-shot call fits, bit for bit against it (the inputs of
+    the sum and the snapshots are random, so -0.0 outputs, which the two-shot op returns as +0.0, do not occur)."""
+    for t in _two_shot_tokens():
+        for s in SNAPSHOTS:
+            for with_prefix in (True, False):
+                call = Call(9000 + 37 * t + s, t, s, prefix=with_prefix or None)
+                got = call.run(WS_A, two_shot=True)
+                where = f"two-shot T {t} snapshots {s} prefix {with_prefix}"
+                verify(call, got, where)
+                if t <= WS_A.max_one_shot_tokens(H):
+                    one = call.run(WS_A)
+                    assert torch.equal(got[0], one[0]) and torch.equal(got[1], one[1]), (
+                        f"{where}: differs from the one-shot call"
+                    )
+
+
+def check_two_shot_over_one_buffer_raises_on_every_rank() -> None:
+    t = WS_A.max_two_shot_tokens(H) + 1
+    call = Call(9500, t, 1)
+    try:
+        call.run(WS_A, two_shot=True)
+        raised = False
+    except RuntimeError as exc:
+        raised = "exceed half a Lamport buffer" in str(exc)
+    assert R.all_true(raised), (
+        f"two-shot T {t} over half a Lamport buffer did not raise on every rank"
+    )
+    call = Call(9501, 16, 2)
+    verify(call, call.run(WS_A, two_shot=True), "after the rejected two-shot call")
+
+
+def check_one_and_two_shot_mixed_sequence() -> None:
+    """One-shot (one stage) and two-shot (two stages) calls share one rotation: each call clears what the previous
+    call, of either kind, left dirty. Steps of 12 layers alternating irregularly between the two, the token count
+    dipping and growing back (two-shot up to 64 tokens, one-shot where it fits), a random rank late at every call."""
+    late = random.Random(11)
+    one_shot_max = WS_A.max_one_shot_tokens(H)
+    for i, t in enumerate(TWO_SHOT_DIP_STEPS):
+        t = min(t, WS_A.max_two_shot_tokens(H))
+        pattern = (
+            (lambda layer: True)
+            if t > one_shot_max
+            else (lambda layer, i=i: (layer * 7 + i) % 3 != 0)
+        )
+        run_step(WS_A, 9600 + 100 * i, t, late_rng=late, two_shot=pattern)
 
 
 def check_two_workspaces_interleaved() -> None:
@@ -229,8 +285,9 @@ def check_two_workspaces_interleaved() -> None:
 
 
 def check_graph_capture_and_replay() -> None:
-    """A captured step of 12 chained calls (T 8) replayed with rewritten inputs, eager calls of other shapes on the
-    same workspace between replays: replays and eager calls share one rotation, in the same order on every rank."""
+    """A captured step of 12 chained calls (T 8, every third two-shot) replayed with rewritten inputs, eager calls of
+    other shapes on the same workspace between replays: replays and eager calls share one rotation, in the same order
+    on every rank."""
     t = 8
     calls = [Call(5000 + layer, t, (layer * 5) % 12, prefix=True) for layer in range(LAYERS)]
     bufs = [(c.inputs[R.rank].clone(), c.block.clone()) for c in calls]
@@ -238,8 +295,9 @@ def check_graph_capture_and_replay() -> None:
 
     def step():
         outs, prefix = [], prefix0
-        for c, (x, blk) in zip(calls, bufs):
-            outs.append(entry(x, prefix, blk, c.res_w, c.rms_w, c.out_w, RMS_EPS, OUT_EPS, WS_B))
+        for layer, (c, (x, blk)) in enumerate(zip(calls, bufs)):
+            outs.append(entry(x, prefix, blk, c.res_w, c.rms_w, c.out_w, RMS_EPS, OUT_EPS, WS_B,
+                              two_shot=layer % 3 == 1))  # fmt: skip
             prefix = outs[-1][1]
         return outs
 
@@ -297,6 +355,9 @@ CHECKS = [
     check_single_calls,
     check_a_call_over_one_buffer_raises_on_every_rank,
     check_dip_and_regrow_sequence,
+    check_two_shot_single_calls,
+    check_two_shot_over_one_buffer_raises_on_every_rank,
+    check_one_and_two_shot_mixed_sequence,
     check_two_workspaces_interleaved,
     check_graph_capture_and_replay,
     # Stays last: it deliberately disagrees on call order.

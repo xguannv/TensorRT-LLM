@@ -108,6 +108,13 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
 )
 
 
+TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(
+    "TRTLLM_K3LL_WIDE_AR_ATTN_RES",
+    0,
+    "wide decode steps: post-attention / MoE-tail all-reduce + residual add + attn_res + RMSNorm in one two-shot call",
+)
+
+
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""
     return dict(_FLAGS)
