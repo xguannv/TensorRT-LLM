@@ -616,13 +616,19 @@ def _kv_half_inputs(num_tokens, seed):
     return raw[:, 1536:2048], raw[:, 2048:2112]
 
 
+@pytest.mark.parametrize("pt_prefetch", [False, True], ids=["plain", "pt_prefetch"])
 @pytest.mark.parametrize("helix", ["none", "inactive", "slots"])
 @pytest.mark.parametrize("batch", [1, 2, 4])
-def test_kv_append_matches_rope_generation(batch, helix, monkeypatch):
+def test_kv_append_matches_rope_generation(batch, helix, pt_prefetch, monkeypatch):
     """``k3_mla_kv_append`` (TRTLLM_K3_MLA_KV_FUSED) writes the latent row, the paged FP8 cache
     rows and the decode's scale / scheduler buffers bit for bit like the FlashInfer RMSNorm, the
     k_pe copy and ``mla_rope_generation(q_rope_applied=True)`` of the default KV half, for every
-    Helix write mode (none, per-request inactive flags, per-token slots with positions)."""
+    Helix write mode (none, per-request inactive flags, per-token slots with positions), also with
+    the decode's page-table L2 prefetch (TRTLLM_K3_MLA_PT_PREFETCH)."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention._K3_MLA_PT_PREFETCH",
+        pt_prefetch,
+    )
     q_len = 8 if batch == 4 else 7
     kv_len = 448
     model, mixer, manager, md, _ = _build(batch, q_len, kv_len, monkeypatch)
