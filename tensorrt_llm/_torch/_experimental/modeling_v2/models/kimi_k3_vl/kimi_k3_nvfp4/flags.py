@@ -90,6 +90,11 @@ TRTLLM_K3LL_FP8W_LOWM_FUSED_A = _flag(
     0,
     "with FP8W_LOWM, also the weight reads whose N is not a multiple of 128 (MLA fused q_a/kv_a, partial row tile)",
 )
+TRTLLM_K3LL_WIDE_ONESHOT = _flag(
+    "TRTLLM_K3LL_WIDE_ONESHOT",
+    0,
+    "wide decode steps (9-16 tokens): one-shot fused AR + attn_res + RMSNorm and one-shot latent AR, not two-shot",
+)
 
 TRTLLM_K3LL_MOE_FRONT16 = _flag(
     "TRTLLM_K3LL_MOE_FRONT16",

@@ -68,6 +68,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace 
 from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
+from . import flags as _flags
+
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
 
@@ -81,8 +83,15 @@ MNNVL_BUFFER_BYTES = 4 << 20
 # 1.75 MiB, which the stock 1 MiB ceiling would send two-shot.
 DECODE_AR_ONE_SHOT_MAX_BYTES = 4 << 20
 
-# A wide decode step's ceiling: the stock 1 MiB. At 16 ranks two-shot is faster for every wide step's rows.
+# A wide decode step's ceiling: the stock 1 MiB (two-shot for every wide step's rows at 16 ranks), or with
+# TRTLLM_K3LL_WIDE_ONESHOT the decode ceiling for steps of at most AR_ATTN_RES_MAX_TOKENS rows.
 WIDE_AR_ONE_SHOT_MAX_BYTES = 1 << 20
+
+
+def _wide_one_shot_max_bytes(rows: int) -> int:
+    if _flags.TRTLLM_K3LL_WIDE_ONESHOT and rows <= AR_ATTN_RES_MAX_TOKENS:
+        return DECODE_AR_ONE_SHOT_MAX_BYTES
+    return WIDE_AR_ONE_SHOT_MAX_BYTES
 
 
 def use_decode_one_shot(model: nn.Module) -> None:
@@ -103,11 +112,14 @@ def skip_all_reduce() -> AllReduceParams:
 
 def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``all_reduce(x)`` of a wide decode step (a stock ``AllReduce`` module, no fusion): its MNNVL all-reduce with
-    the `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""
+    the wide one-shot ceiling (`WIDE_AR_ONE_SHOT_MAX_BYTES`, or the decode one under TRTLLM_K3LL_WIDE_ONESHOT), else
+    the module itself."""
     mnnvl = getattr(all_reduce, "mnnvl_allreduce", None)
     if mnnvl is not None:
         out = mnnvl(
-            x.contiguous(), AllReduceParams(), one_shot_max_bytes=WIDE_AR_ONE_SHOT_MAX_BYTES
+            x.contiguous(),
+            AllReduceParams(),
+            one_shot_max_bytes=_wide_one_shot_max_bytes(x.shape[0]),
         )
         if out is not None:
             return out
@@ -211,8 +223,8 @@ class K3DecodeComm:
         """Whether one of this state's collectives runs the post-attention step of a layer whose attention input is
         ``hidden_states``: at most `AR_ATTN_RES_MAX_TOKENS` bf16 rows of a hidden size the MNNVL entry takes, on any
         step but a wide decode step (``step.wide``), whose post-attention update stays the all-reduce and the fused
-        add + attn_res + RMSNorm."""
-        if step is not None and step.wide:
+        add + attn_res + RMSNorm, unless TRTLLM_K3LL_WIDE_ONESHOT."""
+        if step is not None and step.wide and not _flags.TRTLLM_K3LL_WIDE_ONESHOT:
             return False
         if hidden_states.dim() != 2 or hidden_states.dtype != torch.bfloat16:
             return False
