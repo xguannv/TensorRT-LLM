@@ -421,6 +421,31 @@ def _mla_qkv_split(
     )  # fmt: skip
 
 
+_DBG = {"bad": None, "seen": set()}
+
+
+def _dbg_check(tag, outs, refs, inputs):
+    import os
+
+    if os.environ.get("K3LL_DBG_MLA_SPLIT") != "1":
+        return
+    if _DBG["bad"] is None:
+        _DBG["bad"] = torch.zeros(1, dtype=torch.int64, device=outs[0].device)
+    for o, r in zip(outs, refs):
+        _DBG["bad"] += (o.view(torch.int16) != r.view(torch.int16)).sum()
+    if torch.cuda.is_current_stream_capturing():
+        return
+    key = (tag, tuple(tuple(t.shape) + tuple(t.stride()) + (str(t.dtype),) for t in inputs if torch.is_tensor(t)))
+    bad = int(_DBG["bad"].item())
+    if key not in _DBG["seen"] or bad:
+        _DBG["seen"].add(key)
+        d = [((o.view(torch.int16) != r.view(torch.int16)).sum().item(), (o.float() - r.float()).abs().max().item())
+             for o, r in zip(outs, refs)]
+        meta = [(tuple(t.shape), tuple(t.stride()), str(t.dtype), t.is_contiguous()) if torch.is_tensor(t) else t
+                for t in inputs]
+        print(f"[k3dbg] {tag} bad_total={bad} this_call={d} inputs={meta}", flush=True)
+
+
 @torch.library.custom_op("trtllm::k3_fp8_mla_qkv", mutates_args=("pool",))
 def mla_qkv(
     ag: torch.Tensor,
@@ -444,10 +469,18 @@ def mla_qkv(
     h = kb.shape[0]
     out = ag.new_empty((ag.shape[0], h * 576))
     if _flags.TRTLLM_K3LL_MLA_QKV_SPLIT:
+        ref = out.clone()
+        _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
+            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, pool, pages, lengths, ref, ag.shape[0], h,
+            ag.stride(0), qb_scale.stride(0), *kb.stride(), *kb_scale.stride(), row_stride, pages.stride(0),
+            page_offset, tokens_per_request, qa_eps, kv_eps, QB_UE8M0=qb_ue8m0, num_warps=8,
+        )  # fmt: skip
         _mla_qkv_split(
             ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, out, pool, pages, lengths, row_stride,
             page_offset, tokens_per_request, qa_eps, kv_eps, qb_ue8m0, True,
         )  # fmt: skip
+        _dbg_check("paged", [out], [ref], [ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, pool, pages, lengths,
+                                           row_stride, page_offset, tokens_per_request, qb_ue8m0])
         return out
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
         ag,
@@ -519,10 +552,17 @@ def mla_project_qkv(
     query = ag.new_empty((ag.shape[0], h * 576))
     latent = ag.new_empty((ag.shape[0], 576))
     if _flags.TRTLLM_K3LL_MLA_QKV_SPLIT:
+        rq, rl = query.clone(), latent.clone()
+        _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
+            ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, rl, ag, ag, rq, ag.shape[0], h, ag.stride(0),
+            qb_scale.stride(0), *kb.stride(), *kb_scale.stride(), 576, 0, 0, 1, qa_eps, kv_eps, STORE_PAGED=False,
+            QB_UE8M0=qb_ue8m0, num_warps=8,
+        )  # fmt: skip
         _mla_qkv_split(
             ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, query, latent, ag, ag, 576, 0, 1, qa_eps,
             kv_eps, qb_ue8m0, False,
         )  # fmt: skip
+        _dbg_check("project", [query, latent], [rq, rl], [ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qb_ue8m0])
         return query, latent
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
         ag,
