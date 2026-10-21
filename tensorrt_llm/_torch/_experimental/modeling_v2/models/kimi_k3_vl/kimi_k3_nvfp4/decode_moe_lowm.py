@@ -51,6 +51,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant im
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
+from . import flags as _flags
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
 
@@ -337,6 +338,14 @@ class K3DecodeMoeNvfp4Layer:
         )  # fmt: skip
         return routed, shared_act
 
+    def _l2_prefetch_next(self) -> None:
+        """With TRTLLM_K3LL_L2_PREFETCH, the next decoder layer's attention weights into L2 once the routed experts
+        issued so far are done (l2_prefetch.py); l2_next and state.l2 are set by the target's build."""
+        ranges = getattr(self, "l2_next", None)
+        prefetcher = getattr(self.state, "l2", None)
+        if ranges and prefetcher is not None and _flags.TRTLLM_K3LL_L2_PREFETCH:
+            prefetcher.issue(ranges)
+
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
         `MAX_TOKENS` tokens; with ``partial_tail``, also a wide decode step of at most `WIDE_MAX_TOKENS`."""
@@ -359,6 +368,7 @@ class K3DecodeMoeNvfp4Layer:
         if hidden_states.shape[0] > MAX_TOKENS:
             return self._wide(moe, hidden_states, gemvs)
         routed, shared_act = self._front_routed(moe, hidden_states)
+        self._l2_prefetch_next()
         latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
@@ -409,6 +419,7 @@ class K3DecodeMoeNvfp4Layer:
             routed, shared_act = self._front_routed(moe, x)
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)
+        self._l2_prefetch_next()
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
         # columns.
         normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))

@@ -113,6 +113,11 @@ TRTLLM_K3LL_WIDE_AR_ATTN_RES = _flag(
     0,
     "wide decode steps: post-attention / MoE-tail all-reduce + residual add + attn_res + RMSNorm in one two-shot call",
 )
+TRTLLM_K3LL_L2_PREFETCH = _flag(
+    "TRTLLM_K3LL_L2_PREFETCH",
+    0,
+    "lowm MoE decode: the next layer's attention weights into L2 on a side stream behind the routed experts",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

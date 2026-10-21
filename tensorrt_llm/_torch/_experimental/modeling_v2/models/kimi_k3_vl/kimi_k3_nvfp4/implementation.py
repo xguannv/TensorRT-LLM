@@ -66,6 +66,7 @@ from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
+from . import l2_prefetch as _l2_prefetch
 from . import mla_drafter as _mla_drafter
 from . import spec_worker as _spec_worker
 from . import weights as _weights
@@ -2036,6 +2037,9 @@ class KimiLinearModel(DecoderModel):
                 hidden_states, num_snapshots, pending_moe_partial = outputs
             else:
                 (hidden_states, num_snapshots), pending_moe_partial = outputs, None
+        prefetcher = getattr(self, "l2_prefetcher", None)
+        if prefetcher is not None:
+            prefetcher.join()
 
         if isinstance(pending_moe_partial, _decode_comm.PendingTail):
             normed, _ = self.layers[-1].decode_comm.sandwich_tail(
@@ -3598,6 +3602,30 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 moe, state, mapping.tp_rank, mapping.tp_size
             )
             moe.decode_gemvs = self.model.decode_gemvs
+        # The next layer's attention weights, prefetched behind each MoE layer's routed experts (l2_prefetch.py).
+        state.l2 = _l2_prefetch.K3L2Prefetcher(state.counters.device)
+        layers = list(self.model.layers)
+        for i, layer in enumerate(layers[:-1]):
+            moe = layer.block_sparse_moe if layer.is_moe else None
+            if moe is None or getattr(moe, "decode_moe", None) is None:
+                continue
+            nxt = layers[i + 1]
+            moe.decode_moe.l2_next = _l2_prefetch.module_ranges(
+                nxt.linear_attn if nxt.is_kda else nxt.self_attn
+            )
+        state.l2.warm_up(
+            next(m.decode_moe.l2_next for m in takes if getattr(m.decode_moe, "l2_next", None))
+        )
+        self.model.l2_prefetcher = state.l2
+        sizes = [
+            sum(n for _, n in m.decode_moe.l2_next)
+            for m in takes
+            if getattr(m.decode_moe, "l2_next", None)
+        ]
+        logger.info(
+            f"Kimi K3 lowm MoE: L2 prefetch of the next attention layer's weights on {len(sizes)} MoE layers, "
+            f"{min(sizes) >> 20}-{max(sizes) >> 20} MiB each (TRTLLM_K3LL_L2_PREFETCH={_flags.TRTLLM_K3LL_L2_PREFETCH})"
+        )
         first = takes[0].decode_moe
         first.warm_up(takes[0])
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
