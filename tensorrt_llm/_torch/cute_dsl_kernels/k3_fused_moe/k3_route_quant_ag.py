@@ -67,22 +67,23 @@ def slot_words(world: int) -> int:
     return (HIDDEN_SIZE // world // 8 + NUM_EXPERTS // world // 4) * 4
 
 
-def buffer_words(world: int) -> int:
-    return BUFFERS * M_MAX * world * slot_words(world)
+def buffer_words(world: int, m_max: int = M_MAX) -> int:
+    return BUFFERS * m_max * world * slot_words(world)
 
 
 FRONT_SPLIT = 8  # k3_moe_front's cluster size: its router rows reach the route CTAs as this many split-K partials
 
 
-def partial_words() -> int:
+def partial_words(m_max: int = M_MAX) -> int:
     """Int32 words after the buffers: k3_moe_front's router logits as split-K partials,
     [buffer][token][rank][cluster rank][expert of the rank] (the same size for every world)."""
-    return BUFFERS * M_MAX * FRONT_SPLIT * NUM_EXPERTS
+    return BUFFERS * m_max * FRONT_SPLIT * NUM_EXPERTS
 
 
-def workspace_words(world: int) -> int:
-    """The head workspace: the all-gather's buffers, then the front's router partials."""
-    return buffer_words(world) + partial_words()
+def workspace_words(world: int, m_max: int = M_MAX) -> int:
+    """The head workspace of an m_max-token front build: the all-gather's buffers, then the front's router
+    partials."""
+    return buffer_words(world, m_max) + partial_words(m_max)
 
 
 @dsl_user_op

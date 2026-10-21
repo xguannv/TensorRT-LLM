@@ -3510,11 +3510,19 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             )
         if not takes:
             return 0
+        front16 = bool(_flags.TRTLLM_K3LL_MOE_FRONT16) and _decode_moe_lowm.front16_supported(
+            takes[0], mapping.tp_size
+        )
+        if _flags.TRTLLM_K3LL_MOE_FRONT16:
+            logger.info(
+                f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_FRONT16=1: 9-16 token steps on the 16-token front: {front16}"
+            )
         state = _decode_moe_lowm.K3DecodeMoeNvfp4.create(
             mapping,
             takes[0].routed_experts.backend.w3_w1_weight.device,
             comm.mnnvl,
             front_sort=bool(_flags.TRTLLM_K3LL_MOE_FRONT_SORT),
+            front16=front16,
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)

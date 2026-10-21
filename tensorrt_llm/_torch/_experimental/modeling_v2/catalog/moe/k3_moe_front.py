@@ -43,10 +43,11 @@ def k3_moe_front(
     sort_offset: int = 0,
     sort_local: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(topk_ids, topk_weights, quantized, scales, shared)`` for the MoE input ``x`` (bf16 ``[M <= 8, 7168]``,
-    the same on every rank): the top-16 routing of the gathered router logits with ``e_score_correction_bias`` and the
-    MXFP8 latent with its UE8M0 scales, as ``trtllm::k3_route_quant`` returns them for the gathered head, and the shared
-    experts' activation (bf16 ``[M, shared_cols]``). ``w_front`` from :func:`front_weight`. Advances ``workspace`` by
+    """Return ``(topk_ids, topk_weights, quantized, scales, shared)`` for the MoE input ``x`` (bf16 ``[M <= 16, 7168]``,
+    9-16 rows on a ``K3MoeHeadWorkspace`` created with ``m_max=16``, the same on every rank): the top-16 routing of
+    the gathered router logits with ``e_score_correction_bias`` and the MXFP8 latent with its UE8M0 scales, as
+    ``trtllm::k3_route_quant`` returns them for the gathered head, and the shared experts' activation (bf16
+    ``[M, shared_cols]``). ``w_front`` from :func:`front_weight`. Advances ``workspace`` by
     one call: every rank of the group makes the same front calls on it in the same order.
 
     ``publish``: also release the workspace's per-token ready words, which the next ``moe/k3_moe`` call on a head_flags
