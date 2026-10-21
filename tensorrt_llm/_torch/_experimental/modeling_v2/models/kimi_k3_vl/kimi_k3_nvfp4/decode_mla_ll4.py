@@ -183,6 +183,7 @@ class MlaLl4Decode:
         max_batch: requests the workspace is sized for.
         options: kernel option overrides (see ``kernel_options``).
         num_clusters: persistent clusters of the kernel (the balanced split's cluster count); None: all resident.
+        persistent: uniform split on persistent clusters (the balanced split always is).
     """
 
     _compiled: dict = {}
@@ -198,6 +199,7 @@ class MlaLl4Decode:
         emit_softmax_stats: bool = False,
         options: Optional[dict] = None,
         num_clusters: Optional[int] = None,
+        persistent: bool = False,
     ):
         if num_heads > _MMA_TILE_M:
             raise ValueError(f"MLA ll4 decode: at most {_MMA_TILE_M} heads, got {num_heads}")
@@ -214,6 +216,7 @@ class MlaLl4Decode:
         self.emit_softmax_stats = emit_softmax_stats
         self.options = dict(options or {})
         self.num_clusters = num_clusters
+        self.persistent = persistent
         self.layout = workspace_layout(num_heads, seq_len_q, max_batch)
 
     def workspace_bytes(self) -> int:
@@ -235,7 +238,7 @@ class MlaLl4Decode:
             if self.split_kv is not None
             else default_uniform_split(batch, self.num_heads, self.seq_len_q)
         )
-        return False, split, False
+        return False, split, self.persistent
 
     def __call__(
         self,
