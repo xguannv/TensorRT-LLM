@@ -181,7 +181,7 @@ def check_interleaved_with_the_other_mnnvl_ops() -> None:
                 EPS,
                 EPS,
                 WS_B,
-                two_shot=(k % 2 == 1) and t > 8,
+                two_shot=(k % 2 == 1 and t > 8) or t > WS_B.max_one_shot_tokens(hidden),
             )
             ag_bf16, ag_fp32 = mnnvl_allgather_split(ag_in[R.rank], 32, WS_B)
             outs.append((call.run(WS_B), updated, ag_bf16, ag_fp32))
