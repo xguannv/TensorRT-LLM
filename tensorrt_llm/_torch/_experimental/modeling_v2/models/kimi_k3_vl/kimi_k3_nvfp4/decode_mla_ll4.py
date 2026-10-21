@@ -64,6 +64,7 @@ def max_active_clusters() -> int:
             )
         import cutlass
 
+        torch.cuda.synchronize()  # HardwareInfo needs the device's primary context current on this thread
         _max_active_clusters = int(
             cutlass.utils.HardwareInfo().get_max_active_clusters(_CLUSTER_SIZE)
         )
