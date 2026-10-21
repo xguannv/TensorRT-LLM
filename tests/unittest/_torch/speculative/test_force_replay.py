@@ -63,7 +63,7 @@ def _pairs(targets):
     return buf, 2, 2, 1
 
 
-def _step(replay, pool, positions, groups, targets, drafts_in, drafter_out, frac=0.75):
+def _step(replay, pool, positions, groups, targets, drafts_in, drafter_out, frac=0.75, base=3):
     """One generation step through the fused select-accept and next-new-tokens kernels.
 
     ``positions[g]`` / ``groups[g]``: global position of request g's newest committed token and
@@ -76,7 +76,7 @@ def _step(replay, pool, positions, groups, targets, drafts_in, drafter_out, frac
     ).flatten()
     ids = torch.tensor(groups, dtype=torch.int32, device="cuda").flatten()
     key = ForceAcceptKey(pos, ids, W)
-    force = (3, frac, W, pool, key, 6007, 1009)
+    force = (base, frac, W, pool, key, 6007, 1009)
     acc, n, _ = fused_select_accept(
         _pairs(torch.tensor(targets, device="cuda").flatten()),
         torch.tensor(drafts_in, dtype=torch.int32, device="cuda"),
@@ -167,7 +167,7 @@ def test_replay_ends_with_the_recording():
     assert nxt[0].tolist() == [acc[ng - 1]] + tail[1:]
 
 
-def _run(streams, starts, noise_seed, steps=60, frac=0.75, rewind=False):
+def _run(streams, starts, noise_seed, steps=60, frac=0.75, rewind=False, base=3):
     """A toy decode loop: every step the target selects random tokens and the drafter proposes
     random drafts (numerics noise). Returns each request's committed tokens and counts."""
     replay = ForceReplay.build(streams, torch.device("cuda"), 16, K)
@@ -189,7 +189,7 @@ def _run(streams, starts, noise_seed, steps=60, frac=0.75, rewind=False):
                 [[q + c for c in range(W)] for q in pos], dtype=torch.int32, device="cuda"
             ).flatten()
             ids = torch.tensor(groups, dtype=torch.int32, device="cuda").flatten()
-            force = (3, frac, W, pool, ForceAcceptKey(p, ids, W), 6007, 1009)
+            force = (base, frac, W, pool, ForceAcceptKey(p, ids, W), 6007, 1009)
             acc, n, rw = fused_select_accept(
                 _pairs(torch.tensor(targets, device="cuda").flatten()),
                 torch.tensor(drafts, dtype=torch.int32, device="cuda"),
@@ -202,7 +202,7 @@ def _run(streams, starts, noise_seed, steps=60, frac=0.75, rewind=False):
             nd = torch.tensor(drafter, dtype=torch.int32, device="cuda")
             nxt = fused_next_new_tokens_rewind(acc, nd, n, kv, rw, 0, replay=(replay, 0, num_gens))
         else:
-            acc, n, nxt, nd = _step(replay, pool, pos, groups, targets, drafts, drafter, frac)
+            acc, n, nxt, nd = _step(replay, pool, pos, groups, targets, drafts, drafter, frac, base)
         acc, n, nxt, nd = acc.tolist(), n.tolist(), nxt.tolist(), nd.tolist()
         for g in range(len(starts)):
             committed[g] += acc[g][: n[g]]
@@ -232,6 +232,55 @@ def test_replay_mean_acceptance():
     mean_drafts = sum(flat) / len(flat) - 1
     # 840 Bernoulli(0.75) draws: std of the mean 0.015.
     assert abs(mean_drafts - 2.75) < 0.06, mean_drafts
+
+
+@pytest.mark.parametrize("rewind", [False, True])
+def test_replay_whole_forced_count(rewind):
+    """A whole forced count (e.g. 3.00 drafts at MTP8: base 4, frac 0) replays like a fractional
+    one: every step commits exactly 4 recorded tokens, whatever the numerics."""
+    streams = _streams(lengths=(400, 400, 400))
+    a_tokens, a_counts = _run(streams, [0, 1], noise_seed=1, frac=0.0, rewind=rewind, base=4)
+    b_tokens, b_counts = _run(streams, [0, 1], noise_seed=2, frac=0.0, rewind=rewind, base=4)
+    assert a_tokens == b_tokens and a_counts == b_counts
+    assert all(c == 4 for cs in a_counts for c in cs)
+    for g, r in enumerate([0, 1]):
+        assert a_tokens[g] == streams[r][1][: len(a_tokens[g])]
+
+
+@pytest.mark.parametrize(
+    "forced,replaying,expect",
+    [
+        (3.0, True, (4, 0.0)),  # whole count: state-keyed form (the replay rides on it)
+        (3.0, False, (4,)),  # whole count without replay: the constant form
+        (2.75, True, (3, 0.75)),
+        (2.75, False, (3, 0.75)),
+    ],
+)
+def test_force_kernel_args_whole_count_keeps_the_replay(forced, replaying, expect):
+    """``SpecWorkerBase._force_accept_kernel_args`` (the accept kernels' ``force`` argument)
+    takes the state-keyed form whenever the run replays, also for a whole forced count."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.speculative.interface import FORCE_ACCEPT_KEY_STATE, SpecWorkerBase
+
+    key = ForceAcceptKey(
+        torch.zeros(W, dtype=torch.int32, device="cuda"),
+        torch.zeros(W, dtype=torch.int32, device="cuda"),
+        W,
+    )
+    worker = SimpleNamespace(
+        force_num_accepted_tokens=forced,
+        force_accept_key=FORCE_ACCEPT_KEY_STATE,
+        _force_replay_streams=_streams() if replaying else None,
+        _force_accept_rng_pool=_pool(),
+        _force_accept_rng_counter=None,
+        _ensure_force_accept_rng_state=lambda device: None,
+        _force_accept_state_key=lambda num_gens: key,
+    )
+    force = SpecWorkerBase._force_accept_kernel_args(worker, K, None, torch.device("cuda"), 1)
+    assert force[: len(expect)] == expect
+    if len(expect) > 1:
+        assert len(force) == 7 and force[2] == K + 1 and force[4] is key
 
 
 def test_copies_of_one_recording_diverge():

@@ -1857,7 +1857,12 @@ class SpecWorkerBase(nn.Module, ABC):
         frac_part = self.force_num_accepted_tokens - int_part
         max_total = runtime_draft_len + 1
         base_total = min(int_part + 1, max_total)
-        if frac_part > 0.0 and base_total < max_total:
+        # A replaying run (TLLM_SPEC_DECODE_FORCE_REPLAY) takes the state-keyed
+        # form also for a whole forced count (the replay rides on it); with
+        # frac 0 its draws add nothing, so the counts stay base_total.
+        replay_whole = (self._force_replay_streams is not None
+                        and self.force_accept_key == FORCE_ACCEPT_KEY_STATE)
+        if (frac_part > 0.0 and base_total < max_total) or replay_whole:
             self._ensure_force_accept_rng_state(device)
             if self.force_accept_key == FORCE_ACCEPT_KEY_STATE:
                 source = self._force_accept_state_key(num_gens)
