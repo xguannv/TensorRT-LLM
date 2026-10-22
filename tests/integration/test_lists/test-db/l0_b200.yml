@@ -157,6 +157,8 @@ l0_b200:
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/activation/test_modeling_v2_situ_and_mul.py
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
+  # The KDA [f_a | b] switches of the K3 NVFP4 decode path: off arm against the chain it replaced, on against off.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_kda_bfa_switches.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_103__dep4/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
