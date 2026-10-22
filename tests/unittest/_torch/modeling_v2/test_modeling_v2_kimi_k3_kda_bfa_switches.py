@@ -35,11 +35,13 @@ bit for bit the eager call on the same inputs):
   * TRTLLM_K3LL_KDA_BFA_ROW_TILES: off arm bit for bit the reference chain; on arm (``kda_bfa_rt``, 4 tiles of 34
     rows, split 8) bit for bit the off arm.
   * TRTLLM_K3LL_KDA_BFA_FP8: off arm: ``_k3_fused_rows`` returns None and launches nothing, so the projections are the
-    reference chain, before and after the on arm has built the fused weight (the QKVG weight and the q / k / v / g
-    views are then views of its rows with the same bytes, and the allocated memory grows by the 144 FP8 [f_a | b]
-    rows and the fused scale only, under 2 MB); on arm: the QKVG columns within 1e-2 (relative norm) of the off
-    arm's (the same FP8 products, a partial last row tile and another split-K), the [f_a | b] columns within 5e-2 of
-    the off arm's bf16 ones (an FP8 weight and the MXFP8 activation), the padding columns zero.
+    reference chain, before and after ``build_bfa_fp8`` (the target's load-time call) has built the fused weight. On
+    without a fused weight (launched at 0): ``_k3_fused_rows`` returns None (the forward never builds), the
+    reference chain again. Once built, the QKVG weight and the q / k / v / g views are views of its rows with the
+    same bytes, and the allocated memory grew by the 144 FP8 [f_a | b] rows and the fused scale only, under 2 MB.
+    On arm: the QKVG columns within 1e-2 (relative norm) of the off arm's (the same FP8 products, a partial last row
+    tile and another split-K), the [f_a | b] columns within 5e-2 of the off arm's bf16 ones (an FP8 weight and the
+    MXFP8 activation), the padding columns zero.
 """
 
 import gc
@@ -124,6 +126,7 @@ def stand_in():
         ref_qkvg=(ref_w, s_q),
         _bfa_proj_weight=w_bfa,
         _qkvg_bfa_fp8=None,
+        _bfa_fp8_extra_bytes=0,
         layer_idx=0,
         _projection_fork_event=torch.cuda.Event(),
         _projection_join_event=torch.cuda.Event(),
@@ -229,14 +232,18 @@ def test_fp8(stand_in, flags, rows):
     ref = _eager_and_replay(lambda x: _ref_projections(stand_in, x), rows)
     _assert_equal(off, ref, "FP8 off vs the reference chain")
     flags(FP8=1)
-    x1 = _x(rows, 1)
+    # Not built (as when launched with the switch at 0): the switch on keeps the unfused path, eagerly and when
+    # captured; the forward never builds.
+    unbuilt = _eager_and_replay(stand_in._k3_projections, rows)
+    _assert_equal(unbuilt, ref, "FP8 on without a fused weight vs the reference chain")
+    with torch.inference_mode():
+        assert stand_in._k3_fused_rows(_x(rows, 1)) is None
+    assert stand_in._qkvg_bfa_fp8 is None
     gc.collect()
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
-    with torch.inference_mode():
-        y1 = stand_in._k3_fused_rows(x1)  # eager: builds the fused weight
-    assert y1 is not None
-    del y1
+    assert stand_in.build_bfa_fp8()  # what the target's post_load_weights does at load
+    assert stand_in._bfa_fp8_extra_bytes > 0
     gc.collect()
     torch.cuda.synchronize()
     grown = torch.cuda.memory_allocated() - before

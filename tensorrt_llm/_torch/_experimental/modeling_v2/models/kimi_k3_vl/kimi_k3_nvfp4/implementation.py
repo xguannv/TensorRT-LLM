@@ -2187,8 +2187,8 @@ class KimiLinearModel(DecoderModel):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
-# KDA layers of this process whose fused FP8 [q | k | v | g | f_a | b] weight is built (TRTLLM_K3LL_KDA_BFA_FP8).
-_BFA_FP8_BUILT = [0]
+# Whether this process has logged a TRTLLM_K3LL_KDA_BFA_FP8 call without a fused weight.
+_BFA_FP8_MISSING_LOGGED = [False]
 
 
 class K3DecodeKDA(KimiKDALinearAttention):
@@ -2220,9 +2220,10 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # cache_derived_state under TRTLLM_K3LL_KDA_BFA_GEMV.
         self._bfa_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
         # (weight, packed scale) of [q | k | v | g | f_a | b | pad] in FP8 (the [f_a | b] rows quantized to 128x128
-        # blocks), built by build_bfa_fp8 on the first eager call under TRTLLM_K3LL_KDA_BFA_FP8. The QKVG module's
-        # weight is then a view of the weight's first rows (one buffer); the packed scales are two tensors.
+        # blocks), built by build_bfa_fp8 from the target's post_load_weights under TRTLLM_K3LL_KDA_BFA_FP8. The QKVG
+        # module's weight is then a view of the weight's first rows (one buffer); the packed scales are two tensors.
         self._qkvg_bfa_fp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._bfa_fp8_extra_bytes = 0
 
     @property
     def takes_k3_kernels(self) -> bool:
@@ -2240,8 +2241,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
 
     def build_bfa_fp8(self) -> bool:
         """Build ``_qkvg_bfa_fp8`` from the FP8 QKVG module's weight-read weight and the bf16 ``[f_a | b]`` weight
-        (TRTLLM_K3LL_KDA_BFA_FP8); whether it is built. The QKVG module must hold its packed UE8M0 scale, which its
-        own post_load_weights writes after the target's, so the first eager call builds it.
+        (TRTLLM_K3LL_KDA_BFA_FP8); whether it is built. The target's post_load_weights calls it at load, after routing
+        the FP8 modules to k3_fp8w_lowm_gemm; the loader runs that before the QKVG module's own post_load_weights, so
+        this first runs the module's (idempotent) weight transform, which writes the packed UE8M0 scale.
 
         One weight buffer: the QKVG module's weight becomes a view of the fused weight's first rows (the same bytes
         at the start of the buffer, so the QKVG GEMM with the switch off is unchanged), and so do the weights of the
@@ -2251,10 +2253,13 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # Only a QKVG module routed to k3_fp8w_lowm_gemm (fp8w_lowm.install: SM100 / SM103, DeepGEMM's packed scale).
         if self._qkvg_bfa_fp8 is None and getattr(self.qkvg_proj, "_k3ll_fp8w_lowm", False):
             proj = self.qkvg_proj
+            transform = getattr(proj, "transform_weights", None)
+            if callable(transform) and not getattr(proj, "_weights_transformed", True):
+                transform()
             weight = getattr(proj, "weight", None)
             scale = getattr(proj, "weight_scale", None)
             if isinstance(weight, torch.Tensor) and isinstance(scale, torch.Tensor):
-                # Ordinary tensors even when the first call runs under inference mode (they become module weights).
+                # Ordinary tensors (they become module weights) even if a caller holds inference mode.
                 with torch.inference_mode(False), torch.no_grad():
                     fused = _fp8w_lowm.append_rows(weight, scale, self._bfa_proj_weight)
                 if fused is not None:
@@ -2271,24 +2276,24 @@ class K3DecodeKDA(KimiKDALinearAttention):
                             )
                     del weight
                     self._qkvg_bfa_fp8 = fused
-                    _BFA_FP8_BUILT[0] += 1
-                    if _BFA_FP8_BUILT[0] == 1:
-                        logger.info(
-                            f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_FP8=1: KDA layer {self.layer_idx}'s "
-                            f"[q | k | v | g | f_a | b] in one FP8 weight {tuple(fused[0].shape)}, the QKVG weight a "
-                            f"view of its first {rows} rows; {extra} bytes more than the QKVG weight alone"
-                        )
+                    self._bfa_fp8_extra_bytes = extra
         return self._qkvg_bfa_fp8 is not None
 
     def _k3_fused_rows(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """With TRTLLM_K3LL_KDA_BFA_FP8: ``[q | k | v | g | f_a | b | pad]`` rows of ``x`` from one FP8 GEMM; None
-        without it, under a capture before an eager call has built the weight, or where the low-M kernel does not
-        take the rows."""
+        without it, where the low-M kernel does not take the rows, or where no fused weight was built at load
+        (launched with the switch at 0, or a QKVG module not on k3_fp8w_lowm_gemm). Never builds: a call under
+        CUDA-graph capture and an eager call take the same path. The first call that finds no fused weight with the
+        switch on logs it once per process ("unfused path")."""
         if not _flags.TRTLLM_K3LL_KDA_BFA_FP8:
             return None
-        if self._qkvg_bfa_fp8 is None and (
-            torch.cuda.is_current_stream_capturing() or not self.build_bfa_fp8()
-        ):
+        if self._qkvg_bfa_fp8 is None:
+            if not _BFA_FP8_MISSING_LOGGED[0]:
+                _BFA_FP8_MISSING_LOGGED[0] = True
+                logger.warning(
+                    f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_FP8=1 but KDA layer {self.layer_idx} has no fused FP8 weight "
+                    "(not built at load): unfused path (QKVG + the bf16 [f_a | b] projection)"
+                )
             return None
         return _fp8w_lowm.gemm(x.reshape(-1, x.shape[-1]), *self._qkvg_bfa_fp8)
 
@@ -3810,6 +3815,19 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     f"Kimi K3 NVFP4: TRTLLM_K3LL_FP8W_LOWM=1 (FUSED_A={_flags.TRTLLM_K3LL_FP8W_LOWM_FUSED_A}): "
                     f"{routed} FP8 projections on k3_fp8w_lowm_gemm at decode size; FP8 modules left on their own "
                     f"GEMM: {dict(skipped)}"
+                )
+            if _flags.TRTLLM_K3LL_KDA_BFA_FP8:
+                kda = [
+                    layer.linear_attn
+                    for layer in layers
+                    if layer.is_kda and isinstance(layer.linear_attn, K3DecodeKDA)
+                ]
+                built = [attn for attn in kda if attn.build_bfa_fp8()]
+                extra = sum(attn._bfa_fp8_extra_bytes for attn in built)
+                logger.info(
+                    f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_FP8=1: {len(built)}/{len(kda)} KDA layers' "
+                    "[q | k | v | g | f_a | b] in one FP8 weight at load (the QKVG weight a view of its first rows); "
+                    f"{extra} bytes more than the QKVG weights alone"
                 )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
