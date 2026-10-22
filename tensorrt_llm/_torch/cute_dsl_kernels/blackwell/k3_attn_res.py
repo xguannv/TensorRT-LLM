@@ -100,7 +100,8 @@ _NEG_FLT_MAX = "0fFF7FFFFF"
 _HIDDEN_F32 = "0f45E00000"  # 7168.0
 
 # ---------------------------------------------------------------------------
-# Inline PTX helpers (fixed instructions: the C++ kernels are built with --use_fast_math)
+# Inline PTX helpers (fixed instructions: the kimiK3AttnRes C++ kernels are built with
+# --use_fast_math, the kimiK3Mnnvl ones without it)
 # ---------------------------------------------------------------------------
 
 
@@ -177,6 +178,11 @@ def _mul_ftz(a, b, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _mul(a, b, *, loc=None, ip=None):
+    return _f32_op("mul.rn.f32 $0, $1, $2;", a, b, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def _zero_f32(*, loc=None, ip=None):
     return Float32(_asm(T.f32(), [], "mov.b32 $0, 0f00000000;", "=f", loc=loc, ip=ip))
 
@@ -196,8 +202,27 @@ def _rsigma(sum_sq, eps, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _rsigma_rn(sum_sq, eps, *, loc=None, ip=None):
+    """``rsqrtf(sum_sq / 7168 + eps)`` as nvcc emits it without --use_fast_math (IEEE division)."""
+    return _f32_op(
+        "{\n.reg .f32 t;\n"
+        f"div.rn.f32 t, $1, {_HIDDEN_F32};\n"
+        "add.rn.f32 t, t, $2;\nrsqrt.approx.f32 $0, t;\n}",
+        sum_sq,
+        eps,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _max_ftz(a, b, *, loc=None, ip=None):
     return _f32_op("max.ftz.f32 $0, $1, $2;", a, b, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _max(a, b, *, loc=None, ip=None):
+    return _f32_op("max.f32 $0, $1, $2;", a, b, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -219,8 +244,27 @@ def _softmax_term(logit, max_logit, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _softmax_term_rn(logit, max_logit, *, loc=None, ip=None):
+    """``exp2f((logit - max_logit) * LOG2_E)`` without --use_fast_math."""
+    return _f32_op(
+        "{\n.reg .f32 t;\nsub.rn.f32 t, $1, $2;\n"
+        f"mul.rn.f32 t, t, {_LOG2E};\nex2.approx.f32 $0, t;\n}}",
+        logit,
+        max_logit,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _rcp_ftz(a, *, loc=None, ip=None):
     return _f32_op("rcp.approx.ftz.f32 $0, $1;", a, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _rcp_rn(a, *, loc=None, ip=None):
+    """``1.F / a`` without --use_fast_math (IEEE reciprocal)."""
+    return _f32_op("rcp.rn.f32 $0, $1;", a, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -699,8 +743,8 @@ def _warp_transpose_sum(values, lane, add=_add):
 
     ``len(values)`` must be a power of two <= 32. Afterwards lane ``l`` holds the warp total of
     ``values[l >> (5 - log2(len(values)))]``. Every total is the tree of a ``shfl_down`` (or xor
-    butterfly) reduction from offset 16 down to 1, so with ``add=_add_ftz`` it has the bits of the
-    C++ kernels' ``v += __shfl_down_sync(v, offset)`` loop on lane 0.
+    butterfly) reduction from offset 16 down to 1, so with ``add`` the C++ kernel's ``+=``
+    instruction it has the bits of its ``v += __shfl_down_sync(v, offset)`` loop on lane 0.
     """
     offset = 16
     while len(values) > 1:
@@ -725,17 +769,17 @@ def _cluster_total(smem, lane, c: int, warps: int, nvals: int, stat: int, base_l
     (fp32, CTA ``g < c``, warp ``w``): ``0 + sum_g (0 + sum_w part[g][w])``, CTA after CTA.
 
     Lane ``base_lane + g`` (``base_lane`` 0 or 16) sums CTA ``g``'s warps, then every lane adds
-    the ``c`` CTA partials in rank order; every lane returns the total (``add.ftz``, as the C++
-    kernels' fast-math ``+=``). The other lanes read CTA 0's partials and their sums are not used.
+    the ``c`` CTA partials in rank order; every lane returns the total (``add.rn``, that kernel's
+    ``+=``). The other lanes read CTA 0's partials and their sums are not used.
     """
     g = lane & 15
     g = _selp_b32(Int32(g < c), g, Int32(0))
     cta = _zero_f32()
     for w in range(warps):
-        cta = _add_ftz(cta, _lds_f32(smem + ((g * warps + w) * nvals + stat) * 4))
+        cta = _add(cta, _lds_f32(smem + ((g * warps + w) * nvals + stat) * 4))
     total = _zero_f32()
     for r in range(c):
-        total = _add_ftz(total, _shfl_idx(cta, base_lane + r))
+        total = _add(total, _shfl_idx(cta, base_lane + r))
     return total
 
 
@@ -745,9 +789,9 @@ def _warp_sum(value):
     return value
 
 
-def _warp_max(value):
+def _warp_max(value, maximum=_max_ftz):
     for offset in (16, 8, 4, 2, 1):
-        value = _max_ftz(value, _shfl_xor(value, offset))
+        value = maximum(value, _shfl_xor(value, offset))
     return value
 
 
@@ -1111,8 +1155,10 @@ class K3AttnResFastKernel:
     order of every statistic (within the thread, the warp tree, the CTA's warps in order, then the
     cluster's CTAs in rank order), its softmax (all logits against their common maximum,
     ``p_n = w_n * (1 / sum w)``) and its mixture (``fma`` over the candidates in order) after the
-    wait, with its fast-math instructions, so ``updated`` and the normalized output are the bits of
-    that op. Only the snapshots' statistics and logits are computed before the wait.
+    wait, with its instructions, so ``updated`` and the normalized output are the bits of that op.
+    ``kimiK3Mnnvl`` is compiled without --use_fast_math (unless the build sets ``FAST_MATH``): its
+    divisions are ``div.rn``, ``1 / sum w`` is ``rcp.rn`` and no instruction flushes denormals. Only
+    the snapshots' statistics and logits are computed before the wait.
     """
 
     def __init__(
@@ -1282,25 +1328,28 @@ class K3AttnResFastKernel:
         prefix = []
         if cutlass.const_expr(self.add_mode != ADD_NONE):
             prefix = load(layer_addr + row + col, True)
-        q = [_mul_ftz(res_w[e], rms_w[e]) for e in range(8)]
 
         mo = self.mnnvl_order
-        # The C++ kernels are built with --use_fast_math: their fmaf / += are the .ftz forms.
-        fma = _fma_ftz if mo else _fma
-        add_tree = _add_ftz if mo else _add
+        # The default kernel uses the --use_fast_math forms of kimiK3AttnRes for the products, the
+        # residual add and the rsqrt argument; with mnnvl_order those of kimiK3Mnnvl (IEEE, no ftz).
+        mul = _mul if mo else _mul_ftz
+        rsigma = _rsigma_rn if mo else _rsigma
+        add_prefix = _add if mo else _add_ftz
+        q = [mul(res_w[e], rms_w[e]) for e in range(8)]
+
         snap_f = [unpack(snaps[n]) for n in range(k)]
         stats = []
         for n in cutlass.range_constexpr(k):
             sq = _zero_f32()
             dot = _zero_f32()
             for e in cutlass.range_constexpr(8):
-                sq = fma(snap_f[n][e], snap_f[n][e], sq)
-                dot = fma(snap_f[n][e], q[e], dot)
+                sq = _fma(snap_f[n][e], snap_f[n][e], sq)
+                dot = _fma(snap_f[n][e], q[e], dot)
             stats.append(sq)
             stats.append(dot)
         for _ in cutlass.range_constexpr(self.width - nvals):
             stats.append(_zero_f32())
-        warp_stat = _warp_transpose_sum(stats, lane, add_tree)
+        warp_stat = _warp_transpose_sum(stats, lane, _add)
         vidx = lane >> shift
         sub = lane & ((1 << shift) - 1)
         if cutlass.const_expr(c == 1):
@@ -1334,13 +1383,13 @@ class K3AttnResFastKernel:
                     cta_dot = _zero_f32()
                     for w in cutlass.range_constexpr(warps):
                         j = g * warps + w
-                        cta_sq = _add_ftz(cta_sq, _lds_f32(snap_smem + (j * nvals + 2 * lane) * 4))
-                        cta_dot = _add_ftz(
+                        cta_sq = _add(cta_sq, _lds_f32(snap_smem + (j * nvals + 2 * lane) * 4))
+                        cta_dot = _add(
                             cta_dot, _lds_f32(snap_smem + (j * nvals + 2 * lane + 1) * 4)
                         )
-                    tot_sq = _add_ftz(tot_sq, cta_sq)
-                    tot_dot = _add_ftz(tot_dot, cta_dot)
-                logit = _mul_ftz(tot_dot, _rsigma(tot_sq, eps))
+                    tot_sq = _add(tot_sq, cta_sq)
+                    tot_dot = _add(tot_dot, cta_dot)
+                logit = mul(tot_dot, rsigma(tot_sq, eps))
         else:
             if lane < k:
                 tot_sq = _zero_f32()
@@ -1381,7 +1430,7 @@ class K3AttnResFastKernel:
             else:
                 addend = unpack(load(add_addr + row + col, False))
             pre = unpack(prefix)
-            x = [_round_bf16(_add_ftz(pre[e], addend[e])) for e in range(8)]
+            x = [_round_bf16(add_prefix(pre[e], addend[e])) for e in range(8)]
         elif cutlass.const_expr(self.add_mode == ADD_MOE):
             routed = unpack(load(add_addr + row + col, False))
             shared = unpack(load(add2_addr + row + col, False))
@@ -1398,10 +1447,10 @@ class K3AttnResFastKernel:
         sq = _zero_f32()
         dot = _zero_f32()
         for e in cutlass.range_constexpr(8):
-            sq = fma(x[e], x[e], sq)
-            dot = fma(x[e], q[e], dot)
+            sq = _fma(x[e], x[e], sq)
+            dot = _fma(x[e], q[e], dot)
         # Lanes 0-15 hold the warp's sum of squares, lanes 16-31 its dot product.
-        pair = _warp_transpose_sum([sq, dot], lane, add_tree)
+        pair = _warp_transpose_sum([sq, dot], lane)
         half = lane & 15
         if cutlass.const_expr(c == 1):
             if half == 0:
@@ -1428,25 +1477,25 @@ class K3AttnResFastKernel:
             tot = _warp_transpose_sum([part_sq, part_dot], lane)
             tot_sq = _shfl_idx(tot, 0)
             tot_dot = _shfl_idx(tot, 16)
-        last_logit = _mul_ftz(tot_dot, _rsigma(tot_sq, eps))
+        last_logit = mul(tot_dot, rsigma(tot_sq, eps))
 
         if cutlass.const_expr(mo):
             # The C++ epilogue's softmax: lane n holds logit n (the layer row's is the last), every
-            # weight against the common maximum, p_n = w_n * (1 / sum w) (xor-butterfly sum); the
-            # mixture an fma chain over the candidates in order.
+            # weight against the common maximum, p_n = w_n * (1 / sum w) (xor-butterfly sum, IEEE
+            # reciprocal); the mixture an fma chain over the candidates in order.
             all_logit = _selp(Int32(lane == k), last_logit, logit)
-            top = _warp_max(all_logit)
+            top = _warp_max(all_logit, _max)
             weight = _zero_f32()
             if lane < n_cand:
-                weight = _softmax_term(all_logit, top)
-            prob = _mul_ftz(weight, _rcp_ftz(_warp_sum_bfly_ftz(weight)))
+                weight = _softmax_term_rn(all_logit, top)
+            prob = _mul(weight, _rcp_rn(_warp_sum(weight)))
             probs = [_shfl_idx(prob, n) for n in range(n_cand)]
             mixed = []
             for e in cutlass.range_constexpr(8):
                 val = _zero_f32()
                 for n in cutlass.range_constexpr(k):
-                    val = _fma_ftz(probs[n], snap_f[n][e], val)
-                mixed.append(_round_bf16(_fma_ftz(probs[k], x[e], val)))
+                    val = _fma(probs[n], snap_f[n][e], val)
+                mixed.append(_round_bf16(_fma(probs[k], x[e], val)))
         else:
             # Softmax over all candidates: p_n = exp(logit_n - m_s) * a / den, p_last = b / den.
             new_max = _max_ftz(snap_max, last_logit)
@@ -1458,11 +1507,8 @@ class K3AttnResFastKernel:
             mixed = [_round_bf16(_fma(p_last, x[e], _mul_ftz(scale, premix[e]))) for e in range(8)]
         out_sq = _zero_f32()
         for e in cutlass.range_constexpr(8):
-            out_sq = fma(mixed[e], mixed[e], out_sq)
-        if cutlass.const_expr(mo):
-            out_sq = _warp_sum_bfly_ftz(out_sq)
-        else:
-            out_sq = _warp_sum(out_sq)
+            out_sq = _fma(mixed[e], mixed[e], out_sq)
+        out_sq = _warp_sum(out_sq)
         if cutlass.const_expr(c == 1):
             if lane == 0:
                 _sts_f32(outsq_smem + warp * 4, out_sq)
@@ -1478,10 +1524,10 @@ class K3AttnResFastKernel:
             if lane < parts:
                 part = _lds_f32(outsq_smem + lane * 4)
             out_total = _warp_sum(part)
-        out_rs = _rsigma(out_total, out_eps)
+        out_rs = rsigma(out_total, out_eps)
 
         w_out = unpack(out_w)
-        y = [_mul_ftz(_round_bf16(_mul_ftz(mixed[e], out_rs)), w_out[e]) for e in range(8)]
+        y = [mul(_round_bf16(mul(mixed[e], out_rs)), w_out[e]) for e in range(8)]
         words = [_pack_bf16x2(y[2 * i], y[2 * i + 1]) for i in range(4)]
         _stg_v4_if(valid, out_addr + row + col, words)
         if cutlass.const_expr(self.mxfp8):
