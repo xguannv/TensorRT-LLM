@@ -24,11 +24,11 @@ Checks:
   * eager (1, 8, 9, 16, 32, 64 rows; a layer that snapshots and one that does not; the layer as KDA and as MLA): the
     off arm (the one-shot ``mnnvl_allreduce_attn_res`` up to 8 rows, two-shot on wide steps) bit for bit the pre-change
     chain (o_proj on ``k3_fp8w_lowm_gemm``, then ``K3DecodeComm.allreduce_attn_res``), on every rank alike. The on arm
-    against the off arm: ``updated`` bit for bit (the push GEMM rounds as the plain GEMM, the finish kernel sums in the
-    C++ kernels' order, the residual add is the same bf16 add); ``normed`` within ``_normed_close`` (``K3AttnResFast``
-    sums the attention-residual statistics in another order: per element at most 2^-6 of its magnitude plus 2^-8 of
-    the row's RMS, at most ``MAX_DIFF_FRACTION`` of the elements differ), the same bits on every rank. Switch 2 equals
-    switch 1 on wide steps and the off arm elsewhere, bit for bit. Which collective ran is tapped, not assumed.
+    against the off arm, bit for bit and the same bits on every rank: ``updated`` (the push GEMM rounds as the plain
+    GEMM, the finish kernel sums in the C++ kernels' order, the residual add is the same bf16 add) and ``normed``
+    (``K3AttnResFast`` with ``mnnvl_order`` runs the C++ epilogue's layout, statistics order, softmax and mixture).
+    Switch 2 equals switch 1 on wide steps and the off arm elsewhere, bit for bit. Which collective ran is tapped, not
+    assumed.
   * graphs (8, 16, 32 rows): one step per token count captured in a CUDA graph with the switch on: three layers on the
     push path (KDA, MLA snapshotting, MLA) with the workspace's other users between them: ``mnnvl_allgather_split`` and
     ``allreduce_attn_res`` on the same ``MnnvlWorkspace`` (they share its Lamport rotation), ``sandwich_plain`` on the
@@ -38,8 +38,7 @@ Checks:
     every other collective's output the same bits on both arms and equal to its exact reference (the all-gather's
     concatenation, the latent sum of exact payloads).
 
-Measured on-vs-off error is printed at the end (rank 0): the largest relative error of ``normed`` (max |on - off| /
-max |off|), the largest share of differing elements and the largest difference in bf16 ulps of the element.
+Where ``normed`` differs, the failure names the share of differing elements and the largest difference in bf16 ulps.
 """
 
 import contextlib
@@ -72,7 +71,6 @@ LATENT_ROWS = 8
 LATENT_WORDS = LATENT // 2
 AG_BF16, AG_FP32 = 64, 16  # the all-gather stand-in's columns per rank
 NEG_ZERO = -(2**15)
-MAX_DIFF_FRACTION = 2e-2  # k3_attn_res's fast kernel against the C++ epilogue
 
 R = None
 IMPL = None  # kimi_k3_nvfp4/implementation.py
@@ -80,7 +78,7 @@ DC = None  # decode_comm
 OP = None  # oproj_push
 FLAGS = None  # flags
 BUILT = None
-STATS = {"rel": 0.0, "frac": 0.0, "ulp": 0.0, "push_calls": 0}
+STATS = {"push_calls": 0}
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -105,32 +103,20 @@ def _expect_same(where: str, got: torch.Tensor, want: torch.Tensor, replicated: 
     if not same:
         differ = int((_bytes(got) != _bytes(want)).sum()) if got.shape == want.shape else -1
         raise AssertionError(
-            f"{where}: not bit for bit ({differ} bytes differ, shapes {got.shape} {want.shape})"
+            f"{where}: not bit for bit ({differ} bytes differ, shapes {got.shape} {want.shape}"
+            f"{_ulp_note(got, want)})"
         )
     assert agree, f"{where}: the ranks differ"
 
 
-def _normed_close(where: str, got: torch.Tensor, want: torch.Tensor):
-    """``k3_attn_res``'s fast kernel against another attention-residual epilogue (its test's bound): every element
-    within 2^-6 of its magnitude (two bf16 rounding steps) plus 2^-8 of the row's RMS (where the mix cancels), at most
-    ``MAX_DIFF_FRACTION`` of the elements different; finite; the same bits on every rank."""
+def _ulp_note(got: torch.Tensor, want: torch.Tensor) -> str:
+    """For a bf16 mismatch: the share of differing elements and the largest difference in bf16 ulps of the element."""
+    if got.dtype != torch.bfloat16 or got.shape != want.shape:
+        return ""
     a, e = got.float(), want.float()
-    assert bool(torch.isfinite(a).all()), f"{where}: not finite"
     diff = (a - e).abs()
-    rms = e.pow(2).mean(-1, keepdim=True).sqrt()
-    bound = torch.maximum(a.abs(), e.abs()) * 2.0**-6 + 2.0**-8 * rms
-    frac = float((diff > 0).float().mean())
-    rel = ls.rel_err(got, want)
-    big = e.abs() >= rms * 2.0**-4
-    ulp = float((diff[big] / (e.abs()[big] * 2.0**-8)).max()) if bool(big.any()) else 0.0
-    STATS["rel"] = max(STATS["rel"], rel)
-    STATS["frac"] = max(STATS["frac"], frac)
-    STATS["ulp"] = max(STATS["ulp"], ulp)
-    assert bool((diff <= bound).all()), (
-        f"{where}: normed beyond the bound (max excess {float((diff - bound).max()):.3e})"
-    )
-    assert frac <= MAX_DIFF_FRACTION, f"{where}: {frac:.3%} of the normed elements differ"
-    assert R.same_on_ranks(got), f"{where}: the ranks differ"
+    ulp = torch.exp2(torch.floor(torch.log2(e.abs().clamp_min(2.0**-126))) - 7)
+    return f"; {float((diff > 0).float().mean()):.4%} of the elements, max {float((diff / ulp).max()):.2f} ulp"
 
 
 @contextlib.contextmanager
@@ -406,8 +392,8 @@ def check_takes():
 # Eager
 # ----------------------------------------------------------------------------------------------------------------------
 def _verify_arms(where, on, off):
-    _expect_same(f"{where}: on vs off updated", on["updated"], off["updated"], replicated=True)
-    _normed_close(f"{where}: on vs off normed", on["normed"], off["normed"])
+    for name in ("updated", "normed"):
+        _expect_same(f"{where}: on vs off {name}", on[name], off[name], replicated=True)
 
 
 def check_eager():
@@ -437,8 +423,7 @@ def check_eager():
                                  arms[1 if call.step.wide else 0][name])  # fmt: skip
     if R.rank == 0:
         print(
-            f"[rank 0] eager: off = pre-change chain; on updated = off; normed rel err {STATS['rel']:.2e}, "
-            f"{STATS['frac']:.3%} differ, max {STATS['ulp']:.2f} ulp",
+            "[rank 0] eager: off = pre-change chain; on = off (updated and normed bit for bit)",
             flush=True,
         )
 
@@ -586,9 +571,8 @@ def check_graphs():
     torch.cuda.synchronize()
     if R.rank == 0:
         print(
-            f"[rank 0] graphs {GRAPH_ROWS} replayed {len(REPLAY_ORDER)}x alternately with eager steps: replay = eager; "
-            f"other Lamport users unchanged; normed rel err {STATS['rel']:.2e}, {STATS['frac']:.3%} differ, "
-            f"max {STATS['ulp']:.2f} ulp",
+            f"[rank 0] graphs {GRAPH_ROWS} replayed {len(REPLAY_ORDER)}x alternately with eager steps: replay = eager "
+            "= off arm; other Lamport users unchanged",
             flush=True,
         )
 
@@ -613,9 +597,7 @@ def _run_one_rank(args) -> int:
         code = ls.run_checks(R, CHECKS)
     if R.rank == 0:
         print(
-            f"[rank 0] OPROJ_PUSH on vs off normed: max rel err {STATS['rel']:.3e}, max differing share "
-            f"{STATS['frac']:.4%}, max {STATS['ulp']:.2f} bf16 ulp; updated bit for bit; {STATS['push_calls']} "
-            "eager push calls",
+            f"[rank 0] OPROJ_PUSH on vs off: normed and updated bit for bit; {STATS['push_calls']} eager push calls",
             flush=True,
         )
     return code
