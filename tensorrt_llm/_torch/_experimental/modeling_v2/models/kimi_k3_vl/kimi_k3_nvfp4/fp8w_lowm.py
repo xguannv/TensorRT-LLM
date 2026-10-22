@@ -153,3 +153,59 @@ def install(
         module._k3ll_fp8w_partial_n_tile = partial_n_tile
         count += 1
     return count
+
+
+def append_rows(
+    weight: torch.Tensor, packed_scale: torch.Tensor, rows: torch.Tensor
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """``(weight', packed_scale')``: an FP8 weight-read weight (``N`` a multiple of 128) and its DeepGEMM-packed UE8M0
+    scale with the bf16 ``rows`` appended below it, quantized like the checkpoint's FP8 weights: one power-of-two
+    scale per 128x128 block (the smallest that keeps the block's absolute maximum within E4M3's 448), E4M3 codes.
+    The rows are zero-padded to a multiple of `N_ALIGN` (a partial last 128-row tile). New tensors; the inputs are
+    not modified. None where the inputs are not in that form."""
+    kernel = _kernel()
+    n, k = weight.shape if weight.dim() == 2 else (-1, -1)
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or n % kernel.MMA_M
+        or k % kernel.CTA_K
+        or packed_scale.dtype != torch.int32
+        or packed_scale.dim() != 2
+        or packed_scale.shape[0] != n
+        or rows.dtype != torch.bfloat16
+        or rows.dim() != 2
+        or rows.shape[1] != k
+    ):
+        return None
+    extra = -(-rows.shape[0] // kernel.N_ALIGN) * kernel.N_ALIGN
+    padded = torch.zeros(
+        -(-extra // kernel.MMA_M) * kernel.MMA_M, k, dtype=torch.float32, device=rows.device
+    )
+    padded[: rows.shape[0]] = rows.float()
+    blocks = padded.view(-1, kernel.MMA_M, k // kernel.CTA_K, kernel.CTA_K)
+    amax = blocks.abs().amax(dim=(1, 3)).clamp(min=1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    codes = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn).view(-1, k)[:extra]
+    packed_rows = kernel.pack_ue8m0_block_scale(scale, extra, k)
+    if packed_rows.shape[1] != packed_scale.shape[1]:
+        return None
+    fused_w = torch.cat((weight, codes), dim=0).contiguous()
+    words = torch.cat((packed_scale, packed_rows), dim=0)
+    # DeepGEMM's MN-major layout: int32 [N, ceil(K / 512)] with strides (1, N).
+    fused_s = torch.empty(
+        (words.shape[1], words.shape[0]), dtype=torch.int32, device=words.device
+    ).t()
+    fused_s.copy_(words)
+    return fused_w, fused_s
+
+
+def gemm(
+    x2d: torch.Tensor, weight: torch.Tensor, packed_scale: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """``x2d @ dequant(weight)^T`` on the low-M kernel (a partial last row tile allowed), or None where it does not
+    take the call."""
+    if x2d.dtype != torch.bfloat16 or not _kernel().can_run(
+        x2d, weight, packed_scale, allow_partial_n_tile=True
+    ):
+        return None
+    return torch.ops.trtllm.k3_fp8w_lowm_gemm(x2d, weight, packed_scale)

@@ -107,6 +107,12 @@ TRTLLM_K3LL_KDA_BFA_ROW_TILES = _flag(
     "with TRTLLM_K3LL_KDA_BFA_GEMV: the [f_a | b] projection on decode_gemv site kda_bfa_rt (k3_ctm_gemv_wide over "
     "equal row tiles, more CTAs, the same bits); the site is built at load when this is 1",
 )
+TRTLLM_K3LL_KDA_BFA_FP8 = _flag(
+    "TRTLLM_K3LL_KDA_BFA_FP8",
+    0,
+    "KDA decode / verify: [q | k | v | g | f_a | b] in one k3_fp8w_lowm_gemm, the bf16 [f_a | b] weight quantized "
+    "to FP8 128x128 blocks and appended to the QKVG weight (changes numerics); the weight is built at load when 1",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

@@ -2187,6 +2187,10 @@ class KimiLinearModel(DecoderModel):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
+# KDA layers of this process whose fused FP8 [q | k | v | g | f_a | b] weight is built (TRTLLM_K3LL_KDA_BFA_FP8).
+_BFA_FP8_BUILT = [0]
+
+
 class K3DecodeKDA(KimiKDALinearAttention):
     """FP8 QKVG projection followed by fused gate, convolution and delta recurrence.
 
@@ -2215,6 +2219,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # The decode GEMVs' state for the bf16 [f_a | b] projection (site kda_bfa), set by the target's
         # cache_derived_state under TRTLLM_K3LL_KDA_BFA_GEMV.
         self._bfa_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
+        # (weight, packed scale) of [q | k | v | g | f_a | b | pad] in FP8 (the [f_a | b] rows quantized to 128x128
+        # blocks), built by build_bfa_fp8 on the first eager call under TRTLLM_K3LL_KDA_BFA_FP8.
+        self._qkvg_bfa_fp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
     def takes_k3_kernels(self) -> bool:
@@ -2229,6 +2236,37 @@ class K3DecodeKDA(KimiKDALinearAttention):
             if y is not None:
                 return y
         return torch.nn.functional.linear(x, self._bfa_proj_weight)
+
+    def build_bfa_fp8(self) -> bool:
+        """Build ``_qkvg_bfa_fp8`` from the FP8 QKVG module's weight-read weight and the bf16 ``[f_a | b]`` weight
+        (TRTLLM_K3LL_KDA_BFA_FP8); whether it is built. The QKVG module must hold its packed UE8M0 scale, which its
+        own post_load_weights writes after the target's, so the first eager call builds it."""
+        if self._qkvg_bfa_fp8 is None:
+            proj = self.qkvg_proj
+            weight = getattr(proj, "weight", None)
+            scale = getattr(proj, "weight_scale", None)
+            if isinstance(weight, torch.Tensor) and isinstance(scale, torch.Tensor):
+                self._qkvg_bfa_fp8 = _fp8w_lowm.append_rows(weight, scale, self._bfa_proj_weight)
+                if self._qkvg_bfa_fp8 is not None:
+                    _BFA_FP8_BUILT[0] += 1
+                    if _BFA_FP8_BUILT[0] == 1:
+                        logger.info(
+                            f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_FP8=1: KDA layer {self.layer_idx}'s "
+                            f"[q | k | v | g | f_a | b] in one FP8 weight {tuple(self._qkvg_bfa_fp8[0].shape)}"
+                        )
+        return self._qkvg_bfa_fp8 is not None
+
+    def _k3_fused_rows(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """With TRTLLM_K3LL_KDA_BFA_FP8: ``[q | k | v | g | f_a | b | pad]`` rows of ``x`` from one FP8 GEMM; None
+        without it, under a capture before an eager call has built the weight, or where the low-M kernel does not
+        take the rows."""
+        if not _flags.TRTLLM_K3LL_KDA_BFA_FP8:
+            return None
+        if self._qkvg_bfa_fp8 is None and (
+            torch.cuda.is_current_stream_capturing() or not self.build_bfa_fp8()
+        ):
+            return None
+        return _fp8w_lowm.gemm(x.reshape(-1, x.shape[-1]), *self._qkvg_bfa_fp8)
 
     def finalize_decode_weights(self) -> None:
         super().finalize_decode_weights()
@@ -2317,7 +2355,12 @@ class K3DecodeKDA(KimiKDALinearAttention):
             slots = mamba_metadata.state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
-        qkvg, bfa = self._k3_projections(x)
+        rows = self._k3_fused_rows(x)
+        if rows is not None:
+            n_qkvg = self.qkvg_proj.weight.shape[0]
+            qkvg, bfa = rows[:, :n_qkvg], rows[:, n_qkvg:]
+        else:
+            qkvg, bfa = self._k3_projections(x)
         core = _fp8_attention.kda_decode(
             qkvg,
             bfa,
@@ -2405,12 +2448,14 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = slot_indices[:num_requests]
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
-        qkvg, bfa = self._k3_projections(x)
-        if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
-            # The kernel reads f_a and b from their own rows.
-            rows, bfa_rows = qkvg, bfa
-        else:
-            rows, bfa_rows = torch.cat((qkvg, bfa), dim=-1), None
+        rows, bfa_rows = self._k3_fused_rows(x), None
+        if rows is None:
+            qkvg, bfa = self._k3_projections(x)
+            if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
+                # The kernel reads f_a and b from their own rows.
+                rows, bfa_rows = qkvg, bfa
+            else:
+                rows, bfa_rows = torch.cat((qkvg, bfa), dim=-1), None
         out = k3_fp8_kda_verify(
             rows,
             self.f_b_proj.weight,
