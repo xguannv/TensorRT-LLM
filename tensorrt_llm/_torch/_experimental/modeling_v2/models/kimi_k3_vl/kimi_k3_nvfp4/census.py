@@ -9,7 +9,8 @@ captured path and run no Python):
   with context requests or too many rows), ``decode`` (a pure decode step of R requests x T tokens) or ``small``
   (a non-decode step of at most ``DECODE_MAX_TOKENS`` rows); ``mode`` in ``eager`` / ``capture``;
 - ``fallback:<Class>:<mode>``: a module's ``forward_generic`` called inside a step ``decode_step`` classified as
-  decode or small, i.e. a module that fell back to the generic path where the decode kernels were meant to run.
+  decode or small, i.e. a module that fell back to the generic path where the decode kernels were meant to run;
+- ``dispatch:<path>:<mode>``: a call that ran a switch's kernel path (``dispatch``).
 
 A line ``Kimi K3 census: ...`` is logged on rank 0 whenever a new key appears or a count reaches a power of two,
 which bounds the log at O(log steps) lines per key. The last such line holds the totals.
@@ -111,6 +112,13 @@ def install_model(model_cls, decode_step) -> None:
 
     model_cls.forward = counted
     _installed.add(model_cls)
+
+
+def dispatch(path: str) -> None:
+    """Record one Python-executed call (eager or under capture) that took a switch's kernel path ``path``, as
+    ``dispatch:<path>:<mode>``."""
+    if ENABLED:
+        _bump(f"dispatch:{path}:{_mode()}")
 
 
 def counts() -> dict:

@@ -90,6 +90,12 @@ TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
     1,
     "MLA DSpark drafter: block decode on its cute-dsl implementation when speculative_config leaves it at AUTO",
 )
+TRTLLM_K3LL_DRAFTER_MLA_FUSED = _flag(
+    "TRTLLM_K3LL_DRAFTER_MLA_FUSED",
+    0,
+    "MLA DSpark drafter (with TRTLLM_K3LL_MLA_DRAFTER_QKV): nope absorption, block attention and V up-projection "
+    "in one clustered dspark_mla_attend launch per layer (draft tokens only: a different summation order)",
+)
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",
     1,

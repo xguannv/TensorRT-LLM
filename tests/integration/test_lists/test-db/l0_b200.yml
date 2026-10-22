@@ -200,6 +200,9 @@ l0_b200:
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_gemv.py
   # The Kimi K3 target's DSpark drafter on the drafter entries, against the stock block forward.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter.py
+  # The MLA DSpark drafter's one-launch block attention (TRTLLM_K3LL_DRAFTER_MLA_FUSED), off arm against the chain
+  # it replaced.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter_mla_fused.py
   # The Kimi K3 targets' construction checks and the drift check of tp16_moetp16ep1's copied modules.
   # l0_b300's modeling_v2 entry, the only other one that collects them, is waived (nvbugs/6853741).
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_construction.py

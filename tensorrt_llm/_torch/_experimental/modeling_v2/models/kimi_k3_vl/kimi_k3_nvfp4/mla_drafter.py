@@ -15,6 +15,11 @@ group's decode state (``decode_comm.K3DecodeComm``):
 Where the sandwich does not take a call (more rows than one token tile), the projection runs alone and
 ``comm/mnnvl_fusion_allreduce`` applies the add and the norm. A block the fused all-reduces do not hold (more rows than
 the MNNVL workspace, an eager drafter backend, no page table) runs the stock forward.
+
+With ``TRTLLM_K3LL_DRAFTER_MLA_FUSED`` (and the fused query / latent path of ``TRTLLM_K3LL_MLA_DRAFTER_QKV``) each
+layer's nope absorption, block attention over context and block, and V up-projection run as one clustered
+``dspark_mla_attend`` launch (`K3MLADrafterNorms._attend_fused`) instead of the absorption BMM, the cute-dsl decode's
+split-KV and reduction kernels and the up-projection.
 """
 
 from typing import Callable, FrozenSet, List, Optional, Tuple
@@ -22,6 +27,7 @@ from typing import Callable, FrozenSet, List, Optional, Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.models.modeling_dspark import (
     _build_mla_block_fixup,
     _mla_rope_into,
@@ -29,7 +35,9 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 )
 from tensorrt_llm.logger import logger
 
+from . import census as _census
 from . import decode_comm as _decode_comm
+from . import flags as _flags
 from . import mla_drafter_qkv as _qkv
 
 
@@ -64,7 +72,8 @@ class K3MLADrafterNorms:
     target's decode GEMVs, ``drafter_gate_up``; None until built) is read at each call; ``stock``: the drafter's own
     ``dflash_forward``; ``forms``: the ``k3_sandwich_plain`` forms that compiled (``o_proj``, ``down``);
     ``a_weights``: with the fused query / latent path (`install`'s ``qkv``), each layer's ``[q_a_proj | kv_a_proj]``
-    weight, else None."""
+    weight, else None; ``fused``: whether the one-launch block attention may run (`_attend_fused`; the launch value of
+    ``TRTLLM_K3LL_DRAFTER_MLA_FUSED``, read again at each call)."""
 
     def __init__(
         self,
@@ -74,6 +83,7 @@ class K3MLADrafterNorms:
         stock: Callable[..., torch.Tensor],
         forms: FrozenSet[str],
         a_weights: Optional[List[torch.Tensor]] = None,
+        fused: bool = False,
     ):
         self.drafter = drafter
         self.comm = comm
@@ -81,6 +91,11 @@ class K3MLADrafterNorms:
         self.stock = stock
         self.forms = forms
         self.a_weights = a_weights
+        self.fused = fused
+        # Per attention module: (its k_b / v_b buffers' addresses, k_b transposed [H, 512, 128], v_b [H, 128, 512]).
+        self._fused_weights = {}
+        # (heads, block, page size, PDL, cluster) of every dspark_mla_attend build that ran eagerly.
+        self._fused_ran = set()
 
     @staticmethod
     def layers_take(drafter: nn.Module) -> bool:
@@ -135,7 +150,15 @@ class K3MLADrafterNorms:
             ):
                 forms.add(form)
         a_weights = cls._fuse_a_weights(layers) if qkv else None
-        owner = cls(drafter, comm, gemvs_owner, drafter.dflash_forward, frozenset(forms), a_weights)
+        owner = cls(
+            drafter,
+            comm,
+            gemvs_owner,
+            drafter.dflash_forward,
+            frozenset(forms),
+            a_weights,
+            fused=bool(_flags.TRTLLM_K3LL_DRAFTER_MLA_FUSED) and a_weights is not None,
+        )
         drafter.dflash_forward = _Bound(owner)
         return owner
 
@@ -290,7 +313,8 @@ class K3MLADrafterNorms:
     ) -> Optional[torch.Tensor]:
         """`_attention` with both a-projections as one GEMV over ``[q_a | kv_a]`` and ``trtllm::k3_drafter_mla_a_post``
         (the q_a RMSNorm, and the block latent's RMSNorm + RoPE stored into the pool), then the stock q_b projection,
-        query RoPE and nope absorption, and the cute-dsl decode; None where the kernel does not take the operands."""
+        then the one-launch block attention (`_attend_fused`) where it runs, else the query RoPE and nope absorption,
+        the cute-dsl decode and the V up-projection; None where the kernel does not take the operands."""
         drafter = self.drafter
         gemvs = getattr(self.gemvs_owner, "decode_gemvs", None)
         a = None if gemvs is None else gemvs.project("kv_a", normed, a_weight)
@@ -309,10 +333,100 @@ class K3MLADrafterNorms:
             attn.q_a_layernorm.variance_epsilon,
             attn.kv_a_layernorm.variance_epsilon,
         )
-        query = self._query(attn, attn.q_b_proj(q_a), blk_freqs, batch, block)
+        q = attn.q_b_proj(q_a)
+        attn_out = self._attend_fused(attn, q, blk_freqs, layer_cache, fixup, batch, block)
+        if attn_out is not None:
+            return attn_out
+        query = self._query(attn, q, blk_freqs, batch, block)
         ctx_out = drafter._cute_dsl_block_decode(query, layer_cache, fixup, block)
         attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
         return attn_out.reshape(batch * block, -1)
+
+    def _attend_fused(
+        self,
+        attn: nn.Module,
+        q: torch.Tensor,
+        blk_freqs: torch.Tensor,
+        layer_cache: torch.Tensor,
+        fixup,
+        batch: int,
+        block: int,
+    ) -> Optional[torch.Tensor]:
+        """The layer's attention output ``[B * block, heads x v_head_dim]`` from q_b's output ``q``: the query RoPE
+        into place (``_mla_rope_into``), then one ``dspark_mla_attend`` launch for the nope absorption, the attention
+        over context and block (every block token sees the whole block, as the cute-dsl decode's ``kv_bounds``) and the
+        V up-projection. None where ``TRTLLM_K3LL_DRAFTER_MLA_FUSED`` is off (now or at launch), the kernel does not
+        take the operands, or, under CUDA-graph capture, its operands or build have not been made by an eager call: the
+        caller then runs the separate kernels."""
+        if not (self.fused and _flags.TRTLLM_K3LL_DRAFTER_MLA_FUSED):
+            return None
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell import dspark_mla_attend as _attend
+
+        drafter = self.drafter
+        capturing = torch.cuda.is_current_stream_capturing()
+        weights = self._fused_operands(attn, capturing)
+        if weights is None:
+            return None
+        k_b_t, v_b = weights
+        num_heads = drafter._num_heads
+        nope, rope, latent = (
+            drafter.qk_nope_head_dim,
+            drafter.qk_rope_head_dim,
+            drafter.kv_lora_rank,
+        )
+        q = q.view(batch, block, num_heads, nope + rope)
+        pool = layer_cache[:, 0, 0]
+        query = torch.empty(
+            (batch, block, num_heads, latent + rope), dtype=q.dtype, device=q.device
+        )
+        if not _attend.can_run(
+            q, query, pool, fixup.page_tables_i32, fixup.seq_lens_i32, k_b_t, v_b
+        ):
+            return None
+        use_pdl = get_env_enable_pdl()
+        build = (num_heads, block, pool.shape[1], use_pdl, _attend._default_cluster(batch))
+        if capturing and build not in self._fused_ran:
+            return None
+        if not _mla_rope_into(q, blk_freqs, query, num_heads, rope, latent):
+            return None
+        out = torch.empty((batch, block, num_heads, v_b.shape[1]), dtype=q.dtype, device=q.device)
+        _attend.run_dspark_mla_attend(
+            q,
+            query,
+            pool,
+            fixup.page_tables_i32,
+            fixup.seq_lens_i32,
+            k_b_t,
+            v_b,
+            drafter.softmax_scale,
+            out,
+            use_pdl=use_pdl,
+            cluster=build[4],
+        )
+        if not capturing:
+            self._fused_ran.add(build)
+        _census.dispatch("drafter_mla_fused")
+        return out.view(batch * block, -1)
+
+    def _fused_operands(
+        self, attn: nn.Module, capturing: bool
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """``attn``'s ``k_b`` transposed to ``[H, kv_lora_rank, nope]`` and ``v_b`` ``[H, v_head_dim, kv_lora_rank]``,
+        bf16 contiguous, made on the first eager call (and again if the module's buffers are replaced); None under
+        capture before that."""
+        k_b, v_b = attn._k_b_proj, attn._v_b_proj
+        key = (k_b.data_ptr(), v_b.data_ptr())
+        cached = self._fused_weights.get(id(attn))
+        if cached is None or cached[0] != key:
+            if capturing:
+                return None
+            cached = (
+                key,
+                k_b.detach().to(torch.bfloat16).transpose(1, 2).contiguous(),
+                v_b.detach().to(torch.bfloat16).contiguous(),
+            )
+            self._fused_weights[id(attn)] = cached
+        return cached[1], cached[2]
 
     def _query(
         self, attn: nn.Module, q: torch.Tensor, blk_freqs: torch.Tensor, batch: int, block: int
@@ -423,6 +537,7 @@ class _Bound:
 
 
 def log_install(owner: Optional[K3MLADrafterNorms], qkv: bool = False) -> None:
+    fused = owner is not None and owner.fused
     logger.info(
         "Kimi K3 MLA DSpark drafter: residual adds and RMSNorms "
         + (
@@ -439,5 +554,9 @@ def log_install(owner: Optional[K3MLADrafterNorms], qkv: bool = False) -> None:
                 if owner is not None and owner.a_weights is not None
                 else "on the stock projections (shapes the kernel does not take)"
             )
+        )
+        + (
+            f"; TRTLLM_K3LL_DRAFTER_MLA_FUSED={_flags.TRTLLM_K3LL_DRAFTER_MLA_FUSED}: block attention "
+            + ("in one dspark_mla_attend launch per layer" if fused else "on the separate kernels")
         )
     )
