@@ -187,6 +187,12 @@ TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
     "MLA decode split read: the CuTe DSL FP8 split-KV kernel and its reduction with programmatic dependent launch "
     "(k3_mla_decode_fp8_pdl)",
 )
+TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
+    "TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A",
+    0,
+    "Helix MLA decode: every head's BF16 V up-projection inside the split-KV reduction, the exchange at 128 values "
+    "per head, then the gate (mla_v_up.py); 1 at launch builds the BF16 W_UV of all heads (12.6 MB per MLA layer)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

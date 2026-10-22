@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -281,6 +281,58 @@ def exchange_combine_fused(
     )
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Helix: the V up-projection before the exchange (TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A, mla_v_up.py).
+# ----------------------------------------------------------------------------------------------------------------------
+
+#: Values per head after the V up-projection.
+V_HEAD_DIM = 128
+
+
+def split_read_attention_v_up(
+    q: torch.Tensor,
+    kv_pages: torch.Tensor,
+    plan: SplitReadPlan,
+    latent: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    workspace: torch.Tensor,
+    softmax_scale: float,
+    output_scale: float,
+    max_batch: int,
+    v_weight: torch.Tensor,
+    v_out: torch.Tensor,
+) -> None:
+    """``split_read_attention`` with the softmax statistics, followed by every head's V up-projection
+    (``trtllm::k3_mla_decode_fp8_v_up``).
+
+    Args:
+        latent: ``[batch, q_len, heads, 512]`` bf16 scratch (written only where the op does not fuse the projection).
+        v_weight: ``[heads, 128, 512]`` bf16 ``W_UV`` of every head.
+        v_out: ``[batch * q_len, heads, 128]`` bf16, the projected partial of every head (written).
+    """
+    from . import census as _census
+    from . import mla_v_up  # noqa: F401  (registers the op)
+
+    if _flags.TRTLLM_K3LL_MLA_DECODE_PDL:
+        _census.count(f"mla_decode_pdl:{_census.mode()}")
+    torch.ops.trtllm.k3_mla_decode_fp8_v_up(
+        q,
+        kv_pages,
+        plan.page_table,
+        plan.cache_seqs,
+        plan.kv_bounds,
+        latent,
+        workspace,
+        softmax_stats,
+        v_weight,
+        v_out,
+        softmax_scale,
+        output_scale,
+        max_batch,
+        bool(_flags.TRTLLM_K3LL_MLA_DECODE_PDL),
+    )
+
+
 def default_softmax_scale(qk_nope_head_dim: int = 128, q_scaling: float = 1.0) -> float:
     return 1.0 / (math.sqrt(qk_nope_head_dim + QK_ROPE_DIM) * q_scaling)
 
@@ -362,6 +414,7 @@ class MlaSplitRead:
         # Helix exchange state on MNNVL (build_helix_comm); None: the NCCL collectives.
         self._q_gather_ws = None
         self._a2a_fused = None
+        self._v_up_logged = False
 
     @staticmethod
     def applies(mqa, mapping) -> bool:
@@ -500,11 +553,20 @@ class MlaSplitRead:
         bmm1: torch.Tensor,
         bmm2: torch.Tensor,
         all_heads: bool = False,
+        v_up_weight: Optional[torch.Tensor] = None,
+        v_up_gate: Optional[Union[torch.Tensor, Callable[[], torch.Tensor]]] = None,
     ) -> torch.Tensor:
         """``quant_q``: ``[tokens, heads_per_rank, 576]`` FP8 bytes of this rank's heads, or with ``all_heads``
         (Helix only) ``[tokens, heads, 576]`` of every head, computed on this rank, which then needs no query
         all-gather. Returns the attention latent of this rank's heads, ``[tokens, heads_per_rank * 512]`` bf16 (what
-        the stock attention returns)."""
+        the stock attention returns).
+
+        ``v_up_weight`` (Helix only): ``[heads, 128, 512]`` bf16 ``W_UV`` of every head. The V up-projection then runs
+        on this rank's partials before the exchange, which carries 128 values per head (with the split read's
+        ``(max, sum)`` per head as they are), and the result is the gated attention output of this rank's heads,
+        ``[tokens, heads_per_rank * 128]`` bf16: ``v_up_gate`` is the pre-sigmoid gate of those values, a bf16
+        ``[tokens, heads_per_rank * 128]`` view (unit column stride, 16-byte aligned rows), or a callable returning it,
+        called after the split read and before the exchange (where a gate computed on a side stream is joined)."""
         num_requests = meta.num_generations
         tokens = num_requests * q_len
         hp, cp = self.heads_per_rank, self.cp
@@ -541,6 +603,8 @@ class MlaSplitRead:
             )
             self._logged = True
 
+        if v_up_weight is not None and (not self.helix or v_up_gate is None):
+            raise ValueError("the V up-projection before the exchange is a Helix decode path")
         if cp == 1:
             # the stock backend's operands: a [blocks, R] view of the block rows, global lengths, built-in causal mask
             page_table = block_rows.t()
@@ -577,6 +641,10 @@ class MlaSplitRead:
                 plan.page_table + layer_in_pool, plan.cache_seqs, plan.kv_bounds, plan.empty
             )
         stats = torch.empty(tokens, self.heads, 2, dtype=torch.float32, device=quant_q.device)
+        if v_up_weight is not None:
+            return self._forward_v_up(
+                q_all, pages, plan, out, stats, softmax_scale, output_scale, v_up_weight, v_up_gate
+            )
         split_read_attention(
             q_all,
             pages,
@@ -598,3 +666,60 @@ class MlaSplitRead:
         s_chunks = stats.view(tokens, cp, hp, 2).transpose(0, 1).contiguous()
         o_recv, s_recv = alltoall_helix([*o_chunks.unbind(0), *s_chunks.unbind(0)], self.group)
         return combine(o_recv, s_recv)
+
+    def _forward_v_up(
+        self, q_all, pages, plan, latent, stats, softmax_scale, output_scale, v_up_weight, gate
+    ) -> torch.Tensor:
+        """The Helix split read with every head's V up-projection on this rank's partials, then the exchange of
+        128 values per head and the combine (``helix_a2a_fused`` at head dim 128, or NCCL)."""
+        tokens = stats.shape[0]
+        hp, cp = self.heads_per_rank, self.cp
+        v_part = torch.empty(
+            tokens, self.heads, V_HEAD_DIM, dtype=torch.bfloat16, device=stats.device
+        )
+        split_read_attention_v_up(
+            q_all,
+            pages,
+            plan,
+            latent,
+            stats,
+            self._workspace,
+            softmax_scale,
+            output_scale,
+            MAX_REQUESTS,
+            v_up_weight,
+            v_part,
+        )
+        from . import mla_v_up
+
+        fused_exchange = self._a2a_fused is not None and _flags.TRTLLM_K3LL_HELIX_A2A_FUSED
+        if not self._v_up_logged and self.rank == 0:
+            from tensorrt_llm.logger import logger
+
+            fused = mla_v_up.fused_applies(
+                latent.shape[0], latent.shape[1], self.heads, PAGE_SIZE, MAX_REQUESTS
+            )
+            logger.info(
+                f"K3 MLA Helix V-up before the all-to-all: {self.heads} heads x {V_HEAD_DIM} per rank, exchange "
+                f"{'helix_a2a_gated (gate in the combine)' if fused_exchange else 'NCCL + k3_mla_gate'} at head dim "
+                f"{V_HEAD_DIM}, "
+                f"requests={latent.shape[0]} q_len={latent.shape[1]} "
+                f"reduce={'fused reduce_v_up' if fused else 'reduction + bmm'}"
+            )
+            self._v_up_logged = True
+        from . import census as _census
+
+        _census.count(f"helix_v_up:{_census.mode()}")
+        if callable(gate):
+            gate = gate()
+        if fused_exchange:
+            return mla_v_up.exchange_combine_gated(
+                v_part.view(tokens, -1), stats, plan.empty, gate, self._a2a_fused, hp
+            )
+        from tensorrt_llm._torch.distributed.ops import alltoall_helix
+
+        sanitize_empty(v_part, stats, plan.empty)
+        o_chunks = v_part.view(tokens, cp, hp * V_HEAD_DIM).transpose(0, 1).contiguous()
+        s_chunks = stats.view(tokens, cp, hp, 2).transpose(0, 1).contiguous()
+        o_recv, s_recv = alltoall_helix([*o_chunks.unbind(0), *s_chunks.unbind(0)], self.group)
+        return mla_v_up.mla_gate(combine(o_recv, s_recv), gate, 0)

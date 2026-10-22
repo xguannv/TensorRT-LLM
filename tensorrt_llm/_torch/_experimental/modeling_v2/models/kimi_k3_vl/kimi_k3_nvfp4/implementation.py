@@ -71,6 +71,7 @@ from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
 from . import mla_drafter as _mla_drafter
+from . import mla_v_up as _mla_v_up
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .decode_mla_dcp import MlaSplitRead
@@ -104,6 +105,10 @@ REQUIRED_TRTLLM_OPS = (
     "k3_fp8_mla_output",
     # The split read's FP8 MLA decode with programmatic dependent launch (mla_decode_pdl.py).
     "k3_mla_decode_fp8_pdl",
+    # Helix MLA decode with the V up-projection before the exchange (mla_v_up.py).
+    "k3_mla_decode_fp8_v_up",
+    "k3_helix_a2a_gated",
+    "k3_mla_gate",
     # The decode path's GEMVs, the dense MLP's activation, the LM head and the embedding (decode_gemv.py).
     "k3_decode_gemv",
     "k3_ctm_gemv_wide",
@@ -152,6 +157,10 @@ REQUIRED_ENGINE_FIELDS = {
 UNCERTIFIED_GENERIC_CALLS = (
     # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
+    # The stock checkpoint readers of an FP8 projection's codes and block scales (the Helix V-up's W_UV, with
+    # TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A at launch).
+    "tensorrt_llm._torch.models.modeling_kimi_linear._checkpoint_fp8_pair",
+    "tensorrt_llm._torch.models.modeling_kimi_linear._materialize",
     "tensorrt_llm._torch.models.modeling_speculative.SpecDecOneEngineForCausalLM",
     "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
     # The text model's stock modules.
@@ -2549,6 +2558,10 @@ class K3DecodeMLA(KimiK3MLAAttention):
     projection on a side stream and the V-B / gate kernel reads it in place.
     """
 
+    # Under Helix with TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A at launch: the BF16 W_UV [heads, 128, 512] of every head
+    # (set_helix_v_up), which the decode applies before the exchange; None otherwise.
+    _helix_v_up_weight: Optional[torch.Tensor] = None
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._fp8_qb_weight = self._fp8_qb_scale = None
@@ -2599,6 +2612,16 @@ class K3DecodeMLA(KimiK3MLAAttention):
         ) or (linear.weight.is_cuda and torch.cuda.get_device_capability() == (10, 7))
         if self._fp8_qb_ue8m0:
             resmooth_to_fp8_e8m0(self._fp8_qb_weight, self._fp8_qb_scale)
+
+    def set_helix_v_up(self, codes: torch.Tensor, scales: torch.Tensor) -> None:
+        """Keep the BF16 ``W_UV`` of every head for the Helix decode's V up-projection before the exchange, from the
+        checkpoint's FP8 V-B codes ``[heads, 128, 512]`` and 128 x 128 block scales ``[heads, 1, 4]`` of all heads
+        (the codes this rank's ``v_b_proj`` holds a head group of)."""
+        if not self.mapping.has_cp_helix():
+            raise ValueError("the V up-projection before the exchange is a Helix decode path")
+        if tuple(codes.shape) != (self.num_heads_tp, self.v_head_dim, self.kv_lora_rank):
+            raise ValueError(f"V-B codes {tuple(codes.shape)} do not hold every head")
+        self._helix_v_up_weight = _mla_v_up.dequantize_v_b(codes, scales)
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
@@ -2814,28 +2837,34 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if gate_side:
             self._gate_side.fork(self.g_proj, x, do_multi_stream())
         if self._split_read is not None:
-            latent = self._split_read.forward(
-                self.mqa, quant_q, metadata, ag.shape[0] // metadata.num_generations, bmm1, bmm2
-            )
-        else:
-            latent = self._attn_forward_gen(
-                self.mqa,
-                query,
-                None,
-                None,
-                position_ids,
+            return self._split_read_output(
+                quant_q,
                 metadata,
-                attention_input_type=AttentionInputType.generation_only,
-                out_scale=self.out_scale,
-                latent_cache=latent_cache,
-                q_pe=q_pe,
-                cu_q_seqlens=cu_q,
-                cu_kv_seqlens=cu_kv,
-                fmha_scheduler_counter=scheduler,
-                mla_bmm1_scale=bmm1,
-                mla_bmm2_scale=bmm2,
-                quant_q_buffer=quant_q,
+                ag.shape[0] // metadata.num_generations,
+                bmm1,
+                bmm2,
+                ag,
+                gate_side,
+                gate_col,
             )
+        latent = self._attn_forward_gen(
+            self.mqa,
+            query,
+            None,
+            None,
+            position_ids,
+            metadata,
+            attention_input_type=AttentionInputType.generation_only,
+            out_scale=self.out_scale,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            cu_q_seqlens=cu_q,
+            cu_kv_seqlens=cu_kv,
+            fmha_scheduler_counter=scheduler,
+            mla_bmm1_scale=bmm1,
+            mla_bmm2_scale=bmm2,
+            quant_q_buffer=quant_q,
+        )
         if gate_side:
             gate, gate_col = self._gate_side.join(), 0
         else:
@@ -2926,20 +2955,65 @@ class K3DecodeMLA(KimiK3MLAAttention):
             )
         if gate_side:
             self._gate_side.fork(self.g_proj, x, do_multi_stream())
-        latent = self._split_read.forward(
-            self.mqa,
+        return self._split_read_output(
             quant_q,
             metadata,
             rows // metadata.num_generations,
             bmm1,
             bmm2,
+            ag,
+            gate_side,
+            gate_col,
             all_heads=True,
         )
-        if gate_side:
-            gate, gate_col = self._gate_side.join(), 0
-        else:
-            gate = ag
-        return _fp8_attention.mla_output(latent, self.v_b_proj, self.v_b_proj_scale, gate, gate_col)
+
+    def _split_read_output(
+        self,
+        quant_q: torch.Tensor,
+        metadata: AttentionMetadata,
+        q_len: int,
+        bmm1: torch.Tensor,
+        bmm2: torch.Tensor,
+        ag: torch.Tensor,
+        gate_side: bool,
+        gate_col: int,
+        all_heads: bool = False,
+    ) -> torch.Tensor:
+        """The split read's attention, V up-projection and gate of this rank's heads, ``[tokens, heads * 128]``. The
+        gate is ``ag``'s columns from ``gate_col``, or with ``gate_side`` the side stream's projection, joined where it
+        is first read.
+
+        ``TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A`` (read here, per call; needs the W_UV built at launch): every head's BF16
+        V up-projection on this rank's partials before the exchange, the gate in the exchange's combine.
+        Otherwise the latent of this rank's heads after the exchange, then the FP8 V-B and the gate
+        (``k3_fp8_mla_output``)."""
+
+        def gate() -> Tuple[torch.Tensor, int]:
+            return (self._gate_side.join(), 0) if gate_side else (ag, gate_col)
+
+        if self._helix_v_up_weight is not None and _flags.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A:
+            width = self._decode_heads * self.v_head_dim
+
+            def v_up_gate() -> torch.Tensor:
+                g, col = gate()
+                return g[:, col : col + width]
+
+            return self._split_read.forward(
+                self.mqa,
+                quant_q,
+                metadata,
+                q_len,
+                bmm1,
+                bmm2,
+                all_heads=all_heads,
+                v_up_weight=self._helix_v_up_weight,
+                v_up_gate=v_up_gate,
+            )
+        latent = self._split_read.forward(
+            self.mqa, quant_q, metadata, q_len, bmm1, bmm2, all_heads=all_heads
+        )
+        g, col = gate()
+        return _fp8_attention.mla_output(latent, self.v_b_proj, self.v_b_proj_scale, g, col)
 
     def forward_generic(
         self,
@@ -3878,7 +3952,48 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.mixer.prepare_fp8_decode_weights()
+        if _flags.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A and self.model_config.mapping.has_cp_helix():
+            self._load_helix_v_up(weights, prefix)
         return count
+
+    def _load_helix_v_up(self, weights: Dict[str, torch.Tensor], prefix: str) -> None:
+        """``TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A`` at launch, under Helix: every MLA layer keeps the BF16 ``W_UV`` of all
+        heads, dequantized from the checkpoint's FP8 KV-B (the codes and scales its ``v_b_proj`` takes a head group
+        of)."""
+        from tensorrt_llm._torch.models.modeling_kimi_linear import (
+            _checkpoint_fp8_pair,
+            _materialize,
+        )
+
+        layers = 0
+        for name, linear, attention in self._attention_fp8_linears():
+            if not (name.endswith(".kv_b_proj") and isinstance(attention, K3DecodeMLA)):
+                continue
+            key = prefix + name.replace(".self_attn.mixer.", ".self_attn.") + ".weight"
+            pair = _checkpoint_fp8_pair(key, _materialize(weights[key]), weights)
+            if pair is None:
+                raise ValueError(
+                    f"{key}: the Helix V up-projection needs the checkpoint's FP8 KV-B"
+                )
+            codes, scales = pair
+            h, n, v, k = (
+                attention.num_heads_tp,
+                attention.qk_nope_head_dim,
+                attention.v_head_dim,
+                attention.kv_lora_rank,
+            )
+            device = linear.weight.device
+            codes = linear.load_shard(codes, device=device).reshape(h, n + v, k)
+            scales = linear.load_shard(scales, scale_span=128, device=device).reshape(
+                h, (n + v) // 128, k // 128
+            )
+            attention.set_helix_v_up(codes[:, n:], scales[:, n // 128 :])
+            layers += 1
+        if self.model_config.mapping.cp_rank == 0:
+            logger.info(
+                f"Kimi K3 NVFP4 Helix MLA V-up before the all-to-all (TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A=1 at launch): "
+                f"BF16 W_UV of every head on {layers} layers"
+            )
 
     def cache_derived_state(self) -> None:
         """Build the decode GEMVs' state once the weights are final: the LM head's workspace, and one eager call of

@@ -1144,21 +1144,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.emit_softmax_stats):
-                reduction_kernel = self.reduction_kernel(
-                    o_unpacked,
-                    (lse_unpacked, softmax_stats_unpacked),
-                    acc_o,
-                    acc_lse,
-                    split_kv,
-                    cache_seqs,
-                    kv_bounds,
-                    cum_seq_lens_q,
-                    block_split_kvs,
-                )
-            else:
-                reduction_kernel = self.reduction_kernel(
+                self._launch_reduction(
                     o_unpacked,
                     lse_unpacked,
+                    softmax_stats_unpacked,
                     acc_o,
                     acc_lse,
                     split_kv,
@@ -1166,19 +1155,80 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     kv_bounds,
                     cum_seq_lens_q,
                     block_split_kvs,
-                )
-            reduction_kernel.launch(
-                grid=(
-                    o_unpacked.shape[0] * self.reducer_d_tiles,
-                    self.seq_len_q,
                     runtime_batch_size,
-                ),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=self.reducer_max_splits * self.acc_dtype.width // 8,
-                stream=stream,
-                min_blocks_per_mp=1,
-                use_pdl=self.use_pdl,
+                    stream,
+                )
+            else:
+                self._launch_reduction(
+                    o_unpacked,
+                    lse_unpacked,
+                    None,
+                    acc_o,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    kv_bounds,
+                    cum_seq_lens_q,
+                    block_split_kvs,
+                    runtime_batch_size,
+                    stream,
+                )
+
+    @cute.jit
+    def _launch_reduction(
+        self,
+        o_unpacked,
+        lse_unpacked,
+        softmax_stats_unpacked,
+        acc_o,
+        acc_lse,
+        split_kv,
+        cache_seqs,
+        kv_bounds,
+        cum_seq_lens_q,
+        block_split_kvs,
+        runtime_batch_size,
+        stream,
+    ):
+        """Launch the reduction of the split-KV partials (``acc_o`` / ``acc_lse``) into ``o`` and
+        ``lse`` (and the Helix softmax statistics when ``softmax_stats_unpacked`` is given).
+        A subclass may replace it with another consumer of the same partials."""
+        if cutlass.const_expr(softmax_stats_unpacked is not None):
+            reduction_kernel = self.reduction_kernel(
+                o_unpacked,
+                (lse_unpacked, softmax_stats_unpacked),
+                acc_o,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                kv_bounds,
+                cum_seq_lens_q,
+                block_split_kvs,
             )
+        else:
+            reduction_kernel = self.reduction_kernel(
+                o_unpacked,
+                lse_unpacked,
+                acc_o,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                kv_bounds,
+                cum_seq_lens_q,
+                block_split_kvs,
+            )
+        reduction_kernel.launch(
+            grid=(
+                o_unpacked.shape[0] * self.reducer_d_tiles,
+                self.seq_len_q,
+                runtime_batch_size,
+            ),
+            block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
+            smem=self.reducer_max_splits * self.acc_dtype.width // 8,
+            stream=stream,
+            min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
+        )
 
     @cute.jit
     def make_paged_tiled_tma_atom(
