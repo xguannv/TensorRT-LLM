@@ -126,6 +126,27 @@ def load_layer(layer: int, rank: int = RHO):
     return w_uv, w_scale, g, torch.ones(LATENT, device="cuda"), False
 
 
+def load_w_uv_all(layer: int):
+    """W_UV of all 96 heads, dequantized FP32 ``[96, 128, 512]`` (M1-o's V-up before the exchange)."""
+    if CKPT and os.path.isdir(CKPT):
+        from safetensors import safe_open
+
+        with open(os.path.join(CKPT, "model.safetensors.index.json")) as f:
+            index = json.load(f)["weight_map"]
+        prefix = f"language_model.model.layers.{layer}.self_attn."
+        t = {}
+        for name in ("kv_b_proj.weight", "kv_b_proj.weight_scale"):
+            with safe_open(os.path.join(CKPT, index[prefix + name]), "pt", device="cuda") as f:
+                t[name] = f.get_tensor(prefix + name)
+        w = _dequant_block(t["kv_b_proj.weight"], t["kv_b_proj.weight_scale"])
+        return w.view(HEADS, 256, LATENT)[:, VDIM:].contiguous()
+    return torch.cat([_dequant_rank(*load_layer(layer, r)[:2]) for r in range(P)])
+
+
+def _dequant_rank(w_uv, w_scale):
+    return w_uv.float() * w_scale.float().repeat_interleave(128, 1)[:, None, :]
+
+
 def make_partials(rows: int, kv_norm: torch.Tensor, seed: int):
     """Per source rank: normalized partial outputs ``[T, 96 * 512]`` BF16 and ``(max, sum)`` ``[T, 96, 2]`` of a
     softmax over a synthetic latent cache, and the zero-KV mask ``[T]`` (rows empty on that rank: NaN partials,
@@ -286,6 +307,70 @@ class New:
         return self.out
 
 
+class M1o:
+    """M1-o's expected receive side: V-up before the exchange (each source's partials of all 96 heads projected to
+    128 wide, FP32 then one BF16 rounding, standing in for a V-up in the split read's reducer), ``helix_a2a_fused``
+    at 128 wide (one ``(max, sum)`` per head, no statistics copy), then the sigmoid gate (one Triton kernel; zero if
+    M1-o folds it into the combine)."""
+
+    name = "m1o"
+
+    def __init__(self, rows, srcs, w_uv_all, ag):
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell import helix_a2a_fused as fused
+
+        self.f = fused
+        self.rows, self.ag = rows, ag
+        self.srcs = []
+        for po, stats, mask in srcs:
+            lat = po.view(rows, HEADS, LATENT).float()
+            v = torch.einsum("tak,ank->tan", lat, w_uv_all).to(torch.bfloat16).reshape(rows, -1)
+            self.srcs.append((v.contiguous(), stats, mask))
+        self.grp = Group(rows, fused.record_bytes(HP, VDIM))
+        self.combined = torch.empty(rows, HP * VDIM, dtype=torch.bfloat16, device="cuda")
+        self.out = torch.empty(rows, HP * VDIM, dtype=torch.bfloat16, device="cuda")
+
+    def _launch(self, r, send):
+        g = self.grp
+        po, stats, mask = self.srcs[r]
+        self.f.helix_a2a_fused(
+            po, stats, mask, self.combined, cp_rank=r, cp_size=P, num_heads=HP, head_dim=VDIM,
+            ws_addr=g.addr, rank_stride=g.stride, half_bytes=g.half, state=g.state[r if send else P],
+            max_send_ctas=2 * g.sms if send else 0, max_recv_ctas=0 if send else 2 * g.sms, use_pdl=True,
+        )  # fmt: skip
+
+    def send(self, r):
+        self._launch(r, True)
+
+    def receive(self):
+        self._launch(RHO, False)
+        _gate(self.combined, self.ag[:, GATE_COL:], self.out)
+        return self.out
+
+
+def _gate(x, gate, out):
+    import triton
+    import triton.language as tl
+
+    global _GATE_KERNEL
+    if _GATE_KERNEL is None:
+
+        @triton.jit
+        def kernel(X, G, OUT, GS, N: tl.constexpr, B: tl.constexpr):
+            row = tl.program_id(0)
+            k = tl.arange(0, B)
+            m = k < N
+            v = tl.load(X + row * N + k, m, 0.0).to(tl.float32)
+            g = tl.load(G + row * GS + k, m, 0.0).to(tl.float32)
+            tl.store(OUT + row * N + k, (v * tl.sigmoid(g)).to(tl.bfloat16), m)
+
+        _GATE_KERNEL = kernel
+    n = x.shape[1]
+    _GATE_KERNEL[(x.shape[0],)](x, gate, out, gate.stride(0), n, triton.next_power_of_2(n))
+
+
+_GATE_KERNEL = None
+
+
 def round_once(impl):
     for r in range(P):
         impl.send(r)
@@ -357,6 +442,10 @@ def check(rows: int, layer: int, k_split: int = 4, replays: int = 4) -> dict:
         torch.cuda.synchronize()
         same &= bool(torch.equal(new.out, out_n))
     res["graph_replays_bitwise"] = same
+    m1o = M1o(rows, srcs, load_w_uv_all(layer), ag)
+    out_m = round_once(m1o).clone()
+    res["m1o_vs_ref_rel_l2"] = rel_l2(out_m, ref)
+    res["m1o_vs_ref_max_rel"] = max_rel(out_m, ref)
     return res
 
 
@@ -390,7 +479,9 @@ def time_impl(impl, flush: bool, iters: int) -> dict:
     for e in ev:
         gr.replay(e)
     torch.cuda.synchronize()
-    wall = statistics.median(a.elapsed_time(b) * 1e3 for a, b in ev)
+    wall = statistics.mean(
+        a.elapsed_time(b) * 1e3 for a, b in ev
+    )  # (event times are quantized: the mean)
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -401,7 +492,10 @@ def time_impl(impl, flush: bool, iters: int) -> dict:
         (
             e
             for e in prof.events()
-            if e.device_type.name == "CUDA" and e.name and "Memcpy" not in e.name
+            if e.device_type.name == "CUDA"
+            and e.name
+            and "Memcpy" not in e.name
+            and "Memset" not in e.name
         ),
         key=lambda e: e.time_range.start,
     )
@@ -429,6 +523,7 @@ def label(impl_name: str, kernels, flush: bool):
         else:
             key = {
                 "today": ["stats_copy", "a2a_receive", "mla_output"],
+                "m1o": ["a2a128_receive", "gate"],
             }.get(impl_name, ["value_receive"])[i - base - P]
         out[key] = {"us": round(us, 3), "kernel": name}
     return out
@@ -458,10 +553,11 @@ def main():
     if not args.no_timing:
         layer = int(args.layers.split(",")[0])
         w_uv, w_scale, g, kv_norm, _ = load_layer(layer)
+        w_uv_all = load_w_uv_all(layer)
         for rows in rows_list:
             srcs = make_partials(rows, kv_norm, seed=rows)
             ag = make_gate(rows, g, seed=rows)
-            impls = [Today(rows, srcs, w_uv, w_scale, ag)]
+            impls = [Today(rows, srcs, w_uv, w_scale, ag), M1o(rows, srcs, w_uv_all, ag)]
             impls += [
                 New(rows, srcs, w_uv, w_scale, ag, int(ks), debug=False)
                 for ks in args.ks.split(",")
@@ -469,7 +565,7 @@ def main():
             for flush in (False, True):
                 for impl in impls:
                     t = time_impl(impl, flush, args.iters)
-                    lab = label("today" if impl.name == "today" else impl.name, t["kernels"], flush)
+                    lab = label(impl.name, t["kernels"], flush)
                     rec = {"rows": rows, "impl": impl.name, "l2_flush": flush,
                            "wall_receive_graph_us": round(t["wall_receive_graph_us"], 3), "kernels": lab}  # fmt: skip
                     results["timing"].append(rec)
