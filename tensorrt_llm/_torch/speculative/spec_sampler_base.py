@@ -29,6 +29,7 @@ import torch
 
 from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
+from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..cute_dsl_kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -311,6 +312,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
         if spec_step_copies.is_supported():
             self._store_scatter = spec_step_copies.SlotScatter()
+            logger.info("Spec sampler: store updates on the step-copy scatter kernel")
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
                 pin_memory=prefer_pinned(),

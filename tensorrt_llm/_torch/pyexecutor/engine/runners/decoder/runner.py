@@ -554,6 +554,12 @@ class DecoderRunner(ScheduledModelRunner):
         self._spec_head_fused = (
             self._config.is_spec_decode and spec_head_kernels.spec_head_fusion_enabled()
         )
+        self._spec_head_fused_steps = 0
+        if self._step_input_gather is not None or self._spec_head_fused:
+            logger.info(
+                f"Spec decode step head: step-copy gather kernel {self._step_input_gather is not None}, "
+                f"fused head prep {self._spec_head_fused}"
+            )
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -2911,6 +2917,11 @@ class DecoderRunner(ScheduledModelRunner):
             and self._spec_head_fused
             and self._fused_spec_head_prep(inputs, runtime_draft_len)
         )
+        if head_fused:
+            self._spec_head_fused_steps += 1
+            n = self._spec_head_fused_steps
+            if n & (n - 1) == 0:
+                logger.info(f"Spec decode step head: fused head prep steps={n}")
 
         if enable_spec_decode and not head_fused and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
