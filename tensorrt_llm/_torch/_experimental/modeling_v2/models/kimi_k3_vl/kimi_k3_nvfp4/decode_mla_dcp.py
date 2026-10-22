@@ -38,6 +38,7 @@ import torch
 from tensorrt_llm._torch.utils import helix_local_len_tensor
 
 from . import flags as _flags
+from . import mla_decode_pdl  # noqa: F401  (registers trtllm::k3_mla_decode_fp8_pdl)
 from .flags import TRTLLM_K3LL_MLA_DCP
 
 #: Latent and rope widths of Kimi-K3's absorbed MLA.
@@ -153,7 +154,14 @@ def split_read_attention(
     batch, q_len, heads, _ = q.shape
     c_latent = kv_pages[..., :KV_LORA_RANK].permute(1, 2, 0)
     c_rope = kv_pages[..., KV_LORA_RANK : KV_LORA_RANK + QK_ROPE_DIM].permute(1, 2, 0)
-    torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell(
+    # TRTLLM_K3LL_MLA_DECODE_PDL: the same op with programmatic dependent launch (mla_decode_pdl.py)
+    op = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
+    if _flags.TRTLLM_K3LL_MLA_DECODE_PDL:
+        from . import census as _census
+
+        _census.count(f"mla_decode_pdl:{_census.mode()}")
+        op = torch.ops.trtllm.k3_mla_decode_fp8_pdl
+    op(
         q[..., :KV_LORA_RANK].permute(2, 3, 1, 0),
         q[..., KV_LORA_RANK:].permute(2, 3, 1, 0),
         c_latent,

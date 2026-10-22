@@ -102,6 +102,8 @@ REQUIRED_TRTLLM_OPS = (
     "k3_fp8_mla_attn",
     "k3_fp8_mla_project_qkv",
     "k3_fp8_mla_output",
+    # The split read's FP8 MLA decode with programmatic dependent launch (mla_decode_pdl.py).
+    "k3_mla_decode_fp8_pdl",
     # The decode path's GEMVs, the dense MLP's activation, the LM head and the embedding (decode_gemv.py).
     "k3_decode_gemv",
     "k3_ctm_gemv_wide",

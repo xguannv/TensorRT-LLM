@@ -113,5 +113,16 @@ def install_model(model_cls, decode_step) -> None:
     _installed.add(model_cls)
 
 
+def mode() -> str:
+    """``capture`` inside a CUDA graph capture, else ``eager``."""
+    return _mode()
+
+
+def count(key: str) -> None:
+    """Count one execution of a decode-path branch under ``key`` (a dispatch line for the gates' G3)."""
+    if ENABLED:
+        _bump(key)
+
+
 def counts() -> dict:
     return dict(_counts)

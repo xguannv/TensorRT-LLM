@@ -181,6 +181,12 @@ TRTLLM_K3LL_MLA_GATE_SIDE = _flag(
     "MLA decode (quantized cache): the output gate projection on a side stream beside the attention, read in place "
     "by the V-B / gate kernel (no [kv_a | g] concatenation)",
 )
+TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
+    "TRTLLM_K3LL_MLA_DECODE_PDL",
+    0,
+    "MLA decode split read: the CuTe DSL FP8 split-KV kernel and its reduction with programmatic dependent launch "
+    "(k3_mla_decode_fp8_pdl)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

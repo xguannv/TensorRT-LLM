@@ -11970,6 +11970,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             page_size: int,
             max_batch_size: int = 0,
             emit_softmax_stats: bool = False,
+            use_pdl: bool = False,
         ):
             super().__init__()
             kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
@@ -11985,6 +11986,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.page_size = page_size
             self.max_batch_size = max_batch_size
             self.emit_softmax_stats = emit_softmax_stats
+            # Programmatic dependent launch of the FP8 kernel's grids (a compile variant; the tactic, and so the
+            # tuning entry, is shared with the plain launch).
+            self.use_pdl = use_pdl
 
         def unique_id(self):
             # seq_len_q is part of the id: each decode variant (the MTP
@@ -12489,7 +12493,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 split_kv,
                 is_persistent,
                 kv_bounds is not None,
-            )
+            ) + ((True, ) if self.use_pdl else ())
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
                 # for seconds -- always log enough to identify the variant.
@@ -12518,6 +12522,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_len_q=seq_len_q,
                     reducer_max_splits=32,
                     emit_softmax_stats=self.emit_softmax_stats,
+                    **({
+                        "use_pdl": True
+                    } if self.use_pdl else {}),
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,
