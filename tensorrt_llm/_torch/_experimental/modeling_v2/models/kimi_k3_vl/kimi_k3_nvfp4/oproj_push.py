@@ -13,10 +13,10 @@ RMSNorm). With it, `K3OprojPush.run` runs the same step as three kernels on that
 * ``K3LamportFinishKernel`` without its gather (``k3_lamport_ar.run_lamport_finish_in_place``): the owner polls its
   ``W`` slots, sums them and multicasts the row into the broadcast stage of every rank, where it stays (a
   `LamportResult`);
-* ``K3AttnResFastKernel`` with the Lamport addend (``k3_attn_res.run_k3_attn_res(lamport_addend=...)``): every rank
-  polls every row from its broadcast stage, adds it to the prefix sum (to zeros where the layer has just snapshotted
-  it) and runs the attention-residual selection and the RMSNorm, the snapshot reads and their statistics before its
-  PDL wait.
+* ``K3AttnResFastKernel`` with the Lamport addend and the C++ epilogue's arithmetic (``k3_attn_res.run_k3_attn_res(
+  lamport_addend=..., mnnvl_order=True)``): every rank polls every row from its broadcast stage, adds it to the prefix
+  sum (to zeros where the layer has just snapshotted it) and runs the attention-residual selection and the RMSNorm,
+  the snapshot reads and their statistics before its PDL wait.
 
 Programmatic dependent launch. The GEMM's weight warp streams its weights before the GEMM's ``griddepcontrol.wait``
 as the plain GEMM's does; the push variant releases its dependent from the activation warp right after that wait
@@ -34,9 +34,9 @@ The kernels are Dongxu Yang's (``user/dongxuy/k3_lowlat``, ``TRTLLM_K3_AR_PUSH``
 Numerics. The GEMM rounds as the plain GEMM does and the finish kernel sums the ranks in the C++ one-shot kernel's
 order (chunks of eight ranks above eight), which both transports of ``mnnvl_allreduce_attn_res`` use: the all-reduce
 result and the updated prefix sum ``bf16(prefix + sum)`` are bit for bit those of the path without the switch. The
-attention-residual statistics are summed in another order than that op's epilogue, so the normalized output can differ
-from it by a bf16 rounding step or two in a small fraction of the elements (``k3_attn_res``). Every rank reads the same
-rows and runs the same kernel on them, so the outputs are the same bits on every rank.
+attn_res kernel runs with ``mnnvl_order``: that op's epilogue layout (seven CTAs per token), statistics order, softmax
+and mixture, so the normalized output is bit for bit that op's too. Every rank reads the same rows and runs the same
+kernel on them, so the outputs are the same bits on every rank.
 
 State and ordering. The Lamport rotation (current / dirty buffer, bytes to clear, CTA arrivals) lives in the
 workspace's device flags, which the C++ MNNVL kernels on the same workspace read and advance alike: the push reads it
@@ -342,7 +342,8 @@ class K3OprojPush:
         prefix = self.zeros[:rows] if prefix_sum is None else prefix_sum
         normed = torch.empty_like(prefix)
         updated = torch.empty_like(prefix)
-        # trtllm::k3_attn_res_add_rmsnorm_lamport, releasing the next kernel at its wait (see the module docstring).
+        # trtllm::k3_attn_res_add_rmsnorm_lamport in the C++ epilogue's arithmetic, releasing the next kernel at its
+        # wait (see the module docstring).
         _attn_res().run_k3_attn_res(
             prefix,
             (),
@@ -357,6 +358,7 @@ class K3OprojPush:
             exact=False,
             lamport_addend=result.lamport_addend,
             early_trigger=True,
+            mnnvl_order=True,
         )
         return normed, updated
 

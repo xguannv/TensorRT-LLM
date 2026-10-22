@@ -324,8 +324,8 @@ class K3DecodeComm:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` as ``allreduce_attn_res`` of ``x @ o_proj.weight^T`` (``bf16(x * gate) @ ...`` with
         ``gate``), with o_proj pushing its partial into the MNNVL workspace (``K3OprojPush.run``): ``x`` is this
-        rank's o_proj input ``[T, K]``, ``o_proj`` its FP8 module on ``k3_fp8w_lowm_gemm``. ``updated`` is bit for bit
-        ``allreduce_attn_res``'s; ``normed`` within the attn_res kernels' difference (``oproj_push.py``)."""
+        rank's o_proj input ``[T, K]``, ``o_proj`` its FP8 module on ``k3_fp8w_lowm_gemm``. ``updated`` and ``normed``
+        are bit for bit ``allreduce_attn_res``'s (``oproj_push.py``)."""
         return self.oproj_push.run(
             x, o_proj, prefix_sum, block_residual, res_proj, res_norm, out_norm, gate=gate
         )
