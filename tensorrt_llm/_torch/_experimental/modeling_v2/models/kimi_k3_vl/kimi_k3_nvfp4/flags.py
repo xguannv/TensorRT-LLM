@@ -85,6 +85,12 @@ TRTLLM_K3LL_MLA_QKV_SPLIT = _flag(
     1,
     "target MLA decode: q_a prep, Q-B in 32-column slices and the absorption as three launches, not one per head",
 )
+TRTLLM_K3LL_MLA_QKV_PDL = _flag(
+    "TRTLLM_K3LL_MLA_QKV_PDL",
+    0,
+    "with MLA_QKV_SPLIT, target MLA decode on a quantized cache: its three query kernels launched with PDL, each "
+    "loading its first weights before the dependency wait",
+)
 TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
     "TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL",
     1,
@@ -161,6 +167,19 @@ TRTLLM_K3LL_HELIX_A2A_FUSED = _flag(
     1,
     "Helix MLA decode: the partials' exchange and combine in one Lamport kernel (helix_a2a_fused), not NCCL "
     "alltoall_helix + helix_post_process",
+)
+TRTLLM_K3LL_HELIX_Q_ABSORB = _flag(
+    "TRTLLM_K3LL_HELIX_Q_ABSORB",
+    0,
+    "Helix MLA decode (FP8 cache): every rank computes all heads' FP8 queries (q_b through the module's FP8 "
+    "projection, k3_fp8w_lowm_gemm at decode size; the BF16 W_UK absorption in K3MlaQAbsorb), no query all-gather; "
+    "the BF16 W_UK is built at load when the launch value is 1",
+)
+TRTLLM_K3LL_MLA_GATE_SIDE = _flag(
+    "TRTLLM_K3LL_MLA_GATE_SIDE",
+    0,
+    "MLA decode (quantized cache): the output gate projection on a side stream beside the attention, read in place "
+    "by the V-B / gate kernel (no [kv_a | g] concatenation)",
 )
 
 

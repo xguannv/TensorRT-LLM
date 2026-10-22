@@ -273,9 +273,16 @@ def _mla_qa_prep(
     AG_STRIDE: tl.constexpr,
     QA_EPS: tl.constexpr,
     QB_UE8M0: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     block, chunk = tl.program_id(0), tl.program_id(1)
     rows = chunk * 16 + tl.arange(0, 16)
+    cols = block * 128 + tl.arange(0, 128)
+    if PDL:
+        # Weights first; every read of the previous kernels' outputs and every write after the dependency wait.
+        qa_norm = tl.load(QA_NORM + cols)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     qa_cols = tl.arange(0, 2048)
     qa = tl.load(
         AG + rows[:, None] * AG_STRIDE + qa_cols[None, :],
@@ -283,9 +290,10 @@ def _mla_qa_prep(
         0,
     ).to(tl.float32)
     rms = tl.rsqrt(tl.sum(qa * qa, 1) / 1536 + QA_EPS)
-    cols = block * 128 + tl.arange(0, 128)
     a = tl.load(AG + rows[:, None] * AG_STRIDE + cols[None, :], rows[:, None] < M, 0).to(tl.float32)
-    a *= rms[:, None] * tl.load(QA_NORM + cols)[None, :].to(tl.float32)
+    if not PDL:
+        qa_norm = tl.load(QA_NORM + cols)
+    a *= rms[:, None] * qa_norm[None, :].to(tl.float32)
     a = a.to(tl.bfloat16).to(tl.float32)
     a_scale = tl.maximum(tl.max(tl.abs(a), 1) / 448.0, 1.0e-12)
     if QB_UE8M0:
@@ -319,6 +327,7 @@ def _mla_qb_split(
     KV_EPS: tl.constexpr,
     BN: tl.constexpr,
     STORE_PAGED: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     pid, chunk = tl.program_id(0), tl.program_id(1)
     NS: tl.constexpr = 192 // BN
@@ -326,6 +335,10 @@ def _mla_qb_split(
     if pid == H * NS:
         latent = tl.arange(0, 512)
         pe = tl.arange(0, 64)
+        if PDL:
+            kv_norm = tl.load(KV_NORM + latent)
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
         if STORE_PAGED:
             seq = rows // T
             length = tl.load(LENGTHS + seq, rows < M, 0)
@@ -340,7 +353,9 @@ def _mla_qb_split(
             AG + rows[:, None] * AG_STRIDE + 1536 + latent[None, :], rows[:, None] < M, 0
         ).to(tl.float32)
         kv_rms = tl.rsqrt(tl.sum(ckv * ckv, 1) / 512 + KV_EPS)
-        ckv *= kv_rms[:, None] * tl.load(KV_NORM + latent)[None, :].to(tl.float32)
+        if not PDL:
+            kv_norm = tl.load(KV_NORM + latent)
+        ckv *= kv_rms[:, None] * kv_norm[None, :].to(tl.float32)
         tl.store(POOL + cache_row[:, None] + latent[None, :], ckv, valid[:, None])
         kpe = tl.load(AG + rows[:, None] * AG_STRIDE + 2048 + pe[None, :], rows[:, None] < M, 0)
         tl.store(POOL + cache_row[:, None] + 512 + pe[None, :], kpe, valid[:, None])
@@ -351,13 +366,30 @@ def _mla_qb_split(
         qb_rows = head * 192 + n
         k = tl.arange(0, 128)
         q = tl.full((16, BN), 0, tl.float32)
-        for block in range(12):
-            cols = block * 128 + k
-            a8 = tl.load(A8 + rows[:, None] * 1536 + cols[None, :], rows[:, None] < M, 0.0)
-            a_scale = tl.load(ASC + rows * 12 + block, rows < M, 1.0)
-            b = tl.load(QB + qb_rows[None, :] * 1536 + cols[:, None])
-            bs = tl.load(QB_SCALE + (qb_rows // 128) * QB_SCALE_STRIDE + block)
-            q += tl.dot(a8, b) * a_scale[:, None] * bs[None, :]
+        if PDL:
+            # The first K block's weight and scale before the dependency wait; the same products in the same order.
+            b0 = tl.load(QB + qb_rows[None, :] * 1536 + k[:, None])
+            bs0 = tl.load(QB_SCALE + (qb_rows // 128) * QB_SCALE_STRIDE)
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
+            for block in tl.static_range(12):
+                cols = block * 128 + k
+                a8 = tl.load(A8 + rows[:, None] * 1536 + cols[None, :], rows[:, None] < M, 0.0)
+                a_scale = tl.load(ASC + rows * 12 + block, rows < M, 1.0)
+                if block == 0:
+                    b, bs = b0, bs0
+                else:
+                    b = tl.load(QB + qb_rows[None, :] * 1536 + cols[:, None])
+                    bs = tl.load(QB_SCALE + (qb_rows // 128) * QB_SCALE_STRIDE + block)
+                q += tl.dot(a8, b) * a_scale[:, None] * bs[None, :]
+        else:
+            for block in range(12):
+                cols = block * 128 + k
+                a8 = tl.load(A8 + rows[:, None] * 1536 + cols[None, :], rows[:, None] < M, 0.0)
+                a_scale = tl.load(ASC + rows * 12 + block, rows < M, 1.0)
+                b = tl.load(QB + qb_rows[None, :] * 1536 + cols[:, None])
+                bs = tl.load(QB_SCALE + (qb_rows // 128) * QB_SCALE_STRIDE + block)
+                q += tl.dot(a8, b) * a_scale[:, None] * bs[None, :]
         q = q.to(tl.bfloat16)
         if s * BN < 128:
             tl.store(QN + rows[:, None] * (H * 128) + head * 128 + n[None, :], q, rows[:, None] < M)
@@ -382,18 +414,25 @@ def _mla_absorb(
     KB_S2: tl.constexpr,
     KS_S0: tl.constexpr,
     KS_S1: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     head, quarter, chunk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     rows = chunk * 16 + tl.arange(0, 16)
     k = tl.arange(0, 128)
+    latent = quarter * 128 + tl.arange(0, 128)
+    if PDL:
+        kb = tl.load(KB + head * KB_S0 + latent[None, :] * KB_S1 + k[:, None] * KB_S2)
+        ks = tl.load(KB_SCALE + head * KS_S0 + (latent // 128) * KS_S1)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     qn = tl.load(QN + rows[:, None] * (H * 128) + head * 128 + k[None, :], rows[:, None] < M, 0).to(
         tl.float32
     )
     q_scale = tl.maximum(tl.max(tl.abs(qn), 1) / 448.0, 1.0e-12)
     q8 = (qn / q_scale[:, None]).to(tl.float8e4nv)
-    latent = quarter * 128 + tl.arange(0, 128)
-    kb = tl.load(KB + head * KB_S0 + latent[None, :] * KB_S1 + k[:, None] * KB_S2)
-    ks = tl.load(KB_SCALE + head * KS_S0 + (latent // 128) * KS_S1)
+    if not PDL:
+        kb = tl.load(KB + head * KB_S0 + latent[None, :] * KB_S1 + k[:, None] * KB_S2)
+        ks = tl.load(KB_SCALE + head * KS_S0 + (latent // 128) * KS_S1)
     absorbed = tl.dot(q8, kb) * q_scale[:, None] * ks[None, :]
     tl.store(
         OUT + rows[:, None] * (H * 576) + head * 576 + latent[None, :], absorbed, rows[:, None] < M
@@ -402,26 +441,30 @@ def _mla_absorb(
 
 def _mla_qkv_split(
     ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, out, pool, pages, lengths, row_stride,
-    page_offset, tokens_per_request, qa_eps, kv_eps, qb_ue8m0, store_paged,
+    page_offset, tokens_per_request, qa_eps, kv_eps, qb_ue8m0, store_paged, pdl=False,
 ):  # fmt: skip
-    """``_mla_qkv``'s outputs (``out``, and the latent into ``pool``) by the three split kernels."""
+    """``_mla_qkv``'s outputs (``out``, and the latent into ``pool``) by the three split kernels; ``pdl``
+    (``TRTLLM_K3LL_MLA_QKV_PDL``) launches them with programmatic dependent launch, each loading its first weights
+    before its dependency wait (the same values in the same order: the same bits)."""
     m, h = ag.shape[0], kb.shape[0]
     chunks = triton.cdiv(m, 16)
     a8 = torch.empty((m, 1536), dtype=torch.float8_e4m3fn, device=ag.device)
     asc = torch.empty((m, 12), dtype=torch.float32, device=ag.device)
     qn = torch.empty((m, h * 128), dtype=torch.bfloat16, device=ag.device)
+    launch = {"PDL": True, "launch_pdl": True} if pdl else {}
     _mla_qa_prep[(12, chunks)](
-        ag, qa_norm, a8, asc, m, ag.stride(0), qa_eps, QB_UE8M0=qb_ue8m0, num_warps=MLA_QKV_WARPS
-    )
+        ag, qa_norm, a8, asc, m, ag.stride(0), qa_eps, QB_UE8M0=qb_ue8m0, num_warps=MLA_QKV_WARPS,
+        **launch,
+    )  # fmt: skip
     _mla_qb_split[(h * (192 // QB_SPLIT_N) + 1, chunks)](
         ag, a8, asc, qb, qb_scale, kv_norm, qn, out, pool, pages, lengths, m, h, ag.stride(0),
         qb_scale.stride(0), row_stride, pages.stride(0), page_offset, tokens_per_request, kv_eps,
-        QB_SPLIT_N, STORE_PAGED=store_paged, num_warps=MLA_QKV_WARPS,
+        QB_SPLIT_N, STORE_PAGED=store_paged, num_warps=MLA_QKV_WARPS, **launch,
     )  # fmt: skip
     s0, s1, s2 = kb.stride()
     _mla_absorb[(h, 4, chunks)](
         qn, kb, kb_scale, out, m, h, s0, s1, s2, kb_scale.stride(0), kb_scale.stride(1),
-        num_warps=4,
+        num_warps=4, **launch,
     )  # fmt: skip
 
 
@@ -517,15 +560,16 @@ def mla_project_qkv(
     qa_eps: float,
     kv_eps: float,
     qb_ue8m0: bool = False,
+    pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Produce absorbed Q and normalized latent KV for quantized cache kernels."""
+    """Produce absorbed Q and normalized latent KV for quantized cache kernels (``pdl``: `_mla_qkv_split`'s)."""
     h = kb.shape[0]
     query = ag.new_empty((ag.shape[0], h * 576))
     latent = ag.new_empty((ag.shape[0], 576))
     if _flags.TRTLLM_K3LL_MLA_QKV_SPLIT:
         _mla_qkv_split(
             ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, query, latent, ag, ag, 576, 0, 1, qa_eps,
-            kv_eps, qb_ue8m0, False,
+            kv_eps, qb_ue8m0, False, pdl,
         )  # fmt: skip
         return query, latent
     _mla_qkv[(h, triton.cdiv(ag.shape[0], 16))](
@@ -561,9 +605,30 @@ def mla_project_qkv(
 
 @mla_project_qkv.register_fake
 def _project_qkv_fake(
-    ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qa_eps, kv_eps, qb_ue8m0=False
+    ag, qa_norm, qb, qb_scale, kb, kb_scale, kv_norm, qa_eps, kv_eps, qb_ue8m0=False, pdl=False
 ):
     return ag.new_empty((ag.shape[0], kb.shape[0] * 576)), ag.new_empty((ag.shape[0], 576))
+
+
+@torch.library.custom_op("trtllm::k3_fp8_mla_latent", mutates_args=())
+def mla_latent(
+    ag: torch.Tensor, kv_norm: torch.Tensor, kv_eps: float, pdl: bool = True
+) -> torch.Tensor:
+    """The normalized latent row ``[kv_a_layernorm(ckv) | k_pe]`` (``[tokens, 576]`` bf16) of `mla_project_qkv`, with
+    no query head: ``_mla_qb_split``'s latent program alone (``H`` 0), so its bits are `mla_project_qkv`'s. With
+    ``pdl`` it launches with programmatic dependent launch and loads the norm weight before its dependency wait."""
+    latent = ag.new_empty((ag.shape[0], 576))
+    launch = {"PDL": True, "launch_pdl": True} if pdl else {}
+    _mla_qb_split[(1, triton.cdiv(ag.shape[0], 16))](
+        ag, ag, ag, ag, ag, kv_norm, ag, ag, latent, ag, ag, ag.shape[0], 0, ag.stride(0), 1, 576,
+        ag.stride(0), 0, 1, kv_eps, QB_SPLIT_N, STORE_PAGED=False, num_warps=MLA_QKV_WARPS, **launch,
+    )  # fmt: skip
+    return latent
+
+
+@mla_latent.register_fake
+def _latent_fake(ag, kv_norm, kv_eps, pdl=True):
+    return ag.new_empty((ag.shape[0], 576))
 
 
 @triton.jit

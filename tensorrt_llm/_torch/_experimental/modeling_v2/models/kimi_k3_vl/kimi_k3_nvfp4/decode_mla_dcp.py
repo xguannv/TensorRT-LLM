@@ -491,14 +491,21 @@ class MlaSplitRead:
         q_len: int,
         bmm1: torch.Tensor,
         bmm2: torch.Tensor,
+        all_heads: bool = False,
     ) -> torch.Tensor:
-        """``quant_q``: ``[tokens, heads_per_rank, 576]`` FP8 bytes of this rank's heads. Returns the attention
-        latent of this rank's heads, ``[tokens, heads_per_rank * 512]`` bf16 (what the stock attention returns)."""
+        """``quant_q``: ``[tokens, heads_per_rank, 576]`` FP8 bytes of this rank's heads, or with ``all_heads``
+        (Helix only) ``[tokens, heads, 576]`` of every head, computed on this rank, which then needs no query
+        all-gather. Returns the attention latent of this rank's heads, ``[tokens, heads_per_rank * 512]`` bf16 (what
+        the stock attention returns)."""
         num_requests = meta.num_generations
         tokens = num_requests * q_len
         hp, cp = self.heads_per_rank, self.cp
+        if all_heads and cp == 1:
+            raise ValueError("all_heads queries are a Helix split read's")
         q_local = (
-            quant_q[:tokens].view(torch.float8_e4m3fn).view(tokens, hp, KV_LORA_RANK + QK_ROPE_DIM)
+            quant_q[:tokens]
+            .view(torch.float8_e4m3fn)
+            .view(tokens, self.heads if all_heads else hp, KV_LORA_RANK + QK_ROPE_DIM)
         )
         pages, block_rows, layer_in_pool, lens = self._layer_inputs(mqa, meta, num_requests)
         if self._workspace is None:
@@ -547,7 +554,9 @@ class MlaSplitRead:
 
         from tensorrt_llm._torch.distributed.ops import allgather, alltoall_helix
 
-        if self._q_gather_ws is not None and _flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL:
+        if all_heads:
+            q_all = q_local
+        elif self._q_gather_ws is not None and _flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL:
             q_all = gather_q_mnnvl(q_local.view(torch.uint8), self._q_gather_ws)
         else:
             q_all = allgather(q_local.view(torch.uint8), self.gather_mapping, dim=1)

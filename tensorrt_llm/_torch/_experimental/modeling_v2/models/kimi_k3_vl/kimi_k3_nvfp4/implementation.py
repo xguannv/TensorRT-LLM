@@ -65,6 +65,7 @@ from . import attention as _fp8_attention
 from . import census as _census
 from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
+from . import decode_mla_q as _decode_mla_q
 from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
@@ -2540,7 +2541,10 @@ class K3DecodeMLA(KimiK3MLAAttention):
     K-B, this CP rank's V-B / gate / o_proj head group -- and its generic path is the stock Helix MLA. The decode path
     keeps the TP16 head split: it projects this rank's head group only (``num_heads_tp_cp`` heads, Q-B rows and K-B
     heads of group ``cp_rank``), and ``MlaSplitRead`` all-gathers the absorbed queries over the CP group, attends with
-    every head over this rank's pages and returns this rank's head group, as the TP16 split read does.
+    every head over this rank's pages and returns this rank's head group, as the TP16 split read does. With
+    ``TRTLLM_K3LL_HELIX_Q_ABSORB`` every rank instead computes every head's FP8 query itself (``decode_mla_q``) and the
+    split read skips the all-gather. With ``TRTLLM_K3LL_MLA_GATE_SIDE`` the quantized-cache decode runs the gate
+    projection on a side stream and the V-B / gate kernel reads it in place.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -2552,6 +2556,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # This rank's K-B heads (a view; all of them outside Helix) and the backend view of that many heads.
         self._decode_k_b = self._decode_k_b_scale = None
         self._decode_mqa = None
+        # TRTLLM_K3LL_HELIX_Q_ABSORB at load (Helix, FP8 cache): every head's W_UK in BF16 (decode_mla_q.absorb_weight).
+        self._q_absorb_w_kc: Optional[torch.Tensor] = None
+        self._gate_side = _decode_mla_q.GateSide()
 
     @property
     def _decode_heads(self) -> int:
@@ -2614,6 +2621,39 @@ class K3DecodeMLA(KimiK3MLAAttention):
             self._split_read.register(self.mqa.layer_idx)
         return self._split_read
 
+    def prepare_helix_q_absorb(self) -> Optional[str]:
+        """``TRTLLM_K3LL_HELIX_Q_ABSORB`` at load: build every head's BF16 W_UK (idempotent). Returns why the layer
+        cannot take the all-head query path, None when it can."""
+        if not self.mapping.has_cp_helix():
+            return "not Helix"
+        if not getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
+            self.mqa, "has_fp4_kv_cache", False
+        ):
+            return "not an FP8 cache"
+        if (
+            self.k_b_proj_trans.shape[0] != self.num_heads_tp
+            or self.mqa.num_heads != self.num_heads_tp
+        ):
+            return (
+                f"K-B {tuple(self.k_b_proj_trans.shape)} / backend heads {self.mqa.num_heads} are not every head "
+                f"({self.num_heads_tp})"
+            )
+        if self.q_b_proj.weight.shape[0] != self.num_heads_tp * self.qk_head_dim:
+            return f"Q-B rows {self.q_b_proj.weight.shape[0]} are not every head's"
+        if self._q_absorb_w_kc is None:
+            self._q_absorb_w_kc = _decode_mla_q.absorb_weight(
+                self.k_b_proj_trans, self.k_b_proj_trans_scale
+            )
+        return None
+
+    def _all_head_queries_apply(self) -> bool:
+        """Whether this step's quantized-cache decode takes the ``TRTLLM_K3LL_HELIX_Q_ABSORB`` path."""
+        return bool(
+            _flags.TRTLLM_K3LL_HELIX_Q_ABSORB
+            and self._q_absorb_w_kc is not None
+            and self._split_read is not None
+        )
+
     def will_run_decode_branch(self, attn_metadata: AttentionMetadata, step: DecodeStep) -> bool:
         return self._k3_step_view(attn_metadata, step) is not None
 
@@ -2675,12 +2715,12 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 raise ValueError("project_output=False requires fused MLA decode")
             return self.forward_generic(position_ids, hidden_states, attn_metadata)
         x = hidden_states[: step.num_tokens]
-        ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
         if view.get("quantized_cache", False):
-            core = self._quantized_decode(ag, position_ids, attn_metadata)
+            core = self._quantized_decode(x, position_ids, attn_metadata)
             if not project_output:
                 return core
             return self._project_output([core], position_ids, attn_metadata, None)
+        ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
         fused_q = _fp8_attention.mla_qkv(
             ag,
             self.q_a_layernorm.weight,
@@ -2719,11 +2759,22 @@ class K3DecodeMLA(KimiK3MLAAttention):
 
     def _quantized_decode(
         self,
-        ag: torch.Tensor,
+        x: torch.Tensor,
         position_ids: torch.Tensor | None,
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
         """Keep FP8 projections around the native FP4/FP8 cache and attention kernels."""
+        gate_col = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        # TRTLLM_K3LL_MLA_GATE_SIDE: the gate projection runs on the side stream from where the attention starts and
+        # the output kernel reads it in place; otherwise it runs here and is concatenated behind the fused q_a / kv_a.
+        gate_side = bool(_flags.TRTLLM_K3LL_MLA_GATE_SIDE)
+        self._log_q_dispatch(x, gate_side)
+        if gate_side:
+            ag = self.kv_a_proj_with_mqa(x)
+        else:
+            ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
+        if self._all_head_queries_apply():
+            return self._all_head_decode(ag, x, metadata, gate_side, gate_col)
         heads = self._decode_heads
         query, latent_cache = _fp8_attention.mla_project_qkv(
             ag,
@@ -2736,6 +2787,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             float(self.q_a_layernorm.variance_epsilon),
             float(self.kv_a_layernorm.variance_epsilon),
             self._fp8_qb_ue8m0,
+            bool(_flags.TRTLLM_K3LL_MLA_QKV_PDL),
         )
         q_pe = query.view(-1, heads, 576)[..., 512:]
         cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)
@@ -2757,42 +2809,135 @@ class K3DecodeMLA(KimiK3MLAAttention):
             quant_q,
             fuse_fp4_q_quant=bool(self.mqa.has_fp4_kv_cache),
         )
+        if gate_side:
+            self._gate_side.fork(self.g_proj, x, do_multi_stream())
         if self._split_read is not None:
             latent = self._split_read.forward(
                 self.mqa, quant_q, metadata, ag.shape[0] // metadata.num_generations, bmm1, bmm2
             )
-            return _fp8_attention.mla_output(
-                latent,
-                self.v_b_proj,
-                self.v_b_proj_scale,
-                ag,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+        else:
+            latent = self._attn_forward_gen(
+                self.mqa,
+                query,
+                None,
+                None,
+                position_ids,
+                metadata,
+                attention_input_type=AttentionInputType.generation_only,
+                out_scale=self.out_scale,
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+                cu_q_seqlens=cu_q,
+                cu_kv_seqlens=cu_kv,
+                fmha_scheduler_counter=scheduler,
+                mla_bmm1_scale=bmm1,
+                mla_bmm2_scale=bmm2,
+                quant_q_buffer=quant_q,
             )
-        latent = self._attn_forward_gen(
-            self.mqa,
-            query,
-            None,
-            None,
-            position_ids,
+        if gate_side:
+            gate, gate_col = self._gate_side.join(), 0
+        else:
+            gate = ag
+        return _fp8_attention.mla_output(latent, self.v_b_proj, self.v_b_proj_scale, gate, gate_col)
+
+    # Row counts each rank-0 process has logged the all-head query dispatch line for.
+    _all_head_logged: set = set()
+    # (rows, switch values) each rank-0 process has logged the query-side dispatch line for.
+    _q_dispatch_logged: set = set()
+
+    def _log_q_dispatch(self, x: torch.Tensor, gate_side: bool) -> None:
+        """Rank 0, once per row count and switch values (each CUDA-graph capture of a new state): which query-side
+        path this decode takes -- the G3 line of TRTLLM_K3LL_HELIX_Q_ABSORB / MLA_GATE_SIDE / MLA_QKV_PDL /
+        FP8W_LOWM_FUSED_A."""
+        if getattr(self.mapping, "rank", 0) != 0:
+            return
+        all_heads = self._all_head_queries_apply()
+        pdl = (
+            bool(_flags.TRTLLM_K3LL_MLA_QKV_PDL)
+            and not all_heads
+            and bool(_flags.TRTLLM_K3LL_MLA_QKV_SPLIT)
+        )
+        fused_a = bool(
+            getattr(self.kv_a_proj_with_mqa, "_k3ll_fp8w_lowm", False)
+            and _fp8w_lowm._lowm(self.kv_a_proj_with_mqa, x.reshape(-1, x.shape[-1]))
+        )
+        key = (x.shape[0], all_heads, gate_side, pdl, fused_a)
+        if key in K3DecodeMLA._q_dispatch_logged:
+            return
+        K3DecodeMLA._q_dispatch_logged.add(key)
+        logger.info(
+            f"K3 MLA decode q dispatch: rows={x.shape[0]} all_head_q={int(all_heads)} gate_side={int(gate_side)} "
+            f"qkv_pdl={int(pdl)} fused_a_lowm={int(fused_a)} (layer {self.mqa.layer_idx})"
+        )
+
+    def _all_head_decode(
+        self,
+        ag: torch.Tensor,
+        x: torch.Tensor,
+        metadata: AttentionMetadata,
+        gate_side: bool,
+        gate_col: int,
+    ) -> torch.Tensor:
+        """``TRTLLM_K3LL_HELIX_Q_ABSORB``: every head's FP8 query on this rank (``decode_mla_q.all_head_queries``),
+        the latent row by `attention.mla_latent`, the cache append with the query already in place
+        (``q_rope_applied``), and the Helix split read without its query all-gather."""
+        rows = ag.shape[0]
+        quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(
+            ag[:, : self.q_lora_rank],
+            self.q_a_layernorm,
+            self.q_b_proj,
+            self._q_absorb_w_kc,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+        )
+        latent_cache = _fp8_attention.mla_latent(
+            ag, self.kv_a_layernorm.weight, float(self.kv_a_layernorm.variance_epsilon)
+        )
+        cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)
+        cu_kv = torch.empty_like(cu_q)
+        scheduler = torch.empty(1, dtype=torch.uint32, device=ag.device)
+        bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
+        bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
+        self.mqa.mla_rope_generation(
+            q,
+            q[..., self.qk_nope_head_dim :],
+            latent_cache,
             metadata,
-            attention_input_type=AttentionInputType.generation_only,
-            out_scale=self.out_scale,
-            latent_cache=latent_cache,
-            q_pe=q_pe,
-            cu_q_seqlens=cu_q,
-            cu_kv_seqlens=cu_kv,
-            fmha_scheduler_counter=scheduler,
-            mla_bmm1_scale=bmm1,
-            mla_bmm2_scale=bmm2,
-            quant_q_buffer=quant_q,
+            cu_q,
+            cu_kv,
+            scheduler,
+            bmm1,
+            bmm2,
+            quant_q,
+            q_rope_applied=True,
         )
-        return _fp8_attention.mla_output(
-            latent,
-            self.v_b_proj,
-            self.v_b_proj_scale,
-            ag,
-            self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+        if self.mapping.cp_rank == 0 and rows not in K3DecodeMLA._all_head_logged:
+            K3DecodeMLA._all_head_logged.add(rows)
+            lowm = bool(
+                getattr(self.q_b_proj, "_k3ll_fp8w_lowm", False)
+                and _fp8w_lowm._lowm(self.q_b_proj, q_norm)
+            )
+            logger.info(
+                f"K3 MLA decode TRTLLM_K3LL_HELIX_Q_ABSORB=1: rows={rows} heads={self.num_heads_tp} on every rank, "
+                f"q_b {'k3_fp8w_lowm_gemm' if lowm else type(self.q_b_proj).__name__}, absorb {kernel}, "
+                f"no query all-gather (layer {self.mqa.layer_idx})"
+            )
+        if gate_side:
+            self._gate_side.fork(self.g_proj, x, do_multi_stream())
+        latent = self._split_read.forward(
+            self.mqa,
+            quant_q,
+            metadata,
+            rows // metadata.num_generations,
+            bmm1,
+            bmm2,
+            all_heads=True,
         )
+        if gate_side:
+            gate, gate_col = self._gate_side.join(), 0
+        else:
+            gate = ag
+        return _fp8_attention.mla_output(latent, self.v_b_proj, self.v_b_proj_scale, gate, gate_col)
 
     def forward_generic(
         self,
@@ -3834,6 +3979,12 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     "[q | k | v | g | f_a | b] in one FP8 weight at load (the QKVG weight a view of its first rows); "
                     f"{extra} bytes more than the QKVG weights alone"
                 )
+            self._build_helix_q_absorb()
+            if _flags.TRTLLM_K3LL_MLA_GATE_SIDE:
+                logger.info(
+                    "Kimi K3 NVFP4: TRTLLM_K3LL_MLA_GATE_SIDE=1: MLA decode gate projection on a side stream, read in "
+                    "place by the V-B / gate kernel"
+                )
             self._gate_spec_worker_kernels(comm)
             self._gate_drafter_comm(comm)
             if _flags.TRTLLM_K3LL_DRAFTER_FC_TP:
@@ -3875,6 +4026,26 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     f"{_flags.TRTLLM_K3LL_HELIX_Q_AG_MNNVL}, TRTLLM_K3LL_HELIX_A2A_FUSED="
                     f"{_flags.TRTLLM_K3LL_HELIX_A2A_FUSED})"
                 )
+
+    def _build_helix_q_absorb(self) -> None:
+        """Under Helix with ``TRTLLM_K3LL_HELIX_Q_ABSORB`` at load: every MLA layer's BF16 W_UK
+        (``K3DecodeMLA.prepare_helix_q_absorb``), which the switch then uses at forward time."""
+        if not (self.model_config.mapping.has_cp_helix() and _flags.TRTLLM_K3LL_HELIX_Q_ABSORB):
+            return
+        built, lowm, why = 0, 0, collections.Counter()
+        for module in self.modules():
+            if isinstance(module, K3DecodeMLA):
+                reason = module.prepare_helix_q_absorb()
+                if reason is None:
+                    built += 1
+                    lowm += int(getattr(module.q_b_proj, "_k3ll_fp8w_lowm", False))
+                else:
+                    why[reason] += 1
+        if self.model_config.mapping.cp_rank == 0:
+            logger.info(
+                f"Kimi K3 NVFP4: TRTLLM_K3LL_HELIX_Q_ABSORB=1: all-head queries on {built} MLA layers ({lowm} with Q-B "
+                f"on k3_fp8w_lowm_gemm); not on: {dict(why)}"
+            )
 
     def _build_decode_moe_lowm(self, comm: _decode_comm.K3DecodeComm) -> int:
         """The NVFP4 MoE decode path (``decode_moe_lowm.py``) on every MoE layer it takes: the shared state
