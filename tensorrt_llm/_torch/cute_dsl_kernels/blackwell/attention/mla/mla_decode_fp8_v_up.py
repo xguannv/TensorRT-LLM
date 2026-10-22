@@ -35,6 +35,11 @@ rounds them to BF16 into the B operand in shared memory. Every output element is
 16-wide MMA steps over the 512 latent columns.
 
 Needs the split-KV workspace (``split_kv > 1``), the fixed query layout and the Helix softmax statistics.
+
+``prewait`` (``TRTLLM_K3LL_MLA_PREWAIT_L2``, with the split kernel's PDL): before its ``griddepcontrol.wait`` the
+split kernel L2-prefetches ``w_uv`` (one warp per CTA, the chunks spread over the grid), and after the wait it
+releases the fused reduction, whose CTAs then take SMs as they free up and load their ``w_uv[h]`` from L2 while the
+split kernel still runs. Prefetch hints and trigger placement only: the bytes are the same.
 """
 
 from __future__ import annotations
@@ -46,12 +51,14 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cutlass_dsl import dsl_user_op
 
+from ...k3_l2_prefetch import CHUNK_BYTES as L2_CHUNK_BYTES
+from ...k3_l2_prefetch import _bulk_prefetch_l2
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from .mla_helpers import LOG2_E
 
@@ -103,7 +110,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     reducer capacity of at most 32 splits (one split per lane).
     """
 
-    def __init__(self, *args, v_rows: int = 16, **kwargs):
+    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.emit_softmax_stats or self.is_var_q or self.is_var_split_kv:
             raise ValueError(
@@ -126,6 +133,8 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         self.v_mma_tiler = (V_HEAD_DIM, v_rows, K_BLOCK)
         self.v_mma_warp = COMBINE_WARPS
         self.v_threads = 32 * (COMBINE_WARPS + 1)
+        # The split kernel's pre-wait W_UV L2 prefetch and early release of the fused reduction (needs its PDL wait).
+        self.split_prewait = bool(prewait and self.use_pdl)
 
     @cute.jit
     def run_with_softmax_stats_v_up(
@@ -152,6 +161,9 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         ``[H, 128, 512]``) and ``v_out`` (BF16 ``[B * S_q, H, 128]``); ``o`` and ``lse`` are not written."""
         self._v_weight = v_weight
         self._v_out = v_out
+        self._v_prefetch = None
+        if cutlass.const_expr(self.split_prewait):
+            self._v_prefetch = v_weight
         self._run(
             q_latent,
             q_rope,
@@ -171,6 +183,25 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             output_scale,
             stream,
         )
+
+    @cute.jit
+    def _split_prewait_loads(self, mW: cute.Tensor):
+        """In the split kernel, before its PDL wait (one warp per CTA): an L2 prefetch of ``w_uv``, the fused
+        reduction's weight, in ``L2_CHUNK_BYTES`` chunks spread over every thread of that warp across the grid."""
+        lane = cute.arch.lane_idx()
+        grid_x, grid_y, grid_z = cute.arch.grid_dim()
+        blk_x, blk_y, blk_z = cute.arch.block_idx()
+        cta = Int32(blk_x) + Int32(grid_x) * (Int32(blk_y) + Int32(grid_y) * Int32(blk_z))
+        step = Int32(grid_x) * Int32(grid_y) * Int32(grid_z) * self.threads_per_warp
+        base = mW.iterator.toint()
+        nbytes = Int64(cute.size(mW)) * (cutlass.BFloat16.width // 8)
+        chunks = Int32((nbytes + (L2_CHUNK_BYTES - 1)) // L2_CHUNK_BYTES)
+        for c in cutlass.range(cta * self.threads_per_warp + lane, chunks, step, unroll=1):
+            off = Int64(c) * L2_CHUNK_BYTES
+            size = nbytes - off
+            if size > L2_CHUNK_BYTES:
+                size = Int64(L2_CHUNK_BYTES)
+            _bulk_prefetch_l2(base + off, Int32(size))
 
     @cute.jit
     def _launch_reduction(

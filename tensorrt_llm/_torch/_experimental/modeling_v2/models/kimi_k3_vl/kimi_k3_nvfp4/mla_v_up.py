@@ -46,8 +46,12 @@ def max_fused_rows() -> int:
     return MAX_ROWS
 
 
-def _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out) -> None:
-    """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS)."""
+def _run_fused(
+    runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out, prewait=False
+) -> None:
+    """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS).
+    ``prewait``: the split kernel L2-prefetches ``v_weight`` before its PDL wait and releases the fused reduction
+    after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; with the runner's PDL only; same bytes)."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
@@ -106,6 +110,9 @@ def _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_
         v_rows,
         runner.use_pdl,
     )
+    prewait = bool(prewait and runner.use_pdl)
+    if prewait:
+        key = key + ("prewait",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -131,6 +138,7 @@ def _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_
             emit_softmax_stats=True,
             use_pdl=runner.use_pdl,
             v_rows=v_rows,
+            prewait=prewait,
         )
 
         def dyn(t, lead, align=16):
@@ -210,6 +218,7 @@ def mla_decode_fp8_v_up(
     output_scale: float,
     max_batch_size: int,
     use_pdl: bool,
+    prewait: bool,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages followed by every head's V up-projection.
 
@@ -225,6 +234,8 @@ def mla_decode_fp8_v_up(
         v_out: ``[batch * q_len, heads, 128]`` bf16 (written).
         use_pdl: the split kernel (and the unfused reduction) with programmatic dependent launch, as
             ``trtllm::k3_mla_decode_fp8_pdl`` (``TRTLLM_K3LL_MLA_DECODE_PDL``); the fused reduction always uses it.
+        prewait: with ``use_pdl`` and the fused reduction, the split kernel L2-prefetches ``v_weight`` before its
+            wait and releases the reduction after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; same bytes).
     """
     batch, q_len, heads, _ = q.shape
     page_size = kv_pages.shape[1]
@@ -243,7 +254,7 @@ def mla_decode_fp8_v_up(
     ]
     tactic = mla_decode_pdl.tactic(runner, inputs)
     if int(tactic[2]) > 1 and batch * q_len <= max_fused_rows():
-        _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out)
+        _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out, prewait)
         return
     runner(inputs, tactic=tactic, softmax_scale=softmax_scale, output_scale=output_scale)
     torch.ops.trtllm.bmm_out(
@@ -269,6 +280,7 @@ def _(
     output_scale,
     max_batch_size,
     use_pdl,
+    prewait,
 ) -> None:
     return None
 

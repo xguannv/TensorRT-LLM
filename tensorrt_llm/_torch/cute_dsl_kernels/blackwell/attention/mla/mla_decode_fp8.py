@@ -136,6 +136,12 @@ Constraints for this example:
 
 class BlackwellMultiHeadLatentAttentionForwardFP8:
 
+    #: Subclass hook: the split kernel calls ``_split_prewait_loads(v_prefetch)`` from one warp
+    #: before ``griddepcontrol.wait`` and releases its dependent right after the wait. Off here.
+    split_prewait = False
+    #: The tensor handed to ``_split_prewait_loads`` (None: none).
+    _v_prefetch = None
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -1093,6 +1099,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cta_layout_vmnk,
                 tile_sched_params,
                 SplitKVKernelSharedStorage,
+                self._v_prefetch,
             )
         else:
             split_kv_kernel = self.split_kv_kernel(
@@ -1132,6 +1139,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cta_layout_vmnk,
                 tile_sched_params,
                 SplitKVKernelSharedStorage,
+                self._v_prefetch,
             )
         split_kv_kernel.launch(
             grid=grid,
@@ -1307,6 +1315,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cta_layout_vmnk: cute.Layout,
         tile_sched_params: MLAStaticTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
+        v_prefetch: Optional[cute.Tensor],
     ):
         """The device split_kv kernel implementation of the Multi-Head Latent Attention.
 
@@ -1494,14 +1503,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
+        if cutlass.const_expr(self.split_prewait):
+            # A subclass's loads of load-time state for the next grid (e.g. an
+            # L2 prefetch of its weight), issued before the wait.
+            if warp_idx == self.load_tma_v_warp_id:
+                self._split_prewait_loads(v_prefetch)
         if cutlass.const_expr(self.use_pdl):
             # Everything above touched only this CTA's shared memory and the
             # TMA descriptors; the inputs (the queries, the cache, the page
             # table and bounds the preceding kernels write) and the outputs
-            # are accessed after the preceding kernel completed. The
+            # are accessed after the preceding kernel completed. By default the
             # reduction is released by this grid's exits (no early trigger:
-            # its CTAs would wait on the SMs of running clusters).
+            # its CTAs would wait on the SMs of running clusters); with
+            # ``split_prewait`` a subclass's consumer is released here.
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.split_prewait):
+                cute.arch.griddepcontrol_launch_dependents()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors

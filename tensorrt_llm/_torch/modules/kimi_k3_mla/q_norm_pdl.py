@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """RMSNorm of the MLA q_a latent that releases its dependent grid at launch (Kimi K3 decode).
 
-FlashInfer's CuTe DSL ``RMSNormKernel`` (what ``RMSNorm`` runs for this BF16 norm) with one
-change: ``griddepcontrol.launch_dependents`` is issued when a CTA starts instead of after its
-store. The arithmetic is the kernel's own code, so the output is bitwise the same.
+FlashInfer's CuTe DSL ``RMSNormKernel`` (what ``RMSNorm`` runs for this BF16 norm) with two
+changes: ``griddepcontrol.launch_dependents`` is issued when a CTA starts instead of after its
+store, and the norm weight (load-time state) is read before ``griddepcontrol.wait`` instead of
+after it. The arithmetic is the kernel's own code, so the output is bitwise the same.
 
 Why: the dependent is the q_b projection (``k3_fp8w_lowm_gemm``), a weight-streaming GEMM. With
 the trigger at the end it launches only when this norm finishes, after the q_a GEMM. Released
@@ -47,7 +48,8 @@ except ImportError:  # pragma: no cover - FlashInfer without the CuTe DSL norm k
 
 
 class _LaunchReleaseRMSNormKernel(RMSNormKernel):
-    """``RMSNormKernel`` whose PDL trigger comes first; everything else is unchanged."""
+    """``RMSNormKernel`` whose PDL trigger comes first and whose weight load precedes the PDL wait;
+    everything else is unchanged."""
 
     @cute.kernel
     def kernel(
@@ -67,7 +69,6 @@ class _LaunchReleaseRMSNormKernel(RMSNormKernel):
         if enable_pdl:
             # See the module docstring for why the trigger may precede the wait.
             cute.arch.griddepcontrol_launch_dependents()
-            cute.arch.griddepcontrol_wait()
 
         H = self.H
         cluster_n = self.cluster_n
@@ -170,12 +171,15 @@ class _LaunchReleaseRMSNormKernel(RMSNormKernel):
         row_coord = tXcX[(0, 0), 0, 0]
         row_in_bounds = row_coord[0] < M
 
+        # The weight is load-time state, not written by any grid this one depends on.
+        cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
+
         if cutlass.const_expr(self.use_async_copy):
             if row_in_bounds:
                 cute.copy(copy_atom_async, tXgX, tXsX, pred=tXpX)
             cute.arch.cp_async_commit_group()
-
-            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
 
             cute.arch.cp_async_wait_group(0)
 
@@ -184,8 +188,6 @@ class _LaunchReleaseRMSNormKernel(RMSNormKernel):
             tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
             if row_in_bounds:
                 cute.copy(copy_atom_sync, tXgX, tXrX, pred=tXpX)
-
-            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
 
         x = tXrX.load().to(Float32)
         x_sq = x * x
@@ -254,8 +256,19 @@ def _compiled(dtype_str: str, H: int, sm_version: int, contiguous: bool):
     )
 
 
+def _flashinfer_uses_cuda_norm(device: torch.device) -> bool:
+    """Whether ``flashinfer.norm.rmsnorm`` takes its CUDA JIT kernel on ``device`` (opt-in, or an architecture the
+    installed CuTe DSL cannot target) instead of ``RMSNormKernel``; then this kernel is not its bitwise twin."""
+    try:
+        from flashinfer.norm import _use_cuda_norm
+    except ImportError:
+        return False
+    return bool(_use_cuda_norm(device))
+
+
 def can_use(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether :func:`rmsnorm_release_at_launch` serves ``x`` (2D BF16, unit column stride)."""
+    """Whether :func:`rmsnorm_release_at_launch` serves ``x`` (2D BF16, unit column stride) as the bitwise twin of
+    ``flashinfer.norm.rmsnorm``."""
     return (
         IS_AVAILABLE
         and x.is_cuda
@@ -267,6 +280,7 @@ def can_use(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and x.data_ptr() % 16 == 0
         and x.stride(0) % 8 == 0
         and x.shape[0] * x.stride(0) < 2**31
+        and not _flashinfer_uses_cuda_norm(x.device)
     )
 
 

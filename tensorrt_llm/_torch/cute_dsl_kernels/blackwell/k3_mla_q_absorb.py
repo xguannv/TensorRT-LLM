@@ -36,6 +36,12 @@ epilogue takes ``max.f32(acc, -448)`` (NaN -> -448) and converts with ``cvt.rn.s
 nearest even, so the bytes are identical. Four more warps per CTA copy ``q_pe`` (grid-stride
 over 16-byte chunks, overlapping the GEMM). With PDL the TMA warp issues the weight stages of
 its first tile before ``griddepcontrol.wait``.
+
+``prewait`` (``TRTLLM_K3LL_MLA_PREWAIT_L2``): before the wait the TMA warp walks all of its CTA's
+tiles, issuing weight stages into the shared-memory ring while it has room and an L2 prefetch
+(``cp.async.bulk.prefetch.L2``) of each tile it could not stage whole; every warp releases the
+dependent grid right after its own wait (or at its start, for the MMA warp, which reads only
+shared memory). The loads, the MMA order and the epilogue are unchanged, so the bytes are too.
 """
 
 from __future__ import annotations
@@ -58,6 +64,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .dense_gemm_persistent import PersistentDenseGemmKernel, _compute_stages
+from .k3_l2_prefetch import CHUNK_BYTES as L2_CHUNK_BYTES
+from .k3_l2_prefetch import _bulk_prefetch_l2
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: Largest token count the op accepts.
@@ -181,6 +189,7 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         pe_unroll: int = 8,
         epi_n: int = 64,
         smem_headroom: int = SMEM_HEADROOM,
+        prewait: bool = False,
     ):
         assert pe_warps > 0 and rope_dim % PE_VEC == 0
         super().__init__(
@@ -196,6 +205,12 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         self.rope_dim = rope_dim
         self.lora_dim = lora_dim
         self.use_pdl = use_pdl
+        self.tile_n = tile_n
+        # Weight tiles of every CTA staged / L2-prefetched before the PDL wait, dependents released after it.
+        self.prewait = prewait and use_pdl
+        # One weight tile (tile_n lora rows x nope of one head) is contiguous: L2 prefetch chunks per tile.
+        self.w_tile_chunks = -(-(tile_n * nope_dim * 2) // L2_CHUNK_BYTES)
+        assert self.w_tile_chunks <= 32
         # Extra warps copy q_pe (grid-stride over 16-byte chunks, independent of the tiles).
         self.pe_warp_id = tuple(range(6, 6 + pe_warps))
         self.pe_unroll = pe_unroll
@@ -307,6 +322,9 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
             max_active_clusters,
         )
 
+        w_prefetch = None
+        if cutlass.const_expr(self.prewait):
+            w_prefetch = w_ptr
         self.qabs_kernel(
             tiled_mma,
             tma_atom_a,
@@ -323,6 +341,7 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
             self.tile_sched_params,
             q_ptr,
             out_ptr,
+            w_prefetch,
             num_tokens,
             q_tok_stride,
             out_tok_stride,
@@ -352,6 +371,7 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         tile_sched_params: utils.PersistentTileSchedulerParams,
         q_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
+        w_prefetch: Optional[cute.Pointer],
         num_tokens: Int32,
         q_tok_stride: Int32,
         out_tok_stride: Int32,
@@ -484,83 +504,104 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         #
         # TMA warp: weight stages of the first tile before the PDL wait, then everything else.
         #
-        if warp_idx == self.tma_warp_id:
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-            ab_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
-            )
-            n_pre = Int32(0)
-            if work_tile.is_valid_tile:
-                n_pre = k_tile_cnt
-                if n_pre > self.num_ab_stage:
-                    n_pre = Int32(self.num_ab_stage)
-                coord0 = work_tile.tile_idx
-                tBgB0 = tBgB[(None, coord0[1], None, coord0[2])]
-                for kt in cutlass.range(n_pre, unroll=1):
-                    ab_pipeline.producer_acquire(ab_producer_state)
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB0[(None, kt)],
-                        tBsB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=b_full_mcast_mask,
-                    )
-                    ab_producer_state.advance()
-            if cutlass.const_expr(self.use_pdl):
-                griddepcontrol_wait()
-            k_pre = n_pre
-            pre_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_ab_stage
-            )
-            while work_tile.is_valid_tile:
-                cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_mnl = (
-                    cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
-                    cur_tile_coord[1],
-                    cur_tile_coord[2],
+        if cutlass.const_expr(self.prewait):
+            if warp_idx == self.tma_warp_id:
+                self._tma_warp_prewait(
+                    tile_sched_params,
+                    k_tile_cnt,
+                    tiled_mma,
+                    ab_pipeline,
+                    tma_atom_a,
+                    tma_atom_b,
+                    tAsA,
+                    tAgA,
+                    tBsB,
+                    tBgB,
+                    a_full_mcast_mask,
+                    b_full_mcast_mask,
+                    w_prefetch,
                 )
-                tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
-                # Query halves of the prefetched stages.
-                for kt in cutlass.range(k_pre, unroll=1):
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_slice[(None, kt)],
-                        tAsA[(None, pre_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
-                        mcast_mask=a_full_mcast_mask,
+        else:
+            if warp_idx == self.tma_warp_id:
+                tile_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                ab_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_ab_stage
+                )
+                n_pre = Int32(0)
+                if work_tile.is_valid_tile:
+                    n_pre = k_tile_cnt
+                    if n_pre > self.num_ab_stage:
+                        n_pre = Int32(self.num_ab_stage)
+                    coord0 = work_tile.tile_idx
+                    tBgB0 = tBgB[(None, coord0[1], None, coord0[2])]
+                    for kt in cutlass.range(n_pre, unroll=1):
+                        ab_pipeline.producer_acquire(ab_producer_state)
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB0[(None, kt)],
+                            tBsB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                            mcast_mask=b_full_mcast_mask,
+                        )
+                        ab_producer_state.advance()
+                if cutlass.const_expr(self.use_pdl):
+                    griddepcontrol_wait()
+                k_pre = n_pre
+                pre_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_ab_stage
+                )
+                while work_tile.is_valid_tile:
+                    cur_tile_coord = work_tile.tile_idx
+                    mma_tile_coord_mnl = (
+                        cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                        cur_tile_coord[1],
+                        cur_tile_coord[2],
                     )
-                    pre_state.advance()
-                for kt in cutlass.range(k_pre, k_tile_cnt, 1, unroll=1):
-                    ab_pipeline.producer_acquire(ab_producer_state)
-                    bar = ab_pipeline.producer_get_barrier(ab_producer_state)
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_slice[(None, kt)],
-                        tAsA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=a_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, kt)],
-                        tBsB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=b_full_mcast_mask,
-                    )
-                    ab_producer_state.advance()
-                k_pre = Int32(0)
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-            ab_pipeline.producer_tail(ab_producer_state)
+                    tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
+                    tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                    # Query halves of the prefetched stages.
+                    for kt in cutlass.range(k_pre, unroll=1):
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_slice[(None, kt)],
+                            tAsA[(None, pre_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                            mcast_mask=a_full_mcast_mask,
+                        )
+                        pre_state.advance()
+                    for kt in cutlass.range(k_pre, k_tile_cnt, 1, unroll=1):
+                        ab_pipeline.producer_acquire(ab_producer_state)
+                        bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_slice[(None, kt)],
+                            tAsA[(None, ab_producer_state.index)],
+                            tma_bar_ptr=bar,
+                            mcast_mask=a_full_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_slice[(None, kt)],
+                            tBsB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=bar,
+                            mcast_mask=b_full_mcast_mask,
+                        )
+                        ab_producer_state.advance()
+                    k_pre = Int32(0)
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+                ab_pipeline.producer_tail(ab_producer_state)
 
         #
         # MMA warp
         #
         if warp_idx == self.mma_warp_id:
+            if cutlass.const_expr(self.prewait):
+                # Reads only shared memory and tensor memory, fed by the TMA warp after its wait.
+                griddepcontrol_launch_dependents()
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -619,6 +660,8 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
             if cutlass.const_expr(self.use_pdl):
                 # q_pe comes from the previous grid; ``out`` may still be read by earlier ones.
                 griddepcontrol_wait()
+                if cutlass.const_expr(self.prewait):
+                    griddepcontrol_launch_dependents()
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -720,6 +763,8 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         if warp_idx >= self.pe_warp_id[0]:
             if cutlass.const_expr(self.use_pdl):
                 griddepcontrol_wait()
+                if cutlass.const_expr(self.prewait):
+                    griddepcontrol_launch_dependents()
             head_dim = self.nope_dim + self.rope_dim
             out_head_dim = self.lora_dim + self.rope_dim
             chunks_per_row = self.rope_dim // PE_VEC
@@ -770,6 +815,126 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
         if cutlass.const_expr(self.use_pdl):
             griddepcontrol_launch_dependents()
 
+    @cute.jit
+    def _tma_warp_prewait(
+        self,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
+        k_tile_cnt: Int32,
+        tiled_mma: cute.TiledMma,
+        ab_pipeline,
+        tma_atom_a: cute.CopyAtom,
+        tma_atom_b: cute.CopyAtom,
+        tAsA: cute.Tensor,
+        tAgA: cute.Tensor,
+        tBsB: cute.Tensor,
+        tBgB: cute.Tensor,
+        a_full_mcast_mask,
+        b_full_mcast_mask,
+        w_prefetch: cute.Pointer,
+    ):
+        """The TMA warp of ``prewait``: before ``griddepcontrol.wait``, the weight (B) stages of this CTA's tiles in
+        tile order while the ring has room, and an L2 prefetch of every tile not staged whole; after it, each
+        stage's query (A) half, then the remaining stages as the plain kernel loads them. Stage order and
+        contents are the plain kernel's."""
+        lane = cute.arch.lane_idx()
+        w_base = w_prefetch.toint()
+        tile_elems = self.tile_n * self.nope_dim
+        head_elems = self.lora_dim * self.nope_dim
+        ab_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_ab_stage
+        )
+        pf_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        pf_tile = pf_sched.initial_work_tile_info()
+        room = Int32(self.num_ab_stage)
+        n_pre = Int32(0)
+        while pf_tile.is_valid_tile:
+            coord = pf_tile.tile_idx
+            nb = k_tile_cnt
+            if nb > room:
+                nb = room
+            tBgB_t = tBgB[(None, coord[1], None, coord[2])]
+            for kt in cutlass.range(nb, unroll=1):
+                ab_pipeline.producer_acquire(ab_producer_state)
+                cute.copy(
+                    tma_atom_b,
+                    tBgB_t[(None, kt)],
+                    tBsB[(None, ab_producer_state.index)],
+                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                    mcast_mask=b_full_mcast_mask,
+                )
+                ab_producer_state.advance()
+            if nb < k_tile_cnt:
+                # w_kc[h, n * tile_n : (n + 1) * tile_n, :] is contiguous (bf16).
+                tile_addr = (
+                    w_base
+                    + (Int64(coord[2]) * head_elems + Int64(coord[1]) * tile_elems) * 2
+                    + Int64(lane) * L2_CHUNK_BYTES
+                )
+                if lane < self.w_tile_chunks:
+                    _bulk_prefetch_l2(tile_addr, Int32(L2_CHUNK_BYTES))
+            room = room - nb
+            n_pre = n_pre + nb
+            pf_sched.advance_to_next_work()
+            pf_tile = pf_sched.get_current_work()
+
+        griddepcontrol_wait()
+        griddepcontrol_launch_dependents()
+
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+        k_pre = n_pre
+        pre_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_ab_stage
+        )
+        while work_tile.is_valid_tile:
+            cur_tile_coord = work_tile.tile_idx
+            mma_tile_coord_mnl = (
+                cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                cur_tile_coord[1],
+                cur_tile_coord[2],
+            )
+            tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
+            tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+            k_here = k_pre
+            if k_here > k_tile_cnt:
+                k_here = k_tile_cnt
+            # Query halves of the staged stages.
+            for kt in cutlass.range(k_here, unroll=1):
+                cute.copy(
+                    tma_atom_a,
+                    tAgA_slice[(None, kt)],
+                    tAsA[(None, pre_state.index)],
+                    tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                    mcast_mask=a_full_mcast_mask,
+                )
+                pre_state.advance()
+            for kt in cutlass.range(k_here, k_tile_cnt, 1, unroll=1):
+                ab_pipeline.producer_acquire(ab_producer_state)
+                bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+                cute.copy(
+                    tma_atom_a,
+                    tAgA_slice[(None, kt)],
+                    tAsA[(None, ab_producer_state.index)],
+                    tma_bar_ptr=bar,
+                    mcast_mask=a_full_mcast_mask,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB_slice[(None, kt)],
+                    tBsB[(None, ab_producer_state.index)],
+                    tma_bar_ptr=bar,
+                    mcast_mask=b_full_mcast_mask,
+                )
+                ab_producer_state.advance()
+            k_pre = k_pre - k_here
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+        ab_pipeline.producer_tail(ab_producer_state)
+
 
 def _gmem_ptr(dtype, tensor: torch.Tensor):
     return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
@@ -793,6 +958,7 @@ def _compiled(
     pe_unroll: int = 8,
     epi_n: int = 64,
     smem_headroom: int = SMEM_HEADROOM,
+    prewait: bool = False,
 ):
     kernel = K3MlaQAbsorbKernel(
         num_heads,
@@ -806,6 +972,7 @@ def _compiled(
         pe_unroll,
         min(epi_n, tile_n),
         smem_headroom,
+        prewait,
     )
     dummy = 1 << 20
     bf = make_ptr(cutlass.BFloat16, dummy, cute.AddressSpace.gmem, assumed_align=16)
@@ -839,12 +1006,22 @@ def tile_for(num_tokens: int) -> Tuple[int, bool]:
 
 @functools.cache
 def _compile_all(
-    num_heads: int, nope_dim: int, rope_dim: int, lora_dim: int, use_pdl: bool
+    num_heads: int,
+    nope_dim: int,
+    rope_dim: int,
+    lora_dim: int,
+    use_pdl: bool,
+    prewait: bool = False,
 ) -> None:
     # Every tile the table can pick, at the first (eager) call, so a later CUDA graph capture
     # of another token count never compiles.
     for _, (tile_n, use_2cta) in _TILE_TABLE:
-        _compiled(num_heads, nope_dim, rope_dim, lora_dim, tile_n, use_2cta, use_pdl)
+        if prewait:
+            _compiled(
+                num_heads, nope_dim, rope_dim, lora_dim, tile_n, use_2cta, use_pdl, prewait=True
+            )
+        else:
+            _compiled(num_heads, nope_dim, rope_dim, lora_dim, tile_n, use_2cta, use_pdl)
 
 
 def _is_supported_device(device_index: int) -> bool:
@@ -893,13 +1070,22 @@ def k3_mla_q_absorb(
     *,
     tile: Optional[Tuple[int, bool]] = None,
     use_pdl: bool = True,
+    prewait: bool = False,
 ) -> None:
-    """Write the FP8 absorbed query into ``out`` (see the module docstring); check ``can_run``."""
+    """Write the FP8 absorbed query into ``out`` (see the module docstring); check ``can_run``.
+    ``prewait``: the weight-before-wait / early-release variant (same bytes; needs ``use_pdl``)."""
     num_tokens, num_heads, _ = q.shape
     lora_dim = w_kc.shape[1]
-    _compile_all(num_heads, nope_dim, rope_dim, lora_dim, use_pdl)
+    prewait = bool(prewait and use_pdl)
     tile_n, use_2cta = tile if tile is not None else tile_for(num_tokens)
-    fn = _compiled(num_heads, nope_dim, rope_dim, lora_dim, tile_n, use_2cta, use_pdl)
+    if prewait:
+        _compile_all(num_heads, nope_dim, rope_dim, lora_dim, use_pdl, True)
+        fn = _compiled(
+            num_heads, nope_dim, rope_dim, lora_dim, tile_n, use_2cta, use_pdl, prewait=True
+        )
+    else:
+        _compile_all(num_heads, nope_dim, rope_dim, lora_dim, use_pdl)
+        fn = _compiled(num_heads, nope_dim, rope_dim, lora_dim, tile_n, use_2cta, use_pdl)
     fn(
         num_tokens,
         q.stride(0),

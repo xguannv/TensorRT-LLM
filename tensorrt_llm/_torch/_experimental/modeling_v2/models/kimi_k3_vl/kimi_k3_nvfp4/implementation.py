@@ -3007,7 +3007,16 @@ class K3DecodeMLA(KimiK3MLAAttention):
             self._q_absorb_w_kc,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
+            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL),
+            absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
         )
+        if "+qnorm_pdl" in kernel or "+prewait" in kernel:
+            from . import census as _census
+
+            if "+qnorm_pdl" in kernel:
+                _census.count(f"mla_qnorm_pdl:{_census.mode()}")
+            if "+prewait" in kernel:
+                _census.count(f"mla_prewait_absorb:{_census.mode()}")
         latent_cache = _fp8_attention.mla_latent(
             ag, self.kv_a_layernorm.weight, float(self.kv_a_layernorm.variance_epsilon)
         )

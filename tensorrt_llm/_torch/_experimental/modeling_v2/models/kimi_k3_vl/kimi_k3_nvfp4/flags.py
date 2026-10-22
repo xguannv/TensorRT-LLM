@@ -219,6 +219,19 @@ TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
     "per head, then the gate (mla_v_up.py); 1 at launch builds the BF16 W_UV of all heads (12.6 MB per MLA layer), "
     "on SM103 only (elsewhere the switch-off path)",
 )
+TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
+    "TRTLLM_K3LL_MLA_QNORM_PDL",
+    0,
+    "Helix all-head MLA queries: the q_a RMSNorm releases q_b at launch and reads its weight before the PDL wait "
+    "(modules/kimi_k3_mla/q_norm_pdl.py, bitwise FlashInfer's kernel; read at forward time)",
+)
+TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
+    "TRTLLM_K3LL_MLA_PREWAIT_L2",
+    0,
+    "MLA decode weights before the PDL wait: K3MlaQAbsorb stages / L2-prefetches all of its W_UK tiles and releases "
+    "its dependents after the wait; the V-up split-KV kernel L2-prefetches W_UV and releases reduce_v_up after the "
+    "wait (bitwise; read at forward time)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

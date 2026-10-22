@@ -315,6 +315,9 @@ def split_read_attention_v_up(
 
     if _flags.TRTLLM_K3LL_MLA_DECODE_PDL:
         _census.count(f"mla_decode_pdl:{_census.mode()}")
+    prewait = bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2 and _flags.TRTLLM_K3LL_MLA_DECODE_PDL)
+    if prewait:
+        _census.count(f"mla_prewait_v_up:{_census.mode()}")
     torch.ops.trtllm.k3_mla_decode_fp8_v_up(
         q,
         kv_pages,
@@ -330,6 +333,7 @@ def split_read_attention_v_up(
         output_scale,
         max_batch,
         bool(_flags.TRTLLM_K3LL_MLA_DECODE_PDL),
+        prewait,
     )
 
 
