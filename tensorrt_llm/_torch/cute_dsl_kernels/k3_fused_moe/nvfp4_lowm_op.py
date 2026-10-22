@@ -48,9 +48,15 @@ TILE = 128
 SF_VEC = 16
 #: Tiles a counter buffer holds.
 MAX_TILES = 4096
-#: Weight ring stages for token tiles of 8 and 16 (fewer bytes in flight per SM: FC2 finds its tiles sooner); 32
-#: tokens take as many as fit.
+#: Weight ring stages for token tiles of 8 and 16 when FC2's K is a multiple of 256 (the TP4 slice of 768; fewer bytes
+#: in flight per SM: FC2 finds its tiles sooner); 32 tokens take as many as fit.
 _DEFAULT_STAGES = {8: 6, 16: 6}
+#: Ring stage cap when FC2's K is not a multiple of 256 (TP8 / TP16 slices of 384 / 192): as many as fit, since an FC2
+#: block then carries less than 48 KB of weights and the FC2 phase needs more of them in flight.
+_PARTIAL_K_STAGES = 16
+#: When FC2's K is not a multiple of 256, an FC2 unit takes as many 128-row W2 blocks as stream about the weight bytes
+#: of one block at this K (the kernel lowers it until it divides the blocks and fits in the ring).
+_FC2_UNIT_K = 768
 _SUPPORTED_SM = ((10, 0), (10, 3))
 #: The token counts the two-kernel launch (``k3_moe_nvfp4_lowm_fc12``) serves in the decode path: the 32-token tile.
 FC12_MIN_TOKENS = 17
@@ -94,11 +100,22 @@ def supported(device: torch.device, n1: int, k1: int, num_tokens: int = 1) -> Tu
         import cutlass  # noqa: F401
     except ImportError:
         return False, "CuTe DSL (nvidia-cutlass-dsl) is not installed"
-    if n1 % 256 or (n1 // 2) % 256 or k1 % 256:
-        return False, f"W1 [{n1}, {k1}] is not a multiple of 256 rows / columns (and half rows)"
+    if n1 % TILE or k1 % 256:
+        return False, f"W1 [{n1}, {k1}]: rows not a multiple of {TILE} or columns of 256"
     if not 0 < num_tokens <= MAX_TOKENS:
         return False, f"{num_tokens} tokens (1 to {MAX_TOKENS})"
     return True, ""
+
+
+def kernel_config(n_tok: int, k2: int, fc2_chunk: int = 0, max_stages: int = 0) -> Tuple[int, int]:
+    """``(fc2_chunk, max_stages)`` the kernel is built with for token tile ``n_tok`` and FC2 K ``k2`` (``n1 / 2``); a
+    non-zero argument overrides its default. The kernel may lower both to what divides the W2 blocks and fits in
+    shared memory."""
+    if k2 % 256 == 0:
+        chunk, stages = 1, _DEFAULT_STAGES.get(n_tok, 16)
+    else:
+        chunk, stages = max(1, _FC2_UNIT_K // k2), _PARTIAL_K_STAGES
+    return (fc2_chunk if fc2_chunk > 0 else chunk), (max_stages if max_stages > 0 else stages)
 
 
 def new_counters(device: torch.device) -> torch.Tensor:
@@ -172,6 +189,8 @@ def k3_moe_nvfp4_lowm(
     local_offset: int = 0,
     static_first: bool = False,
     fast_tok: bool = False,
+    fc2_chunk: int = 0,
+    max_stages: int = 0,
 ) -> None:
     """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 32`` tokens.
 
@@ -186,7 +205,8 @@ def k3_moe_nvfp4_lowm(
     kernel sorts the routing over the local experts ``[local_offset, local_offset + E)`` itself (`run`'s
     ``self_sort``) and the four sort arguments are not read. ``static_first``: CTA ``b`` takes unit ``b`` first
     (``K3MoeLowMDynKernel``'s static first unit; same results). ``fast_tok``: the kernel's fast token operand
-    (no per-FC2-unit counter round trip; same results)."""
+    (no per-FC2-unit counter round trip; same results). ``fc2_chunk`` / ``max_stages``: the kernel's FC2 unit size
+    and ring stage cap (0: `kernel_config`'s defaults)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -217,7 +237,7 @@ def k3_moe_nvfp4_lowm(
     device = x_fp4.device
     sms = _num_sms(_device_index(device))
     ctas = min(num_ctas, sms) if num_ctas > 0 else sms
-    stages = _DEFAULT_STAGES.get(n_tok, 16)
+    chunk, stages = kernel_config(n_tok, k2, fc2_chunk, max_stages)
     if h is None:
         h = torch.empty(m, k2 // 2, dtype=torch.uint8, device=device)
     if h_sf is None:
@@ -262,7 +282,7 @@ def k3_moe_nvfp4_lowm(
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (_device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas, stages,
-           use_pdl, num_local if self_sort else 0, scales_bf16, bool(static_first), bool(fast_tok))  # fmt: skip
+           chunk, use_pdl, num_local if self_sort else 0, scales_bf16, bool(static_first), bool(fast_tok))  # fmt: skip
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -273,7 +293,7 @@ def k3_moe_nvfp4_lowm(
             fn = _compiled.get(key)
             if fn is None:
                 kernel = dyn.K3MoeLowMDynKernel(
-                    n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), fc2_chunk=1,
+                    n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), fc2_chunk=chunk,
                     max_ab_stage=stages, use_pdl=use_pdl, self_sort_local=num_local if self_sort else 0,
                     static_first=bool(static_first), fast_tok=bool(fast_tok),
                 )  # fmt: skip
@@ -287,7 +307,7 @@ def k3_moe_nvfp4_lowm(
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, counters, top_k,
       situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, topk_ids=None, local_offset=0,
-      static_first=False, fast_tok=False):  # fmt: skip
+      static_first=False, fast_tok=False, fc2_chunk=0, max_stages=0):  # fmt: skip
     return None
 
 
