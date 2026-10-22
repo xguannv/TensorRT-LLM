@@ -39,6 +39,8 @@ MAX_TOKENS = 8
 # The 16-token build (2 requests x 8 tokens): calls of 9 to 16 rows. Its head workspace is laid out for 16 tokens
 # (``K3MoeHeadWorkspace.create(..., m_max=16)``); a workspace serves one build only.
 WIDE_TOKENS = 16
+# The 32-token build (4 requests x 8 tokens): calls of 17 to 32 rows, on a workspace created with ``m_max=32``.
+WIDE32_TOKENS = 32
 DEFAULT_RING = 4
 
 _lock = threading.Lock()
@@ -88,8 +90,10 @@ def _max_clusters_of(device_index: int) -> int:
 
 
 def m_build(num_tokens: int) -> int:
-    """The kernel build of a call of ``num_tokens`` rows: 8, or 16 above 8."""
-    return MAX_TOKENS if num_tokens <= MAX_TOKENS else WIDE_TOKENS
+    """The kernel build of a call of ``num_tokens`` rows: 8, 16 above 8, or 32 above 16."""
+    if num_tokens <= MAX_TOKENS:
+        return MAX_TOKENS
+    return WIDE_TOKENS if num_tokens <= WIDE_TOKENS else WIDE32_TOKENS
 
 
 def max_clusters(device: torch.device) -> int:
@@ -108,24 +112,25 @@ def weight_supported(
 ) -> bool:
     """Whether the ``m_max``-token build runs this TP world, shared activation width and hidden size (any M up to
     ``m_max``)."""
-    return _kernel().supports(world, shared_cols, max_clusters(device), k_in, ring, m_max)
+    kernel, capacity = _kernel(), max_clusters(device)
+    ring = kernel.fit_ring(world, shared_cols, capacity, k_in, ring, m_max)
+    return kernel.supports(world, shared_cols, capacity, k_in, ring, m_max)
 
 
 def supports(
     x: torch.Tensor, w_front: torch.Tensor, world: int, shared_cols: int, ring: int = DEFAULT_RING
 ) -> bool:
     kernel = _kernel()
-    return (
+    if not (
         x.dim() == 2
-        and 0 < x.shape[0] <= WIDE_TOKENS
+        and 0 < x.shape[0] <= WIDE32_TOKENS
         and x.dtype == torch.bfloat16
         and w_front.dtype == torch.bfloat16
         and x.shape[1] == w_front.shape[1]
         and w_front.shape[0] == (kernel.head_tiles(world) * 128 + 2 * shared_cols)
-        and kernel.supports(
-            world, shared_cols, max_clusters(x.device), x.shape[1], ring, m_build(x.shape[0])
-        )
-    )
+    ):
+        return False
+    return weight_supported(world, shared_cols, x.shape[1], x.device, ring, m_build(x.shape[0]))
 
 
 def sort_layout(num_tokens: int, num_local: int) -> Tuple[int, int, int, int]:
@@ -175,7 +180,7 @@ def k3_moe_front(
     sort_offset: int = 0,
     sort_local: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``x`` bf16 ``[M <= 16, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
+    """``x`` bf16 ``[M <= 32, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
     ``(topk_ids, topk_weights, quantized, scales, shared)``: what ``trtllm::k3_route_quant`` returns for the gathered
     head's router logits and latent, and the shared experts' activation bf16 ``[M, shared_cols]``. With ``ag_ready``
@@ -220,7 +225,9 @@ def k3_moe_front(
     if nvfp4 and ag_ready is not None:
         raise ValueError("k3_moe_front: the NVFP4 latent has no head_flags consumer (ag_ready)")
     if m_max != MAX_TOKENS and ag_ready is not None:
-        raise ValueError("k3_moe_front: the 16-token build has no head_flags consumer (ag_ready)")
+        raise ValueError(
+            "k3_moe_front: the 16- and 32-token builds have no head_flags consumer (ag_ready)"
+        )
     if nvfp4:
         quantized = torch.empty(num_tokens, HIDDEN_SIZE // 2, dtype=torch.uint8, device=device)
         scales = torch.empty(
@@ -273,6 +280,8 @@ def k3_moe_front(
         arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
     )
     capacity = max_clusters(device)
+    # The 32-token build may run a shallower weight ring than asked (`fit_ring`); the others run ``ring``.
+    ring = kernel.fit_ring(ag_world, shared_cols, capacity, k_in, ring, m_max)
     # One round with the head in 64-row half-tiles when it fits (TP16): every head k-tile on chip before the wait.
     half = kernel.half_geometry(ag_world, shared_cols, capacity, k_in, ring, m_max)
     head_half = half is not None

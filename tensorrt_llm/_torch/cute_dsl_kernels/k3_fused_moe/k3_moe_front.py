@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =============================================================================
-# Kimi K3 MoE front for decode, one CTM (prims/cute) kernel per MoE layer, M <= 8 tokens:
+# Kimi K3 MoE front for decode, one CTM (prims/cute) kernel per MoE layer, M <= 8 tokens (or up to the token tile
+# m_max of a wider build, below):
 #
 #   head   = x @ [latent-down slice; router slice]^T       (fp32; this rank's 3584/W latent columns, 896/W logits)
 #   gather = every rank's head slice, through the multicast mapping of the head workspace (Lamport buffers)
@@ -40,14 +41,20 @@
 #       8 partials in rank order from +0.0 (the owner's sum, bit for bit); no fence after the pushes, the readers poll
 #       the words themselves;
 #   shared rows -> gate and up of one column in lanes l and l + 16: bf16(SiTU(bf16 gate) * SiTU_lin(bf16 up)).
-# Role clusters, the first two of the grid (resident before any GEMV cluster): CTA t < M routes token t, CTA M + t
-# quantizes it, k3_route_quant_ag's device code minus its push (the GEMV epilogues push), the route CTA selecting
-# with all its warps (_top16_cta) instead of top16_warp's one warp. Every CTA that reads the
-# buffer index (the 2 M role CTAs and every GEMV CTA) signs in on flags[3] right after the read; thread 0 of token 0's
-# quantization CTA waits for all of them and flips the index for the next call, long before the data it polls arrives,
-# so no count sits on the role CTAs' output path. With `publish`, per-token ready words as route_quant_ag's.
+# Role clusters, the first of the grid (resident before any GEMV cluster): CTA t < M routes token t, CTA M + q
+# quantizes tokens [q Q, q Q + Q) (Q = `quant_tokens`: 1, or 2 in the 32-token build), k3_route_quant_ag's device
+# code minus its push (the GEMV epilogues push), the route CTA selecting with all its warps (_top16_cta) instead of
+# top16_warp's one warp. Every CTA that reads the buffer index (the role CTAs and every GEMV CTA) signs in on flags[3]
+# right after the read; thread 0 of the first quantization CTA waits for all of them and flips the index for the next
+# call, long before the data it polls arrives, so no count sits on the role CTAs' output path. With `publish`,
+# per-token ready words as route_quant_ag's.
 # With `sort`, each route CTA also writes its token's weights in fp32 and counts itself in on sort_ctr; the last one
 # runs moe_sort of every token's routing over this rank's local experts (`_sort_local`) and rearms the counter.
+#
+# Token builds (m_max, compile time): 8; 16 and 32 for calls of 9-16 and 17-32 rows, each on a head workspace laid
+# out for it. m_max is tcgen05 N, x's TMA box rows, the mailbox / owner-row widths and the pushes per lane. The
+# 32-token build quantizes two tokens per CTA (6 role clusters, not 8), sizes its mailbox by the launch's rounds,
+# keeps the sort's larger scratch in a larger s_key, and runs the deepest weight ring that fits (`fit_ring`).
 #
 # Warps of a GEMV CTA: 0 weight TMA (+ early dependent trigger), 1 grid-dependency wait, head workspace flags,
 # activation TMA, 2 TMEM allocation + MMA, 3 idle, 4-7 epilogue, 8-13 exit after setup. Role CTAs: all 14 warps
@@ -74,8 +81,8 @@ HIDDEN_SIZE = 3584  # the routed latent
 MODEL_HIDDEN = 7168  # K
 SF_VEC_SIZE = 32
 NVFP4_SF_VEC = 16  # the NVFP4 latent's scale group (nvfp4)
-M_MAX = 8  # the default build's token tile; M_BUILDS also has the 16-token build
-M_BUILDS = (8, 16)
+M_MAX = 8  # the default build's token tile; M_BUILDS also has the 16- and 32-token builds
+M_BUILDS = (8, 16, 32)
 EMPTY_WORD = _ag.EMPTY_WORD
 
 CTA_M = 128
@@ -126,9 +133,16 @@ STAGE_B = (MMA_N * CTA_K * ELEM_BYTES) >> 4
 io_dtype = cutlass.BFloat16
 
 
+def quant_tokens(m_max: int = M_MAX) -> int:
+    """Tokens per quantization CTA: 1; 2 in the 32-token build, whose role CTAs would otherwise take 8 of a GB300's
+    15 clusters."""
+    return 1 if m_max <= 16 else 2
+
+
 def role_clusters(m_max: int = M_MAX) -> int:
-    """Clusters of role CTAs: CTA t < M routes token t, CTA M + t quantizes it."""
-    return 2 * m_max // SPLIT
+    """Clusters of role CTAs: CTA t < M routes token t, CTA M + q quantizes tokens [q Q, q Q + Q) (`quant_tokens`)."""
+    roles = m_max + -(-m_max // quant_tokens(m_max))
+    return -(-roles // SPLIT)
 
 
 def tmem_cols(m_max: int = M_MAX) -> int:
@@ -139,16 +153,22 @@ def tmem_cols(m_max: int = M_MAX) -> int:
     return cols
 
 
-def smem_bytes(m_max: int, k_in: int, ring: int) -> int:
+def mail_rounds(m_max: int, rounds: int) -> int:
+    """Rounds the split-K mailbox holds: every round a build can run (MAX_ROUNDS); in the 32-token build only the
+    ``rounds`` of the launch's geometry (its mailbox is 32 KB a round)."""
+    return MAX_ROUNDS if m_max <= 16 else rounds
+
+
+def smem_bytes(m_max: int, k_in: int, ring: int, rounds: int = MAX_ROUNDS) -> int:
     """Shared memory of a CTA: the weight ring, x's resident k-tiles, the split-K mailbox, the owner rows, the routing
-    keys and sigmoids, and 4 KB for the small arrays and alignment."""
+    keys (with the sort's scratch) and sigmoids, and 4 KB for the small arrays and alignment."""
     my_tiles = k_in // CTA_K // SPLIT
     return (
         ring * CTA_M * CTA_K * ELEM_BYTES
         + my_tiles * m_max * CTA_K * ELEM_BYTES
-        + MAX_ROUNDS * SPLIT * ROWS_PER_WARP * m_max * 4
+        + mail_rounds(m_max, rounds) * SPLIT * ROWS_PER_WARP * m_max * 4
         + OWNERS * ROWS_PER_WARP * m_max * 4
-        + 2 * NUM_EXPERTS * 4
+        + (key_words(m_max) + NUM_EXPERTS) * 4
         + 4096
     )
 
@@ -213,6 +233,17 @@ def _half_plan(
     return (head_tiles(world) - n_head_tiles) * CTA_M, max(ring, my_tiles)
 
 
+def plan_rounds(
+    world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int, m_max: int = M_MAX
+) -> int:
+    """Rounds of the geometry the front launches with: 1 with the head in half-tiles, else the 128-row tiles over
+    the GEMV clusters."""
+    if half_geometry(world, shared_cols, max_clusters, k_in, ring, m_max) is not None:
+        return 1
+    ht, st, clusters = geometry(world, shared_cols, max_clusters, m_max)
+    return -(-(ht + st) // clusters)
+
+
 def supports(
     world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int, m_max: int = M_MAX
 ) -> bool:
@@ -227,8 +258,25 @@ def supports(
         and m_max in M_BUILDS
         and ring * CTA_M * CTA_K * ELEM_BYTES + (k_tiles // SPLIT) * m_max * CTA_K * ELEM_BYTES
         <= 176 * 1024
-        and smem_bytes(m_max, k_in, ring) <= SMEM_LIMIT
+        and smem_bytes(
+            m_max, k_in, ring, plan_rounds(world, shared_cols, max_clusters, k_in, ring, m_max)
+        )
+        <= SMEM_LIMIT
     )
+
+
+def fit_ring(
+    world: int, shared_cols: int, max_clusters: int, k_in: int, ring: int, m_max: int = M_MAX
+) -> int:
+    """The weight ring a call runs with when it asks for ``ring``: ``ring`` itself in the 8- and 16-token builds; in
+    the 32-token build the deepest ring up to ``ring`` that fits (its x tile and mailbox leave less room), or
+    ``ring`` when none does (``supports`` then refuses it)."""
+    if m_max <= 16:
+        return ring
+    for r in range(ring, 0, -1):
+        if supports(world, shared_cols, max_clusters, k_in, r, m_max):
+            return r
+    return ring
 
 
 def _situ(gate, up, gate_cap: float, linear_cap: float):
@@ -415,7 +463,8 @@ def _popc(v, *, loc=None, ip=None):
 # experts, [T, 2 T) their mn limits, [2 T] the tile count, from SORT_W (2 T + 1 rounded up to 4) the fp32 routing
 # weights [M, 16], then [T * 128] permuted rows. moe_sort's outputs for 128-row tiles, as k3_moe_nvfp4_lowm reads them.
 SORT_WORDS = NUM_EXPERTS // 32  # bitmap words of the experts
-# _sort_local's scratch in s_key (int32 [896]): the ids, the tokens' expert bitmaps, their union, its prefix counts.
+# _sort_local's scratch in s_key (int32 `key_words`): the ids, the tokens' expert bitmaps, their union, its prefix
+# counts.
 SORT_IDS = 0
 
 
@@ -424,12 +473,18 @@ def sort_scratch(m_max: int = M_MAX) -> tuple[int, int, int]:
     bits = SORT_IDS + m_max * TOP_K
     union = bits + m_max * SORT_WORDS
     prefix = union + SORT_WORDS
-    assert prefix + SORT_WORDS <= NUM_EXPERTS and m_max * SORT_WORDS <= THREADS
     return bits, union, prefix
 
 
-for _m in M_BUILDS:
-    sort_scratch(_m)
+def key_words(m_max: int = M_MAX) -> int:
+    """Int32 words of s_key: the routing keys of the experts, or the sort's scratch where it is larger (the 32-token
+    build: 1464)."""
+    return max(NUM_EXPERTS, sort_scratch(m_max)[2] + SORT_WORDS)
+
+
+def _per_thread(items: int) -> int:
+    """Items per thread when THREADS threads take ``items``."""
+    return -(-items // THREADS)
 
 
 def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
@@ -453,18 +508,23 @@ def _sort_local(
     tiles = cutlass.min(n, num_local)
     w0 = (cutlass.Int32(2) * tiles + cutlass.Int32(4)) // cutlass.Int32(4) * cutlass.Int32(4)
     p0 = w0 + n
-    if tx < n:
-        s_key.store(topk_ids.load(idx=tx, is_volatile=True), idx=SORT_IDS + tx)
+    # The 32-token build has more ids (512) and bitmap words (896) than threads: two per thread.
+    for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
+        j = tx + cutlass.Int32(i * THREADS)
+        if j < n:
+            s_key.store(topk_ids.load(idx=j, is_volatile=True), idx=SORT_IDS + j)
     cute.arch.barrier()
-    if tx < num_tokens * cutlass.Int32(SORT_WORDS):
-        t = tx // cutlass.Int32(SORT_WORDS)
-        w = tx - t * cutlass.Int32(SORT_WORDS)
-        word = cutlass.Int32(0)
-        for k in cutlass.range_constexpr(TOP_K):
-            lx = s_key.load(idx=SORT_IDS + t * cutlass.Int32(TOP_K) + k) - offset
-            hit = (lx >= cutlass.Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
-            word = word | cutlass.select_(hit, cutlass.Int32(1) << (lx & 31), cutlass.Int32(0))
-        s_key.store(word, idx=SORT_BITS + tx)
+    for i in cutlass.range_constexpr(_per_thread(m_max * SORT_WORDS)):
+        j = tx + cutlass.Int32(i * THREADS)
+        if j < num_tokens * cutlass.Int32(SORT_WORDS):
+            t = j // cutlass.Int32(SORT_WORDS)
+            w = j - t * cutlass.Int32(SORT_WORDS)
+            word = cutlass.Int32(0)
+            for k in cutlass.range_constexpr(TOP_K):
+                lx = s_key.load(idx=SORT_IDS + t * cutlass.Int32(TOP_K) + k) - offset
+                hit = (lx >= cutlass.Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
+                word = word | cutlass.select_(hit, cutlass.Int32(1) << (lx & 31), cutlass.Int32(0))
+            s_key.store(word, idx=SORT_BITS + j)
     cute.arch.barrier()
     if tx < cutlass.Int32(SORT_WORDS):
         u = cutlass.Int32(0)
@@ -483,26 +543,32 @@ def _sort_local(
         else:
             sort_words.store(before, idx=cutlass.Int32(2) * tiles)
     cute.arch.barrier()
-    if tx < n:
-        t = tx // cutlass.Int32(TOP_K)
-        lx = s_key.load(idx=SORT_IDS + tx) - offset
-        if (lx >= cutlass.Int32(0)) & (lx < num_local):
-            w = lx >> 5
-            b = lx & 31
-            below = s_key.load(idx=SORT_UNION + w) & ((cutlass.Int32(1) << b) - cutlass.Int32(1))
-            tile = s_key.load(idx=SORT_PREFIX + w) + _popc(below)
-            row = cutlass.Int32(0)
-            count = cutlass.Int32(0)
-            for q in cutlass.range_constexpr(m_max):
-                if cutlass.Int32(q) < num_tokens:
-                    bit = (s_key.load(idx=SORT_BITS + q * SORT_WORDS + w) >> b) & cutlass.Int32(1)
-                    count = count + bit
-                    if cutlass.Int32(q) < t:
-                        row = row + bit
-            sort_words.store(tx, idx=p0 + tile * cutlass.Int32(CTA_M) + row)
-            if row == cutlass.Int32(0):
-                sort_words.store(lx, idx=tile)
-                sort_words.store(tile * cutlass.Int32(CTA_M) + count, idx=tiles + tile)
+    for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
+        j = tx + cutlass.Int32(i * THREADS)
+        if j < n:
+            t = j // cutlass.Int32(TOP_K)
+            lx = s_key.load(idx=SORT_IDS + j) - offset
+            if (lx >= cutlass.Int32(0)) & (lx < num_local):
+                w = lx >> 5
+                b = lx & 31
+                below = s_key.load(idx=SORT_UNION + w) & (
+                    (cutlass.Int32(1) << b) - cutlass.Int32(1)
+                )
+                tile = s_key.load(idx=SORT_PREFIX + w) + _popc(below)
+                row = cutlass.Int32(0)
+                count = cutlass.Int32(0)
+                for q in cutlass.range_constexpr(m_max):
+                    if cutlass.Int32(q) < num_tokens:
+                        bit = (s_key.load(idx=SORT_BITS + q * SORT_WORDS + w) >> b) & cutlass.Int32(
+                            1
+                        )
+                        count = count + bit
+                        if cutlass.Int32(q) < t:
+                            row = row + bit
+                sort_words.store(j, idx=p0 + tile * cutlass.Int32(CTA_M) + row)
+                if row == cutlass.Int32(0):
+                    sort_words.store(lx, idx=tile)
+                    sort_words.store(tile * cutlass.Int32(CTA_M) + count, idx=tiles + tile)
 
 
 @cute.jit
@@ -683,8 +749,10 @@ def k3_moe_front_kernel(
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
 ):
-    # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (2 per token).
+    # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
+    # token, a quantization CTA per QT_ tokens).
     MMA_N_ = m_max
+    QT_ = quant_tokens(m_max)
     ROLE_CLUSTERS_ = role_clusters(m_max)
     TMEM_COLS_ = tmem_cols(m_max)
     B_HALF_ELEMS_ = MMA_N_ * TMA_K_BOX
@@ -702,6 +770,7 @@ def k3_moe_front_kernel(
     k_tiles = k_in // CTA_K
     my_tiles = k_tiles // SPLIT
     rounds_max = (n_tiles + gemv_clusters - 1) // gemv_clusters
+    MAIL_ROUNDS_ = mail_rounds(m_max, rounds_max)
     # head_half (one round): clusters < n_head_tiles each own a 64-row head half-tile and hold all its k-tiles; the
     # shared tiles' weight rows start after the 128-row-padded head, hence the row shift for tiles >= n_head_tiles.
     row_shift, nbar = _half_plan(head_half, world, n_head_tiles, ring, my_tiles)
@@ -746,7 +815,7 @@ def k3_moe_front_kernel(
     # [round][source rank][row of the owned slice][token] fp32 partials.
     mailbox = cutlass.Array(
         cutlass.Float32,
-        MAX_ROUNDS * SPLIT * ROWS_PER_WARP * MMA_N_,
+        MAIL_ROUNDS_ * SPLIT * ROWS_PER_WARP * MMA_N_,
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
@@ -758,7 +827,9 @@ def k3_moe_front_kernel(
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
-    s_key = cutlass.Array(cutlass.Int32, NUM_EXPERTS, space=cutlass.AddressSpace.smem, alignment=16)
+    s_key = cutlass.Array(
+        cutlass.Int32, key_words(m_max), space=cutlass.AddressSpace.smem, alignment=16
+    )
     s_sigmoid = cutlass.Array(
         cutlass.Float32, NUM_EXPERTS, space=cutlass.AddressSpace.smem, alignment=16
     )
@@ -1218,12 +1289,18 @@ def k3_moe_front_kernel(
                 prims.tcgen05_dealloc(tmem_ptr, HALF_TMEM_COLS if head_half else TMEM_COLS_)
     else:
         # =====================================================================
-        # Role CTAs: route (CTA t < M) or quantize (CTA M + t) token t from
-        # every rank's pushed slot, as k3_route_quant_ag after its push.
+        # Role CTAs: route token t (CTA t < M) or quantize tokens [q QT_,
+        # q QT_ + QT_) (CTA M + q) from every rank's pushed slot, as
+        # k3_route_quant_ag after its push.
         # =====================================================================
         role = role_or_gemv * cutlass.Int32(SPLIT) + crank
-        if role < num_tokens * cutlass.Int32(2):
+        if cutlass.const_expr(QT_ == 1):
+            n_roles = num_tokens * cutlass.Int32(2)
+        else:
+            n_roles = num_tokens + (num_tokens + cutlass.Int32(QT_ - 1)) // cutlass.Int32(QT_)
+        if role < n_roles:
             routes = role < num_tokens
+            # The route CTA's token, or the quantization CTA's index q.
             tok = cutlass.select_(routes, role, role - num_tokens)
             polls_logits = tx < cutlass.Int32(NUM_EXPERTS // 4)
             e0 = cutlass.select_(polls_logits, tx * cutlass.Int32(4), cutlass.Int32(0))
@@ -1242,17 +1319,12 @@ def k3_moe_front_kernel(
             b = s_flags.load(idx=0)
             epoch = s_flags.load(idx=1)
             # A role CTA signs in as soon as it has read the buffer index (it reads nothing of flags after this).
-            # Token 0's quantization CTA hands the buffer over once every reader is in; its polls wait for the pushes,
-            # which come microseconds later.
+            # The first quantization CTA hands the buffer over once every reader is in; its polls wait for the
+            # pushes, which come microseconds later.
             if tx == 0:
                 _red_add_release(flags.data_ptr(3).toint(), cutlass.Int32(1))
                 if role == num_tokens:
-                    _flip(
-                        flags,
-                        b,
-                        num_tokens * cutlass.Int32(2) + cutlass.Int32(gemv_clusters * SPLIT),
-                    )
-            tok_base = b * cutlass.Int32(BUF) + tok * cutlass.Int32(world * SLOT)
+                    _flip(flags, b, n_roles + cutlass.Int32(gemv_clusters * SPLIT))
             empty = cutlass.Int32(EMPTY_WORD)
             if routes:
                 # The keys and the selection run once per layer, so their code is cold in the SM's instruction cache.
@@ -1371,51 +1443,59 @@ def k3_moe_front_kernel(
                         if tx == 0:
                             sort_ctr.store(cutlass.Int32(0), idx=0)
             else:
-                addr = (
-                    tok_base
-                    + (tx // cutlass.Int32(LV)) * cutlass.Int32(SLOT)
-                    + (tx % cutlass.Int32(LV)) * cutlass.Int32(4)
-                )
-                w0, w1, w2, w3 = _ag._poll4(buf_uc, addr)
-                buf_uc.store((empty, empty, empty, empty), idx=addr, alignment=16)
-                if cutlass.const_expr(nvfp4):
-                    # NVFP4 (fp4_quantize's recipe): 8 E2M1 codes per thread, one E4M3 scale per thread pair.
-                    g = gsf.load(idx=0)
-                    codes, sf_byte = _rq.nvfp4_quant_vec8(
-                        [w0, w1, w2, w3],
-                        g,
-                        _rq.rcp_approx_ftz(g),
-                        _rq.rcp_approx_ftz(cutlass.Float32(6.0)),
-                    )
-                    quant_words.store(codes, idx=tok * cutlass.Int32(HIDDEN_SIZE // 8) + tx)
-                    if tx % cutlass.Int32(NVFP4_SF_VEC // 8) == cutlass.Int32(0):
-                        scales.store(
-                            cutlass.Uint8(sf_byte),
-                            idx=tok * cutlass.Int32(HIDDEN_SIZE // NVFP4_SF_VEC)
-                            + tx // cutlass.Int32(NVFP4_SF_VEC // 8),
+                for qj in cutlass.range_constexpr(QT_):
+                    # Token qtok of this quantization CTA (QT_ 1: its token q).
+                    qtok = tok * cutlass.Int32(QT_) + cutlass.Int32(qj)
+                    if qtok < num_tokens:
+                        tok_base = b * cutlass.Int32(BUF) + qtok * cutlass.Int32(world * SLOT)
+                        addr = (
+                            tok_base
+                            + (tx // cutlass.Int32(LV)) * cutlass.Int32(SLOT)
+                            + (tx % cutlass.Int32(LV)) * cutlass.Int32(4)
                         )
-                else:
-                    q_lo, q_hi, sf_byte = _rq.mxfp8_quant_vec8([w0, w1, w2, w3])
-                    quant_words.store(
-                        (q_lo, q_hi),
-                        idx=tok * cutlass.Int32(HIDDEN_SIZE // 4) + tx * cutlass.Int32(2),
-                        alignment=8,
-                    )
-                    if tx % cutlass.Int32(SF_VEC_SIZE // 8) == cutlass.Int32(0):
-                        scales.store(
-                            cutlass.Uint8(sf_byte),
-                            idx=tok * cutlass.Int32(HIDDEN_SIZE // SF_VEC_SIZE)
-                            + tx // cutlass.Int32(SF_VEC_SIZE // 8),
-                        )
-                if cutlass.const_expr(publish):
-                    prims.fence_proxy("async_global")
-                    cute.arch.fence_acq_rel_gpu()
-                    cute.arch.barrier()
-                    if tx == cutlass.Int32(0):
-                        _ag._store_release(
-                            ready.data_ptr(tok + cutlass.Int32(m_max)).toint(),
-                            epoch + cutlass.Int32(1),
-                        )
+                        w0, w1, w2, w3 = _ag._poll4(buf_uc, addr)
+                        buf_uc.store((empty, empty, empty, empty), idx=addr, alignment=16)
+                        if cutlass.const_expr(nvfp4):
+                            # NVFP4 (fp4_quantize's recipe): 8 E2M1 codes per thread, one E4M3 scale per thread
+                            # pair.
+                            g = gsf.load(idx=0)
+                            codes, sf_byte = _rq.nvfp4_quant_vec8(
+                                [w0, w1, w2, w3],
+                                g,
+                                _rq.rcp_approx_ftz(g),
+                                _rq.rcp_approx_ftz(cutlass.Float32(6.0)),
+                            )
+                            quant_words.store(
+                                codes, idx=qtok * cutlass.Int32(HIDDEN_SIZE // 8) + tx
+                            )
+                            if tx % cutlass.Int32(NVFP4_SF_VEC // 8) == cutlass.Int32(0):
+                                scales.store(
+                                    cutlass.Uint8(sf_byte),
+                                    idx=qtok * cutlass.Int32(HIDDEN_SIZE // NVFP4_SF_VEC)
+                                    + tx // cutlass.Int32(NVFP4_SF_VEC // 8),
+                                )
+                        else:
+                            q_lo, q_hi, sf_byte = _rq.mxfp8_quant_vec8([w0, w1, w2, w3])
+                            quant_words.store(
+                                (q_lo, q_hi),
+                                idx=qtok * cutlass.Int32(HIDDEN_SIZE // 4) + tx * cutlass.Int32(2),
+                                alignment=8,
+                            )
+                            if tx % cutlass.Int32(SF_VEC_SIZE // 8) == cutlass.Int32(0):
+                                scales.store(
+                                    cutlass.Uint8(sf_byte),
+                                    idx=qtok * cutlass.Int32(HIDDEN_SIZE // SF_VEC_SIZE)
+                                    + tx // cutlass.Int32(SF_VEC_SIZE // 8),
+                                )
+                        if cutlass.const_expr(publish):
+                            prims.fence_proxy("async_global")
+                            cute.arch.fence_acq_rel_gpu()
+                            cute.arch.barrier()
+                            if tx == cutlass.Int32(0):
+                                _ag._store_release(
+                                    ready.data_ptr(qtok + cutlass.Int32(m_max)).toint(),
+                                    epoch + cutlass.Int32(1),
+                                )
             cute.arch.barrier()
         else:
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)

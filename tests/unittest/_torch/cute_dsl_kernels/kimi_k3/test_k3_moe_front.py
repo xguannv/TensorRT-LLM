@@ -35,13 +35,22 @@ intermediate 768), as in the TP16 deployment.
   publish_order : the handoff with k3_moe's epoch advance racing the front's epoch read: rank 1 routed nothing, k3_moe
           on half the SMs, each quantization CTA held before its flags read until the epoch moves; every ready word
           left at the next call's epoch (check_publish_order);
+  front32 : the 32-token build (its own K3MoeHeadWorkspace, created with m_max=32) at every M in 17..32 with 384
+          shared columns per rank (Kimi K3 TP16's; W 4's 1536 do not fit beside its role CTAs), MXFP8 and NVFP4: every
+          output bit for bit the 8-token build's on rows [0, 8), [8, 16), [16, 24) and [24, M) (each token's head is
+          its own dot products in the same split-K order, its routing and quantization its own); MXFP8 against the
+          unfused chain as front; run-to-run identical; the same routing and latent bits on every rank; its head
+          buffers empty and its buffer index flipped after each call; with sort_out (NVFP4), the front's outputs the
+          bits of the call without it, the sort (tile count, each tile's local expert, mn limit and rows, the fp32
+          weights) moe_sort's on the front's routing over this rank's 224 experts and over all 896, the counter word
+          zero again (check_front32; SM100 and SM103);
 front and fused each with run-to-run identical bits and each M's rows bit-identical to the same rows of the 8-token
 call (the fused y within one bf16 ulp: k3_moe's slice FC2 groups a token's expert terms by the step's group count).
 The buffer and scratch checks run between barriers (peers write this rank's buffers in their next call); a failing
 rank's rows are printed after rank 0's.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
-  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front.py [front fused head_flags publish_order]
+  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front.py [front fused head_flags publish_order front32]
 """
 
 import importlib.util
@@ -90,17 +99,28 @@ I_TP, E_LOCAL, MOE_TP = 768, 224, 4  # one rank of the routed experts' TP4 x EP4
 EMPTY = -(2**31)
 ULP = 2.0**-8
 M_ALL = list(range(1, 9))
+# The 32-token build: 17-32 rows over 384 shared columns per rank (Kimi K3 TP16's per-rank width).
+M32_ALL = list(range(17, 33))
+FRONT32_SHARED = 384
+NVFP4_GSF = 448.0 * 6.0 / 8.0
+TILE = 128
 
 
-def _supported() -> bool:
+def _supported(capabilities=((10, 0),)) -> bool:
     if MPI is None or not torch.cuda.is_available() or torch.cuda.device_count() < WORLD:
         return False
-    return torch.cuda.get_device_capability() == (10, 0)
+    return torch.cuda.get_device_capability() in capabilities
 
+
+# front32 runs the front alone, on SM100 and SM103; the other checks only on SM100.
+FRONT32_SM = ((10, 0), (10, 3))
 
 pytestmark = [
     pytest.mark.threadleak(enabled=False),
-    pytest.mark.skipif(not _supported(), reason=f"needs {WORLD} sm_100 GPUs with MNNVL and mpi4py"),
+    pytest.mark.skipif(
+        not _supported(FRONT32_SM),
+        reason=f"needs {WORLD} sm_100 / sm_103 GPUs with MNNVL and mpi4py",
+    ),
 ]
 
 
@@ -175,7 +195,8 @@ def _context(with_experts):
     # Fabric handles within one tray, as across trays.
     ws = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True)
     ctx = SimpleNamespace(
-        comm=comm, rank=rank, world=world, wl=wl, we=we, inter=inter, bias=bias, x8=x8, head=head, gate_up=gate_up,
+        comm=comm, mapping=mapping, rank=rank, world=world, wl=wl, we=we, inter=inter, bias=bias, x8=x8, head=head,
+        gate_up=gate_up,
         front=front_op.front_weight(head, gate_up), ws=ws, ag=(ws.uc, ws.mc, ws.flags, ws.rank),
         offset=(rank % 4) * E_LOCAL, experts=_experts(20260928 + rank) if with_experts else None, layer=None,
     )  # fmt: skip
@@ -558,12 +579,161 @@ def check_publish_order(ctx, num_ctas=None):
     return results
 
 
+def _front32_context(ctx):
+    """The 32-token build's inputs: x8 and 24 more rows (the same on every rank), this rank's head with a
+    FRONT32_SHARED-column shared slice, the 32-token workspace, the NVFP4 global scale and the sort's counter word."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import front_op
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op as moe_op
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    for m_max in (8, 32):
+        assert front_op.weight_supported(ctx.world, FRONT32_SHARED, HIDDEN, device, m_max=m_max), (
+            m_max
+        )
+    gen = torch.Generator(device="cuda").manual_seed(17)  # the same on every rank
+    x32 = torch.cat([ctx.x8, torch.randn(24, HIDDEN, device="cuda", generator=gen).bfloat16()])
+    wgen = torch.Generator(device="cuda").manual_seed(171 + ctx.rank)
+    gate_up = (
+        torch.randn(2 * FRONT32_SHARED, HIDDEN, device="cuda", generator=wgen) * 0.02
+    ).bfloat16()
+    ws32 = moe_op.K3MoeHeadWorkspace.create(ctx.mapping, fabric_handle=True, m_max=32)
+    return SimpleNamespace(
+        x32=x32, gate_up=gate_up, front=front_op.front_weight(ctx.head, gate_up), ws32=ws32,
+        gsf=torch.tensor([NVFP4_GSF], dtype=torch.float32, device="cuda"),
+        ctr=torch.zeros(1, dtype=torch.int32, device="cuda"),
+    )  # fmt: skip
+
+
+def _front32(ctx, f, x, nvfp4, sort_out=None, offset=0, num_local=0):
+    """The front with FRONT32_SHARED shared columns: on the 32-token workspace above 16 rows, else the 8-token one."""
+    ws = f.ws32 if x.shape[0] > 16 else ctx.ws
+    return _trtllm().k3_moe_front(
+        x, f.front, ctx.bias, RSF, FRONT32_SHARED, GATE_CAP, LINEAR_CAP, ws.uc, ws.mc, ws.flags, ws.rank, ctx.world,
+        nvfp4_gsf=f.gsf if nvfp4 else None, sort_out=sort_out, sort_ctr=f.ctr if sort_out is not None else None,
+        sort_offset=offset, sort_local=num_local,
+    )  # fmt: skip
+
+
+def _sort_matches(ids, weights, sort_out, m, offset, num_local):
+    """``sort_out`` against moe_sort on the routing ``(ids, weights)``: the tile count, each tile's local expert and
+    mn limit, its rows as a set and in token order (the order the front writes), the fp32 weights."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import front_op
+
+    group, mn_limit, perm, n_tiles, scales = front_op.sort_views(sort_out, m, num_local)
+    r_group, r_limit, _, r_perm, _, r_tiles = _trtllm().moe_sort(
+        token_selected_experts=ids, token_final_scales=weights.float(), num_experts=EXPERTS, top_k=TOP_K,
+        local_expert_offset=offset, local_num_experts=num_local, tile_tokens_dim=TILE,
+    )  # fmt: skip
+    nt, r_nt = int(n_tiles.item()), int(r_tiles.item())
+    by_expert = {}
+    for i, e in enumerate(ids.view(-1).tolist()):
+        if offset <= e < offset + num_local:
+            by_expert.setdefault(e - offset, []).append(i)
+    ordered = [(e, by_expert[e]) for e in sorted(by_expert)]
+    rows_as_set = nt == r_nt
+    rows_ordered = nt == len(ordered)
+    for t in range(nt if rows_as_set else 0):
+        lim, r_lim = int(mn_limit[t]) - t * TILE, int(r_limit[t]) - t * TILE
+        got = perm[t * TILE : t * TILE + lim].tolist()
+        ref = r_perm[t * TILE : t * TILE + r_lim].tolist()
+        rows_as_set = rows_as_set and lim == r_lim and sorted(got) == sorted(ref)
+        rows_ordered = rows_ordered and (int(group[t]), got) == ordered[t]
+    return dict(
+        tiles=nt, experts_equal=nt == r_nt and torch.equal(group[:nt], r_group[:nt]),
+        limits_equal=nt == r_nt and torch.equal(mn_limit[:nt], r_limit[:nt]), rows_as_set=rows_as_set,
+        rows_token_order=rows_ordered, weights_fp32=_same(scales, weights.float()),
+    )  # fmt: skip
+
+
+def check_front32(ctx):
+    """The 32-token build at every M in 17..32 (module docstring)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import front_op
+
+    f = _front32_context(ctx)
+    names = ("ids", "weights", "latent", "scales", "shared")
+    results = []
+    for m in M32_ALL:
+        x = f.x32[:m].contiguous()
+        for nvfp4 in (False, True):
+            flag0 = int(f.ws32.flags[0].item())
+            out = _front32(ctx, f, x, nvfp4)
+            torch.cuda.synchronize()
+            flag1 = int(f.ws32.flags[0].item())
+            empty = _quiet_check(
+                ctx, lambda: bool((f.ws32.uc == EMPTY).all()) and int(f.ws32.flags[1].item()) == 0
+            )
+            parts = [_front32(ctx, f, x[i : i + 8].contiguous(), nvfp4) for i in range(0, m, 8)]
+            ref8 = [torch.cat(ts) for ts in zip(*parts)]
+            again = _front32(ctx, f, x, nvfp4)
+            # The routing and the latent are the same on every rank; the shared activation is this rank's shard.
+            gathered = ctx.comm.allgather([_bits(t).cpu() for t in out[:4]])
+            row = dict(
+                op="k3_moe_front32", case=f"tp{ctx.world}_{'nvfp4' if nvfp4 else 'mxfp8'}", M=m,
+                **{f"{n}_as_8": _same(a, b) for n, a, b in zip(names, out, ref8)},
+                det=all(_same(a, b) for a, b in zip(again, out)),
+                ranks_agree=all(all(torch.equal(a, b) for a, b in zip(g, gathered[0])) for g in gathered),
+                buffers_empty=empty, flag_flipped=flag1 != flag0,
+            )  # fmt: skip
+            if not nvfp4:
+                ids, w, q, s, shared = out
+                r_ids, r_w, r_q, r_s, r_shared, margin, r_latent = _reference(
+                    SimpleNamespace(**{**vars(ctx), "gate_up": f.gate_up}), x
+                )
+                sets_equal = (ids.sort(dim=1).values == r_ids.sort(dim=1).values).all(dim=1)
+                row.update(
+                    mismatch_not_near_tie=int((~sets_equal & ~(margin < 1e-4)).sum()),
+                    codes_equal=(_bits(q) == _bits(r_q)).float().mean().item(),
+                    scales_equal=(s == r_s).float().mean().item(),
+                    latent_mismatch_not_near_tie=_latent_mismatch_not_near_tie(q, s, r_q, r_s, r_latent),
+                    shared_rel=((shared.float() - r_shared.float()).abs().max()
+                                / r_shared.float().abs().max()).item(),
+                )  # fmt: skip
+            good = all(v for k, v in row.items() if k.endswith("_as_8")) and (
+                row["det"] and row["ranks_agree"] and row["buffers_empty"] and row["flag_flipped"]
+            )
+            if not nvfp4:
+                good = good and (row["mismatch_not_near_tie"] == 0 and row["codes_equal"] > 0.999
+                                 and row["scales_equal"] > 0.999 and row["latent_mismatch_not_near_tie"] == 0
+                                 and row["shared_rel"] <= 2e-2)  # fmt: skip
+            row["rank"], row["good"] = ctx.rank, bool(good)
+            row["ok"] = _all_ranks(ctx, good)
+            results.append(row)
+        # The front's sort (NVFP4), over this rank's experts and over all of them.
+        plain = _front32(ctx, f, x, True)
+        for offset, num_local in (((ctx.rank % 4) * E_LOCAL, E_LOCAL), (0, EXPERTS)):
+            sort_out = torch.full(
+                (front_op.sort_layout(m, num_local)[3],), -7, dtype=torch.int32, device="cuda"
+            )
+            out = _front32(ctx, f, x, True, sort_out, offset, num_local)
+            torch.cuda.synchronize()
+            row = dict(
+                op="k3_moe_front32_sort", case=f"tp{ctx.world}_local{num_local}", M=m,
+                front_bits=all(_same(a, b) for a, b in zip(out, plain)),
+                **_sort_matches(out[0], out[1], sort_out, m, offset, num_local),
+                ctr_zero=int(f.ctr.item()) == 0,
+            )  # fmt: skip
+            good = all(v for k, v in row.items() if k not in ("op", "case", "M", "tiles"))
+            row["rank"], row["good"] = ctx.rank, bool(good)
+            row["ok"] = _all_ranks(ctx, good)
+            results.append(row)
+    return results
+
+
 CHECKS = {
     "front": check_front,
     "fused": check_fused,
     "head_flags": check_head_flags,
     "publish_order": check_publish_order,
+    "front32": check_front32,
 }
+
+
+def _check_params():
+    """Every check; all but front32 need SM100 (front32 also runs on SM103)."""
+    sm100 = pytest.mark.skipif(
+        not _supported(), reason=f"needs {WORLD} sm_100 GPUs with MNNVL and mpi4py"
+    )
+    return [pytest.param(name, marks=() if name == "front32" else sm100) for name in CHECKS]
 
 
 def _run_checks(names):
@@ -586,7 +756,7 @@ def _report(per_rank):
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
-@pytest.mark.parametrize("check", list(CHECKS))
+@pytest.mark.parametrize("check", _check_params())
 def test_k3_moe_front(mpi_pool_executor, check):
     per_rank = list(mpi_pool_executor.map(_run_checks, [[check]] * WORLD))
     _report(per_rank)

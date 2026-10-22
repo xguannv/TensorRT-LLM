@@ -65,6 +65,8 @@ from .moe_tail_push import WideTail
 MAX_TOKENS = 8
 # The front's 16-token build (TRTLLM_K3LL_MOE_FRONT16): a wide step of at most this many tokens.
 FRONT16_TOKENS = 16
+# The front's 32-token build (TRTLLM_K3LL_MOE_FRONT32): a wide step of more than FRONT16_TOKENS, up to this many.
+FRONT32_TOKENS = 32
 # A wide decode step's most tokens: the expert kernel's limit.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
 NUM_EXPERTS = 896
@@ -82,6 +84,8 @@ class K3DecodeMoeNvfp4:
     sort_ctr: Optional[torch.Tensor] = None
     #: The 16-token front build's own head workspace (a step of 9-16 tokens), or None: such steps keep the wide head.
     head16: Optional[K3MoeHeadWorkspace] = None
+    #: The 32-token front build's own head workspace (a step of 17-32 tokens), or None: such steps keep the wide head.
+    head32: Optional[K3MoeHeadWorkspace] = None
 
     @classmethod
     def create(
@@ -91,28 +95,50 @@ class K3DecodeMoeNvfp4:
         mnnvl: MnnvlWorkspace,
         front_sort: bool = False,
         front16: bool = False,
+        front32: bool = False,
     ) -> "K3DecodeMoeNvfp4":
         """Collective (the head workspace): every rank of the TP group calls it at the same point, eagerly, before
         any CUDA-graph capture. ``mnnvl``: the TP group's MNNVL workspace, for a wide step's head all-gather.
         ``front_sort``: the front sorts the routing over the local experts (``k3_moe_front``'s ``sort_out``).
-        ``front16``: steps of 9-16 tokens run the front's 16-token build (its own head workspace)."""
+        ``front16``: steps of 9-16 tokens run the front's 16-token build (its own head workspace).
+        ``front32``: steps of 17-32 tokens run the front's 32-token build (its own head workspace)."""
         sort_ctr = torch.zeros(1, dtype=torch.int32, device=device) if front_sort else None
         head16 = K3MoeHeadWorkspace.create(mapping, m_max=FRONT16_TOKENS) if front16 else None
+        head32 = K3MoeHeadWorkspace.create(mapping, m_max=FRONT32_TOKENS) if front32 else None
         return cls(
             K3MoeHeadWorkspace.create(mapping),
             nvfp4_lowm_op.new_counters(device),
             mnnvl,
             sort_ctr,
             head16,
+            head32,
         )
+
+    def front_head(self, rows: int) -> Optional[K3MoeHeadWorkspace]:
+        """The head workspace of the front build that runs a step of ``rows`` tokens, or None: the wide head runs
+        it."""
+        if rows <= MAX_TOKENS:
+            return self.head
+        if rows <= FRONT16_TOKENS:
+            return self.head16
+        return self.head32 if rows <= FRONT32_TOKENS else None
+
+
+def _front_supported(moe: nn.Module, tp_size: int, m_max: int) -> bool:
+    gate_up = moe.shared_experts.gate_up_proj.weight
+    return weight_supported(
+        tp_size, gate_up.shape[0] // 2, gate_up.shape[1], gate_up.device, m_max=m_max
+    )
 
 
 def front16_supported(moe: nn.Module, tp_size: int) -> bool:
     """Whether the front's 16-token build runs MoE layer ``moe`` (whose 8-token path ``layout_gaps`` takes)."""
-    gate_up = moe.shared_experts.gate_up_proj.weight
-    return weight_supported(
-        tp_size, gate_up.shape[0] // 2, gate_up.shape[1], gate_up.device, m_max=FRONT16_TOKENS
-    )
+    return _front_supported(moe, tp_size, FRONT16_TOKENS)
+
+
+def front32_supported(moe: nn.Module, tp_size: int) -> bool:
+    """Whether the front's 32-token build runs MoE layer ``moe`` (whose 8-token path ``layout_gaps`` takes)."""
+    return _front_supported(moe, tp_size, FRONT32_TOKENS)
 
 
 def _experts(backend) -> tuple:
@@ -288,6 +314,8 @@ class K3DecodeMoeNvfp4Layer:
         self._front_routed(moe, x)
         if self.state.head16 is not None:
             self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]))
+        if self.state.head32 is not None:
+            self._front_routed(moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]))
         for rows in (9, WIDE_MAX_TOKENS):
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
@@ -301,7 +329,7 @@ class K3DecodeMoeNvfp4Layer:
         )  # fmt: skip
 
     def _front(self, moe: nn.Module, x: torch.Tensor, sort_out: Optional[torch.Tensor] = None):
-        head = self.state.head16 if x.shape[0] > MAX_TOKENS else self.state.head
+        head = self.state.front_head(x.shape[0])
         return k3_moe_front(
             x.contiguous(),
             self.front_weight,
@@ -329,7 +357,8 @@ class K3DecodeMoeNvfp4Layer:
         )  # fmt: skip
 
     def _front_routed(self, moe: nn.Module, x: torch.Tensor):
-        """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows): ``(routed, shared_act)``.
+        """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
+        takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
@@ -417,8 +446,8 @@ class K3DecodeMoeNvfp4Layer:
         ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
         consumer runs the tail GEMV (``moe_tail_push.py``)."""
         x = hidden_states.contiguous()
-        if self.state.head16 is not None and x.shape[0] <= FRONT16_TOKENS:
-            # The front's 16-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
+        if self.state.front_head(x.shape[0]) is not None:
+            # The front's 16- or 32-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
             routed, shared_act = self._front_routed(moe, x)
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)

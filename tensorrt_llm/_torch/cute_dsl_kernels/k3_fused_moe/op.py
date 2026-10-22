@@ -202,7 +202,7 @@ class K3MoeHeadWorkspace:
     comm: Any
     """The TP-group communicator the handles were exchanged over."""
     m_max: int = 8
-    """The front build whose buffer layout the words follow (8, or 16)."""
+    """The front build whose buffer layout the words follow (8, 16 or 32)."""
 
     @classmethod
     def create(
@@ -211,8 +211,8 @@ class K3MoeHeadWorkspace:
         """Allocate and arm a workspace for ``mapping``'s TP group. Collective: every rank of the group calls it at the
         same point, eagerly (not under CUDA-graph capture); the failure model is :func:`create_mcast_state`'s.
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
-        descriptor; default ``mapping.is_multi_node()``. ``m_max``: the front build it serves (8, or 16 for the
-        16-token build, whose buffers are laid out for 16 tokens: a workspace serves one build only)."""
+        descriptor; default ``mapping.is_multi_node()``. ``m_max``: the front build it serves (8; 16 or 32 for the
+        16- or 32-token build, whose buffers are laid out for that many tokens: a workspace serves one build only)."""
         from . import k3_route_quant_ag as layout
 
         def build(uc, mc, handle, comm):

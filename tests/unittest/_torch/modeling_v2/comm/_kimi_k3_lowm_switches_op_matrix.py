@@ -22,9 +22,9 @@ routing method, int32 ids, fp32 weights). The decoder layer's residual updates r
 ``KimiLinearDecoderLayer.forward`` itself on a stand-in layer (attention and MoE stand-ins that return fixed
 partials). A switch read at forward time (``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, ``TRTLLM_K3LL_WIDE_LATENT_TAIL``) is set
 on the flags module per arm; a switch read when the target is built (``TRTLLM_K3LL_MOE_FRONT_SORT``,
-``TRTLLM_K3LL_MOE_FRONT16``: the state ``K3DecodeMoeNvfp4.create`` builds; ``TRTLLM_K3LL_MOE_LOWM``: whether the
-layer gets a ``decode_moe`` at all) is one built layer per arm. The decode GEMV sites are not built
-(``decode_gemvs`` None): every GEMV runs on ``_gemv``'s stock GEMM.
+``TRTLLM_K3LL_MOE_FRONT16``, ``TRTLLM_K3LL_MOE_FRONT32``: the state ``K3DecodeMoeNvfp4.create`` builds;
+``TRTLLM_K3LL_MOE_LOWM``: whether the layer gets a ``decode_moe`` at all) is one built layer per arm. The decode
+GEMV sites are not built (``decode_gemvs`` None): every GEMV runs on ``_gemv``'s stock GEMM.
 
 Payloads. The MoE inputs and the head and shared gate_up rows are small multiples of powers of two, so every head and
 shared gate_up sum is exact in fp32 in any order (the payloads ``moe/k3_moe_front``'s matrix certifies with): the
@@ -59,6 +59,13 @@ eager call on the same inputs):
     device code on the gathered head, here the same exact sums); the shared activation within ``SHARED_TOL`` of its
     largest magnitude (the front's SiTU uses fast tanh / sigmoid approximations, ``k3_moe_front.md``); the tail input's
     latent columns bit for bit and the output within ``_gemv_bound``.
+  * FRONT32 (17, 24, 32 rows): ``_wide`` with and without the 32-token front (the on arm built with the production
+    switches plus TRTLLM_K3LL_MOE_FRONT32; the off arm the production build), with TRTLLM_K3LL_WIDE_LATENT_TAIL off,
+    against the same references and with the same bounds as FRONT16. Each step is followed by a 16-row step on
+    each arm's 16-token front (the on arm's state also holds the 32-token front's head workspace and shares its sort
+    counter and expert counters with it), on vs off bit for bit. The graph captures, per arm, the wide step, the
+    16-row step and (on arm) the wide step again; each replay's outputs bit for bit the eager calls', both on-arm wide
+    steps the same bits.
   * WIDE_AR_ATTN_RES (16, 32 rows; a layer that snapshots and one that does not): ``KimiLinearDecoderLayer.forward``
     on a wide step, its pre-attention update of the previous layer's MoE partial and its post-attention update. Off
     arm against ``_ref_wide_residual_chain`` (the stock MNNVL all-reduce, then the stock fused add + attn_res +
@@ -133,10 +140,13 @@ SNAPSHOTS = 3
 
 FRONT_SORT_ROWS = (1, 8, 9, 12, 16)
 FRONT16_ROWS = (9, 12, 16)
+FRONT32_ROWS = (17, 24, 32)
 WIDE_ROWS = (16, 32)
 MOE_ROWS = (8, 16, 32)
 GRAPH_FRONT_SORT_ROWS = (8, 16)
 GRAPH_FRONT16_ROWS = (9, 16)
+GRAPH_FRONT32_ROWS = (17, 32)
+INTERLEAVED_ROWS = 16  # the 16-token front's step between FRONT32's wide steps
 REPLAYS = 2
 
 ULP_REL = 2.0**-7  # one bf16 ulp, relative
@@ -586,17 +596,20 @@ def _ref_weights(moe):
     )
 
 
-def _build_lowm(moe, comm, front_sort: int, front16: int):
-    """``moe``'s decode path as ``_build_decode_moe_lowm`` builds it with these values of TRTLLM_K3LL_MOE_FRONT_SORT
-    and TRTLLM_K3LL_MOE_FRONT16 (read when the target is built): its own state on the TP group's MNNVL workspace,
-    the layer, and one call of every kernel (``warm_up``). ``fold_latent_norm`` has run on ``moe``."""
+def _build_lowm(moe, comm, front_sort: int, front16: int, front32: int = 0):
+    """``moe``'s decode path as ``_build_decode_moe_lowm`` builds it with these values of TRTLLM_K3LL_MOE_FRONT_SORT,
+    TRTLLM_K3LL_MOE_FRONT16 and TRTLLM_K3LL_MOE_FRONT32 (read when the target is built): its own state on the TP
+    group's MNNVL workspace, the layer, and one call of every kernel (``warm_up``). ``fold_latent_norm`` has run on
+    ``moe``."""
     front16 = bool(front16) and DML.front16_supported(moe, R.world)
+    front32 = bool(front32) and DML.front32_supported(moe, R.world)
     state = DML.K3DecodeMoeNvfp4.create(
         R.mapping,
         moe.routed_experts.backend.w3_w1_weight.device,
         comm.mnnvl,
         front_sort=bool(front_sort),
         front16=front16,
+        front32=front32,
     )
     layer = DML.K3DecodeMoeNvfp4Layer.create(moe, state, R.rank, R.world)
     layer.warm_up(moe)
@@ -740,6 +753,8 @@ def check_build():
     on = _build_lowm(moe_on, comm, front_sort=1, front16=1)
     plain16 = _build_lowm(moe_on, comm, front_sort=0, front16=1)
     wide = _build_lowm(moe_on, comm, front_sort=1, front16=0)
+    # TRTLLM_K3LL_MOE_FRONT32 on top of the production defaults.
+    on32 = _build_lowm(moe_on, comm, front_sort=1, front16=1, front32=1)
     # The tail stand-in's head is replaced by a fixed partial: its layer is built, never warmed (no front of its width).
     tail = DML.K3DecodeMoeNvfp4Layer.create(moe_tail, wide.state, R.rank, R.world)
     moe_on.decode_moe = on
@@ -762,12 +777,12 @@ def check_build():
     torch.cuda.synchronize()
     BUILT = SimpleNamespace(
         comm=comm, all_reduce=all_reduce, moe_on=moe_on, moe_off=moe_off, moe_tail=moe_tail,
-        on=on, plain16=plain16, wide=wide, tail=tail, res=res, refs=refs,
+        on=on, plain16=plain16, wide=wide, on32=on32, tail=tail, res=res, refs=refs,
     )  # fmt: skip
     if R.rank == 0:
         print(
             f"[rank 0] built at world {R.world}: 16-token front {on.state.head16 is not None}, "
-            f"tail stand-in latent {moe_tail.moe_hidden_size}",
+            f"32-token front {on32.state.head32 is not None}, tail stand-in latent {moe_tail.moe_hidden_size}",
             flush=True,
         )
 
@@ -902,7 +917,7 @@ def _front16_arm(layer, moe, x):
     )
 
 
-def _verify_front16(where, on, off, ref, weights):
+def _verify_front16(where, on, off, ref, weights, switch="FRONT16"):
     names = ("ids", "weights", "latent", "scales")
     _assert_one_hot(where, off.routing[1])
     for name, a, b in zip(names, off.routing, ref.routing):
@@ -914,7 +929,7 @@ def _verify_front16(where, on, off, ref, weights):
     for name, a, b in zip(names, on.routing, off.routing):
         _expect_same(f"{where}: on vs off {name}", a, b)
     _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
-    _expect_close(f"FRONT16 shared: {where}", on.act, off.act, SHARED_TOL)
+    _expect_close(f"{switch} shared: {where}", on.act, off.act, SHARED_TOL)
     latent_cols = weights.width + weights.pad
     _expect_same(
         f"{where}: on vs off tail latent", on.tail_in[:, :latent_cols], off.tail_in[:, :latent_cols]
@@ -963,6 +978,74 @@ def check_front16():
         print(
             f"[rank 0] FRONT16: off arm = pre-change chain; on arm's routing / latent / partial = off arm's, "
             f"shared activation max rel err {STATS.get('FRONT16 shared', 0.0):.2e}",
+            flush=True,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_FRONT32
+# ----------------------------------------------------------------------------------------------------------------------
+_FRONT_FIELDS = ("routing", "routed", "act", "tail_in", "out")
+
+
+def _front32_steps(on, off, moe, x, x16):
+    """Per arm, ``_wide`` on ``x`` (17-32 rows), then on ``x16`` (16 rows, the 16-token front); on the on arm the wide
+    step once more after it."""
+    return SimpleNamespace(
+        on=_front16_arm(on, moe, x),
+        on16=_front16_arm(on, moe, x16),
+        on_again=_front16_arm(on, moe, x),
+        off=_front16_arm(off, moe, x),
+        off16=_front16_arm(off, moe, x16),
+    )
+
+
+def _verify_front32(where, moe, x, steps):
+    _verify_front16(
+        where, steps.on, steps.off, _front16_ref(moe, x), BUILT.refs.on, switch="FRONT32"
+    )
+    _same_arm(f"{where}: the on arm's wide step again", steps.on_again, steps.on, _FRONT_FIELDS)
+    _same_arm(
+        f"{where}: interleaved 16-row step, on vs off", steps.on16, steps.off16, _FRONT_FIELDS
+    )
+
+
+def check_front32():
+    """``_wide`` at 17, 24 and 32 rows with and without the 32-token front, interleaved with 16-row steps on the
+    16-token front (module docstring)."""
+    on, off, moe = BUILT.on32, BUILT.on, BUILT.moe_on
+    assert on.state.head32 is not None, (
+        f"the 32-token front does not take this layer at world {R.world} (front32_supported); FRONT32 is not covered"
+    )
+    assert off.state.head32 is None and on.state.head16 is not None and off.state.head16 is not None
+    with _switch("TRTLLM_K3LL_WIDE_LATENT_TAIL", 0):
+        for rows in FRONT32_ROWS:
+            x = _moe_input(1000 + rows, rows)
+            x16 = _moe_input(1100 + rows, INTERLEAVED_ROWS)
+            _verify_front32(f"FRONT32 {rows} rows", moe, x, _front32_steps(on, off, moe, x, x16))
+        for rows in GRAPH_FRONT32_ROWS:
+            x = _moe_input(1200 + rows, rows)
+            x16 = _moe_input(1300 + rows, INTERLEAVED_ROWS)
+            graph, g = _capture(lambda: _front32_steps(on, off, moe, x, x16))
+            for rep in range(REPLAYS):
+                x.copy_(_moe_input(1400 + 10 * rows + rep, rows))
+                x16.copy_(_moe_input(1500 + 10 * rows + rep, INTERLEAVED_ROWS))
+                _replay(graph)
+                where = f"FRONT32 graph {rows} rows replay {rep}"
+                eager = _front32_steps(on, off, moe, x, x16)
+                for step in vars(g):
+                    _same_arm(
+                        f"{where} {step} vs eager",
+                        getattr(g, step),
+                        getattr(eager, step),
+                        _FRONT_FIELDS,
+                    )
+                _verify_front32(where, moe, x, g)
+            del graph
+    if R.rank == 0:
+        print(
+            f"[rank 0] FRONT32: off arm = pre-change chain; on arm's routing / latent / partial = off arm's, "
+            f"shared activation max rel err {STATS.get('FRONT32 shared', 0.0):.2e}; interleaved 16-row steps on = off",
             flush=True,
         )
 
@@ -1347,6 +1430,7 @@ def check_moe_lowm():
 CHECKS = [
     check_front_sort,
     check_front16,
+    check_front32,
     check_wide_ar_attn_res,
     check_wide_latent_tail,
     check_moe_lowm,
