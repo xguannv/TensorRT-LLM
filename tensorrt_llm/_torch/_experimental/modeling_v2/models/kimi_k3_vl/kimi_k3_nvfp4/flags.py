@@ -158,7 +158,7 @@ TRTLLM_K3LL_WIDE_LATENT_TAIL = _flag(
 
 TRTLLM_K3LL_OPROJ_PUSH = _flag(
     "TRTLLM_K3LL_OPROJ_PUSH",
-    0,
+    1,
     "decode steps up to 64 tokens (1; 2: wide steps only): o_proj's GEMM pushes its partial into the post-attention "
     "all-reduce, K3LamportFinish + K3AttnResFast run the rest (oproj_push.py; read at forward time)",
 )
