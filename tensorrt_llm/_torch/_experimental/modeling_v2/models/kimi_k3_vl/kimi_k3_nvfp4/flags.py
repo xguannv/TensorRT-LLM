@@ -183,7 +183,7 @@ TRTLLM_K3LL_MLA_GATE_SIDE = _flag(
 )
 TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
     "TRTLLM_K3LL_MLA_DECODE_PDL",
-    0,
+    1,
     "MLA decode split read: the CuTe DSL FP8 split-KV kernel and its reduction with programmatic dependent launch "
     "(k3_mla_decode_fp8_pdl)",
 )
