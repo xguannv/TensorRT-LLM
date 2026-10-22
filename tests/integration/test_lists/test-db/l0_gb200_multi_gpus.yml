@@ -102,6 +102,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py
   # The Kimi K3 decode path's MoE-path switches, each off arm against the chain it replaced, 4 ranks
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_lowm_switches_op_matrix.py
+  # The Kimi K3 decode path's o_proj push (TRTLLM_K3LL_OPROJ_PUSH), off arm against the chain it replaced, 4 ranks
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_oproj_push_op_matrix.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_failure_is_collective_and_bounded

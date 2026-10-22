@@ -1564,7 +1564,10 @@ class KimiLinearDecoderLayer(nn.Module):
         collective once the target has built its ``decode_comm``: with o_proj
         (``K3DecodeComm.sandwich_oproj``) where the sandwich takes the layer,
         the step and the attention's decode branch, else on the attention's
-        unreduced o_proj output (``K3DecodeComm.allreduce_attn_res``).
+        unreduced o_proj output (``K3DecodeComm.allreduce_attn_res``). With
+        ``TRTLLM_K3LL_OPROJ_PUSH``, where it takes a pure decode step, o_proj
+        pushes its partial into the all-reduce instead
+        (``_oproj_push_attn_res``).
 
         ``pending_moe_partial`` (only where ``accepts_moe_partial`` held): the
         previous layer's MoE output, unreduced (``defer_moe_tail``); then
@@ -1690,7 +1693,13 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = None
         attention = self.linear_attn if self.is_kda else self.self_attn
         comm = self.decode_comm
-        if comm is not None and comm.takes_post_attention(hidden_states, step):
+        if _flags.TRTLLM_K3LL_OPROJ_PUSH and self._takes_oproj_push(
+            attention, hidden_states, attn_metadata, step, prefix_sum, valid_block_residual
+        ):
+            hidden_states, prefix_sum = self._oproj_push_attn_res(
+                attention, hidden_states, attn_metadata, step, prefix_sum, valid_block_residual
+            )
+        elif comm is not None and comm.takes_post_attention(hidden_states, step):
             if (
                 self.sandwich_oproj
                 and step.num_tokens <= _decode_comm.SANDWICH_MAX_TOKENS
@@ -1870,6 +1879,56 @@ class KimiLinearDecoderLayer(nn.Module):
     def _o_allreduce(self) -> AllReduce:
         """The all-reduce module of this layer's attention output; it also reduces a wide step's MoE partial."""
         return (self.linear_attn if self.is_kda else self.self_attn)._o_allreduce
+
+    def _takes_oproj_push(
+        self,
+        attention: nn.Module,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        step: DecodeStep,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+    ) -> bool:
+        """Whether the post-attention step is ``_oproj_push_attn_res`` (``TRTLLM_K3LL_OPROJ_PUSH``): the collective
+        state takes it (``K3DecodeComm.takes_oproj_push``) and the attention runs the step on its decode branch."""
+        comm = self.decode_comm
+        return (
+            comm is not None
+            and comm.takes_oproj_push(
+                step,
+                hidden_states.shape[0],
+                self._o_proj(),
+                prefix_sum,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+            and attention.will_run_decode_branch(attn_metadata, step)
+        )
+
+    def _oproj_push_attn_res(
+        self,
+        attention: nn.Module,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        step: DecodeStep,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The post-attention step with o_proj pushing its partial into the all-reduce, the same for a KDA and an MLA
+        layer: the attention's o_proj input, then o_proj, the all-reduce and the residual update
+        (``K3DecodeComm.oproj_push_attn_res``). Returns ``(normed, updated)``."""
+        x = attention(hidden_states, attn_metadata, step=step, project_output=False)
+        return self.decode_comm.oproj_push_attn_res(
+            x,
+            self._o_proj(),
+            prefix_sum,
+            block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.post_attention_layernorm,
+        )
 
     def accepts_moe_partial(self, num_snapshots: int) -> bool:
         """Whether this layer's pre-attention step can reduce the previous layer's unreduced MoE output: the target

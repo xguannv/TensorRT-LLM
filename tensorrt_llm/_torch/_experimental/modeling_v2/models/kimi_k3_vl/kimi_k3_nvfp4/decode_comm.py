@@ -13,6 +13,10 @@ aside) one collective runs both:
 * `K3DecodeComm.allreduce_attn_res`, `comm/mnnvl_allreduce_attn_res`, everywhere else: the one-shot MNNVL all-reduce
   of the attention's unreduced o_proj partial, with the residual update as its epilogue.
 
+With ``TRTLLM_K3LL_OPROJ_PUSH`` a pure decode step's post-attention step takes neither:
+`K3DecodeComm.oproj_push_attn_res` runs o_proj with its all-reduce push epilogue, the Lamport finish and the residual
+update on the MNNVL workspace (``oproj_push.py``). The attention hands over its o_proj input.
+
 The pre-attention step after a MoE layer whose row-parallel tail was handed on (a `PendingTail`, `decode_moe.py`) is
 the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
@@ -69,6 +73,7 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
 from . import flags as _flags
+from .oproj_push import K3OprojPush
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
@@ -149,10 +154,12 @@ def _res_args(res_proj: nn.Module, res_norm: nn.Module, out_norm: nn.Module) -> 
 @dataclass(eq=False)
 class K3DecodeComm:
     """The decode path's collective state for the TP group: the `MnnvlWorkspace` and the `K3SandwichWorkspace` the
-    post-attention steps run on. Built by `create`; owned by the target and shared by every layer."""
+    post-attention steps run on, and the o_proj push's view of the former (`K3OprojPush`). Built by `create`; owned
+    by the target and shared by every layer."""
 
     mnnvl: MnnvlWorkspace
     sandwich: K3SandwichWorkspace
+    oproj_push: Optional[K3OprojPush] = None
 
     @classmethod
     def create(cls, mapping, oproj_weight: Optional[torch.Tensor] = None) -> "K3DecodeComm":
@@ -162,10 +169,8 @@ class K3DecodeComm:
         ``oproj_weight``: an o_proj weight ``takes_oproj`` holds for. The sandwich kernel compiles here for its
         shape, with one call on a zero row of a zero weight, so no capture compiles it; the call advances the
         sandwich workspace on every rank alike."""
-        state = cls(
-            MnnvlWorkspace.create(mapping, MNNVL_BUFFER_BYTES),
-            K3SandwichWorkspace.create(mapping),
-        )
+        mnnvl = MnnvlWorkspace.create(mapping, MNNVL_BUFFER_BYTES)
+        state = cls(mnnvl, K3SandwichWorkspace.create(mapping), K3OprojPush.create(mnnvl))
         if oproj_weight is not None:
             weight = torch.zeros_like(oproj_weight)
             hidden = weight.shape[0]
@@ -286,6 +291,43 @@ class K3DecodeComm:
             *_res_args(res_proj, res_norm, out_norm),
             self.mnnvl,
             two_shot=two_shot,
+        )
+
+    def takes_oproj_push(
+        self,
+        step,
+        rows: int,
+        o_proj: nn.Module,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> bool:
+        """Whether ``oproj_push_attn_res`` takes the post-attention step of ``rows`` tokens (``K3OprojPush.takes``:
+        ``TRTLLM_K3LL_OPROJ_PUSH`` asks for ``step``, o_proj's push epilogue and the attn_res kernel take the shapes).
+        Every rank decides alike."""
+        return self.oproj_push is not None and self.oproj_push.takes(
+            step, rows, o_proj, prefix_sum, block_residual, res_proj, res_norm, out_norm
+        )
+
+    def oproj_push_attn_res(
+        self,
+        x: torch.Tensor,
+        o_proj: nn.Module,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+        gate: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` as ``allreduce_attn_res`` of ``x @ o_proj.weight^T`` (``bf16(x * gate) @ ...`` with
+        ``gate``), with o_proj pushing its partial into the MNNVL workspace (``K3OprojPush.run``): ``x`` is this
+        rank's o_proj input ``[T, K]``, ``o_proj`` its FP8 module on ``k3_fp8w_lowm_gemm``. ``updated`` is bit for bit
+        ``allreduce_attn_res``'s; ``normed`` within the attn_res kernels' difference (``oproj_push.py``)."""
+        return self.oproj_push.run(
+            x, o_proj, prefix_sum, block_residual, res_proj, res_norm, out_norm, gate=gate
         )
 
     def sandwich_tail(
