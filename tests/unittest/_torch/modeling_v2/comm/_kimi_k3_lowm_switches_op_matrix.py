@@ -20,11 +20,11 @@ EP4 rank of the target; random, per-expert global scales). The generic path runs
 NVFP4 methods (``quantize_input``, ``run_moe_nvfp4``) after the scheduler's no-communication steps (the gate's
 routing method, int32 ids, fp32 weights). The decoder layer's residual updates run
 ``KimiLinearDecoderLayer.forward`` itself on a stand-in layer (attention and MoE stand-ins that return fixed
-partials). A switch read at forward time (``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, ``TRTLLM_K3LL_WIDE_LATENT_TAIL``) is set
-on the flags module per arm; a switch read when the target is built (``TRTLLM_K3LL_MOE_FRONT_SORT``,
-``TRTLLM_K3LL_MOE_FRONT16``: the state ``K3DecodeMoeNvfp4.create`` builds; ``TRTLLM_K3LL_MOE_LOWM``: whether the
-layer gets a ``decode_moe`` at all) is one built layer per arm. The decode GEMV sites are not built
-(``decode_gemvs`` None): every GEMV runs on ``_gemv``'s stock GEMM.
+partials). A switch read at forward time (``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, ``TRTLLM_K3LL_WIDE_LATENT_TAIL``,
+``TRTLLM_K3LL_NARROW_LATENT_TAIL``) is set on the flags module per arm; a switch read when the target is built
+(``TRTLLM_K3LL_MOE_FRONT_SORT``, ``TRTLLM_K3LL_MOE_FRONT16``: the state ``K3DecodeMoeNvfp4.create`` builds;
+``TRTLLM_K3LL_MOE_LOWM``: whether the layer gets a ``decode_moe`` at all) is one built layer per arm. The decode GEMV
+sites are not built (``decode_gemvs`` None): every GEMV runs on ``_gemv``'s stock GEMM.
 
 Payloads. The MoE inputs and the head and shared gate_up rows are small multiples of powers of two, so every head and
 shared gate_up sum is exact in fp32 in any order (the payloads ``moe/k3_moe_front``'s matrix certifies with): the
@@ -82,12 +82,30 @@ eager call on the same inputs):
     roundings); the routing's experts equal, the weights within one bf16 ulp, the NVFP4 latent and scales bit for bit;
     and the expert kernel on the on arm's routing and latent bit for bit ``CuteDslFusedMoE.run_moe_nvfp4`` on the same
     inputs.
+  * NARROW_LATENT_TAIL (1, 3, 5, 8 rows): a narrow step's ``K3DecodeMoeNvfp4Layer.forward`` with ``partial_tail`` (the
+    real front and lowm experts under one-hot routing) and the consumer's ``K3DecodeComm.sandwich_tail``, with a tail
+    stand-in of the kernel's TP16 per-rank shape (latent columns [224 r, 224 r + 224), zero-padded to 256, and the
+    shared down projection; at W 4 the slices cover 896 of the 3584 columns, as ``test_k3_sandwich.py``'s). Off arm
+    against ``_ref_narrow_tail_chain`` (the routed experts' stock all-reduce, then ``comm/k3_sandwich_tail`` on the
+    reduced latent, x_src 0) bit for bit. On arm (the routed partial handed on unreduced; the tail kernel pushes it
+    into the TP group's ``K3SandwichLatentExchange`` and sums the ranks' partials itself, x_src 3) against the off
+    arm: ``normed`` and ``updated`` bit for bit on every rank. The sum is the one-shot all-reduce's (fp32 in rank
+    order, chunks of 8 ranks added from zero, one bf16 rounding) and the latent RMS and the GEMV read the same bf16
+    rows, so nothing is allowed to differ. The -0.0 -> +0.0 sanitisation of the pushed words happens only on the on
+    arm, in the tail kernel's push (as in the stock all-reduce's own push, so the sums agree); the off arm's chain is
+    untouched by the change, which keeps the off-arm comparison exact. Then the exchange's device-side call count and
+    half parity: per row count 8, 1, 5, three on-arm calls with an o_proj sandwich and an off-arm call between them,
+    every result the off arm's and the count advanced by the on-arm calls only. Then one CUDA graph per row count (1,
+    3, 5, 8), each with two on-arm tails, an off-arm tail and an o_proj sandwich, replayed alternately 12 times with
+    rewritten inputs and eager calls of both arms between the replays: every replay bit for bit the eager calls (as the
+    engine interleaves the graphs of several batch sizes and the drafter's with eager steps).
 
 Outputs the ranks share (routing, latent, reduced outputs, ``updated`` / ``normed``) are also compared bitwise across
 the ranks; the shared activation, the routed partial and the tail are this rank's own.
 """
 
 import contextlib
+import dataclasses
 import functools
 import sys
 from pathlib import Path
@@ -135,6 +153,13 @@ FRONT_SORT_ROWS = (1, 8, 9, 12, 16)
 FRONT16_ROWS = (9, 12, 16)
 WIDE_ROWS = (16, 32)
 MOE_ROWS = (8, 16, 32)
+NARROW_ROWS = (1, 3, 5, 8)
+NARROW_SEQUENCE_ROWS = (8, 1, 5)
+NARROW_REPLAY_ORDER = (8, 3, 8, 1, 5, 3, 8, 5, 1, 3, 1, 8)
+# The sandwich tail kernel's TP16 per-rank shapes: a 224-column latent slice zero-padded to 256, o_proj K 768.
+TAIL16_WIDTH = 224
+TAIL16_LAT = 256
+O_PROJ_K = 768
 GRAPH_FRONT_SORT_ROWS = (8, 16)
 GRAPH_FRONT16_ROWS = (9, 16)
 REPLAYS = 2
@@ -588,8 +613,8 @@ def _ref_weights(moe):
 
 def _build_lowm(moe, comm, front_sort: int, front16: int):
     """``moe``'s decode path as ``_build_decode_moe_lowm`` builds it with these values of TRTLLM_K3LL_MOE_FRONT_SORT
-    and TRTLLM_K3LL_MOE_FRONT16 (read when the target is built): its own state on the TP group's MNNVL workspace,
-    the layer, and one call of every kernel (``warm_up``). ``fold_latent_norm`` has run on ``moe``."""
+    and TRTLLM_K3LL_MOE_FRONT16 (read when the target is built): its own state on the TP group's MNNVL workspace and
+    latent exchange, the layer, and one call of every kernel (``warm_up``). ``fold_latent_norm`` has run on ``moe``."""
     front16 = bool(front16) and DML.front16_supported(moe, R.world)
     state = DML.K3DecodeMoeNvfp4.create(
         R.mapping,
@@ -597,6 +622,7 @@ def _build_lowm(moe, comm, front_sort: int, front16: int):
         comm.mnnvl,
         front_sort=bool(front_sort),
         front16=front16,
+        latent=comm.latent,
     )
     layer = DML.K3DecodeMoeNvfp4Layer.create(moe, state, R.rank, R.world)
     layer.warm_up(moe)
@@ -734,6 +760,7 @@ def check_build():
     moe_tail = _moe_layer(22, TAIL_SLICE * R.world, backend, all_reduce)
     DC.use_decode_one_shot(nn.ModuleList([moe_on, moe_off, moe_tail, all_reduce]))
     comm = DC.K3DecodeComm.create(R.mapping, None)
+    comm.build_latent_exchange(R.mapping)
     for moe in (moe_on, moe_tail):
         DM.fold_latent_norm(moe)
     # Production defaults: the front's sort and the 16-token front.
@@ -1342,12 +1369,191 @@ def check_moe_lowm():
         )
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_NARROW_LATENT_TAIL
+# ----------------------------------------------------------------------------------------------------------------------
+def _narrow_layer():
+    """The lowm layer of the production arms (front's sort, 16-token front) with a tail of the sandwich kernel's TP16
+    per-rank shape: this rank's latent up slice ``[7168, 224]`` (random), 32 zero columns and the layer's own shared
+    down projection, at latent column ``224 r``."""
+    on = BUILT.on
+    weight = torch.cat(
+        [
+            _normal(_gen(9400 + R.rank), (H, TAIL16_WIDTH), 0.02),
+            on.tail_weight.new_zeros(H, TAIL16_LAT - TAIL16_WIDTH),
+            on.tail_weight[:, -SHARED_PER_RANK:],
+        ],
+        dim=1,
+    ).contiguous()
+    return dataclasses.replace(on, tail_weight=weight, lo=TAIL16_WIDTH * R.rank, width=TAIL16_WIDTH)
+
+
+class _NarrowCall:
+    """A narrow step's MoE input and the consumer's running prefix sum and snapshot bank (the same on every rank), and
+    this rank's o_proj input for the sandwich between two tails; buffers rewritten in place for a replay."""
+
+    def __init__(self, seed, rows):
+        self.rows = rows
+        empty = dict(dtype=torch.bfloat16, device="cuda")
+        self.x = torch.empty(rows, H, **empty)
+        self.prefix = torch.empty(rows, H, **empty)
+        self.bank = torch.empty(SNAPSHOTS, rows, H, **empty)
+        self.core = torch.empty(rows, O_PROJ_K, **empty)
+        self.draw(seed)
+
+    def draw(self, seed):
+        self.x.copy_(_moe_input(seed, self.rows))
+        g = _gen(seed)
+        self.prefix.copy_(_normal(g, self.prefix.shape))
+        self.bank.copy_(_normal(g, self.bank.shape))
+        self.core.copy_(_normal(_gen(16 * seed + R.rank), self.core.shape, 0.5))
+
+
+def _narrow_res():
+    res = BUILT.res
+    return res.sa_proj, res.sa_norm, res.in_norm
+
+
+def _narrow_arm(layer, call, on):
+    """The MoE layer's ``forward`` with ``partial_tail`` under TRTLLM_K3LL_NARROW_LATENT_TAIL=``on``, then the
+    consumer's ``sandwich_tail`` of its ``PendingTail``."""
+    with _switch("TRTLLM_K3LL_NARROW_LATENT_TAIL", on), _taps(layer) as seen:
+        pending = layer.forward(BUILT.moe_on, call.x, None, partial_tail=True)
+    assert isinstance(pending, DC.PendingTail) and pending.unreduced == bool(on), pending.unreduced
+    normed, updated = BUILT.comm.sandwich_tail(pending, call.prefix, call.bank, *_narrow_res())
+    return SimpleNamespace(
+        normed=normed, updated=updated, routed=seen["_front_routed"][0], weights=seen["_front"][1]
+    )
+
+
+def _narrow_oproj(call, o_weight):
+    """An o_proj sandwich on the same workspace, between two tails (as a layer's steps alternate)."""
+    return BUILT.comm.sandwich_oproj(call.core, o_weight, call.prefix, call.bank, *_narrow_res())
+
+
+def _ref_narrow_tail_chain(layer, call):
+    """A narrow step's MoE tail before TRTLLM_K3LL_NARROW_LATENT_TAIL: ``_front_routed``, the routed experts' stock
+    all-reduce (one-shot MNNVL), then ``comm/k3_sandwich_tail`` on the reduced latent (x_src 0)."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
+        k3_sandwich_tail,
+    )
+
+    moe = BUILT.moe_on
+    res_proj, res_norm, out_norm = _narrow_res()
+    routed, act = layer._front_routed(moe, call.x)
+    latent = moe.routed_experts.all_reduce(routed)
+    normed, updated = k3_sandwich_tail(
+        latent.contiguous(), act.contiguous(), layer.tail_weight, layer.lo,
+        float(moe.routed_expert_norm.variance_epsilon), call.prefix, call.bank, res_proj.weight.reshape(-1),
+        res_norm.weight, out_norm.weight, DC._eps(res_norm), DC._eps(out_norm), BUILT.comm.sandwich,
+    )  # fmt: skip
+    return SimpleNamespace(normed=normed, updated=updated)
+
+
+def _verify_narrow(where, on, off, ref=None):
+    _assert_one_hot(where, off.weights)
+    _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
+    for name in ("normed", "updated"):
+        if ref is not None:
+            _expect_same(
+                f"{where}: off arm vs pre-change {name}", getattr(off, name), getattr(ref, name),
+                replicated=True,
+            )  # fmt: skip
+        _expect_same(
+            f"{where}: on vs off {name}", getattr(on, name), getattr(off, name), replicated=True
+        )
+
+
+def _lat_count():
+    return int(BUILT.comm.latent.flags[0].item())
+
+
+def check_narrow_latent_tail():
+    """A narrow step's MoE tail with and without the latent all-reduce in the sandwich tail kernel, eagerly at 1, 3,
+    5 and 8 rows, across the exchange's call count and from CUDA graphs (module docstring)."""
+    layer = _narrow_layer()
+    assert BUILT.comm.latent is not None and layer.state.latent is BUILT.comm.latent
+    assert BUILT.comm.latent.max_rows == DC.SANDWICH_MAX_TOKENS >= max(NARROW_ROWS)
+    o_weight = _normal(_gen(9600 + R.rank), (H, O_PROJ_K), 0.03)
+    for rows in NARROW_ROWS:
+        call = _NarrowCall(9500 + rows, rows)
+        a_on = _cloned(_narrow_arm(layer, call, 1))
+        a_off = _cloned(_narrow_arm(layer, call, 0))
+        _verify_narrow(
+            f"NARROW_LATENT_TAIL {rows} rows", a_on, a_off,
+            _cloned(_ref_narrow_tail_chain(layer, call)),
+        )  # fmt: skip
+    # The exchange's call count (its parity picks the half) across changing M, o_proj sandwiches and off-arm calls.
+    for rows in NARROW_SEQUENCE_ROWS:
+        call = _NarrowCall(9700 + rows, rows)
+        count = _lat_count()
+        first = _cloned(_narrow_arm(layer, call, 1))
+        _narrow_oproj(call, o_weight)
+        second = _cloned(_narrow_arm(layer, call, 1))
+        before_off = _lat_count()
+        off = _cloned(_narrow_arm(layer, call, 0))
+        assert _lat_count() == before_off, "an off-arm call advanced the latent exchange"
+        third = _cloned(_narrow_arm(layer, call, 1))
+        assert _lat_count() == (count + 3) % 6, (
+            f"the latent exchange's count went {count} -> {_lat_count()} over three on-arm calls"
+        )
+        where = f"NARROW_LATENT_TAIL sequence {rows} rows"
+        for i, on in enumerate((first, second, third)):
+            _verify_narrow(f"{where} call {i}", on, off)
+    # One graph per row count, replayed alternately with eager calls between the replays.
+    graphs = {}
+    for rows in NARROW_ROWS:
+        calls = (_NarrowCall(9800 + rows, rows), _NarrowCall(9900 + rows, rows))
+
+        def body(calls=calls):
+            on1 = _narrow_arm(layer, calls[0], 1)
+            off1 = _narrow_arm(layer, calls[0], 0)
+            _narrow_oproj(calls[0], o_weight)
+            on2 = _narrow_arm(layer, calls[1], 1)
+            return on1, off1, on2
+
+        graphs[rows] = (calls, *_capture(body))
+    fields = ("normed", "updated", "routed")
+    for rep, rows in enumerate(NARROW_REPLAY_ORDER):
+        calls, graph, outs = graphs[rows]
+        for i, call in enumerate(calls):
+            call.draw(10000 + 10 * rep + i)
+        _replay(graph)
+        g_on1, g_off1, g_on2 = (_cloned(o) for o in outs)
+        where = f"NARROW_LATENT_TAIL graph {rows} rows replay {rep}"
+        e_on1 = _narrow_arm(layer, calls[0], 1)
+        e_off1 = _narrow_arm(layer, calls[0], 0)
+        e_on2 = _narrow_arm(layer, calls[1], 1)
+        for name, g_arm, e_arm in (
+            ("on 1", g_on1, e_on1),
+            ("off", g_off1, e_off1),
+            ("on 2", g_on2, e_on2),
+        ):
+            for field in fields:
+                _expect_same(
+                    f"{where}: {name} {field} vs eager",
+                    getattr(g_arm, field),
+                    getattr(e_arm, field),
+                )
+        _verify_narrow(where, g_on1, g_off1, _cloned(_ref_narrow_tail_chain(layer, calls[0])))
+        _verify_narrow(f"{where} second tail", g_on2, _cloned(_narrow_arm(layer, calls[1], 0)))
+    del graphs
+    if R.rank == 0:
+        print(
+            "[rank 0] NARROW_LATENT_TAIL: off arm = pre-change chain; on arm = off arm bit for bit on every rank "
+            f"(eager at {NARROW_ROWS} rows, the call count across {NARROW_SEQUENCE_ROWS}, "
+            f"{len(NARROW_REPLAY_ORDER)} replays of {len(NARROW_ROWS)} graphs)",
+            flush=True,
+        )
+
+
 CHECKS = [
     check_front_sort,
     check_front16,
     check_wide_ar_attn_res,
     check_wide_latent_tail,
     check_moe_lowm,
+    check_narrow_latent_tail,
 ]
 
 
