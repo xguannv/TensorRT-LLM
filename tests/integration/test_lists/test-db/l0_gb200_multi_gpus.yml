@@ -86,6 +86,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_markov.py
   # TRTLLM_K3LL_DRAFTER_MARKOV_V2: k3_markov's MMA build against the other build, 4 ranks
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_markov_mma.py
+  # The MLA DSpark drafter's switches on its projections and all-reduces, off arm against the call it replaced, 4 ranks
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_drafter_switches_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py

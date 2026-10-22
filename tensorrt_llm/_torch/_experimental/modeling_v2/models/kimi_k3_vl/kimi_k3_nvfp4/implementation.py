@@ -4351,8 +4351,11 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         def project_target_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
             partial = sliced(hidden_states.to(sliced.weight.dtype))
             rows = partial.shape[0]
-            if rows <= zeros.shape[0] and comm.takes_allreduce_norm(rows, partial.shape[1]):
-                normed, _ = comm.allreduce_norm(partial, zeros[:rows], drafter.hidden_norm)
+            ceiling = _mla_drafter.ar_ceiling(rows)
+            if rows <= zeros.shape[0] and comm.takes_allreduce_norm(
+                rows, partial.shape[1], ceiling
+            ):
+                normed, _ = comm.allreduce_norm(partial, zeros[:rows], drafter.hidden_norm, ceiling)
                 return normed
             if rows == 0:
                 return drafter.hidden_norm(partial)
