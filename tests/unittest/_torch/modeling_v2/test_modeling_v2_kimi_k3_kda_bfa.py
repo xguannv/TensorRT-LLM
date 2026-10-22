@@ -17,8 +17,9 @@
 * ``kda_bfa`` decode GEMV site (``K3DecodeGemvs.project`` on ``k3_ctm_gemv_wide``) against ``F.linear`` and an fp32
   reference, at the per-rank TP16 shape (136 x 7168) and 1 / 8 / 16 / 32 / 64 rows.
 * ``kda_bfa_rt`` (TRTLLM_K3LL_KDA_BFA_ROW_TILES: the same GEMV over 34-row weight tiles) bit-identical to ``kda_bfa``.
-* ``K3DecodeKDA._k3_projections`` under every TRTLLM_K3LL_KDA_BFA_FIRST / TRTLLM_K3LL_KDA_BFA_OVERLAP setting: the same
-  bits, and with BFA_FIRST the [f_a | b] projection launched before QKVG on the calling stream.
+* ``K3DecodeKDA._k3_projections`` under every TRTLLM_K3LL_KDA_BFA_SIDE_FIRST / TRTLLM_K3LL_KDA_BFA_OVERLAP setting: the
+  same bits; with OVERLAP the [f_a | b] projection on the projection stream, enqueued before QKVG with SIDE_FIRST and
+  after it without; without OVERLAP both on the calling stream, QKVG first.
 * ``trtllm::k3_fp8_kda_verify`` with the [f_a | b] rows passed beside the [q | k | v | g] rows (``bfa=``) against the
   same call on their concatenation: outputs, the pool state, the drafts' records and the conv caches bit for bit,
   over rounds with changing pending counts, fp32 and bf16 committed states.
@@ -134,25 +135,30 @@ def test_projection_order(rows, monkeypatch):
         mod._bfa_gemvs = decode_gemv.K3DecodeGemvs.create(sites=("kda_bfa",))
         set_do_multi_stream(True)
         try:
-            for first in (0, 1):
+            for side_first in (0, 1):
                 for overlap in (0, 1):
-                    monkeypatch.setattr(flags, "TRTLLM_K3LL_KDA_BFA_FIRST", first)
+                    monkeypatch.setattr(flags, "TRTLLM_K3LL_KDA_BFA_SIDE_FIRST", side_first)
                     monkeypatch.setattr(flags, "TRTLLM_K3LL_KDA_BFA_OVERLAP", overlap)
                     calls.clear()
                     main = torch.cuda.current_stream()
-                    out[first, overlap] = kda._k3_projections(mod, x)
+                    out[side_first, overlap] = kda._k3_projections(mod, x)
                     torch.cuda.synchronize()
-                    if first:
-                        assert [c[0] for c in calls] == ["bfa", "qkvg"]
-                        assert all(c[1] == main for c in calls)
-                    elif overlap:
-                        assert dict(calls)["bfa"] == mod._projection_aux_stream
+                    order = [c[0] for c in calls]
+                    streams = dict(calls)
+                    assert streams["qkvg"] == main
+                    if overlap:
+                        assert order == (["bfa", "qkvg"] if side_first else ["qkvg", "bfa"])
+                        assert streams["bfa"] == mod._projection_aux_stream
+                    else:
+                        assert order == ["qkvg", "bfa"] and streams["bfa"] == main
         finally:
             set_do_multi_stream(False)
     ref_q, ref_b = out[0, 0]
     assert torch.equal(ref_b, mod._bfa_gemvs.project("kda_bfa", x, w_bfa))
     for key, (q, b) in out.items():
-        assert torch.equal(q, ref_q) and torch.equal(b, ref_b), f"BFA_FIRST, BFA_OVERLAP = {key}"
+        assert torch.equal(q, ref_q) and torch.equal(b, ref_b), (
+            f"BFA_SIDE_FIRST, BFA_OVERLAP = {key}"
+        )
 
 
 def _inputs(seed: int, num_spec: int, ssm_dtype: torch.dtype):

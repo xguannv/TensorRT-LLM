@@ -95,11 +95,11 @@ TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     1,
     "KDA decode / verify: the bf16 [f_a | b] projection on the projection stream beside the FP8 QKVG projection",
 )
-TRTLLM_K3LL_KDA_BFA_FIRST = _flag(
-    "TRTLLM_K3LL_KDA_BFA_FIRST",
+TRTLLM_K3LL_KDA_BFA_SIDE_FIRST = _flag(
+    "TRTLLM_K3LL_KDA_BFA_SIDE_FIRST",
     0,
-    "KDA decode / verify: the bf16 [f_a | b] projection on the model's stream ahead of the FP8 QKVG projection "
-    "(both stream their weights early under PDL); takes precedence over TRTLLM_K3LL_KDA_BFA_OVERLAP",
+    "with TRTLLM_K3LL_KDA_BFA_OVERLAP: the [f_a | b] projection enqueued on the projection stream before the FP8 "
+    "QKVG projection is enqueued, not after it",
 )
 TRTLLM_K3LL_KDA_BFA_ROW_TILES = _flag(
     "TRTLLM_K3LL_KDA_BFA_ROW_TILES",

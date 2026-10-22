@@ -37,7 +37,10 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.kimi_k3_mla import KimiK3MLAAttention
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import maybe_bcg_kda_core_inplace
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import (
+    do_multi_stream,
+    maybe_execute_in_parallel,
+)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.situ import SituAndMul
 from tensorrt_llm._torch.moe.fused_moe import (
@@ -162,6 +165,7 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.modules.rms_norm.RMSNorm",
     "tensorrt_llm._torch.distributed.AllReduce",
     "tensorrt_llm._torch.modules.multi_stream_utils.maybe_execute_in_parallel",
+    "tensorrt_llm._torch.modules.multi_stream_utils.do_multi_stream",
     # The DSpark drafter: the stock GQA drafter K3DSparkDrafter extends (its block forward where the drafter entries
     # do not take a block, its context projection without the TP group's collective state, its context k / v, its
     # heads and its weight load), and the stock builder's checks for which drafter a checkpoint gets.
@@ -2358,14 +2362,29 @@ class K3DecodeKDA(KimiKDALinearAttention):
 
     def _k3_projections(self, x: torch.Tensor):
         """``(qkvg, bfa)``: the FP8 QKVG projection and the bf16 ``[f_a | b]`` projection of ``x``, the same kernels on
-        the same inputs in every order. With ``TRTLLM_K3LL_KDA_BFA_FIRST`` the bf16 one runs first on the calling
-        stream and the FP8 one after it, so under PDL both are resident and stream their weights before ``x`` is
-        ready; else, with ``TRTLLM_K3LL_KDA_BFA_OVERLAP``, the bf16 one runs on the module's projection stream while
-        the FP8 one runs (the built-in decode's fork / join events); else it runs after the FP8 one."""
-        if _flags.TRTLLM_K3LL_KDA_BFA_FIRST:
-            bfa = self._k3_bfa(x)
-            return self.qkvg_proj(x), bfa
+        the same inputs in every order. With ``TRTLLM_K3LL_KDA_BFA_OVERLAP`` the bf16 one runs on the module's
+        projection stream while the FP8 one runs (the built-in decode's fork / join events), and with
+        ``TRTLLM_K3LL_KDA_BFA_SIDE_FIRST`` it is enqueued there before the FP8 one is enqueued on the calling stream
+        (``maybe_execute_in_parallel`` enqueues the FP8 one first); without OVERLAP it runs after the FP8 one."""
         aux = self._projection_aux_stream if _flags.TRTLLM_K3LL_KDA_BFA_OVERLAP else None
+        if (
+            _flags.TRTLLM_K3LL_KDA_BFA_SIDE_FIRST
+            and aux is not None
+            and do_multi_stream()
+            and not torch.compiler.is_compiling()
+        ):
+            fork, join = self._projection_fork_event, self._projection_join_event
+            fork.record()
+            with torch.cuda.stream(aux):
+                fork.wait()
+                bfa = self._k3_bfa(x)
+                join.record()
+            qkvg = self.qkvg_proj(x)
+            join.wait()
+            # As maybe_execute_in_parallel: outside a capture, keep bfa's memory until the calling stream's reads.
+            if not torch.cuda.is_current_stream_capturing():
+                bfa.record_stream(torch.cuda.current_stream())
+            return qkvg, bfa
         return maybe_execute_in_parallel(
             lambda: self.qkvg_proj(x),
             lambda: self._k3_bfa(x),
