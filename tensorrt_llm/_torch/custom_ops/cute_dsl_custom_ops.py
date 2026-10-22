@@ -11986,8 +11986,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.page_size = page_size
             self.max_batch_size = max_batch_size
             self.emit_softmax_stats = emit_softmax_stats
-            # Programmatic dependent launch of the FP8 kernel's grids (a compile variant; the tactic, and so the
-            # tuning entry, is shared with the plain launch).
+            # Programmatic dependent launch of the kernel's grids (FP8, FP16 and BF16 alike; a compile variant: the
+            # tactic, and so the tuning entry, is shared with the plain launch).
             self.use_pdl = use_pdl
 
         def unique_id(self):

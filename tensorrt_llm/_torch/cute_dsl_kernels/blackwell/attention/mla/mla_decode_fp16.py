@@ -149,6 +149,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         reducer_d_tiles: int = 1,
         reducer_max_splits: int = MAX_SPLITS,
         emit_softmax_stats: bool = False,
+        use_pdl: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -191,6 +192,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
             stores into the attention epilogue.
         :type emit_softmax_stats: bool
+        :param use_pdl: Launch the split kernel and the reduction with
+            programmatic dependent launch: their prologues (shared-memory
+            and pipeline setup, TMA descriptor prefetch) overlap the
+            preceding kernel's tail, and they wait for it before touching
+            global memory.
+        :type use_pdl: bool
         """
 
         self.latent_dim = 512
@@ -222,6 +229,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         self.emit_softmax_stats = emit_softmax_stats
+        self.use_pdl = use_pdl
         (
             self.total_q_rows,
             self.num_q_tiles,
@@ -1027,6 +1035,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             smem=SplitKVKernelSharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.emit_softmax_stats):
@@ -1063,6 +1072,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 smem=self.reducer_max_splits * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=self.use_pdl,
             )
 
     @cute.jit
@@ -1315,6 +1325,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
+        if cutlass.const_expr(self.use_pdl):
+            # Everything above touched only this CTA's shared memory and the
+            # TMA descriptors; the inputs (the queries, the cache, the page
+            # table and bounds the preceding kernels write) and the outputs
+            # are accessed after the preceding kernel completed. The
+            # reduction is released by this grid's exits (no early trigger:
+            # its CTAs would wait on the SMs of running clusters).
+            cute.arch.griddepcontrol_wait()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
@@ -1753,6 +1771,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         mSoftmaxStats = None
         if cutlass.const_expr(self.emit_softmax_stats):
             mLSE, mSoftmaxStats = mLSE
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()

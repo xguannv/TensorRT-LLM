@@ -1360,6 +1360,20 @@ class DFlashWorker(SpecWorkerBase):
                 kv_layout="HND",
             )
 
+    def _update_mamba_states(self, attn_metadata, num_accepted_tokens: torch.Tensor) -> None:
+        """Move the hybrid cache manager's recurrent states to this step's acceptance. A subclass whose acceptance
+        kernel already recorded it may skip the call."""
+        attn_metadata.kv_cache_manager.update_mamba_states(
+            attn_metadata=attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            state_indices=attn_metadata.mamba_metadata.state_indices,
+        )
+
+    def _step_arange(self, start: int, end: int) -> torch.Tensor:
+        """``arange(start, end)`` (int64, CUDA) for this step's drafter inputs; read only, so a subclass may return a
+        cached one."""
+        return torch.arange(start, end, dtype=torch.long, device="cuda")
+
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
         """Save attn_metadata fields that DFlash modifies during forward."""
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -1686,11 +1700,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
         if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
-            attn_metadata.kv_cache_manager.update_mamba_states(
-                attn_metadata=attn_metadata,
-                num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
-            )
+            self._update_mamba_states(attn_metadata, num_accepted_tokens)
 
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
         self._prepare_kv_for_draft_forward(
@@ -2084,9 +2094,7 @@ class DFlashWorker(SpecWorkerBase):
 
             # Get slots for gen requests from pre-computed mapping
             slots = self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens]
-            gen_rows_out = torch.arange(
-                num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
-            )
+            gen_rows_out = self._step_arange(num_contexts, num_contexts + num_gens)
 
             K_plus_1 = K + 1
 
@@ -2094,8 +2102,8 @@ class DFlashWorker(SpecWorkerBase):
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
-            j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
-            offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
+            j_block = self._step_arange(0, query_tokens_per_req)
+            offsets_kp1 = self._step_arange(0, K_plus_1)
 
             # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
             # tokens are folded in (see the update below), so the running length

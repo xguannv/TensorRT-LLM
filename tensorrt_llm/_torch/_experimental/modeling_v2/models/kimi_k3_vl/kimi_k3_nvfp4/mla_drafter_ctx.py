@@ -32,14 +32,22 @@ def _drafter_mla_ctx_kv(
     PAGE_STRIDE: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     EPS: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     row, layer = tl.program_id(0), tl.program_id(1)
     latent = tl.arange(0, 512)
     half = tl.arange(0, 32)
+    if PDL:
+        # The layer's norm weight first; the latents, positions, pages, offsets and pool pointers after the wait.
+        w = tl.load(NORM + layer * 512 + latent)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     src = LATENT + row * LAT_STRIDE + layer * 576
     x = tl.load(src + latent).to(tl.float32)
     x = x * tl.rsqrt(tl.sum(x * x, 0) / 512 + EPS)
-    x = tl.load(NORM + layer * 512 + latent).to(tl.float32) * x
+    if not PDL:
+        w = tl.load(NORM + layer * 512 + latent)
+    x = w.to(tl.float32) * x
     pos = tl.load(POS + row).to(tl.int64)
     page = tl.load(PAGES + row).to(tl.int64)
     offset = tl.load(OFFSETS + row).to(tl.int64)
@@ -68,12 +76,15 @@ def drafter_mla_ctx_kv(
     pointers: torch.Tensor,
     pools: List[torch.Tensor],
     eps: float,
+    pdl: bool = False,
 ) -> None:
     """Store the drafter's context latents into its paged pools: for every row of ``latent`` (``[rows, L x 576]``,
     the raw ``[kv_a | k_pe]`` of each layer) and layer, ``RMSNorm(kv_a) * norm[layer]`` and ``k_pe`` rotated at
     ``positions[row]`` (``freqs``: fp32 ``[max_pos, 32, 2]``), written to page ``pages[row]``, row ``offsets[row]`` of
     ``pools[layer]``. ``pointers``: int64 ``[L]``, each pool's data pointer; ``pools``: the pools (all of one layout,
-    ``[pages, 1, 1, page_size, 576]`` bf16), named so the op records the write."""
+    ``[pages, 1, 1, page_size, 576]`` bf16), named so the op records the write. ``pdl`` (``TRTLLM_K3LL_DRAFTER_PDL``):
+    launched with programmatic dependent launch, each layer's norm weight loaded before the dependency wait (the same
+    bits)."""
     rows = latent.shape[0]
     if rows == 0:
         return
@@ -92,9 +103,12 @@ def drafter_mla_ctx_kv(
         eps,
         num_warps=4,
         enable_fp_fusion=False,
+        **({"PDL": True, "launch_pdl": True} if pdl else {}),
     )
 
 
 @drafter_mla_ctx_kv.register_fake
-def _drafter_mla_ctx_kv_fake(latent, norm, freqs, positions, pages, offsets, pointers, pools, eps):
+def _drafter_mla_ctx_kv_fake(
+    latent, norm, freqs, positions, pages, offsets, pointers, pools, eps, pdl=False
+):
     return None

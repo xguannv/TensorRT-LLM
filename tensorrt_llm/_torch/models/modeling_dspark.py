@@ -391,11 +391,13 @@ def _mla_rope_into(
     num_heads: int,
     rope_head_dim: int,
     out_rope_offset: int,
+    use_pdl: bool = False,
 ) -> bool:
     """Rotate q's rope tail into ``out[..., out_rope_offset:]``; False if unavailable.
 
     Returns a bool rather than raising so the caller keeps the eager path for
     builds without the fused kernel, the same way _rmsnorm_rope_batched does.
+    ``use_pdl``: the fused kernel with programmatic dependent launch.
     """
     if not (IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()):
         return False
@@ -405,7 +407,7 @@ def _mla_rope_into(
     ):
         return False
     torch.ops.trtllm.cute_dsl_dspark_rope_into(
-        q, freqs_real, out, num_heads, rope_head_dim, out_rope_offset
+        q, freqs_real, out, num_heads, rope_head_dim, out_rope_offset, use_pdl
     )
     return True
 
@@ -3038,8 +3040,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         self._cute_dsl_checked_shape = key
 
-    def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
+    def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size, decode_op=None):
         """One cute-dsl MLA decode over context AND block, no fixup.
+
+        ``decode_op``: an op with ``trtllm::cute_dsl_mla_decode_fp16_blackwell``'s
+        arguments and results to call instead of it (None: that op).
 
         The trtllm-gen path splits the work: its q_len semantics are causal, so
         query i cannot see block positions j > i, and the strict upper triangle is
@@ -3077,7 +3082,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             num_heads, block_size, d_latent, batch, cutlass.Float32
         )
         workspace = self._mla_decode_workspace(device, workspace_numel)
-        torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell(
+        if decode_op is None:
+            decode_op = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
+        decode_op(
             q_latent,
             q_rope,
             c_latent,
@@ -3101,7 +3108,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
         return out
 
-    def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
+    def _mla_paged_attention(
+        self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len, decode_op=None
+    ):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
 
         The kernel is causal across the query block and takes no mask (measured,
@@ -3116,6 +3125,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         log-sum-exp. ``dflash_allocated_ctx_limit`` reserves the room.
 
         Returns the latent-space output ``[B, block, heads, kv_lora_rank]``.
+        ``decode_op``: the cute-dsl variant's decode op (`_cute_dsl_block_decode`).
         """
         decode = self._mla_decode_op()
         batch, _, num_heads, _ = query.shape
@@ -3130,7 +3140,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
-            return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
+            return self._cute_dsl_block_decode(
+                query, layer_cache, fixup, block_size, decode_op=decode_op
+            )
         out_lower = torch.empty(
             batch, block_size, num_heads, self.kv_lora_rank, dtype=query.dtype, device=device
         )

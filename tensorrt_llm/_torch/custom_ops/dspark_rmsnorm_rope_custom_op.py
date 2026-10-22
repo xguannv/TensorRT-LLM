@@ -231,6 +231,7 @@ def _compile_fused_dspark_rope_into(
     eps: float,
     out_dim: int,
     out_rope_offset: int,
+    use_pdl: bool = False,
 ):
     """Rope-only variant that writes into a wider destination row.
 
@@ -269,6 +270,7 @@ def _compile_fused_dspark_rope_into(
         norm_dim=hidden_dim - rope_dim,
         out_rope_offset=out_rope_offset,
         write_nope=False,
+        use_pdl=use_pdl,
     )
     return cute.compile(
         kernel,
@@ -458,11 +460,15 @@ def cute_dsl_dspark_rope_into(
     num_heads: int,
     rope_dim: int,
     out_rope_offset: int,
+    use_pdl: bool = False,
 ) -> None:
     """Rotate x's trailing rope_dim and store it at out[..., out_rope_offset:].
 
     x keeps its own (narrower) row width; nothing is written outside the rope
     columns of `out`, so the caller owns the rest of the destination row.
+    ``use_pdl``: launch with programmatic dependent launch (a separate compile;
+    the kernel waits for the previous one before any global access, the same
+    bits).
     """
     # No weight operand: _compile_fused_dspark_rope_into builds the kernel with
     # apply_weight=False, so there is nothing for the call to scale by and
@@ -503,6 +509,7 @@ def cute_dsl_dspark_rope_into(
         0.0,
         out.shape[-1],
         out_rope_offset,
+        bool(use_pdl),
     )
     compiled(x_flat, None, freqs, out_flat)
 
@@ -515,6 +522,7 @@ def _(
     num_heads: int,
     rope_dim: int,
     out_rope_offset: int,
+    use_pdl: bool = False,
 ) -> None:
     return None
 

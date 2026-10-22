@@ -31,6 +31,7 @@ class DSparkRMSNormRoPEKernel:
         norm_dim: int | None = None,
         out_rope_offset: int | None = None,
         write_nope: bool = True,
+        use_pdl: bool = False,
     ):
         if hidden_dim % self.num_threads != 0:
             raise ValueError(
@@ -71,6 +72,11 @@ class DSparkRMSNormRoPEKernel:
                 f"out_rope_offset must be even and non-negative; got {self.out_rope_offset}"
             )
         self.write_nope = write_nope
+        # Programmatic dependent launch: the grid may start while the previous kernel drains, waits for it
+        # (griddepcontrol.wait) before its first global access, then releases its own dependents. Every input of
+        # this kernel (rows, weight, freqs) may be the previous kernel's output, so nothing is loaded before the
+        # wait; the arithmetic is unchanged.
+        self.use_pdl = use_pdl
         if not self.write_nope and self.norm_covers_rope:
             # The rope lanes would need the RMS scale computed over a row whose
             # nope half is never written -- readable, but no caller wants it and
@@ -114,6 +120,7 @@ class DSparkRMSNormRoPEKernel:
             grid=[x.shape[0], 1, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -126,6 +133,9 @@ class DSparkRMSNormRoPEKernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
         inverse_rms = cutlass.Float32(1.0)
         if cutlass.const_expr(self.apply_rmsnorm):

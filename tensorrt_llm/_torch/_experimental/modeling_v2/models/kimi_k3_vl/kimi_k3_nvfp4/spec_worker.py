@@ -1489,7 +1489,8 @@ class KimiK3MLADSparkWorker(DSparkWorker):
 
     def _store_context_kv_paged(self, k, v, rows, positions) -> None:
         """With the context latent path on (`_k3_install_ctx`), ``k`` holds raw latents: one
-        ``trtllm::k3_drafter_mla_ctx_kv`` call normalizes, rotates and stores all layers; otherwise the stock store."""
+        ``trtllm::k3_drafter_mla_ctx_kv`` call normalizes, rotates and stores all layers (with programmatic dependent
+        launch under ``TRTLLM_K3LL_DRAFTER_PDL``); otherwise the stock store."""
         ctx = self._k3_ctx
         if not ctx or v is not None:
             return super()._store_context_kv_paged(k, v, rows, positions)
@@ -1521,6 +1522,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             ctx["pointers"],
             pools,
             ctx["eps"],
+            bool(_flags.TRTLLM_K3LL_DRAFTER_PDL),
         )
 
     def _k3_store_stock(self, k, pools, pages, offsets, positions) -> None:
@@ -1634,6 +1636,25 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         logits = KimiK3DFlashWorker._k3_head_shard(logits_processor, lm_head, hidden_states)
         self._k3_step_shard = (logits, shard, draft_model)
         return logits
+
+    _k3_static_arange = KimiK3DFlashWorker._k3_static_arange
+
+    def _update_mamba_states(self, attn_metadata, num_accepted_tokens):
+        """The stock update, except on a fused step with ``TRTLLM_K3LL_DRAFTER_GLUE``: there ``trtllm::k3_spec_accept``
+        already wrote the KDA replay record (``prev_num_accepted_tokens[state] = max(n - 1, 0)``, the old value for
+        a dummy request), which is all the V2 manager's ``update_mamba_states`` does on that path
+        (`_k3_accept_step_applies` checks the manager, its unpatched method and the replay mode). Writing it again
+        stores the same values."""
+        if self._k3_prep is not None and _flags.TRTLLM_K3LL_DRAFTER_GLUE:
+            return
+        super()._update_mamba_states(attn_metadata, num_accepted_tokens)
+
+    def _step_arange(self, start: int, end: int) -> torch.Tensor:
+        """With ``TRTLLM_K3LL_DRAFTER_GLUE`` a cached ``arange`` (`_k3_static_arange`, built outside CUDA-graph
+        capture; the stock drafter inputs only read it), else the stock one."""
+        if _flags.TRTLLM_K3LL_DRAFTER_GLUE:
+            return self._k3_static_arange(start, end)
+        return super()._step_arange(start, end)
 
     def _refresh_ctx_block_tables(self, attn_metadata, batch_size):
         """The stock refresh, except on a fused step: ``trtllm::k3_spec_accept`` decodes the block table."""

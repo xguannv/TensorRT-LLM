@@ -114,6 +114,20 @@ TRTLLM_K3LL_DRAFTER_WIDE_AR = _flag(
     "MLA DSpark drafter: its fused all-reduce + RMSNorm calls above one token tile two-shot above the wide decode "
     "steps' 1 MiB one-shot ceiling, not the decode path's 4 MiB (draft tokens only: another reduction order)",
 )
+TRTLLM_K3LL_DRAFTER_PDL = _flag(
+    "TRTLLM_K3LL_DRAFTER_PDL",
+    0,
+    "MLA DSpark drafter: k3_drafter_mla_a_post, the query RoPE (cute_dsl_dspark_rope_into), the bf16 block decode "
+    "(split + reduction, k3_mla_decode_fp16_pdl) and k3_drafter_mla_ctx_kv launched with programmatic dependent "
+    "launch, norm weights loaded before the dependency wait (the same bits; read per call)",
+)
+TRTLLM_K3LL_DRAFTER_GLUE = _flag(
+    "TRTLLM_K3LL_DRAFTER_GLUE",
+    0,
+    "MLA DSpark drafter and worker: fewer glue launches (no second KDA replay record after k3_spec_accept, cached "
+    "arange tensors and block mask, kv_bounds without repeat_interleave, the V up-projection's bmm into the o_proj "
+    "input layout); the same values (read per call)",
+)
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",
     1,

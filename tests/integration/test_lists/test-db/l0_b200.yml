@@ -205,6 +205,9 @@ l0_b200:
   # The MLA DSpark drafter's pinned low-M GEMMs in its attention step (TRTLLM_K3LL_DRAFTER_GEMM), off arm against
   # the chain it replaced.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter_gemm.py
+  # The MLA DSpark drafter's PDL launches and glue removals (TRTLLM_K3LL_DRAFTER_PDL / _GLUE), each arm bit for
+  # bit the off arm.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter_pdl_glue.py
   # The Kimi K3 targets' construction checks and the drift check of tp16_moetp16ep1's copied modules.
   # l0_b300's modeling_v2 entry, the only other one that collects them, is waived (nvbugs/6853741).
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_construction.py

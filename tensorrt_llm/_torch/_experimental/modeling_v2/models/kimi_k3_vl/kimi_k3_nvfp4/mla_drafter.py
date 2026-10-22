@@ -23,6 +23,15 @@ pinned tactics (`mla_drafter_gemm`) instead of cuBLAS.
 With ``TRTLLM_K3LL_DRAFTER_WIDE_AR`` the drafter's fused all-reduces of more rows than one token tile (the
 ``comm/mnnvl_fusion_allreduce`` calls here and the context projection's, `ar_ceiling`) send two-shot above the wide
 decode steps' one-shot ceiling (``decode_comm.WIDE_AR_ONE_SHOT_MAX_BYTES``), not the decode path's.
+
+With ``TRTLLM_K3LL_DRAFTER_PDL`` the drafter's own kernels launch with programmatic dependent launch:
+``k3_drafter_mla_a_post`` (its norm weights loaded before the dependency wait), the query RoPE
+(``cute_dsl_dspark_rope_into``) and the bf16 block decode's split and reduction (``k3_mla_decode_fp16_pdl``).
+
+With ``TRTLLM_K3LL_DRAFTER_GLUE`` the block's layer-invariant state (`_fixup`) is built with fewer launches (cached
+arange tensors and block mask, ``kv_bounds`` without ``repeat_interleave``, no int64 round trip of an int32 page
+table) and the V up-projection writes its bmm straight into the o_proj input layout (`_v_up`). Both are the same
+values.
 """
 
 from typing import Callable, FrozenSet, List, Optional, Tuple
@@ -33,6 +42,7 @@ from torch import nn
 from tensorrt_llm._torch.models.modeling_dspark import (
     _build_mla_block_fixup,
     _mla_rope_into,
+    _MLABlockFixup,
     _rmsnorm_rope_batched,
 )
 from tensorrt_llm.logger import logger
@@ -40,6 +50,7 @@ from tensorrt_llm.logger import logger
 from . import census as _census
 from . import decode_comm as _decode_comm
 from . import flags as _flags
+from . import mla_decode_pdl  # noqa: F401  (registers trtllm::k3_mla_decode_fp16_pdl)
 from . import mla_drafter_gemm as _gemm
 from . import mla_drafter_qkv as _qkv
 
@@ -119,6 +130,8 @@ class K3MLADrafterNorms:
         self.forms = forms
         self.a_weights = a_weights
         self.gemm = gemm
+        # TRTLLM_K3LL_DRAFTER_GLUE's per-shape constants (`_const`), built outside CUDA-graph capture.
+        self._consts = {}
 
     @staticmethod
     def layers_take(drafter: nn.Module) -> bool:
@@ -263,10 +276,18 @@ class K3MLADrafterNorms:
         batch, block = noise_embedding.shape[:2]
         rows = batch * block
         blk_freqs = drafter._mla_freqs_cis(noise_embedding.device)[query_positions.long()]
-        page_tables = ctx_page_table.index_select(0, ctx_cache_batch_idx.long()).long()
         page_size = ctx_kv_cache[0].shape[-2]
-        capacity = page_tables.shape[1] * page_size
-        fixup = _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block, page_size)
+        if _flags.TRTLLM_K3LL_DRAFTER_GLUE:
+            _census.count(f"dispatch:drafter_glue:{_census.mode()}")
+            fixup = self._fixup(
+                num_ctx_per_req[:batch], ctx_page_table, ctx_cache_batch_idx, block, page_size
+            )
+        else:
+            page_tables = ctx_page_table.index_select(0, ctx_cache_batch_idx.long()).long()
+            fixup = _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block, page_size)
+        capacity = fixup.page_tables_i32.shape[1] * page_size
+        if _flags.TRTLLM_K3LL_DRAFTER_PDL:
+            _census.count(f"dispatch:drafter_pdl:{_census.mode()}")
         layers = drafter.model.layers
         qkv = None
         if (
@@ -348,6 +369,7 @@ class K3MLADrafterNorms:
         if not _qkv.supports(a, layer_cache):
             return None
         slots, freqs, blk_freqs = qkv
+        pdl = bool(_flags.TRTLLM_K3LL_DRAFTER_PDL)
         q_a = torch.ops.trtllm.k3_drafter_mla_a_post(
             a,
             attn.q_a_layernorm.weight,
@@ -357,14 +379,86 @@ class K3MLADrafterNorms:
             slots,
             attn.q_a_layernorm.variance_epsilon,
             attn.kv_a_layernorm.variance_epsilon,
+            pdl,
         )
         q = self._gemm(q_a, attn.q_b_proj, "q_b")
         if q is None:
             q = attn.q_b_proj(q_a)
         query = self._query(attn, q, blk_freqs, batch, block)
-        ctx_out = drafter._cute_dsl_block_decode(query, layer_cache, fixup, block)
-        attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
-        return attn_out.reshape(batch * block, -1)
+        ctx_out = drafter._cute_dsl_block_decode(
+            query,
+            layer_cache,
+            fixup,
+            block,
+            decode_op=self._decode_op(),
+        )
+        return self._v_up(attn, ctx_out, batch, block)
+
+    def _v_up(self, attn: nn.Module, ctx_out: torch.Tensor, batch: int, block: int) -> torch.Tensor:
+        """The V up-projection of the block attention's latent output ``[B, block, heads, kv_lora_rank]``:
+        ``[B * block, heads x v_head_dim]``, the o_proj input. The stock arithmetic is an einsum, one bmm over the
+        heads into a ``[heads, B * block, v]`` result that the reshape then copies into this layout. With
+        ``TRTLLM_K3LL_DRAFTER_GLUE`` the same bmm (same operands, strides and shapes) writes this layout directly
+        through a transposed view of the output (``trtllm::bmm_out``), so the copy goes; where ``ctx_out`` is
+        contiguous (the einsum's operand views are then exactly these)."""
+        v_b = attn._v_b_proj.to(ctx_out.dtype)
+        if not (_flags.TRTLLM_K3LL_DRAFTER_GLUE and ctx_out.is_contiguous()):
+            attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, v_b)
+            return attn_out.reshape(batch * block, -1)
+        rows, heads = batch * block, ctx_out.shape[2]
+        out = torch.empty((rows, heads, v_b.shape[1]), dtype=ctx_out.dtype, device=ctx_out.device)
+        torch.ops.trtllm.bmm_out(
+            ctx_out.reshape(rows, heads, -1).transpose(0, 1),
+            v_b.transpose(1, 2),
+            out.transpose(0, 1),
+        )
+        return out.view(rows, -1)
+
+    def _const(self, name: str, block: int, device: torch.device) -> torch.Tensor:
+        """A per-block-size constant of `_fixup`: ``arange`` (``arange(block)``, int64) or ``valid`` (the strict
+        upper-triangle mask ``[1, block, 1, block]``, the stock fixup's), built once outside CUDA-graph capture
+        (inside one it is built in the graph and not kept). Read only."""
+        key = (name, block, device)
+        t = self._consts.get(key)
+        if t is None:
+            idx = torch.arange(block, device=device)
+            t = (
+                idx
+                if name == "arange"
+                else (idx.view(1, block) > idx.view(block, 1)).view(1, block, 1, block)
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                self._consts[key] = t
+        return t
+
+    def _fixup(
+        self,
+        ctx_len: torch.Tensor,
+        ctx_page_table: torch.Tensor,
+        ctx_cache_batch_idx: torch.Tensor,
+        block: int,
+        page_size: int,
+    ) -> _MLABlockFixup:
+        """``_build_mla_block_fixup`` of the gathered page-table rows, each field the same values with fewer launches:
+        the arange and the mask are cached (`_const`), ``kv_bounds`` repeats each request's length ``block`` times
+        through an expanded view (one copy, no ``repeat_interleave`` scan), and an int32 table's gathered rows are the
+        int32 table itself (no int64 round trip)."""
+        device = ctx_len.device
+        gathered = ctx_page_table.index_select(0, ctx_cache_batch_idx.long())
+        page_tables = gathered.long()
+        tables_i32 = gathered if gathered.dtype == torch.int32 else page_tables.to(torch.int32)
+        pos = ctx_len.view(-1, 1) + self._const("arange", block, device)
+        seq_lens = (ctx_len + block).to(torch.int32)
+        return _MLABlockFixup(
+            pages=page_tables.gather(1, pos // page_size),
+            offsets=pos % page_size,
+            valid=self._const("valid", block, device),
+            page_tables_i32=tables_i32,
+            seq_lens_i32=seq_lens,
+            # Batch-major, as the stock repeat_interleave: the kernel reads it at b * seq_len_q + q. contiguous()
+            # also for one request, whose expanded view would otherwise reshape to a stride-0 view.
+            kv_bounds_i32=seq_lens.view(-1, 1).expand(-1, block).contiguous().view(-1),
+        )
 
     def _query(
         self, attn: nn.Module, q: torch.Tensor, blk_freqs: torch.Tensor, batch: int, block: int
@@ -382,7 +476,15 @@ class K3MLADrafterNorms:
         query = torch.empty(
             (batch, block, num_heads, latent + rope), dtype=q.dtype, device=q.device
         )
-        if not _mla_rope_into(q, blk_freqs, query, num_heads, rope, latent):
+        if not _mla_rope_into(
+            q,
+            blk_freqs,
+            query,
+            num_heads,
+            rope,
+            latent,
+            use_pdl=bool(_flags.TRTLLM_K3LL_DRAFTER_PDL),
+        ):
             q = _rmsnorm_rope_batched(
                 q,
                 None,
@@ -427,9 +529,16 @@ class K3MLADrafterNorms:
             blk_freqs,
             norm_dim=latent,
         )
-        ctx_out = drafter._mla_paged_attention(query, blk_kv, layer_cache, fixup, block, capacity)
-        attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
-        return attn_out.reshape(batch * block, -1)
+        ctx_out = drafter._mla_paged_attention(
+            query, blk_kv, layer_cache, fixup, block, capacity, decode_op=self._decode_op()
+        )
+        return self._v_up(attn, ctx_out, batch, block)
+
+    @staticmethod
+    def _decode_op():
+        """The bf16 block decode op: ``trtllm::k3_mla_decode_fp16_pdl`` with ``TRTLLM_K3LL_DRAFTER_PDL``, else None
+        (the stock ``trtllm::cute_dsl_mla_decode_fp16_blackwell``)."""
+        return torch.ops.trtllm.k3_mla_decode_fp16_pdl if _flags.TRTLLM_K3LL_DRAFTER_PDL else None
 
     def _project_norm(
         self, x: torch.Tensor, linear: nn.Module, residual: torch.Tensor, norm: nn.Module

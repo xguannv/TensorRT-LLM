@@ -39,6 +39,7 @@ def _drafter_mla_a_post(
     A_STRIDE: tl.constexpr,
     QA_EPS: tl.constexpr,
     KV_EPS: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     # Program (chunk, 0): q_a of ROW_TILE rows; program (chunk, 1): their block latents.
     chunk, part = tl.program_id(0), tl.program_id(1)
@@ -47,19 +48,33 @@ def _drafter_mla_a_post(
     if part == 0:
         cols = tl.arange(0, 2048)
         keep = valid[:, None] & (cols[None, :] < 1536)
+        if PDL:
+            # The norm weight first; every read of the previous kernels' outputs and every write after the wait.
+            qa_w = tl.load(QA_NORM + cols, cols < 1536, 0)
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
         qa = tl.load(A + rows[:, None] * A_STRIDE + cols[None, :], keep, 0).to(tl.float32)
         qa = qa * tl.rsqrt(tl.sum(qa * qa, 1) / 1536 + QA_EPS)[:, None]
-        qa = tl.load(QA_NORM + cols, cols < 1536, 0).to(tl.float32)[None, :] * qa
+        if not PDL:
+            qa_w = tl.load(QA_NORM + cols, cols < 1536, 0)
+        qa = qa_w.to(tl.float32)[None, :] * qa
         tl.store(QA_OUT + rows[:, None] * 1536 + cols[None, :], qa.to(tl.bfloat16), keep)
     else:
         latent = tl.arange(0, 512)
         half = tl.arange(0, 32)
+        if PDL:
+            # The slots and the freqs rows are this step's (written by the kernels before): after the wait.
+            kv_w = tl.load(KV_NORM + latent)
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
         slot = tl.load(SLOTS + rows, valid, 0)
         ckv = tl.load(A + rows[:, None] * A_STRIDE + 1536 + latent[None, :], valid[:, None], 0).to(
             tl.float32
         )
         ckv = ckv * tl.rsqrt(tl.sum(ckv * ckv, 1) / 512 + KV_EPS)[:, None]
-        ckv = tl.load(KV_NORM + latent).to(tl.float32)[None, :] * ckv
+        if not PDL:
+            kv_w = tl.load(KV_NORM + latent)
+        ckv = kv_w.to(tl.float32)[None, :] * ckv
         tl.store(POOL + slot[:, None] + latent[None, :], ckv.to(tl.bfloat16), valid[:, None])
         cos = tl.load(FREQS + rows[:, None] * 64 + 2 * half[None, :], valid[:, None], 0)
         sin = tl.load(FREQS + rows[:, None] * 64 + 2 * half[None, :] + 1, valid[:, None], 0)
@@ -105,9 +120,12 @@ def drafter_mla_a_post(
     slots: torch.Tensor,
     qa_eps: float,
     kv_eps: float,
+    pdl: bool = False,
 ) -> torch.Tensor:
     """The normalized q_a ``[rows, 1536]`` bf16, and the block latent stored into ``pool`` at ``slots`` (int64 element
-    offsets of each row in ``pool``); ``freqs``: fp32 ``[rows, 32, 2]`` (cos, sin) per row."""
+    offsets of each row in ``pool``); ``freqs``: fp32 ``[rows, 32, 2]`` (cos, sin) per row. ``pdl``
+    (``TRTLLM_K3LL_DRAFTER_PDL``): launched with programmatic dependent launch, the norm weights loaded before the
+    dependency wait (the same values in the same order: the same bits)."""
     rows = a.shape[0]
     out = a.new_empty((rows, Q_LORA))
     if rows == 0:
@@ -127,10 +145,11 @@ def drafter_mla_a_post(
         kv_eps,
         num_warps=4,
         enable_fp_fusion=False,
+        **({"PDL": True, "launch_pdl": True} if pdl else {}),
     )
     return out
 
 
 @drafter_mla_a_post.register_fake
-def _drafter_mla_a_post_fake(a, qa_norm, kv_norm, freqs, pool, slots, qa_eps, kv_eps):
+def _drafter_mla_a_post_fake(a, qa_norm, kv_norm, freqs, pool, slots, qa_eps, kv_eps, pdl=False):
     return a.new_empty((a.shape[0], Q_LORA))
