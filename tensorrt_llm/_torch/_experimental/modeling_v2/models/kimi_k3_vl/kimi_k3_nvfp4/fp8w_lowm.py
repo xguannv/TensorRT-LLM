@@ -39,6 +39,8 @@ from typing import Callable, Iterable, Optional
 import torch
 from torch import nn
 
+from . import flags as _flags
+
 
 def _kernel():
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm
@@ -93,15 +95,16 @@ def takes(module: nn.Module) -> bool:
 
 
 def _lowm(module: nn.Module, x2d: torch.Tensor) -> bool:
+    # A module routed with partial_n_tile takes the kernel's partial last row tile only while
+    # TRTLLM_K3LL_FP8W_LOWM_FUSED_A is 1 (read here, at every call); otherwise its N rejects it and it runs its own
+    # GEMM.
+    partial = bool(
+        getattr(module, "_k3ll_fp8w_partial_n_tile", False) and _flags.TRTLLM_K3LL_FP8W_LOWM_FUSED_A
+    )
     return (
         x2d.dtype == torch.bfloat16
         and getattr(module, "_locality_domain_weight_shards", None) is None
-        and _kernel().can_run(
-            x2d,
-            module.weight,
-            module.weight_scale,
-            allow_partial_n_tile=getattr(module, "_k3ll_fp8w_partial_n_tile", False),
-        )
+        and _kernel().can_run(x2d, module.weight, module.weight_scale, allow_partial_n_tile=partial)
     )
 
 
@@ -130,7 +133,8 @@ def install(
     """Route each module `takes` accepts through the low-M kernel (idempotent); returns how many it routed.
 
     ``skipped`` (optional) counts the `rejection` reasons of the modules with an FP8 weight that were not routed;
-    ``partial_n_tile`` is `rejection`'s."""
+    ``partial_n_tile`` is `rejection`'s. A module whose N needs the partial last row tile takes the kernel only while
+    ``TRTLLM_K3LL_FP8W_LOWM_FUSED_A`` is 1 at its call (`_lowm`); with it 0 it runs its own GEMM."""
     count = 0
     for module in modules:
         if getattr(module, "_k3ll_fp8w_lowm", False):

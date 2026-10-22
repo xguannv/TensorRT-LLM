@@ -381,13 +381,15 @@ def test_weight_read_module_dispatch(m):
     assert out.shape == (1, m, n) and torch.equal(out.reshape(m, n), expected)
 
 
-@pytest.mark.parametrize("m", [1, 8])
-def test_weight_read_partial_n_tile(m):
+@pytest.mark.parametrize("m", [1, 8, 16, 32])
+def test_weight_read_partial_n_tile(monkeypatch, m):
     """TRTLLM_K3LL_FP8W_LOWM_FUSED_A: the MLA fused q_a/kv_a weight read (N = 2112, a partial last row tile) is routed
-    only with partial_n_tile, and then matches the low-M kernel called with allow_partial_n_tile."""
+    only with partial_n_tile; with the switch 1 at the call it matches the low-M kernel called with
+    allow_partial_n_tile, with it 0 it is bit for bit the module's own GEMM (also from a CUDA graph)."""
     from collections import Counter
 
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        flags,
         fp8w_lowm,
     )
     from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
@@ -407,11 +409,26 @@ def test_weight_read_partial_n_tile(m):
     wr.post_load_weights()
     x = _make_activation(m, k, seed=m)
     assert mod.can_run(x, wr.weight, wr.weight_scale, allow_partial_n_tile=True)
-    out = wr(x)
-    expected = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, wr.weight, wr.weight_scale)
     reference = torch.ops.trtllm.fp8_swap_ab_gemm(
         x, wr.weight, wr.weight_scale, output_dtype=torch.bfloat16, disable_ue8m0_cast=True
     )
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_FP8W_LOWM_FUSED_A", 0)
+    off = wr(x)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_FP8W_LOWM_FUSED_A", 1)
+    out = wr(x)
+    expected = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, wr.weight, wr.weight_scale)
     torch.cuda.synchronize()
+    assert torch.equal(off, reference)
     assert torch.equal(out, expected)
     assert _rel_err(out, reference.float()) < 5e-2
+    # The switch is read at every call: graphs captured with it 0 / 1 replay the two GEMMs.
+    for value, want in ((0, reference), (1, expected)):
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_FP8W_LOWM_FUSED_A", value)
+        static_x = x.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = wr(static_x)
+        static_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(static_out, want)

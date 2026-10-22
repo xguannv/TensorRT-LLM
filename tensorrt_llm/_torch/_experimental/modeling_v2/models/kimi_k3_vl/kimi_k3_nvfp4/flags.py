@@ -122,7 +122,8 @@ TRTLLM_K3LL_FP8W_LOWM = _flag(
 TRTLLM_K3LL_FP8W_LOWM_FUSED_A = _flag(
     "TRTLLM_K3LL_FP8W_LOWM_FUSED_A",
     0,
-    "with FP8W_LOWM, also the weight reads whose N is not a multiple of 128 (MLA fused q_a/kv_a, partial row tile)",
+    "with FP8W_LOWM, also the weight reads whose N is not a multiple of 128 (MLA fused q_a/kv_a, partial row tile); "
+    "read at forward time, the routing is installed at load when the launch value is 1",
 )
 
 TRTLLM_K3LL_MOE_FRONT16 = _flag(
