@@ -38,6 +38,7 @@ same inputs):
     programmatic dependent launch; in the graph test they replay after the fused q_a / kv_a GEMM's PDL launch);
   * FUSED_A 1: the fused q_a / kv_a on ``k3_fp8w_lowm_gemm``; its error against FP32 at most ``FUSED_A_ERR_RATIO``
     times the stock GEMM's; the output within ``OUT_TOL`` (relative L2) of the switch-off output;
+  * HELIX_Q_ABSORB 1 on a GPU it does not build on: no W_UK, everything bit for bit the switch-off decode;
   * HELIX_Q_ABSORB 1: every head's FP8 query on this rank (96 heads into the split read, ``all_heads``; the cache
     kernel called with ``q_rope_applied``), the latent row bit for bit the switch-off one; the query's error against
     an FP32 reference at most ``Q_ERR_RATIO`` times the current path's (``mla_project_qkv`` with every head's Q-B / K-B,
@@ -47,6 +48,7 @@ same inputs):
 
 import contextlib
 import types
+from unittest import mock
 
 import pytest
 import torch
@@ -255,7 +257,11 @@ def _standin(w):
     mla._fp8_decode_ready = True
     mla._q_absorb_w_kc = None
     mla._gate_side = p.impl._decode_mla_q.GateSide()
-    assert mla.prepare_helix_q_absorb() is None and mla._q_absorb_w_kc.dtype == torch.bfloat16
+    # W_UK as a launch on a GPU the switch builds on (HELIX_SWITCH_CAPABILITIES) builds it.
+    with mock.patch.object(
+        p.impl, "HELIX_SWITCH_CAPABILITIES", (torch.cuda.get_device_capability(),)
+    ):
+        assert mla.prepare_helix_q_absorb() is None and mla._q_absorb_w_kc.dtype == torch.bfloat16
     return mla
 
 
@@ -378,6 +384,34 @@ def test_switches_off_equal_pre_change(mla, monkeypatch, rows):
         assert _bits(out, ref)
         assert _bits(rope[1], ref_rope[1]) and rope[2] is False and rope[3] == HP
         assert _bits(split[1], ref_split[1]) and split[2] is False
+
+
+@pytest.mark.parametrize("rows", ROWS)
+def test_q_absorb_unsupported_gpu_equals_off(mla, monkeypatch, rows):
+    """HELIX_Q_ABSORB at 1 on a GPU it does not build on (``HELIX_SWITCH_CAPABILITIES`` without this one): no W_UK,
+    and the output, query bytes and latent row bit for bit the switch-off ones; with W_UK built the same inputs take
+    the all-head path."""
+    p = _pkg()
+    meta = _meta(rows)
+    x = _x(rows, 20 + rows)
+    built = mla._q_absorb_w_kc
+    try:
+        mla._q_absorb_w_kc = None
+        with monkeypatch.context() as m:
+            m.setattr(p.impl, "HELIX_SWITCH_CAPABILITIES", ())
+            why = mla.prepare_helix_q_absorb()
+        assert why is not None and "SM103" in why and mla._q_absorb_w_kc is None
+        with _switches(monkeypatch):
+            off, off_rope, off_split = _run(mla, _decode(mla), x, meta)
+        with _switches(monkeypatch, TRTLLM_K3LL_HELIX_Q_ABSORB=1):
+            on, on_rope, on_split = _run(mla, _decode(mla), x, meta)
+        assert _bits(on, off) and on_split[2] is False
+        assert _bits(on_rope[1], off_rope[1]) and _bits(on_split[1], off_split[1])
+    finally:
+        mla._q_absorb_w_kc = built
+    with _switches(monkeypatch, TRTLLM_K3LL_HELIX_Q_ABSORB=1):
+        _, _, split = _run(mla, _decode(mla), x, meta)
+    assert split[2] is True
 
 
 @pytest.mark.parametrize("rows", ROWS)

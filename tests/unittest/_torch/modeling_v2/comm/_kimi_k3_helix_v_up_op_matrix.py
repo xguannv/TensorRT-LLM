@@ -33,7 +33,9 @@ Checks:
     of 128 before its FP8 V-B);
   * a step of two layers per arm captured in a CUDA graph and replayed with new queries and gates, an eager call of
     another row count between replays, a random rank late before each: every replay bit for bit the eager arm on the
-    same inputs.
+    same inputs;
+  * the switch at 1 on a GPU it does not build on (``HELIX_SWITCH_CAPABILITIES`` forced empty): ``set_helix_v_up``
+    keeps no W_UV and the on arm is bit for bit the off arm.
 """
 
 import random
@@ -176,7 +178,9 @@ def run_arm(on: int, module, quant_q, meta, ag, bmm, gate_side: bool = True):
     the gate comes from the module's side-stream gate (here a stand-in whose join copies ``ag``'s gate columns, so
     both gate forms carry the same values); else from ``ag`` at ``GATE_COL``."""
     FLAGS.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = on
-    module._gate_side = SimpleNamespace(join=lambda: ag[:, GATE_COL : GATE_COL + HP * V].contiguous())
+    module._gate_side = SimpleNamespace(
+        join=lambda: ag[:, GATE_COL : GATE_COL + HP * V].contiguous()
+    )
     return IMPL.K3DecodeMLA._split_read_output(
         module, quant_q, meta, Q_LEN, *bmm, ag, gate_side, GATE_COL
     )
@@ -308,7 +312,9 @@ def check_arms() -> None:
         # the gate read from ag in place (MLA_GATE_SIDE=0) gives the same bits in both arms
         for arm, want in ((0, off), (1, on)):
             got = run_arm(arm, module, x.quant_q, x.meta, x.ag, bmm, gate_side=False)
-            assert torch.equal(got, want), f"{rows_per_head} rows, arm {arm}: gate from ag differs from the side gate"
+            assert torch.equal(got, want), (
+                f"{rows_per_head} rows, arm {arm}: gate from ag differs from the side gate"
+            )
         assert on.shape == off.shape and on.dtype == off.dtype and torch.isfinite(on).all()
         # the gate in the combine against the ungated exchange of the same projected partials and the gate kernel
         ungated = ref_on_chain(module, x.quant_q, x.meta, x.ag, softmax_scale, x.w_uv)
@@ -388,6 +394,44 @@ def check_graph() -> None:
     FLAGS.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = 0
 
 
+def check_unsupported_gpu() -> None:
+    """The switch at 1 on a GPU it does not build on (``HELIX_SWITCH_CAPABILITIES`` without this GPU's capability):
+    ``set_helix_v_up`` keeps no W_UV and the on arm is bit for bit the off arm. On this GPU's capability it keeps
+    bit for bit the W_UV the other checks use."""
+    bmm = scales_of(DCP.default_softmax_scale())
+    saved = IMPL.HELIX_SWITCH_CAPABILITIES
+    try:
+        for i, rows_per_head in enumerate(CASES):
+            x = case_inputs(rows_per_head, 1100 + i)
+            module = stand_in(0, x.codes, x.scales, None)
+            module.mapping = SimpleNamespace(has_cp_helix=lambda: True)
+            module.num_heads_tp = HP * R.world
+            IMPL.HELIX_SWITCH_CAPABILITIES = (torch.cuda.get_device_capability(),)
+            assert IMPL.K3DecodeMLA.set_helix_v_up(module, x.codes, x.scales) is None
+            assert torch.equal(module._helix_v_up_weight, x.w_uv), (
+                "W_UV kept differs from dequantize_v_b's"
+            )
+            module._helix_v_up_weight = None
+            IMPL.HELIX_SWITCH_CAPABILITIES = ()
+            why = IMPL.K3DecodeMLA.set_helix_v_up(module, x.codes, x.scales)
+            assert why is not None and module._helix_v_up_weight is None, why
+            R.late(random.Random(1200 + i).randrange(R.world))
+            off = run_arm(0, module, x.quant_q, x.meta, x.ag, bmm)
+            R.late(random.Random(1300 + i).randrange(R.world))
+            on = run_arm(1, module, x.quant_q, x.meta, x.ag, bmm)
+            assert torch.equal(on, off), (
+                f"{rows_per_head} rows: switch at 1 on an unsupported GPU differs from off"
+            )
+            if R.rank == 0:
+                print(
+                    f"[rank 0] {rows_per_head} rows: unsupported GPU ({why}): no W_UV, on == off",
+                    flush=True,
+                )
+    finally:
+        IMPL.HELIX_SWITCH_CAPABILITIES = saved
+        FLAGS.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = 0
+
+
 def rank_main(args) -> int:
     global R, DCP, IMPL, FLAGS, SR, WS, TP_MAPPING
     R = ls.Rank(args)
@@ -414,7 +458,7 @@ def rank_main(args) -> int:
         SR.register(layer)
     built = SR.build_helix_comm(WS, TP_MAPPING)
     assert SR._q_gather_ws is WS and SR._a2a_fused is not None, built
-    code = ls.run_checks(R, [check_arms, check_graph])
+    code = ls.run_checks(R, [check_arms, check_graph, check_unsupported_gpu])
     if R.rank == 0:
         on, off = torch.cat(STATS["on"]), torch.cat(STATS["off"])
         print(f"[rank 0] W={R.world}: per (token, head) vs fp64 over {on.numel()} rows: V-up before the exchange "

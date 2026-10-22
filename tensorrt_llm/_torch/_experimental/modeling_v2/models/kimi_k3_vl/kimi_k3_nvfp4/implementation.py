@@ -2545,6 +2545,27 @@ def _head_view_attention(mqa, num_heads: int):
     return view
 
 
+#: The GPUs (compute capability) on which TRTLLM_K3LL_HELIX_Q_ABSORB and TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A build their
+#: load-time state. On any other GPU neither builds anything and the decode takes the switch-off path.
+HELIX_SWITCH_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+_helix_switch_skips_logged: set = set()
+
+
+def helix_switch_unsupported(switch: str) -> Optional[str]:
+    """Why ``switch`` (a Helix load-time switch at 1) builds nothing on this GPU, or None where it builds. The skip
+    is logged once per switch."""
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) in HELIX_SWITCH_CAPABILITIES:
+        return None
+    why = f"SM{major}{minor}: {switch} builds on SM103 only"
+    if switch not in _helix_switch_skips_logged:
+        _helix_switch_skips_logged.add(switch)
+        logger.warning(
+            f"Kimi K3 NVFP4: {switch}=1 at launch, but on {why}; the decode takes the switch-off path"
+        )
+    return why
+
+
 class K3DecodeMLA(KimiK3MLAAttention):
     """FP8 projections with fused query/cache and attention/V-B/gate decode.
 
@@ -2613,15 +2634,19 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if self._fp8_qb_ue8m0:
             resmooth_to_fp8_e8m0(self._fp8_qb_weight, self._fp8_qb_scale)
 
-    def set_helix_v_up(self, codes: torch.Tensor, scales: torch.Tensor) -> None:
+    def set_helix_v_up(self, codes: torch.Tensor, scales: torch.Tensor) -> Optional[str]:
         """Keep the BF16 ``W_UV`` of every head for the Helix decode's V up-projection before the exchange, from the
         checkpoint's FP8 V-B codes ``[heads, 128, 512]`` and 128 x 128 block scales ``[heads, 1, 4]`` of all heads
-        (the codes this rank's ``v_b_proj`` holds a head group of)."""
+        (the codes this rank's ``v_b_proj`` holds a head group of). Returns why nothing was kept on this GPU
+        (``helix_switch_unsupported``), None when it was."""
         if not self.mapping.has_cp_helix():
             raise ValueError("the V up-projection before the exchange is a Helix decode path")
         if tuple(codes.shape) != (self.num_heads_tp, self.v_head_dim, self.kv_lora_rank):
             raise ValueError(f"V-B codes {tuple(codes.shape)} do not hold every head")
-        self._helix_v_up_weight = _mla_v_up.dequantize_v_b(codes, scales)
+        why = helix_switch_unsupported("TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A")
+        if why is None:
+            self._helix_v_up_weight = _mla_v_up.dequantize_v_b(codes, scales)
+        return why
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
@@ -2651,6 +2676,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
         cannot take the all-head query path, None when it can."""
         if not self.mapping.has_cp_helix():
             return "not Helix"
+        why = helix_switch_unsupported("TRTLLM_K3LL_HELIX_Q_ABSORB")
+        if why is not None:
+            return why
         if not getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
             self.mqa, "has_fp4_kv_cache", False
         ):
@@ -3952,7 +3980,11 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.mixer.prepare_fp8_decode_weights()
-        if _flags.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A and self.model_config.mapping.has_cp_helix():
+        if (
+            _flags.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A
+            and self.model_config.mapping.has_cp_helix()
+            and helix_switch_unsupported("TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A") is None
+        ):
             self._load_helix_v_up(weights, prefix)
         return count
 
