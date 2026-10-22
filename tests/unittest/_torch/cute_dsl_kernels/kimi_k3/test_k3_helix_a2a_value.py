@@ -461,6 +461,84 @@ def test_helix_a2a_value(rows, k_split):
     assert r["graph_replays_bitwise"], r
 
 
+def _fake_fused(rows: int, cp_size: int = 1):
+    """A ``HelixAllToAllFused`` on a local buffer of one rank (``cp_size`` = 1: the rank sends to itself)."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.distributed.helix_a2a_fused import HelixAllToAllFused
+
+    m = _value_module()
+    fused = HelixAllToAllFused.__new__(HelixAllToAllFused)
+    fused.mapping = SimpleNamespace(cp_size=cp_size, cp_rank=0)
+    half = -(-rows * cp_size * m.record_bytes(HP) // 16) * 16
+    fused._buf = torch.full((2 * half,), 255, dtype=torch.uint8, device="cuda")
+    fused.ws_addr, fused.rank_stride, fused.half_bytes = fused._buf.data_ptr(), 2 * half, half
+    fused.state = torch.zeros(8, dtype=torch.int64, device="cuda")
+    fused.max_send_ctas = 2 * torch.cuda.get_device_properties(0).multi_processor_count
+    fused.use_pdl = True
+    return fused
+
+
+@pytest.mark.parametrize("rows", [8, 32])
+def test_production_wrapper_single_rank(rows):
+    """``decode_mla_dcp.exchange_value_fused`` -> ``HelixAllToAllFused.value`` -> ``trtllm::helix_a2a_value``, senders
+    and receivers in one launch (CP size 1), in a CUDA graph, against the fp64 reference."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 / SM103 only")
+    if os.environ.get("K3_MK_VALUE_PY"):
+        pytest.skip("needs the branch's decode_mla_dcp / helix_a2a_fused")
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_mla_dcp as dcp,
+    )
+
+    w_uv, w_scale, g, kv_norm, _ = load_layer(MLA_LAYERS[0], 0)
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    po = (torch.randn(rows, HP, LATENT, generator=gen, device="cuda") * kv_norm).to(torch.bfloat16)
+    stats = torch.stack(
+        (torch.randn(rows, HP, device="cuda"), torch.rand(rows, HP, device="cuda") + 1), -1
+    ).contiguous()
+    empty = torch.zeros(rows, dtype=torch.bool, device="cuda")
+    ag = make_gate(rows, g, seed=rows)
+    gate = ag[:, GATE_COL : GATE_COL + HP * VDIM]
+    fused = _fake_fused(rows)
+    args = (po.view(rows, -1), stats, empty, fused, HP, w_uv, w_scale.view(HP, 1, 4), gate)
+    eager = dcp.exchange_value_fused(*args).clone()
+    wd = _dequant_rank(w_uv, w_scale).double()
+    ref = torch.einsum("tak,ank->tan", po.double(), wd) * torch.sigmoid(
+        gate.double().view(rows, HP, VDIM)
+    )
+    assert rel_l2(eager, ref.reshape(rows, -1)) < TOL_REF
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = dcp.exchange_value_fused(*args)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager)
+
+
+def test_switch_off_keeps_todays_path(monkeypatch):
+    """``TRTLLM_K3LL_HELIX_A2A_VALUE`` = 0 (default): ``MlaSplitRead.value_applies`` is False, so ``forward`` and
+    ``K3DecodeMLA._quantized_decode`` run today's exchange + ``k3_fp8_mla_output`` unchanged."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_mla_dcp as dcp,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
+
+    if os.environ.get("K3_MK_VALUE_PY"):
+        pytest.skip("needs the branch's decode_mla_dcp")
+    sr = dcp.MlaSplitRead.__new__(dcp.MlaSplitRead)
+    sr.cp, sr.heads_per_rank, sr._a2a_fused = P, HP, object()
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_HELIX_A2A_FUSED", 1)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_HELIX_A2A_VALUE", 0)
+    assert not sr.value_applies()
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_HELIX_A2A_VALUE", 1)
+    assert sr.value_applies()
+    sr._a2a_fused = None
+    assert not sr.value_applies()
+
+
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------

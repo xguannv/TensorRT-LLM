@@ -177,6 +177,114 @@ class HelixAllToAllFused:
             )
         return out
 
+    def value(
+        self,
+        partial_o: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        num_heads: int,
+        gate: torch.Tensor,
+        w_uv: torch.Tensor,
+        w_scale: torch.Tensor,
+        zero_kv_mask: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Exchange, combine, V-up and gate of 512-wide latent heads (``helix_a2a_value``) on this workspace.
+
+        Args:
+            partial_o: BF16 ``[T, cp_size * num_heads * 512]``, destination-rank major.
+            softmax_stats: FP32 ``[T, cp_size * num_heads, 2]`` ``(max, sum)`` per head.
+            num_heads: Heads per rank after the exchange.
+            gate: BF16 ``[T, num_heads * 128]`` pre-sigmoid gate of this rank's heads (row stride arbitrary).
+            w_uv: FP8 ``[num_heads, 128, 512]`` V-up rows of this rank's heads; ``w_scale``: their FP32 128 x 128
+                block scales, ``[num_heads, 4]`` (or ``[num_heads, 1, 4]``).
+            zero_kv_mask: Optional bool ``[T]``, True where this rank owns no KV of the token.
+            out: Optional BF16 ``[T, num_heads * 128]`` output.
+
+        Returns:
+            ``sigmoid(gate) * (W_UV @ combined latent)``, BF16 ``[T, num_heads * 128]``.
+        """
+        from ..cute_dsl_kernels.blackwell.helix_a2a_value import record_bytes
+
+        cp_size = self.mapping.cp_size
+        num_tokens = partial_o.shape[0]
+        if out is None:
+            out = partial_o.new_empty((num_tokens, num_heads * 128))
+        partial_o = partial_o.reshape(num_tokens, -1)
+        softmax_stats = softmax_stats.reshape(num_tokens, -1)
+        assert partial_o.is_contiguous() and softmax_stats.is_contiguous()
+        assert partial_o.shape[1] == cp_size * num_heads * 512
+        assert softmax_stats.shape[1] == cp_size * num_heads * 2
+        if zero_kv_mask is not None:
+            zero_kv_mask = zero_kv_mask[:num_tokens].contiguous()
+        chunk = self.half_bytes // (cp_size * record_bytes(num_heads))
+        if chunk < 1:
+            raise ValueError("TRTLLM_HELIX_A2A_FUSED_MB is too small for one token")
+        for start in range(0, num_tokens, chunk):
+            end = min(num_tokens, start + chunk)
+            torch.ops.trtllm.helix_a2a_value(
+                partial_o[start:end],
+                softmax_stats[start:end],
+                None if zero_kv_mask is None else zero_kv_mask[start:end],
+                gate[start:end],
+                w_uv,
+                w_scale,
+                out[start:end],
+                self.state,
+                [
+                    self.mapping.cp_rank,
+                    cp_size,
+                    num_heads,
+                    self.ws_addr,
+                    self.rank_stride,
+                    self.half_bytes,
+                    self.max_send_ctas,
+                    int(self.use_pdl),
+                ],
+            )
+        return out
+
+
+@torch.library.custom_op("trtllm::helix_a2a_value", mutates_args=("out", "state"))
+def _helix_a2a_value_op(
+    partial_o: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    zero_kv_mask: Optional[torch.Tensor],
+    gate: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    state: torch.Tensor,
+    params: List[int],
+) -> None:
+    """One launch of ``helix_a2a_value`` into ``out``; ``params`` = (cp_rank, cp_size, num_heads, ws_addr,
+    rank_stride, half_bytes, max_send_ctas, use_pdl)."""
+    from ..cute_dsl_kernels.blackwell.helix_a2a_value import helix_a2a_value
+
+    cp_rank, cp_size, num_heads, ws_addr, rank_stride, half_bytes, n_send, pdl = params
+    helix_a2a_value(
+        partial_o,
+        softmax_stats,
+        zero_kv_mask,
+        gate,
+        w_uv,
+        w_scale,
+        out,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        num_heads=num_heads,
+        ws_addr=ws_addr,
+        rank_stride=rank_stride,
+        half_bytes=half_bytes,
+        state=state,
+        max_send_ctas=n_send,
+        use_pdl=bool(pdl),
+    )
+
+
+@_helix_a2a_value_op.register_fake
+def _(partial_o, softmax_stats, zero_kv_mask, gate, w_uv, w_scale, out, state, params) -> None:
+    return None
+
 
 @torch.library.custom_op("trtllm::helix_a2a_fused", mutates_args=("out", "state"))
 def _helix_a2a_fused_op(

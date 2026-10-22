@@ -2654,9 +2654,20 @@ class K3DecodeMLA(KimiK3MLAAttention):
             fuse_fp4_q_quant=bool(self.mqa.has_fp4_kv_cache),
         )
         if self._split_read is not None:
-            latent = self._split_read.forward(
-                self.mqa, quant_q, metadata, ag.shape[0] // metadata.num_generations, bmm1, bmm2
-            )
+            q_len = ag.shape[0] // metadata.num_generations
+            if self._split_read.value_applies():
+                gate_col = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+                gate = ag[:, gate_col : gate_col + heads * self.v_head_dim]
+                return self._split_read.forward(
+                    self.mqa,
+                    quant_q,
+                    metadata,
+                    q_len,
+                    bmm1,
+                    bmm2,
+                    tail=(self.v_b_proj, self.v_b_proj_scale, gate),
+                )
+            latent = self._split_read.forward(self.mqa, quant_q, metadata, q_len, bmm1, bmm2)
             return _fp8_attention.mla_output(
                 latent,
                 self.v_b_proj,

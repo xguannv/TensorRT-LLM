@@ -273,6 +273,45 @@ def exchange_combine_fused(
     )
 
 
+def value_supports(cp_size: int, heads_per_rank: int) -> bool:
+    """Whether ``exchange_value_fused`` takes this split."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.helix_a2a_value import supports
+
+    return supports(cp_size, heads_per_rank)
+
+
+def exchange_value_fused(
+    out: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    empty: torch.Tensor,
+    fused,
+    heads_per_rank: int,
+    v_b: torch.Tensor,
+    v_b_scale: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """``exchange_combine_fused`` followed by the V-B projection and the output gate, in one ``helix_a2a_value``
+    launch on the same workspace (the 512-wide heads travel whole, with one ``(max, sum)`` each: no statistics copy).
+
+    Args:
+        out, softmax_stats, empty, fused, heads_per_rank: as ``exchange_combine_fused``.
+        v_b: FP8 ``[heads_per_rank, 128, 512]`` V-B of this rank's heads; ``v_b_scale``: their 128 x 128 block scales.
+        gate: BF16 ``[tokens, heads_per_rank * 128]`` pre-sigmoid gate view.
+    Returns:
+        ``[tokens, heads_per_rank * 128]`` bf16 (what ``k3_fp8_mla_output`` returns, up to its FP8 activations).
+    """
+    tokens = out.shape[0]
+    return fused.value(
+        out.view(tokens, -1),
+        softmax_stats,
+        heads_per_rank,
+        gate,
+        v_b,
+        v_b_scale,
+        zero_kv_mask=empty,
+    )
+
+
 def default_softmax_scale(qk_nope_head_dim: int = 128, q_scaling: float = 1.0) -> float:
     return 1.0 / (math.sqrt(qk_nope_head_dim + QK_ROPE_DIM) * q_scaling)
 
@@ -406,6 +445,16 @@ class MlaSplitRead:
             )
         return ", ".join(built) or "NCCL only"
 
+    def value_applies(self) -> bool:
+        """Whether ``forward`` takes the V-B projection and the gate (``TRTLLM_K3LL_HELIX_A2A_VALUE``, Helix, the fused
+        exchange built)."""
+        return bool(
+            _flags.TRTLLM_K3LL_HELIX_A2A_VALUE
+            and _flags.TRTLLM_K3LL_HELIX_A2A_FUSED
+            and self._a2a_fused is not None
+            and value_supports(self.cp, self.heads_per_rank)
+        )
+
     def register(self, layer_idx: int) -> None:
         self._layers.add(layer_idx)
         self._first_layer = min(self._layers)
@@ -491,9 +540,16 @@ class MlaSplitRead:
         q_len: int,
         bmm1: torch.Tensor,
         bmm2: torch.Tensor,
+        tail: Optional[tuple] = None,
     ) -> torch.Tensor:
         """``quant_q``: ``[tokens, heads_per_rank, 576]`` FP8 bytes of this rank's heads. Returns the attention
-        latent of this rank's heads, ``[tokens, heads_per_rank * 512]`` bf16 (what the stock attention returns)."""
+        latent of this rank's heads, ``[tokens, heads_per_rank * 512]`` bf16 (what the stock attention returns).
+        ``tail`` = ``(v_b, v_b_scale, gate)`` (only where ``value_applies``): returns the gated V-B output
+        ``[tokens, heads_per_rank * 128]`` instead (``exchange_value_fused``)."""
+        if tail is not None and not self.value_applies():
+            raise RuntimeError(
+                "MlaSplitRead.forward: tail given but TRTLLM_K3LL_HELIX_A2A_VALUE does not apply"
+            )
         num_requests = meta.num_generations
         tokens = num_requests * q_len
         hp, cp = self.heads_per_rank, self.cp
@@ -571,6 +627,10 @@ class MlaSplitRead:
             output_scale,
             MAX_REQUESTS,
         )
+        if tail is not None:
+            return exchange_value_fused(
+                out.view(tokens, -1), stats, plan.empty, self._a2a_fused, hp, *tail
+            )
         if self._a2a_fused is not None and _flags.TRTLLM_K3LL_HELIX_A2A_FUSED:
             return exchange_combine_fused(
                 out.view(tokens, -1), stats, plan.empty, self._a2a_fused, hp

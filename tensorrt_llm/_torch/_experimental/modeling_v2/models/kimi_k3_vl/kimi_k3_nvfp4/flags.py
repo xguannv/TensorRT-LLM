@@ -142,6 +142,12 @@ TRTLLM_K3LL_HELIX_A2A_FUSED = _flag(
     "Helix MLA decode: the partials' exchange and combine in one Lamport kernel (helix_a2a_fused), not NCCL "
     "alltoall_helix + helix_post_process",
 )
+TRTLLM_K3LL_HELIX_A2A_VALUE = _flag(
+    "TRTLLM_K3LL_HELIX_A2A_VALUE",
+    0,
+    "Helix MLA decode, with TRTLLM_K3LL_HELIX_A2A_FUSED: exchange + combine + V-B (BF16 MMA on the FP8 weights) + "
+    "output gate in one Lamport kernel (helix_a2a_value), not helix_a2a_fused + k3_fp8_mla_output",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
