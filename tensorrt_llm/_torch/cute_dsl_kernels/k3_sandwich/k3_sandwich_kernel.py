@@ -321,10 +321,10 @@ def _sanitize(word):
 
 def _empty_lat_half(lat_uc, half, half_words: int, bx, tid):
     """Every word of half ``half`` of this rank's latent exchange (``half_words`` int32 words) empty: CTA ``bx``'s
-    1/56 of it, 16-byte stores of epilogue thread ``tid``."""
+    1/56 of it, 16-byte stores of epilogue thread ``tid`` (a plain helper: its loop unrolls as it is traced)."""
     base = half * cutlass.Int32(half_words) + bx * cutlass.Int32(half_words // NUM_CTAS)
     empty = cutlass.Int32(EMPTY_WORD)
-    for q in cutlass.range_constexpr(half_words // NUM_CTAS // (EPI_THREADS * 4)):
+    for q in range(half_words // NUM_CTAS // (EPI_THREADS * 4)):
         lat_uc.store((empty, empty, empty, empty),
                      idx=base + cutlass.Int32(q * EPI_THREADS * 4) + tid * cutlass.Int32(4),
                      alignment=16)  # fmt: skip
