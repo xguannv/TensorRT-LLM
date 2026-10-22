@@ -220,6 +220,13 @@ TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
     "on SM103 only (elsewhere the switch-off path)",
 )
 
+TRTLLM_K3LL_DUMP_TOPK = _flag(
+    "TRTLLM_K3LL_DUMP_TOPK",
+    0,
+    "NVFP4 MoE decode path, rank 0, eager steps only (CUDA graphs off): record the routed top-k ids of the first N "
+    "MoE calls of every layer and save them to TRTLLM_K3LL_DUMP_TOPK_DIR/topk_ids.pt (0: off)",
+)
+
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""

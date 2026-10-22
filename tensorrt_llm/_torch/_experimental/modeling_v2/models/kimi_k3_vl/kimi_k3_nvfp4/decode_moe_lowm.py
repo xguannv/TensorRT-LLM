@@ -27,8 +27,10 @@ every kernel once there so none compiles under a capture.
 
 from __future__ import annotations
 
+import atexit
+import os
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import nn
@@ -67,6 +69,55 @@ FRONT16_TOKENS = 16
 # A wide decode step's most tokens: the expert kernel's limit.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
 NUM_EXPERTS = 896
+
+
+class TopkDump:
+    """``TRTLLM_K3LL_DUMP_TOPK``: the routed top-k ids of the first ``limit`` MoE calls of every layer (rank 0; calls
+    under a CUDA-graph capture are skipped, replays run no Python), saved when the first layer is called once more
+    and at exit to ``<TRTLLM_K3LL_DUMP_TOPK_DIR>/topk_ids.pt``: ``ids`` int16 ``[layers, tokens, top_k]`` (every
+    call's rows in order), ``step_tokens`` (rows per call), ``layers``. The first calls are the warm-up's."""
+
+    def __init__(self, limit: int, path: str):
+        self.limit = limit
+        self.path = path
+        self.calls: Dict[int, List[torch.Tensor]] = {}
+        self.done = False
+        atexit.register(self.save)
+
+    def record(self, layer_idx: int, ids: torch.Tensor) -> None:
+        if self.done or torch.cuda.is_current_stream_capturing():
+            return
+        calls = self.calls.setdefault(layer_idx, [])
+        if len(calls) < self.limit:
+            calls.append(ids.to(torch.int16).cpu())
+        elif layer_idx == min(self.calls):
+            # a step past the last recorded one: every layer has its calls
+            self.save()
+            self.done = True
+
+    def save(self) -> None:
+        if self.done or not self.calls:
+            return
+        layers = sorted(self.calls)
+        n = min(len(self.calls[i]) for i in layers)
+        ids = torch.stack([torch.cat(self.calls[i][:n]) for i in layers])
+        steps = [int(t.shape[0]) for t in self.calls[layers[0]][:n]]
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        torch.save({"ids": ids, "step_tokens": steps, "layers": layers}, self.path)
+
+
+def _topk_dump() -> Optional[TopkDump]:
+    if not _flags.TRTLLM_K3LL_DUMP_TOPK:
+        return None
+    from tensorrt_llm._utils import mpi_rank
+
+    if mpi_rank() != 0:
+        return None
+    directory = os.environ.get("TRTLLM_K3LL_DUMP_TOPK_DIR", ".")
+    return TopkDump(_flags.TRTLLM_K3LL_DUMP_TOPK, os.path.join(directory, "topk_ids.pt"))
+
+
+TOPK_DUMP = _topk_dump()
 
 
 @dataclass(eq=False)
@@ -332,12 +383,16 @@ class K3DecodeMoeNvfp4Layer:
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
+            if TOPK_DUMP is not None:
+                TOPK_DUMP.record(moe.layer_idx, ids)
             return self._routed(ids, weights, x_q, x_sf), shared_act
         rows = x.shape[0]
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
-        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
+        ids, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
+        if TOPK_DUMP is not None:
+            TOPK_DUMP.record(moe.layer_idx, ids)
         routed = nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
             self.state.counters, *self.situ,
@@ -391,7 +446,10 @@ class K3DecodeMoeNvfp4Layer:
         shared = moe.shared_experts
 
         def _routed_partial():
-            return self._routed(*self._route_quant(moe, router_logits, routed_in))
+            routing = self._route_quant(moe, router_logits, routed_in)
+            if TOPK_DUMP is not None:
+                TOPK_DUMP.record(moe.layer_idx, routing[0])
+            return self._routed(*routing)
 
         def _shared_activation():
             return shared._apply_activation(
