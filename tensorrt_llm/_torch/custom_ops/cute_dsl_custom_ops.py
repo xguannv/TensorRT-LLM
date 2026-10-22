@@ -11925,6 +11925,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         BlackwellMultiHeadLatentAttentionForwardFP8
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_helpers import \
+        MAX_SPLITS as MLA_MAX_SPLITS
 
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
@@ -12400,6 +12402,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"{tactic!r}.")
             mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent = tactic
             split_kv = int(split_kv)
+            if not 1 <= split_kv <= MLA_MAX_SPLITS:
+                raise ValueError(
+                    f"CuteDSLNVMlaDecodeBlackwellRunner: split_kv={split_kv} outside [1, {MLA_MAX_SPLITS}]"
+                )
             is_persistent = bool(is_persistent)
             mma_qk_tiler_mn = tuple(mma_qk_tiler_mn)
             mma_pv_tiler_mn = tuple(mma_pv_tiler_mn)
@@ -12516,7 +12522,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._IS_VAR_SPLIT_KV,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
-                    reducer_max_splits=32,
+                    # The split-KV reduction keeps one LSE per split in a shared-memory array of this many entries:
+                    # it must hold every split of the variant (split_kv is part of the cache key).
+                    reducer_max_splits=max(32, split_kv),
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
