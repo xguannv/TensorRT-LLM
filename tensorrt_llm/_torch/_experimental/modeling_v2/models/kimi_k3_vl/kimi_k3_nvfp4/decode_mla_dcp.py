@@ -141,6 +141,7 @@ def split_read_attention(
     softmax_scale: float,
     output_scale: float,
     max_batch: int,
+    split_cap: int = 0,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages.
 
@@ -149,10 +150,22 @@ def split_read_attention(
         kv_pages: ``[num_pages, page_size, >=576]`` FP8 view of the layer's page pool.
         out: ``[batch, q_len, heads, 512]`` bf16, normalized partial output (written).
         softmax_stats: ``[batch * q_len, heads, 2]`` fp32 ``(max, sum)`` per row (written).
+        split_cap: 0, the op (its AutoTuner picks split_kv, at most 32); else the runner directly with split_kv =
+            min(max_active_blocks // batch // (2 * q_tiles), split_cap) and the op's default tilers and persistence
+            (`_runner_split_kv`).
     """
     batch, q_len, heads, _ = q.shape
     c_latent = kv_pages[..., :KV_LORA_RANK].permute(1, 2, 0)
     c_rope = kv_pages[..., KV_LORA_RANK : KV_LORA_RANK + QK_ROPE_DIM].permute(1, 2, 0)
+    if split_cap > 0:
+        runner, tactic = _runner_split_kv(heads, q_len, kv_pages.shape[1], max_batch, batch, split_cap,
+                                          softmax_stats is not None)  # fmt: skip
+        inputs = [
+            q[..., :KV_LORA_RANK].permute(2, 3, 1, 0), q[..., KV_LORA_RANK:].permute(2, 3, 1, 0), c_latent, c_rope,
+            plan.page_table, plan.cache_seqs, out.permute(2, 3, 1, 0), workspace, softmax_stats, plan.kv_bounds,
+        ]  # fmt: skip
+        runner(inputs, tactic=tactic, softmax_scale=softmax_scale, output_scale=output_scale)
+        return
     torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell(
         q[..., :KV_LORA_RANK].permute(2, 3, 1, 0),
         q[..., KV_LORA_RANK:].permute(2, 3, 1, 0),
@@ -286,6 +299,34 @@ PAGE_SIZE = 64
 #: Workspace / autotuner sizing: the decode step contract's ceilings (requests x tokens per request).
 MAX_REQUESTS = 8
 MAX_Q_LEN = 8
+
+
+_RUNNERS: dict = {}
+
+
+def _runner_split_kv(
+    heads: int, q_len: int, page_size: int, max_batch: int, batch: int, split_cap: int, stats: bool
+):
+    """The FP8 MLA decode runner of this shape and its tactic: the op's default tilers and persistence, split_kv =
+    min(max_active_blocks // batch // (2 * q_tiles), split_cap) (the op's occupancy heuristic without its cap of 32;
+    the runner sizes the reduction for the split, and the workspace holds max_active_blocks query-tile splits)."""
+    import cutlass
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVMlaDecodeBlackwellRunner as Runner,
+    )
+
+    key = (heads, q_len, page_size, max_batch, stats)
+    runner = _RUNNERS.get(key)
+    if runner is None:
+        runner = _RUNNERS[key] = Runner(
+            in_dtype=cutlass.Float8E4M3FN, num_heads=heads, seq_len_q=q_len, page_size=page_size,
+            max_batch_size=max_batch, emit_softmax_stats=stats,
+        )  # fmt: skip
+    q_tiles = math.ceil(q_len * heads / 128)
+    split = max(1, min(Runner._get_max_active_blocks() // batch // (2 * q_tiles), split_cap))
+    qk, pv, _, persistent = runner.default_tactic(batch)
+    return runner, (qk, pv, split, persistent)
 
 
 class MlaSplitRead:
@@ -542,6 +583,7 @@ class MlaSplitRead:
                 softmax_scale,
                 output_scale,
                 MAX_REQUESTS,
+                split_cap=_flags.TRTLLM_K3LL_MLA_SPLIT_CAP,
             )
             return out.view(tokens, hp * KV_LORA_RANK)
 

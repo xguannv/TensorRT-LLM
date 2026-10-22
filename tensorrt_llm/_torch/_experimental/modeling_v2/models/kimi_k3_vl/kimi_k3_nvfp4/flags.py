@@ -47,6 +47,12 @@ TRTLLM_K3LL_MLA_DCP = _flag(
     1,
     "FP8-cache MLA decode attention: 0 stock, 1 CuTe DSL kernel on this rank's heads, 2 split-read DCP over TP",
 )
+TRTLLM_K3LL_MLA_SPLIT_CAP = _flag(
+    "TRTLLM_K3LL_MLA_SPLIT_CAP",
+    0,
+    "with TRTLLM_K3LL_MLA_DCP=1: 0 the op's AutoTuner split_kv (at most 32); N > 0 the staircase's own runner call "
+    "with split_kv = min(max_active_blocks // B // (2 * q_tiles), N)",
+)
 TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
     "TRTLLM_K3LL_DRAFTER_FC_TP",
     1,
