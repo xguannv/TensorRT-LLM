@@ -197,8 +197,14 @@ def _sort(ids, scales, num_experts, top_k, offset, num_local):
 
 @pytest.mark.parametrize(
     "shape",
-    [(LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K), (1024, 256, 64, 16, 0, 8)],
-    ids=["k3_tp4ep4", "small"],
+    [
+        (LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K),
+        # TP8 x EP2 (slice 384) and TP16 (slice 192, all experts on the rank): a partial last FC2 K stage
+        (LATENT, 384, EXPERTS, 448, 448, TOP_K),
+        (LATENT, 192, EXPERTS, EXPERTS, 0, TOP_K),
+        (1024, 256, 64, 16, 0, 8),
+    ],
+    ids=["k3_tp4ep4", "k3_tp8ep2", "k3_tp16", "small"],
 )
 @pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 16, 32])
 @pytest.mark.parametrize("num_ctas", [0, 100], ids=["ctas_max", "ctas_100"])
