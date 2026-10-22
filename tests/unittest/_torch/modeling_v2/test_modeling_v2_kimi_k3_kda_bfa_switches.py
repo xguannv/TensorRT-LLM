@@ -111,6 +111,7 @@ def stand_in():
     w_bfa[K + H :] = 0
 
     qkvg = _QkvgProj(w_q, s_q)
+    qkvg._k3ll_fp8w_lowm = True  # routed by fp8w_lowm.install, as on SM100 / SM103
     views = {}
     for i, name in enumerate(("q_proj", "k_proj", "v_proj", "g_proj")):
         views[name] = _QkvgProj(w_q[i * HK : (i + 1) * HK], s_q[i * HK : (i + 1) * HK])

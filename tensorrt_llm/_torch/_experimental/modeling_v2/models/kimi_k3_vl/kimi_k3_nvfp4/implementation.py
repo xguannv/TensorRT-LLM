@@ -2248,7 +2248,8 @@ class K3DecodeKDA(KimiKDALinearAttention):
         q / k / v / g modules that are views of it (``_fused_projection``); the old buffer is then released. The
         packed scale cannot be shared: it is MN-major (strides ``(1, N)``), so the first rows of the fused scale are
         not the layout the QKVG GEMM reads; the fused scale is its own small tensor."""
-        if self._qkvg_bfa_fp8 is None:
+        # Only a QKVG module routed to k3_fp8w_lowm_gemm (fp8w_lowm.install: SM100 / SM103, DeepGEMM's packed scale).
+        if self._qkvg_bfa_fp8 is None and getattr(self.qkvg_proj, "_k3ll_fp8w_lowm", False):
             proj = self.qkvg_proj
             weight = getattr(proj, "weight", None)
             scale = getattr(proj, "weight_scale", None)
