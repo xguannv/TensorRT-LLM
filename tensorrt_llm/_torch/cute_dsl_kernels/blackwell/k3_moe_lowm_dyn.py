@@ -8,9 +8,14 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
 
 * Work units: an FC1 unit is one 128-row block of one touched expert's W1 over the whole K
   (``k1 / 256`` stages); an FC2 unit is ``fc2_chunk`` consecutive 128-row blocks of one expert's W2
-  (``k2 / 256`` stages each). A stage is 128 x 256 NVFP4 weights plus their scale block (18 KB) in both
-  GEMMs, so one TMA ring serves both. The work list is every FC1 unit (tile-major) followed by every
-  FC2 unit (tile-major).
+  (``ceil(k2 / 256)`` stages each). A stage is 128 x 256 NVFP4 weights plus their scale block (18 KB)
+  in both GEMMs, so one TMA ring serves both. The work list is every FC1 unit (tile-major) followed by
+  every FC2 unit (tile-major).
+* FC2 K not a multiple of 256 (``k2 % 256`` a multiple of 64, e.g. a TP16 slice of 192): the last FC2
+  stage is partial. The TMA zero-fills its weights, weight scales and token rows past ``k2``, the
+  token scales are copied for the tile's ``k2 / 64`` scale atoms only, and the MMA issues only the
+  stage's first ``(k2 % 256) / 64`` K-steps (the skipped steps would read scale bytes left in the ring
+  slot by earlier units).
 * Dynamic distribution: the weight TMA warp of every CTA takes the next unit of the list from a global
   counter (one ``atom.add`` per unit, issued while the current unit's stages stream) and publishes it to
   the other warps through a shared-memory queue. A CTA therefore runs FC1 units and then FC2 units,
@@ -21,13 +26,15 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   stages, and the token warp fills it as soon as the unit is published, so the load is issued as far
   ahead of the MMA as the ring reaches.
 * Output: the kernel zeroes the BF16 output itself (no memset before it). The token warp of the CTA
-  that runs FC1 unit ``u < _ZERO_SLICES`` zeroes slice ``u`` of the output and then adds 1 to every
+  that runs unit ``u < _ZERO_SLICES`` zeroes slice ``u`` of the output and then adds 1 to every
   tile counter (GPU-scope release after a warp barrier); with no touched expert, CTA 0 zeroes it all.
+  Unit ``u`` is an FC1 unit unless there are fewer FC1 units than slices (one tile, ``n1 < 512``); an
+  FC2 unit zeroes its slice before it waits on its tile.
 * Dependencies: after the stores of an FC1 unit the epilogue adds 1 to ``tile_ready[tile]`` (GPU-scope
   release). Before loading the FC1 output rows of a tile, the token warp waits until the counter
   reaches ``n1 / 128 + _ZERO_SLICES`` (every FC1 unit of the tile stored, the whole output zeroed;
   acquire, then a generic-to-async proxy fence before the TMA). FC1 units have no dependencies, the
-  zeroing slices belong to the first FC1 units, and every CTA finishes its FC1 units before its FC2
+  zeroing slices belong to the first units, and every CTA finishes its FC1 units before its FC2
   units, so the grid cannot deadlock, also when not all CTAs are resident at once.
 * Counter reset (CUDA graph replays reuse the buffer): every FC2 block adds 1 more to its tile's counter
   after the wait; the add that brings it to ``n1 / 128 + _ZERO_SLICES + n2 / 128`` stores zero. Every
@@ -93,6 +100,8 @@ _EPI_BARRIER_BASE = 1
 CTR_TILE_BASE = 16
 #: Bytes of the weight part of one ring stage (128 x 256 NVFP4).
 _SLOT_BYTES = _MMA_M * _KBLK // 2
+#: K of one block-scaled NVFP4 MMA instruction (a stage is _KBLK / _MMA_K of them).
+_MMA_K = 64
 #: Slices of the output zeroed by the kernel (the CTAs that run FC1 units 0 .. _ZERO_SLICES - 1).
 _ZERO_SLICES = 4
 
@@ -173,7 +182,8 @@ class K3MoeLowMDynKernel:
     scheduled persistent grid.
 
     :param n_tok: Token tile (MMA N) of both GEMMs: 8, 16 or 32.
-    :param n1: Rows of one expert's W1 (2 x intermediate, gate/up interleaved every 64 rows).
+    :param n1: Rows of one expert's W1 (2 x intermediate, gate/up interleaved every 64 rows): a
+        multiple of 128, so FC2's K ``n1 / 2`` is a multiple of 64.
     :param k1: Hidden size (W1 K, W2 rows).
     :param topk: Experts per token.
     :param situ_beta: SiTU gate-side constant.
@@ -204,7 +214,7 @@ class K3MoeLowMDynKernel:
         trace: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
-        assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
+        assert n1 % _MMA_M == 0 and k1 % _KBLK == 0
         assert k1 % _MMA_M == 0
         assert num_epi_wg in (1, 2) and num_acc >= num_epi_wg
         assert situ_beta > 0 and situ_linear_beta > 0
@@ -213,7 +223,9 @@ class K3MoeLowMDynKernel:
         self.n2, self.k2 = k1, n1 // 2
         self.topk = topk
         self.nkb1, self.nblk1 = k1 // _KBLK, n1 // _MMA_M
-        self.nkb2, self.nblk2 = self.k2 // _KBLK, self.n2 // _MMA_M
+        self.nkb2, self.nblk2 = -(-self.k2 // _KBLK), self.n2 // _MMA_M
+        #: MMA K-steps of the last FC2 stage when it is partial (0: every FC2 stage is full)
+        self.k2_tail_kp = (self.k2 % _KBLK) // _MMA_K
         self.situ_beta = float(situ_beta)
         self.situ_linear_beta = float(situ_linear_beta)
         self.num_acc = num_acc
@@ -235,12 +247,15 @@ class K3MoeLowMDynKernel:
         self.b_per_slot = _SLOT_BYTES // self.b_stage_bytes
         self.x_bytes = self.nkb1 * self.b_stage_bytes
         # FC2 token operand in the ring: its rows in one slot, its scales after them in the same slot
-        # if they fit, else at the start of the next slot
+        # if they fit, else at the start of the next slot. The rows' TMA boxes cover whole stages
+        # (zero-filled past k2); the scales are the tile's own k2 / 64 atoms of 512 bytes, read by
+        # the MMA as nkb2 2-KB stages (the bytes past them unused).
         self.b2_data_bytes = self.nkb2 * self.b_stage_bytes
-        self.b2_sf_bytes = self.nkb2 * _SF_KBLK_BYTES
+        self.b2_sf_bytes = _MMA_M * self.k2 // _SF_VEC
+        b2_sf_span = self.nkb2 * _SF_KBLK_BYTES
         self.b2_sf_off = _align(self.b2_data_bytes, _SF_KBLK_BYTES)
-        assert self.b2_data_bytes <= _SLOT_BYTES and self.b2_sf_bytes <= _SLOT_BYTES
-        self.b2_slots = 1 if self.b2_sf_off + self.b2_sf_bytes <= _SLOT_BYTES else 2
+        assert self.b2_data_bytes <= _SLOT_BYTES and b2_sf_span <= _SLOT_BYTES
+        self.b2_slots = 1 if self.b2_sf_off + b2_sf_span <= _SLOT_BYTES else 2
         self.sacc_row_floats = _MMA_M + _SACC_PAD
         self.out_row_bytes = _MMA_M * 2
 
@@ -1087,16 +1102,33 @@ class K3MoeLowMDynKernel:
                         w_a += _globaltimer() - t_w
                     cute.copy(s2t_sfa, tCsSFA[(None, None, None, None, stage)], tCtSFA_s2t)
                     cute.copy(s2t_sfb, tCsSFB[(None, None, None, None, sf0 + kb)], tCtSFB_s2t)
+                    if cutlass.const_expr(self.k2_tail_kp != 0):
+                        # an FC2 unit's last stage is partial: K-steps from kp_end on are skipped
+                        kp_end = Int32(nkp)
+                        if u >= w1:
+                            if kb == nst - 1:
+                                kp_end = Int32(self.k2_tail_kp)
                     for kp in cutlass.range_constexpr(nkp):
+                        # the MMA descriptor fields are set outside the K-step predicate
                         tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
                         tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                        cute.gemm(
-                            tiled_mma,
-                            tAcc[(None, 0, 0)],
-                            tCrA[(None, 0, kp, stage)],
-                            tCrB[(None, 0, kp, b0 + kb)],
-                            tAcc[(None, 0, 0)],
-                        )
+                        if cutlass.const_expr(self.k2_tail_kp == 0 or kp < self.k2_tail_kp):
+                            cute.gemm(
+                                tiled_mma,
+                                tAcc[(None, 0, 0)],
+                                tCrA[(None, 0, kp, stage)],
+                                tCrB[(None, 0, kp, b0 + kb)],
+                                tAcc[(None, 0, 0)],
+                            )
+                        else:
+                            if kp < kp_end:
+                                cute.gemm(
+                                    tiled_mma,
+                                    tAcc[(None, 0, 0)],
+                                    tCrA[(None, 0, kp, stage)],
+                                    tCrB[(None, 0, kp, b0 + kb)],
+                                    tAcc[(None, 0, 0)],
+                                )
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                     with cute.arch.elect_one():
                         tcgen05.commit(a_empty + stage)

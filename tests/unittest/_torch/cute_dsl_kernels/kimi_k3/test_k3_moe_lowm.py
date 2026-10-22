@@ -21,7 +21,10 @@
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell): FC1 rows and scales bit for bit, every FC2
                 partial bit for bit (one non-zero routing weight per token), the full sum within the bf16 accumulation
                 bound of the exact sum of the partials; through nvfp4_lowm_op.run (moe_sort first) as well, eagerly
-                and from CUDA-graph replays, the counters zero after every launch;
+                and from CUDA-graph replays, the counters zero after every launch; at the TP4 x EP4 slice (768), the
+                TP8 x EP2 slice (384) and the TP16 slice (192, all 896 experts on one rank: a partial last FC2 K
+                stage), also over the FC2 unit sizes and ring depths the microbenchmark sweeps, and against fp64 math
+                on the dequantized operands; the 768 slice's kernel configuration as before partial stages existed;
   front (4 GPUs, one process each) : trtllm::k3_moe_front with nvfp4_gsf: the routing and the shared activation
                 bit for bit the MXFP8 call's; the NVFP4 latent against fp4_quantize of the unfused chain's bf16
                 latent (> 99.9 % equal codes and scales: the front sums the head in its own split-K order, so a code
@@ -190,27 +193,31 @@ def _sort(ids, scales, num_experts, top_k, offset, num_local):
     )  # fmt: skip
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [(LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K), (1024, 256, 64, 16, 0, 8)],
-    ids=["k3_tp4ep4", "small"],
-)
-@pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 32])
-@pytest.mark.parametrize("num_ctas", [0, 100], ids=["ctas_max", "ctas_100"])
-def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
-    import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+#: (hidden, intermediate slice, experts, local experts, local offset, top_k) of one rank's routed experts. The TP8 x EP2
+#: (slice 384) and TP16 (slice 192) cases run FC2 with a partial last 256-wide K stage.
+LOWM_SHAPES = {
+    "k3_tp4ep4": (LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K),
+    "k3_tp8ep2": (LATENT, 384, EXPERTS, 448, 448, TOP_K),
+    "k3_tp16": (LATENT, 192, EXPERTS, EXPERTS, 0, TOP_K),
+    "small": (1024, 256, 64, 16, 0, 8),
+}
+
+
+def _lowm_case(shape, num_tokens, one_tile=False):
+    """Routing, sorted tiles, NVFP4 tokens and experts of one rank, and the regular kernels' FC1 output and finalize.
+    ``one_tile``: every token's first expert is the rank's first one and its others are not on the rank."""
     from tensorrt_llm._torch.utils import unswizzle_sf
 
     hidden, inter_size, num_experts, num_local, offset, top_k = shape
-    ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * inter_size, hidden, num_tokens)
-    assert ok, why
     torch.manual_seed(2000 + num_tokens)
     logits = torch.randn(num_tokens, num_experts, device="cuda")
     scales, ids = logits.topk(top_k, dim=-1)
     ids = ids.to(torch.int32)
     scales = scales.softmax(dim=-1).float()
     ids[0, 0] = offset  # at least one token on this rank
+    if one_tile:
+        ids[:, 0] = offset
+        ids[:, 1:] = offset + num_local + torch.arange(top_k - 1, dtype=torch.int32, device="cuda")
     t2g, t2lim, _, p2e, _, nnet = _sort(ids, scales, num_experts, top_k, offset, num_local)
     m = p2e.shape[0]
     tiles = int(nnet.item())
@@ -223,51 +230,86 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     alpha1 = (ex.spread * (x_gsf * ex.w1_gsf)).float()
     c_ref, c_sf_ref, finalize = _regular(x_q, x_sf, ex, alpha1, t2g, t2lim, p2e, nnet, scales, num_experts, top_k,
                                          offset, inter_size)  # fmt: skip
-    counters = nvfp4_lowm_op.new_counters(torch.device("cuda"))
-    out = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
-    h = torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda")
-    h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
-    weights = (ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2)
+    return SimpleNamespace(
+        hidden=hidden, inter_size=inter_size, num_experts=num_experts, num_local=num_local, offset=offset, top_k=top_k,
+        num_tokens=num_tokens, ids=ids, scales=scales, t2g=t2g, t2lim=t2lim, p2e=p2e, nnet=nnet, m=m, rows=rows,
+        x_q=x_q, x_sf=x_sf, ex=ex, alpha1=alpha1, c_ref=c_ref, c_sf_ref=c_sf_ref, finalize=finalize,
+        weights=(ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2),
+        counters=nvfp4_lowm_counters(),
+        out=torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda"),
+        h=torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda"),
+        h_sf=torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda"),
+    )  # fmt: skip
 
-    def lowm(token_scales):
-        out.fill_(7.0)  # the kernel zeroes the output itself
-        _trtllm().k3_moe_nvfp4_lowm(
-            _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, t2g, t2lim, p2e, nnet, ex.fc2_input_scale,
-            token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf,
-        )  # fmt: skip
-        torch.cuda.synchronize()
-        assert int(counters.abs().sum().item()) == 0, "counters not reset"
-        return out.clone()
+
+def nvfp4_lowm_counters():
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+
+    return nvfp4_lowm_op.new_counters(torch.device("cuda"))
+
+
+def _lowm_call(c, token_scales, num_ctas, fc2_chunk=0, max_stages=0):
+    """The op on the case's buffers (output pre-filled with garbage: the kernel zeroes it); counters zero after it."""
+    c.out.fill_(7.0)
+    _trtllm().k3_moe_nvfp4_lowm(
+        _bits(c.x_q), _bits(c.x_sf), *c.weights[:3], *c.weights[3:], c.out, c.t2g, c.t2lim, c.p2e, c.nnet,
+        c.ex.fc2_input_scale, token_scales, c.counters, c.top_k, GATE_CAP, LINEAR_CAP, num_ctas, c.h, c.h_sf,
+        fc2_chunk, max_stages,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    assert int(c.counters.abs().sum().item()) == 0, "counters not reset"
+    return c.out.clone()
+
+
+def _check_partials(c, num_ctas, fc2_chunk=0, max_stages=0, slots=None):
+    """FC1 rows and scales and every FC2 partial (one non-zero routing weight per token) bit for bit the regular
+    kernels'; returns the exact sum of all partials and its bf16 accumulation bound."""
+    from tensorrt_llm._torch.utils import unswizzle_sf
 
     partials = []
-    for slot in range(top_k):
-        one_hot = torch.zeros_like(scales)
-        one_hot[:, slot] = scales[:, slot]
-        ref = finalize(one_hot)
-        new = lowm(one_hot)
+    for slot in range(c.top_k) if slots is None else slots:
+        one_hot = torch.zeros_like(c.scales)
+        one_hot[:, slot] = c.scales[:, slot]
+        ref = c.finalize(one_hot)
+        new = _lowm_call(c, one_hot, num_ctas, fc2_chunk, max_stages)
         assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"FC2 slot {slot}"
         partials.append(ref.double())
-        if slot == 0:
-            assert torch.equal(c_ref[rows], h[rows]), "FC1 output rows differ"
-            assert (h[rows] != 0).any(), "FC1 output is all zero"
-            cols = inter_size // SF16
-            sf_ref = unswizzle_sf(c_sf_ref, m, inter_size, SF16).view(m, cols)
-            sf_new = unswizzle_sf(h_sf, m, inter_size, SF16).view(m, cols)
+        if len(partials) == 1:
+            rows = c.rows
+            assert torch.equal(c.c_ref[rows], c.h[rows]), "FC1 output rows differ"
+            assert (c.h[rows] != 0).any(), "FC1 output is all zero"
+            cols = c.inter_size // SF16
+            sf_ref = unswizzle_sf(c.c_sf_ref, c.m, c.inter_size, SF16).view(c.m, cols)
+            sf_new = unswizzle_sf(c.h_sf, c.m, c.inter_size, SF16).view(c.m, cols)
             assert torch.equal(sf_ref[rows], sf_new[rows]), "FC1 output scale factors differ"
     exact = torch.stack(partials).sum(0)
-    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+    bound = c.top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+    return exact, bound
 
-    def check(result, what):
-        err = (result.double() - exact).abs()
-        assert bool((err <= bound).all()), f"{what}: max err/bound {(err / bound).max()}"
 
-    check(lowm(scales), "op")
+def _check_sum(result, exact, bound, what):
+    err = (result.double() - exact).abs()
+    assert bool((err <= bound).all()), f"{what}: max err/bound {(err / bound).max()}"
+
+
+@pytest.mark.parametrize("shape", list(LOWM_SHAPES.values()), ids=list(LOWM_SHAPES))
+@pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 16, 32])
+@pytest.mark.parametrize("num_ctas", [0, 100], ids=["ctas_max", "ctas_100"])
+def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+
+    ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * shape[1], shape[0], num_tokens)
+    assert ok, why
+    c = _lowm_case(shape, num_tokens)
+    exact, bound = _check_partials(c, num_ctas)
+    _check_sum(_lowm_call(c, c.scales, num_ctas), exact, bound, "op")
     # nvfp4_lowm_op.run: moe_sort, then the op; bf16 routing weights converted to fp32 inside.
-    run_args = (_bits(x_q), _bits(x_sf), ids, scales, weights, offset, num_experts, ex.fc2_input_scale, counters,
-                GATE_CAP, LINEAR_CAP)  # fmt: skip
+    run_args = (_bits(c.x_q), _bits(c.x_sf), c.ids, c.scales, c.weights, c.offset, c.num_experts,
+                c.ex.fc2_input_scale, c.counters, GATE_CAP, LINEAR_CAP)  # fmt: skip
     y = nvfp4_lowm_op.run(*run_args, num_ctas=num_ctas)
     torch.cuda.synchronize()
-    check(y, "run")
+    _check_sum(y, exact, bound, "run")
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -278,8 +320,132 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         static.fill_(7.0)
         graph.replay()
         torch.cuda.synchronize()
-        check(static, f"graph replay {replay}")
-        assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
+        _check_sum(static, exact, bound, f"graph replay {replay}")
+        assert int(c.counters.abs().sum().item()) == 0, "counters not reset after a replay"
+
+
+@pytest.mark.parametrize(
+    "shape", [LOWM_SHAPES["k3_tp8ep2"], LOWM_SHAPES["k3_tp16"]], ids=["k3_tp8ep2", "k3_tp16"]
+)
+@pytest.mark.parametrize("num_tokens", [8, 32])
+@pytest.mark.parametrize("fc2_chunk, max_stages", [(1, 6), (2, 8), (4, 6), (7, 9), (28, 16)])
+def test_moe_nvfp4_lowm_fc2_config(shape, num_tokens, fc2_chunk, max_stages):
+    """The FC2 unit sizes and ring depths the microbenchmark sweeps at the partial-K slices: FC1 and two FC2 partials
+    bit for bit the regular kernels', the full sum within the bound of the exact one (the partials of the default
+    build)."""
+    import tensorrt_llm  # noqa: F401
+
+    c = _lowm_case(shape, num_tokens)
+    exact, bound = _check_partials(c, 0)
+    _check_partials(c, 0, fc2_chunk, max_stages, slots=(0, c.top_k - 1))
+    _check_sum(
+        _lowm_call(c, c.scales, 0, fc2_chunk, max_stages),
+        exact,
+        bound,
+        f"chunk {fc2_chunk} stages {max_stages}",
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 32])
+def test_moe_nvfp4_lowm_one_tile(num_tokens):
+    """One touched expert of FC2 K 192: three FC1 units, so unit 3, which zeroes the last output slice, is an FC2
+    unit."""
+    import tensorrt_llm  # noqa: F401
+
+    c = _lowm_case((1024, 192, 64, 8, 0, 4), num_tokens, one_tile=True)
+    assert int(c.nnet.item()) == 1
+    exact, bound = _check_partials(c, 0)
+    _check_sum(_lowm_call(c, c.scales, 0), exact, bound, "op")
+
+
+def _situ_ref(up, gate):
+    return (
+        GATE_CAP
+        * torch.tanh(gate / GATE_CAP)
+        * torch.sigmoid(gate)
+        * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP))
+    )
+
+
+@pytest.mark.parametrize("shape", list(LOWM_SHAPES.values()), ids=list(LOWM_SHAPES))
+@pytest.mark.parametrize("num_tokens", [8, 32])
+def test_moe_nvfp4_lowm_dequant_ref(shape, num_tokens):
+    """The kernel against fp64 math on the dequantized operands, independent of the regular kernels: FC1 output within
+    one NVFP4 rounding (one scale unit) of SiTU of the exact FC1; the routed sum within the bf16 accumulation bound of
+    the exact FC2 of the kernel's own FC1 output."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    c = _lowm_case(shape, num_tokens)
+    out = _lowm_call(c, c.scales, 0).double()
+    hidden, inter = c.hidden, c.inter_size
+    n1 = 2 * inter
+    x_raw, _ = _dequant(_bits(c.x_q), _bits(c.x_sf), 1.0)
+    h_sf = unswizzle_sf(c.h_sf, c.m, inter, SF16).view(c.m, inter // SF16)
+    rows = c.rows.tolist()
+    expanded = c.p2e[c.rows].tolist()
+    ids = c.ids.tolist()
+    by_expert = {}
+    for r, e_idx in zip(rows, expanded):
+        t, k = divmod(e_idx, c.top_k)
+        by_expert.setdefault(ids[t][k] - c.offset, []).append((r, t, k))
+    exact = torch.zeros(c.num_tokens, hidden, dtype=torch.float64, device="cuda")
+    absum = torch.zeros_like(exact)
+    for e, members in by_expert.items():
+        rr = torch.tensor([r for r, _, _ in members], device="cuda")
+        tt = torch.tensor([t for _, t, _ in members], device="cuda")
+        kk = torch.tensor([k for _, _, k in members], device="cuda")
+        w1, _ = _dequant(
+            c.ex.w1[e], unswizzle_sf(c.ex.w1_sf[e], n1, hidden, SF16).view(n1, -1), 1.0
+        )
+        acc = (x_raw[tt].double() @ w1.double().t()).view(len(members), -1, 2, 64) * float(
+            c.alpha1[e]
+        )
+        h_ref = _situ_ref(acc[:, :, 0], acc[:, :, 1]).reshape(len(members), inter)
+        h_raw, h_scale = _dequant(c.h[rr], h_sf[rr], 1.0)
+        h_val = h_raw.double() / float(c.ex.fc2_input_scale[0])
+        unit = h_scale.double() / float(c.ex.fc2_input_scale[0])
+        err = (h_val - h_ref).abs()
+        # one scale unit: half the widest E2M1 step (4 -> 6); then slack for the MMA's FP32 accumulation and the
+        # approximate exp2 / reciprocal of the SiTU, and for 16-groups below the smallest E4M3 scale
+        tol = 1.01 * unit + 1e-3 * h_ref.abs() + 1e-6 * float(h_ref.abs().max())
+        assert bool((err <= tol).all()), (
+            f"expert {e}: FC1 output off by {(err / (unit + 1e-30)).max().item():.3f} scale units"
+        )
+        w2, _ = _dequant(
+            c.ex.w2[e], unswizzle_sf(c.ex.w2_sf[e], hidden, inter, SF16).view(hidden, -1), 1.0
+        )
+        coef = (c.scales[tt, kk].double() * float(c.ex.alpha2[e])).unsqueeze(1)
+        part = (h_raw.double() @ w2.double().t()) * coef
+        exact.index_add_(0, tt, part)
+        absum.index_add_(
+            0,
+            tt,
+            part.abs() + 2.0**-12 * (h_raw.double().abs() @ w2.double().abs().t()) * coef.abs(),
+        )
+    assert bool((out != 0).any()), "output is all zero"
+    bound = c.top_k * 2.0**-8 * absum + 1e-30
+    err = (out - exact).abs()
+    assert bool((err <= bound).all()), f"routed sum: max err/bound {(err / bound).max().item():.3f}"
+
+
+@pytest.mark.parametrize("n_tok", [8, 16, 32])
+def test_moe_nvfp4_lowm_k2_768_config_unchanged(n_tok):
+    """The TP4 slice (FC2 K 768, every stage full) builds the kernel exactly as before partial FC2 stages existed: the
+    op's default unit size and ring cap, three full FC2 stages, the token scales copied as three 2-KB stages, no
+    K-step predicate (``k2_tail_kp`` 0 compiles none of the partial-stage code)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_moe_lowm_dyn as dyn
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+
+    chunk, stages = nvfp4_lowm_op.kernel_config(n_tok, I_TP)
+    assert (chunk, stages) == (1, {8: 6, 16: 6}.get(n_tok, 16))
+    kernel = dyn.K3MoeLowMDynKernel(n_tok, 2 * I_TP, LATENT, TOP_K, GATE_CAP, LINEAR_CAP, fc2_chunk=chunk,
+                                    max_ab_stage=stages)  # fmt: skip
+    assert kernel.k2_tail_kp == 0 and kernel.nkb2 == I_TP // 256 == 3
+    assert kernel.b2_sf_bytes == kernel.nkb2 * 2048
+    b_stage = n_tok * 128
+    old_slots = 1 if -(-3 * b_stage // 2048) * 2048 + 3 * 2048 <= 16384 else 2
+    assert kernel.b2_slots == old_slots and kernel.fc2_chunk == 1
 
 
 # --------------------------------------------------------------------------------------------------------------------
