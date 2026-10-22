@@ -44,6 +44,8 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     _build_mla_block_fixup,
     _mla_rope_into,
 )
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm.mapping import Mapping
 
 HIDDEN = 7168
 NOPE, ROPE, LATENT, V_DIM = 128, 64, 512, 128
@@ -85,10 +87,16 @@ def _layer(heads, g):
     def w(*shape, scale):
         return (torch.randn(*shape, generator=g, device="cuda") * scale).to(torch.bfloat16)
 
-    q_b = torch.nn.Linear(qkv.Q_LORA, heads * (NOPE + ROPE), bias=False, device="cuda").to(
-        torch.bfloat16
-    )
-    q_b.weight.data = w(heads * (NOPE + ROPE), qkv.Q_LORA, scale=qkv.Q_LORA**-0.5)
+    # The drafter's q_b: a column-parallel Linear without its output gather (TP1 here).
+    q_b = Linear(
+        qkv.Q_LORA,
+        heads * (NOPE + ROPE),
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=Mapping(),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+    ).cuda()
+    q_b.weight.data.copy_(w(heads * (NOPE + ROPE), qkv.Q_LORA, scale=qkv.Q_LORA**-0.5))
     attn = SimpleNamespace(
         q_b_proj=q_b,
         q_a_layernorm=SimpleNamespace(

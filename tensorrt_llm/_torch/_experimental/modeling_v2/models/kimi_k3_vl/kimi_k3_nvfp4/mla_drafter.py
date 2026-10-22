@@ -73,17 +73,18 @@ def ar_ceiling(rows: int) -> int:
 
 
 def _plain_linear(linear: nn.Module) -> bool:
-    """A bias-free, unquantized bf16 projection whose forward is ``F.linear(x, weight)``: no output gather, no
-    all-reduce, no LoRA."""
+    """A bias-free, unquantized bf16 projection, replicated or column-parallel without its output gather: its forward
+    is ``F.linear(x, weight)``."""
     weight = getattr(linear, "weight", None)
+    mode = getattr(getattr(linear, "tp_mode", None), "name", None)
     return (
         isinstance(weight, torch.Tensor)
         and weight.dtype == torch.bfloat16
         and getattr(linear, "bias", None) is None
         and not getattr(linear, "has_any_quant", False)
-        and not getattr(linear, "gather_output", False)
-        and not getattr(linear, "reduce_output", False)
-        and getattr(getattr(linear, "tp_mode", None), "name", "COLUMN") == "COLUMN"
+        # reduce_output only acts on a row-parallel projection, gather_output only on a column-parallel one
+        and mode in (None, "COLUMN")
+        and not (mode == "COLUMN" and getattr(linear, "gather_output", False))
     )
 
 
