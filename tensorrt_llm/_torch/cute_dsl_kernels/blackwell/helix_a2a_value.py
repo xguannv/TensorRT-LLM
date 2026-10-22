@@ -16,7 +16,7 @@ Experimental (``TRTLLM_K3LL_MK_ATTN``): a DcpValue-style tail for the Kimi-K3 He
   FP32 accumulation, the 128 x 128 block scale applied to the accumulator). The ``KS`` partial products are reduced
   through distributed shared memory: CTA ``x`` sums output columns ``[x * 128 / KS, ...)`` of every CTA of its cluster,
   rounds to BF16 and applies ``sigmoid(gate)``. The only synchronization beyond the CTA is that one cluster barrier.
-* W_UV fragments are loaded before ``griddepcontrol.wait``.
+* W_UV fragments and block scales are loaded before ``griddepcontrol.wait``, the gate right after it.
 
 Receive buffers, tickets and halves are the fused kernel's (see its module docstring).
 """
@@ -397,7 +397,12 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
         g = lane // 4
         q = lane % 4
         wb = cute.make_rmem_tensor((self.NT * self.KCH * 4,), Int32)
+        wsc = cute.make_rmem_tensor((1,), Int32)
+        wsc[0] = Int32(0)
         if by >= n_send_groups:
+            wsc[0] = _ld_nc_b32(
+                wscale_addr + Int64(head * (LATENT // 128) + (kx * self.KC) // 128) * 4
+            )
             for j in cutlass.range_constexpr(self.NT):
                 n = warp * self.NW + j * 8 + g
                 for c in cutlass.range_constexpr(self.KCH):
@@ -434,6 +439,7 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
                 head,
                 tile,
                 wb,
+                _as_f32(wsc[0]),
                 out_addr,
                 ws_addr + Int64(rank) * rank_stride + _lds_b64(half_slot),
                 wscale_addr,
@@ -454,6 +460,7 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
         head: Int32,
         tile: Int32,
         wb: cute.Tensor,
+        scale: Float32,
         out_addr: Int64,
         recv_base: Int64,
         wscale_addr: Int64,
@@ -467,6 +474,18 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
     ):
         P, RV, DV, VK, KC, LP = self.P, self.RV, self.DV, self.VK, self.KC, self.LP
         t0 = tile * TILE
+        # 0. The gate words of this thread's outputs (step 6), loaded first: off the critical path.
+        OCP = self.OC // 2
+        n_fin = _ceil_div(TILE * OCP, self.threads)
+        gw = cute.make_rmem_tensor((n_fin,), Int32)
+        for it in cutlass.range_constexpr(n_fin):
+            i = tidx + it * self.threads
+            rr = i // OCP
+            tt = t0 + rr
+            gw[it] = Int32(0)
+            if (i < TILE * OCP) & (tt < num_tokens):
+                col = kx * self.OC + 2 * (i - rr * OCP)
+                gw[it] = _ld_nc_b32(gate_addr + Int64(tt * gate_stride + head * VDIM + col) * 2)
         # 1. This thread's column (token r of the tile, 16-byte vector v of the CTA's columns): issue the loads of
         #    the P sources before the statistics.
         r = tidx // VK
@@ -570,9 +589,6 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
                     )
                     for e in cutlass.range_constexpr(4):
                         acc4[j * 4 + e] = d[e]
-        scale = _as_f32(
-            _ld_nc_b32(wscale_addr + Int64(head * (LATENT // 128) + (kx * KC) // 128) * 4)
-        )
         # 5. Partial products to the owner CTA of each output column (distributed shared memory), one cluster barrier.
         for j in cutlass.range_constexpr(self.NT):
             col = warp * self.NW + j * 8 + 2 * q
@@ -588,8 +604,7 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
                 )
         _cluster_sync()
         # 6. This CTA's output columns: sum the KS partials, round to BF16, gate, store.
-        OCP = self.OC // 2
-        for it in cutlass.range_constexpr(_ceil_div(TILE * OCP, self.threads)):
+        for it in cutlass.range_constexpr(n_fin):
             i = tidx + it * self.threads
             rr = i // OCP
             cp = i - rr * OCP
@@ -603,9 +618,7 @@ class HelixA2AValueKernel(HelixA2AFusedKernel):
                     s1 = _fadd(s1, _lds_f32(a + 4))
                 p0, p1 = _bf16x2_f32(_pack_bf16x2(s0, s1))
                 col = kx * self.OC + 2 * cp
-                g0, g1 = _bf16x2_f32(
-                    _ld_nc_b32(gate_addr + Int64(tt * gate_stride + head * VDIM + col) * 2)
-                )
+                g0, g1 = _bf16x2_f32(gw[it])
                 o = _pack_bf16x2(_fmul(p0, _sigmoid(g0)), _fmul(p1, _sigmoid(g1)))
                 _st_b32(out_addr + Int64(tt * self.H * VDIM + head * VDIM + col) * 2, o)
         # 7. Every CTA of the cluster has read the statistics (before the cluster barrier): CTA 0 re-arms them.
