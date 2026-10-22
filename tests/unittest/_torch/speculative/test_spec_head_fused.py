@@ -24,7 +24,9 @@ whole:
 * switch off (unset or 0): the fused kernel is never launched and every buffer equals the torch ops' result;
 * switch on: every buffer equals the switch-off arm's, eagerly and from a CUDA graph of each arm replayed with every
   input rewritten in place; a replay of the same inputs is bit-identical;
-* switch on, a step the kernel does not cover (context tokens in the batch): the torch path runs.
+* switch on, a step the kernel does not cover (context tokens in the batch): the torch path runs;
+* the runner's fused head-prep count (what its log reports) counts each fused ``_preprocess_inputs`` call Python
+  runs, a CUDA graph capture among them, and no graph replay.
 
 Batch 1, 2 and 4 at draft length 7 (8 tokens per row); Helix16 at CP ranks 0, 5 and 15 with 64-token pages and
 positions straddling page and ledger boundaries, the overlap scheduler on and off, and the TP16 shape (no Helix).
@@ -113,6 +115,7 @@ class Step:
         meta = _metadata_cls()
         md.helix_local_len_vec = types.MethodType(meta.helix_local_len_vec, md)
         md.recompute_helix_spec_buffers = types.MethodType(meta.recompute_helix_spec_buffers, md)
+        # Every DecoderRunner attribute _preprocess_inputs reads on this path, as __init__ sets it.
         runner = types.SimpleNamespace(
             _config=types.SimpleNamespace(disable_overlap_scheduler=not overlap),
             mapping=mapping,
@@ -121,7 +124,10 @@ class Step:
             get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
             guided_decoder=None,
             _spec_head_fused=fused,
+            _spec_head_fused_steps=0,
+            _spec_head_fused_captures=0,
         )
+        self.runner = runner
         cls = _runner_cls()
         runner._fused_spec_head_prep = types.MethodType(cls._fused_spec_head_prep, runner)
         self.preprocess = types.MethodType(cls._preprocess_inputs, runner)
@@ -156,6 +162,10 @@ class Step:
 
     def run(self):
         self.preprocess(self.inputs, enable_spec_decode=True, runtime_draft_len=DRAFT_LEN)
+
+    def fused_counts(self):
+        """The runner's count of fused head preps: (all, under CUDA graph capture)."""
+        return self.runner._spec_head_fused_steps, self.runner._spec_head_fused_captures
 
 
 def torch_reference(st: Step):
@@ -221,6 +231,7 @@ def test_switch_off_unchanged(monkeypatch, batch, label, helix, cp_rank, overlap
     st.run()
     torch.cuda.synchronize()
     assert not diff(want, st.bufs), diff(want, st.bufs)
+    assert st.fused_counts() == (0, 0)
 
 
 @pytest.mark.parametrize("batch,label,helix,cp_rank,overlap", CASES, ids=IDS)
@@ -239,6 +250,7 @@ def test_switch_on_equals_off(batch, label, helix, cp_rank, overlap):
     on.run()
     torch.cuda.synchronize()
     assert not diff(off.bufs, on.bufs), ("eager rerun", diff(off.bufs, on.bufs))
+    assert on.fused_counts() == (2, 0) and off.fused_counts() == (0, 0)
 
     graphs = []
     stream = torch.cuda.Stream()
@@ -250,6 +262,8 @@ def test_switch_on_equals_off(batch, label, helix, cp_rank, overlap):
                 st.run()
             graphs.append(graph)
     torch.cuda.synchronize()
+    # The capture runs Python once; the replays below rerun the captured launch without it.
+    assert on.fused_counts() == (3, 1) and off.fused_counts() == (0, 0)
     for replay in range(4):
         off.rewrite()
         on.rewrite()
@@ -272,6 +286,7 @@ def test_switch_on_equals_off(batch, label, helix, cp_rank, overlap):
     graphs[1].replay()
     torch.cuda.synchronize()
     assert not diff(after, on.bufs), ("same inputs replayed", diff(after, on.bufs))
+    assert on.fused_counts() == (3, 1)
 
 
 @pytest.mark.parametrize("helix", [True, False], ids=["helix16", "tp16"])
@@ -285,3 +300,4 @@ def test_switch_on_context_step_takes_torch_path(monkeypatch, helix):
     on.run()
     torch.cuda.synchronize()
     assert not diff(off.bufs, on.bufs), diff(off.bufs, on.bufs)
+    assert on.fused_counts() == (0, 0)

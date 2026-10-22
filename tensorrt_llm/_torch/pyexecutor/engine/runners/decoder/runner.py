@@ -554,7 +554,10 @@ class DecoderRunner(ScheduledModelRunner):
         self._spec_head_fused = (
             self._config.is_spec_decode and spec_head_kernels.spec_head_fusion_enabled()
         )
+        # _preprocess_inputs calls that took the fused path, all and under CUDA graph capture.
+        # A graph replay reruns the captured launch without running Python, so it is not counted.
         self._spec_head_fused_steps = 0
+        self._spec_head_fused_captures = 0
         if self._step_input_gather is not None or self._spec_head_fused:
             logger.info(
                 f"Spec decode step head: step-copy gather kernel {self._step_input_gather is not None}, "
@@ -2919,9 +2922,15 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if head_fused:
             self._spec_head_fused_steps += 1
+            if torch.cuda.is_current_stream_capturing():
+                self._spec_head_fused_captures += 1
             n = self._spec_head_fused_steps
             if n & (n - 1) == 0:
-                logger.info(f"Spec decode step head: fused head prep steps={n}")
+                logger.info(
+                    f"Spec decode step head: fused head prep steps={n} "
+                    f"(CUDA graph captures {self._spec_head_fused_captures}; "
+                    "graph replays rerun the captured launch and are not counted)"
+                )
 
         if enable_spec_decode and not head_fused and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
