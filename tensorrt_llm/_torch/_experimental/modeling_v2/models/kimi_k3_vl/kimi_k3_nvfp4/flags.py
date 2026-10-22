@@ -156,6 +156,13 @@ TRTLLM_K3LL_WIDE_LATENT_TAIL = _flag(
     "wide decode steps: MoE latent all-reduce + latent RMSNorm + the tail GEMV's input concat in one MNNVL call",
 )
 
+TRTLLM_K3LL_OPROJ_PUSH = _flag(
+    "TRTLLM_K3LL_OPROJ_PUSH",
+    0,
+    "decode steps up to 64 tokens (1; 2: wide steps only): o_proj's GEMM pushes its partial into the post-attention "
+    "all-reduce, K3LamportFinish + K3AttnResFast run the rest (oproj_push.py; read at forward time)",
+)
+
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",
     1,
