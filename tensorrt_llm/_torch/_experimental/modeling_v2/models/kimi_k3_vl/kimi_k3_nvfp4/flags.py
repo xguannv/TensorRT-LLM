@@ -109,7 +109,7 @@ TRTLLM_K3LL_KDA_BFA_ROW_TILES = _flag(
 )
 TRTLLM_K3LL_KDA_BFA_FP8 = _flag(
     "TRTLLM_K3LL_KDA_BFA_FP8",
-    0,
+    1,
     "KDA decode / verify: [q | k | v | g | f_a | b] in one k3_fp8w_lowm_gemm, the bf16 [f_a | b] weight quantized "
     "to FP8 128x128 blocks and appended to the QKVG weight (changes numerics); the weight is built at load when 1",
 )
