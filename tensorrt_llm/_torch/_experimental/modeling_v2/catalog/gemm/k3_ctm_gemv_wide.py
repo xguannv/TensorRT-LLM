@@ -12,6 +12,10 @@ def k3_ctm_gemv_wide(
     weight: torch.Tensor,
     sig_col0: int = -1,
     out_fp32: bool = False,
+    row_tiles: int = 0,
 ) -> torch.Tensor:
-    """Return `x @ weight.T` in bf16 (columns >= `sig_col0` as sigmoid) or fp32, in one call."""
-    return torch.ops.trtllm.k3_ctm_gemv_wide(x, weight, sig_col0=sig_col0, out_fp32=out_fp32)
+    """Return `x @ weight.T` in bf16 (columns >= `sig_col0` as sigmoid) or fp32, in one call; `row_tiles` > 0 runs
+    the weight rows as that many equal tiles, one cluster each."""
+    return torch.ops.trtllm.k3_ctm_gemv_wide(
+        x, weight, sig_col0=sig_col0, out_fp32=out_fp32, row_tiles=row_tiles
+    )

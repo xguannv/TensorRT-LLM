@@ -934,6 +934,25 @@ def _weight_tensor_map(w, n_out, k_in):
     )
 
 
+def _weight_tensor_map_row_tiles(w, n_out, k_in, row_tiles):
+    """W as (64-element column chunk, row in the tile, 64-element chunk index, tile, 1): ``row_tiles`` tiles of
+    ``n_out / row_tiles`` rows. The 128-row box reaches past a tile's rows; the TMA fills those rows with zeros."""
+    rows = n_out // row_tiles
+    return cuda.create_tensor_map_tiled(
+        global_address=w.iterator.toint(),
+        dtype=cutlass.BFloat16,
+        global_dims=[TMA_K_BOX, rows, k_in // TMA_K_BOX, row_tiles, 1],
+        global_strides=[
+            (k_in * ELEM_BYTES) // 16,
+            (TMA_K_BOX * ELEM_BYTES) // 16,
+            (rows * k_in * ELEM_BYTES) // 16,
+            (n_out * k_in * ELEM_BYTES) // 16,
+        ],
+        box_dims=[TMA_K_BOX, CTA_M, TMA_COPY_ITERS, 1, 1],
+        swizzle=cuda.TensorMapSwizzle.s128b,
+    )
+
+
 def _activation_tensor_map(x, cols, num_tokens):
     """x [M, cols] (rows dense) as (cols, M) with an 8-row box: rows past num_tokens arrive as zeros."""
     return cuda.create_tensor_map_tiled(
@@ -1115,6 +1134,11 @@ def k3_ctm_gemv_long(
 # them with one TMA store (tokens >= M clipped; the block holding row N - 1 when N is not a multiple of 32 has its own
 # box): bf16 in the x ring (free once the MMAs are done; rows >= sig_row0 as bf16(sigmoid(bf16(acc)))), or fp32
 # (OUT_FP32: the MoE head's router logits) in place of its own slot.
+# Row tiles (ROW_TILES > 0, bf16 output without sigmoid rows): the N weight rows form ROW_TILES tiles of
+# R = N / ROW_TILES <= 128 rows, one cluster each. The weight's tensor map is 4-D (column, row in the tile, k-chunk,
+# tile), so each 128-row box holds the tile's R rows and zeros (rows past R are out of bounds: the TMA fills them
+# without reading memory). Only rows < R are sent and reduced, and each thread stores its row's owned tokens with
+# plain stores. A row's sums are those of the same split without row tiles (same k-tiles per rank, same rank order).
 # =============================================================================
 WIDE_TILES = (16, 32, 64)
 WIDE_SMEM_BYTES = 220 * 1024  # the ring, the x stages and the mailbox; the barriers fit in the rest
@@ -1139,11 +1163,21 @@ def wide_smem_bytes(split: int, ring: int, n_tile: int, x_ring: int) -> int:
     ) * CTA_K * ELEM_BYTES + split * CTA_M * wide_owned_tokens(n_tile, split) * 4
 
 
-def wide_supports(n_out: int, k_in: int, split: int, ring: int, n_tile: int, x_ring: int) -> bool:
+def row_tiles_supported(n_out: int, row_tiles: int) -> bool:
+    """Row tiles: 0 (128-row tiles), or a count that splits N into equal tiles of at most 128 rows."""
+    return row_tiles == 0 or (
+        row_tiles > 0 and n_out % row_tiles == 0 and n_out // row_tiles <= CTA_M
+    )
+
+
+def wide_supports(
+    n_out: int, k_in: int, split: int, ring: int, n_tile: int, x_ring: int, row_tiles: int = 0
+) -> bool:
     """K in whole 64-column halves (a last half k-tile reads zeros past K, as in the long kernel); N a multiple of 8
-    (the output rows of a token are a whole number of 16-byte units for the TMA store)."""
+    (the output rows of a token are a whole number of 16-byte units for the TMA store); see row_tiles_supported."""
     return (
-        k_in % TMA_K_BOX == 0
+        row_tiles_supported(n_out, row_tiles)
+        and k_in % TMA_K_BOX == 0
         and n_out % 8 == 0
         and n_tile in WIDE_TILES
         and (split == 2 or 4 <= split <= 8)
@@ -1173,6 +1207,8 @@ def k3_ctm_gemv_wide_kernel(
         cuda.TensorMap
     ],  # y [M, N] bf16 (fp32 with out_fp32), box 32 x T
     tma_desc_y_tail: cutlass.GridConstant[cuda.TensorMap],  # the same, box (N % 32 or 32) x T
+    y: cutlass.Array,  # [M * N] bf16, token-major (the plain stores of row tiles)
+    num_tokens: cutlass.Int32,
     sig_row0: cutlass.Int32,  # bf16 output: rows >= sig_row0 store bf16(sigmoid(bf16(acc))); n_out: none
     n_out: cutlass.Constexpr[int],
     k_in: cutlass.Constexpr[int],
@@ -1182,6 +1218,9 @@ def k3_ctm_gemv_wide_kernel(
     n_tile: cutlass.Constexpr[int],
     out_fp32: cutlass.Constexpr[bool],
     trigger_early: cutlass.Constexpr[bool],
+    row_tiles: cutlass.Constexpr[
+        int
+    ],  # 0: 128-row tiles; else N / row_tiles rows per tile (tensor map 4-D)
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1201,6 +1240,13 @@ def k3_ctm_gemv_wide_kernel(
     tma_ptr_y = tma_desc_y.get_ptr()
     tma_ptr_y_tail = tma_desc_y_tail.get_ptr()
     m_offset = (bx // cutlass.Int32(split)) * cutlass.Int32(CTA_M)
+    # The weight box's (row, tile) coordinates and the rows this cluster reduces and stores.
+    tile_rows = n_out // row_tiles if row_tiles > 0 else CTA_M
+    w_row0 = m_offset
+    w_tile = cutlass.Int32(0)
+    if cutlass.const_expr(row_tiles > 0):
+        w_row0 = cutlass.Int32(0)
+        w_tile = bx // cutlass.Int32(split)
     my_tiles = cutlass.Int32(k_tiles // split)
     if cutlass.const_expr(extra > 0):
         if rank < cutlass.Int32(extra):
@@ -1246,7 +1292,7 @@ def k3_ctm_gemv_wide_kernel(
             prims.mbarrier_init(mail_full, 1)
             if my_owned > cutlass.Int32(0):
                 prims.mbarrier_arrive_expect_tx(
-                    mail_full, cutlass.Int32((split - 1) * CTA_M * 4) * my_owned
+                    mail_full, cutlass.Int32((split - 1) * tile_rows * 4) * my_owned
                 )
     if warp_id == 2:
         prims.tcgen05_alloc(tmem_ptr_i32, tmem_cols)
@@ -1272,9 +1318,9 @@ def k3_ctm_gemv_wide_kernel(
                     tma_ptr_w,
                     (
                         cutlass.Int32(0),
-                        m_offset,
+                        w_row0,
                         k * cutlass.Int32(TMA_COPY_ITERS),
-                        cutlass.Int32(0),
+                        w_tile,
                         cutlass.Int32(0),
                     ),
                     a_full.subview(i),
@@ -1286,9 +1332,9 @@ def k3_ctm_gemv_wide_kernel(
                     tma_ptr_w,
                     [
                         cutlass.Int32(0),
-                        m_offset,
+                        w_row0,
                         k * cutlass.Int32(TMA_COPY_ITERS),
-                        cutlass.Int32(0),
+                        w_tile,
                         cutlass.Int32(0),
                     ],
                     [],  # tile mode: no im2col offsets
@@ -1309,9 +1355,9 @@ def k3_ctm_gemv_wide_kernel(
                     tma_ptr_w,
                     (
                         cutlass.Int32(0),
-                        m_offset,
+                        w_row0,
                         k * cutlass.Int32(TMA_COPY_ITERS),
-                        cutlass.Int32(0),
+                        w_tile,
                         cutlass.Int32(0),
                     ),
                     a_full.subview(stage),
@@ -1474,7 +1520,7 @@ def k3_ctm_gemv_wide_kernel(
                             vector_size=4,
                             alignment=16,
                         )  # fmt: skip
-                    else:
+                    elif row < cutlass.Int32(tile_rows):
                         _st_async_v4(
                             peer_slots[r] + ((cutlass.Int32(j) ^ swz) << cutlass.Int32(4)),
                             acc[t], acc[t + 1], acc[t + 2], acc[t + 3], peer_mbars[r],
@@ -1496,49 +1542,65 @@ def k3_ctm_gemv_wide_kernel(
                     )  # fmt: skip
                     for e in cutlass.range_constexpr(4):
                         totals[4 * j + e] = totals[4 * j + e] + cutlass.Float32(part[e])
-            # [token][rows] staging of the warp's rows below N, one TMA store (tokens >= M clipped).
-            n0 = m_offset + w * cutlass.Int32(LONG_ROWS_PER_WARP)
-            tail_block = n0 + cutlass.Int32(LONG_ROWS_PER_WARP) > cutlass.Int32(n_out)
-            pitch = cutlass.Int32(LONG_ROWS_PER_WARP)
-            if tail_block:
-                pitch = cutlass.Int32(tail_rows)
-            t0 = rank * cutlass.Int32(owned)
-            if cutlass.const_expr(out_fp32):
-                # In place of this rank's own slot, rows of this warp only (read above by this warp alone).
-                staged = mailbox.subview(
-                    rank * cutlass.Int32(slot_elems) + w * cutlass.Int32(LONG_ROWS_PER_WARP * owned)
-                )
-                cute.arch.sync_warp()
+            if cutlass.const_expr(row_tiles > 0):
+                # Row tiles: this row's owned tokens below M, plain stores.
+                if row < cutlass.Int32(tile_rows):
+                    n = w_tile * cutlass.Int32(tile_rows) + row
+                    t0 = rank * cutlass.Int32(owned)
+                    for i in cutlass.range_constexpr(owned):
+                        if t0 + cutlass.Int32(i) < num_tokens:
+                            y.store(
+                                totals[i].to(io_dtype),
+                                idx=(t0 + cutlass.Int32(i)) * cutlass.Int32(n_out) + n,
+                            )
             else:
-                staged = smem_b.subview(w * cutlass.Int32(LONG_ROWS_PER_WARP * owned))
-            if n0 < cutlass.Int32(n_out):
-                if lane < pitch:
-                    if cutlass.const_expr(out_fp32):
-                        for i in cutlass.range_constexpr(owned):
-                            staged.store(totals[i], idx=cutlass.Int32(i) * pitch + lane)
-                    else:
-                        if n0 + lane >= sig_row0:
+                # [token][rows] staging of the warp's rows below N, one TMA store (tokens >= M clipped).
+                n0 = m_offset + w * cutlass.Int32(LONG_ROWS_PER_WARP)
+                tail_block = n0 + cutlass.Int32(LONG_ROWS_PER_WARP) > cutlass.Int32(n_out)
+                pitch = cutlass.Int32(LONG_ROWS_PER_WARP)
+                if tail_block:
+                    pitch = cutlass.Int32(tail_rows)
+                t0 = rank * cutlass.Int32(owned)
+                if cutlass.const_expr(out_fp32):
+                    # In place of this rank's own slot, rows of this warp only (read above by this warp alone).
+                    staged = mailbox.subview(
+                        rank * cutlass.Int32(slot_elems)
+                        + w * cutlass.Int32(LONG_ROWS_PER_WARP * owned)
+                    )
+                    cute.arch.sync_warp()
+                else:
+                    staged = smem_b.subview(w * cutlass.Int32(LONG_ROWS_PER_WARP * owned))
+                if n0 < cutlass.Int32(n_out):
+                    if lane < pitch:
+                        if cutlass.const_expr(out_fp32):
                             for i in cutlass.range_constexpr(owned):
-                                staged.store(
-                                    _sigmoid_bf16(_bf16_rn(totals[i])).to(io_dtype), idx=cutlass.Int32(i) * pitch + lane
-                                )  # fmt: skip
+                                staged.store(totals[i], idx=cutlass.Int32(i) * pitch + lane)
                         else:
-                            for i in cutlass.range_constexpr(owned):
-                                staged.store(
-                                    totals[i].to(io_dtype), idx=cutlass.Int32(i) * pitch + lane
-                                )
-                # Generic-proxy writes of the staged rows -> the TMA store's async-proxy reads.
-                prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-                cute.arch.sync_warp()
-                if lane == 0:
-                    if tail_block:
-                        prims.cp_async_bulk_tensor_global_shared_cta(
-                            tma_ptr_y_tail, staged, [n0, t0]
-                        )
-                    else:
-                        prims.cp_async_bulk_tensor_global_shared_cta(tma_ptr_y, staged, [n0, t0])
-                    prims.cp_async_bulk_commit_group()
-                    prims.cp_async_bulk_wait_group(0, read=True)
+                            if n0 + lane >= sig_row0:
+                                for i in cutlass.range_constexpr(owned):
+                                    staged.store(
+                                        _sigmoid_bf16(_bf16_rn(totals[i])).to(io_dtype),
+                                        idx=cutlass.Int32(i) * pitch + lane,
+                                    )
+                            else:
+                                for i in cutlass.range_constexpr(owned):
+                                    staged.store(
+                                        totals[i].to(io_dtype), idx=cutlass.Int32(i) * pitch + lane
+                                    )
+                    # Generic-proxy writes of the staged rows -> the TMA store's async-proxy reads.
+                    prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        if tail_block:
+                            prims.cp_async_bulk_tensor_global_shared_cta(
+                                tma_ptr_y_tail, staged, [n0, t0]
+                            )
+                        else:
+                            prims.cp_async_bulk_tensor_global_shared_cta(
+                                tma_ptr_y, staged, [n0, t0]
+                            )
+                        prims.cp_async_bulk_commit_group()
+                        prims.cp_async_bulk_wait_group(0, read=True)
         prims.barrier_cta_sync(1, thread_count=EPI_THREADS)
         if warp_id == 4:
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols)
@@ -1586,20 +1648,26 @@ def k3_ctm_gemv_wide(
     trigger_early: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
+    row_tiles: cutlass.Constexpr[int] = 0,
 ) -> None:
-    """``y = x @ w^T`` for up to ``n_tile`` tokens; bf16 output rows >= sig_row0 hold bf16(sigmoid(bf16(.)))."""
+    """``y = x @ w^T`` for up to ``n_tile`` tokens; bf16 output rows >= sig_row0 hold bf16(sigmoid(bf16(.))).
+    ``row_tiles`` > 0: that many tiles of N / row_tiles rows, one cluster each (bf16 output, no sigmoid rows)."""
     owned = wide_owned_tokens(n_tile, split)
-    tma_desc_w = _weight_tensor_map(w, n_out, k_in)
+    if cutlass.const_expr(row_tiles > 0):
+        tma_desc_w = _weight_tensor_map_row_tiles(w, n_out, k_in, row_tiles)
+    else:
+        tma_desc_w = _weight_tensor_map(w, n_out, k_in)
     tma_desc_x = _activation_tensor_map_rows(x, k_in, num_tokens, n_tile)
     tma_desc_y = _output_tensor_map(y, n_out, num_tokens, owned, out_fp32)
     tma_desc_y_tail = _output_tensor_map(
         y, n_out, num_tokens, owned, out_fp32, n_out % LONG_ROWS_PER_WARP or LONG_ROWS_PER_WARP
     )
+    clusters = row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M
     k3_ctm_gemv_wide_kernel(
-        tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, sig_row0, n_out, k_in, split, ring, x_ring, n_tile,
-        out_fp32, trigger_early,
+        tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
+        n_tile, out_fp32, trigger_early, row_tiles,
     ).launch(
-        grid=(((n_out + CTA_M - 1) // CTA_M) * split, 1, 1),
+        grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
         cluster=(split, 1, 1),
         stream=stream,

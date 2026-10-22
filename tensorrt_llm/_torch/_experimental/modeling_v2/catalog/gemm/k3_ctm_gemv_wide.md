@@ -13,7 +13,8 @@ The `k3_ctm_gemv_long` GEMV for up to 64 bf16 tokens (a wide decode step, e.g. s
 requests): all `M` token columns go through one tensor-core MMA of 16, 32 or 64 columns, the smallest that holds
 `M`, on the long kernel's split-K clusters and weight ring. Split and ring are not arguments; the op picks them
 from the shape and the device. Output columns from `sig_col0` on can hold the sigmoid of the product, or the whole
-output can be fp32.
+output can be fp32. With `row_tiles > 0` the `N` weight rows are taken as that many equal tiles of `N / row_tiles`
+rows (at most 128) instead of 128-row blocks, one cluster each: more CTAs for a short `N`, the same bits.
 
 ```
 acc[m, n] = sum_k x[m, k] * weight[n, k]       fp32 accumulation, 0 <= m < M <= 64, 0 <= n < N
@@ -35,6 +36,12 @@ the same split, with any ring and either transport, and it does not depend on `M
 to bf16, takes the sigmoid in fp32 (IEEE division, full-precision `exp`) and rounds again: its bits are exactly
 `torch.sigmoid` of the bf16 value the same call returns with `sig_col0=-1`.
 
+Row tiles (`row_tiles > 0`, bf16 output without sigmoid columns): each cluster reduces the rows of one tile of
+`N / row_tiles` rows; the 128-row weight box reaches past the tile's rows, which the TMA fills with zeros without
+reading memory. The split comes from `wide_config` with `row_tiles` clusters in place of `ceil(N / 128)`, and a
+row's sums are those listed above at that split; where it equals the split without row tiles (all certified
+row-tile cells), the output is bit-identical to the call without row tiles.
+
 The split follows the device's SM count, so the bits can differ between devices with different SM counts. On
 148- and 152-SM devices the certified shapes run at the splits listed under *Certified arguments*.
 
@@ -50,6 +57,7 @@ def k3_ctm_gemv_wide(
     weight: torch.Tensor,
     sig_col0: int = -1,
     out_fp32: bool = False,
+    row_tiles: int = 0,
 ) -> torch.Tensor
 ```
 
@@ -59,6 +67,7 @@ def k3_ctm_gemv_wide(
 | `weight` | `[N, K]` (`nn.Linear` layout) | bf16 | contiguous, 16-byte-aligned start | CUDA, `x`'s device |
 | `sig_col0` | scalar | int: first sigmoid column, `< N`; `< 0`: none | — | — |
 | `out_fp32` | scalar | bool: fp32 output, no rounding (needs `sig_col0 < 0`) | — | — |
+| `row_tiles` | scalar | int: `0` (128-row blocks) or a count dividing `N` into tiles of at most 128 rows (needs `sig_col0 < 0`, `out_fp32=False`) | — | — |
 | returns | `[M, N]` | bf16, or fp32 with `out_fp32` | newly allocated, contiguous | `x`'s device |
 
 Every element of the returned tensor is written; the inputs are not mutated.
@@ -93,7 +102,10 @@ bit-identical to the same rows of the 64-row call. Also certified:
   True), at `M` 1..8 and 16, 24, ..., 64: every token's row is bit-identical to `k3_ctm_gemv_long`'s for that
   token, in calls of up to 8 tokens, wherever the device's split equals that call's (all five at 148 or 152 SMs);
 - at the MLA `[W_a; W_g]` and MoE head cells, `M` 1 and 64: calls captured in a CUDA graph after an eager call per
-  key, replayed with `x` rewritten in place, return the bits of eager calls on the new `x`.
+  key, replayed with `x` rewritten in place, return the bits of eager calls on the new `x`;
+- row tiles, at every `M` in 1..64: KDA `[f_a | b]` (`N` 136, `K` 7168) with `row_tiles` 2, 4 and 8 (tiles of 68,
+  34 and 17 rows; split 8 at 148 / 152 SMs) and drafter qkv (`N` 512) with `row_tiles` 8: bit-identical to the call
+  without row tiles.
 
 Other shapes the preconditions admit are accepted but not certified.
 
@@ -103,7 +115,7 @@ None. The op reads no attention metadata, KV cache or module state; every input 
 runs on the current CUDA stream of `x`'s device. The device's SM count enters through `wide_config`.
 
 One process-global cache sits behind it, and it is result-neutral: the compiled kernel per key
-`(N, K, split, ring, activation ring, token tile, out_fp32, PDL on/off)`, where split and the rings follow from
+`(N, K, split, ring, activation ring, token tile, out_fp32, PDL on/off, row_tiles)`, where split and the rings follow from
 `(N, K, token tile)` and the SM count. On one device that is one compile per `(N, K, out_fp32)` and token tile
 (16 for `M <= 16`, 32 for `M <= 32`, 64 above). The first call with a new key compiles the kernel with the CuTe
 DSL, which costs host time; `M` within a token tile and `sig_col0` are runtime arguments and never recompile. That
@@ -121,11 +133,13 @@ The op checks these and raises `ValueError` ("k3_ctm_gemv_wide: unsupported call
   aligned.
 - `sig_col0 < N`, and `sig_col0 < 0` when `out_fp32`.
 - `K % 64 == 0` and `N % 8 == 0`.
-- A split exists: `2 * ceil(N / 128) <= SM count` and `ceil(K / 128) >= 2`. On a 148-SM device that is
-  `N <= 9472`.
+- A split exists: `2 * ceil(N / 128) <= SM count` (`2 * row_tiles` with row tiles) and `ceil(K / 128) >= 2`. On a
+  148-SM device that is `N <= 9472`.
+- `row_tiles` is `0`, or divides `N` with `N / row_tiles <= 128`, and then `sig_col0 < 0` and `out_fp32` is False.
 
 Certified refusals, at `N = 3208`, `K = 7168`: 0 and 65 rows, an `x` starting 2 bytes past a 16-byte boundary,
-`sig_col0 = N`, `sig_col0 = 100` with `out_fp32`, `N = 3204`, `K = 7136`, and fp16 `x`.
+`sig_col0 = N`, `sig_col0 = 100` with `out_fp32`, `N = 3204`, `K = 7136`, and fp16 `x`; at `N = 136`: `row_tiles`
+3 and 1, and `row_tiles` 4 with `sig_col0 = 100` or with `out_fp32`.
 
 Not checked by the op:
 
@@ -151,6 +165,6 @@ Not checked by the op:
   on `M` or the PDL setting.
 - The result is not bit-identical to cuBLAS: `F.linear` sums in another order. The two agree within the
   tolerances above.
-- Grid: `ceil(N / 128) * split` CTAs of 256 threads in clusters of `split`; the choice of split keeps that at
-  most the SM count.
+- Grid: `ceil(N / 128) * split` CTAs (`row_tiles * split` with row tiles) of 256 threads in clusters of `split`;
+  the choice of split keeps that at most the SM count.
 - Only sm_100 has been measured.

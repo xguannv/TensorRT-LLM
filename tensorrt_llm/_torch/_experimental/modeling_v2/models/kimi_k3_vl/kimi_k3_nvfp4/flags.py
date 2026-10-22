@@ -101,6 +101,12 @@ TRTLLM_K3LL_KDA_BFA_FIRST = _flag(
     "KDA decode / verify: the bf16 [f_a | b] projection on the model's stream ahead of the FP8 QKVG projection "
     "(both stream their weights early under PDL); takes precedence over TRTLLM_K3LL_KDA_BFA_OVERLAP",
 )
+TRTLLM_K3LL_KDA_BFA_ROW_TILES = _flag(
+    "TRTLLM_K3LL_KDA_BFA_ROW_TILES",
+    0,
+    "with TRTLLM_K3LL_KDA_BFA_GEMV: the [f_a | b] projection on decode_gemv site kda_bfa_rt (k3_ctm_gemv_wide over "
+    "equal row tiles, more CTAs, the same bits); the site is built at load when this is 1",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

@@ -23,7 +23,8 @@ column window of a dense bf16 matrix (the MLA output gate inside the fused q_a/k
 prefetch before the grid-dependency wait); output columns >= ``sig_col0`` hold ``bf16(sigmoid(bf16(.)))``.
 ``trtllm::k3_ctm_gemv_swiglu``: ``silu_and_mul(gu) @ weight^T`` with the activation in the B prologue.
 ``trtllm::k3_ctm_gemv_wide``: ``x @ weight^T`` for up to 64 tokens in one MMA of 16, 32 or 64 token columns, on the
-long kernel's split-K clusters (bf16 output with optional sigmoid columns, or fp32 output).
+long kernel's split-K clusters (bf16 output with optional sigmoid columns, or fp32 output); with ``row_tiles`` the
+weight rows split into that many equal tiles of at most 128 rows, one cluster each (more CTAs for a short N).
 
 ``push`` (the split-K ops) chooses how a cluster's ranks send their fp32 partials to the row owner: DSMEM
 stores + a release arrive (False) or 16-byte st.async completing the owner's barrier by bytes (True). The
@@ -396,19 +397,23 @@ def _(x, weight, sig_col0=-1, split=6, ring=5, trigger_early=True, push=False):
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
 
 
-def wide_config(n_out: int, k_in: int, n_tile: int, num_sms: int) -> Optional[tuple]:
+def wide_config(
+    n_out: int, k_in: int, n_tile: int, num_sms: int, row_tiles: int = 0
+) -> Optional[tuple]:
     """``(split, ring, x_ring)`` of a ``k3_ctm_gemv_wide`` call, or None: the largest cluster whose CTAs fit one wave,
     then the deepest weight ring that fits shared memory beside an x ring of up to 3 stages. At the call sites that run
     ``k3_ctm_gemv_long`` at most 8 tokens (MLA [W_a; W_g] 6, dense gate_up 4, dense down 2, drafter 8) this is their
-    split, so a token's sums are the same."""
+    split, so a token's sums are the same. ``row_tiles`` > 0 replaces the 128-row tiles by that many tiles."""
     from . import k3_ctm_gemv_kernel as kernel
 
-    tiles = (n_out + kernel.CTA_M - 1) // kernel.CTA_M
+    if not kernel.row_tiles_supported(n_out, row_tiles):
+        return None
+    tiles = row_tiles or (n_out + kernel.CTA_M - 1) // kernel.CTA_M
     for split in (8, 7, 6, 5, 4, 2):
         if tiles * split > num_sms:
             continue
         for ring in range(kernel.num_k_tiles(k_in) // split, 0, -1):
-            if kernel.wide_supports(n_out, k_in, split, ring, n_tile, min(ring, 3)):
+            if kernel.wide_supports(n_out, k_in, split, ring, n_tile, min(ring, 3), row_tiles):
                 return split, ring, min(ring, 3)
     return None
 
@@ -418,9 +423,14 @@ def _num_sms(device: torch.device) -> int:
 
 
 def supports_wide(
-    x: torch.Tensor, weight: torch.Tensor, sig_col0: int = -1, out_fp32: bool = False
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sig_col0: int = -1,
+    out_fp32: bool = False,
+    row_tiles: int = 0,
 ) -> bool:
-    """Whether ``k3_ctm_gemv_wide`` runs ``x @ weight^T``."""
+    """Whether ``k3_ctm_gemv_wide`` runs ``x @ weight^T`` (``row_tiles`` > 0: bf16 output without sigmoid columns,
+    N a multiple of ``row_tiles`` in tiles of at most 128 rows)."""
     from . import k3_ctm_gemv_kernel as kernel
 
     if not (
@@ -437,42 +447,53 @@ def supports_wide(
         and weight.data_ptr() % 16 == 0
         and sig_col0 < weight.shape[0]
         and (sig_col0 < 0 or not out_fp32)
+        and (row_tiles == 0 or (sig_col0 < 0 and not out_fp32))
     ):
         return False
     n_tile = kernel.wide_tile(x.shape[0])
-    return wide_config(weight.shape[0], weight.shape[1], n_tile, _num_sms(x.device)) is not None
+    return (
+        wide_config(weight.shape[0], weight.shape[1], n_tile, _num_sms(x.device), row_tiles)
+        is not None
+    )
 
 
 @torch.library.custom_op("trtllm::k3_ctm_gemv_wide", mutates_args=())
 def k3_ctm_gemv_wide(
-    x: torch.Tensor, weight: torch.Tensor, sig_col0: int = -1, out_fp32: bool = False
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sig_col0: int = -1,
+    out_fp32: bool = False,
+    row_tiles: int = 0,
 ) -> torch.Tensor:
     """``x @ weight.T`` for bf16 ``x`` [M <= 64, K] and ``weight`` [N, K], all M tokens in one MMA of N = 16, 32 or 64
     columns (the long kernel's split-K clusters and weight ring, the partials reduced by token; split and ring from
     ``wide_config``). Returns bf16
     [M, N], whose columns >= ``sig_col0`` (if >= 0) hold ``bf16(sigmoid(bf16(x @ weight.T)))``, or fp32 [M, N] with
-    ``out_fp32``."""
-    if not supports_wide(x, weight, sig_col0, out_fp32):
+    ``out_fp32``. ``row_tiles`` > 0 (bf16, no sigmoid columns): the N rows in that many tiles of N / row_tiles rows,
+    one cluster of ``split`` CTAs each, with the sums of the same split without row tiles."""
+    if not supports_wide(x, weight, sig_col0, out_fp32, row_tiles):
         raise ValueError(
             f"k3_ctm_gemv_wide: unsupported call x {tuple(x.shape)} {x.dtype}, weight {tuple(weight.shape)} "
-            f"{weight.dtype}, sig_col0 {sig_col0}, out_fp32 {out_fp32}"
+            f"{weight.dtype}, sig_col0 {sig_col0}, out_fp32 {out_fp32}, row_tiles {row_tiles}"
         )
     from . import k3_ctm_gemv_kernel as kernel
 
     n_tile = kernel.wide_tile(x.shape[0])
-    split, ring, x_ring = wide_config(weight.shape[0], weight.shape[1], n_tile, _num_sms(x.device))
-    return _launch_wide(x, weight, sig_col0, out_fp32, split, ring, x_ring)
+    split, ring, x_ring = wide_config(
+        weight.shape[0], weight.shape[1], n_tile, _num_sms(x.device), row_tiles
+    )
+    return _launch_wide(x, weight, sig_col0, out_fp32, split, ring, x_ring, row_tiles=row_tiles)
 
 
 def _launch_wide(
-    x, weight, sig_col0, out_fp32, split, ring, x_ring, trigger_early=True
+    x, weight, sig_col0, out_fp32, split, ring, x_ring, trigger_early=True, row_tiles=0
 ) -> torch.Tensor:
     from . import k3_ctm_gemv_kernel as kernel
 
     num_tokens, k_in = x.shape
     n_out = weight.shape[0]
     n_tile = kernel.wide_tile(num_tokens)
-    if not kernel.wide_supports(n_out, k_in, split, ring, n_tile, x_ring):
+    if not kernel.wide_supports(n_out, k_in, split, ring, n_tile, x_ring, row_tiles):
         raise ValueError(
             f"k3_ctm_gemv_wide: split {split}, rings {ring} / {x_ring} do not fit weight {tuple(weight.shape)} at "
             f"{n_tile} tokens"
@@ -485,16 +506,16 @@ def _launch_wide(
     use_pdl = _use_pdl()
     sig_row0 = sig_col0 if sig_col0 >= 0 else n_out
     fn = _compile(
-        ("k3_ctm_gemv_wide", n_out, k_in, split, ring, x_ring, n_tile, out_fp32, trigger_early, use_pdl),
+        ("k3_ctm_gemv_wide", n_out, k_in, split, ring, x_ring, n_tile, out_fp32, trigger_early, use_pdl, row_tiles),
         kernel.k3_ctm_gemv_wide, *args, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring, n_tile, out_fp32,
-        trigger_early, use_pdl, stream,
+        trigger_early, use_pdl, stream, row_tiles,
     )  # fmt: skip
     fn(*args, num_tokens, sig_row0, stream)
     return y
 
 
 @k3_ctm_gemv_wide.register_fake
-def _(x, weight, sig_col0=-1, out_fp32=False):
+def _(x, weight, sig_col0=-1, out_fp32=False, row_tiles=0):
     return x.new_empty(
         (x.shape[0], weight.shape[0]), dtype=torch.float32 if out_fp32 else torch.bfloat16
     )

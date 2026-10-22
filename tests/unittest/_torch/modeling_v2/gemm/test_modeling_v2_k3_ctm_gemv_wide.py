@@ -6,7 +6,9 @@ The Kimi K3 TP16 per-rank shapes of the projections of a wide decode step, at ev
 (sig_col0=-1) output against an fp64 product of the same bf16 inputs, the sigmoid columns torch.sigmoid of that
 output bit for bit, identical bits on a repeated call, and each M's rows bit-identical to the same rows of the
 64-row call. Where the device's split equals a k3_ctm_gemv_long call site's, every token's row carries that op's
-bits; a CUDA-graph replay returns the eager bits; calls outside the op's preconditions raise ValueError.
+bits; a CUDA-graph replay returns the eager bits; calls outside the op's preconditions raise ValueError. With
+row_tiles (the weight rows as equal tiles of at most 128 rows, one cluster each), every M's output is bit-identical to
+the call without row tiles at the same split.
 """
 
 import pytest
@@ -160,6 +162,23 @@ def test_cuda_graph_replay_matches_eager() -> None:
         assert torch.equal(_bits(y), _bits(eager)), f"{cell}: the replay differs from an eager call"
 
 
+# (N, K, row tiles): KDA's [f_a | b] (136 rows) as 2, 4 and 8 tiles of 68, 34 and 17 rows, and drafter qkv (512 rows)
+# as 8 tiles of 64.
+ROW_TILE_CELLS = [(136, 7168, 2), (136, 7168, 4), (136, 7168, 8), (512, 7168, 8)]
+
+
+@pytest.mark.parametrize("n,k,row_tiles", ROW_TILE_CELLS)
+def test_row_tiles_match_128_row_tiles(n: int, k: int, row_tiles: int) -> None:
+    w = _weight(n, k)
+    x = _rows(k)
+    for m in M_ALL:
+        y = k3_ctm_gemv_wide(x[:m], w, row_tiles=row_tiles)
+        ref = k3_ctm_gemv_wide(x[:m], w)
+        assert torch.equal(_bits(y), _bits(ref)), f"N {n} row_tiles {row_tiles} M {m}: bits differ"
+    y = k3_ctm_gemv_wide(x, w, row_tiles=row_tiles)
+    assert _rel(y, x.double() @ w.double().t()) <= TOL
+
+
 def test_unsupported_calls_raise_value_error() -> None:
     """The op's own check refuses these before compiling or launching anything."""
     n, k = 3208, 7168
@@ -176,9 +195,17 @@ def test_unsupported_calls_raise_value_error() -> None:
         "K % 64 != 0": (x8[:, :7136].contiguous(), w[:, :7136].contiguous(), -1, False),
         "fp16 x": (x8.half(), w, -1, False),
     }
-    for name, (x, weight, sig, fp32) in cases.items():
+    w136 = _weight(136, k)
+    tiled = {
+        "row_tiles not dividing N": (x8, w136, -1, False, 3),
+        "row tiles of more than 128 rows": (x8, w136, -1, False, 1),
+        "row tiles with sigmoid columns": (x8, w136, 100, False, 4),
+        "row tiles with fp32 output": (x8, w136, -1, True, 4),
+    }
+    cases = {name: (*args, 0) for name, args in cases.items()} | tiled
+    for name, (x, weight, sig, fp32, row_tiles) in cases.items():
         try:
-            k3_ctm_gemv_wide(x, weight, sig, fp32)
+            k3_ctm_gemv_wide(x, weight, sig, fp32, row_tiles)
         except ValueError:
             continue
         raise AssertionError(f"{name}: expected ValueError, the op accepted the call")

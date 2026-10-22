@@ -2217,10 +2217,11 @@ class K3DecodeKDA(KimiKDALinearAttention):
         return self.qkvg_proj is not None
 
     def _k3_bfa(self, x: torch.Tensor) -> torch.Tensor:
-        """The bf16 ``[f_a | b]`` projection of ``x``: on the ``kda_bfa`` decode GEMV where it takes the rows, else
-        ``F.linear``."""
+        """The bf16 ``[f_a | b]`` projection of ``x``: on the ``kda_bfa`` decode GEMV (``kda_bfa_rt``, its weight in
+        row tiles, with ``TRTLLM_K3LL_KDA_BFA_ROW_TILES``) where it takes the rows, else ``F.linear``."""
         if self._bfa_gemvs is not None:
-            y = self._bfa_gemvs.project("kda_bfa", x, self._bfa_proj_weight)
+            site = "kda_bfa_rt" if _flags.TRTLLM_K3LL_KDA_BFA_ROW_TILES else "kda_bfa"
+            y = self._bfa_gemvs.project(site, x, self._bfa_proj_weight)
             if y is not None:
                 return y
         return torch.nn.functional.linear(x, self._bfa_proj_weight)
@@ -3651,6 +3652,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 sites += ("moe_head", "moe_shared_gate_up", "moe_tail", "moe_up")
             if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
                 sites += ("kda_bfa",)
+                if _flags.TRTLLM_K3LL_KDA_BFA_ROW_TILES:
+                    sites += ("kda_bfa_rt",)
             if isinstance(self.draft_model, K3DSparkDrafter):
                 sites += ("drafter_qkv", "drafter_o", "drafter_gate_up", "drafter_down")
             elif _flags.TRTLLM_K3LL_MLA_DRAFTER_NORMS and self._mla_drafter() is not None:
@@ -3674,10 +3677,12 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             for attn in kda:
                 attn._bfa_gemvs = gemvs
             warmed = sorted(key[2] for key in gemvs._ran if key[0] == "kda_bfa")
+            warmed_rt = sorted(key[2] for key in gemvs._ran if key[0] == "kda_bfa_rt")
             if self.model_config.mapping.tp_rank == 0:
                 logger.info(
                     f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_GEMV=1: {len(kda)} KDA layers' [f_a | b] projection on "
-                    f"k3_ctm_gemv_wide (row tiles warmed: {warmed}); verify reads it beside the QKVG rows"
+                    f"k3_ctm_gemv_wide (row tiles warmed: {warmed}); verify reads it beside the QKVG rows; "
+                    f"kda_bfa_rt ({_decode_gemv.SITES['kda_bfa_rt'].row_tiles} weight row tiles) warmed: {warmed_rt}"
                 )
 
     def post_load_weights(self) -> None:

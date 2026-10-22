@@ -16,6 +16,7 @@
 
 * ``kda_bfa`` decode GEMV site (``K3DecodeGemvs.project`` on ``k3_ctm_gemv_wide``) against ``F.linear`` and an fp32
   reference, at the per-rank TP16 shape (136 x 7168) and 1 / 8 / 16 / 32 / 64 rows.
+* ``kda_bfa_rt`` (TRTLLM_K3LL_KDA_BFA_ROW_TILES: the same GEMV over 34-row weight tiles) bit-identical to ``kda_bfa``.
 * ``K3DecodeKDA._k3_projections`` under every TRTLLM_K3LL_KDA_BFA_FIRST / TRTLLM_K3LL_KDA_BFA_OVERLAP setting: the same
   bits, and with BFA_FIRST the [f_a | b] projection launched before QKVG on the calling stream.
 * ``trtllm::k3_fp8_kda_verify`` with the [f_a | b] rows passed beside the [q | k | v | g] rows (``bfa=``) against the
@@ -76,6 +77,23 @@ def test_kda_bfa_site(rows):
     # bf16 output: one rounding of an fp32 accumulation; cuBLAS's split-K result rounds the same sum.
     assert (y.float() - ref).abs().max().item() <= 1e-2 * scale
     assert (ref_bf16.float() - ref).abs().max().item() <= 1e-2 * scale
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32, 64])
+def test_kda_bfa_row_tiles_site(rows):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_gemv,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(100 + rows)
+    w = (torch.randn(BFA, 7168, generator=g, device="cuda") * 0.02).bfloat16()
+    x = torch.randn(rows, 7168, generator=g, device="cuda").bfloat16()
+    with torch.inference_mode():
+        gemvs = decode_gemv.K3DecodeGemvs.create(sites=("kda_bfa", "kda_bfa_rt"))
+        y = gemvs.project("kda_bfa_rt", x, w)
+        ref = gemvs.project("kda_bfa", x, w)
+    assert y is not None and ref is not None
+    assert torch.equal(y, ref)
 
 
 @pytest.mark.parametrize("rows", [8, 16, 32])

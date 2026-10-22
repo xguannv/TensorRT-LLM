@@ -80,7 +80,8 @@ class Site:
     ``[gate | up]`` input of the SiLU-and-mul, 2 ``k`` wide), and k3_ctm_gemv_wide at MAX_ROWS+1..``wide_rows`` rows
     where ``wide``. Output columns from ``sig_col0`` on are stored through a sigmoid; ``out_fp32``: an fp32 output
     (k3_ctm_gemv_wide only). ``split`` / ``ring`` / ``push``: the CTM kernels' CTAs per 128-row weight tile,
-    k3_ctm_gemv_long's weight-ring stages, and whether the partial sums are pushed to each row's owner."""
+    k3_ctm_gemv_long's weight-ring stages, and whether the partial sums are pushed to each row's owner. ``row_tiles``
+    (k3_ctm_gemv_wide only): the weight rows as that many equal tiles, one cluster each, instead of 128-row tiles."""
 
     n: int
     k: int
@@ -92,6 +93,7 @@ class Site:
     push: bool = False
     out_fp32: bool = False
     wide_rows: int = WIDE_ROWS
+    row_tiles: int = 0
 
 
 SITES: Dict[str, Site] = {
@@ -103,6 +105,9 @@ SITES: Dict[str, Site] = {
     # KDA's bf16 [f_a | b] beside the FP8 [q | k | v | g] projection (128 and 6 heads' b, padded to 136 rows;
     # TRTLLM_K3LL_KDA_BFA_GEMV): a decode step's 1..64 rows on k3_ctm_gemv_wide.
     "kda_bfa": Site(136, 7168, "wide", wide=True),
+    # The same projection as 4 tiles of 34 rows (TRTLLM_K3LL_KDA_BFA_ROW_TILES): 32 CTAs instead of 16, of which 8
+    # held the last tile's 8 rows; the same split, so the same bits.
+    "kda_bfa_rt": Site(136, 7168, "wide", wide=True, row_tiles=4),
     # The attention output projection (row parallel; 6 heads x 128 in).
     "o_proj": Site(7168, 768, "decode", wide=True),
     # The built-in MLA path's projections: kv_a_proj_with_mqa, q_b_proj and the output gate.
@@ -150,9 +155,11 @@ def _run(
             return None
         return k3_decode_gemv(x2d, weight)
     if kernel == "wide":
-        if not _ctm_op.supports_wide(x2d, weight, spec.sig_col0, spec.out_fp32):
+        if not _ctm_op.supports_wide(x2d, weight, spec.sig_col0, spec.out_fp32, spec.row_tiles):
             return None
-        return k3_ctm_gemv_wide(x2d, weight, sig_col0=spec.sig_col0, out_fp32=spec.out_fp32)
+        return k3_ctm_gemv_wide(
+            x2d, weight, sig_col0=spec.sig_col0, out_fp32=spec.out_fp32, row_tiles=spec.row_tiles
+        )
     if spec.out_fp32:
         return None
     if kernel == "ctm":
