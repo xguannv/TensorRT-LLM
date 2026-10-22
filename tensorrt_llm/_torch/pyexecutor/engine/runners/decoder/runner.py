@@ -71,6 +71,7 @@ from tensorrt_llm._torch.speculative import (
     get_num_extra_kv_tokens,
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
+    spec_head_kernels,
 )
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
@@ -551,6 +552,17 @@ class DecoderRunner(ScheduledModelRunner):
             if self._config.is_spec_decode and spec_step_copies.is_available()
             else None
         )
+        # TRTLLM_K3LL_SPEC_HEAD_FUSED=1: a pure-generation spec decode step's head
+        # bookkeeping in _preprocess_inputs as one fused_spec_head_prep launch.
+        self._spec_head_fused = (
+            self._config.is_spec_decode and spec_head_kernels.spec_head_fusion_enabled()
+        )
+        # _preprocess_inputs calls that took the fused path, all and under CUDA graph capture.
+        # A graph replay reruns the captured launch without running Python, so it is not counted.
+        self._spec_head_fused_steps = 0
+        self._spec_head_fused_captures = 0
+        if self._spec_head_fused:
+            logger.info("Spec decode step head: fused head prep on")
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -2917,7 +2929,25 @@ class DecoderRunner(ScheduledModelRunner):
         if attn_meta is not None:
             attn_meta.on_update_kv_lens()
 
-        if enable_spec_decode and not self._config.disable_overlap_scheduler:
+        # With TRTLLM_K3LL_SPEC_HEAD_FUSED=1, one launch for both blocks below where it covers the step.
+        head_fused = (
+            enable_spec_decode
+            and self._spec_head_fused
+            and self._fused_spec_head_prep(inputs, runtime_draft_len)
+        )
+        if head_fused:
+            self._spec_head_fused_steps += 1
+            if torch.cuda.is_current_stream_capturing():
+                self._spec_head_fused_captures += 1
+            n = self._spec_head_fused_steps
+            if n & (n - 1) == 0:
+                logger.info(
+                    f"Spec decode step head: fused head prep steps={n} "
+                    f"(CUDA graph captures {self._spec_head_fused_captures}; "
+                    "graph replays rerun the captured launch and are not counted)"
+                )
+
+        if enable_spec_decode and not head_fused and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_total_draft_tokens. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
@@ -2965,7 +2995,7 @@ class DecoderRunner(ScheduledModelRunner):
                         num_chunked_contexts=num_chunked_ctx_requests,
                     )
 
-        if enable_spec_decode and self.mapping.has_cp_helix():
+        if enable_spec_decode and not head_fused and self.mapping.has_cp_helix():
             # Helix verify groups: the per-token device buffers (write slots,
             # attention bounds, rank-local kv lens) must be derived on EVERY
             # spec step, overlap or not -- the append/mask kernels consume
@@ -2996,6 +3026,70 @@ class DecoderRunner(ScheduledModelRunner):
             self.guided_decoder.token_event.record()
 
         return inputs
+
+    def _fused_spec_head_prep(self, inputs: dict[str, Any], runtime_draft_len: int) -> bool:
+        """The spec decode step's head bookkeeping of ``_preprocess_inputs`` in one launch.
+
+        Covers a step without context tokens on TRTLLM attention metadata: the overlap scheduler's
+        ``position_ids`` / ``kv_lens_cuda`` correction and, for Helix verify groups, the
+        ``helix_position_offsets`` correction and ``recompute_helix_spec_buffers``; every value is the
+        one those torch ops write. Returns False, launching nothing, for any other step, which then
+        takes the torch path.
+        """
+        md = inputs.get("attn_metadata")
+        if md is None or md.kv_cache_manager is None or md.num_ctx_tokens != 0:
+            return False
+        overlap = not self._config.disable_overlap_scheduler
+        helix = self.mapping.has_cp_helix() and getattr(md, "_helix_spec_tokens_valid", False)
+        if not (overlap or helix):
+            return False
+        position_ids = inputs["position_ids"]
+        kv_lens = getattr(md, "kv_lens_cuda", None)
+        if (
+            position_ids.ndim != 2
+            or position_ids.dtype != torch.int32
+            or position_ids.stride(-1) != 1
+            or kv_lens is None
+            or kv_lens.dtype != torch.int32
+            or not kv_lens.is_contiguous()
+            or md.num_chunked_ctx_requests != 0
+        ):
+            return False
+        num_gen_tokens = inputs["input_ids"].shape[0]
+        tokens_per_seq = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+        num_helix = 0
+        if helix:
+            num_helix = num_gen_tokens
+            # The uniform verify groups recompute_helix_spec_buffers asserts.
+            assert num_helix % tokens_per_seq == 0, (
+                f"helix spec expects uniform verify groups: {num_helix} gen tokens not "
+                f"divisible by group size {tokens_per_seq}"
+            )
+            assert num_helix // tokens_per_seq == md.num_generations, (
+                f"helix spec expects uniform verify groups: {num_helix} gen tokens over "
+                f"{md.num_generations} generation rows do not all have width {tokens_per_seq}"
+            )
+        spec_head_kernels.fused_spec_head_prep(
+            position_ids[0],
+            self.previous_pos_id_offsets_cuda,
+            num_gen_tokens,
+            kv_lens,
+            self.previous_kv_lens_offsets_cuda,
+            md.num_contexts,
+            md.num_generations,
+            helix_positions=md.helix_position_offsets if helix else None,
+            helix_slots=md.helix_local_slots if helix else None,
+            helix_bounds=md.helix_kv_bounds if helix else None,
+            num_helix=num_helix,
+            tokens_per_block=md.kv_cache_manager.tokens_per_block if helix else 1,
+            cp_size=self.mapping.cp_size if helix else 1,
+            cp_rank=self.mapping.cp_rank if helix else 0,
+            kv_bound_start=md.num_contexts,
+            tokens_per_seq=tokens_per_seq,
+            has_overlap=overlap,
+        )
+        md.on_update_kv_lens()
+        return True
 
     def _postprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
