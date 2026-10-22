@@ -456,6 +456,27 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.store.new_tokens_lens.index_copy_(0, slots_device, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots_device, o_next_draft_tokens)
 
+    def _update_stores(
+        self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
+    ) -> None:
+        """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``: one
+        ``SlotScatter`` launch where the step-copy kernels run and cover the call, the torch ops otherwise."""
+        if self._store_scatter is not None:
+            # A step whose batch is unchanged leaves the slot table as it is.
+            self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+            if self._store_scatter.scatter(
+                outputs,
+                num_skip,
+                len(slots),
+                self._slot_table_buffer.tensor,
+                self.store.new_tokens,
+                self.store.next_new_tokens,
+                self.store.new_tokens_lens,
+                self.store.next_draft_tokens,
+            ):
+                return
+        self._scatter_to_stores(outputs, num_skip, slots)
+
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
@@ -542,23 +563,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         if self._store_copies_done is not None:
             # The previous step's host copies may still be reading the stores.
             torch.cuda.current_stream().wait_event(self._store_copies_done)
-        slots = [r.py_seq_slot for r in sampling_requests]
-        scattered = False
-        if self._store_scatter is not None:
-            # A step whose batch is unchanged leaves the slot table as it is.
-            self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
-            scattered = self._store_scatter.scatter(
-                outputs,
-                num_skip,
-                len(slots),
-                self._slot_table_buffer.tensor,
-                self.store.new_tokens,
-                self.store.next_new_tokens,
-                self.store.new_tokens_lens,
-                self.store.next_draft_tokens,
-            )
-        if not scattered:
-            self._scatter_to_stores(outputs, num_skip, slots)
+        self._update_stores(outputs, num_skip, [r.py_seq_slot for r in sampling_requests])
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(

@@ -26,6 +26,7 @@ nothing and returns False; the caller then does that work itself.
 
 from __future__ import annotations
 
+import os
 from typing import Any, ClassVar
 
 import torch
@@ -33,14 +34,27 @@ import torch
 from ...._utils import get_sm_version
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
+SM103_ENV_VAR = "TRTLLM_K3LL_SPEC_STEP_COPIES_SM103"
+
+
+def sm103_enabled() -> bool:
+    """Whether ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1`` admits SM 103 (GB300); default 0."""
+    return os.environ.get(SM103_ENV_VAR, "0") == "1"
+
 
 def is_supported() -> bool:
-    """Whether the kernels run on the current device: SM 100 (B200 / GB200) with the CuTe DSL installed.
+    """Whether the kernels run on the current device with the CuTe DSL installed: SM 100 (B200 / GB200), and SM 103
+    (GB300) when ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1``.
 
     The kernels are plain SIMT code (thread and block indices, global loads and stores), with nothing specific to an
-    architecture, but they are validated on SM 100 only; SM 103 and SM 107 keep the torch path.
+    architecture. On SM 103 the switch exists because ``SlotScatter`` stores zeros in a row's ``new_tokens`` past its
+    accepted length where the torch path stores the forward's raw columns: no reader looks there, but the stores are
+    not bit-identical. SM 107 keeps the torch path.
     """
-    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 100
+    if not (IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available()):
+        return False
+    sm = get_sm_version()
+    return sm == 100 or (sm == 103 and sm103_enabled())
 
 
 def _is_i32(t: torch.Tensor) -> bool:

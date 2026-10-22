@@ -1911,7 +1911,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         from tensorrt_llm._torch.cute_dsl_kernels.spec_step_copies import \
             op as spec_step_copies
         if not spec_step_copies.is_supported():
-            self.skipTest("the step-copy kernels run on SM 100")
+            self.skipTest("the step-copy kernels run on SM 100 (SM 103 with "
+                          "TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1)")
         max_draft_len = 3
         tokens_per_step = max_draft_len + 1
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(

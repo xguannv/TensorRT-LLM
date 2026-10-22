@@ -65,7 +65,9 @@ def _supported() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _supported(), reason="the step-copy kernels run on SM 100 with the CuTe DSL"
+    not _supported(),
+    reason="the step-copy kernels run on SM 100, and on SM 103 with "
+    "TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1, with the CuTe DSL",
 )
 
 
