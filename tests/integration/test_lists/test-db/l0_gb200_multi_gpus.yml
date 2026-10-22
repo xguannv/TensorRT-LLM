@@ -74,6 +74,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_rejects_wrong_group_membership
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_growth_keeps_captured_graphs
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allreduce_rmsnorm_slice_op_matrix.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mnnvl_comm.py
   # Kimi K3 collective kernels (sm_100) and the catalog entries over caller-owned state, 4 ranks
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py
@@ -95,6 +96,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_decode_comm_op_matrix.py
   # tp16_moetp16ep1's MoE decode path: the engines pushing into the latent exchange, 4 ranks
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_route_b_decode_moe_op_matrix.py
+  # The Kimi K3 decode path's MoE-path switches, each off arm against the chain it replaced, 4 ranks
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_kimi_k3_lowm_switches_op_matrix.py
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_failure_is_collective_and_bounded
