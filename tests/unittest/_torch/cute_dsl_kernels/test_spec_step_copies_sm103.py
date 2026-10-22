@@ -215,7 +215,9 @@ def _arms(monkeypatch, seed):
 
 @pytest.mark.parametrize("rows", BATCHES, ids=[f"bs{r}" for r in BATCHES])
 def test_switch_on_equals_off_eager(monkeypatch, rows):
-    """Switch on vs off over four chained steps (each step's gather reads the stores the scatter just wrote)."""
+    """Switch on vs off over four chained steps (each step's gather reads the stores the scatter just wrote). A slot
+    keeps the dead ``new_tokens`` columns of its last scatter, so after each step's comparison the switch-off arm takes
+    the switch-on arm's zeros there (everything else having compared equal) and the next step compares that step."""
     off, on = _arms(monkeypatch, 40 + rows)
     assert not [k for k, t in off.snapshot().items() if not torch.equal(t, on.snapshot()[k])]
     g = torch.Generator().manual_seed(rows)
@@ -228,6 +230,7 @@ def test_switch_on_equals_off_eager(monkeypatch, rows):
         torch.cuda.synchronize()
         bad = compare(off, on, slots, outputs)
         assert not bad, (f"step {step}", bad)
+        off.store.new_tokens.copy_(on.store.new_tokens)
 
 
 @pytest.mark.parametrize("rows", BATCHES, ids=[f"bs{r}" for r in BATCHES])
