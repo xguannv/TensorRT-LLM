@@ -2242,8 +2242,12 @@ class K3DecodeKDA(KimiKDALinearAttention):
     def build_bfa_fp8(self) -> bool:
         """Build ``_qkvg_bfa_fp8`` from the FP8 QKVG module's weight-read weight and the bf16 ``[f_a | b]`` weight
         (TRTLLM_K3LL_KDA_BFA_FP8); whether it is built. The target's post_load_weights calls it at load, after routing
-        the FP8 modules to k3_fp8w_lowm_gemm; the loader runs that before the QKVG module's own post_load_weights, so
-        this first runs the module's (idempotent) weight transform, which writes the packed UE8M0 scale.
+        the FP8 modules to k3_fp8w_lowm_gemm; the loader runs that before the post_load_weights of the QKVG module and
+        of the q / k / v / g modules that are views of it (``_fused_projection``), so this first runs their
+        (idempotent) weight transforms: the QKVG module's writes the packed UE8M0 scale, and each view module's
+        resmooths its own checkpoint weight in place and then points it at the QKVG rows. A view module transformed
+        after it pointed at the fused weight would resmooth the fused weight's QKVG rows in place with its checkpoint
+        scale. So the weights built here are the ones a build after the whole load reads.
 
         One weight buffer: the QKVG module's weight becomes a view of the fused weight's first rows (the same bytes
         at the start of the buffer, so the QKVG GEMM with the switch off is unchanged), and so do the weights of the
@@ -2253,9 +2257,16 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # Only a QKVG module routed to k3_fp8w_lowm_gemm (fp8w_lowm.install: SM100 / SM103, DeepGEMM's packed scale).
         if self._qkvg_bfa_fp8 is None and getattr(self.qkvg_proj, "_k3ll_fp8w_lowm", False):
             proj = self.qkvg_proj
-            transform = getattr(proj, "transform_weights", None)
-            if callable(transform) and not getattr(proj, "_weights_transformed", True):
-                transform()
+            views = []
+            for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
+                child = getattr(self, name, None)
+                owner = getattr(child, "_fused_projection", None)
+                if owner is not None and owner[0]() is proj:
+                    views.append((child, owner[1]))
+            for module in [proj] + [child for child, _ in views]:
+                transform = getattr(module, "transform_weights", None)
+                if callable(transform) and not getattr(module, "_weights_transformed", True):
+                    transform()
             weight = getattr(proj, "weight", None)
             scale = getattr(proj, "weight_scale", None)
             if isinstance(weight, torch.Tensor) and isinstance(scale, torch.Tensor):
@@ -2266,14 +2277,8 @@ class K3DecodeKDA(KimiKDALinearAttention):
                     rows = weight.shape[0]
                     extra = fused[0].nbytes - weight.nbytes + fused[1].nbytes
                     _fp8w_lowm.set_weight(proj, fused[0][:rows])
-                    for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
-                        child = getattr(self, name, None)
-                        owner = getattr(child, "_fused_projection", None)
-                        if owner is not None and owner[0]() is proj:
-                            start = owner[1]
-                            _fp8w_lowm.set_weight(
-                                child, fused[0][start : start + child.out_features]
-                            )
+                    for child, start in views:
+                        _fp8w_lowm.set_weight(child, fused[0][start : start + child.out_features])
                     del weight
                     self._qkvg_bfa_fp8 = fused
                     self._bfa_fp8_extra_bytes = extra

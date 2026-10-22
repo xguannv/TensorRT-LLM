@@ -34,6 +34,9 @@ bit for bit the eager call on the same inputs):
     arm (the same kernels on the same inputs, another enqueue order).
   * TRTLLM_K3LL_KDA_BFA_ROW_TILES: off arm bit for bit the reference chain; on arm (``kda_bfa_rt``, 4 tiles of 34
     rows, split 8) bit for bit the off arm.
+  * TRTLLM_K3LL_KDA_BFA_FP8 build order (``test_fp8_build_at_load_equals_build_after_load``): on the real FP8
+    weight-read modules with checkpoint scales, the fused weight built at load (before the QKVG and q / k / v / g
+    modules' post_load_weights) is bit for bit the one built after them, and their post_load_weights leave it intact.
   * TRTLLM_K3LL_KDA_BFA_FP8: off arm: ``_k3_fused_rows`` returns None and launches nothing, so the projections are the
     reference chain, before and after ``build_bfa_fp8`` (the target's load-time call) has built the fused weight. On
     without a fused weight (launched at 0): ``_k3_fused_rows`` returns None (the forward never builds), the
@@ -271,3 +274,60 @@ def test_fp8(stand_in, flags, rows):
         assert _rel(y[:, : 4 * HK], qkvg) < 1e-2
         assert _rel(y[:, 4 * HK : 4 * HK + K + H], bfa[:, : K + H]) < 5e-2
         assert torch.count_nonzero(y[:, 4 * HK + K + H :]) == 0
+
+
+def _checkpoint_modules(seed: int):
+    """The KDA layer's FP8 projections as the checkpoint loader leaves them before post_load: the fused QKVG
+    weight-read module and q / k / v / g weight-read modules linked to it (``_fused_projection``), each holding the
+    checkpoint's E4M3 codes and FP32 128x128 scales (not powers of two, so the transform resmooths), untransformed."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear as WR
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    w = torch.randn((4 * HK, DIM), device="cuda", generator=g) * 0.02
+    blocks = w.view(4 * HK // 128, 128, DIM // 128, 128)
+    jitter = 1 + 0.4 * torch.rand(blocks.shape[0], blocks.shape[2], device="cuda", generator=g)
+    scale = (blocks.abs().amax(dim=(1, 3)).clamp(min=1e-4) / 448.0 * jitter).float()
+    codes = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn).view(4 * HK, DIM)
+    qkvg = WR(codes.clone(), scale.clone(), 4 * HK)
+    qkvg._weights_transformed = False
+    qkvg._k3ll_fp8w_lowm = True
+    mod = types.SimpleNamespace(
+        qkvg_proj=qkvg,
+        _bfa_proj_weight=(torch.randn(BFA, DIM, generator=g, device="cuda") * 0.02).bfloat16(),
+        _qkvg_bfa_fp8=None,
+        _bfa_fp8_extra_bytes=0,
+    )
+    for i, name in enumerate(("q_proj", "k_proj", "v_proj", "g_proj")):
+        rows = slice(i * HK, (i + 1) * HK)
+        child = WR(codes[rows].clone(), scale[i * HK // 128 : (i + 1) * HK // 128].clone(), HK)
+        child._weights_transformed = False
+        child._fused_projection = (weakref.ref(qkvg), i * HK)
+        setattr(mod, name, child)
+    mod.build_bfa_fp8 = types.MethodType(_mods().impl.K3DecodeKDA.build_bfa_fp8, mod)
+    return mod
+
+
+def test_fp8_build_at_load_equals_build_after_load():
+    """The fused weight built in the target's post_load_weights (before the QKVG and q / k / v / g modules' own
+    post_load_weights, as the loader orders them) has the bits of one built after every module's post_load_weights,
+    and the modules' later post_load_weights leave it unchanged."""
+    names = ("qkvg_proj", "q_proj", "k_proj", "v_proj", "g_proj")
+    with torch.no_grad():
+        at_load = _checkpoint_modules(5)
+        assert at_load.build_bfa_fp8()
+        for name in names:
+            getattr(at_load, name).post_load_weights()
+        after = _checkpoint_modules(5)
+        for name in names:
+            getattr(after, name).post_load_weights()
+        assert after.build_bfa_fp8()
+    for a, b, what in zip(at_load._qkvg_bfa_fp8, after._qkvg_bfa_fp8, ("weight", "scale")):
+        assert torch.equal(
+            a.view(torch.uint8) if a.dtype == torch.float8_e4m3fn else a,
+            b.view(torch.uint8) if b.dtype == torch.float8_e4m3fn else b,
+        ), f"fused {what}"
+    for name in names:
+        a, b = getattr(at_load, name).weight, getattr(after, name).weight
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"{name}.weight"
+        assert a.data_ptr() >= at_load._qkvg_bfa_fp8[0].data_ptr()
+    assert torch.equal(at_load.qkvg_proj.weight_scale, after.qkvg_proj.weight_scale)
