@@ -306,3 +306,224 @@ def markov_chain(
         ws["rank"], ws["slots"], ws["push_copies"], ws["buf_words"], accepted, num_accepted, accepted_rows, kv_lens,
         rewind, int(rewind_first),
     )  # fmt: skip
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# The MMA build (k3_markov_mma_kernel.py, TRTLLM_K3LL_DRAFTER_MARKOV_V2): the bias of all requests as one MMA per
+# step, cluster-reduced exchange. Its own exchange buffers (3 sets) and launch counter per TP group.
+# ----------------------------------------------------------------------------------------------------------------------
+def _mma_module():
+    mod = _modules.get("mma")
+    if mod is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "k3_markov_mma_kernel.py")
+        spec = importlib.util.spec_from_file_location(f"{__name__}_k3_markov_mma_kernel", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _modules["mma"] = mod
+    return mod
+
+
+def supports_mma(
+    base: torch.Tensor, markov_w1: torch.Tensor, markov_w2_shard: torch.Tensor
+) -> bool:
+    """Whether the MMA build runs these operands: bf16 block logits ``[B <= 16, K <= 8, S]`` (S even, at most 148
+    CTAs of 128 columns, whole clusters of 8), bf16 Markov weights of a rank that is a multiple of 16 (<= 512), on
+    SM100 / SM103."""
+    if (
+        base.dim() != 3
+        or base.dtype != torch.bfloat16
+        or not base.is_cuda
+        or torch.cuda.get_device_capability(base.device) not in ((10, 0), (10, 3))
+    ):
+        return False
+    mod = _mma_module()
+    batch, block, shard = base.shape
+    rank = markov_w1.shape[1] if markov_w1.dim() == 2 else 0
+    return (
+        markov_w1.dtype == torch.bfloat16
+        and markov_w2_shard.dtype == torch.bfloat16
+        and markov_w1.dim() == 2
+        and 0 < rank <= 512
+        and rank % 16 == 0
+        and tuple(markov_w2_shard.shape) == (shard, rank)
+        and 0 < batch <= mod.MAX_REQS
+        and 0 < block <= WORKSPACE_MAX_BLOCK
+        and shard % 2 == 0
+        and mod.num_ctas_for(shard) is not None
+        and mod.num_ctas_for(shard) <= _sm_count(base.device)
+    )
+
+
+def markov_mma_workspace(mapping, shard: int) -> dict:
+    """This TP group's exchange buffers for the MMA build (every word 0x80000000) behind one multicast mapping, and
+    the launch counter. Collective on first use (per group and CTA count): every rank of the group must make the
+    first call at the same point, outside CUDA-graph capture."""
+    mod = _mma_module()
+    num_ctas = mod.num_ctas_for(shard)
+    key = ("mma", mapping, num_ctas)
+    ws = _workspaces.get(key)
+    if ws is not None:
+        return ws
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "k3_markov (MMA): the workspace must be allocated outside CUDA-graph capture"
+        )
+    from tensorrt_llm._torch.distributed.ops import (
+        _get_mnnvl_workspace_comm,
+        _make_mnnvl_mcast_buffer,
+        _mnnvl_workspace_all_succeeded,
+    )
+
+    world = mapping.tp_size
+    words = mod.exchange_floats(world, num_ctas)
+    comm = _get_mnnvl_workspace_comm(mapping)
+    use_fabric_handle = (
+        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
+    )
+    error: Optional[Exception] = None
+    try:
+        handle = _make_mnnvl_mcast_buffer(comm, words * 4, mapping, use_fabric_handle)
+        uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int32, 0)
+        mc = handle.get_mc_buffer((words,), torch.int32, 0)
+        with torch.inference_mode():
+            uc.fill_(-(2**31))
+            launch = torch.zeros(1, dtype=torch.int32, device=uc.device)
+        torch.cuda.synchronize()
+        ws = dict(
+            handle=handle, comm=comm, uc=uc, mc=mc, launch=launch, rank=mapping.tp_rank, world=world
+        )
+    except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
+        error = exc
+    # Also the barrier that keeps any rank from publishing into a peer's buffer before the peer has armed it.
+    if not _mnnvl_workspace_all_succeeded(comm, error is None):
+        raise RuntimeError(
+            "k3_markov (MMA) exchange buffers failed on at least one rank"
+        ) from error
+    _workspaces[key] = ws
+    return ws
+
+
+@torch.library.custom_op("trtllm::k3_markov_mma", mutates_args=("kv_lens",))
+def k3_markov_mma(
+    base: torch.Tensor,
+    first_prev: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2_shard: torch.Tensor,
+    shard_offset: int,
+    ws_uc: torch.Tensor,
+    ws_mc: torch.Tensor,
+    ws_launch: torch.Tensor,
+    rank: int,
+    world: int,
+    accepted: torch.Tensor,
+    num_accepted: torch.Tensor,
+    accepted_rows: torch.Tensor,
+    kv_lens: torch.Tensor,
+    rewind: torch.Tensor,
+    rewind_first: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``trtllm::k3_markov``'s outputs and KV-length rewind from the MMA build (``k3_markov_mma_kernel``), on bf16
+    block logits; ``ws_*``, ``rank``, ``world``: ``markov_mma_workspace``'s."""
+    mod = _mma_module()
+    if not supports_mma(base, markov_w1, markov_w2_shard):
+        raise ValueError(
+            f"k3_markov (MMA): unsupported operands: base {tuple(base.shape)} {base.dtype}, markov_w1 "
+            f"{tuple(markov_w1.shape)} {markov_w1.dtype}, markov_w2_shard {tuple(markov_w2_shard.shape)}"
+        )
+    batch, block, shard = base.shape
+    if first_prev.dtype != torch.int64 or first_prev.numel() != batch:
+        raise ValueError("k3_markov (MMA): first_prev must be int64 [B]")
+    if (
+        accepted.dtype != torch.int32
+        or accepted.dim() != 2
+        or num_accepted.dtype != torch.int32
+        or accepted_rows.dtype != torch.int32
+        or num_accepted.numel() < batch
+        or accepted_rows.numel() < batch
+    ):
+        raise ValueError(
+            "k3_markov (MMA): accepted must be int32 [rows, K + 1], num_accepted / accepted_rows int32 [>= B]"
+        )
+    rewind_count = rewind.numel()
+    if (
+        kv_lens.dtype != torch.int32
+        or rewind.dtype != torch.int32
+        or rewind_count > batch
+        or (
+            rewind_count > 0 and (rewind_first < 0 or rewind_first + rewind_count > kv_lens.numel())
+        )
+    ):
+        raise ValueError(
+            "k3_markov (MMA): kv_lens / rewind must be int32, the rewind at most B rows inside kv_lens"
+        )
+    device = base.device
+    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    key = mod.build_key(block, markov_w1.shape[1], world, mod.num_ctas_for(shard), use_pdl, batch)
+    if not mod.is_built(key) and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "trtllm::k3_markov_mma must run once per shape outside CUDA-graph capture first"
+        )
+    corrected = torch.empty(batch, block, shard, dtype=torch.float32, device=device)
+    tokens = torch.empty(batch, block, dtype=torch.int32, device=device)
+    next_new = torch.empty(batch, block + 1, dtype=torch.int32, device=device)
+    base = base if base.stride(-1) == 1 else base.contiguous()
+    with _lock:
+        mod.run(
+            base,
+            first_prev.contiguous(),
+            markov_w1.contiguous(),
+            markov_w2_shard.contiguous(),
+            int(shard_offset),
+            corrected,
+            tokens,
+            next_new,
+            accepted.contiguous(),
+            num_accepted.contiguous(),
+            accepted_rows.contiguous(),
+            kv_lens,
+            rewind.contiguous(),
+            int(rewind_first),
+            ws_mc.data_ptr(),
+            ws_uc.data_ptr(),
+            ws_launch,
+            int(world),
+            int(rank),
+            use_pdl,
+        )
+    return corrected, tokens, next_new
+
+
+@k3_markov_mma.register_fake
+def _(base, first_prev, markov_w1, markov_w2_shard, shard_offset, ws_uc, ws_mc, ws_launch, rank, world, accepted,
+      num_accepted, accepted_rows, kv_lens, rewind, rewind_first):  # fmt: skip
+    batch, block, shard = base.shape
+    return (
+        base.new_empty((batch, block, shard), dtype=torch.float32),
+        base.new_empty((batch, block), dtype=torch.int32),
+        base.new_empty((batch, block + 1), dtype=torch.int32),
+    )
+
+
+def markov_chain_mma(
+    mapping,
+    base: torch.Tensor,
+    first_prev: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2_shard: torch.Tensor,
+    shard_offset: int,
+    accepted: torch.Tensor,
+    num_accepted: torch.Tensor,
+    accepted_rows: torch.Tensor,
+    kv_lens: Optional[torch.Tensor] = None,
+    rewind: Optional[torch.Tensor] = None,
+    rewind_first: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`markov_chain` on the MMA build (``supports_mma`` must hold)."""
+    ws = markov_mma_workspace(mapping, base.shape[-1])
+    if kv_lens is None or rewind is None:
+        kv_lens, rewind = ws["launch"], ws["launch"][:0]
+    return torch.ops.trtllm.k3_markov_mma(
+        base, first_prev, markov_w1, markov_w2_shard, int(shard_offset), ws["uc"], ws["mc"], ws["launch"],
+        ws["rank"], ws["world"], accepted, num_accepted, accepted_rows, kv_lens, rewind, int(rewind_first),
+    )  # fmt: skip

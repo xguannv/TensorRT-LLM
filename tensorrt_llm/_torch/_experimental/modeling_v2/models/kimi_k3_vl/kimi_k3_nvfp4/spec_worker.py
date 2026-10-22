@@ -19,6 +19,9 @@ from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecMetadata, SpecWorkerBase
 from tensorrt_llm.logger import logger
 
+from . import census as _census
+from . import flags as _flags
+
 
 @functools.lru_cache(maxsize=None)
 def _takes_ctx_rows_start_cls(cls) -> bool:
@@ -1259,12 +1262,21 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             and rewind.dtype == torch.int32
             and self._kv_rewind_bs - self._kv_rewind_nc == rewind.numel() <= num_gens
         )
-        corrected, tokens, next_new = k3_markov_op.markov_chain(
+        base = gen_logits.contiguous()
+        w2_shard = draft_model.markov_w2[vocab_slice]
+        # TRTLLM_K3LL_DRAFTER_MARKOV_V2: the build that computes every request's bias in one MMA per position.
+        chain = (
+            k3_markov_op.markov_chain_mma
+            if _flags.TRTLLM_K3LL_DRAFTER_MARKOV_V2
+            and k3_markov_op.supports_mma(base, draft_model.markov_w1, w2_shard)
+            else k3_markov_op.markov_chain
+        )
+        corrected, tokens, next_new = chain(
             self.mapping,
-            gen_logits.contiguous(),
+            base,
             first_prev_tokens.long(),
             draft_model.markov_w1,
-            draft_model.markov_w2[vocab_slice],
+            w2_shard,
             vocab_slice.start,
             accepted_tokens,
             num_accepted_tokens[num_contexts : num_contexts + num_gens],
@@ -1273,6 +1285,8 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             rewind=rewind if fold else None,
             rewind_first=self._kv_rewind_nc if fold else 0,
         )
+        if chain is k3_markov_op.markov_chain_mma:
+            _census.dispatch("drafter_markov_v2")
         if fold:
             self._kv_rewind_amount = None
             self._kv_rewind_pending = False
