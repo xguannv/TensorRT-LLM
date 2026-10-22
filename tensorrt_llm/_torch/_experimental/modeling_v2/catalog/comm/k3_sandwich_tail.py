@@ -2,16 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3's pre-attention sandwich: the row-parallel MoE tail (the latent up projection of the normed latent slice and
 the shared experts' down projection), its TP all-reduce and the next layer's residual update (attention-residual
-selection + RMSNorm) in one kernel, over a caller-owned :class:`K3SandwichWorkspace`."""
+selection + RMSNorm) in one kernel, over a caller-owned :class:`K3SandwichWorkspace`; with a
+:class:`K3SandwichLatentExchange`, the latent all-reduce before it as well."""
 
 from typing import Optional, Tuple
 
 import torch
 
-# Importing the op module registers trtllm::k3_sandwich_*; the state type is the one the ops' buffers come from.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.op import K3SandwichWorkspace
+# Importing the op module registers trtllm::k3_sandwich_*; the state types are the ones the ops' buffers come from.
+from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.op import (
+    K3SandwichLatentExchange,
+    K3SandwichWorkspace,
+)
 
-__all__ = ["K3SandwichWorkspace", "k3_sandwich_tail"]
+__all__ = ["K3SandwichLatentExchange", "K3SandwichWorkspace", "k3_sandwich_tail"]
 
 
 def k3_sandwich_tail(
@@ -31,12 +35,16 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    latent_exchange: Optional[K3SandwichLatentExchange] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return ``(normed, updated)``: ``updated = prefix + allreduce([rmsnorm(latent)[:, lo:lo+224] | act] @
     tail_weight^T)`` over ``workspace``'s TP group (the sum alone without ``prefix``), ``normed`` =
     RMSNorm(attn_res(block_residual..., updated)). ``tap``: also store the pre-norm attention-residual mixture there
     (``updated`` with ``tap_updated``). ``updated_out``: store ``updated`` there; it is then the returned ``updated``.
-    Advances ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
+    ``latent_exchange``: ``latent`` is this rank's unreduced latent partial ``[M, 3584]`` (M at most the exchange's
+    ``max_rows``), which the kernel all-reduces over the exchange itself, bit for bit the one-shot MNNVL all-reduce.
+    Advances ``workspace`` (and ``latent_exchange``) by one call: every rank of the group makes the same calls on it in
+    the same order."""
     normed, updated = torch.ops.trtllm.k3_sandwich_tail(
         latent,
         act,
@@ -57,5 +65,8 @@ def k3_sandwich_tail(
         tap=tap,
         tap_updated=tap_updated,
         updated_out=updated_out,
+        lat_uc=None if latent_exchange is None else latent_exchange.uc,
+        lat_flags=None if latent_exchange is None else latent_exchange.flags,
+        lat_mc=None if latent_exchange is None else latent_exchange.mc,
     )
     return normed, (updated if updated_out is None else updated_out)

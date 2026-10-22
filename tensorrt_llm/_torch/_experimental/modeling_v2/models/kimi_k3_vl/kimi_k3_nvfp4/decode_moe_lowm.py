@@ -15,7 +15,9 @@ runs:
   (``TRTLLM_K3LL_MOE_FRONT_SORT``) the front writes the sorted routing itself (``sort_out``) and no ``moe_sort`` runs;
 * the routed experts' latent all-reduce (one-shot, as `decode_comm.use_decode_one_shot` sets);
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
-  residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
+  residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail. With
+  ``TRTLLM_K3LL_NARROW_LATENT_TAIL`` (read at forward time) a `PendingTail` holds the routed partial unreduced and that
+  kernel runs the latent all-reduce too, over the state's latent exchange (the TP group's `K3DecodeComm.latent`).
 
 Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_lowm_op.supported`).
 
@@ -33,6 +35,9 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
+    K3SandwichLatentExchange,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
@@ -81,6 +86,9 @@ class K3DecodeMoeNvfp4:
     sort_ctr: Optional[torch.Tensor] = None
     #: The 16-token front build's own head workspace (a step of 9-16 tokens), or None: such steps keep the wide head.
     head16: Optional[K3MoeHeadWorkspace] = None
+    #: The TP group's latent exchange (``K3DecodeComm.latent``) a narrow step's consumer all-reduces an unreduced
+    #: latent over, or None: every step all-reduces the latent itself.
+    latent: Optional[K3SandwichLatentExchange] = None
 
     @classmethod
     def create(
@@ -90,11 +98,13 @@ class K3DecodeMoeNvfp4:
         mnnvl: MnnvlWorkspace,
         front_sort: bool = False,
         front16: bool = False,
+        latent: Optional[K3SandwichLatentExchange] = None,
     ) -> "K3DecodeMoeNvfp4":
         """Collective (the head workspace): every rank of the TP group calls it at the same point, eagerly, before
         any CUDA-graph capture. ``mnnvl``: the TP group's MNNVL workspace, for a wide step's head all-gather.
         ``front_sort``: the front sorts the routing over the local experts (``k3_moe_front``'s ``sort_out``).
-        ``front16``: steps of 9-16 tokens run the front's 16-token build (its own head workspace)."""
+        ``front16``: steps of 9-16 tokens run the front's 16-token build (its own head workspace). ``latent``: the
+        TP group's latent exchange (``K3DecodeComm.latent``), for TRTLLM_K3LL_NARROW_LATENT_TAIL."""
         sort_ctr = torch.zeros(1, dtype=torch.int32, device=device) if front_sort else None
         head16 = K3MoeHeadWorkspace.create(mapping, m_max=FRONT16_TOKENS) if front16 else None
         return cls(
@@ -103,6 +113,7 @@ class K3DecodeMoeNvfp4:
             mnnvl,
             sort_ctr,
             head16,
+            latent,
         )
 
 
@@ -361,11 +372,22 @@ class K3DecodeMoeNvfp4Layer:
         push: bool = False,
     ) -> Union[torch.Tensor, PendingTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
-        (a ``PendingTail``); else the reduced output. ``push`` is ignored: the latent all-reduce is always the routed
-        experts' all-reduce."""
+        (a ``PendingTail``; with TRTLLM_K3LL_NARROW_LATENT_TAIL and the state's latent exchange, its latent the routed
+        partial unreduced, all-reduced by the consumer's kernel); else the reduced output. ``push`` is ignored: the
+        latent all-reduce is the routed experts' all-reduce, or the consumer's."""
         if hidden_states.shape[0] > MAX_TOKENS:
             return self._wide(moe, hidden_states, gemvs)
         routed, shared_act = self._front_routed(moe, hidden_states)
+        eps = float(moe.routed_expert_norm.variance_epsilon)
+        if partial_tail and _flags.TRTLLM_K3LL_NARROW_LATENT_TAIL and self.state.latent is not None:
+            return PendingTail(
+                routed.contiguous(),
+                shared_act.contiguous(),
+                self.tail_weight,
+                self.lo,
+                eps,
+                unreduced=True,
+            )
         latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
@@ -373,7 +395,7 @@ class K3DecodeMoeNvfp4Layer:
                 shared_act.contiguous(),
                 self.tail_weight,
                 self.lo,
-                float(moe.routed_expert_norm.variance_epsilon),
+                eps,
             )
         shared = moe.shared_experts
         shared_out = shared.down_proj(shared_act, layer_idx=shared.layer_idx)

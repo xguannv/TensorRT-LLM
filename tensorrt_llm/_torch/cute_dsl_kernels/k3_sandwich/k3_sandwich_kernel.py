@@ -54,7 +54,9 @@ The pre-attention sandwich (``k3_sandwich_tail``) runs the same phases with the 
 the activation k-tiles in two TMEM accumulators and the latent RMS (over the whole reduced latent row) applied to
 the first; its phase 2 adds the MoE partial sum to the running prefix sum. The latent RMS of token t is computed once
 per cluster, by epilogue warp t // 7 of CTA t % 7, from a bulk copy of the row into shared memory (the sums of a
-per-lane chain in row order, then a butterfly), and st.async'd into every cluster CTA's row scales.
+per-lane chain in row order, then a butterfly), and st.async'd into every cluster CTA's row scales. With the latent
+all-reduce folded in (``x_src`` 2 / 3, see ``sandwich_role``) the tail sums the ranks' latent partials itself from a
+latent exchange, in the MNNVL one-shot's order.
 
 Warps: 0 weight TMA, 1 the activation TMA (tail: first the bulk copies of the latent rows whose RMS the CTA owns), 2
 TMEM allocation, the weight copies into TMEM and the MMA, 3 idle, 4-7 the phase 1 epilogue and phase 2. After cluster
@@ -139,8 +141,9 @@ SLAB_CANON = 0x7FC07FC0  # what a computed all-ones word is stored as
 POLL_BACKOFF = (
     256  # cycles between two polling rounds of phase 1's input slab that found a sentinel
 )
-# The latent exchange (x_src 2): k3_moe pushes every rank's routed latent partial into two alternating halves of
-# [8 tokens][world][3584] bf16 per rank (int32 words, EMPTY_WORD = not written); the tail sums them itself.
+# The latent exchange (x_src 2 / 3): every rank's routed latent partial goes into two alternating halves of
+# [lat_rows][world][3584] bf16 per rank (int32 words, EMPTY_WORD = not written); the tail sums them itself. A half holds
+# lat_rows token rows: MAX_TOKENS for the tail (the narrow path), more for a wider user of the same layout.
 LAT_SLICE = 224  # latent columns of a rank's slice
 LAT_SLICE_VECS = LAT_SLICE // 8  # its 16-byte vectors per token row
 LAT_WORDS = 3584 // 2  # int32 words of one latent row
@@ -174,9 +177,14 @@ def buffer_words(world: int) -> int:
     return 2 * MAX_TOKENS * world * WORDS_PER_ROW
 
 
-def lat_buffer_words(world: int) -> int:
-    """Int32 words of one rank's latent exchange buffer (both halves)."""
-    return 2 * MAX_TOKENS * world * LAT_WORDS
+def lat_buffer_words(world: int, lat_rows: int = MAX_TOKENS) -> int:
+    """Int32 words of one rank's latent exchange buffer (both halves of ``lat_rows`` token rows)."""
+    return 2 * lat_rows * world * LAT_WORDS
+
+
+def lat_rows_fit(world: int, lat_rows: int) -> bool:
+    """Whether the tail's 56 CTAs empty a half of ``lat_rows`` rows in whole 16-byte stores per epilogue thread."""
+    return lat_rows > 0 and (lat_rows * world * LAT_WORDS) % (NUM_CTAS * EPI_THREADS * 4) == 0
 
 
 @dsl_user_op
@@ -309,6 +317,17 @@ def _sanitize(word):
             (w & cutlass.Int32(-65536)) == cutlass.Int32(EMPTY_WORD), w & cutlass.Int32(0xFFFF), w
         )
     )
+
+
+def _empty_lat_half(lat_uc, half, half_words: int, bx, tid):
+    """Every word of half ``half`` of this rank's latent exchange (``half_words`` int32 words) empty: CTA ``bx``'s
+    1/56 of it, 16-byte stores of epilogue thread ``tid``."""
+    base = half * cutlass.Int32(half_words) + bx * cutlass.Int32(half_words // NUM_CTAS)
+    empty = cutlass.Int32(EMPTY_WORD)
+    for q in cutlass.range_constexpr(half_words // NUM_CTAS // (EPI_THREADS * 4)):
+        lat_uc.store((empty, empty, empty, empty),
+                     idx=base + cutlass.Int32(q * EPI_THREADS * 4) + tid * cutlass.Int32(4),
+                     alignment=16)  # fmt: skip
 
 
 def _slab_word(word):
@@ -498,6 +517,8 @@ def sandwich_role(
     x_slab: cutlass.Array,  # int32 words [SLAB_BUFS, MAX_TOKENS, 3584]: the published normed rows (publish)
     lat_flags: cutlass.Array,  # int32 [LAT_FLAG_WORDS] (x_src 2): the tail's call count and the latent scale slab
     tap: cutlass.Array,  # int32 words of bf16 rows (tap_out), tap_stride words apart: the capture layer's tap, out
+    lat_mc: cutlass.Array,  # x_src 3: int32 words, the latent exchange buffer's multicast mapping (pushed into)
+    lat_part: cutlass.Array,  # x_src 3: int32 words of bf16 [M, 3584], this rank's unreduced latent partial
     smem,  # shared-memory pointer, 1024-byte aligned, at least smem_bytes(k_in, rms_cols) bytes (SmemAllocator)
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
@@ -524,7 +545,7 @@ def sandwich_role(
     x_src: cutlass.Constexpr[
         int
     ],  # 0: phase 1's input by TMA after the grid wait; 1: polled from a slab; 2 (tail):
-    # the latent summed from every rank's pushed partial (below)
+    # the latent summed from every rank's pushed partial (below); 3 (tail): as 2, pushed by this kernel
     plain: cutlass.Constexpr[
         int
     ],  # 1 (MNNVL order) / 2 (IPC order): residual + RMSNorm, not attn_res (below)
@@ -537,6 +558,9 @@ def sandwich_role(
     k_split: cutlass.Constexpr[
         int
     ],  # 2: accumulate the even and the odd k-tiles apart, then (0 + even) + odd
+    lat_rows: cutlass.Constexpr[
+        int
+    ],  # x_src 2 / 3: token rows of one half of the latent exchange (>= M)
     cta_base: cutlass.Constexpr[int],  # grid index of the role's first CTA (a multiple of CLUSTER)
     act_hook: cutlass.Constexpr,  # None: the activation by TMA after the grid wait; else see below
 ):
@@ -561,13 +585,13 @@ def sandwich_role(
 
     ``x_src`` 2 (tail; the latent all-reduce folded in): k3_moe, the producer, pushes its routed latent partial rows
     through the multicast mapping into slot [rank] of half ``n & 1`` of every rank's exchange buffer (``rms_src``: int32
-    [2][8][world][1792], EMPTY_WORD = not written, pushes never write that pattern) and exits; ``n = lat_flags[0]``
-    counts this op's calls modulo 6. No warp waits on the grid before its reads (as for ``x_src`` 1, the producer
-    launches its dependents right after its own grid wait). The epilogue warps first empty the other half (every row:
-    its readers, the previous call, have completed, and the fence before this call's push orders the empties before any
-    rank's next push into it, which follows that rank's phase 2 of this call), then sum the partials in the MNNVL
-    one-shot's order (fp32 per chunk of 8 ranks in rank order, the chunks added from 0, one bf16 rounding), so the
-    latent is the all-reduce's bit for bit:
+    [2][lat_rows][world][1792], EMPTY_WORD = not written, pushes never write that pattern) and exits;
+    ``n = lat_flags[0]`` counts this op's calls modulo 6. No warp waits on the grid before its reads (as for ``x_src``
+    1, the producer launches its dependents right after its own grid wait). The epilogue warps first empty the other
+    half (every row: its readers, the previous call, have completed, and the fence before this call's push orders the
+    empties before any rank's next push into it, which follows that rank's phase 2 of this call), then sum the partials
+    in the MNNVL one-shot's order (fp32 per chunk of 8 ranks in rank order, the chunks added from 0, one bf16 rounding),
+    so the latent is the all-reduce's bit for bit:
     - every cluster: the rank's 224 slice columns of the live rows, one (token, vector, rank chunk) per thread, st.async
       into all 7 CTAs' ``smem_b`` (``lat_full``; the latent k-tiles are zeroed by warp 3 before the cluster forms);
     - cluster t: token t's whole row, st.async into CTA 0's ``rms_row``; CTA 0's warp 4 takes its RMS as the bulk-copy
@@ -575,6 +599,17 @@ def sandwich_role(
       epilogue polls after the MMA (each call re-arms buffer ``(n + 1) % 3``).
     The MMA runs the shared-expert k-tiles first and the latent ones once ``lat_full`` completes. CTA 0 stores
     ``n + 1`` after its final grid wait. Every k3_moe push call must be followed by exactly one such call.
+
+    ``x_src`` 3 (tail; the latent all-reduce folded in, pushed here): ``lat_part`` is this rank's unreduced latent
+    partial [M, 3584], written by the grid this one depends on. Warps 1 and 4-7 wait on the grid as for ``x_src`` 0,
+    and every global store of the call follows that wait. Then each epilogue thread of the 56 CTAs pushes at most one
+    16-byte vector of the partial (-0.0 halves as +0.0, as the one-shot's push) through ``lat_mc`` into slot [rank] of
+    half ``n & 1`` of every rank's exchange, and the reduce of ``x_src`` 2 runs unchanged on ``rms_src`` (this rank's
+    exchange buffer); the epilogue warps empty the other half after it, still before the fenced phase 1 push. The
+    Lamport argument is ``x_src`` 2's: a rank pushes into a half in call n + 1 only after its call n has completed,
+    which needed every rank's phase 1 push of call n, fenced after that rank's empties. Push and reduce share the
+    kernel, so no other call has to bracket it; ``n`` lives on the device, so eager calls and the replays of any number
+    of CUDA graphs may interleave.
 
     ``plain`` 1 (post-attention form, no snapshots): the epilogue is the MNNVL one-shot's residual + RMSNorm
     (``kARResidualRMSNorm``) with its arithmetic: updated = bf16(float(sum) + float(prefix)); per thread the sum of
@@ -599,6 +634,12 @@ def sandwich_role(
     which warp 0 waits on before it refills the stage."""
     tail = rms_cols > 0
     hooked = act_hook is not None
+    # x_src 2 / 3: the latent summed from the exchange in this kernel; 1 / 2: global reads before any grid wait.
+    folded = x_src == 2 or x_src == 3
+    early_reads = x_src == 1 or x_src == 2
+    assert not folded or (tail and lat_rows_fit(world, lat_rows)), (
+        "the folded latent all-reduce: the tail form, an exchange half emptied in whole 16-byte stores"
+    )
     k_tiles = k_in // CTA_K
     split_acc = x_tiles < k_tiles
     stages = weight_stages(k_tiles)
@@ -663,14 +704,14 @@ def sandwich_role(
                 prims.mbarrier_init(mb_ts, 1)
                 prims.mbarrier_arrive_expect_tx(mb_ts, CLUSTER * EPI_THREADS * 4)
             if cutlass.const_expr(tail):
-                # The latent RMS of each live token, from the one cluster CTA that computes it (x_src 2: from the
+                # The latent RMS of each live token, from the one cluster CTA that computes it (x_src 2 / 3: from the
                 # scale slab instead).
                 prims.mbarrier_init(mb_rms, 1)
-                if cutlass.const_expr(x_src != 2):
+                if cutlass.const_expr(not folded):
                     prims.mbarrier_arrive_expect_tx(mb_rms, num_tokens * cutlass.Int32(4))
                 for rj in cutlass.range_constexpr(LATENT_ROWS_PER_CTA):
                     prims.mbarrier_init(rms_full.subview(rj), 1)
-            if cutlass.const_expr(x_src == 2):
+            if cutlass.const_expr(folded):
                 # The live rows' slice vectors from the cluster's reducers, and (CTA 0 of a live token's cluster) the
                 # token's whole summed row.
                 prims.mbarrier_init(lat_full, 1)
@@ -685,7 +726,7 @@ def sandwich_role(
     if warp_id == 2:
         prims.tcgen05_alloc(tmem_ptr_i32, TMEM_COLS)
         prims.tcgen05_relinquish_alloc_permit()
-    if cutlass.const_expr(x_src == 2):
+    if cutlass.const_expr(folded):
         if warp_id == 3:
             # Zero the latent k-tiles of smem_b (rows >= M and the 32 padding columns stay zero; the reducers' st.async
             # land after cluster formation), for the MMA's async-proxy reads and before any peer's store.
@@ -855,9 +896,11 @@ def sandwich_role(
                         cute.arch.sync_warp()
                         if lane1 == cutlass.Int32(0):
                             prims.mbarrier_arrive(rms_full.subview(rj))
-        elif cutlass.const_expr(x_src == 2):
-            # The shared-expert activation (accumulator 1's k-tiles) is complete at launch; the latent k-tiles come
-            # from the epilogue warps' reducers (lat_full).
+        elif cutlass.const_expr(folded):
+            # The shared-expert activation (accumulator 1's k-tiles) is complete at launch (x_src 3: after the grid
+            # wait); the latent k-tiles come from the epilogue warps' reducers (lat_full).
+            if cutlass.const_expr(x_src == 3):
+                prims.griddepcontrol(prims.GridDepAction.WAIT)
             if prims.elect_sync():
                 prims.mbarrier_arrive_expect_tx(
                     act_full, (k_tiles - x_tiles) * MMA_N * CTA_K * ELEM_BYTES
@@ -1010,17 +1053,15 @@ def sandwich_role(
             while not cute.arch.mbarrier_try_wait(act_full.data_ptr(), 0):
                 pass
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        # x_src 2: the shared-expert k-tiles first; the latent ones once the reducers' slice vectors are in.
+        # x_src 2 / 3: the shared-expert k-tiles first; the latent ones once the reducers' slice vectors are in.
         mma_order = (
-            list(range(x_tiles, k_tiles)) + list(range(x_tiles))
-            if x_src == 2
-            else list(range(k_tiles))
+            list(range(x_tiles, k_tiles)) + list(range(x_tiles)) if folded else list(range(k_tiles))
         )
         for ki in cutlass.range_constexpr(k_tiles):
             k = mma_order[ki]
             second = (split_acc and k >= x_tiles) or (k_split == 2 and k % 2 == 1)
             first_tile = k == 0 or (split_acc and k == x_tiles) or (k_split == 2 and k == 1)
-            if cutlass.const_expr(x_src == 2 and k == 0):
+            if cutlass.const_expr(folded and k == 0):
                 # Completed by the peers' st.async (test_wait: a suspended try_wait wakes late on those); their
                 # generic-proxy stores are then made visible to the MMA's async-proxy reads.
                 while not _test_wait_cluster(lat_full.data_ptr(), 0):
@@ -1052,8 +1093,8 @@ def sandwich_role(
         tid = tx - cutlass.Int32(EPI_THREADS)
         lane = tx % 32
         w = warp_id - 4
-        # The flag word, the prefix and the snapshots are written upstream (x_src 1: see the docstring).
-        if cutlass.const_expr(x_src == 0):
+        # The flag word, the prefix and the snapshots are written upstream (x_src 1 / 2: see the docstring).
+        if cutlass.const_expr(x_src == 0 or x_src == 3):
             prims.griddepcontrol(prims.GridDepAction.WAIT)
         if cutlass.const_expr(swiglu):
             swiglu_share(smem_b, smem_g, act_full, b_ready, tid, crank)
@@ -1089,7 +1130,7 @@ def sandwich_role(
         if cutlass.const_expr(tap_out):
             tap_word = row_tok * tap_stride + col_word
         # (x_src 1 and 2: L1-bypassing, as no grid wait orders them.)
-        pre = prefix.load(idx=row_word, vector_size=4, alignment=16, is_volatile=x_src >= 1)
+        pre = prefix.load(idx=row_word, vector_size=4, alignment=16, is_volatile=early_reads)
         # Snapshots past the last one reload snapshot 0 (their candidates are masked below).
         snap = []
         rw = pre
@@ -1109,7 +1150,7 @@ def sandwich_role(
                         + col_word,
                         vector_size=4,
                         alignment=16,
-                        is_volatile=x_src >= 1,
+                        is_volatile=early_reads,
                     )
                 )
             rw = res_w.load(idx=col_word, vector_size=4, alignment=16)
@@ -1117,22 +1158,32 @@ def sandwich_role(
         ow = out_w.load(idx=col_word, vector_size=4, alignment=16)
 
         n_calls = cutlass.Int32(0)
-        if cutlass.const_expr(x_src == 2):
+        if cutlass.const_expr(folded):
             # ---- The latent all-reduce, folded in (see the docstring). The previous call's CTA 0 stored this call's
-            # count after its grid wait, and that call completed before this launch.
+            # count at its end, and that call completed before this launch (x_src 3: before this grid's wait returned).
             n_calls = cutlass.Int32(lat_flags.load(idx=0, is_volatile=True))
-            half_words = MAX_TOKENS * world * LAT_WORDS
+            half_words = lat_rows * world * LAT_WORDS
             cur_h = n_calls & cutlass.Int32(1)
             h_base = cur_h * cutlass.Int32(half_words)
-            # The other half (the next call's) emptied first: this CTA's 1/56 of it, 16-byte stores.
-            e_base = (cur_h ^ cutlass.Int32(1)) * cutlass.Int32(half_words) + bx * cutlass.Int32(
-                half_words // NUM_CTAS
-            )
-            empty_l = cutlass.Int32(EMPTY_WORD)
-            for q in cutlass.range_constexpr(half_words // NUM_CTAS // (EPI_THREADS * 4)):
-                rms_src.store((empty_l, empty_l, empty_l, empty_l),
-                              idx=e_base + cutlass.Int32(q * EPI_THREADS * 4) + tid * cutlass.Int32(4),
-                              alignment=16)  # fmt: skip
+            if cutlass.const_expr(x_src == 3):
+                # This rank's partial into slot [rank] of half n & 1 of every rank's exchange: one 16-byte vector per
+                # thread of the 56 CTAs, -0.0 halves as +0.0 (as the one-shot all-reduce's push).
+                p_g = bx * cutlass.Int32(EPI_THREADS) + tid
+                if p_g < num_tokens * cutlass.Int32(LAT_VECS):
+                    p_tok = p_g // cutlass.Int32(LAT_VECS)
+                    p_vec = p_g % cutlass.Int32(LAT_VECS)
+                    pv = lat_part.load(idx=p_tok * cutlass.Int32(LAT_WORDS) + p_vec * cutlass.Int32(4), vector_size=4,
+                                       alignment=16)  # fmt: skip
+                    lat_mc.store(
+                        (_sanitize(cutlass.Int32(pv[0])), _sanitize(cutlass.Int32(pv[1])),
+                         _sanitize(cutlass.Int32(pv[2])), _sanitize(cutlass.Int32(pv[3]))),
+                        idx=h_base + (p_tok * cutlass.Int32(world) + rank) * cutlass.Int32(LAT_WORDS)
+                        + p_vec * cutlass.Int32(4),
+                        alignment=16,
+                    )  # fmt: skip
+            else:
+                # The other half (the next call's) emptied first.
+                _empty_lat_half(rms_src, cur_h ^ cutlass.Int32(1), half_words, bx, tid)
             if bx == cutlass.Int32(0):
                 if tid < cutlass.Int32(MAX_TOKENS):
                     next_sb = (n_calls + cutlass.Int32(1)) % cutlass.Int32(LAT_SCALE_BUFS)
@@ -1282,8 +1333,11 @@ def sandwich_role(
                         + token,
                         is_volatile=True,
                     )  # fmt: skip
+            if cutlass.const_expr(x_src == 3):
+                # The other half (the next call's) emptied off the reduce's path, before the fenced phase 1 push.
+                _empty_lat_half(rms_src, cur_h ^ cutlass.Int32(1), half_words, bx, tid)
 
-        if cutlass.const_expr(tail and x_src != 2):
+        if cutlass.const_expr(tail and not folded):
             # Per-token latent RMS while the MMA runs: cluster CTA c computes tokens c and c + 7 (epilogue warps 0 and
             # 1) from its bulk-copied row: each lane sums the squares of its 14 16-byte vectors in order, then a
             # butterfly; the scale goes by st.async into row_scale of every cluster CTA, completing mb_rms there.
@@ -1352,7 +1406,7 @@ def sandwich_role(
             )
         prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
         scales = []
-        if cutlass.const_expr(tail and x_src == 2):
+        if cutlass.const_expr(tail and folded):
             # The live tokens' scales from buffer n % 3 of the scale slab (published by each token's cluster).
             sb_idx = cutlass.Int32(LAT_SCALES) + (
                 n_calls % cutlass.Int32(LAT_SCALE_BUFS)
@@ -1418,7 +1472,7 @@ def sandwich_role(
                 vector_size=4,
                 alignment=16,
             )
-            if cutlass.const_expr(x_src == 2):
+            if cutlass.const_expr(folded):
                 # The epilogue warps' empties of the latent half (ordered before this thread by the stage barrier)
                 # before the push: a rank's next push into that half follows its phase 2 of this call.
                 _fence_sys()
@@ -1874,10 +1928,10 @@ def sandwich_role(
                         idx=slab_buf * cutlass.Int32(SLAB_WORDS) + row_word,
                         alignment=16,
                     )
-        if cutlass.const_expr(x_src >= 1):
+        if cutlass.const_expr(early_reads):
             # The grid completes only after its producer (the dependents' own transitive reads rely on that).
             prims.griddepcontrol(prims.GridDepAction.WAIT)
-        if cutlass.const_expr(x_src == 2):
+        if cutlass.const_expr(folded):
             # The next call's count, kept in [0, 6) so that it never wraps: its parity picks the half, its value mod 3
             # the scale buffer. Every CTA of this call has read this one (CTA 0's phase 2 needed every CTA's push).
             if (bx == cutlass.Int32(0)) & (tid == cutlass.Int32(0)):
@@ -1908,6 +1962,8 @@ def k3_sandwich_kernel(
     x_slab: cutlass.Array,
     lat_flags: cutlass.Array,
     tap: cutlass.Array,
+    lat_mc: cutlass.Array,
+    lat_part: cutlass.Array,
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
     num_cand: cutlass.Int32,
@@ -1929,14 +1985,15 @@ def k3_sandwich_kernel(
     tap_out: cutlass.Constexpr[int],
     swiglu: cutlass.Constexpr[int],
     k_split: cutlass.Constexpr[int],
+    lat_rows: cutlass.Constexpr[int],
 ):
     """The sandwich alone: 56 CTAs, each running ``sandwich_role`` on its own shared memory (arguments as there)."""
     smem = SmemAllocator().allocate(smem_bytes(k_in, rms_cols, swiglu), byte_alignment=1024)
     sandwich_role(
         tma_desc_w, tma_desc_x, tma_desc_x2, rms_src, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
-        updated, normed, x_slab, lat_flags, tap, smem, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        x_col0, lat_eps, slab_buf, x_buf, tap_stride, world, k_in, x_tiles, rms_cols, publish, x_src, plain, tap_out,
-        swiglu, k_split, 0, None,
+        updated, normed, x_slab, lat_flags, tap, lat_mc, lat_part, smem, num_tokens, rank, num_cand, add_prefix,
+        rms_eps, out_eps, x_col0, lat_eps, slab_buf, x_buf, tap_stride, world, k_in, x_tiles, rms_cols, publish, x_src,
+        plain, tap_out, swiglu, k_split, lat_rows, 0, None,
     )  # fmt: skip
 
 
@@ -2005,9 +2062,9 @@ def k3_sandwich_oproj(
     tma_desc_x = activation_tensor_map(x, K_IN, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, src_slab, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
-        updated, normed, x_slab, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW), world, K_IN,
-        MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1,
+        updated, normed, x_slab, ws_flags, ws_flags, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix,
+        rms_eps, out_eps, cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW),
+        world, K_IN, MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1, MAX_TOKENS,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2032,6 +2089,8 @@ def k3_sandwich_tail(
     x_slab: cute.Tensor,
     lat_flags: cute.Tensor,  # x_src 2: int32 [LAT_FLAG_WORDS] (the call count and the scale slab)
     tap: cute.Tensor,  # tap_out: int32 words of the bf16 tap rows [M, 7168], tap_stride words apart
+    lat_mc: cute.Tensor,  # x_src 3: the latent exchange buffer's multicast mapping, int32 words
+    lat_part: cute.Tensor,  # x_src 3: ``latent``'s int32 words (this rank's unreduced partial)
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
     num_cand: cutlass.Int32,
@@ -2047,21 +2106,23 @@ def k3_sandwich_tail(
     publish: cutlass.Constexpr[int],
     x_src: cutlass.Constexpr[int],
     tap_out: cutlass.Constexpr[int],  # 1: the pre-norm mixture into ``tap``; 2: updated
+    lat_rows: cutlass.Constexpr[int],  # x_src 2 / 3: token rows of one half of the latent exchange
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """The pre-attention sandwich: phase 1 is the row-parallel MoE tail (x_src 1: ``latent_words`` is the reduced
     latent's Lamport slab, int32 [3][8][1792], polled in buffer ``src_buf``; x_src 2: ``latent_words`` is this rank's
-    latent exchange buffer, int32 [2][8][world][1792], and ``latent`` gives only the shape)."""
+    latent exchange buffer, int32 [2][lat_rows][world][1792], and ``latent`` gives only the shape; x_src 3: the same,
+    ``latent`` (and ``lat_part``, its words) this rank's unreduced partial, pushed through ``lat_mc``)."""
     k_in = TAIL_LAT + TAIL_ACT
     tma_desc_w = weight_tensor_map(w, k_in)
     tma_desc_x = activation_tensor_map(latent, LATENT, num_tokens)
     tma_desc_x2 = activation_tensor_map(act, TAIL_ACT, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x2, latent_words, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w,
-        out_w, updated, normed, x_slab, lat_flags, tap, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT, publish, x_src, 0,
-        tap_out, 0, 1,
+        out_w, updated, normed, x_slab, lat_flags, tap, lat_mc, lat_part, num_tokens, rank, num_cand, add_prefix,
+        rms_eps, out_eps, lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT,
+        publish, x_src, 0, tap_out, 0, 1, lat_rows,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2099,9 +2160,10 @@ def k3_sandwich_plain(
     tma_desc_x = activation_tensor_map(x, 2 * k_in if swiglu else k_in, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, ws_flags, ws_uc, ws_mc, ws_flags, residual, residual, norm_w, norm_w,
-        norm_w, updated, normed, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1), cutlass.Int32(1),
-        eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0), cutlass.Int32(0),
-        cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu, 2 if swiglu else 1,
+        norm_w, updated, normed, ws_flags, ws_flags, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1),
+        cutlass.Int32(1), eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0),
+        cutlass.Int32(0), cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu,
+        2 if swiglu else 1, MAX_TOKENS,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip

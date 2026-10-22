@@ -3783,12 +3783,15 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             logger.info(
                 f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_FRONT16=1: 9-16 token steps on the 16-token front: {front16}"
             )
+        # Built whatever TRTLLM_K3LL_NARROW_LATENT_TAIL says now (read at forward time).
+        comm.build_latent_exchange(mapping)
         state = _decode_moe_lowm.K3DecodeMoeNvfp4.create(
             mapping,
             takes[0].routed_experts.backend.w3_w1_weight.device,
             comm.mnnvl,
             front_sort=bool(_flags.TRTLLM_K3LL_MOE_FRONT_SORT),
             front16=front16,
+            latent=comm.latent,
         )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)

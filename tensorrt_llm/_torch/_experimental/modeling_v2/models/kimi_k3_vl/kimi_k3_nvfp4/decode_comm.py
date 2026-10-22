@@ -15,7 +15,9 @@ aside) one collective runs both:
 
 The pre-attention step after a MoE layer whose row-parallel tail was handed on (a `PendingTail`, `decode_moe.py`) is
 the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
-all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
+all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel. With
+``TRTLLM_K3LL_NARROW_LATENT_TAIL`` the lowm MoE hands on its routed latent partial unreduced (``PendingTail.unreduced``)
+and the same kernel all-reduces it first, over the group's `K3SandwichLatentExchange` (`K3DecodeComm.latent`).
 
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
 
@@ -26,8 +28,9 @@ The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residua
   any token count the MNNVL workspace holds, with the residual add and the RMSNorm in its epilogue (the context
   projection's with a zero residual).
 
-The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group (`K3DecodeComm.create`): collective
-over the group and eager, built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
+The state is one `MnnvlWorkspace` and one `K3SandwichWorkspace` of the TP group (`K3DecodeComm.create`), and with the
+lowm MoE one `K3SandwichLatentExchange` (`K3DecodeComm.build_latent_exchange`): collective over the group and eager,
+built by the target in `post_load_weights` before any CUDA-graph capture. Every rank must
 make the same calls on each in the same order. Which call a step takes is decided from its token count and kind and
 from the load-time layout alone, which every rank of the group shares.
 
@@ -51,6 +54,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_plai
     k3_sandwich_plain,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
+    K3SandwichLatentExchange,
     k3_sandwich_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce_attn_res import (
@@ -118,14 +122,16 @@ def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 class PendingTail(NamedTuple):
     """A MoE layer's row-parallel tail left to its consumer's fused pre-attention step (``K3DecodeComm.sandwich_tail``):
-    the reduced latent ``[T, 3584]``, the shared experts' activation, the tail weight ``[latent up columns | padding |
-    shared down]``, this rank's first latent column and the latent norm's epsilon."""
+    the reduced latent ``[T, 3584]`` (with ``unreduced``, this rank's routed partial, which the consumer's kernel
+    all-reduces over ``K3DecodeComm.latent``), the shared experts' activation, the tail weight ``[latent up columns |
+    padding | shared down]``, this rank's first latent column and the latent norm's epsilon."""
 
     latent: torch.Tensor
     act: torch.Tensor
     weight: torch.Tensor
     lo: int
     lat_eps: float
+    unreduced: bool = False
 
 
 def _eps(norm: nn.Module) -> float:
@@ -149,10 +155,12 @@ def _res_args(res_proj: nn.Module, res_norm: nn.Module, out_norm: nn.Module) -> 
 @dataclass(eq=False)
 class K3DecodeComm:
     """The decode path's collective state for the TP group: the `MnnvlWorkspace` and the `K3SandwichWorkspace` the
-    post-attention steps run on. Built by `create`; owned by the target and shared by every layer."""
+    post-attention steps run on, and the `K3SandwichLatentExchange` the sandwich tail all-reduces an unreduced latent
+    over (None until `build_latent_exchange`). Built by `create`; owned by the target and shared by every layer."""
 
     mnnvl: MnnvlWorkspace
     sandwich: K3SandwichWorkspace
+    latent: Optional[K3SandwichLatentExchange] = None
 
     @classmethod
     def create(cls, mapping, oproj_weight: Optional[torch.Tensor] = None) -> "K3DecodeComm":
@@ -185,28 +193,40 @@ class K3DecodeComm:
             torch.cuda.synchronize(weight.device)
         return state
 
+    def build_latent_exchange(self, mapping) -> None:
+        """Create `latent`, the exchange the sandwich tail all-reduces an unreduced latent over (a narrow step's
+        ``PendingTail.unreduced``), whatever ``TRTLLM_K3LL_NARROW_LATENT_TAIL`` says now: the switch is read at forward
+        time. Its halves hold `SANDWICH_MAX_TOKENS` rows, the most a narrow step's tail takes. Collective over
+        ``mapping``'s TP group and eager, before any CUDA-graph capture."""
+        if self.latent is None:
+            self.latent = K3SandwichLatentExchange.create(mapping, max_rows=SANDWICH_MAX_TOKENS)
+
     def compile_tail(self, latent_size: int, act_size: int, tail_weight: torch.Tensor) -> None:
         """Compile the sandwich tail kernel for a MoE tail of ``latent_size`` latent and ``act_size`` shared columns
-        and ``tail_weight``'s shape, with one call on a zero row of a zero weight, before any capture. Collective: every
-        rank of the group makes the call; it advances the sandwich workspace on every rank alike."""
+        and ``tail_weight``'s shape, with one call on a zero row of a zero weight (and, with `latent`, one with the
+        latent all-reduce folded in), before any capture. Collective: every rank of the group makes the calls; they
+        advance the sandwich workspace and `latent` on every rank alike."""
         weight = torch.zeros_like(tail_weight)
         hidden = weight.shape[0]
         ones = weight.new_ones(hidden)
-        k3_sandwich_tail(
-            weight.new_zeros(1, latent_size),
-            weight.new_zeros(1, act_size),
-            weight,
-            0,
-            1e-6,
-            None,
-            weight.new_zeros(0, 1, hidden),
-            weight.new_zeros(hidden),
-            ones,
-            ones,
-            1e-6,
-            1e-6,
-            self.sandwich,
-        )
+        exchanges = (None,) if self.latent is None else (None, self.latent)
+        for exchange in exchanges:
+            k3_sandwich_tail(
+                weight.new_zeros(1, latent_size),
+                weight.new_zeros(1, act_size),
+                weight,
+                0,
+                1e-6,
+                None,
+                weight.new_zeros(0, 1, hidden),
+                weight.new_zeros(hidden),
+                ones,
+                ones,
+                1e-6,
+                1e-6,
+                self.sandwich,
+                latent_exchange=exchange,
+            )
         torch.cuda.synchronize(weight.device)
 
     def takes_post_attention(self, hidden_states: torch.Tensor, step) -> bool:
@@ -301,10 +321,15 @@ class K3DecodeComm:
         tap_updated: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` as ``allreduce_attn_res`` of a MoE layer's row-parallel tail ``pending``
-        (``[RMSNorm(latent)[:, lo:lo + 224] | act] @ weight.T``), in one ``comm/k3_sandwich_tail`` call.
+        (``[RMSNorm(latent)[:, lo:lo + 224] | act] @ weight.T``), in one ``comm/k3_sandwich_tail`` call; an
+        ``unreduced`` latent is all-reduced over `latent` in the same kernel, bit for bit the one-shot all-reduce.
         ``updated_out``: a bf16 ``[T, H]`` tensor the call stores ``updated`` into (the consumer's snapshot bank row),
         returned as ``updated``. ``tap``: a bf16 ``[T, H]`` view (a speculative capture slot) the call also stores
         the pre-norm attention-residual mixture into, or ``updated`` with ``tap_updated``."""
+        if pending.unreduced and self.latent is None:
+            raise RuntimeError(
+                "sandwich_tail: an unreduced latent needs the latent exchange (build_latent_exchange)"
+            )
         return k3_sandwich_tail(
             pending.latent,
             pending.act,
@@ -318,6 +343,7 @@ class K3DecodeComm:
             tap=tap,
             tap_updated=tap_updated,
             updated_out=updated_out,
+            latent_exchange=self.latent if pending.unreduced else None,
         )
 
     def sandwich_oproj(

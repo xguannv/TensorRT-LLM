@@ -129,6 +129,11 @@ TRTLLM_K3LL_WIDE_LATENT_TAIL = _flag(
     1,
     "wide decode steps: MoE latent all-reduce + latent RMSNorm + the tail GEMV's input concat in one MNNVL call",
 )
+TRTLLM_K3LL_NARROW_LATENT_TAIL = _flag(
+    "TRTLLM_K3LL_NARROW_LATENT_TAIL",
+    0,
+    "narrow decode steps (lowm MoE): the MoE latent all-reduce inside the sandwich tail kernel, not its own kernel",
+)
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",

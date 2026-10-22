@@ -31,17 +31,21 @@ re-armed. ``slab_buf`` is the ordinal of the call among this op's calls in the f
 The latent all-reduce folded into the tail (``lat_uc``, ``lat_flags`` of a :class:`K3SandwichLatentExchange`): k3_moe
 pushes its routed latent partial into every rank's exchange buffer and exits; ``k3_sandwich_tail`` sums the ranks'
 partials itself (bit-identical to the one-shot all-reduce) instead of reading a reduced ``latent``. Every push-only
-k3_moe call must be followed by exactly one such tail call on the same exchange.
+k3_moe call must be followed by exactly one such tail call on the same exchange. With ``lat_mc`` as well, ``latent``
+is this rank's unreduced partial and the tail pushes it itself (after its grid wait) before the same reduce: no other
+call brackets it, and the exchange's call count lives on the device, so eager calls and any CUDA graphs' replays may
+interleave.
 
 Polling the input (``src_slab``, ``src_buf``): when the producer of phase 1's input (the attention output core for
 ``k3_sandwich_oproj``, the reduced latent for ``k3_sandwich_tail``) publishes it as such a slab (int32 [3][8][cols /
 2], sentinel 0xFFFFFFFF) and launches its dependents only after its own grid wait, the kernel polls buffer
 ``src_buf`` of it instead of waiting for the producer's grid; ``core`` / ``latent`` then give only the shape.
 
-The polled input and the folded latent all-reduce store their outputs before the kernel's final grid-dependency
-wait. A caller of either form must make sure that no predecessor still in flight reads memory those outputs may
-occupy, such as a block the caching allocator recycled after that predecessor's launch: synchronize the stream before
-the call (as ``test_k3_sandwich.py``'s ``check_fold_wrap`` does), or run without programmatic dependent launch
+The polled input and the folded latent all-reduce with k3_moe's push store their outputs before the kernel's final
+grid-dependency wait (the tail's own push does not: every store follows its grid wait). A caller of either form must
+make sure that no predecessor still in flight reads memory those outputs may occupy, such as a block the caching
+allocator recycled after that predecessor's launch: synchronize the stream before the call (as
+``test_k3_sandwich.py``'s ``check_fold_wrap`` does), or run without programmatic dependent launch
 (``TRTLLM_ENABLE_PDL=0``).
 """
 
@@ -135,11 +139,12 @@ def _slab_args(x_slab: Optional[torch.Tensor], slab_buf: int, fallback: torch.Te
 
 
 def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Optional[bool],
-                   arm_flags: Optional[Callable[[torch.Tensor], None]] = None):  # fmt: skip
+                   arm_flags: Optional[Callable[[torch.Tensor], None]] = None,
+                   fields: Optional[Dict[str, Any]] = None):  # fmt: skip
     """A ``cls`` over a new multicast buffer of ``words`` int32 per rank of ``mapping``'s TP group, every word empty,
-    and ``flag_words`` int32 flags, zero (then ``arm_flags``). Collective over the TP group only, and eager: every
-    rank of the group, and no other rank, calls it at the same point (its communicator is made from the group's
-    ranks alone).
+    and ``flag_words`` int32 flags, zero (then ``arm_flags``); ``fields``: further constructor arguments. Collective
+    over the TP group only, and eager: every rank of the group, and no other rank, calls it at the same point (its
+    communicator is made from the group's ranks alone).
 
     Failure model (as ``MnnvlWorkspace.create``): before allocating, the ranks agree that each of them can (not
     capturing a CUDA graph, the buffer within its device's free memory); if one cannot, every rank raises
@@ -192,6 +197,7 @@ def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Opt
             world_size=mapping.tp_size,
             handle=handle,
             comm=comm,
+            **(fields or {}),
         )
     except Exception as exc:  # noqa: BLE001 -- reported to every rank below, then re-raised
         error = exc
@@ -241,14 +247,15 @@ class K3SandwichWorkspace:
 
 @dataclass(eq=False)
 class K3SandwichLatentExchange:
-    """One TP group's latent exchange for ``k3_sandwich_tail`` with the latent all-reduce folded in: the push-only
-    k3_moe stores every rank's routed partial into two alternating halves of [8 tokens][world][3584] bf16 per rank
-    behind one multicast mapping, and the tail sums them. ``flags``: [0] the tail's call count mod 6 (its parity selects
-    the half), then the tail's latent scale slab. Pass ``uc`` and ``flags`` as the tail's ``lat_uc`` and ``lat_flags``.
-    Separate from :class:`K3SandwichWorkspace`."""
+    """One TP group's latent exchange for ``k3_sandwich_tail`` with the latent all-reduce folded in: every rank's
+    routed partial goes into two alternating halves of [max_rows tokens][world][3584] bf16 per rank behind one multicast
+    mapping (pushed by the push-only k3_moe, or by the tail itself), and the tail sums them. ``flags``: [0] the tail's
+    call count mod 6, on the device (its parity selects the half), then the tail's latent scale slab. Pass ``uc``,
+    ``mc`` and ``flags`` as the tail's ``lat_uc``, ``lat_mc`` and ``lat_flags``. Separate from
+    :class:`K3SandwichWorkspace`."""
 
     uc: torch.Tensor
-    """int32 [2 * 8 * world * 1792]: this rank's words (0x80000000 = empty)."""
+    """int32 [2 * max_rows * world * 1792]: this rank's words (0x80000000 = empty)."""
     mc: torch.Tensor
     """The same words through the multicast mapping (where the producers push)."""
     flags: torch.Tensor
@@ -259,12 +266,23 @@ class K3SandwichLatentExchange:
     """The ``McastGPUBuffer`` that owns the memory; the exchange is valid while this object lives."""
     comm: Any
     """The TP-group communicator the handles were exchanged over."""
+    max_rows: int = MAX_TOKENS
+    """Token rows of one half: the most rows of a call on the exchange."""
 
     @classmethod
-    def create(cls, mapping, fabric_handle: Optional[bool] = None) -> "K3SandwichLatentExchange":
+    def create(cls, mapping, fabric_handle: Optional[bool] = None,
+               max_rows: int = MAX_TOKENS) -> "K3SandwichLatentExchange":  # fmt: skip
         """Allocate and arm an exchange for ``mapping``'s TP group; collective and eager, as
-        :meth:`K3SandwichWorkspace.create`."""
+        :meth:`K3SandwichWorkspace.create`. ``max_rows``: the most token rows of a call of the path that uses it
+        (``k3_sandwich_tail`` takes at most ``MAX_TOKENS``); a multiple of 16 / TP size, so that the tail empties a half
+        in whole 16-byte stores."""
         from . import k3_sandwich_kernel as kernel
+
+        if not kernel.lat_rows_fit(mapping.tp_size, max_rows):
+            raise ValueError(
+                f"K3SandwichLatentExchange: {max_rows} rows per half at TP {mapping.tp_size} are not a whole number "
+                "of the tail's 16-byte stores"
+            )
 
         def arm(flags: torch.Tensor) -> None:
             scales = slice(
@@ -275,10 +293,11 @@ class K3SandwichLatentExchange:
         return _create_buffer(
             cls,
             mapping,
-            kernel.lat_buffer_words(mapping.tp_size),
+            kernel.lat_buffer_words(mapping.tp_size, max_rows),
             kernel.LAT_FLAG_WORDS,
             fabric_handle,
             arm,
+            dict(max_rows=max_rows),
         )
 
 
@@ -441,6 +460,7 @@ def supports_tail(
         "lat_flags",
         "tap",
         "updated_out",
+        "lat_mc",
     ),
 )
 def k3_sandwich_tail(
@@ -469,19 +489,21 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    lat_mc: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """``(normed, updated)`` of the row-parallel MoE tail (``[rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T``,
-    the RMS on the fp32 latent accumulator) followed by ``mnnvl_allreduce_attn_res`` of that partial. ``latent`` is
-    the whole reduced latent row (16-byte aligned: its rows are bulk-copied), ``act`` the shared-expert activation,
+    the RMS on the fp32 latent accumulator) followed by ``mnnvl_allreduce_attn_res`` of that partial. ``latent`` is the
+    whole reduced latent row (16-byte aligned: its rows are bulk-copied), ``act`` the shared-expert activation,
     ``tail_weight`` [7168, 256 + 384] the latent up columns of the slice zero-padded to 256 and the shared down
     projection; ``src_slab`` (int32 [3, 8, 1792]) supplies the latent in buffer ``src_buf``; with ``lat_uc`` /
-    ``lat_flags`` (a :class:`K3SandwichLatentExchange`) the kernel sums the ranks' pushed partials itself and
-    ``latent`` gives only the shape; with ``tap`` (bf16 [M, 7168], unit column stride, rows a multiple of 8 elements
-    apart, 16-byte aligned: e.g. a column slice of a capture buffer) it also stores there the pre-norm attn_res mixture
-    rows (a DSpark capture layer's tap) or, with ``tap_updated``, ``updated``; with ``updated_out`` (bf16 [M, 7168],
-    contiguous, 16-byte aligned, e.g. the next row of the attention-residual snapshot bank, which this call does not
-    read) it stores ``updated`` there instead of a new tensor and returns an empty [0, 7168] in its place; the rest as
-    ``k3_sandwich_oproj``."""
+    ``lat_flags`` (a :class:`K3SandwichLatentExchange`) the kernel sums the ranks' pushed partials itself and ``latent``
+    gives only the shape; with ``lat_mc`` as well (the exchange's ``mc``), ``latent`` is this rank's unreduced partial
+    (16-byte aligned), which the kernel pushes into the exchange itself before that sum; with ``tap`` (bf16 [M, 7168],
+    unit column stride, rows a multiple of 8 elements apart, 16-byte aligned: e.g. a column slice of a capture buffer)
+    it also stores there the pre-norm attn_res mixture rows (a DSpark capture layer's tap) or, with ``tap_updated``,
+    ``updated``; with ``updated_out`` (bf16 [M, 7168], contiguous, 16-byte aligned, e.g. the next row of the
+    attention-residual snapshot bank, which this call does not read) it stores ``updated`` there instead of a new tensor
+    and returns an empty [0, 7168] in its place; the rest as ``k3_sandwich_oproj``."""
     import cuda.bindings.driver as cuda_driver
 
     from . import k3_sandwich_kernel as kernel
@@ -495,6 +517,9 @@ def k3_sandwich_tail(
         )
     world = ws_uc.numel() // kernel.buffer_words(1)
     fold = lat_uc is not None
+    lat_rows = MAX_TOKENS
+    if lat_mc is not None and not fold:
+        raise ValueError("k3_sandwich_tail: lat_mc needs lat_uc and lat_flags (one exchange)")
     if fold:
         if src_slab is not None:
             raise ValueError(
@@ -506,10 +531,26 @@ def k3_sandwich_tail(
             or lat_flags.numel() != kernel.LAT_FLAG_WORDS
         ):
             raise ValueError(f"k3_sandwich_tail: lat_flags must be int32 [{kernel.LAT_FLAG_WORDS}]")
-        if (lat_uc.dtype != torch.int32 or lat_uc.numel() != kernel.lat_buffer_words(world)
-                or not lat_uc.is_contiguous()):  # fmt: skip
+        lat_rows = lat_uc.numel() // kernel.lat_buffer_words(world, 1)
+        if (lat_uc.dtype != torch.int32 or lat_uc.numel() != kernel.lat_buffer_words(world, lat_rows)
+                or not lat_uc.is_contiguous() or not num_tokens <= lat_rows
+                or not kernel.lat_rows_fit(world, lat_rows)):  # fmt: skip
             raise ValueError(
-                f"k3_sandwich_tail: lat_uc must be the int32 [2, 8, {world}, 1792] exchange buffer"
+                f"k3_sandwich_tail: lat_uc must be an int32 [2, rows, {world}, 1792] exchange buffer of at least "
+                f"{num_tokens} rows"
+            )
+        if lat_mc is None and lat_rows != MAX_TOKENS:
+            raise ValueError(
+                f"k3_sandwich_tail: k3_moe pushes into an exchange of {MAX_TOKENS} rows per half"
+            )
+        if lat_mc is not None and (lat_mc.dtype != torch.int32 or lat_mc.numel() != lat_uc.numel()
+                                   or not lat_mc.is_contiguous()):  # fmt: skip
+            raise ValueError(
+                "k3_sandwich_tail: lat_mc must be the multicast mapping of lat_uc's exchange"
+            )
+        if lat_mc is not None and latent.data_ptr() % 16 != 0:
+            raise ValueError(
+                "k3_sandwich_tail: the latent partial must be 16-byte aligned (it is pushed by vector)"
             )
         if world % 2 != 0 or not (world <= 8 or world % 8 == 0):
             raise ValueError(f"k3_sandwich_tail: the latent exchange takes an even TP of at most 8 or a multiple of 8, "
@@ -535,7 +576,7 @@ def k3_sandwich_tail(
     add_prefix = prefix is not None
     slab_words, buf, publish = _slab_args(x_slab, slab_buf, ws_flags)
     if fold:
-        src_words, sbuf, x_src = lat_uc.reshape(-1), 0, 2
+        src_words, sbuf, x_src = lat_uc.reshape(-1), 0, 2 if lat_mc is None else 3
     else:
         src_words, sbuf, x_src = _src_args(src_slab, src_buf, kernel.LATENT, _words(latent))
     args = (
@@ -556,17 +597,19 @@ def k3_sandwich_tail(
         _arg(slab_words),
         _arg(lat_flags if fold else ws_flags),
         _arg(_tap_words(tap) if tap is not None else ws_flags),
+        _arg(lat_mc.reshape(-1) if x_src == 3 else ws_flags),
+        _arg(_words(latent) if x_src == 3 else ws_flags),
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(latent.device).cuda_stream)
     use_pdl = _use_pdl()
     tap_out = 0 if tap is None else 2 if tap_updated else 1
     tap_stride = tap.stride(0) // 2 if tap is not None else kernel.WORDS_PER_ROW
-    key = ("tail", world, publish, x_src, tap_out, use_pdl)
+    key = ("tail", world, publish, x_src, tap_out, lat_rows, use_pdl)
     runtime = (
         num_tokens, rank, num_snapshots + 1, int(add_prefix), float(rms_eps), float(output_rms_eps), lo,
         float(lat_eps), buf, sbuf, tap_stride,
     )  # fmt: skip
-    consts = (world, publish, x_src, tap_out, use_pdl)
+    consts = (world, publish, x_src, tap_out, lat_rows, use_pdl)
     _compile_and_run(
         kernel.k3_sandwich_tail, key, args, runtime, consts, stream, "k3_sandwich_tail"
     )
@@ -578,7 +621,8 @@ def k3_sandwich_tail(
 @k3_sandwich_tail.register_fake
 def _(latent, act, tail_weight, lo, lat_eps, prefix, block_residual, res_weight, rms_weight, output_rms_weight,
       rms_eps, output_rms_eps, ws_uc, ws_mc, ws_flags, rank, x_slab=None, slab_buf=0, src_slab=None,
-      src_buf=0, lat_uc=None, lat_flags=None, tap=None, tap_updated=False, updated_out=None):  # fmt: skip
+      src_buf=0, lat_uc=None, lat_flags=None, tap=None, tap_updated=False, updated_out=None,
+      lat_mc=None):  # fmt: skip
     normed = latent.new_empty((latent.shape[0], tail_weight.shape[0]), dtype=torch.bfloat16)
     if updated_out is not None:
         return [normed, normed.new_empty((0, tail_weight.shape[0]))]
