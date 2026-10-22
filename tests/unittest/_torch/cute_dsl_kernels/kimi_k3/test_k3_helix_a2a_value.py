@@ -85,7 +85,10 @@ def _mla_output_op():
 
 
 def _dequant_block(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-    s = s.float().repeat_interleave(128, 0)[: w.shape[0]].repeat_interleave(128, 1)[:, : w.shape[1]]
+    s = s.float().reshape(
+        -(-w.shape[0] // 128), -(-w.shape[1] // 128)
+    )  # checkpoint: [R / 128, 1, C / 128, 1]
+    s = s.repeat_interleave(128, 0)[: w.shape[0]].repeat_interleave(128, 1)[:, : w.shape[1]]
     return w.float() * s
 
 
