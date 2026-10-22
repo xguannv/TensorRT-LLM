@@ -85,20 +85,25 @@ eager call on the same inputs):
   * NARROW_LATENT_TAIL (1, 3, 5, 8 rows): a narrow step's ``K3DecodeMoeNvfp4Layer.forward`` with ``partial_tail`` (the
     real front and lowm experts under one-hot routing) and the consumer's ``K3DecodeComm.sandwich_tail``, with a tail
     stand-in of the kernel's TP16 per-rank shape (latent columns [224 r, 224 r + 224), zero-padded to 256, and the
-    shared down projection; at W 4 the slices cover 896 of the 3584 columns, as ``test_k3_sandwich.py``'s). Off arm
-    against ``_ref_narrow_tail_chain`` (the routed experts' stock all-reduce, then ``comm/k3_sandwich_tail`` on the
-    reduced latent, x_src 0) bit for bit. On arm (the routed partial handed on unreduced; the tail kernel pushes it
-    into the TP group's ``K3SandwichLatentExchange`` and sums the ranks' partials itself, x_src 3) against the off
-    arm: ``normed`` and ``updated`` bit for bit on every rank. The sum is the one-shot all-reduce's (fp32 in rank
-    order, chunks of 8 ranks added from zero, one bf16 rounding) and the latent RMS and the GEMV read the same bf16
-    rows, so nothing is allowed to differ. The -0.0 -> +0.0 sanitisation of the pushed words happens only on the on
-    arm, in the tail kernel's push (as in the stock all-reduce's own push, so the sums agree); the off arm's chain is
-    untouched by the change, which keeps the off-arm comparison exact. Then the exchange's device-side call count and
-    half parity: per row count 8, 1, 5, three on-arm calls with an o_proj sandwich and an off-arm call between them,
-    every result the off arm's and the count advanced by the on-arm calls only. Then one CUDA graph per row count (1,
-    3, 5, 8), each with two on-arm tails, an off-arm tail and an o_proj sandwich, replayed alternately 12 times with
-    rewritten inputs and eager calls of both arms between the replays: every replay bit for bit the eager calls (as the
-    engine interleaves the graphs of several batch sizes and the drafter's with eager steps).
+    shared down projection; at W 4 the slices cover 896 of the 3584 columns, as ``test_k3_sandwich.py``'s), in every
+    form ``KimiLinearDecoderLayer.forward`` calls it in: plain, with the DSpark capture tap (the pre-norm mixture, or
+    ``updated``), with ``updated_out`` (a snapshot layer's bank row), and both. Off arm against
+    ``_ref_narrow_tail_chain`` (the routed experts' stock all-reduce, then ``comm/k3_sandwich_tail`` on the reduced
+    latent, x_src 0, in the same form) bit for bit. On arm (the routed partial handed on unreduced; the tail kernel
+    pushes it into the TP group's ``K3SandwichLatentExchange`` and sums the ranks' partials itself, x_src 3) against
+    the off arm: ``normed``, ``updated`` (on every rank), and the whole capture buffer and bank (the written slots and
+    the NaN around them) bit for bit. The sum is the one-shot all-reduce's (fp32 in rank order, chunks of 8 ranks
+    added from zero, one bf16 rounding) and the latent RMS and the GEMV read the same bf16 rows, so nothing is allowed
+    to differ. The -0.0 -> +0.0 sanitisation of the pushed words happens only on the on arm, in the tail kernel's push
+    (as in the stock all-reduce's own push, so the sums agree); the off arm's chain is untouched by the change, which
+    keeps the off-arm comparison exact. The same with a stand-in whose routing sends no token to slice 3's experts
+    (zero-weight dummies included), so those ranks' experts run on no row: their partial is zero. Then the exchange's
+    device-side call count and half parity: per row count 8, 1, 5, three on-arm calls with an o_proj sandwich and an
+    off-arm call between them, every result the off arm's and the count advanced by the on-arm calls only. Then one
+    CUDA graph per row count (1, 3, 5, 8), each with an on / off pair of tails with tap and ``updated_out``, an o_proj
+    sandwich and a second on-arm tail of another form, replayed alternately 12 times with rewritten inputs and eager
+    calls of both arms between the replays: every replay bit for bit the eager calls (as the engine interleaves the
+    graphs of several batch sizes and the drafter's with eager steps).
 
 Outputs the ranks share (routing, latent, reduced outputs, ``updated`` / ``normed``) are also compared bitwise across
 the ranks; the shared activation, the routed partial and the tail are this rank's own.
@@ -156,6 +161,16 @@ MOE_ROWS = (8, 16, 32)
 NARROW_ROWS = (1, 3, 5, 8)
 NARROW_SEQUENCE_ROWS = (8, 1, 5)
 NARROW_REPLAY_ORDER = (8, 3, 8, 1, 5, 3, 8, 5, 1, 3, 1, 8)
+# The consumer's tail call forms on a narrow step (implementation.py, KimiLinearDecoderLayer.forward): updated_out on
+# a snapshot layer, the DSpark capture tap (the mixture, or updated without the aux attn_res stream) on a tapped one.
+NARROW_KINDS = ("plain", "tap", "tap_updated", "bank", "tap_bank")
+# The graphs' second on-arm tail, per row count (the first on / off pair takes tap_bank).
+NARROW_GRAPH_KIND = {1: "plain", 3: "tap", 5: "tap_updated", 8: "bank"}
+CAPTURE_LAYERS = 5  # the stand-in capture buffer's layer slots; the tap writes slot 2
+# A routing that sends no token to slice EMPTY_SLICE's experts (zero-weight dummies included): their ranks run the
+# experts on no row at all.
+EMPTY_SLICE = 3
+EMPTY_DUMMIES = tuple(7 + 41 * j for j in range(TOP_K - 1))
 # The sandwich tail kernel's TP16 per-rank shapes: a 224-column latent slice zero-padded to 256, o_proj K 768.
 TAIL16_WIDTH = 224
 TAIL16_LAT = 256
@@ -492,11 +507,12 @@ def _moe_class():
     return MoeStandIn
 
 
-def _moe_layer(seed: int, latent: int, backend, all_reduce):
+def _moe_layer(seed: int, latent: int, backend, all_reduce, dummies=DUMMY_EXPERTS, excluded=None):
     """A MoE layer with what both paths read, from the modules KimiK3MoERuntime builds; ``latent`` columns. The gate,
     the latent projections and the norm are the same on every rank (seed ``seed``); the shared expert is this rank's
     slice. Router and latent-down rows and shared gate_up rows are exact payloads (module docstring); the routing is
-    one-hot (``DUMMY_EXPERTS``)."""
+    one-hot (``dummies``, the 15 zero-weight experts). ``excluded``: a slice index whose 224 experts get a routing
+    bias of ``-DUMMY_BIAS``, so no token selects any of them (``dummies`` must lie outside it)."""
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -533,7 +549,10 @@ def _moe_layer(seed: int, latent: int, backend, all_reduce):
         )
     g = _gen(5000 + seed)  # the same on every rank
     gr = _gen(5100 + 16 * seed + R.rank)  # this rank's shared expert slice
-    dummies = torch.tensor(DUMMY_EXPERTS, device="cuda")
+    if excluded is not None:
+        assert all(not excluded * E_LOCAL <= e < (excluded + 1) * E_LOCAL for e in dummies), dummies
+    dummy_ids = list(dummies)
+    dummies = torch.tensor(dummy_ids, device="cuda")
     with torch.no_grad():
         router = ls.exact_bf16(g, gate.weight.shape, -1, 2, 1 / 8)
         router[:, 0] = 0
@@ -541,7 +560,9 @@ def _moe_layer(seed: int, latent: int, backend, all_reduce):
         router[dummies, 0] = DUMMY_LOGIT_WEIGHT
         gate.weight.copy_(router)
         bias = 0.05 * torch.randn(NUM_EXPERTS, generator=g, device="cuda")
-        bias[dummies] = DUMMY_BIAS + 0.01 * torch.arange(len(DUMMY_EXPERTS), device="cuda")
+        bias[dummies] = DUMMY_BIAS + 0.01 * torch.arange(len(dummy_ids), device="cuda")
+        if excluded is not None:
+            bias[excluded * E_LOCAL : (excluded + 1) * E_LOCAL] = -DUMMY_BIAS
         gate.e_score_correction_bias.copy_(bias)
         down.weight.copy_(ls.exact_bf16(g, down.weight.shape, -2, 3, 1 / 16))
         up.weight.copy_(_normal(g, up.weight.shape, 0.02))
@@ -758,10 +779,13 @@ def check_build():
     moe_on = _moe_layer(21, LATENT, backend, all_reduce)
     moe_off = _moe_layer(21, LATENT, backend, all_reduce)
     moe_tail = _moe_layer(22, TAIL_SLICE * R.world, backend, all_reduce)
-    DC.use_decode_one_shot(nn.ModuleList([moe_on, moe_off, moe_tail, all_reduce]))
+    moe_empty = _moe_layer(
+        23, LATENT, backend, all_reduce, dummies=EMPTY_DUMMIES, excluded=EMPTY_SLICE
+    )
+    DC.use_decode_one_shot(nn.ModuleList([moe_on, moe_off, moe_tail, moe_empty, all_reduce]))
     comm = DC.K3DecodeComm.create(R.mapping, None)
     comm.build_latent_exchange(R.mapping)
-    for moe in (moe_on, moe_tail):
+    for moe in (moe_on, moe_tail, moe_empty):
         DM.fold_latent_norm(moe)
     # Production defaults: the front's sort and the 16-token front.
     on = _build_lowm(moe_on, comm, front_sort=1, front16=1)
@@ -769,6 +793,8 @@ def check_build():
     wide = _build_lowm(moe_on, comm, front_sort=1, front16=0)
     # The tail stand-in's head is replaced by a fixed partial: its layer is built, never warmed (no front of its width).
     tail = DML.K3DecodeMoeNvfp4Layer.create(moe_tail, wide.state, R.rank, R.world)
+    # The narrow check's no-local-expert stand-in: the production arms' state, the same shapes (compiled by ``on``).
+    empty = DML.K3DecodeMoeNvfp4Layer.create(moe_empty, on.state, R.rank, R.world)
     moe_on.decode_moe = on
     g = _gen(7000)
     with torch.device("cuda"):
@@ -789,7 +815,7 @@ def check_build():
     torch.cuda.synchronize()
     BUILT = SimpleNamespace(
         comm=comm, all_reduce=all_reduce, moe_on=moe_on, moe_off=moe_off, moe_tail=moe_tail,
-        on=on, plain16=plain16, wide=wide, tail=tail, res=res, refs=refs,
+        moe_empty=moe_empty, on=on, plain16=plain16, wide=wide, tail=tail, empty=empty, res=res, refs=refs,
     )  # fmt: skip
     if R.rank == 0:
         print(
@@ -1372,25 +1398,30 @@ def check_moe_lowm():
 # ----------------------------------------------------------------------------------------------------------------------
 # TRTLLM_K3LL_NARROW_LATENT_TAIL
 # ----------------------------------------------------------------------------------------------------------------------
-def _narrow_layer():
-    """The lowm layer of the production arms (front's sort, 16-token front) with a tail of the sandwich kernel's TP16
-    per-rank shape: this rank's latent up slice ``[7168, 224]`` (random), 32 zero columns and the layer's own shared
-    down projection, at latent column ``224 r``."""
-    on = BUILT.on
+def _narrow_layer(base):
+    """``base`` (a lowm layer on the production arms' state) with a tail of the sandwich kernel's TP16 per-rank shape:
+    this rank's latent up slice ``[7168, 224]`` (random), 32 zero columns and the layer's own shared down projection,
+    at latent column ``224 r``."""
     weight = torch.cat(
         [
             _normal(_gen(9400 + R.rank), (H, TAIL16_WIDTH), 0.02),
-            on.tail_weight.new_zeros(H, TAIL16_LAT - TAIL16_WIDTH),
-            on.tail_weight[:, -SHARED_PER_RANK:],
+            base.tail_weight.new_zeros(H, TAIL16_LAT - TAIL16_WIDTH),
+            base.tail_weight[:, -SHARED_PER_RANK:],
         ],
         dim=1,
     ).contiguous()
-    return dataclasses.replace(on, tail_weight=weight, lo=TAIL16_WIDTH * R.rank, width=TAIL16_WIDTH)
+    return dataclasses.replace(
+        base, tail_weight=weight, lo=TAIL16_WIDTH * R.rank, width=TAIL16_WIDTH
+    )
 
 
 class _NarrowCall:
-    """A narrow step's MoE input and the consumer's running prefix sum and snapshot bank (the same on every rank), and
-    this rank's o_proj input for the sandwich between two tails; buffers rewritten in place for a replay."""
+    """A narrow step's MoE input and the consumer's running prefix sum and snapshot bank (the same on every rank), this
+    rank's o_proj input for the sandwich between two tails, and per owner (an arm, the reference, a graph) the stores
+    a tail call may write: a capture buffer whose slot 2 is the tap and a bank whose row 1 is ``updated_out`` (both
+    NaN elsewhere, so a stray store shows). Buffers are rewritten in place for a replay."""
+
+    OWNERS = ("on", "off", "ref", "g_on", "g_off")
 
     def __init__(self, seed, rows):
         self.rows = rows
@@ -1399,6 +1430,9 @@ class _NarrowCall:
         self.prefix = torch.empty(rows, H, **empty)
         self.bank = torch.empty(SNAPSHOTS, rows, H, **empty)
         self.core = torch.empty(rows, O_PROJ_K, **empty)
+        self.stores = {
+            owner: (_nan(rows, CAPTURE_LAYERS * H), _nan(3, rows, H)) for owner in self.OWNERS
+        }
         self.draw(seed)
 
     def draw(self, seed):
@@ -1408,22 +1442,40 @@ class _NarrowCall:
         self.bank.copy_(_normal(g, self.bank.shape))
         self.core.copy_(_normal(_gen(16 * seed + R.rank), self.core.shape, 0.5))
 
+    def tail_kwargs(self, owner, kind):
+        """The tail call's ``tap`` / ``tap_updated`` / ``updated_out`` for ``kind`` (``NARROW_KINDS``), into
+        ``owner``'s stores."""
+        cap, bank_out = self.stores[owner]
+        tap = cap[:, 2 * H : 3 * H] if kind.startswith("tap") else None
+        return dict(
+            tap=tap,
+            tap_updated=kind == "tap_updated",
+            updated_out=bank_out[1] if kind in ("bank", "tap_bank") else None,
+        )
+
+
+def _nan(*shape):
+    return torch.full(shape, float("nan"), dtype=torch.bfloat16, device="cuda")
+
 
 def _narrow_res():
     res = BUILT.res
     return res.sa_proj, res.sa_norm, res.in_norm
 
 
-def _narrow_arm(layer, call, on):
+def _narrow_arm(layer, moe, call, on, kind="plain", owner=None):
     """The MoE layer's ``forward`` with ``partial_tail`` under TRTLLM_K3LL_NARROW_LATENT_TAIL=``on``, then the
-    consumer's ``sandwich_tail`` of its ``PendingTail``."""
+    consumer's ``sandwich_tail`` of its ``PendingTail`` in form ``kind`` into ``owner``'s stores (default the arm's)."""
+    owner = owner or ("on" if on else "off")
     with _switch("TRTLLM_K3LL_NARROW_LATENT_TAIL", on), _taps(layer) as seen:
-        pending = layer.forward(BUILT.moe_on, call.x, None, partial_tail=True)
+        pending = layer.forward(moe, call.x, None, partial_tail=True)
     assert isinstance(pending, DC.PendingTail) and pending.unreduced == bool(on), pending.unreduced
-    normed, updated = BUILT.comm.sandwich_tail(pending, call.prefix, call.bank, *_narrow_res())
-    return SimpleNamespace(
-        normed=normed, updated=updated, routed=seen["_front_routed"][0], weights=seen["_front"][1]
+    normed, updated = BUILT.comm.sandwich_tail(
+        pending, call.prefix, call.bank, *_narrow_res(), **call.tail_kwargs(owner, kind)
     )
+    cap, bank_out = call.stores[owner]
+    return SimpleNamespace(normed=normed, updated=updated, routed=seen["_front_routed"][0],
+                           ids=seen["_front"][0], weights=seen["_front"][1], cap=cap, bank_out=bank_out)  # fmt: skip
 
 
 def _narrow_oproj(call, o_weight):
@@ -1431,14 +1483,13 @@ def _narrow_oproj(call, o_weight):
     return BUILT.comm.sandwich_oproj(call.core, o_weight, call.prefix, call.bank, *_narrow_res())
 
 
-def _ref_narrow_tail_chain(layer, call):
+def _ref_narrow_tail_chain(layer, moe, call, kind="plain"):
     """A narrow step's MoE tail before TRTLLM_K3LL_NARROW_LATENT_TAIL: ``_front_routed``, the routed experts' stock
-    all-reduce (one-shot MNNVL), then ``comm/k3_sandwich_tail`` on the reduced latent (x_src 0)."""
+    all-reduce (one-shot MNNVL), then ``comm/k3_sandwich_tail`` on the reduced latent (x_src 0) in form ``kind``."""
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
         k3_sandwich_tail,
     )
 
-    moe = BUILT.moe_on
     res_proj, res_norm, out_norm = _narrow_res()
     routed, act = layer._front_routed(moe, call.x)
     latent = moe.routed_experts.all_reduce(routed)
@@ -1446,21 +1497,30 @@ def _ref_narrow_tail_chain(layer, call):
         latent.contiguous(), act.contiguous(), layer.tail_weight, layer.lo,
         float(moe.routed_expert_norm.variance_epsilon), call.prefix, call.bank, res_proj.weight.reshape(-1),
         res_norm.weight, out_norm.weight, DC._eps(res_norm), DC._eps(out_norm), BUILT.comm.sandwich,
+        **call.tail_kwargs("ref", kind),
     )  # fmt: skip
-    return SimpleNamespace(normed=normed, updated=updated)
+    cap, bank_out = call.stores["ref"]
+    return SimpleNamespace(normed=normed, updated=updated, cap=cap, bank_out=bank_out)
+
+
+_NARROW_OUT = ("normed", "updated", "cap", "bank_out")
 
 
 def _verify_narrow(where, on, off, ref=None):
+    """On arm against the off arm, the off arm against the pre-change chain: the outputs and the whole capture buffer
+    and bank (the tap / updated_out slots and the NaN around them) bit for bit; normed and updated on every rank."""
     _assert_one_hot(where, off.weights)
     _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
-    for name in ("normed", "updated"):
+    for name in _NARROW_OUT:
+        replicated = name in ("normed", "updated")
         if ref is not None:
-            _expect_same(
-                f"{where}: off arm vs pre-change {name}", getattr(off, name), getattr(ref, name),
-                replicated=True,
-            )  # fmt: skip
+            _expect_same(f"{where}: off arm vs pre-change {name}", getattr(off, name), getattr(ref, name),
+                         replicated=replicated)  # fmt: skip
         _expect_same(
-            f"{where}: on vs off {name}", getattr(on, name), getattr(off, name), replicated=True
+            f"{where}: on vs off {name}",
+            getattr(on, name),
+            getattr(off, name),
+            replicated=replicated,
         )
 
 
@@ -1468,62 +1528,90 @@ def _lat_count():
     return int(BUILT.comm.latent.flags[0].item())
 
 
+def _check_narrow_empty_rank(layer, moe):
+    """No token routed to slice ``EMPTY_SLICE``: its ranks' experts run on no row (their partial must be zero), and
+    the on arm is still the off arm and the pre-change chain, bit for bit."""
+    lo, hi = EMPTY_SLICE * E_LOCAL, (EMPTY_SLICE + 1) * E_LOCAL
+    mine = R.rank % (NUM_EXPERTS // E_LOCAL) == EMPTY_SLICE
+    for rows in NARROW_ROWS:
+        call = _NarrowCall(9300 + rows, rows)
+        for kind in ("plain", "tap_bank"):
+            a_on = _cloned(_narrow_arm(layer, moe, call, 1, kind))
+            a_off = _cloned(_narrow_arm(layer, moe, call, 0, kind))
+            ref = _cloned(_ref_narrow_tail_chain(layer, moe, call, kind))
+            where = f"NARROW_LATENT_TAIL no-local-expert {rows} rows {kind}"
+            assert not bool(((a_off.ids >= lo) & (a_off.ids < hi)).any()), (
+                f"{where}: a token routed to slice {EMPTY_SLICE}"
+            )
+            zero = not bool(a_on.routed.float().any()) and not bool(a_off.routed.float().any())
+            assert R.all_true(not mine or zero), (
+                f"{where}: a rank without tokens has a non-zero partial"
+            )
+            _verify_narrow(where, a_on, a_off, ref)
+
+
 def check_narrow_latent_tail():
-    """A narrow step's MoE tail with and without the latent all-reduce in the sandwich tail kernel, eagerly at 1, 3,
-    5 and 8 rows, across the exchange's call count and from CUDA graphs (module docstring)."""
-    layer = _narrow_layer()
+    """A narrow step's MoE tail with and without the latent all-reduce in the sandwich tail kernel, in every form of
+    the consumer's call, eagerly at 1, 3, 5 and 8 rows, with a slice no token is routed to, across the exchange's
+    call count and from CUDA graphs (module docstring)."""
+    layer, moe = _narrow_layer(BUILT.on), BUILT.moe_on
     assert BUILT.comm.latent is not None and layer.state.latent is BUILT.comm.latent
     assert BUILT.comm.latent.max_rows == DC.SANDWICH_MAX_TOKENS >= max(NARROW_ROWS)
     o_weight = _normal(_gen(9600 + R.rank), (H, O_PROJ_K), 0.03)
     for rows in NARROW_ROWS:
         call = _NarrowCall(9500 + rows, rows)
-        a_on = _cloned(_narrow_arm(layer, call, 1))
-        a_off = _cloned(_narrow_arm(layer, call, 0))
-        _verify_narrow(
-            f"NARROW_LATENT_TAIL {rows} rows", a_on, a_off,
-            _cloned(_ref_narrow_tail_chain(layer, call)),
-        )  # fmt: skip
+        for kind in NARROW_KINDS:
+            a_on = _cloned(_narrow_arm(layer, moe, call, 1, kind))
+            a_off = _cloned(_narrow_arm(layer, moe, call, 0, kind))
+            _verify_narrow(f"NARROW_LATENT_TAIL {rows} rows {kind}", a_on, a_off,
+                           _cloned(_ref_narrow_tail_chain(layer, moe, call, kind)))  # fmt: skip
+    _check_narrow_empty_rank(_narrow_layer(BUILT.empty), BUILT.moe_empty)
     # The exchange's call count (its parity picks the half) across changing M, o_proj sandwiches and off-arm calls.
     for rows in NARROW_SEQUENCE_ROWS:
         call = _NarrowCall(9700 + rows, rows)
         count = _lat_count()
-        first = _cloned(_narrow_arm(layer, call, 1))
+        first = _cloned(_narrow_arm(layer, moe, call, 1))
         _narrow_oproj(call, o_weight)
-        second = _cloned(_narrow_arm(layer, call, 1))
+        second = _cloned(_narrow_arm(layer, moe, call, 1))
         before_off = _lat_count()
-        off = _cloned(_narrow_arm(layer, call, 0))
+        off = _cloned(_narrow_arm(layer, moe, call, 0))
         assert _lat_count() == before_off, "an off-arm call advanced the latent exchange"
-        third = _cloned(_narrow_arm(layer, call, 1))
+        third = _cloned(_narrow_arm(layer, moe, call, 1))
         assert _lat_count() == (count + 3) % 6, (
             f"the latent exchange's count went {count} -> {_lat_count()} over three on-arm calls"
         )
         where = f"NARROW_LATENT_TAIL sequence {rows} rows"
         for i, on in enumerate((first, second, third)):
             _verify_narrow(f"{where} call {i}", on, off)
-    # One graph per row count, replayed alternately with eager calls between the replays.
+    # One graph per row count (a tap_bank on / off pair, an o_proj sandwich, a second on-arm tail of another form),
+    # replayed alternately with eager calls between the replays.
     graphs = {}
     for rows in NARROW_ROWS:
         calls = (_NarrowCall(9800 + rows, rows), _NarrowCall(9900 + rows, rows))
+        kind2 = NARROW_GRAPH_KIND[rows]
+        # Every compile key the graph runs, eagerly first.
+        _narrow_arm(layer, moe, calls[1], 1, kind2)
 
-        def body(calls=calls):
-            on1 = _narrow_arm(layer, calls[0], 1)
-            off1 = _narrow_arm(layer, calls[0], 0)
+        def body(calls=calls, kind2=kind2):
+            on1 = _narrow_arm(layer, moe, calls[0], 1, "tap_bank", "g_on")
+            off1 = _narrow_arm(layer, moe, calls[0], 0, "tap_bank", "g_off")
             _narrow_oproj(calls[0], o_weight)
-            on2 = _narrow_arm(layer, calls[1], 1)
+            on2 = _narrow_arm(layer, moe, calls[1], 1, kind2, "g_on")
             return on1, off1, on2
 
-        graphs[rows] = (calls, *_capture(body))
-    fields = ("normed", "updated", "routed")
+        graphs[rows] = (calls, kind2, *_capture(body))
+    fields = ("normed", "updated", "routed", "cap", "bank_out")
     for rep, rows in enumerate(NARROW_REPLAY_ORDER):
-        calls, graph, outs = graphs[rows]
+        calls, kind2, graph, outs = graphs[rows]
         for i, call in enumerate(calls):
             call.draw(10000 + 10 * rep + i)
         _replay(graph)
         g_on1, g_off1, g_on2 = (_cloned(o) for o in outs)
         where = f"NARROW_LATENT_TAIL graph {rows} rows replay {rep}"
-        e_on1 = _narrow_arm(layer, calls[0], 1)
-        e_off1 = _narrow_arm(layer, calls[0], 0)
-        e_on2 = _narrow_arm(layer, calls[1], 1)
+        e_on1 = _cloned(_narrow_arm(layer, moe, calls[0], 1, "tap_bank"))
+        e_off1 = _cloned(_narrow_arm(layer, moe, calls[0], 0, "tap_bank"))
+        e_on2 = _cloned(_narrow_arm(layer, moe, calls[1], 1, kind2))
+        e_off2 = _cloned(_narrow_arm(layer, moe, calls[1], 0, kind2))
         for name, g_arm, e_arm in (
             ("on 1", g_on1, e_on1),
             ("off", g_off1, e_off1),
@@ -1535,14 +1623,16 @@ def check_narrow_latent_tail():
                     getattr(g_arm, field),
                     getattr(e_arm, field),
                 )
-        _verify_narrow(where, g_on1, g_off1, _cloned(_ref_narrow_tail_chain(layer, calls[0])))
-        _verify_narrow(f"{where} second tail", g_on2, _cloned(_narrow_arm(layer, calls[1], 0)))
+        _verify_narrow(
+            where, g_on1, g_off1, _cloned(_ref_narrow_tail_chain(layer, moe, calls[0], "tap_bank"))
+        )
+        _verify_narrow(f"{where} second tail {kind2}", g_on2, e_off2)
     del graphs
     if R.rank == 0:
         print(
             "[rank 0] NARROW_LATENT_TAIL: off arm = pre-change chain; on arm = off arm bit for bit on every rank "
-            f"(eager at {NARROW_ROWS} rows, the call count across {NARROW_SEQUENCE_ROWS}, "
-            f"{len(NARROW_REPLAY_ORDER)} replays of {len(NARROW_ROWS)} graphs)",
+            f"(eager at {NARROW_ROWS} rows in forms {NARROW_KINDS}, a slice no token is routed to, the call count "
+            f"across {NARROW_SEQUENCE_ROWS}, {len(NARROW_REPLAY_ORDER)} replays of {len(NARROW_ROWS)} graphs)",
             flush=True,
         )
 
