@@ -127,7 +127,7 @@ TRTLLM_K3LL_FP8W_LOWM = _flag(
 )
 TRTLLM_K3LL_FP8W_LOWM_FUSED_A = _flag(
     "TRTLLM_K3LL_FP8W_LOWM_FUSED_A",
-    0,
+    1,
     "with FP8W_LOWM, also the weight reads whose N is not a multiple of 128 (MLA fused q_a/kv_a, partial row tile); "
     "read at forward time, the routing is installed at load when the launch value is 1",
 )
@@ -177,7 +177,7 @@ TRTLLM_K3LL_HELIX_Q_ABSORB = _flag(
 )
 TRTLLM_K3LL_MLA_GATE_SIDE = _flag(
     "TRTLLM_K3LL_MLA_GATE_SIDE",
-    0,
+    1,
     "MLA decode (quantized cache): the output gate projection on a side stream beside the attention, read in place "
     "by the V-B / gate kernel (no [kv_a | g] concatenation)",
 )
