@@ -170,7 +170,7 @@ TRTLLM_K3LL_HELIX_A2A_FUSED = _flag(
 )
 TRTLLM_K3LL_HELIX_Q_ABSORB = _flag(
     "TRTLLM_K3LL_HELIX_Q_ABSORB",
-    0,
+    1,
     "Helix MLA decode (FP8 cache): every rank computes all heads' FP8 queries (q_b through the module's FP8 "
     "projection, k3_fp8w_lowm_gemm at decode size; the BF16 W_UK absorption in K3MlaQAbsorb), no query all-gather; "
     "the BF16 W_UK is built at load when the launch value is 1, on SM103 only (elsewhere the switch-off path)",
@@ -189,7 +189,7 @@ TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
 )
 TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
     "TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A",
-    0,
+    1,
     "Helix MLA decode: every head's BF16 V up-projection inside the split-KV reduction, the exchange at 128 values "
     "per head, then the gate (mla_v_up.py); 1 at launch builds the BF16 W_UV of all heads (12.6 MB per MLA layer), "
     "on SM103 only (elsewhere the switch-off path)",
