@@ -96,6 +96,12 @@ TRTLLM_K3LL_DRAFTER_ATTN_CUTEDSL = _flag(
     1,
     "MLA DSpark drafter: block decode on its cute-dsl implementation when speculative_config leaves it at AUTO",
 )
+TRTLLM_K3LL_DRAFTER_MARKOV_V2 = _flag(
+    "TRTLLM_K3LL_DRAFTER_MARKOV_V2",
+    0,
+    "MLA DSpark worker (with TRTLLM_K3LL_MLA_SPEC_WORKER): trtllm::k3_markov's MMA build, every request's bias in "
+    "one MMA per position and a cluster-reduced exchange (draft tokens only: another bias summation order)",
+)
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",
     1,
