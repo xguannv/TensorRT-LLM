@@ -393,29 +393,34 @@ class K3DecodeComm:
             swiglu=swiglu,
         )
 
-    def takes_allreduce_norm(self, rows: int, hidden: int) -> bool:
+    def takes_allreduce_norm(
+        self, rows: int, hidden: int, one_shot_max_bytes: int = DECODE_AR_ONE_SHOT_MAX_BYTES
+    ) -> bool:
         """Whether ``allreduce_norm`` takes ``rows`` bf16 rows of ``hidden`` columns: the MNNVL workspace holds the
-        call at the decode path's one-shot ceiling (`DECODE_AR_ONE_SHOT_MAX_BYTES`, two-shot above it)."""
+        call at the one-shot ceiling ``one_shot_max_bytes`` (two-shot above it)."""
         if rows <= 0 or hidden <= 0 or hidden % 8:
             return False
         world, buffer_bytes = self.mnnvl.world_size, self.mnnvl.buffer_bytes
-        need = required_buffer_bytes(
-            rows, hidden, world, torch.bfloat16, DECODE_AR_ONE_SHOT_MAX_BYTES
-        )
-        two_shot = rows * hidden * world * 2 > DECODE_AR_ONE_SHOT_MAX_BYTES
+        need = required_buffer_bytes(rows, hidden, world, torch.bfloat16, one_shot_max_bytes)
+        two_shot = rows * hidden * world * 2 > one_shot_max_bytes
         return need <= buffer_bytes and not (two_shot and buffer_bytes % 32)
 
     def allreduce_norm(
-        self, partial: torch.Tensor, residual: torch.Tensor, norm: nn.Module
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        norm: nn.Module,
+        one_shot_max_bytes: int = DECODE_AR_ONE_SHOT_MAX_BYTES,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` in one ``comm/mnnvl_fusion_allreduce`` call: ``updated = residual +
         allreduce(partial)``, ``normed = norm(updated)`` for a plain RMSNorm ``norm``, sent one-shot up to
-        `DECODE_AR_ONE_SHOT_MAX_BYTES`. ``partial`` is this rank's unreduced ``[rows, hidden]`` bf16 output of a
-        row-parallel projection, of a shape ``takes_allreduce_norm`` holds for."""
+        ``one_shot_max_bytes`` (the decode path's `DECODE_AR_ONE_SHOT_MAX_BYTES` by default). ``partial`` is this
+        rank's unreduced ``[rows, hidden]`` bf16 output of a row-parallel projection, of a shape
+        ``takes_allreduce_norm`` holds for at that ceiling."""
         return mnnvl_fusion_allreduce(
             partial.contiguous(),
             self.mnnvl,
-            DECODE_AR_ONE_SHOT_MAX_BYTES,
+            one_shot_max_bytes,
             residual.contiguous(),
             norm.weight,
             _eps(norm),

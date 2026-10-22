@@ -307,3 +307,38 @@ def test_capture_without_an_eager_build_keeps_the_separate_kernels(monkeypatch):
     c.pool.copy_(pool0)
     monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_MLA_FUSED", 0)
     assert torch.equal(got, _run(owner, c))
+
+
+@needs_sm100
+@pytest.mark.parametrize("fused_on", [0, 1])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_drafter_gemm_in_the_attention(batch, fused_on, monkeypatch):
+    """``TRTLLM_K3LL_DRAFTER_GEMM`` in the same layer step: ``[q_a | kv_a]`` (no decode GEMV site here) and q_b on the
+    pinned low-M GEMM, with and without the fused attention, against the off arms within ``ON_OFF_TOL``; off, bit
+    for bit."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        mla_drafter_gemm,
+    )
+
+    heads = 4
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_MLA_FUSED", fused_on)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_GEMM", 0)
+    c = _case(batch, heads)
+    owner = mla_drafter.K3MLADrafterNorms(
+        _Drafter(heads),
+        None,
+        None,
+        None,
+        frozenset(),
+        fused=True,
+        gemm=mla_drafter_gemm.DrafterGemm(),
+    )
+    off = _run(owner, c)
+    assert not owner.gemm._ran
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_GEMM", 1)
+    c2 = _case(batch, heads)
+    on = _run(owner, c2)
+    assert {key[0] for key in owner.gemm._ran} == {"q_kv_a", "q_b"}
+    e = _rel(on, off)
+    print(f"[drafter_gemm] batch {batch} fused {fused_on}: on-off {e:.2e}")
+    assert e <= ON_OFF_TOL, e

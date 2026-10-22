@@ -20,6 +20,14 @@ With ``TRTLLM_K3LL_DRAFTER_MLA_FUSED`` (and the fused query / latent path of ``T
 layer's nope absorption, block attention over context and block, and V up-projection run as one clustered
 ``dspark_mla_attend`` launch (`K3MLADrafterNorms._attend_fused`) instead of the absorption BMM, the cute-dsl decode's
 split-KV and reduction kernels and the up-projection.
+
+With ``TRTLLM_K3LL_DRAFTER_GEMM`` the projections no decode GEMV site or sandwich takes at that row count (``[q_a |
+kv_a]`` above one token tile, q_b at every row count, gate_up above one token tile) run on the low-M split-K GEMM at
+pinned tactics (`mla_drafter_gemm`) instead of cuBLAS.
+
+With ``TRTLLM_K3LL_DRAFTER_WIDE_AR`` the drafter's fused all-reduces of more rows than one token tile (the
+``comm/mnnvl_fusion_allreduce`` calls here and the context projection's, `ar_ceiling`) send two-shot above the wide
+decode steps' one-shot ceiling (``decode_comm.WIDE_AR_ONE_SHOT_MAX_BYTES``), not the decode path's.
 """
 
 from typing import Callable, FrozenSet, List, Optional, Tuple
@@ -38,6 +46,7 @@ from tensorrt_llm.logger import logger
 from . import census as _census
 from . import decode_comm as _decode_comm
 from . import flags as _flags
+from . import mla_drafter_gemm as _gemm
 from . import mla_drafter_qkv as _qkv
 
 
@@ -52,6 +61,29 @@ def _plain_norm(norm: nn.Module, hidden: int) -> bool:
         and not getattr(norm, "use_gemma", True)
         and not getattr(norm, "is_nvfp4", True)
         and not getattr(norm, "return_hp_output", True)
+    )
+
+
+def ar_ceiling(rows: int) -> int:
+    """The one-shot ceiling of the drafter's fused all-reduce of ``rows`` rows: the wide decode steps' with
+    ``TRTLLM_K3LL_DRAFTER_WIDE_AR`` above one token tile, else the decode path's. Every rank decides alike."""
+    if _flags.TRTLLM_K3LL_DRAFTER_WIDE_AR and rows > _decode_comm.SANDWICH_MAX_TOKENS:
+        return _decode_comm.WIDE_AR_ONE_SHOT_MAX_BYTES
+    return _decode_comm.DECODE_AR_ONE_SHOT_MAX_BYTES
+
+
+def _plain_linear(linear: nn.Module) -> bool:
+    """A bias-free, unquantized bf16 projection whose forward is ``F.linear(x, weight)``: no output gather, no
+    all-reduce, no LoRA."""
+    weight = getattr(linear, "weight", None)
+    return (
+        isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.bfloat16
+        and getattr(linear, "bias", None) is None
+        and not getattr(linear, "has_any_quant", False)
+        and not getattr(linear, "gather_output", False)
+        and not getattr(linear, "reduce_output", False)
+        and getattr(getattr(linear, "tp_mode", None), "name", "COLUMN") == "COLUMN"
     )
 
 
@@ -73,7 +105,9 @@ class K3MLADrafterNorms:
     ``dflash_forward``; ``forms``: the ``k3_sandwich_plain`` forms that compiled (``o_proj``, ``down``);
     ``a_weights``: with the fused query / latent path (`install`'s ``qkv``), each layer's ``[q_a_proj | kv_a_proj]``
     weight, else None; ``fused``: whether the one-launch block attention may run (`_attend_fused`; the launch value of
-    ``TRTLLM_K3LL_DRAFTER_MLA_FUSED``, read again at each call)."""
+    ``TRTLLM_K3LL_DRAFTER_MLA_FUSED``, read again at each call); ``gemm``: with the launch value of
+    ``TRTLLM_K3LL_DRAFTER_GEMM`` on, the pinned low-M GEMMs (`_gemm`, the switch read again at each call), else
+    None."""
 
     def __init__(
         self,
@@ -84,6 +118,7 @@ class K3MLADrafterNorms:
         forms: FrozenSet[str],
         a_weights: Optional[List[torch.Tensor]] = None,
         fused: bool = False,
+        gemm: Optional[_gemm.DrafterGemm] = None,
     ):
         self.drafter = drafter
         self.comm = comm
@@ -92,6 +127,7 @@ class K3MLADrafterNorms:
         self.forms = forms
         self.a_weights = a_weights
         self.fused = fused
+        self.gemm = gemm
         # Per attention module: (its k_b / v_b buffers' addresses, k_b transposed [H, 512, 128], v_b [H, 128, 512]).
         self._fused_weights = {}
         # (heads, block, page size, PDL, cluster) of every dspark_mla_attend build that ran eagerly.
@@ -158,6 +194,7 @@ class K3MLADrafterNorms:
             frozenset(forms),
             a_weights,
             fused=bool(_flags.TRTLLM_K3LL_DRAFTER_MLA_FUSED) and a_weights is not None,
+            gemm=_gemm.DrafterGemm() if _flags.TRTLLM_K3LL_DRAFTER_GEMM else None,
         )
         drafter.dflash_forward = _Bound(owner)
         return owner
@@ -208,7 +245,7 @@ class K3MLADrafterNorms:
         ):
             return False
         rows = noise_embedding.shape[0] * noise_embedding.shape[1]
-        return self.comm.takes_allreduce_norm(rows, noise_embedding.shape[2])
+        return self.comm.takes_allreduce_norm(rows, noise_embedding.shape[2], ar_ceiling(rows))
 
     def forward(
         self,
@@ -319,6 +356,8 @@ class K3MLADrafterNorms:
         gemvs = getattr(self.gemvs_owner, "decode_gemvs", None)
         a = None if gemvs is None else gemvs.project("kv_a", normed, a_weight)
         if a is None:
+            a = self._gemm(normed, a_weight, "q_kv_a")
+        if a is None:
             a = torch.nn.functional.linear(normed, a_weight)
         if not _qkv.supports(a, layer_cache):
             return None
@@ -333,7 +372,9 @@ class K3MLADrafterNorms:
             attn.q_a_layernorm.variance_epsilon,
             attn.kv_a_layernorm.variance_epsilon,
         )
-        q = attn.q_b_proj(q_a)
+        q = self._gemm(q_a, attn.q_b_proj, "q_b")
+        if q is None:
+            q = attn.q_b_proj(q_a)
         attn_out = self._attend_fused(attn, q, blk_freqs, layer_cache, fixup, batch, block)
         if attn_out is not None:
             return attn_out
@@ -503,7 +544,7 @@ class K3MLADrafterNorms:
         if "o_proj" in self.forms and comm.takes_plain(x, linear.weight, residual, norm):
             return comm.sandwich_plain(x, linear.weight, residual, norm)
         partial = linear(x, all_reduce_params=_decode_comm.skip_all_reduce())
-        return comm.allreduce_norm(partial, residual, norm)
+        return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
 
     def _mlp_norm(
         self, mlp: nn.Module, x: torch.Tensor, residual: torch.Tensor, norm: nn.Module
@@ -522,8 +563,30 @@ class K3MLADrafterNorms:
             and comm.takes_plain(gate_up, mlp.down_proj.weight, residual, norm, swiglu=True)
         ):
             return comm.sandwich_plain(gate_up, mlp.down_proj.weight, residual, norm, swiglu=True)
-        partial = mlp(x, final_all_reduce_params=_decode_comm.skip_all_reduce())
-        return comm.allreduce_norm(partial, residual, norm)
+        h1 = self._gemm(x, mlp.gate_up_proj, "gate_up")
+        if h1 is not None:
+            # GatedMLP's unfused bf16 path with gate_up on the pinned GEMM.
+            partial = mlp.down_proj(
+                mlp._apply_activation(h1), all_reduce_params=_decode_comm.skip_all_reduce()
+            )
+        else:
+            partial = mlp(x, final_all_reduce_params=_decode_comm.skip_all_reduce())
+        return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
+
+    def _gemm(self, x: torch.Tensor, weight, role: str) -> Optional[torch.Tensor]:
+        """``x @ W.T`` on the pinned low-M GEMM for ``role`` (``weight``: the weight, or a plain column-parallel
+        bf16 ``Linear`` whose forward is exactly that) where ``TRTLLM_K3LL_DRAFTER_GEMM`` is on (now and at launch) and
+        it takes the call; else None."""
+        if self.gemm is None or not _flags.TRTLLM_K3LL_DRAFTER_GEMM:
+            return None
+        if isinstance(weight, nn.Module):
+            if not _plain_linear(weight):
+                return None
+            weight = weight.weight
+        out = self.gemm.project(x, weight, role)
+        if out is not None:
+            _census.dispatch(f"drafter_gemm_{role}")
+        return out
 
 
 class _Bound:
