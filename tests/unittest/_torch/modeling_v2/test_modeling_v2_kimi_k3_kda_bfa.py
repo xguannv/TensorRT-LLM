@@ -16,10 +16,14 @@
 
 * ``kda_bfa`` decode GEMV site (``K3DecodeGemvs.project`` on ``k3_ctm_gemv_wide``) against ``F.linear`` and an fp32
   reference, at the per-rank TP16 shape (136 x 7168) and 1 / 8 / 16 / 32 / 64 rows.
+* ``K3DecodeKDA._k3_projections`` under every TRTLLM_K3LL_KDA_BFA_FIRST / TRTLLM_K3LL_KDA_BFA_OVERLAP setting: the same
+  bits, and with BFA_FIRST the [f_a | b] projection launched before QKVG on the calling stream.
 * ``trtllm::k3_fp8_kda_verify`` with the [f_a | b] rows passed beside the [q | k | v | g] rows (``bfa=``) against the
   same call on their concatenation: outputs, the pool state, the drafts' records and the conv caches bit for bit,
   over rounds with changing pending counts, fp32 and bf16 committed states.
 """
+
+import types
 
 import pytest
 import torch
@@ -72,6 +76,65 @@ def test_kda_bfa_site(rows):
     # bf16 output: one rounding of an fp32 accumulation; cuBLAS's split-K result rounds the same sum.
     assert (y.float() - ref).abs().max().item() <= 1e-2 * scale
     assert (ref_bf16.float() - ref).abs().max().item() <= 1e-2 * scale
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32])
+def test_projection_order(rows, monkeypatch):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_gemv,
+        flags,
+        implementation,
+    )
+    from tensorrt_llm._torch.modules.multi_stream_utils import set_do_multi_stream
+
+    kda = implementation.K3DecodeKDA
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    w_bfa = (torch.randn(BFA, 7168, generator=g, device="cuda") * 0.02).bfloat16()
+    # A bf16 stand-in for the FP8 QKVG module: the order and streams are under test, not its kernel.
+    w_qkvg = (torch.randn(4 * HK, 7168, generator=g, device="cuda") * 0.02).bfloat16()
+    x = torch.randn(rows, 7168, generator=g, device="cuda").bfloat16()
+    calls = []
+    mod = types.SimpleNamespace(
+        _bfa_gemvs=None,
+        _bfa_proj_weight=w_bfa,
+        _projection_fork_event=torch.cuda.Event(),
+        _projection_join_event=torch.cuda.Event(),
+        _projection_aux_stream=torch.cuda.Stream(),
+    )
+
+    def qkvg_proj(t):
+        calls.append(("qkvg", torch.cuda.current_stream()))
+        return F.linear(t, w_qkvg)
+
+    def k3_bfa(t):
+        calls.append(("bfa", torch.cuda.current_stream()))
+        return kda._k3_bfa(mod, t)
+
+    mod.qkvg_proj, mod._k3_bfa = qkvg_proj, k3_bfa
+    out = {}
+    with torch.inference_mode():
+        mod._bfa_gemvs = decode_gemv.K3DecodeGemvs.create(sites=("kda_bfa",))
+        set_do_multi_stream(True)
+        try:
+            for first in (0, 1):
+                for overlap in (0, 1):
+                    monkeypatch.setattr(flags, "TRTLLM_K3LL_KDA_BFA_FIRST", first)
+                    monkeypatch.setattr(flags, "TRTLLM_K3LL_KDA_BFA_OVERLAP", overlap)
+                    calls.clear()
+                    main = torch.cuda.current_stream()
+                    out[first, overlap] = kda._k3_projections(mod, x)
+                    torch.cuda.synchronize()
+                    if first:
+                        assert [c[0] for c in calls] == ["bfa", "qkvg"]
+                        assert all(c[1] == main for c in calls)
+                    elif overlap:
+                        assert dict(calls)["bfa"] == mod._projection_aux_stream
+        finally:
+            set_do_multi_stream(False)
+    ref_q, ref_b = out[0, 0]
+    assert torch.equal(ref_b, mod._bfa_gemvs.project("kda_bfa", x, w_bfa))
+    for key, (q, b) in out.items():
+        assert torch.equal(q, ref_q) and torch.equal(b, ref_b), f"BFA_FIRST, BFA_OVERLAP = {key}"
 
 
 def _inputs(seed: int, num_spec: int, ssm_dtype: torch.dtype):

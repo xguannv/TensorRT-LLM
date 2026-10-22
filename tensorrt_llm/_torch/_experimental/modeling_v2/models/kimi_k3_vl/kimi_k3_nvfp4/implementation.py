@@ -2356,9 +2356,14 @@ class K3DecodeKDA(KimiKDALinearAttention):
         return self._store_core(core, output)
 
     def _k3_projections(self, x: torch.Tensor):
-        """``(qkvg, bfa)``: the FP8 QKVG projection and the bf16 ``[f_a | b]`` projection of ``x``. With
-        ``TRTLLM_K3LL_KDA_BFA_OVERLAP`` the bf16 one runs on the module's projection stream while the FP8 one runs
-        (the built-in decode's fork / join events), the same kernels on the same inputs."""
+        """``(qkvg, bfa)``: the FP8 QKVG projection and the bf16 ``[f_a | b]`` projection of ``x``, the same kernels on
+        the same inputs in every order. With ``TRTLLM_K3LL_KDA_BFA_FIRST`` the bf16 one runs first on the calling
+        stream and the FP8 one after it, so under PDL both are resident and stream their weights before ``x`` is
+        ready; else, with ``TRTLLM_K3LL_KDA_BFA_OVERLAP``, the bf16 one runs on the module's projection stream while
+        the FP8 one runs (the built-in decode's fork / join events); else it runs after the FP8 one."""
+        if _flags.TRTLLM_K3LL_KDA_BFA_FIRST:
+            bfa = self._k3_bfa(x)
+            return self.qkvg_proj(x), bfa
         aux = self._projection_aux_stream if _flags.TRTLLM_K3LL_KDA_BFA_OVERLAP else None
         return maybe_execute_in_parallel(
             lambda: self.qkvg_proj(x),
