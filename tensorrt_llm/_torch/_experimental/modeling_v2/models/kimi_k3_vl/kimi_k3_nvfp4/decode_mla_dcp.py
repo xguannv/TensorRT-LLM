@@ -150,14 +150,15 @@ def split_read_attention(
         kv_pages: ``[num_pages, page_size, >=576]`` FP8 view of the layer's page pool.
         out: ``[batch, q_len, heads, 512]`` bf16, normalized partial output (written).
         softmax_stats: ``[batch * q_len, heads, 2]`` fp32 ``(max, sum)`` per row (written).
-        split_cap: 0, the op (its AutoTuner picks split_kv, at most 32); else the runner directly with split_kv =
-            min(max_active_blocks // batch // (2 * q_tiles), split_cap) and the op's default tilers and persistence
-            (`_runner_split_kv`).
+        split_cap: 0, or a step of more than one request: the op (its AutoTuner picks split_kv, at most 32); else the
+            runner directly with split_kv = min(max_active_blocks // (2 * q_tiles), split_cap) and the op's default
+            tilers and persistence (`_runner_split_kv`). Only single-request steps: from two requests on, splits above
+            32 need a second wave of CTAs and are slower (moss 1175381).
     """
     batch, q_len, heads, _ = q.shape
     c_latent = kv_pages[..., :KV_LORA_RANK].permute(1, 2, 0)
     c_rope = kv_pages[..., KV_LORA_RANK : KV_LORA_RANK + QK_ROPE_DIM].permute(1, 2, 0)
-    if split_cap > 0:
+    if split_cap > 0 and batch == 1:
         runner, tactic = _runner_split_kv(heads, q_len, kv_pages.shape[1], max_batch, batch, split_cap,
                                           softmax_stats is not None)  # fmt: skip
         inputs = [
