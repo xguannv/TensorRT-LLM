@@ -193,6 +193,12 @@ TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
     "Helix MLA decode: every head's BF16 V up-projection inside the split-KV reduction, the exchange at 128 values "
     "per head, then the gate (mla_v_up.py); 1 at launch builds the BF16 W_UV of all heads (12.6 MB per MLA layer)",
 )
+TRTLLM_K3LL_P2_FAKEQUANT_LU = _flag(
+    "TRTLLM_K3LL_P2_FAKEQUANT_LU",
+    0,
+    "measurement-only probe (P2 S0a, lowm MoE): 1 = at load, each MoE latent up weight replaced by its FP8 128x128 "
+    "UE8M0 round trip before the norm fold; 2 = also the wide steps' latent tail input through an MXFP8 round trip",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

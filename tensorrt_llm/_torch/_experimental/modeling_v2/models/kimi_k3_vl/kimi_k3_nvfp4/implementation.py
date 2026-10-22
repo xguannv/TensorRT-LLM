@@ -4200,6 +4200,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             front16=front16,
         )
         for moe in takes:
+            if _flags.TRTLLM_K3LL_P2_FAKEQUANT_LU:
+                _decode_moe_lowm.p2_fakequant_latent_up(moe)
             _decode_moe.fold_latent_norm(moe)
             moe.decode_moe = _decode_moe_lowm.K3DecodeMoeNvfp4Layer.create(
                 moe, state, mapping.tp_rank, mapping.tp_size

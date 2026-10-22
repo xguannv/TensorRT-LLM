@@ -106,6 +106,45 @@ class K3DecodeMoeNvfp4:
         )
 
 
+def p2_fakequant_latent_up(moe: nn.Module) -> None:
+    """Measurement-only probe (``TRTLLM_K3LL_P2_FAKEQUANT_LU``): replace MoE layer ``moe``'s bf16 latent up weight in
+    place by its FP8 round trip, quantized as `fp8w_lowm.append_rows` quantizes (one power-of-two scale per 128x128
+    block, the smallest that keeps the block's absolute maximum within E4M3's 448), so every later use of the weight
+    reads FP8-representable values. Runs before `decode_moe.fold_latent_norm`; with the switch at 2 it keeps the
+    unfolded latent norm weight for `_p2_fakequant_tail_input`."""
+    up, norm = moe.routed_expert_up_proj, moe.routed_expert_norm
+    n, k = up.weight.shape
+    if up.weight.dtype != torch.bfloat16 or n % 128 or k % 128:
+        raise ValueError(
+            f"TRTLLM_K3LL_P2_FAKEQUANT_LU: bf16 [N, K] in 128 tiles expected, got {up.weight.shape}"
+        )
+    with torch.no_grad():
+        blocks = up.weight.float().view(n // 128, 128, k // 128, 128)
+        amax = blocks.abs().amax(dim=(1, 3)).clamp(min=1e-4)
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))[:, None, :, None]
+        codes = (blocks / scale).to(torch.float8_e4m3fn)
+        up.weight.copy_((codes.float() * scale).view(n, k))
+        if _flags.TRTLLM_K3LL_P2_FAKEQUANT_LU == 2:
+            moe._k3ll_p2_latent_gamma = norm.weight.detach().float().clone()
+
+
+def _p2_fakequant_tail_input(moe: nn.Module, latent: torch.Tensor, lo: int) -> torch.Tensor:
+    """Measurement-only probe (``TRTLLM_K3LL_P2_FAKEQUANT_LU`` = 2): the bf16 normalized latent slice ``latent``
+    (columns ``lo:``, unit norm weight) as the tail GEMV, whose weight has the norm weight folded in, would see it if
+    ``latent * gamma`` went through the low-M kernel's MXFP8 quantization (1x32 groups, UE8M0) and the weight were
+    unfolded: ``bf16(dequant(mxfp8(bf16(latent * gamma))) / gamma)``."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_fp8w_lowm_mxfp8 import (
+        mxfp8_quantize_reference,
+    )
+
+    gamma = moe._k3ll_p2_latent_gamma[lo : lo + latent.shape[1]]
+    xq, e = mxfp8_quantize_reference((latent.float() * gamma).bfloat16().contiguous())
+    m, k = xq.shape
+    deq = xq.float().view(m, k // 32, 32) * torch.exp2(e.float() - 127.0).unsqueeze(-1)
+    out = deq.view(m, k) / gamma
+    return torch.where(gamma != 0, out, torch.zeros_like(out)).bfloat16()
+
+
 def front16_supported(moe: nn.Module, tp_size: int) -> bool:
     """Whether the front's 16-token build runs MoE layer ``moe`` (whose 8-token path ``layout_gaps`` takes)."""
     gate_up = moe.shared_experts.gate_up_proj.weight
@@ -430,9 +469,19 @@ class K3DecodeMoeNvfp4Layer:
                 float(moe.routed_expert_norm.variance_epsilon),
                 self.state.mnnvl,
             )
+            if _flags.TRTLLM_K3LL_P2_FAKEQUANT_LU == 2:
+                tail_in = torch.cat(
+                    [
+                        _p2_fakequant_tail_input(moe, tail_in[:, : self.width], self.lo),
+                        tail_in[:, self.width :],
+                    ],
+                    dim=1,
+                )
             return _gemv(gemvs, "moe_tail", tail_in, self.tail_weight)
         normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
         parts = [normed[:, self.lo : self.lo + self.width]]
+        if _flags.TRTLLM_K3LL_P2_FAKEQUANT_LU == 2:
+            parts[0] = _p2_fakequant_tail_input(moe, parts[0], self.lo)
         if self.tail_pad is not None:
             parts.append(self.tail_pad[: x.shape[0]])
         parts.append(shared_act)
