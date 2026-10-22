@@ -20,6 +20,9 @@
 * The fast (vectorized) kernel sums the statistics in another order: its updated prefix sum is
   bit-identical and its normalized output may differ from the C++ op by one BF16 ulp in a small
   fraction of the elements.
+* With ``mnnvl_order`` the fast kernel runs the C++ MNNVL all-reduce epilogue's arithmetic
+  (checked bitwise against that op by the multi-GPU o_proj push op matrix); here it is checked
+  against the per-token C++ op like the fast kernel.
 * Both run inside a CUDA graph behind PDL producers and consumers (DSL and C++).
 """
 
@@ -140,6 +143,51 @@ def test_fast_against_cpp(m: int, n: int, mode: int):
             if mode:
                 assert _mismatches(updated, ref_updated) == 0
             _assert_fast_close(out, ref_out, (cluster, scale))
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("n", [2, 4, 7, 12])
+@pytest.mark.parametrize("m", [1, 8, 16, 64])
+def test_mnnvl_order(m: int, n: int, mode: int):
+    """``mnnvl_order`` (the C++ MNNVL epilogue's arithmetic; bitwise against that op in the
+    multi-GPU ``_kimi_k3_oproj_push_op_matrix.py``): the same updated prefix, the per-token
+    C++ op within the fast kernel's bound, deterministic, and the Lamport addend the same bits."""
+    t = _inputs(m, n, 30.0, seed=7 * m + n)
+    ref_updated, ref_out = _cpp(t, mode)
+    addends = ((), (t["addend"],), (t["addend"], t["shared"]))[mode]
+    outs = []
+    for _ in range(2):
+        out = torch.empty_like(t["layer"])
+        updated = torch.empty_like(t["layer"]) if mode else None
+        _k3().run_k3_attn_res(
+            t["layer"], addends, t["block"], *_weights(t), out, updated, mnnvl_order=True
+        )
+        outs.append(out)
+    assert _mismatches(outs[0], outs[1]) == 0
+    if mode:
+        assert _mismatches(updated, ref_updated) == 0
+    _assert_fast_close(outs[0], ref_out, "mnnvl_order")
+    if mode == 1 and m <= 32:
+        pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_lamport_ar")
+        addend = t["addend"].clone()
+        addend[addend == 0] = 0
+        uc, flags, stage = _lamport_workspace(addend, dirty=1)
+        stage.copy_(addend.view(torch.int32).flatten())
+        got = [torch.empty_like(t["layer"]) for _ in range(2)]
+        want = [torch.empty_like(t["layer"]) for _ in range(2)]
+        k3 = _k3()
+        k3.run_k3_attn_res(t["layer"], (addend,), t["block"], *_weights(t), *want, mnnvl_order=True)
+        k3.run_k3_attn_res(
+            t["layer"],
+            (),
+            t["block"],
+            *_weights(t),
+            *got,
+            lamport_addend=(uc.data_ptr(), flags.data_ptr()),
+            mnnvl_order=True,
+        )
+        for a, b in zip(want, got):
+            assert _mismatches(a, b) == 0
 
 
 @pytest.mark.parametrize("exact", [True, False])

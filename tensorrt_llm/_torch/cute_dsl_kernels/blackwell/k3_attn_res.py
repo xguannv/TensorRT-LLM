@@ -28,7 +28,9 @@ Two kernels share that schedule:
   :func:`fast_cluster_size`), one 16-byte vector per thread. It sums the statistics in another
   order than the C++ kernels, so the normalized output can differ from theirs by one BF16
   rounding step in a small fraction of the elements; the snapshots' share of the softmax and of
-  the mixture is also folded before the wait.
+  the mixture is also folded before the wait. With ``mnnvl_order`` it runs the layout and the
+  arithmetic of the C++ MNNVL all-reduce epilogue (``mnnvl_allreduce_attn_res``) instead, so its
+  outputs are that op's bits.
 * :class:`K3AttnResKernel` (``TRTLLM_K3_ATTN_RES_PDL_EXACT=1``): the per-element layout and the
   arithmetic of ``trtllm::attn_res_rmsnorm_fwd`` / ``trtllm::attn_res_add_rmsnorm_fwd``
   instruction for instruction (one 256-thread CTA per token for ``N <= 4``, an eight-CTA cluster
@@ -65,6 +67,9 @@ MAX_TOKENS = 1024
 #: Inputs of the layer row: the row itself; ``bf16(prefix + addend)`` (the C++ fused add);
 #: ``bf16(residual + bf16(routed + shared))`` (the MoE residual update).
 ADD_NONE, ADD_PREFIX, ADD_MOE = 0, 1, 2
+#: CTAs per token of the C++ MNNVL all-reduce epilogue (``kimiK3Mnnvl::attnResEpilogue``: 1024
+#: elements per 128-thread CTA), the fast kernel's topology with ``mnnvl_order``.
+MNNVL_CLUSTER = HIDDEN_SIZE // 1024
 
 #: Programmatic dependent launch unless TRTLLM_ENABLE_PDL=0 (the stack-wide switch).
 _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
@@ -689,11 +694,13 @@ def _ex2_scaled(x, *, loc=None, ip=None):
     )
 
 
-def _warp_transpose_sum(values, lane):
+def _warp_transpose_sum(values, lane, add=_add):
     """Sums every value over the warp in ``len(values) - 1 + 5 - log2(len)`` shuffles.
 
     ``len(values)`` must be a power of two <= 32. Afterwards lane ``l`` holds the warp total of
-    ``values[l >> (5 - log2(len(values)))]``.
+    ``values[l >> (5 - log2(len(values)))]``. Every total is the tree of a ``shfl_down`` (or xor
+    butterfly) reduction from offset 16 down to 1, so with ``add=_add_ftz`` it has the bits of the
+    C++ kernels' ``v += __shfl_down_sync(v, offset)`` loop on lane 0.
     """
     offset = 16
     while len(values) > 1:
@@ -703,13 +710,32 @@ def _warp_transpose_sum(values, lane):
         for i in range(half):
             mine = _selp(upper, values[i + half], values[i])
             send = _selp(upper, values[i], values[i + half])
-            reduced.append(_add(mine, _shfl_xor(send, offset)))
+            reduced.append(add(mine, _shfl_xor(send, offset)))
         values = reduced
         offset //= 2
     total = values[0]
     while offset >= 1:
-        total = _add(total, _shfl_xor(total, offset))
+        total = add(total, _shfl_xor(total, offset))
         offset //= 2
+    return total
+
+
+def _cluster_total(smem, lane, c: int, warps: int, nvals: int, stat: int, base_lane: int):
+    """The C++ MNNVL epilogue's order for one statistic of the warp partials ``smem[g][w][nvals]``
+    (fp32, CTA ``g < c``, warp ``w``): ``0 + sum_g (0 + sum_w part[g][w])``, CTA after CTA.
+
+    Lane ``base_lane + g`` (``base_lane`` 0 or 16) sums CTA ``g``'s warps, then every lane adds
+    the ``c`` CTA partials in rank order; every lane returns the total (``add.ftz``, as the C++
+    kernels' fast-math ``+=``). The other lanes read CTA 0's partials and their sums are not used.
+    """
+    g = lane & 15
+    g = _selp_b32(Int32(g < c), g, Int32(0))
+    cta = _zero_f32()
+    for w in range(warps):
+        cta = _add_ftz(cta, _lds_f32(smem + ((g * warps + w) * nvals + stat) * 4))
+    total = _zero_f32()
+    for r in range(c):
+        total = _add_ftz(total, _shfl_idx(cta, base_lane + r))
     return total
 
 
@@ -1078,6 +1104,15 @@ class K3AttnResFastKernel:
     the softmax and of the mixture (``sum_n exp(logit_n - m) v_n``) are complete; after it the
     kernel reduces two numbers of the layer row (one cluster round), rescales the mixture and
     reduces its sum of squares (a second round).
+
+    With ``mnnvl_order`` (``cluster`` = :data:`MNNVL_CLUSTER`) the kernel reproduces the arithmetic
+    of the C++ MNNVL all-reduce epilogue (``mnnvl_allreduce_attn_res``, one- and two-shot) instead:
+    its element layout (seven 128-thread CTAs per token, eight contiguous elements per thread), its
+    order of every statistic (within the thread, the warp tree, the CTA's warps in order, then the
+    cluster's CTAs in rank order), its softmax (all logits against their common maximum,
+    ``p_n = w_n * (1 / sum w)``) and its mixture (``fma`` over the candidates in order) after the
+    wait, with its fast-math instructions, so ``updated`` and the normalized output are the bits of
+    that op. Only the snapshots' statistics and logits are computed before the wait.
     """
 
     def __init__(
@@ -1089,13 +1124,16 @@ class K3AttnResFastKernel:
         mxfp8: bool = False,
         lamport: bool = False,
         early_trigger: bool = _EARLY_TRIGGER,
+        mnnvl_order: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
-        if add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE) or cluster not in (1, 2, 4, 8):
-            raise ValueError(f"add_mode={add_mode} cluster={cluster}")
+        clusters = (MNNVL_CLUSTER,) if mnnvl_order else (1, 2, 4, 8)
+        if add_mode not in (ADD_NONE, ADD_PREFIX, ADD_MOE) or cluster not in clusters:
+            raise ValueError(f"add_mode={add_mode} cluster={cluster} mnnvl_order={mnnvl_order}")
         if lamport and add_mode != ADD_PREFIX:
             raise ValueError("the Lamport addend is an ADD_PREFIX variant")
+        self.mnnvl_order = mnnvl_order
         self.mxfp8 = mxfp8
         self.lamport = lamport
         self.early_trigger = early_trigger
@@ -1196,7 +1234,7 @@ class K3AttnResFastKernel:
         out_eps: Float32,
     ):
         c, k, parts, nvals = self.c, self.k, self.parts, self.nvals
-        warps, shift = self.warps, self.shift
+        n_cand, warps, shift = self.n, self.warps, self.shift
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1246,19 +1284,23 @@ class K3AttnResFastKernel:
             prefix = load(layer_addr + row + col, True)
         q = [_mul_ftz(res_w[e], rms_w[e]) for e in range(8)]
 
+        mo = self.mnnvl_order
+        # The C++ kernels are built with --use_fast_math: their fmaf / += are the .ftz forms.
+        fma = _fma_ftz if mo else _fma
+        add_tree = _add_ftz if mo else _add
         snap_f = [unpack(snaps[n]) for n in range(k)]
         stats = []
         for n in cutlass.range_constexpr(k):
             sq = _zero_f32()
             dot = _zero_f32()
             for e in cutlass.range_constexpr(8):
-                sq = _fma(snap_f[n][e], snap_f[n][e], sq)
-                dot = _fma(snap_f[n][e], q[e], dot)
+                sq = fma(snap_f[n][e], snap_f[n][e], sq)
+                dot = fma(snap_f[n][e], q[e], dot)
             stats.append(sq)
             stats.append(dot)
         for _ in cutlass.range_constexpr(self.width - nvals):
             stats.append(_zero_f32())
-        warp_stat = _warp_transpose_sum(stats, lane)
+        warp_stat = _warp_transpose_sum(stats, lane, add_tree)
         vidx = lane >> shift
         sub = lane & ((1 << shift) - 1)
         if cutlass.const_expr(c == 1):
@@ -1279,25 +1321,44 @@ class K3AttnResFastKernel:
                         _st_async_b32(slot, r, mbar_smem, warp_stat)
             _mbar_wait_cluster(mbar_smem)
 
-        # Snapshot totals (lane n < k), logits and the snapshot part of the softmax.
+        # Snapshot totals (lane n < k), logits and (unless mnnvl_order) the snapshot part of the
+        # softmax.
         logit = _neg_flt_max()
-        if lane < k:
-            tot_sq = _zero_f32()
-            tot_dot = _zero_f32()
-            for j in cutlass.range_constexpr(parts):
-                tot_sq = _add(tot_sq, _lds_f32(snap_smem + (j * nvals + 2 * lane) * 4))
-                tot_dot = _add(tot_dot, _lds_f32(snap_smem + (j * nvals + 2 * lane + 1) * 4))
-            logit = _mul_ftz(tot_dot, _rsigma(tot_sq, eps))
-        snap_max = _warp_max(logit)
-        weight = _zero_f32()
-        if lane < k:
-            weight = _ex2_scaled(_add(logit, -snap_max))
-        snap_sum = _warp_sum(weight)
-        premix = [_zero_f32() for _ in range(8)]
-        for n in cutlass.range_constexpr(k):
-            w_n = _shfl_idx(weight, n)
-            for e in cutlass.range_constexpr(8):
-                premix[e] = _fma(w_n, snap_f[n][e], premix[e])
+        if cutlass.const_expr(mo):
+            # 0 + sum over CTAs (0 + sum over the CTA's warps), as the C++ epilogue.
+            if lane < k:
+                tot_sq = _zero_f32()
+                tot_dot = _zero_f32()
+                for g in cutlass.range_constexpr(c):
+                    cta_sq = _zero_f32()
+                    cta_dot = _zero_f32()
+                    for w in cutlass.range_constexpr(warps):
+                        j = g * warps + w
+                        cta_sq = _add_ftz(cta_sq, _lds_f32(snap_smem + (j * nvals + 2 * lane) * 4))
+                        cta_dot = _add_ftz(
+                            cta_dot, _lds_f32(snap_smem + (j * nvals + 2 * lane + 1) * 4)
+                        )
+                    tot_sq = _add_ftz(tot_sq, cta_sq)
+                    tot_dot = _add_ftz(tot_dot, cta_dot)
+                logit = _mul_ftz(tot_dot, _rsigma(tot_sq, eps))
+        else:
+            if lane < k:
+                tot_sq = _zero_f32()
+                tot_dot = _zero_f32()
+                for j in cutlass.range_constexpr(parts):
+                    tot_sq = _add(tot_sq, _lds_f32(snap_smem + (j * nvals + 2 * lane) * 4))
+                    tot_dot = _add(tot_dot, _lds_f32(snap_smem + (j * nvals + 2 * lane + 1) * 4))
+                logit = _mul_ftz(tot_dot, _rsigma(tot_sq, eps))
+            snap_max = _warp_max(logit)
+            weight = _zero_f32()
+            if lane < k:
+                weight = _ex2_scaled(_add(logit, -snap_max))
+            snap_sum = _warp_sum(weight)
+            premix = [_zero_f32() for _ in range(8)]
+            for n in cutlass.range_constexpr(k):
+                w_n = _shfl_idx(weight, n)
+                for e in cutlass.range_constexpr(8):
+                    premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
@@ -1337,10 +1398,10 @@ class K3AttnResFastKernel:
         sq = _zero_f32()
         dot = _zero_f32()
         for e in cutlass.range_constexpr(8):
-            sq = _fma(x[e], x[e], sq)
-            dot = _fma(x[e], q[e], dot)
+            sq = fma(x[e], x[e], sq)
+            dot = fma(x[e], q[e], dot)
         # Lanes 0-15 hold the warp's sum of squares, lanes 16-31 its dot product.
-        pair = _warp_transpose_sum([sq, dot], lane)
+        pair = _warp_transpose_sum([sq, dot], lane, add_tree)
         half = lane & 15
         if cutlass.const_expr(c == 1):
             if half == 0:
@@ -1355,28 +1416,53 @@ class K3AttnResFastKernel:
                     pair,
                 )
             _mbar_wait_cluster(mbar_smem + 8)
-        part_sq = _zero_f32()
-        part_dot = _zero_f32()
-        if lane < parts:
-            part_sq = _lds_f32(last_smem + lane * 8)
-            part_dot = _lds_f32(last_smem + lane * 8 + 4)
-        tot = _warp_transpose_sum([part_sq, part_dot], lane)
-        tot_sq = _shfl_idx(tot, 0)
-        tot_dot = _shfl_idx(tot, 16)
+        if cutlass.const_expr(mo):
+            tot_sq = _cluster_total(last_smem, lane, c, warps, 2, 0, 0)
+            tot_dot = _cluster_total(last_smem, lane, c, warps, 2, 1, 16)
+        else:
+            part_sq = _zero_f32()
+            part_dot = _zero_f32()
+            if lane < parts:
+                part_sq = _lds_f32(last_smem + lane * 8)
+                part_dot = _lds_f32(last_smem + lane * 8 + 4)
+            tot = _warp_transpose_sum([part_sq, part_dot], lane)
+            tot_sq = _shfl_idx(tot, 0)
+            tot_dot = _shfl_idx(tot, 16)
         last_logit = _mul_ftz(tot_dot, _rsigma(tot_sq, eps))
 
-        # Softmax over all candidates: p_n = exp(logit_n - m_s) * a / den, p_last = b / den.
-        new_max = _max_ftz(snap_max, last_logit)
-        a = _ex2_scaled(_add(snap_max, -new_max))
-        b = _ex2_scaled(_add(last_logit, -new_max))
-        inv = _rcp_ftz(_fma(snap_sum, a, b))
-        scale = _mul_ftz(a, inv)
-        p_last = _mul_ftz(b, inv)
-        mixed = [_round_bf16(_fma(p_last, x[e], _mul_ftz(scale, premix[e]))) for e in range(8)]
+        if cutlass.const_expr(mo):
+            # The C++ epilogue's softmax: lane n holds logit n (the layer row's is the last), every
+            # weight against the common maximum, p_n = w_n * (1 / sum w) (xor-butterfly sum); the
+            # mixture an fma chain over the candidates in order.
+            all_logit = _selp(Int32(lane == k), last_logit, logit)
+            top = _warp_max(all_logit)
+            weight = _zero_f32()
+            if lane < n_cand:
+                weight = _softmax_term(all_logit, top)
+            prob = _mul_ftz(weight, _rcp_ftz(_warp_sum_bfly_ftz(weight)))
+            probs = [_shfl_idx(prob, n) for n in range(n_cand)]
+            mixed = []
+            for e in cutlass.range_constexpr(8):
+                val = _zero_f32()
+                for n in cutlass.range_constexpr(k):
+                    val = _fma_ftz(probs[n], snap_f[n][e], val)
+                mixed.append(_round_bf16(_fma_ftz(probs[k], x[e], val)))
+        else:
+            # Softmax over all candidates: p_n = exp(logit_n - m_s) * a / den, p_last = b / den.
+            new_max = _max_ftz(snap_max, last_logit)
+            a = _ex2_scaled(_add(snap_max, -new_max))
+            b = _ex2_scaled(_add(last_logit, -new_max))
+            inv = _rcp_ftz(_fma(snap_sum, a, b))
+            scale = _mul_ftz(a, inv)
+            p_last = _mul_ftz(b, inv)
+            mixed = [_round_bf16(_fma(p_last, x[e], _mul_ftz(scale, premix[e]))) for e in range(8)]
         out_sq = _zero_f32()
         for e in cutlass.range_constexpr(8):
-            out_sq = _fma(mixed[e], mixed[e], out_sq)
-        out_sq = _warp_sum(out_sq)
+            out_sq = fma(mixed[e], mixed[e], out_sq)
+        if cutlass.const_expr(mo):
+            out_sq = _warp_sum_bfly_ftz(out_sq)
+        else:
+            out_sq = _warp_sum(out_sq)
         if cutlass.const_expr(c == 1):
             if lane == 0:
                 _sts_f32(outsq_smem + warp * 4, out_sq)
@@ -1385,10 +1471,14 @@ class K3AttnResFastKernel:
             if lane < c:
                 _st_async_b32(outsq_smem + (rank * warps + warp) * 4, lane, mbar_smem + 16, out_sq)
             _mbar_wait_cluster(mbar_smem + 16)
-        part = _zero_f32()
-        if lane < parts:
-            part = _lds_f32(outsq_smem + lane * 4)
-        out_rs = _rsigma(_warp_sum(part), out_eps)
+        if cutlass.const_expr(mo):
+            out_total = _cluster_total(outsq_smem, lane, c, warps, 1, 0, 0)
+        else:
+            part = _zero_f32()
+            if lane < parts:
+                part = _lds_f32(outsq_smem + lane * 4)
+            out_total = _warp_sum(part)
+        out_rs = _rsigma(out_total, out_eps)
 
         w_out = unpack(out_w)
         y = [_mul_ftz(_round_bf16(_mul_ftz(mixed[e], out_rs)), w_out[e]) for e in range(8)]
@@ -1446,12 +1536,13 @@ def _compiled(
     mxfp8: bool = False,
     lamport: bool = False,
     early_trigger: bool = _EARLY_TRIGGER,
+    mnnvl_order: bool = False,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
         kernel = K3AttnResFastKernel(
-            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, early_trigger
+            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, early_trigger, mnnvl_order
         )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1522,6 +1613,7 @@ def run_k3_attn_res(
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     lamport_addend: tuple[int, int] | None = None,
     early_trigger: bool | None = None,
+    mnnvl_order: bool = False,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1557,9 +1649,16 @@ def run_k3_attn_res(
         early_trigger: The vectorized kernel releases its dependent grid right after its
             ``griddepcontrol.wait`` instead of after its last store; default
             ``TRTLLM_K3_ATTN_RES_EARLY_TRIGGER``. The exact kernel ignores it.
+        mnnvl_order: The vectorized kernel with the arithmetic of the C++ MNNVL all-reduce
+            epilogue (``mnnvl_allreduce_attn_res``; see :class:`K3AttnResFastKernel`), its outputs
+            bit-identical to that op's for the same reduced row; ``cluster`` must be None.
     """
     if exact is None:
         exact = _EXACT
+    if mnnvl_order:
+        if exact or cluster is not None:
+            raise ValueError("mnnvl_order is the vectorized kernel at its own topology")
+        cluster = MNNVL_CLUSTER
     if (mxfp8_out is not None or lamport_addend is not None) and exact:
         raise ValueError("the MXFP8 side output and the Lamport addend need the vectorized kernel")
     lamport = lamport_addend is not None
@@ -1572,7 +1671,15 @@ def run_k3_attn_res(
     if early_trigger is None or exact:
         early_trigger = _EARLY_TRIGGER
     compiled = _compiled(
-        block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8, lamport, early_trigger
+        block.shape[0] + 1,
+        add_mode,
+        use_pdl,
+        cluster,
+        exact,
+        mxfp8,
+        lamport,
+        early_trigger,
+        mnnvl_order,
     )
     if lamport:
         add_addr, add2_addr = lamport_addend
@@ -1907,6 +2014,7 @@ __all__ = [
     "MAX_CANDIDATES",
     "MAX_TOKENS",
     "MIN_CANDIDATES",
+    "MNNVL_CLUSTER",
     "K3AttnResKernel",
     "can_use_k3_attn_res",
     "cluster_size",
