@@ -15,13 +15,16 @@
 """The KDA [f_a | b] switches of the Kimi K3 NVFP4 decode path (``kimi_k3_nvfp4/flags.py``), each arm against the other
 and the off arm against the op chain it replaced, at the TP16 per-rank shapes, one GPU.
 
-What runs. ``K3DecodeKDA``'s projection methods (``_k3_projections``, ``_k3_bfa``, ``_k3_fused_rows``) on a stand-in
-module holding what they read: the FP8 QKVG weight-read weight (3072 x 7168, 128x128 UE8M0 blocks, DeepGEMM-packed
-scale) behind a callable that runs ``trtllm::k3_fp8w_lowm_gemm`` as the routed module does, the bf16 [f_a | b] weight
+What runs. ``K3DecodeKDA``'s projection methods (``_k3_projections``, ``_k3_bfa``, ``_k3_fused_rows``,
+``build_bfa_fp8``) on a stand-in module holding what they read: the FP8 QKVG weight-read weight (3072 x 7168, 128x128
+UE8M0 blocks, DeepGEMM-packed scale) as a buffer of a module whose forward runs ``trtllm::k3_fp8w_lowm_gemm`` on it as
+the routed module does, q / k / v / g modules whose weights are views of its rows (``_fused_projection``, as the
+checkpoint loader links them), the bf16 [f_a | b] weight
 (136 x 7168, rows 134-135 zero), the decode GEMV state with the ``kda_bfa`` and ``kda_bfa_rt`` sites, and the
 projection stream with its fork / join events. Multi-stream is on, as under CUDA-graph capture in the engine.
 
-The chain the switches replaced (``_ref_projections``): ``k3_fp8w_lowm_gemm`` for QKVG and the [f_a | b] rows from
+The chain the switches replaced (``_ref_projections``): ``k3_fp8w_lowm_gemm`` on a separate copy of the QKVG weight
+and the [f_a | b] rows from
 ``k3_ctm_gemv_long`` at split 8, ring 6, push, 8 rows per call: the ``kda_bfa`` site's ``k3_ctm_gemv_wide`` at 136
 rows runs split 8, whose rows its contract certifies bit-identical to the long kernel's at the same split.
 
@@ -32,12 +35,16 @@ bit for bit the eager call on the same inputs):
   * TRTLLM_K3LL_KDA_BFA_ROW_TILES: off arm bit for bit the reference chain; on arm (``kda_bfa_rt``, 4 tiles of 34
     rows, split 8) bit for bit the off arm.
   * TRTLLM_K3LL_KDA_BFA_FP8: off arm: ``_k3_fused_rows`` returns None and launches nothing, so the projections are the
-    reference chain; on arm: the QKVG columns within 1e-2 (relative norm) of the off arm's (the same FP8 products, a
-    partial last row tile and another split-K), the [f_a | b] columns within 5e-2 of the off arm's bf16 ones (an FP8
-    weight and the MXFP8 activation), the padding columns zero.
+    reference chain, before and after the on arm has built the fused weight (the QKVG weight and the q / k / v / g
+    views are then views of its rows with the same bytes, and the allocated memory grows by the 144 FP8 [f_a | b]
+    rows and the fused scale only, under 2 MB); on arm: the QKVG columns within 1e-2 (relative norm) of the off
+    arm's (the same FP8 products, a partial last row tile and another split-K), the [f_a | b] columns within 5e-2 of
+    the off arm's bf16 ones (an FP8 weight and the MXFP8 activation), the padding columns zero.
 """
 
+import gc
 import types
+import weakref
 
 import pytest
 import torch
@@ -75,9 +82,22 @@ def _mods():
     )
 
 
-@pytest.fixture(scope="module")
+class _QkvgProj(torch.nn.Module):
+    """The routed FP8 weight-read QKVG module: ``weight`` / ``weight_scale`` buffers, k3_fp8w_lowm_gemm on them."""
+
+    def __init__(self, weight, scale):
+        super().__init__()
+        self.out_features = weight.shape[0]
+        self.register_buffer("weight", weight, persistent=False)
+        self.register_buffer("weight_scale", scale, persistent=False)
+
+    def forward(self, x):
+        return torch.ops.trtllm.k3_fp8w_lowm_gemm(x, self.weight, self.weight_scale)
+
+
+@pytest.fixture
 def stand_in():
-    """The stand-in K3DecodeKDA (see the module docstring), built once."""
+    """The stand-in K3DecodeKDA (see the module docstring), fresh per test (FP8 rebuilds its QKVG weight)."""
     m = _mods()
     g = torch.Generator(device="cuda").manual_seed(13)
     w = torch.randn((4 * HK, DIM), device="cuda", generator=g) * 0.02
@@ -90,12 +110,17 @@ def stand_in():
     w_bfa = (torch.randn(BFA, DIM, generator=g, device="cuda") * 0.02).bfloat16()
     w_bfa[K + H :] = 0
 
-    def qkvg_proj(x):
-        return torch.ops.trtllm.k3_fp8w_lowm_gemm(x, w_q, s_q)
-
-    qkvg_proj.weight, qkvg_proj.weight_scale = w_q, s_q
+    qkvg = _QkvgProj(w_q, s_q)
+    views = {}
+    for i, name in enumerate(("q_proj", "k_proj", "v_proj", "g_proj")):
+        views[name] = _QkvgProj(w_q[i * HK : (i + 1) * HK], s_q[i * HK : (i + 1) * HK])
+        views[name]._fused_projection = (weakref.ref(qkvg), i * HK)
+    ref_w = w_q.clone()
+    del w_q, w8
     mod = types.SimpleNamespace(
-        qkvg_proj=qkvg_proj,
+        **views,
+        qkvg_proj=qkvg,
+        ref_qkvg=(ref_w, s_q),
         _bfa_proj_weight=w_bfa,
         _qkvg_bfa_fp8=None,
         layer_idx=0,
@@ -119,7 +144,7 @@ def _x(rows: int, seed: int) -> torch.Tensor:
 def _ref_projections(mod, x):
     """The chain the switches replaced: QKVG on k3_fp8w_lowm_gemm, [f_a | b] on k3_ctm_gemv_long (split 8)."""
     m = _mods()
-    qkvg = mod.qkvg_proj(x)
+    qkvg = torch.ops.trtllm.k3_fp8w_lowm_gemm(x, *mod.ref_qkvg)
     bfa = torch.cat(
         [
             m.ctm.k3_ctm_gemv_long(x[i : i + 8], mod._bfa_proj_weight, split=8, ring=6, push=True)
@@ -203,8 +228,35 @@ def test_fp8(stand_in, flags, rows):
     ref = _eager_and_replay(lambda x: _ref_projections(stand_in, x), rows)
     _assert_equal(off, ref, "FP8 off vs the reference chain")
     flags(FP8=1)
+    x1 = _x(rows, 1)
+    gc.collect()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
     with torch.inference_mode():
-        assert stand_in._k3_fused_rows(_x(rows, 1)) is not None  # eager: builds the fused weight
+        y1 = stand_in._k3_fused_rows(x1)  # eager: builds the fused weight
+    assert y1 is not None
+    del y1
+    gc.collect()
+    torch.cuda.synchronize()
+    grown = torch.cuda.memory_allocated() - before
+    fused_w, fused_s = stand_in._qkvg_bfa_fp8
+    # One buffer: the QKVG weight and the q / k / v / g weights are views of the fused weight's rows.
+    weight = stand_in.qkvg_proj.weight
+    assert weight.data_ptr() == fused_w.data_ptr() and weight.shape == (4 * HK, DIM)
+    assert weight.is_contiguous() and not weight.is_inference()
+    assert torch.equal(weight, stand_in.ref_qkvg[0])
+    for i, name in enumerate(("q_proj", "k_proj", "v_proj", "g_proj")):
+        view = getattr(stand_in, name).weight
+        assert view.data_ptr() == fused_w[i * HK].data_ptr() and view.shape == (HK, DIM)
+    del weight, view
+    assert grown < 2 << 20, f"building the fused weight allocated {grown} bytes"
+    print(f"[bfa_fp8] rows {rows}: memory_allocated +{grown} bytes for the fused weight and scale")
+    flags(FP8=0)
+    off_after = _eager_and_replay(stand_in._k3_projections, rows)
+    _assert_equal(
+        off_after, ref, "FP8 off, after the fused weight is built, vs the reference chain"
+    )
+    flags(FP8=1)
     on = _eager_and_replay(lambda x: (stand_in._k3_fused_rows(x),), rows)
     for (y,), (qkvg, bfa) in zip(on, off):
         assert y.shape == (rows, 3216)

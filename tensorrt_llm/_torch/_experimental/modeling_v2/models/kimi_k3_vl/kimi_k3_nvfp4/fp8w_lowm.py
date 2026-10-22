@@ -162,7 +162,8 @@ def append_rows(
     scale with the bf16 ``rows`` appended below it, quantized like the checkpoint's FP8 weights: one power-of-two
     scale per 128x128 block (the smallest that keeps the block's absolute maximum within E4M3's 448), E4M3 codes.
     The rows are zero-padded to a multiple of `N_ALIGN` (a partial last 128-row tile). New tensors; the inputs are
-    not modified. None where the inputs are not in that form."""
+    not modified, and the new weight's first ``N`` rows hold ``weight``'s bytes (a caller may replace ``weight`` by
+    that view). None where the inputs are not in that form."""
     kernel = _kernel()
     n, k = weight.shape if weight.dim() == 2 else (-1, -1)
     if (
@@ -197,6 +198,17 @@ def append_rows(
     ).t()
     fused_s.copy_(words)
     return fused_w, fused_s
+
+
+def set_weight(module: nn.Module, weight: torch.Tensor) -> None:
+    """Point ``module.weight`` (a buffer, a parameter or a plain attribute) at ``weight``, keeping its kind; the
+    module no longer references its previous weight tensor."""
+    if "weight" in module._buffers:
+        module._buffers["weight"] = weight
+    elif "weight" in module._parameters:
+        module._parameters["weight"] = nn.Parameter(weight, requires_grad=False)
+    else:
+        module.weight = weight
 
 
 def gemm(

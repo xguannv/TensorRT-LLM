@@ -2220,7 +2220,8 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # cache_derived_state under TRTLLM_K3LL_KDA_BFA_GEMV.
         self._bfa_gemvs: Optional[_decode_gemv.K3DecodeGemvs] = None
         # (weight, packed scale) of [q | k | v | g | f_a | b | pad] in FP8 (the [f_a | b] rows quantized to 128x128
-        # blocks), built by build_bfa_fp8 on the first eager call under TRTLLM_K3LL_KDA_BFA_FP8.
+        # blocks), built by build_bfa_fp8 on the first eager call under TRTLLM_K3LL_KDA_BFA_FP8. The QKVG module's
+        # weight is then a view of the weight's first rows (one buffer); the packed scales are two tensors.
         self._qkvg_bfa_fp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
@@ -2240,19 +2241,41 @@ class K3DecodeKDA(KimiKDALinearAttention):
     def build_bfa_fp8(self) -> bool:
         """Build ``_qkvg_bfa_fp8`` from the FP8 QKVG module's weight-read weight and the bf16 ``[f_a | b]`` weight
         (TRTLLM_K3LL_KDA_BFA_FP8); whether it is built. The QKVG module must hold its packed UE8M0 scale, which its
-        own post_load_weights writes after the target's, so the first eager call builds it."""
+        own post_load_weights writes after the target's, so the first eager call builds it.
+
+        One weight buffer: the QKVG module's weight becomes a view of the fused weight's first rows (the same bytes
+        at the start of the buffer, so the QKVG GEMM with the switch off is unchanged), and so do the weights of the
+        q / k / v / g modules that are views of it (``_fused_projection``); the old buffer is then released. The
+        packed scale cannot be shared: it is MN-major (strides ``(1, N)``), so the first rows of the fused scale are
+        not the layout the QKVG GEMM reads; the fused scale is its own small tensor."""
         if self._qkvg_bfa_fp8 is None:
             proj = self.qkvg_proj
             weight = getattr(proj, "weight", None)
             scale = getattr(proj, "weight_scale", None)
             if isinstance(weight, torch.Tensor) and isinstance(scale, torch.Tensor):
-                self._qkvg_bfa_fp8 = _fp8w_lowm.append_rows(weight, scale, self._bfa_proj_weight)
-                if self._qkvg_bfa_fp8 is not None:
+                # Ordinary tensors even when the first call runs under inference mode (they become module weights).
+                with torch.inference_mode(False), torch.no_grad():
+                    fused = _fp8w_lowm.append_rows(weight, scale, self._bfa_proj_weight)
+                if fused is not None:
+                    rows = weight.shape[0]
+                    extra = fused[0].nbytes - weight.nbytes + fused[1].nbytes
+                    _fp8w_lowm.set_weight(proj, fused[0][:rows])
+                    for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
+                        child = getattr(self, name, None)
+                        owner = getattr(child, "_fused_projection", None)
+                        if owner is not None and owner[0]() is proj:
+                            start = owner[1]
+                            _fp8w_lowm.set_weight(
+                                child, fused[0][start : start + child.out_features]
+                            )
+                    del weight
+                    self._qkvg_bfa_fp8 = fused
                     _BFA_FP8_BUILT[0] += 1
                     if _BFA_FP8_BUILT[0] == 1:
                         logger.info(
                             f"Kimi K3 NVFP4: TRTLLM_K3LL_KDA_BFA_FP8=1: KDA layer {self.layer_idx}'s "
-                            f"[q | k | v | g | f_a | b] in one FP8 weight {tuple(self._qkvg_bfa_fp8[0].shape)}"
+                            f"[q | k | v | g | f_a | b] in one FP8 weight {tuple(fused[0].shape)}, the QKVG weight a "
+                            f"view of its first {rows} rows; {extra} bytes more than the QKVG weight alone"
                         )
         return self._qkvg_bfa_fp8 is not None
 
