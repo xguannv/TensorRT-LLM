@@ -2832,8 +2832,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     ``spec_config.attention_backend`` selects among this class's own three
     block-decode implementations, not among the shared DFlash worker op sets:
 
-    ``CUTEDSL``  one cute-dsl pass with ``kv_bounds``, no fixup; paged only, AUTO's pick.
-    ``TRTLLM``   trtllm-gen absorbed-MLA paged decode + upper-triangle fixup.
+    ``CUTEDSL``  one cute-dsl pass with ``kv_bounds``, no fixup; paged only.
+    ``TRTLLM``   trtllm-gen absorbed-MLA paged decode + upper-triangle fixup; AUTO's pick.
     ``VANILLA``  the eager torch reference; where the other two land unpaged.
 
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
