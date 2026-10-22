@@ -13,9 +13,19 @@ RMSNorm). With it, `K3OprojPush.run` runs the same step as three kernels on that
 * ``K3LamportFinishKernel`` without its gather (``k3_lamport_ar.run_lamport_finish_in_place``): the owner polls its
   ``W`` slots, sums them and multicasts the row into the broadcast stage of every rank, where it stays (a
   `LamportResult`);
-* ``K3AttnResFastKernel`` with the Lamport addend (``trtllm::k3_attn_res_add_rmsnorm_lamport``): every rank polls every
-  row from its broadcast stage, adds it to the prefix sum (to zeros where the layer has just snapshotted it) and runs
-  the attention-residual selection and the RMSNorm, the snapshot reads and their statistics before its PDL wait.
+* ``K3AttnResFastKernel`` with the Lamport addend (``k3_attn_res.run_k3_attn_res(lamport_addend=...)``): every rank
+  polls every row from its broadcast stage, adds it to the prefix sum (to zeros where the layer has just snapshotted
+  it) and runs the attention-residual selection and the RMSNorm, the snapshot reads and their statistics before its
+  PDL wait.
+
+Programmatic dependent launch. The GEMM's weight warp streams its weights before the GEMM's ``griddepcontrol.wait``
+as the plain GEMM's does; the push variant releases its dependent from the activation warp right after that wait
+(the plain GEMM: from the weight warp at its start), since the finish kernel reads the rotation state as soon as it
+is resident. The finish kernel's CTAs release theirs at their start, so the attn_res kernel is resident and has read
+the snapshots while the rows travel. The attn_res kernel releases the next kernel (the MoE front or head) right after
+its own wait (``early_trigger``), as ``mnnvl_allreduce_attn_res`` does after its ``cudaGridDependencySynchronize``,
+so that kernel streams its weights while the attn_res kernel finishes; it becomes resident about one finish kernel
+later than behind ``mnnvl_allreduce_attn_res``.
 
 The kernels are Dongxu Yang's (``user/dongxuy/k3_lowlat``, ``TRTLLM_K3_AR_PUSH`` / ``TRTLLM_K3_AR_PUSH_AMID`` with
 ``TRTLLM_K3_ATTN_RES_PDL``); `LamportPushTarget`, `LamportResult`, `push_target` and `finish_lamport_push` are their
@@ -330,17 +340,23 @@ class K3OprojPush:
         target.pushed = True
         result = finish_lamport_push(target, in_place=True)
         prefix = self.zeros[:rows] if prefix_sum is None else prefix_sum
-        uc_local, flags = result.lamport_addend
-        updated, normed = torch.ops.trtllm.k3_attn_res_add_rmsnorm_lamport(
+        normed = torch.empty_like(prefix)
+        updated = torch.empty_like(prefix)
+        # trtllm::k3_attn_res_add_rmsnorm_lamport, releasing the next kernel at its wait (see the module docstring).
+        _attn_res().run_k3_attn_res(
             prefix,
-            uc_local,
-            flags,
+            (),
             block_residual,
             res_proj.weight.reshape(-1),
             res_norm.weight,
             out_norm.weight,
             _eps(res_norm),
             _eps(out_norm),
+            normed,
+            updated,
+            exact=False,
+            lamport_addend=result.lamport_addend,
+            early_trigger=True,
         )
         return normed, updated
 

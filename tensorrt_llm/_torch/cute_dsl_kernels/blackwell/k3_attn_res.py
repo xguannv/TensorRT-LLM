@@ -1088,6 +1088,7 @@ class K3AttnResFastKernel:
         cluster: int = 4,
         mxfp8: bool = False,
         lamport: bool = False,
+        early_trigger: bool = _EARLY_TRIGGER,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -1097,6 +1098,7 @@ class K3AttnResFastKernel:
             raise ValueError("the Lamport addend is an ADD_PREFIX variant")
         self.mxfp8 = mxfp8
         self.lamport = lamport
+        self.early_trigger = early_trigger
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -1300,7 +1302,7 @@ class K3AttnResFastKernel:
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
-            if cutlass.const_expr(_EARLY_TRIGGER):
+            if cutlass.const_expr(self.early_trigger):
                 _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
@@ -1410,7 +1412,7 @@ class K3AttnResFastKernel:
                 e_a,
             )
 
-        if cutlass.const_expr(self.use_pdl and not _EARLY_TRIGGER):
+        if cutlass.const_expr(self.use_pdl and not self.early_trigger):
             _bar_sync(4, self.threads)
             _griddepcontrol_launch_dependents()
 
@@ -1443,11 +1445,14 @@ def _compiled(
     exact: bool,
     mxfp8: bool = False,
     lamport: bool = False,
+    early_trigger: bool = _EARLY_TRIGGER,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
-        kernel = K3AttnResFastKernel(num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport)
+        kernel = K3AttnResFastKernel(
+            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, early_trigger
+        )
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1516,6 +1521,7 @@ def run_k3_attn_res(
     exact: bool | None = None,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     lamport_addend: tuple[int, int] | None = None,
+    early_trigger: bool | None = None,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1548,6 +1554,9 @@ def run_k3_attn_res(
             (vectorized kernel only). The next all-reduce on the workspace re-arms that buffer:
             it must not start before this kernel completed (its producer must trigger only
             after its own ``griddepcontrol.wait``, as the push producers and the C++ kernels do).
+        early_trigger: The vectorized kernel releases its dependent grid right after its
+            ``griddepcontrol.wait`` instead of after its last store; default
+            ``TRTLLM_K3_ATTN_RES_EARLY_TRIGGER``. The exact kernel ignores it.
     """
     if exact is None:
         exact = _EXACT
@@ -1560,7 +1569,11 @@ def run_k3_attn_res(
     if cluster is None and not exact:
         cluster = fast_cluster_size(layer.shape[0], block.shape[0] + 1)
     mxfp8 = mxfp8_out is not None
-    compiled = _compiled(block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8, lamport)
+    if early_trigger is None or exact:
+        early_trigger = _EARLY_TRIGGER
+    compiled = _compiled(
+        block.shape[0] + 1, add_mode, use_pdl, cluster, exact, mxfp8, lamport, early_trigger
+    )
     if lamport:
         add_addr, add2_addr = lamport_addend
     else:
