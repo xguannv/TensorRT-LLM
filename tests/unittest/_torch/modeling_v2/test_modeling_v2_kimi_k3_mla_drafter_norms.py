@@ -53,13 +53,13 @@ class _OneRankComm:
     def __init__(self):
         self.calls = 0
 
-    def takes_allreduce_norm(self, rows, hidden):
+    def takes_allreduce_norm(self, rows, hidden, one_shot_max_bytes=None):
         return rows > 0
 
     def takes_plain(self, *args, **kwargs):
         raise AssertionError("no k3_sandwich_plain form compiled, so none is asked for")
 
-    def allreduce_norm(self, partial, residual, norm):
+    def allreduce_norm(self, partial, residual, norm, one_shot_max_bytes=None):
         self.calls += 1
         updated = residual + partial
         return norm(updated), updated

@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """``TRTLLM_K3LL_DRAFTER_MLA_FUSED``: one MLA DSpark drafter layer's attention (`K3MLADrafterNorms._attention_qkv`) at
-the K3 drafter's per-rank shapes, 8 / 16 / 32 rows (1 / 2 / 4 requests of an 8-token block).
+the K3 drafter's per-rank shapes, 1 / 2 / 4 requests of a 7-token block (the staircase's) and an 8-token one (the
+kernel's largest): 7 / 14 / 28 and 8 / 16 / 32 rows.
 
 * Off (now, or at launch): bit for bit the chain it replaced, rebuilt here from the stock ops (the ``[q_a | kv_a]``
   linear, ``k3_drafter_mla_a_post``, q_b, ``_mla_rope_into`` + the absorption ``bmm_out``, the drafter's cute-dsl
@@ -46,7 +47,7 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 
 HIDDEN = 7168
 NOPE, ROPE, LATENT, V_DIM = 128, 64, 512, 128
-BLOCK = 8
+BLOCKS = (7, 8)  # the staircase's DSpark block (block_size 7) and the kernel's largest
 PAGE = 64
 CTX_LENS = (3000, 517, 4100, 1700)
 FP32_TOL = 2e-2  # max |out - fp32| / max |fp32|
@@ -105,13 +106,14 @@ def _layer(heads, g):
     return attn, a_weight
 
 
-def _case(batch, heads, seed=0):
+def _case(batch, heads, seed=0, block=7):
     """A layer, its block inputs and a paged latent pool holding every request's context (random rows) and room for
     the block."""
+    blk = block
     g = torch.Generator(device="cuda").manual_seed(seed)
     attn, a_weight = _layer(heads, g)
     ctx = torch.tensor(CTX_LENS[:batch], dtype=torch.int64, device="cuda")
-    per_req = [math.ceil((int(c) + BLOCK) / PAGE) for c in ctx]
+    per_req = [math.ceil((int(c) + blk) / PAGE) for c in ctx]
     pages = sum(per_req) + 2
     perm = torch.randperm(pages, generator=torch.Generator().manual_seed(seed)).cuda()
     width = max(per_req)
@@ -123,14 +125,14 @@ def _case(batch, heads, seed=0):
     pool = (
         torch.randn(pages, 1, 1, PAGE, LATENT + ROPE, generator=g, device="cuda") * 0.5
     ).bfloat16()
-    normed = (torch.randn(batch * BLOCK, HIDDEN, generator=g, device="cuda")).bfloat16()
-    angles = torch.rand(batch, BLOCK, ROPE // 2, generator=g, device="cuda") * 6.28
+    normed = (torch.randn(batch * blk, HIDDEN, generator=g, device="cuda")).bfloat16()
+    angles = torch.rand(batch, blk, ROPE // 2, generator=g, device="cuda") * 6.28
     blk_freqs = torch.polar(torch.ones_like(angles), angles)
-    fixup = _build_mla_block_fixup(ctx, page_tables, BLOCK, PAGE)
+    fixup = _build_mla_block_fixup(ctx, page_tables, blk, PAGE)
     slots = (fixup.pages * pool.stride(0) + fixup.offsets * pool.stride(3)).reshape(-1)
     qkv_state = (
         slots,
-        torch.view_as_real(blk_freqs).reshape(batch * BLOCK, -1).contiguous(),
+        torch.view_as_real(blk_freqs).reshape(batch * blk, -1).contiguous(),
         blk_freqs,
     )
     return SimpleNamespace(
@@ -144,6 +146,7 @@ def _case(batch, heads, seed=0):
         heads=heads,
         ctx=ctx,
         page_tables=page_tables,
+        block=block,
     )
 
 
@@ -155,15 +158,15 @@ def _owner(heads, fused):
 
 def _run(owner, c):
     return owner._attention_qkv(
-        c.attn, c.a_weight, c.normed, c.qkv, c.pool, c.fixup, c.batch, BLOCK
+        c.attn, c.a_weight, c.normed, c.qkv, c.pool, c.fixup, c.batch, c.block
     )
 
 
 def _reference_chain(drafter, c):
     """The chain before the switch, from the stock ops; returns the output and the absorbed query (the fp32
     reference's input)."""
-    attn, batch, heads = c.attn, c.batch, c.heads
-    rows = batch * BLOCK
+    attn, batch, heads, blk = c.attn, c.batch, c.heads, c.block
+    rows = batch * blk
     a = torch.nn.functional.linear(c.normed, c.a_weight)
     slots, freqs, blk_freqs = c.qkv
     q_a = torch.ops.trtllm.k3_drafter_mla_a_post(
@@ -176,15 +179,15 @@ def _reference_chain(drafter, c):
         attn.q_a_layernorm.variance_epsilon,
         attn.kv_a_layernorm.variance_epsilon,
     )
-    q = attn.q_b_proj(q_a).view(batch, BLOCK, heads, NOPE + ROPE)
-    query = torch.empty(batch, BLOCK, heads, LATENT + ROPE, dtype=q.dtype, device=q.device)
+    q = attn.q_b_proj(q_a).view(batch, blk, heads, NOPE + ROPE)
+    query = torch.empty(batch, blk, heads, LATENT + ROPE, dtype=q.dtype, device=q.device)
     assert _mla_rope_into(q, blk_freqs, query, heads, ROPE, LATENT)
     torch.ops.trtllm.bmm_out(
         q[..., :NOPE].view(rows, heads, NOPE).transpose(0, 1),
         attn._k_b_proj.to(q.dtype),
         query[..., :LATENT].view(rows, heads, LATENT).transpose(0, 1),
     )
-    ctx_out = drafter._cute_dsl_block_decode(query, c.pool, c.fixup, BLOCK)
+    ctx_out = drafter._cute_dsl_block_decode(query, c.pool, c.fixup, blk)
     out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
     return out.reshape(rows, -1), query
 
@@ -194,14 +197,14 @@ def _fp32_attention(c, query):
     pool = c.pool[:, 0, 0].float()
     outs = []
     for b in range(c.batch):
-        n = int(c.ctx[b]) + BLOCK
+        n = int(c.ctx[b]) + c.block
         pages = c.page_tables[b, : math.ceil(n / PAGE)]
         kv = pool[pages].reshape(-1, LATENT + ROPE)[:n]
-        qb = query[b].float()  # [BLOCK, H, 576]
+        qb = query[b].float()  # [block, H, 576]
         s = torch.einsum("qhd,nd->qhn", qb, kv) * _Drafter(c.heads).softmax_scale
         o = torch.einsum("qhn,nc->qhc", torch.softmax(s, -1), kv[:, :LATENT])
         outs.append(torch.einsum("qhc,hvc->qhv", o, c.attn._v_b_proj.float()))
-    return torch.stack(outs).reshape(c.batch * BLOCK, -1)
+    return torch.stack(outs).reshape(c.batch * c.block, -1)
 
 
 def _rel(x, ref):
@@ -218,13 +221,14 @@ def _rewrite(c, seed):
 @needs_sm100
 @pytest.mark.parametrize("heads", [4, 6])
 @pytest.mark.parametrize("batch", [1, 2, 4])
-def test_off_is_the_replaced_chain_bit_for_bit(batch, heads, monkeypatch):
+@pytest.mark.parametrize("block", BLOCKS)
+def test_off_is_the_replaced_chain_bit_for_bit(block, batch, heads, monkeypatch):
     for launch, now in ((False, 1), (True, 0), (False, 0)):
         monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_MLA_FUSED", now)
-        c = _case(batch, heads)
+        c = _case(batch, heads, block=block)
         owner = _owner(heads, fused=launch)
         got = _run(owner, c)
-        c2 = _case(batch, heads)
+        c2 = _case(batch, heads, block=block)
         want, _ = _reference_chain(owner.drafter, c2)
         assert torch.equal(got, want), f"launch {launch} now {now}: not bit for bit"
         assert torch.equal(c.pool, c2.pool)
@@ -234,13 +238,14 @@ def test_off_is_the_replaced_chain_bit_for_bit(batch, heads, monkeypatch):
 @needs_sm100
 @pytest.mark.parametrize("heads", [4, 6])
 @pytest.mark.parametrize("batch", [1, 2, 4])
-def test_on_matches_fp32_and_the_off_arm(batch, heads, monkeypatch):
+@pytest.mark.parametrize("block", BLOCKS)
+def test_on_matches_fp32_and_the_off_arm(block, batch, heads, monkeypatch):
     monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_MLA_FUSED", 1)
-    c = _case(batch, heads)
+    c = _case(batch, heads, block=block)
     owner = _owner(heads, fused=True)
     on = _run(owner, c)
     assert owner._fused_ran, "the fused kernel did not run"
-    c2 = _case(batch, heads)
+    c2 = _case(batch, heads, block=block)
     off, query = _reference_chain(owner.drafter, c2)
     ref = _fp32_attention(c2, query)
     e_on, e_off, e_on_off = _rel(on, ref), _rel(off, ref), _rel(on, off)
