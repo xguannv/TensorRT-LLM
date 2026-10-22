@@ -1390,26 +1390,24 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
 
 
 @needs_cuda
-def test_mla_dspark_auto_backend_resolves_to_cutedsl():
-    """AUTO is the one-pass kernel, and it must reach the dispatch as such.
+def test_mla_dspark_auto_backend_resolves_to_trtllm():
+    """AUTO is the class default (``_default_attention_backend``, trtllm-gen plus the
+    upper-triangle fixup), and it must reach the dispatch as such; CUTEDSL is opt-in.
 
     Asserting the dispatch and not just the field: every variant returns the
     same shape, so a default that resolved but never reached
     _mla_block_decode_variant would be silent.
     """
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_dspark import (
-        MLADSparkForCausalLM,
-        cute_dsl_mla_decode_unavailability_reason,
-    )
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
-    reason = cute_dsl_mla_decode_unavailability_reason()
-    if reason is not None:
-        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
     model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="VANILLA")
     drafter = MLADSparkForCausalLM(model_config, dflash_attention_backend="AUTO")
-    assert drafter.dflash_attention_backend == "CUTEDSL"
-    assert drafter._mla_block_decode_variant(paged=True) == "cute_dsl"
+    assert drafter.dflash_attention_backend == MLADSparkForCausalLM._default_attention_backend
+    assert drafter.dflash_attention_backend == "TRTLLM"
+    if drafter._mla_decode_op() is None:
+        pytest.skip("trtllm-gen absorbed-MLA paged decode unavailable")
+    assert drafter._mla_block_decode_variant(paged=True) == "trtllm_gen"
 
 
 @needs_cuda

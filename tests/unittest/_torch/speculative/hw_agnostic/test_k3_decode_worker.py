@@ -101,7 +101,8 @@ def _kda_manager(cls=MambaHybridCacheManagerV2):
     mgr = object.__new__(cls)
     mgr._use_kda_replay_update = True
     mgr.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
-    mgr._dummy_request_mask = torch.zeros(4, dtype=torch.bool)
+    # _dummy_request_mask is a read-only property over this buffer.
+    mgr._dummy_request_mask_buffer = SimpleNamespace(tensor=torch.zeros(4, dtype=torch.bool))
     return mgr
 
 
@@ -222,7 +223,7 @@ _ACCEPT_DECLINES = {
     ),
     "no KDA replay": _set("attn.kv_cache_manager._use_kda_replay_update", False),
     "no replay record": _set("attn.kv_cache_manager.prev_num_accepted_tokens", None),
-    "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask", None),
+    "no dummy-request mask": _set("attn.kv_cache_manager._dummy_request_mask_buffer", None),
     "no Mamba metadata": _set("attn.mamba_metadata", None),
     "int64 state indices": _set(
         "attn.mamba_metadata.state_indices", torch.zeros(4, dtype=torch.int64)
