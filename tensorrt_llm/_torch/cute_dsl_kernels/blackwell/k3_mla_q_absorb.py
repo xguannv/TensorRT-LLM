@@ -637,7 +637,7 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
             tTR_tAcc_base = thr_copy_t2r.partition_S(tAcc_epi)
             gC_mnl_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None, None)], epi_tile)
             tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
-            tTR_rAcc = cute.make_fragment(
+            tTR_rAcc = cute.make_rmem_tensor(
                 tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
             )
             copy_atom_r2s = utils.sm100.get_smem_store_op(
@@ -646,7 +646,7 @@ class K3MlaQAbsorbKernel(PersistentDenseGemmKernel):
             tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
             thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
             tRS_sC = thr_copy_r2s.partition_D(sC)
-            tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tRS_rC = tiled_copy_r2s.retile(tTR_rC)
             sC_for_tma = cute.group_modes(sC, 0, 2)
             gC_for_tma = cute.group_modes(gC_mnl_epi, 0, 2)
