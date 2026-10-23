@@ -25,6 +25,9 @@ Computes exactly what ``trtllm::kimi_k3_noaux_tc_mxfp8_quant`` computes, bit for
   NVFP4 (E2M1) with one E4M3 scale per 16 elements in the linear [M, 224] layout on a global scale,
   the recipe of ``cvt_warp_fp16_to_fp4`` (``fp4_quantize``).
 
+With ``weights_fp32`` the routing weights are stored as fp32 words holding the same bf16 values (the bf16 bits in
+the high half, the low half zero): exactly what a bf16 -> fp32 cast of the bf16 output gives.
+
 The selection differs from the C++ kernel's: one warp holds 28 keys per lane, each lane sorts its
 six largest, and the 16 winners come out of 16 rounds of ``redux.sync.max`` over the lanes' heads
 plus ``redux.sync.min`` over the candidate ids of the lanes holding that maximum (the tie-break);
@@ -438,7 +441,7 @@ def k3_route_quant_kernel(
     bias: cutlass.Array,  # fp32 [896]
     hidden_words: cutlass.Array,  # int32 view of bf16 [M, 3584]: [M * 1792]
     topk_ids: cutlass.Array,  # int32 [M * 16]
-    topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]
+    topk_weight_bits: cutlass.Array,  # int16 view of bf16 [M * 16]; int32 view of fp32 with weights_fp32
     quant_words: cutlass.Array,  # int32 view of e4m3 [M, 3584]: [M * 896]
     scales: cutlass.Array,  # uint8 [M * 112]
     gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
@@ -446,6 +449,7 @@ def k3_route_quant_kernel(
     routed_scaling_factor: cutlass.Float64,
     early_trigger: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
+    weights_fp32: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -478,7 +482,13 @@ def k3_route_quant_kernel(
             if tidx < cutlass.Int32(TOP_K):
                 out = bidx * cutlass.Int32(TOP_K) + tidx
                 topk_ids.store(expert, idx=out)
-                topk_weight_bits.store(weight_bits, idx=out)
+                if cutlass.const_expr(weights_fp32):
+                    # The fp32 word of the bf16 value: its bits in the high half, the low half zero.
+                    topk_weight_bits.store(
+                        (cutlass.Int32(weight_bits) & cutlass.Int32(0xFFFF)) << 16, idx=out
+                    )
+                else:
+                    topk_weight_bits.store(weight_bits, idx=out)
     else:
         row = bidx - num_tokens
         words = hidden_words.load(
@@ -536,11 +546,12 @@ def k3_route_quant(
     early_trigger: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
+    weights_fp32: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     k3_route_quant_kernel(
         scores, bias, hidden_words, topk_ids, topk_weight_bits, quant_words, scales, gsf, num_tokens,
-        routed_scaling_factor, early_trigger, nvfp4,
+        routed_scaling_factor, early_trigger, nvfp4, weights_fp32,
     ).launch(
         grid=[num_tokens * 2, 1, 1],
         block=[THREADS, 1, 1],

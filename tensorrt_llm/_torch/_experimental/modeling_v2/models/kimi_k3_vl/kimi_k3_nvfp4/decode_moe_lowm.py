@@ -66,6 +66,8 @@ MAX_TOKENS = 8
 FRONT16_TOKENS = 16
 # A wide decode step's most tokens: the expert kernel's limit.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
+# The rows of the tail's zero padding: a wide decode step of up to 8 requests of 8 tokens.
+TAIL_PAD_ROWS = max(WIDE_MAX_TOKENS, 64)
 NUM_EXPERTS = 896
 
 
@@ -266,7 +268,7 @@ class K3DecodeMoeNvfp4Layer:
             front_weight=front,
             head_weight=front[: head.shape[0]],
             tail_weight=tail,
-            tail_pad=up.new_zeros(WIDE_MAX_TOKENS, pad) if pad else None,
+            tail_pad=up.new_zeros(TAIL_PAD_ROWS, pad) if pad else None,
             bias=moe.gate.e_score_correction_bias.detach(),
             lo=lo,
             width=width,
@@ -294,9 +296,11 @@ class K3DecodeMoeNvfp4Layer:
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):
+        """``k3_route_quant`` with the NVFP4 latent; with ``TRTLLM_K3LL_ROUTE_QUANT_FP32`` its routing weights in fp32
+        (the same values), which ``nvfp4_lowm_op.run`` hands ``moe_sort`` and the expert kernel without a cast."""
         return k3_route_quant(
             logits, self.bias, latent.contiguous(), float(moe.gate.routed_scaling_factor),
-            nvfp4_gsf=self.input_scale,
+            nvfp4_gsf=self.input_scale, weights_fp32=bool(_flags.TRTLLM_K3LL_ROUTE_QUANT_FP32),
         )  # fmt: skip
 
     def _front(self, moe: nn.Module, x: torch.Tensor, sort_out: Optional[torch.Tensor] = None):

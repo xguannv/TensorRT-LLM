@@ -67,6 +67,8 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_head_gemv import op as _head_op
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
 
+from . import flags as _flags
+
 # The row limit of the decode GEMV and head kernels (one token tile), and of k3_ctm_gemv_wide (a decode step of 8
 # requests of 8 tokens).
 MAX_ROWS = 8
@@ -120,10 +122,13 @@ SITES: Dict[str, Site] = {
     # The MoE decode path (decode_moe.py): this rank's head slice [latent down 224 | router 56] with an fp32 output,
     # the shared experts' gate_up, the row-parallel tail [latent up 224 | padding 32 | shared down 384] and the
     # replicated tail's latent up projection with an fp32 output. The wide kernel takes the head slice and the tail up
-    # to 32 rows, where it is faster than the stock GEMM.
-    "moe_head": Site(280, 7168, "wide", wide=True, out_fp32=True, wide_rows=32),
+    # to TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS / TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS rows (default 32, up to which it was measured
+    # faster than the stock GEMM).
+    "moe_head": Site(
+        280, 7168, "wide", wide=True, out_fp32=True, wide_rows=_flags.TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS
+    ),
     "moe_shared_gate_up": Site(768, 7168, "wide", wide=True),
-    "moe_tail": Site(7168, 640, "wide", wide=True, wide_rows=32),
+    "moe_tail": Site(7168, 640, "wide", wide=True, wide_rows=_flags.TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS),
     "moe_up": Site(7168, 3584, "wide", out_fp32=True),
     # The DSpark drafter's projections (K3DSparkDrafter; 6 query heads, 1 KV head of 64, MLP width 896): the fused
     # q / k / v, the output projection (row parallel), gate_up [gate 896 | up 896], and the down projection with the
@@ -138,6 +143,14 @@ SITES: Dict[str, Site] = {
 def _width(spec: Site) -> int:
     """The row width a site's kernel reads: ``k``, or the ``[gate | up]`` input of a SiLU-and-mul site, 2 ``k``."""
     return 2 * spec.k if spec.small == "swiglu" else spec.k
+
+
+def _warm_rows(spec: Site) -> tuple:
+    """The row counts `K3DecodeGemvs.create` runs a site at: one, and with ``wide`` one per wide token tile up to the
+    site's ``wide_rows`` (a ``wide_rows`` inside a tile warms that tile at ``wide_rows``)."""
+    if not spec.wide:
+        return (1,)
+    return tuple(sorted({min(rows, spec.wide_rows) for rows in (1, 16, 32, WIDE_ROWS)}))
 
 
 def _wide_tile(rows: int) -> int:
@@ -271,9 +284,7 @@ class K3DecodeGemvs:
         for site in sites:
             spec = SITES[site]
             weight = torch.zeros(spec.n, spec.k, dtype=torch.bfloat16, device=device)
-            for rows in (1, 16, 32, 64) if spec.wide else (1,):
-                if rows > spec.wide_rows:
-                    continue
+            for rows in _warm_rows(spec):
                 state._project(site, weight.new_zeros(rows, _width(spec)), weight, warm=True)
             del weight
         if "dense_gate_up" in sites:

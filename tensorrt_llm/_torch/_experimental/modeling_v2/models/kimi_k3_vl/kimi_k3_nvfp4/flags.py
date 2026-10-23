@@ -174,6 +174,32 @@ TRTLLM_K3LL_WIDE_LATENT_TAIL = _flag(
     "wide decode steps: MoE latent all-reduce + latent RMSNorm + the tail GEMV's input concat in one MNNVL call",
 )
 
+TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS = _flag(
+    "TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS",
+    32,
+    "wide decode steps: the most tokens whose residual epilogues outside the fused all-reduces run the fused (add +) "
+    "attn_res + RMSNorm kernel, above it add, attn_res_fwd and RMSNorm (changes numerics above 32; read at forward "
+    "time)",
+)
+TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS = _flag(
+    "TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS",
+    32,
+    "lowm MoE on wide steps: the most rows of the head slice GEMV on k3_ctm_gemv_wide (decode_gemv site moe_head), "
+    "above it the fp32 router GEMM op (changes numerics above 32; up to 64; read at import)",
+)
+TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS = _flag(
+    "TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS",
+    32,
+    "lowm MoE on wide steps: the most rows of the row-parallel tail GEMV on k3_ctm_gemv_wide (decode_gemv site "
+    "moe_tail), above it F.linear (changes numerics above 32; up to 64; read at import)",
+)
+TRTLLM_K3LL_ROUTE_QUANT_FP32 = _flag(
+    "TRTLLM_K3LL_ROUTE_QUANT_FP32",
+    0,
+    "lowm MoE on wide steps the front does not take: k3_route_quant stores the routing weights widened to fp32, so "
+    "no cast kernel runs before moe_sort (the same bits; read at forward time, compiled by the layer's warm-up)",
+)
+
 TRTLLM_K3LL_OPROJ_PUSH = _flag(
     "TRTLLM_K3LL_OPROJ_PUSH",
     1,

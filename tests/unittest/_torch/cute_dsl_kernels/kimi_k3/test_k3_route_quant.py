@@ -16,7 +16,10 @@
 top-16 ids, routing weights, MXFP8 codes and scales bit for bit against trtllm::kimi_k3_noaux_tc_mxfp8_quant and
 against the unfused chain (trtllm::noaux_tc_op + trtllm::mxfp8_quantize), run-to-run and early-trigger bits, each M's
 rows the bits of the same rows of the 64-row call; plus ties, saturation, lane overflow and zero / large / denormal
-latent rows at M = 1, 3, 8. The ids are also compared with a stable PyTorch sort of sigmoid + bias (reported)."""
+latent rows at M = 1, 3, 8. The ids are also compared with a stable PyTorch sort of sigmoid + bias (reported).
+``weights_fp32`` (the routing weights stored widened to fp32): at every M of the cases, MXFP8 and NVFP4 latent, with
+and without the early trigger, the weights bit for bit the default call's ``.float()`` and every other output its
+bits."""
 
 import functools
 
@@ -180,3 +183,21 @@ def test_token_limit(m):
     h = torch.zeros(m, H, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError):
         ops.k3_route_quant(s, torch.zeros(E, device="cuda"), h, SCALE)
+
+
+@pytest.mark.parametrize("nvfp4", [False, True])
+@pytest.mark.parametrize("m", M_CASES)
+def test_k3_route_quant_weights_fp32(m, nvfp4):
+    ops = _ops()
+    s64, b, h64 = _random()
+    s, h = s64[:m].contiguous(), h64[:m].contiguous()
+    # The NVFP4 latent's global scale: |latent| up to about 4 maps to the largest code.
+    gsf = torch.tensor([448.0 * 6.0 / 4.0], device="cuda") if nvfp4 else None
+    for early in (False, True):
+        ref = ops.k3_route_quant(s, b, h, SCALE, early, nvfp4_gsf=gsf)
+        got = ops.k3_route_quant(s, b, h, SCALE, early, nvfp4_gsf=gsf, weights_fp32=True)
+        weights = got[1].dtype == torch.float32 and _same(got[1], ref[1].float())
+        rest = all(_same(g, r) for g, r in zip((got[0], got[2], got[3]), (ref[0], ref[2], ref[3])))
+        print(f"OPCHECK op=k3_route_quant case=weights_fp32 M={m} nvfp4={nvfp4} early={early} "
+              f"weights_widened={weights} ids_latent_scales_same={rest}")  # fmt: skip
+        assert weights and rest

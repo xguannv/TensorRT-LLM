@@ -20,10 +20,11 @@ EP4 rank of the target; random, per-expert global scales). The generic path runs
 NVFP4 methods (``quantize_input``, ``run_moe_nvfp4``) after the scheduler's no-communication steps (the gate's
 routing method, int32 ids, fp32 weights). The decoder layer's residual updates run
 ``KimiLinearDecoderLayer.forward`` itself on a stand-in layer (attention and MoE stand-ins that return fixed
-partials). A switch read at forward time (``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, ``TRTLLM_K3LL_WIDE_LATENT_TAIL``) is set
-on the flags module per arm; a switch read when the target is built (``TRTLLM_K3LL_MOE_FRONT_SORT``,
-``TRTLLM_K3LL_MOE_FRONT16``: the state ``K3DecodeMoeNvfp4.create`` builds; ``TRTLLM_K3LL_MOE_LOWM``: whether the
-layer gets a ``decode_moe`` at all) is one built layer per arm. The decode GEMV sites are not built
+partials). A switch read at forward time (``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, ``TRTLLM_K3LL_WIDE_LATENT_TAIL``,
+``TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS``, ``TRTLLM_K3LL_ROUTE_QUANT_FP32``) is set on the flags module per arm; a
+switch read when the target is built (``TRTLLM_K3LL_MOE_FRONT_SORT``, ``TRTLLM_K3LL_MOE_FRONT16``: the state
+``K3DecodeMoeNvfp4.create`` builds; ``TRTLLM_K3LL_MOE_LOWM``: whether the layer gets a ``decode_moe`` at all) is one
+built layer per arm. The decode GEMV sites are not built
 (``decode_gemvs`` None): every GEMV runs on ``_gemv``'s stock GEMM.
 
 Payloads. The MoE inputs and the head and shared gate_up rows are small multiples of powers of two, so every head and
@@ -59,7 +60,8 @@ eager call on the same inputs):
     device code on the gathered head, here the same exact sums); the shared activation within ``SHARED_TOL`` of its
     largest magnitude (the front's SiTU uses fast tanh / sigmoid approximations, ``k3_moe_front.md``); the tail input's
     latent columns bit for bit and the output within ``_gemv_bound``.
-  * WIDE_AR_ATTN_RES (16, 32 rows; a layer that snapshots and one that does not): ``KimiLinearDecoderLayer.forward``
+  * WIDE_AR_ATTN_RES (16, 32, 64 rows; a layer that snapshots and one that does not; TRTLLM_K3LL_OPROJ_PUSH off, so
+    the post-attention update is the all-reduce of the attention's partial): ``KimiLinearDecoderLayer.forward``
     on a wide step, its pre-attention update of the previous layer's MoE partial and its post-attention update. Off
     arm against ``_ref_wide_residual_chain`` (the stock MNNVL all-reduce, then the stock fused add + attn_res +
     RMSNorm helpers) bit for bit, and its ``updated`` against the exact sums. On arm (``mnnvl_allreduce_attn_res``
@@ -68,7 +70,19 @@ eager call on the same inputs):
     within ``NORMED_TOL`` of its largest magnitude (the op's epilogue mixes the snapshots and sums the squares in
     another order than the stock ``attn_res_add_rmsnorm_fwd`` / ``attn_res_rmsnorm_fwd``; on GB300 a few elements
     per 16 x 7168 differ, up to about 6 bf16 ulp of their own magnitude where the mix nearly cancels).
-  * WIDE_LATENT_TAIL (16, 32 rows, a fixed routed partial fed into ``_wide``): a tail-only stand-in with 224 latent
+  * WIDE_ATTN_RES_MAX_TOKENS (32, 48, 64 rows; both layer kinds; WIDE_AR_ATTN_RES and OPROJ_PUSH off, so both
+    updates run the epilogue helpers): the same forward with the switch at 32 (off, the default) and 64 (on). Off
+    arm against ``_ref_wide_residual_chain`` bit for bit and, above 32 rows, against ``_ref_unfused_residual_chain``
+    (the add, ``attn_res_fwd`` and the RMSNorm module) bit for bit. On arm against the off arm: every ``updated`` bit
+    for bit (exact sums); ``normed`` bit for bit up to 32 rows (the same fused kernel), above 32 within
+    ``ATTN_RES_FUSED_TOL`` of its largest magnitude (the fused kernel normalizes the fp32 mixture, the chain the
+    mixture rounded to bf16: not bitwise).
+  * ROUTE_QUANT_FP32 (17, 32 rows, and 64 where the expert kernel takes it): ``_wide_head`` with and without fp32
+    routing weights from ``k3_route_quant``. Off arm against ``_ref_wide_head_chain`` bit for bit (routing, latent,
+    scales, routed partial, shared activation). On arm against the off arm: ids, latent and scales bit for bit, its
+    fp32 weights bit for bit the off arm's bf16 weights widened, ``moe_sort``'s tiles, limits and weights equal (each
+    tile's rows as a set), the routed partial and the shared activation bit for bit.
+  * WIDE_LATENT_TAIL (16, 32, 64 rows, a fixed routed partial fed into ``_wide``): a tail-only stand-in with 224 latent
     columns per rank (the latent scaled with W as ``_mnnvl_allreduce_rmsnorm_slice_op_matrix.py`` scales it: the
     fused op takes at most 256 columns per rank, so at W 4 the 3584-wide latent keeps the stock tail). Off arm
     against ``_ref_latent_tail_chain`` bit for bit, its normalized slice within one bf16 ulp of the exact sum's.
@@ -133,7 +147,9 @@ SNAPSHOTS = 3
 
 FRONT_SORT_ROWS = (1, 8, 9, 12, 16)
 FRONT16_ROWS = (9, 12, 16)
-WIDE_ROWS = (16, 32)
+WIDE_ROWS = (16, 32, 64)
+ATTN_RES_CAP_ROWS = (32, 48, 64)
+ROUTE_FP32_ROWS = (17, 32, 64)
 MOE_ROWS = (8, 16, 32)
 GRAPH_FRONT_SORT_ROWS = (8, 16)
 GRAPH_FRONT16_ROWS = (9, 16)
@@ -143,6 +159,8 @@ ULP_REL = 2.0**-7  # one bf16 ulp, relative
 SHARED_TOL = 2e-2  # the front's shared activation: max |err| / max |ref| (k3_moe_front.md)
 NORMED_TOL = 2e-2  # normed without a prefix sum: max |err| / max |ref| (the attn_res matrix's TOL)
 MOE_TOL = 3e-2  # MOE_LOWM, the on arm's reduced output: max |err| / max |ref|
+# WIDE_ATTN_RES_MAX_TOKENS above 32 rows, fused against the add -> attn_res_fwd -> RMSNorm chain: max |err| / max |ref|
+ATTN_RES_FUSED_TOL = 2e-2
 STOCK_WIDE_ONE_SHOT_MAX_BYTES = 1 << 20  # the stock MNNVL all-reduce's one-shot ceiling
 
 R = None
@@ -1027,7 +1045,8 @@ def _decoder(call, layer_idx):
 
 
 def _residual_arm(layer, call, on):
-    with _switch("TRTLLM_K3LL_WIDE_AR_ATTN_RES", on):
+    # The stand-in has no o_proj: the post-attention update is the all-reduce of the attention's partial.
+    with _switch("TRTLLM_K3LL_WIDE_AR_ATTN_RES", on), _switch("TRTLLM_K3LL_OPROJ_PUSH", 0):
         prefix, snapshots, _ = IMPL.KimiLinearDecoderLayer.forward(
             layer, call.prefix, call.bank, SNAPSHOTS, None, call.step,
             pending_moe_partial=call.moe_partial, defer_moe_tail=True,
@@ -1130,6 +1149,197 @@ def check_wide_ar_attn_res():
             "[rank 0] WIDE_AR_ATTN_RES: off arm = pre-change chain = exact sums; on arm's updated = off arm's, "
             f"normed max rel err {STATS.get('WIDE_AR_ATTN_RES normed1', 0.0):.2e} / "
             f"{STATS.get('WIDE_AR_ATTN_RES normed2', 0.0):.2e}",
+            flush=True,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS
+# ----------------------------------------------------------------------------------------------------------------------
+ATTN_RES_CAP_OFF, ATTN_RES_CAP_ON = 32, 64
+
+
+def _ref_unfused_residual_chain(layer, call):
+    """A wide step's two residual updates above the fused kernels' token limit, as before the switch: the stock MNNVL
+    all-reduce of each partial, the residual add, ``attn_res_fwd`` (``_apply_attn_res``) and the RMSNorm module.
+    Returns the step's four outputs."""
+    valid = call.bank[:SNAPSHOTS]
+    moe_out = _stock_wide_all_reduce(layer._o_allreduce(), call.moe_partial)
+    updated1 = call.prefix + moe_out
+    normed1 = layer.input_layernorm(
+        IMPL._apply_attn_res(
+            updated1, valid, layer.self_attention_res_proj, layer.self_attention_res_norm
+        )
+    )
+    prefix = updated1
+    if call.snapshot_layer:
+        call.bank[SNAPSHOTS].copy_(updated1)
+        valid, prefix = call.bank[: SNAPSHOTS + 1], None
+    attn_out = _stock_wide_all_reduce(layer._o_allreduce(), call.attn_partial)
+    updated2 = attn_out if prefix is None else prefix + attn_out
+    normed2 = layer.post_attention_layernorm(
+        IMPL._apply_attn_res(updated2, valid, layer.mlp_res_proj, layer.mlp_res_norm)
+    )
+    return SimpleNamespace(normed1=normed1, updated1=updated1, normed2=normed2, updated2=updated2)
+
+
+def _cap_arm(layer, call, cap):
+    """The wide step's forward with WIDE_AR_ATTN_RES off (both updates on the epilogue helpers) and the helpers'
+    token limit ``cap``."""
+    with _switch("TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS", cap):
+        return _residual_arm(layer, call, 0)
+
+
+def _verify_cap(where, call, on, off):
+    rows = call.rows
+    with _switch("TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS", ATTN_RES_CAP_OFF):
+        ref = _cloned(_ref_wide_residual_chain(call.layer, call))
+    for name in ("normed1", "updated1", "normed2", "updated2"):
+        a = getattr(off, name)
+        if a is not None:
+            _expect_same(
+                f"{where}: off arm vs pre-change {name}", a, getattr(ref, name), replicated=True
+            )
+    if rows > ATTN_RES_CAP_OFF:
+        unfused = _cloned(_ref_unfused_residual_chain(call.layer, call))
+        for name in ("normed1", "updated1", "normed2", "updated2"):
+            a = getattr(off, name)
+            if a is not None:
+                _expect_same(
+                    f"{where}: off arm vs add -> attn_res_fwd -> RMSNorm {name}",
+                    a,
+                    getattr(unfused, name),
+                    replicated=True,
+                )
+    want1, want2 = call.exact_updated()
+    if off.updated1 is not None:
+        _expect_same(f"{where}: off arm's first update vs the exact sum", off.updated1, want1)
+    _expect_same(f"{where}: off arm's second update vs the exact sum", off.updated2, want2)
+    for name in ("updated1", "updated2"):
+        if getattr(off, name) is not None:
+            _expect_same(
+                f"{where}: on vs off {name}", getattr(on, name), getattr(off, name), replicated=True
+            )
+    for name in ("normed1", "normed2"):
+        a, b = getattr(on, name), getattr(off, name)
+        if rows <= ATTN_RES_CAP_OFF:
+            _expect_same(f"{where}: on vs off {name}", a, b, replicated=True)
+        else:
+            _expect_close(
+                f"WIDE_ATTN_RES_MAX_TOKENS {name}: {where}",
+                a,
+                b,
+                ATTN_RES_FUSED_TOL,
+                replicated=True,
+            )
+
+
+def check_wide_attn_res_max_tokens():
+    """``KimiLinearDecoderLayer.forward``'s two residual updates on wide steps of 32, 48 and 64 tokens with the fused
+    kernels' token limit at 32 and at 64 (module docstring)."""
+    for rows in ATTN_RES_CAP_ROWS:
+        for snapshot_layer in (False, True):
+            layer_idx = ATTN_RES_BLOCK if snapshot_layer else 1
+            call = _ResidualCall(8500 + rows + int(snapshot_layer), rows, snapshot_layer)
+            layer = _decoder(call, layer_idx)
+            call.layer = layer
+            for cap in (ATTN_RES_CAP_ON, ATTN_RES_CAP_OFF):
+                with _switch("TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS", cap):
+                    assert IMPL._attn_res_max_tokens(call.step) == cap
+            where = f"WIDE_ATTN_RES_MAX_TOKENS {rows} rows snapshot {snapshot_layer}"
+            a_on = _cloned(_cap_arm(layer, call, ATTN_RES_CAP_ON))
+            a_off = _cloned(_cap_arm(layer, call, ATTN_RES_CAP_OFF))
+            _verify_cap(where, call, a_on, a_off)
+            caps = (ATTN_RES_CAP_ON, ATTN_RES_CAP_OFF)
+            graphs = {cap: _capture(lambda cap=cap: _cap_arm(layer, call, cap)) for cap in caps}
+            for rep in range(REPLAYS):
+                call.draw(8600 + 10 * rows + 2 * rep + int(snapshot_layer))
+                replayed = {}
+                for cap, (graph, out) in graphs.items():
+                    _replay(graph)
+                    replayed[cap] = _cloned(out)
+                gw = f"{where} graph replay {rep}"
+                fields = ("normed1", "normed2", "updated2") + (
+                    ("updated1",) if snapshot_layer else ()
+                )
+                for cap in caps:
+                    eager = _cloned(_cap_arm(layer, call, cap))
+                    for name in fields:
+                        _expect_same(f"{gw}: cap {cap} {name} vs eager", getattr(replayed[cap], name),
+                                     getattr(eager, name))  # fmt: skip
+                _verify_cap(gw, call, replayed[ATTN_RES_CAP_ON], replayed[ATTN_RES_CAP_OFF])
+            del graphs
+    if R.rank == 0:
+        print(
+            "[rank 0] WIDE_ATTN_RES_MAX_TOKENS: off arm = pre-change chain = exact sums; on arm's updated = off arm's, "
+            "normed bit for bit up to 32 rows, above it max rel err "
+            f"{STATS.get('WIDE_ATTN_RES_MAX_TOKENS normed1', 0.0):.2e} / "
+            f"{STATS.get('WIDE_ATTN_RES_MAX_TOKENS normed2', 0.0):.2e}",
+            flush=True,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_ROUTE_QUANT_FP32
+# ----------------------------------------------------------------------------------------------------------------------
+def _route_fp32_arm(layer, moe, x, on):
+    """``_wide_head`` on ``x`` with TRTLLM_K3LL_ROUTE_QUANT_FP32 = ``on``: the routing and latent the expert step
+    reads, the sorted routing it hands the expert kernel, the routed partial and the shared activation."""
+    with _switch("TRTLLM_K3LL_ROUTE_QUANT_FP32", on), _taps(layer) as seen, _sort_tap() as sort:
+        routed, act = layer._wide_head(moe, x, None)
+    return SimpleNamespace(routing=seen["_routed"][:4], sort=sort["sort"], routed=routed, act=act)
+
+
+def _verify_route_fp32(where, on, off, ref):
+    names = ("ids", "weights", "latent", "scales")
+    _assert_one_hot(where, off.routing[1])
+    for name, a, b in zip(names, off.routing, ref.routing):
+        _expect_same(f"{where}: off arm vs pre-change {name}", a, b, replicated=True)
+    _expect_same(f"{where}: off arm vs pre-change routed partial", off.routed, ref.routed)
+    _expect_same(f"{where}: off arm vs pre-change shared activation", off.act, ref.act)
+    assert off.routing[1].dtype == torch.bfloat16, off.routing[1].dtype
+    assert on.routing[1].dtype == torch.float32, on.routing[1].dtype
+    for name, a, b in zip(names, on.routing, off.routing):
+        want = b.float() if name == "weights" else b
+        _expect_same(f"{where}: on vs off {name}", a, want, replicated=True)
+    on_t, off_t = _sort_table(on.sort), _sort_table(off.sort)
+    assert on_t[:3] == off_t[:3], f"{where}: the tiles {on_t[:3]} differ from {off_t[:3]}"
+    _same_rows(where, "on vs off", on_t[3], off_t[3])
+    _expect_same(f"{where}: on vs off sort weights", on_t[4], off_t[4])
+    _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
+    _expect_same(f"{where}: on vs off shared activation", on.act, off.act)
+
+
+def check_route_quant_fp32():
+    """``_wide_head`` with and without fp32 routing weights from ``k3_route_quant`` (module docstring)."""
+    layer, moe, ref = BUILT.on, BUILT.moe_on, BUILT.refs.on
+    rows_list = [rows for rows in ROUTE_FP32_ROWS if rows <= LOWM_OP.MAX_TOKENS]
+    for rows in rows_list:
+        x = _moe_input(1100 + rows, rows)
+        a_on = _route_fp32_arm(layer, moe, x, 1)
+        a_off = _route_fp32_arm(layer, moe, x, 0)
+        _verify_route_fp32(
+            f"ROUTE_QUANT_FP32 {rows} rows", a_on, a_off,
+            _ref_wide_head_chain(layer.state, ref, moe, x),
+        )  # fmt: skip
+    fields = ("routing", "routed", "act")
+    for rows in rows_list:
+        x = _moe_input(1200 + rows, rows)
+        graph, (g_on, g_off) = _capture(
+            lambda: (_route_fp32_arm(layer, moe, x, 1), _route_fp32_arm(layer, moe, x, 0))
+        )
+        for rep in range(REPLAYS):
+            x.copy_(_moe_input(1300 + 10 * rows + rep, rows))
+            _replay(graph)
+            where = f"ROUTE_QUANT_FP32 graph {rows} rows replay {rep}"
+            _same_arm(f"{where} on vs eager", g_on, _route_fp32_arm(layer, moe, x, 1), fields)
+            _same_arm(f"{where} off vs eager", g_off, _route_fp32_arm(layer, moe, x, 0), fields)
+            _verify_route_fp32(where, g_on, g_off, _ref_wide_head_chain(layer.state, ref, moe, x))
+        del graph
+    if R.rank == 0:
+        print(
+            f"[rank 0] ROUTE_QUANT_FP32 ({rows_list} rows): off arm = pre-change chain; on arm's routing, sort and "
+            "routed partial bit for bit the off arm's (weights widened)",
             flush=True,
         )
 
@@ -1346,6 +1556,8 @@ CHECKS = [
     check_front_sort,
     check_front16,
     check_wide_ar_attn_res,
+    check_wide_attn_res_max_tokens,
+    check_route_quant_fp32,
     check_wide_latent_tail,
     check_moe_lowm,
 ]

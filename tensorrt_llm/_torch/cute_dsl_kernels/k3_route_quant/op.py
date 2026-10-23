@@ -16,8 +16,8 @@
 
 Same arguments, same outputs bit for bit: top-16 expert ids (int32 [M, 16]), routing weights
 (bf16 [M, 16]), the MXFP8 latent (e4m3 [M, 3584]) and its UE8M0 scales (uint8 [M, 112], linear).
-The kernel is compiled on the first call for each (early trigger, PDL) pair, which must happen
-outside CUDA-graph capture (the model's warmup does it).
+The kernel is compiled on the first call for each (early trigger, PDL, NVFP4, fp32 weights) key, which
+must happen outside CUDA-graph capture (the model's warmup does it).
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ NVFP4_SF_VEC = 16
 MAX_TOKENS = 64
 
 _lock = threading.Lock()
-_compiled: Dict[Tuple[bool, bool, bool], object] = {}
+_compiled: Dict[Tuple[bool, bool, bool, bool], object] = {}
 
 
 def _arg(t: torch.Tensor):
@@ -80,8 +80,9 @@ def _kernel(
     scale: float,
     stream,
     nvfp4: bool = False,
+    weights_fp32: bool = False,
 ):
-    key = (early_trigger, use_pdl, nvfp4)
+    key = (early_trigger, use_pdl, nvfp4, weights_fp32)
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -104,6 +105,7 @@ def _kernel(
                     early_trigger,
                     use_pdl,
                     nvfp4,
+                    weights_fp32,
                     stream,
                 )
     return fn
@@ -117,6 +119,7 @@ def k3_route_quant(
     routed_scaling_factor: float,
     early_trigger: bool = False,
     nvfp4_gsf: Optional[torch.Tensor] = None,
+    weights_fp32: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Kimi K3 top-16 routing of ``scores`` (fp32 [M, 896]) with ``bias`` (fp32 [896]) and MXFP8
     quantization of ``hidden_states`` (bf16 [M, 3584]); M <= 64.
@@ -128,6 +131,9 @@ def k3_route_quant(
     ``nvfp4_gsf`` (fp32 ``[1]``): quantize to NVFP4 on that global scale instead, ``fp4_quantize``'s recipe with
     ``sf_vec_size`` 16 and linear scales: ``quantized`` uint8 ``[M, 1792]`` (E2M1 pairs, low nibble first) and
     ``scales`` uint8 ``[M, 224]`` (E4M3).
+
+    ``weights_fp32``: ``topk_weights`` as fp32 ``[M, 16]`` holding the same bf16 values (``topk_weights.float()`` of
+    the default output, bit for bit), for a consumer that reads fp32 weights.
     """
     import cuda.bindings.driver as cuda_driver
 
@@ -135,7 +141,8 @@ def k3_route_quant(
     num_tokens = scores.shape[0]
     device = scores.device
     topk_ids = torch.empty(num_tokens, TOP_K, dtype=torch.int32, device=device)
-    topk_weights = torch.empty(num_tokens, TOP_K, dtype=torch.bfloat16, device=device)
+    weight_dtype = torch.float32 if weights_fp32 else torch.bfloat16
+    topk_weights = torch.empty(num_tokens, TOP_K, dtype=weight_dtype, device=device)
     nvfp4 = nvfp4_gsf is not None
     if nvfp4 and (
         nvfp4_gsf.dtype != torch.float32 or nvfp4_gsf.numel() != 1 or nvfp4_gsf.device != device
@@ -156,7 +163,7 @@ def k3_route_quant(
         _arg(bias.view(-1)),
         _arg(hidden_states.view(-1).view(torch.int32)),
         _arg(topk_ids.view(-1)),
-        _arg(topk_weights.view(-1).view(torch.int16)),
+        _arg(topk_weights.view(-1).view(torch.int32 if weights_fp32 else torch.int16)),
         _arg(quantized.view(-1).view(torch.int32)),
         _arg(scales.view(-1)),
         # Without nvfp4 the kernel never reads it: any fp32 word.
@@ -165,14 +172,22 @@ def k3_route_quant(
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     use_pdl = _use_pdl()
     scale = float(routed_scaling_factor)
-    fn = _kernel(early_trigger, use_pdl, args, num_tokens, scale, stream, nvfp4)
+    fn = _kernel(early_trigger, use_pdl, args, num_tokens, scale, stream, nvfp4, weights_fp32)
     # The compiled function takes the runtime arguments only (the Constexpr ones are baked in).
     fn(*args, num_tokens, scale, stream)
     return topk_ids, topk_weights, quantized, scales
 
 
 @k3_route_quant.register_fake
-def _(scores, bias, hidden_states, routed_scaling_factor, early_trigger=False, nvfp4_gsf=None):
+def _(
+    scores,
+    bias,
+    hidden_states,
+    routed_scaling_factor,
+    early_trigger=False,
+    nvfp4_gsf=None,
+    weights_fp32=False,
+):
     num_tokens = scores.shape[0]
     if nvfp4_gsf is not None:
         quantized = hidden_states.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)
@@ -186,7 +201,9 @@ def _(scores, bias, hidden_states, routed_scaling_factor, early_trigger=False, n
         )
     return (
         scores.new_empty((num_tokens, TOP_K), dtype=torch.int32),
-        scores.new_empty((num_tokens, TOP_K), dtype=torch.bfloat16),
+        scores.new_empty(
+            (num_tokens, TOP_K), dtype=torch.float32 if weights_fp32 else torch.bfloat16
+        ),
         quantized,
         scales,
     )

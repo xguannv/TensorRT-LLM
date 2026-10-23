@@ -739,15 +739,12 @@ def _apply_attn_res_add_and_rmsnorm(
     )
 
 
-# A wide decode step's residual epilogues take the fused add + attn_res + RMSNorm kernels up to this many tokens, where
-# they are faster than the add -> attn_res -> RMSNorm chain.
-_WIDE_ATTN_RES_MAX_TOKENS = 32
-
-
 def _attn_res_max_tokens(step: DecodeStep) -> int:
     """The most tokens of ``step`` the fused attn_res kernels take: one token tile (``DECODE_MAX_TOKENS``) on a step
-    ``decode_step`` classifies, ``_WIDE_ATTN_RES_MAX_TOKENS`` on a wide decode step."""
-    return _WIDE_ATTN_RES_MAX_TOKENS if step.wide else DECODE_MAX_TOKENS
+    ``decode_step`` classifies, ``TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS`` on a wide decode step (default 32, up to
+    which the fused add + attn_res + RMSNorm kernels were measured faster than the add -> attn_res -> RMSNorm chain;
+    the kernels take any token count)."""
+    return _flags.TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS if step.wide else DECODE_MAX_TOKENS
 
 
 _K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
