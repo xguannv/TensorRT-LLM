@@ -459,6 +459,14 @@ class K3DecodeMoeNvfp4Layer:
         consumer runs the tail GEMV (``moe_tail_push.py``)."""
         x = hidden_states.contiguous()
         front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
+        if (
+            front32
+            and FRONT16_TOKENS < x.shape[0] <= FRONT32_TOKENS
+            and self.state.head32 is not None
+        ):
+            from . import census as _census
+
+            _census.count(f"moe_front32:{_census.mode()}")
         if self.state.front_head(x.shape[0], front32) is not None:
             # The front's 16- or 32-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
             routed, shared_act = self._front_routed(moe, x, front32)
