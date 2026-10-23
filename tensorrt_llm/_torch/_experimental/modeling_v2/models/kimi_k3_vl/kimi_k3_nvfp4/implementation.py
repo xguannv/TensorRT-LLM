@@ -2880,13 +2880,21 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # TRTLLM_K3LL_MLA_GATE_SIDE: the gate projection runs on the side stream from where the attention starts and
         # the output kernel reads it in place; otherwise it runs here and is concatenated behind the fused q_a / kv_a.
         gate_side = bool(_flags.TRTLLM_K3LL_MLA_GATE_SIDE)
+        # TRTLLM_K3LL_MLA_GATE_EARLY (with GATE_SIDE): fork the gate projection before the fused q_a / kv_a instead of
+        # after the cache append, so it does not wait for SMs behind the split read (bs4); same kernel, same input.
+        gate_forked = gate_side and bool(_flags.TRTLLM_K3LL_MLA_GATE_EARLY)
         self._log_q_dispatch(x, gate_side)
+        if gate_forked:
+            self._gate_side.fork(self.g_proj, x, do_multi_stream())
+            from . import census as _census
+
+            _census.count(f"mla_gate_early:{_census.mode()}")
         if gate_side:
             ag = self.kv_a_proj_with_mqa(x)
         else:
             ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
         if self._all_head_queries_apply():
-            return self._all_head_decode(ag, x, metadata, gate_side, gate_col)
+            return self._all_head_decode(ag, x, metadata, gate_side, gate_col, gate_forked)
         heads = self._decode_heads
         query, latent_cache = _fp8_attention.mla_project_qkv(
             ag,
@@ -2921,7 +2929,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
             quant_q,
             fuse_fp4_q_quant=bool(self.mqa.has_fp4_kv_cache),
         )
-        if gate_side:
+        if gate_side and not gate_forked:
             self._gate_side.fork(self.g_proj, x, do_multi_stream())
         if self._split_read is not None:
             return self._split_read_output(
@@ -2995,6 +3003,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
         metadata: AttentionMetadata,
         gate_side: bool,
         gate_col: int,
+        gate_forked: bool = False,
     ) -> torch.Tensor:
         """``TRTLLM_K3LL_HELIX_Q_ABSORB``: every head's FP8 query on this rank (``decode_mla_q.all_head_queries``),
         the latent row by `attention.mla_latent`, the cache append with the query already in place
@@ -3049,7 +3058,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 f"q_b {'k3_fp8w_lowm_gemm' if lowm else type(self.q_b_proj).__name__}, absorb {kernel}, "
                 f"no query all-gather (layer {self.mqa.layer_idx})"
             )
-        if gate_side:
+        if gate_side and not gate_forked:
             self._gate_side.fork(self.g_proj, x, do_multi_stream())
         return self._split_read_output(
             quant_q,
