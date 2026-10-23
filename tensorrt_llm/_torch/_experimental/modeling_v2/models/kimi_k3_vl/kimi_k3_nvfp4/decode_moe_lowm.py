@@ -17,7 +17,10 @@ runs:
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
   residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
 
-Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_lowm_op.supported`).
+A wide decode step (9 to `WIDE_MAX_TOKENS` = 32 tokens; to `WIDE_MAX_TOKENS_M64` = 64 with ``TRTLLM_K3LL_MOE_LOWM_M64``,
+read at forward time, on the expert kernel's 64-token build) runs the M-general head (`_wide_head`), the same expert
+kernel and the row-parallel tail. Steps of more tokens keep the generic path. Only SM100 / SM103 take it
+(`nvfp4_lowm_op.supported`).
 
 `K3DecodeMoeNvfp4` holds what every MoE layer shares (the head workspace, the expert kernel's counters);
 `K3DecodeMoeNvfp4Layer` holds one layer's decode weights and handles. The target builds both in
@@ -64,8 +67,9 @@ from .decode_moe import TAIL_K_TILE, _gemv
 MAX_TOKENS = 8
 # The front's 16-token build (TRTLLM_K3LL_MOE_FRONT16): a wide step of at most this many tokens.
 FRONT16_TOKENS = 16
-# A wide decode step's most tokens: the expert kernel's limit.
+# A wide decode step's most tokens: the expert kernel's default limit, and its limit with TRTLLM_K3LL_MOE_LOWM_M64.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
+WIDE_MAX_TOKENS_M64 = nvfp4_lowm_op.MAX_TOKENS_WIDE
 NUM_EXPERTS = 896
 
 
@@ -234,6 +238,8 @@ class K3DecodeMoeNvfp4Layer:
     fc2_input_scale: torch.Tensor
     offset: int
     situ: tuple
+    #: Whether the expert kernel's 64-token build serves this layer's experts (``TRTLLM_K3LL_MOE_LOWM_M64``).
+    m64: bool = False
 
     @classmethod
     def create(
@@ -266,7 +272,8 @@ class K3DecodeMoeNvfp4Layer:
             front_weight=front,
             head_weight=front[: head.shape[0]],
             tail_weight=tail,
-            tail_pad=up.new_zeros(WIDE_MAX_TOKENS, pad) if pad else None,
+            # sized for the 64-token steps whatever the switch (free when unused)
+            tail_pad=up.new_zeros(WIDE_MAX_TOKENS_M64, pad) if pad else None,
             bias=moe.gate.e_score_correction_bias.detach(),
             lo=lo,
             width=width,
@@ -276,18 +283,29 @@ class K3DecodeMoeNvfp4Layer:
             fc2_input_scale=backend.fc2_input_scale.detach().reshape(1),
             offset=int(backend.slot_start),
             situ=(_scalar(backend.act_alpha), _scalar(backend.act_beta)),
+            m64=nvfp4_lowm_op.supported(
+                backend.w3_w1_weight.device,
+                backend.w3_w1_weight.shape[1],
+                backend.w2_weight.shape[1],
+                WIDE_MAX_TOKENS_M64,
+                max_tokens=WIDE_MAX_TOKENS_M64,
+            )[0],
         )
 
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
         (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens."""
+        32 tokens, and for 64 when ``TRTLLM_K3LL_MOE_LOWM_M64`` is 1 at load (set later, the 64-token build compiles
+        on the first eager call, e.g. a CUDA graph's warm-up run)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         self._front_routed(moe, x)
         if self.state.head16 is not None:
             self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]))
-        for rows in (9, WIDE_MAX_TOKENS):
+        rows_list = (9, WIDE_MAX_TOKENS)
+        if _flags.TRTLLM_K3LL_MOE_LOWM_M64 and self.m64:
+            rows_list += (WIDE_MAX_TOKENS_M64,)
+        for rows in rows_list:
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
             self._routed(*self._route_quant(moe, logits, latent))
@@ -344,13 +362,22 @@ class K3DecodeMoeNvfp4Layer:
         )  # fmt: skip
         return routed, shared_act
 
+    def wide_max_tokens(self) -> int:
+        """A wide decode step's most tokens on this path: `WIDE_MAX_TOKENS_M64` with ``TRTLLM_K3LL_MOE_LOWM_M64`` (read
+        here, at forward time) where the 64-token build serves the layer, else `WIDE_MAX_TOKENS`."""
+        if _flags.TRTLLM_K3LL_MOE_LOWM_M64 and self.m64:
+            return WIDE_MAX_TOKENS_M64
+        return WIDE_MAX_TOKENS
+
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
-        `MAX_TOKENS` tokens; with ``partial_tail``, also a wide decode step of at most `WIDE_MAX_TOKENS`."""
+        `MAX_TOKENS` tokens; with ``partial_tail``, also a wide decode step of at most ``wide_max_tokens()``."""
         rows = hidden_states.shape[0]
         if hidden_states.dtype != torch.bfloat16:
             return False
-        return 0 < rows <= MAX_TOKENS or (partial_tail and step.wide and rows <= WIDE_MAX_TOKENS)
+        return 0 < rows <= MAX_TOKENS or (
+            partial_tail and step.wide and rows <= self.wide_max_tokens()
+        )
 
     def forward(
         self,
@@ -408,7 +435,7 @@ class K3DecodeMoeNvfp4Layer:
         )
 
     def _wide(self, moe: nn.Module, hidden_states: torch.Tensor, gemvs) -> torch.Tensor:
-        """A wide decode step's MoE (`MAX_TOKENS` < M <= `WIDE_MAX_TOKENS`): this rank's unreduced share of the
+        """A wide decode step's MoE (`MAX_TOKENS` < M <= ``wide_max_tokens()``): this rank's unreduced share of the
         output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts."""
         x = hidden_states.contiguous()
         if self.state.head16 is not None and x.shape[0] <= FRONT16_TOKENS:

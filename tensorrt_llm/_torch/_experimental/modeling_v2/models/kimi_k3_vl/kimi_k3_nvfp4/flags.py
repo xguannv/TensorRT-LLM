@@ -155,6 +155,12 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
     1,
     "lowm MoE on 9-16 token steps: the head, routing, NVFP4 latent and shared gate_up in k3_moe_front's 16-token build",
 )
+TRTLLM_K3LL_MOE_LOWM_M64 = _flag(
+    "TRTLLM_K3LL_MOE_LOWM_M64",
+    0,
+    "lowm MoE on 33-64 token wide steps (bs8 x 8): k3_moe_lowm_dyn's 64-token build (read at forward time; the "
+    "build compiles at load when the launch value is 1, else on the first eager call)",
+)
 TRTLLM_K3LL_KDA_BFA_GEMV = _flag(
     "TRTLLM_K3LL_KDA_BFA_GEMV",
     1,
