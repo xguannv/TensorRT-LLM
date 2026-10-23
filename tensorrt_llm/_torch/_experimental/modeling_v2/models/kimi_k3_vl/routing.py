@@ -14,7 +14,6 @@ targets are text-only: they load no vision tower and refuse image input.
 
 from __future__ import annotations
 
-import importlib
 from typing import Any, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -231,28 +230,35 @@ def route(
 
         return ModelingV2KimiK3Nvfp4Sm107Helix16Moetp4ep4
 
-    ctx_only = {
-        ((10, 3), "tp8_moetp1ep8"): (
-            "kimi_k3_nvfp4__sm_103__tp8_moetp1ep8",
-            "ModelingV2KimiK3Nvfp4Sm103Tp8Moetp1ep8",
-        ),
-        ((10, 7), "tp8_moetp1ep8"): (
-            "kimi_k3_nvfp4__sm_107__tp8_moetp1ep8",
-            "ModelingV2KimiK3Nvfp4Sm107Tp8Moetp1ep8",
-        ),
-        ((10, 3), "tp8_moetp2ep4"): (
-            "kimi_k3_nvfp4__sm_103__tp8_moetp2ep4",
-            "ModelingV2KimiK3Nvfp4Sm103Tp8Moetp2ep4",
-        ),
-        ((10, 7), "tp8_moetp2ep4"): (
-            "kimi_k3_nvfp4__sm_107__tp8_moetp2ep4",
-            "ModelingV2KimiK3Nvfp4Sm107Tp8Moetp2ep4",
-        ),
-    }.get((compute_capability, parallel))
-    if ctx_only is not None and shape == _SHAPE and _has_nvfp4_experts(pretrained_config):
-        # Context-only (prefill) targets: every step on the generic path, no decode state built.
-        module = importlib.import_module(f".{ctx_only[0]}.modeling", __package__)
-        return getattr(module, ctx_only[1])
+    # Context-only (prefill) targets: every step on the generic path, no decode state built.
+    if shape == _SHAPE and _has_nvfp4_experts(pretrained_config):
+        if compute_capability == (10, 3) and parallel == "tp8_moetp1ep8":
+            from .kimi_k3_nvfp4__sm_103__tp8_moetp1ep8.modeling import (
+                ModelingV2KimiK3Nvfp4Sm103Tp8Moetp1ep8,
+            )
+
+            return ModelingV2KimiK3Nvfp4Sm103Tp8Moetp1ep8
+
+        if compute_capability == (10, 7) and parallel == "tp8_moetp1ep8":
+            from .kimi_k3_nvfp4__sm_107__tp8_moetp1ep8.modeling import (
+                ModelingV2KimiK3Nvfp4Sm107Tp8Moetp1ep8,
+            )
+
+            return ModelingV2KimiK3Nvfp4Sm107Tp8Moetp1ep8
+
+        if compute_capability == (10, 3) and parallel == "tp8_moetp2ep4":
+            from .kimi_k3_nvfp4__sm_103__tp8_moetp2ep4.modeling import (
+                ModelingV2KimiK3Nvfp4Sm103Tp8Moetp2ep4,
+            )
+
+            return ModelingV2KimiK3Nvfp4Sm103Tp8Moetp2ep4
+
+        if compute_capability == (10, 7) and parallel == "tp8_moetp2ep4":
+            from .kimi_k3_nvfp4__sm_107__tp8_moetp2ep4.modeling import (
+                ModelingV2KimiK3Nvfp4Sm107Tp8Moetp2ep4,
+            )
+
+            return ModelingV2KimiK3Nvfp4Sm107Tp8Moetp2ep4
 
     if mxfp4_on_blackwell and compute_capability == (10, 3) and parallel == "tp16_moetp4ep4":
         from .kimi_k3_mxfp4__sm_103__tp16_moetp4ep4.modeling import (
