@@ -188,3 +188,52 @@ def test_helix16_requires_its_layout(monkeypatch):
     )
     with pytest.raises(AssertionError, match="without context parallelism"):
         tp16._check_construction(_helix_config())
+
+
+def _tp8_config(spec_config=None, **overrides):
+    """An NVFP4 attention-TP8 engine with the experts split over the 8 ranks (EP8), as a ctx worker builds it."""
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    kwargs = dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8)
+    kwargs.update(overrides)
+    config = _config(1, 8, spec_config=spec_config)
+    config.mapping = Mapping(**kwargs)
+    config.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.MIXED_PRECISION, kv_cache_quant_algo=QuantAlgo.FP8
+    )
+    config.quant_config_dict = {
+        f"model.layers.{i}.mlp.experts": QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+        for i in range(1, 93)
+    }
+    return config
+
+
+@pytest.mark.parametrize("sm", [103, 107])
+def test_tp8_ctx_only_requires_its_layout(monkeypatch, sm):
+    target = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        f"kimi_k3_nvfp4__sm_{sm}__tp8_moetp1ep8.modeling"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (sm // 10, sm % 10))
+    assert target._TARGET.ctx_only and target._TARGET.parallel == "tp8_moetp1ep8"
+    target._check_construction(_tp8_config())
+    with pytest.raises(AssertionError, match="the tp8_moetp1ep8 target needs world_size 8"):
+        target._check_construction(
+            _tp8_config(world_size=16, tp_size=16, moe_tp_size=2, moe_ep_size=8)
+        )
+    with pytest.raises(AssertionError, match="the tp8_moetp1ep8 target needs"):
+        target._check_construction(_tp8_config(moe_tp_size=2, moe_ep_size=4))
+    with pytest.raises(AssertionError, match="context-only"):
+        target._check_construction(
+            _tp8_config(
+                spec_config=types.SimpleNamespace(spec_dec_mode=None, decoding_type="DSpark")
+            )
+        )
+    # the TP16 target refuses a TP8 engine
+    tp16 = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        f"kimi_k3_nvfp4__sm_{sm}__tp16_moetp4ep4.modeling"
+    )
+    with pytest.raises(AssertionError, match="the tp16_moetp4ep4 target needs world_size 16"):
+        tp16._check_construction(_tp8_config(moe_tp_size=2, moe_ep_size=4))

@@ -14,6 +14,7 @@ targets are text-only: they load no vision tower and refuse image input.
 
 from __future__ import annotations
 
+import importlib
 from typing import Any, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -124,6 +125,20 @@ def _parallel(m) -> Optional[str]:
         ):
             return "helix16_moetp4ep4"
         return None
+    if (
+        m.world_size == 8
+        and m.tp_size == 8
+        and m.pp_size == 1
+        and getattr(m, "cp_size", 1) == 1
+        and not m.enable_attention_dp
+    ):
+        # The context-only targets: attention TP8 with the experts over 8 ranks, set explicitly (EP8, or TP2 x EP4).
+        if getattr(m, "moe_tp_ep_user_specified", False):
+            if (m.moe_tp_size, m.moe_ep_size) == (1, 8):
+                return "tp8_moetp1ep8"
+            if (m.moe_tp_size, m.moe_ep_size) == (2, 4):
+                return "tp8_moetp2ep4"
+        return None
     if not (
         m.world_size == 16 and m.tp_size == 16 and m.pp_size == 1 and not m.enable_attention_dp
     ):
@@ -216,6 +231,29 @@ def route(
 
         return ModelingV2KimiK3Nvfp4Sm107Helix16Moetp4ep4
 
+    ctx_only = {
+        ((10, 3), "tp8_moetp1ep8"): (
+            "kimi_k3_nvfp4__sm_103__tp8_moetp1ep8",
+            "ModelingV2KimiK3Nvfp4Sm103Tp8Moetp1ep8",
+        ),
+        ((10, 7), "tp8_moetp1ep8"): (
+            "kimi_k3_nvfp4__sm_107__tp8_moetp1ep8",
+            "ModelingV2KimiK3Nvfp4Sm107Tp8Moetp1ep8",
+        ),
+        ((10, 3), "tp8_moetp2ep4"): (
+            "kimi_k3_nvfp4__sm_103__tp8_moetp2ep4",
+            "ModelingV2KimiK3Nvfp4Sm103Tp8Moetp2ep4",
+        ),
+        ((10, 7), "tp8_moetp2ep4"): (
+            "kimi_k3_nvfp4__sm_107__tp8_moetp2ep4",
+            "ModelingV2KimiK3Nvfp4Sm107Tp8Moetp2ep4",
+        ),
+    }.get((compute_capability, parallel))
+    if ctx_only is not None and shape == _SHAPE and _has_nvfp4_experts(pretrained_config):
+        # Context-only (prefill) targets: every step on the generic path, no decode state built.
+        module = importlib.import_module(f".{ctx_only[0]}.modeling", __package__)
+        return getattr(module, ctx_only[1])
+
     if mxfp4_on_blackwell and compute_capability == (10, 3) and parallel == "tp16_moetp4ep4":
         from .kimi_k3_mxfp4__sm_103__tp16_moetp4ep4.modeling import (
             ModelingV2KimiK3Mxfp4Sm103Tp16Moetp4ep4,
@@ -255,5 +293,7 @@ def route(
         "Kimi K3 checkpoint on sm100/sm103, 16 ranks of tensor-parallel attention, with the "
         "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1; "
         "and group-size-16 NVFP4 Kimi K3 on sm103/sm107 with moe_tp 4 x moe_ep 4 and either tp16 attention "
-        "or Helix context parallelism tp 1 x cp 16 (experts split set explicitly)"
+        "or Helix context parallelism tp 1 x cp 16 (experts split set explicitly); context-only: group-size-16 "
+        "NVFP4 Kimi K3 on sm103/sm107, tp8 attention with the experts split, set explicitly, moe_tp 1 x moe_ep 8 "
+        "or moe_tp 2 x moe_ep 4"
     )
