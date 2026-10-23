@@ -4088,6 +4088,43 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
+    def _defer_transfer_complete_without_seat(
+            self, generation_requests: List[LlmRequest]
+    ) -> Tuple[List[LlmRequest], int]:
+        """Keep transfer-complete requests only while sequence slots are free.
+
+        With ``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS`` a request can finish its
+        KV-cache transfer while the batch is full. Once the request it replaces
+        finishes, the scheduler sees a free batch entry and schedules it, but
+        under the overlap executor the finished request keeps its sequence
+        slot until the next iteration, and a transfer-complete request takes a
+        new slot in ``_prepare_disagg_gen_transmission_complete``. Requests
+        beyond the free slots stay transfer-complete for the next scheduling
+        pass, with the KV-cache capacity the V2 scheduler grew for them
+        reverted.
+
+        Returns the requests to schedule and the number deferred.
+        """
+        seq_slot_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.SEQ_SLOT_MANAGER)
+        if seq_slot_manager is None:
+            return generation_requests, 0
+        free_slots = len(seq_slot_manager.slot_manager.free_slots)
+        kept, deferred = [], []
+        for req in generation_requests:
+            if not req.is_disagg_generation_transmission_complete:
+                kept.append(req)
+            elif free_slots > 0:
+                free_slots -= 1
+                kept.append(req)
+            else:
+                deferred.append(req)
+        if deferred:
+            reverted = ScheduledRequests()
+            reverted.generation_requests = deferred
+            self._revert_gen_alloc(reverted)
+        return kept, len(deferred)
+
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Update self, draft, and cross caches after a context forward."""
         self.kv_cache_manager.update_context_resources(scheduled_batch)
@@ -7296,12 +7333,19 @@ class PyExecutor:
         scheduled_context_requests = self._cap_context_by_total_kv_len(
             scheduled_context_requests)
 
+        scheduled_generation_requests = scheduler_output.generation_requests
+        if self._disagg_gen_prefetch_limit > 0:
+            scheduled_generation_requests, num_deferred = (
+                self._defer_transfer_complete_without_seat(
+                    scheduled_generation_requests))
+            num_fitting -= num_deferred
+
         scheduled_requests = ScheduledRequests()
         if getattr(self, "_enable_remote_tail_adp", False):
             scheduled_requests.attention_dp_phase = self._remote_tail_phase
         scheduled_requests.encoder_requests = scheduled_encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
-        scheduled_requests.generation_requests = scheduler_output.generation_requests
+        scheduled_requests.generation_requests = scheduled_generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
