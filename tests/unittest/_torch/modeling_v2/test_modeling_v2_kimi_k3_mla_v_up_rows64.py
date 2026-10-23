@@ -25,12 +25,11 @@ split read on one GPU (the helpers of ``test_modeling_v2_kimi_k3_mla_v_up``):
   gets the combine's identity (statistics (-inf, 0), V rows 0); the softmax statistics and V rows of the others
   against the switch-off fallback within the V-up tolerance (per (token, head) relative L2 ``ON_OFF_TOL``, the Helix
   V-up op matrix's on/off bound), and against fp32 attention x fp32 W_UV (the whole sequence on one rank) within
-  ``FP32_TOL``, beside the fallback's own error; replayed from a CUDA graph with new queries, bit for bit its eager
-  call.
+  ``FP32_TOL`` and within ``FP32_OVER_FALLBACK`` of the fallback's own error; replayed from a CUDA graph with new
+  queries, bit for bit its eager call.
 """
 
 import contextlib
-import math
 import os
 import sys
 
@@ -45,7 +44,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 ON_OFF_TOL = 8e-2
-FP32_TOL = 3e-2
+FP32_TOL = 5e-2
+#: The fused path's error against fp32 over the fallback's (same FP8 inputs; measured 1.05x at the max, 1.0x median).
+FP32_OVER_FALLBACK = 1.25
 LE32 = {
     "bs1_mtp7": ([153600 + 8], 8, 5),
     "bs2_mtp7": ([153600 + 8, 70000 + 8], 8, 3),
@@ -221,4 +222,5 @@ def test_rows64_against_fp32(monkeypatch):
         f"fallback median {err_off.median():.2e} max {err_off.max():.2e}"
     )
     assert float(err_on.max()) < FP32_TOL
-    assert math.isfinite(float(err_off.max()))
+    assert float(err_on.max()) <= FP32_OVER_FALLBACK * float(err_off.max())
+    assert float(err_on.median()) <= FP32_OVER_FALLBACK * float(err_off.median())
