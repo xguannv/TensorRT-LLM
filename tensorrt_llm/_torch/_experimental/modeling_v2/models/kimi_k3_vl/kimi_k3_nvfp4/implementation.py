@@ -698,6 +698,14 @@ def _apply_attn_res(
     return hidden_states.to(v.dtype)
 
 
+def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
+    """``x`` with zero rows appended up to ``rows`` (a breakable prefill CUDA graph pads the step's tokens to its
+    capture bucket); ``x`` itself when it already has them."""
+    if x.shape[0] >= rows:
+        return x
+    return torch.cat([x, x.new_zeros((rows - x.shape[0],) + tuple(x.shape[1:]))], dim=0)
+
+
 def _apply_attn_res_and_rmsnorm(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -2485,11 +2493,14 @@ class K3DecodeKDA(KimiKDALinearAttention):
         attn_metadata: AttentionMetadata,
         reduce_output: bool = True,
     ) -> torch.Tensor:
+        """The built-in forward (core, then ``_project_output``), with the core padded back to the input's rows: under
+        a breakable prefill CUDA graph the input is padded to the capture bucket, while the eager core (warmup, or a
+        step outside a graph) covers only the step's real tokens (``attn_metadata.num_tokens``). Without padding the
+        two are the same tensor, so this is the built-in forward."""
+        core = _pad_rows(self._builtin_core(hidden_states, attn_metadata), hidden_states.shape[0])
         if reduce_output:
-            return super().forward(hidden_states, attn_metadata)
-        return self.o_proj(
-            self._builtin_core(hidden_states, attn_metadata).reshape(-1, self.proj_size)
-        )
+            return self._project_output(core)
+        return self.o_proj(core.reshape(-1, self.proj_size))
 
     def _builtin_core(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata

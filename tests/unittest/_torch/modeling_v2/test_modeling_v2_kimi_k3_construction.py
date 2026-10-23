@@ -260,3 +260,15 @@ def test_tp16_target_keeps_mnnvl_all_reduces(monkeypatch):
     config.allreduce_strategy = AllReduceStrategy.NCCL_SYMMETRIC
     with pytest.raises(AssertionError, match="allreduce_strategy is NCCL_SYMMETRIC"):
         target._check_construction(config)
+
+
+def test_pad_rows_is_identity_without_padding():
+    """The KDA core is padded back to the input's rows only under a padded (breakable-graph) step."""
+    impl = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.implementation"
+    )
+    x = torch.randn(5, 3, 4)
+    assert impl._pad_rows(x, 5) is x
+    padded = impl._pad_rows(x, 8)
+    assert padded.shape == (8, 3, 4)
+    assert torch.equal(padded[:5], x) and not padded[5:].any()
