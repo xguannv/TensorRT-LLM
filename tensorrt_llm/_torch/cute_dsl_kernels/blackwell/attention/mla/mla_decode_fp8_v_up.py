@@ -66,9 +66,13 @@ from .mla_helpers import LOG2_E
 V_HEAD_DIM = 128
 #: BF16 elements per 128-byte swizzled shared-memory row: the K extent of one operand stage.
 K_BLOCK = 64
-#: Largest number of rows per head (batch * seq_len_q) the fused reduction serves (UMMA N <= 32: each
-#: combine warp reduces at most two rows one after the other).
-MAX_ROWS = 32
+#: Largest number of rows per head (batch * seq_len_q) the fused reduction serves: UMMA N (the padded row count,
+#: a power of two for the accumulator's TMEM load) up to 64; each of the ``COMBINE_WARPS`` combine warps reduces
+#: ``v_rows / COMBINE_WARPS`` rows one after the other.
+MAX_ROWS = 64
+#: The callers' default cap (``mla_v_up``): rows above it take the fused reduction only with
+#: ``TRTLLM_K3LL_MLA_V_UP_ROWS64``.
+DEFAULT_MAX_ROWS = 32
 #: Warps that combine rows (warps 0-3 also read the accumulator); the next warp loads the weight and
 #: issues the MMA.
 COMBINE_WARPS = 16
@@ -96,9 +100,12 @@ def _sts_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
 
 
 def v_up_rows_bucket(rows: int) -> int:
-    """UMMA N (padded rows per head) of the fused reduction for ``rows`` = batch * seq_len_q."""
+    """UMMA N (padded rows per head) of the fused reduction for ``rows`` = batch * seq_len_q: 16 / 32 as before for
+    up to 32 rows, 64 above (a power of two: the accumulator's ``tcgen05.ld`` repetition)."""
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"rows must be in [1, {MAX_ROWS}], got {rows}")
+    if rows > DEFAULT_MAX_ROWS:
+        return 64
     return max(16, -(-rows // 16) * 16)
 
 
@@ -122,8 +129,8 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                 f"The fused V up-projection reduces one split per lane, got reducer_max_splits="
                 f"{self.reducer_max_splits}"
             )
-        if v_rows % 16 or not 16 <= v_rows <= MAX_ROWS:
-            raise ValueError(f"v_rows must be a multiple of 16 in [16, {MAX_ROWS}], got {v_rows}")
+        if v_rows not in (16, 32, 64) or v_rows > MAX_ROWS:
+            raise ValueError(f"v_rows must be 16, 32 or 64 (<= {MAX_ROWS}), got {v_rows}")
         self.v_rows = v_rows
         # The fused reduction always launches with programmatic dependent launch: it loads its weight before
         # ``griddepcontrol.wait`` (the split kernel's ``use_pdl`` is the base class's).

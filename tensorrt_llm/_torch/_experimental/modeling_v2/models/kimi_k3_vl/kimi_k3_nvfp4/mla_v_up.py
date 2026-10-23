@@ -38,12 +38,20 @@ V_HEAD_DIM = 128
 _compiled: dict = {}
 
 
-def max_fused_rows() -> int:
+def max_fused_rows(rows64: bool = False) -> int:
+    """Rows per head the fused reduction serves: 32, or 64 with ``TRTLLM_K3LL_MLA_V_UP_ROWS64``."""
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
+        DEFAULT_MAX_ROWS,
         MAX_ROWS,
     )
 
-    return MAX_ROWS
+    return MAX_ROWS if rows64 else DEFAULT_MAX_ROWS
+
+
+#: With ``TRTLLM_K3LL_MLA_V_UP_ROWS64``: the smallest split-KV the fused path runs above 32 rows. The runner's
+#: default split is ``active blocks // batch // (2 * query tiles)``, 1 at 8 requests x 96 heads x 8 tokens on GB300,
+#: which has no reduction to fuse into; 2 fits the split read's workspace (``decode_mla_dcp.workspace_bytes``).
+ROWS64_MIN_SPLIT = 2
 
 
 def _run_fused(
@@ -219,6 +227,7 @@ def mla_decode_fp8_v_up(
     max_batch_size: int,
     use_pdl: bool,
     prewait: bool,
+    rows64: bool,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages followed by every head's V up-projection.
 
@@ -236,6 +245,8 @@ def mla_decode_fp8_v_up(
             ``trtllm::k3_mla_decode_fp8_pdl`` (``TRTLLM_K3LL_MLA_DECODE_PDL``); the fused reduction always uses it.
         prewait: with ``use_pdl`` and the fused reduction, the split kernel L2-prefetches ``v_weight`` before its
             wait and releases the reduction after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; same bytes).
+        rows64: the fused reduction also for 33-64 rows per head, with at least ``ROWS64_MIN_SPLIT`` splits
+            (``TRTLLM_K3LL_MLA_V_UP_ROWS64``); up to 32 rows nothing changes.
     """
     batch, q_len, heads, _ = q.shape
     page_size = kv_pages.shape[1]
@@ -253,7 +264,14 @@ def mla_decode_fp8_v_up(
         kv_bounds,
     ]
     tactic = mla_decode_pdl.tactic(runner, inputs)
-    if int(tactic[2]) > 1 and batch * q_len <= max_fused_rows():
+    rows = batch * q_len
+    if (
+        rows64
+        and max_fused_rows() < rows <= max_fused_rows(True)
+        and int(tactic[2]) < ROWS64_MIN_SPLIT
+    ):
+        tactic = (tactic[0], tactic[1], ROWS64_MIN_SPLIT, tactic[3])
+    if int(tactic[2]) > 1 and rows <= max_fused_rows(rows64):
         _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out, prewait)
         return
     runner(inputs, tactic=tactic, softmax_scale=softmax_scale, output_scale=output_scale)
@@ -281,15 +299,20 @@ def _(
     max_batch_size,
     use_pdl,
     prewait,
+    rows64,
 ) -> None:
     return None
 
 
-def fused_applies(batch: int, q_len: int, heads: int, page_size: int, max_batch_size: int) -> bool:
+def fused_applies(
+    batch: int, q_len: int, heads: int, page_size: int, max_batch_size: int, rows64: bool = False
+) -> bool:
     """Whether ``k3_mla_decode_fp8_v_up`` takes the fused reduction for this shape with the default tactic (for
     logs; the op decides on the tuner's tactic)."""
-    if batch * q_len > max_fused_rows():
+    if batch * q_len > max_fused_rows(rows64):
         return False
+    if rows64 and batch * q_len > max_fused_rows():
+        return True
     runner = mla_decode_pdl.runner(heads, q_len, page_size, max_batch_size, True, False)
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 

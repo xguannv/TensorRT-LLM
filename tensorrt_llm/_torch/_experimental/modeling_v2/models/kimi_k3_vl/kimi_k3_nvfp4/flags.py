@@ -225,6 +225,12 @@ TRTLLM_K3LL_MLA_GATE_FUSED_A = _flag(
     "MLA decode: the output gate rows appended to the fused q_a / kv_a FP8 weight (one k3_fp8w_lowm_gemm, gate read "
     "in place, no side stream); 1 at launch builds the stacked weight (module weights become views of it)",
 )
+TRTLLM_K3LL_MLA_V_UP_ROWS64 = _flag(
+    "TRTLLM_K3LL_MLA_V_UP_ROWS64",
+    0,
+    "with TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A: the fused split-KV reduction + V up-projection also for 33-64 rows per "
+    "head (bs8 at draft 7), with at least 2 KV splits; up to 32 rows unchanged (read at forward time)",
+)
 TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
     "TRTLLM_K3LL_MLA_QNORM_PDL",
     0,

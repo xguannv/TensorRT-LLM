@@ -318,6 +318,9 @@ def split_read_attention_v_up(
     prewait = bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2 and _flags.TRTLLM_K3LL_MLA_DECODE_PDL)
     if prewait:
         _census.count(f"mla_prewait_v_up:{_census.mode()}")
+    rows64 = bool(_flags.TRTLLM_K3LL_MLA_V_UP_ROWS64)
+    if rows64 and q.shape[0] * q.shape[1] > 32:
+        _census.count(f"mla_v_up_rows64:{_census.mode()}")
     torch.ops.trtllm.k3_mla_decode_fp8_v_up(
         q,
         kv_pages,
@@ -334,6 +337,7 @@ def split_read_attention_v_up(
         max_batch,
         bool(_flags.TRTLLM_K3LL_MLA_DECODE_PDL),
         prewait,
+        rows64,
     )
 
 
@@ -701,7 +705,12 @@ class MlaSplitRead:
             from tensorrt_llm.logger import logger
 
             fused = mla_v_up.fused_applies(
-                latent.shape[0], latent.shape[1], self.heads, PAGE_SIZE, MAX_REQUESTS
+                latent.shape[0],
+                latent.shape[1],
+                self.heads,
+                PAGE_SIZE,
+                MAX_REQUESTS,
+                bool(_flags.TRTLLM_K3LL_MLA_V_UP_ROWS64),
             )
             logger.info(
                 f"K3 MLA Helix V-up before the all-to-all: {self.heads} heads x {V_HEAD_DIM} per rank, exchange "
