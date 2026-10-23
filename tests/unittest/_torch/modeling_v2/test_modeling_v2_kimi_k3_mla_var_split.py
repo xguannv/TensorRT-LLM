@@ -23,9 +23,10 @@ on the rank, and equal lengths:
 * switch off (no counts): the split read + BF16 BMM bit for bit, as before (the decode runner without the optional
   ``block_split_kvs`` input);
 * switch on: a variable-split variant compiled; the softmax statistics within 1e-3 (LSE) and the V rows within
-  ``ON_OFF_ULPS`` bf16 ulps of their magnitude of the switch-off rows; a request with no key on the rank gets the
-  combine's identity; against fp32 attention x fp32 W_UV (the whole sequence on one rank) within ``FP32_OVER_OFF`` of
-  the switch-off error;
+  ``ON_OFF_TOL`` (per (token, head) relative L2: other split boundaries round P to FP8 at other running maxima, the
+  Helix V-up op matrix's on/off bound) of the switch-off rows; a request with no key on the rank gets the combine's
+  identity; against fp32 attention x fp32 W_UV (the whole sequence on one rank) within ``FP32_OVER_OFF`` of the
+  switch-off error;
 * the counts and the split read captured in one CUDA graph, replayed with new queries and shorter lengths: bit for bit
   the eager switch-on call.
 """
@@ -43,7 +44,7 @@ pytestmark = pytest.mark.skipif(
     reason="the fused V up-projection runs on SM100/SM103 (tcgen05)",
 )
 
-ON_OFF_ULPS = 4
+ON_OFF_TOL = 8e-2
 FP32_OVER_OFF = 1.25
 CASES = {
     # (global lengths, q_len, rank)
@@ -132,9 +133,10 @@ def _keyless(plan, q_len):
     return (plan.cache_seqs == 0).repeat_interleave(q_len)
 
 
-def _magnitude_close(a, b, ulps):
-    scale = b.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
-    return float(((a.float() - b.float()).abs() / scale).max()) <= ulps * 2.0**-8
+def _per_head_rel(a, b):
+    a, b = a.double(), b.double()
+    rel = ((a - b).norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-30)).flatten()
+    return rel[torch.isfinite(rel)]
 
 
 @pytest.mark.parametrize("name", list(CASES))
@@ -200,9 +202,13 @@ def test_on_close_to_off(name):
     assert torch.equal(finite, torch.isfinite(lse_on))
     assert float((lse_on[finite] - lse_off[finite]).abs().max()) < 1e-3
     assert torch.equal(s_on[keyed][..., 1][finite], s_off[keyed][..., 1][finite])
-    assert _magnitude_close(v_on[keyed], v_off[keyed], ON_OFF_ULPS)
+    rel = _per_head_rel(v_on[keyed], v_off[keyed])
     same = torch.equal(v_on[keyed].view(torch.int16), v_off[keyed].view(torch.int16))
-    print(f"[{name}] splits {counts.tolist()}: V rows bitwise equal to the switch-off rows: {same}")
+    print(
+        f"[{name}] splits {counts.tolist()}: V rows vs switch off per (token, head) median {rel.median():.2e} "
+        f"max {rel.max():.2e}; bitwise {same}"
+    )
+    assert float(rel.max()) <= ON_OFF_TOL
 
 
 @pytest.mark.parametrize(

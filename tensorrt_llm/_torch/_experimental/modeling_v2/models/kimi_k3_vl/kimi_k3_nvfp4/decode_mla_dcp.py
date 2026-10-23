@@ -121,7 +121,8 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
     cost = torch.where(
         total <= budget, largest * (budget + 1) + total, torch.iinfo(torch.int64).max
     )
-    return splits[cost.argmin()].to(torch.int32).contiguous()
+    # index_select, not splits[argmin]: a 0-d index tensor would be read on the host (no sync under capture)
+    return splits.index_select(0, cost.argmin().view(1)).view(-1).to(torch.int32).contiguous()
 
 
 def with_var_split(plan: SplitReadPlan, heads: int, q_len: int) -> SplitReadPlan:
