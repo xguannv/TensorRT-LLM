@@ -261,6 +261,12 @@ TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
     "per head, then the gate (mla_v_up.py); 1 at launch builds the BF16 W_UV of all heads (12.6 MB per MLA layer), "
     "on SM103 only (elsewhere the switch-off path)",
 )
+TRTLLM_K3LL_MLA_GATE_FUSED_A = _flag(
+    "TRTLLM_K3LL_MLA_GATE_FUSED_A",
+    0,
+    "MLA decode: the output gate rows appended to the fused q_a / kv_a FP8 weight (one k3_fp8w_lowm_gemm, gate read "
+    "in place, no side stream); 1 at launch builds the stacked weight (module weights become views of it)",
+)
 TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
     "TRTLLM_K3LL_MLA_QNORM_PDL",
     0,

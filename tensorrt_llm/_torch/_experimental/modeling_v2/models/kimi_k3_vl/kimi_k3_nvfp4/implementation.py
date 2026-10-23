@@ -2710,6 +2710,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # TRTLLM_K3LL_HELIX_Q_ABSORB at load (Helix, FP8 cache): every head's W_UK in BF16 (decode_mla_q.absorb_weight).
         self._q_absorb_w_kc: Optional[torch.Tensor] = None
         self._gate_side = _decode_mla_q.GateSide()
+        # TRTLLM_K3LL_MLA_GATE_FUSED_A at load: ([fused q_a / kv_a | pad | gate] FP8 weight, its packed scale, the
+        # gate's first column), built by build_gate_fused_a.
+        self._gate_fused_a: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None
 
     @property
     def _decode_heads(self) -> int:
@@ -2813,6 +2816,52 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 self.k_b_proj_trans, self.k_b_proj_trans_scale
             )
         return None
+
+    def build_gate_fused_a(self) -> Optional[str]:
+        """``TRTLLM_K3LL_MLA_GATE_FUSED_A`` at load: stack the gate projection's FP8 rows below the fused q_a / kv_a
+        rows (the latter padded to whole 128-row tiles) in one weight buffer, and point both modules' weights at their
+        rows of it (same bytes, so either GEMM with the switch off is unchanged; their packed scales stay theirs, the
+        stacked scale is its own small tensor). Idempotent. As ``build_bfa_fp8``: the target's post_load_weights calls
+        it before the modules' own, so it first runs their (idempotent) weight transforms. Returns why the layer cannot
+        take it, None when built."""
+        if self._gate_fused_a is not None:
+            return None
+        fused, gate = self.kv_a_proj_with_mqa, self.g_proj
+        if not all(getattr(m, "_k3ll_fp8w_lowm", False) for m in (fused, gate)):
+            return "fused q_a / kv_a or gate not on k3_fp8w_lowm_gemm"
+        for module in (fused, gate):
+            transform = getattr(module, "transform_weights", None)
+            if callable(transform) and not getattr(module, "_weights_transformed", True):
+                transform()
+        parts = []
+        for module in (fused, gate):
+            weight, scale = getattr(module, "weight", None), getattr(module, "weight_scale", None)
+            if not isinstance(weight, torch.Tensor) or not isinstance(scale, torch.Tensor):
+                return "no weight / weight_scale"
+            parts.append((weight, scale))
+        with torch.inference_mode(False), torch.no_grad():
+            stacked = _fp8w_lowm.concat_rows(parts)
+        if stacked is None:
+            return f"weights {[tuple(w.shape) for w, _ in parts]} / scales {[s.dtype for _, s in parts]}"
+        weight, scale, starts = stacked
+        _fp8w_lowm.set_weight(fused, weight[: parts[0][0].shape[0]])
+        _fp8w_lowm.set_weight(gate, weight[starts[1] : starts[1] + parts[1][0].shape[0]])
+        self._gate_fused_a = (weight, scale, starts[1])
+        return None
+
+    def _gate_fused_rows(self, x: torch.Tensor) -> Optional[Tuple[torch.Tensor, int]]:
+        """With ``TRTLLM_K3LL_MLA_GATE_FUSED_A`` and the stacked weight built: ``([fused q_a / kv_a | pad | gate] rows
+        of x, gate column)`` from one low-M GEMM; None otherwise (the caller takes the switch-off path)."""
+        if not _flags.TRTLLM_K3LL_MLA_GATE_FUSED_A or self._gate_fused_a is None:
+            return None
+        weight, scale, gate_col = self._gate_fused_a
+        out = _fp8w_lowm.gemm(x.reshape(-1, x.shape[-1]), weight, scale)
+        if out is None:
+            return None
+        from . import census as _census
+
+        _census.count(f"mla_gate_fused_a:{_census.mode()}")
+        return out, gate_col
 
     def _all_head_queries_apply(self) -> bool:
         """Whether this step's quantized-cache decode takes the ``TRTLLM_K3LL_HELIX_Q_ABSORB`` path."""
@@ -2936,8 +2985,15 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # TRTLLM_K3LL_MLA_GATE_SIDE: the gate projection runs on the side stream from where the attention starts and
         # the output kernel reads it in place; otherwise it runs here and is concatenated behind the fused q_a / kv_a.
         gate_side = bool(_flags.TRTLLM_K3LL_MLA_GATE_SIDE)
+        # TRTLLM_K3LL_MLA_GATE_FUSED_A: the gate's rows come out of the fused q_a / kv_a GEMM (no side stream, no
+        # concatenation); ``ag`` then carries padding columns between k_pe and the gate, which nothing reads.
+        fused_rows = self._gate_fused_rows(x)
+        if fused_rows is not None:
+            gate_side = False
         self._log_q_dispatch(x, gate_side)
-        if gate_side:
+        if fused_rows is not None:
+            ag, gate_col = fused_rows
+        elif gate_side:
             ag = self.kv_a_proj_with_mqa(x)
         else:
             ag = torch.cat((self.kv_a_proj_with_mqa(x), self.g_proj(x)), dim=-1)
@@ -4253,6 +4309,19 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     f"{extra} bytes more than the QKVG weights alone"
                 )
             self._build_helix_q_absorb()
+            if _flags.TRTLLM_K3LL_MLA_GATE_FUSED_A:
+                built, why = 0, collections.Counter()
+                for module in self.modules():
+                    if isinstance(module, K3DecodeMLA):
+                        reason = module.build_gate_fused_a()
+                        if reason is None:
+                            built += 1
+                        else:
+                            why[reason] += 1
+                logger.info(
+                    f"Kimi K3 NVFP4: TRTLLM_K3LL_MLA_GATE_FUSED_A=1: gate rows stacked below the fused q_a / kv_a on "
+                    f"{built} MLA layers (one k3_fp8w_lowm_gemm); not on: {dict(why)}"
+                )
             if _flags.TRTLLM_K3LL_MLA_GATE_SIDE:
                 logger.info(
                     "Kimi K3 NVFP4: TRTLLM_K3LL_MLA_GATE_SIDE=1: MLA decode gate projection on a side stream, read in "
