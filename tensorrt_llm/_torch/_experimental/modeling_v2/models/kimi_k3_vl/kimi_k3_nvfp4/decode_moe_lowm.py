@@ -282,8 +282,8 @@ class K3DecodeMoeNvfp4Layer:
 
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
-        (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens."""
+        (collective: every rank makes the same call), ``k3_route_quant`` (with bf16 and with fp32 routing weights) and
+        the expert kernel's builds for 8, 16 and 32 tokens."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         self._front_routed(moe, x)
@@ -293,6 +293,12 @@ class K3DecodeMoeNvfp4Layer:
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
             self._routed(*self._route_quant(moe, logits, latent))
+        # Both forms of the routing weights (TRTLLM_K3LL_ROUTE_QUANT_FP32 is read at forward time).
+        for weights_fp32 in (False, True):
+            k3_route_quant(
+                logits, self.bias, latent, float(moe.gate.routed_scaling_factor),
+                nvfp4_gsf=self.input_scale, weights_fp32=weights_fp32,
+            )  # fmt: skip
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):

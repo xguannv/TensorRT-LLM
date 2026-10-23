@@ -83,7 +83,9 @@ class Site:
     where ``wide``. Output columns from ``sig_col0`` on are stored through a sigmoid; ``out_fp32``: an fp32 output
     (k3_ctm_gemv_wide only). ``split`` / ``ring`` / ``push``: the CTM kernels' CTAs per 128-row weight tile,
     k3_ctm_gemv_long's weight-ring stages, and whether the partial sums are pushed to each row's owner. ``row_tiles``
-    (k3_ctm_gemv_wide only): the weight rows as that many equal tiles, one cluster each, instead of 128-row tiles."""
+    (k3_ctm_gemv_wide only): the weight rows as that many equal tiles, one cluster each, instead of 128-row tiles.
+    ``rows_flag``: a ``flags.py`` switch read at forward time that lowers the wide row limit below ``wide_rows`` (the
+    rows `K3DecodeGemvs.create` warms, so the switch can move within them after load)."""
 
     n: int
     k: int
@@ -96,6 +98,7 @@ class Site:
     out_fp32: bool = False
     wide_rows: int = WIDE_ROWS
     row_tiles: int = 0
+    rows_flag: str = ""
 
 
 SITES: Dict[str, Site] = {
@@ -123,12 +126,12 @@ SITES: Dict[str, Site] = {
     # the shared experts' gate_up, the row-parallel tail [latent up 224 | padding 32 | shared down 384] and the
     # replicated tail's latent up projection with an fp32 output. The wide kernel takes the head slice and the tail up
     # to TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS / TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS rows (default 32, up to which it was measured
-    # faster than the stock GEMM).
+    # faster than the stock GEMM; every tile up to 64 rows is warmed).
     "moe_head": Site(
-        280, 7168, "wide", wide=True, out_fp32=True, wide_rows=_flags.TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS
+        280, 7168, "wide", wide=True, out_fp32=True, rows_flag="TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS"
     ),
     "moe_shared_gate_up": Site(768, 7168, "wide", wide=True),
-    "moe_tail": Site(7168, 640, "wide", wide=True, wide_rows=_flags.TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS),
+    "moe_tail": Site(7168, 640, "wide", wide=True, rows_flag="TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS"),
     "moe_up": Site(7168, 3584, "wide", out_fp32=True),
     # The DSpark drafter's projections (K3DSparkDrafter; 6 query heads, 1 KV head of 64, MLP width 896): the fused
     # q / k / v, the output projection (row parallel), gate_up [gate 896 | up 896], and the down projection with the
@@ -143,6 +146,13 @@ SITES: Dict[str, Site] = {
 def _width(spec: Site) -> int:
     """The row width a site's kernel reads: ``k``, or the ``[gate | up]`` input of a SiLU-and-mul site, 2 ``k``."""
     return 2 * spec.k if spec.small == "swiglu" else spec.k
+
+
+def _row_limit(spec: Site) -> int:
+    """The most rows ``spec``'s wide kernel takes now: ``wide_rows``, lowered by its ``rows_flag`` switch."""
+    if not spec.rows_flag:
+        return spec.wide_rows
+    return min(spec.wide_rows, int(getattr(_flags, spec.rows_flag)))
 
 
 def _warm_rows(spec: Site) -> tuple:
@@ -330,7 +340,7 @@ class K3DecodeGemvs:
         rows = x.numel() // width
         if 0 < rows <= MAX_ROWS:
             kernel = spec.small
-        elif spec.wide and MAX_ROWS < rows <= spec.wide_rows:
+        elif spec.wide and MAX_ROWS < rows <= (spec.wide_rows if warm else _row_limit(spec)):
             kernel = "wide"
         else:
             return None

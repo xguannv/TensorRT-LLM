@@ -21,8 +21,9 @@ Checks:
   * Launch values (``test_launch_values``): with none of the switches in the environment, each holds its default,
     which is the behaviour before the switch: WIDE_ATTN_RES_MAX_TOKENS 32, WIDE_MOE_HEAD_ROWS 32, WIDE_MOE_TAIL_ROWS
     32, ROUTE_QUANT_FP32 0; ``_attn_res_max_tokens`` is the switch on a wide step and one token tile otherwise; the
-    ``moe_head`` / ``moe_tail`` sites take the switches' row limits; the rows ``K3DecodeGemvs.create`` warms a site at
-    (``_warm_rows``) are the pre-change ones at the default limits.
+    ``moe_head`` / ``moe_tail`` sites take the switches' row limits (``_row_limit``), no other site has one;
+    ``K3DecodeGemvs.create`` warms those two sites at every wide tile up to 64 rows (``_warm_rows``; before the
+    switches up to 32: a compile more at load, nothing else), the other sites at the rows it warmed before.
   * TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS (``test_wide_attn_res_max_tokens``): ``_apply_attn_res_add_and_rmsnorm`` and
     ``_apply_attn_res_and_rmsnorm`` at 16, 32, 48 and 64 rows, 1, 5 and 11 snapshots, with the limit at 32 (off) and
     64 (on). Off arm above 32 rows bit for bit the chain (the residual add, ``_apply_attn_res`` and the RMSNorm
@@ -31,7 +32,8 @@ Checks:
     mixture rounded to bf16; within ``ATTN_RES_FUSED_TOL`` of its largest magnitude (max |err| / max |ref|), the
     measured error and ulp distance printed (``OPCHECK``).
   * TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS / TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS (``test_wide_moe_gemv_rows``): ``K3DecodeGemvs``
-    on the ``moe_head`` (fp32 output) and ``moe_tail`` sites with the row limit at 32 (off) and 64 (on). Off arm:
+    on the ``moe_head`` (fp32 output) and ``moe_tail`` sites, one state (built with every tile up to 64 rows warmed),
+    the switch (read at forward time) at 32 (off) and 64 (on). Off arm:
     ``project`` returns None above 32 rows, so the caller's stock GEMM runs as before. Up to 32 rows both arms the
     same bits. On arm above 32: ``k3_ctm_gemv_wide``, NOT bitwise the stock GEMM (another summation order): within
     ``GEMV_TOL`` of the fp32 reference and of the stock GEMM (``decode_moe._gemv`` without the decode state); a
@@ -111,16 +113,23 @@ def test_launch_values():
     assert wide.wide and not small.wide
     assert m.impl._attn_res_max_tokens(wide) == m.flags.TRTLLM_K3LL_WIDE_ATTN_RES_MAX_TOKENS
     assert m.impl._attn_res_max_tokens(small) == m.impl.DECODE_MAX_TOKENS
-    sites = m.gemv.SITES
-    assert sites["moe_head"].wide_rows == m.flags.TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS
-    assert sites["moe_tail"].wide_rows == m.flags.TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS
-    spec = sites["moe_tail"]
-    warm = m.gemv._warm_rows
-    assert warm(dataclasses.replace(spec, wide_rows=32)) == (1, 16, 32)
-    assert warm(dataclasses.replace(spec, wide_rows=48)) == (1, 16, 32, 48)
-    assert warm(dataclasses.replace(spec, wide_rows=64)) == (1, 16, 32, 64)
+    sites, limit, warm = m.gemv.SITES, m.gemv._row_limit, m.gemv._warm_rows
+    head, tail = sites["moe_head"], sites["moe_tail"]
+    assert (head.rows_flag, tail.rows_flag) == (
+        "TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS",
+        "TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS",
+    )
+    assert limit(head) == min(64, m.flags.TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS)
+    assert limit(tail) == min(64, m.flags.TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS)
+    # Every wide tile up to 64 rows is warmed at load, so the switches can move after it.
+    assert warm(head) == warm(tail) == (1, 16, 32, 64)
+    assert warm(dataclasses.replace(tail, wide_rows=32)) == (1, 16, 32)
+    assert warm(dataclasses.replace(tail, wide_rows=48)) == (1, 16, 32, 48)
     assert warm(sites["moe_shared_gate_up"]) == (1, 16, 32, 64)
     assert warm(sites["moe_up"]) == (1,)
+    for name, spec in sites.items():
+        if name not in ("moe_head", "moe_tail"):
+            assert not spec.rows_flag and limit(spec) == spec.wide_rows, name
 
 
 def _residual_modules(m):
@@ -184,23 +193,15 @@ def test_wide_attn_res_max_tokens(rows, snapshots):
         assert err <= ATTN_RES_FUSED_TOL, f"{name}: fused vs chain rel err {err:.3e}"
 
 
-def _site_state(m, site: str, wide_rows: int):
-    """A ``K3DecodeGemvs`` of ``site`` alone with the row limit ``wide_rows`` (the switch's value at load)."""
-    original = m.gemv.SITES[site]
-    m.gemv.SITES[site] = dataclasses.replace(original, wide_rows=wide_rows)
-    try:
-        return m.gemv.K3DecodeGemvs.create(sites=(site,), device=torch.device("cuda"))
-    finally:
-        m.gemv.SITES[site] = original
-
-
-def _project(m, state, site, wide_rows, x, weight):
-    original = m.gemv.SITES[site]
-    m.gemv.SITES[site] = dataclasses.replace(original, wide_rows=wide_rows)
+def _project(m, state, site, limit, x, weight):
+    """``state.project`` with the site's switch (read at forward time) at ``limit``."""
+    name = m.gemv.SITES[site].rows_flag
+    old = getattr(m.flags, name)
+    setattr(m.flags, name, limit)
     try:
         return state.project(site, x, weight)
     finally:
-        m.gemv.SITES[site] = original
+        setattr(m.flags, name, old)
 
 
 @pytest.mark.skipif(not _sm100(), reason="needs an SM100-family GPU (k3_ctm_gemv_wide)")
@@ -211,12 +212,11 @@ def test_wide_moe_gemv_rows(site):
     out_fp32 = spec.out_fp32
     g = torch.Generator(device="cuda").manual_seed(20261024)
     weight = (0.02 * torch.randn(spec.n, spec.k, generator=g, device="cuda")).bfloat16()
-    off_state = _site_state(m, site, LIMIT_OFF)
-    on_state = _site_state(m, site, LIMIT_ON)
+    state = m.gemv.K3DecodeGemvs.create(sites=(site,), device=torch.device("cuda"))
     for rows in GEMV_ROWS:
         x = (0.5 * torch.randn(rows, spec.k, generator=g, device="cuda")).bfloat16()
-        off = _project(m, off_state, site, LIMIT_OFF, x, weight)
-        on = _project(m, on_state, site, LIMIT_ON, x, weight)
+        off = _project(m, state, site, LIMIT_OFF, x, weight)
+        on = _project(m, state, site, LIMIT_ON, x, weight)
         assert on is not None, (
             f"{site}: the wide kernel does not take {rows} rows at the 64-row limit"
         )
@@ -233,17 +233,20 @@ def test_wide_moe_gemv_rows(site):
             f"vs_stock={err_stock:.3e} stock_vs_fp32={_rel_err(stock, ref):.3e}"
         )
         assert err_ref <= GEMV_TOL[site] and err_stock <= GEMV_TOL[site], (err_ref, err_stock)
-    # Under capture the site takes a 64-row call only once its kernel ran eagerly (create warmed it).
+    # Under capture a fresh state takes a 64-row call: create warmed the 64-row tile whatever the switch's value.
+    fresh = m.gemv.K3DecodeGemvs.create(sites=(site,), device=torch.device("cuda"))
     x = (0.5 * torch.randn(LIMIT_ON, spec.k, generator=g, device="cuda")).bfloat16()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        captured = _project(m, on_state, site, LIMIT_ON, x, weight)
+        captured = _project(m, fresh, site, LIMIT_ON, x, weight)
+        refused = _project(m, fresh, site, LIMIT_OFF, x, weight)
     assert captured is not None, f"{site}: the 64-row call was refused under capture"
+    assert refused is None, f"{site}: the 32-row limit took a 64-row call under capture"
     for rep in range(2):
         x.copy_((0.5 * torch.randn(x.shape, generator=g, device="cuda")).bfloat16())
         graph.replay()
         torch.cuda.synchronize()
-        eager = _project(m, on_state, site, LIMIT_ON, x, weight)
+        eager = _project(m, fresh, site, LIMIT_ON, x, weight)
         assert _same(captured, eager), f"{site}: replay {rep} differs from the eager call"

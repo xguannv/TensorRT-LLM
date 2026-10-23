@@ -185,19 +185,19 @@ TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS = _flag(
     "TRTLLM_K3LL_WIDE_MOE_HEAD_ROWS",
     32,
     "lowm MoE on wide steps: the most rows of the head slice GEMV on k3_ctm_gemv_wide (decode_gemv site moe_head), "
-    "above it the fp32 router GEMM op (changes numerics above 32; up to 64; read at import)",
+    "above it the fp32 router GEMM op (changes numerics above 32; up to 64; read at forward time)",
 )
 TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS = _flag(
     "TRTLLM_K3LL_WIDE_MOE_TAIL_ROWS",
     32,
     "lowm MoE on wide steps: the most rows of the row-parallel tail GEMV on k3_ctm_gemv_wide (decode_gemv site "
-    "moe_tail), above it F.linear (changes numerics above 32; up to 64; read at import)",
+    "moe_tail), above it F.linear (changes numerics above 32; up to 64; read at forward time)",
 )
 TRTLLM_K3LL_ROUTE_QUANT_FP32 = _flag(
     "TRTLLM_K3LL_ROUTE_QUANT_FP32",
     0,
     "lowm MoE on wide steps the front does not take: k3_route_quant stores the routing weights widened to fp32, so "
-    "no cast kernel runs before moe_sort (the same bits; read at forward time, compiled by the layer's warm-up)",
+    "no cast kernel runs before moe_sort (the same bits; read at forward time; the layer's warm-up compiles both)",
 )
 
 TRTLLM_K3LL_OPROJ_PUSH = _flag(
