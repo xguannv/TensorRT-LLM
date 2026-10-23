@@ -22,6 +22,8 @@
                 partial bit for bit (one non-zero routing weight per token), the full sum within the bf16 accumulation
                 bound of the exact sum of the partials; through nvfp4_lowm_op.run (moe_sort first) as well, eagerly
                 and from CUDA-graph replays, the counters zero after every launch;
+  split       : trtllm::k3_moe_nvfp4_lowm_split (blackwell/k3_moe_lowm.py's FC1 + FC2) against the fused kernel: FC1
+                rows and scales and every FC2 partial bit for bit, also with CTA caps and the late FC1 trigger;
   front (4 GPUs, one process each) : trtllm::k3_moe_front with nvfp4_gsf: the routing and the shared activation
                 bit for bit the MXFP8 call's; the NVFP4 latent against fp4_quantize of the unfused chain's bf16
                 latent (> 99.9 % equal codes and scales: the front sums the head in its own split-K order, so a code
@@ -29,7 +31,7 @@
                 front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs.
 
 Run under pytest (the front check takes a pool of 4 MPI workers) or directly:
-  python3 test_k3_moe_lowm.py route_quant lowm
+  python3 test_k3_moe_lowm.py route_quant lowm split
   srun -N1 -n4 --mpi=pmix python3 test_k3_moe_lowm.py front
 """
 
@@ -282,6 +284,108 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
 
 
+@pytest.mark.parametrize("num_tokens", [1, 8, 14, 17, 32])
+def test_moe_nvfp4_lowm_split(num_tokens):
+    """trtllm::k3_moe_nvfp4_lowm_split (blackwell/k3_moe_lowm.py's FC1 + FC2 after an output memset) against
+    trtllm::k3_moe_nvfp4_lowm (the fused kernel) on the same inputs at the K3 TP4 x EP4 shapes: FC1 rows and scales bit
+    for bit, every FC2 partial bit for bit (one non-zero routing weight per token), the full sum within the bf16
+    accumulation bound; nvfp4_lowm_op.run(split=True) eagerly and from CUDA-graph replays (the output pre-filled
+    with garbage: the op zeroes it), and with CTA caps and the late FC1 trigger."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    hidden, inter_size, num_experts, num_local, offset, top_k = (
+        LATENT,
+        I_TP,
+        EXPERTS,
+        E_LOCAL,
+        E_LOCAL,
+        TOP_K,
+    )
+    torch.manual_seed(4000 + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    scales, ids = logits.topk(top_k, dim=-1)
+    ids = ids.to(torch.int32)
+    scales = scales.softmax(dim=-1).float()
+    ids[0, 0] = offset
+    t2g, t2lim, _, p2e, _, nnet = _sort(ids, scales, num_experts, top_k, offset, num_local)
+    m = p2e.shape[0]
+    tiles = int(nnet.item())
+    limits = t2lim[:tiles].tolist()
+    rows = torch.tensor([r for t in range(tiles) for r in range(t * 128, limits[t])], device="cuda")
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    x_q, x_sf, x_gsf = _quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden)[:num_tokens].contiguous()
+    ex = _nvfp4_experts(num_local, hidden, inter_size, 5000 + num_tokens)
+    alpha1 = (ex.spread * (x_gsf * ex.w1_gsf)).float()
+    weights = (ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2)
+    counters = nvfp4_lowm_op.new_counters(torch.device("cuda"))
+    cols = inter_size // SF16
+
+    def fused(token_scales):
+        out = torch.full((num_tokens, hidden), 7.0, dtype=torch.bfloat16, device="cuda")
+        h = torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda")
+        h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
+        _trtllm().k3_moe_nvfp4_lowm(
+            _bits(x_q), _bits(x_sf), *weights, out, t2g, t2lim, p2e, nnet, ex.fc2_input_scale, token_scales,
+            counters, top_k, GATE_CAP, LINEAR_CAP, 0, h, h_sf,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return out, h, h_sf
+
+    def split(token_scales, fc1_ctas=0, fc2_ctas=0, late=False):
+        out = torch.full((num_tokens, hidden), 7.0, dtype=torch.bfloat16, device="cuda")
+        h = torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda")
+        h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
+        _trtllm().k3_moe_nvfp4_lowm_split(
+            _bits(x_q), _bits(x_sf), *weights, out, t2g, t2lim, p2e, nnet, ex.fc2_input_scale, token_scales, top_k,
+            GATE_CAP, LINEAR_CAP, fc1_ctas, fc2_ctas, late, h, h_sf,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return out, h, h_sf
+
+    partials = []
+    for slot in range(top_k):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        ref, h_ref, h_sf_ref = fused(one_hot)
+        new, h_new, h_sf_new = split(one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"FC2 slot {slot}"
+        partials.append(ref.double())
+        if slot == 0:
+            assert torch.equal(h_ref[rows], h_new[rows]), "FC1 output rows differ"
+            sf_ref = unswizzle_sf(h_sf_ref, m, inter_size, SF16).view(m, cols)
+            sf_new = unswizzle_sf(h_sf_new, m, inter_size, SF16).view(m, cols)
+            assert torch.equal(sf_ref[rows], sf_new[rows]), "FC1 output scale factors differ"
+            capped, _, _ = split(one_hot, 100, 120, True)
+            assert torch.equal(ref.view(torch.int16), capped.view(torch.int16)), (
+                "FC2 slot 0, capped grids"
+            )
+    exact = torch.stack(partials).sum(0)
+    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+
+    def check(result, what):
+        err = (result.double() - exact).abs()
+        assert bool((err <= bound).all()), f"{what}: max err/bound {(err / bound).max()}"
+
+    check(split(scales)[0], "op")
+    run_args = (_bits(x_q), _bits(x_sf), ids, scales, weights, offset, num_experts, ex.fc2_input_scale, counters,
+                GATE_CAP, LINEAR_CAP)  # fmt: skip
+    check(nvfp4_lowm_op.run(*run_args, split=True), "run")
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    static = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    with torch.cuda.graph(graph, stream=stream):
+        nvfp4_lowm_op.run(*run_args, out=static, split=True)
+    for replay in range(3):
+        static.fill_(7.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(static, f"graph replay {replay}")
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # front (4 GPUs)
 # --------------------------------------------------------------------------------------------------------------------
@@ -457,7 +561,11 @@ def main() -> int:
             _report(per_rank)
             print("PASS" if all(r["ok"] for r in rows) else "FAIL", flush=True)
         return 0 if all(r["ok"] for r in rows) else 1
-    tests = {"route_quant": "test_route_quant_nvfp4", "lowm": "test_moe_nvfp4_lowm"}
+    tests = {
+        "route_quant": "test_route_quant_nvfp4",
+        "lowm": "test_moe_nvfp4_lowm",
+        "split": "test_moe_nvfp4_lowm_split",
+    }
     return pytest.main(["-q", __file__, "-k", " or ".join(tests[n] for n in names)])
 
 

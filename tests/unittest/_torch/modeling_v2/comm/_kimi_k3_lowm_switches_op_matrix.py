@@ -83,8 +83,22 @@ eager call on the same inputs):
     and the expert kernel on the on arm's routing and latent bit for bit ``CuteDslFusedMoE.run_moe_nvfp4`` on the same
     inputs.
 
+  * ROUTE_TAIL_FAST (1, 3, 8 rows; 9 and 16, where the 16-token front ignores it): ``_front_routed`` of the one
+    production layer with ``TRTLLM_K3LL_ROUTE_TAIL_FAST`` set per call on the flags module, so both arms run on the
+    same built state (the switch is read at forward time; ``warm_up`` built both front variants). On arm against the
+    off arm, all bit for bit: the front's outputs, the tile table with each tile's rows in stored order, the fp32
+    weights, the routed partial, the shared activation; off arm against the pre-change chain as FRONT_SORT. Then one
+    graph capturing both arms back to back (the switch flipped between them inside the capture), replayed.
+  * MOE_LOWM_DYN_CTAS16 (9, 16 rows: 0 vs ``DYN_CTAS16_WARM`` persistent CTAs) and MOE_LOWM_SPLIT32 (17, 32 rows: the
+    fused expert kernel vs ``k3_moe_nvfp4_lowm_split``): ``_wide`` of the one production layer with the switch set per
+    call. On arm against the off arm bit for bit: routing, latent, scales, routed partial (one-hot routing), shared
+    activation, tail input and output; the off arm's routed partial against ``moe_sort`` + ``k3_moe_nvfp4_lowm`` on
+    its routing. Then one graph per switch capturing both arms, replayed.
+
 Outputs the ranks share (routing, latent, reduced outputs, ``updated`` / ``normed``) are also compared bitwise across
 the ranks; the shared activation, the routed partial and the tail are this rank's own.
+
+``--checks route_tail_fast,lowm_launch`` runs only those checks (after the build).
 """
 
 import contextlib
@@ -137,6 +151,10 @@ WIDE_ROWS = (16, 32)
 MOE_ROWS = (8, 16, 32)
 GRAPH_FRONT_SORT_ROWS = (8, 16)
 GRAPH_FRONT16_ROWS = (9, 16)
+ROUTE_FAST_ROWS = (1, 3, 8, 9, 16)  # 9 and 16: the 16-token front, which ignores the switch
+GRAPH_ROUTE_FAST_ROWS = (8,)
+LOWM_CTAS_ROWS = (9, 16)
+LOWM_SPLIT_ROWS = (17, 32)
 REPLAYS = 2
 
 ULP_REL = 2.0**-7  # one bf16 ulp, relative
@@ -1342,13 +1360,167 @@ def check_moe_lowm():
         )
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_ROUTE_TAIL_FAST
+# ----------------------------------------------------------------------------------------------------------------------
+def _route_fast_arm(value, x):
+    """``_front_routed`` of the production layer (front sort and 16-token front, one built state) with
+    TRTLLM_K3LL_ROUTE_TAIL_FAST set to ``value`` for this call."""
+    with _switch("TRTLLM_K3LL_ROUTE_TAIL_FAST", value):
+        return _front_sort_arm(BUILT.on, BUILT.moe_on, x)
+
+
+def _verify_route_fast(where, on, off, ref):
+    """On arm against the off arm, all bit for bit: the front's outputs, the tile count, each tile's local expert,
+    mn limit and rows in their stored order (both arms run the front's own sort, which writes them in token order),
+    the fp32 weights, the routed partial and the shared activation. Off arm against the pre-change chain (the front
+    without the sort, ``moe_sort``, ``k3_moe_nvfp4_lowm``) as FRONT_SORT holds it."""
+    _assert_one_hot(where, off.front[1])
+    for name, a, b in zip(_FRONT_NAMES, on.front, off.front):
+        _expect_same(f"{where}: on vs off front {name}", a, b, replicated=name != "shared")
+    on_t, off_t, ref_t = _sort_table(on.sort), _sort_table(off.sort), _sort_table(ref.sort)
+    assert on_t[:4] == off_t[:4], (
+        f"{where}: on arm's sort {on_t[:4]} differs from the off arm's {off_t[:4]}"
+    )
+    _expect_same(f"{where}: on vs off sort weights", on_t[4], off_t[4])
+    _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
+    _expect_same(f"{where}: on vs off shared activation", on.act, off.act)
+    for name, a, b in zip(_FRONT_NAMES, off.front, ref.front):
+        _expect_same(f"{where}: off arm vs pre-change front {name}", a, b)
+    assert off_t[:3] == ref_t[:3], f"{where}: off arm's tiles differ from moe_sort's"
+    _same_rows(where, "off arm vs moe_sort", off_t[3], ref_t[3])
+    _expect_same(f"{where}: off arm vs pre-change routed partial", off.routed, ref.routed)
+
+
+def check_route_tail_fast():
+    """``_front_routed`` on one built layer with TRTLLM_K3LL_ROUTE_TAIL_FAST flipped per call (read at forward time):
+    the 8-token front takes the st.async id hand-over, the 16-token front ignores the switch; eagerly, then one CUDA
+    graph capturing both arms back to back (the flags module flipped between them inside the capture), replayed."""
+    on, moe, ref = BUILT.on, BUILT.moe_on, BUILT.refs.on
+    assert on.state.sort_ctr is not None, "the production layer has the front's sort"
+    for rows in ROUTE_FAST_ROWS:
+        if rows > DML.MAX_TOKENS and on.state.head16 is None:
+            continue
+        x = _moe_input(1000 + rows, rows)
+        a_on, a_off = _route_fast_arm(1, x), _route_fast_arm(0, x)
+        _verify_route_fast(
+            f"ROUTE_TAIL_FAST {rows} rows",
+            a_on,
+            a_off,
+            _ref_front_sort_chain(on.state, ref, moe, x),
+        )
+        assert int(on.state.sort_ctr.item()) == 0, "the front's sort counter is not zero"
+    fields = ("front", "routed", "act")
+    for rows in GRAPH_ROUTE_FAST_ROWS:
+        x = _moe_input(1100 + rows, rows)
+        graph, (g_on, g_off) = _capture(lambda: (_route_fast_arm(1, x), _route_fast_arm(0, x)))
+        for rep in range(REPLAYS):
+            x.copy_(_moe_input(1200 + 10 * rows + rep, rows))
+            _replay(graph)
+            where = f"ROUTE_TAIL_FAST graph {rows} rows replay {rep}"
+            e_on, e_off = _route_fast_arm(1, x), _route_fast_arm(0, x)
+            _same_arm(f"{where} on vs eager", g_on, e_on, fields)
+            _same_arm(f"{where} off vs eager", g_off, e_off, fields)
+            assert _sort_table(g_on.sort)[:4] == _sort_table(e_on.sort)[:4], (
+                f"{where}: on arm's sort"
+            )
+            _verify_route_fast(where, g_on, g_off, _ref_front_sort_chain(on.state, ref, moe, x))
+        del graph
+    if R.rank == 0:
+        print(
+            "[rank 0] ROUTE_TAIL_FAST: on arm = off arm bit for bit on one built state (eager and replays); off arm "
+            "= pre-change chain",
+            flush=True,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16, TRTLLM_K3LL_MOE_LOWM_SPLIT32
+# ----------------------------------------------------------------------------------------------------------------------
+def _launch_arm(name, value, x):
+    """``_wide`` of the production layer with switch ``name`` at ``value`` for this call (`_front16_arm`'s fields)."""
+    with _switch(name, value):
+        return _front16_arm(BUILT.on, BUILT.moe_on, x)
+
+
+def _verify_launch(where, on, off, ref_routed):
+    """On arm against the off arm bit for bit: routing, NVFP4 latent and scales, routed partial (one-hot routing:
+    deterministic), shared activation, tail input and output. Off arm's routed partial against the pre-change chain
+    (``moe_sort`` + ``k3_moe_nvfp4_lowm`` at one CTA per SM) on its own routing."""
+    _assert_one_hot(where, off.routing[1])
+    names = ("ids", "weights", "latent", "scales")
+    for name, a, b in zip(names, on.routing, off.routing):
+        _expect_same(f"{where}: on vs off {name}", a, b, replicated=True)
+    for name in ("routed", "act", "tail_in", "out"):
+        _expect_same(f"{where}: on vs off {name}", getattr(on, name), getattr(off, name))
+    _expect_same(f"{where}: off arm vs pre-change routed partial", off.routed, ref_routed)
+
+
+def check_lowm_launch():
+    """``_wide`` on one built layer with the expert kernel's launch switches flipped per call (read at forward time):
+    TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16 0 / `DYN_CTAS16_WARM` at 9 and 16 rows (the 16-token front), and
+    TRTLLM_K3LL_MOE_LOWM_SPLIT32 0 / 1 at 17 and 32 rows (the wide head); eagerly, then one CUDA graph per switch
+    capturing both arms back to back, replayed."""
+    layer, ref = BUILT.on, BUILT.refs.on
+    cases = [("TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16", DML.DYN_CTAS16_WARM, r) for r in LOWM_CTAS_ROWS]
+    cases += [("TRTLLM_K3LL_MOE_LOWM_SPLIT32", 1, r) for r in LOWM_SPLIT_ROWS]
+    for name, value, rows in cases:
+        x = _moe_input(1300 + rows, rows)
+        a_on, a_off = _launch_arm(name, value, x), _launch_arm(name, 0, x)
+        _, ref_routed = _ref_experts(
+            *a_off.routing[2:], *a_off.routing[:2], ref, layer.state.counters
+        )
+        _verify_launch(f"{name} {rows} rows", a_on, a_off, ref_routed)
+    fields = ("routing", "routed", "act", "tail_in", "out")
+    for name, value, rows in cases:
+        x = _moe_input(1400 + rows, rows)
+        graph, (g_on, g_off) = _capture(
+            lambda: (_launch_arm(name, value, x), _launch_arm(name, 0, x))
+        )
+        for rep in range(REPLAYS):
+            x.copy_(_moe_input(1500 + 10 * rows + rep, rows))
+            _replay(graph)
+            where = f"{name} graph {rows} rows replay {rep}"
+            _same_arm(f"{where} on vs eager", g_on, _launch_arm(name, value, x), fields)
+            _same_arm(f"{where} off vs eager", g_off, _launch_arm(name, 0, x), fields)
+            _, ref_routed = _ref_experts(
+                *g_off.routing[2:], *g_off.routing[:2], ref, layer.state.counters
+            )
+            _verify_launch(where, g_on, g_off, ref_routed)
+        del graph
+    if R.rank == 0:
+        print(
+            "[rank 0] MOE_LOWM_DYN_CTAS16 / MOE_LOWM_SPLIT32: on arm = off arm bit for bit on one built state (eager "
+            "and replays); off arm's experts = pre-change chain",
+            flush=True,
+        )
+
+
 CHECKS = [
     check_front_sort,
     check_front16,
     check_wide_ar_attn_res,
     check_wide_latent_tail,
     check_moe_lowm,
+    check_route_tail_fast,
+    check_lowm_launch,
 ]
+
+
+def _selected_checks(argv) -> list:
+    """``--checks a,b``: only those of `CHECKS` (by name, with or without ``check_``); default all."""
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--checks", default="")
+    wanted = [
+        c if c.startswith("check_") else f"check_{c}"
+        for c in parser.parse_known_args(argv)[0].checks.split(",")
+        if c
+    ]
+    unknown = set(wanted) - {c.__name__ for c in CHECKS}
+    assert not unknown, f"unknown checks {sorted(unknown)}"
+    return [c for c in CHECKS if not wanted or c.__name__ in wanted]
 
 
 def _run_one_rank(args) -> int:
@@ -1370,7 +1542,7 @@ def _run_one_rank(args) -> int:
     if code:
         return code
     with torch.inference_mode():
-        code = ls.run_checks(R, CHECKS)
+        code = ls.run_checks(R, _selected_checks(sys.argv[1:]))
     return code
 
 

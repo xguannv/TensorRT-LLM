@@ -67,6 +67,19 @@ FRONT16_TOKENS = 16
 # A wide decode step's most tokens: the expert kernel's limit.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
 NUM_EXPERTS = 896
+# A value of TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16 every layer warms besides 0 and the launch value (12 of GB300's 148 SMs
+# left to the kernels beside the expert kernel).
+DYN_CTAS16_WARM = 136
+
+
+def lowm_launch(rows: int) -> dict:
+    """The expert kernel's launch for a step of ``rows`` tokens, from the switches read now (forward time):
+    ``nvfp4_lowm_op.run_sorted``'s ``num_ctas`` / ``split``."""
+    if rows > FRONT16_TOKENS:
+        return {"split": bool(_flags.TRTLLM_K3LL_MOE_LOWM_SPLIT32)}
+    if rows > MAX_TOKENS:
+        return {"num_ctas": int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16)}
+    return {}
 
 
 @dataclass(eq=False)
@@ -280,17 +293,26 @@ class K3DecodeMoeNvfp4Layer:
 
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
-        (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens."""
+        (collective: every rank makes the same calls; with the sort, both TRTLLM_K3LL_ROUTE_TAIL_FAST builds),
+        ``k3_route_quant`` and the expert kernel's builds for 8, 16 and 32 tokens, every launch the forward-time
+        switches reach (`lowm_launch`: 16 tokens at 0, `DYN_CTAS16_WARM` and the launch value of
+        TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16 CTAs; 32 tokens fused and split)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
-        self._front_routed(moe, x)
+        for route_fast in (False, True) if self.state.sort_ctr is not None else (False,):
+            self._front_routed(moe, x, route_fast=route_fast)
         if self.state.head16 is not None:
             self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]))
-        for rows in (9, WIDE_MAX_TOKENS):
+        ctas16 = sorted({0, DYN_CTAS16_WARM, int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16)})
+        for rows, launches in (
+            (9, [{"num_ctas": c} for c in ctas16]),
+            (WIDE_MAX_TOKENS, [{"split": False}, {"split": True}]),
+        ):
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
-            self._routed(*self._route_quant(moe, logits, latent))
+            routing = self._route_quant(moe, logits, latent)
+            for launch in launches:
+                self._routed(*routing, **launch)
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):
@@ -299,8 +321,18 @@ class K3DecodeMoeNvfp4Layer:
             nvfp4_gsf=self.input_scale,
         )  # fmt: skip
 
-    def _front(self, moe: nn.Module, x: torch.Tensor, sort_out: Optional[torch.Tensor] = None):
+    def _front(
+        self,
+        moe: nn.Module,
+        x: torch.Tensor,
+        sort_out: Optional[torch.Tensor] = None,
+        route_fast: Optional[bool] = None,
+    ):
+        """``k3_moe_front`` on ``x``; with ``sort_out``, its sort, the route tail's id hand-over by st.async when
+        ``route_fast`` (None: TRTLLM_K3LL_ROUTE_TAIL_FAST, read now)."""
         head = self.state.head16 if x.shape[0] > MAX_TOKENS else self.state.head
+        if route_fast is None:
+            route_fast = bool(_flags.TRTLLM_K3LL_ROUTE_TAIL_FAST)
         return k3_moe_front(
             x.contiguous(),
             self.front_weight,
@@ -314,6 +346,7 @@ class K3DecodeMoeNvfp4Layer:
             sort_ctr=self.state.sort_ctr if sort_out is not None else None,
             sort_offset=self.offset,
             sort_local=self.num_local,
+            route_fast=bool(route_fast) and sort_out is not None,
         )
 
     @property
@@ -321,15 +354,19 @@ class K3DecodeMoeNvfp4Layer:
         """This rank's routed experts."""
         return self.experts[0].shape[0]
 
-    def _routed(self, ids, weights, x_q, x_sf) -> torch.Tensor:
+    def _routed(self, ids, weights, x_q, x_sf, **launch) -> torch.Tensor:
+        """This rank's routed partial: ``moe_sort``, then the expert kernel at ``launch`` (default `lowm_launch`)."""
+        if not launch:
+            launch = lowm_launch(ids.shape[0])
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, **launch,
         )  # fmt: skip
 
-    def _front_routed(self, moe: nn.Module, x: torch.Tensor):
+    def _front_routed(self, moe: nn.Module, x: torch.Tensor, route_fast: Optional[bool] = None):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows): ``(routed, shared_act)``.
-        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
+        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it.
+        ``route_fast``: as `_front` (None: the switch)."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
             return self._routed(ids, weights, x_q, x_sf), shared_act
@@ -337,10 +374,10 @@ class K3DecodeMoeNvfp4Layer:
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
-        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
+        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, route_fast)
         routed = nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, **lowm_launch(rows),
         )  # fmt: skip
         return routed, shared_act
 

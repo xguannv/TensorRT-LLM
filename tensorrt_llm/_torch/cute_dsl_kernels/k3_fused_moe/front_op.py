@@ -92,6 +92,12 @@ def m_build(num_tokens: int) -> int:
     return MAX_TOKENS if num_tokens <= MAX_TOKENS else WIDE_TOKENS
 
 
+def route_fast_applies(num_tokens: int, sort: bool, publish: bool = False) -> bool:
+    """Whether a call takes ``route_fast``: with the sort, without ``ag_ready``, on the 8-token build (whose route CTAs,
+    one per token, all sit in the first role cluster; the 16-token build's span two)."""
+    return sort and not publish and m_build(num_tokens) <= _kernel().SPLIT
+
+
 def max_clusters(device: torch.device) -> int:
     """Clusters of the kernel's SPLIT CTAs, one CTA per SM, that ``device`` holds at once."""
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -174,6 +180,7 @@ def k3_moe_front(
     sort_ctr: Optional[torch.Tensor] = None,
     sort_offset: int = 0,
     sort_local: int = 0,
+    route_fast: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 16, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -188,7 +195,11 @@ def k3_moe_front(
     With ``sort_out`` (int32, at least `sort_layout`'s words; with ``nvfp4_gsf``) the kernel also writes ``moe_sort``
     of the routing over the local experts ``[sort_offset, sort_offset + sort_local)`` with 128-row tiles and the
     routing weights in fp32 there (`sort_views`). ``sort_ctr``: int32 ``[1]``, zero, which every call leaves zero;
-    calls that share it must be stream-ordered."""
+    calls that share it must be stream-ordered.
+
+    ``route_fast`` (with the sort, on the 8-token build; `route_fast_applies`): the route CTAs hand their ids to the
+    sorting CTA over distributed shared memory (st.async on an mbarrier) instead of a GPU-scope fence, a global counter
+    and a reload; the same outputs. Elsewhere it is ignored. Each value is its own compiled build."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -280,6 +291,7 @@ def k3_moe_front(
         half if head_half else kernel.geometry(ag_world, shared_cols, capacity, m_max)
     )
     publish = ag_ready is not None
+    fast = bool(route_fast) and route_fast_applies(num_tokens, sort, publish)
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (
@@ -298,6 +310,7 @@ def k3_moe_front(
         nvfp4,
         sort,
         m_max,
+        fast,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -311,7 +324,7 @@ def k3_moe_front(
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
                     sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
-                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, stream,
+                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, fast, stream,
                 )  # fmt: skip
     fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
     return topk_ids, topk_weights, quantized, scales, shared
@@ -320,7 +333,7 @@ def k3_moe_front(
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
       ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
-      sort_local=0):  # fmt: skip
+      sort_local=0, route_fast=False):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

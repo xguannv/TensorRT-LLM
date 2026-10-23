@@ -42,6 +42,7 @@ def k3_moe_front(
     sort_ctr: Optional[torch.Tensor] = None,
     sort_offset: int = 0,
     sort_local: int = 0,
+    route_fast: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(topk_ids, topk_weights, quantized, scales, shared)`` for the MoE input ``x`` (bf16 ``[M <= 16, 7168]``,
     9-16 rows on a ``K3MoeHeadWorkspace`` created with ``m_max=16``, the same on every rank): the top-16 routing of
@@ -57,7 +58,10 @@ def k3_moe_front(
     uint8 ``[M, 1792]`` E2M1 pairs, ``scales`` uint8 ``[M, 224]`` E4M3, linear; ``fp4_quantize``'s recipe).
 
     ``sort_out`` / ``sort_ctr`` / ``sort_offset`` / ``sort_local`` (with ``nvfp4_gsf``): also ``moe_sort`` of the
-    routing over the local experts and the fp32 weights into ``sort_out`` (``sort_layout``, ``sort_views``)."""
+    routing over the local experts and the fp32 weights into ``sort_out`` (``sort_layout``, ``sort_views``).
+
+    ``route_fast`` (with the sort, at most 8 rows; ignored elsewhere): the route CTAs hand the ids to the sorting CTA
+    by st.async on an mbarrier instead of a GPU-scope fence and a global counter; the same outputs."""
     return torch.ops.trtllm.k3_moe_front(
         x,
         w_front,
@@ -77,4 +81,5 @@ def k3_moe_front(
         sort_ctr=sort_ctr,
         sort_offset=sort_offset,
         sort_local=sort_local,
+        route_fast=route_fast,
     )

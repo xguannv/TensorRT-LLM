@@ -20,6 +20,9 @@ MoE backend's NVFP4 buffers, read in place, for at most 32 tokens. Its inputs ar
 scales (``[M, 3584 / 16]``), the routing weights in fp32 and the six ``moe_sort`` outputs of this rank's experts with
 128-row tiles.
 
+``trtllm::k3_moe_nvfp4_lowm_split`` computes the same partial as two persistent kernels (``blackwell/k3_moe_lowm.py``:
+FC1 + SiTU + NVFP4 quantization, then FC2 + the combine) after zeroing the output, with optional CTA caps per kernel.
+
 The weight layouts are the CuteDSL backend's on SM100 / SM103: W1 rows interleaved 64 up rows then the matching 64
 gate rows per 128-row block, W1 / W2 scales in the 128x4 blocked layout. SM107 stores W1 with another interleave, so
 `supported` refuses every other architecture.
@@ -216,6 +219,137 @@ def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_gro
     return None
 
 
+@torch.library.custom_op("trtllm::k3_moe_nvfp4_lowm_split", mutates_args=("output", "h", "h_sf"))
+def k3_moe_nvfp4_lowm_split(
+    x_fp4: torch.Tensor,
+    x_sf: torch.Tensor,
+    w1: torch.Tensor,
+    w1_sf: torch.Tensor,
+    alpha1: torch.Tensor,
+    w2: torch.Tensor,
+    w2_sf: torch.Tensor,
+    alpha2: torch.Tensor,
+    output: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    top_k: int,
+    situ_beta: float,
+    situ_linear_beta: float,
+    fc1_ctas: int = 0,
+    fc2_ctas: int = 0,
+    fc1_late_trigger: bool = False,
+    h: Optional[torch.Tensor] = None,
+    h_sf: Optional[torch.Tensor] = None,
+) -> None:
+    """`k3_moe_nvfp4_lowm`'s result as two persistent kernels (``blackwell/k3_moe_lowm.py``): the output zeroed, then
+    ``K3MoeFc1LowMKernel`` (FC1 + SiTU + NVFP4 quantization into ``h`` / ``h_sf``, static equal unit ranges over its
+    CTAs) and ``K3MoeFc2LowMKernel`` (FC2 + the routing-weighted combine, ``red.global.add`` in hardware order, its
+    weights streamed before FC1 completes). FC1 rows and scales and every FC2 partial are bit for bit the fused
+    kernel's. ``fc1_ctas`` / ``fc2_ctas``: persistent CTAs (0: one per SM); ``fc1_late_trigger``: FC1 releases FC2 when
+    each CTA starts its last unit instead of right after its own wait."""
+    import cuda.bindings.driver as cuda_driver
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..blackwell.utils import make_ptr
+
+    lowm = _lowm()
+    orig_m = x_fp4.shape[0]
+    num_local, n1 = w1.shape[0], w1.shape[1]
+    k1 = w2.shape[1]
+    k2 = n1 // 2
+    m = permuted_idx_to_expanded_idx.shape[0]
+    n_tok = lowm.n_tok_for(orig_m)
+    device = x_fp4.device
+    sms = _num_sms(_device_index(device))
+    ctas1 = min(fc1_ctas, sms) if fc1_ctas > 0 else sms
+    ctas2 = min(fc2_ctas, sms) if fc2_ctas > 0 else sms
+    if h is None:
+        h = torch.empty(m, k2 // 2, dtype=torch.uint8, device=device)
+    if h_sf is None:
+        h_sf = torch.empty(m * k2 // SF_VEC, dtype=torch.uint8, device=device)
+    if h.numel() < m * k2 // 2 or h_sf.numel() < m * k2 // SF_VEC:
+        raise ValueError(
+            "k3_moe_nvfp4_lowm_split: h / h_sf hold fewer than the permuted rows' FC1 output"
+        )
+
+    def ptr(dtype, t, align=None):
+        if align is None:
+            return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem)
+        return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+    meta = [
+        ptr(cutlass.Int32, tile_idx_to_group_idx),
+        ptr(cutlass.Int32, tile_idx_to_mn_limit),
+        ptr(cutlass.Int32, permuted_idx_to_expanded_idx),
+        ptr(cutlass.Int32, num_non_exiting_tiles),
+    ]
+    fc1_ptrs = [
+        ptr(cutlass.Float4E2M1FN, x_fp4, 32),
+        ptr(cutlass.Float4E2M1FN, w1, 32),
+        ptr(cutlass.Float8E4M3FN, x_sf, 16),
+        ptr(cutlass.Float8E4M3FN, w1_sf, 16),
+        ptr(cutlass.Float4E2M1FN, h, 32),
+        ptr(cutlass.Float8E4M3FN, h_sf, 16),
+        ptr(cutlass.Float32, alpha1),
+        *meta,
+        ptr(cutlass.Float32, fc2_input_scale),
+    ]
+    fc2_ptrs = [
+        ptr(cutlass.Float4E2M1FN, h, 32),
+        ptr(cutlass.Float4E2M1FN, w2, 32),
+        ptr(cutlass.Float8E4M3FN, h_sf, 16),
+        ptr(cutlass.Float8E4M3FN, w2_sf, 16),
+        ptr(cutlass.BFloat16, output, 16),
+        ptr(cutlass.Float32, alpha2),
+        *meta,
+        ptr(cutlass.Float32, token_final_scales),
+    ]
+    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    late = bool(fc1_late_trigger)
+    key1 = ("fc1", _device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas1,
+            late, use_pdl)  # fmt: skip
+    key2 = ("fc2", _device_index(device), n_tok, k1, k2, top_k, ctas2, use_pdl)
+    fn1, fn2 = _compiled.get(key1), _compiled.get(key2)
+    if fn1 is None or fn2 is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "trtllm::k3_moe_nvfp4_lowm_split must run once per configuration outside CUDA-graph capture first"
+            )
+        with _lock:
+            fn1 = _compiled.get(key1)
+            if fn1 is None:
+                kernel1 = lowm.K3MoeFc1LowMKernel(
+                    n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), use_pdl=use_pdl,
+                    late_trigger=late,
+                )  # fmt: skip
+                fn1 = _compiled[key1] = cute.compile(
+                    kernel1.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas1, stream
+                )
+            fn2 = _compiled.get(key2)
+            if fn2 is None:
+                kernel2 = lowm.K3MoeFc2LowMKernel(n_tok, k1, k2, top_k, use_pdl=use_pdl)
+                fn2 = _compiled[key2] = cute.compile(
+                    kernel2.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas2, stream
+                )
+    # FC2 adds its partials into the output.
+    output.zero_()
+    fn1(*fc1_ptrs, orig_m, m, num_local, stream)
+    fn2(*fc2_ptrs, m, num_local, orig_m, stream)
+
+
+@k3_moe_nvfp4_lowm_split.register_fake
+def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
+      permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, top_k, situ_beta,
+      situ_linear_beta, fc1_ctas=0, fc2_ctas=0, fc1_late_trigger=False, h=None, h_sf=None):  # fmt: skip
+    return None
+
+
 def run(
     x_fp4: torch.Tensor,
     x_sf: torch.Tensor,
@@ -230,10 +364,12 @@ def run(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    split: bool = False,
 ) -> torch.Tensor:
-    """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
-    bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
-    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32)."""
+    """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm` (``split``:
+    `k3_moe_nvfp4_lowm_split`): this rank's routed partial bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2,
+    w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order); ``topk_weights`` any float dtype ``[M, top_k]`` (converted to
+    fp32)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
@@ -256,7 +392,7 @@ def run(
     return run_sorted(
         x_fp4, x_sf, (tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                       num_non_exiting_tiles, scales),
-        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas,
+        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas, split,
     )  # fmt: skip
 
 
@@ -271,8 +407,10 @@ def run_sorted(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    split: bool = False,
 ) -> torch.Tensor:
-    """`k3_moe_nvfp4_lowm` on a routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
+    """`k3_moe_nvfp4_lowm` (``split``: `k3_moe_nvfp4_lowm_split` at one CTA per SM, ``num_ctas`` ignored) on a
+    routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
     tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales)``, ``moe_sort``'s
     outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
@@ -286,6 +424,13 @@ def run_sorted(
     num_tokens, top_k = scales.shape
     if out is None:
         out = torch.empty(num_tokens, w2.shape[1], dtype=torch.bfloat16, device=x_fp4.device)
+    if split:
+        torch.ops.trtllm.k3_moe_nvfp4_lowm_split(
+            x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, top_k, float(situ_beta),
+            float(situ_linear_beta),
+        )  # fmt: skip
+        return out
     torch.ops.trtllm.k3_moe_nvfp4_lowm(
         x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, counters, top_k,

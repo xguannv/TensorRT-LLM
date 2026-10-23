@@ -19,7 +19,9 @@ K3MoeHeadWorkspace, for this rank's 224 experts (TP4 x EP4) and for all 896.
 Per call: the routing, latent and shared activation the bits of the call without the sort; the tile count, each
 tile's local expert and mn limit and its rows (expanded indices) those of trtllm::moe_sort on the front's routing
 with 128-row tiles (the rows as a set, and in token order: the order the front writes); the fp32 weights the bf16
-weights widened; the counter word zero again.
+weights widened; the counter word zero again. With ``route_fast`` (the ids handed to the sorting CTA by st.async on
+an mbarrier; taken at M <= 8, ignored above): every output and every word of ``sort_out`` the bits of the call
+without it, back to back with it on the same workspace, the counter word zero.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
   srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front_sort.py
@@ -112,12 +114,12 @@ def _context():
     )  # fmt: skip
 
 
-def _front(ctx, x, sort_out=None, offset=0, num_local=0):
+def _front(ctx, x, sort_out=None, offset=0, num_local=0, route_fast=False):
     ws = ctx["ws16"] if x.shape[0] > 8 else ctx["ws"]
     return _trtllm().k3_moe_front(
         x, ctx["front"], ctx["bias"], RSF, ctx["inter"], GATE_CAP, LINEAR_CAP, ws.uc, ws.mc, ws.flags, ws.rank,
         ctx["world"], nvfp4_gsf=ctx["gsf"], sort_out=sort_out, sort_ctr=ctx["ctr"] if sort_out is not None else None,
-        sort_offset=offset, sort_local=num_local,
+        sort_offset=offset, sort_local=num_local, route_fast=route_fast,
     )  # fmt: skip
 
 
@@ -142,6 +144,8 @@ def check_sort(ctx):
             words = front_op.sort_layout(m, num_local)[3]
             sort_out = torch.full((words,), -7, dtype=torch.int32, device="cuda")
             out = _front(ctx, x, sort_out, offset, num_local)
+            fast_out = torch.full((words,), -7, dtype=torch.int32, device="cuda")
+            fast = _front(ctx, x, fast_out, offset, num_local, route_fast=True)
             torch.cuda.synchronize()
             group, mn_limit, perm, n_tiles, scales = front_op.sort_views(sort_out, m, num_local)
             ids, weights = out[0], out[1]
@@ -168,9 +172,12 @@ def check_sort(ctx):
                 limits_equal=nt == r_nt and torch.equal(mn_limit[:nt], r_limit[:nt]),
                 rows_as_set=rows_as_set, rows_token_order=rows_ordered,
                 weights_fp32=_same(scales, weights.float()), ctr_zero=int(ctx["ctr"].item()) == 0,
+                fast_taken=front_op.route_fast_applies(m, True),
+                fast_front_bits=all(_same(a, b) for a, b in zip(fast, out)), fast_sort_bits=_same(fast_out, sort_out),
             )  # fmt: skip
             good = all(row[k] for k in ("front_bits", "experts_equal", "limits_equal", "rows_as_set",
-                                        "rows_token_order", "weights_fp32", "ctr_zero"))  # fmt: skip
+                                        "rows_token_order", "weights_fp32", "ctr_zero", "fast_front_bits",
+                                        "fast_sort_bits"))  # fmt: skip
             row["rank"], row["good"] = ctx["rank"], bool(good)
             row["ok"] = all(ctx["comm"].allgather(bool(good)))
             results.append(row)

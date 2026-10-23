@@ -155,6 +155,25 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
     1,
     "lowm MoE on 9-16 token steps: the head, routing, NVFP4 latent and shared gate_up in k3_moe_front's 16-token build",
 )
+TRTLLM_K3LL_ROUTE_TAIL_FAST = _flag(
+    "TRTLLM_K3LL_ROUTE_TAIL_FAST",
+    0,
+    "with TRTLLM_K3LL_MOE_FRONT_SORT, steps of at most 8 tokens: k3_moe_front's route CTAs hand their ids to the "
+    "sorting CTA by st.async on an mbarrier, not a GPU-scope fence + global counter (bitwise; read at forward time, "
+    "both front builds warmed at load)",
+)
+TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16 = _flag(
+    "TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16",
+    0,
+    "lowm MoE, steps of 9-16 tokens: persistent CTAs of k3_moe_lowm_dyn (0: one per SM; read at forward time, 0, "
+    "136 and the launch value warmed at load)",
+)
+TRTLLM_K3LL_MOE_LOWM_SPLIT32 = _flag(
+    "TRTLLM_K3LL_MOE_LOWM_SPLIT32",
+    0,
+    "lowm MoE, steps of 17-32 tokens: the routed experts as k3_moe_lowm's FC1 + FC2 kernels after an output memset "
+    "instead of k3_moe_lowm_dyn (same partials, read at forward time, both warmed at load)",
+)
 TRTLLM_K3LL_KDA_BFA_GEMV = _flag(
     "TRTLLM_K3LL_KDA_BFA_GEMV",
     1,

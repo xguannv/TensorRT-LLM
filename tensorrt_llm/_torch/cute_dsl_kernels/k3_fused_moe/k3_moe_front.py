@@ -48,6 +48,10 @@
 # so no count sits on the role CTAs' output path. With `publish`, per-token ready words as route_quant_ag's.
 # With `sort`, each route CTA also writes its token's weights in fp32 and counts itself in on sort_ctr; the last one
 # runs moe_sort of every token's routing over this rank's local experts (`_sort_local`) and rearms the counter.
+# With `route_fast` (the sort; every route CTA in role cluster 0: M <= SPLIT) the ids travel over distributed shared
+# memory instead: token 0's route CTA arms an mbarrier for M * 16 ids before the cluster forms, every route CTA
+# st.async-es its 16 ids into that CTA's s_sids completing the barrier by bytes, and token 0's route CTA waits on it
+# and sorts from shared memory. No GPU-scope fence, no global counter, no reload of the ids; the same outputs.
 #
 # Warps of a GEMV CTA: 0 weight TMA (+ early dependent trigger), 1 grid-dependency wait, head workspace flags,
 # activation TMA, 2 TMEM allocation + MMA, 3 idle, 4-7 epilogue, 8-13 exit after setup. Role CTAs: all 14 warps
@@ -279,6 +283,20 @@ def _st_async_v4_f32(dst, a, b, c, d, mbar, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _st_async_b32(dst, value, mbar, *, loc=None, ip=None):
+    """st.async of one 32-bit word to a shared::cluster address, completing ``mbar`` (shared::cluster) by 4 bytes."""
+    from cutlass._mlir.dialects import llvm as _llvm
+
+    _llvm.inline_asm(
+        None,
+        [cutlass.Int32(dst).ir_value(loc=loc, ip=ip), cutlass.Int32(value).ir_value(loc=loc, ip=ip),
+         cutlass.Int32(mbar).ir_value(loc=loc, ip=ip)],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [$0], $1, [$2];", "r,r,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+@dsl_user_op
 def _test_wait_cluster(mbar, parity, *, loc=None, ip=None):
     """mbarrier.test_wait.parity.acquire.cluster on a barrier of this CTA (``mbar``, its shared-memory pointer): whether
     phase ``parity`` has completed, acquiring at cluster scope. The barrier is completed by other CTAs' st.async, whose
@@ -443,18 +461,31 @@ def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
 
 @cute.jit
 def _sort_local(
-    s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx, m_max: cutlass.Constexpr[int]
+    s_key,
+    topk_ids,
+    sort_words,
+    num_tokens,
+    offset,
+    num_local,
+    tx,
+    m_max: cutlass.Constexpr[int],
+    s_ids,
+    ids_in_smem: cutlass.Constexpr[bool],
 ):
     """moe_sort of the M tokens' top-16 over the local experts [offset, offset + num_local), 128-row tiles, by all
     THREADS threads of one CTA, into ``sort_words`` (`sort_layout`): one tile per local expert some token selected, in
-    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order."""
+    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order. The ids come from
+    ``topk_ids`` (global), or with ``ids_in_smem`` from this CTA's ``s_ids`` (the route tail's st.async exchange)."""
     SORT_BITS, SORT_UNION, SORT_PREFIX = sort_scratch(m_max)
     n = num_tokens * cutlass.Int32(TOP_K)
     tiles = cutlass.min(n, num_local)
     w0 = (cutlass.Int32(2) * tiles + cutlass.Int32(4)) // cutlass.Int32(4) * cutlass.Int32(4)
     p0 = w0 + n
     if tx < n:
-        s_key.store(topk_ids.load(idx=tx, is_volatile=True), idx=SORT_IDS + tx)
+        if cutlass.const_expr(ids_in_smem):
+            s_key.store(s_ids.load(idx=tx), idx=SORT_IDS + tx)
+        else:
+            s_key.store(topk_ids.load(idx=tx, is_volatile=True), idx=SORT_IDS + tx)
     cute.arch.barrier()
     if tx < num_tokens * cutlass.Int32(SORT_WORDS):
         t = tx // cutlass.Int32(SORT_WORDS)
@@ -682,6 +713,7 @@ def k3_moe_front_kernel(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    route_fast: cutlass.Constexpr[bool],
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (2 per token).
     MMA_N_ = m_max
@@ -771,6 +803,19 @@ def k3_moe_front_kernel(
     )
     s_win = cutlass.Array(cutlass.Int32, TOP_K, space=cutlass.AddressSpace.smem, alignment=16)
     s_wsig = cutlass.Array(cutlass.Float32, TOP_K, space=cutlass.AddressSpace.smem, alignment=16)
+    # route_fast: every token's 16 ids, pushed into token 0's route CTA, and the barrier their bytes complete (the
+    # other builds allocate neither). The host builds it only with the sort, without publish, at m_max <= SPLIT.
+    s_sids = None
+    sids_full = None
+    if cutlass.const_expr(route_fast):
+        s_sids = cutlass.Array(
+            cutlass.Int32, M_MAX * TOP_K, space=cutlass.AddressSpace.smem, alignment=16
+        )
+        sids_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+        if (role_or_gemv == cutlass.Int32(0)) & (crank == cutlass.Int32(0)) & (tx == 0):
+            # Expected before the cluster forms, so before any peer's st.async.
+            prims.mbarrier_init(sids_full, 1)
+            prims.mbarrier_arrive_expect_tx(sids_full, num_tokens * cutlass.Int32(TOP_K * 4))
 
     if is_gemv:
         if warp_id == 0:
@@ -1338,8 +1383,16 @@ def k3_moe_front_kernel(
                                         (cutlass.Int32(weight_bits) & cutlass.Int32(0xFFFF)) << 16,
                                         idx=w_off + out,
                                     )
-                                    # The last route CTA reads these ids.
-                                    cute.arch.fence_acq_rel_gpu()
+                                    if cutlass.const_expr(route_fast):
+                                        # The id into token 0's route CTA (cluster rank 0), completing its barrier.
+                                        _st_async_b32(
+                                            _mapa_u32(s_sids.subview(out).data_ptr(), 0),
+                                            expert,
+                                            _mapa_u32(sids_full.data_ptr(), 0),
+                                        )
+                                    else:
+                                        # The last route CTA reads these ids.
+                                        cute.arch.fence_acq_rel_gpu()
                                 if cutlass.const_expr(publish):
                                     cute.arch.fence_acq_rel_gpu()
                             if cutlass.const_expr(publish):
@@ -1350,7 +1403,24 @@ def k3_moe_front_kernel(
                                     )
                     # Pass 0's readers of the keys and of the selection's scratch are done before pass 1 rewrites them.
                     cute.arch.barrier()
-                if cutlass.const_expr(sort):
+                if cutlass.const_expr(route_fast):
+                    # Token 0's route CTA sorts once every route CTA's ids have landed in its s_sids.
+                    if tok == cutlass.Int32(0):
+                        while not _test_wait_cluster(sids_full.data_ptr(), 0):
+                            pass
+                        _sort_local(
+                            s_key,
+                            topk_ids,
+                            sort_words,
+                            num_tokens,
+                            sort_offset,
+                            sort_local,
+                            tx,
+                            m_max,
+                            s_sids,
+                            True,
+                        )
+                elif cutlass.const_expr(sort):
                     # The last route CTA to finish sorts every token's routing over the local experts.
                     if tx == 0:
                         s_cnt.store(
@@ -1367,6 +1437,8 @@ def k3_moe_front_kernel(
                             sort_local,
                             tx,
                             m_max,
+                            s_key,
+                            False,
                         )
                         if tx == 0:
                             sort_ctr.store(cutlass.Int32(0), idx=0)
@@ -1524,6 +1596,7 @@ def k3_moe_front(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    route_fast: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1534,7 +1607,7 @@ def k3_moe_front(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
         quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
         sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort, m_max,
+        linear_cap, publish, head_half, nvfp4, sort, m_max, route_fast,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),
