@@ -3082,8 +3082,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
         rows = ag.shape[0]
         # TRTLLM_K3LL_MLA_KV_SIDE: the latent row and KV append read only ag's kv half and the step's positions, so
         # they go on their own stream from here, beside the query path, and the main stream joins them before the
-        # split read (before anything after this point that reads the KV pages).
-        kv_side = bool(_flags.TRTLLM_K3LL_MLA_KV_SIDE)
+        # split read (before anything after this point that reads the KV pages). Steps of 1 to
+        # decode_mla_q.KV_SIDE_MAX_REQUESTS requests only.
+        kv_side = bool(_flags.TRTLLM_K3LL_MLA_KV_SIDE) and _decode_mla_q.kv_side_applies(
+            metadata.num_generations
+        )
         if kv_side:
             self._kv_side.mark(do_multi_stream())
         quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(

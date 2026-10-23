@@ -56,6 +56,16 @@ def side_stream(device: torch.device) -> torch.cuda.Stream:
 
 _KV_STREAMS: Dict[int, torch.cuda.Stream] = {}
 
+# TRTLLM_K3LL_MLA_KV_SIDE applies to decode steps of 1 to KV_SIDE_MAX_REQUESTS requests; from 5 requests the latent row
+# and the KV append run in order on the main stream (the side stream measured slower at 8 requests).
+KV_SIDE_MAX_REQUESTS = 4
+
+
+def kv_side_applies(requests: int) -> bool:
+    """``TRTLLM_K3LL_MLA_KV_SIDE``: whether a decode step of ``requests`` requests puts the latent row and the KV append
+    on `kv_side_stream` (1 to `KV_SIDE_MAX_REQUESTS`)."""
+    return 1 <= requests <= KV_SIDE_MAX_REQUESTS
+
 
 def kv_side_stream(device: torch.device) -> torch.cuda.Stream:
     """``TRTLLM_K3LL_MLA_KV_SIDE``: one stream per device for the latent row and the KV append, shared by every MLA

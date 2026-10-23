@@ -254,7 +254,8 @@ TRTLLM_K3LL_MLA_KV_SIDE = _flag(
     "Helix all-head MLA decode (HELIX_Q_ABSORB): the latent row and the KV append (mla_latent, mla_rope_generation "
     "with q_rope_applied) on their own side stream from right after the fused q_a / kv_a, beside the query path "
     "(q_a norm, q_b, K3MlaQAbsorb); the main stream joins it before the split read, so every later reader of the "
-    "KV pages runs after the append (same kernels and bytes; read at forward time)",
+    "KV pages runs after the append (same kernels and bytes; read at forward time). Decode steps of 1 to 4 requests "
+    "only (decode_mla_q.KV_SIDE_MAX_REQUESTS); from 5 requests the main stream runs them in order as with 0",
 )
 TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
     "TRTLLM_K3LL_MLA_DECODE_PDL",

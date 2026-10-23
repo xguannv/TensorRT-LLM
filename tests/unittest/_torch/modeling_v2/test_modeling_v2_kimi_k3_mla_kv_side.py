@@ -15,7 +15,8 @@
 """``TRTLLM_K3LL_MLA_KV_SIDE`` (``kimi_k3_nvfp4/flags.py``): in the Helix all-head MLA decode, the latent row and the KV
 append on their own stream (``decode_mla_q.kv_side_stream``) beside the query path, joined by the main stream before
 the split read. One GPU, ``K3DecodeMLA._quantized_decode`` on the stand-in module of
-``test_modeling_v2_kimi_k3_mla_q_switches`` at the trunk defaults, 8 / 16 / 32 rows.
+``test_modeling_v2_kimi_k3_mla_q_switches`` at the trunk defaults, 8 / 16 / 32 rows (1 / 2 / 4 requests); 40 / 64 rows
+(5 / 8 requests) for the request-count bound.
 
 The stand-in cache kernel here also appends: it writes the latent row into a page buffer that stands in for the KV
 pages, after a ~20 us device sleep, so a reader that is not ordered after the append sees the old pages.
@@ -26,6 +27,8 @@ pages, after a ~20 us device sleep, so a reader that is not ordered after the ap
 * the pages read right after the layer: the layer and a copy of the pages captured in one CUDA graph (side stream on),
   replayed with new inputs, gives the off arm's eager pages bit for bit (the append completes before every later
   reader on the main stream, not just the split read);
+* from 5 requests (``decode_mla_q.KV_SIDE_MAX_REQUESTS`` is 4) the switch at 1 runs the cache kernel on the main
+  stream, and the output, records and pages equal the switch at 0 bit for bit;
 * the instrument fires: with the main stream's join removed, the same eager read right after the layer sees pages
   that differ from the appended ones (so the check above would catch a missing join).
 """
@@ -45,6 +48,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 ROWS = (8, 16, 32)
+ROWS_ABOVE = (40, 64)
 REPLAYS = 2
 SLEEP_CYCLES = 40_000  # ~20 us at GB300 clocks
 # Negative control: ~25 ms, longer than the main stream's eager launches of the rest of the layer, so the append
@@ -95,7 +99,7 @@ def mla():
     torch.manual_seed(0)
     qs = _qs()
     module = qs._standin(qs._random_weights(torch.Generator(device="cuda").manual_seed(1234)))
-    module.mqa = _PagingBackend(module.mqa, max(ROWS))
+    module.mqa = _PagingBackend(module.mqa, max(ROWS + ROWS_ABOVE))
     return module
 
 
@@ -181,6 +185,36 @@ def test_pages_read_after_the_layer_graph_replay(mla, monkeypatch, rows):
         ref, _, _, ref_pages, _ = _arm(mla, monkeypatch, 0, x.clone(), meta)
         assert _bits(replayed_out, ref)
         assert _bits(replayed_pages, ref_pages) and bool(ref_pages[:rows].abs().sum() > 0)
+
+
+def test_kv_side_applies_to_one_to_four_requests():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_mla_q,
+    )
+
+    assert decode_mla_q.KV_SIDE_MAX_REQUESTS == 4
+    assert [n for n in range(0, 10) if decode_mla_q.kv_side_applies(n)] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("rows", ROWS_ABOVE)
+def test_kv_side_main_stream_from_five_requests(mla, monkeypatch, rows):
+    """5 and 8 requests with the switch at 1: the cache kernel stays on the main stream (no side stream, no join), and
+    everything equals the switch at 0."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_mla_q,
+    )
+
+    qs = _qs()
+    meta = qs._meta(rows)
+    assert not decode_mla_q.kv_side_applies(meta.num_generations)
+    x = qs._x(rows, 50 + rows)
+    off, off_rope, off_split, off_pages, off_streams = _arm(mla, monkeypatch, 0, x, meta)
+    on, on_rope, on_split, on_pages, on_streams = _arm(mla, monkeypatch, 1, x, meta)
+    side = decode_mla_q.kv_side_stream(x.device)
+    assert on_streams == off_streams and len(on_streams) == 1 and on_streams[0] != side
+    assert _bits(on, off)
+    assert _bits(on_rope[1], off_rope[1]) and _bits(on_split[1], off_split[1])
+    assert _bits(on_pages, off_pages) and bool(on_pages[:rows].abs().sum() > 0)
 
 
 def test_missing_join_is_seen(mla, monkeypatch):
