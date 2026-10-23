@@ -162,6 +162,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         emit_softmax_stats: bool = False,
         use_pdl: bool = False,
         var_split_bounded: bool = False,
+        var_split_direct: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -216,6 +217,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ``reducer_max_splits``, so a reducer capacity below the generic
             ``MAX_SPLITS`` is allowed.
         :type var_split_bounded: bool
+        :param var_split_direct: With ``is_var_split_kv`` (fixed query
+            lengths): a request whose ``block_split_kvs`` count is 1 writes
+            its final output, LSE and Helix statistics from the split kernel's
+            epilogue, as the ``split_kv == 1`` kernel does, and the reduction
+            skips it (the same values: a one-split reduction is the identity).
+        :type var_split_direct: bool
         """
 
         self.latent_dim = 512
@@ -241,6 +248,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 "variable split-KV requires the generic reducer capacity "
                 f"of {MAX_SPLITS}, got {reducer_max_splits}")
         self.reducer_max_splits = reducer_max_splits
+        if var_split_direct and (not is_var_split_kv or is_var_q):
+            raise ValueError(
+                "var_split_direct needs variable split-KV and fixed query "
+                "lengths")
+        self.var_split_direct = var_split_direct
         # ``seq_len_q`` is the compile-time query capacity.  Fixed-query
         # specializations use it as the request length; variable-query
         # specializations obtain each request's actual length from its indptr.
@@ -2002,6 +2014,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         tiled_mma_pv=tiled_mma_pv,
                         p_cor_pipeline=p_cor_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
+                        direct=(block_split_kvs[blk_coord[2]] == 1
+                                if cutlass.const_expr(self.var_split_direct)
+                                else False),
                     )
                     if cutlass.const_expr(self.emit_softmax_stats):
                         compute_epilogue_params = SimpleNamespace(
@@ -2076,6 +2091,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         q_begin = cutlass.Int32(0)
         q_len = cutlass.Int32(self.seq_len_q)
         is_active = True
+        if cutlass.const_expr(self.var_split_direct):
+            # a one-split request wrote its final output from the split kernel
+            is_active = block_split_kvs[bidz] > 1
         if cutlass.const_expr(self.is_var_q):
             q_begin, q_len, _ = get_variable_query_tile_info(
                 self.num_heads,
@@ -4178,103 +4196,118 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # FP8 PV commits each D tile separately; consume every pipeline entry.
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
-            # tmem load tiled copy and partition results.
-            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
-                self._tmem_load_partition(common_params,
-                                          common_params.tiled_mma_pv, iter_n))
-
-            # load o
-            cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
-
-            # apply output scale and normalize by row_sum
-            for i in cutlass.range(cute.size(tTR_rAcc),
-                                   vectorize=True,
-                                   unroll_full=True):
-                tTR_rAcc[i] = (tTR_rAcc[i] * epilogue_params.output_scale *
-                               cute.arch.rcp_approx(row_sum))
-
-            # store o to global memory
-            tR2G_rO_src = None
-            tR2G_rO_dst = tTR_gO
-            if cutlass.const_expr(common_params.mAccO is None):
-                tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-                # using final output dtype for o
-                tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
-            else:
-                # using accumulate dtype for o
-                tR2G_rO_src = tTR_rAcc
-
-            if cute.elem_less(tTR_cO[0][0], common_params.H):
-                cute.autovec_copy(
-                    tR2G_rO_src,
-                    tR2G_rO_dst,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.
-                    NO_ALLOCATE,
-                )
-
-            # store the lse to global memory
-            cta_pv_tiler = (
-                self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
-                self.mma_pv_tiler[1],
-                self.mma_pv_tiler[2],
-            )
-            gLSE = None
-            cLSE = None
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                if cutlass.const_expr(self.is_var_q):
-                    request_lse = cute.domain_offset(
-                        (common_params.q_begin * self.num_heads, 0, 0),
-                        epilogue_params.mLSE,
-                    )
-                    request_cta_m = (
-                        common_params.blk_coord[1] * self.cluster_shape_mnk[0] +
-                        common_params.blk_coord[0])
-                    gLSE = cute.local_tile(
-                        request_lse,
-                        (cta_pv_tiler[0], 1, 1),
-                        (
-                            request_cta_m,
-                            0,
-                            0,
-                        ),
-                        (1, 1, 1),
-                    )
-                    cLSE = cute.local_tile(
-                        cute.make_identity_tensor((self.mma_qk_tiler[0], 1, 1)),
-                        (cta_pv_tiler[0], 1, 1),
-                        (
-                            common_params.blk_coord[0],
-                            0,
-                            0,
-                        ),
-                        (1, 1, 1),
-                    )
+            if cutlass.const_expr(self.var_split_direct
+                                  and common_params.mAccO is not None):
+                # var_split_direct: a request split one way writes the final
+                # output, LSE and statistics here (as the split_kv == 1
+                # kernel does); the reduction skips it.
+                if common_params.direct:
+                    final_common_params = SimpleNamespace(**vars(common_params))
+                    final_common_params.mAccO = None
+                    final_epilogue_params = SimpleNamespace(
+                        **vars(epilogue_params))
+                    final_epilogue_params.mAccLSE = None
+                    self._epilogue_tile(final_common_params,
+                                        final_epilogue_params, iter_n, tidx,
+                                        row_sum, row_max)
                 else:
-                    gLSE = cute.local_tile(
-                        epilogue_params.mLSE,
-                        (cta_pv_tiler[0], 1, 1),
-                        (
-                            common_params.blk_coord[0],
-                            common_params.blk_coord[1],
-                            common_params.blk_coord[2],
-                        ),
-                        (1, 1, 1),
-                    )
-                    cLSE = cute.local_tile(
-                        cute.make_identity_tensor(epilogue_params.mLSE.shape),
-                        (cta_pv_tiler[0], 1, 1),
-                        (
-                            common_params.blk_coord[0],
-                            common_params.blk_coord[1],
-                            common_params.blk_coord[2],
-                        ),
-                        (1, 1, 1),
-                    )
+                    self._epilogue_tile(common_params, epilogue_params, iter_n,
+                                        tidx, row_sum, row_max)
+            else:
+                self._epilogue_tile(common_params, epilogue_params, iter_n,
+                                    tidx, row_sum, row_max)
+            cute.arch.fence_view_async_tmem_load()
+            common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
+            mma_o_consumer_state.advance()
 
+        return mma_o_consumer_state
+
+    @cute.jit
+    def _epilogue_tile(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        iter_n: cutlass.Constexpr[int],
+        tidx: cutlass.Int32,
+        row_sum: cutlass.Float32,
+        row_max: cutlass.Float32,
+    ):
+        """One D tile of the epilogue: the normalized output tile to the
+        final output (``common_params.mAccO`` None) or to the split
+        workspace, and the LSE (and Helix statistics) likewise."""
+        # tmem load tiled copy and partition results.
+        tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
+            self._tmem_load_partition(common_params, common_params.tiled_mma_pv,
+                                      iter_n))
+
+        # load o
+        cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+
+        # apply output scale and normalize by row_sum
+        for i in cutlass.range(cute.size(tTR_rAcc),
+                               vectorize=True,
+                               unroll_full=True):
+            tTR_rAcc[i] = (tTR_rAcc[i] * epilogue_params.output_scale *
+                           cute.arch.rcp_approx(row_sum))
+
+        # store o to global memory
+        tR2G_rO_src = None
+        tR2G_rO_dst = tTR_gO
+        if cutlass.const_expr(common_params.mAccO is None):
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
+            # using final output dtype for o
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+        else:
+            # using accumulate dtype for o
+            tR2G_rO_src = tTR_rAcc
+
+        if cute.elem_less(tTR_cO[0][0], common_params.H):
+            cute.autovec_copy(
+                tR2G_rO_src,
+                tR2G_rO_dst,
+                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+            )
+
+        # store the lse to global memory
+        cta_pv_tiler = (
+            self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
+            self.mma_pv_tiler[1],
+            self.mma_pv_tiler[2],
+        )
+        gLSE = None
+        cLSE = None
+        if cutlass.const_expr(epilogue_params.mAccLSE is None):
+            if cutlass.const_expr(self.is_var_q):
+                request_lse = cute.domain_offset(
+                    (common_params.q_begin * self.num_heads, 0, 0),
+                    epilogue_params.mLSE,
+                )
+                request_cta_m = (
+                    common_params.blk_coord[1] * self.cluster_shape_mnk[0] +
+                    common_params.blk_coord[0])
+                gLSE = cute.local_tile(
+                    request_lse,
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        request_cta_m,
+                        0,
+                        0,
+                    ),
+                    (1, 1, 1),
+                )
+                cLSE = cute.local_tile(
+                    cute.make_identity_tensor((self.mma_qk_tiler[0], 1, 1)),
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        0,
+                        0,
+                    ),
+                    (1, 1, 1),
+                )
             else:
                 gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[None, common_params.blk_coord[3],
-                                            None, None],
+                    epilogue_params.mLSE,
                     (cta_pv_tiler[0], 1, 1),
                     (
                         common_params.blk_coord[0],
@@ -4284,10 +4317,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     (1, 1, 1),
                 )
                 cLSE = cute.local_tile(
-                    cute.make_identity_tensor(
-                        epilogue_params.mAccLSE[None,
-                                                common_params.blk_coord[3],
-                                                None, None].shape),
+                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
                     (cta_pv_tiler[0], 1, 1),
                     (
                         common_params.blk_coord[0],
@@ -4296,52 +4326,68 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     ),
                     (1, 1, 1),
                 )
-            # row_sum carries the 2^P_EXP2_BIAS of the softmax's probabilities
-            lse = (cute.math.log2(row_sum, fastmath=True) - P_EXP2_BIAS +
-                   epilogue_params.softmax_scale_log2 * row_max)
-            if cutlass.const_expr(self.warps_in_n == 2):
-                if cute.elem_less(cLSE[tidx][0], common_params.H):
-                    has_local_kv = True
-                    if cutlass.const_expr(common_params.kv_bounds is not None):
+
+        else:
+            gLSE = cute.local_tile(
+                epilogue_params.mAccLSE[None, common_params.blk_coord[3], None,
+                                        None],
+                (cta_pv_tiler[0], 1, 1),
+                (
+                    common_params.blk_coord[0],
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ),
+                (1, 1, 1),
+            )
+            cLSE = cute.local_tile(
+                cute.make_identity_tensor(
+                    epilogue_params.mAccLSE[None, common_params.blk_coord[3],
+                                            None, None].shape),
+                (cta_pv_tiler[0], 1, 1),
+                (
+                    common_params.blk_coord[0],
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ),
+                (1, 1, 1),
+            )
+        # row_sum carries the 2^P_EXP2_BIAS of the softmax's probabilities
+        lse = (cute.math.log2(row_sum, fastmath=True) - P_EXP2_BIAS +
+               epilogue_params.softmax_scale_log2 * row_max)
+        if cutlass.const_expr(self.warps_in_n == 2):
+            if cute.elem_less(cLSE[tidx][0], common_params.H):
+                has_local_kv = True
+                if cutlass.const_expr(common_params.kv_bounds is not None):
+                    flat_q_row = (
+                        common_params.blk_coord[1] * self.mma_qk_tiler[0] +
+                        cLSE[tidx][0])
+                    k_bound = self.get_query_kv_bound(common_params, flat_q_row)
+                    has_local_kv = k_bound > 0
+                gLSE[tidx] = lse
+                if cutlass.const_expr(self.emit_softmax_stats
+                                      and epilogue_params.mAccLSE is None
+                                      and iter_n == 0):
+                    if cutlass.const_expr(self.is_var_q):
                         flat_q_row = (
+                            common_params.q_begin * self.num_heads +
                             common_params.blk_coord[1] * self.mma_qk_tiler[0] +
                             cLSE[tidx][0])
-                        k_bound = self.get_query_kv_bound(
-                            common_params, flat_q_row)
-                        has_local_kv = k_bound > 0
-                    gLSE[tidx] = lse
-                    if cutlass.const_expr(self.emit_softmax_stats
-                                          and epilogue_params.mAccLSE is None
-                                          and iter_n == 0):
-                        if cutlass.const_expr(self.is_var_q):
-                            flat_q_row = (
-                                common_params.q_begin * self.num_heads +
-                                common_params.blk_coord[1] *
-                                self.mma_qk_tiler[0] + cLSE[tidx][0])
-                            epilogue_params.mSoftmaxStats[
-                                flat_q_row, 0, 0,
-                                0] = (lse / LOG2_E
-                                      if has_local_kv else -self.lse_dtype.inf)
-                            epilogue_params.mSoftmaxStats[
-                                flat_q_row, 0, 0,
-                                1] = 1.0 if has_local_kv else 0.0
-                        else:
-                            head_idx = cLSE[tidx][0]
-                            epilogue_params.mSoftmaxStats[
-                                head_idx, common_params.blk_coord[1],
-                                common_params.blk_coord[2],
-                                0] = (lse / LOG2_E
-                                      if has_local_kv else -self.lse_dtype.inf)
-                            epilogue_params.mSoftmaxStats[
-                                head_idx, common_params.blk_coord[1],
-                                common_params.blk_coord[2],
-                                1] = 1.0 if has_local_kv else 0.0
-
-            cute.arch.fence_view_async_tmem_load()
-            common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
-            mma_o_consumer_state.advance()
-
-        return mma_o_consumer_state
+                        epilogue_params.mSoftmaxStats[flat_q_row, 0, 0, 0] = (
+                            lse /
+                            LOG2_E if has_local_kv else -self.lse_dtype.inf)
+                        epilogue_params.mSoftmaxStats[
+                            flat_q_row, 0, 0, 1] = 1.0 if has_local_kv else 0.0
+                    else:
+                        head_idx = cLSE[tidx][0]
+                        epilogue_params.mSoftmaxStats[
+                            head_idx, common_params.blk_coord[1],
+                            common_params.blk_coord[2],
+                            0] = (lse / LOG2_E
+                                  if has_local_kv else -self.lse_dtype.inf)
+                        epilogue_params.mSoftmaxStats[
+                            head_idx, common_params.blk_coord[1],
+                            common_params.blk_coord[2],
+                            1] = 1.0 if has_local_kv else 0.0
 
     def make_and_init_load_qkv_pipeline(self, load_qkv_mbar_ptr,
                                         cta_layout_vmnk, load_stages,

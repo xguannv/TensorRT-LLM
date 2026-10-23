@@ -11957,6 +11957,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # decode, scalar split): not tunable, not part of any cache key.
         _IS_VAR_SEQ = True
         _IS_VAR_SPLIT_KV = False
+        # With the optional block_split_kvs input: a request split one way
+        # writes its final output from the split kernel and the reduction
+        # skips it (``var_split_direct``; the same values).
+        _VAR_SPLIT_DIRECT = True
         _SKIP_CORRECTION_THRESHOLD = 0.0
 
         _WORKSPACE_ALIGN = 128
@@ -12501,7 +12505,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
                 kv_bounds is not None,
             ) + ((True, ) if self.use_pdl else
-                 ()) + (("var_split", ) if block_split_kvs is not None else ())
+                 ()) + (("var_split", self._VAR_SPLIT_DIRECT)
+                        if block_split_kvs is not None else ())
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
                 # for seconds -- always log enough to identify the variant.
@@ -12534,7 +12539,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         "use_pdl": True
                     } if self.use_pdl else {}),
                     **({
-                        "var_split_bounded": True
+                        "var_split_bounded": True,
+                        "var_split_direct": self._VAR_SPLIT_DIRECT,
                     } if block_split_kvs is not None else {}),
                 )
                 q_latent_ct = cute.runtime.from_dlpack(

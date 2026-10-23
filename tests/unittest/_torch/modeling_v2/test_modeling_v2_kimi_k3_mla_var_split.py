@@ -28,7 +28,10 @@ on the rank, and equal lengths:
   identity; against fp32 attention x fp32 W_UV (the whole sequence on one rank) within ``FP32_OVER_OFF`` of the
   switch-off error;
 * the counts and the split read captured in one CUDA graph, replayed with new queries and shorter lengths: bit for bit
-  the eager switch-on call.
+  the eager switch-on call;
+* above 32 rows (the op's own split read and reduction): a request split one way written from the split kernel's
+  epilogue (``var_split_direct``) is bit for bit the one-split partial + reduction of the same counts (output latent,
+  V rows, statistics of every row with keys on the rank).
 """
 
 import os
@@ -184,10 +187,10 @@ def test_on_close_to_off(name):
     torch.cuda.synchronize()
     new = (set(mla_v_up._compiled) | set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)) - before
     counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q.shape[1])
-    if int(counts.max()) > 1 and not any(k[-1] == "var_split" for k in new):
+    if int(counts.max()) > 1 and not any("var_split" in k for k in new):
         # a variant may already be compiled by an earlier test; then it must exist in a cache
         assert any(
-            k[-1] == "var_split"
+            "var_split" in k
             for k in set(mla_v_up._compiled) | set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
         ), "no variable-split variant compiled"
     keyless = _keyless(plan, q.shape[1])
@@ -278,3 +281,31 @@ def test_graph_replay(name):
         )
         assert torch.equal(replayed_stats[keyed], s_eager[keyed]), (name, seed)
     plan.cache_seqs.copy_(full)
+
+
+@pytest.mark.parametrize("name", ["bs8_64rows_agentx", "bs8_equal"])
+def test_direct_equals_one_split_reduction(name, monkeypatch):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    vu, dcp, _, pool, _, _, q, plan = _setup(CASES[name])
+    w, _, _ = vu._w_uv(1, q.device)
+    counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q.shape[1])
+    assert 1 in counts.tolist() and q.shape[0] * q.shape[1] > 32
+    outs = {}
+    for direct in (False, True):
+        monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_VAR_SPLIT_DIRECT", direct)
+        run = _Run(vu, dcp, q, pool, plan, w, True)
+        v, stats = run()
+        torch.cuda.synchronize()
+        outs[direct] = (run.latent.clone(), v.clone(), stats.clone())
+    keyed = ~plan.empty.to(q.device)
+    rows = q.shape[0] * q.shape[1]
+    lat0, v0, s0 = outs[False]
+    lat1, v1, s1 = outs[True]
+    lat0, lat1 = lat0.view(rows, vu.HEADS, vu.LATENT), lat1.view(rows, vu.HEADS, vu.LATENT)
+    print(
+        f"[{name}] splits {counts.tolist()}: {int(keyed.sum())} of {rows} rows with keys compared"
+    )
+    assert torch.equal(lat1[keyed].view(torch.int16), lat0[keyed].view(torch.int16))
+    assert torch.equal(v1[keyed].view(torch.int16), v0[keyed].view(torch.int16))
+    assert torch.equal(s1[keyed], s0[keyed])
