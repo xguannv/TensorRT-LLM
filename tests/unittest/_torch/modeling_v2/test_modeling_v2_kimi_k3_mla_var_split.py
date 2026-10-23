@@ -148,6 +148,9 @@ def test_counts(name):
     batch, q_len = q.shape[:2]
     budget, grid = dcp._var_split_envelope(batch, vu.HEADS, q_len)
     counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q_len)
+    if batch < dcp._VAR_SPLIT_MIN_BATCH:  # the static split, no counts
+        assert counts is None and dcp.var_split_grid(batch, vu.HEADS, q_len) == 0
+        return
     assert counts is not None and dcp.var_split_grid(batch, vu.HEADS, q_len) == grid > 1
     got = counts.tolist()
     assert all(1 <= c <= grid for c in got) and sum(got) <= budget
@@ -162,7 +165,7 @@ def test_counts(name):
 @pytest.mark.parametrize("batch", range(1, 9))
 def test_counts_random(batch):
     """The one-kernel selection against the python reference on random per-rank lengths (0 included: a request
-    with no page on the rank), 200 batches per size."""
+    with no page on the rank), 200 batches per size; below ``_VAR_SPLIT_MIN_BATCH`` requests, no counts."""
     vu = _vu()
     dcp = vu._mods()[0]
     budget, grid = dcp._var_split_envelope(batch, vu.HEADS, 8)
@@ -171,6 +174,9 @@ def test_counts_random(batch):
         lens = torch.randint(0, 40000, (batch,), generator=g)
         lens[torch.rand(batch, generator=g) < 0.1] = 0
         counts = dcp.var_split_counts(lens.to(torch.int32).cuda(), vu.HEADS, 8)
+        if batch < dcp._VAR_SPLIT_MIN_BATCH:
+            assert counts is None
+            continue
         assert counts is not None and counts.dtype == torch.int32
         assert counts.tolist() == _ref_counts(lens.tolist(), budget, grid), lens.tolist()
 
@@ -203,6 +209,13 @@ def test_on_close_to_off(name):
     torch.cuda.synchronize()
     new = (set(mla_v_up._compiled) | set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)) - before
     counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q.shape[1])
+    if (
+        counts is None
+    ):  # below _VAR_SPLIT_MIN_BATCH: the switch-on call is the static split, bit for bit
+        assert torch.equal(v_on.view(torch.int16), v_off.view(torch.int16)) and torch.equal(
+            s_on, s_off
+        )
+        return
     if int(counts.max()) > 1 and not any("var_split" in k for k in new):
         # a variant may already be compiled by an earlier test; then it must exist in a cache
         assert any(
@@ -258,7 +271,7 @@ def test_on_against_fp32(seq_lens):
 
     e_on, e_off = err(v_on), err(v_off)
     print(
-        f"[fp32 ref {seq_lens}] splits {dcp.var_split_counts(plan.cache_seqs, vu.HEADS, 8).tolist()}: on median "
+        f"[fp32 ref {seq_lens}] splits {dcp.var_split_counts(plan.cache_seqs, vu.HEADS, 8)}: on median "
         f"{e_on.median():.2e} max {e_on.max():.2e}; off median {e_off.median():.2e} max {e_off.max():.2e}"
     )
     assert float(e_on.max()) <= FP32_OVER_OFF * float(e_off.max())

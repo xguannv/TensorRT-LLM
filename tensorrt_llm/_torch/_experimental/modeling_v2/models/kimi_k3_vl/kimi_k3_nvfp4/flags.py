@@ -281,8 +281,8 @@ TRTLLM_K3LL_MLA_VAR_SPLIT = _flag(
     "rank (computed on device once per step, decode_mla_dcp.var_split_counts), so a batch of mixed lengths is not "
     "bound by its longest request; equal lengths keep the static split's count (not bitwise in general: the split "
     "boundaries move; read at forward time). Only the V-up split read (TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A, SM103) "
-    "takes the counts; elsewhere (SM107, or the V-up off) the split read keeps the static split and no counts are "
-    "computed",
+    "takes the counts, and only for 4 or more requests; elsewhere (SM107, the V-up off, or 1-3 requests) the split "
+    "read keeps the static split and no counts are computed",
 )
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",

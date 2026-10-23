@@ -78,6 +78,9 @@ _M_TILE = 128
 _K_TILE = 128
 #: Largest split count of one request (the fused reduction combines one split per lane).
 _MAX_VAR_SPLIT = 32
+#: Fewest requests that take per-request split counts. Below it the static split: a grid sized for the largest
+#: count launches more empty clusters than balancing two or three requests saves.
+_VAR_SPLIT_MIN_BATCH = 4
 
 
 def _var_split_envelope(batch: int, heads: int, q_len: int):
@@ -97,9 +100,10 @@ def _var_split_envelope(batch: int, heads: int, q_len: int):
 
 def var_split_grid(batch: int, heads: int, q_len: int) -> int:
     """``TRTLLM_K3LL_MLA_VAR_SPLIT``: the split count the decode grid is sized for (every request's own count is at
-    most this), or 0 where per-request splits cannot help (one split each fills the budget)."""
+    most this), or 0 where per-request splits do not apply: fewer than `_VAR_SPLIT_MIN_BATCH` requests, or one split
+    each fills the budget."""
     budget, grid = _var_split_envelope(batch, heads, q_len)
-    return grid if grid > 1 and batch <= budget else 0
+    return grid if grid > 1 and _VAR_SPLIT_MIN_BATCH <= batch <= budget else 0
 
 
 @triton.jit
@@ -143,9 +147,9 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
     the smallest largest split (``max ceil(t_b / s_b)``, then the fewest splits) whose splits fit in one wave
     (``sum s_b`` within the budget). Equal lengths get the static split's count: as many each as fit."""
     batch = cache_seqs.shape[0]
-    budget, grid = _var_split_envelope(batch, heads, q_len)
-    if not (grid > 1 and batch <= budget):
+    if var_split_grid(batch, heads, q_len) == 0:
         return None
+    budget, grid = _var_split_envelope(batch, heads, q_len)
     out = torch.empty(batch, dtype=torch.int32, device=cache_seqs.device)
     _var_split_counts_kernel[(1,)](
         cache_seqs.contiguous(),

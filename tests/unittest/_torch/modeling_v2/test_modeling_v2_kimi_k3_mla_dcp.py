@@ -261,12 +261,16 @@ def test_var_split_counts_only_for_the_v_up_split_read(monkeypatch, switch):
     )
     for layer in layers:
         split.register(layer)
-    lens = torch.tensor([153600 + q_len, 70000 + q_len], dtype=torch.int32, device=device)
+    lens = torch.tensor(
+        [597248 + q_len, 179840 + q_len, 93568 + q_len, 39488 + q_len],
+        dtype=torch.int32,
+        device=device,
+    )
     positions = (
         (lens.view(-1, 1) - q_len + torch.arange(q_len, device=device)).reshape(-1).to(torch.int32)
     )
-    meta = types.SimpleNamespace(num_generations=2, helix_position_offsets=positions)
-    local_rows = torch.arange(2 * 200, dtype=torch.int32, device=device).view(2, 200)
+    meta = types.SimpleNamespace(num_generations=4, helix_position_offsets=positions)
+    local_rows = torch.arange(4 * 600, dtype=torch.int32, device=device).view(4, 600)
     local_lens = helix_local_len_tensor(lens, PAGE, cp, rank)
 
     monkeypatch.setattr(flags, "TRTLLM_K3LL_MLA_VAR_SPLIT", switch)
@@ -283,7 +287,7 @@ def test_var_split_counts_only_for_the_v_up_split_read(monkeypatch, switch):
     split._forward_v_up = lambda q_all, pages, plan, *a: plans.append(plan)
     split._layer_inputs = lambda mqa, meta, n: (None, local_rows, 0, local_lens)
     split._layer_scales = lambda *a: (1.0, 1.0)
-    quant_q = torch.zeros(2 * q_len, HEADS, LATENT + ROPE, dtype=torch.uint8, device=device)
+    quant_q = torch.zeros(4 * q_len, HEADS, LATENT + ROPE, dtype=torch.uint8, device=device)
     w_uv = torch.zeros(1, device=device)
     gate = torch.zeros(1, device=device)
 
