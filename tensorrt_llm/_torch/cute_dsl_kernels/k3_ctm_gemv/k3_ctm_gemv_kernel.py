@@ -55,6 +55,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.cute as cute
@@ -63,6 +65,8 @@ from cutlass._mlir.dialects import llvm as _llvm
 from cutlass._mlir.extras import types as _T
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
+
+from ..blackwell import k3_lamport_ar as _lamport
 
 CTA_M = 128  # weight rows (output features) per cluster = the MMA's M
 MMA_N = 8  # token columns
@@ -168,6 +172,20 @@ def _test_wait_cluster(mbar, parity, *, loc=None, ip=None):
         )
     )  # fmt: skip
     return done != cutlass.Int32(0)
+
+
+@dsl_user_op
+def _lds_v4_b32(addr, *, loc=None, ip=None):
+    """16 bytes of shared memory (a shared::cta address) as four 32-bit words."""
+    res = _llvm.inline_asm(
+        _llvm.StructType.get_literal([_T.i32()] * 4),
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r", has_side_effects=True,
+        is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+    return tuple(
+        cutlass.Int32(_llvm.extractvalue(_T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    )
 
 
 def _bf16_rn(v):
@@ -1139,6 +1157,13 @@ def k3_ctm_gemv_long(
 # tile), so each 128-row box holds the tile's R rows and zeros (rows past R are out of bounds: the TMA fills them
 # without reading memory). Only rows < R are sent and reduced, and each thread stores its row's owned tokens with
 # plain stores. A row's sums are those of the same split without row tiles (same k-tiles per rank, same rank order).
+# All-reduce push (AR_WORLD > 0; bf16 output, 128-row tiles, no sigmoid rows): instead of the TMA store, each warp
+# stages its rows as above (the same bf16 values) and pushes them as 16-byte vectors (8 rows of one token) into the
+# Lamport slots of the next two-shot MNNVL all-reduce on a workspace (k3_lamport_ar.push_slot: token t of this rank
+# into slot (t // W, rank) of the scatter stage of owner t % W; -0 sent as +0, as the C++ kernels' scatter does).
+# The epilogue reads the workspace's rotation state after its own griddepcontrol.wait; the dependent grid (the Lamport
+# finish kernel, which reads that state as soon as it is resident) is released from the activation warp after its
+# wait, not from the weight warp at the start.
 # =============================================================================
 WIDE_TILES = (16, 32, 64)
 WIDE_SMEM_BYTES = 220 * 1024  # the ring, the x stages and the mailbox; the barriers fit in the rest
@@ -1221,6 +1246,14 @@ def k3_ctm_gemv_wide_kernel(
     row_tiles: cutlass.Constexpr[
         int
     ],  # 0: 128-row tiles; else N / row_tiles rows per tile (tensor map 4-D)
+    # 0: store y. W > 0: push into a W-rank two-shot Lamport all-reduce instead, on the workspace of peer table
+    # ar_peers (every rank's unicast address, int64 [W]), multicast address ar_mc and rotation state ar_flags
+    # (uint32 [9]), as rank ar_rank; None without the push.
+    ar_world: cutlass.Constexpr[int],
+    ar_peers: Optional[cutlass.Int64],
+    ar_mc: Optional[cutlass.Int64],
+    ar_flags: Optional[cutlass.Int64],
+    ar_rank: Optional[cutlass.Int32],
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1339,7 +1372,7 @@ def k3_ctm_gemv_wide_kernel(
                     ],
                     [],  # tile mode: no im2col offsets
                 )
-        if cutlass.const_expr(trigger_early):
+        if cutlass.const_expr(trigger_early and ar_world == 0):
             # Dependents may launch now; they wait for this whole grid before reading y.
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
         if prims.elect_sync():
@@ -1373,6 +1406,10 @@ def k3_ctm_gemv_wide_kernel(
         # into the x ring, refilled once the stage's MMAs are done.
         # =====================================================================
         prims.griddepcontrol(prims.GridDepAction.WAIT)
+        if cutlass.const_expr(ar_world > 0):
+            # The finish kernel reads the Lamport rotation state as soon as it is resident: release it only once every
+            # earlier grid (the previous call on the workspace included) has completed.
+            prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
         if prims.elect_sync():
             for i in cutlass.range_constexpr(x_ring):
                 k = rank + cutlass.Int32(i * split)
@@ -1481,6 +1518,9 @@ def k3_ctm_gemv_wide_kernel(
         lane = tx % 32
         w = warp_id - 4  # TMEM lanes 32 w .. 32 w + 31: tile rows 32 w + lane
         row = w * cutlass.Int32(LONG_ROWS_PER_WARP) + lane
+        if cutlass.const_expr(ar_world > 0):
+            # The push reads the Lamport rotation state, which the previous grids leave final.
+            prims.griddepcontrol(prims.GridDepAction.WAIT)
         while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
             pass
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1542,7 +1582,41 @@ def k3_ctm_gemv_wide_kernel(
                     )  # fmt: skip
                     for e in cutlass.range_constexpr(4):
                         totals[4 * j + e] = totals[4 * j + e] + cutlass.Float32(part[e])
-            if cutlass.const_expr(row_tiles > 0):
+            if cutlass.const_expr(ar_world > 0):
+                # All-reduce push: the warp's 32 rows staged [token][row] in bf16 as for the TMA store (the same
+                # values), then each lane pushes 16-byte vectors (8 rows of one token below M) into the Lamport slots.
+                staged = smem_b.subview(w * cutlass.Int32(LONG_ROWS_PER_WARP * owned))
+                for i in cutlass.range_constexpr(owned):
+                    staged.store(
+                        totals[i].to(io_dtype), idx=cutlass.Int32(i * LONG_ROWS_PER_WARP) + lane
+                    )
+                cute.arch.sync_warp()
+                # After this warp's griddepcontrol.wait (above): the previous call on the workspace has completed.
+                cur, _, nbytes, _, _, _, _, _ = _lamport.lamport_state(ar_flags)
+                n0 = m_offset + w * cutlass.Int32(LONG_ROWS_PER_WARP)
+                t0 = rank * cutlass.Int32(owned)
+                vecs = owned * (LONG_ROWS_PER_WARP // VEC)
+                for p in cutlass.range_constexpr((vecs + 31) // 32):
+                    # Vector vj: token vt of the staging, its 8-row chunk vc.
+                    vj = lane + cutlass.Int32(p * 32)
+                    vt = vj >> cutlass.Int32(2)
+                    vc = vj & cutlass.Int32(3)
+                    tok = t0 + vt
+                    if vj < cutlass.Int32(vecs):
+                        if tok < num_tokens:
+                            words = _lds_v4_b32(
+                                staged.subview(
+                                    vt * cutlass.Int32(LONG_ROWS_PER_WARP) + vc * cutlass.Int32(VEC)
+                                )
+                                .data_ptr()
+                                .toint()
+                            )
+                            dst = _lamport.push_slot(
+                                ar_peers, ar_mc, cur, nbytes, tok, ar_rank, n0 + vc * cutlass.Int32(VEC),
+                                ar_world, n_out, False,
+                            )  # fmt: skip
+                            _lamport.push_v4(dst, *words, False)
+            elif cutlass.const_expr(row_tiles > 0):
                 # Row tiles: this row's owned tokens below M, plain stores.
                 if row < cutlass.Int32(tile_rows):
                     n = w_tile * cutlass.Int32(tile_rows) + row
@@ -1665,9 +1739,46 @@ def k3_ctm_gemv_wide(
     clusters = row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
-        n_tile, out_fp32, trigger_early, row_tiles,
+        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None,
     ).launch(
         grid=(clusters * split, 1, 1),
+        block=(THREADS, 1, 1),
+        cluster=(split, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )  # fmt: skip
+
+
+@cute.jit
+def k3_ctm_gemv_wide_ar_push(
+    w: cute.Tensor,  # [N, K] bf16, K contiguous; N a multiple of 128
+    x: cute.Tensor,  # [M, K] bf16, K contiguous, M <= n_tile
+    x_flat: cute.Tensor,  # x as [M * K] (the kernel's unused output operand)
+    num_tokens: cutlass.Int32,
+    peer_ptrs: cutlass.Int64,
+    mc_base: cutlass.Int64,
+    flags: cutlass.Int64,
+    rank: cutlass.Int32,
+    n_out: cutlass.Constexpr[int],
+    k_in: cutlass.Constexpr[int],
+    split: cutlass.Constexpr[int],
+    ring: cutlass.Constexpr[int],
+    x_ring: cutlass.Constexpr[int],
+    n_tile: cutlass.Constexpr[int],
+    ar_world: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+) -> None:
+    """``x @ w^T`` as ``k3_ctm_gemv_wide`` computes and rounds it (bf16, 128-row tiles), pushed into the Lamport slots
+    of the next two-shot all-reduce over ``ar_world`` ranks on a workspace (``k3_lamport_ar.LamportWorkspace``
+    addresses) instead of stored."""
+    tma_desc_w = _weight_tensor_map(w, n_out, k_in)
+    tma_desc_x = _activation_tensor_map_rows(x, k_in, num_tokens, n_tile)
+    k3_ctm_gemv_wide_kernel(
+        tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
+        ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank,
+    ).launch(
+        grid=((n_out // CTA_M) * split, 1, 1),
         block=(THREADS, 1, 1),
         cluster=(split, 1, 1),
         stream=stream,

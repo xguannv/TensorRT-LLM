@@ -60,6 +60,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_para
 from . import flags as _flags
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
+from .moe_tail_push import WideTail
 
 MAX_TOKENS = 8
 # The front's 16-token build (TRTLLM_K3LL_MOE_FRONT16): a wide step of at most this many tokens.
@@ -361,7 +362,8 @@ class K3DecodeMoeNvfp4Layer:
         push: bool = False,
     ) -> Union[torch.Tensor, PendingTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
-        (a ``PendingTail``); else the reduced output. ``push`` is ignored: the latent all-reduce is always the routed
+        (a ``PendingTail``; on a wide step a tensor, or a ``WideTail`` with ``TRTLLM_K3LL_MOE_TAIL_PUSH``); else the
+        reduced output. ``push`` is ignored: the latent all-reduce is always the routed
         experts' all-reduce."""
         if hidden_states.shape[0] > MAX_TOKENS:
             return self._wide(moe, hidden_states, gemvs)
@@ -407,9 +409,13 @@ class K3DecodeMoeNvfp4Layer:
             disable_on_compile=True,
         )
 
-    def _wide(self, moe: nn.Module, hidden_states: torch.Tensor, gemvs) -> torch.Tensor:
+    def _wide(
+        self, moe: nn.Module, hidden_states: torch.Tensor, gemvs
+    ) -> Union[torch.Tensor, WideTail]:
         """A wide decode step's MoE (`MAX_TOKENS` < M <= `WIDE_MAX_TOKENS`): this rank's unreduced share of the
-        output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts."""
+        output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts. With
+        ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
+        consumer runs the tail GEMV (``moe_tail_push.py``)."""
         x = hidden_states.contiguous()
         if self.state.head16 is not None and x.shape[0] <= FRONT16_TOKENS:
             # The front's 16-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
@@ -430,10 +436,14 @@ class K3DecodeMoeNvfp4Layer:
                 float(moe.routed_expert_norm.variance_epsilon),
                 self.state.mnnvl,
             )
-            return _gemv(gemvs, "moe_tail", tail_in, self.tail_weight)
-        normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
-        parts = [normed[:, self.lo : self.lo + self.width]]
-        if self.tail_pad is not None:
-            parts.append(self.tail_pad[: x.shape[0]])
-        parts.append(shared_act)
-        return _gemv(gemvs, "moe_tail", torch.cat(parts, dim=1), self.tail_weight)
+        else:
+            normed = moe.routed_expert_norm(wide_all_reduce(moe.routed_experts.all_reduce, routed))
+            parts = [normed[:, self.lo : self.lo + self.width]]
+            if self.tail_pad is not None:
+                parts.append(self.tail_pad[: x.shape[0]])
+            parts.append(shared_act)
+            tail_in = torch.cat(parts, dim=1)
+        if _flags.TRTLLM_K3LL_MOE_TAIL_PUSH and gemvs is not None:
+            # The consumer (the next pre-attention step or the final norm) runs the GEMV, pushing where it can.
+            return WideTail(tail_in, self.tail_weight, gemvs)
+        return _gemv(gemvs, "moe_tail", tail_in, self.tail_weight)

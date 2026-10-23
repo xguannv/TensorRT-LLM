@@ -304,6 +304,22 @@ class K3OprojPush:
             return False
         if not _pushes(o_proj, rows, gated):
             return False
+        return self.finish_takes(rows, prefix_sum, block_residual, res_proj, res_norm, out_norm)
+
+    def finish_takes(
+        self,
+        rows: int,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> bool:
+        """Whether `finish_attn_res` takes a pushed call of ``rows`` tokens with these operands: one Lamport buffer
+        holds the two-shot call, and the attn_res kernel takes the prefix sum (``None``: the zero prefix), the
+        snapshots ``[S, rows, HIDDEN]`` and the weights. Shapes and load-time state only."""
+        if not 0 < rows <= MAX_TOKENS:
+            return False
         if _lamport().required_bytes(rows, HIDDEN, self.lamport.world, False) > (
             self.lamport.bytes_per_buffer
         ):
@@ -338,6 +354,24 @@ class K3OprojPush:
             x2d, o_proj.weight, o_proj.weight_scale, self.lamport, target.one_shot, gate=gate
         )
         target.pushed = True
+        return self.finish_attn_res(
+            target, prefix_sum, block_residual, res_proj, res_norm, out_norm
+        )
+
+    def finish_attn_res(
+        self,
+        target: LamportPushTarget,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` of a call every rank's producer has just pushed into ``target`` (an in-place
+        `push_target` of this state's workspace; `finish_takes` holds): the Lamport finish in place (the C++ one-shot
+        order), then the attn_res kernel adding the result to ``prefix_sum`` (the zero prefix for None) in the C++
+        epilogue's arithmetic, releasing the next kernel at its wait."""
+        rows = target.shape[0]
         result = finish_lamport_push(target, in_place=True)
         prefix = self.zeros[:rows] if prefix_sum is None else prefix_sum
         normed = torch.empty_like(prefix)

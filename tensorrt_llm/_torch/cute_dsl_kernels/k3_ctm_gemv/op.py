@@ -25,6 +25,8 @@ prefetch before the grid-dependency wait); output columns >= ``sig_col0`` hold `
 ``trtllm::k3_ctm_gemv_wide``: ``x @ weight^T`` for up to 64 tokens in one MMA of 16, 32 or 64 token columns, on the
 long kernel's split-K clusters (bf16 output with optional sigmoid columns, or fp32 output); with ``row_tiles`` the
 weight rows split into that many equal tiles of at most 128 rows, one cluster each (more CTAs for a short N).
+``run_k3_ctm_gemv_wide_ar_push`` (a plain function, not a torch op): ``k3_ctm_gemv_wide``'s bf16 output pushed into
+the Lamport slots of the next two-shot MNNVL all-reduce on a workspace instead of stored (the same values).
 
 ``push`` (the split-K ops) chooses how a cluster's ranks send their fp32 partials to the row owner: DSMEM
 stores + a release arrive (False) or 16-byte st.async completing the owner's barrier by bytes (True). The
@@ -519,6 +521,128 @@ def _(x, weight, sig_col0=-1, out_fp32=False, row_tiles=0):
     return x.new_empty(
         (x.shape[0], weight.shape[0]), dtype=torch.float32 if out_fp32 else torch.bfloat16
     )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# k3_ctm_gemv_wide with the all-reduce push epilogue (not a torch op: it writes a Lamport workspace, returns nothing)
+# ----------------------------------------------------------------------------------------------------------------------
+#: The rank counts of the two-shot MNNVL all-reduce the push serves.
+AR_PUSH_WORLDS = (2, 4, 8, 16)
+
+
+def wide_push_config(
+    n_out: int, k_in: int, num_tokens: int, num_sms: int, world: int
+) -> Optional[tuple]:
+    """``(split, ring, x_ring, n_tile)`` of ``run_k3_ctm_gemv_wide_ar_push`` for ``num_tokens`` rows of an ``[n_out,
+    k_in]`` weight over ``world`` ranks, or None where the push does not take the shape: the plain bf16
+    ``k3_ctm_gemv_wide`` call's config (so the same sums and bf16 values), 128-row tiles (N a multiple of 128: every
+    warp stores whole 16-byte vectors of 32 rows), no sigmoid rows or row tiles, a rank count the two-shot all-reduce
+    runs. Shapes only."""
+    from . import k3_ctm_gemv_kernel as kernel
+
+    if not 0 < num_tokens <= WIDE_MAX_TOKENS or world not in AR_PUSH_WORLDS:
+        return None
+    if n_out <= 0 or n_out % kernel.CTA_M:
+        return None
+    n_tile = kernel.wide_tile(num_tokens)
+    config = wide_config(n_out, k_in, n_tile, num_sms)
+    return None if config is None else (*config, n_tile)
+
+
+def _wide_push_key(n_out, k_in, config, world, use_pdl) -> tuple:
+    return ("k3_ctm_gemv_wide_ar_push", n_out, k_in, *config, world, use_pdl)
+
+
+def compile_wide_ar_push(weight: torch.Tensor, num_tokens: int, world: int) -> bool:
+    """Compile ``run_k3_ctm_gemv_wide_ar_push``'s kernel for ``weight``'s shape at ``num_tokens``'s token tile over
+    ``world`` ranks without launching it (a push needs every rank's finish); False where the push does not take the
+    shape. Eager, before any CUDA-graph capture."""
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2 or not weight.is_cuda:
+        return False
+    n_out, k_in = weight.shape
+    config = wide_push_config(n_out, k_in, num_tokens, _num_sms(weight.device), world)
+    if config is None:
+        return False
+    from cutlass import Int32, Int64
+
+    from . import k3_ctm_gemv_kernel as kernel
+
+    x = torch.zeros(num_tokens, k_in, dtype=torch.bfloat16, device=weight.device)
+    split, ring, x_ring, n_tile = config
+    use_pdl = _use_pdl()
+    addr = Int64(1 << 20)
+    _compile(
+        _wide_push_key(n_out, k_in, config, world, use_pdl),
+        kernel.k3_ctm_gemv_wide_ar_push, _arg(weight), _arg(x), _arg(x.view(-1)), num_tokens, addr, addr, addr,
+        Int32(0), n_out, k_in, split, ring, x_ring, n_tile, world, use_pdl, _stream(x),
+    )  # fmt: skip
+    return True
+
+
+def wide_ar_push_compiled(n_out: int, k_in: int, num_tokens: int, world: int, device) -> bool:
+    """Whether ``compile_wide_ar_push`` (or an eager call) compiled the push for this shape and token tile."""
+    config = wide_push_config(n_out, k_in, num_tokens, _num_sms(device), world)
+    return (
+        config is not None and _wide_push_key(n_out, k_in, config, world, _use_pdl()) in _compiled
+    )
+
+
+def run_k3_ctm_gemv_wide_ar_push(x: torch.Tensor, weight: torch.Tensor, ws) -> None:
+    """``x @ weight.T`` as ``k3_ctm_gemv_wide`` stores it (bf16 ``[M, N]``, M <= 64), pushed instead into the Lamport
+    slots of the next two-shot all-reduce on ``ws`` (a ``k3_lamport_ar.LamportWorkspace``): token ``t``'s row into slot
+    ``(t // W, rank)`` of the scatter stage of rank ``t % W`` (``-0`` as ``+0``). ``k3_lamport_ar``'s finish (two-shot)
+    completes the call: the pair is bitwise ``k3_ctm_gemv_wide`` followed by the MNNVL two-shot all-reduce of its
+    output. Releases its dependent only after its own grid-dependency wait (the finish kernel reads the rotation state
+    as soon as it is resident). Compiles on its first call for the shape (refused under capture)."""
+    from cutlass import Int32, Int64
+
+    from ..blackwell import k3_lamport_ar
+
+    if not (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.dim() == 2
+        and weight.dim() == 2
+        and x.shape[1] == weight.shape[1]
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    ):
+        raise ValueError(
+            f"k3_ctm_gemv_wide push: unsupported call x {tuple(x.shape)} {x.dtype}, weight "
+            f"{tuple(weight.shape)} {weight.dtype}"
+        )
+    num_tokens, k_in = x.shape
+    n_out = weight.shape[0]
+    config = wide_push_config(n_out, k_in, num_tokens, _num_sms(x.device), ws.world)
+    if config is None:
+        raise ValueError(
+            f"k3_ctm_gemv_wide push: no config for {num_tokens} rows of weight {tuple(weight.shape)} over "
+            f"{ws.world} ranks"
+        )
+    need = k3_lamport_ar.required_bytes(num_tokens, n_out, ws.world, False)
+    if need > ws.bytes_per_buffer:
+        raise ValueError(f"Lamport buffer of {ws.bytes_per_buffer} B < {need} B")
+    from . import k3_ctm_gemv_kernel as kernel
+
+    split, ring, x_ring, n_tile = config
+    use_pdl = _use_pdl()
+    args = (_arg(weight), _arg(x), _arg(x.view(-1)))
+    lamport = (
+        Int64(ws.peer_ptrs.data_ptr()),
+        Int64(ws.mc_base),
+        Int64(ws.flags.data_ptr()),
+        Int32(ws.rank),
+    )
+    stream = _stream(x)
+    fn = _compile(
+        _wide_push_key(n_out, k_in, config, ws.world, use_pdl),
+        kernel.k3_ctm_gemv_wide_ar_push, *args, num_tokens, *lamport, n_out, k_in, split, ring, x_ring, n_tile,
+        ws.world, use_pdl, stream,
+    )  # fmt: skip
+    fn(*args, num_tokens, *lamport, stream)
 
 
 def supports_situ_mul(gu: torch.Tensor) -> bool:

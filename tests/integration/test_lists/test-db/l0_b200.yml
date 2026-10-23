@@ -176,6 +176,7 @@ l0_b200:
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_embed.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv_wide.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv_wide_ar_push.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_decode_gemv.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_head_gemv.py
   - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_cluster_waits.py

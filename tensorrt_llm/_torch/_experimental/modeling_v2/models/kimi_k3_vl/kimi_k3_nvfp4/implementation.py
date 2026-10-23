@@ -72,6 +72,7 @@ from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
 from . import mla_drafter as _mla_drafter
 from . import mla_v_up as _mla_v_up
+from . import moe_tail_push as _moe_tail_push
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .decode_mla_dcp import MlaSplitRead
@@ -1196,11 +1197,12 @@ class KimiK3MoERuntime(nn.Module):
         partial_tail: bool = False,
         *,
         step: DecodeStep,
-    ) -> Union[torch.Tensor, _decode_comm.PendingTail]:
+    ) -> Union[torch.Tensor, _decode_comm.PendingTail, _decode_comm.WideTail]:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16. ``step``: the step's classification
         (``decode_step``); the decode path (``decode_moe.py``) runs the steps it takes. ``partial_tail`` (only where
         ``tail_rp_eligible`` holds): return this rank's unreduced share of the output instead, a ``PendingTail`` at
-        most 8 tokens, a tensor on a wide decode step."""
+        most 8 tokens, a tensor on a wide decode step (a ``WideTail``, the tail before its GEMV, with
+        ``TRTLLM_K3LL_MOE_TAIL_PUSH``)."""
         decode = self.decode_moe
         if decode is not None and decode.takes(hidden_states, step, partial_tail):
             return decode.forward(
@@ -1536,7 +1538,9 @@ class KimiLinearDecoderLayer(nn.Module):
         step: DecodeStep,
         capture: Optional[Tuple[Any, int]] = None,
         prenormed: bool = False,
-        pending_moe_partial: Optional[Union[torch.Tensor, _decode_comm.PendingTail]] = None,
+        pending_moe_partial: Optional[
+            Union[torch.Tensor, _decode_comm.PendingTail, _decode_comm.WideTail]
+        ] = None,
         defer_moe_tail: bool = False,
     ) -> Union[Tuple[torch.Tensor, int], Tuple[torch.Tensor, int, Any]]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
@@ -1574,7 +1578,10 @@ class KimiLinearDecoderLayer(nn.Module):
         ``hidden_states`` is the prefix sum without it, and this layer's
         pre-attention step reduces and adds it: a ``PendingTail`` in one
         ``K3DecodeComm.sandwich_tail`` call, a wide decode step's tensor by its
-        all-reduce and the fused add + attn_res + RMSNorm. On a tapped layer
+        all-reduce and the fused add + attn_res + RMSNorm; a ``WideTail``
+        (``TRTLLM_K3LL_MOE_TAIL_PUSH``) with the tail GEMV pushing into that
+        all-reduce where ``K3DecodeComm.takes_tail_push`` holds, else by the
+        tail GEMV and the tensor's path. On a tapped layer
         the ``sandwich_tail`` call also stores the tap into the capture slot
         where the speculative metadata exposes it (``capture_view``); other
         tapped layers take the tap after the step.
@@ -1601,6 +1608,21 @@ class KimiLinearDecoderLayer(nn.Module):
         tap_view = None
         if tail is not None and capture is not None:
             tap_view = _spec_worker.capture_view(capture[0], capture[1], prefix_sum.shape[0])
+        # A wide step's MoE tail handed on before its GEMV (TRTLLM_K3LL_MOE_TAIL_PUSH): pushed into the all-reduce
+        # where the decode collectives take it, else run here, where the switch-off path's GEMV would have run.
+        tail_push = False
+        if isinstance(pending_moe_partial, _decode_comm.WideTail):
+            tail_push = self.decode_comm is not None and self.decode_comm.takes_tail_push(
+                pending_moe_partial,
+                step,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+            )
+            if not tail_push:
+                pending_moe_partial = pending_moe_partial.partial()
 
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
@@ -1616,6 +1638,16 @@ class KimiLinearDecoderLayer(nn.Module):
                 updated_out=snapshot_row,
                 tap=tap_view,
                 tap_updated=not _AUX_ATTN_RES_STREAM_ENABLED,
+            )
+        elif tail_push:
+            _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
+            hidden_states, prefix_sum = self.decode_comm.tail_push_attn_res(
+                pending_moe_partial,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
             )
         elif (
             pending_moe_partial is not None
@@ -2122,6 +2154,30 @@ class KimiLinearModel(DecoderModel):
             else:
                 (hidden_states, num_snapshots), pending_moe_partial = outputs, None
 
+        if isinstance(pending_moe_partial, _decode_comm.WideTail):
+            # The last MoE layer's tail handed on before its GEMV (TRTLLM_K3LL_MOE_TAIL_PUSH; see the layer's
+            # pre-attention step).
+            tail_comm = self.layers[-1].decode_comm
+            if tail_comm is not None and tail_comm.takes_tail_push(
+                pending_moe_partial,
+                step,
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            ):
+                _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
+                normed, _ = tail_comm.tail_push_attn_res(
+                    pending_moe_partial,
+                    hidden_states,
+                    block_residual[:num_snapshots],
+                    self.output_attn_res_proj,
+                    self.output_attn_res_norm,
+                    self.norm,
+                )
+                return normed
+            pending_moe_partial = pending_moe_partial.partial()
         if isinstance(pending_moe_partial, _decode_comm.PendingTail):
             normed, _ = self.layers[-1].decode_comm.sandwich_tail(
                 pending_moe_partial,
@@ -4308,6 +4364,18 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         first = takes[0].decode_moe
         first.warm_up(takes[0])
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
+        gemvs = self.model.decode_gemvs
+        if gemvs is not None and comm.oproj_push is not None:
+            # TRTLLM_K3LL_MOE_TAIL_PUSH is read at forward time: its push GEMV compiles here whatever the switch says
+            # (compile only, no launch), so a capture after flipping it finds the kernel.
+            tiles = gemvs.compile_push(
+                _moe_tail_push.SITE, first.tail_weight, comm.oproj_push.lamport.world
+            )
+            if mapping.tp_rank == 0:
+                logger.info(
+                    f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_TAIL_PUSH={_flags.TRTLLM_K3LL_MOE_TAIL_PUSH} (read at forward "
+                    f"time): the wide tail's push GEMV compiled for token tiles {tiles}"
+                )
         return len(takes)
 
     def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:

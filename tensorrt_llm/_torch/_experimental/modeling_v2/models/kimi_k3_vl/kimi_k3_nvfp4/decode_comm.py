@@ -19,7 +19,10 @@ update on the MNNVL workspace (``oproj_push.py``). The attention hands over its 
 
 The pre-attention step after a MoE layer whose row-parallel tail was handed on (a `PendingTail`, `decode_moe.py`) is
 the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
-all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
+all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel. On a wide
+decode step with ``TRTLLM_K3LL_MOE_TAIL_PUSH`` the layer hands on its tail's input (a `WideTail`) and
+`K3DecodeComm.tail_push_attn_res` runs the tail GEMV with its all-reduce push epilogue, the Lamport finish and the
+residual update on the MNNVL workspace (``moe_tail_push.py``).
 
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
 
@@ -73,7 +76,10 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
 from . import flags as _flags
-from .oproj_push import K3OprojPush
+from . import moe_tail_push as _tail_push
+from .moe_tail_push import WideTail
+from .oproj_push import HIDDEN as _PUSH_HIDDEN
+from .oproj_push import K3OprojPush, push_target
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
@@ -234,15 +240,66 @@ class K3DecodeComm:
         """Whether allreduce_attn_res(..., two_shot=True) takes a wide decode step's (step.wide)
         post-attention or MoE-tail update of the bf16 partial x (TRTLLM_K3LL_WIDE_AR_ATTN_RES): a hidden size the
         MNNVL entry takes and at most max_two_shot_tokens rows. Every rank decides alike (shapes and the flag)."""
-        if not _flags.TRTLLM_K3LL_WIDE_AR_ATTN_RES or step is None or not step.wide:
-            return False
         if x.dim() != 2 or x.dtype != torch.bfloat16:
             return False
-        rows, hidden = x.shape
+        return self._takes_wide_rows(x.shape[0], x.shape[1], step)
+
+    def _takes_wide_rows(self, rows: int, hidden: int, step) -> bool:
+        """``takes_wide`` of a bf16 partial ``[rows, hidden]``."""
+        if not _flags.TRTLLM_K3LL_WIDE_AR_ATTN_RES or step is None or not step.wide:
+            return False
         return (
             hidden % 1024 == 0
             and hidden <= 8192
             and 0 < rows <= self.mnnvl.max_two_shot_tokens(hidden)
+        )
+
+    def takes_tail_push(
+        self,
+        tail: WideTail,
+        step,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> bool:
+        """Whether ``tail_push_attn_res`` takes a wide decode step's handed-on MoE tail ``tail`` (``moe_tail_push.py``):
+        ``TRTLLM_K3LL_MOE_TAIL_PUSH`` asks for ``step``, the switch-off consumer would be the two-shot
+        ``allreduce_attn_res`` (``takes_wide`` of the partial's shape), the tail runs on ``k3_ctm_gemv_wide`` and its
+        push variant takes it (``K3DecodeGemvs.takes_push``), and the Lamport finish and the attn_res kernel take the
+        prefix sum, the snapshots and the weights. Read from the switch, shapes and load-time state only, so every
+        rank of the group decides alike."""
+        push = self.oproj_push
+        if push is None or not _tail_push.enabled(step) or tail.gemvs is None:
+            return False
+        rows, hidden = tail.x.shape[0], tail.weight.shape[0]
+        if hidden != _PUSH_HIDDEN or rows != step.num_tokens:
+            return False
+        if not self._takes_wide_rows(rows, hidden, step):
+            return False
+        if not tail.gemvs.takes_push(_tail_push.SITE, tail.x, tail.weight, push.lamport.world):
+            return False
+        return push.finish_takes(rows, prefix_sum, block_residual, res_proj, res_norm, out_norm)
+
+    def tail_push_attn_res(
+        self,
+        tail: WideTail,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` as ``allreduce_attn_res(tail.partial(), ..., two_shot=True)``, bit for bit, with the
+        tail GEMV pushing its partial into the MNNVL workspace (``takes_tail_push`` holds): the push GEMV, the Lamport
+        finish in place and the attn_res kernel (``moe_tail_push.py``)."""
+        push = self.oproj_push
+        target = push_target(push.lamport, tail.x.shape[0], _PUSH_HIDDEN, in_place=True)
+        tail.gemvs.project_push(_tail_push.SITE, tail.x, tail.weight, push.lamport)
+        target.pushed = True
+        return push.finish_attn_res(
+            target, prefix_sum, block_residual, res_proj, res_norm, out_norm
         )
 
     @staticmethod
