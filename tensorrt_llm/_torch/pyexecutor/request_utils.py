@@ -4,7 +4,6 @@
 """Utility functions for request processing."""
 
 import os
-import sys
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
@@ -20,19 +19,8 @@ from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
+from .k3ll_flags import k3ll_flag as _k3ll_flag
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
-
-# Kimi K3 low-latency switches (kimi_k3_nvfp4/flags.py). Read from the module object on every call, so a switch set at
-# runtime (one-process A/B) takes effect; 0 when the K3 NVFP4 target is not loaded.
-_K3LL_FLAGS_MODULE = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.flags"
-)
-
-
-def _k3ll_flag(name: str) -> int:
-    flags = sys.modules.get(_K3LL_FLAGS_MODULE)
-    return int(getattr(flags, name, 0)) if flags is not None else 0
-
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py

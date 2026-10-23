@@ -58,6 +58,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
+from tensorrt_llm._torch.pyexecutor.k3ll_flags import k3ll_flag
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -401,6 +402,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._gen_allgather: Callable = (
             pp_allgather if m.enable_attention_dp else self._dist.allgather
         )
+        # TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC (read per call, `check_gen_transfer_status`): where the world is the
+        # TP x CP group (no attention DP, PP 1), an idle poll can be decided by one int64 all-gather over it.
+        self._gen_idle_probe_ok = (
+            self._gen_need_sync and not m.enable_attention_dp and m.pp_size == 1
+        )
+        self._gen_idle_skips = 0
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -1316,8 +1323,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             failed.extend(rid for rid in cancelled if rid not in failed)
         return CtxTransferStatus(completed, failed)
 
+    def _any_rank_has_recv_sessions(self) -> bool:
+        """One fixed-size int64 all-gather of every rank's receive-session count over TP x CP (= the world here)."""
+        counts = self._dist.tp_cp_allgather_int64([len(self._recv_sessions)])
+        return bool(counts.any())
+
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return GenTransferStatus([], [], [])
+        # TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC: with no receive session on any rank, the non-blocking poll below gathers
+        # empty lists twice and returns three empty lists without side effects; skip it on every rank alike (the
+        # decision is the collective's). Blocking and at-least-N polls keep their pacing.
+        if (
+            at_least_request_num == 0
+            and self._gen_idle_probe_ok
+            and k3ll_flag("TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC")
+            and not self._any_rank_has_recv_sessions()
+        ):
+            self._gen_idle_skips += 1
+            n = self._gen_idle_skips
+            if self._dist.rank == 0 and n & (n - 1) == 0:
+                logger.info(f"K3LL disagg_gen_fast_sync idle_polls_skipped={n}")
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0

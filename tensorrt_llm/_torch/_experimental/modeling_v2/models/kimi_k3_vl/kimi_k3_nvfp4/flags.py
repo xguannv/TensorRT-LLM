@@ -259,6 +259,12 @@ TRTLLM_K3LL_SLICED_HELIX_PARTITION = _flag(
     "Helix generation intake: merge_helix_requests reads the prompt from the request's serialized int32 bytes and "
     "slices only this rank's blocks (pyexecutor/request_utils.py; same lists; read per call)",
 )
+TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC = _flag(
+    "TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC",
+    0,
+    "disagg generation (no attention DP, PP 1): the per-iteration non-blocking KV-receive poll is skipped when one "
+    "int64 all-gather shows no receive session on any rank (disaggregation/transceiver.py; read per call)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
