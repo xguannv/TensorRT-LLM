@@ -82,8 +82,9 @@ class KvSide:
     """``TRTLLM_K3LL_MLA_KV_SIDE``: the latent row and KV append of one forward on `kv_side_stream`.
 
     `mark` records the main stream's position (after the fused q_a / kv_a); `run` enqueues ``fn`` on the side stream
-    behind that position (so the query kernels the main stream enqueues in between run beside it); `join` makes the
-    main stream wait for it. Without a side stream (``multi_stream`` False) `run` calls ``fn`` in place."""
+    behind that position (so the query kernels the main stream enqueues in between run beside it) and returns True;
+    `join` makes the main stream wait for it. Without a side stream (``multi_stream`` False) `run` calls ``fn`` in
+    place and returns False."""
 
     def __init__(self) -> None:
         self._fork_event = torch.cuda.Event()
@@ -97,16 +98,18 @@ class KvSide:
             self._fork_event.record()
         self._marked = True
 
-    def run(self, fn: Callable[[], None], device: torch.device) -> None:
+    def run(self, fn: Callable[[], None], device: torch.device) -> bool:
+        """Whether ``fn`` ran on `kv_side_stream` (False: in place on the current stream)."""
         if not self._marked:
             raise RuntimeError("KvSide.run without mark")
         if not self._side:
             fn()
-            return
+            return False
         with torch.cuda.stream(kv_side_stream(device)):
             self._fork_event.wait()
             fn()
             self._done_event.record()
+        return True
 
     def join(self) -> None:
         if not self._marked:

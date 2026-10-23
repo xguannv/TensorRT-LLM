@@ -29,6 +29,9 @@ pages, after a ~20 us device sleep, so a reader that is not ordered after the ap
   reader on the main stream, not just the split read);
 * from 5 requests (``decode_mla_q.KV_SIDE_MAX_REQUESTS`` is 4) the switch at 1 runs the cache kernel on the main
   stream, and the output, records and pages equal the switch at 0 bit for bit;
+* the census key ``mla_kv_side`` counts the side-stream fork only: one per forward that forks (eager with multi-stream
+  on, and the graph capture), none at 0, none from 5 requests, none for an eager step that runs in place
+  (multi-stream off);
 * the instrument fires: with the main stream's join removed, the same eager read right after the layer sees pages
   that differ from the appended ones (so the check above would catch a missing join).
 """
@@ -75,6 +78,12 @@ def _pkg():
     return _qs()._pkg()
 
 
+def _census():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import census
+
+    return census
+
+
 class _PagingBackend:
     """The stand-in cache kernel (``q_switches._Backend``) that also appends: the latent row goes into ``pages`` after
     a device sleep, on whatever stream the decode enqueues it."""
@@ -116,7 +125,17 @@ def _bits(a, b) -> bool:
     return _qs()._bits(a, b)
 
 
-def _arm(mla, monkeypatch, kv_side, x, meta, read_pages=True):
+def _forks():
+    """The census count of ``mla_kv_side`` (every mode), with the census enabled by the ``census`` fixture."""
+    return sum(v for k, v in _census().counts().items() if k.startswith("mla_kv_side:"))
+
+
+@pytest.fixture
+def census(monkeypatch):
+    monkeypatch.setattr(_census(), "ENABLED", True)
+
+
+def _arm(mla, monkeypatch, kv_side, x, meta, read_pages=True, multi_stream=True):
     """Output, rope record, split record, the pages read on the main stream right after the layer, and the streams
     the cache kernel ran on."""
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -125,7 +144,7 @@ def _arm(mla, monkeypatch, kv_side, x, meta, read_pages=True):
     mla.mqa.pages.zero_()
     torch.cuda.synchronize()
     mla.mqa.streams.clear()
-    with _switches(monkeypatch, kv_side), with_multi_stream(True):
+    with _switches(monkeypatch, kv_side), with_multi_stream(multi_stream):
         mla.record.clear()
         out = qs._decode(mla)(x, meta)
         pages = mla.mqa.pages.clone() if read_pages else None
@@ -137,7 +156,7 @@ def _arm(mla, monkeypatch, kv_side, x, meta, read_pages=True):
 
 
 @pytest.mark.parametrize("rows", ROWS)
-def test_kv_side_equals_off_eager(mla, monkeypatch, rows):
+def test_kv_side_equals_off_eager(mla, monkeypatch, census, rows):
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
         decode_mla_q,
     )
@@ -146,8 +165,11 @@ def test_kv_side_equals_off_eager(mla, monkeypatch, rows):
     meta = qs._meta(rows)
     for seed in (10, 11):
         x = qs._x(rows, seed + rows)
+        forks = _forks()
         off, off_rope, off_split, off_pages, off_streams = _arm(mla, monkeypatch, 0, x, meta)
+        assert _forks() == forks
         on, on_rope, on_split, on_pages, on_streams = _arm(mla, monkeypatch, 1, x, meta)
+        assert _forks() == forks + 1
         assert (
             on_split[2] is True and on_rope[2] is True
         )  # the all-head path, the cache kernel with q_rope_applied
@@ -159,7 +181,7 @@ def test_kv_side_equals_off_eager(mla, monkeypatch, rows):
 
 
 @pytest.mark.parametrize("rows", ROWS)
-def test_pages_read_after_the_layer_graph_replay(mla, monkeypatch, rows):
+def test_pages_read_after_the_layer_graph_replay(mla, monkeypatch, census, rows):
     """The layer and a read of the pages right after it, captured together with the switch on, replayed with new
     inputs: the read sees the appended pages (the off arm's eager ones), bit for bit."""
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -171,9 +193,11 @@ def test_pages_read_after_the_layer_graph_replay(mla, monkeypatch, rows):
         qs._decode(mla)(x, meta)  # compiles every kernel outside the capture
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        captured = _census().counts().get("mla_kv_side:capture", 0)
         with torch.cuda.graph(graph):
             out = qs._decode(mla)(x, meta)
             pages = mla.mqa.pages.clone()
+    assert _census().counts().get("mla_kv_side:capture", 0) == captured + 1
     for replay in range(REPLAYS):
         x.copy_(qs._x(rows, 300 + replay))
         mla.mqa.pages.zero_()
@@ -197,7 +221,7 @@ def test_kv_side_applies_to_one_to_four_requests():
 
 
 @pytest.mark.parametrize("rows", ROWS_ABOVE)
-def test_kv_side_main_stream_from_five_requests(mla, monkeypatch, rows):
+def test_kv_side_main_stream_from_five_requests(mla, monkeypatch, census, rows):
     """5 and 8 requests with the switch at 1: the cache kernel stays on the main stream (no side stream, no join), and
     everything equals the switch at 0."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
@@ -208,13 +232,41 @@ def test_kv_side_main_stream_from_five_requests(mla, monkeypatch, rows):
     meta = qs._meta(rows)
     assert not decode_mla_q.kv_side_applies(meta.num_generations)
     x = qs._x(rows, 50 + rows)
+    forks = _forks()
     off, off_rope, off_split, off_pages, off_streams = _arm(mla, monkeypatch, 0, x, meta)
     on, on_rope, on_split, on_pages, on_streams = _arm(mla, monkeypatch, 1, x, meta)
+    assert _forks() == forks
     side = decode_mla_q.kv_side_stream(x.device)
     assert on_streams == off_streams and len(on_streams) == 1 and on_streams[0] != side
     assert _bits(on, off)
     assert _bits(on_rope[1], off_rope[1]) and _bits(on_split[1], off_split[1])
     assert _bits(on_pages, off_pages) and bool(on_pages[:rows].abs().sum() > 0)
+
+
+@pytest.mark.parametrize("rows", ROWS)
+def test_in_place_without_multi_stream_is_not_counted(mla, monkeypatch, census, rows):
+    """Switch at 1, 1 to 4 requests, multi-stream off (an eager step): the cache kernel runs in place on the main
+    stream, nothing is counted under ``mla_kv_side``, and everything equals the switch at 0."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_mla_q,
+    )
+
+    qs = _qs()
+    meta = qs._meta(rows)
+    assert decode_mla_q.kv_side_applies(meta.num_generations)
+    x = qs._x(rows, 70 + rows)
+    forks = _forks()
+    off, off_rope, off_split, off_pages, off_streams = _arm(
+        mla, monkeypatch, 0, x, meta, multi_stream=False
+    )
+    on, on_rope, on_split, on_pages, on_streams = _arm(
+        mla, monkeypatch, 1, x, meta, multi_stream=False
+    )
+    assert _forks() == forks
+    assert on_streams == off_streams and on_streams[0] != decode_mla_q.kv_side_stream(x.device)
+    assert _bits(on, off)
+    assert _bits(on_rope[1], off_rope[1]) and _bits(on_split[1], off_split[1])
+    assert _bits(on_pages, off_pages)
 
 
 def test_missing_join_is_seen(mla, monkeypatch):

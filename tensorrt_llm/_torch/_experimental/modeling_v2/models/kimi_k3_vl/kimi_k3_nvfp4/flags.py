@@ -255,7 +255,9 @@ TRTLLM_K3LL_MLA_KV_SIDE = _flag(
     "with q_rope_applied) on their own side stream from right after the fused q_a / kv_a, beside the query path "
     "(q_a norm, q_b, K3MlaQAbsorb); the main stream joins it before the split read, so every later reader of the "
     "KV pages runs after the append (same kernels and bytes; read at forward time). Decode steps of 1 to 4 requests "
-    "only (decode_mla_q.KV_SIDE_MAX_REQUESTS); from 5 requests the main stream runs them in order as with 0",
+    "only (decode_mla_q.KV_SIDE_MAX_REQUESTS); from 5 requests the main stream runs them in order as with 0. SM103 "
+    "only: the all-head path needs HELIX_Q_ABSORB's W_UK, built on implementation.HELIX_SWITCH_CAPABILITIES; on "
+    "SM107 (Rubin) the decode takes the switch-off path and this switch has no effect",
 )
 TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
     "TRTLLM_K3LL_MLA_DECODE_PDL",
@@ -274,7 +276,8 @@ TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
     "TRTLLM_K3LL_MLA_QNORM_PDL",
     0,
     "Helix all-head MLA queries: the q_a RMSNorm releases q_b at launch and reads its weight before the PDL wait "
-    "(modules/kimi_k3_mla/q_norm_pdl.py, bitwise FlashInfer's kernel; read at forward time)",
+    "(modules/kimi_k3_mla/q_norm_pdl.py, bitwise FlashInfer's kernel; read at forward time). SM103 only, like "
+    "TRTLLM_K3LL_MLA_KV_SIDE: it acts on the HELIX_Q_ABSORB all-head path (implementation.HELIX_SWITCH_CAPABILITIES)",
 )
 TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
     "TRTLLM_K3LL_MLA_PREWAIT_L2",

@@ -3134,9 +3134,10 @@ class K3DecodeMLA(KimiK3MLAAttention):
         if kv_side:
             from . import census as _census
 
-            self._kv_side.run(latent_and_append, ag.device)
+            forked = self._kv_side.run(latent_and_append, ag.device)
             self._kv_side.join()
-            _census.count(f"mla_kv_side:{_census.mode()}")
+            if forked:  # the census counts the side-stream fork, not the switch
+                _census.count(f"mla_kv_side:{_census.mode()}")
         else:
             latent_and_append()
         if self.mapping.cp_rank == 0 and rows not in K3DecodeMLA._all_head_logged:
