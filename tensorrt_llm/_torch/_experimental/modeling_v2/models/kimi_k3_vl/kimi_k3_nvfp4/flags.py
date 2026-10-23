@@ -253,6 +253,12 @@ TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "commit its tokens and take its continuation as drafts, draws keyed by the stream offset (force_replay.py; MLA "
     "DSpark worker; read at forward time)",
 )
+TRTLLM_K3LL_SLICED_HELIX_PARTITION = _flag(
+    "TRTLLM_K3LL_SLICED_HELIX_PARTITION",
+    0,
+    "Helix generation intake: merge_helix_requests reads the prompt from the request's serialized int32 bytes and "
+    "slices only this rank's blocks (pyexecutor/request_utils.py; same lists; read per call)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

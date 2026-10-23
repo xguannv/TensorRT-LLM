@@ -4,19 +4,35 @@
 """Utility functions for request processing."""
 
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+import sys
+import time
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
 
+import numpy as np
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+
+# Kimi K3 low-latency switches (kimi_k3_nvfp4/flags.py). Read from the module object on every call, so a switch set at
+# runtime (one-process A/B) takes effect; 0 when the K3 NVFP4 target is not loaded.
+_K3LL_FLAGS_MODULE = (
+    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.flags"
+)
+
+
+def _k3ll_flag(name: str) -> int:
+    flags = sys.modules.get(_K3LL_FLAGS_MODULE)
+    return int(getattr(flags, name, 0)) if flags is not None else 0
+
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -213,6 +229,10 @@ def partition_context_for_helix(
     Raises:
         ValueError: If the prompt is empty (no blocks to distribute).
     """
+    if _k3ll_flag("TRTLLM_K3LL_SLICED_HELIX_PARTITION"):
+        return _partition_context_for_helix_sliced(
+            input_token_ids, cp_rank, cp_size, tokens_per_block
+        )
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
@@ -256,6 +276,76 @@ def partition_context_for_helix(
         position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
     return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
+
+
+def _partition_context_for_helix_sliced(
+    input_token_ids: Sequence[int], cp_rank: int, cp_size: int, tokens_per_block: int
+) -> Tuple[List[int], List[int], int, int]:
+    """``partition_context_for_helix`` touching only this rank's ~input_len / cp_size tokens (switch
+    TRTLLM_K3LL_SLICED_HELIX_PARTITION): the same round-robin blocks, the same lists of Python ints, the padding of the
+    last block never built. ``input_token_ids`` is a list of ints or a 1-D integer numpy array."""
+    input_len = len(input_token_ids)
+    num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    padding_len = (tokens_per_block - input_len % tokens_per_block) % tokens_per_block
+    # Rank r owns blocks {r, r + cp_size, ...} (as cacheSplitConcat.cu splits the KV).
+    block_starts = range(cp_rank * tokens_per_block, input_len, cp_size * tokens_per_block)
+    if len(block_starts) == 0:
+        return [], [], input_len, padding_len
+    if isinstance(input_token_ids, np.ndarray):
+        positions = (
+            np.asarray(block_starts, dtype=np.int64)[:, None]
+            + np.arange(tokens_per_block, dtype=np.int64)[None, :]
+        ).reshape(-1)
+        positions = positions[positions < input_len]
+        return input_token_ids[positions].tolist(), positions.tolist(), input_len, padding_len
+    input_ids_this_rank: List[int] = []
+    position_ids_this_rank: List[int] = []
+    for start in block_starts:
+        stop = min(start + tokens_per_block, input_len)
+        input_ids_this_rank.extend(input_token_ids[start:stop])
+        position_ids_this_rank.extend(range(start, stop))
+    return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
+
+
+# Request.__getstate__ serializes the prompt as a raw int32 byte buffer in its first field (nanobind
+# executor/request.cpp requestGetstate): one memcpy, where the input_token_ids property builds one Python int per
+# token. The layout is checked against input_token_ids on first use; any mismatch falls back to input_token_ids.
+_PROMPT_BYTES_VERIFIED: Optional[bool] = None
+_SLICED_PARTITION_STATS = {"calls": 0, "tokens": 0, "seconds": 0.0}
+
+
+def _prompt_token_array(executor_request: ExecutorRequest) -> Sequence[int]:
+    """Prompt tokens of an executor request, as an int32 numpy array when its serialized state allows."""
+    global _PROMPT_BYTES_VERIFIED
+    if _PROMPT_BYTES_VERIFIED is not False:
+        state = executor_request.__getstate__()
+        raw = state[0] if isinstance(state, tuple) and state else None
+        if isinstance(raw, bytes) and len(raw) % 4 == 0:
+            tokens = np.frombuffer(raw, dtype=np.int32)
+            if _PROMPT_BYTES_VERIFIED is None and tokens.size > 0:
+                _PROMPT_BYTES_VERIFIED = tokens.tolist() == executor_request.input_token_ids
+            if _PROMPT_BYTES_VERIFIED:
+                return tokens
+        else:
+            _PROMPT_BYTES_VERIFIED = False
+    return executor_request.input_token_ids
+
+
+def _log_sliced_partition(cp_rank: int, input_len: int, seconds: float) -> None:
+    """G3 evidence of TRTLLM_K3LL_SLICED_HELIX_PARTITION on CP rank 0: every call under TRTLLM_K3LL_CENSUS, else the
+    first 16 calls and then every power of two."""
+    st = _SLICED_PARTITION_STATS
+    st["calls"] += 1
+    st["tokens"] += input_len
+    st["seconds"] += seconds
+    n = st["calls"]
+    if cp_rank == 0 and (n <= 16 or n & (n - 1) == 0 or _k3ll_flag("TRTLLM_K3LL_CENSUS")):
+        logger.info(
+            f"K3LL sliced_helix_partition calls={n} prompt_tokens={input_len} ms={seconds * 1e3:.3f} "
+            f"total_ms={st['seconds'] * 1e3:.1f} bytes_path={bool(_PROMPT_BYTES_VERIFIED)}"
+        )
 
 
 def merge_requests_to_llm_requests(
@@ -306,9 +396,18 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
-        input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
-            req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
-        )
+        if _k3ll_flag("TRTLLM_K3LL_SLICED_HELIX_PARTITION"):
+            t0 = time.perf_counter()
+            input_ids_this_rank, position_ids_this_rank, input_len, _ = (
+                _partition_context_for_helix_sliced(
+                    _prompt_token_array(req_item.request), cp_rank, cp_size, tokens_per_block
+                )
+            )
+            _log_sliced_partition(cp_rank, input_len, time.perf_counter() - t0)
+        else:
+            input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
+                req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
+            )
 
         req = executor_request_to_llm_request(
             req_id=req_item.id,
