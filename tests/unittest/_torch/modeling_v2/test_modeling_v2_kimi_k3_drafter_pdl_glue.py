@@ -100,12 +100,12 @@ def _same(a, b, what):
     assert torch.equal(_bits(a), _bits(b)), f"{what}: not bit for bit"
 
 
-def test_switches_are_registered_off_by_default():
+def test_switches_are_registered_on_by_default():
     flags = _flags()
     table = flags.flags()
     for name in ("TRTLLM_K3LL_DRAFTER_PDL", "TRTLLM_K3LL_DRAFTER_GLUE"):
         assert name in table
-        assert table[name][1] == 0, f"{name} must default to 0"
+        assert table[name][1] == 1, f"{name} must default to 1"
 
 
 # ----------------------------------------------------------------------------------------------------------------------
