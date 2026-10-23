@@ -2697,6 +2697,8 @@ class K3DecodeMLA(KimiK3MLAAttention):
     # Under Helix with TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A at launch: the BF16 W_UV [heads, 128, 512] of every head
     # (set_helix_v_up), which the decode applies before the exchange; None otherwise.
     _helix_v_up_weight: Optional[torch.Tensor] = None
+    # TRTLLM_K3LL_MLA_GATE_FUSED_A at load (build_gate_fused_a); None otherwise.
+    _gate_fused_a: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
