@@ -1120,6 +1120,23 @@ class PyExecutor:
                 and not self.is_benchmark_disagg):
             self._disagg_gen_prefetch_limit = prefetch_request_limit(
                 self.max_num_active_requests)
+        # TRTLLM_DISAGG_GEN_PREFETCH_DEBUG=<n>: with prefetch on, rank 0 logs
+        # the running count of transfer-complete requests deferred for want of
+        # a sequence slot and, every n consecutive iterations that schedule
+        # nothing while requests are active, the state of every active request
+        # (at most 20 dumps). Logging only.
+        self._prefetch_debug_idle_limit = 0
+        if self._disagg_gen_prefetch_limit > 0:
+            try:
+                self._prefetch_debug_idle_limit = max(
+                    0,
+                    int(os.environ.get("TRTLLM_DISAGG_GEN_PREFETCH_DEBUG",
+                                       "0")))
+            except ValueError:
+                self._prefetch_debug_idle_limit = 0
+        self._prefetch_debug_deferred = 0
+        self._prefetch_debug_idle = 0
+        self._prefetch_debug_dumps = 0
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -4124,6 +4141,64 @@ class PyExecutor:
             reverted.generation_requests = deferred
             self._revert_gen_alloc(reverted)
         return kept, len(deferred)
+
+    def _prefetch_debug_note(self, num_deferred: int,
+                             context_requests: List[LlmRequest],
+                             generation_requests: List[LlmRequest]) -> None:
+        """Rank-0 logging for ``TRTLLM_DISAGG_GEN_PREFETCH_DEBUG``.
+
+        Logs the deferral count each time it reaches a new power of two and,
+        every ``_prefetch_debug_idle_limit`` consecutive iterations that
+        schedule nothing while requests are active, one line per active
+        request with its state, sequence slot, decoding iteration and whether
+        its KV cache is active, after a line with the free sequence slots, the
+        free KV-cache index slots and the waiting-queue length.
+        """
+        if self.dist.rank != 0:
+            return
+        if num_deferred:
+            before = self._prefetch_debug_deferred
+            self._prefetch_debug_deferred += num_deferred
+            if self._prefetch_debug_deferred.bit_length() != before.bit_length(
+            ):
+                logger.info("disagg_gen_prefetch deferred_without_seat="
+                            f"{self._prefetch_debug_deferred}")
+        if context_requests or generation_requests or not self.active_requests:
+            self._prefetch_debug_idle = 0
+            return
+        self._prefetch_debug_idle += 1
+        if (self._prefetch_debug_idle % self._prefetch_debug_idle_limit != 0
+                or self._prefetch_debug_dumps >= 20):
+            return
+        self._prefetch_debug_dumps += 1
+        try:
+            seq_slot_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.SEQ_SLOT_MANAGER)
+            free_seats = (len(seq_slot_manager.slot_manager.free_slots)
+                          if seq_slot_manager is not None else None)
+            index_mapper = getattr(self.kv_cache_manager, "index_mapper", None)
+            free_index_slots = (index_mapper.num_free_slots()
+                                if index_mapper is not None else None)
+            kv_cache_map = getattr(self.kv_cache_manager, "kv_cache_map", {})
+            logger.info(
+                f"disagg_gen_prefetch idle dump {self._prefetch_debug_dumps}: "
+                f"idle_iters={self._prefetch_debug_idle} "
+                f"active={len(self.active_requests)} "
+                f"waiting={len(self.waiting_queue)} free_seats={free_seats} "
+                f"free_index_slots={free_index_slots} "
+                f"inflight={len(self.inflight_req_ids)} "
+                f"deferred_without_seat={self._prefetch_debug_deferred}")
+            for req in self.active_requests[:32]:
+                kv_cache = kv_cache_map.get(req.py_request_id)
+                logger.info(
+                    f"disagg_gen_prefetch idle dump {self._prefetch_debug_dumps}: "
+                    f"request {req.py_request_id} state={req.state.name} "
+                    f"seq_slot={getattr(req, 'py_seq_slot', None)} "
+                    f"decoding_iter={getattr(req, 'py_decoding_iter', None)} "
+                    f"kv_active="
+                    f"{None if kv_cache is None else kv_cache.is_active}")
+        except Exception as e:  # noqa: BLE001 - diagnostics must not stop the executor
+            logger.warning(f"disagg_gen_prefetch idle dump failed: {e!r}")
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Update self, draft, and cross caches after a context forward."""
@@ -7339,6 +7414,10 @@ class PyExecutor:
                 self._defer_transfer_complete_without_seat(
                     scheduled_generation_requests))
             num_fitting -= num_deferred
+            if self._prefetch_debug_idle_limit > 0:
+                self._prefetch_debug_note(num_deferred,
+                                          scheduled_context_requests,
+                                          scheduled_generation_requests)
 
         scheduled_requests = ScheduledRequests()
         if getattr(self, "_enable_remote_tail_adp", False):

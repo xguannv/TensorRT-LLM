@@ -275,3 +275,64 @@ def test_defer_transfer_complete_without_seat(
     assert len(seq_slot_manager.slot_manager.free_slots) >= sum(
         1 for req in kept if req.is_disagg_generation_transmission_complete
     )
+
+
+class _DebugRequest:
+    def __init__(self, request_id, state_name):
+        self.py_request_id = request_id
+        self.state = type("State", (), {"name": state_name})()
+        self.py_seq_slot = None
+        self.py_decoding_iter = 0
+
+
+class _DebugStub(_SeatStub):
+    """_SeatStub plus what PyExecutor._prefetch_debug_note reads."""
+
+    def __init__(self, py_executor, seq_slot_manager, rank, idle_limit, active):
+        super().__init__(py_executor, seq_slot_manager)
+        self.dist = type("Dist", (), {"rank": rank})()
+        self._prefetch_debug_idle_limit = idle_limit
+        self._prefetch_debug_deferred = 0
+        self._prefetch_debug_idle = 0
+        self._prefetch_debug_dumps = 0
+        self.active_requests = active
+        self.waiting_queue = []
+        self.inflight_req_ids = set()
+        self.kv_cache_manager.index_mapper = type("IM", (), {"num_free_slots": lambda self: 2})()
+        self.kv_cache_manager.kv_cache_map = {}
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_prefetch_debug_note_dumps_idle_worker(monkeypatch, rank):
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+
+    lines = []
+    monkeypatch.setattr(py_executor.logger, "info", lines.append)
+    stub = _DebugStub(
+        py_executor,
+        SeqSlotManager(1),
+        rank=rank,
+        idle_limit=2,
+        active=[_DebugRequest(7, "DISAGG_GENERATION_TRANS_COMPLETE")],
+    )
+    note = py_executor.PyExecutor._prefetch_debug_note
+
+    note(stub, 1, [], [])  # first deferral: a new power of two
+    note(stub, 1, [], [])  # second deferral: 2, a new power of two; idle 2 -> dump 1
+    note(stub, 0, [], [])  # idle 3
+    note(stub, 0, [], [])  # idle 4 -> dump 2
+    note(stub, 0, [], [object()])  # a scheduled request resets the idle count
+
+    if rank != 0:
+        assert lines == []
+        return
+    assert [line for line in lines if "deferred_without_seat=" in line and "dump" not in line] == [
+        "disagg_gen_prefetch deferred_without_seat=1",
+        "disagg_gen_prefetch deferred_without_seat=2",
+    ]
+    dumps = [line for line in lines if "idle dump" in line]
+    assert len(dumps) == 4  # two dumps, each a header and one request line
+    assert "free_seats=1" in dumps[0] and "free_index_slots=2" in dumps[0]
+    assert "request 7 state=DISAGG_GENERATION_TRANS_COMPLETE" in dumps[1]
+    assert stub._prefetch_debug_idle == 0
