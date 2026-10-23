@@ -280,6 +280,13 @@ TRTLLM_K3LL_CTX_SP = _flag(
     "work (attn_res, norms, router, latent projections) runs on 1/TP of the tokens, an all-gather feeds attention and "
     "the experts (read at forward time)",
 )
+TRTLLM_K3LL_CTX_SP_MIN_TOKENS = _flag(
+    "TRTLLM_K3LL_CTX_SP_MIN_TOKENS",
+    8193,
+    "TRTLLM_K3LL_CTX_SP applies only to steps of at least this many tokens; the default keeps it above the largest "
+    "breakable prefill CUDA graph bucket (8192), where the step is launch-bound and the extra collectives cost more "
+    "than they save (read at forward time)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

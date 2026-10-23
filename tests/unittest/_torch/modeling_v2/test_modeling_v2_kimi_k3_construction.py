@@ -300,3 +300,25 @@ def test_ctx_sequence_parallel_switch_defaults_off():
     )
     value, default, _ = flags.flags()["TRTLLM_K3LL_CTX_SP"]
     assert default == 0
+
+
+@pytest.mark.parametrize(
+    "switch, min_tokens, num_tokens, wanted",
+    [
+        (0, 8193, 32768, False),
+        (1, 8193, 8192, False),
+        (1, 8193, 8193, True),
+        (1, 8193, 32768, True),
+        (1, 1, 1667, True),
+    ],
+)
+def test_ctx_sequence_parallel_token_gate(monkeypatch, switch, min_tokens, num_tokens, wanted):
+    """TRTLLM_K3LL_CTX_SP applies from TRTLLM_K3LL_CTX_SP_MIN_TOKENS rows up; by default only above the largest
+    breakable prefill graph bucket (8192)."""
+    pkg = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4"
+    impl = importlib.import_module(f"{pkg}.implementation")
+    flags = importlib.import_module(f"{pkg}.flags")
+    assert flags.flags()["TRTLLM_K3LL_CTX_SP_MIN_TOKENS"][1] == 8193
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_CTX_SP", switch)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_CTX_SP_MIN_TOKENS", min_tokens)
+    assert impl._ctx_sequence_parallel_wanted(num_tokens) is wanted

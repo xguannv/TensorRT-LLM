@@ -716,6 +716,12 @@ def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     return torch.cat([x, x.new_zeros((rows - x.shape[0],) + tuple(x.shape[1:]))], dim=0)
 
 
+def _ctx_sequence_parallel_wanted(num_tokens: int) -> bool:
+    """Whether a context-only step of ``num_tokens`` rows takes the sequence-parallel generic path: the switch is on
+    and the step is at least ``TRTLLM_K3LL_CTX_SP_MIN_TOKENS`` rows."""
+    return bool(_flags.TRTLLM_K3LL_CTX_SP) and num_tokens >= _flags.TRTLLM_K3LL_CTX_SP_MIN_TOKENS
+
+
 class _CtxSeqParallel:
     """One step's sequence-parallel row layout over the TP group (``TRTLLM_K3LL_CTX_SP``, context-only targets).
 
@@ -2224,7 +2230,11 @@ class KimiLinearModel(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
-        if self.ctx_only and _flags.TRTLLM_K3LL_CTX_SP and self._takes_sequence_parallel():
+        if (
+            self.ctx_only
+            and _ctx_sequence_parallel_wanted(num_tokens)
+            and self._takes_sequence_parallel()
+        ):
             return self._generic_forward_sp(attn_metadata, input_ids, inputs_embeds, spec_metadata)
         step = None if self.ctx_only else decode_step(attn_metadata, num_tokens)
         if step is None:
