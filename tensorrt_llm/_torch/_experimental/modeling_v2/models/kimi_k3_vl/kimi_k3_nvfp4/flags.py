@@ -273,6 +273,14 @@ TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X = _flag(
     "step)",
 )
 
+TRTLLM_K3LL_CTX_SP = _flag(
+    "TRTLLM_K3LL_CTX_SP",
+    0,
+    "context-only targets: sequence-parallel generic path; each TP all-reduce becomes a reduce-scatter, the per-token "
+    "work (attn_res, norms, router, latent projections) runs on 1/TP of the tokens, an all-gather feeds attention and "
+    "the experts (read at forward time)",
+)
+
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""

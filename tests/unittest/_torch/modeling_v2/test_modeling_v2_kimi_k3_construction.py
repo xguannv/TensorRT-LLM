@@ -272,3 +272,31 @@ def test_pad_rows_is_identity_without_padding():
     padded = impl._pad_rows(x, 8)
     assert padded.shape == (8, 3, 4)
     assert torch.equal(padded[:5], x) and not padded[5:].any()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 1664, 1667, 32768])
+def test_ctx_sequence_parallel_row_layout(num_tokens):
+    """TRTLLM_K3LL_CTX_SP's rows: the step's rows padded to a multiple of the TP size, contiguous per rank, so the
+    ranks' rows in order are the step's rows followed by zero rows."""
+    impl = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.implementation"
+    )
+    tp = 8
+    x = torch.randn(num_tokens, 3)
+    parts = []
+    for rank in range(tp):
+        sp = impl._CtxSeqParallel(types.SimpleNamespace(tp_size=tp, tp_rank=rank), num_tokens)
+        assert sp.padded % tp == 0 and sp.padded - num_tokens < tp and sp.local * tp == sp.padded
+        parts.append(sp.scatter(x))
+    joined = torch.cat(parts)
+    assert joined.shape[0] == sp.padded
+    assert torch.equal(joined[:num_tokens], x) and not joined[num_tokens:].any()
+
+
+def test_ctx_sequence_parallel_switch_defaults_off():
+    """TRTLLM_K3LL_CTX_SP is registered and off by default (the generic path is unchanged without it)."""
+    flags = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.flags"
+    )
+    value, default, _ = flags.flags()["TRTLLM_K3LL_CTX_SP"]
+    assert default == 0

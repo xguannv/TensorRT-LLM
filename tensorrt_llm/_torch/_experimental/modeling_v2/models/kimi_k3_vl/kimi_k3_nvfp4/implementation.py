@@ -9,7 +9,18 @@ import copy
 import math
 import os
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import nn
@@ -23,7 +34,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 # Registers trtllm::kda_mtp_decode (REQUIRED_TRTLLM_OPS), which the built-in KDA module loads on its first verify.
 from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
 from tensorrt_llm._torch.cute_dsl_kernels.k3_mla.decode_view import k3_mla_decode_view
-from tensorrt_llm._torch.distributed import AllReduce
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams, allgather, reducescatter
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_dspark import (
@@ -705,6 +716,34 @@ def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     return torch.cat([x, x.new_zeros((rows - x.shape[0],) + tuple(x.shape[1:]))], dim=0)
 
 
+class _CtxSeqParallel:
+    """One step's sequence-parallel row layout over the TP group (``TRTLLM_K3LL_CTX_SP``, context-only targets).
+
+    The step's ``num_tokens`` rows are padded with zero rows to a multiple of the TP size; rank ``r`` owns rows
+    ``[r * local, (r + 1) * local)``. ``gather`` and ``reduce_scatter`` are the NCCL collectives over the TP group, so
+    reduce_scatter + all-gather move the bytes of the all-reduce they replace."""
+
+    def __init__(self, mapping: Mapping, num_tokens: int) -> None:
+        self.mapping = mapping
+        self.num_tokens = num_tokens
+        self.local = -(-num_tokens // mapping.tp_size)
+        self.padded = self.local * mapping.tp_size
+        self.begin = mapping.tp_rank * self.local
+
+    def scatter(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's rows of a tensor every rank holds whole (no communication)."""
+        return _pad_rows(x, self.padded)[self.begin : self.begin + self.local]
+
+    def gather(self, *xs: torch.Tensor) -> List[torch.Tensor]:
+        """Every rank's rows of each ``[local, ...]`` tensor, in one grouped all-gather, cut to ``num_tokens``."""
+        out = allgather(list(xs), self.mapping, dim=0)
+        return [x[: self.num_tokens] for x in out]
+
+    def reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
+        """This rank's rows of the sum over the TP group of a ``[num_tokens, ...]`` partial."""
+        return reducescatter(_pad_rows(partial, self.padded).contiguous(), self.mapping, dim=0)
+
+
 def _apply_attn_res_and_rmsnorm(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -1279,6 +1318,34 @@ class KimiK3MoERuntime(nn.Module):
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
 
+    def takes_sequence_parallel(self) -> bool:
+        """Whether ``forward_generic_sp`` applies: the routed output is this rank's partial over a TP group (the
+        latent all-reduce Kimi owns) and the shared expert is TP-split."""
+        return self._reduce_routed_output
+
+    def forward_generic_sp(self, hidden_local: torch.Tensor, sp: "_CtxSeqParallel") -> torch.Tensor:
+        """``forward_generic`` on this rank's rows (``TRTLLM_K3LL_CTX_SP``): the router and the latent down projection
+        on the local rows; one all-gather of [latent | block input] and the router logits feeds the experts (each rank
+        its own) and the TP-split shared expert; one reduce-scatter of [routed latent | shared] partials; the latent
+        norm and up projection on the local rows."""
+        router_logits = self.gate.compute_logits(hidden_local)
+        routed_in = self._routed_projection(hidden_local, self.routed_expert_down_proj)
+        latent_width = routed_in.shape[1]
+        gathered, router_logits = sp.gather(
+            torch.cat([routed_in, hidden_local], dim=1), router_logits
+        )
+        routed_in, identity = gathered[:, :latent_width], gathered[:, latent_width:]
+        routed_partial = self.routed_experts(
+            routed_in.contiguous(), router_logits, all_rank_num_tokens=None
+        )
+        shared_partial = self.shared_experts(
+            identity.contiguous(), final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+        )
+        reduced = sp.reduce_scatter(torch.cat([routed_partial, shared_partial], dim=1))
+        routed_latent = self.routed_expert_norm(reduced[:, :latent_width])
+        routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        return routed_out + reduced[:, latent_width:]
+
 
 def resolve_attention_quant_config(
     config: ModelConfig | None, layer_idx: int, projection: str
@@ -1443,6 +1510,7 @@ class KimiLinearDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
+        self._tp_size = model_config.mapping.tp_size
         dtype = torch.bfloat16
 
         self.is_kda = _is_kda_layer(cfg, layer_idx)
@@ -1870,6 +1938,72 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
         return prefix_sum + hidden_states, num_snapshots
 
+    def takes_sequence_parallel(self) -> bool:
+        """Whether ``forward_generic_sp`` applies to this layer (its MLP / MoE output is a TP partial)."""
+        if self.is_moe:
+            return self.block_sparse_moe.takes_sequence_parallel()
+        return self.mlp_tp_size == self._tp_size > 1
+
+    def forward_generic_sp(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        num_snapshots: int,
+        attn_metadata: AttentionMetadata,
+        sp: "_CtxSeqParallel",
+    ) -> Tuple[torch.Tensor, int]:
+        """``forward_generic`` on this rank's rows of the residual stream (``TRTLLM_K3LL_CTX_SP``): the attention
+        residuals and norms on the local rows, an all-gather into attention, a reduce-scatter of its ``o_proj``
+        partial in place of the all-reduce; the same around the dense MLP, or ``forward_generic_sp`` of the MoE."""
+        prefix_sum = hidden_states
+        valid_block_residual = block_residual[:num_snapshots]
+        if num_snapshots > 0:
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+            )
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+        if self.layer_idx % self.attn_res_block_size == 0:
+            block_residual[num_snapshots].copy_(prefix_sum)
+            num_snapshots += 1
+            valid_block_residual = block_residual[:num_snapshots]
+            prefix_sum = None
+        attention = self.linear_attn if self.is_kda else self.self_attn
+        (attention_in,) = sp.gather(hidden_states)
+        attention_out = sp.reduce_scatter(
+            attention.forward_generic(attention_in, attn_metadata, reduce_output=False)
+        )
+        if prefix_sum is None:
+            prefix_sum = attention_out
+            hidden_states = _apply_attn_res_and_rmsnorm(
+                prefix_sum,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        else:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                prefix_sum,
+                attention_out,
+                valid_block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.post_attention_layernorm,
+            )
+        if self.is_moe:
+            hidden_states = self.block_sparse_moe.forward_generic_sp(hidden_states, sp)
+        else:
+            (mlp_in,) = sp.gather(hidden_states)
+            hidden_states = sp.reduce_scatter(
+                self.mlp(mlp_in, final_all_reduce_params=AllReduceParams(enable_allreduce=False))
+            )
+        return prefix_sum + hidden_states, num_snapshots
+
     def _dense_mlp(self, hidden_states: torch.Tensor, step: DecodeStep) -> torch.Tensor:
         """The dense MLP: on a step of at most DECODE_MAX_TOKENS tokens, its GEMVs and activation on the decode
         kernels (``K3DecodeGemvs.dense_mlp``), then the down projection's all-reduce; else the module."""
@@ -1988,6 +2122,8 @@ class KimiLinearModel(DecoderModel):
 
         # A context-only target (K3TargetSpec.ctx_only) sets this: every step then takes the generic path.
         self.ctx_only = False
+        # Whether the sequence-parallel generic path applies (TRTLLM_K3LL_CTX_SP), resolved at the first step.
+        self._sp_ok: Optional[bool] = None
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
@@ -2088,6 +2224,8 @@ class KimiLinearModel(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
+        if self.ctx_only and _flags.TRTLLM_K3LL_CTX_SP and self._takes_sequence_parallel():
+            return self._generic_forward_sp(attn_metadata, input_ids, inputs_embeds, spec_metadata)
         step = None if self.ctx_only else decode_step(attn_metadata, num_tokens)
         if step is None:
             return self._generic_forward(attn_metadata, input_ids, inputs_embeds, spec_metadata)
@@ -2214,6 +2352,51 @@ class KimiLinearModel(DecoderModel):
         return self._final_norm(
             hidden_states, block_residual, num_snapshots, spec_metadata, capture_set
         )
+
+    def _takes_sequence_parallel(self) -> bool:
+        """Whether ``_generic_forward_sp`` applies: TP > 1 and every layer's MLP / MoE output is a TP partial."""
+        if self._sp_ok is None:
+            self._sp_ok = self.model_config.mapping.tp_size > 1 and all(
+                layer.takes_sequence_parallel() for layer in self.layers
+            )
+            logger.info(
+                f"Kimi K3 context-only sequence-parallel generic path available: {self._sp_ok}"
+            )
+        return self._sp_ok
+
+    def _generic_forward_sp(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor],
+        inputs_embeds: Optional[torch.FloatTensor],
+        spec_metadata,
+    ) -> torch.Tensor:
+        """``_generic_forward`` with the residual stream split by rows over the TP group (``TRTLLM_K3LL_CTX_SP``):
+        each rank keeps its rows of the stream and of the attention-residual snapshots; the output is all-gathered
+        after the final norm. A context-only target builds no drafter, so there is no hidden-state capture."""
+        assert spec_metadata is None, (
+            "the sequence-parallel generic path is context-only (no drafter capture)"
+        )
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        sp = _CtxSeqParallel(self.model_config.mapping, hidden_states.shape[0])
+        hidden_states = sp.scatter(hidden_states)
+        block_residual = hidden_states.new_empty(
+            self.num_attn_res_snapshots, hidden_states.shape[0], hidden_states.shape[1]
+        )
+        num_snapshots = 0
+        for layer in self.layers:
+            hidden_states, num_snapshots = layer.forward_generic_sp(
+                hidden_states, block_residual, num_snapshots, attn_metadata, sp
+            )
+        normed = _apply_attn_res_and_rmsnorm(
+            hidden_states,
+            block_residual[:num_snapshots],
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+            self.norm,
+        )
+        (out,) = sp.gather(normed)
+        return out
 
     def _capture(self, spec_metadata, capture_set, i: int) -> Optional[Tuple[Any, int]]:
         # DFlash/DSpark hidden-state capture. The drafter is distilled on
