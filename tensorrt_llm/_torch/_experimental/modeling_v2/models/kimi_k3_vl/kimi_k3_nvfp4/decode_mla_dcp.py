@@ -34,6 +34,8 @@ from dataclasses import dataclass, replace
 from typing import Callable, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.utils import helix_local_len_tensor
 
@@ -100,9 +102,41 @@ def var_split_grid(batch: int, heads: int, q_len: int) -> int:
     return grid if grid > 1 and batch <= budget else 0
 
 
+@triton.jit
+def _var_split_counts_kernel(
+    SEQS,
+    OUT,
+    B: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    GRID: tl.constexpr,
+    BUDGET: tl.constexpr,
+    K_TILE: tl.constexpr,
+):
+    """One program: every candidate unit ``ceil(t_b / k)`` in the order (b, k), the first of the lowest cost wins."""
+    offs = tl.arange(0, BLOCK_B)
+    live = offs < B
+    tiles = tl.maximum(
+        (tl.load(SEQS + offs, mask=live, other=0).to(tl.int64) + (K_TILE - 1)) // K_TILE, 1
+    )
+    best_cost = tl.full([], 2**62, tl.int64)
+    best = tl.full((BLOCK_B,), 1, tl.int64)
+    for b in tl.range(0, B):
+        t_b = tl.maximum((tl.load(SEQS + b).to(tl.int64) + (K_TILE - 1)) // K_TILE, 1)
+        for k in tl.range(1, GRID + 1):
+            unit = (t_b + k - 1) // k
+            splits = tl.minimum(tl.maximum((tiles + unit - 1) // unit, 1), GRID)
+            largest = tl.max(tl.where(live, (tiles + splits - 1) // splits, 0), axis=0)
+            total = tl.sum(tl.where(live, splits, 0), axis=0)
+            cost = tl.where(total <= BUDGET, largest * (BUDGET + 1) + total, 2**62)
+            better = cost < best_cost
+            best = tl.where(better, splits, best)
+            best_cost = tl.where(better, cost, best_cost)
+    tl.store(OUT + offs, best.to(tl.int32), mask=live)
+
+
 def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Optional[torch.Tensor]:
     """``TRTLLM_K3LL_MLA_VAR_SPLIT``: each request's split-KV count from its KV length on this rank, on device
-    (capturable, no host sync), or None where `var_split_grid` is 0.
+    (one kernel, capturable, no host sync), or None where `var_split_grid` is 0.
 
     Every request ``b`` of ``t_b`` K tiles is cut into ``s_b = ceil(t_b / u)`` splits of at most ``u`` tiles (at
     least 1, at most the grid's). ``u`` is the candidate ``ceil(t_b / k)`` (``k`` up to the grid's split count) with
@@ -112,17 +146,17 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
     budget, grid = _var_split_envelope(batch, heads, q_len)
     if not (grid > 1 and batch <= budget):
         return None
-    tiles = ((cache_seqs.to(torch.int64) + (_K_TILE - 1)) // _K_TILE).clamp(min=1)
-    k = torch.arange(1, grid + 1, dtype=torch.int64, device=cache_seqs.device)
-    unit = ((tiles.view(-1, 1) + k.view(1, -1) - 1) // k.view(1, -1)).reshape(-1)
-    splits = ((tiles.view(1, -1) + unit.view(-1, 1) - 1) // unit.view(-1, 1)).clamp(1, grid)
-    largest = ((tiles.view(1, -1) + splits - 1) // splits).amax(dim=1)
-    total = splits.sum(dim=1)
-    cost = torch.where(
-        total <= budget, largest * (budget + 1) + total, torch.iinfo(torch.int64).max
+    out = torch.empty(batch, dtype=torch.int32, device=cache_seqs.device)
+    _var_split_counts_kernel[(1,)](
+        cache_seqs.contiguous(),
+        out,
+        B=batch,
+        BLOCK_B=triton.next_power_of_2(batch),
+        GRID=grid,
+        BUDGET=budget,
+        K_TILE=_K_TILE,
     )
-    # index_select, not splits[argmin]: a 0-d index tensor would be read on the host (no sync under capture)
-    return splits.index_select(0, cost.argmin().view(1)).view(-1).to(torch.int32).contiguous()
+    return out
 
 
 def with_var_split(plan: SplitReadPlan, heads: int, q_len: int) -> SplitReadPlan:
@@ -445,6 +479,9 @@ class MlaSplitRead:
     """
 
     _shared: dict = {}
+    _var_plan: Optional[SplitReadPlan] = (
+        None  # the step plan with per-request split counts (`_step_plan`)
+    )
 
     @classmethod
     def shared(cls, mapping, heads_per_rank: int, gather_mapping=None) -> "MlaSplitRead":
@@ -598,8 +635,15 @@ class MlaSplitRead:
             self._scales[layer_idx] = scales
         return scales
 
-    def _step_plan(self, layer_idx, block_rows, lens, q_len, meta=None) -> SplitReadPlan:
+    def _step_plan(
+        self, layer_idx, block_rows, lens, q_len, meta=None, var_split: bool = False
+    ) -> SplitReadPlan:
+        """The step's plan, built by its first MLA layer and reused by the others. ``var_split``: the caller's split
+        read takes per-request split counts (only the Helix V-up split read does); with
+        ``TRTLLM_K3LL_MLA_VAR_SPLIT`` the first such call of the step computes them and the step's later ones reuse
+        them. A step whose split reads take none computes none."""
         if self._plan is None or layer_idx == self._first_layer:
+            self._var_plan = None
             if self.helix:
                 tokens = block_rows.shape[0] * q_len
                 self._plan = make_helix_plan(
@@ -610,20 +654,20 @@ class MlaSplitRead:
                     self.cp,
                     self.rank,
                 )
-                if _flags.TRTLLM_K3LL_MLA_VAR_SPLIT:
-                    # once per step (read at forward time): every layer's split read takes these counts
-                    self._plan = with_var_split(self._plan, self.heads, q_len)
-                return self._plan
-            index = self._block_index.get(block_rows.shape[1])
-            if index is None:
-                index = local_block_index(
-                    block_rows.shape[1], self.cp, self.rank, block_rows.device
-                )
-                self._block_index[block_rows.shape[1]] = index
-            self._plan = make_split_read_plan(
-                block_rows, lens, q_len, PAGE_SIZE, self.cp, self.rank, index
-            )
+            else:
+                self._plan = self._split_read_plan(block_rows, lens, q_len)
+        if var_split and self.helix and _flags.TRTLLM_K3LL_MLA_VAR_SPLIT:
+            if self._var_plan is None:
+                self._var_plan = with_var_split(self._plan, self.heads, q_len)
+            return self._var_plan
         return self._plan
+
+    def _split_read_plan(self, block_rows, lens, q_len) -> SplitReadPlan:
+        index = self._block_index.get(block_rows.shape[1])
+        if index is None:
+            index = local_block_index(block_rows.shape[1], self.cp, self.rank, block_rows.device)
+            self._block_index[block_rows.shape[1]] = index
+        return make_split_read_plan(block_rows, lens, q_len, PAGE_SIZE, self.cp, self.rank, index)
 
     def forward(
         self,
@@ -716,7 +760,9 @@ class MlaSplitRead:
         q_all = q_all.view(torch.float8_e4m3fn).view(
             num_requests, q_len, self.heads, KV_LORA_RANK + QK_ROPE_DIM
         )
-        plan = self._step_plan(mqa.layer_idx, block_rows, lens, q_len, meta)
+        plan = self._step_plan(
+            mqa.layer_idx, block_rows, lens, q_len, meta, var_split=v_up_weight is not None
+        )
         if layer_in_pool:
             plan = replace(plan, page_table=plan.page_table + layer_in_pool)
         stats = torch.empty(tokens, self.heads, 2, dtype=torch.float32, device=quant_q.device)

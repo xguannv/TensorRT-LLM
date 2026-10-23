@@ -159,6 +159,22 @@ def test_counts(name):
     )
 
 
+@pytest.mark.parametrize("batch", range(1, 9))
+def test_counts_random(batch):
+    """The one-kernel selection against the python reference on random per-rank lengths (0 included: a request
+    with no page on the rank), 200 batches per size."""
+    vu = _vu()
+    dcp = vu._mods()[0]
+    budget, grid = dcp._var_split_envelope(batch, vu.HEADS, 8)
+    g = torch.Generator().manual_seed(batch)
+    for _ in range(200):
+        lens = torch.randint(0, 40000, (batch,), generator=g)
+        lens[torch.rand(batch, generator=g) < 0.1] = 0
+        counts = dcp.var_split_counts(lens.to(torch.int32).cuda(), vu.HEADS, 8)
+        assert counts is not None and counts.dtype == torch.int32
+        assert counts.tolist() == _ref_counts(lens.tolist(), budget, grid), lens.tolist()
+
+
 @pytest.mark.parametrize("name", list(CASES))
 def test_off_is_split_read_then_bmm(name):
     vu, dcp, _, pool, _, _, q, plan = _setup(CASES[name])

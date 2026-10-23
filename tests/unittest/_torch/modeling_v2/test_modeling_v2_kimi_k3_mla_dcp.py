@@ -239,6 +239,79 @@ def test_helix_step_plan_reads_the_helix_metadata():
     )
 
 
+@pytest.mark.parametrize("switch", [0, 1])
+def test_var_split_counts_only_for_the_v_up_split_read(monkeypatch, switch):
+    """TRTLLM_K3LL_MLA_VAR_SPLIT: only the Helix V-up split read takes per-request split counts. Steps whose split
+    reads are the plain one (no W_UV: SM107, or TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A off) compute none and read the
+    static plan; a step of V-up split reads computes them once, at its first MLA layer, and every layer reads those
+    counts; the next step computes them again. With the switch off no step computes any."""
+    import types
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
+    from tensorrt_llm._torch.utils import helix_local_len_tensor
+
+    dcp = _dcp()
+    device = torch.device("cuda")
+    cp, rank, q_len, layers = 16, 3, 8, (7, 9)
+    helix = types.SimpleNamespace(
+        has_cp_helix=lambda: True, cp_size=cp, cp_rank=rank, cp_group=list(range(cp)), tp_rank=0
+    )
+    split = dcp.MlaSplitRead(
+        helix, 6, mode=1, gather_mapping=types.SimpleNamespace(tp_size=cp, tp_rank=rank)
+    )
+    for layer in layers:
+        split.register(layer)
+    lens = torch.tensor([153600 + q_len, 70000 + q_len], dtype=torch.int32, device=device)
+    positions = (
+        (lens.view(-1, 1) - q_len + torch.arange(q_len, device=device)).reshape(-1).to(torch.int32)
+    )
+    meta = types.SimpleNamespace(num_generations=2, helix_position_offsets=positions)
+    local_rows = torch.arange(2 * 200, dtype=torch.int32, device=device).view(2, 200)
+    local_lens = helix_local_len_tensor(lens, PAGE, cp, rank)
+
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_MLA_VAR_SPLIT", switch)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_HELIX_A2A_FUSED", 1)
+    counted = []
+    real_counts = dcp.var_split_counts
+    monkeypatch.setattr(
+        dcp, "var_split_counts", lambda *a, **k: counted.append(1) or real_counts(*a, **k)
+    )
+    plans = []
+    monkeypatch.setattr(dcp, "split_read_attention", lambda q, pages, plan, *a: plans.append(plan))
+    monkeypatch.setattr(dcp, "exchange_combine_fused", lambda out, *a: out)
+    split._a2a_fused = object()
+    split._forward_v_up = lambda q_all, pages, plan, *a: plans.append(plan)
+    split._layer_inputs = lambda mqa, meta, n: (None, local_rows, 0, local_lens)
+    split._layer_scales = lambda *a: (1.0, 1.0)
+    quant_q = torch.zeros(2 * q_len, HEADS, LATENT + ROPE, dtype=torch.uint8, device=device)
+    w_uv = torch.zeros(1, device=device)
+    gate = torch.zeros(1, device=device)
+
+    def step(v_up: bool):
+        plans.clear()
+        for layer in layers:
+            split.forward(
+                types.SimpleNamespace(layer_idx=layer), quant_q, meta, q_len, None, None,
+                all_heads=True, v_up_weight=w_uv if v_up else None, v_up_gate=gate if v_up else None,
+            )  # fmt: skip
+        assert len(plans) == len(layers)
+        return list(plans)
+
+    for _ in range(2):
+        assert all(p.block_splits is None for p in step(v_up=False))
+    assert counted == []
+    first = step(v_up=True)
+    if not switch:
+        assert counted == [] and all(p.block_splits is None for p in first)
+        return
+    assert len(counted) == 1
+    assert first[0].block_splits is not None and first[0].var_split > 1
+    assert all(p.block_splits is first[0].block_splits for p in first)
+    step(v_up=True)
+    assert len(counted) == 2
+    assert all(p.block_splits is None for p in step(v_up=False)) and len(counted) == 2
+
+
 @pytest.mark.parametrize(
     "seq_lens,q_len,heads", [([5000, 300], 7, 6), ([PAGE * 16 + 2], 8, 6), ([9000], 1, 96)]
 )
