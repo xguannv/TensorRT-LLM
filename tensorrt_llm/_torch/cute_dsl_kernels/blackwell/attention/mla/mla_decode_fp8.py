@@ -163,6 +163,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         use_pdl: bool = False,
         var_split_bounded: bool = False,
         var_split_direct: bool = False,
+        early_prologue: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -223,6 +224,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             epilogue, as the ``split_kv == 1`` kernel does, and the reduction
             skips it (the same values: a one-split reduction is the identity).
         :type var_split_direct: bool
+        :param early_prologue: With ``use_pdl`` (fixed query lengths): the
+            load-K warp reads the page table and loads the first K tile of its
+            first work item before ``griddepcontrol.wait`` when that tile holds
+            only KV older than this step (no position of the last ``seq_len_q``
+            of the request, which this step may append); the query follows the
+            wait, and the load-V warp starts its first work item once the query
+            is issued. Every other warp waits where it would without it. The
+            caller must guarantee that ``cache_seqs``, ``block_split_kvs``, the
+            page table and that older KV are complete when this grid launches
+            (written before the CUDA graph, or by kernels that completed before
+            the preceding kernel released this grid after its own wait). Same
+            bytes.
+        :type early_prologue: bool
         """
 
         self.latent_dim = 512
@@ -253,6 +267,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 "var_split_direct needs variable split-KV and fixed query "
                 "lengths")
         self.var_split_direct = var_split_direct
+        if early_prologue and is_var_q:
+            raise ValueError("early_prologue needs fixed query lengths")
+        self.early_prologue = bool(early_prologue and use_pdl)
         # ``seq_len_q`` is the compile-time query capacity.  Fixed-query
         # specializations use it as the request length; variable-query
         # specializations obtain each request's actual length from its indptr.
@@ -366,6 +383,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             barrier_id=7,
             num_threads=(self.threads_per_warp * self.num_total_compute_warps),
         )
+        # early_prologue: the load-K warp arrives once its first query load is
+        # issued; the load-V warp waits for it before its first V tile.
+        self.q_issued_bar = pipeline.NamedBarrier(barrier_id=8,
+                                                  num_threads=2 *
+                                                  self.threads_per_warp)
         # Init seed for TMEM corr (row_max, row_sum). load_other_group_metadata
         # reads peer's prev-tile metadata; the first tile of each group needs a
         # valid "no prev yet" seed: row_max = -inf, row_sum = 0 form the online
@@ -1535,10 +1557,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # are accessed after the preceding kernel completed. By default the
             # reduction is released by this grid's exits (no early trigger:
             # its CTAs would wait on the SMs of running clusters); with
-            # ``split_prewait`` a subclass's consumer is released here.
-            cute.arch.griddepcontrol_wait()
-            if cutlass.const_expr(self.split_prewait):
-                cute.arch.griddepcontrol_launch_dependents()
+            # ``split_prewait`` a subclass's consumer is released here. With
+            # ``early_prologue`` the load-K warp waits in ``load_tma_qk``.
+            if cutlass.const_expr(self.early_prologue):
+                if warp_idx != self.load_tma_k_warp_id:
+                    cute.arch.griddepcontrol_wait()
+                    if cutlass.const_expr(self.split_prewait):
+                        cute.arch.griddepcontrol_launch_dependents()
+            else:
+                cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(self.split_prewait):
+                    cute.arch.griddepcontrol_launch_dependents()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
@@ -1554,6 +1583,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
+            # early_prologue: 1 until the first work item with K tiles (whose
+            # load_tma_qk does the wait) is issued.
+            early_first = cutlass.Int32(1)
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 (
@@ -1596,6 +1628,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         sKC=sKC_for_tma,
                         sKC_rope=sKC_rope_for_tma,
                     )
+                    if cutlass.const_expr(self.early_prologue):
+                        tma_common_params.early_first = early_first
+                        tma_common_params.seq_k = cache_seqs[blk_coord[2]]
                     # Load tma
                     load_q_producer_state, load_k_producer_state = self.load_tma_qk(
                         tma_common_params,
@@ -1605,8 +1640,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         load_q_producer_state,
                         load_k_producer_state,
                     )
+                    early_first = cutlass.Int32(0)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+            if cutlass.const_expr(self.early_prologue):
+                if early_first != 0:
+                    # No work item with K tiles: wait as every other warp did.
+                    cute.arch.griddepcontrol_wait()
+                    if cutlass.const_expr(self.split_prewait):
+                        cute.arch.griddepcontrol_launch_dependents()
 
             load_q_pipeline.producer_tail(load_q_producer_state)
             load_k_pipeline.producer_tail(load_k_producer_state)
@@ -1618,6 +1660,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
+            early_first_v = cutlass.Int32(1)
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 (
@@ -1648,6 +1691,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mCLT=mCLT,
                         sVC=sVC_for_tma,
                     )
+                    if cutlass.const_expr(self.early_prologue):
+                        if early_first_v != 0:
+                            # The V tiles follow the first query in the TMA queue.
+                            self.q_issued_bar.arrive_and_wait()
+                        early_first_v = cutlass.Int32(0)
                     # Load tma
                     load_v_producer_state = self.load_tma_v(
                         tma_common_params,
@@ -2486,6 +2534,67 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         qk_params.tKCsKC = tKCsKC
         qk_params.tKCsKC_rope = tKCsKC_rope
 
+        if cutlass.const_expr(self.early_prologue):
+            if common_params.early_first != 0:
+                # Before the wait: the first K tile when it holds only KV older
+                # than this step (positions below the request's last seq_len_q,
+                # which this step may append), then the wait, then the query.
+                n_early = cutlass.Int32(0)
+                if (k_index + 1) * self.mma_qk_tiler[
+                        1] + self.seq_len_q <= common_params.seq_k:
+                    n_early = cutlass.Int32(1)
+                for _ in cutlass.range(n_early, unroll=1):
+                    load_q_producer_state, load_k_producer_state = self.load_tma_qk_one_k_tile(
+                        common_params,
+                        qk_params,
+                        k_index,
+                        k_tile_count,
+                        load_q_producer_state,
+                        load_k_producer_state,
+                        load_q=False,
+                    )
+                    k_index += 1
+                    k_tile_count -= 1
+                cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(self.split_prewait):
+                    cute.arch.griddepcontrol_launch_dependents()
+                load_q_producer_state = self.load_tma_q_only(
+                    common_params, qk_params, load_q_producer_state)
+                self.q_issued_bar.arrive()
+                while k_tile_count > 0:
+                    load_q_producer_state, load_k_producer_state = self.load_tma_qk_one_k_tile(
+                        common_params,
+                        qk_params,
+                        k_index,
+                        k_tile_count,
+                        load_q_producer_state,
+                        load_k_producer_state,
+                        load_q=False,
+                    )
+                    k_index += 1
+                    k_tile_count -= 1
+            else:
+                load_q_producer_state, load_k_producer_state = self._load_tma_qk_tiles(
+                    common_params, qk_params, k_index, k_tile_count,
+                    load_q_producer_state, load_k_producer_state)
+        else:
+            load_q_producer_state, load_k_producer_state = self._load_tma_qk_tiles(
+                common_params, qk_params, k_index, k_tile_count,
+                load_q_producer_state, load_k_producer_state)
+
+        return load_q_producer_state, load_k_producer_state
+
+    @cute.jit
+    def _load_tma_qk_tiles(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        k_index: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+        load_q_producer_state: pipeline.PipelineState,
+        load_k_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        """The query with the first K tile, then the remaining K tiles."""
         k_tile_count_init = k_tile_count
         while k_tile_count > 0:
             load_q_producer_state, load_k_producer_state = self.load_tma_qk_one_k_tile(
@@ -2499,8 +2608,31 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
             k_index += 1
             k_tile_count -= 1
-
         return load_q_producer_state, load_k_producer_state
+
+    @cute.jit
+    def load_tma_q_only(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        load_q_producer_state: pipeline.PipelineState,
+    ) -> pipeline.PipelineState:
+        """Issue the work item's query load alone (``early_prologue``)."""
+        load_q_pipeline = common_params.load_q_pipeline
+        tma_bar_ptr = load_q_pipeline.producer_get_barrier(
+            load_q_producer_state)
+        load_q_pipeline.producer_acquire(load_q_producer_state)
+        self.issue_q_tma_load(
+            qk_params.tma_atom_q_latent,
+            qk_params.tQLgQL,
+            qk_params.tQsQ,
+            qk_params.tma_atom_q_rope,
+            qk_params.tQRgQR,
+            qk_params.tQsQ_rope,
+            tma_bar_ptr,
+        )
+        load_q_producer_state.advance()
+        return load_q_producer_state
 
     @cute.jit
     def load_tma_v(

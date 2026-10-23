@@ -409,6 +409,7 @@ def split_read_attention_v_up(
     max_batch: int,
     v_weight: torch.Tensor,
     v_out: torch.Tensor,
+    early_prologue: bool = False,
 ) -> None:
     """``split_read_attention`` with the softmax statistics, followed by every head's V up-projection
     (``trtllm::k3_mla_decode_fp8_v_up``).
@@ -417,6 +418,8 @@ def split_read_attention_v_up(
         latent: ``[batch, q_len, heads, 512]`` bf16 scratch (written only where the op does not fuse the projection).
         v_weight: ``[heads, 128, 512]`` bf16 ``W_UV`` of every head.
         v_out: ``[batch * q_len, heads, 128]`` bf16, the projected partial of every head (written).
+        early_prologue: the split kernel's first K tile before its PDL wait (with ``TRTLLM_K3LL_MLA_DECODE_PDL``).
+            Only a caller that certifies the plan's tensors and the older KV complete at launch passes True.
     """
     from . import census as _census
     from . import mla_v_up  # noqa: F401  (registers the op)
@@ -446,6 +449,7 @@ def split_read_attention_v_up(
         prewait,
         plan.block_splits,
         plan.var_split,
+        bool(early_prologue and _flags.TRTLLM_K3LL_MLA_DECODE_PDL),
     )
 
 

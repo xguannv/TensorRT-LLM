@@ -58,11 +58,14 @@ def _run_fused(
     v_out,
     prewait=False,
     block_split_kvs=None,
+    early_prologue=False,
 ) -> None:
     """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS).
     ``prewait``: the split kernel L2-prefetches ``v_weight`` before its PDL wait and releases the fused reduction
     after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; with the runner's PDL only; same bytes). ``block_split_kvs``: each
-    request's split count (``[batch]`` int32, at most the tactic's ``split_kv``), or None for the scalar split."""
+    request's split count (``[batch]`` int32, at most the tactic's ``split_kv``), or None for the scalar split.
+    ``early_prologue``: the split kernel's first K tile of KV older than this step before its PDL wait (with the
+    runner's PDL only; same bytes; the caller certifies its inputs, see ``k3_mla_decode_fp8_v_up``)."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
@@ -127,6 +130,9 @@ def _run_fused(
     var_split = block_split_kvs is not None
     if var_split:
         key = key + ("var_split",)
+    early_prologue = bool(early_prologue and runner.use_pdl)
+    if early_prologue:
+        key = key + ("early_prologue",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -154,6 +160,7 @@ def _run_fused(
             var_split_bounded=var_split,
             v_rows=v_rows,
             prewait=prewait,
+            early_prologue=early_prologue,
         )
 
         def dyn(t, lead, align=16):
@@ -240,6 +247,7 @@ def mla_decode_fp8_v_up(
     prewait: bool,
     block_split_kvs: Optional[torch.Tensor] = None,
     var_split: int = 0,
+    early_prologue: bool = False,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages followed by every head's V up-projection.
 
@@ -260,6 +268,10 @@ def mla_decode_fp8_v_up(
         block_split_kvs, var_split: ``TRTLLM_K3LL_MLA_VAR_SPLIT``: each request's split count (``[batch]`` int32,
             device) and the largest one the grid is sized for (``decode_mla_dcp.var_split_grid``); with
             ``var_split`` <= 1 or no counts, the tactic's scalar split.
+        early_prologue: with ``use_pdl`` and the fused reduction, the split kernel reads the page table and loads
+            the first K tile of KV older than this step before its wait (``TRTLLM_K3LL_MLA_EARLY_PROLOGUE``; same
+            bytes). The caller certifies that ``page_table``, ``cache_seqs``, ``block_split_kvs`` and that KV are
+            complete when the split kernel launches.
     """
     batch, q_len, heads, _ = q.shape
     page_size = kv_pages.shape[1]
@@ -293,6 +305,7 @@ def mla_decode_fp8_v_up(
             v_out,
             prewait,
             block_split_kvs,
+            early_prologue,
         )
         return
     if block_split_kvs is not None:
@@ -324,6 +337,7 @@ def _(
     prewait,
     block_split_kvs=None,
     var_split=0,
+    early_prologue=False,
 ) -> None:
     return None
 
