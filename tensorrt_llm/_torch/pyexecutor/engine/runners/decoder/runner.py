@@ -45,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     get_mrope_dummy_seq_slot,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.k3ll_flags import k3ll_census_dispatch, k3ll_flag
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     BaseMambaCacheManager,
@@ -552,17 +553,17 @@ class DecoderRunner(ScheduledModelRunner):
             if self._config.is_spec_decode and spec_step_copies.is_available()
             else None
         )
-        # TRTLLM_K3LL_SPEC_HEAD_FUSED=1: a pure-generation spec decode step's head
-        # bookkeeping in _preprocess_inputs as one fused_spec_head_prep launch.
-        self._spec_head_fused = (
-            self._config.is_spec_decode and spec_head_kernels.spec_head_fusion_enabled()
-        )
+        # TRTLLM_K3LL_SPEC_HEAD_FUSED (K3 flags module, read on every _preprocess_inputs call, so a
+        # CUDA graph holds the value current at its capture): a pure-generation spec decode step's
+        # head bookkeeping in _preprocess_inputs as one fused_spec_head_prep launch. The fused path
+        # keeps no state of its own; its Triton kernel compiles on its first (eager) launch.
+        self._spec_head_fusable = self._config.is_spec_decode
         # _preprocess_inputs calls that took the fused path, all and under CUDA graph capture.
         # A graph replay reruns the captured launch without running Python, so it is not counted.
         self._spec_head_fused_steps = 0
         self._spec_head_fused_captures = 0
-        if self._spec_head_fused:
-            logger.info("Spec decode step head: fused head prep on")
+        if self._spec_head_fusable and k3ll_flag("TRTLLM_K3LL_SPEC_HEAD_FUSED") == 1:
+            logger.info("Spec decode step head: fused head prep on at load")
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -2929,13 +2930,16 @@ class DecoderRunner(ScheduledModelRunner):
         if attn_meta is not None:
             attn_meta.on_update_kv_lens()
 
-        # With TRTLLM_K3LL_SPEC_HEAD_FUSED=1, one launch for both blocks below where it covers the step.
+        # With TRTLLM_K3LL_SPEC_HEAD_FUSED=1 (read here, per call), one launch for both blocks below
+        # where it covers the step.
         head_fused = (
             enable_spec_decode
-            and self._spec_head_fused
+            and self._spec_head_fusable
+            and k3ll_flag("TRTLLM_K3LL_SPEC_HEAD_FUSED") == 1
             and self._fused_spec_head_prep(inputs, runtime_draft_len)
         )
         if head_fused:
+            k3ll_census_dispatch("spec_head_fused")
             self._spec_head_fused_steps += 1
             if torch.cuda.is_current_stream_capturing():
                 self._spec_head_fused_captures += 1

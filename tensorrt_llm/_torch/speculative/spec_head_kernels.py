@@ -23,23 +23,16 @@ for the bookkeeping and one for the gather. Every value written is the one the
 eager code writes (integer arithmetic with PyTorch's floor-division and
 remainder semantics; the gather is a copy).
 
-``TRTLLM_K3LL_SPEC_HEAD_FUSED=1`` (default 0) selects the bookkeeping kernel in
-the engine's decode-step head (``_preprocess_inputs``). Launch shapes depend
-only on host batch sizes, so both are CUDA-graph capturable.
+The engine's decode-step head (``DecoderRunner._preprocess_inputs``) launches
+the bookkeeping kernel when the Kimi K3 low-latency switch
+``TRTLLM_K3LL_SPEC_HEAD_FUSED`` is 1 (read per call from the K3 flags module,
+``pyexecutor/k3ll_flags.py``). Launch shapes depend only on host batch sizes,
+so both are CUDA-graph capturable.
 """
-
-import os
 
 import torch
 import triton
 import triton.language as tl
-
-SPEC_HEAD_FUSION_ENV_VAR = "TRTLLM_K3LL_SPEC_HEAD_FUSED"
-
-
-def spec_head_fusion_enabled() -> bool:
-    """Whether ``TRTLLM_K3LL_SPEC_HEAD_FUSED=1`` selects the fused decode-step head."""
-    return os.environ.get(SPEC_HEAD_FUSION_ENV_VAR, "0") == "1"
 
 
 @triton.jit

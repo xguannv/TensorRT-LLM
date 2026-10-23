@@ -26,16 +26,30 @@ whole:
   input rewritten in place; a replay of the same inputs is bit-identical;
 * switch on, a step the kernel does not cover (context tokens in the batch): the torch path runs;
 * the runner's fused head-prep count (what its log reports) counts each fused ``_preprocess_inputs`` call Python
-  runs, a CUDA graph capture among them, and no graph replay.
+  runs, a CUDA graph capture among them, and no graph replay;
+* the switch is the K3 flags module's attribute, read on every ``_preprocess_inputs`` call (``k3ll_flag``): on only
+  at 1, off with any other value or without the K3 target loaded; registered in ``flags.py`` with default 0 and bound
+  by value nowhere else (what the one-process A/B's switch tool requires);
+* one runner, built once, the switch flipped between eager steps and between CUDA graph captures (what the
+  one-process A/B does), equals a runner of the other arm on every step and replay, and the K3 census key
+  ``dispatch:spec_head_fused:<mode>`` counts each fused eager call (``eager``) and capture (``capture``), never a
+  replay or a switch-off call.
 
-Batch 1, 2 and 4 at draft length 7 (8 tokens per row); Helix16 at CP ranks 0, 5 and 15 with 64-token pages and
+Batch 1, 2, 4 and 8 at draft length 7 (8 tokens per row); Helix16 at CP ranks 0, 5 and 15 with 64-token pages and
 positions straddling page and ledger boundaries, the overlap scheduler on and off, and the TP16 shape (no Helix).
 """
 
+import sys
 import types
 
 import pytest
 import torch
+
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+    census,
+    flags,
+)
+from tensorrt_llm._torch.pyexecutor import k3ll_flags
 
 DRAFT_LEN = 7
 TOKENS = DRAFT_LEN + 1
@@ -43,10 +57,25 @@ MAX_BATCH = 8
 MAX_NUM_TOKENS = 512
 PAGE = 64
 CP_SIZE = 16
-BATCHES = [1, 2, 4]
-ENV = "TRTLLM_K3LL_SPEC_HEAD_FUSED"
+BATCHES = [1, 2, 4, 8]
+NAME = "TRTLLM_K3LL_SPEC_HEAD_FUSED"
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@pytest.fixture(autouse=True)
+def _k3_switch(monkeypatch):
+    """The switch at 0 on the K3 flags module (as at launch with its default) and the K3 census on; both restored
+    afterwards. ``Step.run`` sets the switch to its arm right before the call."""
+    monkeypatch.setattr(flags, NAME, 0)
+    monkeypatch.setattr(census, "ENABLED", True)
+
+
+def dispatches():
+    """The census counts of ``dispatch:spec_head_fused:<mode>``: (eager, capture)."""
+    c = census.counts()
+    return c.get("dispatch:spec_head_fused:eager", 0), c.get("dispatch:spec_head_fused:capture", 0)
+
 
 # (label, helix, cp_rank, overlap)
 SHAPES = [
@@ -115,7 +144,8 @@ class Step:
         meta = _metadata_cls()
         md.helix_local_len_vec = types.MethodType(meta.helix_local_len_vec, md)
         md.recompute_helix_spec_buffers = types.MethodType(meta.recompute_helix_spec_buffers, md)
-        # Every DecoderRunner attribute _preprocess_inputs reads on this path, as __init__ sets it.
+        # Every DecoderRunner attribute _preprocess_inputs reads on this path, as __init__ sets it. The switch
+        # itself is read per call from the K3 flags module (set by run()).
         runner = types.SimpleNamespace(
             _config=types.SimpleNamespace(disable_overlap_scheduler=not overlap),
             mapping=mapping,
@@ -123,11 +153,12 @@ class Step:
             previous_kv_lens_offsets_cuda=b["kv_off"],
             get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
             guided_decoder=None,
-            _spec_head_fused=fused,
+            _spec_head_fusable=True,
             _spec_head_fused_steps=0,
             _spec_head_fused_captures=0,
         )
         self.runner = runner
+        self.fused = fused
         cls = _runner_cls()
         runner._fused_spec_head_prep = types.MethodType(cls._fused_spec_head_prep, runner)
         self.preprocess = types.MethodType(cls._preprocess_inputs, runner)
@@ -161,6 +192,8 @@ class Step:
         )
 
     def run(self):
+        """``_preprocess_inputs`` with the switch at this step's ``fused`` (read by the runner during the call)."""
+        setattr(flags, NAME, int(self.fused))
         self.preprocess(self.inputs, enable_spec_decode=True, runtime_draft_len=DRAFT_LEN)
 
     def fused_counts(self):
@@ -205,16 +238,40 @@ def _forbid_fused(monkeypatch):
     monkeypatch.setattr(spec_head_kernels, "fused_spec_head_prep", forbidden)
 
 
-@pytest.mark.parametrize("value", [None, "0", "1"])
+@pytest.mark.parametrize("value", [None, 0, 1, 2])
 def test_switch_read(monkeypatch, value):
-    """The runner's switch: on only for ``1``; unset and ``0`` keep the torch path."""
-    from tensorrt_llm._torch.speculative import spec_head_kernels
-
+    """The runner reads the flags module's value at the call: fused only at 1; 0, 2 and no K3 target loaded (the
+    flags module not imported) keep the torch path."""
+    st = Step(2, True, 5, True, fused=False, seed=3)
     if value is None:
-        monkeypatch.delenv(ENV, raising=False)
+        monkeypatch.delitem(sys.modules, k3ll_flags.K3LL_FLAGS_MODULE)
     else:
-        monkeypatch.setenv(ENV, value)
-    assert spec_head_kernels.spec_head_fusion_enabled() == (value == "1")
+        monkeypatch.setattr(flags, NAME, value)
+    if value != 1:
+        _forbid_fused(monkeypatch)
+    eager0, capture0 = dispatches()
+    st.preprocess(st.inputs, enable_spec_decode=True, runtime_draft_len=DRAFT_LEN)
+    torch.cuda.synchronize()
+    on = value == 1
+    assert st.fused_counts() == (int(on), 0)
+    assert dispatches() == (eager0 + on, capture0)
+
+
+def test_switch_registered_and_not_bound():
+    """Registered in the K3 flags with default 0, and bound by value in no other loaded module of the K3 package nor
+    in the runner (the one-process A/B's switch tool refuses a switch bound at import)."""
+    assert flags.flags()[NAME][1] == 0
+    runner_module = sys.modules[_runner_cls().__module__]
+    package = k3ll_flags.K3LL_FLAGS_MODULE.rsplit(".", 1)[0]
+    bound = [
+        name
+        for name, module in list(sys.modules.items())
+        if module is not None
+        and (name.startswith(package) or module is runner_module)
+        and name != k3ll_flags.K3LL_FLAGS_MODULE
+        and NAME in getattr(module, "__dict__", {})
+    ]
+    assert not bound, bound
 
 
 @pytest.mark.parametrize("batch,label,helix,cp_rank,overlap", CASES, ids=IDS)
@@ -301,3 +358,75 @@ def test_switch_on_context_step_takes_torch_path(monkeypatch, helix):
     torch.cuda.synchronize()
     assert not diff(off.bufs, on.bufs), diff(off.bufs, on.bufs)
     assert on.fused_counts() == (0, 0)
+
+
+@pytest.mark.parametrize("batch,label,helix,cp_rank,overlap", CASES, ids=IDS)
+def test_flip_between_steps_and_captures(batch, label, helix, cp_rank, overlap):
+    """One runner, built once, the switch flipped on the K3 flags module between eager steps and between CUDA graph
+    captures (what the one-process A/B does: set the switch on the flags module, release the graphs, recapture).
+    Every step and every replay equals a runner of the other arm on the same inputs; a graph keeps the arm current at
+    its capture whatever the switch says at replay; the census key and the runner's counts see each fused eager call
+    and capture, no replay and no switch-off call."""
+    seed = 13 * batch + cp_rank + 100 * overlap
+    flip = Step(batch, helix, cp_rank, overlap, fused=False, seed=seed)
+    # The other arm's runner for each value of flip's switch: off for a fused flip, on for a torch-path flip.
+    other = {
+        True: Step(batch, helix, cp_rank, overlap, fused=False, seed=seed),
+        False: Step(batch, helix, cp_rank, overlap, fused=True, seed=seed),
+    }
+    eager0, capture0 = dispatches()
+
+    def step_pair(arm, run_flip):
+        flip.rewrite()
+        ref = other[arm]
+        for st in other.values():
+            st.rewrite()
+        run_flip()
+        ref.run()
+        torch.cuda.synchronize()
+        return ref
+
+    def check(ref, what):
+        assert not diff(ref.bufs, flip.bufs), (what, diff(ref.bufs, flip.bufs))
+
+    def expected_dispatches(captures):
+        # Every fused Python call of flip and of the switch-on reference; captures are flip's only.
+        eager = flip.fused_counts()[0] - captures + other[False].fused_counts()[0]
+        return eager0 + eager, capture0 + captures
+
+    # Eager steps, the switch flipped between them: off, on, on, off, on.
+    flip_on = 0
+    for i, arm in enumerate((False, True, True, False, True)):
+        flip.fused = arm
+        ref = step_pair(arm, flip.run)
+        check(ref, f"eager step {i} switch {int(arm)}")
+        flip_on += arm
+        assert flip.fused_counts() == (flip_on, 0)
+        assert dispatches() == expected_dispatches(0), (i, dispatches())
+    assert other[True].fused_counts() == (0, 0)
+
+    stream = torch.cuda.Stream()
+    captures = 0
+    # Capture with the switch off, then on, then off again; each graph replayed with rewritten inputs, the switch
+    # flipped after capture (a captured graph does not read it).
+    for arm in (False, True, False):
+        flip.fused = arm
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                flip.run()
+        torch.cuda.synchronize()
+        flip_on += arm
+        captures += arm
+        assert flip.fused_counts() == (flip_on, captures)
+        assert dispatches() == expected_dispatches(captures)
+        for replay in range(3):
+            setattr(flags, NAME, int(not arm))
+            ref = step_pair(arm, graph.replay)
+            check(ref, f"graph switch {int(arm)} replay {replay}")
+        assert flip.fused_counts() == (flip_on, captures), "a replay ran Python"
+        assert dispatches() == expected_dispatches(captures), "a replay ran Python"
+        del graph
+    assert flip.fused_counts() == (4, 1)
+    assert other[True].fused_counts() == (0, 0)
