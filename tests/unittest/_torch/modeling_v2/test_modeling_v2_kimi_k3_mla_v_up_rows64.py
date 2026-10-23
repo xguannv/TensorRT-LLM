@@ -21,7 +21,8 @@ split read on one GPU (the helpers of ``test_modeling_v2_kimi_k3_mla_v_up``):
   from a CUDA graph with new queries;
 * 64 rows, switch off: the fallback, bit for bit the split read + BMM it is (no fused variant compiled for 64 rows;
   the statistics of the rows that have keys on the rank);
-* 64 rows, switch on: the fused path ran (a 64-row, >= 2-split variant compiled); the softmax statistics and V rows
+* 64 rows, switch on: the fused path ran (a 64-row, >= 2-split variant compiled); a request with no key on the rank
+  gets the combine's identity (statistics (-inf, 0), V rows 0); the softmax statistics and V rows of the others
   against the switch-off fallback within the V-up tolerance (per (token, head) relative L2 ``ON_OFF_TOL``, the Helix
   V-up op matrix's on/off bound), and against fp32 attention x fp32 W_UV (the whole sequence on one rank) within
   ``FP32_TOL``, beside the fallback's own error; replayed from a CUDA graph with new queries, bit for bit its eager
@@ -88,6 +89,13 @@ def _setup(case, cp=None, seed=11):
     return vu, dcp, mla_v_up, pool, block_rows, lens, q, plan, w, codes, scales
 
 
+def _keyless_rows(plan, q_len):
+    """Rows (``batch * q_len``) of the requests that hold no key on this rank (at least one, not all)."""
+    rows = (plan.cache_seqs == 0).repeat_interleave(q_len)
+    assert 0 < int(rows.sum()) < rows.numel()
+    return rows
+
+
 def _per_head_rel(a, b):
     a, b = a.double(), b.double()
     return ((a - b).norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-30)).flatten()
@@ -137,10 +145,9 @@ def test_rows64_off_is_the_fallback(monkeypatch):
     torch.cuda.synchronize()
     assert not any(k[-2] == 64 for k in set(mla_v_up._compiled) - before)
     assert torch.equal(v.view(torch.int16), v_ref.view(torch.int16))
-    # One split: the decode leaves the statistics of a row with no key on this rank unwritten (the exchange masks
-    # those rows, ``plan.empty``), so compare the rows that have keys here.
-    keyed = ~plan.empty.to(stats.device)
-    assert 0 < int(keyed.sum()) < stats.shape[0]
+    # One split: the decode leaves the statistics of a request with no key on this rank unwritten (the exchange
+    # masks it), so compare the requests that have keys here.
+    keyed = ~_keyless_rows(plan, BS8[1]).to(stats.device)
     assert torch.equal(stats[keyed], stats_ref[keyed])
 
 
@@ -158,11 +165,17 @@ def test_rows64_on_close_to_off(monkeypatch):
     # key = runner id + (mma_qk, mma_pv, split_kv, is_persistent, kv_bounds?, v_rows, use_pdl)
     assert any(k[-2] == 64 and k[-5] >= 2 for k in new), f"no fused 64-row variant compiled: {new}"
     assert not torch.isnan(v_on).any()
+    # rows with no key on this rank: the fused reduction writes the combine's identity; the one-split fallback
+    # leaves them unwritten (the exchange masks them), so the comparison below takes the keyed rows
+    empty = _keyless_rows(plan, BS8[1]).to(s_on.device)
+    assert torch.all(s_on[empty, :, 0] == float("-inf")) and torch.all(s_on[empty, :, 1] == 0)
+    assert torch.all(v_on[empty] == 0)
+    s_on, s_off, v_on_k, v_off_k = s_on[~empty], s_off[~empty], v_on[~empty], v_off[~empty]
     assert torch.equal(torch.isinf(s_on), torch.isinf(s_off))
     lse_on, lse_off = s_on[..., 0], s_off[..., 0]
     finite = torch.isfinite(lse_off)
     assert (lse_on[finite] - lse_off[finite]).abs().max().item() < 1e-3
-    rel = _per_head_rel(v_on, v_off)
+    rel = _per_head_rel(v_on_k, v_off_k)
     rel = rel[torch.isfinite(rel)]
     print(
         f"[bs8 rows 64] fused vs fallback per (token, head): median {rel.median():.2e} max {rel.max():.2e}"
