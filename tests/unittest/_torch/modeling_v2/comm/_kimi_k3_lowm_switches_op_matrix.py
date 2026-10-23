@@ -1027,7 +1027,9 @@ def _decoder(call, layer_idx):
 
 
 def _residual_arm(layer, call, on):
-    with _switch("TRTLLM_K3LL_WIDE_AR_ATTN_RES", on):
+    # The post-attention step on the wide all-reduce: TRTLLM_K3LL_OPROJ_PUSH (default 1) would take it instead, and
+    # its own op matrix covers that path; the stand-in layer has no o_proj push state.
+    with _switch("TRTLLM_K3LL_WIDE_AR_ATTN_RES", on), _switch("TRTLLM_K3LL_OPROJ_PUSH", 0):
         prefix, snapshots, _ = IMPL.KimiLinearDecoderLayer.forward(
             layer, call.prefix, call.bank, SNAPSHOTS, None, call.step,
             pending_moe_partial=call.moe_partial, defer_moe_tail=True,
