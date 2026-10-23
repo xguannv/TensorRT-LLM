@@ -230,6 +230,15 @@ def test_tp8_ctx_only_requires_its_layout(monkeypatch, sm):
                 spec_config=types.SimpleNamespace(spec_dec_mode=None, decoding_type="DSpark")
             )
         )
+    # a context-only target may take a bandwidth all-reduce; the decode targets may not
+    for strategy in (AllReduceStrategy.NCCL, AllReduceStrategy.NCCL_SYMMETRIC):
+        config = _tp8_config()
+        config.allreduce_strategy = strategy
+        target._check_construction(config)
+    config = _tp8_config()
+    config.allreduce_strategy = AllReduceStrategy.UB
+    with pytest.raises(AssertionError, match="allreduce_strategy is UB"):
+        target._check_construction(config)
     # the TP16 target refuses a TP8 engine
     tp16 = importlib.import_module(
         "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
@@ -237,3 +246,17 @@ def test_tp8_ctx_only_requires_its_layout(monkeypatch, sm):
     )
     with pytest.raises(AssertionError, match="the tp16_moetp4ep4 target needs world_size 16"):
         tp16._check_construction(_tp8_config(moe_tp_size=2, moe_ep_size=4))
+
+
+def test_tp16_target_keeps_mnnvl_all_reduces(monkeypatch):
+    """The decode targets still refuse NCCL all-reduces (their decode collectives are MNNVL)."""
+    target = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "kimi_k3_nvfp4__sm_103__tp16_moetp4ep4.modeling"
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 3))
+    config = _tp8_config(world_size=16, tp_size=16, moe_tp_size=4, moe_ep_size=4)
+    target._check_construction(config)
+    config.allreduce_strategy = AllReduceStrategy.NCCL_SYMMETRIC
+    with pytest.raises(AssertionError, match="allreduce_strategy is NCCL_SYMMETRIC"):
+        target._check_construction(config)
