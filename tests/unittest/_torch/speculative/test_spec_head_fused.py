@@ -28,7 +28,7 @@ whole:
 * the runner's fused head-prep count (what its log reports) counts each fused ``_preprocess_inputs`` call Python
   runs, a CUDA graph capture among them, and no graph replay;
 * the switch is the K3 flags module's attribute, read on every ``_preprocess_inputs`` call (``k3ll_flag``): on only
-  at 1, off with any other value or without the K3 target loaded; registered in ``flags.py`` with default 0 and bound
+  at 1, off with any other value or without the K3 target loaded; registered in ``flags.py`` with default 1 and bound
   by value nowhere else (what the one-process A/B's switch tool requires);
 * one runner, built once, the switch flipped between eager steps and between CUDA graph captures (what the
   one-process A/B does), equals a runner of the other arm on every step and replay, and the K3 census key
@@ -258,9 +258,9 @@ def test_switch_read(monkeypatch, value):
 
 
 def test_switch_registered_and_not_bound():
-    """Registered in the K3 flags with default 0, and bound by value in no other loaded module of the K3 package nor
+    """Registered in the K3 flags with default 1, and bound by value in no other loaded module of the K3 package nor
     in the runner (the one-process A/B's switch tool refuses a switch bound at import)."""
-    assert flags.flags()[NAME][1] == 0
+    assert flags.flags()[NAME][1] == 1
     runner_module = sys.modules[_runner_cls().__module__]
     package = k3ll_flags.K3LL_FLAGS_MODULE.rsplit(".", 1)[0]
     bound = [

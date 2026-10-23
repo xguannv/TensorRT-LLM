@@ -301,7 +301,7 @@ TRTLLM_K3LL_KDA_SEED_STACKED = _flag(
 )
 TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "TRTLLM_K3LL_SPEC_HEAD_FUSED",
-    0,
+    1,
     "speculative decode step without context tokens: _preprocess_inputs' head bookkeeping (overlap position / "
     "KV-length correction, Helix position correction and spec buffers) as one fused_spec_head_prep launch, bit for "
     "bit the torch ops (pyexecutor/engine/runners/decoder/runner.py; read per call, so per CUDA graph capture)",
