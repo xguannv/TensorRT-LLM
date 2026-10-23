@@ -3867,8 +3867,14 @@ def _check_construction(model_config: ModelConfig, target: K3TargetSpec) -> None
             f"{len(model_config.quant_config_dict or {})} per-layer declarations"
         )
     strategy = model_config.allreduce_strategy
-    assert strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL), (
-        f"this target runs its all-reduces over MNNVL; allreduce_strategy is {strategy.name}"
+    allowed = (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL)
+    if target.ctx_only:
+        # A context-only target has no MNNVL decode collectives; its prefill all-reduces are large, where a
+        # bandwidth all-reduce wins (NCCL_SYMMETRIC: 32K-token forward 1116 -> 921 ms on stock TP16, jhb 1209266).
+        allowed += (AllReduceStrategy.NCCL, AllReduceStrategy.NCCL_SYMMETRIC)
+    assert strategy in allowed, (
+        f"this target runs its all-reduces over {' / '.join(s.name for s in allowed)}; "
+        f"allreduce_strategy is {strategy.name}"
     )
 
 
