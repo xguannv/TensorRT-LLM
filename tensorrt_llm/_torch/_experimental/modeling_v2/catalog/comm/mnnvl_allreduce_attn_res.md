@@ -46,6 +46,8 @@ def mnnvl_allreduce_attn_res(
     rms_eps: float,
     output_rms_eps: float,
     workspace: MnnvlWorkspace,
+    two_shot: bool = False,
+    mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]
 ```
 
@@ -63,6 +65,13 @@ def mnnvl_allreduce_attn_res(
 
 `input`, `prefix_sum` and `block_residual` are read only. The op writes the workspace's buffers and flag words; its
 schema declares both mutable.
+
+`mxfp8_out = (xq, xs)` (float8_e4m3fn `[T, H]` and uint8 `[T, H / 32]`, contiguous, 16-byte aligned; one-shot and
+two-shot) calls `trtllm::mnnvl_allreduce_attn_res_mx` instead, which also stores on every rank the MXFP8 form of
+`normed` that `k3_fp8w_lowm_gemm` quantizes its activation to inside its kernel: per 1x32 group the UE8M0 exponent
+of `2^ceil(log2(amax / 448))` (amax floored at bf16 `0x38D2`) and the E4M3 codes of `normed * 2^(127 - e)` (round to
+nearest, satfinite), the input of `k3_fp8w_lowm_mxfp8`. `normed` and `updated` are the plain op's bits. A library
+built before that op has no `mnnvl_allreduce_attn_res_mx` (`has_mxfp8_out()` is then False).
 
 ## State
 

@@ -39,6 +39,13 @@ wrapper returns that tensor as `updated` (the op itself returns an empty `[0, 71
 outputs, not values: certified, the same inputs give bit-identical `normed` and `updated` with each option and
 without.
 
+A third, `mxfp8_out = (xq, xs)`: the kernel also stores the MXFP8 form of `normed` that `k3_fp8w_lowm_gemm`
+quantizes its activation to inside its kernel (per 1x32 group of a row the UE8M0 exponent of
+`2^ceil(log2(amax / 448))`, amax floored at bf16 `0x38D2`, and the E4M3 codes of `normed * 2^(127 - e)`, round to
+nearest, satfinite), with that kernel's own PTX helpers: `xq` E4M3 `[M, 7168]`, `xs` one exponent per group
+`[M, 224]`, the input of `k3_fp8w_lowm_mxfp8`, which on it is bitwise `k3_fp8w_lowm_gemm` on `normed`. It moves no
+value either: `normed` and `updated` are bit-identical with it and without.
+
 Fusion boundary. Inside: the latent's RMS, the tail projection, the all-reduce, the residual add, the selection, the
 RMSNorm, and the tap. Outside: the latent all-reduce that produced `latent`, the shared experts' gate_up and
 activation that produced `act`, folding the latent norm's weight into `tail_weight`, keeping the snapshot bank,
@@ -65,6 +72,7 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]
 ```
 
@@ -84,6 +92,7 @@ def k3_sandwich_tail(
 | `tap` | `None`, or `[M, 7168]` (below) | bf16 | unit column stride | CUDA |
 | `tap_updated` | `False` (the mixture) or `True` (`updated`) | bool | — | — |
 | `updated_out` | `None`, or `[M, 7168]` | bf16 | contiguous, 16-byte aligned | CUDA |
+| `mxfp8_out` | `None`, or `([M, 7168], [M, 224])` | float8_e4m3fn, uint8 | contiguous, 16-byte aligned | CUDA |
 | returns | `(normed, updated)`, each `[M, 7168]` | bf16 | contiguous | = `latent.device` |
 
 - `latent`: the whole reduced latent row, the same on every rank (the latent all-reduce's output).
@@ -173,7 +182,8 @@ over 10 times it. A plain call right after is correct again.
 ## Metadata consumed
 
 Besides `workspace`, the op module's process-wide compile cache, keyed by (`W`, publish, input source, tap kind,
-PDL): a call without a tap, one tapping the mixture and one tapping `updated` run three kernels, each compiled
+MXFP8 copy, PDL): a call without a tap, one tapping the mixture and one tapping `updated` run three kernels (each
+with and without `mxfp8_out`), each compiled
 (seconds) on its first call, which must be eager — under capture the op raises "must run once per configuration
 outside CUDA-graph capture first". `updated_out` is not part of the key. The cache is result-neutral. PDL
 (`TRTLLM_ENABLE_PDL`, read at every call, default on) changes scheduling, not results.
@@ -216,7 +226,7 @@ outside CUDA-graph capture first". `updated_out` is not part of the key. The cac
   test (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
   trays in a recorded run: the kernel's record, not this entry's receipt.
 - State: `mutates_args` names every buffer the op can write: `ws_uc`, `ws_mc`, `ws_flags`, `x_slab`, `lat_uc`,
-  `lat_flags`, `tap` and `updated_out`. The compile cache is the documented process-wide cache above.
+  `lat_flags`, `tap`, `updated_out`, `mx_q` and `mx_s`. The compile cache is the documented process-wide cache above.
 - Not certified (an op option the wrapper does not expose): the folded latent all-reduce. With `lat_uc` / `lat_flags`
   of a `K3SandwichLatentExchange` — its own collective `create(mapping, fabric_handle=None)`; two halves of
   `[8 tokens][W ranks][3584]` bf16 per rank, a call count mod 6 and a latent-scale slab — `k3_moe` pushes its

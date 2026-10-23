@@ -134,6 +134,34 @@ def _slab_args(x_slab: Optional[torch.Tensor], slab_buf: int, fallback: torch.Te
     return x_slab.reshape(-1), int(slab_buf), 1
 
 
+def _mx_args(mx_q: Optional[torch.Tensor], mx_s: Optional[torch.Tensor], num_tokens: int) -> int:
+    """1 when the call stores the MXFP8 copy of normed into ``mx_q`` / ``mx_s`` (both given and valid), 0 when neither
+    is given; ValueError otherwise."""
+    from . import k3_sandwich_kernel as kernel
+
+    if mx_q is None and mx_s is None:
+        return 0
+    if (
+        mx_q is None
+        or mx_s is None
+        or mx_q.dtype != torch.float8_e4m3fn
+        or mx_s.dtype != torch.uint8
+        or tuple(mx_q.shape) != (num_tokens, kernel.H)
+        or tuple(mx_s.shape) != (num_tokens, kernel.H // kernel.MX_GROUP)
+        or not mx_q.is_contiguous()
+        or not mx_s.is_contiguous()
+        or mx_q.data_ptr() % 16 != 0
+        or mx_s.data_ptr() % 16 != 0
+    ):
+        raise ValueError(
+            f"k3_sandwich: mx_q / mx_s must be contiguous, 16-byte aligned float8_e4m3fn [{num_tokens}, {kernel.H}] "
+            f"and uint8 [{num_tokens}, {kernel.H // kernel.MX_GROUP}] tensors, got "
+            f"{None if mx_q is None else (tuple(mx_q.shape), mx_q.dtype)} and "
+            f"{None if mx_s is None else (tuple(mx_s.shape), mx_s.dtype)}"
+        )
+    return 1
+
+
 def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Optional[bool],
                    arm_flags: Optional[Callable[[torch.Tensor], None]] = None):  # fmt: skip
     """A ``cls`` over a new multicast buffer of ``words`` int32 per rank of ``mapping``'s TP group, every word empty,
@@ -441,6 +469,8 @@ def supports_tail(
         "lat_flags",
         "tap",
         "updated_out",
+        "mx_q",
+        "mx_s",
     ),
 )
 def k3_sandwich_tail(
@@ -469,6 +499,8 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    mx_q: Optional[torch.Tensor] = None,
+    mx_s: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """``(normed, updated)`` of the row-parallel MoE tail (``[rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T``,
     the RMS on the fp32 latent accumulator) followed by ``mnnvl_allreduce_attn_res`` of that partial. ``latent`` is
@@ -480,8 +512,10 @@ def k3_sandwich_tail(
     apart, 16-byte aligned: e.g. a column slice of a capture buffer) it also stores there the pre-norm attn_res mixture
     rows (a DSpark capture layer's tap) or, with ``tap_updated``, ``updated``; with ``updated_out`` (bf16 [M, 7168],
     contiguous, 16-byte aligned, e.g. the next row of the attention-residual snapshot bank, which this call does not
-    read) it stores ``updated`` there instead of a new tensor and returns an empty [0, 7168] in its place; the rest as
-    ``k3_sandwich_oproj``."""
+    read) it stores ``updated`` there instead of a new tensor and returns an empty [0, 7168] in its place; with ``mx_q``
+    (float8_e4m3fn [M, 7168]) and ``mx_s`` (uint8 [M, 224]), both contiguous and 16-byte aligned, it also stores there
+    the MXFP8 form of ``normed`` that ``k3_fp8w_lowm_gemm`` would quantize it to (``k3_fp8w_lowm_mxfp8``'s input); the
+    rest as ``k3_sandwich_oproj``."""
     import cuda.bindings.driver as cuda_driver
 
     from . import k3_sandwich_kernel as kernel
@@ -529,6 +563,7 @@ def k3_sandwich_tail(
                                     or updated_out.data_ptr() % 16 != 0):  # fmt: skip
         raise ValueError(f"k3_sandwich_tail: updated_out must be a contiguous, 16-byte aligned bf16 [{num_tokens}, "
                          f"{kernel.H}] tensor, got {tuple(updated_out.shape)} {updated_out.dtype}")  # fmt: skip
+    mx_out = _mx_args(mx_q, mx_s, num_tokens)
     normed = torch.empty(num_tokens, kernel.H, dtype=torch.bfloat16, device=latent.device)
     updated = updated_out if updated_out is not None else torch.empty_like(normed)
     snaps = block_residual if num_snapshots > 0 else latent.new_zeros(1, num_tokens, kernel.H)
@@ -556,17 +591,19 @@ def k3_sandwich_tail(
         _arg(slab_words),
         _arg(lat_flags if fold else ws_flags),
         _arg(_tap_words(tap) if tap is not None else ws_flags),
+        _arg(_words(mx_q) if mx_out else ws_flags),
+        _arg(_words(mx_s) if mx_out else ws_flags),
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(latent.device).cuda_stream)
     use_pdl = _use_pdl()
     tap_out = 0 if tap is None else 2 if tap_updated else 1
     tap_stride = tap.stride(0) // 2 if tap is not None else kernel.WORDS_PER_ROW
-    key = ("tail", world, publish, x_src, tap_out, use_pdl)
+    key = ("tail", world, publish, x_src, tap_out, mx_out, use_pdl)
     runtime = (
         num_tokens, rank, num_snapshots + 1, int(add_prefix), float(rms_eps), float(output_rms_eps), lo,
         float(lat_eps), buf, sbuf, tap_stride,
     )  # fmt: skip
-    consts = (world, publish, x_src, tap_out, use_pdl)
+    consts = (world, publish, x_src, tap_out, mx_out, use_pdl)
     _compile_and_run(
         kernel.k3_sandwich_tail, key, args, runtime, consts, stream, "k3_sandwich_tail"
     )
@@ -578,7 +615,8 @@ def k3_sandwich_tail(
 @k3_sandwich_tail.register_fake
 def _(latent, act, tail_weight, lo, lat_eps, prefix, block_residual, res_weight, rms_weight, output_rms_weight,
       rms_eps, output_rms_eps, ws_uc, ws_mc, ws_flags, rank, x_slab=None, slab_buf=0, src_slab=None,
-      src_buf=0, lat_uc=None, lat_flags=None, tap=None, tap_updated=False, updated_out=None):  # fmt: skip
+      src_buf=0, lat_uc=None, lat_flags=None, tap=None, tap_updated=False, updated_out=None, mx_q=None,
+      mx_s=None):  # fmt: skip
     normed = latent.new_empty((latent.shape[0], tail_weight.shape[0]), dtype=torch.bfloat16)
     if updated_out is not None:
         return [normed, normed.new_empty((0, tail_weight.shape[0]))]

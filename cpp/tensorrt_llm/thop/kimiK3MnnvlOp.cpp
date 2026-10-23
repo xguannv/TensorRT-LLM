@@ -32,13 +32,18 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
+namespace
+{
+
 // Kimi K3 pre-MoE residual update in the MNNVL all-reduce epilogue; see
-// tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp, or twoshotAllreduceAttnResOp with two_shot.
-// Returns {normed, updated_prefix_sum}.
-std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
+// tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp, or twoshotAllreduceAttnResOp with two_shot. With
+// mx_quant / mx_scale it also stores the MXFP8 form of normed there (AttnResEpilogueParams::mxQuant). Returns
+// {normed, updated_prefix_sum}.
+std::vector<torch::Tensor> runAllReduceAttnRes(torch::Tensor const& input,
     torch::optional<torch::Tensor> const& prefix_sum, torch::Tensor const& block_residual,
     torch::Tensor const& res_weight, torch::Tensor const& rms_weight, torch::Tensor const& output_rms_weight,
-    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags, bool two_shot)
+    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags, bool two_shot,
+    torch::Tensor* mx_quant, torch::Tensor* mx_scale)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -113,6 +118,20 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     epilogue.rmsEps = static_cast<float>(rms_eps);
     epilogue.outputRmsEps = static_cast<float>(output_rms_eps);
     epilogue.numCandidates = static_cast<int>(block_residual.size(0)) + 1;
+    if (mx_quant != nullptr)
+    {
+        TORCH_CHECK(hiddenDim % 32 == 0, "[mnnvlAllReduceAttnRes] the MXFP8 output needs hidden a multiple of 32");
+        TORCH_CHECK(mx_quant->is_cuda() && mx_quant->scalar_type() == at::ScalarType::Float8_e4m3fn
+                && mx_quant->is_contiguous() && mx_quant->dim() == 2 && mx_quant->size(0) == numTokens
+                && mx_quant->size(1) == hiddenDim && reinterpret_cast<uintptr_t>(mx_quant->data_ptr()) % 16 == 0,
+            "[mnnvlAllReduceAttnRes] mx_quant must be a contiguous 16-byte aligned float8_e4m3fn [num_tokens, hidden] "
+            "CUDA tensor");
+        TORCH_CHECK(mx_scale->is_cuda() && mx_scale->scalar_type() == torch::kUInt8 && mx_scale->is_contiguous()
+                && mx_scale->dim() == 2 && mx_scale->size(0) == numTokens && mx_scale->size(1) == hiddenDim / 32,
+            "[mnnvlAllReduceAttnRes] mx_scale must be a contiguous uint8 [num_tokens, hidden / 32] CUDA tensor");
+        epilogue.mxQuant = mx_quant->mutable_data_ptr();
+        epilogue.mxScale = mx_scale->mutable_data_ptr();
+    }
 
     if (two_shot)
     {
@@ -123,6 +142,30 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
         tensorrt_llm::kernels::kimiK3Mnnvl::oneshotAllreduceAttnResOp(params, epilogue);
     }
     return {normOut, prefixOut};
+}
+
+} // namespace
+
+std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& prefix_sum, torch::Tensor const& block_residual,
+    torch::Tensor const& res_weight, torch::Tensor const& rms_weight, torch::Tensor const& output_rms_weight,
+    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags, bool two_shot)
+{
+    return runAllReduceAttnRes(input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps,
+        output_rms_eps, comm_buffer, buffer_flags, two_shot, nullptr, nullptr);
+}
+
+// mnnvl_allreduce_attn_res that also stores the MXFP8 form of normed into mx_quant (E4M3 [num_tokens, hidden]) and
+// mx_scale (one UE8M0 exponent per 1x32 group, uint8 [num_tokens, hidden / 32]) on every rank: the activation the
+// CuTe DSL low-M FP8 GEMM quantizes normed to inside its kernel. normed and updated are the plain op's bits.
+std::vector<torch::Tensor> mnnvlAllReduceAttnResMx(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& prefix_sum, torch::Tensor const& block_residual,
+    torch::Tensor const& res_weight, torch::Tensor const& rms_weight, torch::Tensor const& output_rms_weight,
+    double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags,
+    torch::Tensor& mx_quant, torch::Tensor& mx_scale, bool two_shot)
+{
+    return runAllReduceAttnRes(input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps,
+        output_rms_eps, comm_buffer, buffer_flags, two_shot, &mx_quant, &mx_scale);
 }
 
 // This rank's column slice of RMSNorm(allreduce(input)) (no weight), then pad_cols zero columns, then tail; see
@@ -256,6 +299,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor rms_weight, Tensor output_rms_weight, float rms_eps, float output_rms_eps, Tensor(a!) comm_buffer, "
         "Tensor(b!) buffer_flags, bool two_shot=False) -> Tensor[]");
     m.def(
+        "mnnvl_allreduce_attn_res_mx(Tensor input, Tensor? prefix_sum, Tensor block_residual, Tensor res_weight, "
+        "Tensor rms_weight, Tensor output_rms_weight, float rms_eps, float output_rms_eps, Tensor(a!) comm_buffer, "
+        "Tensor(b!) buffer_flags, Tensor(c!) mx_quant, Tensor(d!) mx_scale, bool two_shot=False) -> Tensor[]");
+    m.def(
         "mnnvl_allgather_split(Tensor input, int bf16_columns, int world_size, Tensor(a!) comm_buffer, "
         "Tensor(b!) buffer_flags) -> Tensor[]");
     m.def(
@@ -266,6 +313,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_allreduce_attn_res", &tensorrt_llm::torch_ext::mnnvlAllReduceAttnRes);
+    m.impl("mnnvl_allreduce_attn_res_mx", &tensorrt_llm::torch_ext::mnnvlAllReduceAttnResMx);
     m.impl("mnnvl_allgather_split", &tensorrt_llm::torch_ext::mnnvlAllGatherSplit);
     m.impl("mnnvl_allreduce_rmsnorm_slice", &tensorrt_llm::torch_ext::mnnvlAllReduceRmsNormSlice);
 }

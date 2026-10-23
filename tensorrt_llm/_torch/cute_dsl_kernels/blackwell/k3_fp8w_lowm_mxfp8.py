@@ -92,7 +92,9 @@ __all__ = [
     "MAX_M",
     "K3LowMMxTactic",
     "can_run_mxfp8",
+    "can_take_rows",
     "default_mx_tactic",
+    "is_compiled",
     "mxfp8_quantize_reference",
     "run_k3_fp8w_lowm_gemm_mxfp8",
 ]
@@ -230,8 +232,14 @@ def _sts_b32(addr, v, *, loc=None, ip=None):
 class K3Fp8wLowMMxGemmKernel:
     """Swap-AB MXFP8 GEMM on an upstream-quantized activation (``M <= 64``), cluster split-K."""
 
-    def __init__(self, n: int, k: int, tactic: K3LowMMxTactic, use_pdl: bool):
+    def __init__(
+        self, n: int, k: int, tactic: K3LowMMxTactic, use_pdl: bool, sf_early_release: bool = False
+    ):
         validate_tactic(n, k, tactic)
+        # Where every K tile has its own activation stage, release each K tile to the MMA warp as soon as its scales
+        # are folded (one proxy fence per tile) instead of after folding every tile (one fence for all). The same
+        # scale bytes and MMAs.
+        self.sf_early_release = sf_early_release
         self.n = n
         self.k = k
         self.mma_n = tactic.mma_n
@@ -547,7 +555,23 @@ class K3Fp8wLowMMxGemmKernel:
                     v = _ldg_b32(xs_ptr.toint() + Int64(r * self.groups + (kt_start + kt) * 4))
                 row_words.append(v)
             acts.append(row_words)
-        if cutlass.const_expr(self.b_stages >= self.kt_max):
+        if cutlass.const_expr(self.b_stages >= self.kt_max and self.sf_early_release):
+            # Every K tile has its own stage: release each tile once its scales are written.
+            for kt in cutlass.range_constexpr(self.kt_max):
+                if kt < kt_count:
+                    e_w = cute.arch.shuffle_sync(w_exps[kt // 32], kt % 32)
+                    for i in cutlass.range_constexpr(rows_per_lane):
+                        r = lane + 32 * i
+                        if r < self.mma_n:
+                            _sts_b32(
+                                sf_base + kt * 512 + (r & 31) * 16 + (r >> 5) * 4,
+                                _fold_scales_x4(acts[i][kt], e_w),
+                            )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(b_full + kt)
+        elif cutlass.const_expr(self.b_stages >= self.kt_max):
             # Every K tile has its own stage: write all scales, fence once, release all tiles.
             for kt in cutlass.range_constexpr(self.kt_max):
                 if kt < kt_count:
@@ -830,26 +854,73 @@ class K3Fp8wLowMMxGemmKernel:
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
-def _compiled_kernel(n: int, k: int, tactic: K3LowMMxTactic, use_pdl: bool):
-    kernel = K3Fp8wLowMMxGemmKernel(n, k, tactic, use_pdl)
-    dummy = 1 << 20
-    ptrs = [
-        make_ptr(dtype, dummy, cute.AddressSpace.gmem, assumed_align=16)
-        for dtype in (
-            cutlass.Float8E4M3FN,
-            cutlass.Float8E4M3FN,
-            cutlass.Uint8,
-            cutlass.Uint8,
-            cutlass.BFloat16,
-        )
-    ]
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(kernel, *ptrs, Int32(1), stream)
+#: The compiled kernels, by (N, K, tactic, use_pdl, sf_early_release).
+_COMPILED: dict = {}
+
+
+def _compiled_kernel(
+    n: int, k: int, tactic: K3LowMMxTactic, use_pdl: bool, sf_early_release: bool = False
+):
+    key = (n, k, tactic, bool(use_pdl), bool(sf_early_release))
+    compiled = _COMPILED.get(key)
+    if compiled is None:
+        kernel = K3Fp8wLowMMxGemmKernel(n, k, tactic, use_pdl, sf_early_release)
+        dummy = 1 << 20
+        ptrs = [
+            make_ptr(dtype, dummy, cute.AddressSpace.gmem, assumed_align=16)
+            for dtype in (
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E4M3FN,
+                cutlass.Uint8,
+                cutlass.Uint8,
+                cutlass.BFloat16,
+            )
+        ]
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled = _COMPILED[key] = cute.compile(kernel, *ptrs, Int32(1), stream)
+    return compiled
+
+
+def is_compiled(
+    m: int, n: int, k: int, use_pdl: bool = True, sf_early_release: bool = False
+) -> bool:
+    """Whether :func:`run_k3_fp8w_lowm_gemm_mxfp8` of ``M`` rows on an ``[N, K]`` weight at the default tactic has
+    compiled its kernel in this process (a call that has not compiles it first)."""
+    key = (n, k, default_mx_tactic(m, n, k), bool(use_pdl), bool(sf_early_release))
+    return key in _COMPILED
 
 
 def _gmem_ptr(dtype, tensor: torch.Tensor):
     return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+
+def can_take_rows(
+    m: int, w: torch.Tensor, w_scale: torch.Tensor, allow_partial_n_tile: bool = False
+) -> bool:
+    """The weight and row-count half of :func:`can_run_mxfp8` (no activation needed): the low-M
+    kernel's weight contract (UE8M0-resmoothed E4M3 ``w [N, K]``, DeepGEMM-packed ``w_scale``, N a
+    multiple of 128 unless ``allow_partial_n_tile``) and ``1 <= M <= low_m_max_for(N, K)`` on
+    SM100/SM103."""
+    if w.dim() != 2 or not w.is_cuda or not lowm._is_supported_device(w.device.index):
+        return False
+    n, k = w.shape
+    if n % N_ALIGN or k % CTA_K or (n % MMA_M and not allow_partial_n_tile):
+        return False
+    if not 1 <= m <= min(MAX_M, lowm.low_m_max_for(n, k)):
+        return False
+    if w.dtype != torch.float8_e4m3fn or not w.is_contiguous() or w.data_ptr() % 16 != 0:
+        return False
+    try:
+        validate_tactic(n, k, default_mx_tactic(m, n, k))
+    except ValueError:
+        return False
+    words = _ceil_div(k // CTA_K, 4)
+    return (
+        w_scale.dtype == torch.int32
+        and tuple(w_scale.shape) == (n, words)
+        and w_scale.stride(0) == 1
+        and (words == 1 or w_scale.stride(1) == n)
+    )
 
 
 def can_run_mxfp8(
@@ -859,40 +930,19 @@ def can_run_mxfp8(
     w_scale: torch.Tensor,
     allow_partial_n_tile: bool = False,
 ) -> bool:
-    """Whether :func:`run_k3_fp8w_lowm_gemm_mxfp8` accepts these operands: the low-M kernel's
-    weight contract (UE8M0-resmoothed E4M3 ``w [N, K]``, DeepGEMM-packed ``w_scale``, N a
-    multiple of 128 unless ``allow_partial_n_tile``), ``1 <= M <= low_m_max_for(N, K)`` on
-    SM100/SM103, and ``xq`` E4M3 ``[M, K]`` / ``xs`` uint8 ``[M, K / 32]``, contiguous, 16- and
-    4-byte aligned."""
-    if xq.dim() != 2 or xs.dim() != 2 or w.dim() != 2 or not xq.is_cuda:
-        return False
-    if not lowm._is_supported_device(xq.device.index):
+    """Whether :func:`run_k3_fp8w_lowm_gemm_mxfp8` accepts these operands: :func:`can_take_rows`
+    for ``M`` rows, and ``xq`` E4M3 ``[M, K]`` / ``xs`` uint8 ``[M, K / 32]``, contiguous, 16- and
+    4-byte aligned, on the weight's device."""
+    if xq.dim() != 2 or xs.dim() != 2 or not xq.is_cuda or xq.device != w.device:
         return False
     m, k = xq.shape
-    n = w.shape[0]
-    if w.shape[1] != k or n % N_ALIGN or k % CTA_K or (n % MMA_M and not allow_partial_n_tile):
-        return False
-    if not 1 <= m <= min(MAX_M, lowm.low_m_max_for(n, k)):
+    if w.dim() != 2 or w.shape[1] != k or not can_take_rows(m, w, w_scale, allow_partial_n_tile):
         return False
     if xq.dtype != torch.float8_e4m3fn or xs.dtype != torch.uint8:
         return False
     if tuple(xs.shape) != (m, k // SF_VEC) or not xq.is_contiguous() or not xs.is_contiguous():
         return False
-    if w.dtype != torch.float8_e4m3fn or not w.is_contiguous():
-        return False
-    try:
-        validate_tactic(n, k, default_mx_tactic(m, n, k))
-    except ValueError:
-        return False
-    words = _ceil_div(k // CTA_K, 4)
-    if (
-        w_scale.dtype != torch.int32
-        or tuple(w_scale.shape) != (n, words)
-        or w_scale.stride(0) != 1
-        or (words > 1 and w_scale.stride(1) != n)
-    ):
-        return False
-    return xq.data_ptr() % 16 == 0 and w.data_ptr() % 16 == 0 and xs.data_ptr() % 4 == 0
+    return xq.data_ptr() % 16 == 0 and xs.data_ptr() % 4 == 0
 
 
 def run_k3_fp8w_lowm_gemm_mxfp8(
@@ -904,17 +954,22 @@ def run_k3_fp8w_lowm_gemm_mxfp8(
     *,
     tactic: K3LowMMxTactic | None = None,
     use_pdl: bool = True,
+    sf_early_release: bool = False,
 ) -> torch.Tensor:
     """``out = dequant(xq, xs) @ dequant(w, w_scale)^T`` into ``out`` (bf16 ``[M, N]``) on the
     current stream, bitwise the low-M kernel on the BF16 activation that ``(xq, xs)`` quantizes
-    (inputs are not re-validated; see :func:`can_run_mxfp8`)."""
+    (inputs are not re-validated; see :func:`can_run_mxfp8`). ``sf_early_release``: where every
+    K tile of a CTA has its own activation stage, the scale warp releases each K tile to the MMA
+    warp as soon as its scales are folded (the same bits; a separately compiled kernel). The kernel
+    compiles on the first call of each configuration (:func:`is_compiled`), which must not happen
+    under CUDA-graph capture."""
     m, k = xq.shape
     n = w.shape[0]
     if tactic is None:
         tactic = default_mx_tactic(m, n, k)
     if m > tactic.mma_n:
         raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
-    compiled = _compiled_kernel(n, k, tactic, use_pdl)
+    compiled = _compiled_kernel(n, k, tactic, use_pdl, bool(sf_early_release))
     compiled(
         _gmem_ptr(cutlass.Float8E4M3FN, w),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),

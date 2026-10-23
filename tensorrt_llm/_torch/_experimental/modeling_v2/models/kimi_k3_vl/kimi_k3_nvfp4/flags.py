@@ -232,6 +232,19 @@ TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
     "its dependents after the wait; the V-up split-KV kernel L2-prefetches W_UV and releases reduce_v_up after the "
     "wait (bitwise; read at forward time)",
 )
+TRTLLM_K3LL_ATTN_RES_MXFP8 = _flag(
+    "TRTLLM_K3LL_ATTN_RES_MXFP8",
+    0,
+    "decode steps: the pre-attention collective (k3_sandwich_tail; a wide step's mnnvl_allreduce_attn_res) also "
+    "writes its output's MXFP8 form, and the attention's first FP8 projection (KDA QKVG, MLA fused q_a / kv_a) runs "
+    "k3_fp8w_lowm_mxfp8 on it instead of quantizing inside k3_fp8w_lowm_gemm (bitwise; read at forward time)",
+)
+TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
+    "TRTLLM_K3LL_MX_SF_EARLY_RELEASE",
+    0,
+    "k3_fp8w_lowm_mxfp8 (TRTLLM_K3LL_ATTN_RES_MXFP8): where every K tile has its own activation stage, release each "
+    "K tile to the MMA once its scales are folded, not after all of them (bitwise; read at forward time)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

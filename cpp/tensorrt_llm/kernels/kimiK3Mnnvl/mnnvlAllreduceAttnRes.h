@@ -35,6 +35,11 @@ struct AttnResEpilogueParams
     float rmsEps;
     float outputRmsEps;
     int numCandidates; //!< Snapshots plus the running prefix sum, 1..12
+    //! Optional MXFP8 copy of the output (both or neither): E4M3 codes [numTokens, tokenDim] and one UE8M0 exponent
+    //! per 1x32 group [numTokens, tokenDim / 32], the activation quantization of the CuTe DSL low-M FP8 GEMM
+    //! (k3_fp8w_lowm_gemm.py) bit for bit, so that k3_fp8w_lowm_mxfp8 consumes it in place of the BF16 output.
+    void* mxQuant = nullptr;
+    void* mxScale = nullptr;
 };
 
 /**
@@ -44,7 +49,8 @@ struct AttnResEpilogueParams
  *   residualOut = bf16(residualIn + r), or r when residualIn is null
  *   output      = RMSNorm(attn_res(blockResidual[0 .. numCandidates-2], residualOut), outputRmsWeight)
  * with the rounding of the unfused sequence all-reduce -> attn_res_add_rmsnorm_fwd. The reduction order is fixed, so
- * the result is deterministic and identical on every rank.
+ * the result is deterministic and identical on every rank. With epilogue.mxQuant / mxScale every rank also stores the
+ * MXFP8 form of output (AttnResEpilogueParams).
  *
  * Requirements: BF16; tokenDim a multiple of 1024 and at most 8192; the one-shot footprint
  * numTokens * tokenDim * nRanks elements fits in one Lamport buffer; nRanks in {2, 4, 8, 16}.

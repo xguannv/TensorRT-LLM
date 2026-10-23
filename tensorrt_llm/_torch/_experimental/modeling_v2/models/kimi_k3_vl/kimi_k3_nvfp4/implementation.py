@@ -1414,6 +1414,30 @@ class KimiMLARuntime(nn.Module):
         return self._o_allreduce(out) if self._o_allreduce is not None else out
 
 
+def _attn_res_mxfp8_out(
+    layer: nn.Module, rows: int, device: torch.device
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """``TRTLLM_K3LL_ATTN_RES_MXFP8``: new ``(xq, xs)`` (``fp8w_lowm.new_mxfp8_input``) for the MXFP8 form of
+    ``layer``'s attention input of ``rows`` tokens, where the attention's first FP8 projection takes it
+    (``fp8w_lowm.takes_mxfp8_input``): KDA its fused ``[q | k | v | g | f_a | b]`` GEMM (``TRTLLM_K3LL_KDA_BFA_FP8``
+    with the fused weight built) or its QKVG module, MLA its fused q_a / kv_a module. None elsewhere."""
+    if layer.is_kda:
+        kda = layer.linear_attn
+        fused = getattr(kda, "_qkvg_bfa_fp8", None)
+        if _flags.TRTLLM_K3LL_KDA_BFA_FP8 and fused is not None:
+            target = (fused[0], fused[1], True)
+        else:
+            target = getattr(kda, "qkvg_proj", None)
+    else:
+        target = getattr(layer.self_attn.mixer, "kv_a_proj_with_mqa", None)
+    if not _fp8w_lowm.takes_mxfp8_input(target, rows):
+        return None
+    from . import census as _census
+
+    _census.count(f"dispatch:attn_res_mxfp8:{_census.mode()}")
+    return _fp8w_lowm.new_mxfp8_input(rows, layer.hidden_size, device)
+
+
 class KimiLinearDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1602,10 +1626,15 @@ class KimiLinearDecoderLayer(nn.Module):
         if tail is not None and capture is not None:
             tap_view = _spec_worker.capture_view(capture[0], capture[1], prefix_sum.shape[0])
 
+        # TRTLLM_K3LL_ATTN_RES_MXFP8: the pre-attention collective also writes the MXFP8 form of its output for the
+        # attention's first FP8 projection (offered to it below).
+        mxfp8_out = None
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
             assert pending_moe_partial is None and capture is None
         elif tail is not None:
+            if _flags.TRTLLM_K3LL_ATTN_RES_MXFP8:
+                mxfp8_out = _attn_res_mxfp8_out(self, tail.latent.shape[0], tail.latent.device)
             hidden_states, prefix_sum = self.decode_comm.sandwich_tail(
                 tail,
                 prefix_sum,
@@ -1616,12 +1645,17 @@ class KimiLinearDecoderLayer(nn.Module):
                 updated_out=snapshot_row,
                 tap=tap_view,
                 tap_updated=not _AUX_ATTN_RES_STREAM_ENABLED,
+                mxfp8_out=mxfp8_out,
             )
         elif (
             pending_moe_partial is not None
             and self.decode_comm is not None
             and self.decode_comm.takes_wide(pending_moe_partial, step)
         ):
+            if _flags.TRTLLM_K3LL_ATTN_RES_MXFP8 and _decode_comm.wide_mxfp8_out():
+                mxfp8_out = _attn_res_mxfp8_out(
+                    self, pending_moe_partial.shape[0], pending_moe_partial.device
+                )
             hidden_states, prefix_sum = self.decode_comm.allreduce_attn_res(
                 pending_moe_partial,
                 prefix_sum,
@@ -1630,6 +1664,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 two_shot=True,
+                mxfp8_out=mxfp8_out,
             )
         elif pending_moe_partial is not None:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
@@ -1691,6 +1726,8 @@ class KimiLinearDecoderLayer(nn.Module):
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
+        if mxfp8_out is not None:
+            _fp8w_lowm.offer_mxfp8(hidden_states, *mxfp8_out)
         attention = self.linear_attn if self.is_kda else self.self_attn
         comm = self.decode_comm
         if _flags.TRTLLM_K3LL_OPROJ_PUSH and self._takes_oproj_push(
@@ -1762,6 +1799,8 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                     attn_res_max_tokens,
                 )
+        if mxfp8_out is not None:
+            _fp8w_lowm.withdraw_mxfp8()
         all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
         if self.is_moe and defer_moe_tail:
             partial = self.block_sparse_moe(

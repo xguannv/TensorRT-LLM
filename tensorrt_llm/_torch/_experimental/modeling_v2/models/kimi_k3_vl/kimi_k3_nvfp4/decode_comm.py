@@ -21,6 +21,10 @@ The pre-attention step after a MoE layer whose row-parallel tail was handed on (
 the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tail`, runs the tail GEMV, its
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel.
 
+Both pre-attention collectives (``sandwich_tail``; ``allreduce_attn_res``, a wide step's) can also write the MXFP8
+form of their normed output (``mxfp8_out``), which the attention's FP8 projections then consume without quantizing it
+(``TRTLLM_K3LL_ATTN_RES_MXFP8``, ``fp8w_lowm``'s MXFP8 input).
+
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
 
 * `K3DecodeComm.sandwich_plain`, `comm/k3_sandwich_plain`: a row-parallel projection of at most `SANDWICH_MAX_TOKENS`
@@ -58,6 +62,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail
     k3_sandwich_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce_attn_res import (
+    has_mxfp8_out,
     mnnvl_allreduce_attn_res,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_fusion_allreduce import (
@@ -73,6 +78,7 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
 from . import flags as _flags
+from . import fp8w_lowm as _fp8w_lowm
 from .oproj_push import K3OprojPush
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
@@ -151,6 +157,11 @@ def _res_args(res_proj: nn.Module, res_norm: nn.Module, out_norm: nn.Module) -> 
     )
 
 
+def wide_mxfp8_out() -> bool:
+    """Whether ``allreduce_attn_res`` can take ``mxfp8_out`` (the loaded library has the op)."""
+    return has_mxfp8_out()
+
+
 @dataclass(eq=False)
 class K3DecodeComm:
     """The decode path's collective state for the TP group: the `MnnvlWorkspace` and the `K3SandwichWorkspace` the
@@ -197,21 +208,24 @@ class K3DecodeComm:
         weight = torch.zeros_like(tail_weight)
         hidden = weight.shape[0]
         ones = weight.new_ones(hidden)
-        k3_sandwich_tail(
-            weight.new_zeros(1, latent_size),
-            weight.new_zeros(1, act_size),
-            weight,
-            0,
-            1e-6,
-            None,
-            weight.new_zeros(0, 1, hidden),
-            weight.new_zeros(hidden),
-            ones,
-            ones,
-            1e-6,
-            1e-6,
-            self.sandwich,
-        )
+        # Both builds, with and without the MXFP8 copy of the output (TRTLLM_K3LL_ATTN_RES_MXFP8 picks per call).
+        for mxfp8_out in (None, _fp8w_lowm.new_mxfp8_input(1, hidden, weight.device)):
+            k3_sandwich_tail(
+                weight.new_zeros(1, latent_size),
+                weight.new_zeros(1, act_size),
+                weight,
+                0,
+                1e-6,
+                None,
+                weight.new_zeros(0, 1, hidden),
+                weight.new_zeros(hidden),
+                ones,
+                ones,
+                1e-6,
+                1e-6,
+                self.sandwich,
+                mxfp8_out=mxfp8_out,
+            )
         torch.cuda.synchronize(weight.device)
 
     def takes_post_attention(self, hidden_states: torch.Tensor, step) -> bool:
@@ -278,12 +292,15 @@ class K3DecodeComm:
         res_norm: nn.Module,
         out_norm: nn.Module,
         two_shot: bool = False,
+        mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` in one ``comm/mnnvl_allreduce_attn_res`` call (two-shot with ``two_shot``, see
         ``takes_wide``): ``updated = prefix_sum +
         allreduce(partial)`` (the sum alone without ``prefix_sum``), ``normed = out_norm(attn_res(block_residual...,
         updated))``, the attention residual selected with ``res_proj`` and ``res_norm``. ``block_residual`` holds the
-        valid snapshots, ``[S, T, H]``."""
+        valid snapshots, ``[S, T, H]``. ``mxfp8_out`` (``fp8w_lowm.new_mxfp8_input``; only where
+        ``wide_mxfp8_out()``): also the
+        MXFP8 form of ``normed`` there, the same ``normed`` and ``updated``."""
         return mnnvl_allreduce_attn_res(
             partial.contiguous(),
             prefix_sum,
@@ -291,6 +308,7 @@ class K3DecodeComm:
             *_res_args(res_proj, res_norm, out_norm),
             self.mnnvl,
             two_shot=two_shot,
+            mxfp8_out=mxfp8_out,
         )
 
     def takes_oproj_push(
@@ -341,12 +359,15 @@ class K3DecodeComm:
         updated_out: Optional[torch.Tensor] = None,
         tap: Optional[torch.Tensor] = None,
         tap_updated: bool = False,
+        mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` as ``allreduce_attn_res`` of a MoE layer's row-parallel tail ``pending``
         (``[RMSNorm(latent)[:, lo:lo + 224] | act] @ weight.T``), in one ``comm/k3_sandwich_tail`` call.
         ``updated_out``: a bf16 ``[T, H]`` tensor the call stores ``updated`` into (the consumer's snapshot bank row),
         returned as ``updated``. ``tap``: a bf16 ``[T, H]`` view (a speculative capture slot) the call also stores
-        the pre-norm attention-residual mixture into, or ``updated`` with ``tap_updated``."""
+        the pre-norm attention-residual mixture into, or ``updated`` with ``tap_updated``. ``mxfp8_out``
+        (``fp8w_lowm.new_mxfp8_input``): also the MXFP8 form of ``normed`` there, the same ``normed`` and
+        ``updated``."""
         return k3_sandwich_tail(
             pending.latent,
             pending.act,
@@ -360,6 +381,7 @@ class K3DecodeComm:
             tap=tap,
             tap_updated=tap_updated,
             updated_out=updated_out,
+            mxfp8_out=mxfp8_out,
         )
 
     def sandwich_oproj(

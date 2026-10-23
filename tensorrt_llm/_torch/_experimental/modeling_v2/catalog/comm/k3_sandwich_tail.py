@@ -31,11 +31,14 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return ``(normed, updated)``: ``updated = prefix + allreduce([rmsnorm(latent)[:, lo:lo+224] | act] @
     tail_weight^T)`` over ``workspace``'s TP group (the sum alone without ``prefix``), ``normed`` =
     RMSNorm(attn_res(block_residual..., updated)). ``tap``: also store the pre-norm attention-residual mixture there
     (``updated`` with ``tap_updated``). ``updated_out``: store ``updated`` there; it is then the returned ``updated``.
+    ``mxfp8_out``: ``(xq, xs)``, float8_e4m3fn [M, 7168] and uint8 [M, 224]: also store there the MXFP8 form of
+    ``normed`` that ``k3_fp8w_lowm_gemm`` quantizes it to inside its kernel (``k3_fp8w_lowm_mxfp8``'s input).
     Advances ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
     normed, updated = torch.ops.trtllm.k3_sandwich_tail(
         latent,
@@ -57,5 +60,7 @@ def k3_sandwich_tail(
         tap=tap,
         tap_updated=tap_updated,
         updated_out=updated_out,
+        mx_q=None if mxfp8_out is None else mxfp8_out[0],
+        mx_s=None if mxfp8_out is None else mxfp8_out[1],
     )
     return normed, (updated if updated_out is None else updated_out)

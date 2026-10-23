@@ -49,6 +49,13 @@ words, sentinel 0xFFFFFFFF, a computed all-ones word stored as 0x7FC07FC0) that 
 instead of waiting for this grid. Call ``slab_buf`` writes buffer ``slab_buf`` and, after its grid wait, re-arms
 buffer ``(slab_buf + 1) % 3`` (every row, every CTA), whose last readers ran two grid completions earlier.
 
+MXFP8 copy (``mx_out``, attn_res forms): the normed rows also go out as the activation the low-M FP8 GEMM
+(``k3_fp8w_lowm_gemm``) quantizes them to inside its kernel, E4M3 codes ``mx_q`` [M, 7168] and one UE8M0 exponent per
+1x32 group ``mx_s`` [M, 224], for ``k3_fp8w_lowm_mxfp8``, which then skips that quantization. The four threads of a
+group (eight consecutive columns each) take the group's absolute maximum by two butterfly shuffles and convert with
+that GEMM's own helpers, so the bytes are its in-kernel quantization's; lanes 0 and 16 of each warp store the
+exponents of four groups as one word.
+
 The pre-attention sandwich (``k3_sandwich_tail``) runs the same phases with the row-parallel MoE tail as phase 1:
 ``[rmsnorm(latent)[:, lo:lo+224] | act] @ [W_lat (zero-padded to 256) | W_act]^T``, K = 256 + 384, the latent and
 the activation k-tiles in two TMEM accumulators and the latent RMS (over the whole reduced latent row) applied to
@@ -83,6 +90,9 @@ try:
     from cutlass.memory.smem import SmemAllocator
 except ImportError:  # DSL builds that keep it under cutlass.utils
     from cutlass.utils import SmemAllocator
+
+# The low-M FP8 GEMM's activation quantization helpers (mx_out): the MXFP8 copy is that GEMM's own quantization.
+from ..blackwell import k3_fp8w_lowm_mxfp8 as _mx
 
 H = 7168
 K_IN = 768  # this rank's o_proj input: 96 heads x 128 / TP16
@@ -149,6 +159,11 @@ LAT_FLAG_WORDS = 64  # int32: [0] the tail's call count mod 6, [LAT_SCALES + 8 b
 LAT_SCALES = 32
 LAT_SCALE_BUFS = 3
 SCALE_SENTINEL = -1  # 0xFFFFFFFF: an unwritten scale (a computed rsqrt is never this NaN pattern)
+# The MXFP8 copy of normed (mx_out): E4M3 codes [M, 7168] and one UE8M0 exponent per 1x32 group [M, 224], as int32
+# words.
+MX_GROUP = 32
+MX_Q_WORDS_PER_ROW = H // 4
+MX_S_WORDS_PER_ROW = H // MX_GROUP // 4
 
 LEADING = 16
 STRIDE = 8 * TMA_K_BOX * ELEM_BYTES
@@ -185,6 +200,20 @@ def _clock64(*, loc=None, ip=None):
         _llvm.inline_asm(
             _T.i64(), [], "mov.u64 $0, %clock64;", "=l", has_side_effects=True,
             is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _pack_u8x4(b0, b1, b2, b3, *, loc=None, ip=None):
+    """The low bytes of b0..b3 as one word, b0 in its lowest byte."""
+    return cutlass.Int32(
+        _llvm.inline_asm(
+            _T.i32(), [cutlass.Int32(b).ir_value(loc=loc, ip=ip) for b in (b0, b1, b2, b3)],
+            "{\n.reg .b32 r;\nand.b32 r, $1, 0xff;\nbfi.b32 r, $2, r, 8, 8;\nbfi.b32 r, $3, r, 16, 8;\n"
+            "bfi.b32 $0, $4, r, 24, 8;\n}",
+            "=r,r,r,r,r", has_side_effects=False, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT,
+            loc=loc, ip=ip,
         )
     )  # fmt: skip
 
@@ -498,6 +527,8 @@ def sandwich_role(
     x_slab: cutlass.Array,  # int32 words [SLAB_BUFS, MAX_TOKENS, 3584]: the published normed rows (publish)
     lat_flags: cutlass.Array,  # int32 [LAT_FLAG_WORDS] (x_src 2): the tail's call count and the latent scale slab
     tap: cutlass.Array,  # int32 words of bf16 rows (tap_out), tap_stride words apart: the capture layer's tap, out
+    mx_q: cutlass.Array,  # mx_out: int32 words of the E4M3 codes of normed [M, 7168], out
+    mx_s: cutlass.Array,  # mx_out: int32 words of their UE8M0 exponents [M, 224], out
     smem,  # shared-memory pointer, 1024-byte aligned, at least smem_bytes(k_in, rms_cols) bytes (SmemAllocator)
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
@@ -537,6 +568,9 @@ def sandwich_role(
     k_split: cutlass.Constexpr[
         int
     ],  # 2: accumulate the even and the odd k-tiles apart, then (0 + even) + odd
+    mx_out: cutlass.Constexpr[
+        int
+    ],  # attn_res forms, 1: also store normed's MXFP8 copy into mx_q / mx_s
     cta_base: cutlass.Constexpr[int],  # grid index of the role's first CTA (a multiple of CLUSTER)
     act_hook: cutlass.Constexpr,  # None: the activation by TMA after the grid wait; else see below
 ):
@@ -608,6 +642,7 @@ def sandwich_role(
     assert not swiglu or (plain and k_split == 2 and k_tiles == CLUSTER), (
         "swiglu: the plain form, split 2's order, K 896"
     )
+    assert not (mx_out and plain), "mx_out: the attn_res forms"
     tx, _, _ = cute.arch.thread_idx()
     grid_bx, _, _ = cute.arch.block_idx()
     bx = grid_bx - cutlass.Int32(cta_base)  # the role's CTA index (0-55)
@@ -1862,6 +1897,40 @@ def sandwich_role(
                     idx=row_word,
                     alignment=16,
                 )
+                if cutlass.const_expr(mx_out):
+                    # The MXFP8 copy (see the docstring): threads 4 j .. 4 j + 3 hold group j of the row's columns.
+                    amax = _mx.amax_bf16x8_words(
+                        out_words[0], out_words[1], out_words[2], out_words[3]
+                    )
+                    amax = _mx.amax_pair(amax, cute.arch.shuffle_sync_bfly(amax, offset=1))
+                    amax = _mx.amax_pair(amax, cute.arch.shuffle_sync_bfly(amax, offset=2))
+                    e_act = _mx.ue8m0_of_amax(amax)
+                    q0, q1 = _mx.quant_bf16x8_to_e4m3(
+                        out_words[0],
+                        out_words[1],
+                        out_words[2],
+                        out_words[3],
+                        _mx.bf16x2_inv_scale(e_act),
+                    )
+                    vec = (
+                        crank * cutlass.Int32(EPI_THREADS) + tid
+                    )  # this thread's 8-column vector of the row
+                    mx_q.store((q0, q1), idx=row_tok * cutlass.Int32(MX_Q_WORDS_PER_ROW) + vec * cutlass.Int32(2),
+                               alignment=8)  # fmt: skip
+                    e1 = cute.arch.shuffle_sync(
+                        e_act, offset=(lane + cutlass.Int32(4)) % cutlass.Int32(32)
+                    )
+                    e2 = cute.arch.shuffle_sync(
+                        e_act, offset=(lane + cutlass.Int32(8)) % cutlass.Int32(32)
+                    )
+                    e3 = cute.arch.shuffle_sync(
+                        e_act, offset=(lane + cutlass.Int32(12)) % cutlass.Int32(32)
+                    )
+                    if lane % cutlass.Int32(16) == cutlass.Int32(0):
+                        s_word = row_tok * cutlass.Int32(MX_S_WORDS_PER_ROW) + vec // cutlass.Int32(
+                            16
+                        )
+                        mx_s.store(_pack_u8x4(e_act, e1, e2, e3), idx=s_word)
                 if cutlass.const_expr(publish):
                     # The same 16 bytes into the slab, where the next kernel's poll takes them as ready.
                     x_slab.store(
@@ -1908,6 +1977,8 @@ def k3_sandwich_kernel(
     x_slab: cutlass.Array,
     lat_flags: cutlass.Array,
     tap: cutlass.Array,
+    mx_q: cutlass.Array,
+    mx_s: cutlass.Array,
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
     num_cand: cutlass.Int32,
@@ -1929,14 +2000,15 @@ def k3_sandwich_kernel(
     tap_out: cutlass.Constexpr[int],
     swiglu: cutlass.Constexpr[int],
     k_split: cutlass.Constexpr[int],
+    mx_out: cutlass.Constexpr[int],
 ):
     """The sandwich alone: 56 CTAs, each running ``sandwich_role`` on its own shared memory (arguments as there)."""
     smem = SmemAllocator().allocate(smem_bytes(k_in, rms_cols, swiglu), byte_alignment=1024)
     sandwich_role(
         tma_desc_w, tma_desc_x, tma_desc_x2, rms_src, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
-        updated, normed, x_slab, lat_flags, tap, smem, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        x_col0, lat_eps, slab_buf, x_buf, tap_stride, world, k_in, x_tiles, rms_cols, publish, x_src, plain, tap_out,
-        swiglu, k_split, 0, None,
+        updated, normed, x_slab, lat_flags, tap, mx_q, mx_s, smem, num_tokens, rank, num_cand, add_prefix, rms_eps,
+        out_eps, x_col0, lat_eps, slab_buf, x_buf, tap_stride, world, k_in, x_tiles, rms_cols, publish, x_src, plain,
+        tap_out, swiglu, k_split, mx_out, 0, None,
     )  # fmt: skip
 
 
@@ -2005,9 +2077,9 @@ def k3_sandwich_oproj(
     tma_desc_x = activation_tensor_map(x, K_IN, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, src_slab, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
-        updated, normed, x_slab, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW), world, K_IN,
-        MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1,
+        updated, normed, x_slab, ws_flags, ws_flags, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix,
+        rms_eps, out_eps, cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW),
+        world, K_IN, MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1, 0,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2032,6 +2104,8 @@ def k3_sandwich_tail(
     x_slab: cute.Tensor,
     lat_flags: cute.Tensor,  # x_src 2: int32 [LAT_FLAG_WORDS] (the call count and the scale slab)
     tap: cute.Tensor,  # tap_out: int32 words of the bf16 tap rows [M, 7168], tap_stride words apart
+    mx_q: cute.Tensor,  # mx_out: int32 words of normed's E4M3 codes [M, 7168]
+    mx_s: cute.Tensor,  # mx_out: int32 words of their UE8M0 exponents [M, 224]
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
     num_cand: cutlass.Int32,
@@ -2047,6 +2121,7 @@ def k3_sandwich_tail(
     publish: cutlass.Constexpr[int],
     x_src: cutlass.Constexpr[int],
     tap_out: cutlass.Constexpr[int],  # 1: the pre-norm mixture into ``tap``; 2: updated
+    mx_out: cutlass.Constexpr[int],  # 1: also normed's MXFP8 copy into mx_q / mx_s
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -2059,9 +2134,9 @@ def k3_sandwich_tail(
     tma_desc_x2 = activation_tensor_map(act, TAIL_ACT, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x2, latent_words, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w,
-        out_w, updated, normed, x_slab, lat_flags, tap, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT, publish, x_src, 0,
-        tap_out, 0, 1,
+        out_w, updated, normed, x_slab, lat_flags, tap, mx_q, mx_s, num_tokens, rank, num_cand, add_prefix, rms_eps,
+        out_eps, lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT, publish,
+        x_src, 0, tap_out, 0, 1, mx_out,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2099,9 +2174,10 @@ def k3_sandwich_plain(
     tma_desc_x = activation_tensor_map(x, 2 * k_in if swiglu else k_in, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, ws_flags, ws_uc, ws_mc, ws_flags, residual, residual, norm_w, norm_w,
-        norm_w, updated, normed, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1), cutlass.Int32(1),
-        eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0), cutlass.Int32(0),
-        cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu, 2 if swiglu else 1,
+        norm_w, updated, normed, ws_flags, ws_flags, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1),
+        cutlass.Int32(1), eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0),
+        cutlass.Int32(0), cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu,
+        2 if swiglu else 1, 0,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip

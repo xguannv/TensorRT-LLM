@@ -23,13 +23,16 @@ in 1..8:
          trtllm::attn_res_fwd) and updated_out (a snapshot bank row);
   plain  against k3_ctm_gemv -> the MNNVL one-shot RESIDUAL_RMS_NORM all-reduce, bit for bit (drafter o_proj, K 384),
          and the SwiGLU form against k3_ctm_gemv_swiglu split 2 -> the same all-reduce (drafter down, K 896);
+  mx     tail with the MXFP8 copy of normed (and mnnvl_mx: trtllm::mnnvl_allreduce_attn_res_mx, one- and two-shot):
+         normed / updated bit for bit the call without it, the copy bit for bit the low-M FP8 GEMM's quantization,
+         k3_fp8w_lowm_mxfp8 on it bit for bit k3_fp8w_lowm_gemm on normed (KDA QKVG and MLA fused_a shapes);
 each with run-to-run identical bits, each M's rows bit-identical to the same rows of the 8-row call, every rank's
 result changed by one rank's perturbed input; then CUDA graphs captured per M and replayed in mixed order with refilled
 inputs, against eager calls; and the call counters (the buffer's, the folded latent all-reduce's) across the int32
 wrap.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
-  srun -N1 -n4 --mpi=pmix python3 test_k3_sandwich.py [oproj tail plain swiglu replay wrap fold_wrap]
+  srun -N1 -n4 --mpi=pmix python3 test_k3_sandwich.py [oproj tail plain swiglu replay wrap fold_wrap mx mnnvl_mx]
 """
 
 import os
@@ -566,8 +569,191 @@ def check_fold_wrap(ctx):
     return [row]
 
 
+# The FP8 projections that consume the MXFP8 copy (k3_fp8w_lowm_mxfp8): KDA QKVG and MLA fused q_a / kv_a at TP16.
+MX_WEIGHTS = ((3072, H), (2112, H))
+
+
+def _mx_modules():
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm as lowm
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx
+
+    return lowm, mx
+
+
+def _fp8_weight(n, k, seed):
+    """An FP8 projection weight as the low-M GEMM holds it: N(0, 0.02), power-of-two 128x128 block scales."""
+    lowm, _ = _mx_modules()
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    n_pad = -(-n // 128) * 128
+    w = torch.randn((n_pad, k), device="cuda", generator=gen) * 0.02
+    blocks = w.view(n_pad // 128, 128, k // 128, 128)
+    scale = torch.exp2(
+        torch.ceil(torch.log2(blocks.abs().amax(dim=(1, 3)).clamp(min=1e-4) / 448.0))
+    )
+    w_fp8 = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn).view(n_pad, k)
+    return lowm.prepare_k3_fp8w_lowm_weight(w_fp8[:n].contiguous(), scale.float())
+
+
+def _mx_buffers(m):
+    """MXFP8 output buffers filled with a pattern the kernel must overwrite."""
+    xq = torch.full((m, H), 0x7E, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    return xq, torch.full((m, H // 32), 0xAB, dtype=torch.uint8, device="cuda")
+
+
+def _mx_consumers(normed, xq, xs, weights):
+    """Whether the MXFP8 copy is the low-M GEMM's own quantization of normed (its torch statement), and each
+    projection on k3_fp8w_lowm_mxfp8 (both scale-release builds) is bit for bit k3_fp8w_lowm_gemm on normed."""
+    lowm, mx = _mx_modules()
+    rq, rs = mx.mxfp8_quantize_reference(normed)
+    quant = torch.equal(xq.view(torch.uint8), rq.view(torch.uint8)) and torch.equal(xs, rs)
+    gemm = True
+    for w, ws in weights:
+        ref = torch.empty((normed.shape[0], w.shape[0]), dtype=torch.bfloat16, device="cuda")
+        lowm.run_k3_fp8w_lowm_gemm(normed, w, ws, ref)
+        for early in (False, True):
+            out = torch.empty_like(ref)
+            assert mx.can_run_mxfp8(xq, xs, w, ws, allow_partial_n_tile=True)
+            mx.run_k3_fp8w_lowm_gemm_mxfp8(xq, xs, w, ws, out, sf_early_release=early)
+            gemm = gemm and _same(out, ref)
+    torch.cuda.synchronize()
+    return quant, gemm
+
+
+def _replicated(ctx, *tensors) -> bool:
+    """The tensors' bytes are the same on every rank."""
+    sums = [int(t.contiguous().view(torch.uint8).long().sum().item()) for t in tensors]
+    return all(other == sums for other in ctx.comm.allgather(sums))
+
+
+def check_mx(ctx):
+    """k3_sandwich_tail with the MXFP8 copy of normed (mx_q / mx_s, TRTLLM_K3LL_ATTN_RES_MXFP8): normed and updated
+    bit for bit the call without it (also with the capture tap), the copy bit for bit the low-M GEMM's quantization
+    of normed and the same on every rank, and the consuming projections' outputs bit for bit k3_fp8w_lowm_gemm on
+    normed; then the copy and its GEMM captured in a CUDA graph and replayed with rewritten inputs."""
+    results = []
+    weights = [_fp8_weight(n, k, 7 + n) for n, k in MX_WEIGHTS]
+    for snapshots in (0, 3, 8):
+        for with_prefix in (True, False):
+            latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(
+                ctx, snapshots, 600 + snapshots
+            )
+            for m in M_ALL:
+                latent, act = latent8[:m].contiguous(), act8[:m].contiguous()
+                pre, block = _first(m, prefix8, block8, with_prefix)
+                args = (latent, act, w, lo, pre, block, res_w, rms_w, out_w)
+                n0, u0 = _tail(ctx, *args)
+                xq, xs = _mx_buffers(m)
+                n1, u1 = _tail(ctx, *args, mx_q=xq, mx_s=xs)
+                tap0, tap1 = _nan(m, H), _nan(m, H)
+                _tail(ctx, *args, tap=tap0)
+                xq2, xs2 = _mx_buffers(m)
+                n2, u2 = _tail(ctx, *args, tap=tap1, mx_q=xq2, mx_s=xs2)
+                quant, gemm = _mx_consumers(n1, xq, xs, weights)
+                row = dict(
+                    op="k3_sandwich_tail_mx", case=f"S{snapshots}_{'prefix' if with_prefix else 'noprefix'}", M=m,
+                    unchanged=_same(n1, n0) and _same(u1, u0) and _same(n2, n0) and _same(u2, u0)
+                    and _same(tap1, tap0), quant=quant, gemm=gemm,
+                    with_tap=torch.equal(xq2.view(torch.uint8), xq.view(torch.uint8)) and torch.equal(xs2, xs),
+                    replicated=_replicated(ctx, xq, xs),
+                )  # fmt: skip
+                row["ok"] = _all_ranks(ctx, row["unchanged"] and quant and gemm and row["with_tap"]
+                                       and row["replicated"])  # fmt: skip
+                results.append(row)
+    # A captured step: the copy and its consumer, replayed with new inputs, against eager calls.
+    lowm, mx = _mx_modules()
+    w_q, ws_q = weights[0]
+    for m in (1, 8):
+        latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(ctx, 4, 700 + m)
+        latent, act = latent8[:m].contiguous(), act8[:m].contiguous()
+        pre, block = _first(m, prefix8, block8, True)
+        xq, xs = _mx_buffers(m)
+        out = torch.empty((m, w_q.shape[0]), dtype=torch.bfloat16, device="cuda")
+        held = {}
+
+        def body():
+            held["n"], held["u"] = _tail(
+                ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w, mx_q=xq, mx_s=xs
+            )
+            mx.run_k3_fp8w_lowm_gemm_mxfp8(xq, xs, w_q, ws_q, out)
+
+        body()
+        torch.cuda.synchronize()
+        ctx.comm.Barrier()
+        graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            body()
+        torch.cuda.synchronize()
+        for rep in range(3):
+            latent.copy_(_rand((m, LATENT), 800 + rep, 0.8))
+            act.copy_(_rand((m, ACT), 900 + 1000 * ctx.rank + rep, 0.5))
+            ctx.comm.Barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            got_n, got_out = held["n"].clone(), out.clone()
+            got_q, got_s = xq.clone(), xs.clone()
+            want_n, want_u = _tail(ctx, latent, act, w, lo, pre, block, res_w, rms_w, out_w)
+            ref = torch.empty_like(out)
+            lowm.run_k3_fp8w_lowm_gemm(want_n, w_q, ws_q, ref)
+            rq, rs = mx.mxfp8_quantize_reference(want_n)
+            torch.cuda.synchronize()
+            row = dict(op="k3_sandwich_tail_mx", case=f"graph_replay{rep}", M=m, normed=_same(got_n, want_n),
+                       quant=torch.equal(got_q.view(torch.uint8), rq.view(torch.uint8)) and torch.equal(got_s, rs),
+                       gemm=_same(got_out, ref))  # fmt: skip
+            row["ok"] = _all_ranks(ctx, row["normed"] and row["quant"] and row["gemm"])
+            results.append(row)
+        del graph
+    return results
+
+
+def check_mnnvl_mx(ctx):
+    """trtllm::mnnvl_allreduce_attn_res_mx (the wide steps' pre-attention collective with the MXFP8 copy), one- and
+    two-shot: normed and updated bit for bit trtllm::mnnvl_allreduce_attn_res, the copy bit for bit the low-M GEMM's
+    quantization of normed and the same on every rank, the consuming projections bit for bit k3_fp8w_lowm_gemm."""
+    from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+
+    if not hasattr(_trtllm(), "mnnvl_allreduce_attn_res_mx"):
+        why = "the loaded libtensorrt_llm has no mnnvl_allreduce_attn_res_mx: rebuild the tree"
+        return [dict(op="mnnvl_allreduce_attn_res_mx", case="missing", M=0, ok=False, why=why)]
+    results = []
+    weights = [_fp8_weight(n, k, 11 + n) for n, k in MX_WEIGHTS]
+    mnnvl = ctx.mnnvl
+    for m in (1, 5, 8, 16, 32):
+        for two_shot in (False, True):
+            for snapshots, with_prefix in ((0, False), (3, True), (8, True)):
+                seed = 1000 + 10 * m + snapshots + int(two_shot)
+                partial = _rand((m, H), seed + 100 * ctx.rank, 0.5)
+                prefix = _rand((m, H), seed + 1) if with_prefix else None
+                block = _rand((snapshots, m, H), seed + 2)
+                res_w, rms_w, out_w = (
+                    _rand((H,), seed + 3, 0.05),
+                    _norm_w(seed + 4),
+                    _norm_w(seed + 5),
+                )
+                rows_cap = -(-max(m, ctx.world) // ctx.world) * ctx.world
+                ws = get_or_scale_allreduce_mnnvl_workspace(
+                    mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=4 * rows_cap * H * ctx.world * 2
+                )
+                buf, flags = ws["uc_buffer"].view(mnnvl.dtype).view(3, -1), ws["buffer_flags"]
+                n0, u0 = _trtllm().mnnvl_allreduce_attn_res(partial, prefix, block, res_w, rms_w, out_w, EPS, EPS,
+                                                            buf, flags, two_shot)  # fmt: skip
+                xq, xs = _mx_buffers(m)
+                n1, u1 = _trtllm().mnnvl_allreduce_attn_res_mx(partial, prefix, block, res_w, rms_w, out_w, EPS, EPS,
+                                                               buf, flags, xq, xs, two_shot)  # fmt: skip
+                quant, gemm = _mx_consumers(n1, xq, xs, weights)
+                row = dict(op="mnnvl_allreduce_attn_res_mx", case=f"{'two' if two_shot else 'one'}shot_S{snapshots}",
+                           M=m, unchanged=_same(n1, n0) and _same(u1, u0), quant=quant, gemm=gemm,
+                           replicated=_replicated(ctx, xq, xs, n1))  # fmt: skip
+                row["ok"] = _all_ranks(
+                    ctx, row["unchanged"] and quant and gemm and row["replicated"]
+                )
+                results.append(row)
+    return results
+
+
 CHECKS = {"oproj": check_oproj, "tail": check_tail, "plain": check_plain, "swiglu": check_swiglu,
-          "replay": check_replay, "wrap": check_wrap, "fold_wrap": check_fold_wrap}  # fmt: skip
+          "replay": check_replay, "wrap": check_wrap, "fold_wrap": check_fold_wrap, "mx": check_mx,
+          "mnnvl_mx": check_mnnvl_mx}  # fmt: skip
 
 
 def _run_checks(names):

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cuda/atomic>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <optional>
 #include <tuple>
@@ -556,6 +557,65 @@ __device__ __forceinline__ void attnResEpilogue(PackedVec<float4, __nv_bfloat16>
             = __float2bfloat16_rn(__bfloat162float(normalized) * __bfloat162float(outputRmsWeight.elements[i]));
     }
 }
+
+// The MXFP8 form of eight contiguous BF16 outputs of a row (thread packedIdx's elements [8 packedIdx, 8 packedIdx +
+// 8)), stored for k3_fp8w_lowm_mxfp8: the four threads 4 j .. 4 j + 3 hold group j (32 columns) and take its absolute
+// maximum by two butterfly shuffles; then, as the CuTe DSL low-M FP8 GEMM quantizes its activation
+// (k3_fp8w_lowm_gemm.py: _abs_max_bf16x32, _ue8m0_of_amax, _bf16x2_inv_scale, _quant_bf16x8_to_e4m3), the exponent
+// e = biased exponent of 2^ceil(log2(amax / 448)) with amax floored at bf16 0x38D2, and the codes of the exact BF16
+// products x * 2^(127 - e), rounded to nearest E4M3 with satfinite. The conversion goes through FP32, which holds the
+// BF16 product exactly, so its rounding is the BF16 conversion's. Every lane of the warp must call it.
+__device__ __forceinline__ uint32_t mxAbsMaxBf16x2(uint32_t a, uint32_t b)
+{
+    uint32_t r;
+    asm("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+__device__ __forceinline__ uint32_t mxMulBf16x2(uint32_t a, uint32_t b)
+{
+    uint32_t r;
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+__device__ __forceinline__ uint32_t mxE4m3x4(uint32_t lo, uint32_t hi)
+{
+    uint32_t const b01 = __nv_cvt_float2_to_fp8x2(
+        make_float2(__uint_as_float(lo << 16), __uint_as_float(lo & 0xffff0000U)), __NV_SATFINITE, __NV_E4M3);
+    uint32_t const b23 = __nv_cvt_float2_to_fp8x2(
+        make_float2(__uint_as_float(hi << 16), __uint_as_float(hi & 0xffff0000U)), __NV_SATFINITE, __NV_E4M3);
+    return (b01 & 0xffffU) | (b23 << 16);
+}
+
+__device__ __forceinline__ void storeMxfp8(PackedVec<float4, __nv_bfloat16> const& out, int token, int packedIdx,
+    int tokenDim, AttnResEpilogueParams const& epilogue)
+{
+    constexpr uint32_t kAmaxFloorBf16 = 0x38D2U;
+    uint32_t const w0 = __float_as_uint(out.packed.x);
+    uint32_t const w1 = __float_as_uint(out.packed.y);
+    uint32_t const w2 = __float_as_uint(out.packed.z);
+    uint32_t const w3 = __float_as_uint(out.packed.w);
+    uint32_t amax = mxAbsMaxBf16x2(mxAbsMaxBf16x2(w0, w1), mxAbsMaxBf16x2(w2, w3));
+    amax = mxAbsMaxBf16x2(amax, __shfl_xor_sync(0xffffffffU, amax, 1));
+    amax = mxAbsMaxBf16x2(amax, __shfl_xor_sync(0xffffffffU, amax, 2));
+    uint32_t a = max(amax & 0x7fffU, (amax >> 16) & 0x7fffU);
+    a = max(a, kAmaxFloorBf16);
+    uint32_t const e = (a >> 7) - 8U + ((a & 0x7fU) > 0x60U ? 1U : 0U);
+    uint32_t const s = (254U - e) << 7;
+    uint32_t const invScale = s | (s << 16);
+    uint2 codes;
+    codes.x = mxE4m3x4(mxMulBf16x2(w0, invScale), mxMulBf16x2(w1, invScale));
+    codes.y = mxE4m3x4(mxMulBf16x2(w2, invScale), mxMulBf16x2(w3, invScale));
+    auto* quant = static_cast<uint8_t*>(epilogue.mxQuant);
+    *reinterpret_cast<uint2*>(&quant[static_cast<size_t>(token) * tokenDim + packedIdx * kAttnResEltsPerThread])
+        = codes;
+    if ((packedIdx & 3) == 0)
+    {
+        auto* scale = static_cast<uint8_t*>(epilogue.mxScale);
+        scale[static_cast<size_t>(token) * (tokenDim / 32) + packedIdx / 4] = static_cast<uint8_t>(e);
+    }
+}
 } // namespace detail
 
 using detail::PackedVec;
@@ -636,6 +696,10 @@ __global__ void __launch_bounds__(detail::kAttnResThreads)
         reduced, prefix, snapshot, resWeight, rmsWeight, outputRmsWeight, epilogue, params.tokenDim, updated, output);
     reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset])[0] = updated.packed;
     reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = output.packed;
+    if (epilogue.mxQuant != nullptr)
+    {
+        detail::storeMxfp8(output, token, packedIdx, params.tokenDim, epilogue);
+    }
     flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * sizeof(T)), 0, 0, 0});
 #endif
 }
@@ -758,6 +822,12 @@ __global__ void __launch_bounds__(detail::kAttnResThreads)
     }
     reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = output.packed;
     reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset])[0] = updated.packed;
+    if (epilogue.mxQuant != nullptr)
+    {
+        Packed received;
+        received.packed = output.packed;
+        detail::storeMxfp8(received, token, packedIdx, tokenDim, epilogue);
+    }
     flag.waitAndUpdate(
         {static_cast<uint32_t>((params.numTokens + WorldSize - 1) / WorldSize * WorldSize * tokenDim * sizeof(T)),
             static_cast<uint32_t>(2 * params.numTokens * tokenDim * sizeof(T)), 0, 0});
