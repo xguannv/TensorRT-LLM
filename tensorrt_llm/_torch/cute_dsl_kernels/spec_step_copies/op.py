@@ -53,15 +53,17 @@ def is_available() -> bool:
 
 
 def is_enabled() -> bool:
-    """Per call: the kernels replace the torch ops on SM 100 (``is_supported``), and on SM 103 / 107 when the Kimi K3
-    low-latency switch ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X`` is set (read from the K3 flags module at every call)."""
+    """Per call: the kernels replace the torch ops on SM 100 (``is_supported``); on SM 103 when the Kimi K3 low-latency
+    switch ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X`` is >= 1, on SM 107 only when it is 2 (bit-for-bit checks so far on SM
+    100 and SM 103 only). Read from the K3 flags module at every call."""
     if not is_available():
         return False
-    if get_sm_version() == 100:
+    sm = get_sm_version()
+    if sm == 100:
         return True
     from ...pyexecutor.k3ll_flags import k3ll_flag
 
-    if not k3ll_flag("TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X"):
+    if k3ll_flag("TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X") < (2 if sm == 107 else 1):
         return False
     _SM10X_CALLS[0] += 1
     n = _SM10X_CALLS[0]

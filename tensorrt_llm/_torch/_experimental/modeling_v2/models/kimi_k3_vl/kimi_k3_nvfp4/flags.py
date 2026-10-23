@@ -255,7 +255,7 @@ TRTLLM_K3LL_FORCE_REPLAY = _flag(
 )
 TRTLLM_K3LL_SLICED_HELIX_PARTITION = _flag(
     "TRTLLM_K3LL_SLICED_HELIX_PARTITION",
-    0,
+    1,
     "Helix generation intake: merge_helix_requests reads the prompt from the request's serialized int32 bytes and "
     "slices only this rank's blocks (pyexecutor/request_utils.py; same lists; read per call)",
 )
@@ -267,9 +267,10 @@ TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC = _flag(
 )
 TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X = _flag(
     "TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X",
-    0,
-    "SM 103 / 107: the speculative step's overlap gathers and sampler store scatters as the two spec_step_copies "
-    "kernels (one launch each, bit for bit the torch ops; SM 100 always uses them; read per step)",
+    1,
+    "the speculative step's overlap gathers and sampler store scatters as the two spec_step_copies kernels (one "
+    "launch each, bit for bit the torch ops): 1 on SM 103, 2 on SM 103 and SM 107 (SM 100 always uses them; read per "
+    "step)",
 )
 
 
