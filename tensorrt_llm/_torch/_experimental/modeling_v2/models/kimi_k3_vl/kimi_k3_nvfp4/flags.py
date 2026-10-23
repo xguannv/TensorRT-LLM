@@ -171,7 +171,7 @@ TRTLLM_K3LL_MOE_FRONT16 = _flag(
 )
 TRTLLM_K3LL_MOE_FRONT32 = _flag(
     "TRTLLM_K3LL_MOE_FRONT32",
-    0,
+    1,
     "lowm MoE on 17-32 token steps: the head, routing, NVFP4 latent and shared gate_up in k3_moe_front's 32-token "
     "build",
 )
