@@ -5,7 +5,8 @@
 One ``_flag(...)`` line per switch: environment variable name, default, one sentence. A switch is read once, at
 import, from the environment of every rank; ``log_flags`` prints every switch's effective value when the model is
 built, so a log always states which variant ran. With every switch at its default the target behaves as before the
-switch was added.
+switch was added. A switch whose value is a path is a ``_path_flag(...)``: unset, empty or ``0`` is off (so a
+harness that sets a switch's off arm to 0 works for it too).
 """
 
 import os
@@ -14,6 +15,7 @@ from typing import Dict, Tuple
 from tensorrt_llm.logger import logger
 
 _FLAGS: Dict[str, Tuple[int, int, str]] = {}
+_PATH_FLAGS: Dict[str, Tuple[str, str]] = {}
 
 
 def _flag(name: str, default: int, doc: str) -> int:
@@ -26,6 +28,15 @@ def _flag(name: str, default: int, doc: str) -> int:
         except ValueError as err:
             raise ValueError(f"{name} must be an integer, got {raw!r}") from err
     _FLAGS[name] = (value, default, doc)
+    return value
+
+
+def _path_flag(name: str, doc: str) -> str:
+    """A switch whose value is a file or directory path; ``""`` (unset, empty or ``0``) is off."""
+    value = os.environ.get(name) or ""
+    if value == "0":
+        value = ""
+    _PATH_FLAGS[name] = (value, doc)
     return value
 
 
@@ -323,11 +334,39 @@ TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "KV-length correction, Helix position correction and spec buffers) as one fused_spec_head_prep launch, bit for "
     "bit the torch ops (pyexecutor/engine/runners/decoder/runner.py; read per call, so per CUDA graph capture)",
 )
+TRTLLM_K3LL_EXPERT_PLACEMENT = _path_flag(
+    "TRTLLM_K3LL_EXPERT_PLACEMENT",
+    "routed MoE, at load: a kimi_k3_expert_placement/v1 JSON whose expert_of_slot[layer][slot] names the checkpoint "
+    "expert each slot (EP rank slot // 224) holds; the router rows and score bias are permuted to slot order, decode "
+    "unchanged (expert_placement.py; not bitwise: the EP groups' partial sums and top-k tie order change)",
+)
+TRTLLM_K3LL_ROUTING_STATS_DIR = _path_flag(
+    "TRTLLM_K3LL_ROUTING_STATS_DIR",
+    "measurement only, rank 0: per-step token counts of every MoE layer's checkpoint experts on the lowm decode path "
+    "(<= 32 tokens), counted on the GPU inside the CUDA graphs and written as routing_*.npz chunks to this directory "
+    "(routing_stats.py; adds small kernels per MoE layer on rank 0, so do not time with it)",
+)
+TRTLLM_K3LL_ROUTING_STATS_STRIDE = _flag(
+    "TRTLLM_K3LL_ROUTING_STATS_STRIDE",
+    0,
+    "with TRTLLM_K3LL_ROUTING_STATS_DIR: tokens per request of a decode step (1 + draft length); > 0 adds a second "
+    "count plane of every request's first token",
+)
+TRTLLM_K3LL_ROUTING_STATS_CHUNK = _flag(
+    "TRTLLM_K3LL_ROUTING_STATS_CHUNK",
+    1024,
+    "with TRTLLM_K3LL_ROUTING_STATS_DIR: steps per .npz chunk (one is also written every 30 s and at exit)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
-    """Every switch: name -> (value, default, doc)."""
+    """Every integer switch: name -> (value, default, doc)."""
     return dict(_FLAGS)
+
+
+def path_flags() -> Dict[str, Tuple[str, str]]:
+    """Every path switch: name -> (value, doc); ``""`` is off."""
+    return dict(_PATH_FLAGS)
 
 
 def log_flags() -> None:
@@ -336,4 +375,5 @@ def log_flags() -> None:
         f"{name}={value}{'*' if value != default else ''}"
         for name, (value, default, _) in _FLAGS.items()
     ]
+    parts += [f"{name}={value!r}{'*' if value else ''}" for name, (value, _) in _PATH_FLAGS.items()]
     logger.info("Kimi K3 low-latency switches: " + " ".join(parts))

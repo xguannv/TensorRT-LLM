@@ -17,6 +17,9 @@ runs:
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
   residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
 
+With ``TRTLLM_K3LL_ROUTING_STATS_DIR`` each layer's routed ids (the front's, or ``k3_route_quant``'s on a wide step)
+are also counted into rank 0's `routing_stats.RoutingStats` (``K3DecodeMoeNvfp4Layer.stats``).
+
 Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_lowm_op.supported`).
 
 `K3DecodeMoeNvfp4` holds what every MoE layer shares (the head workspace, the expert kernel's counters);
@@ -61,6 +64,7 @@ from . import flags as _flags
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
 from .moe_tail_push import WideTail
+from .routing_stats import RoutingStats
 
 MAX_TOKENS = 8
 # The front's 16-token build (TRTLLM_K3LL_MOE_FRONT16): a wide step of at most this many tokens.
@@ -267,6 +271,9 @@ class K3DecodeMoeNvfp4Layer:
     fc2_input_scale: torch.Tensor
     offset: int
     situ: tuple
+    #: ``TRTLLM_K3LL_ROUTING_STATS_DIR``: the recorder this layer's routing is counted into (rank 0), else None.
+    stats: Optional[RoutingStats] = None
+    layer_idx: int = -1
 
     @classmethod
     def create(
@@ -309,6 +316,7 @@ class K3DecodeMoeNvfp4Layer:
             fc2_input_scale=backend.fc2_input_scale.detach().reshape(1),
             offset=int(backend.slot_start),
             situ=(_scalar(backend.act_alpha), _scalar(backend.act_beta)),
+            layer_idx=getattr(moe, "layer_idx", -1),
         )
 
     def warm_up(self, moe: nn.Module) -> None:
@@ -374,12 +382,16 @@ class K3DecodeMoeNvfp4Layer:
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
+            if self.stats is not None:
+                self.stats.record(self.layer_idx, ids)
             return self._routed(ids, weights, x_q, x_sf), shared_act
         rows = x.shape[0]
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
-        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
+        ids, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
+        if self.stats is not None:
+            self.stats.record(self.layer_idx, ids)
         routed = nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
             self.state.counters, *self.situ,
@@ -434,7 +446,10 @@ class K3DecodeMoeNvfp4Layer:
         shared = moe.shared_experts
 
         def _routed_partial():
-            return self._routed(*self._route_quant(moe, router_logits, routed_in))
+            routing = self._route_quant(moe, router_logits, routed_in)
+            if self.stats is not None:
+                self.stats.record(self.layer_idx, routing[0])
+            return self._routed(*routing)
 
         def _shared_activation():
             return shared._apply_activation(
