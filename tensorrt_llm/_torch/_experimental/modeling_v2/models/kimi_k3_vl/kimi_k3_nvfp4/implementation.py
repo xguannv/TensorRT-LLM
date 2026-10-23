@@ -1641,6 +1641,8 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         elif tail_push:
             _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
+            if self.decode_comm.tail_push_folds(pending_moe_partial):
+                _census.count(f"dispatch:moe_tail_push_fold:{_census.mode()}")
             hidden_states, prefix_sum = self.decode_comm.tail_push_attn_res(
                 pending_moe_partial,
                 prefix_sum,
@@ -2168,6 +2170,8 @@ class KimiLinearModel(DecoderModel):
                 self.norm,
             ):
                 _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
+                if tail_comm.tail_push_folds(pending_moe_partial):
+                    _census.count(f"dispatch:moe_tail_push_fold:{_census.mode()}")
                 normed, _ = tail_comm.tail_push_attn_res(
                     pending_moe_partial,
                     hidden_states,
@@ -4379,10 +4383,16 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             tiles = gemvs.compile_push(
                 _moe_tail_push.SITE, first.tail_weight, comm.oproj_push.lamport.world
             )
+            # TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD likewise: the push GEMV's folded-finish variant.
+            fold_tiles = gemvs.compile_push(
+                _moe_tail_push.SITE, first.tail_weight, comm.oproj_push.lamport.world, fold=True
+            )
             if mapping.tp_rank == 0:
                 logger.info(
                     f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_TAIL_PUSH={_flags.TRTLLM_K3LL_MOE_TAIL_PUSH} (read at forward "
-                    f"time): the wide tail's push GEMV compiled for token tiles {tiles}"
+                    f"time): the wide tail's push GEMV compiled for token tiles {tiles}; "
+                    f"TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD={_flags.TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD}: its folded-finish "
+                    f"variant for {fold_tiles}"
                 )
         return len(takes)
 

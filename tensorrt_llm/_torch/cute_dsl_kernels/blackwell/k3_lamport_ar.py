@@ -272,6 +272,21 @@ def red_release_add(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def atom_add_acq_rel_u32(addr, value, *, loc=None, ip=None):
+    """``atomicAdd`` at GPU scope with acquire-release semantics; returns the old value."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_acquire_u32(addr, *, loc=None, ip=None):
     return Int32(
         _asm(
@@ -369,6 +384,106 @@ def push_v4(addr: Int64, w0: Int32, w1: Int32, w2: Int32, w3: Int32, one_shot: b
         multimem_st_v4(addr, *s)
     else:
         st_v4(addr, *s)
+
+
+def cpp_chunk(world: int, cpp_one_shot: bool = True) -> int:
+    """Ranks per partial sum of the reproduced C++ kernel: the one-shot kernel's (chunks of eight
+    ranks above eight ranks, the order of every ``mnnvl_allreduce_attn_res`` call), else the
+    two-shot kernel's (up to sixteen ranks in one chunk)."""
+    return (world if world <= 8 else 8) if cpp_one_shot else min(world, 16)
+
+
+@cute.jit
+def reduce_slots(base: Int64, slot_bytes: int, world: int, chunk: int):
+    """Poll the ``world`` 16-byte slots at ``base + r * slot_bytes`` until every word has arrived,
+    then sum them in rank order, ``chunk`` ranks per partial sum (:func:`cpp_chunk`), in FP32 with
+    round to nearest; returns eight FP32 values (four BF16 pairs)."""
+    words = cute.make_rmem_tensor((world * 4,), Int32)
+    ready = Int32(0)
+    while ready == 0:
+        ready = Int32(1)
+        for r in cutlass.range_constexpr(world):
+            w = ld_volatile_v4(base + Int64(r * slot_bytes))
+            for e in cutlass.range_constexpr(4):
+                words[r * 4 + e] = w[e]
+            ready = ready & clean4(*w)
+    acc = [cutlass.Float32(0.0)] * 8
+    for c0 in cutlass.range_constexpr(0, world, chunk):
+        part = [cutlass.Float32(0.0)] * 8
+        for r in cutlass.range_constexpr(c0, c0 + chunk):
+            for q in cutlass.range_constexpr(4):
+                part[2 * q], part[2 * q + 1] = acc_bf16x2(
+                    words[r * 4 + q], part[2 * q], part[2 * q + 1]
+                )
+        for i in cutlass.range_constexpr(8):
+            acc[i] = add_f32(acc[i], part[i])
+    return acc
+
+
+@cute.jit
+def owner_reduce_v4(
+    uc_local: Int64,
+    mc_base: Int64,
+    cur: Int32,
+    nbytes: Int32,
+    tok: Int32,
+    elem: Int32,
+    world: int,
+    hidden: int,
+    chunk: int,
+):
+    """The two-shot owner step of the finish kernel for values ``[elem, elem + 8)`` of token
+    ``tok`` (``tok % world`` is this rank): poll its ``world`` slots in the scatter stage of buffer
+    ``cur``, sum them (:func:`reduce_slots`), round to BF16, send ``-0`` as ``+0`` and multicast
+    the vector into the broadcast stage of every rank, where :func:`poll_result_v4` reads it."""
+    row_bytes = hidden * 2
+    scatter = stage_addr(uc_local, cur, Int32(0), 2, nbytes)
+    acc = reduce_slots(
+        scatter + Int64((tok // world) * world * hidden + elem) * 2, row_bytes, world, chunk
+    )
+    o = [sanitize_bf16x2(pack_bf16x2(acc[2 * q], acc[2 * q + 1])) for q in range(4)]
+    bcast_mc = stage_addr(mc_base, cur, Int32(1), 2, nbytes)
+    multimem_st_v4(bcast_mc + Int64(tok * hidden + elem) * 2, *o)
+
+
+@cute.jit
+def clear_dirty(
+    uc_local: Int64,
+    dirty: Int32,
+    nbytes: Int32,
+    dstages: Int32,
+    c0: Int32,
+    c1: Int32,
+    c2: Int32,
+    c3: Int32,
+    gtid: Int32,
+    nthreads: Int32,
+):
+    """Re-arm every stage the previous call on the workspace used (its buffer ``dirty``,
+    ``dstages`` stages, ``c0..c3`` bytes each) with the sentinel, grid-strided."""
+    clears = (c0, c1, c2, c3)
+    for s in cutlass.range_constexpr(4):
+        if s < dstages:
+            clear_stage(
+                uc_local + Int64(dirty * dstages + s) * Int64(nbytes // dstages),
+                clears[s],
+                gtid,
+                nthreads,
+            )
+
+
+@cute.jit
+def advance_two_shot(flags: Int64, cur: Int32, nbytes: Int32, m: Int32, world: int, hidden: int):
+    """Write the rotation state after a two-shot call of ``m`` rows on buffer ``cur`` (as the
+    finish kernel's updater does): the next buffer current, ``cur`` dirty with its two stages'
+    bytes to clear, the arrival counter back to zero. Only once every reader of this call's state
+    has read it."""
+    row_bytes = hidden * 2
+    clear0 = ((m + (world - 1)) // world) * (world * row_bytes)
+    clear1 = m * row_bytes
+    st_v4(flags, (cur + 1) % NUM_BUFFERS, cur, nbytes, Int32(2))
+    st_v4(flags + Int64(16), clear0, clear1, Int32(0), Int32(0))
+    st_u32(flags + Int64(_FLAG_ARRIVALS * 4), Int32(0))
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +603,7 @@ class K3LamportFinishKernel:
         self.cols = _ceil_div(self.vecs, THREADS)
         # Ranks per partial sum of the reproduced C++ kernel, and whether the one-shot transport
         # sanitizes its output like the two-shot kernel (the two-shot transport always does).
-        self.chunk = (world if world <= 8 else 8) if cpp_one_shot else min(world, 16)
+        self.chunk = cpp_chunk(world, cpp_one_shot)
         self.sanitize_out = not cpp_one_shot
 
     @cute.jit
@@ -513,27 +628,7 @@ class K3LamportFinishKernel:
     def reduce_slots(self, base: Int64, slot_bytes: int):
         """Poll the ``W`` 16-byte slots at ``base + r * slot_bytes`` until every word has arrived,
         then sum them in the C++ order; returns eight FP32 values (four BF16 pairs)."""
-        W = self.W
-        words = cute.make_rmem_tensor((W * 4,), Int32)
-        ready = Int32(0)
-        while ready == 0:
-            ready = Int32(1)
-            for r in cutlass.range_constexpr(W):
-                w = ld_volatile_v4(base + Int64(r * slot_bytes))
-                for e in cutlass.range_constexpr(4):
-                    words[r * 4 + e] = w[e]
-                ready = ready & clean4(*w)
-        acc = [cutlass.Float32(0.0)] * 8
-        for c0 in cutlass.range_constexpr(0, W, self.chunk):
-            part = [cutlass.Float32(0.0)] * 8
-            for r in cutlass.range_constexpr(c0, c0 + self.chunk):
-                for q in cutlass.range_constexpr(4):
-                    part[2 * q], part[2 * q + 1] = acc_bf16x2(
-                        words[r * 4 + q], part[2 * q], part[2 * q + 1]
-                    )
-            for i in cutlass.range_constexpr(8):
-                acc[i] = add_f32(acc[i], part[i])
-        return acc
+        return reduce_slots(base, slot_bytes, self.W, self.chunk)
 
     @cute.kernel
     def kernel(
@@ -851,10 +946,15 @@ __all__ = [
     "K3LamportGatherKernel",
     "K3LamportPushKernel",
     "LamportWorkspace",
+    "advance_two_shot",
+    "clear_dirty",
+    "cpp_chunk",
+    "owner_reduce_v4",
     "one_shot_for",
     "poll_result_v4",
     "push_slot",
     "push_v4",
+    "reduce_slots",
     "required_bytes",
     "run_lamport_finish",
     "run_lamport_finish_in_place",

@@ -26,7 +26,8 @@ prefetch before the grid-dependency wait); output columns >= ``sig_col0`` hold `
 long kernel's split-K clusters (bf16 output with optional sigmoid columns, or fp32 output); with ``row_tiles`` the
 weight rows split into that many equal tiles of at most 128 rows, one cluster each (more CTAs for a short N).
 ``run_k3_ctm_gemv_wide_ar_push`` (a plain function, not a torch op): ``k3_ctm_gemv_wide``'s bf16 output pushed into
-the Lamport slots of the next two-shot MNNVL all-reduce on a workspace instead of stored (the same values).
+the Lamport slots of the next two-shot MNNVL all-reduce on a workspace instead of stored (the same values); with
+``fold`` the kernel also finishes that all-reduce in place (no Lamport finish kernel after it).
 
 ``push`` (the split-K ops) chooses how a cluster's ranks send their fp32 partials to the row owner: DSMEM
 stores + a release arrive (False) or 16-byte st.async completing the owner's barrier by bytes (True). The
@@ -549,14 +550,16 @@ def wide_push_config(
     return None if config is None else (*config, n_tile)
 
 
-def _wide_push_key(n_out, k_in, config, world, use_pdl) -> tuple:
-    return ("k3_ctm_gemv_wide_ar_push", n_out, k_in, *config, world, use_pdl)
+def _wide_push_key(n_out, k_in, config, world, use_pdl, fold=False) -> tuple:
+    return ("k3_ctm_gemv_wide_ar_push", n_out, k_in, *config, world, use_pdl, bool(fold))
 
 
-def compile_wide_ar_push(weight: torch.Tensor, num_tokens: int, world: int) -> bool:
-    """Compile ``run_k3_ctm_gemv_wide_ar_push``'s kernel for ``weight``'s shape at ``num_tokens``'s token tile over
-    ``world`` ranks without launching it (a push needs every rank's finish); False where the push does not take the
-    shape. Eager, before any CUDA-graph capture."""
+def compile_wide_ar_push(
+    weight: torch.Tensor, num_tokens: int, world: int, fold: bool = False
+) -> bool:
+    """Compile ``run_k3_ctm_gemv_wide_ar_push``'s kernel (``fold``: its folded-finish variant) for ``weight``'s shape at
+    ``num_tokens``'s token tile over ``world`` ranks without launching it (a push needs every rank's finish); False
+    where the push does not take the shape. Eager, before any CUDA-graph capture."""
     if weight.dtype != torch.bfloat16 or weight.dim() != 2 or not weight.is_cuda:
         return False
     n_out, k_in = weight.shape
@@ -572,28 +575,41 @@ def compile_wide_ar_push(weight: torch.Tensor, num_tokens: int, world: int) -> b
     use_pdl = _use_pdl()
     addr = Int64(1 << 20)
     _compile(
-        _wide_push_key(n_out, k_in, config, world, use_pdl),
+        _wide_push_key(n_out, k_in, config, world, use_pdl, fold),
         kernel.k3_ctm_gemv_wide_ar_push, _arg(weight), _arg(x), _arg(x.view(-1)), num_tokens, addr, addr, addr,
-        Int32(0), n_out, k_in, split, ring, x_ring, n_tile, world, use_pdl, _stream(x),
+        Int32(0), n_out, k_in, split, ring, x_ring, n_tile, world, use_pdl, _stream(x), bool(fold),
     )  # fmt: skip
     return True
 
 
-def wide_ar_push_compiled(n_out: int, k_in: int, num_tokens: int, world: int, device) -> bool:
-    """Whether ``compile_wide_ar_push`` (or an eager call) compiled the push for this shape and token tile."""
+def wide_ar_push_compiled(
+    n_out: int, k_in: int, num_tokens: int, world: int, device, fold: bool = False
+) -> bool:
+    """Whether ``compile_wide_ar_push`` (or an eager call) compiled the push (``fold``: its folded-finish variant) for
+    this shape and token tile."""
     config = wide_push_config(n_out, k_in, num_tokens, _num_sms(device), world)
     return (
-        config is not None and _wide_push_key(n_out, k_in, config, world, _use_pdl()) in _compiled
+        config is not None
+        and _wide_push_key(n_out, k_in, config, world, _use_pdl(), fold) in _compiled
     )
 
 
-def run_k3_ctm_gemv_wide_ar_push(x: torch.Tensor, weight: torch.Tensor, ws) -> None:
+def run_k3_ctm_gemv_wide_ar_push(
+    x: torch.Tensor, weight: torch.Tensor, ws, fold: bool = False
+) -> None:
     """``x @ weight.T`` as ``k3_ctm_gemv_wide`` stores it (bf16 ``[M, N]``, M <= 64), pushed instead into the Lamport
     slots of the next two-shot all-reduce on ``ws`` (a ``k3_lamport_ar.LamportWorkspace``): token ``t``'s row into slot
     ``(t // W, rank)`` of the scatter stage of rank ``t % W`` (``-0`` as ``+0``). ``k3_lamport_ar``'s finish (two-shot)
     completes the call: the pair is bitwise ``k3_ctm_gemv_wide`` followed by the MNNVL two-shot all-reduce of its
     output. Releases its dependent only after its own grid-dependency wait (the finish kernel reads the rotation state
-    as soon as it is resident). Compiles on its first call for the shape (refused under capture)."""
+    as soon as it is resident). Compiles on its first call for the shape (refused under capture).
+
+    ``fold``: the kernel finishes the call in place itself, as ``k3_lamport_ar.run_lamport_finish_in_place(ws, M, N,
+    cpp_one_shot=True)`` after the plain push would (the same sums in the C++ one-shot order, the same result rows in
+    every rank's broadcast stage, the previous call's buffer re-armed, the rotation advanced); the next kernel reads
+    the result with ``k3_lamport_ar.poll_result_v4`` (e.g. ``k3_attn_res.run_k3_attn_res(lamport_addend=...)``). Every
+    rank must run the same variant of a call. Its CTAs wait for the other ranks' CTAs: the grid is one wave
+    (``wide_config``) and must be resident at once."""
     from cutlass import Int32, Int64
 
     from ..blackwell import k3_lamport_ar
@@ -638,9 +654,9 @@ def run_k3_ctm_gemv_wide_ar_push(x: torch.Tensor, weight: torch.Tensor, ws) -> N
     )
     stream = _stream(x)
     fn = _compile(
-        _wide_push_key(n_out, k_in, config, ws.world, use_pdl),
+        _wide_push_key(n_out, k_in, config, ws.world, use_pdl, fold),
         kernel.k3_ctm_gemv_wide_ar_push, *args, num_tokens, *lamport, n_out, k_in, split, ring, x_ring, n_tile,
-        ws.world, use_pdl, stream,
+        ws.world, use_pdl, stream, bool(fold),
     )  # fmt: skip
     fn(*args, num_tokens, *lamport, stream)
 

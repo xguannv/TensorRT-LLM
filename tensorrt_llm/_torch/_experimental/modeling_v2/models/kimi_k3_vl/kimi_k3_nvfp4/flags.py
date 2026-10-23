@@ -222,6 +222,13 @@ TRTLLM_K3LL_MOE_TAIL_PUSH = _flag(
     "the next pre-attention step's (or final norm's) all-reduce, K3LamportFinish + K3AttnResFast run the rest "
     "(moe_tail_push.py; bitwise; read at forward time)",
 )
+TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD",
+    0,
+    "where TRTLLM_K3LL_MOE_TAIL_PUSH takes the step: the push GEMV also finishes the all-reduce (owner sum in the C++ "
+    "one-shot order, multicast, clear, rotation), no K3LamportFinish; tail GEMV + K3AttnResFast only "
+    "(moe_tail_push.py; bitwise; read at forward time)",
+)
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",

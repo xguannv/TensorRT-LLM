@@ -1164,6 +1164,15 @@ def k3_ctm_gemv_long(
 # The epilogue reads the workspace's rotation state after its own griddepcontrol.wait; the dependent grid (the Lamport
 # finish kernel, which reads that state as soon as it is resident) is released from the activation warp after its
 # wait, not from the weight warp at the start.
+# Folded finish (AR_FOLD, with the push): the kernel also runs the rest of the finish kernel's in-place two-shot call
+# (k3_lamport_ar.K3LamportFinishKernel without the gather), so a consumer polls the result from the broadcast stage
+# right after it: each warp, after its pushes, re-arms its share of the previous call's buffer (grid-strided over
+# every epilogue thread of the grid), then for the tokens of its own owned range that this rank owns in the all-reduce
+# (t % W == rank) polls the W slots of its 32 rows, sums them in the C++ one-shot order (k3_lamport_ar.reduce_slots,
+# the finish kernel's code), rounds, sends -0 as +0 and multicasts them into every rank's broadcast stage
+# (owner_reduce_v4). Every CTA counts itself on the state's arrival counter once its epilogue warps have read the
+# state; the last one writes the next call's state (advance_two_shot). A CTA's owner step waits for the same CTA of
+# every other rank: all (N / 128) * SPLIT CTAs must be resident at once, which wide_config's one-wave split provides.
 # =============================================================================
 WIDE_TILES = (16, 32, 64)
 WIDE_SMEM_BYTES = 220 * 1024  # the ring, the x stages and the mailbox; the barriers fit in the rest
@@ -1254,6 +1263,8 @@ def k3_ctm_gemv_wide_kernel(
     ar_mc: Optional[cutlass.Int64],
     ar_flags: Optional[cutlass.Int64],
     ar_rank: Optional[cutlass.Int32],
+    # With the push: the finish kernel's owner step, clear and rotation folded in (see the section comment).
+    ar_fold: cutlass.Constexpr[bool],
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1675,7 +1686,53 @@ def k3_ctm_gemv_wide_kernel(
                             )
                         prims.cp_async_bulk_commit_group()
                         prims.cp_async_bulk_wait_group(0, read=True)
+        if cutlass.const_expr(ar_world > 0 and ar_fold):
+            # Folded finish, after this warp's pushes (above): re-arm the previous call's buffer, then the owner step
+            # of the tokens of this rank's owned range that this rank owns in the all-reduce, this warp's 32 rows.
+            f_cur, f_dirty, f_nbytes, f_dstages, f_c0, f_c1, f_c2, f_c3 = _lamport.lamport_state(
+                ar_flags
+            )
+            local = _lamport.ld_nc_u64(ar_peers + cutlass.Int64(ar_rank) * cutlass.Int64(8))
+            _lamport.clear_dirty(
+                local, f_dirty, f_nbytes, f_dstages, f_c0, f_c1, f_c2, f_c3,
+                bx * cutlass.Int32(EPI_THREADS) + tx - cutlass.Int32(THREADS - EPI_THREADS),
+                cutlass.Int32((n_out // CTA_M) * split * EPI_THREADS),
+            )  # fmt: skip
+            if my_owned > cutlass.Int32(0):
+                t0 = rank * cutlass.Int32(owned)
+                t_end = t0 + my_owned
+                if t_end > num_tokens:
+                    t_end = num_tokens
+                # The first token >= t0 with t % W == ar_rank; then every W-th.
+                first = t0 + (
+                    ar_rank + cutlass.Int32(ar_world) - t0 % cutlass.Int32(ar_world)
+                ) % cutlass.Int32(ar_world)
+                n0 = m_offset + w * cutlass.Int32(LONG_ROWS_PER_WARP)
+                chunks = LONG_ROWS_PER_WARP // VEC  # 16-byte vectors per token of the warp's rows
+                fold_vecs = ((owned + ar_world - 1) // ar_world) * chunks
+                for p in cutlass.range_constexpr((fold_vecs + 31) // 32):
+                    vj = lane + cutlass.Int32(p * 32)
+                    tok = first + (vj // cutlass.Int32(chunks)) * cutlass.Int32(ar_world)
+                    if vj < cutlass.Int32(fold_vecs):
+                        if tok < t_end:
+                            _lamport.owner_reduce_v4(
+                                local, ar_mc, f_cur, f_nbytes, tok,
+                                n0 + (vj % cutlass.Int32(chunks)) * cutlass.Int32(VEC),
+                                ar_world, n_out, _lamport.cpp_chunk(ar_world),
+                            )  # fmt: skip
         prims.barrier_cta_sync(1, thread_count=EPI_THREADS)
+        if cutlass.const_expr(ar_world > 0 and ar_fold):
+            # Every epilogue warp of this CTA has read the state (before the barrier): count the CTA; the last CTA of
+            # the grid writes the next call's state. The consumer reads it after its griddepcontrol.wait.
+            if tx == cutlass.Int32(THREADS - EPI_THREADS):
+                a_cur, _, a_nbytes, _, _, _, _, _ = _lamport.lamport_state(ar_flags)
+                arrived = _lamport.atom_add_acq_rel_u32(
+                    ar_flags + cutlass.Int64(_lamport._FLAG_ARRIVALS * 4), cutlass.Int32(1)
+                )
+                if arrived == cutlass.Int32((n_out // CTA_M) * split - 1):
+                    _lamport.advance_two_shot(
+                        ar_flags, a_cur, a_nbytes, num_tokens, ar_world, n_out
+                    )
         if warp_id == 4:
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols)
 
@@ -1739,7 +1796,7 @@ def k3_ctm_gemv_wide(
     clusters = row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
-        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None,
+        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None, False,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1768,15 +1825,18 @@ def k3_ctm_gemv_wide_ar_push(
     ar_world: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
+    ar_fold: cutlass.Constexpr[bool] = False,
 ) -> None:
     """``x @ w^T`` as ``k3_ctm_gemv_wide`` computes and rounds it (bf16, 128-row tiles), pushed into the Lamport slots
     of the next two-shot all-reduce over ``ar_world`` ranks on a workspace (``k3_lamport_ar.LamportWorkspace``
-    addresses) instead of stored."""
+    addresses) instead of stored. ``ar_fold``: the kernel also finishes the call in place (the owner sums in the C++
+    one-shot order multicast into every rank's broadcast stage, the previous buffer re-armed, the rotation advanced),
+    as ``k3_lamport_ar.run_lamport_finish_in_place`` would."""
     tma_desc_w = _weight_tensor_map(w, n_out, k_in)
     tma_desc_x = _activation_tensor_map_rows(x, k_in, num_tokens, n_tile)
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
-        ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank,
+        ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank, ar_fold,
     ).launch(
         grid=((n_out // CTA_M) * split, 1, 1),
         block=(THREADS, 1, 1),

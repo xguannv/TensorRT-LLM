@@ -22,7 +22,8 @@ the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tai
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel. On a wide
 decode step with ``TRTLLM_K3LL_MOE_TAIL_PUSH`` the layer hands on its tail's input (a `WideTail`) and
 `K3DecodeComm.tail_push_attn_res` runs the tail GEMV with its all-reduce push epilogue, the Lamport finish and the
-residual update on the MNNVL workspace (``moe_tail_push.py``).
+residual update on the MNNVL workspace (``moe_tail_push.py``); with ``TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD`` the push GEMV
+finishes the all-reduce itself (`K3DecodeComm.tail_push_folds`).
 
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
 
@@ -282,6 +283,20 @@ class K3DecodeComm:
             return False
         return push.finish_takes(rows, prefix_sum, block_residual, res_proj, res_norm, out_norm)
 
+    def tail_push_folds(self, tail: WideTail) -> bool:
+        """Whether ``tail_push_attn_res`` (``takes_tail_push`` holds) runs the folded finish: the push GEMV finishing
+        the all-reduce itself, no Lamport finish kernel (``TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD``, read at forward time;
+        that variant compiled at load, ``K3DecodeGemvs.takes_push(..., fold=True)``). Every rank decides alike."""
+        push = self.oproj_push
+        return (
+            push is not None
+            and _tail_push.fold_enabled()
+            and tail.gemvs is not None
+            and tail.gemvs.takes_push(
+                _tail_push.SITE, tail.x, tail.weight, push.lamport.world, fold=True
+            )
+        )
+
     def tail_push_attn_res(
         self,
         tail: WideTail,
@@ -293,8 +308,14 @@ class K3DecodeComm:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` as ``allreduce_attn_res(tail.partial(), ..., two_shot=True)``, bit for bit, with the
         tail GEMV pushing its partial into the MNNVL workspace (``takes_tail_push`` holds): the push GEMV, the Lamport
-        finish in place and the attn_res kernel (``moe_tail_push.py``)."""
+        finish in place and the attn_res kernel (``moe_tail_push.py``); where ``tail_push_folds`` holds, the push GEMV
+        with the folded finish and the attn_res kernel."""
         push = self.oproj_push
+        if self.tail_push_folds(tail):
+            tail.gemvs.project_push(_tail_push.SITE, tail.x, tail.weight, push.lamport, fold=True)
+            return push.attn_res_lamport(
+                tail.x.shape[0], prefix_sum, block_residual, res_proj, res_norm, out_norm
+            )
         target = push_target(push.lamport, tail.x.shape[0], _PUSH_HIDDEN, in_place=True)
         tail.gemvs.project_push(_tail_push.SITE, tail.x, tail.weight, push.lamport)
         target.pushed = True

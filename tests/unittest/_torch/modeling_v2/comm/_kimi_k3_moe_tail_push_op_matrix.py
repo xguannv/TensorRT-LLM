@@ -19,21 +19,28 @@ stand-in. The previous layer's handed-on tail is what ``decode_moe_lowm``'s wide
 ``WideTail`` of this rank's tail input and weight (a row-parallel shard each); without it, ``_gemv(gemvs, "moe_tail",
 ...)``. Both switches are set on the flags module per arm (read at forward time), on one built state.
 
+TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD (the push GEMV finishing the all-reduce itself, no Lamport finish kernel) is a third
+switch on the same built state: its arms run next to the others and must give the same bits. At W = 4 the C++ one-shot
+order (chunks of 8 ranks) and a plain rank-order sum coincide; only the W = 16 run checks the chunked order.
+
 Checks:
-  * build: the push GEMV compiled at load for the 16- and 32-token tiles, its Lamport view the workspace's.
-  * takes: ``K3DecodeComm.takes_tail_push`` per switch, token count (9..32 on the wide GEMV; 33..64, where the plain
-    tail is ``F.linear``, refused), step kind, ``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, an empty bank, and a capture whose
-    plain wide GEMV has not run eagerly.
+  * build: the push GEMV and its folded-finish variant compiled at load for the 16- and 32-token tiles, its Lamport
+    view the workspace's.
+  * takes: ``K3DecodeComm.takes_tail_push`` per switch (and ``tail_push_folds`` per FOLD), token count (9..32 on
+    the wide GEMV; 33..64, where the plain tail is ``F.linear``, refused), step kind, ``TRTLLM_K3LL_WIDE_AR_ATTN_RES``,
+    an empty bank, and a capture whose plain wide GEMV has not run eagerly.
   * eager (9, 16, 17, 24, 32, 33, 48, 64 rows; a layer that snapshots and one that does not; KDA and MLA; the four
-    combinations of TAIL_PUSH x OPROJ_PUSH, the same ``WideTail`` objects handed to both tail arms): the off arm's
+    combinations of TAIL_PUSH x OPROJ_PUSH plus TAIL_PUSH with FOLD at both OPROJ_PUSH, the same ``WideTail``
+    objects handed to every tail arm): the off arm's
     pre-attention step bit for bit the pre-change chain (the tail GEMV, then ``allreduce_attn_res(two_shot=True)``);
     every arm bit for bit every other (pre-attention normed and updated, the bank's snapshot row, the post-attention
     normed, the layer's output prefix sum), the same bits on every rank; which collective ran is tapped. The final
-    norm's consumer (``output_attn_res_*`` and the model norm) on and off, bit for bit. Census counts the switch's
-    dispatch key.
-  * graphs (16, 24, 32 rows): one step per token count captured three times on one built state (tail on / oproj on,
-    tail off / oproj on, tail on / oproj off; the switches flipped between captures): two layers with the workspace's
-    other users between them (``mnnvl_allgather_split``, ``allreduce_attn_res``) and the final norm's consumer. Replayed
+    norm's consumer (``output_attn_res_*`` and the model norm) on, folded and off, bit for bit. Census counts the
+    switches' dispatch keys.
+  * graphs (16, 24, 32 rows): one step per token count captured five times on one built state (tail on / oproj on,
+    tail off / oproj on, tail on / oproj off, and the first and third folded; the switches flipped between
+    captures): two layers with the workspace's other users between them (``mnnvl_allgather_split``,
+    ``allreduce_attn_res``) and the final norm's consumer. Replayed
     alternately with new inputs, one rank late on every other replay, with eager steps (both arms) in between: every
     graph's outputs bit for bit every other graph's and the eager arms', the other users' outputs their exact
     references.
@@ -64,10 +71,12 @@ RES_EPS = 1e-5
 PUSH_ROWS = (9, 16, 17, 24, 32)
 EAGER_ROWS = PUSH_ROWS + (33, 48, 64)
 GRAPH_ROWS = (16, 24, 32)
-GRAPH_MODES = ((1, 1), (0, 1), (1, 0))  # (TAIL_PUSH, OPROJ_PUSH) of each captured graph
+# (TAIL_PUSH, OPROJ_PUSH, TAIL_PUSH_FOLD) of each captured graph
+GRAPH_MODES = ((1, 1, 0), (0, 1, 0), (1, 0, 0), (1, 1, 1), (1, 0, 1))
 REPLAY_ORDER = (16, 32, 24, 16, 24, 32, 32, 16, 24)
 AG_BF16, AG_FP32 = 64, 16
 CENSUS_KEY = "dispatch:moe_tail_push"
+FOLD_KEY = "dispatch:moe_tail_push_fold"
 
 R = None
 IMPL = None  # kimi_k3_nvfp4/implementation.py
@@ -78,7 +87,7 @@ TP = None  # moe_tail_push
 FLAGS = None
 CENSUS = None
 BUILT = None
-STATS = {"tail_push_calls": 0}
+STATS = {"tail_push_calls": 0, "fold_calls": 0}
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -119,12 +128,17 @@ def _expect_same(where: str, got: torch.Tensor, want: torch.Tensor, replicated: 
 
 
 @contextlib.contextmanager
-def _switches(tail: int, oproj: int, wide_ar: int = 1):
-    """TRTLLM_K3LL_MOE_TAIL_PUSH, TRTLLM_K3LL_OPROJ_PUSH and TRTLLM_K3LL_WIDE_AR_ATTN_RES on the flags module (read at
-    forward time) for the block."""
-    names = ("TRTLLM_K3LL_MOE_TAIL_PUSH", "TRTLLM_K3LL_OPROJ_PUSH", "TRTLLM_K3LL_WIDE_AR_ATTN_RES")
+def _switches(tail: int, oproj: int, wide_ar: int = 1, fold: int = 0):
+    """TRTLLM_K3LL_MOE_TAIL_PUSH, TRTLLM_K3LL_OPROJ_PUSH, TRTLLM_K3LL_WIDE_AR_ATTN_RES and
+    TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD on the flags module (read at forward time) for the block."""
+    names = (
+        "TRTLLM_K3LL_MOE_TAIL_PUSH",
+        "TRTLLM_K3LL_OPROJ_PUSH",
+        "TRTLLM_K3LL_WIDE_AR_ATTN_RES",
+        "TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD",
+    )
     old = [getattr(FLAGS, n) for n in names]
-    for n, v in zip(names, (tail, oproj, wide_ar)):
+    for n, v in zip(names, (tail, oproj, wide_ar, fold)):
         setattr(FLAGS, n, int(v))
     try:
         yield
@@ -174,8 +188,8 @@ def _cloned(ns):
     return {k: v.clone() for k, v in _flat(ns).items()}
 
 
-def _census(mode: str) -> int:
-    return CENSUS.counts().get(f"{CENSUS_KEY}:{mode}", 0)
+def _census(mode: str, key: str = CENSUS_KEY) -> int:
+    return CENSUS.counts().get(f"{key}:{mode}", 0)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -283,11 +297,11 @@ def _decoder(call: _Call, kind: str):
     return layer
 
 
-def _arm(layer, call: _Call, tail: int, oproj: int):
-    """The layer's decode forward with the previous layer's tail handed on, at TAIL_PUSH = ``tail`` and OPROJ_PUSH =
-    ``oproj``: the pre-attention ``normed`` (the attention's input), the bank's snapshot row (a snapshotting layer),
-    the post-attention ``normed`` (the MoE's input) and the output prefix sum."""
-    with _switches(tail, oproj):
+def _arm(layer, call: _Call, tail: int, oproj: int, fold: int = 0):
+    """The layer's decode forward with the previous layer's tail handed on, at TAIL_PUSH = ``tail``, OPROJ_PUSH =
+    ``oproj`` and TAIL_PUSH_FOLD = ``fold``: the pre-attention ``normed`` (the attention's input), the bank's snapshot
+    row (a snapshotting layer), the post-attention ``normed`` (the MoE's input) and the output prefix sum."""
+    with _switches(tail, oproj, fold=fold):
         prefix, snapshots, _ = IMPL.KimiLinearDecoderLayer.forward(
             layer, call.prefix, call.bank, SNAPSHOTS, None, call.step,
             pending_moe_partial=call.pending(tail), defer_moe_tail=True,
@@ -301,14 +315,15 @@ def _arm(layer, call: _Call, tail: int, oproj: int):
     )
 
 
-def _final(call: _Call, tail: int):
+def _final(call: _Call, tail: int, fold: int = 0):
     """The final norm's consumer of the last MoE layer's handed-on tail (``KimiLinearModel.forward`` after the
-    layers): the push where ``takes_tail_push`` holds, else the tail GEMV and the two-shot ``allreduce_attn_res``."""
+    layers): the push (folded with ``fold``) where ``takes_tail_push`` holds, else the tail GEMV and the two-shot
+    ``allreduce_attn_res``."""
     comm, res = BUILT.comm, BUILT.res
     pending = call.pending(tail)
     out_mods = (res.out_proj, res.out_attn_norm, res.model_norm)
     valid = call.bank[:SNAPSHOTS]
-    with _switches(tail, 1):
+    with _switches(tail, 1, fold=fold):
         if isinstance(pending, DC.WideTail):
             if comm.takes_tail_push(pending, call.step, call.prefix, valid, *out_mods):
                 normed, _ = comm.tail_push_attn_res(pending, call.prefix, valid, *out_mods)
@@ -350,6 +365,8 @@ def check_build():
     tail_w[:, PAD[0] : PAD[1]] = 0
     tiles = gemvs.compile_push(TP.SITE, tail_w, view.world)
     assert tiles == [16, 32], f"the push compiled for {tiles}"
+    fold_tiles = gemvs.compile_push(TP.SITE, tail_w, view.world, fold=True)
+    assert fold_tiles == [16, 32], f"the folded push compiled for {fold_tiles}"
     g = _gen(7000)
     with torch.device("cuda"):
         res = SimpleNamespace(
@@ -375,7 +392,8 @@ def check_build():
     )
     if R.rank == 0:
         print(
-            f"[rank 0] built at world {R.world}: push compiled for token tiles {tiles}", flush=True
+            f"[rank 0] built at world {R.world}: push compiled for token tiles {tiles}, folded {fold_tiles}",
+            flush=True,
         )
 
 
@@ -396,10 +414,18 @@ def check_takes():
                 call.bank[:snapshots], *norms,
             )  # fmt: skip
 
+    def folds(fold, rows, gemvs=None):
+        call = calls[rows]
+        pending = TP.WideTail(call.tail_x, BUILT.tail_w, gemvs or BUILT.gemvs)
+        with _switches(1, 1, fold=fold):
+            return comm.tail_push_folds(pending)
+
     calls = {rows: _Call(300 + rows, rows, False) for rows in EAGER_ROWS}
     for rows in EAGER_ROWS:
         assert not takes(0, rows), f"switch 0 took {rows} rows"
         assert takes(1, rows) == (rows in PUSH_ROWS), f"switch 1 at {rows} rows"
+        assert not folds(0, rows), f"FOLD 0 folds {rows} rows"
+        assert folds(1, rows) == (rows in PUSH_ROWS), f"FOLD 1 at {rows} rows"
     assert not takes(1, 16, step=IMPL.DecodeStep(16)), "took a step that is not a pure decode step"
     assert not takes(1, 16, step=None), "took a step of None"
     assert not takes(1, 16, step=_decode_step(24)), "took 16 rows of a 24-token step"
@@ -414,14 +440,23 @@ def check_takes():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.graph(graph, stream=stream):
         refused = not takes(1, 16, gemvs=fresh)
+        refused_fold = not folds(1, 16, gemvs=fresh)
     assert refused, "took a capture whose plain wide GEMV had not run eagerly"
+    assert refused_fold, "folded a capture whose plain wide GEMV had not run eagerly"
     del graph
 
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Eager
 # ----------------------------------------------------------------------------------------------------------------------
-ARMS = ((0, 0), (1, 0), (0, 1), (1, 1))  # (TAIL_PUSH, OPROJ_PUSH)
+ARMS = (
+    (0, 0, 0),
+    (1, 0, 0),
+    (0, 1, 0),
+    (1, 1, 0),
+    (1, 0, 1),
+    (1, 1, 1),
+)  # (TAIL_PUSH, OPROJ_PUSH, FOLD)
 
 
 def check_eager():
@@ -435,42 +470,49 @@ def check_eager():
                 layer = _decoder(call, kind)
                 ref_normed, ref_updated = (t.clone() for t in _ref_pre_attention(call))
                 arms, pre = {}, {}
-                for tail, oproj in ARMS:
+                for arm in ARMS:
+                    tail, oproj, fold = arm
                     call.draw(seed)
                     before = _census("eager")
+                    before_fold = _census("eager", FOLD_KEY)
                     with _tap() as seen:
-                        arms[tail, oproj] = _cloned(_arm(layer, call, tail, oproj))
+                        arms[arm] = _cloned(_arm(layer, call, tail, oproj, fold))
                     pushed = bool(tail) and rows in PUSH_ROWS
                     first, (pre_normed, pre_updated) = seen[0]
                     assert first == ("tail_push_attn_res" if pushed else "allreduce_attn_res"), (
-                        f"{where}: arm {(tail, oproj)} ran {[name for name, _ in seen]}"
+                        f"{where}: arm {arm} ran {[name for name, _ in seen]}"
                     )
                     assert [name for name, _ in seen[1:]] == [
                         "oproj_push_attn_res" if oproj else "allreduce_attn_res"
-                    ], (
-                        f"{where}: arm {(tail, oproj)} post-attention ran {[name for name, _ in seen]}"
-                    )
+                    ], f"{where}: arm {arm} post-attention ran {[name for name, _ in seen]}"
                     if CENSUS.ENABLED:
                         assert _census("eager") - before == int(pushed), f"{where}: census"
+                        assert _census("eager", FOLD_KEY) - before_fold == int(pushed and fold), (
+                            f"{where}: arm {arm} fold census"
+                        )
                     STATS["tail_push_calls"] += int(pushed)
-                    pre[tail, oproj] = (pre_normed.clone(), pre_updated.clone())
-                for (tail, oproj), (normed, updated) in pre.items():
-                    _expect_same(f"{where} arm {(tail, oproj)}: pre-attention normed vs pre-change",
+                    STATS["fold_calls"] += int(pushed and fold)
+                    pre[arm] = (pre_normed.clone(), pre_updated.clone())
+                for arm, (normed, updated) in pre.items():
+                    _expect_same(f"{where} arm {arm}: pre-attention normed vs pre-change",
                                  normed, ref_normed, replicated=True)  # fmt: skip
-                    _expect_same(f"{where} arm {(tail, oproj)}: pre-attention updated vs pre-change",
+                    _expect_same(f"{where} arm {arm}: pre-attention updated vs pre-change",
                                  updated, ref_updated, replicated=True)  # fmt: skip
                 for arm in ARMS[1:]:
                     for name, value in arms[arm].items():
-                        _expect_same(f"{where}: arm {arm} vs (0, 0) {name}", value,
-                                     arms[0, 0][name], replicated=True)  # fmt: skip
+                        _expect_same(f"{where}: arm {arm} vs (0, 0, 0) {name}", value,
+                                     arms[0, 0, 0][name], replicated=True)  # fmt: skip
                 # The final norm's consumer.
                 call.draw(seed)
                 off = _final(call, 0).clone()
                 on = _final(call, 1).clone()
+                folded = _final(call, 1, fold=1).clone()
                 _expect_same(f"{where}: final norm on vs off", on, off, replicated=True)
+                _expect_same(f"{where}: final norm folded vs off", folded, off, replicated=True)
     if R.rank == 0:
         print(
-            "[rank 0] eager: off = pre-change chain; every TAIL_PUSH x OPROJ_PUSH arm bit for bit; final norm on = off",
+            "[rank 0] eager: off = pre-change chain; every TAIL_PUSH x OPROJ_PUSH (x FOLD) arm bit for bit; final norm "
+            "on = folded = off",
             flush=True,
         )
 
@@ -501,22 +543,22 @@ class _Step:
         self.ag_all = torch.randn(R.world, self.rows, AG_BF16 + AG_FP32, generator=g, device="cuda")
         self.ag_in.copy_(self.ag_all[R.rank])
 
-    def run(self, tail: int, oproj: int):
+    def run(self, tail: int, oproj: int, fold: int = 0):
         from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allgather_split import (
             mnnvl_allgather_split,
         )
 
         comm, res = BUILT.comm, BUILT.res
         out = SimpleNamespace()
-        out.a = _arm(self.la, self.a, tail, oproj)
+        out.a = _arm(self.la, self.a, tail, oproj, fold)
         out.ag_bf16, out.ag_fp32 = mnnvl_allgather_split(self.ag_in, AG_BF16, comm.mnnvl)
-        out.b = _arm(self.lb, self.b, tail, oproj)
+        out.b = _arm(self.lb, self.b, tail, oproj, fold)
         normed, updated = comm.allreduce_attn_res(
             self.ar_partial, self.ar.prefix, self.ar.bank[:SNAPSHOTS], res.mlp_proj,
             res.mlp_norm, res.post_norm, two_shot=True,
         )  # fmt: skip
         out.ar = SimpleNamespace(normed=normed, updated=updated)
-        out.final = _final(self.f, tail)
+        out.final = _final(self.f, tail, fold)
         return out
 
     def verify_refs(self, where: str, got: dict):
@@ -542,53 +584,59 @@ def check_graphs():
     replayed alternately among eager steps (module docstring)."""
     steps = {rows: _Step(rows, 600 + 10 * rows) for rows in GRAPH_ROWS}
     for step in steps.values():
-        for tail, oproj in ARMS:
-            step.run(tail, oproj)  # every kernel compiles eagerly, before any capture
+        for arm in ARMS:
+            step.run(*arm)  # every kernel compiles eagerly, before any capture
     torch.cuda.synchronize()
     graphs = {}
     for rows, step in steps.items():
-        for tail, oproj in GRAPH_MODES:
+        for mode in GRAPH_MODES:
+            tail = mode[0]
             before = _census("capture")
+            before_fold = _census("capture", FOLD_KEY)
             with _tap() as seen:
-                graphs[rows, tail, oproj] = _capture(lambda s=step, t=tail, o=oproj: s.run(t, o))
+                graphs[(rows, *mode)] = _capture(lambda s=step, m=mode: s.run(*m))
             pushes = sum(name == "tail_push_attn_res" for name, _ in seen)
             # The two layers' pre-attention steps and the final norm's consumer; the census counts the layers' only
             # (the final norm's block is the model's forward, which _final stands in for).
-            assert pushes == 3 * tail, (
-                f"captured {rows} rows {(tail, oproj)}: {[n for n, _ in seen]}"
-            )
+            assert pushes == 3 * tail, f"captured {rows} rows {mode}: {[n for n, _ in seen]}"
             if CENSUS.ENABLED:
-                assert _census("capture") - before == 2 * tail, (
-                    f"census at capture {rows} {(tail, oproj)}"
+                assert _census("capture") - before == 2 * tail, f"census at capture {rows} {mode}"
+                assert _census("capture", FOLD_KEY) - before_fold == 2 * tail * mode[2], (
+                    f"fold census at capture {rows} {mode}"
                 )
     for i, rows in enumerate(REPLAY_ORDER):
         step = steps[rows]
         where = f"graph {rows} rows replay {i}"
         step.draw(700 + 13 * i)
         got = {}
-        for tail, oproj in GRAPH_MODES:
-            graph, out = graphs[rows, tail, oproj]
+        for mode in GRAPH_MODES:
+            graph, out = graphs[(rows, *mode)]
             R.barrier()
             R.late(i % R.world if i % 2 else None)
             graph.replay()
             torch.cuda.synchronize()
-            got[tail, oproj] = _cloned(out)
+            got[mode] = _cloned(out)
         on = _cloned(step.run(1, 1))
         off = _cloned(step.run(0, 0))
+        folded = _cloned(step.run(1, 1, 1))
         for mode, outs in got.items():
             for name, value in outs.items():
                 _expect_same(f"{where}: graph {mode} vs eager on {name}", value, on[name])
                 _expect_same(f"{where}: graph {mode} vs eager off {name}", value, off[name],
                              replicated=True)  # fmt: skip
+                _expect_same(f"{where}: graph {mode} vs eager folded {name}", value, folded[name])
             step.verify_refs(f"{where} graph {mode}", outs)
         # An eager push of another token count between replays.
         extra = _Call(800 + i, PUSH_ROWS[i % len(PUSH_ROWS)], i % 2 == 1)
-        a = _cloned(_arm(_decoder(extra, "kda"), extra, 1, 1))
+        a = _cloned(_arm(_decoder(extra, "kda"), extra, 1, 1, i % 2))
         extra.draw(800 + i)
         b = _cloned(_arm(_decoder(extra, "kda"), extra, 0, 1))
         for name in a:
             _expect_same(
-                f"{where} eager {extra.rows} rows {name}", a[name], b[name], replicated=True
+                f"{where} eager {extra.rows} rows fold {i % 2} {name}",
+                a[name],
+                b[name],
+                replicated=True,
             )
     del graphs
     torch.cuda.synchronize()
@@ -624,8 +672,10 @@ def _run_one_rank(args) -> int:
         code = ls.run_checks(R, CHECKS)
     if R.rank == 0:
         print(
-            f"[rank 0] MOE_TAIL_PUSH on vs off: bit for bit; {STATS['tail_push_calls']} eager layer push calls; "
-            f"census {CENSUS_KEY}: eager={_census('eager')} capture={_census('capture')}",
+            f"[rank 0] MOE_TAIL_PUSH on / folded vs off: bit for bit; {STATS['tail_push_calls']} eager layer push "
+            f"calls, {STATS['fold_calls']} folded; census {CENSUS_KEY}: eager={_census('eager')} "
+            f"capture={_census('capture')}; {FOLD_KEY}: eager={_census('eager', FOLD_KEY)} "
+            f"capture={_census('capture', FOLD_KEY)}",
             flush=True,
         )
     return code

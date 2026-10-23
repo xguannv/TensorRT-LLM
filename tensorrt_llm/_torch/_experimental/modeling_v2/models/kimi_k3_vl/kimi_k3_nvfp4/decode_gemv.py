@@ -25,7 +25,7 @@ Each returns None where its kernel does not take the call, and the caller then r
 `K3DecodeGemvs.project_push` runs a wide site's ``k3_ctm_gemv_wide`` call with its all-reduce push epilogue (the MoE
 tail under ``TRTLLM_K3LL_MOE_TAIL_PUSH``, ``moe_tail_push.py``) where `K3DecodeGemvs.takes_push` holds: where
 ``project`` would run that kernel and the push variant, compiled at load by `K3DecodeGemvs.compile_push` without a
-launch, takes the shape.
+launch, takes the shape. Its ``fold`` variant (``TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD``) also finishes the all-reduce.
 
 A kernel compiles on its first call for a shape, which must not happen under CUDA-graph capture.
 `K3DecodeGemvs.create`, run once the weights are final, runs every site's kernel and the head once, eagerly. The
@@ -339,27 +339,30 @@ class K3DecodeGemvs:
             self._ran.add(key)
         return y.view(*x.shape[:-1], spec.n)
 
-    def compile_push(self, site: str, weight: torch.Tensor, world: int) -> list:
-        """Compile the all-reduce push variant of ``site``'s ``k3_ctm_gemv_wide`` (``project_push``) for ``weight``'s
-        shape over ``world`` ranks at every wide token tile the site takes, without launching it (a push needs every
-        rank's finish). Eager, before any capture; every rank of the group runs it alike. Returns the token tiles
-        compiled."""
+    def compile_push(self, site: str, weight: torch.Tensor, world: int, fold: bool = False) -> list:
+        """Compile the all-reduce push variant of ``site``'s ``k3_ctm_gemv_wide`` (``project_push``; ``fold``: its
+        folded-finish variant) for ``weight``'s shape over ``world`` ranks at every wide token tile the site takes,
+        without launching it (a push needs every rank's finish). Eager, before any capture; every rank of the group
+        runs it alike. Returns the token tiles compiled."""
         spec = SITES[site]
         tiles = []
         if not spec.wide or tuple(weight.shape) != (spec.n, spec.k):
             return tiles
         for rows in (16, 32, 64):
             if MAX_ROWS < rows <= spec.wide_rows and _ctm_op.compile_wide_ar_push(
-                weight, rows, world
+                weight, rows, world, fold=fold
             ):
                 tiles.append(rows)
         return tiles
 
-    def takes_push(self, site: str, x: torch.Tensor, weight: torch.Tensor, world: int) -> bool:
+    def takes_push(
+        self, site: str, x: torch.Tensor, weight: torch.Tensor, world: int, fold: bool = False
+    ) -> bool:
         """Whether ``project_push`` takes ``x @ weight.T``: ``project`` would run it on ``k3_ctm_gemv_wide`` (a wide
-        row count of the site, the kernel warmed when capturing) and the push variant, compiled at load
-        (``compile_push``), takes the shape over ``world`` ranks. Shapes, dtypes and load-time state only, so every
-        rank decides alike; with it the push stores the bf16 values ``project`` would return."""
+        row count of the site, the kernel warmed when capturing) and the push variant (``fold``: its folded-finish
+        variant), compiled at load (``compile_push``), takes the shape over ``world`` ranks. Shapes, dtypes and
+        load-time state only, so every rank decides alike; with it the push stores the bf16 values ``project`` would
+        return."""
         spec = SITES[site]
         if (
             not spec.wide
@@ -383,12 +386,15 @@ class K3DecodeGemvs:
             return False
         # The push's config is the plain call's (``wide_config``, which is what ``supports_wide`` checks besides the
         # rows' layout, which ``_dense_rows`` provides on both paths).
-        return _ctm_op.wide_ar_push_compiled(spec.n, spec.k, rows, world, x.device)
+        return _ctm_op.wide_ar_push_compiled(spec.n, spec.k, rows, world, x.device, fold=fold)
 
-    def project_push(self, site: str, x: torch.Tensor, weight: torch.Tensor, lamport) -> None:
+    def project_push(
+        self, site: str, x: torch.Tensor, weight: torch.Tensor, lamport, fold: bool = False
+    ) -> None:
         """``x @ weight.T`` on ``site``'s ``k3_ctm_gemv_wide`` (``takes_push`` holds), pushed into the Lamport slots of
-        the next two-shot all-reduce on ``lamport`` (a ``k3_lamport_ar.LamportWorkspace``) instead of returned."""
-        _ctm_op.run_k3_ctm_gemv_wide_ar_push(_dense_rows(x), weight, lamport)
+        the next two-shot all-reduce on ``lamport`` (a ``k3_lamport_ar.LamportWorkspace``) instead of returned; with
+        ``fold`` (``takes_push(..., fold=True)`` holds) that all-reduce finished in place by the same kernel."""
+        _ctm_op.run_k3_ctm_gemv_wide_ar_push(_dense_rows(x), weight, lamport, fold=fold)
 
     def lm_head_logits(
         self, rows: torch.Tensor, lm_head: nn.Module, gather: bool = True

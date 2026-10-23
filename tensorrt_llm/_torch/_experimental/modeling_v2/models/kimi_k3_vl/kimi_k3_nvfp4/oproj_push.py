@@ -371,8 +371,24 @@ class K3OprojPush:
         `push_target` of this state's workspace; `finish_takes` holds): the Lamport finish in place (the C++ one-shot
         order), then the attn_res kernel adding the result to ``prefix_sum`` (the zero prefix for None) in the C++
         epilogue's arithmetic, releasing the next kernel at its wait."""
-        rows = target.shape[0]
-        result = finish_lamport_push(target, in_place=True)
+        finish_lamport_push(target, in_place=True)
+        return self.attn_res_lamport(
+            target.shape[0], prefix_sum, block_residual, res_proj, res_norm, out_norm
+        )
+
+    def attn_res_lamport(
+        self,
+        rows: int,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)`` from the ``[rows, HIDDEN]`` result of the in-place two-shot call that completed last on
+        this state's workspace (finished by the finish kernel, or by a push GEMV with the folded finish; a
+        `LamportResult`): the attn_res kernel adding it to ``prefix_sum`` (the zero prefix for None) in the C++
+        epilogue's arithmetic, releasing the next kernel at its wait. It must run right after that call."""
         prefix = self.zeros[:rows] if prefix_sum is None else prefix_sum
         normed = torch.empty_like(prefix)
         updated = torch.empty_like(prefix)
@@ -390,7 +406,7 @@ class K3OprojPush:
             normed,
             updated,
             exact=False,
-            lamport_addend=result.lamport_addend,
+            lamport_addend=(self.lamport.uc_local, self.lamport.flags.data_ptr()),
             early_trigger=True,
             mnnvl_order=True,
         )

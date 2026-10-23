@@ -22,6 +22,17 @@ the post-attention step (``oproj_push.py``):
 Where it does not hold, the consumer runs the tail GEMV (`WideTail.partial`) and its own path, unchanged: the same
 kernels in the same stream order as without the switch.
 
+Folded finish (``TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD``, where the push takes the step and its folded variant was compiled
+at load: ``K3DecodeComm.tail_push_folds``): the step is two kernels. The push GEMV runs the finish kernel's work
+itself (``k3_ctm_gemv_kernel``, ``ar_fold``): after its pushes, each epilogue warp re-arms its share of the previous
+call's buffer, then, for the tokens of its own range that this rank owns in the all-reduce, polls the W slots of its
+32 rows, sums them with the finish kernel's code (``k3_lamport_ar.reduce_slots``, the C++ one-shot order), rounds,
+sends ``-0`` as ``+0`` and multicasts the rows into every rank's broadcast stage; the grid's last CTA to have read the
+rotation state advances it as the finish kernel's updater does. The attn_res kernel then reads the rows as after the
+finish kernel. Same bits as the three-kernel step: the slots hold the same values, the sum is the same code in the
+same order, the broadcast rows and the rotation state are the same. A CTA's owner step waits for the same CTA of every
+other rank, so the GEMV's grid (one wave, ``wide_config``) must be resident at once on every rank.
+
 Which steps. A wide decode step (``step.wide``) whose tail the plain path runs on ``k3_ctm_gemv_wide`` (9 to the site's
 ``wide_rows``, 32: above it the plain path is ``F.linear`` and its cuBLAS sums, which the push cannot reproduce) and
 whose consumer is the two-shot ``mnnvl_allreduce_attn_res`` (``TRTLLM_K3LL_WIDE_AR_ATTN_RES``, ``takes_wide``); the
@@ -83,4 +94,10 @@ def enabled(step) -> bool:
     return bool(_flags.TRTLLM_K3LL_MOE_TAIL_PUSH) and step is not None and step.wide
 
 
-__all__ = ["SITE", "WideTail", "enabled"]
+def fold_enabled() -> bool:
+    """Whether ``TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD`` (read at forward time) asks for the folded finish where the push
+    takes a step."""
+    return bool(_flags.TRTLLM_K3LL_MOE_TAIL_PUSH_FOLD)
+
+
+__all__ = ["SITE", "WideTail", "enabled", "fold_enabled"]
