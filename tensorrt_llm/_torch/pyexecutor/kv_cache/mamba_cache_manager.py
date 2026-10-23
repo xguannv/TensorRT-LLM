@@ -37,8 +37,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
                                                               RoleLayout)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
-from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
-    KVCacheV2IterationStatsReport
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+    KVCacheV2IterationStatsReport, KVCacheV2SsmLifeCycleIterationStats)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -68,6 +68,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
 from ..config_utils import mamba_effective_tp_size
+
+# TRTLLM_K3LL_REUSE_AUDIT=1: rank 0 logs each request's prefix-reuse diagnostics and, when iteration stats are on
+# (enable_iter_perf_stats), one occupancy / snapshot line per iteration, at INFO instead of DEBUG. Read at import.
+_REUSE_AUDIT = os.environ.get("TRTLLM_K3LL_REUSE_AUDIT", "0") == "1"
 
 GB = 1 << 30
 
@@ -3694,8 +3698,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # recomputed by prefill. Restore it for the request-length metric.
             request_total_tokens = len(input_tokens) + 1
             prefix_reuse_diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
-            logger.debug(
-                f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
+            log = logger.info if _REUSE_AUDIT else logger.debug
+            log(f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
                 f"request_id={request_id} "
                 f"request_total_tokens={request_total_tokens} "
                 f"longest_attention_match_tokens="
@@ -3841,6 +3845,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._recurrent_evicted_blocks_total += evicted_blocks
             self._recurrent_onboarded_blocks_total += onboarded_blocks
             self._recurrent_dropped_blocks_total += dropped_blocks
+        if _REUSE_AUDIT and self.mapping.rank == 0:
+            self._log_reuse_audit(report)
         if (self.mapping.rank == 0
                 and (has_movement or not self._recurrent_status_logged)):
             logger.debug(
@@ -3871,6 +3877,41 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"{self._format_branch_snapshot_counters()}")
             self._recurrent_status_logged = True
         return report
+
+    def _log_reuse_audit(self, report: KVCacheV2IterationStatsReport) -> None:
+        """``TRTLLM_K3LL_REUSE_AUDIT``: one line per iteration with every pool group's occupancy on each tier and its
+        movement, and the KDA snapshot lookups, so a reuse miss can be told apart as a missing snapshot slot or a
+        dropped attention chain."""
+
+        def occupancy(stat) -> str:
+            return (
+                f"gpu max/free/used/evictable={stat.primary_max_num_blocks}/{stat.primary_free_num_blocks}/"
+                f"{stat.primary_used_num_blocks}/{stat.primary_evictable_num_blocks} "
+                f"host max/free/used/evictable={stat.secondary_max_num_blocks}/{stat.secondary_free_num_blocks}/"
+                f"{stat.secondary_used_num_blocks}/{stat.secondary_evictable_num_blocks} "
+                f"offload={stat.iter_offload_blocks} onboard={stat.iter_onboard_blocks} "
+                f"host_dropped={stat.iter_host_dropped_blocks} reused={stat.iter_reused_blocks} "
+                f"missed={stat.iter_missed_blocks}")
+
+        kinds = {
+            pool_group_id: kind
+            for pool_group_id, _, kind in
+            self._stats_life_cycle_metadata().values()
+        }
+        parts = [
+            f"pg{pool_group_id}[{kinds.get(pool_group_id, '?')}] {occupancy(group.stats)}"
+            for pool_group_id, group in sorted(report.by_pool_group.items())
+        ]
+        for life_cycle_id, life_cycle in sorted(report.by_life_cycle.items()):
+            if isinstance(life_cycle, KVCacheV2SsmLifeCycleIterationStats):
+                snap = life_cycle.snapshot_stats
+                parts.append(
+                    f"lc{life_cycle_id}[ssm] lookups={snap.iter_snapshot_lookups} "
+                    f"hits={snap.iter_snapshot_hits} misses={snap.iter_snapshot_misses} "
+                    f"reused_tokens={snap.iter_reused_tokens} unreused_tokens={snap.iter_unreused_tokens}"
+                )
+        logger.info("[MambaHybridCacheManagerV2] reuse audit " +
+                    " | ".join(parts))
 
     @staticmethod
     def get_cache_size_per_token(model_config,
