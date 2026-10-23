@@ -17,6 +17,9 @@ runs:
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
   residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
 
+With ``TRTLLM_K3LL_ROUTING_STATS_DIR`` each layer's routed ids (the front's, or ``k3_route_quant``'s on a wide step)
+are also counted into rank 0's `routing_stats.RoutingStats` (``K3DecodeMoeNvfp4Layer.stats``).
+
 Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_lowm_op.supported`).
 
 With ``TRTLLM_K3LL_MOE_LOWM_FC12`` (built at load when set at launch, `K3MoeFc12`; engagement read at forward time,
@@ -77,6 +80,7 @@ from .decode_moe import TAIL_K_TILE, _gemv
 from .moe_tail_col import ColTail
 from .moe_tail_lu import LuTail
 from .moe_tail_push import WideTail
+from .routing_stats import RoutingStats
 
 MAX_TOKENS = 8
 # The front's 16-token build (TRTLLM_K3LL_MOE_FRONT16): a wide step of at most this many tokens.
@@ -388,6 +392,9 @@ class K3DecodeMoeNvfp4Layer:
     #: ``TRTLLM_K3LL_MOE_TAIL_COL``'s weights of this layer (``moe_tail_col.py``), built where the switch is set at
     #: load.
     col: Optional[_tail_col.K3TailColLayer] = None
+    #: ``TRTLLM_K3LL_ROUTING_STATS_DIR``: the recorder this layer's routing is counted into (rank 0), else None.
+    stats: Optional[RoutingStats] = None
+    layer_idx: int = -1
 
     @classmethod
     def create(
@@ -430,6 +437,7 @@ class K3DecodeMoeNvfp4Layer:
             fc2_input_scale=backend.fc2_input_scale.detach().reshape(1),
             offset=int(backend.slot_start),
             situ=(_scalar(backend.act_alpha), _scalar(backend.act_beta)),
+            layer_idx=getattr(moe, "layer_idx", -1),
         )
 
     def warm_up(self, moe: nn.Module) -> None:
@@ -523,12 +531,16 @@ class K3DecodeMoeNvfp4Layer:
         """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
+            if self.stats is not None:
+                self.stats.record(self.layer_idx, ids)
             return (None, ids, weights, x_q, x_sf), shared_act
         rows = x.shape[0]
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
-        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
+        ids, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
+        if self.stats is not None:
+            self.stats.record(self.layer_idx, ids)
         return (sort_out, rows, None, x_q, x_sf), shared_act
 
     def _routed_after(self, routing, fc12: Optional[Fc12Step] = None) -> torch.Tensor:
@@ -598,7 +610,10 @@ class K3DecodeMoeNvfp4Layer:
         shared = moe.shared_experts
 
         def _routed_partial():
-            return self._routed(*self._route_quant(moe, router_logits, routed_in), fc12=fc12)
+            routing = self._route_quant(moe, router_logits, routed_in)
+            if self.stats is not None:
+                self.stats.record(self.layer_idx, routing[0])
+            return self._routed(*routing, fc12=fc12)
 
         def _shared_activation():
             return shared._apply_activation(

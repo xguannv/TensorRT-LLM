@@ -205,11 +205,13 @@ def test_streaming_loader_preserves_checkpoint_tensors(algo: QuantAlgo) -> None:
     def record(backend: object, **kwargs: object) -> None:
         calls.append(kwargs)
 
+    # This rank's slots hold experts 5..8 in order (no placement), so local slot 2 is checkpoint expert 7.
     backend = SimpleNamespace(
+        initial_local_expert_ids=[5, 6, 7, 8],
         quant_method=SimpleNamespace(
             load_packed_mxfp4_expert=record,
             load_streaming_nvfp4_expert=record,
-        )
+        ),
     )
     spec = modeling._k3_expert_ckpt_spec(algo)
     tensors = {
