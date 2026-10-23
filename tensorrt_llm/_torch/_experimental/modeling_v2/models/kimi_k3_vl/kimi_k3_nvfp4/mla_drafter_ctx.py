@@ -9,7 +9,7 @@ the kv_lora_rank latent and the RoPE of k_pe per layer) and scatters them layer 
 row's page and offset. Shapes are the K3 drafter's: kv_lora_rank 512, rope 64.
 """
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import triton
@@ -28,11 +28,13 @@ def _drafter_mla_ctx_kv(
     PAGES,
     OFFSETS,
     PTRS,
+    MASK,
     LAT_STRIDE: tl.constexpr,
     PAGE_STRIDE: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     EPS: tl.constexpr,
     PDL: tl.constexpr = False,
+    HAS_MASK: tl.constexpr = False,
 ):
     row, layer = tl.program_id(0), tl.program_id(1)
     latent = tl.arange(0, 512)
@@ -44,6 +46,10 @@ def _drafter_mla_ctx_kv(
         tl.extra.cuda.gdc_launch_dependents()
     src = LATENT + row * LAT_STRIDE + layer * 576
     x = tl.load(src + latent).to(tl.float32)
+    if HAS_MASK:
+        # The stock bf16 multiply by 0 / 1 is exact, so the fp32 product is its value (a zero keeps the sign).
+        keep = tl.load(MASK + row)
+        x = x * keep
     x = x * tl.rsqrt(tl.sum(x * x, 0) / 512 + EPS)
     if not PDL:
         w = tl.load(NORM + layer * 512 + latent)
@@ -59,6 +65,9 @@ def _drafter_mla_ctx_kv(
     tl.store(dst + latent, x.to(tl.bfloat16))
     k_even = tl.load(src + 512 + 2 * half).to(tl.float32)
     k_odd = tl.load(src + 513 + 2 * half).to(tl.float32)
+    if HAS_MASK:
+        k_even = k_even * keep
+        k_odd = k_odd * keep
     cos = tl.load(FREQS + pos * 64 + 2 * half)
     sin = tl.load(FREQS + pos * 64 + 2 * half + 1)
     tl.store(dst + 512 + 2 * half, (k_even * cos - k_odd * sin).to(tl.bfloat16))
@@ -77,6 +86,7 @@ def drafter_mla_ctx_kv(
     pools: List[torch.Tensor],
     eps: float,
     pdl: bool = False,
+    mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Store the drafter's context latents into its paged pools: for every row of ``latent`` (``[rows, L x 576]``,
     the raw ``[kv_a | k_pe]`` of each layer) and layer, ``RMSNorm(kv_a) * norm[layer]`` and ``k_pe`` rotated at
@@ -84,11 +94,15 @@ def drafter_mla_ctx_kv(
     ``pools[layer]``. ``pointers``: int64 ``[L]``, each pool's data pointer; ``pools``: the pools (all of one layout,
     ``[pages, 1, 1, page_size, 576]`` bf16), named so the op records the write. ``pdl`` (``TRTLLM_K3LL_DRAFTER_PDL``):
     launched with programmatic dependent launch, each layer's norm weight loaded before the dependency wait (the same
-    bits)."""
+    bits). ``mask`` (fp32 ``[rows]`` of 0 / 1, ``TRTLLM_K3LL_DRAFTER_PREP_FUSED``): each row's latents multiplied by
+    it first, the values of the stock bf16 ``mul_`` by the bf16 mask (exact for 0 and 1)."""
     rows = latent.shape[0]
     if rows == 0:
         return
     pool = pools[0]
+    launch = {"PDL": True, "launch_pdl": True} if pdl else {}
+    if mask is not None:
+        launch["HAS_MASK"] = True
     _drafter_mla_ctx_kv[(rows, len(pools))](
         latent,
         norm,
@@ -97,18 +111,19 @@ def drafter_mla_ctx_kv(
         pages,
         offsets,
         pointers,
+        positions if mask is None else mask,
         latent.stride(0),
         pool.stride(0),
         pool.stride(3),
         eps,
         num_warps=4,
         enable_fp_fusion=False,
-        **({"PDL": True, "launch_pdl": True} if pdl else {}),
+        **launch,
     )
 
 
 @drafter_mla_ctx_kv.register_fake
 def _drafter_mla_ctx_kv_fake(
-    latent, norm, freqs, positions, pages, offsets, pointers, pools, eps, pdl=False
+    latent, norm, freqs, positions, pages, offsets, pointers, pools, eps, pdl=False, mask=None
 ):
     return None

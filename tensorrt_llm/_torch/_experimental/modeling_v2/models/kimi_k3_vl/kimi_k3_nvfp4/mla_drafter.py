@@ -34,7 +34,7 @@ table) and the V up-projection writes its bmm straight into the o_proj input lay
 values.
 """
 
-from typing import Callable, FrozenSet, List, Optional, Tuple
+from typing import Callable, FrozenSet, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
@@ -103,6 +103,27 @@ def _reduces(linear: nn.Module) -> bool:
     )
 
 
+class BlockPrep(NamedTuple):
+    """The block decode's layer-invariant inputs, computed by the worker together with the drafter's inputs
+    (``TRTLLM_K3LL_DRAFTER_PREP_FUSED``, `mla_drafter_prep.drafter_input_prep`) with the values `forward` would build
+    from them: the fixup of ``num_ctx`` and the page-table rows ``[rows_start, rows_start + B)``, the pool slots of the
+    block's latents for a pool of ``pool_strides`` (``(stride(0), stride(3))``) and the query RoPE rows
+    ``freqs_cis[query_positions]``. `forward` takes it only for the call whose ``query_positions``,
+    ``num_ctx_per_req`` and ``ctx_page_table`` are these very tensors."""
+
+    query_positions: torch.Tensor
+    num_ctx: torch.Tensor
+    page_table: torch.Tensor
+    rows_start: int
+    pages: torch.Tensor
+    offsets: torch.Tensor
+    seq_lens_i32: torch.Tensor
+    kv_bounds_i32: torch.Tensor
+    slots: torch.Tensor
+    pool_strides: Tuple[int, int]
+    blk_freqs: torch.Tensor
+
+
 class K3MLADrafterNorms:
     """A ``MLADSparkForCausalLM``'s block decode on the TP group's decode state (the module docstring).
 
@@ -112,6 +133,8 @@ class K3MLADrafterNorms:
     ``a_weights``: with the fused query / latent path (`install`'s ``qkv``), each layer's ``[q_a_proj | kv_a_proj]``
     weight, else None; ``gemm``: with the launch value of ``TRTLLM_K3LL_DRAFTER_GEMM`` on, the pinned low-M GEMMs
     (`_gemm`, the switch read again at each call), else None."""
+
+    block_prep: Optional[BlockPrep] = None
 
     def __init__(
         self,
@@ -132,6 +155,8 @@ class K3MLADrafterNorms:
         self.gemm = gemm
         # TRTLLM_K3LL_DRAFTER_GLUE's per-shape constants (`_const`), built outside CUDA-graph capture.
         self._consts = {}
+        # The next call's precomputed block state (`BlockPrep`), set by the worker; every call clears it.
+        self.block_prep = None
 
     @staticmethod
     def layers_take(drafter: nn.Module) -> bool:
@@ -258,7 +283,9 @@ class K3MLADrafterNorms:
         ctx_page_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The block's hidden states ``[B * block, hidden]`` after the final norm; arguments as the drafter's
-        ``dflash_forward``."""
+        ``dflash_forward``. A `BlockPrep` the worker left for this call (``block_prep``) replaces the fixup, the pool
+        slots and the query RoPE rows built here (the same values)."""
+        prep, self.block_prep = self.block_prep, None
         if not self.takes(noise_embedding, ctx_kv_cache, ctx_page_table):
             return self.stock(
                 noise_embedding,
@@ -275,16 +302,38 @@ class K3MLADrafterNorms:
             drafter._build_fused_kv_buffers()
         batch, block = noise_embedding.shape[:2]
         rows = batch * block
-        blk_freqs = drafter._mla_freqs_cis(noise_embedding.device)[query_positions.long()]
         page_size = ctx_kv_cache[0].shape[-2]
-        if _flags.TRTLLM_K3LL_DRAFTER_GLUE:
-            _census.count(f"dispatch:drafter_glue:{_census.mode()}")
-            fixup = self._fixup(
-                num_ctx_per_req[:batch], ctx_page_table, ctx_cache_batch_idx, block, page_size
+        if prep is not None and not (
+            prep.query_positions is query_positions
+            and prep.num_ctx is num_ctx_per_req
+            and prep.page_table is ctx_page_table
+            and ctx_page_table.dtype == torch.int32
+            and tuple(prep.pages.shape) == (batch, block)
+        ):
+            prep = None
+        if prep is not None:
+            _census.count(f"dispatch:drafter_block_prep:{_census.mode()}")
+            blk_freqs = prep.blk_freqs
+            fixup = _MLABlockFixup(
+                pages=prep.pages,
+                offsets=prep.offsets,
+                valid=self._const("valid", block, noise_embedding.device),
+                page_tables_i32=ctx_page_table[prep.rows_start : prep.rows_start + batch],
+                seq_lens_i32=prep.seq_lens_i32,
+                kv_bounds_i32=prep.kv_bounds_i32,
             )
         else:
-            page_tables = ctx_page_table.index_select(0, ctx_cache_batch_idx.long()).long()
-            fixup = _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block, page_size)
+            blk_freqs = drafter._mla_freqs_cis(noise_embedding.device)[query_positions.long()]
+            if _flags.TRTLLM_K3LL_DRAFTER_GLUE:
+                _census.count(f"dispatch:drafter_glue:{_census.mode()}")
+                fixup = self._fixup(
+                    num_ctx_per_req[:batch], ctx_page_table, ctx_cache_batch_idx, block, page_size
+                )
+            else:
+                page_tables = ctx_page_table.index_select(0, ctx_cache_batch_idx.long()).long()
+                fixup = _build_mla_block_fixup(
+                    num_ctx_per_req[:batch], page_tables, block, page_size
+                )
         capacity = fixup.page_tables_i32.shape[1] * page_size
         if _flags.TRTLLM_K3LL_DRAFTER_PDL:
             _census.count(f"dispatch:drafter_pdl:{_census.mode()}")
@@ -299,7 +348,15 @@ class K3MLADrafterNorms:
                 all(c.stride() == pool.stride() for c in ctx_kv_cache)
                 and pool.dtype == torch.bfloat16
             ):
-                slots = (fixup.pages * pool.stride(0) + fixup.offsets * pool.stride(3)).reshape(-1)
+                if prep is not None and tuple(prep.pool_strides) == (
+                    pool.stride(0),
+                    pool.stride(3),
+                ):
+                    slots = prep.slots
+                else:
+                    slots = (fixup.pages * pool.stride(0) + fixup.offsets * pool.stride(3)).reshape(
+                        -1
+                    )
                 qkv = (
                     slots,
                     torch.view_as_real(blk_freqs).reshape(rows, -1).contiguous(),

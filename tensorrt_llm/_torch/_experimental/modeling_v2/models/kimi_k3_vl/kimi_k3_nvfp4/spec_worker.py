@@ -1412,6 +1412,10 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     _k3_markov_next = None
     _k3_acceptance = None
     _k3_spec_metadata = None
+    # This step's fused drafter inputs (TRTLLM_K3LL_DRAFTER_PREP_FUSED, `_k3_input_begin`), and the context path's side
+    # stream (TRTLLM_K3LL_DRAFTER_CTX_SIDE, built by the constructor whatever the switches: both are read per step).
+    _k3_input = None
+    _k3_side = None
 
     _keep_draft_logits_sharded = KimiK3DSparkWorker._keep_draft_logits_sharded
     _k3_logits_shard = KimiK3DFlashWorker._k3_logits_shard
@@ -1419,6 +1423,14 @@ class KimiK3MLADSparkWorker(DSparkWorker):
     _k3_shard_args = staticmethod(KimiK3DFlashWorker._k3_shard_args)
     _k3_markov_chain = KimiK3DSparkWorker._k3_markov_chain
     _apply_dspark_markov_bias = KimiK3DSparkWorker._apply_dspark_markov_bias
+    _mask_token_id = KimiK3DFlashWorker._mask_token_id
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if torch.cuda.is_available():
+            from . import mla_drafter_prep as _prep
+
+            self._k3_side = _prep.CtxSide()
 
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
@@ -1503,16 +1515,9 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         pages = table[rows.long(), positions // page_size].long()
         offsets = positions % page_size
         pools = list(self._ctx_kv_buf)
-        key = tuple(p.data_ptr() for p in pools)
-        drafter = ctx["drafter"]
-        capturing = torch.cuda.is_current_stream_capturing()
-        if ctx["key"] != key or ctx["freqs"] is None:
-            if capturing or any(p.stride() != pools[0].stride() for p in pools):
-                self._k3_store_stock(k, pools, pages, offsets, positions)
-                return
-            ctx["pointers"] = torch.tensor(key, dtype=torch.int64, device=k.device)
-            ctx["freqs"] = torch.view_as_real(drafter._mla_freqs_cis(k.device)).contiguous()
-            ctx["key"] = key
+        if not self._k3_ctx_ready(k.device):
+            self._k3_store_stock(k, pools, pages, offsets, positions)
+            return
         torch.ops.trtllm.k3_drafter_mla_ctx_kv(
             k.reshape(k.shape[0], -1),
             ctx["norm"],
@@ -1525,6 +1530,26 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             ctx["eps"],
             bool(_flags.TRTLLM_K3LL_DRAFTER_PDL),
         )
+
+    def _k3_ctx_ready(self, device) -> bool:
+        """Whether ``trtllm::k3_drafter_mla_ctx_kv`` can store into the bound pools now: its pool pointers and fp32
+        RoPE table are built for them (outside CUDA-graph capture, here, when the pools are new) and every layer's pool
+        has one layout."""
+        ctx = self._k3_ctx
+        if not ctx:
+            return False
+        pools = list(self._ctx_kv_buf)
+        key = tuple(p.data_ptr() for p in pools)
+        if ctx["key"] == key and ctx["freqs"] is not None:
+            return True
+        if torch.cuda.is_current_stream_capturing() or any(
+            p.stride() != pools[0].stride() for p in pools
+        ):
+            return False
+        ctx["pointers"] = torch.tensor(key, dtype=torch.int64, device=device)
+        ctx["freqs"] = torch.view_as_real(ctx["drafter"]._mla_freqs_cis(device)).contiguous()
+        ctx["key"] = key
+        return True
 
     def _k3_store_stock(self, k, pools, pages, offsets, positions) -> None:
         """The stock drafter's RMSNorm + RoPE of raw latents ``k`` and the stock per-layer scatter."""
@@ -1625,6 +1650,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         """This rank's bf16 vocabulary shard of the target logits for a step ``trtllm::k3_spec_accept`` takes (its only
         reader), else the gathered fp32 logits (``KimiK3DFlashWorker.target_logits``)."""
         self._k3_step_shard = None
+        self._k3_input_end()
         shard = None
         if self.k3_mla_accept:
             shard = self._k3_logits_shard(
@@ -1634,6 +1660,8 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             return super().target_logits(
                 hidden_states, lm_head, logits_processor, attn_metadata, spec_metadata, draft_model
             )
+        # Before the head: with TRTLLM_K3LL_DRAFTER_CTX_SIDE the context path starts beside it.
+        self._k3_input = self._k3_input_begin(draft_model, spec_metadata, attn_metadata)
         logits = KimiK3DFlashWorker._k3_head_shard(logits_processor, lm_head, hidden_states)
         self._k3_step_shard = (logits, shard, draft_model)
         return logits
@@ -1762,6 +1790,265 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         )
         return accepted, num_acc, rewind
 
+    # -- the fused drafter inputs (TRTLLM_K3LL_DRAFTER_PREP_FUSED, TRTLLM_K3LL_DRAFTER_CTX_SIDE) ----------------------
+
+    @staticmethod
+    def _k3_embed_range(embed) -> Optional[tuple]:
+        """``(vocab_start, vocab_end, all-reduce)`` of the stock ``Embedding.forward`` of the drafter's embedding: the
+        id range its pre-communication lookup keeps (``pre_comm_embedding_ops``) and whether it then all-reduces; None
+        for another module or layout (a 16-bit contiguous ``[rows, hidden]`` weight, column-parallel under TP)."""
+        from tensorrt_llm._torch.modules.embedding import Embedding
+        from tensorrt_llm._torch.modules.linear import TensorParallelMode
+
+        weight = getattr(embed, "weight", None)
+        if (
+            type(embed).forward is not Embedding.forward
+            or not isinstance(weight, torch.Tensor)
+            or weight.dim() != 2
+            or weight.element_size() != 2
+            or not weight.is_contiguous()
+        ):
+            return None
+        if embed.tp_mode == TensorParallelMode.COLUMN:
+            return embed.vocab_start_index, embed.vocab_end_index, embed.tp_size > 1
+        if embed.tp_size > 1:
+            return None
+        return 0, weight.shape[0], False
+
+    def _k3_trained_mask(self, draft_model, mask_token_id: int) -> Optional[torch.Tensor]:
+        """The stock ``prepare_1st_drafter_inputs``' trained mask row: the drafter's own, if it kept one for the id."""
+        if mask_token_id != getattr(draft_model, "mask_token_id", None):
+            return None
+        return getattr(draft_model, "mask_token_embedding", None)
+
+    def _k3_input_applies(self, draft_model, spec_metadata, attn_metadata) -> bool:
+        """Whether this ``k3_spec_accept`` step's drafter inputs can be built fused (`_k3_prepare_fused`): the stock
+        ``prepare_1st_drafter_inputs`` would take its paged single-latent branch with the context latent path
+        (`_k3_install_ctx`, its store ready for the bound pools), the stock embedding, a complex64 RoPE table and
+        shapes `mla_drafter_prep.supports` takes. Every condition is the batch's or the configuration's."""
+        from . import mla_drafter_prep as _prep
+
+        num_gens = attn_metadata.num_seqs
+        K = spec_metadata.runtime_draft_len
+        block = self._compute_block_size
+        if (
+            attn_metadata.num_contexts != 0
+            or block is None
+            or K + 1 != self._draft_tokens_per_req
+            or not self._ctx_paged
+            or self._ctx_block_tables is None
+            or self._ctx_block_tables.shape[0] < num_gens
+            or self._ctx_block_tables.stride(1) != 1
+            or getattr(draft_model, "lilicorr", None) is not None
+            or not hasattr(draft_model, "fc")
+            or not hasattr(draft_model, "hidden_norm")
+            or spec_metadata.get_hidden_states(0) is None
+            or getattr(attn_metadata, "_seq_lens_cuda", None) is None
+        ):
+            return False
+        embed = draft_model.draft_model_full.model.embed_tokens
+        vocab = self._k3_embed_range(embed)
+        if vocab is None or not _prep.supports(num_gens, K, block, embed.weight.shape[1]):
+            return False
+        trained = self._k3_trained_mask(draft_model, self._mask_token_id(draft_model))
+        if trained is not None and (
+            trained.dtype != embed.weight.dtype or trained.numel() != embed.weight.shape[1]
+        ):
+            return False
+        device = embed.weight.device
+        freqs = draft_model._mla_freqs_cis(device)
+        if freqs.dtype != torch.complex64 or freqs.dim() != 2 or freqs.shape[1] != 32:
+            return False
+        return self._k3_ctx_ready(device)
+
+    def _k3_side_applies(self, draft_model, rows: int) -> bool:
+        """Whether the context path may run on the side stream: the drafter's ``project_target_hidden`` declares that
+        its only collective at ``rows`` rows is on the decode collectives' MNNVL workspace (``k3_comm_only``, the
+        target's split ``fc``), which nothing on the main stream uses between the fork and the join."""
+        comm_only = getattr(draft_model.project_target_hidden, "k3_comm_only", None)
+        return self._k3_side is not None and comm_only is not None and bool(comm_only(rows))
+
+    def _k3_ctx_latents(self, draft_model, spec_metadata, rows: int) -> torch.Tensor:
+        """The step's raw context latents ``[rows, L, 1, 576]``: the stock projection of the captured rows and the
+        context latent path's GEMM (`_k3_install_ctx`), on the same views of the same tensors."""
+        gen_hs = spec_metadata.get_hidden_states(rows)[0:rows]
+        projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+        latents, _ = draft_model.precompute_context_kv(
+            projected.to(self._ctx_kv_buf[0].dtype), None
+        )
+        return latents
+
+    def _k3_input_begin(self, draft_model, spec_metadata, attn_metadata):
+        """This step's fused-input decision (``TRTLLM_K3LL_DRAFTER_PREP_FUSED``, read here), None for the stock path;
+        with ``TRTLLM_K3LL_DRAFTER_CTX_SIDE`` under multi-stream it also forks the context path onto the side stream.
+        Called before the target LM head of a step whose acceptance runs as ``k3_spec_accept``."""
+        from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+
+        if not _flags.TRTLLM_K3LL_DRAFTER_PREP_FUSED or not self._k3_input_applies(
+            draft_model, spec_metadata, attn_metadata
+        ):
+            return None
+        step = {"side": None, "latents": None}
+        rows = attn_metadata.num_seqs * (spec_metadata.runtime_draft_len + 1)
+        if (
+            _flags.TRTLLM_K3LL_DRAFTER_CTX_SIDE
+            and do_multi_stream()
+            and self._k3_side_applies(draft_model, rows)
+        ):
+            side = self._k3_side
+            step["latents"] = side.fork(
+                lambda: self._k3_ctx_latents(draft_model, spec_metadata, rows)
+            )
+            step["side"] = side
+            _census.count(f"dispatch:drafter_ctx_side:{_census.mode()}")
+        return step
+
+    def _k3_input_end(self) -> None:
+        """Drop an unconsumed step decision, joining its side stream."""
+        step, self._k3_input = self._k3_input, None
+        if step is not None and step["side"] is not None:
+            step["side"].join(step["latents"])
+
+    def prepare_1st_drafter_inputs(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        accepted_tokens,
+        num_accepted_tokens,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        total_target_tokens: int = 0,
+    ):
+        """The fused drafter inputs on a step `_k3_input_begin` took (`_k3_prepare_fused`), else the stock ones. The
+        conditions are checked again here: the buffers may have been rebound since (`_lazy_init_ctx_buffers` runs
+        after the target LM head), and the store's pool pointers are then rebuilt, or the step takes the stock path."""
+        step, self._k3_input = self._k3_input, None
+        num_gens = attn_metadata.num_seqs
+        K = spec_metadata.runtime_draft_len
+        if step is not None and (
+            tuple(accepted_tokens.shape) != (num_gens, K + 1)
+            or accepted_tokens.dtype != torch.int32
+            or num_accepted_tokens.dtype != torch.int32
+            or not self._k3_input_applies(draft_model, spec_metadata, attn_metadata)
+        ):
+            self._k3_input = step
+            self._k3_input_end()
+            step = None
+        if step is None:
+            return super().prepare_1st_drafter_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=draft_model,
+                total_target_tokens=total_target_tokens,
+            )
+        return self._k3_prepare_fused(
+            step, accepted_tokens, num_accepted_tokens, attn_metadata, spec_metadata, draft_model
+        )
+
+    def _k3_prepare_fused(
+        self, step, accepted_tokens, num_accepted_tokens, attn_metadata, spec_metadata, draft_model
+    ) -> dict:
+        """The stock ``prepare_1st_drafter_inputs`` of a decode step (its paged single-latent branch), the same values
+        and side effects in fewer launches:
+
+        * ``k3_drafter_input_prep``: bonus, query positions, the context store's columns / pages / offsets / mask,
+          ``_ctx_len`` advanced, the advertised context, ``_seq_lens_cuda``, the block decode's fixup, pool slots and
+          query RoPE rows (handed to `K3MLADrafterNorms` as a `BlockPrep`), the noise rows' vocabulary-shard lookup;
+        * the embedding's own all-reduce of those rows (the stock call on the same rows), then ``k3_noise_block``;
+        * the context latents: joined from the side stream (``TRTLLM_K3LL_DRAFTER_CTX_SIDE``) or computed here;
+        * ``k3_drafter_mla_ctx_kv`` with the mask folded in."""
+        from . import mla_drafter as _mla_drafter
+        from . import mla_drafter_prep as _prep
+
+        _census.count(f"dispatch:drafter_prep_fused:{_census.mode()}")
+        num_gens = attn_metadata.num_seqs
+        K = spec_metadata.runtime_draft_len
+        block = self._compute_block_size
+        pdl = bool(_flags.TRTLLM_K3LL_DRAFTER_PDL)
+        embed = draft_model.draft_model_full.model.embed_tokens
+        vocab_start, vocab_end, reduce = self._k3_embed_range(embed)
+        mask_token_id = self._mask_token_id(draft_model)
+        pool = self._ctx_kv_buf[0]
+        pool_strides = (pool.stride(0), pool.stride(3))
+        out = _prep.drafter_input_prep(
+            accepted_tokens,
+            num_accepted_tokens[:num_gens],
+            self._batch_to_slot_buffer.tensor[:num_gens],
+            self._ctx_len,
+            self._ctx_block_counts,
+            self._ctx_block_tables,
+            attn_metadata._seq_lens_cuda[:num_gens],
+            draft_model._mla_freqs_cis(accepted_tokens.device),
+            embed.weight,
+            vocab_start,
+            vocab_end,
+            mask_token_id,
+            self._max_ctx,
+            self._dummy_slot,
+            self._ctx_page_size,
+            block,
+            pool_strides,
+            pdl,
+        )
+        attn_metadata._seq_lens[:num_gens] = K + 1
+        reduced = embed.all_reduce(out.lookup) if reduce else out.lookup
+        noise = _prep.noise_block(
+            reduced, block, self._k3_trained_mask(draft_model, mask_token_id), pdl
+        )
+        if step["side"] is not None:
+            latents = step["latents"]
+            step["side"].join(latents)
+        else:
+            latents = self._k3_ctx_latents(draft_model, spec_metadata, num_gens * (K + 1))
+        ctx = self._k3_ctx
+        torch.ops.trtllm.k3_drafter_mla_ctx_kv(
+            latents.reshape(latents.shape[0], -1),
+            ctx["norm"],
+            ctx["freqs"],
+            out.store_positions,
+            out.store_pages,
+            out.store_offsets,
+            ctx["pointers"],
+            list(self._ctx_kv_buf),
+            ctx["eps"],
+            pdl,
+            out.store_mask,
+        )
+        owner = getattr(getattr(draft_model, "dflash_forward", None), "owner", None)
+        if isinstance(owner, _mla_drafter.K3MLADrafterNorms):
+            owner.block_prep = _mla_drafter.BlockPrep(
+                query_positions=out.query_positions,
+                num_ctx=out.num_ctx,
+                page_table=self._ctx_block_tables,
+                rows_start=0,
+                pages=out.blk_pages,
+                offsets=out.blk_offsets,
+                seq_lens_i32=out.blk_seq_lens,
+                kv_bounds_i32=out.blk_kv_bounds,
+                slots=out.blk_slots,
+                pool_strides=pool_strides,
+                blk_freqs=out.blk_freqs,
+            )
+        return {
+            "lilicorr_anchor": None,
+            "noise_embedding": noise,
+            "query_positions": out.query_positions,
+            "num_ctx_per_req": out.num_ctx,
+            "ctx_k_cache": self._ctx_k_buf,
+            "ctx_v_cache": self._ctx_v_buf,
+            "ctx_cache_batch_idx": self._step_arange(0, num_gens),
+            "first_prev_tokens": out.bonus,
+            "ctx_kv_cache": self._ctx_kv_buf,
+            "ctx_page_table": self._ctx_block_tables,
+        }
+
     def _forward_impl(self, input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata,
                       draft_model, resource_manager=None):  # fmt: skip
         """The stock forward; a step whose target logits stayed vocabulary-sharded says so to the engine. With
@@ -1771,10 +2058,14 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         replay = _force_replay.replay_begin(
             self, input_ids, position_ids, attn_metadata, spec_metadata
         )
-        outputs = super()._forward_impl(
-            input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata, draft_model,
-            resource_manager,
-        )  # fmt: skip
+        try:
+            outputs = super()._forward_impl(
+                input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata, draft_model,
+                resource_manager,
+            )  # fmt: skip
+        finally:
+            # A step that forked the context path but did not reach its join still joins it here.
+            self._k3_input_end()
         if replay is not None:
             _force_replay.replay_end(replay, outputs)
         if self._k3_shard_returned:

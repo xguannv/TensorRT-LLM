@@ -128,6 +128,21 @@ TRTLLM_K3LL_DRAFTER_GLUE = _flag(
     "arange tensors and block mask, kv_bounds without repeat_interleave, the V up-projection's bmm into the o_proj "
     "input layout); the same values (read per call)",
 )
+TRTLLM_K3LL_DRAFTER_PREP_FUSED = _flag(
+    "TRTLLM_K3LL_DRAFTER_PREP_FUSED",
+    0,
+    "MLA DSpark worker (with MLA_SPEC_ACCEPT and MLA_DRAFTER_CTX), on a k3_spec_accept step: the drafter's inputs in "
+    "one k3_drafter_input_prep launch (bonus, positions, context-store targets and mask, ctx_len, seq_lens, the "
+    "block fixup, pool slots and query RoPE rows, the noise rows' lookup), the noise block in one copy kernel, the "
+    "store mask in k3_drafter_mla_ctx_kv (the same values; read per step)",
+)
+TRTLLM_K3LL_DRAFTER_CTX_SIDE = _flag(
+    "TRTLLM_K3LL_DRAFTER_CTX_SIDE",
+    0,
+    "with TRTLLM_K3LL_DRAFTER_PREP_FUSED, under multi-stream (CUDA-graph warmup and capture): the context projection "
+    "(fc and its all-reduce + hidden_norm) and the latent GEMM on a side stream forked before the target LM head, "
+    "joined before the context store (the same values; read per step)",
+)
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",
     1,

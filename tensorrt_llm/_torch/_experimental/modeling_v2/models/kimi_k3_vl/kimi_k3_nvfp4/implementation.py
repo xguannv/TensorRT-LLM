@@ -4505,6 +4505,14 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 return drafter.hidden_norm(partial)
             return drafter.hidden_norm(tp_all_reduce(partial))
 
+        def comm_only(rows: int) -> bool:
+            """Whether ``rows`` rows take the ``comm`` all-reduce above (its only collective then): the worker's
+            side-stream context path (``TRTLLM_K3LL_DRAFTER_CTX_SIDE``) needs that."""
+            return 0 < rows <= zeros.shape[0] and comm.takes_allreduce_norm(
+                rows, sliced.weight.shape[0], _mla_drafter.ar_ceiling(rows)
+            )
+
+        project_target_hidden.k3_comm_only = comm_only
         drafter.project_target_hidden = project_target_hidden
         logger.info(
             f"Kimi K3 MLA DSpark drafter: fc split by input feature over TP{mapping.tp_size}: rank {mapping.tp_rank} "
