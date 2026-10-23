@@ -68,11 +68,13 @@ from . import decode_gemv as _decode_gemv
 from . import decode_mla_q as _decode_mla_q
 from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
+from . import expert_placement as _expert_placement
 from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
 from . import mla_drafter as _mla_drafter
 from . import mla_v_up as _mla_v_up
 from . import moe_tail_push as _moe_tail_push
+from . import routing_stats as _routing_stats
 from . import spec_worker as _spec_worker
 from . import weights as _weights
 from .decode_mla_dcp import MlaSplitRead
@@ -809,10 +811,13 @@ def _uses_nvfp4(config: ModelConfig) -> bool:
 _K3_DEFAULT_ROUTED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_MXFP8
 
 
+# Expert loader signature ``(backend, base, expert_idx, local_slot_id, get_tensor)``: checkpoint expert ``expert_idx``
+# (the keys ``{base}.{expert_idx}.*``) goes into local slot ``local_slot_id``, whose routed-expert id is the backend's
+# ``initial_local_expert_ids[local_slot_id]`` (the same id unless TRTLLM_K3LL_EXPERT_PLACEMENT relabels the slots).
 def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
     backend.quant_method.load_packed_mxfp4_expert(
         backend,
-        global_expert_id=expert_idx,
+        global_expert_id=backend.initial_local_expert_ids[local_slot_id],
         local_slot_id=local_slot_id,
         w1_weight=get_tensor(f"{base}.{expert_idx}.w1.weight_packed"),
         w1_weight_scale=get_tensor(f"{base}.{expert_idx}.w1.weight_scale"),
@@ -826,7 +831,7 @@ def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tens
 def _load_nvfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
     backend.quant_method.load_streaming_nvfp4_expert(
         backend,
-        global_expert_id=expert_idx,
+        global_expert_id=backend.initial_local_expert_ids[local_slot_id],
         local_slot_id=local_slot_id,
         **{
             f"{w}_{kind}": get_tensor(f"{base}.{expert_idx}.{w}.{kind}")
@@ -981,7 +986,18 @@ class KimiK3MoERuntime(nn.Module):
                 "Kimi K3 packed-checkpoint streaming currently requires a "
                 "contiguous static expert partition."
             )
-        self.local_expert_ids = tuple(local_expert_ids)
+        # TRTLLM_K3LL_EXPERT_PLACEMENT (expert_placement.py): slot s holds checkpoint expert expert_of_slot[s]; None
+        # is the identity. ``local_expert_ids`` names the checkpoint expert of each local slot, in slot order (the
+        # inherited loader reads those keys into those slots); ``expert_lo`` / ``expert_hi`` bound this rank's slots.
+        self.moe_ep_size = routed_moe_model_config.mapping.moe_ep_size
+        self.expert_of_slot: Optional[Tuple[int, ...]] = None
+        if _flags.TRTLLM_K3LL_EXPERT_PLACEMENT:
+            self.expert_of_slot = _expert_placement.load_placement(
+                _flags.TRTLLM_K3LL_EXPERT_PLACEMENT, self.num_experts, self.moe_ep_size
+            ).get(layer_idx)
+        self.local_expert_ids = _expert_placement.local_checkpoint_experts(
+            local_expert_ids, self.expert_of_slot
+        )
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
         self.expert_hi = self.expert_lo + self.experts_per_rank
@@ -4159,7 +4175,30 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         self.spec_worker = worker
 
     def load_weights(self, weights, *args, **kwargs):
+        placed = self._expert_placement_layers()
         _weights.load(self, weights)
+        for moe in placed:
+            _expert_placement.permute_router_rows(
+                moe.gate.weight.data, moe.gate.e_score_correction_bias.data, moe.expert_of_slot
+            )
+        if placed and self.model_config.mapping.rank == 0:
+            logger.info(
+                f"Kimi K3 NVFP4: TRTLLM_K3LL_EXPERT_PLACEMENT={_flags.TRTLLM_K3LL_EXPERT_PLACEMENT}: "
+                f"{len(placed)} MoE layers load their experts by the placement, routers permuted to slot order"
+            )
+
+    def _expert_placement_layers(self) -> list:
+        """The MoE layers ``TRTLLM_K3LL_EXPERT_PLACEMENT`` permutes (each ``KimiK3MoERuntime`` read its table at
+        construction), after checking the file permutes no layer of this model that is not a MoE layer."""
+        path = _flags.TRTLLM_K3LL_EXPERT_PLACEMENT
+        moes = [layer.block_sparse_moe for layer in self.model.layers if layer.is_moe]
+        if not path or not moes:
+            return []
+        tables = _expert_placement.load_placement(path, moes[0].num_experts, moes[0].moe_ep_size)
+        _expert_placement.check_layers(
+            tables, (moe.layer_idx for moe in moes), len(self.model.layers), path
+        )
+        return [moe for moe in moes if moe.expert_of_slot is not None]
 
     def _load_attention_fp8(self, weights: Dict[str, torch.Tensor], prefix: str) -> int:
         count = super()._load_attention_fp8(weights, prefix)
@@ -4432,11 +4471,27 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             front16=front16,
             front32=front32,
         )
+        stats = None
+        if _flags.TRTLLM_K3LL_ROUTING_STATS_DIR and mapping.rank == 0:
+            stats = _routing_stats.create(
+                _flags.TRTLLM_K3LL_ROUTING_STATS_DIR,
+                num_layers=len(self.model.layers),
+                num_experts=takes[0].num_experts,
+                first_layer=takes[0].layer_idx,
+                expert_of_slot={
+                    moe.layer_idx: moe.expert_of_slot
+                    for moe in moes
+                    if moe.expert_of_slot is not None
+                },
+                stride=_flags.TRTLLM_K3LL_ROUTING_STATS_STRIDE,
+                chunk_steps=_flags.TRTLLM_K3LL_ROUTING_STATS_CHUNK,
+            )
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)
             moe.decode_moe = _decode_moe_lowm.K3DecodeMoeNvfp4Layer.create(
                 moe, state, mapping.tp_rank, mapping.tp_size
             )
+            moe.decode_moe.stats = stats
             moe.decode_gemvs = self.model.decode_gemvs
         first = takes[0].decode_moe
         first.warm_up(takes[0])
