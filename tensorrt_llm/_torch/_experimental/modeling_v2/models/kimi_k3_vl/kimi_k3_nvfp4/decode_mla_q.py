@@ -61,6 +61,17 @@ _KV_STREAMS: Dict[int, torch.cuda.Stream] = {}
 KV_SIDE_MAX_REQUESTS = 4
 
 
+# TRTLLM_K3LL_MLA_QNORM_PDL applies to decode steps of 1 to QNORM_PDL_MAX_REQUESTS requests; above it the q_a norm is
+# the module's own kernel, as with the switch at 0.
+QNORM_PDL_MAX_REQUESTS = 4
+
+
+def qnorm_pdl_applies(requests: int) -> bool:
+    """``TRTLLM_K3LL_MLA_QNORM_PDL``: whether a decode step of ``requests`` requests releases q_b from the q_a norm at
+    launch (1 to `QNORM_PDL_MAX_REQUESTS`)."""
+    return 1 <= requests <= QNORM_PDL_MAX_REQUESTS
+
+
 def kv_side_applies(requests: int) -> bool:
     """``TRTLLM_K3LL_MLA_KV_SIDE``: whether a decode step of ``requests`` requests puts the latent row and the KV append
     on `kv_side_stream` (1 to `KV_SIDE_MAX_REQUESTS`)."""

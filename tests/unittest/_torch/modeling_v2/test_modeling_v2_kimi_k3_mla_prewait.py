@@ -30,7 +30,9 @@ Both only move loads ahead of ``griddepcontrol.wait`` and triggers earlier, so e
   ``test_modeling_v2_kimi_k3_mla_q_switches`` at the trunk defaults (HELIX_Q_ABSORB, GATE_SIDE, FUSED_A at 1), each
   arm's output, recorded query bytes and latent row against the off arm, 8 / 16 / 32 rows, eagerly and from a CUDA
   graph (side stream on) replayed with new inputs; ``split_read_attention_v_up`` at 8 / 16 / 32 rows per head, the V
-  rows and softmax statistics, eagerly and replayed. Spies confirm the switched kernels ran.
+  rows and softmax statistics, eagerly and replayed. Spies confirm the switched kernels ran;
+* the QNORM_PDL request-count bound (``decode_mla_q.QNORM_PDL_MAX_REQUESTS``): the released norm runs for 1 to that
+  many requests only; one request above it, the switch at 1 runs the module's norm and equals the switch at 0.
 """
 
 import contextlib
@@ -247,9 +249,20 @@ def _decode_arm(mla, monkeypatch, arm, x, meta):
     return out, rope, split, dict(seen)
 
 
-def _check_spies(arm, seen):
+def _decode_mla_q():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        decode_mla_q,
+    )
+
+    return decode_mla_q
+
+
+def _check_spies(arm, seen, requests):
     on = ARMS[arm]
-    assert (seen["qnorm"] > 0) == bool(on.get("TRTLLM_K3LL_MLA_QNORM_PDL")), (arm, seen)
+    released = bool(on.get("TRTLLM_K3LL_MLA_QNORM_PDL")) and _decode_mla_q().qnorm_pdl_applies(
+        requests
+    )
+    assert (seen["qnorm"] > 0) == released, (arm, requests, seen)
     if on.get("TRTLLM_K3LL_MLA_PREWAIT_L2"):
         assert seen["absorb_prewait"] > 0 and seen["absorb_plain"] == 0, (arm, seen)
     else:
@@ -264,8 +277,8 @@ def test_switch_on_equals_off_eager(mla, monkeypatch, rows, arm):
         x = _qs()._x(rows, seed + rows)
         off, off_rope, off_split, seen_off = _decode_arm(mla, monkeypatch, "off", x, meta)
         on, on_rope, on_split, seen_on = _decode_arm(mla, monkeypatch, arm, x, meta)
-        _check_spies("off", seen_off)
-        _check_spies(arm, seen_on)
+        _check_spies("off", seen_off, meta.num_generations)
+        _check_spies(arm, seen_on, meta.num_generations)
         assert on_split[2] is True  # the all-head path (HELIX_Q_ABSORB) is the one switched
         assert _bits(on, off)
         assert _bits(on_rope[1], off_rope[1]) and _bits(on_split[1], off_split[1])
@@ -288,7 +301,7 @@ def test_graph_replay_equals_off_eager(mla, monkeypatch, rows, arm):
         graph = torch.cuda.CUDAGraph()
         with with_multi_stream(True), torch.cuda.graph(graph):
             out = qs._decode(mla)(x, meta)
-        _check_spies(arm, dict(seen))
+        _check_spies(arm, dict(seen), meta.num_generations)
     records = list(mla.record)
     for replay in range(REPLAYS):
         x.copy_(qs._x(rows, 200 + replay))
@@ -300,6 +313,31 @@ def test_graph_replay_equals_off_eager(mla, monkeypatch, rows, arm):
         ref, _, ref_split, _ = _decode_arm(mla, monkeypatch, "off", x.clone(), meta)
         assert _bits(replayed, ref)
         assert _bits(replay_split, ref_split[1])
+
+
+def test_qnorm_pdl_bound():
+    d = _decode_mla_q()
+    assert d.QNORM_PDL_MAX_REQUESTS >= 1
+    assert [n for n in range(0, 10) if d.qnorm_pdl_applies(n)] == list(
+        range(1, d.QNORM_PDL_MAX_REQUESTS + 1)
+    )
+
+
+@pytest.mark.parametrize("arm", ["qnorm", "both"])
+def test_qnorm_off_above_bound(mla, monkeypatch, arm):
+    """One request above ``QNORM_PDL_MAX_REQUESTS`` with the switch at 1: the module's norm runs (the spy sees no
+    released norm), and output, query bytes and latent row equal the switch at 0, eagerly."""
+    qs = _qs()
+    rows = qs.TOKENS_PER_REQUEST * (_decode_mla_q().QNORM_PDL_MAX_REQUESTS + 1)
+    meta = qs._meta(rows)
+    x = qs._x(rows, 90 + rows)
+    off, off_rope, off_split, seen_off = _decode_arm(mla, monkeypatch, "off", x, meta)
+    on, on_rope, on_split, seen_on = _decode_arm(mla, monkeypatch, arm, x, meta)
+    assert seen_on["qnorm"] == 0
+    _check_spies("off", seen_off, meta.num_generations)
+    _check_spies(arm, seen_on, meta.num_generations)
+    assert _bits(on, off)
+    assert _bits(on_rope[1], off_rope[1]) and _bits(on_split[1], off_split[1])
 
 
 # ---------------------------------------------------------------------------------------------------------------------

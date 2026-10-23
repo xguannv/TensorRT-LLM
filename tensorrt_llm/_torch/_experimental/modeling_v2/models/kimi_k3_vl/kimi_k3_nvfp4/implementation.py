@@ -3096,7 +3096,8 @@ class K3DecodeMLA(KimiK3MLAAttention):
             self._q_absorb_w_kc,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
-            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL),
+            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL)
+            and _decode_mla_q.qnorm_pdl_applies(metadata.num_generations),
             absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
         )
         if "+qnorm_pdl" in kernel or "+prewait" in kernel:
