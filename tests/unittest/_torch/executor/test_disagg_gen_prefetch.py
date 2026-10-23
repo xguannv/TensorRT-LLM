@@ -204,7 +204,7 @@ def test_executor_pop_from_waiting_queue_prefetch(monkeypatch, limit, active, qu
 
 
 class _GenRequest:
-    """Scheduled generation request: transfer-complete (needs a new sequence slot) or decoding."""
+    """Active generation request: transfer-complete (needs a new sequence slot) or decoding."""
 
     def __init__(self, request_id, transfer_complete):
         self.request_id = request_id
@@ -212,69 +212,156 @@ class _GenRequest:
         self.is_disagg_generation_transmission_complete = transfer_complete
 
 
-class _RevertRecorder:
-    def __init__(self):
-        self.reverted = []
-
-    def revert_allocate_generation(self, req):
-        self.reverted.append(req.py_request_id)
-
-
 class _SeatStub:
-    """The attributes PyExecutor._defer_transfer_complete_without_seat and _revert_gen_alloc read."""
+    """The attributes PyExecutor._hold_transfer_complete_without_seat and _schedulable_requests read."""
 
-    def __init__(self, py_executor, seq_slot_manager):
+    def __init__(self, py_executor, seq_slot_manager, prefetch_limit=1, active=()):
         self._py_executor = py_executor
         self.resource_manager = type("RM", (), {})()
         self.resource_manager.resource_managers = {
             py_executor.ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager
         }
-        self._is_kv_manager_v2 = True
-        self.kv_cache_manager = _RevertRecorder()
-        self.enable_joint_kv_cache_reuse = False
-        self.draft_kv_cache_manager = None
+        self.kv_cache_manager = type("KVCM", (), {})()
+        self._disagg_gen_prefetch_limit = prefetch_limit
+        self.active_requests = list(active)
 
-    def _revert_gen_alloc(self, scheduled_batch):
-        return self._py_executor.PyExecutor._revert_gen_alloc(self, scheduled_batch)
+    def _hold_transfer_complete_without_seat(self, active_requests):
+        return self._py_executor.PyExecutor._hold_transfer_complete_without_seat(
+            self, active_requests
+        )
 
 
-@pytest.mark.parametrize(
-    "num_seats, held, scheduled, expected_kept, expected_deferred",
-    [
-        # b1 under the overlap executor: the finished request (id 1) still holds the only
-        # seat when the prefetched request (id 2), already transfer-complete, is scheduled.
-        (1, [1], [(2, True)], [], [2]),
-        # The seat is back: the transfer-complete request goes ahead.
-        (1, [], [(2, True)], [2], []),
-        # Decoding requests already own their seats and are never deferred.
-        (2, [1, 3], [(1, False), (4, True)], [1], [4]),
-        # One free seat, two transfer-complete requests: the first keeps it, in batch order.
-        (2, [1], [(5, True), (6, True)], [5], [6]),
-    ],
-)
-def test_defer_transfer_complete_without_seat(
-    num_seats, held, scheduled, expected_kept, expected_deferred
-):
-    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+def _seat_manager(num_seats, held):
     from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 
     seq_slot_manager = SeqSlotManager(num_seats)
     for request_id in held:
         seq_slot_manager.slot_manager.add_slot(request_id)
-    stub = _SeatStub(py_executor, seq_slot_manager)
-    requests = [_GenRequest(request_id, tc) for request_id, tc in scheduled]
+    return seq_slot_manager
 
-    kept, num_deferred = py_executor.PyExecutor._defer_transfer_complete_without_seat(
-        stub, requests
-    )
+
+@pytest.mark.parametrize(
+    "num_seats, held, active, expected_kept",
+    [
+        # b1: the earlier request (2) finished its transfer after the later one (1) took the
+        # only seat and started decoding. 2 must not reach the scheduler, or it takes the one
+        # request-budget entry, 1 never decodes and the seat never frees.
+        (1, [1], [(2, True), (1, False)], [1]),
+        # b1 under the overlap executor: the finished request still holds the only seat.
+        (1, [1], [(2, True)], []),
+        # b1, the seat is back.
+        (1, [], [(2, True)], [2]),
+        # b2, both seats held by decoders, the transfer-complete request first in order.
+        (2, [1, 3], [(4, True), (1, False), (3, False)], [1, 3]),
+        # b2, one free seat, two transfer-complete requests: the earlier one keeps it.
+        (2, [1], [(5, True), (1, False), (6, True)], [5, 1]),
+        # b4, two free seats, three transfer-complete requests interleaved with decoders.
+        (4, [1, 2], [(7, True), (1, False), (8, True), (2, False), (9, True)], [7, 1, 8, 2]),
+        # b4, no free seat.
+        (
+            4,
+            [1, 2, 3, 4],
+            [(5, True), (1, False), (6, True), (2, False), (3, False), (4, False)],
+            [1, 2, 3, 4],
+        ),
+    ],
+)
+def test_hold_transfer_complete_without_seat(num_seats, held, active, expected_kept):
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    seq_slot_manager = _seat_manager(num_seats, held)
+    stub = _SeatStub(py_executor, seq_slot_manager)
+    requests = [_GenRequest(request_id, tc) for request_id, tc in active]
+
+    kept, num_held = py_executor.PyExecutor._hold_transfer_complete_without_seat(stub, requests)
 
     assert [req.request_id for req in kept] == expected_kept
-    assert num_deferred == len(expected_deferred)
-    assert stub.kv_cache_manager.reverted == expected_deferred
-    # Deferring takes no seat: every kept transfer-complete request still finds one.
+    assert num_held == len(requests) - len(kept)
+    # Every kept transfer-complete request finds a free seat.
     assert len(seq_slot_manager.slot_manager.free_slots) >= sum(
         1 for req in kept if req.is_disagg_generation_transmission_complete
     )
+
+
+def test_hold_transfer_complete_without_seat_nothing_held_returns_same_list():
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    stub = _SeatStub(py_executor, _seat_manager(2, [1]))
+    requests = [_GenRequest(1, False), _GenRequest(2, True)]
+
+    kept, num_held = py_executor.PyExecutor._hold_transfer_complete_without_seat(stub, requests)
+
+    assert kept is requests and num_held == 0
+
+
+@pytest.mark.parametrize("prefetch_limit", [0, 1])
+def test_schedulable_requests_gate_only_with_prefetch(prefetch_limit):
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    active = [_GenRequest(2, True), _GenRequest(1, False)]
+    stub = _SeatStub(py_executor, _seat_manager(1, [1]), prefetch_limit, active)
+
+    schedulable, num_held = py_executor.PyExecutor._schedulable_requests(stub)
+
+    if prefetch_limit == 0:
+        # Prefetch off: the scheduler sees the active requests unchanged.
+        assert schedulable is stub.active_requests and num_held == 0
+    else:
+        assert [req.request_id for req in schedulable] == [1] and num_held == 1
+
+
+class _SimRequest(_GenRequest):
+    def __init__(self, request_id, decode_steps):
+        super().__init__(request_id, transfer_complete=True)
+        self.decode_steps = decode_steps
+        self.decoded = 0
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("long_first", [True, False])
+def test_seat_gate_no_starvation_with_arriving_decoders(batch, long_first):
+    """Executor-level simulation of the seat gate with a FIFO request budget.
+
+    Each iteration: the gate filters the active requests, a stand-in scheduler takes the first
+    ``batch`` of them, a scheduled transfer-complete request takes a seat and decodes, a decoder
+    that has run its steps finishes and frees its seat, and a new transfer-complete request
+    arrives at the back. Every request finishes, and a held request gets the first seat that
+    frees ahead of any later request.
+    """
+    py_executor = pytest.importorskip("tensorrt_llm._torch.pyexecutor.py_executor")
+    seq_slot_manager = _seat_manager(batch, [])
+    slots = seq_slot_manager.slot_manager
+    stub = _SeatStub(py_executor, seq_slot_manager)
+    # Decoders already holding every seat, behind one early transfer-complete request: the
+    # ordering that livelocked the post-schedule gate.
+    early = _SimRequest(100, decode_steps=3)
+    decoders = []
+    for i in range(batch):
+        req = _SimRequest(i, decode_steps=5 if long_first else 2 + i)
+        req.is_disagg_generation_transmission_complete = False
+        slots.add_slot(req.request_id)
+        decoders.append(req)
+    active = [early] + decoders
+    next_id, finished, seat_order = 200, [], []
+    for _ in range(200):
+        schedulable, _ = py_executor.PyExecutor._hold_transfer_complete_without_seat(stub, active)
+        scheduled = schedulable[:batch]
+        assert scheduled, "the batch must never be empty while requests are active"
+        for req in scheduled:
+            if req.is_disagg_generation_transmission_complete:
+                slots.add_slot(req.request_id)  # raises if no seat is free
+                seat_order.append(req.request_id)
+                req.is_disagg_generation_transmission_complete = False
+            req.decoded += 1
+        for req in [r for r in scheduled if r.decoded >= r.decode_steps]:
+            slots.remove_slot(req.request_id)
+            active.remove(req)
+            finished.append(req.request_id)
+        if next_id < 230:
+            active.append(_SimRequest(next_id, decode_steps=2))
+            next_id += 1
+        if not active:
+            break
+    assert not active and 100 in finished
+    # Seats go to transfer-complete requests in arrival order: the early one first.
+    assert seat_order[0] == 100 and seat_order == sorted(seat_order)
 
 
 class _DebugRequest:
@@ -289,7 +376,7 @@ class _DebugStub(_SeatStub):
     """_SeatStub plus what PyExecutor._prefetch_debug_note reads."""
 
     def __init__(self, py_executor, seq_slot_manager, rank, idle_limit, active):
-        super().__init__(py_executor, seq_slot_manager)
+        super().__init__(py_executor, seq_slot_manager, active=active)
         self.dist = type("Dist", (), {"rank": rank})()
         self._prefetch_debug_idle_limit = idle_limit
         self._prefetch_debug_deferred = 0

@@ -3208,7 +3208,7 @@ class PyExecutor:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests, self.inflight_req_ids)
+                        self._schedulable_requests()[0], self.inflight_req_ids)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
@@ -4105,42 +4105,51 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
-    def _defer_transfer_complete_without_seat(
-            self, generation_requests: List[LlmRequest]
-    ) -> Tuple[List[LlmRequest], int]:
-        """Keep transfer-complete requests only while sequence slots are free.
+    def _hold_transfer_complete_without_seat(
+            self,
+            active_requests: List[LlmRequest]) -> Tuple[List[LlmRequest], int]:
+        """Leave out of scheduling the transfer-complete requests no sequence slot is free for.
 
         With ``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS`` a request can finish its
-        KV-cache transfer while the batch is full. Once the request it replaces
-        finishes, the scheduler sees a free batch entry and schedules it, but
-        under the overlap executor the finished request keeps its sequence
-        slot until the next iteration, and a transfer-complete request takes a
-        new slot in ``_prepare_disagg_gen_transmission_complete``. Requests
-        beyond the free slots stay transfer-complete for the next scheduling
-        pass, with the KV-cache capacity the V2 scheduler grew for them
-        reverted.
+        KV-cache transfer while every sequence slot is taken: by a decoding
+        request, or under the overlap executor by a request that finished
+        this iteration and keeps its slot until the next one. A
+        transfer-complete request takes a new slot in
+        ``_prepare_disagg_gen_transmission_complete``, so only as many of them
+        as there are free slots may be scheduled.
 
-        Returns the requests to schedule and the number deferred.
+        The filter runs before the scheduler. A transfer-complete request the
+        scheduler saw would take a request-budget entry, and at a small batch
+        it can crowd out the decoding request that holds the slot it is
+        waiting for: the batch then runs nothing and the slot never frees.
+        The kept transfer-complete requests are the earliest in
+        ``active_requests`` (arrival order), so a request left out gets the
+        next free slot ahead of every later one.
+
+        Returns the requests to schedule and the number left out.
         """
         seq_slot_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.SEQ_SLOT_MANAGER)
         if seq_slot_manager is None:
-            return generation_requests, 0
+            return active_requests, 0
         free_slots = len(seq_slot_manager.slot_manager.free_slots)
-        kept, deferred = [], []
-        for req in generation_requests:
+        kept, num_held = [], 0
+        for req in active_requests:
             if not req.is_disagg_generation_transmission_complete:
                 kept.append(req)
             elif free_slots > 0:
                 free_slots -= 1
                 kept.append(req)
             else:
-                deferred.append(req)
-        if deferred:
-            reverted = ScheduledRequests()
-            reverted.generation_requests = deferred
-            self._revert_gen_alloc(reverted)
-        return kept, len(deferred)
+                num_held += 1
+        return (kept, num_held) if num_held else (active_requests, 0)
+
+    def _schedulable_requests(self) -> Tuple[List[LlmRequest], int]:
+        """The active requests offered to the scheduler, and how many were held back (prefetch seat gate)."""
+        if getattr(self, "_disagg_gen_prefetch_limit", 0) > 0:
+            return self._hold_transfer_complete_without_seat(
+                self.active_requests)
+        return self.active_requests, 0
 
     def _prefetch_debug_note(self, num_deferred: int,
                              context_requests: List[LlmRequest],
@@ -7360,8 +7369,9 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        schedulable_requests, num_held = self._schedulable_requests()
         scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+            schedulable_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -7409,15 +7419,10 @@ class PyExecutor:
             scheduled_context_requests)
 
         scheduled_generation_requests = scheduler_output.generation_requests
-        if self._disagg_gen_prefetch_limit > 0:
-            scheduled_generation_requests, num_deferred = (
-                self._defer_transfer_complete_without_seat(
-                    scheduled_generation_requests))
-            num_fitting -= num_deferred
-            if self._prefetch_debug_idle_limit > 0:
-                self._prefetch_debug_note(num_deferred,
-                                          scheduled_context_requests,
-                                          scheduled_generation_requests)
+        if (getattr(self, "_disagg_gen_prefetch_limit", 0) > 0
+                and self._prefetch_debug_idle_limit > 0):
+            self._prefetch_debug_note(num_held, scheduled_context_requests,
+                                      scheduled_generation_requests)
 
         scheduled_requests = ScheduledRequests()
         if getattr(self, "_enable_remote_tail_adp", False):
