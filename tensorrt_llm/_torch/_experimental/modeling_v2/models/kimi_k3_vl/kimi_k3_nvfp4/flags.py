@@ -274,7 +274,7 @@ TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X = _flag(
 )
 TRTLLM_K3LL_KDA_SEED_STACKED = _flag(
     "TRTLLM_K3LL_KDA_SEED_STACKED",
-    0,
+    1,
     "disagg generation intake: MambaHybridCacheManagerV2 seeds every KDA layer's replay conv caches of the new "
     "requests at once from the stacked conv-state view (~10 launches, not ~7 per layer; same values; read per call)",
 )
