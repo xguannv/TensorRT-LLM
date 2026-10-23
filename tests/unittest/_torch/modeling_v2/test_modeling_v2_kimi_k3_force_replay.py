@@ -167,7 +167,7 @@ def test_lookup_commit_reference(rows, nctx, graph):
             assert new_h[r] == [_padded(entries, e, j + 1 + c) for c in range(k1)]
             assert nn_h[r] == [_padded(entries, e, j + n[r] + c) for c in range(k1)]
             assert nd_h[r][:K] == [_padded(entries, e, j + n[r] + 1 + c) for c in range(K)]
-            assert nd_h[r][K:] == [-1, -1]
+            assert nd_h[r][K:] == [-1] * 3
         want_counter = hits[0][1] if hits[0][0] >= 0 else -5
         assert counter.item() == want_counter
 
