@@ -21,7 +21,9 @@
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell): FC1 rows and scales bit for bit, every FC2
                 partial bit for bit (one non-zero routing weight per token), the full sum within the bf16 accumulation
                 bound of the exact sum of the partials; through nvfp4_lowm_op.run (moe_sort first) as well, eagerly
-                and from CUDA-graph replays, the counters zero after every launch;
+                and from CUDA-graph replays, the counters zero after every launch; M up to 32 on the narrow builds
+                and 33 / 48 / 64 on the 64-token build (test_moe_nvfp4_lowm_m64), the narrow builds' configuration
+                pinned (test_moe_nvfp4_lowm_config_pin);
   front (4 GPUs, one process each) : trtllm::k3_moe_front with nvfp4_gsf: the routing and the shared activation
                 bit for bit the MXFP8 call's; the NVFP4 latent against fp4_quantize of the unfused chain's bf16
                 latent (> 99.9 % equal codes and scales: the front sums the head in its own split-K order, so a code
@@ -190,31 +192,109 @@ def _sort(ids, scales, num_experts, top_k, offset, num_local):
     )  # fmt: skip
 
 
+K3_TP4EP4 = (LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K)
+
+
 @pytest.mark.parametrize(
     "shape",
-    [(LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K), (1024, 256, 64, 16, 0, 8)],
+    [K3_TP4EP4, (1024, 256, 64, 16, 0, 8)],
     ids=["k3_tp4ep4", "small"],
 )
 @pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 32])
 @pytest.mark.parametrize("num_ctas", [0, 100], ids=["ctas_max", "ctas_100"])
 def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
+    _check_moe_nvfp4_lowm(shape, num_tokens, num_ctas)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_ctas,hot",
+    [(33, 0, False), (48, 0, True), (64, 0, True), (64, 100, True)],
+    ids=["m33", "m48_hot", "m64_hot", "m64_hot_ctas_100"],
+)
+def test_moe_nvfp4_lowm_m64(num_tokens, num_ctas, hot):
+    """The kernel's 64-token build (33 to 64 tokens) at the TP4 x EP4 shape, as the narrow builds are checked. ``hot``:
+    every token also routes to one local expert, so its tile holds more than 32 rows (the FC1 epilogue's second row
+    of each thread, FC2 columns 32 to 63)."""
+    _check_moe_nvfp4_lowm(K3_TP4EP4, num_tokens, num_ctas, hot=hot)
+
+
+#: The kernel configuration at the TP4 x EP4 shape (W1 [1536, 3584], top 16) as nvfp4_lowm_op builds it: for the narrow
+#: builds (8, 16, 32) the one from before the 64-token build, which must leave it as it was.
+_CONFIG_PIN = {
+    8: dict(num_ab_stage=6, num_epi_wg=2, sout_bufs=2, sout_bytes=4096, sout_off=[43008, 47104], region_bytes=51200,
+            sfb_off=14336, x_bytes=14336, b_stage_bytes=1024, b_per_slot=16, b2_data_bytes=3072, b2_sf_bytes=6144,
+            b2_sf_off=4096, b2_slots=1, acc_cols=32, tmem_cols=64, threads=352, fc2_chunk=1, nchunk2=28, num_acc=4,
+            queue_depth=16, mma_tiler=(128, 8, 256), wide=False),
+    16: dict(num_ab_stage=6, num_epi_wg=2, sout_bufs=2, sout_bytes=8192, sout_off=[57344, 65536], region_bytes=73728,
+             sfb_off=28672, x_bytes=28672, b_stage_bytes=2048, b_per_slot=8, b2_data_bytes=6144, b2_sf_bytes=6144,
+             b2_sf_off=6144, b2_slots=1, acc_cols=64, tmem_cols=128, threads=352, fc2_chunk=1, nchunk2=28, num_acc=4,
+             queue_depth=16, mma_tiler=(128, 16, 256), wide=False),
+    32: dict(num_ab_stage=6, num_epi_wg=1, sout_bufs=2, sout_bytes=16384, sout_off=[86016], region_bytes=102400,
+             sfb_off=57344, x_bytes=57344, b_stage_bytes=4096, b_per_slot=4, b2_data_bytes=12288, b2_sf_bytes=6144,
+             b2_sf_off=12288, b2_slots=2, acc_cols=128, tmem_cols=256, threads=224, fc2_chunk=1, nchunk2=28,
+             num_acc=4, queue_depth=16, mma_tiler=(128, 32, 256), wide=False),
+    # the 64-token build: 5 stages of 16 KB weights + 2 KB weight scales + 8 KB tokens + 2 KB token scales
+    64: dict(num_ab_stage=5, num_epi_wg=1, sout_bufs=1, sout_bytes=16384, b_stage_bytes=8192, b_per_slot=2,
+             x_bytes=40960, sfr_off=40960, sfb_off=51200, b2_slots=0, fc1_stage_tx=26624, fc2_stage_tx=28672,
+             acc_cols=256, tmem_cols=512, threads=224, fc2_chunk=1, nchunk2=28, mma_tiler=(128, 64, 256), wide=True),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("n_tok", [8, 16, 32, 64])
+def test_moe_nvfp4_lowm_config_pin(n_tok):
+    """The kernel configuration nvfp4_lowm_op builds for each token tile: for 8, 16 and 32 tokens attribute for
+    attribute the one before the 64-token build existed, and the same token tile for every M <= 32."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_moe_lowm, k3_moe_lowm_dyn
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+
+    assert nvfp4_lowm_op.MAX_TOKENS == 32 and nvfp4_lowm_op._DEFAULT_STAGES == {8: 6, 16: 6}
+    assert [k3_moe_lowm_dyn.n_tok_for(m) for m in range(1, 33)] == [
+        k3_moe_lowm.n_tok_for(m) for m in range(1, 33)
+    ]
+    assert [k3_moe_lowm_dyn.n_tok_for(m) for m in range(33, 65)] == [64] * 32
+    ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * I_TP, LATENT, 33)
+    assert not ok and "1 to 32" in why, "the default limit must stay 32 tokens"
+    kernel = k3_moe_lowm_dyn.K3MoeLowMDynKernel(
+        n_tok, 2 * I_TP, LATENT, TOP_K, GATE_CAP, LINEAR_CAP, fc2_chunk=1,
+        max_ab_stage=nvfp4_lowm_op._DEFAULT_STAGES.get(n_tok, 16), use_pdl=True,
+    )  # fmt: skip
+    pin = _CONFIG_PIN[n_tok]
+    got = {name: getattr(kernel, name) for name in pin}
+    assert got == pin
+
+
+def _check_moe_nvfp4_lowm(shape, num_tokens, num_ctas, hot=False):
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
     from tensorrt_llm._torch.utils import unswizzle_sf
 
     hidden, inter_size, num_experts, num_local, offset, top_k = shape
-    ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * inter_size, hidden, num_tokens)
+    limit = (
+        nvfp4_lowm_op.MAX_TOKENS
+        if num_tokens <= nvfp4_lowm_op.MAX_TOKENS
+        else nvfp4_lowm_op.MAX_TOKENS_WIDE
+    )
+    ok, why = nvfp4_lowm_op.supported(
+        torch.device("cuda"), 2 * inter_size, hidden, num_tokens, max_tokens=limit
+    )
     assert ok, why
     torch.manual_seed(2000 + num_tokens)
     logits = torch.randn(num_tokens, num_experts, device="cuda")
+    if hot:
+        logits[:, offset + 1] += 8.0  # every token on local expert 1
     scales, ids = logits.topk(top_k, dim=-1)
     ids = ids.to(torch.int32)
     scales = scales.softmax(dim=-1).float()
-    ids[0, 0] = offset  # at least one token on this rank
+    if not hot:
+        ids[0, 0] = offset  # at least one token on this rank
     t2g, t2lim, _, p2e, _, nnet = _sort(ids, scales, num_experts, top_k, offset, num_local)
     m = p2e.shape[0]
     tiles = int(nnet.item())
     limits = t2lim[:tiles].tolist()
+    if hot:
+        assert max(lim - 128 * t for t, lim in enumerate(limits)) > 32, (
+            "no tile holds more than 32 rows"
+        )
     rows = torch.tensor([r for t in range(tiles) for r in range(t * 128, limits[t])], device="cuda")
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     x_q, x_sf, x_gsf = _quantize(x)

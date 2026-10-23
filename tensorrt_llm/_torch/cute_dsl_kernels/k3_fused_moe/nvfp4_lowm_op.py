@@ -16,7 +16,9 @@
 
 The persistent CuTe DSL kernel ``blackwell/k3_moe_lowm_dyn.py`` (FC1 + SiTU + NVFP4 quantization + FC2 + the
 routing-weighted combine, work units handed out dynamically, the output zeroed by the kernel itself) over the CuteDSL
-MoE backend's NVFP4 buffers, read in place, for at most 32 tokens. Its inputs are the NVFP4 latent with linear E4M3
+MoE backend's NVFP4 buffers, read in place, for at most 64 tokens (33 to 64 on the kernel's wide build, which streams
+the token operand through its weight ring). Callers take at most `MAX_TOKENS` tokens unless they opt into
+`MAX_TOKENS_WIDE` (``supported``'s ``max_tokens``). Its inputs are the NVFP4 latent with linear E4M3
 scales (``[M, 3584 / 16]``), the routing weights in fp32 and the six ``moe_sort`` outputs of this rank's experts with
 128-row tiles.
 
@@ -36,24 +38,21 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+#: The callers' default token limit (the narrow builds: token tiles of 8, 16 and 32).
 MAX_TOKENS = 32
+#: The kernel's token limit (the wide build: a token tile of 64).
+MAX_TOKENS_WIDE = 64
 TILE = 128
 SF_VEC = 16
 #: Tiles a counter buffer holds.
 MAX_TILES = 4096
 #: Weight ring stages for token tiles of 8 and 16 (fewer bytes in flight per SM: FC2 finds its tiles sooner); 32
-#: tokens take as many as fit.
+#: and 64 tokens take as many as fit.
 _DEFAULT_STAGES = {8: 6, 16: 6}
 _SUPPORTED_SM = ((10, 0), (10, 3))
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
-
-
-def _lowm():
-    from ..blackwell import k3_moe_lowm
-
-    return k3_moe_lowm
 
 
 def _dyn():
@@ -73,8 +72,13 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def supported(device: torch.device, n1: int, k1: int, num_tokens: int = 1) -> Tuple[bool, str]:
-    """Whether the kernel serves ``num_tokens`` tokens over experts of W1 ``[n1, k1]`` on ``device``, and why not."""
+def supported(
+    device: torch.device, n1: int, k1: int, num_tokens: int = 1, max_tokens: int = MAX_TOKENS
+) -> Tuple[bool, str]:
+    """Whether the kernel serves ``num_tokens`` tokens over experts of W1 ``[n1, k1]`` on ``device``, and why not.
+    ``max_tokens``: the caller's token limit, `MAX_TOKENS` or `MAX_TOKENS_WIDE`."""
+    if not 0 < max_tokens <= MAX_TOKENS_WIDE:
+        raise ValueError(f"max_tokens {max_tokens}: 1 to {MAX_TOKENS_WIDE}")
     if torch.cuda.get_device_capability(device) not in _SUPPORTED_SM:
         return (
             False,
@@ -86,8 +90,8 @@ def supported(device: torch.device, n1: int, k1: int, num_tokens: int = 1) -> Tu
         return False, "CuTe DSL (nvidia-cutlass-dsl) is not installed"
     if n1 % 256 or (n1 // 2) % 256 or k1 % 256:
         return False, f"W1 [{n1}, {k1}] is not a multiple of 256 rows / columns (and half rows)"
-    if not 0 < num_tokens <= MAX_TOKENS:
-        return False, f"{num_tokens} tokens (1 to {MAX_TOKENS})"
+    if not 0 < num_tokens <= max_tokens:
+        return False, f"{num_tokens} tokens (1 to {max_tokens})"
     return True, ""
 
 
@@ -124,7 +128,8 @@ def k3_moe_nvfp4_lowm(
     h: Optional[torch.Tensor] = None,
     h_sf: Optional[torch.Tensor] = None,
 ) -> None:
-    """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 32`` tokens.
+    """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 64`` tokens (33 to
+    64: the kernel's wide build).
 
     ``x_fp4`` uint8 ``[M, k1 / 2]`` (E2M1 pairs) and ``x_sf`` uint8 ``[M, k1 / 16]`` (E4M3, linear): the NVFP4 latent;
     ``w1`` / ``w1_sf`` / ``alpha1`` / ``w2`` / ``w2_sf`` / ``alpha2``: the CuteDSL backend's NVFP4 buffers and global
@@ -139,7 +144,7 @@ def k3_moe_nvfp4_lowm(
 
     from ..blackwell.utils import make_ptr
 
-    lowm, dyn = _lowm(), _dyn()
+    dyn = _dyn()
     orig_m = x_fp4.shape[0]
     num_local, n1 = w1.shape[0], w1.shape[1]
     k1 = w2.shape[1]
@@ -147,7 +152,7 @@ def k3_moe_nvfp4_lowm(
     m = permuted_idx_to_expanded_idx.shape[0]
     if m // TILE > MAX_TILES or counters.numel() < dyn.counter_words(m // TILE):
         raise ValueError(f"k3_moe_nvfp4_lowm: {m // TILE} tiles exceed the counter buffer")
-    n_tok = lowm.n_tok_for(orig_m)
+    n_tok = dyn.n_tok_for(orig_m)
     device = x_fp4.device
     sms = _num_sms(_device_index(device))
     ctas = min(num_ctas, sms) if num_ctas > 0 else sms

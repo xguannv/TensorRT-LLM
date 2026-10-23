@@ -42,6 +42,23 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
 * PDL: every warp waits on the previous grid (tile metadata, tokens and token scales come from it)
   before it reads any of them or the counters; each CTA triggers its dependents after all of its
   warps are done (later than the safe default of right after the wait).
+
+Wide build (``n_tok`` = 64, 33 to 64 tokens). The narrow builds keep FC1's token operand (every
+token over the whole K: 56 KB at 32 tokens, 112 KB at 64) and its scales in shared memory for the
+whole grid; at 64 tokens that and the ring no longer fit. Here every ring stage has a token-operand
+stage (64 x 256 NVFP4, 8 KB) and a token-scale block (2 KB) next to its weights, and the token
+operand streams with the weights:
+
+* FC1 stage: the weight TMA warp loads K block ``kb`` of the step's tokens into the stage with the
+  weights, on the stage's full barrier (the tokens come from L2: 8 KB per 18 KB of weights). The
+  token scales stay in shared memory, converted once as in the narrow builds.
+* FC2 stage: the weight TMA warp expects the token part's bytes on the stage's full barrier with
+  the weights' and publishes the unit with its first stage; once the tile is ready the token warp
+  waits until the MMA has released each of the unit's stages and loads K block ``kb`` of the tile's
+  FC1 output rows and its 2 KB scale block into it. No ring slot is reserved for a token operand.
+* FC1 epilogue: each thread quantizes its 16 outputs of rows ``r`` and ``r + 32`` of the tile.
+* Every narrow-build statement that changes sits under ``const_expr(self.wide)`` or its negation,
+  so the narrow builds (8, 16, 32) trace the same kernel as before.
 """
 
 from typing import Optional, Tuple
@@ -95,11 +112,25 @@ CTR_TILE_BASE = 16
 _SLOT_BYTES = _MMA_M * _KBLK // 2
 #: Slices of the output zeroed by the kernel (the CTAs that run FC1 units 0 .. _ZERO_SLICES - 1).
 _ZERO_SLICES = 4
+#: Token tile of the wide build (33 to 64 tokens): the token operand streams through the ring.
+WIDE_N_TOK = 64
+#: Token tiles this kernel takes.
+DYN_N_TOK = SUPPORTED_N_TOK + (WIDE_N_TOK,)
+#: Largest number of tokens of one call.
+MAX_TOKENS_WIDE = WIDE_N_TOK
 
 
 def counter_words(max_tiles: int) -> int:
     """int32 words of the (zero-initialized) counter buffer for up to ``max_tiles`` tiles."""
     return CTR_TILE_BASE + max_tiles
+
+
+def n_tok_for(num_tokens: int) -> int:
+    """Smallest token tile of this kernel holding ``num_tokens`` tokens."""
+    for n_tok in DYN_N_TOK:
+        if num_tokens <= n_tok:
+            return n_tok
+    raise ValueError(f"{num_tokens} tokens exceed the small-batch MoE kernel ({MAX_TOKENS_WIDE})")
 
 
 @dsl_user_op
@@ -169,10 +200,11 @@ def _align(v: int, a: int) -> int:
 
 
 class K3MoeLowMDynKernel:
-    """FC1 + SiTU + NVFP4 quantization + FC2 + finalize for at most 32 tokens in one dynamically
+    """FC1 + SiTU + NVFP4 quantization + FC2 + finalize for at most 64 tokens in one dynamically
     scheduled persistent grid.
 
-    :param n_tok: Token tile (MMA N) of both GEMMs: 8, 16 or 32.
+    :param n_tok: Token tile (MMA N) of both GEMMs: 8, 16, 32 or 64 (the wide build, see the module
+        docstring).
     :param n1: Rows of one expert's W1 (2 x intermediate, gate/up interleaved every 64 rows).
     :param k1: Hidden size (W1 K, W2 rows).
     :param topk: Experts per token.
@@ -203,11 +235,13 @@ class K3MoeLowMDynKernel:
         use_pdl: bool = True,
         trace: bool = False,
     ):
-        assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
+        assert n_tok in DYN_N_TOK, f"n_tok {n_tok} not in {DYN_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
         assert k1 % _MMA_M == 0
         assert num_epi_wg in (1, 2) and num_acc >= num_epi_wg
         assert situ_beta > 0 and situ_linear_beta > 0
+        #: the wide build: the token operand of both GEMMs streams through the ring (module docstring)
+        self.wide = n_tok == WIDE_N_TOK
         self.n_tok = n_tok
         self.n1, self.k1 = n1, k1
         self.n2, self.k2 = k1, n1 // 2
@@ -234,6 +268,9 @@ class K3MoeLowMDynKernel:
         # token-operand stages (n_tok x 256) per ring slot
         self.b_per_slot = _SLOT_BYTES // self.b_stage_bytes
         self.x_bytes = self.nkb1 * self.b_stage_bytes
+        if self.wide:
+            self._init_wide(num_epi_wg, fc2_chunk, queue_depth, max_ab_stage)
+            return
         # FC2 token operand in the ring: its rows in one slot, its scales after them in the same slot
         # if they fit, else at the start of the next slot
         self.b2_data_bytes = self.nkb2 * self.b_stage_bytes
@@ -280,6 +317,73 @@ class K3MoeLowMDynKernel:
         # (token operand + weights) fit in the ring at once with one to spare
         chunk = max(1, fc2_chunk)
         while self.nblk2 % chunk or self.b2_slots + chunk * self.nkb2 + 1 > self.num_ab_stage:
+            chunk -= 1
+        self.fc2_chunk = chunk
+        self.nchunk2 = self.nblk2 // chunk
+
+    def _init_wide(self, num_epi_wg: int, fc2_chunk: int, queue_depth: int, max_ab_stage: int):
+        """Configuration of the wide build. Every ring stage ``i`` has, besides its weight slot and
+        weight scales, a token-operand stage (``n_tok x 256``, at ``x_bytes`` = ``S`` of them from
+        the region's start) and a token-scale block (2 KB, ``S`` of them from ``sfr_off``): FC1
+        stages carry the step's tokens (their scales stay in shared memory at ``sfb_off``, converted
+        once), FC2 stages the FC1 output rows and scales of the unit's tile. No ring slot is
+        reserved for a token operand. Of the epilogue configurations the one with the deepest ring
+        is taken (the first of equals)."""
+        n_tok = self.n_tok
+        self.b2_slots = 0
+        self.b2_data_bytes = self.b_stage_bytes
+        self.b2_sf_bytes = _SF_KBLK_BYTES
+        self.b2_sf_off = 0
+        #: bytes an FC1 / FC2 ring stage expects on its full barrier
+        self.fc1_stage_tx = self.a_stage_bytes + self.b_stage_bytes
+        self.fc2_stage_tx = self.fc1_stage_tx + _SF_KBLK_BYTES
+        self.sacc_row_floats = _MMA_M + _SACC_PAD
+        self.out_row_bytes = _MMA_M * 2
+        assert self.b_stage_bytes % _SF_KBLK_BYTES == 0
+
+        def layout(stages: int, wgs: int, sout_bufs: int):
+            x_bytes = stages * self.b_stage_bytes
+            sfr_off = x_bytes
+            sfb_off = _align(sfr_off + stages * _SF_KBLK_BYTES, 1024)
+            p1_end = sfb_off + self.nkb1 * _SF_KBLK_BYTES
+            sout_bytes = sout_bufs * n_tok * self.out_row_bytes
+            sout_off = [_align(p1_end, 128) + wg * sout_bytes for wg in range(wgs)]
+            region_bytes = _align(sout_off[-1] + sout_bytes, 1024)
+            total = (
+                stages * self.a_stage_bytes
+                + region_bytes
+                + n_tok * self.sacc_row_floats * 4
+                + 2 * wgs * n_tok * 4
+                + 2 * queue_depth * 4
+                + 2 * 1024  # barriers, TMEM holder and alignment slack
+            )
+            return total, x_bytes, sfr_off, sfb_off, sout_bytes, sout_off, region_bytes
+
+        need = self.nkb2 + 1
+        best = None
+        for wgs, sout_bufs in ((2, 2), (2, 1), (1, 2), (1, 1)):
+            if wgs > num_epi_wg:
+                continue
+            stages = max_ab_stage
+            while stages > 0 and layout(stages, wgs, sout_bufs)[0] > _SMEM_CAPACITY:
+                stages -= 1
+            if best is None or stages > best[0]:
+                best = (stages, wgs, sout_bufs)
+        stages, wgs, sout_bufs = best
+        assert stages >= need, "ring too small for FC2"
+        (_, self.x_bytes, self.sfr_off, self.sfb_off, self.sout_bytes, self.sout_off,
+         self.region_bytes) = layout(stages, wgs, sout_bufs)  # fmt: skip
+        self.num_ab_stage = stages
+        self.num_epi_wg = wgs
+        self.sout_bufs = sout_bufs
+        assert self.num_acc >= self.num_epi_wg
+        self.epi_warps = 4 * self.num_epi_wg
+        self.mma_warp = self.epi_warps
+        self.tma_warp = self.epi_warps + 1
+        self.tok_warp = self.epi_warps + 2
+        self.threads = 32 * (self.epi_warps + 3)
+        chunk = max(1, fc2_chunk)
+        while self.nblk2 % chunk or chunk * self.nkb2 + 1 > self.num_ab_stage:
             chunk -= 1
         self.fc2_chunk = chunk
         self.nchunk2 = self.nblk2 // chunk
@@ -615,6 +719,9 @@ class K3MoeLowMDynKernel:
                 nctas,
                 trace_ptr,
                 bid,
+                b_layout,
+                tma_b1,
+                mB1,
             )
         elif warp_idx == self.tok_warp:
             self._token_producer(
@@ -714,6 +821,29 @@ class K3MoeLowMDynKernel:
         return g + 1
 
     @cute.jit
+    def _load_stage_wide(
+        self, tma_a, tma_sfa, tAsA, tAgA, tAsSFA, tAgSFA, blk, kb, expert, a_full, stage, tx: int
+    ):
+        """Wide build: the weights and weight scales of reserved ring stage ``stage``, whose full
+        barrier expects ``tx`` bytes (the stage's token operand arrives on it as well)."""
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(a_full + stage, tx)
+        cute.copy(
+            tma_a,
+            tAgA[(None, blk, kb, expert)],
+            tAsA[(None, stage)],
+            tma_bar_ptr=a_full + stage,
+            cache_policy=Int64(_EVICT_FIRST),
+        )
+        cute.copy(
+            tma_sfa,
+            tAgSFA[(None, blk, kb, expert)],
+            tAsSFA[(None, stage)],
+            tma_bar_ptr=a_full + stage,
+            cache_policy=Int64(_EVICT_FIRST),
+        )
+
+    @cute.jit
     def _expert_of(self, tile_idx_to_expert_idx, t2e_pre: Int32, tile: Int32):
         """Expert of ``tile`` (warp-uniform): from the prefetched lanes for the first 32 tiles."""
         expert = Int32(0)
@@ -748,11 +878,27 @@ class K3MoeLowMDynKernel:
         nctas: Int32,
         trace_ptr,
         bid,
+        b_layout,
+        tma_b1,
+        mB1,
     ):
         """Fetches the CTA's units from the work counter (one ahead; ``first``: lane 0's first
         fetch; ``t2e_pre``: lane i holds the expert of tile i), reserves the ring slot(s) of an FC2
         unit's token operand, publishes the unit and streams its weight stages through the ring;
-        the CTA that exits last resets the work counter."""
+        the CTA that exits last resets the work counter. Wide build: an FC1 stage carries the
+        step's tokens too; an FC2 unit reserves no slot and is published with its first stage
+        (the token warp fills the token part of its stages)."""
+        if cutlass.const_expr(self.wide):
+            b_cta = cute.make_layout(cute.slice_(cl, (0, None, 0, 0)).shape)
+            sB = self._view(st, b_layout, self.ab_dtype)
+            tCgB1 = thr_mma.partition_B(
+                cute.local_tile(
+                    mB1, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+                )
+            )
+            tBsB1, tBgB1 = cpasync.tma_partition(
+                tma_b1, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB1, 0, 3)
+            )
         a_full, a_empty = st.a_full.data_ptr(), st.a_empty.data_ptr()
         sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
         sSFA = st.sSFA.get_tensor(sfa_layout)
@@ -793,50 +939,82 @@ class K3MoeLowMDynKernel:
                     if j == 0:
                         with cute.arch.elect_one():
                             self._stamp(trace_ptr, bid, 2)
-                for kb in cutlass.range(self.nkb1, unroll=1):
-                    g = self._load_stage(
-                        tma_a1,
-                        tma_sfa1,
-                        tAsA1,
-                        tAgA1,
-                        tAsSFA1,
-                        tAgSFA1,
-                        blk,
-                        kb,
-                        expert,
-                        a_full,
-                        a_empty,
-                        g,
-                    )
-                n1u += 1
-            else:
-                # the token warp fills the reserved slot(s) with the unit's token operand
-                slot = self._reserve_slot(a_empty, g)
-                g += 1
-                if cutlass.const_expr(self.b2_slots > 1):
-                    self._reserve_slot(a_empty, g)
-                    g += 1
-                self._q_write(st, j, cur, slot)
-                v = cur - w1
-                tile = v // self.nchunk2
-                c = v - tile * self.nchunk2
-                expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
-                for sb in cutlass.range(self.fc2_chunk, unroll=1):
-                    for kb in cutlass.range(self.nkb2, unroll=1):
+                if cutlass.const_expr(self.wide):
+                    for kb in cutlass.range(self.nkb1, unroll=1):
+                        stage = self._reserve_slot(a_empty, g)
+                        self._load_stage_wide(
+                            tma_a1, tma_sfa1, tAsA1, tAgA1, tAsSFA1, tAgSFA1, blk, kb, expert,
+                            a_full, stage, self.fc1_stage_tx,
+                        )  # fmt: skip
+                        # the step's tokens of this K block into the stage's token operand
+                        cute.copy(
+                            tma_b1,
+                            tBgB1[(None, 0, kb, 0)],
+                            tBsB1[(None, self.num_ab_stage * self.b_per_slot + stage)],
+                            tma_bar_ptr=a_full + stage,
+                        )
+                        g += 1
+                else:
+                    for kb in cutlass.range(self.nkb1, unroll=1):
                         g = self._load_stage(
-                            tma_a2,
-                            tma_sfa2,
-                            tAsA2,
-                            tAgA2,
-                            tAsSFA2,
-                            tAgSFA2,
-                            c * self.fc2_chunk + sb,
+                            tma_a1,
+                            tma_sfa1,
+                            tAsA1,
+                            tAgA1,
+                            tAsSFA1,
+                            tAgSFA1,
+                            blk,
                             kb,
                             expert,
                             a_full,
                             a_empty,
                             g,
                         )
+                n1u += 1
+            else:
+                if cutlass.const_expr(self.wide):
+                    # the token warp fills the token part of the unit's stages, from stage g on
+                    self._q_write(st, j, cur, g)
+                    v = cur - w1
+                    tile = v // self.nchunk2
+                    c = v - tile * self.nchunk2
+                    expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
+                    for sb in cutlass.range(self.fc2_chunk, unroll=1):
+                        for kb in cutlass.range(self.nkb2, unroll=1):
+                            stage = self._reserve_slot(a_empty, g)
+                            self._load_stage_wide(
+                                tma_a2, tma_sfa2, tAsA2, tAgA2, tAsSFA2, tAgSFA2, c * self.fc2_chunk + sb,
+                                kb, expert, a_full, stage, self.fc2_stage_tx,
+                            )  # fmt: skip
+                            g += 1
+                else:
+                    # the token warp fills the reserved slot(s) with the unit's token operand
+                    slot = self._reserve_slot(a_empty, g)
+                    g += 1
+                    if cutlass.const_expr(self.b2_slots > 1):
+                        self._reserve_slot(a_empty, g)
+                        g += 1
+                    self._q_write(st, j, cur, slot)
+                    v = cur - w1
+                    tile = v // self.nchunk2
+                    c = v - tile * self.nchunk2
+                    expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
+                    for sb in cutlass.range(self.fc2_chunk, unroll=1):
+                        for kb in cutlass.range(self.nkb2, unroll=1):
+                            g = self._load_stage(
+                                tma_a2,
+                                tma_sfa2,
+                                tAsA2,
+                                tAgA2,
+                                tAsSFA2,
+                                tAgSFA2,
+                                c * self.fc2_chunk + sb,
+                                kb,
+                                expert,
+                                a_full,
+                                a_empty,
+                                g,
+                            )
             cur = cute.arch.shuffle_sync(nxt, 0)
             j += 1
         self._q_write(st, j, Int32(-1), Int32(-1))
@@ -873,7 +1051,9 @@ class K3MoeLowMDynKernel:
         """The step's tokens (FC1's token operand) once; for FC1 unit ``u < _ZERO_SLICES`` slice
         ``u`` of the output is zeroed and every tile counter released once more; then for every
         FC2 unit the FC1 output rows and scales of its tile into the unit's ring slot(s), once FC1
-        has stored all of the tile's rows and the output is zeroed."""
+        has stored all of the tile's rows and the output is zeroed. Wide build: no tokens here (the
+        weight TMA warp streams them); an FC2 unit's rows and scales go into the token part of each
+        of its stages, as the MMA releases them."""
         S = self.num_ab_stage
         b_cta = cute.make_layout(cute.slice_(cl, (0, None, 0, 0)).shape)
         tiler = cute.slice_(self.mma_tiler, (0, None, None))
@@ -887,17 +1067,21 @@ class K3MoeLowMDynKernel:
             tma_b2, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB2, 0, 3)
         )
         x_stage0 = S * self.b_per_slot
-        if w1 > 0:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(st.tok_full, self.x_bytes)
-            for kb in cutlass.range(self.nkb1, unroll=1):
-                cute.copy(
-                    tma_b1,
-                    tBgB1[(None, 0, kb, 0)],
-                    tBsB1[(None, x_stage0 + kb)],
-                    tma_bar_ptr=st.tok_full,
-                )
+        if cutlass.const_expr(not self.wide):
+            if w1 > 0:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(st.tok_full, self.x_bytes)
+                for kb in cutlass.range(self.nkb1, unroll=1):
+                    cute.copy(
+                        tma_b1,
+                        tBgB1[(None, 0, kb, 0)],
+                        tBsB1[(None, x_stage0 + kb)],
+                        tma_bar_ptr=st.tok_full,
+                    )
         a_full = st.a_full.data_ptr()
+        if cutlass.const_expr(self.wide):
+            a_empty = st.a_empty.data_ptr()
+            sfr_base = self._region_addr(st, self.sfr_off)
         slot_base = st.sA.data_ptr().toint()
         h_sf_base = h_sf_ptr.toint()
         ctr = ctr_ptr.toint()
@@ -944,35 +1128,62 @@ class K3MoeLowMDynKernel:
                     with cute.arch.elect_one():
                         _atom_max_u64(tt + 16, t_done - t_poll)
                 h_sf_src = h_sf_base + Int64(tile) * (_MMA_M * (self.k2 // _SF_VEC))
-                if cutlass.const_expr(self.b2_slots == 1):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            a_full + slot, self.b2_data_bytes + self.b2_sf_bytes
-                        )
-                        _bulk_g2s(
-                            slot_base + slot * _SLOT_BYTES + self.b2_sf_off,
-                            h_sf_src,
-                            self.b2_sf_bytes,
-                            (a_full + slot).toint(),
-                        )
+                if cutlass.const_expr(self.wide):
+                    # the token part of the unit's stages (from stage ``slot`` on): K block kb of
+                    # the tile's rows and its 2 KB scale block, once the MMA has released the stage
+                    for sb in cutlass.range(self.fc2_chunk, unroll=1):
+                        for kb in cutlass.range(self.nkb2, unroll=1):
+                            gs = slot + sb * self.nkb2 + kb
+                            ws = gs % S
+                            if gs >= S:
+                                cute.arch.mbarrier_wait(a_empty + ws, ((gs // S) & 1) ^ 1)
+                            with cute.arch.elect_one():
+                                _bulk_g2s(
+                                    sfr_base + ws * _SF_KBLK_BYTES,
+                                    h_sf_src + Int64(kb * _SF_KBLK_BYTES),
+                                    _SF_KBLK_BYTES,
+                                    (a_full + ws).toint(),
+                                )
+                            cute.copy(
+                                tma_b2,
+                                tBgB2[(None, tile * (_MMA_M // self.n_tok), kb, 0)],
+                                tBsB2[(None, x_stage0 + ws)],
+                                tma_bar_ptr=a_full + ws,
+                            )
                 else:
-                    slot2 = (slot + 1) % S
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(a_full + slot, self.b2_data_bytes)
-                        cute.arch.mbarrier_arrive_and_expect_tx(a_full + slot2, self.b2_sf_bytes)
-                        _bulk_g2s(
-                            slot_base + slot2 * _SLOT_BYTES,
-                            h_sf_src,
-                            self.b2_sf_bytes,
-                            (a_full + slot2).toint(),
+                    if cutlass.const_expr(self.b2_slots == 1):
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                a_full + slot, self.b2_data_bytes + self.b2_sf_bytes
+                            )
+                            _bulk_g2s(
+                                slot_base + slot * _SLOT_BYTES + self.b2_sf_off,
+                                h_sf_src,
+                                self.b2_sf_bytes,
+                                (a_full + slot).toint(),
+                            )
+                    else:
+                        slot2 = (slot + 1) % S
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                a_full + slot, self.b2_data_bytes
+                            )
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                a_full + slot2, self.b2_sf_bytes
+                            )
+                            _bulk_g2s(
+                                slot_base + slot2 * _SLOT_BYTES,
+                                h_sf_src,
+                                self.b2_sf_bytes,
+                                (a_full + slot2).toint(),
+                            )
+                    for kb in cutlass.range(self.nkb2, unroll=1):
+                        cute.copy(
+                            tma_b2,
+                            tBgB2[(None, tile * (_MMA_M // self.n_tok), kb, 0)],
+                            tBsB2[(None, slot * self.b_per_slot + kb)],
+                            tma_bar_ptr=a_full + slot,
                         )
-                for kb in cutlass.range(self.nkb2, unroll=1):
-                    cute.copy(
-                        tma_b2,
-                        tBgB2[(None, tile * (_MMA_M // self.n_tok), kb, 0)],
-                        tBsB2[(None, slot * self.b_per_slot + kb)],
-                        tma_bar_ptr=a_full + slot,
-                    )
                 # counter reset: every FC2 block of the tile adds 1 after the wait; the last zeroes it
                 if lane == 0:
                     old = _atom_add_relaxed(ready_addr, self.fc2_chunk)
@@ -1046,7 +1257,8 @@ class K3MoeLowMDynKernel:
             if u < w1:
                 if first1 > 0:
                     first1 = Int32(0)
-                    cute.arch.mbarrier_wait(st.tok_full, 0)
+                    if cutlass.const_expr(not self.wide):
+                        cute.arch.mbarrier_wait(st.tok_full, 0)
                     cute.arch.mbarrier_wait(st.sfb_full, 0)
             else:
                 if cutlass.const_expr(self.trace):
@@ -1063,11 +1275,15 @@ class K3MoeLowMDynKernel:
                     w_b2 += _globaltimer() - t_w
                 nsub = Int32(self.fc2_chunk)
                 nst = Int32(self.nkb2)
-                b0 = slot * self.b_per_slot
-                if cutlass.const_expr(self.b2_slots == 1):
-                    sf0 = (slot * _SLOT_BYTES + self.b2_sf_off) // _SF_KBLK_BYTES
+                if cutlass.const_expr(not self.wide):
+                    b0 = slot * self.b_per_slot
+                    if cutlass.const_expr(self.b2_slots == 1):
+                        sf0 = (slot * _SLOT_BYTES + self.b2_sf_off) // _SF_KBLK_BYTES
+                    else:
+                        sf0 = ((slot + 1) % S) * sf_per_slot
                 else:
-                    sf0 = ((slot + 1) % S) * sf_per_slot
+                    # the token scales of a stage: the stage's block of the scale ring
+                    sf0 = Int32((S * _SLOT_BYTES + self.sfr_off) // _SF_KBLK_BYTES)
             for sb in cutlass.range(nsub, unroll=1):
                 acc_stage = j % NACC
                 if j >= NACC:
@@ -1086,30 +1302,50 @@ class K3MoeLowMDynKernel:
                     if cutlass.const_expr(self.trace):
                         w_a += _globaltimer() - t_w
                     cute.copy(s2t_sfa, tCsSFA[(None, None, None, None, stage)], tCtSFA_s2t)
-                    cute.copy(s2t_sfb, tCsSFB[(None, None, None, None, sf0 + kb)], tCtSFB_s2t)
-                    for kp in cutlass.range_constexpr(nkp):
-                        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
-                        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                        cute.gemm(
-                            tiled_mma,
-                            tAcc[(None, 0, 0)],
-                            tCrA[(None, 0, kp, stage)],
-                            tCrB[(None, 0, kp, b0 + kb)],
-                            tAcc[(None, 0, 0)],
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    if cutlass.const_expr(self.wide):
+                        # the token operand is the stage's own; its scales are the stage's block of
+                        # the scale ring (FC2) or K block kb of the step's scales (FC1)
+                        sfi = sf0 + kb
+                        if u >= w1:
+                            sfi = sf0 + stage
+                        cute.copy(s2t_sfb, tCsSFB[(None, None, None, None, sfi)], tCtSFB_s2t)
+                        for kp in cutlass.range_constexpr(nkp):
+                            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                            cute.gemm(
+                                tiled_mma,
+                                tAcc[(None, 0, 0)],
+                                tCrA[(None, 0, kp, stage)],
+                                tCrB[(None, 0, kp, x_b0 + stage)],
+                                tAcc[(None, 0, 0)],
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    else:
+                        cute.copy(s2t_sfb, tCsSFB[(None, None, None, None, sf0 + kb)], tCtSFB_s2t)
+                        for kp in cutlass.range_constexpr(nkp):
+                            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                            cute.gemm(
+                                tiled_mma,
+                                tAcc[(None, 0, 0)],
+                                tCrA[(None, 0, kp, stage)],
+                                tCrB[(None, 0, kp, b0 + kb)],
+                                tAcc[(None, 0, 0)],
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                     with cute.arch.elect_one():
                         tcgen05.commit(a_empty + stage)
                     g += 1
                 with cute.arch.elect_one():
                     tcgen05.commit(acc_full + acc_stage)
                 j += 1
-            if u >= w1:
-                # the token-operand slot(s) are free once the unit's MMAs are done
-                with cute.arch.elect_one():
-                    tcgen05.commit(a_empty + slot)
-                    if cutlass.const_expr(self.b2_slots > 1):
-                        tcgen05.commit(a_empty + (slot + 1) % S)
+            if cutlass.const_expr(not self.wide):
+                if u >= w1:
+                    # the token-operand slot(s) are free once the unit's MMAs are done
+                    with cute.arch.elect_one():
+                        tcgen05.commit(a_empty + slot)
+                        if cutlass.const_expr(self.b2_slots > 1):
+                            tcgen05.commit(a_empty + (slot + 1) % S)
             e += 1
             u, slot = self._q_read(st, e)
         if cutlass.const_expr(self.trace):
@@ -1199,6 +1435,65 @@ class K3MoeLowMDynKernel:
             out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)
             out[i] = out_pair[0]
             out[i + 1] = out_pair[1]
+
+    @cute.jit
+    def _fc1_row(
+        self, src, row, q, tile, blk, alpha_val, norm_const, h_base, h_sf_base, up, gate, tCompute, rSF,
+        rQ, rPv,
+    ):  # fmt: skip
+        """Wide build, FC1 epilogue of one thread for row ``row`` of the tile: the 16 up / gate
+        accumulators of its quarter from the staged column at ``src``, SiTU, NVFP4 quantization and
+        the stores, the instruction sequence of the narrow builds' epilogue."""
+        rcp_limit = Float32(1.0 / 6.0)
+        fp32_max = Float32(3.40282346638528859812e38)
+        h_row_bytes = self.k2 // 2
+        tile_sf_bytes = _MMA_M * (self.k2 // _SF_VEC)
+        for vv in cutlass.range_constexpr(4):
+            u0, u1, u2, u3 = _lds_v4_f32(src + vv * 16)
+            g0, g1, g2, g3 = _lds_v4_f32(src + 256 + vv * 16)
+            up[4 * vv] = u0
+            up[4 * vv + 1] = u1
+            up[4 * vv + 2] = u2
+            up[4 * vv + 3] = u3
+            gate[4 * vv] = g0
+            gate[4 * vv + 1] = g1
+            gate[4 * vv + 2] = g2
+            gate[4 * vv + 3] = g3
+        self._situ(up, gate, alpha_val, tCompute)
+        frg = cute.logical_divide(tCompute, cute.make_layout(_SF_VEC))
+        acc_frg = frg.load()
+        abs_ir = math.absf(acc_frg.ir_value())
+        abs_frg = type(acc_frg)(abs_ir, acc_frg.shape, acc_frg.dtype)
+        amax = abs_frg[None, 0].reduce(cute.ReductionOp.MAX, Float32(0.0), 0)
+        pv = cute.arch.mul_packed_f32x2((amax, Float32(0.0)), (rcp_limit, rcp_limit))
+        pv = cute.arch.mul_packed_f32x2((pv[0], pv[1]), (norm_const, norm_const))
+        rPv[0] = pv[0]
+        rPv[1] = pv[1]
+        rSF.store(rPv.load().to(self.sf_dtype))
+        sf_f32 = rSF.load().to(Float32)
+        acc_scale = cute.arch.mul_packed_f32x2(
+            (cute.arch.rcp_approx(sf_f32[0]), cute.arch.rcp_approx(sf_f32[1])),
+            (norm_const, norm_const),
+        )
+        scale0 = fmin(acc_scale[0], fp32_max, nan=True)
+        for ei in cutlass.range_constexpr(0, 16, 2):
+            tCompute[ei], tCompute[ei + 1] = cute.arch.mul_packed_f32x2(
+                (tCompute[ei], tCompute[ei + 1]), (scale0, scale0)
+            )
+        rQ.store(tCompute.load().to(cutlass.Float4E2M1FN))
+        rQw = cute.recast_tensor(rQ, Int32)
+        rSFb = cute.recast_tensor(rSF, cutlass.Uint8)
+        grow = tile * _MMA_M + row
+        _stg_v2_b32(h_base + Int64(grow) * h_row_bytes + blk * 32 + q * 8, rQw[0], rQw[1])
+        _stg_u8(
+            h_sf_base
+            + Int64(tile) * tile_sf_bytes
+            + blk * 512
+            + (row % 32) * 16
+            + (row // 32) * 4
+            + q,
+            Int32(rSFb[0]),
+        )
 
     @cute.jit
     def _epilogue(
@@ -1293,72 +1588,109 @@ class K3MoeLowMDynKernel:
                         Int32(n_tok),
                     )
                     alpha_val = alpha1[tile_idx_to_expert_idx[tile]]
-                    tok = Int32(0)
-                    if r < n_valid:
-                        tok = permuted_idx_to_expanded_idx[tile * _MMA_M + r] // self.topk
-                    acc_stage = j % NACC
-                    cute.arch.mbarrier_wait(acc_full + acc_stage, (j // NACC) & 1)
-                    cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0, 0, acc_stage)], rAcc)
-                    cute.arch.fence_view_async_tmem_load()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(acc_empty + acc_stage)
-                    for i in cutlass.range_constexpr(cute.size(rAcc)):
-                        row, col = tTR_cAcc[i]
-                        _sts_f32(sacc_base + col * col_bytes + row * 4, rAcc[i])
-                    self._wg_barrier(Int32(0))
-                    if r < n_valid:
-                        src = sacc_base + tok * col_bytes + q * 64
-                        for vv in cutlass.range_constexpr(4):
-                            u0, u1, u2, u3 = _lds_v4_f32(src + vv * 16)
-                            g0, g1, g2, g3 = _lds_v4_f32(src + 256 + vv * 16)
-                            up[4 * vv] = u0
-                            up[4 * vv + 1] = u1
-                            up[4 * vv + 2] = u2
-                            up[4 * vv + 3] = u3
-                            gate[4 * vv] = g0
-                            gate[4 * vv + 1] = g1
-                            gate[4 * vv + 2] = g2
-                            gate[4 * vv + 3] = g3
-                        self._situ(up, gate, alpha_val, tCompute)
-                        frg = cute.logical_divide(tCompute, cute.make_layout(_SF_VEC))
-                        acc_frg = frg.load()
-                        abs_ir = math.absf(acc_frg.ir_value())
-                        abs_frg = type(acc_frg)(abs_ir, acc_frg.shape, acc_frg.dtype)
-                        amax = abs_frg[None, 0].reduce(cute.ReductionOp.MAX, Float32(0.0), 0)
-                        pv = cute.arch.mul_packed_f32x2(
-                            (amax, Float32(0.0)), (rcp_limit, rcp_limit)
-                        )
-                        pv = cute.arch.mul_packed_f32x2((pv[0], pv[1]), (norm_const, norm_const))
-                        rPv[0] = pv[0]
-                        rPv[1] = pv[1]
-                        rSF.store(rPv.load().to(self.sf_dtype))
-                        sf_f32 = rSF.load().to(Float32)
-                        acc_scale = cute.arch.mul_packed_f32x2(
-                            (cute.arch.rcp_approx(sf_f32[0]), cute.arch.rcp_approx(sf_f32[1])),
-                            (norm_const, norm_const),
-                        )
-                        scale0 = fmin(acc_scale[0], fp32_max, nan=True)
-                        for ei in cutlass.range_constexpr(0, 16, 2):
-                            tCompute[ei], tCompute[ei + 1] = cute.arch.mul_packed_f32x2(
-                                (tCompute[ei], tCompute[ei + 1]), (scale0, scale0)
+                    if cutlass.const_expr(self.wide):
+                        # 64 tokens: thread et quantizes 16 outputs of rows r and r + 32
+                        tok = Int32(0)
+                        tok_hi = Int32(0)
+                        if r < n_valid:
+                            tok = permuted_idx_to_expanded_idx[tile * _MMA_M + r] // self.topk
+                        if r + 32 < n_valid:
+                            tok_hi = (
+                                permuted_idx_to_expanded_idx[tile * _MMA_M + r + 32] // self.topk
                             )
-                        rQ.store(tCompute.load().to(cutlass.Float4E2M1FN))
-                        rQw = cute.recast_tensor(rQ, Int32)
-                        rSFb = cute.recast_tensor(rSF, cutlass.Uint8)
-                        grow = tile * _MMA_M + r
-                        _stg_v2_b32(
-                            h_base + Int64(grow) * h_row_bytes + blk * 32 + q * 8, rQw[0], rQw[1]
-                        )
-                        _stg_u8(
-                            h_sf_base
-                            + Int64(tile) * tile_sf_bytes
-                            + blk * 512
-                            + (r % 32) * 16
-                            + (r // 32) * 4
-                            + q,
-                            Int32(rSFb[0]),
-                        )
+                        acc_stage = j % NACC
+                        cute.arch.mbarrier_wait(acc_full + acc_stage, (j // NACC) & 1)
+                        cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0, 0, acc_stage)], rAcc)
+                        cute.arch.fence_view_async_tmem_load()
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(acc_empty + acc_stage)
+                        for i in cutlass.range_constexpr(cute.size(rAcc)):
+                            row, col = tTR_cAcc[i]
+                            _sts_f32(sacc_base + col * col_bytes + row * 4, rAcc[i])
+                        self._wg_barrier(Int32(0))
+                        if r < n_valid:
+                            self._fc1_row(
+                                sacc_base + tok * col_bytes + q * 64, r, q, tile, blk, alpha_val,
+                                norm_const, h_base, h_sf_base, up, gate, tCompute, rSF, rQ, rPv,
+                            )  # fmt: skip
+                        if r + 32 < n_valid:
+                            self._fc1_row(
+                                sacc_base + tok_hi * col_bytes + q * 64, r + 32, q, tile, blk,
+                                alpha_val, norm_const, h_base, h_sf_base, up, gate, tCompute, rSF, rQ,
+                                rPv,
+                            )  # fmt: skip
+                    else:
+                        tok = Int32(0)
+                        if r < n_valid:
+                            tok = permuted_idx_to_expanded_idx[tile * _MMA_M + r] // self.topk
+                        acc_stage = j % NACC
+                        cute.arch.mbarrier_wait(acc_full + acc_stage, (j // NACC) & 1)
+                        cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, 0, 0, acc_stage)], rAcc)
+                        cute.arch.fence_view_async_tmem_load()
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(acc_empty + acc_stage)
+                        for i in cutlass.range_constexpr(cute.size(rAcc)):
+                            row, col = tTR_cAcc[i]
+                            _sts_f32(sacc_base + col * col_bytes + row * 4, rAcc[i])
+                        self._wg_barrier(Int32(0))
+                        if r < n_valid:
+                            src = sacc_base + tok * col_bytes + q * 64
+                            for vv in cutlass.range_constexpr(4):
+                                u0, u1, u2, u3 = _lds_v4_f32(src + vv * 16)
+                                g0, g1, g2, g3 = _lds_v4_f32(src + 256 + vv * 16)
+                                up[4 * vv] = u0
+                                up[4 * vv + 1] = u1
+                                up[4 * vv + 2] = u2
+                                up[4 * vv + 3] = u3
+                                gate[4 * vv] = g0
+                                gate[4 * vv + 1] = g1
+                                gate[4 * vv + 2] = g2
+                                gate[4 * vv + 3] = g3
+                            self._situ(up, gate, alpha_val, tCompute)
+                            frg = cute.logical_divide(tCompute, cute.make_layout(_SF_VEC))
+                            acc_frg = frg.load()
+                            abs_ir = math.absf(acc_frg.ir_value())
+                            abs_frg = type(acc_frg)(abs_ir, acc_frg.shape, acc_frg.dtype)
+                            amax = abs_frg[None, 0].reduce(cute.ReductionOp.MAX, Float32(0.0), 0)
+                            pv = cute.arch.mul_packed_f32x2(
+                                (amax, Float32(0.0)), (rcp_limit, rcp_limit)
+                            )
+                            pv = cute.arch.mul_packed_f32x2(
+                                (pv[0], pv[1]), (norm_const, norm_const)
+                            )
+                            rPv[0] = pv[0]
+                            rPv[1] = pv[1]
+                            rSF.store(rPv.load().to(self.sf_dtype))
+                            sf_f32 = rSF.load().to(Float32)
+                            acc_scale = cute.arch.mul_packed_f32x2(
+                                (cute.arch.rcp_approx(sf_f32[0]), cute.arch.rcp_approx(sf_f32[1])),
+                                (norm_const, norm_const),
+                            )
+                            scale0 = fmin(acc_scale[0], fp32_max, nan=True)
+                            for ei in cutlass.range_constexpr(0, 16, 2):
+                                tCompute[ei], tCompute[ei + 1] = cute.arch.mul_packed_f32x2(
+                                    (tCompute[ei], tCompute[ei + 1]), (scale0, scale0)
+                                )
+                            rQ.store(tCompute.load().to(cutlass.Float4E2M1FN))
+                            rQw = cute.recast_tensor(rQ, Int32)
+                            rSFb = cute.recast_tensor(rSF, cutlass.Uint8)
+                            grow = tile * _MMA_M + r
+                            _stg_v2_b32(
+                                h_base + Int64(grow) * h_row_bytes + blk * 32 + q * 8,
+                                rQw[0],
+                                rQw[1],
+                            )
+                            _stg_u8(
+                                h_sf_base
+                                + Int64(tile) * tile_sf_bytes
+                                + blk * 512
+                                + (r % 32) * 16
+                                + (r // 32) * 4
+                                + q,
+                                Int32(rSFb[0]),
+                            )
                     self._wg_barrier(Int32(0))
                     # the barrier orders every thread's stores of this unit before the release
                     if et == 0:
