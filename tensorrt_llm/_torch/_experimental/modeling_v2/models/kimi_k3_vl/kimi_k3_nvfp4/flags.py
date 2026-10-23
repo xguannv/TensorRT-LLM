@@ -196,7 +196,7 @@ TRTLLM_K3LL_OPROJ_PUSH = _flag(
 )
 TRTLLM_K3LL_MOE_TAIL_PUSH = _flag(
     "TRTLLM_K3LL_MOE_TAIL_PUSH",
-    0,
+    1,
     "wide decode steps whose MoE tail runs on k3_ctm_gemv_wide (9-32 tokens): the tail GEMV pushes its partial into "
     "the next pre-attention step's (or final norm's) all-reduce, K3LamportFinish + K3AttnResFast run the rest "
     "(moe_tail_push.py; bitwise; read at forward time)",
