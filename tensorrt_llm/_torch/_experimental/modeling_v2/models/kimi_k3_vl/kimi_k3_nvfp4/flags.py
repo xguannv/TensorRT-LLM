@@ -261,7 +261,7 @@ TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
 )
 TRTLLM_K3LL_MLA_VAR_SPLIT = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT",
-    0,
+    1,
     "Helix MLA split read with the V up-projection: each request's own split-KV count from its KV length on the "
     "rank (computed on device once per step, decode_mla_dcp.var_split_counts), so a batch of mixed lengths is not "
     "bound by its longest request; equal lengths keep the static split's count (not bitwise in general: the split "

@@ -238,6 +238,8 @@ def ref_on_chain(module, quant_q, meta, ag, softmax_scale, w_uv):
     ]
     plan = DCP.make_helix_plan(meta.kv_cache_block_offsets[0, :, 0, :], meta.kv_lens_cuda_runtime,
                                meta.helix_position_offsets[:tokens], PAGE, R.world, R.rank)  # fmt: skip
+    if FLAGS.TRTLLM_K3LL_MLA_VAR_SPLIT:  # the split counts MlaSplitRead._step_plan gives the on arm
+        plan = DCP.with_var_split(plan, heads, Q_LEN)
     latent = torch.empty(requests, Q_LEN, heads, LATENT, dtype=torch.bfloat16, device="cuda")
     stats = torch.empty(tokens, heads, 2, dtype=torch.float32, device="cuda")
     v_part = torch.empty(tokens, heads, V, dtype=torch.bfloat16, device="cuda")
