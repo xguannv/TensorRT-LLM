@@ -27,6 +27,11 @@ Two bitwise switches act on these launches (forward time):
   twin (another norm path, PDL off, the CUDA JIT FlashInfer norm) the module's norm runs.
 * ``TRTLLM_K3LL_MLA_PREWAIT_L2``: ``K3MlaQAbsorb`` with ``prewait`` (every W_UK tile of the CTA staged or
   L2-prefetched before its PDL wait, dependents released after it).
+* ``TRTLLM_K3LL_MLA_QNORM_MXFP8`` (with ``TRTLLM_K3LL_MLA_QNORM_PDL``): that released norm also writes the MXFP8 form
+  of its output (``q_norm_pdl.rmsnorm_mxfp8_release_at_launch``) and Q-B runs ``k3_fp8w_lowm_mxfp8`` on it
+  (``fp8w_lowm.forward_mxfp8``) instead of quantizing its activation inside ``k3_fp8w_lowm_gemm`` after its wait
+  (`q_norm_and_q_b`). Where Q-B's MXFP8 GEMM does not take the rows (or is not compiled under a capture) Q-B reads
+  the BF16 norm as before.
 
 ``TRTLLM_K3LL_MLA_GATE_SIDE``: `GateSide` runs the output gate projection on a per-device side stream, forked where
 the attention starts and joined before the V-B / gate kernel, which reads it in place.
@@ -121,6 +126,36 @@ def q_a_norm(q_a: torch.Tensor, q_a_layernorm, release: bool) -> Tuple[torch.Ten
     return q_a_layernorm(q_a), False
 
 
+def q_norm_and_q_b(
+    q_a: torch.Tensor, q_a_layernorm, q_b_proj, release: bool, mxfp8: bool
+) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    """``q_b_proj(q_a_layernorm(q_a))`` (bitwise), with ``release`` (``TRTLLM_K3LL_MLA_QNORM_PDL``) through `q_a_norm`
+    and, with ``mxfp8`` too (``TRTLLM_K3LL_MLA_QNORM_MXFP8``), the norm's MXFP8 form handed to Q-B where Q-B's MXFP8
+    GEMM takes these rows. Returns ``(q_norm, q, suffix)``: ``suffix`` ``"+qnorm_mxfp8"`` when Q-B ran on the MXFP8
+    form, ``"+qnorm_pdl"`` when the released norm ran, else ``""``."""
+    from . import fp8w_lowm as _fp8w_lowm
+
+    if (
+        release
+        and mxfp8
+        and _fp8w_lowm.takes_mxfp8_input(q_b_proj, q_a.shape[0])
+        and _release_norm_applies(q_a, q_a_layernorm)
+    ):
+        from tensorrt_llm._torch.modules.kimi_k3_mla import q_norm_pdl
+
+        if q_norm_pdl.can_use_mxfp8(q_a, q_a_layernorm.weight):
+            xq, xs = _fp8w_lowm.new_mxfp8_input(q_a.shape[0], q_a.shape[1], q_a.device)
+            q_norm = q_norm_pdl.rmsnorm_mxfp8_release_at_launch(
+                q_a, q_a_layernorm.weight, float(q_a_layernorm.variance_epsilon), xq, xs
+            )
+            before = _fp8w_lowm.MX_STATS["mxfp8"]
+            q = _fp8w_lowm.forward_mxfp8(q_b_proj, q_norm, xq, xs)
+            took = _fp8w_lowm.MX_STATS["mxfp8"] > before
+            return q_norm, q, "+qnorm_mxfp8" if took else "+qnorm_pdl"
+    q_norm, released = q_a_norm(q_a, q_a_layernorm, release)
+    return q_norm, q_b_proj(q_norm), "+qnorm_pdl" if released else ""
+
+
 def all_head_queries(
     q_a: torch.Tensor,
     q_a_layernorm: Callable[[torch.Tensor], torch.Tensor],
@@ -130,20 +165,21 @@ def all_head_queries(
     rope: int,
     release_norm: bool = False,
     absorb_prewait: bool = False,
+    qnorm_mxfp8: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
     """Every head's FP8 query from the q_a columns ``q_a`` (``[tokens, q_lora_rank]`` bf16, any row stride).
 
-    ``release_norm`` / ``absorb_prewait``: ``TRTLLM_K3LL_MLA_QNORM_PDL`` / ``TRTLLM_K3LL_MLA_PREWAIT_L2`` (bitwise).
-    Returns ``(quant_q, q, kernel, q_norm)``: ``quant_q`` ``[tokens, heads, kv_lora_rank + rope]`` uint8 (FP8 bytes,
-    what the split read takes), ``q`` the BF16 Q-B output viewed ``[tokens, heads, nope + rope]``, the kernels'
-    names (absorption, and ``+qnorm_pdl`` when the released norm ran) and Q-B's input (the normalized q_a)."""
+    ``release_norm`` / ``absorb_prewait`` / ``qnorm_mxfp8``: ``TRTLLM_K3LL_MLA_QNORM_PDL`` /
+    ``TRTLLM_K3LL_MLA_PREWAIT_L2`` / ``TRTLLM_K3LL_MLA_QNORM_MXFP8`` (bitwise). Returns ``(quant_q, q, kernel,
+    q_norm)``: ``quant_q`` ``[tokens, heads, kv_lora_rank + rope]`` uint8 (FP8 bytes, what the split read takes),
+    ``q`` the BF16 Q-B output viewed ``[tokens, heads, nope + rope]``, the kernels' names (absorption, then
+    ``+qnorm_pdl`` when the released norm ran or ``+qnorm_mxfp8`` when Q-B also ran on its MXFP8 form) and Q-B's
+    input (the normalized q_a)."""
     heads, lora = w_kc.shape[0], w_kc.shape[1]
-    q_norm, released = q_a_norm(q_a, q_a_layernorm, release_norm)
-    q = q_b_proj(q_norm).view(q_a.shape[0], heads, nope + rope)
+    q_norm, q, suffix = q_norm_and_q_b(q_a, q_a_layernorm, q_b_proj, release_norm, qnorm_mxfp8)
+    q = q.view(q_a.shape[0], heads, nope + rope)
     quant_q = torch.empty((q_a.shape[0], heads, lora + rope), dtype=torch.uint8, device=q_a.device)
-    kernel = absorb_queries(q, w_kc, quant_q, nope, rope, prewait=absorb_prewait)
-    if released:
-        kernel += "+qnorm_pdl"
+    kernel = absorb_queries(q, w_kc, quant_q, nope, rope, prewait=absorb_prewait) + suffix
     return quant_q, q, kernel, q_norm
 
 

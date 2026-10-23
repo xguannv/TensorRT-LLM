@@ -20,6 +20,12 @@ completion implies the q_a GEMM's (this grid waits on it before reading). Grids 
 the chain (q absorb, MLA decode) are released by q_b's own trigger and read only weights
 before their waits, as before; the decode additionally has a full graph dependency on the
 KV append. So no read moves ahead of its writer.
+
+MXFP8 form (``TRTLLM_K3LL_MLA_QNORM_MXFP8``, :func:`rmsnorm_mxfp8_release_at_launch`): the same kernel also stores
+the MXFP8 form of its BF16 output (``fp8w_lowm``'s pre-quantized input: E4M3 codes and one UE8M0 exponent per 1x32
+group, quantized as ``k3_fp8w_lowm_gemm`` quantizes a BF16 activation in-kernel), so q_b runs
+``k3_fp8w_lowm_mxfp8`` on it and skips that quantization after its wait. The BF16 output is still written (every
+fallback reads it).
 """
 
 from __future__ import annotations
@@ -30,7 +36,11 @@ import math
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int64
+from cutlass import Float32, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+from ...cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx_ops
 
 try:
     from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
@@ -217,6 +227,250 @@ class _LaunchReleaseRMSNormKernel(RMSNormKernel):
             cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
 
+@dsl_user_op
+def _shfl_xor_b32(value, offset: int, *, loc=None, ip=None):
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(value).ir_value(loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 0x1f, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_v2_b32(addr, w0, w1, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _stg_u8_if(valid, addr, value, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(valid).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n.reg .pred p;\nsetp.ne.u32 p, $0, 0;\n@p st.global.u8 [$1], $2;\n}",
+        "r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+class _MxReleaseRMSNormKernel(_LaunchReleaseRMSNormKernel):
+    """:class:`_LaunchReleaseRMSNormKernel` that also stores the MXFP8 form of its BF16 output (for
+    ``k3_fp8w_lowm_mxfp8``).
+
+    The body is the parent's (weight before the wait, the same loads, reduction, ``rsqrt`` and multiply order, the
+    BF16 store), so the BF16 values are bitwise FlashInfer's. They are then quantized like the low-M FP8 GEMM
+    quantizes a BF16 activation in-kernel: per 1x32 group the ``max.xorsign.abs`` amax of the 32 BF16 values (the
+    four lanes of a quad hold one group: ``threads_per_row == 32`` and 8-value vectors put columns
+    ``8 * lane + 256 * j`` in lane ``lane``), the UE8M0 exponent of ``amax / 448`` with the GEMM's amax floor, the
+    exact power-of-two BF16 multiply and the satfinite round-to-nearest E4M3 conversion (the producer helpers of
+    ``k3_fp8w_lowm_mxfp8``). ``xq`` gets the E4M3 codes ``[M, H]`` and ``xs`` one UE8M0 byte per group
+    ``[M, H / 32]``. Only the tiling :func:`_mx_layout_ok` admits (one CTA per row group, no cluster).
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        xq_addr: Int64,
+        xs_addr: Int64,
+        M: Int64,
+        eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
+        stream,
+    ):
+        tv_shape, tv_stride = self._make_tv_layout(
+            self.threads_per_row,
+            self.rows_per_block,
+            self.vec_size,
+            self.num_vec_blocks,
+        )
+        tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
+        tiler_mn = (self.rows_per_block, self.cols_per_tile)
+        self.kernel_mx(
+            mX, mW, mY, xq_addr, xs_addr, M, eps, enable_pdl, tv_layout, tiler_mn
+        ).launch(
+            grid=[cute.ceil_div(M, self.rows_per_block), 1, 1],
+            block=[self.num_threads, 1, 1],
+            smem=self._smem_size_in_bytes(),
+            stream=stream,
+            use_pdl=enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel_mx(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        xq_addr: Int64,
+        xs_addr: Int64,
+        M: Int64,
+        eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
+        tv_layout: cute.Layout,
+        tiler_mn: cute.Shape,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        if enable_pdl:
+            # See the module docstring for why the trigger may precede the wait.
+            cute.arch.griddepcontrol_launch_dependents()
+
+        H = self.H
+        weight_bias = self.weight_bias
+        copy_bits = self.copy_bits
+        threads_per_row = tv_layout.shape[0][0]
+        rows_per_block = tiler_mn[0]
+        warps_per_row = max(threads_per_row // 32, 1)
+
+        smem = cutlass.utils.SmemAllocator()
+        if cutlass.const_expr(self.use_async_copy):
+            sX = smem.allocate_tensor(
+                mX.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
+        reduction_buffer = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((rows_per_block, warps_per_row)),
+            byte_alignment=4,
+        )
+
+        idX = cute.make_identity_tensor(mX.shape)
+        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
+        gY = cute.local_tile(mY, tiler_mn, (bidx, 0))
+        cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
+        mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
+        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
+
+        copy_atom_sync = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mX.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        copy_atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mY.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        if cutlass.const_expr(self.use_async_copy):
+            copy_atom_async = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mX.element_type,
+                num_bits_per_copy=copy_bits,
+            )
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_async, tv_layout, tiler_mn)
+        else:
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_sync, tv_layout, tiler_mn)
+        tiled_copy_W = cute.make_tiled_copy(copy_atom_sync, tv_layout, tiler_mn)
+        tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
+
+        thr_copy_X = tiled_copy_load.get_slice(tidx)
+        thr_copy_W = tiled_copy_W.get_slice(tidx)
+        thr_copy_O = tiled_copy_store.get_slice(tidx)
+
+        tXgX = thr_copy_X.partition_S(gX)
+        tXcX = thr_copy_X.partition_S(cX)
+        tXrX = cute.make_fragment_like(tXgX)
+        if cutlass.const_expr(self.use_async_copy):
+            tXsX = thr_copy_X.partition_D(sX)
+        tWgW = thr_copy_W.partition_S(gW)
+        tWrW = cute.make_fragment_like(tWgW)
+        tXrW = thr_copy_X.retile(tWrW)
+        tXgO = thr_copy_O.partition_D(gY)
+        tXrO = cute.make_fragment_like(tXgO)
+
+        tXpX = predicate_k(tXcX, limit=H)
+        tWpW = predicate_k(thr_copy_W.partition_S(cX), limit=H)
+        row_coord = tXcX[(0, 0), 0, 0]
+        row_in_bounds = row_coord[0] < M
+
+        # The weight is load-time state, not written by any grid this one depends on.
+        cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
+
+        if cutlass.const_expr(self.use_async_copy):
+            if row_in_bounds:
+                cute.copy(copy_atom_async, tXgX, tXsX, pred=tXpX)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.autovec_copy(tXsX, tXrX)
+        else:
+            tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
+            if row_in_bounds:
+                cute.copy(copy_atom_sync, tXgX, tXrX, pred=tXpX)
+
+        x = tXrX.load().to(Float32)
+        x_sq = x * x
+        sum_sq = row_reduce_sum_multirow(x_sq, threads_per_row, reduction_buffer, None, 1)
+
+        mean_sq = sum_sq / Float32(H)
+        rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
+
+        cute.arch.barrier()
+
+        if cutlass.const_expr(self.use_async_copy):
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(Float32)
+
+        w = tXrW.load().to(Float32)
+        y = x * rstd * (w + Float32(weight_bias))
+
+        tXrO.store(y.to(mY.element_type))
+
+        if row_in_bounds:
+            cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
+
+        # MXFP8 form of the BF16 row. A warp holds one row, so the quad shuffles below run in whole warps whatever
+        # the row bound.
+        if row_in_bounds:
+            words = cute.recast_tensor(tXrO, Int32)
+            lane = cute.arch.lane_idx()
+            row = Int64(row_coord[0])
+            for j in cutlass.range_constexpr(self.num_vec_blocks):
+                # flat index: element 0 of the j-th 8-value vector of this thread
+                col = Int64(tXcX[8 * j][1])
+                vec = [words[4 * j + i] for i in range(4)]
+                amax = mx_ops.amax_bf16x8_words(*vec)
+                amax = mx_ops.amax_pair(amax, _shfl_xor_b32(amax, 1))
+                amax = mx_ops.amax_pair(amax, _shfl_xor_b32(amax, 2))
+                e_a = mx_ops.ue8m0_of_amax(amax)
+                q0, q1 = mx_ops.quant_bf16x8_to_e4m3(*vec, mx_ops.bf16x2_inv_scale(e_a))
+                _stg_v2_b32(xq_addr + row * H + col, q0, q1)
+                _stg_u8_if(Int32((lane & 3) == 0), xs_addr + row * (H // 32) + (col >> 5), e_a)
+
+
 @functools.cache
 def _compiled(dtype_str: str, H: int, sm_version: int, contiguous: bool):
     """Compile like FlashInfer's ``_get_compiled_rmsnorm_kernel`` (weight_bias 0, PDL on)."""
@@ -294,4 +548,87 @@ def rmsnorm_release_at_launch(x: torch.Tensor, weight: torch.Tensor, eps: float)
     return out
 
 
-__all__ = ["IS_AVAILABLE", "can_use", "rmsnorm_release_at_launch"]
+@functools.cache
+def _mx_layout_ok(H: int, sm_version: int) -> bool:
+    """Whether FlashInfer's norm tiling for ``H`` is the one :class:`_MxReleaseRMSNormKernel` quantizes: one CTA per
+    row group (no cluster), 32 threads per row with 8-value vectors, the whole row in one tile."""
+    kernel_obj = _MxReleaseRMSNormKernel(
+        get_cutlass_dtype("bfloat16"), H, 0.0, sm_version=sm_version
+    )
+    return (
+        kernel_obj.cluster_n == 1
+        and kernel_obj.threads_per_row == 32
+        and kernel_obj.vec_size == 8
+        and kernel_obj.cols_per_tile == H
+    )
+
+
+@functools.cache
+def _compiled_mx(H: int, sm_version: int, contiguous: bool):
+    """:func:`_compiled` for :class:`_MxReleaseRMSNormKernel` (BF16, weight_bias 0, PDL on)."""
+    dtype = get_cutlass_dtype("bfloat16")
+    kernel_obj = _MxReleaseRMSNormKernel(dtype, H, 0.0, sm_version=sm_version)
+    sym_m = cute.sym_int(64)
+    if contiguous:
+        tensor_align = math.gcd(128, H * 2)
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+        )
+    else:
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        x_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+        )
+    y_fake = cute.runtime.make_fake_compact_tensor(
+        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=math.gcd(128, H * 2)
+    )
+    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel_obj,
+        x_fake,
+        w_fake,
+        y_fake,
+        Int64(0),
+        Int64(0),
+        Int64(1),
+        Float32(1e-6),
+        True,
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+
+
+def can_use_mxfp8(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether :func:`rmsnorm_mxfp8_release_at_launch` serves ``x``: :func:`can_use` with a row length FlashInfer's
+    norm tiles as :class:`_MxReleaseRMSNormKernel` expects (a multiple of 256 up to 3072, e.g. the 1536-wide q_a
+    latent)."""
+    if not can_use(x, weight):
+        return False
+    H = x.shape[-1]
+    return H % 256 == 0 and H <= 3072 and _mx_layout_ok(H, get_sm_version(x.device))
+
+
+def rmsnorm_mxfp8_release_at_launch(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, xq: torch.Tensor, xs: torch.Tensor
+) -> torch.Tensor:
+    """:func:`rmsnorm_release_at_launch` (returned, bit for bit) that also writes its MXFP8 form into ``xq`` (E4M3
+    ``[M, H]``) and ``xs`` (``uint8 [M, H / 32]``, one UE8M0 exponent per 1x32 group), both contiguous
+    (``fp8w_lowm.new_mxfp8_input``): bitwise the operands the low-M FP8 GEMM makes of that BF16 output in-kernel.
+    See :func:`can_use_mxfp8`."""
+    m, h = x.shape
+    assert xq.shape == (m, h) and xq.dtype == torch.float8_e4m3fn and xq.is_contiguous()
+    assert xs.shape == (m, h // 32) and xs.dtype == torch.uint8 and xs.is_contiguous()
+    out = torch.empty((m, h), dtype=x.dtype, device=x.device)
+    kernel = _compiled_mx(h, get_sm_version(x.device), x.is_contiguous())
+    kernel(x, weight, out, xq.data_ptr(), xs.data_ptr(), m, eps)
+    return out
+
+
+__all__ = [
+    "IS_AVAILABLE",
+    "can_use",
+    "can_use_mxfp8",
+    "rmsnorm_mxfp8_release_at_launch",
+    "rmsnorm_release_at_launch",
+]

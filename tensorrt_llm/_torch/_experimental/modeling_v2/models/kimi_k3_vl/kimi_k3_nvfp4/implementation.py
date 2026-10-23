@@ -3048,12 +3048,15 @@ class K3DecodeMLA(KimiK3MLAAttention):
             self.qk_rope_head_dim,
             release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL),
             absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
+            qnorm_mxfp8=bool(_flags.TRTLLM_K3LL_MLA_QNORM_MXFP8),
         )
-        if "+qnorm_pdl" in kernel or "+prewait" in kernel:
+        if "+qnorm" in kernel or "+prewait" in kernel:
             from . import census as _census
 
-            if "+qnorm_pdl" in kernel:
+            if "+qnorm_pdl" in kernel or "+qnorm_mxfp8" in kernel:
                 _census.count(f"mla_qnorm_pdl:{_census.mode()}")
+            if "+qnorm_mxfp8" in kernel:
+                _census.count(f"mla_qnorm_mxfp8:{_census.mode()}")
             if "+prewait" in kernel:
                 _census.count(f"mla_prewait_absorb:{_census.mode()}")
         latent_cache = _fp8_attention.mla_latent(

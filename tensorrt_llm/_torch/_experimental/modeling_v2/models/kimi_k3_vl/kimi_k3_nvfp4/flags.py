@@ -232,6 +232,13 @@ TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
     "its dependents after the wait; the V-up split-KV kernel L2-prefetches W_UV and releases reduce_v_up after the "
     "wait (bitwise; read at forward time)",
 )
+TRTLLM_K3LL_MLA_QNORM_MXFP8 = _flag(
+    "TRTLLM_K3LL_MLA_QNORM_MXFP8",
+    0,
+    "with TRTLLM_K3LL_MLA_QNORM_PDL, all-head MLA queries: the released q_a norm also writes the MXFP8 form of its "
+    "output and Q-B runs k3_fp8w_lowm_mxfp8 on it instead of quantizing inside k3_fp8w_lowm_gemm (bitwise; read at "
+    "forward time)",
+)
 TRTLLM_K3LL_ATTN_RES_MXFP8 = _flag(
     "TRTLLM_K3LL_ATTN_RES_MXFP8",
     0,
