@@ -309,7 +309,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_accepted_path_len = args.max_draft_len + 1
         self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
         self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
-        if spec_step_copies.is_supported():
+        # Built wherever the kernel can run; used where spec_step_copies.is_enabled() (per step).
+        if spec_step_copies.is_available():
             self._store_scatter = spec_step_copies.SlotScatter()
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
@@ -544,7 +545,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
         scattered = False
-        if self._store_scatter is not None:
+        if self._store_scatter is not None and spec_step_copies.is_enabled():
             # A step whose batch is unchanged leaves the slot table as it is.
             self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
             scattered = self._store_scatter.scatter(

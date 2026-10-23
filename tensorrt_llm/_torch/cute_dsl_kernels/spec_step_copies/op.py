@@ -43,6 +43,38 @@ def is_supported() -> bool:
     return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 100
 
 
+def is_available() -> bool:
+    """Whether the kernels can run here: the CuTe DSL and an SM 100 / 103 / 107 device (plain SIMT code)."""
+    return (
+        IS_CUTLASS_DSL_AVAILABLE
+        and torch.cuda.is_available()
+        and get_sm_version() in (100, 103, 107)
+    )
+
+
+def is_enabled() -> bool:
+    """Per call: the kernels replace the torch ops on SM 100 (``is_supported``), and on SM 103 / 107 when the Kimi K3
+    low-latency switch ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X`` is set (read from the K3 flags module at every call)."""
+    if not is_available():
+        return False
+    if get_sm_version() == 100:
+        return True
+    from ...pyexecutor.k3ll_flags import k3ll_flag
+
+    if not k3ll_flag("TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X"):
+        return False
+    _SM10X_CALLS[0] += 1
+    n = _SM10X_CALLS[0]
+    if n & (n - 1) == 0:
+        from tensorrt_llm.logger import logger
+
+        logger.info(f"K3LL spec_step_copies_sm10x enabled_calls={n}")
+    return True
+
+
+_SM10X_CALLS = [0]
+
+
 def _is_i32(t: torch.Tensor) -> bool:
     """A contiguous CUDA int32 tensor."""
     return t.is_cuda and t.dtype == torch.int32 and t.is_contiguous()

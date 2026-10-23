@@ -541,11 +541,12 @@ class DecoderRunner(ScheduledModelRunner):
         # unchanged skips both copies.
         self._staged_previous_batch_indices: list[int] | None = None
         self._staged_previous_pos_indices: list[int] | None = None
-        # Where the step-copy kernels run: performs a speculative decode step's
-        # overlap gathers with one launch.
+        # Where the step-copy kernels can run: performs a speculative decode
+        # step's overlap gathers with one launch (on steps where
+        # spec_step_copies.is_enabled()).
         self._step_input_gather: spec_step_copies.StepInputGather | None = (
             spec_step_copies.StepInputGather()
-            if self._config.is_spec_decode and spec_step_copies.is_supported()
+            if self._config.is_spec_decode and spec_step_copies.is_available()
             else None
         )
         # Let the first CUDA graph capture create its private pool. Piecewise
@@ -4078,7 +4079,11 @@ class DecoderRunner(ScheduledModelRunner):
         total_num_tokens = len(position_ids)
         # Where the step-copy kernels run, the overlap gathers below are one
         # kernel.
-        step_gather = self._step_input_gather if enable_spec_decode else None
+        step_gather = (
+            self._step_input_gather
+            if enable_spec_decode and spec_step_copies.is_enabled()
+            else None
+        )
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )

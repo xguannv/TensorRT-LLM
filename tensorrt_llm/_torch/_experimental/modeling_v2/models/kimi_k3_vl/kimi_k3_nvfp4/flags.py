@@ -265,6 +265,12 @@ TRTLLM_K3LL_DISAGG_GEN_FAST_SYNC = _flag(
     "disagg generation (no attention DP, PP 1): the per-iteration non-blocking KV-receive poll is skipped when one "
     "int64 all-gather shows no receive session on any rank (disaggregation/transceiver.py; read per call)",
 )
+TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X = _flag(
+    "TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X",
+    0,
+    "SM 103 / 107: the speculative step's overlap gathers and sampler store scatters as the two spec_step_copies "
+    "kernels (one launch each, bit for bit the torch ops; SM 100 always uses them; read per step)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

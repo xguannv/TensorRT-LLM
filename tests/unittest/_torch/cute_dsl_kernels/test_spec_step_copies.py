@@ -61,11 +61,13 @@ def _op():
 
 
 def _supported() -> bool:
-    return torch.cuda.is_available() and _op().is_supported()
+    # is_available, not is_supported: the bit-for-bit checks below are what lets SM 103 / 107 enable the kernels
+    # (TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X).
+    return torch.cuda.is_available() and _op().is_available()
 
 
 pytestmark = pytest.mark.skipif(
-    not _supported(), reason="the step-copy kernels run on SM 100 with the CuTe DSL"
+    not _supported(), reason="the step-copy kernels run on SM 100 / 103 / 107 with the CuTe DSL"
 )
 
 
