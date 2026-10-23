@@ -20,9 +20,10 @@ both (``K3DecodeMLA.build_gate_fused_a`` / ``_gate_fused_rows``), on the stand-i
 * the build: both modules' weights become views of the stacked buffer holding their bytes unchanged;
 * switch off with the stacked weight built = switch off without it (a fresh stand-in), bit for bit, at the trunk
   defaults (HELIX_Q_ABSORB / GATE_SIDE / FUSED_A at 1) and on the head-group path, eagerly and from a CUDA graph;
-* the stacked GEMM's columns against the two GEMMs it replaces: the q_a / kv_a / k_pe columns and the gate columns
-  each bit for bit, or within one bf16 ulp of the value (the split-K of the stacked shape can differ from the
-  separate shapes'); the printed counts say which;
+* the stacked GEMM's columns against the two GEMMs it replaces: the q_a / kv_a / k_pe columns bit for bit (same
+  split-K 6 as the fused_a GEMM); the gate columns within one bf16 ulp of their row's largest value on at most 1 % of
+  the elements (the stacked shape runs split-K 6, the gate's own 768 x 7168 GEMM split 8: the FP32 sums round
+  differently);
 * switch on, the whole decode: output within ``OUT_TOL`` of switch off, query bytes and latent row bit for bit where
   the q_a / kv_a columns are; captured and replayed with new inputs, bit for bit its own eager call.
 """
@@ -141,11 +142,15 @@ def test_stacked_columns(pair, rows):
         ("gate", out[:, gate_col:], gate),
     ):
         diff = (got.float() - ref.float()).abs()
-        rel = (diff / ref.float().abs().clamp_min(1e-30)).max().item()
+        # relative to the row's largest value: a rounding difference of the split-K sum is one bf16 ulp of it
+        rel = (diff / ref.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)).max().item()
+        frac = float((diff > 0).float().mean())
         report.append(
-            f"{name}: {int((diff > 0).sum())} of {diff.numel()} differ, max rel {rel:.2e}"
+            f"{name}: {int((diff > 0).sum())} of {diff.numel()} differ, max rel (row max) {rel:.2e}"
         )
-        assert rel <= ULP, report[-1]
+        assert rel <= ULP and frac <= 0.01, report[-1]
+    # Same split-K and bytes for the fused q_a / kv_a rows: these columns are the fused_a GEMM's, bit for bit.
+    assert torch.equal(out[:, :FUSED].view(torch.int16), fused.view(torch.int16)), report[0]
     print(f"[rows {rows}] " + "; ".join(report))
 
 
