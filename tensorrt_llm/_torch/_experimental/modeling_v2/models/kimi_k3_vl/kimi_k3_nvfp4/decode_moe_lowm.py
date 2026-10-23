@@ -438,6 +438,10 @@ class K3DecodeMoeNvfp4Layer:
         """A wide decode step's MoE (`MAX_TOKENS` < M <= ``wide_max_tokens()``): this rank's unreduced share of the
         output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts."""
         x = hidden_states.contiguous()
+        if x.shape[0] > WIDE_MAX_TOKENS:
+            from . import census as _census
+
+            _census.count(f"dispatch:moe_lowm_m64:{_census.mode()}")
         if self.state.head16 is not None and x.shape[0] <= FRONT16_TOKENS:
             # The front's 16-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
             routed, shared_act = self._front_routed(moe, x)
