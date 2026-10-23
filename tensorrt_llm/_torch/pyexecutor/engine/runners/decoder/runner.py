@@ -516,6 +516,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
+        # Token count of the last Mamba hybrid warmup whose every shape ran a forward pass.
+        self._completed_mamba_warmup_num_tokens: int | None = None
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
@@ -1847,6 +1849,17 @@ class DecoderRunner(ScheduledModelRunner):
         WARMUP_TOKEN_CAP = 4096
         capped_num_tokens = min(curr_max_num_tokens, WARMUP_TOKEN_CAP)
 
+        # The warmup runs again after the KV cache is rebuilt. Its shapes depend only on the capped token count, and
+        # what it primes (the Triton kernels' JIT cache, the autotuner's profiling cache) outlives the rebuild, so a
+        # second pass at the same count only repeats the forwards. Agreed over the forward group, as the count comes
+        # from this rank's free KV capacity.
+        if self._agree_warmup_flag(self._completed_mamba_warmup_num_tokens == capped_num_tokens):
+            logger.info(
+                "Skipping duplicate Mamba hybrid warmup for already completed "
+                f"num_tokens={capped_num_tokens}"
+            )
+            return
+
         logger.info("Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
 
         # A model whose prefill kernel specializes on chunk alignment declares
@@ -1870,6 +1883,7 @@ class DecoderRunner(ScheduledModelRunner):
             autotune(cache_path=cache_path) if autotuner_enabled else contextlib.nullcontext()
         )
 
+        num_shapes_run = 0
         with self.no_cuda_graph(), autotune_ctx:
             for (
                 num_tokens_i,
@@ -1938,6 +1952,7 @@ class DecoderRunner(ScheduledModelRunner):
                                 AutoTuner.get().clean_pp_flag()
 
                             torch.cuda.synchronize()
+                            num_shapes_run += 1
                     # Once peers can enter warmup synchronization or forward,
                     # any rank-local exception can strand them in a collective.
                     except Exception as e:  # noqa: BLE001
@@ -1959,6 +1974,8 @@ class DecoderRunner(ScheduledModelRunner):
                         self._reset_moe_alltoall_state()
                         torch.cuda.empty_cache()
 
+        if num_shapes_run == len(mamba_warmup_shapes):
+            self._completed_mamba_warmup_num_tokens = capped_num_tokens
         clear_memory_buffers()
         torch.cuda.empty_cache()
 

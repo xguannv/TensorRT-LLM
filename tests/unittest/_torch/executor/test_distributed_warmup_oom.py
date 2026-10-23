@@ -438,6 +438,7 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderRu
         enable_autotuner=False,
     )
     engine.no_cuda_graph = contextlib.nullcontext
+    engine._completed_mamba_warmup_num_tokens = None
     # The warmup resolves its chunk-alignment variant off the model's Mamba
     # metadata class; a model declaring none takes the ``Mamba2Metadata``
     # default, i.e. no alignment rewrite.
@@ -524,3 +525,35 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     # The remaining shape is never attempted: recovering locally would leave
     # peers waiting in a forward this rank has abandoned.
     engine._create_warmup_request.assert_called_once()
+
+
+def test_mamba_warmup_runs_once_per_token_count() -> None:
+    """The warmup repeated after the KV cache rebuild skips its forwards when every shape already ran at the same
+    token count; a shape that did not run leaves the warmup incomplete, so the next pass runs it again."""
+    engine, resource_manager = _mamba_engine()
+    engine._create_warmup_request = mock.Mock(return_value=object())
+    engine._should_run_warmup_batch = mock.Mock(return_value=True)
+    engine._forward_warmup = mock.Mock()
+
+    with _no_cuda_side_effects():
+        _run_mamba_warmup(engine, resource_manager)
+        first = engine._forward_warmup.call_count
+        _run_mamba_warmup(engine, resource_manager)
+
+    assert first == 2
+    assert engine._forward_warmup.call_count == first
+    assert engine._completed_mamba_warmup_num_tokens is not None
+
+    engine, resource_manager = _mamba_engine()
+    engine._create_warmup_request = mock.Mock(
+        side_effect=[torch.OutOfMemoryError("OOM"), object(), object(), object()]
+    )
+    engine._should_run_warmup_batch = mock.Mock(return_value=True)
+    engine._forward_warmup = mock.Mock()
+
+    with _no_cuda_side_effects():
+        _run_mamba_warmup(engine, resource_manager)
+        assert engine._completed_mamba_warmup_num_tokens is None
+        _run_mamba_warmup(engine, resource_manager)
+
+    assert engine._forward_warmup.call_count == 3
