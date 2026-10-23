@@ -38,9 +38,12 @@ def _manager(seed, affine):
     ):  # per-layer views into one pool, base pointers spaced by a constant (as V2 coalesces them)
         pool = torch.randn((SLOTS, LAYERS, c, W), generator=g).to(dev, torch.bfloat16)
         m.all_conv_states = [pool[:, i] for i in range(LAYERS)]
-    else:
+    else:  # per-layer views at irregular offsets of one buffer (separate allocations can come out evenly spaced)
+        chunk = SLOTS * c * W
+        flat = torch.randn((LAYERS * (chunk + 64),), generator=g).to(dev, torch.bfloat16)
+        offs = [i * chunk + (i * i) % 61 for i in range(LAYERS)]
         m.all_conv_states = [
-            torch.randn((SLOTS, c, W), generator=g).to(dev, torch.bfloat16) for _ in range(LAYERS)
+            flat.as_strided((SLOTS, c, W), (c * W, W, 1), storage_offset=o) for o in offs
         ]
     m._stacked_conv_states = mcm.MambaHybridCacheManagerV2._stack_state_views(m.all_conv_states)
     assert (m._stacked_conv_states is not None) == affine
