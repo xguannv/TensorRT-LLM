@@ -114,14 +114,20 @@ class K3DecodeMoeNvfp4:
             head32,
         )
 
-    def front_head(self, rows: int) -> Optional[K3MoeHeadWorkspace]:
+    def front_head(self, rows: int, front32: Optional[bool] = None) -> Optional[K3MoeHeadWorkspace]:
         """The head workspace of the front build that runs a step of ``rows`` tokens, or None: the wide head runs
-        it."""
+        it. ``front32``: whether a step of 17-32 tokens takes the 32-token build (None: ``TRTLLM_K3LL_MOE_FRONT32``,
+        read at forward time, so a one-process A/B can switch it; the build's workspace exists whenever the layer
+        supports it)."""
         if rows <= MAX_TOKENS:
             return self.head
         if rows <= FRONT16_TOKENS:
             return self.head16
-        return self.head32 if rows <= FRONT32_TOKENS else None
+        if rows > FRONT32_TOKENS:
+            return None
+        if front32 is None:
+            front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
+        return self.head32 if front32 else None
 
 
 def _front_supported(moe: nn.Module, tp_size: int, m_max: int) -> bool:
@@ -315,7 +321,7 @@ class K3DecodeMoeNvfp4Layer:
         if self.state.head16 is not None:
             self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]))
         if self.state.head32 is not None:
-            self._front_routed(moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]))
+            self._front_routed(moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]), front32=True)
         for rows in (9, WIDE_MAX_TOKENS):
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
@@ -328,8 +334,14 @@ class K3DecodeMoeNvfp4Layer:
             nvfp4_gsf=self.input_scale,
         )  # fmt: skip
 
-    def _front(self, moe: nn.Module, x: torch.Tensor, sort_out: Optional[torch.Tensor] = None):
-        head = self.state.front_head(x.shape[0])
+    def _front(
+        self,
+        moe: nn.Module,
+        x: torch.Tensor,
+        sort_out: Optional[torch.Tensor] = None,
+        front32: Optional[bool] = None,
+    ):
+        head = self.state.front_head(x.shape[0], front32)
         return k3_moe_front(
             x.contiguous(),
             self.front_weight,
@@ -356,18 +368,18 @@ class K3DecodeMoeNvfp4Layer:
             self.state.counters, *self.situ,
         )  # fmt: skip
 
-    def _front_routed(self, moe: nn.Module, x: torch.Tensor):
+    def _front_routed(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
         if self.state.sort_ctr is None:
-            ids, weights, x_q, x_sf, shared_act = self._front(moe, x)
+            ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
             return self._routed(ids, weights, x_q, x_sf), shared_act
         rows = x.shape[0]
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
-        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out)
+        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
         routed = nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
             self.state.counters, *self.situ,
@@ -446,9 +458,10 @@ class K3DecodeMoeNvfp4Layer:
         ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
         consumer runs the tail GEMV (``moe_tail_push.py``)."""
         x = hidden_states.contiguous()
-        if self.state.front_head(x.shape[0]) is not None:
+        front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
+        if self.state.front_head(x.shape[0], front32) is not None:
             # The front's 16- or 32-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
-            routed, shared_act = self._front_routed(moe, x)
+            routed, shared_act = self._front_routed(moe, x, front32)
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's

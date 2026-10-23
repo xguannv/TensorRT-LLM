@@ -990,13 +990,24 @@ _FRONT_FIELDS = ("routing", "routed", "act", "tail_in", "out")
 
 def _front32_steps(on, off, moe, x, x16):
     """Per arm, ``_wide`` on ``x`` (17-32 rows), then on ``x16`` (16 rows, the 16-token front); on the on arm the wide
-    step once more after it."""
+    step once more after it. TRTLLM_K3LL_MOE_FRONT32 is read per step: the on arm runs with it set, the off arm (built
+    without the 32-token workspace) with it clear, and ``on_switched_off`` is the on arm's state with it clear (a
+    one-process A/B's off segment), which must be the off arm."""
+    with _switch("TRTLLM_K3LL_MOE_FRONT32", 1):
+        on_x = _front16_arm(on, moe, x)
+        on16 = _front16_arm(on, moe, x16)
+        on_again = _front16_arm(on, moe, x)
+    with _switch("TRTLLM_K3LL_MOE_FRONT32", 0):
+        on_switched_off = _front16_arm(on, moe, x)
+        off_x = _front16_arm(off, moe, x)
+        off16 = _front16_arm(off, moe, x16)
     return SimpleNamespace(
-        on=_front16_arm(on, moe, x),
-        on16=_front16_arm(on, moe, x16),
-        on_again=_front16_arm(on, moe, x),
-        off=_front16_arm(off, moe, x),
-        off16=_front16_arm(off, moe, x16),
+        on=on_x,
+        on16=on16,
+        on_again=on_again,
+        on_switched_off=on_switched_off,
+        off=off_x,
+        off16=off16,
     )
 
 
@@ -1008,6 +1019,10 @@ def _verify_front32(where, moe, x, steps):
     _same_arm(
         f"{where}: interleaved 16-row step, on vs off", steps.on16, steps.off16, _FRONT_FIELDS
     )
+    _same_arm(
+        f"{where}: the on arm's state with TRTLLM_K3LL_MOE_FRONT32=0 vs the off arm",
+        steps.on_switched_off, steps.off, _FRONT_FIELDS,
+    )  # fmt: skip
 
 
 def check_front32():

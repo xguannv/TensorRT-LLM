@@ -4348,13 +4348,13 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             logger.info(
                 f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_FRONT16=1: 9-16 token steps on the 16-token front: {front16}"
             )
-        front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32) and _decode_moe_lowm.front32_supported(
-            takes[0], mapping.tp_size
+        # The 32-token build exists whenever the layer supports it; TRTLLM_K3LL_MOE_FRONT32 picks it per step
+        # (forward time, decode_moe_lowm.K3DecodeMoeNvfp4.front_head).
+        front32 = _decode_moe_lowm.front32_supported(takes[0], mapping.tp_size)
+        logger.info(
+            f"Kimi K3 lowm MoE: 32-token front build for 17-32 token steps: {front32} "
+            f"(TRTLLM_K3LL_MOE_FRONT32={_flags.TRTLLM_K3LL_MOE_FRONT32}, read per step)"
         )
-        if _flags.TRTLLM_K3LL_MOE_FRONT32:
-            logger.info(
-                f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_FRONT32=1: 17-32 token steps on the 32-token front: {front32}"
-            )
         state = _decode_moe_lowm.K3DecodeMoeNvfp4.create(
             mapping,
             takes[0].routed_experts.backend.w3_w1_weight.device,
