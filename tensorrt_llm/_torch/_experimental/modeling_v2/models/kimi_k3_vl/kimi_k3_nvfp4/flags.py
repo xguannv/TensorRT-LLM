@@ -259,6 +259,14 @@ TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
     "its dependents after the wait; the V-up split-KV kernel L2-prefetches W_UV and releases reduce_v_up after the "
     "wait (bitwise; read at forward time)",
 )
+TRTLLM_K3LL_MLA_VAR_SPLIT = _flag(
+    "TRTLLM_K3LL_MLA_VAR_SPLIT",
+    0,
+    "Helix MLA split read with the V up-projection: each request's own split-KV count from its KV length on the "
+    "rank (computed on device once per step, decode_mla_dcp.var_split_counts), so a batch of mixed lengths is not "
+    "bound by its longest request; equal lengths keep the static split's count (not bitwise in general: the split "
+    "boundaries move; read at forward time)",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,

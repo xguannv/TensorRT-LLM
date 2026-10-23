@@ -15,7 +15,9 @@ own partials, and the all-to-all carries 128 values per head instead of the 512-
   (same runner, same tactic: the split kernel and its partials are that op's), with its split-KV reduction replaced
   by ``mla_decode_fp8_v_up.BlackwellMlaDecodeFP8VUp``'s reduction fused with the V up-projection, up to
   ``MAX_ROWS`` rows per head. Other shapes (more rows, or a tactic without split-KV partials) run the op itself and
-  a BF16 BMM of its latent rows.
+  a BF16 BMM of its latent rows. With ``block_split_kvs`` (``TRTLLM_K3LL_MLA_VAR_SPLIT``,
+  ``decode_mla_dcp.var_split_counts``) each request is split its own number of ways, the grid sized for
+  ``var_split`` splits; the fused reduction and the op's own reduction then combine each request's partials.
 * ``trtllm::k3_helix_a2a_gated``: ``helix_a2a_fused`` at 128 values per head (the split read's ``(max, sum)`` per
   head as they are) with the gate in its combine (``cute_dsl_kernels/blackwell/helix_a2a_gated.py``).
 * ``trtllm::k3_mla_gate``: ``values * sigmoid(gate)`` per head, the gate half of ``k3_fp8_mla_output`` (after the
@@ -47,11 +49,20 @@ def max_fused_rows() -> int:
 
 
 def _run_fused(
-    runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out, prewait=False
+    runner,
+    inputs,
+    tactic,
+    softmax_scale,
+    output_scale,
+    v_weight,
+    v_out,
+    prewait=False,
+    block_split_kvs=None,
 ) -> None:
     """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS).
     ``prewait``: the split kernel L2-prefetches ``v_weight`` before its PDL wait and releases the fused reduction
-    after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; with the runner's PDL only; same bytes)."""
+    after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; with the runner's PDL only; same bytes). ``block_split_kvs``: each
+    request's split count (``[batch]`` int32, at most the tactic's ``split_kv``), or None for the scalar split."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
@@ -113,6 +124,9 @@ def _run_fused(
     prewait = bool(prewait and runner.use_pdl)
     if prewait:
         key = key + ("prewait",)
+    var_split = block_split_kvs is not None
+    if var_split:
+        key = key + ("var_split",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -131,12 +145,13 @@ def _run_fused(
             runner._SKIP_CORRECTION_THRESHOLD,
             is_persistent,
             runner._IS_VAR_SEQ,
-            runner._IS_VAR_SPLIT_KV,
+            runner._IS_VAR_SPLIT_KV or var_split,
             num_heads=heads,
             seq_len_q=seq_len_q,
             reducer_max_splits=32,
             emit_softmax_stats=True,
             use_pdl=runner.use_pdl,
+            var_split_bounded=var_split,
             v_rows=v_rows,
             prewait=prewait,
         )
@@ -163,6 +178,9 @@ def _run_fused(
             None
             if kv_bounds is None
             else cute.runtime.from_dlpack(kv_bounds, assumed_align=4).mark_layout_dynamic(),
+            None
+            if block_split_kvs is None
+            else cute.runtime.from_dlpack(block_split_kvs, assumed_align=4).mark_layout_dynamic(),
             cutlass.Float32(softmax_scale),
             cutlass.Float32(output_scale),
             cute.runtime.from_dlpack(v_weight, assumed_align=16),
@@ -190,6 +208,7 @@ def _run_fused(
         split_kv,
         cache_seqs,
         kv_bounds,
+        block_split_kvs,
         softmax_scale,
         output_scale,
         v_weight,
@@ -219,6 +238,8 @@ def mla_decode_fp8_v_up(
     max_batch_size: int,
     use_pdl: bool,
     prewait: bool,
+    block_split_kvs: Optional[torch.Tensor] = None,
+    var_split: int = 0,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages followed by every head's V up-projection.
 
@@ -236,6 +257,9 @@ def mla_decode_fp8_v_up(
             ``trtllm::k3_mla_decode_fp8_pdl`` (``TRTLLM_K3LL_MLA_DECODE_PDL``); the fused reduction always uses it.
         prewait: with ``use_pdl`` and the fused reduction, the split kernel L2-prefetches ``v_weight`` before its
             wait and releases the reduction after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; same bytes).
+        block_split_kvs, var_split: ``TRTLLM_K3LL_MLA_VAR_SPLIT``: each request's split count (``[batch]`` int32,
+            device) and the largest one the grid is sized for (``decode_mla_dcp.var_split_grid``); with
+            ``var_split`` <= 1 or no counts, the tactic's scalar split.
     """
     batch, q_len, heads, _ = q.shape
     page_size = kv_pages.shape[1]
@@ -253,9 +277,26 @@ def mla_decode_fp8_v_up(
         kv_bounds,
     ]
     tactic = mla_decode_pdl.tactic(runner, inputs)
+    if block_split_kvs is not None and var_split > 1:
+        # the grid holds var_split splits of every request; each runs block_split_kvs[b] of them
+        tactic = (tactic[0], tactic[1], var_split, False)
+    else:
+        block_split_kvs = None
     if int(tactic[2]) > 1 and batch * q_len <= max_fused_rows():
-        _run_fused(runner, inputs, tactic, softmax_scale, output_scale, v_weight, v_out, prewait)
+        _run_fused(
+            runner,
+            inputs,
+            tactic,
+            softmax_scale,
+            output_scale,
+            v_weight,
+            v_out,
+            prewait,
+            block_split_kvs,
+        )
         return
+    if block_split_kvs is not None:
+        inputs.append(block_split_kvs)
     runner(inputs, tactic=tactic, softmax_scale=softmax_scale, output_scale=output_scale)
     torch.ops.trtllm.bmm_out(
         latent.view(batch * q_len, heads, KV_LORA_RANK).transpose(0, 1),
@@ -281,6 +322,8 @@ def _(
     max_batch_size,
     use_pdl,
     prewait,
+    block_split_kvs=None,
+    var_split=0,
 ) -> None:
     return None
 

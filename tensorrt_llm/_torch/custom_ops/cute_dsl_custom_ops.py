@@ -12381,6 +12381,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         softmax (max, sum) pair for Helix reduction.
                     inputs[9] (kv_bounds): Optional contiguous int32 per-query
                         local KV bounds of shape (B * S_q,).
+                    inputs[10] (block_split_kvs): Optional contiguous int32
+                        per-request split-KV counts of shape (B,), each at most
+                        the tactic's split_kv (the grid's) and at most 32: a
+                        variable split-KV variant of the kernel.
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional softmax_scale and output_scale values.
@@ -12394,6 +12398,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # inputs[9] (optional): helix per-token attention bounds of shape
             # (B * S_q,), int32 — speculative verify groups only.
             kv_bounds = inputs[9] if len(inputs) > 9 else None
+            # inputs[10] (optional): per-request split-KV counts (B,), int32.
+            block_split_kvs = inputs[10] if len(inputs) > 10 else None
+            var_split = self._IS_VAR_SPLIT_KV or block_split_kvs is not None
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
 
@@ -12493,7 +12500,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 split_kv,
                 is_persistent,
                 kv_bounds is not None,
-            ) + ((True, ) if self.use_pdl else ())
+            ) + ((True, ) if self.use_pdl else
+                 ()) + (("var_split", ) if block_split_kvs is not None else ())
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
                 # for seconds -- always log enough to identify the variant.
@@ -12517,7 +12525,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._SKIP_CORRECTION_THRESHOLD,
                     is_persistent,
                     self._IS_VAR_SEQ,
-                    self._IS_VAR_SPLIT_KV,
+                    var_split,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
                     reducer_max_splits=32,
@@ -12525,6 +12533,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     **({
                         "use_pdl": True
                     } if self.use_pdl else {}),
+                    **({
+                        "var_split_bounded": True
+                    } if block_split_kvs is not None else {}),
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,
@@ -12560,8 +12571,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kv_bounds_ct = (cute.runtime.from_dlpack(
                     kv_bounds, assumed_align=4).mark_layout_dynamic()
                                 if kv_bounds is not None else None)
-                # Variable split-KV (block_split_kvs) is not used on this path:
-                block_split_kvs_ct = None
+                block_split_kvs_ct = (cute.runtime.from_dlpack(
+                    block_split_kvs, assumed_align=4).mark_layout_dynamic()
+                                      if block_split_kvs is not None else None)
 
                 compile_args = [
                     q_latent_ct,
@@ -12622,7 +12634,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_seqs,
                 kv_bounds,
                 None,  # cum_seq_lens_q: this path uses fixed query lengths
-                None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
+                block_split_kvs,
                 softmax_scale,
                 output_scale,
                 stream,

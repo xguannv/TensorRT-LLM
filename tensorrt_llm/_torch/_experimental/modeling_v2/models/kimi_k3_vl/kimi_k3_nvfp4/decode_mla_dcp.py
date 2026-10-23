@@ -30,7 +30,7 @@ combine). The caller owns the collectives so the pieces can be tested on one GPU
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Union
 
 import torch
@@ -57,12 +57,81 @@ class SplitReadPlan:
         attend to (its causal bound restricted to this rank's pages).
     empty: ``[batch * q_len]`` bool, tokens that see no key on this rank (their partials are
         undefined and must be replaced by the identity of the combine).
+    block_splits: ``TRTLLM_K3LL_MLA_VAR_SPLIT``: ``[batch]`` int32, each request's split-KV count
+        (`var_split_counts`), or None.
+    var_split: the largest split count the decode grid is sized for (`var_split_grid`), 0 without
+        ``block_splits``.
     """
 
     page_table: torch.Tensor
     cache_seqs: torch.Tensor
     kv_bounds: Optional[torch.Tensor]
     empty: Optional[torch.Tensor]
+    block_splits: Optional[torch.Tensor] = None
+    var_split: int = 0
+
+
+#: Query rows of one decode M tile and KV tokens of one K tile of the split kernel (``(128, 128)`` QK tiler).
+_M_TILE = 128
+_K_TILE = 128
+#: Largest split count of one request (the fused reduction combines one split per lane).
+_MAX_VAR_SPLIT = 32
+
+
+def _var_split_envelope(batch: int, heads: int, q_len: int):
+    """``(budget, grid)``: how many splits all requests of the batch may take together (one wave: the GPU's 2-CTA
+    clusters over the ``q_tiles`` M tiles of each split), and the largest split count of one request: within that
+    budget with every other request at one split, the split workspace (its 128-row units, sized for the occupancy
+    bound of the static split) and ``_MAX_VAR_SPLIT``."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    q_tiles = -(-heads * q_len // _M_TILE)
+    blocks = CuteDSLNVMlaDecodeBlackwellRunner._get_max_active_blocks()
+    budget = (blocks // 2) // q_tiles
+    units = 2 * (blocks // 2) * max(heads, _M_TILE) // _M_TILE
+    grid = min(_MAX_VAR_SPLIT, budget - batch + 1, units // (batch * q_tiles))
+    return budget, grid
+
+
+def var_split_grid(batch: int, heads: int, q_len: int) -> int:
+    """``TRTLLM_K3LL_MLA_VAR_SPLIT``: the split count the decode grid is sized for (every request's own count is at
+    most this), or 0 where per-request splits cannot help (one split each fills the budget)."""
+    budget, grid = _var_split_envelope(batch, heads, q_len)
+    return grid if grid > 1 and batch <= budget else 0
+
+
+def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Optional[torch.Tensor]:
+    """``TRTLLM_K3LL_MLA_VAR_SPLIT``: each request's split-KV count from its KV length on this rank, on device
+    (capturable, no host sync), or None where `var_split_grid` is 0.
+
+    Every request ``b`` of ``t_b`` K tiles is cut into ``s_b = ceil(t_b / u)`` splits of at most ``u`` tiles (at
+    least 1, at most the grid's). ``u`` is the candidate ``ceil(t_b / k)`` (``k`` up to the grid's split count) with
+    the smallest largest split (``max ceil(t_b / s_b)``, then the fewest splits) whose splits fit in one wave
+    (``sum s_b`` within the budget). Equal lengths get the static split's count: as many each as fit."""
+    batch = cache_seqs.shape[0]
+    budget, grid = _var_split_envelope(batch, heads, q_len)
+    if not (grid > 1 and batch <= budget):
+        return None
+    tiles = ((cache_seqs.to(torch.int64) + (_K_TILE - 1)) // _K_TILE).clamp(min=1)
+    k = torch.arange(1, grid + 1, dtype=torch.int64, device=cache_seqs.device)
+    unit = ((tiles.view(-1, 1) + k.view(1, -1) - 1) // k.view(1, -1)).reshape(-1)
+    splits = ((tiles.view(1, -1) + unit.view(-1, 1) - 1) // unit.view(-1, 1)).clamp(1, grid)
+    largest = ((tiles.view(1, -1) + splits - 1) // splits).amax(dim=1)
+    total = splits.sum(dim=1)
+    cost = torch.where(
+        total <= budget, largest * (budget + 1) + total, torch.iinfo(torch.int64).max
+    )
+    return splits[cost.argmin()].to(torch.int32).contiguous()
+
+
+def with_var_split(plan: SplitReadPlan, heads: int, q_len: int) -> SplitReadPlan:
+    """``plan`` with `var_split_counts` (``TRTLLM_K3LL_MLA_VAR_SPLIT``), unchanged where they do not apply."""
+    counts = var_split_counts(plan.cache_seqs, heads, q_len)
+    if counts is None:
+        return plan
+    return replace(
+        plan, block_splits=counts, var_split=var_split_grid(counts.shape[0], heads, q_len)
+    )
 
 
 def local_block_index(max_blocks: int, cp_size: int, cp_rank: int, device) -> torch.Tensor:
@@ -318,6 +387,8 @@ def split_read_attention_v_up(
     prewait = bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2 and _flags.TRTLLM_K3LL_MLA_DECODE_PDL)
     if prewait:
         _census.count(f"mla_prewait_v_up:{_census.mode()}")
+    if plan.block_splits is not None and plan.var_split > 1:
+        _census.count(f"mla_var_split:{_census.mode()}")
     torch.ops.trtllm.k3_mla_decode_fp8_v_up(
         q,
         kv_pages,
@@ -334,6 +405,8 @@ def split_read_attention_v_up(
         max_batch,
         bool(_flags.TRTLLM_K3LL_MLA_DECODE_PDL),
         prewait,
+        plan.block_splits,
+        plan.var_split,
     )
 
 
@@ -536,6 +609,9 @@ class MlaSplitRead:
                     self.cp,
                     self.rank,
                 )
+                if _flags.TRTLLM_K3LL_MLA_VAR_SPLIT:
+                    # once per step (read at forward time): every layer's split read takes these counts
+                    self._plan = with_var_split(self._plan, self.heads, q_len)
                 return self._plan
             index = self._block_index.get(block_rows.shape[1])
             if index is None:
@@ -641,9 +717,7 @@ class MlaSplitRead:
         )
         plan = self._step_plan(mqa.layer_idx, block_rows, lens, q_len, meta)
         if layer_in_pool:
-            plan = SplitReadPlan(
-                plan.page_table + layer_in_pool, plan.cache_seqs, plan.kv_bounds, plan.empty
-            )
+            plan = replace(plan, page_table=plan.page_table + layer_in_pool)
         stats = torch.empty(tokens, self.heads, 2, dtype=torch.float32, device=quant_q.device)
         if v_up_weight is not None:
             return self._forward_v_up(

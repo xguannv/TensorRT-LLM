@@ -36,6 +36,10 @@ rounds them to BF16 into the B operand in shared memory. Every output element is
 
 Needs the split-KV workspace (``split_kv > 1``), the fixed query layout and the Helix softmax statistics.
 
+With ``is_var_split_kv`` (``TRTLLM_K3LL_MLA_VAR_SPLIT``; constructed with ``var_split_bounded``) request ``b`` is
+split ``block_split_kvs[b]`` ways (at most the grid's ``split_kv`` <= 32): the split kernel's clusters past a
+request's count have no K tiles, and the reduction combines that request's partials only.
+
 ``prewait`` (``TRTLLM_K3LL_MLA_PREWAIT_L2``, with the split kernel's PDL): before its ``griddepcontrol.wait`` the
 split kernel L2-prefetches ``w_uv`` (one warp per CTA, the chunks spread over the grid), and after the wait it
 releases the fused reduction, whose CTAs then take SMs as they free up and load their ``w_uv[h]`` from L2 while the
@@ -112,10 +116,9 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
 
     def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
-        if not self.emit_softmax_stats or self.is_var_q or self.is_var_split_kv:
+        if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
-                "The fused V up-projection needs the Helix softmax statistics, a fixed query layout and "
-                "a scalar split-KV."
+                "The fused V up-projection needs the Helix softmax statistics and a fixed query layout."
             )
         if self.reducer_max_splits > 32:
             raise ValueError(
@@ -151,14 +154,17 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         v_weight: cute.Tensor,
         v_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        """``run_with_softmax_stats`` (fixed query lengths, scalar split) plus ``v_weight`` (BF16
-        ``[H, 128, 512]``) and ``v_out`` (BF16 ``[B * S_q, H, 128]``); ``o`` and ``lse`` are not written."""
+        """``run_with_softmax_stats`` (fixed query lengths) plus ``v_weight`` (BF16 ``[H, 128, 512]``) and ``v_out``
+        (BF16 ``[B * S_q, H, 128]``); ``o`` and ``lse`` are not written. ``block_split_kvs``: with
+        ``is_var_split_kv``, each request's split count (``[B]`` int32, at most ``split_kv``, the grid's); else
+        None (the scalar ``split_kv``)."""
         self._v_weight = v_weight
         self._v_out = v_out
         self._v_prefetch = None
@@ -178,7 +184,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             cache_seqs,
             kv_bounds,
             None,
-            None,
+            block_split_kvs,
             softmax_scale,
             output_scale,
             stream,
@@ -278,6 +284,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             split_kv,
             cache_seqs,
             kv_bounds,
+            block_split_kvs,
             self._v_out,
             a_layout,
             b_layout,
@@ -303,6 +310,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         split_kv: Int32,
         cache_seqs: cute.Tensor,
         kv_bounds: Optional[cute.Tensor],
+        block_split_kvs: Optional[cute.Tensor],
         mV: cute.Tensor,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
@@ -373,6 +381,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                         split_kv,
                         cache_seqs,
                         kv_bounds,
+                        block_split_kvs,
                         b,
                         t,
                         head,
@@ -450,6 +459,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         split_kv,
         cache_seqs,
         kv_bounds,
+        block_split_kvs,
         b,
         t,
         head,
@@ -468,6 +478,8 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         has_local_kv = cache_seqs[b] > 0
         if cutlass.const_expr(kv_bounds is not None):
             has_local_kv = kv_bounds[b * self.seq_len_q + t] > 0
+        if cutlass.const_expr(self.is_var_split_kv):
+            split_kv = block_split_kvs[b]
         k_tile_total = cute.ceil_div(cache_seqs[b], self.mma_qk_tiler[1])
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
         if cutlass.const_expr(kv_bounds is not None):

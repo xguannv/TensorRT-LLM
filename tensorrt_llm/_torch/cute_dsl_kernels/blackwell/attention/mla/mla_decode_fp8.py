@@ -161,6 +161,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_max_splits: int = MAX_SPLITS,
         emit_softmax_stats: bool = False,
         use_pdl: bool = False,
+        var_split_bounded: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -209,6 +210,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             preceding kernel's tail, and they wait for it before touching
             global memory.
         :type use_pdl: bool
+        :param var_split_bounded: With ``is_var_split_kv``: the caller
+            guarantees every ``block_split_kvs`` value (and the scalar
+            ``split_kv`` the grid is sized for) is at most
+            ``reducer_max_splits``, so a reducer capacity below the generic
+            ``MAX_SPLITS`` is allowed.
+        :type var_split_bounded: bool
         """
 
         self.latent_dim = 512
@@ -228,7 +235,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             raise ValueError(
                 f"reducer_max_splits must be in [1, {MAX_SPLITS}], "
                 f"got {reducer_max_splits}")
-        if is_var_split_kv and reducer_max_splits != MAX_SPLITS:
+        if (is_var_split_kv and reducer_max_splits != MAX_SPLITS
+                and not var_split_bounded):
             raise ValueError(
                 "variable split-KV requires the generic reducer capacity "
                 f"of {MAX_SPLITS}, got {reducer_max_splits}")
