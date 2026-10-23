@@ -257,6 +257,7 @@ def _standin(w):
     mla._fp8_decode_ready = True
     mla._q_absorb_w_kc = None
     mla._gate_side = p.impl._decode_mla_q.GateSide()
+    mla._kv_side = p.impl._decode_mla_q.KvSide()
     # W_UK as a launch on a GPU the switch builds on (HELIX_SWITCH_CAPABILITIES) builds it.
     with mock.patch.object(
         p.impl, "HELIX_SWITCH_CAPABILITIES", (torch.cuda.get_device_capability(),)

@@ -54,6 +54,58 @@ def side_stream(device: torch.device) -> torch.cuda.Stream:
     return stream
 
 
+_KV_STREAMS: Dict[int, torch.cuda.Stream] = {}
+
+
+def kv_side_stream(device: torch.device) -> torch.cuda.Stream:
+    """``TRTLLM_K3LL_MLA_KV_SIDE``: one stream per device for the latent row and the KV append, shared by every MLA
+    layer and used by nothing else (not the gate's `side_stream`, whose projection would queue behind the append)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _KV_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _KV_STREAMS[index] = stream
+    return stream
+
+
+class KvSide:
+    """``TRTLLM_K3LL_MLA_KV_SIDE``: the latent row and KV append of one forward on `kv_side_stream`.
+
+    `mark` records the main stream's position (after the fused q_a / kv_a); `run` enqueues ``fn`` on the side stream
+    behind that position (so the query kernels the main stream enqueues in between run beside it); `join` makes the
+    main stream wait for it. Without a side stream (``multi_stream`` False) `run` calls ``fn`` in place."""
+
+    def __init__(self) -> None:
+        self._fork_event = torch.cuda.Event()
+        self._done_event = torch.cuda.Event()
+        self._side = False
+        self._marked = False
+
+    def mark(self, multi_stream: bool) -> None:
+        self._side = multi_stream
+        if multi_stream:
+            self._fork_event.record()
+        self._marked = True
+
+    def run(self, fn: Callable[[], None], device: torch.device) -> None:
+        if not self._marked:
+            raise RuntimeError("KvSide.run without mark")
+        if not self._side:
+            fn()
+            return
+        with torch.cuda.stream(kv_side_stream(device)):
+            self._fork_event.wait()
+            fn()
+            self._done_event.record()
+
+    def join(self) -> None:
+        if not self._marked:
+            raise RuntimeError("KvSide.join without mark")
+        if self._side:
+            self._done_event.wait()
+        self._marked = self._side = False
+
+
 def absorb_weight(k_b: torch.Tensor, k_b_scale: Optional[torch.Tensor]) -> torch.Tensor:
     """BF16 W_UK ``[heads, kv_lora_rank, nope]`` from the module's K-B (``k_b_proj_trans``, FP8 codes with
     ``k_b_proj_trans_scale`` ``[heads, kv_lora_rank / 128, nope / 128]``, or already BF16): the codes times their

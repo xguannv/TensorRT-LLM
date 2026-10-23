@@ -248,6 +248,14 @@ TRTLLM_K3LL_MLA_GATE_SIDE = _flag(
     "MLA decode (quantized cache): the output gate projection on a side stream beside the attention, read in place "
     "by the V-B / gate kernel (no [kv_a | g] concatenation)",
 )
+TRTLLM_K3LL_MLA_KV_SIDE = _flag(
+    "TRTLLM_K3LL_MLA_KV_SIDE",
+    0,
+    "Helix all-head MLA decode (HELIX_Q_ABSORB): the latent row and the KV append (mla_latent, mla_rope_generation "
+    "with q_rope_applied) on their own side stream from right after the fused q_a / kv_a, beside the query path "
+    "(q_a norm, q_b, K3MlaQAbsorb); the main stream joins it before the split read, so every later reader of the "
+    "KV pages runs after the append (same kernels and bytes; read at forward time)",
+)
 TRTLLM_K3LL_MLA_DECODE_PDL = _flag(
     "TRTLLM_K3LL_MLA_DECODE_PDL",
     1,

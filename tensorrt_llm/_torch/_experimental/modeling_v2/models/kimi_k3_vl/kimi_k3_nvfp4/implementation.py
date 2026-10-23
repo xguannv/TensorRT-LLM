@@ -2733,6 +2733,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # TRTLLM_K3LL_HELIX_Q_ABSORB at load (Helix, FP8 cache): every head's W_UK in BF16 (decode_mla_q.absorb_weight).
         self._q_absorb_w_kc: Optional[torch.Tensor] = None
         self._gate_side = _decode_mla_q.GateSide()
+        self._kv_side = _decode_mla_q.KvSide()
 
     @property
     def _decode_heads(self) -> int:
@@ -3079,6 +3080,12 @@ class K3DecodeMLA(KimiK3MLAAttention):
         the latent row by `attention.mla_latent`, the cache append with the query already in place
         (``q_rope_applied``), and the Helix split read without its query all-gather."""
         rows = ag.shape[0]
+        # TRTLLM_K3LL_MLA_KV_SIDE: the latent row and KV append read only ag's kv half and the step's positions, so
+        # they go on their own stream from here, beside the query path, and the main stream joins them before the
+        # split read (before anything after this point that reads the KV pages).
+        kv_side = bool(_flags.TRTLLM_K3LL_MLA_KV_SIDE)
+        if kv_side:
+            self._kv_side.mark(do_multi_stream())
         quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(
             ag[:, : self.q_lora_rank],
             self.q_a_layernorm,
@@ -3096,27 +3103,39 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 _census.count(f"mla_qnorm_pdl:{_census.mode()}")
             if "+prewait" in kernel:
                 _census.count(f"mla_prewait_absorb:{_census.mode()}")
-        latent_cache = _fp8_attention.mla_latent(
-            ag, self.kv_a_layernorm.weight, float(self.kv_a_layernorm.variance_epsilon)
-        )
         cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)
         cu_kv = torch.empty_like(cu_q)
         scheduler = torch.empty(1, dtype=torch.uint32, device=ag.device)
         bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
         bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
-        self.mqa.mla_rope_generation(
-            q,
-            q[..., self.qk_nope_head_dim :],
-            latent_cache,
-            metadata,
-            cu_q,
-            cu_kv,
-            scheduler,
-            bmm1,
-            bmm2,
-            quant_q,
-            q_rope_applied=True,
-        )
+
+        def latent_and_append() -> None:
+            # With q_rope_applied the cache kernel reads q / quant_q for their pointers and strides only.
+            latent_cache = _fp8_attention.mla_latent(
+                ag, self.kv_a_layernorm.weight, float(self.kv_a_layernorm.variance_epsilon)
+            )
+            self.mqa.mla_rope_generation(
+                q,
+                q[..., self.qk_nope_head_dim :],
+                latent_cache,
+                metadata,
+                cu_q,
+                cu_kv,
+                scheduler,
+                bmm1,
+                bmm2,
+                quant_q,
+                q_rope_applied=True,
+            )
+
+        if kv_side:
+            from . import census as _census
+
+            self._kv_side.run(latent_and_append, ag.device)
+            self._kv_side.join()
+            _census.count(f"mla_kv_side:{_census.mode()}")
+        else:
+            latent_and_append()
         if self.mapping.cp_rank == 0 and rows not in K3DecodeMLA._all_head_logged:
             K3DecodeMLA._all_head_logged.add(rows)
             lowm = bool(
