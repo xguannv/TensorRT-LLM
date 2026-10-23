@@ -246,6 +246,13 @@ TRTLLM_K3LL_MLA_PREWAIT_L2 = _flag(
     "its dependents after the wait; the V-up split-KV kernel L2-prefetches W_UV and releases reduce_v_up after the "
     "wait (bitwise; read at forward time)",
 )
+TRTLLM_K3LL_FORCE_REPLAY = _flag(
+    "TRTLLM_K3LL_FORCE_REPLAY",
+    0,
+    "measurement only, with forced acceptance: generation rows that follow a stream of TRTLLM_K3LL_FORCE_REPLAY_FILE "
+    "commit its tokens and take its continuation as drafts, draws keyed by the stream offset (force_replay.py; MLA "
+    "DSpark worker; read at forward time)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

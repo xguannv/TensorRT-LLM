@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger
 
 from . import census as _census
 from . import flags as _flags
+from . import force_replay as _force_replay
 
 
 @functools.lru_cache(maxsize=None)
@@ -1763,12 +1764,19 @@ class KimiK3MLADSparkWorker(DSparkWorker):
 
     def _forward_impl(self, input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata,
                       draft_model, resource_manager=None):  # fmt: skip
-        """The stock forward; a step whose target logits stayed vocabulary-sharded says so to the engine."""
+        """The stock forward; a step whose target logits stayed vocabulary-sharded says so to the engine. With
+        ``TRTLLM_K3LL_FORCE_REPLAY`` (measurement only) the generation rows that follow a recorded stream replay it
+        (force_replay.py)."""
         self._k3_shard_returned = False
+        replay = _force_replay.replay_begin(
+            self, input_ids, position_ids, attn_metadata, spec_metadata
+        )
         outputs = super()._forward_impl(
             input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata, draft_model,
             resource_manager,
         )  # fmt: skip
+        if replay is not None:
+            _force_replay.replay_end(replay, outputs)
         if self._k3_shard_returned:
             outputs["logits_vocab_shard"] = True
             self._k3_shard_returned = False
