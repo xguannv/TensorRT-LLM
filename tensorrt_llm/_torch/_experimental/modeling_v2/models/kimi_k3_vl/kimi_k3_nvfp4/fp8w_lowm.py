@@ -204,6 +204,55 @@ def append_rows(
     return fused_w, fused_s
 
 
+def concat_rows(
+    parts: "list[tuple[torch.Tensor, torch.Tensor]]",
+) -> Optional[tuple[torch.Tensor, torch.Tensor, list[int]]]:
+    """``(weight', packed_scale', starts)``: FP8 weight-read weights stacked by rows, each part zero-padded to a
+    multiple of the 128-row MMA tile except the last (which may keep a partial tile), with their DeepGEMM-packed
+    UE8M0 scales stacked the same way (padding rows repeat the part's last scale row; their weight rows are zero).
+    The parts' bytes are copied as they are (no requantization), so every output column of one GEMM on the result
+    multiplies the same weight bytes and scale as that part's own GEMM. ``starts`` are the parts' first rows. None
+    where a part is not in that form (FP8 2D weight, int32 packed scale with one row per weight row, same K)."""
+    kernel = _kernel()
+    if not parts:
+        return None
+    k = parts[0][0].shape[1] if parts[0][0].dim() == 2 else -1
+    words_k = parts[0][1].shape[1] if parts[0][1].dim() == 2 else -1
+    for i, (weight, scale) in enumerate(parts):
+        if (
+            weight.dtype != torch.float8_e4m3fn
+            or weight.dim() != 2
+            or weight.shape[1] != k
+            or k % kernel.CTA_K
+            or scale.dtype != torch.int32
+            or scale.dim() != 2
+            or scale.shape[0] != weight.shape[0]
+            or scale.shape[1] != words_k
+        ):
+            return None
+        if i < len(parts) - 1 and weight.shape[0] % kernel.N_ALIGN:
+            return None
+    weights, words, starts, row = [], [], [], 0
+    for i, (weight, scale) in enumerate(parts):
+        n = weight.shape[0]
+        starts.append(row)
+        weights.append(weight)
+        words.append(scale.contiguous())
+        pad = 0 if i == len(parts) - 1 else -(-n // kernel.MMA_M) * kernel.MMA_M - n
+        if pad:
+            weights.append(torch.zeros(pad, k, dtype=weight.dtype, device=weight.device))
+            words.append(scale[-1:].expand(pad, -1).contiguous())
+        row += n + pad
+    fused_w = torch.cat(weights, dim=0).contiguous()
+    stacked = torch.cat(words, dim=0)
+    # DeepGEMM's MN-major layout: int32 [N, ceil(K / 512)] with strides (1, N).
+    fused_s = torch.empty(
+        (stacked.shape[1], stacked.shape[0]), dtype=torch.int32, device=stacked.device
+    ).t()
+    fused_s.copy_(stacked)
+    return fused_w, fused_s, starts
+
+
 def set_weight(module: nn.Module, weight: torch.Tensor) -> None:
     """Point ``module.weight`` (a buffer, a parameter or a plain attribute) at ``weight``, keeping its kind; the
     module no longer references its previous weight tensor."""
