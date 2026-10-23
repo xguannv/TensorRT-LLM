@@ -24,6 +24,7 @@ The things worth proving:
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import replace
 
 import pytest
@@ -555,6 +556,67 @@ def test_kimi_k3_nvfp4_helix_near_misses_do_not_match(mapping_kwargs, missed):
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed):
         modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("sm", [103, 107])
+@pytest.mark.parametrize("moe", [(1, 8), (2, 4)], ids=["moetp1ep8", "moetp2ep4"])
+def test_kimi_k3_nvfp4_tp8_ctx_only_routes(monkeypatch, mode, sm, moe):
+    """Attention TP8 with the experts split set explicitly over the 8 ranks lands on a context-only target."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (sm // 10, sm % 10))
+    moe_tp, moe_ep = moe
+    config = _model_config(
+        _k3_config(quantization=_k3_nvfp4_mixed_config()),
+        world_size=8,
+        tp_size=8,
+        moe_tp_size=moe_tp,
+        moe_ep_size=moe_ep,
+    )
+    target = modeling_v2_resolve(config, _llm_args(mode))
+    assert _qualified(target) == (
+        f"models.kimi_k3_vl.kimi_k3_nvfp4__sm_{sm}__tp8_moetp{moe_tp}ep{moe_ep}.modeling."
+        f"ModelingV2KimiK3Nvfp4Sm{sm}Tp8Moetp{moe_tp}ep{moe_ep}"
+    )
+    assert (
+        target.target_spec.ctx_only and target.target_spec.tp == 8 and target.target_spec.world == 8
+    )
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # the expert split left unset
+        (dict(world_size=8, tp_size=8), "split_set=False"),
+        (dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1), "moe_tp=8"),
+        (
+            dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8, enable_attention_dp=True),
+            "attention_dp=True",
+        ),
+    ],
+)
+def test_kimi_k3_nvfp4_tp8_near_misses_do_not_match(mapping_kwargs, missed):
+    config = _model_config(_k3_config(quantization=_k3_nvfp4_mixed_config()), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_kimi_k3_tp16_targets_stay_decode_targets():
+    """The existing targets keep tp 16 and are not context-only (their behaviour is unchanged)."""
+    base = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    helix = importlib.import_module(base + "kimi_k3_nvfp4__sm_103__helix16_moetp4ep4.modeling")
+    tp16 = importlib.import_module(base + "kimi_k3_nvfp4__sm_103__tp16_moetp4ep4.modeling")
+
+    assert (
+        tp16._TARGET.parallel == "tp16_moetp4ep4"
+        and tp16._TARGET.world == 16
+        and not tp16._TARGET.ctx_only
+    )
+    assert (
+        helix._TARGET.parallel == "helix16_moetp4ep4"
+        and helix._TARGET.world == 16
+        and not helix._TARGET.ctx_only
+    )
 
 
 @pytest.mark.parametrize("bad_layer", ["missing", "mxfp4", "wrong_group_size"])

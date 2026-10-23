@@ -769,11 +769,21 @@ class K3TargetSpec:
     moe_ep: int = 4
     #: Helix context parallelism of the MLA KV cache: 1 (attention TP16) or 16 (tp 1 x cp 16, the rest on TP16).
     cp: int = 1
+    #: Attention tensor parallelism without Helix: 16, or 8 for the context-only targets.
+    tp: int = 16
+    #: A context-only (prefill) target: every step runs the generic path and no decode state is built at load
+    #: (decode GEMVs, MNNVL decode collectives, lowm MoE, FP8 decode weights), so it serves a disaggregated ctx
+    #: worker, never generation.
+    ctx_only: bool = False
 
     @property
     def parallel(self) -> str:
-        attention = "tp16" if self.cp == 1 else f"helix{self.cp}"
+        attention = f"tp{self.tp}" if self.cp == 1 else f"helix{self.cp}"
         return f"{attention}_moetp{self.moe_tp}ep{self.moe_ep}"
+
+    @property
+    def world(self) -> int:
+        return self.cp if self.cp > 1 else self.tp
 
 
 def _uses_nvfp4(config: ModelConfig) -> bool:
@@ -1968,6 +1978,8 @@ class KimiLinearModel(DecoderModel):
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
 
+        # A context-only target (K3TargetSpec.ctx_only) sets this: every step then takes the generic path.
+        self.ctx_only = False
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
@@ -2068,7 +2080,7 @@ class KimiLinearModel(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         num_tokens = (input_ids if inputs_embeds is None else inputs_embeds).shape[0]
-        step = decode_step(attn_metadata, num_tokens)
+        step = None if self.ctx_only else decode_step(attn_metadata, num_tokens)
         if step is None:
             return self._generic_forward(attn_metadata, input_ids, inputs_embeds, spec_metadata)
         if self._latent_push(attn_metadata, step):
@@ -3809,12 +3821,20 @@ def _check_construction(model_config: ModelConfig, target: K3TargetSpec) -> None
     assert target.cp > 1 or getattr(mapping, "cp_size", 1) == 1, (
         f"the {parallel} target runs without context parallelism; the engine built cp_size {mapping.cp_size}"
     )
-    assert topology == (16, 16, 1, target.moe_tp, target.moe_ep, False), (
-        f"the {parallel} target needs world_size 16, tensor_parallel_size 16, "
+    assert topology == (target.world, target.world, 1, target.moe_tp, target.moe_ep, False), (
+        f"the {parallel} target needs world_size {target.world}, tensor_parallel_size {target.world}, "
         f"pipeline_parallel_size 1, moe_tensor_parallel_size {target.moe_tp}, "
         f"moe_expert_parallel_size {target.moe_ep} and enable_attention_dp false; "
         f"the engine built (world, tp, pp, moe_tp, moe_ep, attention_dp) = {topology}"
     )
+    if target.ctx_only:
+        assert mapping.moe_tp_ep_user_specified, (
+            f"the {parallel} target needs moe_tensor_parallel_size {target.moe_tp} and "
+            f"moe_expert_parallel_size {target.moe_ep} set explicitly"
+        )
+        assert getattr(model_config, "spec_config", None) is None, (
+            f"the {parallel} target is context-only (a disaggregated ctx worker); it builds no drafter"
+        )
     if target.moe_tp == 16:
         assert mapping.moe_tp_ep_user_specified, (
             f"the {parallel} target needs moe_tensor_parallel_size 16 and "
@@ -3934,6 +3954,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             vocab_size=cfg.vocab_size,
         )
         self._own_spec_branch(text)
+        self.model.ctx_only = self.target_spec.ctx_only
         self._step_checked = False
         self._decode_state_ready = False
         # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state. It is the
@@ -4101,7 +4122,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         a later call keeps it, since CUDA graphs captured in between hold its workspace. The DSpark drafter's sites
         are among them, and the drafter gets the state too."""
         super().cache_derived_state()
-        if self.model.decode_gemvs is not None:
+        if self.model.decode_gemvs is not None or self.target_spec.ctx_only:
             return
         sites = tuple(_decode_gemv.SITES)
         if self.target_spec.quant_algo == QuantAlgo.NVFP4:
@@ -4154,6 +4175,13 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         """
         super().post_load_weights()
         if self._decode_state_ready:
+            return
+        if self.target_spec.ctx_only:
+            self._decode_state_ready = True
+            logger.info(
+                f"Kimi K3 NVFP4 SM{self.target_spec.sm[0]}{self.target_spec.sm[1]} {self.target_spec.parallel}: "
+                "context-only target, every step on the generic path, no decode state built"
+            )
             return
         if self.target_spec.quant_algo == QuantAlgo.NVFP4:
             layers = self.model.layers
