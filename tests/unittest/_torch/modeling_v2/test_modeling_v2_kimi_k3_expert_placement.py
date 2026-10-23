@@ -508,12 +508,13 @@ def _run_front(_=None):
         )
         biases = (bias, bias[index].contiguous())
         gsf = torch.tensor([448.0 * 6.0 / 0.5], device="cuda")
+        # k3_moe_front's 32-token build is specialized for the TP16 per-rank shapes: at world 4, up to 16 tokens.
         workspaces = {m_max: K3MoeHeadWorkspace.create(mapping, fabric_handle=True, m_max=m_max)
-                      for m_max in (8, 16, 32)}  # fmt: skip
+                      for m_max in (8, 16)}  # fmt: skip
         results = []
         with torch.inference_mode():
-            for m in (1, 2, 8, 16, 32):
-                ws = workspaces[8 if m <= 8 else 16 if m <= 16 else 32]
+            for m in (1, 2, 8, 16):
+                ws = workspaces[8 if m <= 8 else 16]
                 x = x32[:m].contiguous()
                 ref, new = (
                     k3_moe_front(x, front, b, RSF, inter, GATE_CAP, LINEAR_CAP, ws, nvfp4_gsf=gsf)
