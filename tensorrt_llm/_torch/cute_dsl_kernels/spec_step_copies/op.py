@@ -17,17 +17,18 @@
 ``SlotScatter`` moves a step's per-row outputs into the sampler's slot stores (one launch for the sampler's four
 ``index_copy_``). ``StepInputGather`` performs the overlap scheduler's gathers from those stores into a decode step's
 inputs (one launch for the engine's four). Each kernel takes every size and address as a launch argument, so it is
-compiled once per process, on the first launch, which must happen outside CUDA-graph capture. The kernels are called
-through TVM-FFI: a launch costs a few microseconds of host time.
+compiled once per process, on the first launch or by ``precompile``, outside CUDA-graph capture. The kernels are
+called through TVM-FFI: a launch costs a few microseconds of host time.
 
-Callers use them only where ``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches
-nothing and returns False; the caller then does that work itself.
+Callers build them where ``build_at_load()`` holds and launch them where ``is_enabled()`` holds on that call. A call
+whose arguments are outside what the kernel covers launches nothing and returns False; the caller then does that work
+itself.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar, Optional
 
 import torch
 
@@ -36,25 +37,76 @@ from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 SM103_ENV_VAR = "TRTLLM_K3LL_SPEC_STEP_COPIES_SM103"
 
+# A model that flips ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103`` at run time installs its reader here
+# (``set_sm103_switch``); without one the environment decides. Either is read on every call.
+_sm103_reader: Optional[Callable[[], Any]] = None
+_sm103_dispatched: Optional[Callable[[], None]] = None
+
+
+def set_sm103_switch(
+    reader: Optional[Callable[[], Any]], dispatched: Optional[Callable[[], None]] = None
+) -> None:
+    """Read ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103`` as ``reader()`` (true = on) on every call instead of from the
+    environment, and call ``dispatched()`` after each launch on SM 103. ``reader=None`` restores the environment.
+
+    With a reader installed the switch can change between steps, so the callers build their state and compile the
+    kernels at load on SM 103 whatever its value (``precompile_at_load``).
+    """
+    global _sm103_reader, _sm103_dispatched
+    _sm103_reader = reader
+    _sm103_dispatched = dispatched if reader is not None else None
+
 
 def sm103_enabled() -> bool:
-    """Whether ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1`` admits SM 103 (GB300); default 0."""
+    """Whether ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103`` admits SM 103 (GB300) now; default 0."""
+    reader = _sm103_reader
+    if reader is not None:
+        return bool(reader())
     return os.environ.get(SM103_ENV_VAR, "0") == "1"
 
 
-def is_supported() -> bool:
-    """Whether the kernels run on the current device with the CuTe DSL installed: SM 100 (B200 / GB200), and SM 103
-    (GB300) when ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1``.
+def is_available() -> bool:
+    """Whether the kernels can run on the current device: SM 100 (B200 / GB200) or SM 103 (GB300) with the CuTe DSL
+    installed. Callers build their state where ``build_at_load()`` holds and ask ``is_enabled()`` on every call.
 
     The kernels are plain SIMT code (thread and block indices, global loads and stores), with nothing specific to an
-    architecture. On SM 103 the switch exists because ``SlotScatter`` stores zeros in a row's ``new_tokens`` past its
-    accepted length where the torch path stores the forward's raw columns: no reader looks there, but the stores are
-    not bit-identical. SM 107 keeps the torch path.
+    architecture. On SM 103 a switch admits them because ``SlotScatter`` stores zeros in a row's ``new_tokens`` past
+    its accepted length where the torch path stores the forward's raw columns: no reader looks there, but the stores
+    are not bit-identical. SM 107 keeps the torch path.
     """
     if not (IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available()):
         return False
-    sm = get_sm_version()
-    return sm == 100 or (sm == 103 and sm103_enabled())
+    return get_sm_version() in (100, 103)
+
+
+def is_enabled() -> bool:
+    """Per call, on a device where ``is_available()`` holds: SM 100 always, SM 103 when the switch is on now."""
+    return get_sm_version() != 103 or sm103_enabled()
+
+
+def is_supported() -> bool:
+    """Whether the kernels run now: ``is_available()`` and ``is_enabled()``, i.e. SM 100, and SM 103 (GB300) when
+    ``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103=1``."""
+    return is_available() and is_enabled()
+
+
+def build_at_load() -> bool:
+    """Whether a caller builds its kernel state at load: the kernels run now, or a run-time reader may turn them on
+    between steps. Without a reader, SM 103 with the switch off builds nothing, as before the switch could change."""
+    return is_available() and (is_enabled() or _sm103_reader is not None)
+
+
+def precompile_at_load() -> bool:
+    """Whether callers compile the kernels at load: on SM 103 with a run-time reader installed (the switch may turn
+    on between steps; the first launch must not compile in a timed step). Elsewhere they compile on first launch."""
+    return _sm103_reader is not None and is_available() and get_sm_version() == 103
+
+
+def _note_dispatch() -> None:
+    """A launch happened: report it on SM 103 (the switched architecture)."""
+    dispatched = _sm103_dispatched
+    if dispatched is not None and get_sm_version() == 103:
+        dispatched()
 
 
 def _is_i32(t: torch.Tensor) -> bool:
@@ -111,6 +163,8 @@ class SlotScatter:
     """
 
     _kernel: ClassVar[Any] = None
+    # scatter_kernel's arguments: 9 addresses, 10 sizes.
+    _NUM_ARGS: ClassVar[int] = 19
 
     def scatter(
         self,
@@ -200,13 +254,23 @@ class SlotScatter:
         if SlotScatter._kernel is None:
             SlotScatter._kernel = _compile("scatter", args)
         SlotScatter._kernel(*args, torch.cuda.current_stream().cuda_stream)
+        _note_dispatch()
         return True
+
+    @classmethod
+    def precompile(cls) -> None:
+        """Compile the kernel now, outside CUDA-graph capture, if no launch has (sizes and addresses are launch
+        arguments: one build serves every call)."""
+        if cls._kernel is None:
+            cls._kernel = _compile("scatter", (0,) * cls._NUM_ARGS)
 
 
 class StepInputGather:
     """The overlap scheduler's gathers of a decode step's inputs from the sampler's slot stores, as one kernel."""
 
     _kernel: ClassVar[Any] = None
+    # gather_kernel's arguments: 9 addresses, 9 sizes.
+    _NUM_ARGS: ClassVar[int] = 18
 
     def gather(
         self,
@@ -294,4 +358,12 @@ class StepInputGather:
         if StepInputGather._kernel is None:
             StepInputGather._kernel = _compile("gather", args)
         StepInputGather._kernel(*args, torch.cuda.current_stream().cuda_stream)
+        _note_dispatch()
         return True
+
+    @classmethod
+    def precompile(cls) -> None:
+        """Compile the kernel now, outside CUDA-graph capture, if no launch has (sizes and addresses are launch
+        arguments: one build serves every call)."""
+        if cls._kernel is None:
+            cls._kernel = _compile("gather", (0,) * cls._NUM_ARGS)

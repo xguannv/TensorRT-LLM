@@ -253,6 +253,20 @@ TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "commit its tokens and take its continuation as drafts, draws keyed by the stream offset (force_replay.py; MLA "
     "DSpark worker; read at forward time)",
 )
+TRTLLM_K3LL_SPEC_STEP_COPIES_SM103 = _flag(
+    "TRTLLM_K3LL_SPEC_STEP_COPIES_SM103",
+    0,
+    "spec decode step on SM103: the sampler's store update and the overlap scheduler's input gathers on the "
+    "step-copy CuTe DSL kernels (one launch each), not torch; built and compiled at load, read per step "
+    "(engine_switches.py; new_tokens past a row's accepted length stored as zeros, which no reader looks at)",
+)
+TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
+    "TRTLLM_K3LL_SPEC_HEAD_FUSED",
+    0,
+    "spec decode step: the engine's decode-step head bookkeeping (overlap position / KV-length correction, Helix "
+    "position correction and spec buffers) in one fused_spec_head_prep launch; read per _preprocess_inputs call, "
+    "i.e. per CUDA graph capture (engine_switches.py; the same values)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

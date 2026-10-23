@@ -310,12 +310,19 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_accepted_path_len = args.max_draft_len + 1
         self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
         self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
-        if spec_step_copies.is_supported():
+        if spec_step_copies.build_at_load():
+            # Built whatever TRTLLM_K3LL_SPEC_STEP_COPIES_SM103 says now: _update_stores
+            # asks spec_step_copies.is_enabled() on every call.
             self._store_scatter = spec_step_copies.SlotScatter()
-            logger.info("Spec sampler: store updates on the step-copy scatter kernel")
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
                 pin_memory=prefer_pinned(),
+            )
+            if spec_step_copies.precompile_at_load():
+                spec_step_copies.SlotScatter.precompile()
+            logger.info(
+                "Spec sampler: step-copy scatter kernel built "
+                f"(store updates on it now: {spec_step_copies.is_enabled()})"
             )
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
@@ -462,8 +469,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
     ) -> None:
         """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``: one
-        ``SlotScatter`` launch where the step-copy kernels run and cover the call, the torch ops otherwise."""
-        if self._store_scatter is not None:
+        ``SlotScatter`` launch where the step-copy kernels are built, enabled on this call
+        (``TRTLLM_K3LL_SPEC_STEP_COPIES_SM103`` on SM 103) and cover it; the torch ops otherwise."""
+        if self._store_scatter is not None and spec_step_copies.is_enabled():
             # A step whose batch is unchanged leaves the slot table as it is.
             self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
             if self._store_scatter.scatter(

@@ -68,6 +68,7 @@ from . import decode_gemv as _decode_gemv
 from . import decode_mla_q as _decode_mla_q
 from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
+from . import engine_switches as _engine_switches
 from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
 from . import mla_drafter as _mla_drafter
@@ -3911,6 +3912,8 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             model_config, config.text_config, getattr(model_config, "spec_config", None)
         )
         _flags.log_flags()
+        # The engine's step-copy kernels and fused decode-step head read their switches from _flags per call.
+        _engine_switches.install()
         _census.install_model(KimiLinearModel, decode_step)
         _census.install(
             KimiLinearDecoderLayer, KimiK3MoERuntime, KimiMLARuntime, K3DecodeKDA, K3DecodeMLA

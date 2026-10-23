@@ -23,12 +23,14 @@ for the bookkeeping and one for the gather. Every value written is the one the
 eager code writes (integer arithmetic with PyTorch's floor-division and
 remainder semantics; the gather is a copy).
 
-``TRTLLM_K3LL_SPEC_HEAD_FUSED=1`` (default 0) selects the bookkeeping kernel in
+``TRTLLM_K3LL_SPEC_HEAD_FUSED=1`` (default 0; read on every call, from a
+model-installed reader or the environment) selects the bookkeeping kernel in
 the engine's decode-step head (``_preprocess_inputs``). Launch shapes depend
 only on host batch sizes, so both are CUDA-graph capturable.
 """
 
 import os
+from typing import Any, Callable, Optional
 
 import torch
 import triton
@@ -36,10 +38,37 @@ import triton.language as tl
 
 SPEC_HEAD_FUSION_ENV_VAR = "TRTLLM_K3LL_SPEC_HEAD_FUSED"
 
+# A model that flips ``TRTLLM_K3LL_SPEC_HEAD_FUSED`` at run time installs its reader here
+# (``set_spec_head_fusion_switch``); without one the environment decides. Either is read on every
+# ``_preprocess_inputs`` call, so a CUDA graph captures the arm current at its capture.
+_switch_reader: Optional[Callable[[], Any]] = None
+_dispatched: Optional[Callable[[], None]] = None
+
+
+def set_spec_head_fusion_switch(
+    reader: Optional[Callable[[], Any]], dispatched: Optional[Callable[[], None]] = None
+) -> None:
+    """Read ``TRTLLM_K3LL_SPEC_HEAD_FUSED`` as ``reader()`` (true = on) instead of from the environment, and call
+    ``dispatched()`` on each fused head prep the engine launches (eagerly or under capture). ``reader=None`` restores
+    the environment."""
+    global _switch_reader, _dispatched
+    _switch_reader = reader
+    _dispatched = dispatched if reader is not None else None
+
 
 def spec_head_fusion_enabled() -> bool:
-    """Whether ``TRTLLM_K3LL_SPEC_HEAD_FUSED=1`` selects the fused decode-step head."""
+    """Whether ``TRTLLM_K3LL_SPEC_HEAD_FUSED`` (default 0) selects the fused decode-step head now."""
+    reader = _switch_reader
+    if reader is not None:
+        return bool(reader())
     return os.environ.get(SPEC_HEAD_FUSION_ENV_VAR, "0") == "1"
+
+
+def note_dispatch() -> None:
+    """The engine launched a fused head prep: report it to the installed ``dispatched`` callback."""
+    dispatched = _dispatched
+    if dispatched is not None:
+        dispatched()
 
 
 @triton.jit

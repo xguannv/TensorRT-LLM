@@ -25,7 +25,13 @@ engine's torch ops (``torch_gather`` of ``test_spec_step_copies``, a copy of ``_
 * switch on, batch 1, 2 and 4 x 8 tokens: every gathered buffer and every store equals the switch-off arm's, except
   ``new_tokens`` past a row's accepted length, which the kernel stores as zeros where the torch ops store the
   forward's raw columns (no reader looks there); eagerly over chained steps, and from a CUDA graph of the scatter
-  and the gather replayed with every input rewritten in place, a replay of the same inputs bit-identical.
+  and the gather replayed with every input rewritten in place, a replay of the same inputs bit-identical;
+* a run-time reader installed (``set_sm103_switch``, what the K3 model installs: its flags module): the sampler
+  builds its state and compiles the kernel at load whatever the switch says, the environment is no longer read,
+  and one sampler, built once, with the switch flipped between chained steps (the gathers chosen per step as
+  ``_prepare_tp_inputs`` chooses them) equals the switch-off arm on every step; with the switch off it touches
+  neither the kernel nor its slot table, and the installed ``dispatched`` callback (the K3 census key
+  ``dispatch:spec_step_copies_sm103:eager``) fires once per launch, only with the switch on.
 """
 
 import pytest
@@ -76,6 +82,14 @@ def _sampler():
             max_total_draft_tokens=DRAFT_LEN,
         )
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_reader():
+    """Tests start and end with the environment deciding (no run-time reader installed)."""
+    _op().set_sm103_switch(None)
+    yield
+    _op().set_sm103_switch(None)
 
 
 def _set_switch(monkeypatch, value):
@@ -281,3 +295,107 @@ def test_switch_on_equals_off_graph_replay(monkeypatch, rows):
     torch.cuda.synchronize()
     again = on.snapshot()
     assert not [k for k in after if not torch.equal(after[k], again[k])], "same inputs replayed"
+
+
+needs_sm103 = pytest.mark.skipif(
+    not _runnable() or _sm() != 103,
+    reason="the switch gates SM 103 only (SM 100 always runs the kernels)",
+)
+
+
+class Reader:
+    """A run-time switch reader (as the K3 model installs) and the launches it was told of."""
+
+    def __init__(self):
+        self.on = False
+        self.dispatched = 0
+
+    def install(self):
+        _op().set_sm103_switch(lambda: self.on, self._dispatched)
+
+    def _dispatched(self):
+        self.dispatched += 1
+
+
+@needs_sm103
+@pytest.mark.parametrize("env", [None, "0", "1"], ids=["unset", "0", "1"])
+def test_reader_builds_at_load_and_overrides_environment(monkeypatch, env):
+    """With a reader installed: the sampler builds its scatter state and compiles the kernel at construction even
+    with the switch off, and the switch is the reader's, whatever the environment says."""
+    op = _op()
+    _set_switch(monkeypatch, env)
+    monkeypatch.setattr(op.SlotScatter, "_kernel", None)
+    reader = Reader()
+    reader.install()
+    assert op.build_at_load() and op.precompile_at_load()
+    sampler = _sampler()
+    assert sampler._store_scatter is not None and sampler._slot_table_buffer is not None
+    assert op.SlotScatter._kernel is not None, "not compiled at load"
+    for on in (False, True, False):
+        reader.on = on
+        assert op.is_enabled() is on and op.is_supported() is on
+    op.set_sm103_switch(None)
+    assert op.is_enabled() == (env == "1")
+    assert not op.precompile_at_load()
+
+
+@needs_sm103
+def test_switch_off_with_reader_touches_nothing(monkeypatch):
+    """Built at load, switch off: ``_update_stores`` neither updates the slot table nor launches the kernel, and
+    the stores are the torch ops', bit for bit."""
+    reader = Reader()
+    reader.install()
+    sampler = _sampler()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("step-copy state used with the switch off")
+
+    monkeypatch.setattr(sampler._slot_table_buffer, "update", forbidden)
+    monkeypatch.setattr(sampler._store_scatter, "scatter", forbidden)
+    g = torch.Generator().manual_seed(5)
+    off = Arm(sampler, g)
+    ref = Arm(_sampler(), torch.Generator().manual_seed(5))
+    for rows in BATCHES:
+        outputs, slots, _, _ = step_inputs(rows, g)
+        off.sampler._update_stores(outputs, 0, slots)
+        ref.sampler._scatter_to_stores(outputs, 0, slots)
+        torch.cuda.synchronize()
+        assert not [k for k, t in off.snapshot().items() if not torch.equal(t, ref.snapshot()[k])]
+    assert reader.dispatched == 0
+
+
+@needs_sm103
+@pytest.mark.parametrize("rows", BATCHES, ids=[f"bs{r}" for r in BATCHES])
+def test_flip_between_steps_equals_off_arm(rows):
+    """One sampler built once with the reader installed, the switch flipped between chained steps (off, on, on, off,
+    on, off): its store update and the gathers chosen as ``_prepare_tp_inputs`` chooses them (``StepInputGather``
+    where ``is_enabled()``, the torch ops otherwise) equal a switch-off arm's on every step (the switch-on steps up
+    to the dead ``new_tokens`` columns, as above). The dispatch callback counts two launches per switch-on step."""
+    op = _op()
+    reader = Reader()
+    reader.install()
+    flip = Arm(_sampler(), torch.Generator().manual_seed(120 + rows))
+    ref_sampler = _sampler()
+    ref_sampler._store_scatter = None  # the torch ops, every step
+    ref = Arm(ref_sampler, torch.Generator().manual_seed(120 + rows))
+    assert not [k for k, t in ref.snapshot().items() if not torch.equal(t, flip.snapshot()[k])]
+    g = torch.Generator().manual_seed(rows)
+    expect = 0
+    for step, on in enumerate((False, True, True, False, True, False)):
+        reader.on = on
+        outputs, slots, prev_slots, pos_index = step_inputs(rows, g)
+        flip.sampler._update_stores(outputs, 0, slots)
+        gather = kernel_gather if op.is_enabled() else torch_gather
+        gather(flip.store, prev_slots, pos_index, rows, flip.bufs)
+        ref.sampler._update_stores(outputs, 0, slots)
+        torch_gather(ref.store, prev_slots, pos_index, rows, ref.bufs)
+        torch.cuda.synchronize()
+        expect += 2 * on
+        assert reader.dispatched == expect, (step, reader.dispatched, expect)
+        if on:
+            bad = compare(ref, flip, slots, outputs)
+        else:
+            a, b = ref.snapshot(), flip.snapshot()
+            bad = [k for k in a if not torch.equal(a[k], b[k])]
+        assert not bad, (f"step {step} switch {int(on)}", bad)
+        ref.store.new_tokens.copy_(flip.store.new_tokens)

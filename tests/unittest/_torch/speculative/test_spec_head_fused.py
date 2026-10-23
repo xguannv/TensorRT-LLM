@@ -26,7 +26,12 @@ whole:
   input rewritten in place; a replay of the same inputs is bit-identical;
 * switch on, a step the kernel does not cover (context tokens in the batch): the torch path runs;
 * the runner's fused head-prep count (what its log reports) counts each fused ``_preprocess_inputs`` call Python
-  runs, a CUDA graph capture among them, and no graph replay.
+  runs, a CUDA graph capture among them, and no graph replay;
+* the switch is read on every ``_preprocess_inputs`` call, from an installed reader (what the K3 model installs:
+  its flags module) or else the environment: one runner, built once, flipped between eager steps and between CUDA
+  graph captures, equals the switch-off arm on every step and replay, and the installed ``dispatched`` callback
+  (the K3 census key ``dispatch:spec_head_fused:<mode>``) fires once per fused eager call or capture, never on a
+  replay or with the switch off.
 
 Batch 1, 2 and 4 at draft length 7 (8 tokens per row); Helix16 at CP ranks 0, 5 and 15 with 64-token pages and
 positions straddling page and ledger boundaries, the overlap scheduler on and off, and the TP16 shape (no Helix).
@@ -47,6 +52,29 @@ BATCHES = [1, 2, 4]
 ENV = "TRTLLM_K3LL_SPEC_HEAD_FUSED"
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+# The switch value the installed reader returns, and the dispatches it was told of.
+SWITCH = {"on": False, "dispatched": 0}
+
+
+def _kernels():
+    from tensorrt_llm._torch.speculative import spec_head_kernels
+
+    return spec_head_kernels
+
+
+@pytest.fixture(autouse=True)
+def _switch_reader():
+    """Every test reads the switch through an installed reader (as under the K3 model), restored afterwards."""
+
+    def dispatched():
+        SWITCH["dispatched"] += 1
+
+    SWITCH.update(on=False, dispatched=0)
+    _kernels().set_spec_head_fusion_switch(lambda: SWITCH["on"], dispatched)
+    yield
+    _kernels().set_spec_head_fusion_switch(None)
+
 
 # (label, helix, cp_rank, overlap)
 SHAPES = [
@@ -115,7 +143,8 @@ class Step:
         meta = _metadata_cls()
         md.helix_local_len_vec = types.MethodType(meta.helix_local_len_vec, md)
         md.recompute_helix_spec_buffers = types.MethodType(meta.recompute_helix_spec_buffers, md)
-        # Every DecoderRunner attribute _preprocess_inputs reads on this path, as __init__ sets it.
+        # Every DecoderRunner attribute _preprocess_inputs reads on this path, as __init__ sets it. The switch
+        # itself is read per call through spec_head_kernels (SWITCH below, set by run()).
         runner = types.SimpleNamespace(
             _config=types.SimpleNamespace(disable_overlap_scheduler=not overlap),
             mapping=mapping,
@@ -123,11 +152,12 @@ class Step:
             previous_kv_lens_offsets_cuda=b["kv_off"],
             get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
             guided_decoder=None,
-            _spec_head_fused=fused,
+            _spec_head_fusable=True,
             _spec_head_fused_steps=0,
             _spec_head_fused_captures=0,
         )
         self.runner = runner
+        self.fused = fused
         cls = _runner_cls()
         runner._fused_spec_head_prep = types.MethodType(cls._fused_spec_head_prep, runner)
         self.preprocess = types.MethodType(cls._preprocess_inputs, runner)
@@ -161,6 +191,8 @@ class Step:
         )
 
     def run(self):
+        """``_preprocess_inputs`` with the switch at this step's ``fused`` (read by the runner during the call)."""
+        SWITCH["on"] = self.fused
         self.preprocess(self.inputs, enable_spec_decode=True, runtime_draft_len=DRAFT_LEN)
 
     def fused_counts(self):
@@ -207,9 +239,9 @@ def _forbid_fused(monkeypatch):
 
 @pytest.mark.parametrize("value", [None, "0", "1"])
 def test_switch_read(monkeypatch, value):
-    """The runner's switch: on only for ``1``; unset and ``0`` keep the torch path."""
-    from tensorrt_llm._torch.speculative import spec_head_kernels
-
+    """The runner's switch without an installed reader: on only for ``1``; unset and ``0`` keep the torch path."""
+    spec_head_kernels = _kernels()
+    spec_head_kernels.set_spec_head_fusion_switch(None)
     if value is None:
         monkeypatch.delenv(ENV, raising=False)
     else:
@@ -301,3 +333,78 @@ def test_switch_on_context_step_takes_torch_path(monkeypatch, helix):
     torch.cuda.synchronize()
     assert not diff(off.bufs, on.bufs), diff(off.bufs, on.bufs)
     assert on.fused_counts() == (0, 0)
+
+
+@pytest.mark.parametrize("env", [None, "0", "1"])
+def test_installed_reader_overrides_environment(monkeypatch, env):
+    """With a reader installed the environment is not read; uninstalling it brings the environment back."""
+    spec_head_kernels = _kernels()
+    if env is None:
+        monkeypatch.delenv(ENV, raising=False)
+    else:
+        monkeypatch.setenv(ENV, env)
+    for on in (False, True, False):
+        SWITCH["on"] = on
+        assert spec_head_kernels.spec_head_fusion_enabled() is on
+    spec_head_kernels.note_dispatch()
+    assert SWITCH["dispatched"] == 1
+    spec_head_kernels.set_spec_head_fusion_switch(None)
+    assert spec_head_kernels.spec_head_fusion_enabled() == (env == "1")
+    spec_head_kernels.note_dispatch()  # no callback without a reader
+    assert SWITCH["dispatched"] == 1
+
+
+@pytest.mark.parametrize("batch,label,helix,cp_rank,overlap", CASES, ids=IDS)
+def test_flip_between_steps_and_captures(batch, label, helix, cp_rank, overlap):
+    """One runner, built once, the switch flipped between eager steps and between CUDA graph captures (what the
+    one-process A/B does: set the switch, release the graphs, recapture). Every step and every replay equals a
+    switch-off runner's on the same inputs; a graph keeps the arm current at its capture; the dispatch callback
+    and the runner's counts see each fused eager call and capture, no replay and no switch-off call."""
+    seed = 13 * batch + cp_rank + 100 * overlap
+    flip = Step(batch, helix, cp_rank, overlap, fused=False, seed=seed)
+    ref = Step(batch, helix, cp_rank, overlap, fused=False, seed=seed)
+
+    def check(what):
+        torch.cuda.synchronize()
+        assert not diff(ref.bufs, flip.bufs), (what, diff(ref.bufs, flip.bufs))
+
+    # Eager steps, the switch flipped between them: off, on, on, off, on.
+    expect = 0
+    for i, on in enumerate((False, True, True, False, True)):
+        flip.rewrite()
+        ref.rewrite()
+        flip.fused = on
+        flip.run()
+        ref.run()
+        check(f"eager step {i} switch {int(on)}")
+        expect += on
+        assert SWITCH["dispatched"] == expect, (i, SWITCH["dispatched"], expect)
+    assert flip.fused_counts() == (expect, 0) and ref.fused_counts() == (0, 0)
+
+    stream = torch.cuda.Stream()
+    captures = 0
+    # Capture with the switch off, then on, then off again; each graph replayed with rewritten inputs, the switch
+    # value after capture flipped (a captured graph does not read it).
+    for arm in (False, True, False):
+        flip.fused = arm
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                flip.run()
+        torch.cuda.synchronize()
+        expect += arm
+        captures += arm
+        assert SWITCH["dispatched"] == expect
+        assert flip.fused_counts() == (expect, captures)
+        for replay in range(3):
+            SWITCH["on"] = not arm
+            flip.rewrite()
+            ref.rewrite()
+            graph.replay()
+            ref.run()
+            check(f"graph switch {int(arm)} replay {replay}")
+        assert SWITCH["dispatched"] == expect, "a replay ran Python"
+        del graph
+    assert flip.fused_counts() == (expect, captures) == (4, 1)
+    assert ref.fused_counts() == (0, 0)

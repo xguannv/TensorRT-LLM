@@ -542,26 +542,29 @@ class DecoderRunner(ScheduledModelRunner):
         # unchanged skips both copies.
         self._staged_previous_batch_indices: list[int] | None = None
         self._staged_previous_pos_indices: list[int] | None = None
-        # Where the step-copy kernels run: performs a speculative decode step's
-        # overlap gathers with one launch.
-        self._step_input_gather: spec_step_copies.StepInputGather | None = (
-            spec_step_copies.StepInputGather()
-            if self._config.is_spec_decode and spec_step_copies.is_supported()
-            else None
-        )
-        # TRTLLM_K3LL_SPEC_HEAD_FUSED=1: a pure-generation spec decode step's head
-        # bookkeeping in _preprocess_inputs as one fused_spec_head_prep launch.
-        self._spec_head_fused = (
-            self._config.is_spec_decode and spec_head_kernels.spec_head_fusion_enabled()
-        )
+        # Where the step-copy kernels can run: performs a speculative decode step's
+        # overlap gathers with one launch. Built whatever TRTLLM_K3LL_SPEC_STEP_COPIES_SM103
+        # says now; _prepare_tp_inputs asks spec_step_copies.is_enabled() on every step.
+        self._step_input_gather: spec_step_copies.StepInputGather | None = None
+        if self._config.is_spec_decode and spec_step_copies.build_at_load():
+            self._step_input_gather = spec_step_copies.StepInputGather()
+            if spec_step_copies.precompile_at_load():
+                spec_step_copies.StepInputGather.precompile()
+        # TRTLLM_K3LL_SPEC_HEAD_FUSED (spec_head_kernels.spec_head_fusion_enabled(), read on
+        # every _preprocess_inputs call): a pure-generation spec decode step's head bookkeeping
+        # in _preprocess_inputs as one fused_spec_head_prep launch. It needs no state of its own.
+        self._spec_head_fusable = self._config.is_spec_decode
         # _preprocess_inputs calls that took the fused path, all and under CUDA graph capture.
         # A graph replay reruns the captured launch without running Python, so it is not counted.
         self._spec_head_fused_steps = 0
         self._spec_head_fused_captures = 0
-        if self._step_input_gather is not None or self._spec_head_fused:
+        if self._step_input_gather is not None or (
+            self._spec_head_fusable and spec_head_kernels.spec_head_fusion_enabled()
+        ):
             logger.info(
-                f"Spec decode step head: step-copy gather kernel {self._step_input_gather is not None}, "
-                f"fused head prep {self._spec_head_fused}"
+                f"Spec decode step head: step-copy gather kernel built {self._step_input_gather is not None} "
+                f"(on now {self._step_input_gather is not None and spec_step_copies.is_enabled()}), "
+                f"fused head prep on now {self._spec_head_fusable and spec_head_kernels.spec_head_fusion_enabled()}"
             )
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
@@ -2914,13 +2917,16 @@ class DecoderRunner(ScheduledModelRunner):
         if attn_meta is not None:
             attn_meta.on_update_kv_lens()
 
-        # With TRTLLM_K3LL_SPEC_HEAD_FUSED=1, one launch for both blocks below where it covers the step.
+        # With TRTLLM_K3LL_SPEC_HEAD_FUSED on (read here, per call), one launch for both blocks
+        # below where it covers the step.
         head_fused = (
             enable_spec_decode
-            and self._spec_head_fused
+            and self._spec_head_fusable
+            and spec_head_kernels.spec_head_fusion_enabled()
             and self._fused_spec_head_prep(inputs, runtime_draft_len)
         )
         if head_fused:
+            spec_head_kernels.note_dispatch()
             self._spec_head_fused_steps += 1
             if torch.cuda.is_current_stream_capturing():
                 self._spec_head_fused_captures += 1
@@ -4173,9 +4179,15 @@ class DecoderRunner(ScheduledModelRunner):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
-        # Where the step-copy kernels run, the overlap gathers below are one
-        # kernel.
-        step_gather = self._step_input_gather if enable_spec_decode else None
+        # Where the step-copy kernels run on this step (SM 100; SM 103 with
+        # TRTLLM_K3LL_SPEC_STEP_COPIES_SM103 on now), the overlap gathers below are one kernel.
+        step_gather = (
+            self._step_input_gather
+            if enable_spec_decode
+            and self._step_input_gather is not None
+            and spec_step_copies.is_enabled()
+            else None
+        )
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
