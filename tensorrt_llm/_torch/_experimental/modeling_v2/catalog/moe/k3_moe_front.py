@@ -11,6 +11,7 @@ import torch
 # weight_supported reads metadata only.
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.front_op import (
     front_weight,
+    route_fast_applies,
     sort_layout,
     sort_views,
     weight_supported,
@@ -21,6 +22,7 @@ __all__ = [
     "K3MoeHeadWorkspace",
     "front_weight",
     "k3_moe_front",
+    "route_fast_applies",
     "sort_layout",
     "sort_views",
     "weight_supported",

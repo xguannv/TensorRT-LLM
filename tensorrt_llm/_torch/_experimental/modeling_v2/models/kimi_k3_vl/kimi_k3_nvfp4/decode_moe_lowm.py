@@ -49,6 +49,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front impo
     K3MoeHeadWorkspace,
     front_weight,
     k3_moe_front,
+    route_fast_applies,
     sort_layout,
     sort_views,
     weight_supported,
@@ -57,6 +58,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant im
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
+from . import census as _census
 from . import flags as _flags
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
@@ -76,9 +78,15 @@ def lowm_launch(rows: int) -> dict:
     """The expert kernel's launch for a step of ``rows`` tokens, from the switches read now (forward time):
     ``nvfp4_lowm_op.run_sorted``'s ``num_ctas`` / ``split``."""
     if rows > FRONT16_TOKENS:
-        return {"split": bool(_flags.TRTLLM_K3LL_MOE_LOWM_SPLIT32)}
+        split = bool(_flags.TRTLLM_K3LL_MOE_LOWM_SPLIT32)
+        if split:
+            _census.count(f"dispatch:moe_lowm_split32:{_census.mode()}")
+        return {"split": split}
     if rows > MAX_TOKENS:
-        return {"num_ctas": int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16)}
+        ctas = int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_CTAS16)
+        if ctas:
+            _census.count(f"dispatch:moe_lowm_dyn_ctas16:{_census.mode()}")
+        return {"num_ctas": ctas}
     return {}
 
 
@@ -333,6 +341,8 @@ class K3DecodeMoeNvfp4Layer:
         head = self.state.head16 if x.shape[0] > MAX_TOKENS else self.state.head
         if route_fast is None:
             route_fast = bool(_flags.TRTLLM_K3LL_ROUTE_TAIL_FAST)
+            if route_fast and sort_out is not None and route_fast_applies(x.shape[0], True):
+                _census.count(f"dispatch:route_tail_fast:{_census.mode()}")
         return k3_moe_front(
             x.contiguous(),
             self.front_weight,
