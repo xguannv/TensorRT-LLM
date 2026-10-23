@@ -250,7 +250,7 @@ TRTLLM_K3LL_MLA_GATE_SIDE = _flag(
 )
 TRTLLM_K3LL_MLA_KV_SIDE = _flag(
     "TRTLLM_K3LL_MLA_KV_SIDE",
-    0,
+    1,
     "Helix all-head MLA decode (HELIX_Q_ABSORB): the latent row and the KV append (mla_latent, mla_rope_generation "
     "with q_rope_applied) on their own side stream from right after the fused q_a / kv_a, beside the query path "
     "(q_a norm, q_b, K3MlaQAbsorb); the main stream joins it before the split read, so every later reader of the "
