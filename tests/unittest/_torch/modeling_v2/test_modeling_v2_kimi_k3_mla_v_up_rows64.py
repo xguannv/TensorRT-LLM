@@ -19,7 +19,8 @@ split read on one GPU (the helpers of ``test_modeling_v2_kimi_k3_mla_v_up``):
 
 * up to 32 rows (8 / 16 / 32): switch on = switch off bit for bit (V rows and softmax statistics), eagerly and replayed
   from a CUDA graph with new queries;
-* 64 rows, switch off: the fallback, bit for bit the split read + BMM it is (no fused variant compiled for 64 rows);
+* 64 rows, switch off: the fallback, bit for bit the split read + BMM it is (no fused variant compiled for 64 rows;
+  the statistics of the rows that have keys on the rank);
 * 64 rows, switch on: the fused path ran (a 64-row, >= 2-split variant compiled); the softmax statistics and V rows
   against the switch-off fallback within the V-up tolerance (per (token, head) relative L2 ``ON_OFF_TOL``, the Helix
   V-up op matrix's on/off bound), and against fp32 attention x fp32 W_UV (the whole sequence on one rank) within
@@ -136,7 +137,11 @@ def test_rows64_off_is_the_fallback(monkeypatch):
     torch.cuda.synchronize()
     assert not any(k[-2] == 64 for k in set(mla_v_up._compiled) - before)
     assert torch.equal(v.view(torch.int16), v_ref.view(torch.int16))
-    assert torch.equal(torch.nan_to_num(stats), torch.nan_to_num(stats_ref))
+    # One split: the decode leaves the statistics of a row with no key on this rank unwritten (the exchange masks
+    # those rows, ``plan.empty``), so compare the rows that have keys here.
+    keyed = ~plan.empty.to(stats.device)
+    assert 0 < int(keyed.sum()) < stats.shape[0]
+    assert torch.equal(stats[keyed], stats_ref[keyed])
 
 
 def test_rows64_on_close_to_off(monkeypatch):
