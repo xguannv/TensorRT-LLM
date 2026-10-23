@@ -72,6 +72,12 @@ TRTLLM_K3LL_MLA_SPEC_ACCEPT = _flag(
     1,
     "MLA DSpark worker: vocab-sharded target logits + k3_spec_accept (greedy, or temperature via no_topk_no_topp)",
 )
+TRTLLM_K3LL_SPEC_ACCEPT_PAR = _flag(
+    "TRTLLM_K3LL_SPEC_ACCEPT_PAR",
+    0,
+    "k3_spec_accept: the draft pool's block table decoded by extra CTAs of 2048 columns each beside the argmax CTAs, "
+    "not by CTA 0 one request after another (the same bits; read per call, both builds compiled at warmup)",
+)
 
 TRTLLM_K3LL_MLA_DRAFTER_QKV = _flag(
     "TRTLLM_K3LL_MLA_DRAFTER_QKV",

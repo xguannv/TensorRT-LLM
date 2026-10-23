@@ -167,11 +167,12 @@ def context_lengths(gen, batch_to_slot: torch.Tensor, batch: int) -> torch.Tenso
     return ctx
 
 
-def make_state(gen, batch: int) -> dict:
+def make_state(gen, batch: int, max_blocks=None) -> dict:
     """One decode step's state with the model's dtypes: distinct KDA slots and context slots per request, except the
     two CUDA-graph padding requests of a batch of 5 or more (one state slot, one context slot); stale block counts and
-    tables the kernel overwrites for the batch's rows only."""
-    max_blocks = MAX_BLOCKS[batch % len(MAX_BLOCKS)]
+    tables the kernel overwrites for the batch's rows only. ``max_blocks``: the block-table width (by batch if None)."""
+    if max_blocks is None:
+        max_blocks = MAX_BLOCKS[batch % len(MAX_BLOCKS)]
     state_idx = torch.randperm(SLOTS, generator=gen, device="cuda")[:SEQS].to(torch.int32)
     batch_to_slot = torch.randperm(SLOTS, generator=gen, device="cuda")[:SEQS]
     if batch >= PADDING_FROM:
@@ -360,9 +361,9 @@ def reference(st: dict, logits, draft, force: float, block: int) -> list:
     return [accepted, num_acc, rewind, bonus, qpos, cpos, noise]
 
 
-def fused(st: dict, logits, draft, force: float, block: int, shard=None) -> list:
+def fused(st: dict, logits, draft, force: float, block: int, shard=None, **extra) -> list:
     """``trtllm::k3_spec_accept`` on the state ``st``; ``shard``: (workspace, first column) when ``logits`` are this
-    rank's bf16 vocabulary shard."""
+    rank's bf16 vocabulary shard; ``extra``: the op's keyword arguments (sampling inputs, ``split_table``, ...)."""
     ws_args = ()
     if shard is not None:
         ws, first = shard
@@ -371,7 +372,7 @@ def fused(st: dict, logits, draft, force: float, block: int, shard=None) -> list
     return torch.ops.trtllm.k3_spec_accept(
         logits, draft, st["block_off"], st["pool_idx"], st["divisor"], st["block_counts"], st["block_tables"],
         st["prev_acc"], st["state_idx"], st["dummy"], st["kv_lens"], st["batch_to_slot"], st["ctx_len"], MAX_CTX,
-        st["embed"], st["mask_row"], st["rng_pool"], st["rng_counter"], force, block, *ws_args,
+        st["embed"], st["mask_row"], st["rng_pool"], st["rng_counter"], force, block, *ws_args, **extra,
     )  # fmt: skip
 
 

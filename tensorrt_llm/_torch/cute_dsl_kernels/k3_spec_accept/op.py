@@ -23,6 +23,10 @@ column-parallel head): the ranks exchange their row maxima over a multicast Lamp
 the logits, with the same argmax. Compiled on the first call per shape, which must happen outside CUDA-graph capture.
 Every call on a device with the same number of logits columns shares one arrival counter, so the calls must be ordered
 on one stream: two calls not ordered on one stream would mix their arrivals.
+
+``split_table``: the draft pool's block table is decoded by extra CTAs (``TABLE_COLS`` columns each, beside the argmax
+CTAs) instead of serially by CTA 0; the same bits. ``compile_both``: the first call per shape (outside capture) also
+compiles the other build, so a caller may switch between them from one CUDA-graph capture to the next.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ import torch
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
 _scratch: Dict[tuple, tuple] = {}
+_table_scratch: Dict[tuple, torch.Tensor] = {}
 _modules: Dict[str, object] = {}
 _workspaces: Dict[object, dict] = {}
 
@@ -202,6 +207,8 @@ def k3_spec_accept(
     samp_temp: Optional[torch.Tensor] = None,
     samp_seed: Optional[torch.Tensor] = None,
     samp_off: Optional[torch.Tensor] = None,
+    split_table: bool = False,
+    compile_both: bool = False,
 ) -> List[torch.Tensor]:
     """Returns ``[accepted [B, K + 1] int32, num_accepted [B] int32, rewind [B] int32, bonus [B] int64,
     query_positions [B, block] int64, ctx_positions [B, K + 1] int64, noise [B, block, H] bf16]`` and updates
@@ -215,7 +222,10 @@ def k3_spec_accept(
     target token is a temperature sample instead of the argmax, by the Gumbel-max trick on noise that depends on the
     row's seed and offset and the global column only (:func:`gumbel_reference`), so a sharded call needs no extra
     exchange. Exact for pure temperature sampling (no top-k, top-p or min-p); a row below ``GREEDY_TEMPERATURE`` stays
-    greedy."""
+    greedy.
+
+    ``split_table``: the block table decoded by ``op.table_geometry`` extra CTAs, not CTA 0 (the same bits);
+    ``compile_both``: a shape's first call also compiles the other build (see the module docstring)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
 
@@ -268,6 +278,18 @@ def k3_spec_accept(
         scratch = _scratch[(device, grid)] = (
             torch.empty(kern.MAX_ROWS * grid * 2, dtype=torch.int32, device=device),
             torch.zeros(1, dtype=torch.int32, device=device),
+        )
+    n_seq, max_blocks = block_off.shape[1], block_off.shape[3]
+    table_ctas, chunks = kern.table_geometry(batch, max_blocks)
+    table_part = _table_scratch.get((device, chunks))
+    if table_part is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "trtllm::k3_spec_accept must run once per block-table width outside CUDA-graph capture first"
+            )
+        # One per (device, chunks per request), never freed: captured graphs keep its address.
+        table_part = _table_scratch[(device, chunks)] = torch.zeros(
+            kern.MAX_BATCH * chunks, dtype=torch.int32, device=device
         )
     sample = samp_temp is not None
     if sample:
@@ -327,11 +349,11 @@ def k3_spec_accept(
         _arg(noise.view(-1).view(torch.int32)),
         _arg(scratch[0]),
         _arg(scratch[1]),
+        _arg(table_part),
         _arg(ws_uc),
         _arg(ws_mc),
         _arg(ws_flags),
     )
-    n_seq, max_blocks = block_off.shape[1], block_off.shape[3]
     scalars = (int(pool_idx) * n_seq * 2 * max_blocks, 2 * max_blocks, int(divisor), int(max_ctx), int(total),
                float(frac), int(mode), int(rank), int(shard_offset))  # fmt: skip
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
@@ -347,20 +369,28 @@ def k3_spec_accept(
         int(push_copies),
         sample,
     )
-    key = consts + (use_pdl,)
+    # The build's table CTAs: 0 = CTA 0 decodes the block table.
+    want = table_ctas if split_table else 0
+    key = consts + (want, use_pdl)
     fn = _compiled.get(key)
-    if fn is None:
+    if fn is None or (
+        compile_both and _compiled.get(consts + (table_ctas - want, use_pdl)) is None
+    ):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "trtllm::k3_spec_accept must run once per shape outside CUDA-graph capture first"
-            )
-        with _lock:
-            fn = _compiled.get(key)
             if fn is None:
-                fn = _compiled[key] = cute.compile(
-                    kern.k3_spec_accept, *args, *scalars, *consts, use_pdl,
-                    cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
-                )  # fmt: skip
+                raise RuntimeError(
+                    "trtllm::k3_spec_accept must run once per shape outside CUDA-graph capture first"
+                )
+        else:
+            with _lock:
+                for build in (want, table_ctas - want) if compile_both else (want,):
+                    build_key = consts + (build, use_pdl)
+                    if _compiled.get(build_key) is None:
+                        _compiled[build_key] = cute.compile(
+                            kern.k3_spec_accept, *args, *scalars, *consts, build, use_pdl,
+                            cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
+                        )  # fmt: skip
+            fn = _compiled[key]
     fn(*args, *scalars, cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream))
     return [accepted, num_acc, rewind, bonus, qpos, cpos, noise]
 
@@ -369,7 +399,7 @@ def k3_spec_accept(
 def _(logits, draft, block_off, pool_idx, divisor, block_counts, block_tables, prev_acc, state_idx, dummy, kv_lens,
       batch_to_slot, ctx_len, max_ctx, embed, mask_row, rng_pool, rng_counter, force, block, ws_uc=None, ws_mc=None,
       ws_flags=None, rank=0, slots=1, push_copies=1, shard_offset=0, samp_temp=None, samp_seed=None,
-      samp_off=None):  # fmt: skip
+      samp_off=None, split_table=False, compile_both=False):  # fmt: skip
     batch, drafts = draft.shape
     hidden = embed.shape[1]
     return [

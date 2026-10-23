@@ -29,16 +29,20 @@ whole row, NaNs in two shards, a NaN in the last shard only: the first NaN wins)
 rank but rank 0 launching the last one late (the last call reads the buffer of the first after a 2-row call re-armed
 it), a batch that dips and grows back (64, 64, 64, 16, 56 and 64 rows, then 50 calls of a random B x 8 with one random
 rank late each call), and CUDA graphs of 3 sharded calls replayed 10 times with the logits, drafts and dummy mask
-rewritten in place (the buffer rotation inside a graph).
+rewritten in place (the buffer rotation inside a graph). The split block table (``split_table=True``): B = 1, 2, 4, 8
+x 8 tokens, greedy and sampled, a 32768-column block table, 4 calls with the state carried and a CUDA graph of each
+build replayed 6 times, against the serial build on the same sharded calls (the last CTA may be a table CTA: the
+exchange must not care).
 
 Shapes: the rank's shard V / W of V = 163840 (W exchange slots), and TP16's 10240-column shard with every rank filling
 16 / W slots (the exchange of 16 ranks; ``--copies`` overrides).
 
     srun -n W --mpi=pmix python3 test_k3_spec_accept_sharded.py [report] [--copies C] [--time [--base]]
 
-``--time`` also reports us per call at batch 1 and every split of the sharded kernel and of the kernel on the gathered
-fp32 logits (CUDA graphs of 20 back-to-back calls, the slowest rank of each replay, median over 12 replays in
-alternating order; the all-gather, cat and cast that the sharded path removes are not in the second number);
+``--time`` also reports us per call at batch 1 and every split of the sharded kernel, of its split-table build
+(``--width`` sets the block-table columns of the timed calls) and of the kernel on the gathered fp32 logits (CUDA
+graphs of 20 back-to-back calls, the slowest rank of each replay, median over 12 replays in alternating order; the
+all-gather, cat and cast that the sharded path removes are not in the gathered number);
 ``--base`` adds the installed base package's kernel (``$K3_BASE_TRTLLM``) on the same sharded calls and workspace.
 Under pytest (``python3 -m pytest test_k3_spec_accept_sharded.py``, 4 GPUs visible) one test runs the checks on 4
 ranks: this file under a local ``mpirun -n 4``, started from a fresh interpreter, under a deadline; with fewer GPUs the
@@ -98,6 +102,9 @@ CASES = (
 )
 GRAPH_SPLITS = [(1, 2), (2, 8), (4, 4), (8, 8)]
 GRAPH_KINDS = ("plain", "ties", "rank_ties", "nan", "negzero")
+# The split block table's checks: (B, K + 1) and the block-table columns (16 table CTAs per request).
+SPLIT_TABLE_SPLITS = [(1, 8), (2, 8), (4, 8), (8, 8)]
+SPLIT_TABLE_WIDTH = 32768
 
 
 # The ranks of the pytest run (one GB200 tray) and its deadline: a broken exchange hangs rather than raising.
@@ -161,8 +168,8 @@ def same_logits_everywhere(env: dict, x: torch.Tensor) -> bool:
     return all(other == sums for other in env["comm"].allgather(sums))
 
 
-def sharded_state(gen, batch: int, vocab: int) -> dict:
-    st = make_state(gen, batch)
+def sharded_state(gen, batch: int, vocab: int, max_blocks=None) -> dict:
+    st = make_state(gen, batch, max_blocks)
     st["embed"] = embedding()[:vocab]  # the drafter embedding covers the vocabulary
     return st
 
@@ -356,25 +363,120 @@ def check_graph(env: dict, ws: dict, vocab: int, config: str, batch: int, tokens
     return finish(res)
 
 
+def sampling_inputs(gen, rows: int) -> dict:
+    """The op's sampling keywords (the same draws on every rank): every third row greedy, the others at 0.7 / 1.0 /
+    1.3."""
+    temps = [0.0 if r % 3 == 0 else (0.7, 1.0, 1.3)[r % 3] for r in range(rows)]
+    return dict(
+        samp_temp=torch.tensor(temps, dtype=torch.float32, device="cuda"),
+        samp_seed=torch.randint(0, 2**62, (rows,), generator=gen, device="cuda", dtype=torch.int64),
+        samp_off=torch.randint(0, 2**40, (rows,), generator=gen, device="cuda", dtype=torch.int64),
+    )
+
+
+def check_split_table(env: dict, ws: dict, vocab: int, config: str, steps: int = 4) -> list:
+    """The split block table against the serial build on the same sharded calls (each on its own copy of one state):
+    ``SPLIT_TABLE_SPLITS`` x (greedy, sampled), ``steps`` calls with the state carried."""
+    shard, lo = shard_of(env, vocab)
+    results = []
+    for batch, tokens in SPLIT_TABLE_SPLITS:
+        for sampled in (False, True):
+            gen = torch.Generator(device="cuda").manual_seed(
+                7000 + 100 * batch + 10 * tokens + sampled
+            )
+            st_serial = sharded_state(gen, batch, vocab, SPLIT_TABLE_WIDTH)
+            st_split = clone_state(st_serial)
+            res = new_result(config=config, split=f"{batch}x{tokens}",
+                             case=f"split table = serial ({'sampled' if sampled else 'greedy'})")  # fmt: skip
+            for step in range(steps):
+                x = torch.randn(batch * tokens, vocab, generator=gen, device="cuda").bfloat16()
+                shape_logits(x, gen, GRAPH_KINDS[step % len(GRAPH_KINDS)], step, env["world"])
+                draft = drafts_for(gen, x, batch, tokens - 1, step)
+                samp = sampling_inputs(gen, batch * tokens) if sampled else {}
+                set_dummies((st_serial, st_split), batch, step)
+                tally(res, "logits", same_logits_everywhere(env, x), step)
+                x_shard = x[:, lo : lo + shard].contiguous()
+                want = fused(st_serial, x_shard, draft, 0.0, tokens, (ws, lo), **samp)
+                got = fused(
+                    st_split, x_shard, draft, 0.0, tokens, (ws, lo), split_table=True, **samp
+                )
+                record(res, step, {
+                    "outputs": (OUTPUTS, got, want),
+                    "state": (STATE_KEYS, state_of(st_split), state_of(st_serial)),
+                })  # fmt: skip
+            results.append(finish(res))
+    return results
+
+
+def check_split_table_graph(env: dict, ws: dict, vocab: int, config: str, batch: int, tokens: int,
+                            replays: int = 6) -> dict:  # fmt: skip
+    """One sampled sharded call of each build in its own CUDA graph (own copy of one state, shared inputs), both
+    replayed ``replays`` times with the logits, drafts, sampling inputs and dummy mask rewritten in place."""
+    comm = env["comm"]
+    shard, lo = shard_of(env, vocab)
+    drafts, rows = tokens - 1, batch * tokens
+    gen = torch.Generator(device="cuda").manual_seed(8000 + 10 * batch + tokens)
+    st_serial = sharded_state(gen, batch, vocab, SPLIT_TABLE_WIDTH)
+    st_split = clone_state(st_serial)
+    x_buf = torch.zeros(rows, shard, dtype=torch.bfloat16, device="cuda")
+    d_buf = torch.zeros(batch, drafts, dtype=torch.int32, device="cuda")
+    samp = sampling_inputs(gen, rows)
+    graphs, outs = [], []
+    for st, split in ((st_serial, False), (st_split, True)):
+        # Compiled outside capture (an exchange: every rank makes this call).
+        fused(clone_state(st), x_buf, d_buf, 0.0, tokens, (ws, lo), split_table=split, **samp)
+        torch.cuda.synchronize()
+        comm.Barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs.append(fused(st, x_buf, d_buf, 0.0, tokens, (ws, lo), split_table=split, **samp))
+        torch.cuda.synchronize()
+        graphs.append(graph)
+    res = new_result(config=config, split=f"{batch}x{tokens}",
+                     case=f"split table = serial, graphs x {replays} (sampled)")  # fmt: skip
+    for rep in range(replays):
+        x = torch.randn(rows, vocab, generator=gen, device="cuda").bfloat16()
+        shape_logits(x, gen, GRAPH_KINDS[rep % len(GRAPH_KINDS)], rep, env["world"])
+        draft = drafts_for(gen, x, batch, drafts, rep)
+        set_dummies((st_serial, st_split), batch, rep)
+        tally(res, "logits", same_logits_everywhere(env, x), rep)
+        x_buf.copy_(x[:, lo : lo + shard])
+        d_buf.copy_(draft)
+        for key, value in sampling_inputs(gen, rows).items():
+            samp[key].copy_(value)
+        for graph in graphs:
+            graph.replay()
+        torch.cuda.synchronize()
+        record(res, rep, {
+            "outputs": (OUTPUTS, outs[1], outs[0]),
+            "state": (STATE_KEYS, state_of(st_split), state_of(st_serial)),
+        })  # fmt: skip
+    torch.cuda.synchronize()
+    comm.Barrier()
+    del graphs
+    return finish(res)
+
+
 def time_split(env: dict, ws: dict, vocab: int, config: str, batch: int, tokens: int, calls: int = 20,
-               rounds: int = 12, base=None) -> dict:  # fmt: skip
-    """us per call at one split of the sharded kernel and of the kernel on the gathered fp32 logits (and of the
-    ``base`` kernel module on the sharded logits, twice: the second graph is the noise control): CUDA graphs of
-    ``calls`` back-to-back calls, the slowest rank of each replay, median over ``rounds`` replays in alternating
-    order."""
+               rounds: int = 12, base=None, width=None) -> dict:  # fmt: skip
+    """us per call at one split of the sharded kernel, of its split-table build and of the kernel on the gathered fp32
+    logits (and of the ``base`` kernel module on the sharded logits, twice: the second graph is the noise control):
+    CUDA graphs of ``calls`` back-to-back calls, the slowest rank of each replay, median over ``rounds`` replays in
+    alternating order. ``width``: the block-table columns (by batch if None)."""
     comm = env["comm"]
     shard, lo = shard_of(env, vocab)
     gen = torch.Generator(device="cuda").manual_seed(6000 + 10 * batch + tokens)
-    st_sh = sharded_state(gen, batch, vocab)
+    st_sh = sharded_state(gen, batch, vocab, width)
     # The CUDA-graph padding requests (one KDA slot) are dummies, as in the model: no two lanes write one slot.
     set_dummies((st_sh,), batch, 0)
-    st_g = clone_state(st_sh)
+    st_g, st_p = clone_state(st_sh), clone_state(st_sh)
     x = torch.randn(batch * tokens, vocab, generator=gen, device="cuda").bfloat16()
     x_shard, x32 = x[:, lo : lo + shard].contiguous(), x.float()
     draft = drafts_for(gen, x, batch, tokens - 1, 3)
     arms = [
         lambda: fused(st_sh, x_shard, draft, 0.0, tokens, (ws, lo)),
         lambda: fused(st_g, x32, draft, 0.0, tokens),
+        lambda: fused(st_p, x_shard, draft, 0.0, tokens, (ws, lo), split_table=True),
     ]
     identical = None
     if base is not None:
@@ -421,13 +523,13 @@ def time_split(env: dict, ws: dict, vocab: int, config: str, batch: int, tokens:
             per_call[arm].append(max(comm.allgather(start.elapsed_time(end) * 1e3 / calls)))
     comm.Barrier()
     return dict(config=config, split=f"{batch}x{tokens}", sharded=statistics.median(per_call[0]),
-                gathered=statistics.median(per_call[1]),
-                base=statistics.median(per_call[2]) if base is not None else None,
-                base2=statistics.median(per_call[3]) if base is not None else None, identical=identical)  # fmt: skip
+                gathered=statistics.median(per_call[1]), split_table=statistics.median(per_call[2]),
+                base=statistics.median(per_call[3]) if base is not None else None,
+                base2=statistics.median(per_call[4]) if base is not None else None, identical=identical)  # fmt: skip
 
 
 def run_config(env: dict, name: str, vocab: int, copies: int, time_it: bool = False, base=None, rounds: int = 12,
-               time_splits=None, checks: bool = True):  # fmt: skip
+               time_splits=None, checks: bool = True, width=None):  # fmt: skip
     """Every check of one shape (and its timing with ``time_it``): (skip reason or None, results, timings)."""
     world = env["world"]
     shard, slots = vocab // world, world * copies
@@ -446,10 +548,16 @@ def run_config(env: dict, name: str, vocab: int, copies: int, time_it: bool = Fa
         results.append(check_transition(env, ws, vocab, config))
         results.append(check_dip_regrow(env, ws, vocab, config))
         results += [check_graph(env, ws, vocab, config, b, t) for b, t in GRAPH_SPLITS]
+        results += check_split_table(env, ws, vocab, config)
+        results += [
+            check_split_table_graph(env, ws, vocab, config, b, t) for b, t in SPLIT_TABLE_SPLITS
+        ]
     timings = []
     if time_it:
         for b, t in time_splits or SPLITS:
-            timings.append(time_split(env, ws, vocab, config, b, t, rounds=rounds, base=base))
+            timings.append(
+                time_split(env, ws, vocab, config, b, t, rounds=rounds, base=base, width=width)
+            )
     return None, results, timings
 
 
@@ -524,17 +632,19 @@ def print_report(per_rank: list, timings: list, skips: list, world: int) -> None
             "\nus per call: the slowest rank, median over the replays of a CUDA graph of 20 calls (alternating order)"
         )
         with_base = timings[0]["base"] is not None
-        print("| config | split | sharded (bf16 shard + exchange) | gathered fp32 logits |"
+        print("| config | split | sharded (bf16 shard + exchange) | sharded, split table | split - sharded "
+              "| gathered fp32 logits |"
               + (" sharded, base kernel | sharded - base | base2 - base | outputs = base |"
                  if with_base else ""))  # fmt: skip
-        print("| :-- | :-- | --: | --: |" + (" --: | --: | --: | :-- |" if with_base else ""))
+        print(
+            "| :-- | :-- | --: | --: | --: | --: |"
+            + (" --: | --: | --: | :-- |" if with_base else "")
+        )
         for t in timings:
             extra = (f" {t['base']:.2f} | {t['sharded'] - t['base']:+.2f} | {t['base2'] - t['base']:+.2f} | "
                      f"{t['identical']} |" if with_base else "")  # fmt: skip
-            print(
-                f"| {t['config']} | {t['split']} | {t['sharded']:.2f} | {t['gathered']:.2f} |{extra}",
-                flush=True,
-            )
+            print(f"| {t['config']} | {t['split']} | {t['sharded']:.2f} | {t['split_table']:.2f} | "
+                  f"{t['split_table'] - t['sharded']:+.2f} | {t['gathered']:.2f} |{extra}", flush=True)  # fmt: skip
 
 
 def main() -> int:
@@ -558,6 +668,12 @@ def main() -> int:
         "--splits", default=None, help="with --time: only these splits, e.g. 1x2,1x8"
     )
     parser.add_argument("--time-only", action="store_true", help="the timing without the checks")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="with --time: block-table columns of the timed calls (default: 72 / 300 / 4100 by batch)",
+    )
     args = parser.parse_args()
     if args.mode == "launch":
         return launch()
@@ -576,7 +692,7 @@ def main() -> int:
         for name, vocab, copies in configs(world, args.copies):
             skip, res, tim = on_every_rank(env, run_config, env, name, vocab, copies, args.time or args.time_only,
                                            base_kernel() if args.base else None, args.rounds, time_splits,
-                                           not args.time_only)  # fmt: skip
+                                           not args.time_only, args.width)  # fmt: skip
             if skip:
                 skips.append(f"{name}: {skip}")
             results += res

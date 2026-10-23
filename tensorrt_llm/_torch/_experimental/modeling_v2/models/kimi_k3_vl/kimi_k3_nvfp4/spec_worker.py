@@ -41,6 +41,16 @@ def dflash_ctx_rows_kwargs(draft_model, ctx_rows_start: Optional[int]) -> dict:
     return {"ctx_rows_start": ctx_rows_start}
 
 
+def spec_accept_build_kwargs() -> dict:
+    """``trtllm::k3_spec_accept``'s build keywords for this call: ``TRTLLM_K3LL_SPEC_ACCEPT_PAR`` read now (the block
+    table decoded by extra CTAs, counted as ``dispatch:spec_accept_par:<mode>``), and both builds compiled on a shape's
+    first call, so the switch may change from one CUDA-graph capture to the next."""
+    split = bool(_flags.TRTLLM_K3LL_SPEC_ACCEPT_PAR)
+    if split:
+        _census.count(f"dispatch:spec_accept_par:{_census.mode()}")
+    return {"split_table": split, "compile_both": True}
+
+
 def capture_view(
     spec_metadata: Optional[SpecMetadata], layer_id: int, num_tokens: int
 ) -> Optional[torch.Tensor]:
@@ -469,6 +479,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             force,
             self._compute_block_size,
             *self._k3_shard_args(shard),
+            **spec_accept_build_kwargs(),
         )
         self._on_acceptance(accepted, num_acc, attn_metadata, spec_metadata)
         return (
@@ -1758,6 +1769,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             ws["push_copies"],
             first_column,
             *sampling,
+            **spec_accept_build_kwargs(),
         )
         return accepted, num_acc, rewind
 
