@@ -18,8 +18,10 @@ What it does, on a decode step whose generation rows follow a recorded stream:
   tokens of the row, its newest committed token first) and the global position ``p`` of that first token. Entry ``e``
   (a stream ``tok_e`` placed at global position ``base_e``) matches when ``j = p - base_e`` is inside the stream and
   the group equals ``tok_e[j : j + K + 1]``; the lowest such entry wins, a row without one is left alone. The forced
-  acceptance's random draw is keyed by the offset of row 0 (the RNG counter is set to ``j``), so the accepted counts
-  depend on where the rows are in their streams, not on how many steps the process has run.
+  acceptance's random draw of every matched row is keyed by its own ``(e, j)``: the RNG counter is set to 0 and the
+  pool entry the acceptance reads for row ``b`` (``pool[(S_counter + b * S_slot) & mask]``, the strides of
+  ``speculative/interface.py`` and ``k3_spec_accept``) gets a hash of ``(e, j)`` in [0, 1). A request's accepted
+  counts then depend only on where it is in its stream: not on how many steps the process has run, nor on its row.
 * after the step (`replay_end`), for every matched row with ``n`` accepted tokens (bonus included): the committed
   tokens become ``tok_e[j + 1 : j + K + 2]`` (the first ``n`` are kept), the next drafts ``tok_e[j + n + 1 : j + n +
   K + 1]`` and the next step's input group ``tok_e[j + n : j + n + K + 1]``. The next step's group then matches
@@ -117,8 +119,12 @@ def _replay_lookup_kernel(
     num_entries,
     state_ptr,
     counter_ptr,
+    pool_ptr,
     K1: tl.constexpr,
-    HAS_COUNTER: tl.constexpr,
+    HAS_RNG: tl.constexpr,
+    S_COUNTER: tl.constexpr,
+    S_SLOT: tl.constexpr,
+    POOL_MASK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -153,11 +159,38 @@ def _replay_lookup_kernel(
     jk = tl.sum(tl.where(e[None, :] == ek[:, None], j, 0), axis=1)
     tl.store(state_ptr + rows * 2, tl.where(found, ek, -1).to(tl.int32), mask=row_ok)
     tl.store(state_ptr + rows * 2 + 1, tl.where(found, jk, 0).to(tl.int32), mask=row_ok)
-    if HAS_COUNTER:
-        first = row_ok & (rows == 0) & found
-        j0 = tl.sum(tl.where(first, jk, 0), axis=0)
-        n0 = tl.sum(first.to(tl.int32), axis=0)
-        tl.store(counter_ptr, j0.to(tl.int64), mask=n0 > 0)
+    if HAS_RNG:
+        hit = row_ok & found
+        n_hit = tl.sum(hit.to(tl.int32), axis=0)
+        u = _replay_draw(ek.to(tl.int64), jk.to(tl.int64))
+        idx = (S_COUNTER + rows.to(tl.int64) * S_SLOT) & POOL_MASK
+        tl.store(pool_ptr + idx, u, mask=hit)
+        tl.store(counter_ptr, tl.zeros_like(n_hit).to(tl.int64), mask=n_hit > 0)
+
+
+@triton.jit
+def _replay_draw(e, j):
+    """A uniform in [0, 1) from (entry, offset): 32-bit integer hash (int64 lanes, masked), top 24 bits."""
+    m32 = 0xFFFFFFFF
+    h = ((e + 1) * 0x9E3779B1 + j * 0x85EBCA77) & m32
+    h = h ^ (h >> 15)
+    h = (h * 0x2C1B3C6D) & m32
+    h = h ^ (h >> 12)
+    h = (h * 0x297A2D39) & m32
+    h = h ^ (h >> 15)
+    return (h >> 8).to(tl.float32) * (1.0 / 16777216.0)
+
+
+def replay_draw_reference(e: int, j: int) -> float:
+    """Host copy of the kernel's draw (tests)."""
+    m32 = 0xFFFFFFFF
+    h = ((e + 1) * 0x9E3779B1 + j * 0x85EBCA77) & m32
+    h ^= h >> 15
+    h = (h * 0x2C1B3C6D) & m32
+    h ^= h >> 12
+    h = (h * 0x297A2D39) & m32
+    h ^= h >> 15
+    return (h >> 8) / 16777216.0
 
 
 @triton.jit
@@ -213,11 +246,15 @@ def replay_lookup(
     num_rows: int,
     tokens_per_row: int,
     rng_counter: Optional[torch.Tensor] = None,
+    rng_pool: Optional[torch.Tensor] = None,
 ) -> None:
     """Match generation rows ``0 .. num_rows - 1`` (row ``g``'s group is ``input_ids[tok0 + g * tokens_per_row :][:
-    tokens_per_row]`` at global position ``positions[tok0 + g * tokens_per_row]``) into ``tables.state``; set
-    ``rng_counter[0]`` to row 0's offset when row 0 matches."""
+    tokens_per_row]`` at global position ``positions[tok0 + g * tokens_per_row]``) into ``tables.state``; with the
+    forced-acceptance RNG state given, key every matched row's draw by its ``(entry, offset)`` (module docstring)."""
+    from tensorrt_llm._torch.speculative import interface as _spec
+
     E = tables.tok.shape[0]
+    has_rng = rng_counter is not None and rng_pool is not None
     _replay_lookup_kernel[(1,)](
         input_ids,
         positions,
@@ -229,9 +266,13 @@ def replay_lookup(
         tables.tok.stride(0),
         E,
         tables.state,
-        rng_counter if rng_counter is not None else tables.state,
+        rng_counter if has_rng else tables.state,
+        rng_pool if has_rng else tables.state,
         K1=int(tokens_per_row),
-        HAS_COUNTER=rng_counter is not None,
+        HAS_RNG=has_rng,
+        S_COUNTER=_spec._FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+        S_SLOT=_spec._FORCE_ACCEPT_RNG_SLOT_STRIDE,
+        POOL_MASK=_spec._FORCE_ACCEPT_RNG_POOL_SIZE - 1,
         BLOCK_R=_pow2(num_rows),
         BLOCK_E=_pow2(E),
         BLOCK_C=_pow2(tokens_per_row),
@@ -338,7 +379,8 @@ def replay_begin(worker, input_ids, position_ids, attn_metadata, spec_metadata):
     if not torch.cuda.is_current_stream_capturing():
         worker._ensure_force_accept_rng_state(ids.device)
     counter = getattr(worker, "_force_accept_rng_counter", None)
-    replay_lookup(tables, ids, pos, tok0, num_gens, K + 1, counter)
+    pool = getattr(worker, "_force_accept_rng_pool", None)
+    replay_lookup(tables, ids, pos, tok0, num_gens, K + 1, counter, pool)
     return tables, num_contexts, num_gens, K
 
 

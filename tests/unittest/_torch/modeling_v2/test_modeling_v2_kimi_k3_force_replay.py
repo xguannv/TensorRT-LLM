@@ -17,9 +17,10 @@
 * switch off: ``replay_begin`` returns None and launches nothing (the MLA DSpark worker's step is then exactly the
   pre-change step), also with the switch on but forced acceptance off;
 * the lookup and the commit against a Python reference: rows that follow an entry (any offset, including rows past
-  the end of their stream and rows of no stream), several placements of one stream, the RNG counter keyed by row 0's
-  offset, at 1 / 2 / 4 / 8 generation rows (8 / 16 / 32 / 64 tokens) behind context tokens, eagerly and from a CUDA
-  graph replayed with new inputs;
+  the end of their stream and rows of no stream), several placements of one stream, the forced-acceptance draw of
+  every matched row keyed by its (entry, offset) (counter 0, the pool entry that row reads), at 1 / 2 / 4 / 8
+  generation rows (8 / 16 / 32 / 64 tokens) behind context tokens, eagerly and from a CUDA graph replayed with new
+  inputs;
 * a decode loop: rows started on their streams commit exactly the streams' tokens whatever the accepted counts.
 """
 
@@ -122,6 +123,7 @@ def test_lookup_commit_reference(rows, nctx, graph):
     ids_buf = torch.zeros(ntok, dtype=torch.int32, device=dev)
     pos_buf = torch.zeros(1, ntok, dtype=torch.int32, device=dev)
     counter = torch.full((1,), -5, dtype=torch.int64, device=dev)
+    pool = torch.full((1 << 16,), -1.0, dtype=torch.float32, device=dev)
     new = torch.zeros(batch, k1, dtype=torch.int32, device=dev)
     lens = torch.zeros(batch, dtype=torch.int32, device=dev)
     nd_base = torch.zeros(batch, K + 3, dtype=torch.int32, device=dev)
@@ -129,7 +131,7 @@ def test_lookup_commit_reference(rows, nctx, graph):
     nn = torch.zeros(batch, k1, dtype=torch.int64, device=dev)
 
     def step():
-        fr.replay_lookup(tables, ids_buf, pos_buf.reshape(-1), nctx, rows, k1, counter)
+        fr.replay_lookup(tables, ids_buf, pos_buf.reshape(-1), nctx, rows, k1, counter, pool)
         fr.replay_commit(tables, new, lens, nd, nn, ncreq, rows, K)
 
     g = None
@@ -149,6 +151,7 @@ def test_lookup_commit_reference(rows, nctx, graph):
         nd_base.fill_(-1)
         nn.fill_(-1)
         counter.fill_(-5)
+        pool.fill_(-1.0)
         if graph:
             g.replay()
         else:
@@ -168,8 +171,12 @@ def test_lookup_commit_reference(rows, nctx, graph):
             assert nn_h[r] == [_padded(entries, e, j + n[r] + c) for c in range(k1)]
             assert nd_h[r][:K] == [_padded(entries, e, j + n[r] + 1 + c) for c in range(K)]
             assert nd_h[r][K:] == [-1] * 3
-        want_counter = hits[0][1] if hits[0][0] >= 0 else -5
-        assert counter.item() == want_counter
+        assert counter.item() == (0 if any(e >= 0 for e, _ in hits) else -5)
+        pool_h = pool.tolist()
+        for g_, (e, j) in enumerate(hits):
+            idx = (6007 + g_ * 1009) & 0xFFFF
+            want = fr.replay_draw_reference(e, j) if e >= 0 else -1.0
+            assert pool_h[idx] == want, (g_, e, j, pool_h[idx], want)
 
 
 def test_decode_loop_follows_streams():
@@ -205,6 +212,14 @@ def test_decode_loop_follows_streams():
             pos[g] += n[g]
     for g in range(rows):
         assert committed[g] == entries[g][1][: len(committed[g])]
+
+
+def test_draw_is_uniform():
+    fr = _mod()
+    u = [fr.replay_draw_reference(e, j) for e in range(8) for j in range(2000)]
+    assert 0.0 <= min(u) and max(u) < 1.0
+    frac = sum(x < 0.84 for x in u) / len(u)
+    assert abs(frac - 0.84) < 0.01
 
 
 def test_switch_off_launches_nothing(monkeypatch, tmp_path):
