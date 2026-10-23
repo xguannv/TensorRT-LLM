@@ -272,6 +272,12 @@ TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X = _flag(
     "launch each, bit for bit the torch ops): 1 on SM 103, 2 on SM 103 and SM 107 (SM 100 always uses them; read per "
     "step)",
 )
+TRTLLM_K3LL_KDA_SEED_STACKED = _flag(
+    "TRTLLM_K3LL_KDA_SEED_STACKED",
+    0,
+    "disagg generation intake: MambaHybridCacheManagerV2 seeds every KDA layer's replay conv caches of the new "
+    "requests at once from the stacked conv-state view (~10 launches, not ~7 per layer; same values; read per call)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

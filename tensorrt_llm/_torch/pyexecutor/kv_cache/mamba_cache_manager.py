@@ -68,6 +68,18 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
 from ..config_utils import mamba_effective_tp_size
+from ..k3ll_flags import k3ll_flag
+
+_KDA_SEED_STACKED_CALLS = [0]
+
+
+def _count_kda_seed_stacked(num_slots: int) -> None:
+    """G3 evidence of TRTLLM_K3LL_KDA_SEED_STACKED: a log line at powers of two."""
+    _KDA_SEED_STACKED_CALLS[0] += 1
+    n = _KDA_SEED_STACKED_CALLS[0]
+    if n & (n - 1) == 0:
+        logger.info(f"K3LL kda_seed_stacked calls={n} slots={num_slots}")
+
 
 GB = 1 << 30
 
@@ -4838,7 +4850,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _seed_kda_replay_slots(self, state_indices: torch.Tensor) -> None:
         """Seed the replay caches of distinct slots from their V2 conv
-        states, with no drafts pending."""
+        states, with no drafts pending.
+
+        With the Kimi K3 low-latency switch TRTLLM_K3LL_KDA_SEED_STACKED and an
+        affine pool layout (``_stacked_conv_states``), every layer is seeded at
+        once (about ten launches instead of seven per layer); the values
+        written are the same."""
         assert self.prev_num_accepted_tokens is not None
         committed_window = self.conv_state_shape[1]
         section_offsets = [0]
@@ -4847,6 +4864,40 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         replay_conv_buffers = (self.kda_conv_q, self.kda_conv_k,
                                self.kda_conv_v)
+        stacked = getattr(self, "_stacked_conv_states", None)
+        if (stacked is not None and k3ll_flag("TRTLLM_K3LL_KDA_SEED_STACKED")
+                and all(buf is not None and buf.shape[0] == stacked.shape[0]
+                        for buf in replay_conv_buffers)):
+            selected_conv = stacked.index_select(1, state_indices)
+            for section_idx, replay_buffer in enumerate(replay_conv_buffers):
+                seeded = torch.zeros(
+                    (replay_buffer.shape[0], state_indices.numel()) +
+                    tuple(replay_buffer.shape[2:]),
+                    dtype=replay_buffer.dtype,
+                    device=replay_buffer.device)
+                seeded[:, :, :, :
+                       committed_window] = selected_conv[:, :, section_offsets[
+                           section_idx]:section_offsets[section_idx + 1], :].to(
+                               replay_buffer.dtype)
+                replay_buffer.index_copy_(1, state_indices, seeded)
+            _count_kda_seed_stacked(int(state_indices.numel()))
+        else:
+            self._seed_kda_replay_slots_per_layer(state_indices,
+                                                  replay_conv_buffers,
+                                                  section_offsets,
+                                                  committed_window)
+
+        # The drafts' records need no reset: with no pending drafts, none of
+        # them is read.
+        for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
+                              self.kda_beta_cache):
+            if replay_buffer is not None:
+                replay_buffer.index_fill_(1, state_indices, 0)
+        self.prev_num_accepted_tokens[state_indices] = 0
+
+    def _seed_kda_replay_slots_per_layer(self, state_indices,
+                                         replay_conv_buffers, section_offsets,
+                                         committed_window) -> None:
         for layer_offset, conv_state in enumerate(self.all_conv_states):
             selected_conv = conv_state.index_select(0, state_indices)
             for section_idx, replay_buffer in enumerate(replay_conv_buffers):
@@ -4857,14 +4908,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                         section_offsets[section_idx + 1], :]
                 replay_layer[:, :, :committed_window].index_copy_(
                     0, state_indices, section.to(replay_layer.dtype))
-
-        # The drafts' records need no reset: with no pending drafts, none of
-        # them is read.
-        for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
-                              self.kda_beta_cache):
-            if replay_buffer is not None:
-                replay_buffer.index_fill_(1, state_indices, 0)
-        self.prev_num_accepted_tokens[state_indices] = 0
 
     def mamba_layer_cache(
         self, layer_idx: int
