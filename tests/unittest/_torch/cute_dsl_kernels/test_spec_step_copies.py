@@ -525,7 +525,7 @@ def test_contract():
     """rows == 0 launches nothing; every call the kernels do not cover returns False and launches nothing, so the
     caller keeps its torch path."""
     op = _op()
-    assert op.is_supported()
+    assert op.is_available()
     st = Step(MAX_BATCH, STORE_WIDTH, _seed(6, 0, 0, 0))
     b = clone_bufs(st.bufs)
     before = clone_bufs(b)
