@@ -163,12 +163,33 @@ def test_on_close_to_off(pair, monkeypatch, rows, base):
     x = qs._x(rows, 80 + rows)
     with _switches(monkeypatch, **BASES[base]):
         off, off_rope, off_split = qs._run(built, qs._decode(built), x, meta)
-    with _switches(monkeypatch, TRTLLM_K3LL_MLA_GATE_FUSED_A=1, **BASES[base]):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        fp8w_lowm,
+    )
+
+    calls = []
+    stacked_gemm = fp8w_lowm.gemm
+
+    def spy(x2d, weight, scale):
+        calls.append(weight.data_ptr() == built._gate_fused_a[0].data_ptr())
+        return stacked_gemm(x2d, weight, scale)
+
+    with (
+        _switches(monkeypatch, TRTLLM_K3LL_MLA_GATE_FUSED_A=1, **BASES[base]),
+        monkeypatch.context() as m,
+    ):
+        m.setattr(fp8w_lowm, "gemm", spy)
         on, on_rope, on_split = qs._run(built, qs._decode(built), x, meta)
+    assert calls == [True], f"the stacked GEMM did not run: {calls}"
+    # the gate the decode read: the stacked GEMM's, against the gate projection on the same input
+    ref_gate = built.g_proj(x)
+    stacked = stacked_gemm(x, *built._gate_fused_a[:2])
+    gate_bits = qs._bits(stacked[:, built._gate_fused_a[2] :].contiguous(), ref_gate)
     rel = qs._rel(on, off)
     same_q = qs._bits(on_rope[1], off_rope[1]) and qs._bits(on_split[1], off_split[1])
     print(
-        f"[{base} rows {rows}] output rel L2 {rel:.2e}, bitwise {qs._bits(on, off)}; query + latent bitwise {same_q}"
+        f"[{base} rows {rows}] output rel L2 {rel:.2e}, bitwise {qs._bits(on, off)}; query + latent bitwise "
+        f"{same_q}; gate bitwise {gate_bits}"
     )
     assert rel <= OUT_TOL
 
