@@ -25,7 +25,7 @@ A cache hint only, so every check is bit for bit against the switch at 0 (the tr
   replayed with new queries; the on arm compiles its own ``split_pipe`` variant;
 * the census counts ``mla_split_pipe`` once per fused call with the switch on, never with it off, and never on the
   unfused fallback (35 rows), which the switch leaves unchanged;
-* the default (-1) is on on SM103 only (``decode_mla_dcp.MLA_SPLIT_PIPE_CAPABILITIES``).
+* -1 is on on SM103 only (``decode_mla_dcp.MLA_SPLIT_PIPE_CAPABILITIES``).
 """
 
 import contextlib

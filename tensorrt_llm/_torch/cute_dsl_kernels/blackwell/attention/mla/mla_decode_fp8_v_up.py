@@ -40,6 +40,9 @@ With ``is_var_split_kv`` (``TRTLLM_K3LL_MLA_VAR_SPLIT``; constructed with ``var_
 split ``block_split_kvs[b]`` ways (at most the grid's ``split_kv`` <= 32): the split kernel's clusters past a
 request's count have no K tiles, and the reduction combines that request's partials only.
 
+``bf16_partials`` (``TRTLLM_K3LL_MLA_SPLIT_LOSSY``): the split kernel stores its partial O in BF16 and the
+combine widens each partial to FP32 before weighting it (the partial LSE stays FP32).
+
 ``prewait`` (``TRTLLM_K3LL_MLA_PREWAIT_L2``, with the split kernel's PDL): before its ``griddepcontrol.wait`` the
 split kernel L2-prefetches ``w_uv`` (one warp per CTA, the chunks spread over the grid), and after the wait it
 releases the fused reduction, whose CTAs then take SMs as they free up and load their ``w_uv[h]`` from L2 while the
@@ -114,7 +117,9 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     reducer capacity of at most 32 splits (one split per lane).
     """
 
-    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
+    def __init__(
+        self, *args, v_rows: int = 16, prewait: bool = False, bf16_partials: bool = False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
@@ -138,6 +143,10 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         self.v_threads = 32 * (COMBINE_WARPS + 1)
         # The split kernel's pre-wait W_UV L2 prefetch and early release of the fused reduction (needs its PDL wait).
         self.split_prewait = bool(prewait and self.use_pdl)
+        # The split kernel stores its partial O in BF16 (half the partial bytes written and read back; one more BF16
+        # rounding of each partial); the partial LSE stays FP32, and the combine still accumulates in FP32.
+        if bf16_partials:
+            self.partial_dtype = cutlass.BFloat16
 
     @cute.jit
     def run_with_softmax_stats_v_up(
@@ -367,7 +376,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             stage = lane * vec // K_BLOCK
             chunk0 = (lane * vec % K_BLOCK) // 8
             rAcc = cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
-            rPart = cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
+            rPart = cute.make_rmem_tensor(cute.make_layout(vec), self.partial_dtype)
             rO = cute.make_rmem_tensor(cute.make_layout(vec), cutlass.BFloat16)
             for j in cutlass.range(warp_idx, self.v_rows, COMBINE_WARPS, unroll=1):
                 rO.fill(0.0)
@@ -515,8 +524,14 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         for i in range(local_split_kv):
             scale = cute.arch.shuffle_sync(weight, i)
             cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rPart)
-            for e in cutlass.range_constexpr(vec):
-                rAcc[e] += rPart[e] * scale
+            if cutlass.const_expr(self.partial_dtype is not self.acc_dtype):
+                rWide = cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
+                rWide.store(rPart.load().to(self.acc_dtype))
+                for e in cutlass.range_constexpr(vec):
+                    rAcc[e] += rWide[e] * scale
+            else:
+                for e in cutlass.range_constexpr(vec):
+                    rAcc[e] += rPart[e] * scale
 
 
 __all__ = ["BlackwellMlaDecodeFP8VUp", "MAX_ROWS", "V_HEAD_DIM", "v_up_rows_bucket"]

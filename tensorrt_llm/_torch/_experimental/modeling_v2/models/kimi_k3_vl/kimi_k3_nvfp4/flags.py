@@ -236,8 +236,8 @@ TRTLLM_K3LL_MOE_TAIL_LU = _flag(
     "RMSNorm on its own MNNVL workspace (K3LatentArRowKernel, with the latent's MXFP8 form), latent_up replicated on "
     "k3_fp8w_lowm_mxfp8 with an FP8 block-scale weight, and K3AttnResFast adding routed + shared (moe_tail_lu.py). "
     "LOSSY (FP8 latent_up). 1 at launch builds the FP8 latent_up of every MoE layer (+25.9 MB per layer per rank, "
-    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 (default): on "
-    "on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
+    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 (default): "
+    "on on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
 )
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
@@ -325,11 +325,20 @@ TRTLLM_K3LL_MLA_VAR_SPLIT = _flag(
 )
 TRTLLM_K3LL_MLA_SPLIT_PIPE = _flag(
     "TRTLLM_K3LL_MLA_SPLIT_PIPE",
-    -1,
+    0,
     "Helix MLA split read with the fused V up-projection (k3_mla_decode_fp8_v_up): the split kernel's V tile loads "
-    "carry an L2 evict-first hint (cache hint only, bitwise; read at forward time). 1 on, 0 off, -1 (default) on "
-    "SM103 only (decode_mla_dcp.MLA_SPLIT_PIPE_CAPABILITIES; the fused V-up path itself is SM100 / SM103 only, so on "
-    "SM107 / Rubin nothing changes even with 1)",
+    "carry an L2 evict-first hint (cache hint only, bitwise; read at forward time; op-level net ~0). 1 on, 0 off "
+    "(default), -1 on SM103 only (decode_mla_dcp.MLA_SPLIT_PIPE_CAPABILITIES; the fused V-up path itself is SM100 / "
+    "SM103 only, so on SM107 / Rubin nothing changes even with 1)",
+)
+TRTLLM_K3LL_MLA_SPLIT_LOSSY = _flag(
+    "TRTLLM_K3LL_MLA_SPLIT_LOSSY",
+    0,
+    "Helix MLA split read with the fused V up-projection, steps of decode_mla_dcp.SPLIT_LOSSY_MIN_BATCH or more "
+    "requests (LOSSY): 1 a rescale threshold (a row keeps its running max while a K tile raises it by at most "
+    "2^mla_v_up.SPLIT_LOSSY_THRESHOLD; P's exponent bias lowered to fit e4m3) and BF16 split-KV partials, 2 the "
+    "threshold only, 3 the BF16 partials only, 0 off (default), -1 1 on SM103 only "
+    "(decode_mla_dcp.MLA_SPLIT_LOSSY_CAPABILITIES; the fused V-up path is SM100 / SM103 only); read at forward time",
 )
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",

@@ -82,7 +82,7 @@ _MAX_VAR_SPLIT = 32
 #: Fewest requests that take per-request split counts. Below it the static split: a grid sized for the largest
 #: count launches more empty clusters than balancing two or three requests saves.
 _VAR_SPLIT_MIN_BATCH = 4
-#: ``TRTLLM_K3LL_MLA_SPLIT_PIPE``'s default (-1) turns it on only on these compute capabilities (measured on GB300 /
+#: ``TRTLLM_K3LL_MLA_SPLIT_PIPE`` = -1 turns it on only on these compute capabilities (measured on GB300 /
 #: SM103). It acts on the fused V-up split read only (``mla_v_up``, SM100 / SM103), so SM107 / Rubin is unchanged.
 MLA_SPLIT_PIPE_CAPABILITIES = ((10, 3),)
 
@@ -93,13 +93,38 @@ def _split_pipe_by_default(device_index: int) -> bool:
 
 
 def split_pipe_on(device: torch.device) -> bool:
-    """``TRTLLM_K3LL_MLA_SPLIT_PIPE`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    """``TRTLLM_K3LL_MLA_SPLIT_PIPE`` on ``device``: 1 on, 0 off (default), -1 on where the device is in
     ``MLA_SPLIT_PIPE_CAPABILITIES`` (read per call, so per CUDA graph capture)."""
     value = int(_flags.TRTLLM_K3LL_MLA_SPLIT_PIPE)
     if value >= 0:
         return value > 0
     index = device.index if device.index is not None else torch.cuda.current_device()
     return _split_pipe_by_default(index)
+
+
+#: ``TRTLLM_K3LL_MLA_SPLIT_LOSSY``: the compute capabilities its -1 turns on, and the fewest requests of a step that
+#: take it.
+MLA_SPLIT_LOSSY_CAPABILITIES = ((10, 3),)
+SPLIT_LOSSY_MIN_BATCH = 3
+
+
+def split_lossy_bits(device: torch.device, batch: int) -> int:
+    """``mla_v_up.LOSSY_*`` bits of ``TRTLLM_K3LL_MLA_SPLIT_LOSSY`` for a step of ``batch`` requests (read per call, so
+    per CUDA graph capture): 0 off; 1 (and -1 where the device is in ``MLA_SPLIT_LOSSY_CAPABILITIES``) both the
+    rescale threshold and the BF16 partials; 2 the threshold only; 3 the BF16 partials only. Off below
+    ``SPLIT_LOSSY_MIN_BATCH`` requests."""
+    from . import mla_v_up
+
+    value = int(_flags.TRTLLM_K3LL_MLA_SPLIT_LOSSY)
+    if value == 0 or batch < SPLIT_LOSSY_MIN_BATCH:
+        return 0
+    if value < 0:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if torch.cuda.get_device_capability(index) not in MLA_SPLIT_LOSSY_CAPABILITIES:
+            return 0
+        value = 1
+    both = mla_v_up.LOSSY_THRESHOLD | mla_v_up.LOSSY_BF16_PARTIALS
+    return {1: both, 2: mla_v_up.LOSSY_THRESHOLD, 3: mla_v_up.LOSSY_BF16_PARTIALS}.get(value, 0)
 
 
 def _var_split_envelope(batch: int, heads: int, q_len: int):
@@ -466,6 +491,7 @@ def split_read_attention_v_up(
         plan.block_splits,
         plan.var_split,
         split_pipe_on(q.device),
+        split_lossy_bits(q.device, q.shape[0]),
     )
 
 

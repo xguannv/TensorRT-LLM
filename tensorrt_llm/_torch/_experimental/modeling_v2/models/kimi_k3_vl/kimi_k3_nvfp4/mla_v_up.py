@@ -39,6 +39,14 @@ V_HEAD_DIM = 128
 
 _compiled: dict = {}
 
+#: ``TRTLLM_K3LL_MLA_SPLIT_LOSSY`` option bits of :func:`mla_decode_fp8_v_up`'s ``split_lossy``.
+LOSSY_THRESHOLD = 1
+LOSSY_BF16_PARTIALS = 2
+#: The rescale threshold T (exp2 domain of the scaled scores) of ``LOSSY_THRESHOLD``: a row keeps its running max while
+#: a K tile raises it by at most 2^T, and P's exponent bias drops from P_EXP2_BIAS (8) to P_EXP_BUDGET - T, so P stays
+#: within e4m3 (see ``mla_decode_fp8.P_EXP_BUDGET``).
+SPLIT_LOSSY_THRESHOLD = 2.0
+
 
 def max_fused_rows() -> int:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
@@ -59,13 +67,14 @@ def _run_fused(
     prewait=False,
     block_split_kvs=None,
     split_pipe=False,
+    split_lossy=0,
 ) -> None:
     """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS).
     ``prewait``: the split kernel L2-prefetches ``v_weight`` before its PDL wait and releases the fused reduction
     after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; with the runner's PDL only; same bytes). ``block_split_kvs``: each
     request's split count (``[batch]`` int32, at most the tactic's ``split_kv``), or None for the scalar split.
     ``split_pipe``: the split kernel's V tile loads carry an L2 evict-first hint (``TRTLLM_K3LL_MLA_SPLIT_PIPE``; same
-    bytes)."""
+    bytes). ``split_lossy``: ``LOSSY_THRESHOLD`` / ``LOSSY_BF16_PARTIALS`` bits (``TRTLLM_K3LL_MLA_SPLIT_LOSSY``)."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
@@ -132,6 +141,16 @@ def _run_fused(
         key = key + ("var_split",)
     if split_pipe:
         key = key + ("split_pipe",)
+    threshold = runner._SKIP_CORRECTION_THRESHOLD
+    p_exp2_bias = None
+    if split_lossy & LOSSY_THRESHOLD:
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla import mla_decode_fp8
+
+        threshold = float(SPLIT_LOSSY_THRESHOLD)
+        p_exp2_bias = mla_decode_fp8.P_EXP_BUDGET - threshold
+    bf16_partials = bool(split_lossy & LOSSY_BF16_PARTIALS)
+    if split_lossy:
+        key = key + ("split_lossy", int(split_lossy), threshold)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -147,7 +166,7 @@ def _run_fused(
             mma_pv,
             clusters,
             runner.page_size,
-            runner._SKIP_CORRECTION_THRESHOLD,
+            threshold,
             is_persistent,
             runner._IS_VAR_SEQ,
             runner._IS_VAR_SPLIT_KV or var_split,
@@ -160,6 +179,8 @@ def _run_fused(
             v_rows=v_rows,
             prewait=prewait,
             v_evict_first=split_pipe,
+            p_exp2_bias=p_exp2_bias,
+            bf16_partials=bf16_partials,
         )
 
         def dyn(t, lead, align=16):
@@ -247,6 +268,7 @@ def mla_decode_fp8_v_up(
     block_split_kvs: Optional[torch.Tensor] = None,
     var_split: int = 0,
     split_pipe: bool = False,
+    split_lossy: int = 0,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages followed by every head's V up-projection.
 
@@ -269,6 +291,9 @@ def mla_decode_fp8_v_up(
             ``var_split`` <= 1 or no counts, the tactic's scalar split.
         split_pipe: ``TRTLLM_K3LL_MLA_SPLIT_PIPE``: with the fused reduction, the split kernel's V tile loads carry an
             L2 evict-first hint (same bytes); counted as ``mla_split_pipe`` in the census where it applies.
+        split_lossy: ``TRTLLM_K3LL_MLA_SPLIT_LOSSY``, with the fused reduction: ``LOSSY_THRESHOLD`` (the rescale
+            threshold ``SPLIT_LOSSY_THRESHOLD`` with P's bias lowered to fit) and / or ``LOSSY_BF16_PARTIALS`` (BF16
+            split-KV partials); not bitwise. Counted as ``mla_split_lossy`` in the census where it applies.
     """
     batch, q_len, heads, _ = q.shape
     page_size = kv_pages.shape[1]
@@ -292,10 +317,13 @@ def mla_decode_fp8_v_up(
     else:
         block_split_kvs = None
     if int(tactic[2]) > 1 and batch * q_len <= max_fused_rows():
-        if split_pipe:
+        if split_pipe or split_lossy:
             from . import census as _census
 
-            _census.count(f"mla_split_pipe:{_census.mode()}")
+            if split_pipe:
+                _census.count(f"mla_split_pipe:{_census.mode()}")
+            if split_lossy:
+                _census.count(f"mla_split_lossy:{_census.mode()}")
         _run_fused(
             runner,
             inputs,
@@ -307,6 +335,7 @@ def mla_decode_fp8_v_up(
             prewait,
             block_split_kvs,
             split_pipe,
+            split_lossy,
         )
         return
     if block_split_kvs is not None:
@@ -339,6 +368,7 @@ def _(
     block_split_kvs=None,
     var_split=0,
     split_pipe=False,
+    split_lossy=0,
 ) -> None:
     return None
 

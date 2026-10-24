@@ -62,6 +62,10 @@ from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
 # 256, inside e4m3's 448); row_sum carries the same factor, so O = acc / row_sum is unchanged, and the LSE subtracts
 # it back. A power of two keeps the rounding of every normal value exactly as before.
 P_EXP2_BIAS = 8.0
+#: The largest exponent of P the MMA may see: 2^8 = 256 <= e4m3's 448. A rescale threshold T (``skip_correction_threshold``
+#: > 0) keeps a row's running max while a K tile raises it by at most 2^T, so P = exp2(s - kept max) reaches 2^T before the
+#: bias; the bias is then P_EXP_BUDGET - T (``p_exp2_bias``), which lowers the tail the FP8 P keeps by 2^T.
+P_EXP_BUDGET = 8.0
 
 #: L2 eviction hint of the V tile loads with ``v_evict_first`` (CacheHintSm90::EVICT_FIRST).
 _EVICT_FIRST = 0x12F0000000000000
@@ -167,6 +171,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         var_split_bounded: bool = False,
         var_split_direct: bool = False,
         v_evict_first: bool = False,
+        p_exp2_bias: Optional[float] = None,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -233,6 +238,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             keep the default policy: the M tiles of a request share them
             through L2. A cache hint only; the result does not depend on it.
         :type v_evict_first: bool
+        :param p_exp2_bias: The exponent bias of P (None: ``P_EXP2_BIAS`` at construction). With
+            ``skip_correction_threshold`` T > 0, a row keeps its running max while a K tile raises it by at
+            most 2^T (in the exp2 domain of the scaled scores): P, the row sum and the correction then all use
+            the kept max, so the O / row-sum rescale is skipped for that tile, and P reaches 2^(T + bias).
+            ``p_exp2_bias + T`` must be at most ``P_EXP_BUDGET`` (P stays within e4m3). Changes the FP8
+            rounding of P only.
+        :type p_exp2_bias: Optional[float]
         """
 
         self.latent_dim = 512
@@ -243,6 +255,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
+        self.p_exp2_bias = P_EXP2_BIAS if p_exp2_bias is None else float(
+            p_exp2_bias)
+        if skip_correction_threshold > 0.0 and (
+                self.p_exp2_bias + skip_correction_threshold > P_EXP_BUDGET):
+            raise ValueError(
+                f"p_exp2_bias {self.p_exp2_bias} + skip_correction_threshold {skip_correction_threshold} exceeds "
+                f"the FP8 P budget 2^{P_EXP_BUDGET}")
+        # Dtype of the split-KV partial O in the workspace (a subclass with its own reduction may narrow it).
+        self.partial_dtype = acc_dtype
         self.is_persistent = is_persistent
         self.page_size = page_size
         self.is_var_seq = is_var_seq
@@ -3768,6 +3789,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_max_new = cute.arch.fmax(row_max_new, other_row_max)
         row_max = other_row_max
         row_sum = other_row_sum
+        if cutlass.const_expr(self.skip_correction_threshold > 0.0):
+            # Keep the running max while this tile raises it by at most 2^T: P, the row sum and the
+            # correction factor (then exactly 1) below all use the kept max, as the correction warp's skip
+            # (exchange_p_cor_metadata) does.
+            if (
+                    row_max_new - row_max
+            ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+                row_max_new = row_max
 
         # find correction factor
         correction_factor = cute.math.exp2(
@@ -3795,7 +3824,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # softmax
         fma_b = softmax_params.softmax_scale_log2
         fma_c = ((0.0 - row_max_new) * softmax_params.softmax_scale_log2 +
-                 P_EXP2_BIAS)
+                 self.p_exp2_bias)
 
         for i in cutlass.range(cute.size(tTR_rAcc),
                                vectorize=True,
@@ -4278,6 +4307,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
             # using final output dtype for o
             tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+        elif cutlass.const_expr(self.partial_dtype is not self.acc_dtype):
+            # split-KV partial in the narrower partial dtype
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.partial_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.partial_dtype))
         else:
             # using accumulate dtype for o
             tR2G_rO_src = tTR_rAcc
@@ -4392,8 +4425,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
                 (1, 1, 1),
             )
-        # row_sum carries the 2^P_EXP2_BIAS of the softmax's probabilities
-        lse = (cute.math.log2(row_sum, fastmath=True) - P_EXP2_BIAS +
+        # row_sum carries the 2^p_exp2_bias of the softmax's probabilities
+        lse = (cute.math.log2(row_sum, fastmath=True) - self.p_exp2_bias +
                epilogue_params.softmax_scale_log2 * row_max)
         if cutlass.const_expr(self.warps_in_n == 2):
             if cute.elem_less(cLSE[tidx][0], common_params.H):
@@ -4721,7 +4754,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cute.assume(workspace_rows * split_kv * S * D, align),
                 ),
             )
-            acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
+            acc_o_iter = cute.recast_ptr(workspace.iterator,
+                                         dtype=self.partial_dtype)
             acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
             acc_lse_layout = cute.make_layout(
                 (workspace_rows, split_kv, S, B),
@@ -4733,6 +4767,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # dynamic arithmetic once cosize * width reaches 2^31 bits, e.g.
             # B=64, split_kv=16.
             acc_lse_iter = acc_o_iter + cute.cosize(acc_o_layout)
+            if cutlass.const_expr(self.partial_dtype is not acc_dtype):
+                acc_lse_iter = cute.recast_ptr(acc_lse_iter, dtype=acc_dtype)
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
         return acc_o, acc_lse
 
