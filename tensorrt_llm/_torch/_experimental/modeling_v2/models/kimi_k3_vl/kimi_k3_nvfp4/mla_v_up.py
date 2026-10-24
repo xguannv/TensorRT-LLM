@@ -58,11 +58,14 @@ def _run_fused(
     v_out,
     prewait=False,
     block_split_kvs=None,
+    split_pipe=False,
 ) -> None:
     """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS).
     ``prewait``: the split kernel L2-prefetches ``v_weight`` before its PDL wait and releases the fused reduction
     after it (``TRTLLM_K3LL_MLA_PREWAIT_L2``; with the runner's PDL only; same bytes). ``block_split_kvs``: each
-    request's split count (``[batch]`` int32, at most the tactic's ``split_kv``), or None for the scalar split."""
+    request's split count (``[batch]`` int32, at most the tactic's ``split_kv``), or None for the scalar split.
+    ``split_pipe``: the split kernel's V tile loads carry an L2 evict-first hint (``TRTLLM_K3LL_MLA_SPLIT_PIPE``; same
+    bytes)."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
@@ -127,6 +130,8 @@ def _run_fused(
     var_split = block_split_kvs is not None
     if var_split:
         key = key + ("var_split",)
+    if split_pipe:
+        key = key + ("split_pipe",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -154,6 +159,7 @@ def _run_fused(
             var_split_bounded=var_split,
             v_rows=v_rows,
             prewait=prewait,
+            v_evict_first=split_pipe,
         )
 
         def dyn(t, lead, align=16):
@@ -240,6 +246,7 @@ def mla_decode_fp8_v_up(
     prewait: bool,
     block_split_kvs: Optional[torch.Tensor] = None,
     var_split: int = 0,
+    split_pipe: bool = False,
 ) -> None:
     """All-head FP8 MLA decode over this rank's pages followed by every head's V up-projection.
 
@@ -260,6 +267,8 @@ def mla_decode_fp8_v_up(
         block_split_kvs, var_split: ``TRTLLM_K3LL_MLA_VAR_SPLIT``: each request's split count (``[batch]`` int32,
             device) and the largest one the grid is sized for (``decode_mla_dcp.var_split_grid``); with
             ``var_split`` <= 1 or no counts, the tactic's scalar split.
+        split_pipe: ``TRTLLM_K3LL_MLA_SPLIT_PIPE``: with the fused reduction, the split kernel's V tile loads carry an
+            L2 evict-first hint (same bytes); counted as ``mla_split_pipe`` in the census where it applies.
     """
     batch, q_len, heads, _ = q.shape
     page_size = kv_pages.shape[1]
@@ -283,6 +292,10 @@ def mla_decode_fp8_v_up(
     else:
         block_split_kvs = None
     if int(tactic[2]) > 1 and batch * q_len <= max_fused_rows():
+        if split_pipe:
+            from . import census as _census
+
+            _census.count(f"mla_split_pipe:{_census.mode()}")
         _run_fused(
             runner,
             inputs,
@@ -293,6 +306,7 @@ def mla_decode_fp8_v_up(
             v_out,
             prewait,
             block_split_kvs,
+            split_pipe,
         )
         return
     if block_split_kvs is not None:
@@ -324,6 +338,7 @@ def _(
     prewait,
     block_split_kvs=None,
     var_split=0,
+    split_pipe=False,
 ) -> None:
     return None
 

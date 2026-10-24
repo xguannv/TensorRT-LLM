@@ -63,6 +63,9 @@ from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
 # it back. A power of two keeps the rounding of every normal value exactly as before.
 P_EXP2_BIAS = 8.0
 
+#: L2 eviction hint of the V tile loads with ``v_evict_first`` (CacheHintSm90::EVICT_FIRST).
+_EVICT_FIRST = 0x12F0000000000000
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, "../.."))
@@ -163,6 +166,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         use_pdl: bool = False,
         var_split_bounded: bool = False,
         var_split_direct: bool = False,
+        v_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -223,6 +227,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             epilogue, as the ``split_kv == 1`` kernel does, and the reduction
             skips it (the same values: a one-split reduction is the identity).
         :type var_split_direct: bool
+        :param v_evict_first: The V tile TMA loads (the latent transpose of
+            the KV cache) carry an L2 evict-first hint, so the decode's KV
+            stream does not push the kernels after it out of L2. The K tiles
+            keep the default policy: the M tiles of a request share them
+            through L2. A cache hint only; the result does not depend on it.
+        :type v_evict_first: bool
         """
 
         self.latent_dim = 512
@@ -253,6 +263,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 "var_split_direct needs variable split-KV and fixed query "
                 "lengths")
         self.var_split_direct = var_split_direct
+        self.v_evict_first = v_evict_first
         # ``seq_len_q`` is the compile-time query capacity.  Fixed-query
         # specializations use it as the request length; variable-query
         # specializations obtain each request's actual length from its indptr.
@@ -2716,6 +2727,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
             load_v_producer_state)
         common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
+        v_policy = {}
+        if cutlass.const_expr(self.v_evict_first):
+            v_policy = {"cache_policy": cutlass.Int64(_EVICT_FIRST)}
         for j in cutlass.range_constexpr(self.iterations_pv_n):
             for i in cutlass.range_constexpr(self.iterations_pv_k):
                 if cutlass.const_expr(page_per_tile > 1):
@@ -2728,6 +2742,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                             ((j, i),
                                              load_v_producer_state.index)],
                             tma_bar_ptr=tma_bar_ptr,
+                            **v_policy,
                         )
                 else:
                     cute.copy(
@@ -2736,6 +2751,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         v_params.tVCsVC[None, 0, 0,
                                         ((j, i), load_v_producer_state.index)],
                         tma_bar_ptr=tma_bar_ptr,
+                        **v_policy,
                     )
         load_v_producer_state.advance()
         return load_v_producer_state

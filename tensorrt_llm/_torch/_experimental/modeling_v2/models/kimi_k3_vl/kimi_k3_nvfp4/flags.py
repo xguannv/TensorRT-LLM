@@ -323,6 +323,14 @@ TRTLLM_K3LL_MLA_VAR_SPLIT = _flag(
     "takes the counts, and only for 4 or more requests; elsewhere (SM107, the V-up off, or 1-3 requests) the split "
     "read keeps the static split and no counts are computed",
 )
+TRTLLM_K3LL_MLA_SPLIT_PIPE = _flag(
+    "TRTLLM_K3LL_MLA_SPLIT_PIPE",
+    -1,
+    "Helix MLA split read with the fused V up-projection (k3_mla_decode_fp8_v_up): the split kernel's V tile loads "
+    "carry an L2 evict-first hint (cache hint only, bitwise; read at forward time). 1 on, 0 off, -1 (default) on "
+    "SM103 only (decode_mla_dcp.MLA_SPLIT_PIPE_CAPABILITIES; the fused V-up path itself is SM100 / SM103 only, so on "
+    "SM107 / Rubin nothing changes even with 1)",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,

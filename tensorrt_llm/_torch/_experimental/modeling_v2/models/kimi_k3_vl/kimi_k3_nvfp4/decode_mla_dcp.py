@@ -29,6 +29,7 @@ combine). The caller owns the collectives so the pieces can be tested on one GPU
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Union
@@ -81,6 +82,24 @@ _MAX_VAR_SPLIT = 32
 #: Fewest requests that take per-request split counts. Below it the static split: a grid sized for the largest
 #: count launches more empty clusters than balancing two or three requests saves.
 _VAR_SPLIT_MIN_BATCH = 4
+#: ``TRTLLM_K3LL_MLA_SPLIT_PIPE``'s default (-1) turns it on only on these compute capabilities (measured on GB300 /
+#: SM103). It acts on the fused V-up split read only (``mla_v_up``, SM100 / SM103), so SM107 / Rubin is unchanged.
+MLA_SPLIT_PIPE_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _split_pipe_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_SPLIT_PIPE_CAPABILITIES
+
+
+def split_pipe_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MLA_SPLIT_PIPE`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``MLA_SPLIT_PIPE_CAPABILITIES`` (read per call, so per CUDA graph capture)."""
+    value = int(_flags.TRTLLM_K3LL_MLA_SPLIT_PIPE)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _split_pipe_by_default(index)
 
 
 def _var_split_envelope(batch: int, heads: int, q_len: int):
@@ -446,6 +465,7 @@ def split_read_attention_v_up(
         prewait,
         plan.block_splits,
         plan.var_split,
+        split_pipe_on(q.device),
     )
 
 
