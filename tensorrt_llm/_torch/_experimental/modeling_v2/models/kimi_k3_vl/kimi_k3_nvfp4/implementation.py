@@ -1743,6 +1743,15 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         elif tail_lu_fused:
             _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
+            # TRTLLM_K3LL_ATTN_RES_MXFP8, as in the tail push branch, where the MXFP8 build of the MoE-add kernel
+            # compiled at load for this candidate count.
+            if (
+                valid_block_residual.shape[0] + 1 in pending_moe_partial.mx_candidates
+                and _attn_res_mxfp8_on(pending_moe_partial.routed.device)
+            ):
+                mxfp8_out = _attn_res_mxfp8_out(
+                    self, pending_moe_partial.routed.shape[0], pending_moe_partial.routed.device
+                )
             hidden_states, prefix_sum = self.decode_comm.tail_lu_attn_res(
                 pending_moe_partial,
                 prefix_sum,
@@ -1750,6 +1759,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
+                mxfp8_out=mxfp8_out,
             )
         elif tail_lu:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
@@ -4568,7 +4578,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         gemvs = self.model.decode_gemvs
         if state.lu is not None:
-            _moe_tail_lu.warm_up(state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1)
+            _moe_tail_lu.warm_up(
+                state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1,
+                mxfp8=_attn_res_mxfp8_on(first.lu.up_weight.device),
+            )
             if mapping.tp_rank == 0:
                 logger.info(
                     f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_TAIL_LU={_flags.TRTLLM_K3LL_MOE_TAIL_LU} (read at forward "

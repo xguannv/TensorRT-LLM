@@ -146,12 +146,16 @@ def dequantize_block_fp8(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tens
 class LuTail(NamedTuple):
     """A wide decode step's MoE output handed on by ``TRTLLM_K3LL_MOE_TAIL_LU``: ``routed`` (latent_up of the reduced,
     normalized latent) and ``shared`` (the shared expert's reduced output), both bf16 ``[T, 7168]`` and the same on
-    every rank. The consumer adds ``bf16(routed + shared)`` to its prefix sum. ``candidates``: the candidate counts
-    (snapshots + 1) the attn_res kernel with the MoE add compiled for at load (``K3TailLuState``)."""
+    every rank. The consumer adds ``bf16(routed + shared)`` to its prefix sum. ``candidates`` / ``mx_candidates``: the
+    candidate counts (snapshots + 1) the attn_res kernel with the MoE add compiled for at load, without / with the
+    MXFP8 side output (``K3TailLuState``)."""
 
     routed: torch.Tensor
     shared: torch.Tensor
     candidates: frozenset = frozenset()
+    #: The candidate counts whose MoE-add attn_res kernel with the MXFP8 side output (``TRTLLM_K3LL_ATTN_RES_MXFP8``)
+    #: compiled at load.
+    mx_candidates: frozenset = frozenset()
 
     def reduced(self) -> torch.Tensor:
         """The MoE output ``bf16(routed + shared)`` (one bf16 rounding, as the attn_res kernel's MoE add)."""
@@ -176,6 +180,8 @@ class K3TailLuState:
     ready: bool = False
     #: Candidate counts (snapshots + 1) whose MoE-add attn_res kernel compiled at load.
     attn_res_candidates: frozenset = field(default_factory=frozenset)
+    #: The same with the MXFP8 side output (``warm_up(..., mxfp8=True)``).
+    attn_res_mx_candidates: frozenset = field(default_factory=frozenset)
 
     @classmethod
     def create(cls, mapping, push) -> "K3TailLuState":
@@ -331,13 +337,14 @@ def run(
     routed = latent_up(layer, xq, xs)
     if side:
         main.wait_event(state.join)
-    return LuTail(routed, shared, state.attn_res_candidates)
+    return LuTail(routed, shared, state.attn_res_candidates, state.attn_res_mx_candidates)
 
 
-def warm_up(state: K3TailLuState, layer: K3TailLuLayer, gemvs, max_candidates: int) -> None:
+def warm_up(state: K3TailLuState, layer: K3TailLuLayer, gemvs, max_candidates: int, mxfp8: bool = False) -> None:
     """Compile every kernel of the switch before any capture, whatever the switch says at forward time. Collective:
     every rank makes the same calls (one shared all-reduce and one latent all-reduce on zeros, advancing both
-    workspaces alike). Records what it compiled in ``state``."""
+    workspaces alike). ``mxfp8``: also the attn_res kernel with the MXFP8 side output (``TRTLLM_K3LL_ATTN_RES_MXFP8``
+    on this device at load). Records what it compiled in ``state``."""
     device = layer.up_weight.device
     zeros = dict(dtype=torch.bfloat16, device=device)
     tiles = gemvs.compile_push(SHARED_SITE, layer.shared_down, state.push.world)
@@ -372,9 +379,21 @@ def warm_up(state: K3TailLuState, layer: K3TailLuLayer, gemvs, max_candidates: i
             exact=False, early_trigger=True, mnnvl_order=True,
         )  # fmt: skip
         candidates.append(n)
+    mx_candidates = []
+    if mxfp8:
+        xq = torch.empty(1, HIDDEN, dtype=torch.float8_e4m3fn, device=device)
+        xs = torch.empty(1, HIDDEN // 32, dtype=torch.uint8, device=device)
+        for n in candidates:
+            block = torch.zeros(n - 1, 1, HIDDEN, **zeros)
+            _attn_res().run_k3_attn_res(
+                row, (row, row), block, ones, ones, ones, 1e-6, 1e-6, torch.empty_like(row), torch.empty_like(row),
+                exact=False, early_trigger=True, mnnvl_order=True, mxfp8_out=(xq, xs),
+            )  # fmt: skip
+            mx_candidates.append(n)
     torch.cuda.synchronize(device)
     state.mx_rows = frozenset(mx_rows)
     state.attn_res_candidates = frozenset(candidates)
+    state.attn_res_mx_candidates = frozenset(mx_candidates)
     state.ready = True
 
 
