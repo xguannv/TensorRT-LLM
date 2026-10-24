@@ -38,6 +38,63 @@ import torch
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
 _scratch: Dict[tuple, tuple] = {}
+# THROWAWAY PROBE (oak, never merged): K3_SA_PROBE=1 stamps %globaltimer at the kernel's phases into a ring per device,
+# saved to $K3_SA_PROBE_DIR/sa_probe_rank<r>_pid<p>.pt every 20 s and at exit.
+_PROBE = os.environ.get("K3_SA_PROBE", "0") == "1"
+_probe_bufs: Dict[int, torch.Tensor] = {}
+
+
+def _probe_buffer(device, grid: int) -> torch.Tensor:
+    kern = _kernel_module()
+    buf = _probe_bufs.get(device.index)
+    if buf is None:
+        buf = torch.zeros(
+            kern.PROBE_HEAD + kern.PROBE_RING * max(grid, 16) * 8, dtype=torch.int64, device=device
+        )
+        _probe_bufs[device.index] = buf
+        _start_probe_dump()
+    return buf
+
+
+_probe_thread = []
+
+
+def _probe_save():
+    import atexit  # noqa: F401
+
+    out = os.environ.get("K3_SA_PROBE_DIR", ".")
+    rank = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "x"))
+    for index, buf in list(_probe_bufs.items()):
+        try:
+            with torch.cuda.device(index):
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
+                    host = buf.to("cpu", non_blocking=False)
+            torch.save(
+                host, os.path.join(out, f"sa_probe_rank{rank}_pid{os.getpid()}_dev{index}.pt")
+            )
+        except Exception as exc:  # a probe must never take the run down
+            print(f"[sa_probe] save failed: {exc}", flush=True)
+
+
+def _start_probe_dump():
+    if _probe_thread:
+        return
+    import atexit
+    import threading
+    import time
+
+    def loop():
+        while True:
+            time.sleep(20)
+            _probe_save()
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    _probe_thread.append(t)
+    atexit.register(_probe_save)
+
+
 _modules: Dict[str, object] = {}
 _workspaces: Dict[object, dict] = {}
 
@@ -352,7 +409,8 @@ def k3_spec_accept(
         sample,
         bool(wide_table),
     )
-    key = consts + (use_pdl,)
+    probe_buf = _arg(_probe_buffer(device, grid) if _PROBE else rng_counter)
+    key = consts + (use_pdl, _PROBE)
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -363,10 +421,15 @@ def k3_spec_accept(
             fn = _compiled.get(key)
             if fn is None:
                 fn = _compiled[key] = cute.compile(
-                    kern.k3_spec_accept, *args, *scalars, *consts, use_pdl,
+                    kern.k3_spec_accept, *args, *scalars, *consts, probe_buf, _PROBE, use_pdl,
                     cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
                 )  # fmt: skip
-    fn(*args, *scalars, cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream))
+    fn(
+        *args,
+        *scalars,
+        probe_buf,
+        cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
+    )
     return [accepted, num_acc, rewind, bonus, qpos, cpos, noise]
 
 

@@ -103,6 +103,20 @@ def supports(vocab: int, batch: int, block: int, drafts: int, hidden: int, slots
     )
 
 
+PROBE_RING = 4096  # THROWAWAY PROBE (oak, never merged): calls kept in the ring
+PROBE_HEAD = 8  # int64 words before the ring: [0] the call counter
+
+
+@dsl_user_op
+def _stamp(addr_i64, *, loc=None, ip=None):
+    """THROWAWAY PROBE: %globaltimer (ns) stored at addr."""
+    _llvm.inline_asm(
+        None, [addr_i64.ir_value(loc=loc, ip=ip)],
+        "{ .reg .u64 t; mov.u64 t, %globaltimer; st.global.u64 [$0], t; }", "l", has_side_effects=True,
+        is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+
+
 @dsl_user_op
 def _atomic_add_acq_rel(addr_i64, val, *, loc=None, ip=None):
     """atom.acq_rel.gpu.global.add.u32, returning the old value."""
@@ -238,6 +252,8 @@ def k3_spec_accept_kernel(
     wide_table: cutlass.Constexpr[
         bool
     ],  # the block table over every CTA (else CTA 0 alone); the same bits
+    probe_buf: cutlass.Array,  # THROWAWAY PROBE: int64 [PROBE_HEAD + PROBE_RING * G * 8]
+    probe: cutlass.Constexpr[bool],
 ):
     rows = batch * (drafts + 1)
     count_base = MAX_ROWS * grid * 2  # the count partials [b][G] in the scratch
@@ -269,9 +285,21 @@ def k3_spec_accept_kernel(
     )
 
     # Nothing this kernel reads is a weight: all of it comes after the grid dependency.
+    if cutlass.const_expr(probe):
+        pr_call = probe_buf.load(idx=0, is_volatile=True)
+        pr_slot = (pr_call % cutlass.Int64(PROBE_RING)) * cutlass.Int64(grid * 8) + cutlass.Int64(
+            PROBE_HEAD
+        )
+        pr_word = pr_slot + cutlass.Int64(cta) * cutlass.Int64(8)
+        pr_addr = probe_buf.data_ptr(0).toint() + pr_word * cutlass.Int64(8)
+        if tx == 0:
+            _stamp(pr_addr)
     if warp == 0:
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
     prims.griddepcontrol(prims.GridDepAction.WAIT)
+    if cutlass.const_expr(probe):
+        if tx == 0:
+            _stamp(pr_addr + cutlass.Int64(8))
 
     # Per-row partial argmax over this CTA's 1024 columns.
     col0 = cta * cutlass.Int32(COLS_PER_CTA) + tx * cutlass.Int32(4)
@@ -405,6 +433,9 @@ def k3_spec_accept_kernel(
                     total += s_tok.load(idx=tx * cutlass.Int32(WARPS) + cutlass.Int32(w))
                 block_counts.store(cutlass.Int64(total), idx=tx)
 
+    if cutlass.const_expr(probe):
+        if tx == 0:
+            _stamp(pr_addr + cutlass.Int64(16))
     prims.barrier_cta_sync(0)
     # This CTA's partial per row, then its arrival (the partials first: fence.acq_rel.gpu + the acq_rel atom).
     if tx < cutlass.Int32(rows):
@@ -435,6 +466,9 @@ def k3_spec_accept_kernel(
             idx=0,
         )
     prims.barrier_cta_sync(0)
+    if cutlass.const_expr(probe):
+        if tx == 0:
+            _stamp(pr_addr + cutlass.Int64(24))
     if s_last.load(idx=0) != cutlass.Int32(0):
         cute.arch.fence_acq_rel_gpu()
         # The bookkeeping's inputs (none depends on the argmax), in flight while the rows reduce: one element per
@@ -494,6 +528,9 @@ def k3_spec_accept_kernel(
                                 alignment=8)  # fmt: skip
             r_w += cutlass.Int32(WARPS)
         prims.barrier_cta_sync(0)
+        if cutlass.const_expr(probe):
+            if tx == 0:
+                _stamp(pr_addr + cutlass.Int64(32))
         if cutlass.const_expr(slots > 1):
             # The vocabulary shards' exchange (see the header): re-arm the buffer before last, push, poll, reduce.
             cur = flags.load(idx=0, is_volatile=True)
@@ -540,6 +577,9 @@ def k3_spec_accept_kernel(
             prims.barrier_cta_sync(0)
             if tx == 0:
                 flags.store((cur + cutlass.Int32(1)) % cutlass.Int32(BUFFERS), idx=0)
+        if cutlass.const_expr(probe):
+            if tx == 0:
+                _stamp(pr_addr + cutlass.Int64(40))
         # Per-request bookkeeping on lane b of warp 0.
         if tx < cutlass.Int32(batch):
             b = tx
@@ -645,6 +685,12 @@ def k3_spec_accept_kernel(
                             alignment=16)  # fmt: skip
         if tx == 0:
             counter.store(cutlass.Int32(0), idx=0)
+        if cutlass.const_expr(probe):
+            if tx == 0:
+                _stamp(pr_addr + cutlass.Int64(48))
+                pr_meta = pr_slot + cutlass.Int64(cta) * cutlass.Int64(8) + cutlass.Int64(7)
+                probe_buf.store(cutlass.Int64(batch * 1000 + grid), idx=pr_meta)
+                probe_buf.store(pr_call + cutlass.Int64(1), idx=0)
 
 
 @cute.jit
@@ -699,6 +745,8 @@ def k3_spec_accept(
     push_copies: cutlass.Constexpr[int],
     sample: cutlass.Constexpr[bool],
     wide_table: cutlass.Constexpr[bool],
+    probe_buf: cute.Tensor,
+    probe: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -707,7 +755,7 @@ def k3_spec_accept(
         ctx_len, embed, mask_row, rng_pool, rng_counter, samp_temp, samp_seed, samp_off, accepted, num_acc, rewind,
         bonus, qpos, cpos, noise, partials, counter, buf_uc, buf_mc, flags, off_base, off_stride, divisor, max_ctx,
         force_total, force_frac, force_mode, rank, shard_offset, grid, vocab, batch, drafts, block, hidden, max_blocks,
-        slots, push_copies, sample, wide_table,
+        slots, push_copies, sample, wide_table, probe_buf, probe,
     ).launch(
         grid=[grid, 1, 1],
         block=[THREADS, 1, 1],
