@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The MLA DSpark drafter's switches on its projections and all-reduces (``kimi_k3_nvfp4/flags.py``:
-``TRTLLM_K3LL_DRAFTER_WIDE_AR``, ``TRTLLM_K3LL_DRAFTER_GEMM``), each arm against the other and the off arm against
-the call it replaced, at W ranks (default 4) with the TP16 per-rank shapes, 8 / 16 / 32 rows.
+``TRTLLM_K3LL_DRAFTER_WIDE_AR``, ``TRTLLM_K3LL_DRAFTER_GEMM``, ``TRTLLM_K3LL_DRAFTER_GEMM_ROW``), each arm against
+the other and the off arm against the call it replaced, at W ranks (default 4) with the TP16 per-rank shapes, 8 / 16 /
+32 rows.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _kimi_k3_drafter_switches_op_matrix.py [--world-size 4]
     srun -n 4 --mpi=pmix python _kimi_k3_drafter_switches_op_matrix.py --launcher srun --world-size 4
@@ -28,6 +29,10 @@ bit the eager call on the same inputs):
     GatedMLP + ``allreduce_norm`` chain. On arm: each role's output against an fp32 product within ``GEMM_TOL`` of
     its largest magnitude and no worse than ``WORSE`` times cuBLAS's; ``_mlp_norm`` within ``MLP_TOL`` of the off
     arm; a ``dispatch:drafter_gemm_<role>`` count per call.
+  * GEMM_ROW (8, 16, 32 rows; graph at 16, 32; with GEMM on): off arm: ``_row_gemm`` returns None. On arm: o_proj
+    (a row-parallel stand-in [7168, 512]) and q_b (its shallower ring at up to 16 rows) against an fp32 product within
+    ``GEMM_TOL`` and no worse than ``WORSE`` times cuBLAS's, a count per call; down is not taken; both steps bit for
+    bit the GEMM-only arm (the output projection's stand-in is not row-parallel, so it keeps its call).
 """
 
 import sys
@@ -149,9 +154,10 @@ def _replaced(x_o, res_o, x_m, res_m):
     return n1, u1, n2, u2
 
 
-def _set(wide_ar, gemm):
+def _set(wide_ar, gemm, row=0):
     FLAGS.TRTLLM_K3LL_DRAFTER_WIDE_AR = wide_ar
     FLAGS.TRTLLM_K3LL_DRAFTER_GEMM = gemm
+    FLAGS.TRTLLM_K3LL_DRAFTER_GEMM_ROW = row
 
 
 def check_wide_ar():
@@ -215,11 +221,60 @@ def check_gemm():
     _set(0, 0)
 
 
+def check_gemm_row():
+    from types import SimpleNamespace
+
+    owner = _owner(gemm=True)
+    o_row = SimpleNamespace(
+        weight=_normal(_gen(13), (H, O_IN), O_IN**-0.5),
+        bias=None,
+        tp_mode=SimpleNamespace(name="ROW"),
+    )
+    for rows in ROWS:
+        _set(0, 1, 1)
+        x = _normal(_gen(750 + rows + R.rank), (rows, INTER))
+        assert owner._row_gemm(x, B.mlp.down_proj, "down") is None, "GEMM_ROW: down taken"
+        for role, linear in (("o_proj", o_row),):
+            x = _normal(_gen(700 + rows + R.rank), (rows, linear.weight.shape[1]))
+            _set(0, 1, 0)
+            assert owner._row_gemm(x, linear, role) is None, f"GEMM_ROW off: {role} taken"
+            _set(0, 1, 1)
+            before = CENSUS.counts().get(f"dispatch:drafter_gemm_{role}:eager", 0)
+            got = owner._row_gemm(x, linear, role)
+            assert got is not None, f"GEMM_ROW {role} {rows} rows: not taken"
+            assert CENSUS.counts().get(f"dispatch:drafter_gemm_{role}:eager", 0) == before + 1
+            ref = x.float() @ linear.weight.float().t()
+            cublas = torch.nn.functional.linear(x, linear.weight)
+            e_on, e_off = ls.rel_err(got, ref), ls.rel_err(cublas, ref)
+            assert e_on <= GEMM_TOL and e_on <= max(WORSE * e_off, 2**-8), (role, rows, e_on, e_off)
+            if R.rank == 0:
+                print(f"[gemm_row] {role} {rows} rows: {e_on:.2e} (cuBLAS {e_off:.2e})", flush=True)
+        weight = B.weights["q_b"]
+        x = _normal(_gen(800 + rows + R.rank), (rows, weight.shape[1]))
+        _set(0, 1, 1)
+        got = owner._gemm(x, weight, "q_b")
+        ref = x.float() @ weight.float().t()
+        e_on, e_off = ls.rel_err(got, ref), ls.rel_err(torch.nn.functional.linear(x, weight), ref)
+        assert e_on <= GEMM_TOL and e_on <= max(WORSE * e_off, 2**-8), (
+            "q_b row pins",
+            rows,
+            e_on,
+            e_off,
+        )
+        ins = _inputs(rows, 900 + rows)
+        _set(0, 1, 0)
+        off = _steps(owner, *ins)
+        _set(0, 1, 1)
+        on = _steps(owner, *ins)
+        assert all(_same(a, b) for a, b in zip(on, off)), f"GEMM_ROW on, {rows} rows: steps changed"
+    _set(0, 0)
+
+
 def check_graphs():
-    for wide_ar, gemm in ((0, 0), (1, 0), (0, 1), (1, 1)):
+    for wide_ar, gemm, row in ((0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 1, 1), (1, 1, 1)):
         owner = _owner(gemm=True)
         for rows in GRAPH_ROWS:
-            _set(wide_ar, gemm)
+            _set(wide_ar, gemm, row)
             ins = [t.clone() for t in _inputs(rows, 500 + rows)]
             _steps(owner, *ins)
             torch.cuda.synchronize()
@@ -240,13 +295,13 @@ def check_graphs():
                 got = [o.clone() for o in outs]
                 want = _steps(owner, *ins)
                 assert all(_same(a, b) for a, b in zip(got, want)), (
-                    f"graph WIDE_AR {wide_ar} GEMM {gemm}, {rows} rows, replay {r}: not the eager call"
+                    f"graph WIDE_AR {wide_ar} GEMM {gemm} ROW {row}, {rows} rows, replay {r}: not the eager call"
                 )
             del graph
     _set(0, 0)
 
 
-CHECKS = [check_wide_ar, check_gemm, check_graphs]
+CHECKS = [check_wide_ar, check_gemm, check_gemm_row, check_graphs]
 
 
 def _run_one_rank(args) -> int:

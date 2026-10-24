@@ -77,6 +77,19 @@ def ar_ceiling(rows: int) -> int:
     return _decode_comm.DECODE_AR_ONE_SHOT_MAX_BYTES
 
 
+def _row_linear(linear: nn.Module) -> bool:
+    """A bias-free, unquantized bf16 row-parallel projection: with its all-reduce skipped, its forward is
+    ``F.linear(x, weight)`` (this rank's partial sum)."""
+    weight = getattr(linear, "weight", None)
+    return (
+        isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.bfloat16
+        and getattr(linear, "bias", None) is None
+        and not getattr(linear, "has_any_quant", False)
+        and getattr(getattr(linear, "tp_mode", None), "name", None) == "ROW"
+    )
+
+
 def _plain_linear(linear: nn.Module) -> bool:
     """A bias-free, unquantized bf16 projection, replicated or column-parallel without its output gather: its forward
     is ``F.linear(x, weight)``."""
@@ -606,7 +619,9 @@ class K3MLADrafterNorms:
         comm = self.comm
         if "o_proj" in self.forms and comm.takes_plain(x, linear.weight, residual, norm):
             return comm.sandwich_plain(x, linear.weight, residual, norm)
-        partial = linear(x, all_reduce_params=_decode_comm.skip_all_reduce())
+        partial = self._row_gemm(x, linear, "o_proj")
+        if partial is None:
+            partial = linear(x, all_reduce_params=_decode_comm.skip_all_reduce())
         return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
 
     def _mlp_norm(
@@ -646,7 +661,23 @@ class K3MLADrafterNorms:
             if not _plain_linear(weight):
                 return None
             weight = weight.weight
-        out = self.gemm.project(x, weight, role)
+        out = self.gemm.project(x, weight, role, row_pins=bool(_flags.TRTLLM_K3LL_DRAFTER_GEMM_ROW))
+        if out is not None:
+            _census.count(f"dispatch:drafter_gemm_{role}:{_census.mode()}")
+        return out
+
+    def _row_gemm(self, x: torch.Tensor, linear: nn.Module, role: str) -> Optional[torch.Tensor]:
+        """This rank's partial ``x @ W.T`` of a row-parallel bf16 projection (its all-reduce follows separately) on the
+        pinned low-M GEMM where ``TRTLLM_K3LL_DRAFTER_GEMM_ROW`` (with ``TRTLLM_K3LL_DRAFTER_GEMM``) is on and it takes
+        the call; else None."""
+        if (
+            self.gemm is None
+            or not _flags.TRTLLM_K3LL_DRAFTER_GEMM
+            or not _flags.TRTLLM_K3LL_DRAFTER_GEMM_ROW
+            or not _row_linear(linear)
+        ):
+            return None
+        out = self.gemm.project(x, linear.weight, role, row_pins=True)
         if out is not None:
             _census.count(f"dispatch:drafter_gemm_{role}:{_census.mode()}")
         return out

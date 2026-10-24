@@ -108,6 +108,13 @@ TRTLLM_K3LL_DRAFTER_GEMM = _flag(
     "MLA DSpark drafter (with TRTLLM_K3LL_MLA_DRAFTER_NORMS): [q_a | kv_a] and gate_up above one token tile and q_b "
     "on the low-M split-K GEMM at pinned tactics, not cuBLAS (draft tokens only: split-K partial sums)",
 )
+TRTLLM_K3LL_DRAFTER_GEMM_ROW = _flag(
+    "TRTLLM_K3LL_DRAFTER_GEMM_ROW",
+    0,
+    "MLA DSpark drafter (with TRTLLM_K3LL_DRAFTER_GEMM): o_proj (row-parallel, before its all-reduce) on the low-M "
+    "GEMM at pinned tactics, not cuBLAS, and q_b at up to 16 rows on a 4-stage ring (draft tokens only: another "
+    "accumulation order)",
+)
 TRTLLM_K3LL_DRAFTER_WIDE_AR = _flag(
     "TRTLLM_K3LL_DRAFTER_WIDE_AR",
     1,

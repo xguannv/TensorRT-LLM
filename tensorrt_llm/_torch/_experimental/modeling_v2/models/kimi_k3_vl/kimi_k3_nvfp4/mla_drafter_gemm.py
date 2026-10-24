@@ -30,6 +30,16 @@ PINS = {
     "gate_up": ((16, (64, 16, 4, 8)), (32, (64, 32, 4, 8))),
 }
 
+# TRTLLM_K3LL_DRAFTER_GEMM_ROW: o_proj (row-parallel, before its all-reduce) and a shallower q_b ring at up to 16 rows.
+# Measured with a PDL predecessor and cold weights (oak/dgemm/bench_drafter_gemm.py, GB300), exposed us against cuBLAS /
+# the GEMM pin: o_proj 2.56 / 3.22 (16 rows), 2.77 / 3.43 (32); q_b 2.22 / 2.77 (16 rows). down stays on cuBLAS: on
+# the low-M GEMM it measured +0.2..+0.3 us per layer in the decode graph.
+ROW_PINS = {
+    # o_proj: 7168 x (4 heads x 128) per rank.
+    "o_proj": ((16, (64, 16, 1, 4)), (32, (64, 32, 1, 4))),
+    "q_b": ((16, (64, 8, 4, 4)), (32, (64, 16, 3, 10))),
+}
+
 
 class DrafterGemm:
     """The builds (role, rows tactic, PDL) that ran eagerly: the only ones a capture may take."""
@@ -37,10 +47,13 @@ class DrafterGemm:
     def __init__(self) -> None:
         self._ran: Set[Tuple] = set()
 
-    def project(self, x: torch.Tensor, weight: torch.Tensor, role: str) -> Optional[torch.Tensor]:
+    def project(
+        self, x: torch.Tensor, weight: torch.Tensor, role: str, row_pins: bool = False
+    ) -> Optional[torch.Tensor]:
         k = x.shape[-1]
         m = x.numel() // k if k else 0
-        pin = next((p for p in PINS.get(role, ()) if 0 < m <= p[0]), None)
+        table = ROW_PINS if row_pins and role in ROW_PINS else PINS
+        pin = next((p for p in table.get(role, ()) if 0 < m <= p[0]), None)
         if (
             pin is None
             or x.dtype != torch.bfloat16
@@ -64,7 +77,7 @@ class DrafterGemm:
         if not x2d.is_contiguous() or x2d.data_ptr() % 32 or weight.data_ptr() % 32:
             return None
         pdl = get_env_enable_pdl()
-        key = (role, pin[0], tuple(weight.shape), pdl)
+        key = (role, pin[0], tuple(weight.shape), pdl, pin[1])
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and key not in self._ran:
             return None
