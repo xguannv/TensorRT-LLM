@@ -99,6 +99,25 @@ _OFFER: list = [None, 0]
 MX_STATS: Counter = Counter()
 _MX_LOGGED: set = set()
 
+# TRTLLM_K3LL_MX_SF_EARLY_RELEASE's default (-1) picks the early-release build only on these compute capabilities
+# (measured on GB300 / SM103). k3_fp8w_lowm_mxfp8 itself runs only where can_take_rows passes (SM100 / SM103).
+MX_SF_EARLY_RELEASE_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _sf_early_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MX_SF_EARLY_RELEASE_CAPABILITIES
+
+
+def _sf_early_release(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MX_SF_EARLY_RELEASE`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``MX_SF_EARLY_RELEASE_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MX_SF_EARLY_RELEASE)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _sf_early_by_default(index)
+
 
 def _census_count(key: str) -> None:
     from . import census as _census
@@ -235,7 +254,7 @@ def _run_mx(
         MX_STATS["declined"] += 1
         return None
     m, n, k = xq.shape[0], weight.shape[0], weight.shape[1]
-    early = bool(_flags.TRTLLM_K3LL_MX_SF_EARLY_RELEASE)
+    early = _sf_early_release(xq.device)
     if torch.cuda.is_current_stream_capturing() and not kernel.is_compiled(m, n, k, True, early):
         # Compiling under capture is not allowed; the low-M kernel gives the same bits. Warm-up runs eagerly first.
         MX_STATS["not_compiled"] += 1

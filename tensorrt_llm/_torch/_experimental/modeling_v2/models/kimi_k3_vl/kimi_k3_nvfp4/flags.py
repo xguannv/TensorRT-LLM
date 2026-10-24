@@ -364,9 +364,11 @@ TRTLLM_K3LL_ATTN_RES_MXFP8 = _flag(
 )
 TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "TRTLLM_K3LL_MX_SF_EARLY_RELEASE",
-    0,
+    -1,
     "k3_fp8w_lowm_mxfp8 (TRTLLM_K3LL_ATTN_RES_MXFP8): where every K tile has its own activation stage, release each "
-    "K tile to the MMA once its scales are folded, not after all of them (bitwise; read at forward time)",
+    "K tile to the MMA once its scales are folded, not after all of them (bitwise; read at forward time). 1 on, 0 "
+    "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
+    "SM100 / SM103 only",
 )
 
 
