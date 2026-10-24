@@ -240,6 +240,10 @@ def k3_fp8_kda_verify(
                     float(eps), fold_fb, sep_bfa, pdl, _prof_on(), _hoist_replay(), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
+    if key[-1]:
+        from . import census
+
+        census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
     return out
 
 
