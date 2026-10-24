@@ -22,7 +22,9 @@ the same kind of collective: `K3DecodeComm.sandwich_tail`, `comm/k3_sandwich_tai
 all-reduce and the next layer's residual update (the final norm's, after the last layer) in one kernel. On a wide
 decode step with ``TRTLLM_K3LL_MOE_TAIL_PUSH`` the layer hands on its tail's input (a `WideTail`) and
 `K3DecodeComm.tail_push_attn_res` runs the tail GEMV with its all-reduce push epilogue, the Lamport finish and the
-residual update on the MNNVL workspace (``moe_tail_push.py``).
+residual update on the MNNVL workspace (``moe_tail_push.py``). With ``TRTLLM_K3LL_MOE_TAIL_LU`` the layer hands on its
+reduced routed and shared outputs instead (a `LuTail`), and `K3DecodeComm.tail_lu_attn_res` runs the residual update
+with the MoE add (``moe_tail_lu.py``), no collective.
 
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
 
@@ -76,7 +78,9 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
 from . import flags as _flags
+from . import moe_tail_lu as _tail_lu
 from . import moe_tail_push as _tail_push
+from .moe_tail_lu import LuTail
 from .moe_tail_push import WideTail
 from .oproj_push import HIDDEN as _PUSH_HIDDEN
 from .oproj_push import K3OprojPush, push_target
@@ -302,6 +306,45 @@ class K3DecodeComm:
         target.pushed = True
         return push.finish_attn_res(
             target, prefix_sum, block_residual, res_proj, res_norm, out_norm, mxfp8_out=mxfp8_out
+        )
+
+    def takes_tail_lu(
+        self,
+        tail: LuTail,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> bool:
+        """Whether ``tail_lu_attn_res`` takes a wide decode step's handed-on ``LuTail`` (``moe_tail_lu.py``): the
+        attn_res kernel with the MoE add takes the prefix sum (the zero prefix for None), the tail, the snapshots and
+        the weights. Shapes and load-time state only, so every rank decides alike."""
+        push = self.oproj_push
+        rows = tail.routed.shape[0]
+        if prefix_sum is None and (push is None or rows > push.zeros.shape[0]):
+            return False
+        prefix = push.zeros[:rows] if prefix_sum is None else prefix_sum
+        return _tail_lu.attn_res_takes(tail, prefix, block_residual, res_proj, res_norm, out_norm)
+
+    def tail_lu_attn_res(
+        self,
+        tail: LuTail,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+        mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)``: ``updated = bf16(prefix_sum + bf16(tail.routed + tail.shared))`` (the sum alone
+        without ``prefix_sum``), ``normed = out_norm(attn_res(block_residual..., updated))``, in one
+        ``K3AttnResFastKernel`` launch (``takes_tail_lu`` holds; ``moe_tail_lu.attn_res``). ``mxfp8_out``: passed to
+        the kernel (the MXFP8 form of ``normed``)."""
+        rows = tail.routed.shape[0]
+        prefix = self.oproj_push.zeros[:rows] if prefix_sum is None else prefix_sum
+        return _tail_lu.attn_res(
+            tail, prefix, block_residual, res_proj, res_norm, out_norm, mxfp8_out=mxfp8_out
         )
 
     @staticmethod

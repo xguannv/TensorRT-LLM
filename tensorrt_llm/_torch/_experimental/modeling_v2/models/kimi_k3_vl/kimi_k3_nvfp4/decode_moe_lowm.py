@@ -58,8 +58,10 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
 from . import flags as _flags
+from . import moe_tail_lu as _tail_lu
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
+from .moe_tail_lu import LuTail
 from .moe_tail_push import WideTail
 
 MAX_TOKENS = 8
@@ -86,6 +88,8 @@ class K3DecodeMoeNvfp4:
     head16: Optional[K3MoeHeadWorkspace] = None
     #: The 32-token front build's own head workspace (a step of 17-32 tokens), or None: such steps keep the wide head.
     head32: Optional[K3MoeHeadWorkspace] = None
+    #: ``TRTLLM_K3LL_MOE_TAIL_LU``'s shared state (``moe_tail_lu.py``), built where the switch is set at load.
+    lu: Optional[_tail_lu.K3TailLuState] = None
 
     @classmethod
     def create(
@@ -267,6 +271,8 @@ class K3DecodeMoeNvfp4Layer:
     fc2_input_scale: torch.Tensor
     offset: int
     situ: tuple
+    #: ``TRTLLM_K3LL_MOE_TAIL_LU``'s weights of this layer (``moe_tail_lu.py``), built where the switch is set at load.
+    lu: Optional[_tail_lu.K3TailLuLayer] = None
 
     @classmethod
     def create(
@@ -372,19 +378,30 @@ class K3DecodeMoeNvfp4Layer:
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
+        routing, shared_act = self._front_only(moe, x, front32)
+        return self._routed_after(routing), shared_act
+
+    def _front_only(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):
+        """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
-            return self._routed(ids, weights, x_q, x_sf), shared_act
+            return (None, ids, weights, x_q, x_sf), shared_act
         rows = x.shape[0]
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
         _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
-        routed = nvfp4_lowm_op.run_sorted(
-            x_q, x_sf, sort_views(sort_out, rows, self.num_local), self.experts, self.fc2_input_scale,
+        return (sort_out, rows, None, x_q, x_sf), shared_act
+
+    def _routed_after(self, routing) -> torch.Tensor:
+        """``_front_routed``'s routed experts on the front's ``routing`` (`_front_only`)."""
+        sort_out, a, b, x_q, x_sf = routing
+        if sort_out is None:
+            return self._routed(a, b, x_q, x_sf)
+        return nvfp4_lowm_op.run_sorted(
+            x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
             self.state.counters, *self.situ,
         )  # fmt: skip
-        return routed, shared_act
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:
         """Whether this decode path runs the layer on ``step`` (bf16 rows ``hidden_states``): any step of at most
@@ -401,9 +418,10 @@ class K3DecodeMoeNvfp4Layer:
         gemvs,
         partial_tail: bool,
         push: bool = False,
-    ) -> Union[torch.Tensor, PendingTail]:
+    ) -> Union[torch.Tensor, PendingTail, WideTail, LuTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
-        (a ``PendingTail``; on a wide step a tensor, or a ``WideTail`` with ``TRTLLM_K3LL_MOE_TAIL_PUSH``); else the
+        (a ``PendingTail``; on a wide step a tensor, a ``WideTail`` with ``TRTLLM_K3LL_MOE_TAIL_PUSH``, or a
+        ``LuTail`` with ``TRTLLM_K3LL_MOE_TAIL_LU``); else the
         reduced output. ``push`` is ignored: the latent all-reduce is always the routed
         experts' all-reduce."""
         if hidden_states.shape[0] > MAX_TOKENS:
@@ -452,11 +470,13 @@ class K3DecodeMoeNvfp4Layer:
 
     def _wide(
         self, moe: nn.Module, hidden_states: torch.Tensor, gemvs
-    ) -> Union[torch.Tensor, WideTail]:
+    ) -> Union[torch.Tensor, WideTail, LuTail]:
         """A wide decode step's MoE (`MAX_TOKENS` < M <= `WIDE_MAX_TOKENS`): this rank's unreduced share of the
         output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts. With
         ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
-        consumer runs the tail GEMV (``moe_tail_push.py``)."""
+        consumer runs the tail GEMV (``moe_tail_push.py``). With ``TRTLLM_K3LL_MOE_TAIL_LU`` (read at forward time),
+        where ``moe_tail_lu.takes`` holds after the front, the reduced routed and shared outputs (a `LuTail`,
+        ``moe_tail_lu.py``)."""
         x = hidden_states.contiguous()
         front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
         if (
@@ -469,7 +489,15 @@ class K3DecodeMoeNvfp4Layer:
             _census.count(f"moe_front32:{_census.mode()}")
         if self.state.front_head(x.shape[0], front32) is not None:
             # The front's 16- or 32-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
-            routed, shared_act = self._front_routed(moe, x, front32)
+            routing, shared_act = self._front_only(moe, x, front32)
+            if _tail_lu.takes(self.state.lu, self.lu, shared_act, gemvs):
+                from . import census as _census
+
+                _census.count(f"dispatch:moe_tail_lu:{_census.mode()}")
+                return _tail_lu.run(
+                    self.state.lu, self.lu, gemvs, shared_act, lambda: self._routed_after(routing)
+                )
+            routed = self._routed_after(routing)
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's

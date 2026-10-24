@@ -73,6 +73,7 @@ from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
 from . import mla_drafter as _mla_drafter
 from . import mla_v_up as _mla_v_up
+from . import moe_tail_lu as _moe_tail_lu
 from . import moe_tail_push as _moe_tail_push
 from . import spec_worker as _spec_worker
 from . import weights as _weights
@@ -1216,12 +1217,13 @@ class KimiK3MoERuntime(nn.Module):
         partial_tail: bool = False,
         *,
         step: DecodeStep,
-    ) -> Union[torch.Tensor, _decode_comm.PendingTail, _decode_comm.WideTail]:
+    ) -> Union[torch.Tensor, _decode_comm.PendingTail, _decode_comm.WideTail, _moe_tail_lu.LuTail]:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16. ``step``: the step's classification
         (``decode_step``); the decode path (``decode_moe.py``) runs the steps it takes. ``partial_tail`` (only where
         ``tail_rp_eligible`` holds): return this rank's unreduced share of the output instead, a ``PendingTail`` at
         most 8 tokens, a tensor on a wide decode step (a ``WideTail``, the tail before its GEMV, with
-        ``TRTLLM_K3LL_MOE_TAIL_PUSH``)."""
+        ``TRTLLM_K3LL_MOE_TAIL_PUSH``; a ``LuTail``, the reduced routed and shared outputs, with
+        ``TRTLLM_K3LL_MOE_TAIL_LU``)."""
         decode = self.decode_moe
         if decode is not None and decode.takes(hidden_states, step, partial_tail):
             return decode.forward(
@@ -1601,7 +1603,9 @@ class KimiLinearDecoderLayer(nn.Module):
         capture: Optional[Tuple[Any, int]] = None,
         prenormed: bool = False,
         pending_moe_partial: Optional[
-            Union[torch.Tensor, _decode_comm.PendingTail, _decode_comm.WideTail]
+            Union[
+                torch.Tensor, _decode_comm.PendingTail, _decode_comm.WideTail, _moe_tail_lu.LuTail
+            ]
         ] = None,
         defer_moe_tail: bool = False,
     ) -> Union[Tuple[torch.Tensor, int], Tuple[torch.Tensor, int, Any]]:
@@ -1643,7 +1647,10 @@ class KimiLinearDecoderLayer(nn.Module):
         all-reduce and the fused add + attn_res + RMSNorm; a ``WideTail``
         (``TRTLLM_K3LL_MOE_TAIL_PUSH``) with the tail GEMV pushing into that
         all-reduce where ``K3DecodeComm.takes_tail_push`` holds, else by the
-        tail GEMV and the tensor's path. On a tapped layer
+        tail GEMV and the tensor's path; a ``LuTail``
+        (``TRTLLM_K3LL_MOE_TAIL_LU``, already reduced) by the attn_res kernel
+        with the MoE add (``K3DecodeComm.tail_lu_attn_res``) where
+        ``takes_tail_lu`` holds, else the fused add + attn_res + RMSNorm. On a tapped layer
         the ``sandwich_tail`` call also stores the tap into the capture slot
         where the speculative metadata exposes it (``capture_view``); other
         tapped layers take the tap after the step.
@@ -1685,6 +1692,21 @@ class KimiLinearDecoderLayer(nn.Module):
             )
             if not tail_push:
                 pending_moe_partial = pending_moe_partial.partial()
+        # A wide step's MoE output with the replicated FP8 latent_up (TRTLLM_K3LL_MOE_TAIL_LU), already reduced: the
+        # attn_res kernel adds routed + shared where the decode collectives take it, else the fused add + attn_res.
+        tail_lu = isinstance(pending_moe_partial, _moe_tail_lu.LuTail)
+        tail_lu_fused = (
+            tail_lu
+            and self.decode_comm is not None
+            and self.decode_comm.takes_tail_lu(
+                pending_moe_partial,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+            )
+        )
 
         # TRTLLM_K3LL_ATTN_RES_MXFP8: the K3AttnResFast that finishes a pushed MoE tail also writes the MXFP8 form of
         # its output for the attention's first FP8 projection (offered to it below, withdrawn after the attention).
@@ -1718,6 +1740,26 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 mxfp8_out=mxfp8_out,
+            )
+        elif tail_lu_fused:
+            _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
+            hidden_states, prefix_sum = self.decode_comm.tail_lu_attn_res(
+                pending_moe_partial,
+                prefix_sum,
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+            )
+        elif tail_lu:
+            prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
+                prefix_sum,
+                pending_moe_partial.reduced(),
+                valid_block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.input_layernorm,
+                attn_res_max_tokens,
             )
         elif (
             pending_moe_partial is not None
@@ -2254,6 +2296,28 @@ class KimiLinearModel(DecoderModel):
                 )
                 return normed
             pending_moe_partial = pending_moe_partial.partial()
+        if isinstance(pending_moe_partial, _moe_tail_lu.LuTail):
+            # The last MoE layer's output with the replicated FP8 latent_up (TRTLLM_K3LL_MOE_TAIL_LU; see the layer's
+            # pre-attention step).
+            tail_comm = self.layers[-1].decode_comm
+            out_mods = (self.output_attn_res_proj, self.output_attn_res_norm, self.norm)
+            valid = block_residual[:num_snapshots]
+            if tail_comm is not None and tail_comm.takes_tail_lu(
+                pending_moe_partial, hidden_states, valid, *out_mods
+            ):
+                _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
+                normed, _ = tail_comm.tail_lu_attn_res(
+                    pending_moe_partial, hidden_states, valid, *out_mods
+                )
+                return normed
+            _, normed = _apply_attn_res_add_and_rmsnorm(
+                hidden_states,
+                pending_moe_partial.reduced(),
+                valid,
+                *out_mods,
+                _attn_res_max_tokens(step),
+            )
+            return normed
         if isinstance(pending_moe_partial, _decode_comm.PendingTail):
             normed, _ = self.layers[-1].decode_comm.sandwich_tail(
                 pending_moe_partial,
@@ -4277,13 +4341,16 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         super().cache_derived_state()
         if self.model.decode_gemvs is not None or self.target_spec.ctx_only:
             return
-        sites = tuple(_decode_gemv.SITES)
+        sites = _decode_gemv.DEFAULT_SITES
         if self.target_spec.quant_algo == QuantAlgo.NVFP4:
             sites = ("dense_gate_up", "dense_down")
             if _flags.TRTLLM_K3LL_MOE_LOWM:
                 # The lowm MoE decode path's bf16 GEMVs (decode_moe_lowm.py): a wide step's head, shared gate_up
                 # and tail, and the replicated tail's latent up projection.
                 sites += ("moe_head", "moe_shared_gate_up", "moe_tail", "moe_up")
+                if _flags.TRTLLM_K3LL_MOE_TAIL_LU:
+                    # The shared experts' down projection with its own all-reduce (moe_tail_lu.py).
+                    sites += (_moe_tail_lu.SHARED_SITE,)
             if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
                 sites += ("kda_bfa",)
                 if _flags.TRTLLM_K3LL_KDA_BFA_ROW_TILES:
@@ -4488,16 +4555,29 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             front16=front16,
             front32=front32,
         )
+        lu_layers = self._build_tail_lu(comm, state, takes)
         for moe in takes:
             _decode_moe.fold_latent_norm(moe)
             moe.decode_moe = _decode_moe_lowm.K3DecodeMoeNvfp4Layer.create(
                 moe, state, mapping.tp_rank, mapping.tp_size
             )
+            moe.decode_moe.lu = lu_layers.get(id(moe))
             moe.decode_gemvs = self.model.decode_gemvs
         first = takes[0].decode_moe
         first.warm_up(takes[0])
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         gemvs = self.model.decode_gemvs
+        if state.lu is not None:
+            _moe_tail_lu.warm_up(state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1)
+            if mapping.tp_rank == 0:
+                logger.info(
+                    f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_TAIL_LU={_flags.TRTLLM_K3LL_MOE_TAIL_LU} (read at forward "
+                    f"time; LOSSY): FP8 latent_up on {len(lu_layers)} layers "
+                    f"({sum(lu.extra_bytes for lu in lu_layers.values())} bytes per rank), latent workspace "
+                    f"{3 * state.lu.latent_ws.buffer_bytes} bytes; kernels ready: {state.lu.ready}, MXFP8 latent_up "
+                    f"rows {sorted(state.lu.mx_rows)}, MoE-add attn_res candidates "
+                    f"{sorted(state.lu.attn_res_candidates)}"
+                )
         if gemvs is not None and comm.oproj_push is not None:
             # TRTLLM_K3LL_MOE_TAIL_PUSH is read at forward time: its push GEMV compiles here whatever the switch says
             # (compile only, no launch), so a capture after flipping it finds the kernel.
@@ -4510,6 +4590,32 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                     f"time): the wide tail's push GEMV compiled for token tiles {tiles}"
                 )
         return len(takes)
+
+    def _build_tail_lu(
+        self,
+        comm: _decode_comm.K3DecodeComm,
+        state: _decode_moe_lowm.K3DecodeMoeNvfp4,
+        moes: list,
+    ) -> dict:
+        """``TRTLLM_K3LL_MOE_TAIL_LU`` set at load (``moe_tail_lu.py``): its shared state on ``state`` (collective: the
+        latent workspace) and each MoE layer's FP8 latent_up, built before the latent norm is folded. Returns the
+        layers' weights by ``id(moe)``; empty where the switch is off at load or a layer or the target does not take
+        it (every rank decides alike: shapes and the TP size)."""
+        if not _flags.TRTLLM_K3LL_MOE_TAIL_LU:
+            return {}
+        mapping = self.tp_mapping
+        gemvs = self.model.decode_gemvs
+        gaps = sorted(
+            {gap for moe in moes for gap in _moe_tail_lu.layer_gaps(moe, mapping.tp_size)}
+        )
+        if gemvs is None or comm.oproj_push is None or gaps:
+            logger.info(
+                "Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_TAIL_LU=1 at load, not built: "
+                f"{gaps or 'no decode GEMV state or o_proj push view'}"
+            )
+            return {}
+        state.lu = _moe_tail_lu.K3TailLuState.create(mapping, comm.oproj_push.lamport)
+        return {id(moe): _moe_tail_lu.K3TailLuLayer.create(moe) for moe in moes}
 
     def _gate_spec_worker_kernels(self, comm: Optional[_decode_comm.K3DecodeComm]) -> bool:
         """Turn the DFlash / DSpark worker's Kimi K3 decode kernels (its ``k3_decode``: ``trtllm::k3_spec_accept``,
