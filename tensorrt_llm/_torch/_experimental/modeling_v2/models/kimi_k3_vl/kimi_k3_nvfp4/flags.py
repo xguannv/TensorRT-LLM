@@ -416,6 +416,22 @@ TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "tokens and next_new bit for bit (read at forward time)",
 )
 
+# Decode-step input-chain switches of the executor, read once at import by
+# tensorrt_llm/_torch/pyexecutor/input_commit.py (not registered here, so log_flags does not print them; each
+# defaults to 0, off, and the path with all of them at 0 is the one before they were added):
+#   TRTLLM_BATCHED_INPUT_COMMIT=1            a CUDA-graph decode step's H2D input copies and overlap gathers as one
+#                                            _input_commit_kernel before the replay
+#                                            (engine/runners/decoder/runner.py _input_commit_for_step)
+#   TRTLLM_BATCHED_INPUT_COMMIT_VERIFY=<n>   debug: check the first n commits (-1: all) against the staged bytes
+#   TRTLLM_KV_BLOCK_OFFSETS_TRITON=1|2       KVCacheManagerV2 block-offset copy as a Triton kernel; 2: also the target
+#                                            and draft tables in one _copy_block_offsets_pair_kernel
+#   TRTLLM_STATE_INDEX_COPY_KERNEL=1         MambaHybridCacheManagerV2 state indices + dummy mask in one
+#                                            _small_copy_pair_kernel
+#   TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1      spec sampler store scatters as one _spec_store_scatter_kernel where
+#                                            spec_step_copies does not run (see TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X)
+#   TRTLLM_FUSED_HELIX_SPEC_PREPROCESS=1     Helix spec steps the fused head prep (TRTLLM_K3LL_SPEC_HEAD_FUSED) does
+#                                            not take: _preprocess_inputs' corrections in one kernel
+
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every switch: name -> (value, default, doc)."""
