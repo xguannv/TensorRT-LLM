@@ -427,8 +427,8 @@ TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
 #                                            and draft tables in one _copy_block_offsets_pair_kernel
 #   TRTLLM_STATE_INDEX_COPY_KERNEL=1         MambaHybridCacheManagerV2 state indices + dummy mask in one
 #                                            _small_copy_pair_kernel
-#   TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1      spec sampler store scatters as one _spec_store_scatter_kernel where
-#                                            spec_step_copies does not run (see TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X)
+#   TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1      spec sampler store scatters as one _spec_store_scatter_kernel, taken
+#                                            before the spec_step_copies scatter (TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X)
 #   TRTLLM_FUSED_HELIX_SPEC_PREPROCESS=1     Helix spec steps the fused head prep (TRTLLM_K3LL_SPEC_HEAD_FUSED) does
 #                                            not take: _preprocess_inputs' corrections in one kernel
 

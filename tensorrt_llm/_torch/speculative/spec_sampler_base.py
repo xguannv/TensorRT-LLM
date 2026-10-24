@@ -320,9 +320,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
-        # TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1, where the spec_step_copies scatter does not run: one
-        # kernel for the four store scatters, and the slot tensor reused while the batch's slots do
-        # not change.
+        # TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1 (before the spec_step_copies scatter): one kernel for
+        # the four store scatters, and the slot tensor reused while the batch's slots do not change.
         self._fused_scatter = spec_sampler_fused_scatter_enabled()
         self._slots_key: Optional[list] = None
         self._slots_device: Optional[torch.Tensor] = None
@@ -570,7 +569,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
         scattered = False
-        if self._store_scatter is not None and spec_step_copies.is_enabled():
+        # TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1 takes the store scatter (_scatter_to_stores) even where
+        # the spec_step_copies scatter would run.
+        if (
+            self._store_scatter is not None
+            and not self._fused_scatter
+            and spec_step_copies.is_enabled()
+        ):
             # A step whose batch is unchanged leaves the slot table as it is.
             self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
             scattered = self._store_scatter.scatter(
