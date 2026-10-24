@@ -20,18 +20,44 @@ def _mod(name: str):
     return importlib.import_module(f"{_PKG}.{name}")
 
 
-def test_switch_default_off_and_documented():
+def test_switch_default_sm103_and_documented():
     flags = _mod("flags")
     value, default, doc = flags.flags()["TRTLLM_K3LL_MOE_TAIL_COL"]
-    assert default == 0
-    assert "Lossless" in doc and "MB per layer" in doc and "TRTLLM_K3LL_MOE_TAIL_LU" in doc
+    assert default == -1
+    assert (
+        "Lossless" in doc
+        and "MB per layer" in doc
+        and "TRTLLM_K3LL_MOE_TAIL_LU" in doc
+        and "SM103" in doc
+    )
+    assert _mod("moe_tail_col").MOE_TAIL_COL_CAPABILITIES == ((10, 3),)
+    # The lossy replicated tail is off by default: this switch takes its steps.
+    assert flags.flags()["TRTLLM_K3LL_MOE_TAIL_LU"][1] == 0
 
 
-@pytest.mark.parametrize("value,on", [(0, False), (1, True), (2, True), (-1, False)])
-def test_enabled_value(monkeypatch, value, on):
+@pytest.mark.parametrize(
+    "value,capability,on",
+    [
+        (0, (10, 3), False),
+        (1, (10, 3), True),
+        (2, (10, 7), True),
+        (1, (10, 7), True),
+        (-1, (10, 3), True),
+        (-1, (10, 7), False),
+        (-1, (10, 0), False),
+        (-1, (9, 0), False),
+    ],
+)
+def test_enabled_value(monkeypatch, value, capability, on):
     col = _mod("moe_tail_col")
     monkeypatch.setattr(col._flags, "TRTLLM_K3LL_MOE_TAIL_COL", value)
-    assert col.enabled() is on
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: capability)
+    col._on_by_default.cache_clear()
+    try:
+        assert col.enabled() is on
+    finally:
+        col._on_by_default.cache_clear()
 
 
 def test_slice_geometry():

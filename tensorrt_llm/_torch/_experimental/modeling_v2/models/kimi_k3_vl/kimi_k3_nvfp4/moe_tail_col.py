@@ -65,6 +65,7 @@ The target builds it after the fold, so the operands are the push tail's.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -112,9 +113,27 @@ def _lamport():
     return k3_lamport_ar
 
 
+#: ``TRTLLM_K3LL_MOE_TAIL_COL``'s default (-1) turns it on only on these compute capabilities (measured on GB300 /
+#: SM103). Its kernels (``k3_ctm_gemv_wide``'s column publish, ``K3LatentArRowKernel``) run on SM100 / SM103 only;
+#: elsewhere the load builds no state and the layer keeps the push tail, even when forced with 1.
+MOE_TAIL_COL_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _on_by_default() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in MOE_TAIL_COL_CAPABILITIES
+    )
+
+
 def enabled() -> bool:
-    """``TRTLLM_K3LL_MOE_TAIL_COL`` (read at load for the state, at forward time for engagement)."""
-    return int(_flags.TRTLLM_K3LL_MOE_TAIL_COL) > 0
+    """``TRTLLM_K3LL_MOE_TAIL_COL`` (read at load for the state, at forward time for engagement): 1 on, 0 off, -1
+    (default) on where the device is in ``MOE_TAIL_COL_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_TAIL_COL)
+    if value >= 0:
+        return value > 0
+    return _on_by_default()
 
 
 def slice_width(world: int) -> int:

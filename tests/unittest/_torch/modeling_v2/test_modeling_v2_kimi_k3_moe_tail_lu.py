@@ -25,10 +25,10 @@ def _sm10x() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-def test_switch_default_sm103_and_documented():
+def test_switch_default_off_and_documented():
     flags = _mod("flags")
     value, default, doc = flags.flags()["TRTLLM_K3LL_MOE_TAIL_LU"]
-    assert default == -1
+    assert default == 0
     assert "LOSSY" in doc and "MB per layer" in doc and "SM103" in doc
     assert _mod("moe_tail_lu").MOE_TAIL_LU_CAPABILITIES == ((10, 3),)
 
