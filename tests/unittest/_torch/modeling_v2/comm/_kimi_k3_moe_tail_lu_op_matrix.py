@@ -81,6 +81,7 @@ FLAGS = None
 CENSUS = None
 MSU = None
 BUILT = None
+STATS = {}
 
 
 def _gen(seed):
@@ -108,6 +109,8 @@ def _expect_same(where: str, got: torch.Tensor, want: torch.Tensor, replicated: 
 
 def _expect_close(where: str, got: torch.Tensor, want: torch.Tensor, rel: float):
     err = ls.rel_err(got, want)
+    key = where.split(": ", 1)[-1]
+    STATS[key] = max(STATS.get(key, 0.0), err)
     assert err <= rel, f"{where}: relative error {err:.3e} > {rel:.1e}"
 
 
@@ -280,17 +283,27 @@ def _lat_norm_ref(latent_sum: torch.Tensor) -> torch.Tensor:
 def check_takes():
     st, layer, gemvs = BUILT.state, BUILT.layer, BUILT.gemvs
     for rows in (8, 9, 16, 17, 24, 32, 33, 48):
-        act = torch.zeros(rows, S_ACT, dtype=torch.bfloat16, device="cuda")
         with _switch(0):
-            assert not LU.takes(st, layer, act, gemvs), f"switch 0 took {rows} rows"
+            assert not LU.takes(st, layer, rows, S_ACT, gemvs), f"switch 0 took {rows} rows"
         with _switch(1):
             want = LU.MIN_ROWS <= rows <= LU.MAX_ROWS
-            assert LU.takes(st, layer, act, gemvs) == want, f"switch 1 at {rows} rows"
-            assert not LU.takes(None, layer, act, gemvs) and not LU.takes(st, None, act, gemvs)
-            assert not LU.takes(st, layer, act, None)
+            assert LU.takes(st, layer, rows, S_ACT, gemvs) == want, f"switch 1 at {rows} rows"
+            assert not LU.takes(None, layer, rows, S_ACT, gemvs)
+            assert not LU.takes(st, None, rows, S_ACT, gemvs)
+            assert not LU.takes(st, layer, rows, S_ACT, None)
     with _switch(1):
-        act = torch.zeros(16, S_ACT + 128, dtype=torch.bfloat16, device="cuda")
-        assert not LU.takes(st, layer, act, gemvs), "took a shared activation of another width"
+        assert not LU.takes(st, layer, 16, S_ACT + 128, gemvs), (
+            "took a shared activation of another width"
+        )
+        # A capture whose shared site's plain wide GEMV has not run eagerly: refused, as the plain path refuses it.
+        fresh = DG.K3DecodeGemvs()
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            refused = not LU.takes(st, layer, 16, S_ACT, fresh)
+        assert refused, "took a capture whose shared site's GEMV had not run eagerly"
+        del graph
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -357,7 +370,8 @@ def check_pieces():
         _expect_same(f"{where}: updated without prefix", updated0, tail.routed + tail.shared)
     if R.rank == 0:
         print(
-            "[rank 0] pieces: latent AR + RMSNorm + MXFP8, FP8 latent_up, shared AR, MoE-add attn_res",
+            "[rank 0] pieces: latent AR + RMSNorm + MXFP8, FP8 latent_up, shared AR, MoE-add attn_res; max rel err "
+            + ", ".join(f"{k} {v:.2e}" for k, v in sorted(STATS.items())),
             flush=True,
         )
 
@@ -509,15 +523,34 @@ def check_graphs():
         step.run()
     torch.cuda.synchronize()
     graphs = {}
-    for rows, step in steps.items():
-        R.barrier()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        graph = torch.cuda.CUDAGraph()
-        with MSU.with_multi_stream(True), torch.cuda.graph(graph, stream=stream):
-            out = step.run()
-        R.barrier()
-        graphs[rows] = (graph, out)
+    # Where the shared all-reduce runs: the side stream under multi-stream capture, the current stream eagerly.
+    streams = []
+    original = LU.shared_all_reduce
+
+    def tapped(*args, **kwargs):
+        streams.append(torch.cuda.current_stream().cuda_stream)
+        return original(*args, **kwargs)
+
+    LU.shared_all_reduce = tapped
+    try:
+        for rows, step in steps.items():
+            R.barrier()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with MSU.with_multi_stream(True), torch.cuda.graph(graph, stream=stream):
+                out = step.run()
+            R.barrier()
+            graphs[rows] = (graph, out)
+            assert streams == [BUILT.state.stream.cuda_stream] * 2, (
+                "the captured shared all-reduces' streams"
+            )
+            streams.clear()
+        step.run()
+        current = torch.cuda.current_stream().cuda_stream
+        assert streams == [current] * 2, "eagerly the shared all-reduce runs on the current stream"
+    finally:
+        LU.shared_all_reduce = original
     for i, rows in enumerate(REPLAY_ORDER):
         step = steps[rows]
         where = f"graph {rows} rows replay {i}"
