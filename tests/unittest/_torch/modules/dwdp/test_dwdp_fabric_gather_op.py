@@ -120,3 +120,25 @@ def test_sm_reserve_hook_reads_the_k3ll_name(monkeypatch):
     assert sm_reserve() == 0
     monkeypatch.setenv("TRTLLM_K3LL_CUTEDSL_SM_RESERVE", "16")
     assert sm_reserve() == 16
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_misaligned_layer_uses_the_configured_copy_path(monkeypatch, batched):
+    from tensorrt_llm._torch.modules.dwdp import weight_manager as wm
+
+    mgr = object.__new__(wm.DWDPWeightManager)
+    mgr._gather_plans = {7: None}  # layer 7 is cached as not gatherable
+    mgr._use_batched_prefetch = batched
+    calls = []
+    monkeypatch.setattr(
+        wm.DWDPWeightManager,
+        "_prefetch_layer_batched",
+        lambda self, i: calls.append(("batched", i)),
+    )
+    monkeypatch.setattr(
+        wm.DWDPWeightManager,
+        "_prefetch_layer_per_slice",
+        lambda self, i: calls.append(("per_slice", i)),
+    )
+    mgr._prefetch_layer_gather(7)
+    assert calls == [("batched" if batched else "per_slice", 7)]

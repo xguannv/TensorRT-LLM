@@ -513,7 +513,11 @@ class DWDPWeightManager:
                 )
 
         if plan is None:
-            self._prefetch_layer_batched(layer_idx)
+            # The copy-engine path the manager would use without the gather.
+            if self._use_batched_prefetch:
+                self._prefetch_layer_batched(layer_idx)
+            else:
+                self._prefetch_layer_per_slice(layer_idx)
             return
 
         dst_ptrs, src_ptrs, lines, row_starts, blocks = plan
