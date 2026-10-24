@@ -432,6 +432,13 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
     "SM100 / SM103 only",
 )
+TRTLLM_K3LL_OPROJ_PUSH_EARLY_STATE = _flag(
+    "TRTLLM_K3LL_OPROJ_PUSH_EARLY_STATE",
+    1,
+    "o_proj GEMM with the all-reduce push epilogue (k3_fp8w_lowm_gemm ar_push): read the Lamport workspace's "
+    "rotation state right after the grid-dependency wait and the owners' slot pointers before it, instead of after "
+    "the MMAs (the same stores; bitwise; read at forward time). 1 on (default), 0 off",
+)
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
     1,

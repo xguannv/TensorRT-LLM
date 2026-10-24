@@ -797,6 +797,7 @@ class K3Fp8wLowMGemmKernel:
         fp4_out: bool = False,
         ar_push: int = 0,
         ar_world: int = 0,
+        ar_early_state: bool = False,
     ):
         validate_tactic(n, k, tactic, gated)
         if fp4_out and n % MMA_M:
@@ -810,6 +811,7 @@ class K3Fp8wLowMGemmKernel:
                 raise ValueError("the all-reduce push needs split_k == 1, no sigmoid / NVFP4")
         self.ar_push = ar_push
         self.ar_world = ar_world
+        self.ar_early_state = bool(ar_push) and ar_early_state
         self.gated = gated
         self.sigmoid = sigmoid
         self.fp4_out = fp4_out
@@ -1296,6 +1298,26 @@ class K3Fp8wLowMGemmKernel:
             )
         elif warp_idx >= _QUANT_WARP0:
             q = tidx - _QUANT_WARP0 * 32
+            ar_cur = Int32(0)
+            ar_nbytes = Int32(0)
+            vecs = MMA_M // 8
+            n_push = self.mma_n * vecs // MMA_M
+            rOwner = cute.make_rmem_tensor((max(n_push, 1),), Int64)
+            if cutlass.const_expr(self.ar_early_state):
+                if warp_idx < _QUANT_WARP0 + 4:
+                    # The push's addressing, read by the epilogue threads before they quantize instead of after the
+                    # MMAs: the owners of their tokens' slots from the pointer table (no kernel writes it) and, once
+                    # the grid dependency is resolved (the previous call on the workspace has completed), the
+                    # workspace's rotation state.
+                    if cutlass.const_expr(self.ar_push == AR_PUSH_TWO_SHOT):
+                        for p in cutlass.range_constexpr(n_push):
+                            t_own = (q + p * MMA_M) // vecs
+                            rOwner[p] = k3_lamport_ar.ld_nc_u64(
+                                ar_peers + Int64(t_own % self.ar_world) * 8
+                            )
+                    if cutlass.const_expr(self.use_pdl):
+                        _griddepcontrol_wait()
+                    ar_cur, _, ar_nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(ar_flags)
             self.quantize_activations(
                 storage,
                 g_smem,
@@ -1344,6 +1366,9 @@ class K3Fp8wLowMGemmKernel:
                     ar_mc,
                     ar_flags,
                     ar_rank,
+                    ar_cur,
+                    ar_nbytes,
+                    rOwner,
                 )
 
     @cute.jit
@@ -1594,6 +1619,9 @@ class K3Fp8wLowMGemmKernel:
         ar_mc: Optional[Int64] = None,
         ar_flags: Optional[Int64] = None,
         ar_rank: Optional[Int32] = None,
+        ar_cur: Optional[Int32] = None,
+        ar_nbytes: Optional[Int32] = None,
+        rOwner: Optional[cute.Tensor] = None,
     ):
         S = self.split_k
         gsf = cutlass.Float32(0.0)
@@ -1640,7 +1668,19 @@ class K3Fp8wLowMGemmKernel:
                 m_store = Int32(0)
         if cutlass.const_expr(self.ar_push != 0):
             self._push_lamport(
-                storage, rAcc, tTR_cAcc, m, q, n_base, ar_peers, ar_mc, ar_flags, ar_rank
+                storage,
+                rAcc,
+                tTR_cAcc,
+                m,
+                q,
+                n_base,
+                ar_peers,
+                ar_mc,
+                ar_flags,
+                ar_rank,
+                ar_cur,
+                ar_nbytes,
+                rOwner,
             )
         elif cutlass.const_expr(S == 1):
             for i in cutlass.range_constexpr(nchunks * 4):
@@ -1750,6 +1790,9 @@ class K3Fp8wLowMGemmKernel:
         mc_base: Int64,
         flags: Int64,
         ar_rank: Int32,
+        early_cur: Int32,
+        early_nbytes: Int32,
+        rOwner: cute.Tensor,
     ):
         """All-reduce push of this CTA's output tile (``split_k == 1``): round every value to
         BF16 (as the BF16 store would), stage the tile token-major in the dead weight ring, then
@@ -1763,7 +1806,10 @@ class K3Fp8wLowMGemmKernel:
             row, col = tTR_cAcc[i]
             _sts_u16(stage_base + col * tile_row + row * 2, _f32_to_bf16_bits(rAcc[i]))
         cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
-        cur, _, nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(flags)
+        cur = early_cur
+        nbytes = early_nbytes
+        if cutlass.const_expr(not self.ar_early_state):
+            cur, _, nbytes, _, _, _, _, _ = k3_lamport_ar.lamport_state(flags)
         one_shot = self.ar_push == AR_PUSH_ONE_SHOT
         vecs = MMA_M // 8
         for p in cutlass.range_constexpr(self.mma_n * vecs // MMA_M):
@@ -1772,19 +1818,28 @@ class K3Fp8wLowMGemmKernel:
             c = j - t * vecs
             if t < m and n_base + c * 8 < self.n:
                 w = _lds_v4_b32(stage_base + t * tile_row + c * 16)
-                dst = k3_lamport_ar.push_slot(
-                    peer_ptrs,
-                    mc_base,
-                    cur,
-                    nbytes,
-                    t,
-                    ar_rank,
-                    n_base + c * 8,
-                    self.ar_world,
-                    self.n,
-                    one_shot,
-                )
-                k3_lamport_ar.push_v4(dst, *w, one_shot)
+                if cutlass.const_expr(self.ar_early_state and not one_shot):
+                    # push_slot's two-shot address with the owner loaded before the wait
+                    dst = (
+                        k3_lamport_ar.stage_addr(rOwner[p], cur, Int32(0), 2, nbytes)
+                        + Int64((t // self.ar_world) * self.ar_world + ar_rank) * (self.n * 2)
+                        + Int64(n_base + c * 8) * 2
+                    )
+                    k3_lamport_ar.push_v4(dst, *w, one_shot)
+                else:
+                    dst = k3_lamport_ar.push_slot(
+                        peer_ptrs,
+                        mc_base,
+                        cur,
+                        nbytes,
+                        t,
+                        ar_rank,
+                        n_base + c * 8,
+                        self.ar_world,
+                        self.n,
+                        one_shot,
+                    )
+                    k3_lamport_ar.push_v4(dst, *w, one_shot)
 
     @cute.jit
     def _store_nvfp4(
@@ -3187,10 +3242,24 @@ def run_k3_fp8w_lowm_gemm_gated(
 
 @functools.cache
 def _compiled_ar_push_kernel(
-    n: int, k: int, tactic: K3LowMTactic, use_pdl: bool, ar_push: int, ar_world: int, gated: bool
+    n: int,
+    k: int,
+    tactic: K3LowMTactic,
+    use_pdl: bool,
+    ar_push: int,
+    ar_world: int,
+    gated: bool,
+    early_state: bool = False,
 ):
     kernel = K3Fp8wLowMGemmKernel(
-        n, k, tactic, use_pdl, gated=gated, ar_push=ar_push, ar_world=ar_world
+        n,
+        k,
+        tactic,
+        use_pdl,
+        gated=gated,
+        ar_push=ar_push,
+        ar_world=ar_world,
+        ar_early_state=early_state,
     )
     dummy = 1 << 20
     w_ptr = make_ptr(cutlass.Float8E4M3FN, dummy, cute.AddressSpace.gmem, assumed_align=16)
@@ -3238,6 +3307,7 @@ def run_k3_fp8w_lowm_gemm_ar_push(
     gate: Optional[torch.Tensor] = None,
     tactic: K3LowMTactic | None = None,
     use_pdl: bool = True,
+    early_state: bool = False,
 ) -> None:
     """Low-M GEMM with the all-reduce push epilogue, on the current stream.
 
@@ -3246,6 +3316,8 @@ def run_k3_fp8w_lowm_gemm_ar_push(
     :func:`k3_lamport_ar.run_lamport_finish` with the same ``one_shot`` completes it. Same
     tactic and rounding as :func:`run_k3_fp8w_lowm_gemm` (:func:`run_k3_fp8w_lowm_gemm_gated`),
     so the pair is bitwise that GEMM followed by the MNNVL all-reduce of its output.
+    ``early_state`` reads the workspace's rotation state right after the grid-dependency wait and
+    the owners' slot pointers before it, instead of after the MMAs (same stores, bitwise).
     """
     m, k = x.shape
     n = w.shape[0]
@@ -3259,7 +3331,9 @@ def run_k3_fp8w_lowm_gemm_ar_push(
     if need > ws.bytes_per_buffer:
         raise ValueError(f"Lamport buffer of {ws.bytes_per_buffer} B < {need} B")
     mode = AR_PUSH_ONE_SHOT if one_shot else AR_PUSH_TWO_SHOT
-    compiled = _compiled_ar_push_kernel(n, k, tactic, use_pdl, mode, ws.world, gate is not None)
+    compiled = _compiled_ar_push_kernel(
+        n, k, tactic, use_pdl, mode, ws.world, gate is not None, early_state
+    )
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     ptrs = (
         make_ptr(cutlass.Float8E4M3FN, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),

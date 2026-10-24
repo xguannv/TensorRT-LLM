@@ -350,9 +350,20 @@ class K3OprojPush:
             x2d = x2d.clone(memory_format=torch.contiguous_format)
         rows = x2d.shape[0]
         target = push_target(self.lamport, rows, HIDDEN, in_place=True)
+        early = _flags.TRTLLM_K3LL_OPROJ_PUSH_EARLY_STATE != 0
         _lowm().run_k3_fp8w_lowm_gemm_ar_push(
-            x2d, o_proj.weight, o_proj.weight_scale, self.lamport, target.one_shot, gate=gate
+            x2d,
+            o_proj.weight,
+            o_proj.weight_scale,
+            self.lamport,
+            target.one_shot,
+            gate=gate,
+            early_state=early,
         )
+        if early:
+            from . import census
+
+            census.count(f"dispatch:oproj_push_early_state:{census.mode()}")
         target.pushed = True
         return self.finish_attn_res(
             target, prefix_sum, block_residual, res_proj, res_norm, out_norm
