@@ -10,7 +10,7 @@ step has two collectives in a row after the experts.
 
 With the switch, where `takes` holds, the layer runs:
 
-* the front (``k3_moe_front``'s 16- or 32-token build), unchanged;
+* the front (``k3_moe_front``'s 16- or 32-token build), unchanged (the layer decides before it, `takes`);
 * on a high-priority side stream forked right after it: the shared expert's down projection, row parallel, bf16, on
   the decode GEMV site `SHARED_SITE` (``k3_ctm_gemv_wide``) with its all-reduce push epilogue into the decode
   collectives' MNNVL workspace, then ``K3LamportFinishKernel`` gathering the sum into a tensor (C++ one-shot order);
@@ -251,14 +251,14 @@ class K3TailLuLayer:
 
 
 def takes(
-    state: Optional[K3TailLuState], layer: Optional[K3TailLuLayer], shared_act: torch.Tensor, gemvs
+    state: Optional[K3TailLuState], layer: Optional[K3TailLuLayer], rows: int, act_width: int, gemvs
 ) -> bool:
-    """Whether `run` takes a wide step whose front build produced ``shared_act`` (``[T, shared width]``): the switch
-    is set, the load-time state exists and compiled the step's kernels, 9 to 32 tokens, the shared site's push takes
-    the rows and both Lamport buffers hold the calls. Shapes, the switch and load-time state only."""
+    """Whether `run` takes a wide step of ``rows`` tokens whose front build produces a shared activation ``act_width``
+    wide (decided before the front runs): the switch is set, the load-time state exists and compiled the step's
+    kernels, 9 to 32 tokens, the shared site's push takes the rows and both Lamport buffers hold the calls. Shapes,
+    the switch and load-time state only."""
     if not enabled() or state is None or layer is None or gemvs is None or not state.ready:
         return False
-    rows = shared_act.shape[0] if shared_act.dim() == 2 else 0
     if not MIN_ROWS <= rows <= MAX_ROWS or rows not in state.mx_rows:
         return False
     latent, push = state.latent, state.push
@@ -266,7 +266,7 @@ def takes(
         return False
     if _lamport().required_bytes(rows, HIDDEN, push.world, False) > push.bytes_per_buffer:
         return False
-    return gemvs.takes_push(SHARED_SITE, shared_act, layer.shared_down, push.world)
+    return gemvs.takes_push_rows(SHARED_SITE, rows, act_width, layer.shared_down, push.world)
 
 
 def shared_all_reduce(state: K3TailLuState, gemvs, shared_down: torch.Tensor, act: torch.Tensor,
