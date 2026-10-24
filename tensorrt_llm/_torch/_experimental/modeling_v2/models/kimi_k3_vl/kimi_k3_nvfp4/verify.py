@@ -72,6 +72,15 @@ def _words(t: torch.Tensor) -> torch.Tensor:
     return _flat(t).view(torch.int32)
 
 
+# Diagnostic profile (TRTLLM_K3LL_KDA_VERIFY_PROF=1): every CTA writes (globaltimer, clock64) at PROF_MARKS points
+# of the kernel into PROF_BUF [CTAs, PROF_MARKS, 2] int64.
+PROF_BUF: Dict[int, torch.Tensor] = {}
+
+
+def _prof_on() -> bool:
+    return os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF", "0") == "1"
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -190,6 +199,7 @@ def k3_fp8_kda_verify(
         _index_arg(slots),
         _index_arg(pending),
         _arg(_flat(out)),
+        _arg(_prof_buf(proj.device, num_heads * n_req * 8), 8),
     )
     runtime = (proj.shape[1] // 2, (bfa if sep_bfa else proj).shape[1] // 2, n_req, ssm.stride(0))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
@@ -204,6 +214,7 @@ def k3_fp8_kda_verify(
         fold_fb,
         sep_bfa,
         pdl,
+        _prof_on(),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -219,10 +230,20 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, stream,
+                    float(eps), fold_fb, sep_bfa, pdl, _prof_on(), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
     return out
+
+
+def _prof_buf(device, ctas: int) -> torch.Tensor:
+    from . import verify_kernel as kernel
+
+    n = ctas * kernel.PROF_MARKS * 2 if _prof_on() else 2
+    buf = PROF_BUF.get(device.index)
+    if buf is None or buf.numel() < n:
+        buf = PROF_BUF[device.index] = torch.zeros(max(n, 2), dtype=torch.int64, device=device)
+    return buf
 
 
 @k3_fp8_kda_verify.register_fake

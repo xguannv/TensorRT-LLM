@@ -139,6 +139,20 @@ def _st_async_f32(dst, value, mbar, *, loc=None, ip=None):
     )  # fmt: skip
 
 
+@dsl_user_op
+def _read_u64(reg, *, loc=None, ip=None):
+    """%globaltimer or %clock64 (diagnostic profile only)."""
+    return cutlass.Int64(
+        _llvm.inline_asm(
+            _T.i64(), [], f"mov.u64 $0, %{reg};", "=l,~{memory}", has_side_effects=True,
+            is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+PROF_MARKS = 12  # diagnostic profile: (globaltimer, clock64) pairs per CTA
+
+
 def _lo(word):
     return (word << cutlass.Int32(16)).bitcast(cutlass.Float32)
 
@@ -235,6 +249,7 @@ def k3_fp8_kda_verify_kernel(
     slots: cutlass.Array,  # int32 [N]
     pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [T][H][V]
+    prof: cutlass.Array,  # int64 [CTAs][PROF_MARKS][2] (PROFILE only)
     proj_words: cutlass.Int32,
     bfa_words: cutlass.Int32,  # int32 words per row of bfa
     ssm_stride: cutlass.Int64,  # elements between the pool's slots (the manager interleaves conv states)
@@ -246,6 +261,7 @@ def k3_fp8_kda_verify_kernel(
     FOLD_FB: cutlass.Constexpr[bool],
     SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
+    PROFILE: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
     S = CONV_W - 1 + NUM_SPEC  # conv-cache columns
@@ -275,6 +291,16 @@ def k3_fp8_kda_verify_kernel(
     v0 = vs * V_CTA
     ch0 = h * K
     row0 = n * NT
+    _, n_grid, _ = cute.arch.grid_dim()
+    cta_lin = h + H * (n + n_grid * vs)
+
+    def _mark(k):
+        if cutlass.const_expr(PROFILE):
+            if tidx == 0:
+                prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + k) * 2)
+                prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + k) * 2 + 1)
+
+    _mark(0)
 
     smem_a = cutlass.Array(
         cutlass.BFloat16, CTA_M * K, space=SMEM, alignment=1024
@@ -343,6 +369,7 @@ def k3_fp8_kda_verify_kernel(
     prims.barrier_cluster_arrive_relaxed()
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
+    _mark(1)
     if cutlass.const_expr(FOLD_FB):
         if warp == 0:
             if prims.elect_sync():
@@ -399,6 +426,7 @@ def k3_fp8_kda_verify_kernel(
         for j in cutlass.range_constexpr(ROWS * VEC):
             r_st.store(sts_acc[j], idx=j)
 
+    _mark(2)
     # Conv weights, transposed to [tap][channel]: q by threads 0..127, k by 128..255.
     if tidx < K:
         wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
@@ -443,8 +471,10 @@ def k3_fp8_kda_verify_kernel(
         )
 
     # ---- This step's projection rows.
+    _mark(3)
     if cutlass.const_expr(USE_PDL):
         prims.griddepcontrol(prims.GridDepAction.WAIT)
+    _mark(4)
     if cutlass.const_expr(FOLD_FB):
         if warp == 1:
             if prims.elect_sync():
@@ -501,6 +531,7 @@ def k3_fp8_kda_verify_kernel(
                                  alignment=16)  # fmt: skip
             _store8(s_gr, words_g, t_g * K + j_g * CHUNK)
     prims.barrier_cta_sync(0)
+    _mark(5)
 
     # ---- f_b on the tensor cores (warp 2 issues, warps 4-7 read TMEM) beside the q/k pre-compute (warps 0-3).
     if cutlass.const_expr(FOLD_FB):
@@ -585,6 +616,7 @@ def k3_fp8_kda_verify_kernel(
                 idx=item_v,
             )
     prims.barrier_cta_sync(0)
+    _mark(6)
 
     # ---- The recurrence's per-token operands: warp t, token t: decay = exp(gate), decay * k, beta * k.
     if warp < NT:
@@ -610,6 +642,7 @@ def k3_fp8_kda_verify_kernel(
             s_bk.store(bk0, idx=tg * K + c0)
             s_bk.store(bk1, idx=tg * K + c1)
     prims.barrier_cta_sync(0)
+    _mark(7)
 
     # ---- Recurrence over the verify tokens (register-resident state).
     st = [r_st.load(idx=j) for j in range(ROWS * VEC)]
@@ -708,6 +741,7 @@ def k3_fp8_kda_verify_kernel(
 
     # ---- Output gated RMSNorm over V: per-token partial sums of squares to every CTA of the cluster.
     prims.barrier_cta_sync(0)
+    _mark(8)
     # Whole warps enter (the full-mask shuffles below): with an odd NT, NT * V_CTA ends mid-warp, and the lanes past it
     # carry zeros and store nothing.
     if tidx < (NT * V_CTA + 31) // 32 * 32:
@@ -731,6 +765,7 @@ def k3_fp8_kda_verify_kernel(
     # them; and no CTA exits before its own mailbox has received every peer's partials.
     while not _try_wait_cluster(ss_ready.data_ptr(), 0):
         pass
+    _mark(9)
     if tidx < NT:
         total = cutlass.Float32(0.0)
         for r in cutlass.range_constexpr(V_SPLIT):
@@ -744,6 +779,7 @@ def k3_fp8_kda_verify_kernel(
         gate = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-z, fastmath=True))
         y = s_o.load(idx=tidx) * s_rs.load(idx=t_y) * s_onw.load(idx=v_y) * gate
         out.store(cutlass.BFloat16(y), idx=((row0 + t_y) * H + h) * V + v0 + v_y)
+    _mark(10)
 
     # ---- The drafts' per-key records (beta * k and the decay), one CTA per head, after every peer's norm partials
     # have arrived: each peer sends them after its recurrence, i.e. after its prologue read the last round's records.
@@ -780,6 +816,7 @@ def k3_fp8_kda_verify_kernel(
                 s_uv.load(idx=(s_col + 1) * V_CTA + v_col),
                 idx=(slot * S + s_col) * HK + ch0 + v0 + v_col,
             )
+    _mark(11)
 
 
 @cute.jit
@@ -802,6 +839,7 @@ def k3_fp8_kda_verify(
     slots: cute.Tensor,
     pending: cute.Tensor,
     out: cute.Tensor,
+    prof: cute.Tensor,
     proj_words: cutlass.Int32,
     bfa_words: cutlass.Int32,
     n_req: cutlass.Int32,
@@ -814,6 +852,7 @@ def k3_fp8_kda_verify(
     FOLD_FB: cutlass.Constexpr[bool],
     SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
+    PROFILE: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each."""
@@ -839,8 +878,8 @@ def k3_fp8_kda_verify(
     )
     k3_fp8_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
-        slots, pending, out, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB, SEP_BFA,
-        USE_PDL,
+        slots, pending, out, prof, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
+        SEP_BFA, USE_PDL, PROFILE,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip
