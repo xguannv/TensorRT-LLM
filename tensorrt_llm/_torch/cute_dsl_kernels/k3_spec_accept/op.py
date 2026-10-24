@@ -202,6 +202,7 @@ def k3_spec_accept(
     samp_temp: Optional[torch.Tensor] = None,
     samp_seed: Optional[torch.Tensor] = None,
     samp_off: Optional[torch.Tensor] = None,
+    wide_table: bool = False,
 ) -> List[torch.Tensor]:
     """Returns ``[accepted [B, K + 1] int32, num_accepted [B] int32, rewind [B] int32, bonus [B] int64,
     query_positions [B, block] int64, ctx_positions [B, K + 1] int64, noise [B, block, H] bf16]`` and updates
@@ -215,7 +216,10 @@ def k3_spec_accept(
     target token is a temperature sample instead of the argmax, by the Gumbel-max trick on noise that depends on the
     row's seed and offset and the global column only (:func:`gumbel_reference`), so a sharded call needs no extra
     exchange. Exact for pure temperature sampling (no top-k, top-p or min-p); a row below ``GREEDY_TEMPERATURE`` stays
-    greedy."""
+    greedy.
+
+    ``wide_table``: every CTA writes its column slice of the block table (all B rows' loads of a thread in flight) and
+    the last CTA sums the per-CTA counts, instead of CTA 0 walking B x max_blocks entries alone; the same bits."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
 
@@ -266,7 +270,7 @@ def k3_spec_accept(
                 "trtllm::k3_spec_accept must run once outside CUDA-graph capture first"
             )
         scratch = _scratch[(device, grid)] = (
-            torch.empty(kern.MAX_ROWS * grid * 2, dtype=torch.int32, device=device),
+            torch.empty(kern.SCRATCH_WORDS_PER_CTA * grid, dtype=torch.int32, device=device),
             torch.zeros(1, dtype=torch.int32, device=device),
         )
     sample = samp_temp is not None
@@ -346,6 +350,7 @@ def k3_spec_accept(
         int(slots),
         int(push_copies),
         sample,
+        bool(wide_table),
     )
     key = consts + (use_pdl,)
     fn = _compiled.get(key)
@@ -369,7 +374,7 @@ def k3_spec_accept(
 def _(logits, draft, block_off, pool_idx, divisor, block_counts, block_tables, prev_acc, state_idx, dummy, kv_lens,
       batch_to_slot, ctx_len, max_ctx, embed, mask_row, rng_pool, rng_counter, force, block, ws_uc=None, ws_mc=None,
       ws_flags=None, rank=0, slots=1, push_copies=1, shard_offset=0, samp_temp=None, samp_seed=None,
-      samp_off=None):  # fmt: skip
+      samp_off=None, wide_table=False):  # fmt: skip
     batch, drafts = draft.shape
     hidden = embed.shape[1]
     return [

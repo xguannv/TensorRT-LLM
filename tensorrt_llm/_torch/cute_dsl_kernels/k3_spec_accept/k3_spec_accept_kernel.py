@@ -28,10 +28,13 @@
 #   tables[b, i]    = max(off[b, i], 0) // divisor;  counts[b] = #(off[b, i] >= 0)    (the draft pool's block table)
 #
 # Geometry: G CTAs of 256 threads; CTA c reduces columns [1024 c, 1024 c + 1024) of every logits row (one 16-byte
-# load per thread per row) to a (value, index) partial, writes its share of the constant mask rows, and (CTA 0) the
-# block table. Each CTA publishes its partials (fence.acq_rel.gpu, then an acq_rel arrival); the last CTA to arrive
-# reduces all partials in the same total order, runs the per-request bookkeeping on lanes 0 .. B-1 of warp 0, copies
-# the bonus embedding rows, and zeroes the arrival counter for the next call. No CTA waits on another.
+# load per thread per row) to a (value, index) partial, writes its share of the constant mask rows, and the block
+# table: CTA 0 all of it, or (wide_table) every CTA its column slice [c ceil(M / G), (c + 1) ceil(M / G)) of every
+# request's row, all B rows' loads of a thread in flight at once, with its per-request placeholder-free counts as a
+# partial. Each CTA publishes its partials (fence.acq_rel.gpu, then an acq_rel arrival); the last CTA to arrive
+# reduces all partials in the same total order (wide_table: and sums the count partials, integers), runs the
+# per-request bookkeeping on lanes 0 .. B-1 of warp 0, copies the bonus embedding rows, and zeroes the arrival counter
+# for the next call. No CTA waits on another.
 #
 # Vocabulary-sharded logits (SLOTS > 1): the rank holds bf16 logits of columns [shard_offset, shard_offset + V) of a
 # TP column-parallel head. The last CTA's per-row (value, global index) goes to slot [rank] of every rank's Lamport
@@ -60,6 +63,8 @@ WARPS = THREADS // 32
 COLS_PER_CTA = THREADS * 4  # one fp32x4 per thread per row
 MAX_BATCH = 8
 MAX_ROWS = 64  # B (K + 1)
+# int32 scratch words per CTA: the (value, index) partial of every row, then (wide_table) a count per request.
+SCRATCH_WORDS_PER_CTA = MAX_ROWS * 2 + MAX_BATCH
 INT_MAX = 2**31 - 1
 NEG_INF_BITS = -8388608  # 0xFF800000
 FORCE_OFF = 0  # natural acceptance
@@ -200,7 +205,7 @@ def k3_spec_accept_kernel(
     qpos: cutlass.Array,  # int64 [B * block], out
     cpos: cutlass.Array,  # int64 [B * (K + 1)], out
     noise: cutlass.Array,  # int32 words of bf16 [B, block, H], out
-    partials: cutlass.Array,  # int32 [R * G * 2] scratch
+    partials: cutlass.Array,  # int32 [SCRATCH_WORDS_PER_CTA * G] scratch: row partials [R][G][2], then counts [B][G]
     counter: cutlass.Array,  # int32 [1]: CTAs arrived (0 between calls)
     buf_uc: cutlass.Array,  # sharded: int32 [BUFFERS * BUF_WORDS], this rank's Lamport words
     buf_mc: cutlass.Array,  # sharded: the same words through the multicast mapping (every rank's)
@@ -230,8 +235,12 @@ def k3_spec_accept_kernel(
     sample: cutlass.Constexpr[
         bool
     ],  # each row's token is a temperature sample (Gumbel-max), else its argmax
+    wide_table: cutlass.Constexpr[
+        bool
+    ],  # the block table over every CTA (else CTA 0 alone); the same bits
 ):
     rows = batch * (drafts + 1)
+    count_base = MAX_ROWS * grid * 2  # the count partials [b][G] in the scratch
     row_words = hidden // 2  # int32 words per embedding row
     row_vecs = row_words // 4  # 16-byte vectors per embedding row
     tx, _, _ = cute.arch.thread_idx()
@@ -323,31 +332,78 @@ def k3_spec_accept_kernel(
                     alignment=16)  # fmt: skip
         v_id += cutlass.Int32(grid * THREADS)
 
-    # The draft pool's block table (CTA 0): tables[b, i] = max(off, 0) // divisor, counts[b] = #(off >= 0).
-    if cta == 0:
-        for b in cutlass.range_constexpr(batch):
-            present = cutlass.Int32(0)
-            i = tx
-            while i < cutlass.Int32(max_blocks):
-                e = block_off.load(idx=off_base + cutlass.Int32(b) * off_stride + i)
-                block_tables.store(cutlass.Int32(cutlass.select_(e > cutlass.Int32(0), e, cutlass.Int32(0))) // divisor,
-                                   idx=cutlass.Int32(b * max_blocks) + i)  # fmt: skip
-                present += cutlass.Int32(
-                    cutlass.select_(e >= cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(0))
+    # The draft pool's block table: tables[b, i] = max(off, 0) // divisor, counts[b] = #(off >= 0).
+    if cutlass.const_expr(wide_table):
+        # This CTA's column slice of every request's row; per pass, a thread loads its column of all B rows before
+        # it stores any (B loads in flight), then counts its present entries per request.
+        w_chunk = (max_blocks + grid - 1) // grid
+        w_lo = cta * cutlass.Int32(w_chunk)
+        w_present = [cutlass.Int32(0) for _ in range(batch)]
+        for w_it in cutlass.range_constexpr((w_chunk + THREADS - 1) // THREADS):
+            w_col = w_lo + cutlass.Int32(w_it * THREADS) + tx
+            w_live = (w_col < w_lo + cutlass.Int32(w_chunk)) & (w_col < cutlass.Int32(max_blocks))
+            w_ld = cutlass.Int32(cutlass.select_(w_live, w_col, cutlass.Int32(0)))
+            w_vals = []
+            for w_b in cutlass.range_constexpr(batch):
+                w_vals.append(
+                    cutlass.Int32(
+                        block_off.load(idx=off_base + cutlass.Int32(w_b) * off_stride + w_ld)
+                    )
                 )
-                i += cutlass.Int32(THREADS)
+            for w_b in cutlass.range_constexpr(batch):
+                w_e = w_vals[w_b]
+                if w_live:
+                    block_tables.store(cutlass.Int32(cutlass.select_(w_e > cutlass.Int32(0), w_e, cutlass.Int32(0)))
+                                       // divisor, idx=cutlass.Int32(w_b * max_blocks) + w_col)  # fmt: skip
+                w_present[w_b] = w_present[w_b] + cutlass.Int32(
+                    cutlass.select_(
+                        w_live & (w_e >= cutlass.Int32(0)), cutlass.Int32(1), cutlass.Int32(0)
+                    )
+                )
+        for w_b in cutlass.range_constexpr(batch):
+            w_sum = w_present[w_b]
             for offset in [16, 8, 4, 2, 1]:
-                present += cute.arch.shuffle_sync_bfly(
-                    present, offset=offset, mask=-1, mask_and_clamp=31
+                w_sum += cute.arch.shuffle_sync_bfly(
+                    w_sum, offset=offset, mask=-1, mask_and_clamp=31
                 )
             if lane == 0:
-                s_tok.store(present, idx=cutlass.Int32(b * WARPS) + warp)
+                s_tok.store(w_sum, idx=cutlass.Int32(w_b * WARPS) + warp)
         prims.barrier_cta_sync(0)
         if tx < cutlass.Int32(batch):
-            total = cutlass.Int32(0)
+            w_cta_count = cutlass.Int32(0)
             for w in cutlass.range_constexpr(WARPS):
-                total += s_tok.load(idx=tx * cutlass.Int32(WARPS) + cutlass.Int32(w))
-            block_counts.store(cutlass.Int64(total), idx=tx)
+                w_cta_count += s_tok.load(idx=tx * cutlass.Int32(WARPS) + cutlass.Int32(w))
+            partials.store(
+                w_cta_count, idx=cutlass.Int32(count_base) + tx * cutlass.Int32(grid) + cta
+            )
+    if cutlass.const_expr(not wide_table):
+        if cta == 0:
+            for b in cutlass.range_constexpr(batch):
+                present = cutlass.Int32(0)
+                i = tx
+                while i < cutlass.Int32(max_blocks):
+                    e = block_off.load(idx=off_base + cutlass.Int32(b) * off_stride + i)
+                    block_tables.store(
+                        cutlass.Int32(cutlass.select_(e > cutlass.Int32(0), e, cutlass.Int32(0)))
+                        // divisor,
+                        idx=cutlass.Int32(b * max_blocks) + i,
+                    )
+                    present += cutlass.Int32(
+                        cutlass.select_(e >= cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(0))
+                    )
+                    i += cutlass.Int32(THREADS)
+                for offset in [16, 8, 4, 2, 1]:
+                    present += cute.arch.shuffle_sync_bfly(
+                        present, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                if lane == 0:
+                    s_tok.store(present, idx=cutlass.Int32(b * WARPS) + warp)
+            prims.barrier_cta_sync(0)
+            if tx < cutlass.Int32(batch):
+                total = cutlass.Int32(0)
+                for w in cutlass.range_constexpr(WARPS):
+                    total += s_tok.load(idx=tx * cutlass.Int32(WARPS) + cutlass.Int32(w))
+                block_counts.store(cutlass.Int64(total), idx=tx)
 
     prims.barrier_cta_sync(0)
     # This CTA's partial per row, then its arrival (the partials first: fence.acq_rel.gpu + the acq_rel atom).
@@ -398,6 +454,16 @@ def k3_spec_accept_kernel(
             s_ctx.store(
                 cutlass.Int64(ctx_len.load(idx=cutlass.Int32(batch_to_slot.load(idx=tx)))), idx=tx
             )
+            if cutlass.const_expr(wide_table):
+                # counts[b]: the sum of every CTA's count (integers: any order gives the same value).
+                w_parts = []
+                for w_q in cutlass.range_constexpr(grid):
+                    w_parts.append(partials.load(idx=cutlass.Int32(count_base) + tx * cutlass.Int32(grid)
+                                                 + cutlass.Int32(w_q), is_volatile=True))  # fmt: skip
+                w_total = cutlass.Int32(0)
+                for w_q in cutlass.range_constexpr(grid):
+                    w_total += cutlass.Int32(w_parts[w_q])
+                block_counts.store(cutlass.Int64(w_total), idx=tx)
         # The target token of each row: warp w reduces rows w, w + 8, ... over the G partials (every partial load of
         # the lane in flight at once).
         r_w = warp
@@ -632,6 +698,7 @@ def k3_spec_accept(
     slots: cutlass.Constexpr[int],
     push_copies: cutlass.Constexpr[int],
     sample: cutlass.Constexpr[bool],
+    wide_table: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -640,7 +707,7 @@ def k3_spec_accept(
         ctx_len, embed, mask_row, rng_pool, rng_counter, samp_temp, samp_seed, samp_off, accepted, num_acc, rewind,
         bonus, qpos, cpos, noise, partials, counter, buf_uc, buf_mc, flags, off_base, off_stride, divisor, max_ctx,
         force_total, force_frac, force_mode, rank, shard_offset, grid, vocab, batch, drafts, block, hidden, max_blocks,
-        slots, push_copies, sample,
+        slots, push_copies, sample, wide_table,
     ).launch(
         grid=[grid, 1, 1],
         block=[THREADS, 1, 1],

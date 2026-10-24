@@ -329,6 +329,13 @@ TRTLLM_K3LL_KDA_SEED_STACKED = _flag(
     "disagg generation intake: MambaHybridCacheManagerV2 seeds every KDA layer's replay conv caches of the new "
     "requests at once from the stacked conv-state view (~10 launches, not ~7 per layer; same values; read per call)",
 )
+TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE = _flag(
+    "TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE",
+    0,
+    "trtllm::k3_spec_accept: the draft pool's block table (B x max_blocks entries, max_blocks = max_seq_len / 64) "
+    "written by every CTA over its column slice with all B rows' loads in flight, the counts summed by the last CTA, "
+    "instead of CTA 0 walking it alone; the same bits (read per call, so per CUDA graph capture)",
+)
 TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "TRTLLM_K3LL_SPEC_HEAD_FUSED",
     1,

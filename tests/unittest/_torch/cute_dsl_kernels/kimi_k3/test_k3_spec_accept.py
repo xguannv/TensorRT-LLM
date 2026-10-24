@@ -32,6 +32,9 @@ inputs are untouched and a second run on a clone of the state gives the same bit
 captured call per split family, replayed 20 times with the logits, drafts, dummy mask, block offsets and context lengths
 rewritten in place and the state carried.
 
+``wide_table`` (``TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE``: the block table over every CTA): every split and case, the
+engines' widths 9361 and 16384 at every batch, and the CUDA-graph replays, against the same reference.
+
 Table: ``python3 test_k3_spec_accept.py report``. Timing: ``python3 test_k3_spec_accept.py time`` (batch 1, then every
 split: CUDA graphs of 20 back-to-back calls of the reference ops and of the kernel, median over 12 replays in
 alternating order). The vocabulary-sharded variant: test_k3_spec_accept_sharded.py (MPI).
@@ -167,11 +170,11 @@ def context_lengths(gen, batch_to_slot: torch.Tensor, batch: int) -> torch.Tenso
     return ctx
 
 
-def make_state(gen, batch: int) -> dict:
+def make_state(gen, batch: int, max_blocks=None) -> dict:
     """One decode step's state with the model's dtypes: distinct KDA slots and context slots per request, except the
     two CUDA-graph padding requests of a batch of 5 or more (one state slot, one context slot); stale block counts and
-    tables the kernel overwrites for the batch's rows only."""
-    max_blocks = MAX_BLOCKS[batch % len(MAX_BLOCKS)]
+    tables the kernel overwrites for the batch's rows only. ``max_blocks``: the block-table width (default by batch)."""
+    max_blocks = max_blocks or MAX_BLOCKS[batch % len(MAX_BLOCKS)]
     state_idx = torch.randperm(SLOTS, generator=gen, device="cuda")[:SEQS].to(torch.int32)
     batch_to_slot = torch.randperm(SLOTS, generator=gen, device="cuda")[:SEQS]
     if batch >= PADDING_FROM:
@@ -360,9 +363,11 @@ def reference(st: dict, logits, draft, force: float, block: int) -> list:
     return [accepted, num_acc, rewind, bonus, qpos, cpos, noise]
 
 
-def fused(st: dict, logits, draft, force: float, block: int, shard=None) -> list:
+def fused(
+    st: dict, logits, draft, force: float, block: int, shard=None, wide_table: bool = False
+) -> list:
     """``trtllm::k3_spec_accept`` on the state ``st``; ``shard``: (workspace, first column) when ``logits`` are this
-    rank's bf16 vocabulary shard."""
+    rank's bf16 vocabulary shard; ``wide_table``: the block table over every CTA."""
     ws_args = ()
     if shard is not None:
         ws, first = shard
@@ -372,6 +377,7 @@ def fused(st: dict, logits, draft, force: float, block: int, shard=None) -> list
         logits, draft, st["block_off"], st["pool_idx"], st["divisor"], st["block_counts"], st["block_tables"],
         st["prev_acc"], st["state_idx"], st["dummy"], st["kv_lens"], st["batch_to_slot"], st["ctx_len"], MAX_CTX,
         st["embed"], st["mask_row"], st["rng_pool"], st["rng_counter"], force, block, *ws_args,
+        wide_table=wide_table,
     )  # fmt: skip
 
 
@@ -423,7 +429,8 @@ def cell(res: dict, check: str) -> str:
 # ----------------------------------------------------------------------------------------------------------------
 
 
-def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS) -> dict:
+def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS, wide_table: bool = False,
+            max_blocks=None) -> dict:  # fmt: skip
     """One case at one split: ``steps`` consecutive steps with the state carried, the kernel against the reference
     (every output and state tensor), its inputs untouched and a rerun on a clone of its state."""
     _op()
@@ -431,7 +438,7 @@ def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS) 
     force = force_value(drafts, forced)
     seed = 20260930 + 1000 * batch + 100 * drafts + 10 * block + case
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    st_ref = make_state(gen, batch)
+    st_ref = make_state(gen, batch, max_blocks)
     st_new = clone_state(st_ref)
     res = new_result(split=f"{batch}x{drafts + 1}", block=block, case=name, force=force)
     for step in range(steps):
@@ -440,8 +447,8 @@ def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS) 
         logits_in, draft_in = logits.clone(), draft.clone()
         st_again = clone_state(st_new)
         want = reference(st_ref, logits, draft, force, block)
-        got = fused(st_new, logits, draft, force, block)
-        again = fused(st_again, logits, draft, force, block)
+        got = fused(st_new, logits, draft, force, block, wide_table=wide_table)
+        again = fused(st_again, logits, draft, force, block, wide_table=wide_table)
         record(res, step, {
             "outputs": (OUTPUTS, got, want),
             "state": (STATE_KEYS, state_of(st_new), state_of(st_ref)),
@@ -452,7 +459,9 @@ def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS) 
     return finish(res)
 
 
-def measure_graph(batch: int, drafts: int, block: int, forced, replays: int = STEPS) -> dict:
+def measure_graph(
+    batch: int, drafts: int, block: int, forced, replays: int = STEPS, wide_table: bool = False
+) -> dict:
     """One call captured in a CUDA graph and replayed ``replays`` times with the logits (every kind), drafts, dummy
     mask, block offsets and context lengths rewritten in place and the state carried: every replay against the
     reference."""
@@ -465,11 +474,13 @@ def measure_graph(batch: int, drafts: int, block: int, forced, replays: int = ST
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        fused(clone_state(st_new), logits, draft, force, block)  # compiled outside capture
+        fused(
+            clone_state(st_new), logits, draft, force, block, wide_table=wide_table
+        )  # compiled outside capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        outs = fused(st_new, logits, draft, force, block)
+        outs = fused(st_new, logits, draft, force, block, wide_table=wide_table)
     torch.cuda.synchronize()
     name = f"graph x{replays} ({'natural' if forced is None else 'forced ' + forced})"
     res = new_result(split=f"{batch}x{drafts + 1}", block=block, case=name, force=force)
@@ -530,6 +541,37 @@ def test_graph_replay(batch, tokens, block_delta, forced):
     """A captured call replayed 20 times with its inputs rewritten in place, the state carried."""
     with torch.inference_mode():
         res = measure_graph(batch, tokens - 1, tokens - 1 + block_delta, forced)
+    assert res["ok"], failures([res])
+
+
+@pytest.mark.parametrize("batch,tokens", SPLITS, ids=[f"{b}x{t}" for b, t in SPLITS])
+def test_split_wide_table(batch, tokens):
+    """``wide_table``: every case at one split (block K + 1), 20 steps each, against the reference."""
+    with torch.inference_mode():
+        results = [
+            measure(batch, tokens - 1, tokens, c, wide_table=True) for c in range(len(CASES))
+        ]
+    assert not failures(results), failures(results)
+
+
+@pytest.mark.parametrize("max_blocks", [9361, 16384])
+@pytest.mark.parametrize("batch", range(1, 9))
+def test_wide_table_engine_widths(batch, max_blocks):
+    """``wide_table`` at the engines' widths (max_seq_len 599040 / 64 rounded up, and 1M / 64; not a multiple of the
+    CTA count, so the last CTA's slice is short): natural and forced-fraction cases at K = 7, against the reference."""
+    with torch.inference_mode():
+        results = [
+            measure(batch, 7, 8, c, steps=4, wide_table=True, max_blocks=max_blocks) for c in (0, 5)
+        ]
+    assert not failures(results), failures(results)
+
+
+@pytest.mark.parametrize("forced", [None, "frac"], ids=["natural", "forced-frac"])
+@pytest.mark.parametrize("batch,tokens", GRAPH_SPLITS, ids=[f"{b}x{t}" for b, t in GRAPH_SPLITS])
+def test_graph_replay_wide_table(batch, tokens, forced):
+    """``wide_table``: a captured call replayed 20 times with its inputs rewritten in place (block offsets included)."""
+    with torch.inference_mode():
+        res = measure_graph(batch, tokens - 1, tokens, forced, wide_table=True)
     assert res["ok"], failures([res])
 
 

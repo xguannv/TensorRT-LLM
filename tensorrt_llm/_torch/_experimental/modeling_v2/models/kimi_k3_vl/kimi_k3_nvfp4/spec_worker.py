@@ -60,6 +60,14 @@ def capture_view(
     ]
 
 
+def _k3_wide_table() -> bool:
+    """``TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE`` for this ``trtllm::k3_spec_accept`` call (census when on)."""
+    wide = bool(_flags.TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE)
+    if wide:
+        _census.count(f"spec_accept_wide_table:{_census.mode()}")
+    return wide
+
+
 class KimiK3DFlashWorker(DFlashWorker):
     # Set by a Kimi K3 target running its decode kernels: decode steps then run the acceptance and the drafter's
     # inputs as trtllm::k3_spec_accept, keep the target logits vocabulary-sharded and write the drafter's context
@@ -470,6 +478,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             force,
             self._compute_block_size,
             *self._k3_shard_args(shard),
+            wide_table=_k3_wide_table(),
         )
         self._on_acceptance(accepted, num_acc, attn_metadata, spec_metadata)
         return (
@@ -1787,6 +1796,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             ws["push_copies"],
             first_column,
             *sampling,
+            wide_table=_k3_wide_table(),
         )
         return accepted, num_acc, rewind
 
