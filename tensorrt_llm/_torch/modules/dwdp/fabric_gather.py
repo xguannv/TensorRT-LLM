@@ -15,15 +15,18 @@
 
 """Host-side access to the DWDP fabric-gather kernel (``trtllm::dwdp_fabric_gather``).
 
-Opt-in via ``TRTLLM_K3LL_DWDP_GATHER=1`` (default 0): an SM kernel out-runs the copy engine but occupies
-SMs for the whole step, so the compute kernels are told to leave those SMs free
-(``apply_compute_side_defaults``).
-``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library; ``TRTLLM_DWDP_GATHER_BLOCKS`` and
-``TRTLLM_DWDP_GATHER_THREADS`` size the grid; the launcher reads ``TRTLLM_DWDP_GATHER_CLUSTER`` and
-``TRTLLM_DWDP_GATHER_KERNEL`` (``tma`` unless set).  ``TRTLLM_DWDP_GATHER_ROWS`` (default 8) re-cuts
-a layer's plan into that many equal-byte grid rows instead of one row per peer, so the grid can be
-smaller than two blocks per peer (``TRTLLM_DWDP_GATHER_BLOCKS`` = rows x blocks per row; the SM
-reserves follow it).  See ``compute_side_defaults`` for the compute-side knobs.
+``TRTLLM_K3LL_DWDP_GATHER``: 1 on, 0 off, -1 (default) on where the device is SM103 (see ``is_enabled``).
+Read only by ``DWDPWeightManager``, i.e. only where DWDP expert prefetch runs.  An SM kernel out-runs the
+copy engine but occupies SMs for the whole step, so the compute kernels are told to leave those SMs
+free (``apply_compute_side_defaults``).
+``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library; ``TRTLLM_K3LL_DWDP_GATHER_BLOCKS``
+(default 16) and ``TRTLLM_K3LL_DWDP_GATHER_THREADS`` size the grid; the launcher reads
+``TRTLLM_DWDP_GATHER_CLUSTER`` and ``TRTLLM_DWDP_GATHER_KERNEL`` (``tma`` unless set).
+``TRTLLM_K3LL_DWDP_GATHER_ROWS`` (default 8) re-cuts a layer's plan into that many equal-byte grid rows
+instead of one row per peer, so the grid can be smaller than two blocks per peer (blocks = rows x
+blocks per row; the SM reserves follow it).  The shape knobs carry K3LL names because the bench
+harness exports ``TRTLLM_DWDP_GATHER_BLOCKS=30`` for every DWDP ctx worker.  See
+``compute_side_defaults`` for the compute-side knobs.
 """
 
 from __future__ import annotations
@@ -41,9 +44,9 @@ except ImportError:
 
 _ENABLE_ENV = "TRTLLM_K3LL_DWDP_GATHER"
 _LIB_ENV = "TRTLLM_DWDP_GATHER_LIB"
-_BLOCKS_ENV = "TRTLLM_DWDP_GATHER_BLOCKS"
-_THREADS_ENV = "TRTLLM_DWDP_GATHER_THREADS"
-_ROWS_ENV = "TRTLLM_DWDP_GATHER_ROWS"
+_BLOCKS_ENV = "TRTLLM_K3LL_DWDP_GATHER_BLOCKS"
+_THREADS_ENV = "TRTLLM_K3LL_DWDP_GATHER_THREADS"
+_ROWS_ENV = "TRTLLM_K3LL_DWDP_GATHER_ROWS"
 
 #: Row cut granularity: the TMA kernel moves a descriptor in 16 KiB chunks.
 ROW_CUT_BYTES = 16384
@@ -78,7 +81,7 @@ def _threads() -> int:
     return threads
 
 
-#: Threads per block (``TRTLLM_DWDP_GATHER_THREADS`` overrides).  Bytes in flight scale with
+#: Threads per block (``TRTLLM_K3LL_DWDP_GATHER_THREADS`` overrides).  Bytes in flight scale with
 #: blocks x threads, so 1024 keeps the fabric saturated from as few SMs as possible.
 THREADS = _threads()
 
@@ -87,20 +90,32 @@ THREADS = _threads()
 #: 779 GB/s vs 15 x 2 792 GB/s (a465ed5296), so 16 SMs instead of 30.
 TARGET_BLOCKS = 16
 
-#: Grid rows a layer's plan is re-cut into when ``TRTLLM_DWDP_GATHER_ROWS`` is unset.
+#: Grid rows a layer's plan is re-cut into when ``TRTLLM_K3LL_DWDP_GATHER_ROWS`` is unset.
 TARGET_ROWS = 8
 
 _op: Optional[Callable] = None
 _probed = False
 
 
+#: Devices where ``TRTLLM_K3LL_DWDP_GATHER=-1`` (the default) turns the gather on: GB300 (SM103), where
+#: it was measured (DWDP16 Kimi-K3 ctx, GB300).
+DEFAULT_ON_CAPABILITIES = ((10, 3),)
+
+
 def is_enabled() -> bool:
-    """True if the env knob asks for the gather transport."""
-    return os.environ.get(_ENABLE_ENV, "0") not in ("", "0", "false", "False")
+    """Whether DWDP prefetch uses the gather: ``TRTLLM_K3LL_DWDP_GATHER`` 1 / 0, or -1 (default) = the
+    current device's capability is in ``DEFAULT_ON_CAPABILITIES``."""
+    raw = os.environ.get(_ENABLE_ENV, "-1").strip()
+    if raw == "-1":
+        return (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability() in DEFAULT_ON_CAPABILITIES
+        )
+    return raw not in ("", "0", "false", "False")
 
 
 def total_blocks() -> int:
-    """Total gather blocks, from ``TRTLLM_DWDP_GATHER_BLOCKS`` or ``TARGET_BLOCKS``."""
+    """Total gather blocks, from ``TRTLLM_K3LL_DWDP_GATHER_BLOCKS`` or ``TARGET_BLOCKS``."""
     return max(1, _int_env(_BLOCKS_ENV, TARGET_BLOCKS))
 
 

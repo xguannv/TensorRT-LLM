@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DWDP fabric-gather plan re-cut into fewer grid rows (TRTLLM_DWDP_GATHER_ROWS)."""
+"""DWDP fabric-gather plan re-cut into fewer grid rows (TRTLLM_K3LL_DWDP_GATHER_ROWS)."""
 
 import pytest
 
