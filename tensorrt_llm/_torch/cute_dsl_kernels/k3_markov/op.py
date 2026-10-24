@@ -422,9 +422,13 @@ def k3_markov_mma(
     kv_lens: torch.Tensor,
     rewind: torch.Tensor,
     rewind_first: int,
+    ldsm: bool = False,
+    store_corrected: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``trtllm::k3_markov``'s outputs and KV-length rewind from the MMA build (``k3_markov_mma_kernel``), on bf16
-    block logits; ``ws_*``, ``rank``, ``world``: ``markov_mma_workspace``'s."""
+    block logits; ``ws_*``, ``rank``, ``world``: ``markov_mma_workspace``'s. ``ldsm``: the bias MMA's fragments by
+    ldmatrix (the same tokens and logits). ``store_corrected`` False: the corrected logits are not computed into
+    memory and the first output is an empty ``[B, K, 0]`` tensor."""
     mod = _mma_module()
     if not supports_mma(base, markov_w1, markov_w2_shard):
         raise ValueError(
@@ -459,12 +463,17 @@ def k3_markov_mma(
         )
     device = base.device
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-    key = mod.build_key(block, markov_w1.shape[1], world, mod.num_ctas_for(shard), use_pdl, batch)
+    key = mod.build_key(
+        block, markov_w1.shape[1], world, mod.num_ctas_for(shard), use_pdl, batch, ldsm,
+        store_corrected,
+    )  # fmt: skip
     if not mod.is_built(key) and torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "trtllm::k3_markov_mma must run once per shape outside CUDA-graph capture first"
         )
-    corrected = torch.empty(batch, block, shard, dtype=torch.float32, device=device)
+    corrected = torch.empty(
+        batch, block, shard if store_corrected else 0, dtype=torch.float32, device=device
+    )
     tokens = torch.empty(batch, block, dtype=torch.int32, device=device)
     next_new = torch.empty(batch, block + 1, dtype=torch.int32, device=device)
     base = base if base.stride(-1) == 1 else base.contiguous()
@@ -490,16 +499,18 @@ def k3_markov_mma(
             int(world),
             int(rank),
             use_pdl,
+            bool(ldsm),
+            bool(store_corrected),
         )
     return corrected, tokens, next_new
 
 
 @k3_markov_mma.register_fake
 def _(base, first_prev, markov_w1, markov_w2_shard, shard_offset, ws_uc, ws_mc, ws_launch, rank, world, accepted,
-      num_accepted, accepted_rows, kv_lens, rewind, rewind_first):  # fmt: skip
+      num_accepted, accepted_rows, kv_lens, rewind, rewind_first, ldsm=False, store_corrected=True):  # fmt: skip
     batch, block, shard = base.shape
     return (
-        base.new_empty((batch, block, shard), dtype=torch.float32),
+        base.new_empty((batch, block, shard if store_corrected else 0), dtype=torch.float32),
         base.new_empty((batch, block), dtype=torch.int32),
         base.new_empty((batch, block + 1), dtype=torch.int32),
     )
@@ -518,12 +529,38 @@ def markov_chain_mma(
     kv_lens: Optional[torch.Tensor] = None,
     rewind: Optional[torch.Tensor] = None,
     rewind_first: int = 0,
+    ldsm: bool = False,
+    store_corrected: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`markov_chain` on the MMA build (``supports_mma`` must hold)."""
+    """`markov_chain` on the MMA build (``supports_mma`` must hold); ``ldsm`` / ``store_corrected``: see
+    ``k3_markov_mma``."""
     ws = markov_mma_workspace(mapping, base.shape[-1])
     if kv_lens is None or rewind is None:
         kv_lens, rewind = ws["launch"], ws["launch"][:0]
     return torch.ops.trtllm.k3_markov_mma(
         base, first_prev, markov_w1, markov_w2_shard, int(shard_offset), ws["uc"], ws["mc"], ws["launch"],
         ws["rank"], ws["world"], accepted, num_accepted, accepted_rows, kv_lens, rewind, int(rewind_first),
+        bool(ldsm), bool(store_corrected),
     )  # fmt: skip
+
+
+_unread: Dict[object, torch.Tensor] = {}
+
+
+def unread_logits(batch: int, block: int, shard: int, device) -> Optional[torch.Tensor]:
+    """A ``[batch, block, shard]`` fp32 stand-in for corrected logits that no consumer reads (one NaN, expanded: no
+    memory, no kernel), or None while a CUDA graph is capturing before its first use on ``device`` (it is made once,
+    outside capture)."""
+    device = torch.device(device)
+    marker = _unread.get(device)
+    if marker is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        with _lock:
+            marker = _unread.get(device)
+            if marker is None:
+                with torch.inference_mode(False):
+                    marker = _unread[device] = torch.full(
+                        (1, 1, 1), float("nan"), dtype=torch.float32, device=device
+                    )
+    return marker.expand(batch, block, shard)
