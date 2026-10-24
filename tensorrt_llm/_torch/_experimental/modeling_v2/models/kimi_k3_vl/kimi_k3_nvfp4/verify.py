@@ -25,9 +25,10 @@ The kernel compiles on the first call for each configuration, which must happen 
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -70,6 +71,29 @@ def _slots_view(t: torch.Tensor) -> torch.Tensor:
 
 def _words(t: torch.Tensor) -> torch.Tensor:
     return _flat(t).view(torch.int32)
+
+
+# TRTLLM_K3LL_KDA_VERIFY_HOIST's default (-1) turns the two-deep prologue on only on these compute capabilities
+# (measured on GB300 / SM103). The verify kernel itself also runs on SM100 / SM107, where the prologue's cost when no
+# draft was accepted has not been measured.
+KDA_VERIFY_HOIST_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _hoist_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in KDA_VERIFY_HOIST_CAPABILITIES
+
+
+def _hoist_replay(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_KDA_VERIFY_HOIST`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``KDA_VERIFY_HOIST_CAPABILITIES``."""
+    from . import flags
+
+    value = int(flags.TRTLLM_K3LL_KDA_VERIFY_HOIST)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _hoist_by_default(index)
 
 
 def use_pdl() -> bool:
@@ -204,6 +228,7 @@ def k3_fp8_kda_verify(
         fold_fb,
         sep_bfa,
         pdl,
+        _hoist_replay(proj.device),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -219,9 +244,13 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, stream,
+                    float(eps), fold_fb, sep_bfa, pdl, _hoist_replay(proj.device), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
+    if key[-1]:
+        from . import census
+
+        census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
     return out
 
 

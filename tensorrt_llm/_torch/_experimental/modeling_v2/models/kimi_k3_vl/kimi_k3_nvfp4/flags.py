@@ -432,6 +432,14 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
     "SM100 / SM103 only",
 )
+TRTLLM_K3LL_KDA_VERIFY_HOIST = _flag(
+    "TRTLLM_K3LL_KDA_VERIFY_HOIST",
+    -1,
+    "k3_fp8_kda_verify: issue every prologue load while the cluster forms, two round trips deep (the slot, then the "
+    "accepted-draft count, pool state, weights and, by bulk copies into shared memory, the conv history at every "
+    "cache column and every draft's records), instead of one load round trip per accepted draft (bitwise; read at "
+    "forward time). 1 on, 0 off, -1 (default) on SM103 only (verify.KDA_VERIFY_HOIST_CAPABILITIES)",
+)
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
     1,
