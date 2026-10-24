@@ -2152,6 +2152,51 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
+# TRTLLM_K3LL_DEEPGEMM_SM_RESERVE=<n> (default 0, off): run the DeepGEMM swap-AB FP8 GEMMs with n
+# fewer SMs. DeepGEMM compiles a static persistent grid of one CTA per SM; while another kernel holds
+# SMs (the DWDP fabric gather on a ctx worker, which sets this to its block count) the CTAs behind it
+# run as a second wave. GEMMs with fewer than TRTLLM_K3LL_DEEPGEMM_SM_RESERVE_MIN_K (default 1024)
+# input features keep the full grid: they are bound by their output stores, which fewer SMs slow down.
+# Read at each call; DeepGEMM's SM count is process state, set around the call and restored after.
+_DEEPGEMM_SM_RESERVE_ENV = "TRTLLM_K3LL_DEEPGEMM_SM_RESERVE"
+_DEEPGEMM_SM_RESERVE_MIN_K_ENV = "TRTLLM_K3LL_DEEPGEMM_SM_RESERVE_MIN_K"
+
+
+def _deep_gemm_reserved_num_sms(k: int, device: torch.device) -> int:
+    """DeepGEMM SM count for a GEMM with ``k`` input features, or 0 to keep DeepGEMM's own."""
+    reserve = int(os.environ.get(_DEEPGEMM_SM_RESERVE_ENV, "0") or 0)
+    if reserve <= 0 or torch.compiler.is_compiling():
+        return 0
+    if k < int(os.environ.get(_DEEPGEMM_SM_RESERVE_MIN_K_ENV, "1024")):
+        return 0
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if reserve >= sms:
+        raise ValueError(
+            f"{_DEEPGEMM_SM_RESERVE_ENV}={reserve} leaves no SM of {sms}")
+    return sms - reserve
+
+
+def _deep_gemm_fp8_gemm_nt(a, b, output, k: int,
+                           disable_ue8m0_cast: bool) -> None:
+    """``deep_gemm.fp8_gemm_nt`` with ``TRTLLM_K3LL_DEEPGEMM_SM_RESERVE`` SMs left free."""
+    num_sms = _deep_gemm_reserved_num_sms(k, output.device)
+    if not num_sms:
+        deep_gemm.fp8_gemm_nt(a,
+                              b,
+                              output,
+                              disable_ue8m0_cast=disable_ue8m0_cast)
+        return
+    saved = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(num_sms)
+    try:
+        deep_gemm.fp8_gemm_nt(a,
+                              b,
+                              output,
+                              disable_ue8m0_cast=disable_ue8m0_cast)
+    finally:
+        deep_gemm.set_num_sms(saved)
+
+
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2201,12 +2246,10 @@ class fp8SwapABGemmRunner(TunableRunner):
             dtype=self.output_dtype,
         )
 
-        deep_gemm.fp8_gemm_nt(
-            (a, a_sf),
-            (weight, weight_scale),
-            output,
-            disable_ue8m0_cast=self.disable_ue8m0_cast,
-        )
+        _deep_gemm_fp8_gemm_nt((a, a_sf), (weight, weight_scale),
+                               output,
+                               k=input.size(-1),
+                               disable_ue8m0_cast=self.disable_ue8m0_cast)
         return output
 
 
@@ -2265,12 +2308,11 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             device=activation.device,
             dtype=self.output_dtype,
         )
-        deep_gemm.fp8_gemm_nt(
-            (activation, activation_scale),
-            (weight, weight_scale),
-            output,
-            disable_ue8m0_cast=self.disable_ue8m0_cast,
-        )
+        _deep_gemm_fp8_gemm_nt((activation, activation_scale),
+                               (weight, weight_scale),
+                               output,
+                               k=weight.size(-1),
+                               disable_ue8m0_cast=self.disable_ue8m0_cast)
         return output
 
 

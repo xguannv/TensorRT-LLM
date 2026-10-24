@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KDA prefill persistent grids that keep TRTLLM_CUTEDSL_SM_RESERVE SMs free
-(TRTLLM_K3_KDA_PREFILL_SM_RESERVE=1) give bit-identical outputs and states."""
+"""KDA prefill persistent grids that keep TRTLLM_K3LL_CUTEDSL_SM_RESERVE SMs free
+(TRTLLM_K3LL_KDA_PREFILL_SM_RESERVE=1) give bit-identical outputs and states."""
 
 import pytest
 import torch
@@ -33,11 +33,11 @@ pytestmark = pytest.mark.skipif(
 
 def _run(seqlens, monkeypatch, reserve):
     if reserve:
-        monkeypatch.setenv("TRTLLM_K3_KDA_PREFILL_SM_RESERVE", "1")
-        monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", str(reserve))
+        monkeypatch.setenv("TRTLLM_K3LL_KDA_PREFILL_SM_RESERVE", "1")
+        monkeypatch.setenv("TRTLLM_K3LL_CUTEDSL_SM_RESERVE", str(reserve))
     else:
-        monkeypatch.delenv("TRTLLM_K3_KDA_PREFILL_SM_RESERVE", raising=False)
-        monkeypatch.delenv("TRTLLM_CUTEDSL_SM_RESERVE", raising=False)
+        monkeypatch.delenv("TRTLLM_K3LL_KDA_PREFILL_SM_RESERVE", raising=False)
+        monkeypatch.delenv("TRTLLM_K3LL_CUTEDSL_SM_RESERVE", raising=False)
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(1)
     tokens = sum(seqlens)

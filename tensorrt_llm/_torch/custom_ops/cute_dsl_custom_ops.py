@@ -19,6 +19,7 @@ from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
+from ..cute_dsl_kernels import sm_reserve
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
@@ -695,15 +696,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     @functools.cache
-    def _get_full_device_max_active_clusters(device_id: int,
-                                             cluster_size: int) -> int:
-        """Return the cached full-device occupancy for a cluster shape."""
+    def _get_full_device_max_active_clusters(device_id: int, cluster_size: int,
+                                             reserved_sms: int) -> int:
+        """Return the cached full-device occupancy for a cluster shape.
+
+        ``reserved_sms`` (``TRTLLM_K3LL_CUTEDSL_SM_RESERVE``, applied inside
+        ``HardwareInfo.get_max_active_clusters``) is part of the key so a
+        reserve set after the first query is not hidden by the cache.
+        """
         hardware_info = cutlass.utils.HardwareInfo(device_id=device_id)
         return hardware_info.get_max_active_clusters(cluster_size)
 
     def get_max_activate_clusters(cluster_size):
         max_active = _get_full_device_max_active_clusters(
-            torch.cuda.current_device(), cluster_size)
+            torch.cuda.current_device(), cluster_size, sm_reserve())
         if get_current_locality_domain() is not None:
             node_local = node_local_max_active_clusters(max_active)
             max_active = node_local if node_local is not None else max(
