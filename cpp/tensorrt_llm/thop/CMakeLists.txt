@@ -161,7 +161,10 @@ add_th_common_family(
   loraOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
-  compressorOp.cpp)
+  compressorOp.cpp
+  dwdpFabricGather.cu
+  dwdpFabricGatherTma.cu
+  dwdpFabricGatherOp.cpp)
 
 add_library(
   th_common SHARED

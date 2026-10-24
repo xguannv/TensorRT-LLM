@@ -68,14 +68,16 @@ else:
 def _kda_prefill_num_ctas(device: torch.device, ceiling: int = 148) -> int:
     """Persistent grid of the KDA prefill kernels (fused K1-K3 and K4): at most ``ceiling`` CTAs.
 
-    With ``TRTLLM_K3_KDA_PREFILL_SM_RESERVE=1`` the grid also keeps ``TRTLLM_CUTEDSL_SM_RESERVE``
+    With ``TRTLLM_K3LL_KDA_PREFILL_SM_RESERVE=1`` the grid also keeps ``TRTLLM_K3LL_CUTEDSL_SM_RESERVE``
     SMs free like the other CuTeDSL persistent grids, so the CTAs that would land on SMs a
     resident kernel holds (the DWDP gather) do not run their static work share as a second wave.
     Every work unit is computed by one CTA, so the outputs do not depend on the grid.
     """
     from ..cute_dsl_kernels import sm_reserve
 
-    reserve = sm_reserve() if os.environ.get("TRTLLM_K3_KDA_PREFILL_SM_RESERVE", "0") == "1" else 0
+    reserve = (
+        sm_reserve() if os.environ.get("TRTLLM_K3LL_KDA_PREFILL_SM_RESERVE", "0") == "1" else 0
+    )
     if reserve <= 0:
         return ceiling
     return max(1, min(ceiling, _device_sm_count(device.index or 0) - reserve))
