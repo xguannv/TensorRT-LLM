@@ -11,7 +11,9 @@ Draft token ``j`` of request ``b`` is the global argmax over the vocab of
   (``cp.async`` copies issued before the PDL wait, all in flight at once). Per step it gathers the ``markov_w1``
   rows of every request's ``prev`` into shared memory and computes the bias of all requests at once
   (``mma.sync.m16n8k16`` BF16 -> FP32, requests padded to 16 rows, the rank dimension in K steps of 16 in order),
-  rounds it to BF16, adds the shard logits (loaded before the step's exchange wait) and stores ``corrected`` (fp32).
+  rounds it to BF16, adds the shard logits (loaded before the step's exchange wait) and stores ``corrected`` (fp32;
+  the ``store_corrected=False`` build does not). The MMA fragments come from 4-byte shared loads, or with ``ldsm``
+  from ``ldmatrix.x4`` (the same registers, so the same sums).
 * Argmax in ``torch.argmax`` order (NaN first, then the largest value, the lowest index among equal values;
   ``+0 == -0``) within the CTA; each CTA of a cluster of 8 sends its candidate per request to the cluster leader
   with ``st.async`` on the leader's barrier of the step; the leader takes the cluster's winner and multicasts the
@@ -230,6 +232,20 @@ def _gdc_wait(*, loc=None, ip=None):
 @dsl_user_op
 def _gdc_launch(*, loc=None, ip=None):
     _asm(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ldsm_x4(addr, *, loc=None, ip=None):
+    """``ldmatrix.x4``: four 8x8 BF16 matrices (lane ``8 i + r`` gives row ``r`` of matrix ``i``)."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_iv(addr, loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -603,6 +619,8 @@ class DSparkMarkovChainKernel:
         use_pdl: bool,
         anchor_64: bool,
         num_reqs: int,
+        ldsm: bool = False,
+        store_corrected: bool = True,
     ):
         if rank % 16 or rank > 512:
             raise ValueError(f"markov rank {rank} must be a multiple of 16 (<= 512)")
@@ -613,6 +631,10 @@ class DSparkMarkovChainKernel:
         if not 1 <= num_reqs <= MAX_REQS:
             raise ValueError(f"{num_reqs} requests (1..{MAX_REQS})")
         self.B = num_reqs
+        # The bias MMA's fragments by ldmatrix.x4 (else one 4-byte shared load per register): the same values.
+        self.ldsm = ldsm
+        # Whether ``corrected`` is written (else only the tokens, next_new and the rewind).
+        self.store_corrected = store_corrected
         self.steps = steps
         self.R = rank
         self.tp = tp
@@ -926,16 +948,41 @@ class DSparkMarkovChainKernel:
 
                 # bias = A (w1 rows, 16 x R) * B (w2 rows of the warp's 32 columns, R x 32).
                 acc = [Float32(0.0)] * (nt_per_warp * 4)
+                # With ldsm, one ldmatrix.x4 for A (matrices: rows 0-7 / 8-15 x k 0-7, then x k 8-15) and one per
+                # two n8 tiles of B (tile 2p k 0-7 / 8-15, tile 2p + 1 k 0-7 / 8-15); lane 8 i + r addresses row r
+                # of matrix i. Row starts are 16-byte aligned (RB and k0 are), as ldmatrix needs.
+                lm_row = (lane & 7) + ((lane >> 3) & 1) * 8
+                lm_col = (lane >> 4) * 8
+                lm_brow = warp * 32 + (lane >> 4) * 8 + (lane & 7)
+                lm_bcol = ((lane >> 3) & 1) * 8
                 for ks in cutlass.range_constexpr(R // 16):
                     k0 = ks * 16
-                    a0 = _lds_b32(w1s + g * RB + (k0 + 2 * t) * 2)
-                    a1 = _lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t) * 2)
-                    a2 = _lds_b32(w1s + g * RB + (k0 + 2 * t + 8) * 2)
-                    a3 = _lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t + 8) * 2)
+                    afr = []
+                    bfr = []
+                    if cutlass.const_expr(self.ldsm):
+                        af = _ldsm_x4(w1s + lm_row * RB + (k0 + lm_col) * 2)
+                        for e in cutlass.range_constexpr(4):
+                            afr.append(af[e])
+                        for np_ in cutlass.range_constexpr(nt_per_warp // 2):
+                            bq = _ldsm_x4(w2s + (lm_brow + np_ * 16) * RB + (k0 + lm_bcol) * 2)
+                            for e in cutlass.range_constexpr(4):
+                                bfr.append(bq[e])
+                    else:
+                        afr.append(_lds_b32(w1s + g * RB + (k0 + 2 * t) * 2))
+                        afr.append(_lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t) * 2))
+                        afr.append(_lds_b32(w1s + g * RB + (k0 + 2 * t + 8) * 2))
+                        afr.append(_lds_b32(w1s + (g + 8) * RB + (k0 + 2 * t + 8) * 2))
+                        for nt in cutlass.range_constexpr(nt_per_warp):
+                            n = warp * 32 + nt * 8 + g
+                            bfr.append(_lds_b32(w2s + n * RB + (k0 + 2 * t) * 2))
+                            bfr.append(_lds_b32(w2s + n * RB + (k0 + 2 * t + 8) * 2))
+                    a0 = afr[0]
+                    a1 = afr[1]
+                    a2 = afr[2]
+                    a3 = afr[3]
                     for nt in cutlass.range_constexpr(nt_per_warp):
-                        n = warp * 32 + nt * 8 + g
-                        b0 = _lds_b32(w2s + n * RB + (k0 + 2 * t) * 2)
-                        b1 = _lds_b32(w2s + n * RB + (k0 + 2 * t + 8) * 2)
+                        b0 = bfr[2 * nt]
+                        b1 = bfr[2 * nt + 1]
                         d = _mma_bf16(
                             acc[4 * nt],
                             acc[4 * nt + 1],
@@ -964,13 +1011,15 @@ class DSparkMarkovChainKernel:
                         v1 = _fadd(hi, _round_bf16_f32(acc[4 * nt + 2 * half + 1]))
                         ok0 = rok & Int32(col < n_cols)
                         ok1 = rok & Int32(col + 1 < n_cols)
-                        # n_cols is even, so a column pair is all in or all out.
-                        if ok0 != 0:
-                            _st_v2(
-                                corrected_addr + Int64((row * self.steps + s) * n_cols + col) * 4,
-                                _f32_bits(v0),
-                                _f32_bits(v1),
-                            )
+                        if cutlass.const_expr(self.store_corrected):
+                            # n_cols is even, so a column pair is all in or all out.
+                            if ok0 != 0:
+                                _st_v2(
+                                    corrected_addr
+                                    + Int64((row * self.steps + s) * n_cols + col) * 4,
+                                    _f32_bits(v0),
+                                    _f32_bits(v1),
+                                )
                         i0 = col_base + col
                         f0 = _better(v0, i0, bv, bi) & ok0
                         bv = _pick_v(f0, v0, bv)
@@ -1038,9 +1087,18 @@ class DSparkMarkovChainKernel:
 _COMPILED = {}
 
 
-def build_key(steps: int, rank: int, tp: int, num_ctas: int, use_pdl: bool, num_reqs: int) -> tuple:
+def build_key(
+    steps: int,
+    rank: int,
+    tp: int,
+    num_ctas: int,
+    use_pdl: bool,
+    num_reqs: int,
+    ldsm: bool = False,
+    store_corrected: bool = True,
+) -> tuple:
     """The compile-time constants of one build."""
-    return (steps, rank, tp, num_ctas, bool(use_pdl), num_reqs)
+    return (steps, rank, tp, num_ctas, bool(use_pdl), num_reqs, bool(ldsm), bool(store_corrected))
 
 
 def is_built(key: tuple) -> bool:
@@ -1050,8 +1108,10 @@ def is_built(key: tuple) -> bool:
 def _compiled(key: tuple):
     fn = _COMPILED.get(key)
     if fn is None:
-        steps, rank, tp, num_ctas, use_pdl, num_reqs = key
-        kernel = DSparkMarkovChainKernel(steps, rank, tp, num_ctas, use_pdl, True, num_reqs)
+        steps, rank, tp, num_ctas, use_pdl, num_reqs, ldsm, store_corrected = key
+        kernel = DSparkMarkovChainKernel(
+            steps, rank, tp, num_ctas, use_pdl, True, num_reqs, ldsm, store_corrected
+        )
         a = Int64(1 << 20)
         i = Int32(1)
         fn = _COMPILED[key] = cute.compile(
@@ -1095,6 +1155,8 @@ def run(
     tp: int,
     tp_rank: int,
     use_pdl: bool,
+    ldsm: bool = False,
+    store_corrected: bool = True,
 ) -> None:
     """One launch over the block logits ``base [B, K, shard]`` (BF16, unit column stride; this rank's vocab shard
     starting at ``col_base``) and the anchors ``first_prev [B]`` (int64): ``corrected [B, K, shard]`` (fp32),
@@ -1103,9 +1165,12 @@ def run(
     ``numel()`` rows from ``rewind_first``; empty: none). ``mc_addr`` / ``uc_addr``: multicast and local addresses of
     the exchange buffer (``exchange_floats(tp, num_ctas_for(shard))`` floats, ``-0.0`` initially; the same buffer for
     one rank at ``tp == 1``); ``launch``: its int32 launch counter. Every rank of the group launches it with the same
-    shapes."""
+    shapes. ``ldsm``: the bias MMA's fragments by ldmatrix (the same values); ``store_corrected`` False: ``corrected``
+    is not written (it may then be any tensor)."""
     num_reqs, steps, shard = base.shape
-    key = build_key(steps, markov_w1.shape[1], tp, num_ctas_for(shard), use_pdl, num_reqs)
+    key = build_key(
+        steps, markov_w1.shape[1], tp, num_ctas_for(shard), use_pdl, num_reqs, ldsm, store_corrected
+    )
     _compiled(key)(
         Int64(base.data_ptr()),
         Int32(base.stride(0)),

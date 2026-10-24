@@ -381,6 +381,13 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
     "SM100 / SM103 only",
 )
+TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
+    "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
+    0,
+    "with TRTLLM_K3LL_DRAFTER_MARKOV_V2: the MMA build's bias fragments by ldmatrix, and no store of the corrected "
+    "logits on steps where only its tokens are read (greedy drafts, no lilicorr / DFlash 2 selector); the same "
+    "tokens and next_new bit for bit (read at forward time)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
