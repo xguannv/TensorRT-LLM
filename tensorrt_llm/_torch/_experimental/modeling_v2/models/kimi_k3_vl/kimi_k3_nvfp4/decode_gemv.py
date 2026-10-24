@@ -130,6 +130,9 @@ SITES: Dict[str, Site] = {
     "moe_shared_gate_up": Site(768, 7168, "wide", wide=True),
     "moe_tail": Site(7168, 640, "wide", wide=True, wide_rows=32),
     "moe_up": Site(7168, 3584, "wide", out_fp32=True),
+    # The shared experts' down projection alone (row parallel, 384 in), pushed into its own all-reduce on a wide step
+    # (TRTLLM_K3LL_MOE_TAIL_LU, moe_tail_lu.py). Warmed only where that switch is set at load (OPTIONAL_SITES).
+    "moe_shared_down": Site(7168, 384, "wide", wide=True, wide_rows=32),
     # The DSpark drafter's projections (K3DSparkDrafter; 6 query heads, 1 KV head of 64, MLP width 896): the fused
     # q / k / v, the output projection (row parallel), gate_up [gate 896 | up 896], and the down projection with the
     # SiLU-and-mul (row parallel).
@@ -138,6 +141,12 @@ SITES: Dict[str, Site] = {
     "drafter_gate_up": Site(1792, 7168, "long", split=8, ring=6, push=True),
     "drafter_down": Site(7168, 896, "swiglu", split=2, push=True),
 }
+
+
+#: Sites warmed only where a load-time switch asks for them; `K3DecodeGemvs.create`'s default leaves them out.
+OPTIONAL_SITES = ("moe_shared_down",)
+#: The sites `K3DecodeGemvs.create` warms by default.
+DEFAULT_SITES = tuple(site for site in SITES if site not in OPTIONAL_SITES)
 
 
 def _width(spec: Site) -> int:
@@ -254,7 +263,7 @@ class K3DecodeGemvs:
     def create(
         cls,
         lm_head: Optional[nn.Module] = None,
-        sites: Iterable[str] = tuple(SITES),
+        sites: Iterable[str] = DEFAULT_SITES,
         device: Optional[torch.device] = None,
     ) -> "K3DecodeGemvs":
         """The state for ``lm_head`` and ``sites`` on ``device`` (default: the head's, else the current one). Eager:
