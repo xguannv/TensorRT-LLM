@@ -24,7 +24,9 @@ decode step with ``TRTLLM_K3LL_MOE_TAIL_PUSH`` the layer hands on its tail's inp
 `K3DecodeComm.tail_push_attn_res` runs the tail GEMV with its all-reduce push epilogue, the Lamport finish and the
 residual update on the MNNVL workspace (``moe_tail_push.py``). With ``TRTLLM_K3LL_MOE_TAIL_LU`` the layer hands on its
 reduced routed and shared outputs instead (a `LuTail`), and `K3DecodeComm.tail_lu_attn_res` runs the residual update
-with the MoE add (``moe_tail_lu.py``), no collective.
+with the MoE add (``moe_tail_lu.py``), no collective. With ``TRTLLM_K3LL_MOE_TAIL_COL`` every rank has published its
+column slice of the reduced output into the MNNVL workspace (a `ColTail`), and `K3DecodeComm.tail_col_attn_res` runs
+the residual update polling those rows (``moe_tail_col.py``), no finish kernel.
 
 The DSpark drafter (`K3DSparkDrafter`) runs its collectives with a plain residual add and RMSNorm on the same state:
 
@@ -78,8 +80,10 @@ from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
 from . import flags as _flags
+from . import moe_tail_col as _tail_col
 from . import moe_tail_lu as _tail_lu
 from . import moe_tail_push as _tail_push
+from .moe_tail_col import ColTail
 from .moe_tail_lu import LuTail
 from .moe_tail_push import WideTail
 from .oproj_push import HIDDEN as _PUSH_HIDDEN
@@ -344,6 +348,46 @@ class K3DecodeComm:
         rows = tail.routed.shape[0]
         prefix = self.oproj_push.zeros[:rows] if prefix_sum is None else prefix_sum
         return _tail_lu.attn_res(
+            tail, prefix, block_residual, res_proj, res_norm, out_norm, mxfp8_out=mxfp8_out
+        )
+
+    def takes_tail_col(
+        self,
+        tail: ColTail,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+    ) -> bool:
+        """Whether ``tail_col_attn_res`` takes a wide decode step's handed-on ``ColTail`` (``moe_tail_col.py``): the
+        Lamport attn_res kernel takes the prefix sum (the zero prefix for None), the snapshots and the weights. Shapes
+        and load-time state only, so every rank decides alike. Where it does not hold, the consumer must still read
+        the rows before the next call on the workspace (``ColTail.materialize``)."""
+        push = self.oproj_push
+        if push is None or tail.lamport is not push.lamport:
+            return False
+        if prefix_sum is None and tail.rows > push.zeros.shape[0]:
+            return False
+        prefix = push.zeros[: tail.rows] if prefix_sum is None else prefix_sum
+        return _tail_col.attn_res_takes(tail, prefix, block_residual, res_proj, res_norm, out_norm)
+
+    def tail_col_attn_res(
+        self,
+        tail: ColTail,
+        prefix_sum: Optional[torch.Tensor],
+        block_residual: torch.Tensor,
+        res_proj: nn.Module,
+        res_norm: nn.Module,
+        out_norm: nn.Module,
+        mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(normed, updated)``: ``updated = bf16(prefix_sum + moe)`` (``moe`` alone without ``prefix_sum``), ``moe``
+        the rows the column publish left in the workspace, ``normed = out_norm(attn_res(block_residual...,
+        updated))``, in one ``K3AttnResFastKernel`` launch (``takes_tail_col`` holds; ``moe_tail_col.attn_res``).
+        ``mxfp8_out``: passed to the kernel (the MXFP8 form of ``normed``)."""
+        prefix = self.oproj_push.zeros[: tail.rows] if prefix_sum is None else prefix_sum
+        return _tail_col.attn_res(
             tail, prefix, block_residual, res_proj, res_norm, out_norm, mxfp8_out=mxfp8_out
         )
 

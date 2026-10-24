@@ -259,6 +259,16 @@ TRTLLM_K3LL_MOE_LOWM_FC12 = _flag(
     "kernels; engagement is read at forward time. -1 (default): on on SM103 only "
     "(decode_moe_lowm.MOE_LOWM_FC12_CAPABILITIES; L1 bs4 -0.229 ms, moss-0361)",
 )
+TRTLLM_K3LL_MOE_TAIL_COL = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_COL",
+    0,
+    "wide decode steps of 9-32 tokens on the MoE front's 16- / 32-token builds: TRTLLM_K3LL_MOE_TAIL_LU's side-stream "
+    "shared all-reduce and full latent all-reduce + RMSNorm, then a column-sharded BF16 latent_up (each rank its "
+    "7168 / TP output columns, k3_ctm_gemv_wide) adding the shared output's columns and multicasting its slice into "
+    "the next K3AttnResFast's Lamport rows: no FP8, no finish kernel (moe_tail_col.py). Lossless (BF16 weight, fp32 "
+    "sums). 1 at launch builds the latent_up row slice of every MoE layer (+3.2 MB per layer per rank) and TAIL_LU's "
+    "12 MiB MNNVL workspace; engagement is read at forward time. Takes precedence over TRTLLM_K3LL_MOE_TAIL_LU",
+)
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",

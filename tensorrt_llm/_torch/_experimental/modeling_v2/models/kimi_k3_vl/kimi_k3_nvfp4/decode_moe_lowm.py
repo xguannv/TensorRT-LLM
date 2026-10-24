@@ -70,9 +70,11 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 
 from . import flags as _flags
+from . import moe_tail_col as _tail_col
 from . import moe_tail_lu as _tail_lu
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 from .decode_moe import TAIL_K_TILE, _gemv
+from .moe_tail_col import ColTail
 from .moe_tail_lu import LuTail
 from .moe_tail_push import WideTail
 
@@ -198,6 +200,8 @@ class K3DecodeMoeNvfp4:
     #: ``TRTLLM_K3LL_MOE_LOWM_FC12``'s state (`K3MoeFc12`), built by the first layer's ``warm_up`` where the switch is
     #: set at launch.
     fc12: Optional[K3MoeFc12] = None
+    #: ``TRTLLM_K3LL_MOE_TAIL_COL``'s shared state (``moe_tail_col.py``), built where the switch is set at load.
+    col: Optional[_tail_col.K3TailColState] = None
 
     @classmethod
     def create(
@@ -381,6 +385,9 @@ class K3DecodeMoeNvfp4Layer:
     situ: tuple
     #: ``TRTLLM_K3LL_MOE_TAIL_LU``'s weights of this layer (``moe_tail_lu.py``), built where the switch is set at load.
     lu: Optional[_tail_lu.K3TailLuLayer] = None
+    #: ``TRTLLM_K3LL_MOE_TAIL_COL``'s weights of this layer (``moe_tail_col.py``), built where the switch is set at
+    #: load.
+    col: Optional[_tail_col.K3TailColLayer] = None
 
     @classmethod
     def create(
@@ -556,10 +563,10 @@ class K3DecodeMoeNvfp4Layer:
         gemvs,
         partial_tail: bool,
         push: bool = False,
-    ) -> Union[torch.Tensor, PendingTail, WideTail, LuTail]:
+    ) -> Union[torch.Tensor, PendingTail, WideTail, LuTail, ColTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
-        (a ``PendingTail``; on a wide step a tensor, a ``WideTail`` with ``TRTLLM_K3LL_MOE_TAIL_PUSH``, or a
-        ``LuTail`` with ``TRTLLM_K3LL_MOE_TAIL_LU``); else the
+        (a ``PendingTail``; on a wide step a tensor, a ``WideTail`` with ``TRTLLM_K3LL_MOE_TAIL_PUSH``, a ``LuTail``
+        with ``TRTLLM_K3LL_MOE_TAIL_LU``, or a ``ColTail`` with ``TRTLLM_K3LL_MOE_TAIL_COL``); else the
         reduced output. ``push`` is ignored: the latent all-reduce is always the routed
         experts' all-reduce."""
         if hidden_states.shape[0] > MAX_TOKENS:
@@ -609,14 +616,17 @@ class K3DecodeMoeNvfp4Layer:
 
     def _wide(
         self, moe: nn.Module, hidden_states: torch.Tensor, gemvs
-    ) -> Union[torch.Tensor, WideTail, LuTail]:
+    ) -> Union[torch.Tensor, WideTail, LuTail, ColTail]:
         """A wide decode step's MoE (`MAX_TOKENS` < M <= `WIDE_MAX_TOKENS`): this rank's unreduced share of the
         output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts. With
         ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
         consumer runs the tail GEMV (``moe_tail_push.py``). With ``TRTLLM_K3LL_MOE_TAIL_LU`` (read at forward time),
         where ``moe_tail_lu.takes`` holds, the reduced routed and shared outputs (a `LuTail`,
-        ``moe_tail_lu.py``). With ``TRTLLM_K3LL_MOE_LOWM_FC12`` (read at forward time), where `fc12_takes` holds, the
-        routed experts run as FC1 + FC2 (`K3MoeFc12`), their output zeroed from before the front."""
+        ``moe_tail_lu.py``). With ``TRTLLM_K3LL_MOE_TAIL_COL`` (read at forward time), where ``moe_tail_col.takes``
+        holds, the reduced output published into the decode workspace (a `ColTail`, ``moe_tail_col.py``); it takes
+        precedence over ``TRTLLM_K3LL_MOE_TAIL_LU``. With ``TRTLLM_K3LL_MOE_LOWM_FC12`` (read at forward time), where
+        `fc12_takes` holds, the routed experts run as FC1 + FC2 (`K3MoeFc12`), their output zeroed from before the
+        front."""
         x = hidden_states.contiguous()
         fc12 = None
         if fc12_takes(self.state, x.shape[0]):
@@ -635,6 +645,19 @@ class K3DecodeMoeNvfp4Layer:
             _census.count(f"moe_front32:{_census.mode()}")
         if self.state.front_head(x.shape[0], front32) is not None:
             # The front's 16- or 32-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
+            # TRTLLM_K3LL_MOE_TAIL_COL first: where both tails take the step, the lossless one runs.
+            if _tail_col.takes(self.state.col, self.col, x.shape[0], self.shared_cols, gemvs):
+                from . import census as _census
+
+                _census.count(f"dispatch:moe_tail_col:{_census.mode()}")
+                routing, shared_act = self._front_only(moe, x, front32)
+                return _tail_col.run(
+                    self.state.col,
+                    self.col,
+                    gemvs,
+                    shared_act,
+                    lambda: self._routed_after(routing, fc12=fc12),
+                )
             if _tail_lu.takes(self.state.lu, self.lu, x.shape[0], self.shared_cols, gemvs):
                 from . import census as _census
 

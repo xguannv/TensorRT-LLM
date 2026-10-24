@@ -27,6 +27,9 @@ long kernel's split-K clusters (bf16 output with optional sigmoid columns, or fp
 weight rows split into that many equal tiles of at most 128 rows, one cluster each (more CTAs for a short N).
 ``run_k3_ctm_gemv_wide_ar_push`` (a plain function, not a torch op): ``k3_ctm_gemv_wide``'s bf16 output pushed into
 the Lamport slots of the next two-shot MNNVL all-reduce on a workspace instead of stored (the same values).
+``run_k3_ctm_gemv_wide_col_publish`` (a plain function): ``k3_ctm_gemv_wide``'s fp32 sums plus a bf16 addend, rounded
+once and published as this rank's column slice of a Lamport result that every rank of a workspace assembles (the
+producer and the finish of the call in one kernel; the column-sharded MoE tail, ``TRTLLM_K3LL_MOE_TAIL_COL``).
 
 ``push`` (the split-K ops) chooses how a cluster's ranks send their fp32 partials to the row owner: DSMEM
 stores + a release arrive (False) or 16-byte st.async completing the owner's barrier by bytes (True). The
@@ -641,6 +644,142 @@ def run_k3_ctm_gemv_wide_ar_push(x: torch.Tensor, weight: torch.Tensor, ws) -> N
         _wide_push_key(n_out, k_in, config, ws.world, use_pdl),
         kernel.k3_ctm_gemv_wide_ar_push, *args, num_tokens, *lamport, n_out, k_in, split, ring, x_ring, n_tile,
         ws.world, use_pdl, stream,
+    )  # fmt: skip
+    fn(*args, num_tokens, *lamport, stream)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# k3_ctm_gemv_wide with the column publish epilogue (not a torch op: it writes a Lamport workspace, returns nothing)
+# ----------------------------------------------------------------------------------------------------------------------
+def col_publish_config(
+    n_out: int, k_in: int, num_tokens: int, num_sms: int, row_tiles: int, hidden: int
+) -> Optional[tuple]:
+    """``(split, ring, x_ring, n_tile)`` of ``run_k3_ctm_gemv_wide_col_publish`` for ``num_tokens`` rows of an
+    ``[n_out, k_in]`` weight slice published into ``hidden``-wide result rows, or None where it does not take the
+    shape: ``k3_ctm_gemv_wide``'s config at ``row_tiles``, with every tile's rows a whole number of 16-byte vectors (a
+    multiple of 8) and the slice within the row. Shapes only."""
+    from . import k3_ctm_gemv_kernel as kernel
+
+    if not 0 < num_tokens <= WIDE_MAX_TOKENS or n_out <= 0 or hidden % 8 or n_out > hidden:
+        return None
+    if (n_out // row_tiles if row_tiles > 0 else n_out) % 8:
+        return None
+    n_tile = kernel.wide_tile(num_tokens)
+    config = wide_config(n_out, k_in, n_tile, num_sms, row_tiles)
+    return None if config is None else (*config, n_tile)
+
+
+def _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl) -> tuple:
+    return ("k3_ctm_gemv_wide_col_publish", n_out, k_in, *config, row_tiles, hidden, use_pdl)
+
+
+def compile_wide_col_publish(
+    weight: torch.Tensor, num_tokens: int, row_tiles: int, hidden: int
+) -> bool:
+    """Compile ``run_k3_ctm_gemv_wide_col_publish``'s kernel for ``weight``'s shape at ``num_tokens``'s token tile
+    without launching it (a publish is a collective call); False where it does not take the shape. Eager, before any
+    CUDA-graph capture."""
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2 or not weight.is_cuda:
+        return False
+    n_out, k_in = weight.shape
+    config = col_publish_config(n_out, k_in, num_tokens, _num_sms(weight.device), row_tiles, hidden)
+    if config is None:
+        return False
+    from cutlass import Int32, Int64
+
+    from . import k3_ctm_gemv_kernel as kernel
+
+    x = torch.zeros(num_tokens, k_in, dtype=torch.bfloat16, device=weight.device)
+    split, ring, x_ring, n_tile = config
+    use_pdl = _use_pdl()
+    addr = Int64(1 << 20)
+    _compile(
+        _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl),
+        kernel.k3_ctm_gemv_wide_col_publish, _arg(weight), _arg(x), _arg(x.view(-1)), num_tokens, addr, addr, addr,
+        addr, Int32(0), n_out, k_in, split, ring, x_ring, n_tile, row_tiles, hidden, use_pdl, _stream(x),
+    )  # fmt: skip
+    return True
+
+
+def wide_col_publish_compiled(
+    n_out: int, k_in: int, num_tokens: int, row_tiles: int, hidden: int, device
+) -> bool:
+    """Whether ``compile_wide_col_publish`` (or an eager call) compiled the publish for this shape and token tile."""
+    config = col_publish_config(n_out, k_in, num_tokens, _num_sms(device), row_tiles, hidden)
+    return (
+        config is not None
+        and _col_publish_key(n_out, k_in, config, row_tiles, hidden, _use_pdl()) in _compiled
+    )
+
+
+def run_k3_ctm_gemv_wide_col_publish(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    addend: torch.Tensor,
+    col0: int,
+    ws,
+    row_tiles: int,
+) -> None:
+    """``bf16(x @ weight.T + addend[:, col0:col0 + N])`` (fp32 sums as ``k3_ctm_gemv_wide``'s, one rounding) published
+    as columns ``[col0, col0 + N)`` of the ``[M, H]`` result of the next Lamport call on ``ws`` (a
+    ``k3_lamport_ar.LamportWorkspace``; ``addend`` bf16 ``[M, H]``): stored (``-0`` as ``+0``) into the broadcast stage
+    of the workspace's current buffer on every rank, the rotation advanced as ``k3_lamport_ar``'s finish advances it.
+    Once every rank has published its columns, the next kernel reads the rows with ``k3_lamport_ar.poll_result_v4``.
+    Releases its dependent only after its own grid-dependency wait. Compiles on its first call for the shape (refused
+    under capture)."""
+    from cutlass import Int32, Int64
+
+    from ..blackwell import k3_lamport_ar
+
+    num_tokens, k_in = x.shape if x.dim() == 2 else (0, 0)
+    n_out = weight.shape[0] if weight.dim() == 2 else 0
+    hidden = addend.shape[1] if addend.dim() == 2 else 0
+    if not (
+        x.is_cuda
+        and x.dtype == weight.dtype == addend.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.shape[1] == k_in
+        and tuple(addend.shape) == (num_tokens, hidden)
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and addend.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+        and addend.data_ptr() % 16 == 0
+        and 0 <= col0
+        and col0 % 8 == 0
+        and col0 + n_out <= hidden
+    ):
+        raise ValueError(
+            f"k3_ctm_gemv_wide publish: unsupported call x {tuple(x.shape)} {x.dtype}, weight "
+            f"{tuple(weight.shape)} {weight.dtype}, addend {tuple(addend.shape)} {addend.dtype}, col0 {col0}"
+        )
+    config = col_publish_config(n_out, k_in, num_tokens, _num_sms(x.device), row_tiles, hidden)
+    if config is None:
+        raise ValueError(
+            f"k3_ctm_gemv_wide publish: no config for {num_tokens} rows of weight {tuple(weight.shape)}, "
+            f"row tiles {row_tiles}"
+        )
+    need = k3_lamport_ar.required_bytes(num_tokens, hidden, ws.world, False)
+    if need > ws.bytes_per_buffer:
+        raise ValueError(f"Lamport buffer of {ws.bytes_per_buffer} B < {need} B")
+    from . import k3_ctm_gemv_kernel as kernel
+
+    split, ring, x_ring, n_tile = config
+    use_pdl = _use_pdl()
+    args = (_arg(weight), _arg(x), _arg(x.view(-1)))
+    lamport = (
+        Int64(ws.uc_local),
+        Int64(ws.mc_base),
+        Int64(ws.flags.data_ptr()),
+        Int64(addend.data_ptr()),
+        Int32(col0),
+    )
+    stream = _stream(x)
+    fn = _compile(
+        _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl),
+        kernel.k3_ctm_gemv_wide_col_publish, *args, num_tokens, *lamport, n_out, k_in, split, ring, x_ring, n_tile,
+        row_tiles, hidden, use_pdl, stream,
     )  # fmt: skip
     fn(*args, num_tokens, *lamport, stream)
 

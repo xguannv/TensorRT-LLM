@@ -55,6 +55,7 @@ NUM_BUFFERS = 3
 #: Word of the CTA arrival counter in the workspace's state flags (uint32 [9]: current buffer,
 #: dirty buffer, bytes per buffer, dirty stages, bytes to clear per stage x4, arrivals).
 _FLAG_ARRIVALS = 8
+FLAG_ARRIVALS = _FLAG_ARRIVALS
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -268,6 +269,21 @@ def red_release_add(addr, value, *, loc=None, ip=None):
         "l,r",
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def atom_add_acq_rel(addr, value, *, loc=None, ip=None):
+    """``atom.acq_rel.gpu.global.add.u32``; returns the previous value."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            loc=loc,
+            ip=ip,
+        )
     )
 
 

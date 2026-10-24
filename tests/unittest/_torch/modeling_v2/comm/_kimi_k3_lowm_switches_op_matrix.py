@@ -96,6 +96,13 @@ eager call on the same inputs):
     within ``LU_TOL`` (LOSSY: the FP8 latent_up). The switch on without the shared site's GEMV state runs the off arm,
     bit for bit. Graphs captured with multi-stream on (the shared expert on the side stream), replayed with
     rewritten inputs: bit for bit the eager call (in order on one stream).
+  * MOE_TAIL_COL (16 and 32 rows, the 16- and 32-token fronts; ``moe_tail_col.py``, built in ``check_build`` as
+    ``_build_tail_col`` builds it, after the fold, on MOE_TAIL_LU's state): ``_wide`` with both TAIL switches on hands
+    on a ``ColTail`` (TAIL_COL takes precedence); its rows (``ColTail.materialize``) against the off arm's reduced
+    output within ``COL_TOL`` (lossless: only the bf16 roundings of the column-sharded sums differ). The switch on
+    without the shared site's GEMV state runs the off arm, bit for bit. Graphs captured with multi-stream on, replayed
+    ``COL_REPLAYS`` times with rewritten inputs (the Lamport rotation advances twice per replay): bit for bit the
+    eager call.
 
 Outputs the ranks share (routing, latent, reduced outputs, ``updated`` / ``normed``) are also compared bitwise across
 the ranks; the shared activation, the routed partial and the tail are this rank's own.
@@ -162,6 +169,9 @@ NORMED_TOL = 2e-2  # normed without a prefix sum: max |err| / max |ref| (the att
 MOE_TOL = 3e-2  # MOE_LOWM, the on arm's reduced output: max |err| / max |ref|
 LU_TOL = 6e-2  # MOE_TAIL_LU's reduced output vs the off arm's: the FP8 latent_up on top of MOE_TOL's differences
 LU_ROWS = (16, 32)
+# MOE_TAIL_COL's rows vs the off arm's reduced output: the latent norm's and the sums' bf16 roundings only.
+COL_TOL = 2e-2
+COL_REPLAYS = 3
 STOCK_WIDE_ONE_SHOT_MAX_BYTES = 1 << 20  # the stock MNNVL all-reduce's one-shot ceiling
 
 R = None
@@ -171,6 +181,7 @@ DM = None  # decode_moe
 DML = None  # decode_moe_lowm
 DG = None  # decode_gemv
 LU = None  # moe_tail_lu
+COL = None  # moe_tail_col
 FLAGS = None  # flags
 LOWM_OP = None  # cute_dsl_kernels/k3_fused_moe/nvfp4_lowm_op.py
 BUILT = None
@@ -779,6 +790,14 @@ def check_build():
     )
     LU.warm_up(lu.state, lu.layer, lu.gemvs, SNAPSHOTS + 1)
     assert lu.state.ready, "MOE_TAIL_LU warm-up"
+    # TRTLLM_K3LL_MOE_TAIL_COL's state and weights as _build_tail_col builds them (from moe_on: the latent norm folded),
+    # on TAIL_LU's state, attached to the on arms by check_moe_tail_col only.
+    assert COL.layer_gaps(moe_on, R.world) == [], COL.layer_gaps(moe_on, R.world)
+    col = SimpleNamespace(
+        state=COL.K3TailColState(lu.state), layer=COL.K3TailColLayer.create(moe_on, R.rank, R.world)
+    )
+    COL.warm_up(col.state, col.layer, lu.gemvs, SNAPSHOTS + 1)
+    assert col.state.ready and col.state.tiles == frozenset((16, 32)), "MOE_TAIL_COL warm-up"
     g = _gen(7000)
     with torch.device("cuda"):
         res = SimpleNamespace(
@@ -798,7 +817,7 @@ def check_build():
     torch.cuda.synchronize()
     BUILT = SimpleNamespace(
         comm=comm, all_reduce=all_reduce, moe_on=moe_on, moe_off=moe_off, moe_tail=moe_tail,
-        on=on, plain16=plain16, wide=wide, on32=on32, tail=tail, res=res, refs=refs, lu=lu,
+        on=on, plain16=plain16, wide=wide, on32=on32, tail=tail, res=res, refs=refs, lu=lu, col=col,
     )  # fmt: skip
     if R.rank == 0:
         print(
@@ -1537,6 +1556,75 @@ def check_moe_tail_lu():
         )
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_TAIL_COL
+# ----------------------------------------------------------------------------------------------------------------------
+def _col_on(layer, moe, x):
+    """``_wide`` with TRTLLM_K3LL_MOE_TAIL_COL and TRTLLM_K3LL_MOE_TAIL_LU on and the shared site's GEMV state: the
+    ``ColTail``'s rows, copied out of the decode workspace."""
+    with _switch("TRTLLM_K3LL_MOE_TAIL_COL", 1), _switch("TRTLLM_K3LL_MOE_TAIL_LU", 1):
+        tail = layer._wide(moe, x, BUILT.lu.gemvs)
+    assert isinstance(tail, COL.ColTail), type(tail)
+    return tail.materialize()
+
+
+def check_moe_tail_col():
+    """``_wide`` at 16 and 32 rows with TRTLLM_K3LL_MOE_TAIL_COL (module docstring)."""
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    moe, lu, col = BUILT.moe_on, BUILT.lu, BUILT.col
+    layers = {16: BUILT.on, 32: BUILT.on32}
+    for layer in layers.values():
+        layer.lu, layer.state.lu = lu.layer, lu.state
+        layer.col, layer.state.col = col.layer, col.state
+    try:
+        with _switch("TRTLLM_K3LL_WIDE_LATENT_TAIL", 0), _switch("TRTLLM_K3LL_MOE_FRONT32", 1):
+            for rows in LU_ROWS:
+                where = f"MOE_TAIL_COL {rows} rows"
+                layer = layers[rows]
+                x = _moe_input(1900 + rows, rows)
+                got = _col_on(layer, moe, x)
+                with _switch("TRTLLM_K3LL_MOE_TAIL_COL", 0), _switch("TRTLLM_K3LL_MOE_TAIL_LU", 0):
+                    partial = layer._wide(moe, x, None)
+                with _switch("TRTLLM_K3LL_MOE_TAIL_COL", 1):
+                    partial_no_gemvs = layer._wide(moe, x, None)
+                assert isinstance(partial, torch.Tensor), type(partial)
+                _expect_same(
+                    f"{where}: switch on without GEMV state = off", partial_no_gemvs, partial
+                )
+                off = _stock_wide_all_reduce(BUILT.all_reduce, partial)
+                _expect_close(
+                    f"MOE_TAIL_COL: {where} rows vs off", got, off, COL_TOL, replicated=True
+                )
+            for rows in LU_ROWS:
+                layer = layers[rows]
+                x = _moe_input(2000 + rows, rows)
+
+                def run(layer=layer, x=x):
+                    with with_multi_stream(True):
+                        return _col_on(layer, moe, x)
+
+                graph, g = _capture(run)
+                for rep in range(COL_REPLAYS):
+                    x.copy_(_moe_input(2100 + 10 * rows + rep, rows))
+                    _replay(graph)
+                    where = f"MOE_TAIL_COL graph {rows} rows replay {rep}"
+                    _expect_same(
+                        f"{where}: rows vs eager", g, _col_on(layer, moe, x), replicated=True
+                    )
+                del graph
+    finally:
+        for layer in layers.values():
+            layer.lu, layer.state.lu = None, None
+            layer.col, layer.state.col = None, None
+    if R.rank == 0:
+        print(
+            f"[rank 0] MOE_TAIL_COL: rows vs off max rel err {STATS.get('MOE_TAIL_COL', 0.0):.2e} "
+            f"(tolerance {COL_TOL}); graphs with the side stream replayed {COL_REPLAYS}x = eager",
+            flush=True,
+        )
+
+
 CHECKS = [
     check_front_sort,
     check_front16,
@@ -1545,11 +1633,12 @@ CHECKS = [
     check_wide_latent_tail,
     check_moe_lowm,
     check_moe_tail_lu,
+    check_moe_tail_col,
 ]
 
 
 def _run_one_rank(args) -> int:
-    global R, IMPL, DC, DM, DML, DG, LU, FLAGS, LOWM_OP
+    global R, IMPL, DC, DM, DML, DG, LU, COL, FLAGS, LOWM_OP
     R = ls.Rank(args)
     import importlib
 
@@ -1560,6 +1649,7 @@ def _run_one_rank(args) -> int:
     DML = importlib.import_module(f"{package}.decode_moe_lowm")
     DG = importlib.import_module(f"{package}.decode_gemv")
     LU = importlib.import_module(f"{package}.moe_tail_lu")
+    COL = importlib.import_module(f"{package}.moe_tail_col")
     FLAGS = importlib.import_module(f"{package}.flags")
     # the matrix covers MOE_TAIL_LU's whole 9-32 row range; the product default caps it at 16 rows
     FLAGS.TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = 32

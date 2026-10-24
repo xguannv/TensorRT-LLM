@@ -1164,6 +1164,18 @@ def k3_ctm_gemv_long(
 # The epilogue reads the workspace's rotation state after its own griddepcontrol.wait; the dependent grid (the Lamport
 # finish kernel, which reads that state as soon as it is resident) is released from the activation warp after its
 # wait, not from the weight warp at the start.
+# Column publish (PUB_HIDDEN > 0; bf16, no sigmoid rows; TRTLLM_K3LL_MOE_TAIL_COL): the call's N weight rows are the
+# output columns [col0, col0 + N) of a [M, PUB_HIDDEN] result every rank of a Lamport workspace assembles from its
+# slice. Each warp stages its rows' fp32 sums [token][row] in place of its rows of the own mailbox slot; each lane then
+# adds 8 columns of a bf16 addend row (the same [M, PUB_HIDDEN] layout), rounds once to bf16 and stores the 16-byte
+# vector (-0 as +0) through the workspace's multicast address into the broadcast stage (stage 1 of 2) of its current
+# Lamport buffer on every rank, where the slices of all ranks form the rows a consumer polls
+# (k3_lamport_ar.poll_result_v4): the kernel is the call's producer and its finish at once. Rotation, as
+# K3LamportFinishKernel's: every epilogue thread reads the state after its griddepcontrol.wait; once a CTA's epilogue
+# has read it, one thread counts the CTA (atom.acq_rel); the last CTA to count writes the next call's state (current
+# +1, dirty = this buffer, two stages, M rows of stage 1 to clear) and resets the counter; every CTA's epilogue re-arms
+# its share of the previous call's buffer after its stores. Dependents are released from the activation warp after its
+# wait, as for the push.
 # =============================================================================
 WIDE_TILES = (16, 32, 64)
 WIDE_SMEM_BYTES = 220 * 1024  # the ring, the x stages and the mailbox; the barriers fit in the rest
@@ -1254,6 +1266,15 @@ def k3_ctm_gemv_wide_kernel(
     ar_mc: Optional[cutlass.Int64],
     ar_flags: Optional[cutlass.Int64],
     ar_rank: Optional[cutlass.Int32],
+    # 0: no column publish. H > 0: publish the output as columns [pub_col0, pub_col0 + N) of an [M, H] Lamport result
+    # (see the section comment) on the workspace of local unicast address pub_uc, multicast address pub_mc and
+    # rotation state pub_flags, adding the bf16 [M, H] addend at pub_addend; None without the publish.
+    pub_hidden: cutlass.Constexpr[int],
+    pub_uc: Optional[cutlass.Int64],
+    pub_mc: Optional[cutlass.Int64],
+    pub_flags: Optional[cutlass.Int64],
+    pub_addend: Optional[cutlass.Int64],
+    pub_col0: Optional[cutlass.Int32],
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1406,9 +1427,10 @@ def k3_ctm_gemv_wide_kernel(
         # into the x ring, refilled once the stage's MMAs are done.
         # =====================================================================
         prims.griddepcontrol(prims.GridDepAction.WAIT)
-        if cutlass.const_expr(ar_world > 0):
+        if cutlass.const_expr(ar_world > 0 or pub_hidden > 0):
             # The finish kernel reads the Lamport rotation state as soon as it is resident: release it only once every
-            # earlier grid (the previous call on the workspace included) has completed.
+            # earlier grid (the previous call on the workspace included) has completed. The publish's consumer reads
+            # the state after its own wait; it is released here too, so its pre-wait reads see only completed grids.
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
         if prims.elect_sync():
             for i in cutlass.range_constexpr(x_ring):
@@ -1518,9 +1540,31 @@ def k3_ctm_gemv_wide_kernel(
         lane = tx % 32
         w = warp_id - 4  # TMEM lanes 32 w .. 32 w + 31: tile rows 32 w + lane
         row = w * cutlass.Int32(LONG_ROWS_PER_WARP) + lane
-        if cutlass.const_expr(ar_world > 0):
-            # The push reads the Lamport rotation state, which the previous grids leave final.
+        if cutlass.const_expr(ar_world > 0 or pub_hidden > 0):
+            # The push reads the Lamport rotation state, which the previous grids leave final; the publish reads the
+            # addend, which the previous grids wrote.
             prims.griddepcontrol(prims.GridDepAction.WAIT)
+        if cutlass.const_expr(pub_hidden > 0):
+            # This call's rotation state (the previous call on the workspace has completed). Once every epilogue
+            # thread of the CTA has read it, the CTA counts itself; the last CTA writes the next call's state.
+            pub_cur, pub_dirty, pub_nbytes, pub_dstages, pub_c0, pub_c1, pub_c2, pub_c3 = (
+                _lamport.lamport_state(pub_flags)
+            )
+            prims.barrier_cta_sync(2, thread_count=EPI_THREADS)
+            if tx == cutlass.Int32(4 * 32):
+                arrivals = pub_flags + cutlass.Int64(_lamport.FLAG_ARRIVALS * 4)
+                pub_ctas = (row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M) * split
+                if _lamport.atom_add_acq_rel(arrivals, cutlass.Int32(1)) == cutlass.Int32(
+                    pub_ctas - 1
+                ):
+                    _lamport.st_v4(
+                        pub_flags, (pub_cur + 1) % _lamport.NUM_BUFFERS, pub_cur, pub_nbytes, cutlass.Int32(2)
+                    )  # fmt: skip
+                    _lamport.st_v4(
+                        pub_flags + cutlass.Int64(16), cutlass.Int32(0),
+                        num_tokens * cutlass.Int32(pub_hidden * ELEM_BYTES), cutlass.Int32(0), cutlass.Int32(0),
+                    )  # fmt: skip
+                    _lamport.st_u32(arrivals, cutlass.Int32(0))
         while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
             pass
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1616,6 +1660,58 @@ def k3_ctm_gemv_wide_kernel(
                                 ar_world, n_out, False,
                             )  # fmt: skip
                             _lamport.push_v4(dst, *words, False)
+            elif cutlass.const_expr(pub_hidden > 0):
+                # Column publish: the warp's fp32 sums staged [token][row] in place of its rows of the own mailbox
+                # slot (read above by this warp alone), then 16-byte vectors (8 rows = 8 output columns of one token
+                # below M): bf16(sum + addend) into the broadcast stage of the call's buffer on every rank.
+                staged = mailbox.subview(
+                    rank * cutlass.Int32(slot_elems) + w * cutlass.Int32(LONG_ROWS_PER_WARP * owned)
+                )
+                cute.arch.sync_warp()
+                for i in cutlass.range_constexpr(owned):
+                    staged.store(totals[i], idx=cutlass.Int32(i * LONG_ROWS_PER_WARP) + lane)
+                cute.arch.sync_warp()
+                # The tile's first output column within the slice and its rows that hold columns.
+                n_base = m_offset
+                n_rows = cutlass.Int32(n_out) - m_offset
+                if cutlass.const_expr(row_tiles > 0):
+                    n_base = w_tile * cutlass.Int32(tile_rows)
+                    n_rows = cutlass.Int32(tile_rows)
+                bcast = _lamport.stage_addr(pub_mc, pub_cur, cutlass.Int32(1), 2, pub_nbytes)
+                t0 = rank * cutlass.Int32(owned)
+                vecs = owned * (LONG_ROWS_PER_WARP // VEC)
+                for p in cutlass.range_constexpr((vecs + 31) // 32):
+                    # Vector vj: token vt of the staging, its 8-row chunk vc.
+                    vj = lane + cutlass.Int32(p * 32)
+                    vt = vj >> cutlass.Int32(2)
+                    vc = vj & cutlass.Int32(3)
+                    tok = t0 + vt
+                    r0 = w * cutlass.Int32(LONG_ROWS_PER_WARP) + vc * cutlass.Int32(VEC)
+                    if vj < cutlass.Int32(vecs):
+                        if tok < num_tokens:
+                            if r0 < n_rows:
+                                idx = vt * cutlass.Int32(LONG_ROWS_PER_WARP) + vc * cutlass.Int32(
+                                    VEC
+                                )
+                                lo = staged.load(idx=idx, vector_size=4, alignment=16)
+                                hi = staged.load(
+                                    idx=idx + cutlass.Int32(4), vector_size=4, alignment=16
+                                )
+                                sums = [lo[e] for e in range(4)] + [hi[e] for e in range(4)]
+                                off = (
+                                    cutlass.Int64(tok) * cutlass.Int64(pub_hidden)
+                                    + cutlass.Int64(pub_col0 + n_base + r0)
+                                ) * cutlass.Int64(ELEM_BYTES)
+                                add = _lamport.ld_v4(pub_addend + off)
+                                words = []
+                                for q in cutlass.range_constexpr(4):
+                                    s_lo, s_hi = _lamport.acc_bf16x2(
+                                        add[q],
+                                        cutlass.Float32(sums[2 * q]),
+                                        cutlass.Float32(sums[2 * q + 1]),
+                                    )
+                                    words.append(_lamport.pack_bf16x2(s_lo, s_hi))
+                                _lamport.push_v4(bcast + off, *words, True)
             elif cutlass.const_expr(row_tiles > 0):
                 # Row tiles: this row's owned tokens below M, plain stores.
                 if row < cutlass.Int32(tile_rows):
@@ -1675,6 +1771,24 @@ def k3_ctm_gemv_wide_kernel(
                             )
                         prims.cp_async_bulk_commit_group()
                         prims.cp_async_bulk_wait_group(0, read=True)
+        if cutlass.const_expr(pub_hidden > 0):
+            # Re-arm the previous call's buffer (every stage it used) while the rows travel, grid-strided over every
+            # CTA's epilogue threads (those owning no tokens included).
+            pub_threads = (
+                (row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M) * split * EPI_THREADS
+            )
+            gtid = bx * cutlass.Int32(EPI_THREADS) + (tx - cutlass.Int32(4 * 32))
+            clears = (pub_c0, pub_c1, pub_c2, pub_c3)
+            for s in cutlass.range_constexpr(4):
+                if s < pub_dstages:
+                    _lamport.clear_stage(
+                        pub_uc
+                        + cutlass.Int64(pub_dirty * pub_dstages + s)
+                        * cutlass.Int64(pub_nbytes // pub_dstages),
+                        clears[s],
+                        gtid,
+                        cutlass.Int32(pub_threads),
+                    )
         prims.barrier_cta_sync(1, thread_count=EPI_THREADS)
         if warp_id == 4:
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols)
@@ -1739,7 +1853,7 @@ def k3_ctm_gemv_wide(
     clusters = row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
-        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None,
+        n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None, 0, None, None, None, None, None,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1776,9 +1890,56 @@ def k3_ctm_gemv_wide_ar_push(
     tma_desc_x = _activation_tensor_map_rows(x, k_in, num_tokens, n_tile)
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
-        ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank,
+        ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank, 0, None, None, None, None,
+        None,
     ).launch(
         grid=((n_out // CTA_M) * split, 1, 1),
+        block=(THREADS, 1, 1),
+        cluster=(split, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )  # fmt: skip
+
+
+@cute.jit
+def k3_ctm_gemv_wide_col_publish(
+    w: cute.Tensor,  # [N, K] bf16, K contiguous: output columns [col0, col0 + N) of the result
+    x: cute.Tensor,  # [M, K] bf16, K contiguous, M <= n_tile
+    x_flat: cute.Tensor,  # x as [M * K] (the kernel's unused output operand)
+    num_tokens: cutlass.Int32,
+    uc_local: cutlass.Int64,
+    mc_base: cutlass.Int64,
+    flags: cutlass.Int64,
+    addend: cutlass.Int64,
+    col0: cutlass.Int32,
+    n_out: cutlass.Constexpr[int],
+    k_in: cutlass.Constexpr[int],
+    split: cutlass.Constexpr[int],
+    ring: cutlass.Constexpr[int],
+    x_ring: cutlass.Constexpr[int],
+    n_tile: cutlass.Constexpr[int],
+    row_tiles: cutlass.Constexpr[int],
+    hidden: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda_driver.CUstream,
+) -> None:
+    """``x @ w^T`` (fp32 sums as ``k3_ctm_gemv_wide``'s) plus the bf16 ``addend [M, hidden]``'s columns
+    [col0, col0 + N), rounded once to bf16 and published as those columns of the ``[M, hidden]`` result of the next
+    Lamport call on a workspace (broadcast stage of its current buffer, every rank), advancing the workspace's rotation
+    (see the column publish section comment). ``row_tiles`` as in ``k3_ctm_gemv_wide`` (tiles of a multiple of 8
+    rows)."""
+    if cutlass.const_expr(row_tiles > 0):
+        tma_desc_w = _weight_tensor_map_row_tiles(w, n_out, k_in, row_tiles)
+    else:
+        tma_desc_w = _weight_tensor_map(w, n_out, k_in)
+    tma_desc_x = _activation_tensor_map_rows(x, k_in, num_tokens, n_tile)
+    clusters = row_tiles if row_tiles > 0 else (n_out + CTA_M - 1) // CTA_M
+    k3_ctm_gemv_wide_kernel(
+        tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
+        ring, x_ring, n_tile, False, False, row_tiles, 0, None, None, None, None, hidden, uc_local, mc_base, flags,
+        addend, col0,
+    ).launch(
+        grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
         cluster=(split, 1, 1),
         stream=stream,

@@ -151,7 +151,9 @@ def _wide_layer(dm, takes: bool, monkeypatch):
     """A ``K3DecodeMoeNvfp4Layer`` whose front and experts are stand-ins; records what ``_wide`` calls."""
     calls = []
     layer = object.__new__(dm.K3DecodeMoeNvfp4Layer)
-    layer.state = SimpleNamespace(front_head=lambda rows, front32=None: object(), lu="state")
+    layer.state = SimpleNamespace(
+        front_head=lambda rows, front32=None: object(), lu="state", col=None
+    )
     layer.lu = "layer"
     layer.shared_cols = 384
     shared_act = torch.zeros(16, 384, dtype=torch.bfloat16)
