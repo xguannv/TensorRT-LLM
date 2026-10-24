@@ -81,12 +81,28 @@ def _k3_wide_table(device: torch.device) -> bool:
     return wide
 
 
-def _k3_rows_per_cta(sample: bool) -> int:
-    """``TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT`` for this ``trtllm::k3_spec_accept`` call (its ``rows_per_cta``; census when
-    on, per greedy / sampled call). Also counts every sampled call, switch on or off."""
+#: The GPUs (compute capability) on which TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT at its default (-1) is on (1 row per CTA):
+#: where it was measured and tested. Elsewhere the default keeps one CTA per column slice; a value > 0 forces it.
+SPEC_ACCEPT_ROW_SPLIT_CAPABILITIES = ((10, 3),)
+SPEC_ACCEPT_ROW_SPLIT_DEFAULT_ROWS = 1
+
+
+@functools.lru_cache(maxsize=None)
+def _row_split_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in SPEC_ACCEPT_ROW_SPLIT_CAPABILITIES
+
+
+def _k3_rows_per_cta(sample: bool, device: torch.device) -> int:
+    """``TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT`` for this ``trtllm::k3_spec_accept`` call on ``device`` (its
+    ``rows_per_cta``; census when on, per greedy / sampled call): N > 0 as given, 0 off, -1 (default)
+    ``SPEC_ACCEPT_ROW_SPLIT_DEFAULT_ROWS`` where the device is in ``SPEC_ACCEPT_ROW_SPLIT_CAPABILITIES``, else off.
+    Also counts every sampled call, switch on or off."""
     if sample:
         _census.count(f"dispatch:spec_accept_sample:{_census.mode()}")
-    value = max(int(_flags.TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT), 0)
+    value = int(_flags.TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT)
+    if value < 0:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        value = SPEC_ACCEPT_ROW_SPLIT_DEFAULT_ROWS if _row_split_by_default(index) else 0
     if value:
         kind = "sample" if sample else "greedy"
         _census.count(f"dispatch:spec_accept_row_split_{kind}:{_census.mode()}")
@@ -504,7 +520,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             self._compute_block_size,
             *self._k3_shard_args(shard),
             wide_table=_k3_wide_table(logits.device),
-            rows_per_cta=_k3_rows_per_cta(False),
+            rows_per_cta=_k3_rows_per_cta(False, logits.device),
         )
         self._on_acceptance(accepted, num_acc, attn_metadata, spec_metadata)
         return (
@@ -1851,7 +1867,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             first_column,
             *sampling,
             wide_table=_k3_wide_table(logits.device),
-            rows_per_cta=_k3_rows_per_cta(bool(sampling)),
+            rows_per_cta=_k3_rows_per_cta(bool(sampling), logits.device),
         )
         return accepted, num_acc, rewind
 
