@@ -413,8 +413,32 @@ def k3_fp8_kda_verify_kernel(
         # every cache column (the rows at the count are picked below) and every draft's records (replayed below only
         # for the accepted ones).
         slot = slots.load(idx=n)
-        pend_raw = pending.load(idx=slot)
         a_raw = a_log.load(idx=h)
+        # (the slot-independent loads first: their round trip overlaps the slot's)
+        # Conv weights, transposed to [tap][channel]: q by threads 0..127, k by 128..255.
+        if tidx < K:
+            wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
+            for w in cutlass.range_constexpr(CONV_W):
+                s_wq.store(cutlass.Float32(wq4[w]), idx=w * K + tidx)
+        else:
+            ck_w = tidx - K
+            wk4 = w_k.load(idx=(ch0 + ck_w) * CONV_W, vector_size=CONV_W, alignment=16)
+            for w in cutlass.range_constexpr(CONV_W):
+                s_wk.store(cutlass.Float32(wk4[w]), idx=w * K + ck_w)
+        if tidx < V_CTA:
+            wv4 = w_v.load(idx=(ch0 + v0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
+            for w in cutlass.range_constexpr(CONV_W):
+                s_wv.store(cutlass.Float32(wv4[w]), idx=w * V_CTA + tidx)
+        elif tidx < 2 * V_CTA:
+            s_onw.store(onorm_w.load(idx=v0 + tidx - V_CTA), idx=tidx - V_CTA)
+        elif tidx >= THREADS - K // 4:
+            c_dtb = tidx - (THREADS - K // 4)
+            s_dtb.store(
+                dt_bias.load(idx=ch0 + c_dtb * 4, vector_size=4, alignment=16),
+                idx=c_dtb * 4,
+                alignment=16,
+            )
+        pend_raw = pending.load(idx=slot)
         pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
         tok = state_tok.subview(cutlass.Int64(slot) * CT_SLOT)
         for r in cutlass.range_constexpr(ROWS):
@@ -448,29 +472,6 @@ def k3_fp8_kda_verify_kernel(
                               tok.subview(CT_WB + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
                     _bulk_g2s(s_rec.subview(d_t + V_CTA + K).data_ptr().toint(),
                               tok.subview(CT_WD + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
-        # Conv weights, transposed to [tap][channel]: q by threads 0..127, k by 128..255.
-        if tidx < K:
-            wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
-            for w in cutlass.range_constexpr(CONV_W):
-                s_wq.store(cutlass.Float32(wq4[w]), idx=w * K + tidx)
-        else:
-            ck_w = tidx - K
-            wk4 = w_k.load(idx=(ch0 + ck_w) * CONV_W, vector_size=CONV_W, alignment=16)
-            for w in cutlass.range_constexpr(CONV_W):
-                s_wk.store(cutlass.Float32(wk4[w]), idx=w * K + ck_w)
-        if tidx < V_CTA:
-            wv4 = w_v.load(idx=(ch0 + v0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
-            for w in cutlass.range_constexpr(CONV_W):
-                s_wv.store(cutlass.Float32(wv4[w]), idx=w * V_CTA + tidx)
-        elif tidx < 2 * V_CTA:
-            s_onw.store(onorm_w.load(idx=v0 + tidx - V_CTA), idx=tidx - V_CTA)
-        elif tidx >= THREADS - K // 4:
-            c_dtb = tidx - (THREADS - K // 4)
-            s_dtb.store(
-                dt_bias.load(idx=ch0 + c_dtb * 4, vector_size=4, alignment=16),
-                idx=c_dtb * 4,
-                alignment=16,
-            )
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
     if cutlass.const_expr(PROFILE):
