@@ -209,3 +209,38 @@ def test_latent_up_mxfp8(rows):
     assert torch.equal(
         out, torch.ops.trtllm.k3_fp8w_lowm_gemm(latent, layer.up_weight, layer.up_scale)
     )
+
+
+@pytest.mark.skipif(not _sm10x(), reason="needs an SM100/SM103 GPU")
+@pytest.mark.parametrize("rows,snapshots", [(16, 1), (16, 3), (32, 5)])
+def test_attn_res_mxfp8_side_output(rows, snapshots):
+    """``moe_tail_lu.attn_res`` with ``mxfp8_out`` (``TRTLLM_K3LL_ATTN_RES_MXFP8`` on a MoE-tail-LU consumer):
+    ``normed`` and ``updated`` the same bits as without it, and the MXFP8 copy equal to the reference quantizer of
+    ``normed`` (what the attention's first FP8 projection would quantize itself)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_mxfp8 as mx
+
+    lu = _mod("moe_tail_lu")
+    fp8w = _mod("fp8w_lowm")
+    g = torch.Generator(device="cuda").manual_seed(rows + snapshots)
+
+    def rnd(*shape, scale=1.0):
+        return (torch.randn(*shape, generator=g, device="cuda") * scale).bfloat16()
+
+    tail = lu.LuTail(rnd(rows, lu.HIDDEN, scale=0.5), rnd(rows, lu.HIDDEN, scale=0.5))
+    prefix = rnd(rows, lu.HIDDEN)
+    block = rnd(snapshots, rows, lu.HIDDEN)
+
+    def norm(w):
+        return SimpleNamespace(weight=w, eps=1e-6)
+
+    res_proj = SimpleNamespace(weight=rnd(1, lu.HIDDEN, scale=0.05))
+    res_norm, out_norm = norm(1 + rnd(lu.HIDDEN, scale=0.1)), norm(1 + rnd(lu.HIDDEN, scale=0.1))
+    normed0, updated0 = lu.attn_res(tail, prefix, block, res_proj, res_norm, out_norm)
+    xq, xs = fp8w.new_mxfp8_input(rows, lu.HIDDEN, prefix.device)
+    normed1, updated1 = lu.attn_res(tail, prefix, block, res_proj, res_norm, out_norm, mxfp8_out=(xq, xs))
+    torch.cuda.synchronize()
+    assert torch.equal(normed0, normed1)
+    assert torch.equal(updated0, updated1)
+    ref_q, ref_s = mx.mxfp8_quantize_reference(normed1)
+    assert torch.equal(xs, ref_s)
+    assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
