@@ -130,7 +130,7 @@ def test_on_equals_off(monkeypatch, case):
         assert _census_count(census) == before + 1
     torch.cuda.synchronize()
     keys = list(mla_v_up._compiled)
-    assert any(k[-1] == "split_pipe" for k in keys) and any(k[-1] != "split_pipe" for k in keys)
+    assert any("split_pipe" in k for k in keys) and any("split_pipe" not in k for k in keys)
     assert not torch.isnan(v_off).any()
     assert _bits(v_on, v_off), f"{case}: V rows differ with the switch on"
     assert _bits(s_on, s_off), f"{case}: softmax statistics differ with the switch on"

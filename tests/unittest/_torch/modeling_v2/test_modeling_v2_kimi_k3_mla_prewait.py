@@ -371,7 +371,8 @@ def test_v_up_prewait_bitwise(monkeypatch, case):
         v_on, s_on = (t.clone() for t in on_run())
     torch.cuda.synchronize()
     keys = list(mla_v_up._compiled)
-    assert any(k[-1] == "prewait" for k in keys) and any(k[-1] != "prewait" for k in keys)
+    # (TRTLLM_K3LL_MLA_SPLIT_PIPE may append its own tag after "prewait")
+    assert any("prewait" in k for k in keys) and any("prewait" not in k for k in keys)
     assert _bits(v_on, v_off) and _bits(s_on, s_off)
 
     # the prewait arm captured and replayed with new queries: bit for bit the off arm's eager call
@@ -403,5 +404,5 @@ def test_v_up_prewait_needs_pdl(monkeypatch):
     with _switches(monkeypatch, TRTLLM_K3LL_MLA_DECODE_PDL=0, TRTLLM_K3LL_MLA_PREWAIT_L2=1):
         v_on, s_on = (t.clone() for t in vu._VUp(dcp, q, pool, plan, w, scale)())
     torch.cuda.synchronize()
-    assert not any(k[-1] == "prewait" for k in set(mla_v_up._compiled) - before)
+    assert not any("prewait" in k for k in set(mla_v_up._compiled) - before)
     assert _bits(v_on, v_off) and _bits(s_on, s_off)
