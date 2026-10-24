@@ -38,6 +38,10 @@ Checks:
     every other collective's output the same bits on both arms and equal to its exact reference (the all-gather's
     concatenation, the latent sum of exact payloads).
 
+TRTLLM_K3LL_FINISH_FOLD (the attn_res kernel running the Lamport finish itself): every eager case also runs the on
+arm with the fold off and on (whether ``finish_lamport_push`` ran is tapped), both bit for bit the off arm; the graph
+check runs twice, its graphs captured with the fold off, then on.
+
 Where ``normed`` differs, the failure names the share of differing elements and the largest difference in bf16 ulps.
 """
 
@@ -78,7 +82,7 @@ DC = None  # decode_comm
 OP = None  # oproj_push
 FLAGS = None  # flags
 BUILT = None
-STATS = {"push_calls": 0}
+STATS = {"push_calls": 0, "fold_calls": 0}
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -128,6 +132,34 @@ def _switch(value: int):
         yield
     finally:
         FLAGS.TRTLLM_K3LL_OPROJ_PUSH = old
+
+
+@contextlib.contextmanager
+def _fold(value: int):
+    """Set TRTLLM_K3LL_FINISH_FOLD on the flags module (read at forward time) for the block."""
+    old = FLAGS.TRTLLM_K3LL_FINISH_FOLD
+    FLAGS.TRTLLM_K3LL_FINISH_FOLD = int(value)
+    try:
+        yield
+    finally:
+        FLAGS.TRTLLM_K3LL_FINISH_FOLD = old
+
+
+@contextlib.contextmanager
+def _finish_tap():
+    """Count the separate Lamport finish launches (``oproj_push.finish_lamport_push``) in the block."""
+    seen = {"finish": 0}
+    orig = OP.finish_lamport_push
+
+    def tapped(*args, **kwargs):
+        seen["finish"] += 1
+        return orig(*args, **kwargs)
+
+    OP.finish_lamport_push = tapped
+    try:
+        yield seen
+    finally:
+        OP.finish_lamport_push = orig
 
 
 @contextlib.contextmanager
@@ -418,6 +450,12 @@ def check_eager():
                     _expect_same(f"{where}: off arm vs pre-change {name}", arms[0][name], ref[name],
                                  replicated=True)  # fmt: skip
                 _verify_arms(where, arms[1], arms[0])
+                for fold in (0, 1):
+                    with _fold(fold), _finish_tap() as fin:
+                        folded = _cloned(_arm(layer, call, 1))
+                    assert fin["finish"] == int(not fold), f"{where}: fold {fold} ran {fin}"
+                    _verify_arms(f"{where} fold {fold}", folded, arms[0])
+                    STATS["fold_calls"] += int(fold)
                 for name in ("normed", "updated"):
                     _expect_same(f"{where}: switch 2 {name}", arms[2][name],
                                  arms[1 if call.step.wide else 0][name])  # fmt: skip
@@ -529,6 +567,13 @@ def _capture(fn):
 
 
 def check_graphs():
+    """The graph check with TRTLLM_K3LL_FINISH_FOLD off, then on."""
+    for fold in (0, 1):
+        with _fold(fold):
+            _check_graphs(fold)
+
+
+def _check_graphs(fold: int):
     """Graphs of 8, 16 and 32 tokens replayed alternately among eager steps (module docstring)."""
     steps = {rows: _Step(rows, 600 + 10 * rows) for rows in GRAPH_ROWS}
     for step in steps.values():
@@ -571,8 +616,8 @@ def check_graphs():
     torch.cuda.synchronize()
     if R.rank == 0:
         print(
-            f"[rank 0] graphs {GRAPH_ROWS} replayed {len(REPLAY_ORDER)}x alternately with eager steps: replay = eager "
-            "= off arm; other Lamport users unchanged",
+            f"[rank 0] graphs {GRAPH_ROWS} (fold {fold}) replayed {len(REPLAY_ORDER)}x alternately with eager steps: "
+            "replay = eager = off arm; other Lamport users unchanged",
             flush=True,
         )
 
@@ -597,7 +642,8 @@ def _run_one_rank(args) -> int:
         code = ls.run_checks(R, CHECKS)
     if R.rank == 0:
         print(
-            f"[rank 0] OPROJ_PUSH on vs off: normed and updated bit for bit; {STATS['push_calls']} eager push calls",
+            f"[rank 0] OPROJ_PUSH on vs off: normed and updated bit for bit; {STATS['push_calls']} eager push calls; "
+            f"FINISH_FOLD on = off: {STATS['fold_calls']} folded eager calls",
             flush=True,
         )
     return code

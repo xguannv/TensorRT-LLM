@@ -1159,6 +1159,18 @@ class K3AttnResFastKernel:
     ``kimiK3Mnnvl`` is compiled without --use_fast_math (unless the build sets ``FAST_MATH``): its
     divisions are ``div.rn``, ``1 / sum w`` is ``rcp.rn`` and no instruction flushes denormals. Only
     the snapshots' statistics and logits are computed before the wait.
+
+    With ``fold_world`` (``TRTLLM_K3LL_FINISH_FOLD``; Lamport addend and ``mnnvl_order`` only) the kernel is also
+    the two-shot :class:`k3_lamport_ar.K3LamportFinishKernel` (in place, no gather) of the all-reduce whose addend it
+    polls, so that kernel and its launch boundary go away. Its element layout is the finish kernel's (seven 128-thread
+    CTAs per token, eight contiguous elements per thread), so CTA ``(token, rank)`` thread ``t`` is finish worker
+    ``token * 7 + rank`` thread ``t``: every CTA reads the rotation state and counts itself as the finish workers do;
+    those of the tokens this rank owns sum the ``W`` scatter slots with the finish kernel's own ``reduce_slots`` (the
+    same order, the same rounding, ``-0`` sanitized) and multicast the row into the broadcast stage; every thread
+    re-arms its share of the previous call's buffer; after ``griddepcontrol.wait`` the addend is polled from the
+    broadcast stage of the buffer read at the start (:func:`k3_lamport_ar.poll_row_v4`), and CTA 0 thread 0 advances
+    the rotation last (:func:`k3_lamport_ar.finish_update`). Every polled row is the finish kernel's result, so the
+    outputs are bit for bit those of the finish kernel followed by this kernel without the fold.
     """
 
     def __init__(
@@ -1171,6 +1183,8 @@ class K3AttnResFastKernel:
         lamport: bool = False,
         early_trigger: bool = _EARLY_TRIGGER,
         mnnvl_order: bool = False,
+        fold_world: int = 0,
+        fold_cpp_one_shot: bool = True,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -1179,6 +1193,20 @@ class K3AttnResFastKernel:
             raise ValueError(f"add_mode={add_mode} cluster={cluster} mnnvl_order={mnnvl_order}")
         if lamport and add_mode != ADD_PREFIX:
             raise ValueError("the Lamport addend is an ADD_PREFIX variant")
+        if fold_world and not (lamport and mnnvl_order):
+            raise ValueError("the folded finish needs the Lamport addend and mnnvl_order")
+        self.fold_world = fold_world
+        self.fin = None
+        if fold_world:
+            # The finish kernel's own reduction (same chunking, same rounding), traced into this kernel.
+            self.fin = _lamport_ops().K3LamportFinishKernel(
+                fold_world,
+                HIDDEN_SIZE,
+                False,
+                use_pdl,
+                cpp_one_shot=fold_cpp_one_shot,
+                gather=False,
+            )
         self.mnnvl_order = mnnvl_order
         self.mxfp8 = mxfp8
         self.lamport = lamport
@@ -1212,6 +1240,8 @@ class K3AttnResFastKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        mc_addr: Int64,
+        lrank: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1239,6 +1269,8 @@ class K3AttnResFastKernel:
             upd_addr,
             xq_addr,
             xs_addr,
+            mc_addr,
+            lrank,
             m,
             eps,
             out_eps,
@@ -1275,6 +1307,8 @@ class K3AttnResFastKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        mc_addr: Int64,
+        lrank: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1299,6 +1333,48 @@ class K3AttnResFastKernel:
                     _mbar_init(mbar_smem + r * 8, 1)
                 _fence_mbar_init()
             _cluster_arrive_relaxed()
+
+        fold = self.fold_world
+        cur = Int32(0)
+        nbytes = Int32(0)
+        if cutlass.const_expr(fold):
+            # The finish kernel's worker part (class docstring); valid == 1 here (vecs == threads).
+            # (k3_lamport_ar's helpers are called through _lamport_ops() inline: a module held in a local variable
+            # would be carried through the DSL's dynamic control flow as a value.)
+            cur, dirty, nbytes, dstages, cl0, cl1, cl2, cl3 = _lamport_ops().lamport_state(
+                add2_addr
+            )
+            cute.arch.barrier()
+            if tidx == 0:
+                _lamport_ops().red_release_add(
+                    add2_addr + Int64(_lamport_ops()._FLAG_ARRIVALS * 4), Int32(1)
+                )
+            v = rank * self.vecs + tidx
+            if token % fold == lrank:
+                scatter = _lamport_ops().stage_addr(add_addr, cur, Int32(0), 2, nbytes)
+                acc = self.fin.reduce_slots(
+                    scatter + Int64((token // fold) * fold * HIDDEN_SIZE + v * 8) * 2,
+                    HIDDEN_SIZE * 2,
+                )
+                o = [
+                    _lamport_ops().sanitize_bf16x2(
+                        _lamport_ops().pack_bf16x2(acc[2 * j], acc[2 * j + 1])
+                    )
+                    for j in range(4)
+                ]
+                bcast_mc = _lamport_ops().stage_addr(mc_addr, cur, Int32(1), 2, nbytes)
+                _lamport_ops().multimem_st_v4(bcast_mc + Int64(token * HIDDEN_SIZE + v * 8) * 2, *o)
+            gtid = bidx * self.threads + tidx
+            nthreads = m * c * self.threads
+            clears = (cl0, cl1, cl2, cl3)
+            for st in cutlass.range_constexpr(4):
+                if st < dstages:
+                    _lamport_ops().clear_stage(
+                        add_addr + Int64(dirty * dstages + st) * Int64(nbytes // dstages),
+                        clears[st],
+                        gtid,
+                        nthreads,
+                    )
 
         valid = Int32(1)
         if cutlass.const_expr(self.vecs != self.threads):
@@ -1423,9 +1499,14 @@ class K3AttnResFastKernel:
                 # k3_lamport_ar.poll_result_v4). Threads past the row poll the row's first vector
                 # and use zeros.
                 off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
-                polled = _lamport_ops().poll_result_v4(
-                    add_addr, add2_addr, Int32(token), off, HIDDEN_SIZE
-                )
+                if cutlass.const_expr(fold):
+                    polled = _lamport_ops().poll_row_v4(
+                        add_addr, cur, nbytes, Int32(token), off, HIDDEN_SIZE
+                    )
+                else:
+                    polled = _lamport_ops().poll_result_v4(
+                        add_addr, add2_addr, Int32(token), off, HIDDEN_SIZE
+                    )
                 addend = unpack([_selp_b32(valid, w, Int32(0)) for w in polled])
             else:
                 addend = unpack(load(add_addr + row + col, False))
@@ -1548,6 +1629,14 @@ class K3AttnResFastKernel:
                 e_a,
             )
 
+        if cutlass.const_expr(fold):
+            # The finish kernel's updater, last (k3_lamport_ar.finish_update); this thread passed the wait above.
+            if bidx == 0:
+                if tidx == 0:
+                    _lamport_ops().finish_update(
+                        add2_addr, cur, nbytes, m, m * c, fold, HIDDEN_SIZE
+                    )
+
         if cutlass.const_expr(self.use_pdl and not self.early_trigger):
             _bar_sync(4, self.threads)
             _griddepcontrol_launch_dependents()
@@ -1583,14 +1672,27 @@ def _compiled(
     lamport: bool = False,
     early_trigger: bool = _EARLY_TRIGGER,
     mnnvl_order: bool = False,
+    fold_world: int = 0,
+    fold_cpp_one_shot: bool = True,
 ):
+    addr = Int64(1 << 20)
+    fast_extra = ()
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
         kernel = K3AttnResFastKernel(
-            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, early_trigger, mnnvl_order
+            num_candidates,
+            add_mode,
+            use_pdl,
+            cluster,
+            mxfp8,
+            lamport,
+            early_trigger,
+            mnnvl_order,
+            fold_world,
+            fold_cpp_one_shot,
         )
-    addr = Int64(1 << 20)
+        fast_extra = (addr, Int32(0))  # mc_addr, lrank (used by the folded finish only)
     return cute.compile(
         kernel,
         addr,
@@ -1604,6 +1706,7 @@ def _compiled(
         addr,
         addr,
         addr,
+        *fast_extra,
         Int32(1),
         Float32(1e-6),
         Float32(1e-6),
@@ -1660,6 +1763,7 @@ def run_k3_attn_res(
     lamport_addend: tuple[int, int] | None = None,
     early_trigger: bool | None = None,
     mnnvl_order: bool = False,
+    lamport_fold: tuple[int, int, int, int, int, bool] | None = None,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1698,6 +1802,12 @@ def run_k3_attn_res(
         mnnvl_order: The vectorized kernel with the arithmetic of the C++ MNNVL all-reduce
             epilogue (``mnnvl_allreduce_attn_res``; see :class:`K3AttnResFastKernel`), its outputs
             bit-identical to that op's for the same reduced row; ``cluster`` must be None.
+        lamport_fold: ``(uc_local, flags, mc_base, world, rank, cpp_one_shot)`` of a Lamport
+            workspace whose two-shot call every rank has pushed but nobody finished
+            (``TRTLLM_K3LL_FINISH_FOLD``): the kernel also runs that call's
+            ``K3LamportFinishKernel`` (in place, ``cpp_one_shot`` as there) and polls the addend
+            from it; the same bits as ``run_lamport_finish_in_place`` followed by this kernel with
+            ``lamport_addend``. Needs ``mnnvl_order``; excludes ``lamport_addend`` and ``addends``.
     """
     if exact is None:
         exact = _EXACT
@@ -1707,6 +1817,12 @@ def run_k3_attn_res(
         cluster = MNNVL_CLUSTER
     if (mxfp8_out is not None or lamport_addend is not None) and exact:
         raise ValueError("the MXFP8 side output and the Lamport addend need the vectorized kernel")
+    fold_world, fold_cpp, mc_addr, lrank = 0, True, 0, 0
+    if lamport_fold is not None:
+        if lamport_addend is not None or not mnnvl_order:
+            raise ValueError("lamport_fold replaces lamport_addend and needs mnnvl_order")
+        uc_local, flags_addr, mc_addr, fold_world, lrank, fold_cpp = lamport_fold
+        lamport_addend = (uc_local, flags_addr)
     lamport = lamport_addend is not None
     if lamport and addends:
         raise ValueError("pass either addends or lamport_addend")
@@ -1726,7 +1842,10 @@ def run_k3_attn_res(
         lamport,
         early_trigger,
         mnnvl_order,
+        int(fold_world),
+        bool(fold_cpp),
     )
+    fast_extra = () if exact else (Int64(mc_addr), Int32(lrank))
     if lamport:
         add_addr, add2_addr = lamport_addend
     else:
@@ -1744,6 +1863,7 @@ def run_k3_attn_res(
         Int64(updated.data_ptr() if add_mode else 0),
         Int64(mxfp8_out[0].data_ptr() if mxfp8 else 0),
         Int64(mxfp8_out[1].data_ptr() if mxfp8 else 0),
+        *fast_extra,
         Int32(layer.shape[0]),
         Float32(rms_eps),
         Float32(out_eps),

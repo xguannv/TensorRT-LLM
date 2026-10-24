@@ -695,6 +695,42 @@ def poll_result_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, h
     return w
 
 
+@cute.jit
+def poll_row_v4(
+    uc_local: Int64, cur: Int32, nbytes: Int32, tok: Int32, byte_off: Int32, hidden: int
+):
+    """16 bytes at ``byte_off`` of row ``tok`` of the broadcast stage of Lamport buffer ``cur`` (a
+    two-shot call's result), polled until they arrived: :func:`poll_result_v4` for a consumer that
+    finishes the call itself (``TRTLLM_K3LL_FINISH_FOLD``) and so knows the call's buffer from the
+    state it read before the rotation advanced."""
+    row = stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * hidden) * 2
+    w = ld_volatile_v4(row + Int64(byte_off))
+    while clean4(*w) == 0:
+        w = ld_volatile_v4(row + Int64(byte_off))
+    return w
+
+
+@cute.jit
+def finish_update(
+    flags: Int64, cur: Int32, nbytes: Int32, m: Int32, workers: Int32, world: int, hidden: int
+):
+    """The updater of a two-shot :class:`K3LamportFinishKernel` call, for a kernel that folds the
+    finish in (``TRTLLM_K3LL_FINISH_FOLD``): once all ``workers`` CTAs have counted themselves
+    (having read the state), write the next call's state exactly as the finish kernel's updater CTA
+    does. The caller must have passed ``griddepcontrol.wait`` (the producer reads the state after
+    its own wait, so the state may only change once it has completed). One thread."""
+    arrivals = flags + Int64(_FLAG_ARRIVALS * 4)
+    arrived = ld_acquire_u32(arrivals)
+    while arrived < workers:
+        arrived = ld_acquire_u32(arrivals)
+    row_bytes = hidden * 2
+    clear0 = ((m + (world - 1)) // world) * (world * row_bytes)
+    clear1 = m * row_bytes
+    st_v4(flags, (cur + 1) % NUM_BUFFERS, cur, nbytes, Int32(2))
+    st_v4(flags + Int64(16), clear0, clear1, Int32(0), Int32(0))
+    st_u32(arrivals, Int32(0))
+
+
 class K3LamportGatherKernel:
     """Copy the result rows of the last in-place two-shot call on a workspace into a tensor
     (:func:`poll_result_v4` per 16-byte vector), for a consumer that cannot poll them itself.
@@ -852,7 +888,9 @@ __all__ = [
     "K3LamportPushKernel",
     "LamportWorkspace",
     "one_shot_for",
+    "finish_update",
     "poll_result_v4",
+    "poll_row_v4",
     "push_slot",
     "push_v4",
     "required_bytes",
