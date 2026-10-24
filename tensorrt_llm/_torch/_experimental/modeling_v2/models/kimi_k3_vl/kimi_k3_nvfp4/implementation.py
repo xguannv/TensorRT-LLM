@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import functools
 import math
 import os
 from dataclasses import dataclass, replace
@@ -1434,6 +1435,27 @@ class KimiMLARuntime(nn.Module):
         return self._o_allreduce(out) if self._o_allreduce is not None else out
 
 
+# TRTLLM_K3LL_ATTN_RES_MXFP8's default (-1) turns it on only on these compute capabilities (measured on GB300 /
+# SM103). Where the consumer runs at all is k3_fp8w_lowm_mxfp8.can_take_rows -> k3_fp8w_lowm_gemm._is_supported_device
+# (SM100 / SM103): elsewhere _attn_res_mxfp8_out returns None and the step is unchanged, even when forced with 1.
+ATTN_RES_MXFP8_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _attn_res_mxfp8_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ATTN_RES_MXFP8_CAPABILITIES
+
+
+def _attn_res_mxfp8_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_ATTN_RES_MXFP8`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``ATTN_RES_MXFP8_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_ATTN_RES_MXFP8)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _attn_res_mxfp8_by_default(index)
+
+
 def _attn_res_mxfp8_out(
     layer: nn.Module, rows: int, device: torch.device
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -1684,7 +1706,7 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         elif tail_push:
             _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
-            if _flags.TRTLLM_K3LL_ATTN_RES_MXFP8:
+            if _attn_res_mxfp8_on(pending_moe_partial.x.device):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.x.shape[0], pending_moe_partial.x.device
                 )

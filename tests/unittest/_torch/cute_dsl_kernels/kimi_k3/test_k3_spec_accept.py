@@ -33,7 +33,8 @@ captured call per split family, replayed 20 times with the logits, drafts, dummy
 rewritten in place and the state carried.
 
 ``wide_table`` (``TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE``: the block table over every CTA): every split and case, the
-engines' widths 9361 and 16384 at every batch, and the CUDA-graph replays, against the same reference.
+widths 9361 (one column past the L1 engine's 599040 / 64 = 9360) and 16384 (1M / 64) at every batch, and the
+CUDA-graph replays, against the same reference.
 
 Table: ``python3 test_k3_spec_accept.py report``. Timing: ``python3 test_k3_spec_accept.py time`` (batch 1, then every
 split: CUDA graphs of 20 back-to-back calls of the reference ops and of the kernel, median over 12 replays in
@@ -557,8 +558,9 @@ def test_split_wide_table(batch, tokens):
 @pytest.mark.parametrize("max_blocks", [9361, 16384])
 @pytest.mark.parametrize("batch", range(1, 9))
 def test_wide_table_engine_widths(batch, max_blocks):
-    """``wide_table`` at the engines' widths (max_seq_len 599040 / 64 rounded up, and 1M / 64; not a multiple of the
-    CTA count, so the last CTA's slice is short): natural and forced-fraction cases at K = 7, against the reference."""
+    """``wide_table`` at engine-like widths (9361: one column past the L1 engine's 599040 / 64 = 9360; 16384: 1M / 64;
+    the e2e GEN engine has 15592): not a multiple of the CTA count, so the last CTA's slice is short. Natural and
+    forced-fraction cases at K = 7, against the reference."""
     with torch.inference_mode():
         results = [
             measure(batch, 7, 8, c, steps=4, wide_table=True, max_blocks=max_blocks) for c in (0, 5)

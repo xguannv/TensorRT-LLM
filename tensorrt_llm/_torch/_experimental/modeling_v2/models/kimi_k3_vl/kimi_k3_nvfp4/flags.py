@@ -348,11 +348,13 @@ TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
 
 TRTLLM_K3LL_ATTN_RES_MXFP8 = _flag(
     "TRTLLM_K3LL_ATTN_RES_MXFP8",
-    0,
+    -1,
     "decode steps whose MoE tail pushes into the all-reduce (TRTLLM_K3LL_MOE_TAIL_PUSH): the K3AttnResFast that "
     "finishes it before an attention also writes its output's MXFP8 form, and the attention's first FP8 projection "
     "(KDA fused [q | k | v | g | f_a | b] or QKVG, MLA fused q_a / kv_a) runs k3_fp8w_lowm_mxfp8 on it instead of "
-    "quantizing inside k3_fp8w_lowm_gemm (bitwise; read at forward time)",
+    "quantizing inside k3_fp8w_lowm_gemm (bitwise; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
+    "(implementation.ATTN_RES_MXFP8_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes SM100 / SM103 only, so on SM107 / "
+    "Rubin nothing changes even with 1",
 )
 TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "TRTLLM_K3LL_MX_SF_EARLY_RELEASE",
