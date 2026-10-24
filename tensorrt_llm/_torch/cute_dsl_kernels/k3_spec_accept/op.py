@@ -203,6 +203,7 @@ def k3_spec_accept(
     samp_seed: Optional[torch.Tensor] = None,
     samp_off: Optional[torch.Tensor] = None,
     wide_table: bool = False,
+    rows_per_cta: int = 0,
 ) -> List[torch.Tensor]:
     """Returns ``[accepted [B, K + 1] int32, num_accepted [B] int32, rewind [B] int32, bonus [B] int64,
     query_positions [B, block] int64, ctx_positions [B, K + 1] int64, noise [B, block, H] bf16]`` and updates
@@ -219,7 +220,12 @@ def k3_spec_accept(
     greedy.
 
     ``wide_table``: every CTA writes its column slice of the block table (all B rows' loads of a thread in flight) and
-    the last CTA sums the per-CTA counts, instead of CTA 0 walking B x max_blocks entries alone; the same bits."""
+    the last CTA sums the per-CTA counts, instead of CTA 0 walking B x max_blocks entries alone; the same bits.
+
+    ``rows_per_cta`` (> 0): every column slice of 1024 logits columns is reduced by B (K + 1) / P CTAs of P rows each
+    (P the largest divisor of B (K + 1) not above ``rows_per_cta``; :func:`rows_per_cta_for`) instead of one CTA walking
+    every row, so a row's partial (its Gumbel noise with sampling) is not waited for behind the other rows'; the same
+    bits. 0: one CTA per column slice."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
 
@@ -291,6 +297,7 @@ def k3_spec_accept(
         samp_temp = rng_pool[:1]
         samp_seed = samp_off = rng_counter[:1]
     mode, total, frac = force_mode(force, drafts)
+    row_groups = rows // kern.rows_per_cta_for(rows, int(rows_per_cta))
     accepted = torch.empty(batch, drafts + 1, dtype=torch.int32, device=device)
     num_acc = torch.empty(batch, dtype=torch.int32, device=device)
     rewind = torch.empty(batch, dtype=torch.int32, device=device)
@@ -351,6 +358,7 @@ def k3_spec_accept(
         int(push_copies),
         sample,
         bool(wide_table),
+        row_groups,
     )
     key = consts + (use_pdl,)
     fn = _compiled.get(key)
@@ -374,7 +382,7 @@ def k3_spec_accept(
 def _(logits, draft, block_off, pool_idx, divisor, block_counts, block_tables, prev_acc, state_idx, dummy, kv_lens,
       batch_to_slot, ctx_len, max_ctx, embed, mask_row, rng_pool, rng_counter, force, block, ws_uc=None, ws_mc=None,
       ws_flags=None, rank=0, slots=1, push_copies=1, shard_offset=0, samp_temp=None, samp_seed=None,
-      samp_off=None, wide_table=False):  # fmt: skip
+      samp_off=None, wide_table=False, rows_per_cta=0):  # fmt: skip
     batch, drafts = draft.shape
     hidden = embed.shape[1]
     return [

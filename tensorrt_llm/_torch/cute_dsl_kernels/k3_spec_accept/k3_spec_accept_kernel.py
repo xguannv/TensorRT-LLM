@@ -27,11 +27,14 @@
 #   noise[b, 0, :]  = embed[bonus[b], :];  noise[b, j > 0, :] = mask_row
 #   tables[b, i]    = max(off[b, i], 0) // divisor;  counts[b] = #(off[b, i] >= 0)    (the draft pool's block table)
 #
-# Geometry: G CTAs of 256 threads; CTA c reduces columns [1024 c, 1024 c + 1024) of every logits row (one 16-byte
-# load per thread per row) to a (value, index) partial, writes its share of the constant mask rows, and the block
-# table: CTA 0 all of it, or (wide_table) every CTA its column slice [c ceil(M / G), (c + 1) ceil(M / G)) of every
-# request's row, all B rows' loads of a thread in flight at once, with its per-request placeholder-free counts as a
-# partial. Each CTA publishes its partials (fence.acq_rel.gpu, then an acq_rel arrival); the last CTA to arrive
+# Geometry: G x RG CTAs of 256 threads; CTA (c, g) reduces columns [1024 c, 1024 c + 1024) of the logits rows
+# [g P, g P + P), P = R / RG rows per CTA (one 16-byte load per thread per row), to a (value, index) partial per row,
+# writes its share of the constant mask rows, and the block table: CTA (0, 0) all of it, or (wide_table) every CTA
+# (c, 0) its column slice [c ceil(M / G), (c + 1) ceil(M / G)) of every request's row, all B rows' loads of a thread in
+# flight at once, with its per-request placeholder-free counts as a partial. RG = 1 is one CTA per column slice walking
+# every row; RG > 1 (rows_per_cta) spreads the rows, which are reduced one after another inside a CTA, over more CTAs:
+# the partial of (row, c) is the same reduction of the same 1024 values whichever CTA computes it, so every RG gives
+# the same bits. Each CTA publishes its partials (fence.acq_rel.gpu, then an acq_rel arrival); the last CTA to arrive
 # reduces all partials in the same total order (wide_table: and sums the count partials, integers), runs the
 # per-request bookkeeping on lanes 0 .. B-1 of warp 0, copies the bonus embedding rows, and zeroes the arrival counter
 # for the next call. No CTA waits on another.
@@ -89,6 +92,14 @@ def supports_columns(vocab: int, slots: int = 1) -> bool:
     """``vocab``: the columns this rank reduces (the whole vocabulary, or the rank's shard when ``slots`` > 1, one
     exchange slot per rank; an even count, so every row's slots are whole 16-byte vectors)."""
     return vocab % COLS_PER_CTA == 0 and (slots == 1 or (slots % 2 == 0 and slots <= MAX_SLOTS))
+
+
+def rows_per_cta_for(rows: int, requested: int) -> int:
+    """The rows one CTA reduces for ``requested`` rows per CTA (0 or less: all ``rows``): the largest divisor of
+    ``rows`` not above ``requested``, so that every CTA has the same number of rows."""
+    if requested <= 0 or requested >= rows:
+        return rows
+    return max(d for d in range(1, requested + 1) if rows % d == 0)
 
 
 def supports(vocab: int, batch: int, block: int, drafts: int, hidden: int, slots: int = 1) -> bool:
@@ -238,18 +249,31 @@ def k3_spec_accept_kernel(
     wide_table: cutlass.Constexpr[
         bool
     ],  # the block table over every CTA (else CTA 0 alone); the same bits
+    row_groups: cutlass.Constexpr[
+        int
+    ],  # RG: CTAs per column slice, each reducing R / RG rows; the same bits
 ):
     rows = batch * (drafts + 1)
+    rows_per_cta = rows // row_groups
+    ctas = grid * row_groups
     count_base = MAX_ROWS * grid * 2  # the count partials [b][G] in the scratch
     row_words = hidden // 2  # int32 words per embedding row
     row_vecs = row_words // 4  # 16-byte vectors per embedding row
     tx, _, _ = cute.arch.thread_idx()
-    cta, _, _ = cute.arch.block_idx()
+    cta, rgroup, _ = cute.arch.block_idx()
+    # The CTA's linear index (row group-major), its first row, and whether it is in row group 0 (constants for RG = 1).
+    lin = cta
+    row0 = cutlass.Int32(0)
+    group0 = cutlass.Boolean(True)
+    if cutlass.const_expr(row_groups > 1):
+        lin = rgroup * cutlass.Int32(grid) + cta
+        row0 = rgroup * cutlass.Int32(rows_per_cta)
+        group0 = rgroup == cutlass.Int32(0)
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = tx % cutlass.Int32(32)
 
     s_best = cutlass.Array(
-        cutlass.Int32, rows * WARPS * 2, space=cutlass.AddressSpace.smem, alignment=16
+        cutlass.Int32, rows_per_cta * WARPS * 2, space=cutlass.AddressSpace.smem, alignment=16
     )
     s_tok = cutlass.Array(cutlass.Int32, MAX_ROWS, space=cutlass.AddressSpace.smem, alignment=16)
     s_bonus = cutlass.Array(cutlass.Int32, MAX_BATCH, space=cutlass.AddressSpace.smem, alignment=16)
@@ -273,14 +297,15 @@ def k3_spec_accept_kernel(
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
     prims.griddepcontrol(prims.GridDepAction.WAIT)
 
-    # Per-row partial argmax over this CTA's 1024 columns.
+    # Per-row partial argmax over this CTA's 1024 columns, for this CTA's rows (row0 + rr).
     col0 = cta * cutlass.Int32(COLS_PER_CTA) + tx * cutlass.Int32(4)
-    for r in cutlass.range_constexpr(rows):
+    for rr in cutlass.range_constexpr(rows_per_cta):
+        r = row0 + cutlass.Int32(rr)
         vals = []
         if cutlass.const_expr(slots > 1):
             # bf16 pairs as int32 words; bf16 -> fp32 is exact (the high half of the word).
             lw = logits.load(
-                idx=(cutlass.Int32(r * vocab) + col0) // cutlass.Int32(2),
+                idx=(r * cutlass.Int32(vocab) + col0) // cutlass.Int32(2),
                 vector_size=2,
                 alignment=8,
             )
@@ -289,21 +314,19 @@ def k3_spec_accept_kernel(
                 vals.append(cutlass.Int32(word << cutlass.Int32(16)).bitcast(cutlass.Float32))
                 vals.append(cutlass.Int32(word & cutlass.Int32(-65536)).bitcast(cutlass.Float32))
         else:
-            v = logits.load(idx=cutlass.Int32(r * vocab) + col0, vector_size=4, alignment=16)
+            v = logits.load(idx=r * cutlass.Int32(vocab) + col0, vector_size=4, alignment=16)
             for q in cutlass.range_constexpr(4):
                 vals.append(cutlass.Float32(v[q]))
         if cutlass.const_expr(sample):
             # Gumbel-max: argmax(logit / T + g) samples softmax(logit / T); g depends on the row's key and the global
             # column only, so every rank's shard draws its own columns' noise and the exchange is unchanged. A row
             # below the greedy temperature keeps its logits (v * 1 + 0 is v).
-            samp_t = samp_temp.load(idx=cutlass.Int32(r))
+            samp_t = samp_temp.load(idx=r)
             samp_hot = samp_t >= cutlass.Float32(GREEDY_TEMPERATURE)
             samp_inv = cutlass.Float32(
                 cutlass.select_(samp_hot, cutlass.Float32(1.0) / samp_t, cutlass.Float32(1.0))
             )
-            samp_key = _sample_key(
-                samp_seed.load(idx=cutlass.Int32(r)), samp_off.load(idx=cutlass.Int32(r))
-            )
+            samp_key = _sample_key(samp_seed.load(idx=r), samp_off.load(idx=r))
             for q in cutlass.range_constexpr(4):
                 samp_g = _gumbel(samp_key, shard_offset + col0 + cutlass.Int32(q))
                 vals[q] = vals[q] * samp_inv + cutlass.Float32(
@@ -315,12 +338,12 @@ def k3_spec_accept_kernel(
             best_value, best_index = _keep(best_value, best_index, vals[q], col0 + cutlass.Int32(q))
         best_value, best_index = _warp_best(best_value, best_index)
         if lane == 0:
-            s_best.store((best_value.bitcast(cutlass.Int32), best_index), idx=cutlass.Int32(r * WARPS * 2) + warp * 2,
+            s_best.store((best_value.bitcast(cutlass.Int32), best_index), idx=cutlass.Int32(rr * WARPS * 2) + warp * 2,
                          alignment=8)  # fmt: skip
 
     # The constant mask rows of the block (j >= 1), this CTA's share of their 16-byte vectors.
     n_mask_vecs = batch * (block - 1) * row_vecs
-    v_id = cta * cutlass.Int32(THREADS) + tx
+    v_id = lin * cutlass.Int32(THREADS) + tx
     while v_id < cutlass.Int32(n_mask_vecs):
         b_j = v_id // cutlass.Int32(row_vecs)  # (b, j - 1) row
         within = v_id - b_j * cutlass.Int32(row_vecs)
@@ -330,54 +353,58 @@ def k3_spec_accept_kernel(
         noise.store((cutlass.Int32(m[0]), cutlass.Int32(m[1]), cutlass.Int32(m[2]), cutlass.Int32(m[3])),
                     idx=((b * cutlass.Int32(block) + j) * cutlass.Int32(row_vecs) + within) * cutlass.Int32(4),
                     alignment=16)  # fmt: skip
-        v_id += cutlass.Int32(grid * THREADS)
+        v_id += cutlass.Int32(ctas * THREADS)
 
-    # The draft pool's block table: tables[b, i] = max(off, 0) // divisor, counts[b] = #(off >= 0).
+    # The draft pool's block table: tables[b, i] = max(off, 0) // divisor, counts[b] = #(off >= 0); the CTAs of row
+    # group 0 (CTA-uniform branches: their barriers are reached by every thread of the CTA or by none).
     if cutlass.const_expr(wide_table):
-        # This CTA's column slice of every request's row; per pass, a thread loads its column of all B rows before
-        # it stores any (B loads in flight), then counts its present entries per request.
-        w_chunk = (max_blocks + grid - 1) // grid
-        w_lo = cta * cutlass.Int32(w_chunk)
-        w_present = [cutlass.Int32(0) for _ in range(batch)]
-        for w_it in cutlass.range_constexpr((w_chunk + THREADS - 1) // THREADS):
-            w_col = w_lo + cutlass.Int32(w_it * THREADS) + tx
-            w_live = (w_col < w_lo + cutlass.Int32(w_chunk)) & (w_col < cutlass.Int32(max_blocks))
-            w_ld = cutlass.Int32(cutlass.select_(w_live, w_col, cutlass.Int32(0)))
-            w_vals = []
-            for w_b in cutlass.range_constexpr(batch):
-                w_vals.append(
-                    cutlass.Int32(
-                        block_off.load(idx=off_base + cutlass.Int32(w_b) * off_stride + w_ld)
+        if group0:
+            # This CTA's column slice of every request's row; per pass, a thread loads its column of all B rows before
+            # it stores any (B loads in flight), then counts its present entries per request.
+            w_chunk = (max_blocks + grid - 1) // grid
+            w_lo = cta * cutlass.Int32(w_chunk)
+            w_present = [cutlass.Int32(0) for _ in range(batch)]
+            for w_it in cutlass.range_constexpr((w_chunk + THREADS - 1) // THREADS):
+                w_col = w_lo + cutlass.Int32(w_it * THREADS) + tx
+                w_live = (w_col < w_lo + cutlass.Int32(w_chunk)) & (
+                    w_col < cutlass.Int32(max_blocks)
+                )
+                w_ld = cutlass.Int32(cutlass.select_(w_live, w_col, cutlass.Int32(0)))
+                w_vals = []
+                for w_b in cutlass.range_constexpr(batch):
+                    w_vals.append(
+                        cutlass.Int32(
+                            block_off.load(idx=off_base + cutlass.Int32(w_b) * off_stride + w_ld)
+                        )
                     )
-                )
-            for w_b in cutlass.range_constexpr(batch):
-                w_e = w_vals[w_b]
-                if w_live:
-                    block_tables.store(cutlass.Int32(cutlass.select_(w_e > cutlass.Int32(0), w_e, cutlass.Int32(0)))
-                                       // divisor, idx=cutlass.Int32(w_b * max_blocks) + w_col)  # fmt: skip
-                w_present[w_b] = w_present[w_b] + cutlass.Int32(
-                    cutlass.select_(
-                        w_live & (w_e >= cutlass.Int32(0)), cutlass.Int32(1), cutlass.Int32(0)
+                for w_b in cutlass.range_constexpr(batch):
+                    w_e = w_vals[w_b]
+                    if w_live:
+                        block_tables.store(cutlass.Int32(cutlass.select_(w_e > cutlass.Int32(0), w_e, cutlass.Int32(0)))
+                                           // divisor, idx=cutlass.Int32(w_b * max_blocks) + w_col)  # fmt: skip
+                    w_present[w_b] = w_present[w_b] + cutlass.Int32(
+                        cutlass.select_(
+                            w_live & (w_e >= cutlass.Int32(0)), cutlass.Int32(1), cutlass.Int32(0)
+                        )
                     )
+            for w_b in cutlass.range_constexpr(batch):
+                w_sum = w_present[w_b]
+                for offset in [16, 8, 4, 2, 1]:
+                    w_sum += cute.arch.shuffle_sync_bfly(
+                        w_sum, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                if lane == 0:
+                    s_tok.store(w_sum, idx=cutlass.Int32(w_b * WARPS) + warp)
+            prims.barrier_cta_sync(0)
+            if tx < cutlass.Int32(batch):
+                w_cta_count = cutlass.Int32(0)
+                for w in cutlass.range_constexpr(WARPS):
+                    w_cta_count += s_tok.load(idx=tx * cutlass.Int32(WARPS) + cutlass.Int32(w))
+                partials.store(
+                    w_cta_count, idx=cutlass.Int32(count_base) + tx * cutlass.Int32(grid) + cta
                 )
-        for w_b in cutlass.range_constexpr(batch):
-            w_sum = w_present[w_b]
-            for offset in [16, 8, 4, 2, 1]:
-                w_sum += cute.arch.shuffle_sync_bfly(
-                    w_sum, offset=offset, mask=-1, mask_and_clamp=31
-                )
-            if lane == 0:
-                s_tok.store(w_sum, idx=cutlass.Int32(w_b * WARPS) + warp)
-        prims.barrier_cta_sync(0)
-        if tx < cutlass.Int32(batch):
-            w_cta_count = cutlass.Int32(0)
-            for w in cutlass.range_constexpr(WARPS):
-                w_cta_count += s_tok.load(idx=tx * cutlass.Int32(WARPS) + cutlass.Int32(w))
-            partials.store(
-                w_cta_count, idx=cutlass.Int32(count_base) + tx * cutlass.Int32(grid) + cta
-            )
     if cutlass.const_expr(not wide_table):
-        if cta == 0:
+        if lin == cutlass.Int32(0):
             for b in cutlass.range_constexpr(batch):
                 present = cutlass.Int32(0)
                 i = tx
@@ -407,7 +434,7 @@ def k3_spec_accept_kernel(
 
     prims.barrier_cta_sync(0)
     # This CTA's partial per row, then its arrival (the partials first: fence.acq_rel.gpu + the acq_rel atom).
-    if tx < cutlass.Int32(rows):
+    if tx < cutlass.Int32(rows_per_cta):
         value = cutlass.Int32(NEG_INF_BITS).bitcast(cutlass.Float32)
         index = cutlass.Int32(INT_MAX)
         for w in cutlass.range_constexpr(WARPS):
@@ -420,8 +447,8 @@ def k3_spec_accept_kernel(
                 cutlass.Int32(pair[0]).bitcast(cutlass.Float32),
                 cutlass.Int32(pair[1]),
             )
-        partials.store((value.bitcast(cutlass.Int32), index), idx=(tx * cutlass.Int32(grid) + cta) * cutlass.Int32(2),
-                       alignment=8)  # fmt: skip
+        partials.store((value.bitcast(cutlass.Int32), index),
+                       idx=((row0 + tx) * cutlass.Int32(grid) + cta) * cutlass.Int32(2), alignment=8)  # fmt: skip
     cute.arch.fence_acq_rel_gpu()
     prims.barrier_cta_sync(0)
     if tx == 0:
@@ -429,7 +456,7 @@ def k3_spec_accept_kernel(
         s_last.store(
             cutlass.Int32(
                 cutlass.select_(
-                    arrived == cutlass.Int32(grid - 1), cutlass.Int32(1), cutlass.Int32(0)
+                    arrived == cutlass.Int32(ctas - 1), cutlass.Int32(1), cutlass.Int32(0)
                 )
             ),
             idx=0,
@@ -699,6 +726,7 @@ def k3_spec_accept(
     push_copies: cutlass.Constexpr[int],
     sample: cutlass.Constexpr[bool],
     wide_table: cutlass.Constexpr[bool],
+    row_groups: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -707,9 +735,9 @@ def k3_spec_accept(
         ctx_len, embed, mask_row, rng_pool, rng_counter, samp_temp, samp_seed, samp_off, accepted, num_acc, rewind,
         bonus, qpos, cpos, noise, partials, counter, buf_uc, buf_mc, flags, off_base, off_stride, divisor, max_ctx,
         force_total, force_frac, force_mode, rank, shard_offset, grid, vocab, batch, drafts, block, hidden, max_blocks,
-        slots, push_copies, sample, wide_table,
+        slots, push_copies, sample, wide_table, row_groups,
     ).launch(
-        grid=[grid, 1, 1],
+        grid=[grid, row_groups, 1],
         block=[THREADS, 1, 1],
         stream=stream,
         use_pdl=use_pdl,
