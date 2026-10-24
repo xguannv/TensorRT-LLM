@@ -247,6 +247,17 @@ TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = _flag(
     "without one outlier round: the tail K3AttnResFast waits on the shared-stream join), so the lossy path stays off "
     "there",
 )
+TRTLLM_K3LL_MOE_LOWM_FC12 = _flag(
+    "TRTLLM_K3LL_MOE_LOWM_FC12",
+    0,
+    "lowm MoE on wide decode steps of 17-32 tokens: the routed experts as K3MoeFc1LowMKernel then "
+    "K3MoeFc2LowMKernel (one CTA per SM each, FC2 streaming its weights under FC1 by PDL; "
+    "nvfp4_lowm_op.k3_moe_nvfp4_lowm_fc12), the output zeroed on a side stream forked before the MoE front, instead "
+    "of K3MoeLowMDynKernel; steps of at most 16 tokens keep it. Not bitwise: the FC1 output and every FC2 partial "
+    "are the single kernel's bits, only the order of the bf16 red.add of a token's partials differs (hardware order "
+    "in both). 1 at launch builds the FC1 output buffer (12.5 MB per rank at K3 TP4 x EP4) and compiles both "
+    "kernels; engagement is read at forward time",
+)
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",

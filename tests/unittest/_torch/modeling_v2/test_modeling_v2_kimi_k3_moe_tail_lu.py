@@ -159,11 +159,11 @@ def _wide_layer(dm, takes: bool, monkeypatch):
         calls.append("front") or ("routing", shared_act)
     )
 
-    def front_routed(moe, x, front32=None):
+    def front_routed(moe, x, front32=None, fc12=None):
         calls.append("front_routed")
         raise _Stop
 
-    def routed_after(routing):
+    def routed_after(routing, fc12=None):
         calls.append(("routed", routing))
         raise _Stop
 

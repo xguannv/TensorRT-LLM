@@ -19,6 +19,14 @@ runs:
 
 Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_lowm_op.supported`).
 
+With ``TRTLLM_K3LL_MOE_LOWM_FC12`` (built at load when set at launch, `K3MoeFc12`; engagement read at forward time,
+`fc12_takes`) a wide step of 17-32 tokens runs the routed experts as two kernels, ``K3MoeFc1LowMKernel`` then
+``K3MoeFc2LowMKernel`` (`nvfp4_lowm_op.k3_moe_nvfp4_lowm_fc12`), into a persistent FC1 output buffer. FC2 adds into
+the routed output, so the step zeroes that output first: under multi-stream capture on the state's side stream,
+forked from the main stream before the MoE front and joined right before FC1, so the zeroing runs beside the front
+(no kernel between the front and FC1); elsewhere on the main stream right before FC1. Every consumer of the routed
+output follows FC2 on the main stream, as it followed the single kernel.
+
 `K3DecodeMoeNvfp4` holds what every MoE layer shares (the head workspace, the expert kernel's counters);
 `K3DecodeMoeNvfp4Layer` holds one layer's decode weights and handles. The target builds both in
 `post_load_weights` when ``TRTLLM_K3LL_MOE_LOWM`` (flags.py) is set, before any CUDA-graph capture, and runs
@@ -55,7 +63,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe_front impo
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import (
+    do_multi_stream,
+    maybe_execute_in_parallel,
+)
 
 from . import flags as _flags
 from . import moe_tail_lu as _tail_lu
@@ -72,6 +83,78 @@ FRONT32_TOKENS = 32
 # A wide decode step's most tokens: the expert kernel's limit.
 WIDE_MAX_TOKENS = nvfp4_lowm_op.MAX_TOKENS
 NUM_EXPERTS = 896
+#: CUDA priority of ``TRTLLM_K3LL_MOE_LOWM_FC12``'s zeroing stream (lower is higher): its small kernel takes SMs
+#: ahead of the front's pending CTAs.
+FC12_STREAM_PRIORITY = -1
+
+
+@dataclass(eq=False)
+class K3MoeFc12:
+    """``TRTLLM_K3LL_MOE_LOWM_FC12``'s state on one device: the FC1 output buffers every layer shares (the layers run
+    one at a time on one stream) and the side stream that zeroes a step's routed output, with its fork and join
+    events."""
+
+    buffers: nvfp4_lowm_op.Fc12
+    stream: torch.cuda.Stream
+    fork: torch.cuda.Event
+    join: torch.cuda.Event
+
+    @classmethod
+    def create(cls, device, n1: int, num_local: int, top_k: int) -> "K3MoeFc12":
+        """Buffers for `WIDE_MAX_TOKENS` tokens over ``num_local`` experts of W1 ``[n1, k1]``. Eagerly, before any
+        CUDA-graph capture."""
+        with torch.cuda.device(device):
+            stream = torch.cuda.Stream(device=device, priority=FC12_STREAM_PRIORITY)
+        return cls(
+            nvfp4_lowm_op.new_fc12(device, n1, num_local, top_k, WIDE_MAX_TOKENS),
+            stream,
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        )
+
+    def begin(self, rows: int, cols: int, device) -> "Fc12Step":
+        """A step's routed output, bf16 ``[rows, cols]``, being zeroed: under multi-stream capture on the side stream
+        forked here (call it before the front), else not yet (``Fc12Step.launch`` zeroes it on the main stream)."""
+        out = torch.empty(rows, cols, dtype=torch.bfloat16, device=device)
+        side = do_multi_stream() and not torch.compiler.is_compiling()
+        if side:
+            main = torch.cuda.current_stream()
+            self.fork.record(main)
+            with torch.cuda.stream(self.stream):
+                self.stream.wait_event(self.fork)
+                out.zero_()
+                self.join.record(self.stream)
+        return Fc12Step(self, out, side)
+
+
+@dataclass(eq=False)
+class Fc12Step:
+    """One wide step's ``TRTLLM_K3LL_MOE_LOWM_FC12`` launch (`K3MoeFc12.begin`): the routed output and whether the
+    side stream zeroes it."""
+
+    state: K3MoeFc12
+    out: torch.Tensor
+    side: bool
+
+    def launch(self) -> nvfp4_lowm_op.Fc12:
+        """`nvfp4_lowm_op.run_sorted`'s ``fc12`` for this step, called on the main stream right before the experts:
+        with the side stream, the main stream joins it here (the zeroing is done before FC1 starts)."""
+        if self.side:
+            torch.cuda.current_stream().wait_event(self.state.join)
+        buffers = self.state.buffers
+        return nvfp4_lowm_op.Fc12(buffers.h, buffers.h_sf, zeroed=self.side)
+
+
+def fc12_takes(state, rows: int) -> bool:
+    """Whether a wide step of ``rows`` tokens runs the routed experts as FC1 + FC2: ``TRTLLM_K3LL_MOE_LOWM_FC12``
+    (read at forward time) is set, ``rows`` is 17 to 32 (``nvfp4_lowm_op.FC12_MIN_TOKENS`` / ``FC12_MAX_TOKENS``;
+    at most 16 rows keep ``K3MoeLowMDynKernel``), and the load built ``state.fc12``. The switch and shapes only, so
+    every rank decides alike."""
+    return (
+        bool(_flags.TRTLLM_K3LL_MOE_LOWM_FC12)
+        and nvfp4_lowm_op.FC12_MIN_TOKENS <= rows <= nvfp4_lowm_op.FC12_MAX_TOKENS
+        and state.fc12 is not None
+    )
 
 
 @dataclass(eq=False)
@@ -90,6 +173,9 @@ class K3DecodeMoeNvfp4:
     head32: Optional[K3MoeHeadWorkspace] = None
     #: ``TRTLLM_K3LL_MOE_TAIL_LU``'s shared state (``moe_tail_lu.py``), built where the switch is set at load.
     lu: Optional[_tail_lu.K3TailLuState] = None
+    #: ``TRTLLM_K3LL_MOE_LOWM_FC12``'s state (`K3MoeFc12`), built by the first layer's ``warm_up`` where the switch is
+    #: set at launch.
+    fc12: Optional[K3MoeFc12] = None
 
     @classmethod
     def create(
@@ -320,7 +406,8 @@ class K3DecodeMoeNvfp4Layer:
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
         (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens."""
+        32 tokens. With ``TRTLLM_K3LL_MOE_LOWM_FC12`` set at launch, also builds the shared `K3MoeFc12` and runs the
+        FC1 + FC2 launch at 17 and 32 tokens (its 32-token build)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         self._front_routed(moe, x)
@@ -332,6 +419,15 @@ class K3DecodeMoeNvfp4Layer:
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
             self._routed(*self._route_quant(moe, logits, latent))
+        if _flags.TRTLLM_K3LL_MOE_LOWM_FC12 and self.state.fc12 is None:
+            w1 = self.experts[0]
+            self.state.fc12 = K3MoeFc12.create(device, w1.shape[1], self.num_local, moe.top_k)
+        if self.state.fc12 is not None:
+            for rows in (nvfp4_lowm_op.FC12_MIN_TOKENS, nvfp4_lowm_op.FC12_MAX_TOKENS):
+                logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
+                latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
+                step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
+                self._routed(*self._route_quant(moe, logits, latent), fc12=step)
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):
@@ -368,18 +464,31 @@ class K3DecodeMoeNvfp4Layer:
         """This rank's routed experts."""
         return self.experts[0].shape[0]
 
-    def _routed(self, ids, weights, x_q, x_sf) -> torch.Tensor:
+    def _routed(self, ids, weights, x_q, x_sf, fc12: Optional[Fc12Step] = None) -> torch.Tensor:
+        """``moe_sort`` and the routed experts; ``fc12``: as two kernels into ``fc12.out`` (`Fc12Step`)."""
+        if fc12 is not None:
+            return nvfp4_lowm_op.run(
+                x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
+                self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(),
+            )  # fmt: skip
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
             self.state.counters, *self.situ,
         )  # fmt: skip
 
-    def _front_routed(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):
+    def _front_routed(
+        self,
+        moe: nn.Module,
+        x: torch.Tensor,
+        front32: Optional[bool] = None,
+        fc12: Optional[Fc12Step] = None,
+    ):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
-        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
+        With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it.
+        ``fc12``: `_routed_after`'s."""
         routing, shared_act = self._front_only(moe, x, front32)
-        return self._routed_after(routing), shared_act
+        return self._routed_after(routing, fc12=fc12), shared_act
 
     def _front_only(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):
         """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes."""
@@ -393,11 +502,18 @@ class K3DecodeMoeNvfp4Layer:
         _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
         return (sort_out, rows, None, x_q, x_sf), shared_act
 
-    def _routed_after(self, routing) -> torch.Tensor:
-        """``_front_routed``'s routed experts on the front's ``routing`` (`_front_only`)."""
+    def _routed_after(self, routing, fc12: Optional[Fc12Step] = None) -> torch.Tensor:
+        """``_front_routed``'s routed experts on the front's ``routing`` (`_front_only`). ``fc12``
+        (``TRTLLM_K3LL_MOE_LOWM_FC12``, `K3MoeFc12.begin`): FC1 + FC2 into ``fc12.out`` instead of the single
+        kernel."""
         sort_out, a, b, x_q, x_sf = routing
         if sort_out is None:
-            return self._routed(a, b, x_q, x_sf)
+            return self._routed(a, b, x_q, x_sf, fc12=fc12)
+        if fc12 is not None:
+            return nvfp4_lowm_op.run_sorted(
+                x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
+                self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(),
+            )  # fmt: skip
         return nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
             self.state.counters, *self.situ,
@@ -444,15 +560,16 @@ class K3DecodeMoeNvfp4Layer:
         )
         return (up * scale + shared_out.float()).bfloat16()
 
-    def _wide_head(self, moe: nn.Module, x: torch.Tensor, gemvs):
+    def _wide_head(self, moe: nn.Module, x: torch.Tensor, gemvs, fc12: Optional[Fc12Step] = None):
         """A wide step's routed partial and shared activation on M-general ops: the head GEMV, the MNNVL all-gather,
-        ``k3_route_quant`` and the experts, and the shared gate_up GEMV + activation on the shared-expert stream."""
+        ``k3_route_quant`` and the experts, and the shared gate_up GEMV + activation on the shared-expert stream.
+        ``fc12``: `_routed`'s."""
         head = _gemv(gemvs, "moe_head", x, self.head_weight, out_fp32=True)
         routed_in, router_logits = mnnvl_allgather_split(head, self.width, self.state.mnnvl)
         shared = moe.shared_experts
 
         def _routed_partial():
-            return self._routed(*self._route_quant(moe, router_logits, routed_in))
+            return self._routed(*self._route_quant(moe, router_logits, routed_in), fc12=fc12)
 
         def _shared_activation():
             return shared._apply_activation(
@@ -476,8 +593,15 @@ class K3DecodeMoeNvfp4Layer:
         ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
         consumer runs the tail GEMV (``moe_tail_push.py``). With ``TRTLLM_K3LL_MOE_TAIL_LU`` (read at forward time),
         where ``moe_tail_lu.takes`` holds, the reduced routed and shared outputs (a `LuTail`,
-        ``moe_tail_lu.py``)."""
+        ``moe_tail_lu.py``). With ``TRTLLM_K3LL_MOE_LOWM_FC12`` (read at forward time), where `fc12_takes` holds, the
+        routed experts run as FC1 + FC2 (`K3MoeFc12`), their output zeroed from before the front."""
         x = hidden_states.contiguous()
+        fc12 = None
+        if fc12_takes(self.state, x.shape[0]):
+            from . import census as _census
+
+            _census.count(f"dispatch:moe_lowm_fc12:{_census.mode()}")
+            fc12 = self.state.fc12.begin(x.shape[0], self.experts[3].shape[1], x.device)
         front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
         if (
             front32
@@ -495,11 +619,15 @@ class K3DecodeMoeNvfp4Layer:
                 _census.count(f"dispatch:moe_tail_lu:{_census.mode()}")
                 routing, shared_act = self._front_only(moe, x, front32)
                 return _tail_lu.run(
-                    self.state.lu, self.lu, gemvs, shared_act, lambda: self._routed_after(routing)
+                    self.state.lu,
+                    self.lu,
+                    gemvs,
+                    shared_act,
+                    lambda: self._routed_after(routing, fc12=fc12),
                 )
-            routed, shared_act = self._front_routed(moe, x, front32)
+            routed, shared_act = self._front_routed(moe, x, front32, fc12=fc12)
         else:
-            routed, shared_act = self._wide_head(moe, x, gemvs)
+            routed, shared_act = self._wide_head(moe, x, gemvs, fc12=fc12)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
         # columns. With TRTLLM_K3LL_WIDE_LATENT_TAIL one MNNVL call builds the tail's input: each rank reduces only its
         # own latent columns, and the ranks exchange the per-token sums of squares.

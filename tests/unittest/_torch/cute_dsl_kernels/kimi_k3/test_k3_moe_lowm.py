@@ -282,6 +282,129 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
 
 
+@pytest.mark.parametrize("num_tokens", [17, 24, 32])
+def test_moe_nvfp4_lowm_fc12(num_tokens):
+    """trtllm::k3_moe_nvfp4_lowm_fc12 (K3MoeFc1LowMKernel + K3MoeFc2LowMKernel, TRTLLM_K3LL_MOE_LOWM_FC12) against
+    trtllm::k3_moe_nvfp4_lowm at K3 shapes: FC1 rows and scales bit for bit, every FC2 partial bit for bit (one
+    non-zero routing weight per token), the full sum within the bf16 accumulation bound of the exact sum of the
+    partials (both add a token's partials in hardware order); through run_sorted with the persistent buffers
+    (nvfp4_lowm_op.new_fc12, the output zeroed in the call), and from CUDA-graph replays with the decode path's
+    zeroing on its side stream (decode_moe_lowm.K3MoeFc12, forked before the experts as before the front, joined
+    before FC1)."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.decode_moe_lowm import (
+        K3MoeFc12,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    hidden, inter_size, num_experts, num_local, offset, top_k = (
+        LATENT,
+        I_TP,
+        EXPERTS,
+        E_LOCAL,
+        E_LOCAL,
+        TOP_K,
+    )
+    ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * inter_size, hidden, num_tokens)
+    assert ok, why
+    torch.manual_seed(5000 + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    scales, ids = logits.topk(top_k, dim=-1)
+    ids = ids.to(torch.int32)
+    scales = scales.softmax(dim=-1).float()
+    ids[0, 0] = offset  # at least one token on this rank
+    t2g, t2lim, _, p2e, _, nnet = _sort(ids, scales, num_experts, top_k, offset, num_local)
+    m = p2e.shape[0]
+    assert m <= nvfp4_lowm_op.max_permuted_rows(num_tokens, top_k, num_local)
+    tiles = int(nnet.item())
+    limits = t2lim[:tiles].tolist()
+    rows = torch.tensor([r for t in range(tiles) for r in range(t * 128, limits[t])], device="cuda")
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    x_q, x_sf, x_gsf = _quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden)[:num_tokens].contiguous()
+    ex = _nvfp4_experts(num_local, hidden, inter_size, 6000 + num_tokens)
+    alpha1 = (ex.spread * (x_gsf * ex.w1_gsf)).float()
+    weights = (ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2)
+    counters = nvfp4_lowm_op.new_counters(torch.device("cuda"))
+    out_dyn = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    out_fc12 = torch.empty_like(out_dyn)
+    h_dyn = torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda")
+    h_sf_dyn = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
+    fc12 = nvfp4_lowm_op.new_fc12(torch.device("cuda"), 2 * inter_size, num_local, top_k)
+    sorted_args = (t2g, t2lim, p2e, nnet, ex.fc2_input_scale)
+
+    def dyn(token_scales):
+        out_dyn.fill_(7.0)  # the kernel zeroes the output itself
+        _trtllm().k3_moe_nvfp4_lowm(
+            _bits(x_q), _bits(x_sf), *weights, out_dyn, *sorted_args, token_scales, counters, top_k, GATE_CAP,
+            LINEAR_CAP, 0, h_dyn, h_sf_dyn,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return out_dyn.clone()
+
+    def two_kernels(token_scales):
+        out_fc12.zero_()  # FC2 adds into its output
+        _trtllm().k3_moe_nvfp4_lowm_fc12(
+            _bits(x_q), _bits(x_sf), *weights, out_fc12, *sorted_args, token_scales, fc12.h, fc12.h_sf, top_k,
+            GATE_CAP, LINEAR_CAP,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return out_fc12.clone()
+
+    partials = []
+    for slot in range(top_k):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        ref = dyn(one_hot)
+        new = two_kernels(one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), f"FC2 slot {slot}"
+        partials.append(ref.double())
+        if slot == 0:
+            assert torch.equal(h_dyn[rows], fc12.h[rows]), "FC1 output rows differ"
+            assert (fc12.h[rows] != 0).any(), "FC1 output is all zero"
+            cols = inter_size // SF16
+            sf_ref = unswizzle_sf(h_sf_dyn, m, inter_size, SF16).view(m, cols)
+            sf_new = unswizzle_sf(fc12.h_sf[: m * cols], m, inter_size, SF16).view(m, cols)
+            assert torch.equal(sf_ref[rows], sf_new[rows]), "FC1 output scale factors differ"
+    exact = torch.stack(partials).sum(0)
+    bound = top_k * 2.0**-8 * torch.stack(partials).abs().sum(0) + 1e-30
+
+    def check(result, what):
+        err = (result.double() - exact).abs()
+        assert bool((err <= bound).all()), f"{what}: max err/bound {(err / bound).max()}"
+
+    check(dyn(scales), "dyn")
+    check(two_kernels(scales), "op")
+    # run_sorted with fc12: the output (here not zero) zeroed on the current stream, then FC1 + FC2.
+    static = torch.full_like(out_dyn, 7.0)
+    y = nvfp4_lowm_op.run_sorted(_bits(x_q), _bits(x_sf), (t2g, t2lim, p2e, nnet, scales), weights,
+                                 ex.fc2_input_scale, counters, GATE_CAP, LINEAR_CAP, out=static, fc12=fc12)  # fmt: skip
+    torch.cuda.synchronize()
+    assert y is static
+    check(y, "run_sorted")
+
+    # The decode path's launch: the output zeroed on K3MoeFc12's side stream (forked before the experts, joined
+    # right before FC1), captured with multi-stream on as under the model's CUDA-graph capture.
+    state = K3MoeFc12(fc12, torch.cuda.Stream(priority=-1), torch.cuda.Event(), torch.cuda.Event())
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=stream), with_multi_stream(True):
+        step = state.begin(num_tokens, hidden, torch.device("cuda"))
+        assert step.side
+        captured = nvfp4_lowm_op.run_sorted(
+            _bits(x_q), _bits(x_sf), (t2g, t2lim, p2e, nnet, scales), weights, ex.fc2_input_scale, counters,
+            GATE_CAP, LINEAR_CAP, out=step.out, fc12=step.launch(),
+        )  # fmt: skip
+    for replay in range(3):
+        captured.fill_(7.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(captured, f"graph replay {replay}")
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # front (4 GPUs)
 # --------------------------------------------------------------------------------------------------------------------

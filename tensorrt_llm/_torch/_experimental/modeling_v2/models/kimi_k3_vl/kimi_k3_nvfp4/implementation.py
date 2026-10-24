@@ -4610,6 +4610,13 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             moe.decode_gemvs = self.model.decode_gemvs
         first = takes[0].decode_moe
         first.warm_up(takes[0])
+        if state.fc12 is not None and mapping.tp_rank == 0:
+            fc12 = state.fc12.buffers
+            logger.info(
+                f"Kimi K3 lowm MoE: TRTLLM_K3LL_MOE_LOWM_FC12={_flags.TRTLLM_K3LL_MOE_LOWM_FC12} (read at forward "
+                f"time): 17-32 token steps' routed experts as FC1 + FC2, FC1 output buffer "
+                f"{fc12.h.numel() + fc12.h_sf.numel()} bytes per rank"
+            )
         comm.compile_tail(takes[0].moe_hidden_size, first.shared_cols, first.tail_weight)
         gemvs = self.model.decode_gemvs
         if state.lu is not None:

@@ -24,6 +24,13 @@ The weight layouts are the CuteDSL backend's on SM100 / SM103: W1 rows interleav
 gate rows per 128-row block, W1 / W2 scales in the 128x4 blocked layout. SM107 stores W1 with another interleave, so
 `supported` refuses every other architecture.
 
+``trtllm::k3_moe_nvfp4_lowm_fc12`` runs the same experts as two persistent kernels of ``blackwell/k3_moe_lowm.py``
+on the same buffers: ``K3MoeFc1LowMKernel`` (FC1 + SiTU + NVFP4 quantization into ``h`` / ``h_sf``, triggering its
+dependents right after its wait) and then ``K3MoeFc2LowMKernel`` (FC2 + the routing-weighted combine, streaming its
+weights before its wait), one CTA per SM each. FC2 adds into its output, so the output must be zero before FC2
+(`run_sorted` with ``fc12``). The FC1 output and every FC2 partial are bit for bit the single kernel's; the bf16 sum
+of a token's partials (``red.global.add``) is in hardware order in both, so the output is not bitwise.
+
 Each configuration compiles on its first call, which must happen outside CUDA-graph capture.
 """
 
@@ -32,7 +39,7 @@ from __future__ import annotations
 import functools
 import os
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -45,6 +52,9 @@ MAX_TILES = 4096
 #: tokens take as many as fit.
 _DEFAULT_STAGES = {8: 6, 16: 6}
 _SUPPORTED_SM = ((10, 0), (10, 3))
+#: The token counts the two-kernel launch (``k3_moe_nvfp4_lowm_fc12``) serves in the decode path: the 32-token tile.
+FC12_MIN_TOKENS = 17
+FC12_MAX_TOKENS = MAX_TOKENS
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
@@ -95,6 +105,39 @@ def new_counters(device: torch.device) -> torch.Tensor:
     """A zeroed counter buffer (work, exit and per-tile counters) for one caller. Every launch leaves it zero again;
     launches that share it must be stream-ordered."""
     return torch.zeros(_dyn().counter_words(MAX_TILES), dtype=torch.int32, device=device)
+
+
+def max_permuted_rows(num_tokens: int, top_k: int, num_local: int) -> int:
+    """The most permuted rows a sort of ``num_tokens`` tokens' top ``top_k`` over ``num_local`` local experts in
+    128-row tiles produces: ``moe_sort``'s allocation (``getMaxPermutedPaddedCount``: one tile per touched expert,
+    plus one per 128 expanded rows beyond the first per expert), which also bounds ``k3_moe_front``'s sort (one tile
+    per touched expert)."""
+    expanded = num_tokens * top_k
+    filled = min(num_local, expanded)
+    return (filled + (expanded - filled) // TILE) * TILE
+
+
+class Fc12(NamedTuple):
+    """`run` / `run_sorted`'s two-kernel launch (``k3_moe_nvfp4_lowm_fc12``): the FC1 output buffers (`new_fc12`) and
+    whether the caller already zeroed the output (stream-ordered before the call; else the call zeroes it first)."""
+
+    h: torch.Tensor
+    h_sf: torch.Tensor
+    zeroed: bool = False
+
+
+def new_fc12(
+    device: torch.device, n1: int, num_local: int, top_k: int, num_tokens: int = MAX_TOKENS
+) -> Fc12:
+    """Persistent FC1 output buffers for ``k3_moe_nvfp4_lowm_fc12`` on up to ``num_tokens`` tokens over
+    ``num_local`` experts of W1 ``[n1, k1]``: ``h`` uint8 ``[rows, n1 / 4]`` and ``h_sf`` uint8 ``rows * n1 / 32``
+    (``rows`` = `max_permuted_rows`). Launches that share them must be stream-ordered."""
+    rows = max_permuted_rows(num_tokens, top_k, num_local)
+    k2 = n1 // 2
+    return Fc12(
+        torch.zeros(rows, k2 // 2, dtype=torch.uint8, device=device),
+        torch.zeros(rows * k2 // SF_VEC, dtype=torch.uint8, device=device),
+    )
 
 
 @torch.library.custom_op(
@@ -216,6 +259,131 @@ def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_gro
     return None
 
 
+def _gmem_ptr(dtype, t: torch.Tensor, align: Optional[int] = None):
+    import cutlass.cute as cute
+
+    from ..blackwell.utils import make_ptr
+
+    if align is None:
+        return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem)
+    return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+
+
+@torch.library.custom_op("trtllm::k3_moe_nvfp4_lowm_fc12", mutates_args=("output", "h", "h_sf"))
+def k3_moe_nvfp4_lowm_fc12(
+    x_fp4: torch.Tensor,
+    x_sf: torch.Tensor,
+    w1: torch.Tensor,
+    w1_sf: torch.Tensor,
+    alpha1: torch.Tensor,
+    w2: torch.Tensor,
+    w2_sf: torch.Tensor,
+    alpha2: torch.Tensor,
+    output: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    h: torch.Tensor,
+    h_sf: torch.Tensor,
+    top_k: int,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> None:
+    """`k3_moe_nvfp4_lowm`'s routed partial as two kernels: ``K3MoeFc1LowMKernel`` into ``h`` / ``h_sf`` (required:
+    `new_fc12`), then ``K3MoeFc2LowMKernel`` adding into ``output``, which must be zero (this op does not zero it).
+    Same operands as `k3_moe_nvfp4_lowm` but the counters. Both grids one CTA per SM. With PDL
+    (``TRTLLM_ENABLE_PDL``, as `k3_moe_nvfp4_lowm`): FC1 waits on the previous grid and then triggers FC2 at once;
+    FC2 streams its weights before its wait (it reads only the tile metadata, which the kernel before FC1 wrote) and
+    loads FC1's output, so also computes and adds, after it; FC2 triggers its dependents after all of its warps are
+    done."""
+    import cuda.bindings.driver as cuda_driver
+    import cutlass
+    import cutlass.cute as cute
+
+    lowm = _lowm()
+    orig_m = x_fp4.shape[0]
+    num_local, n1 = w1.shape[0], w1.shape[1]
+    k1 = w2.shape[1]
+    k2 = n1 // 2
+    m = permuted_idx_to_expanded_idx.shape[0]
+    if h.numel() < m * k2 // 2 or h_sf.numel() < m * k2 // SF_VEC:
+        raise ValueError(
+            "k3_moe_nvfp4_lowm_fc12: h / h_sf hold fewer than the permuted rows' FC1 output"
+        )
+    n_tok = lowm.n_tok_for(orig_m)
+    device = x_fp4.device
+    ctas = _num_sms(_device_index(device))
+    P = _gmem_ptr
+    fc1_ptrs = [
+        P(cutlass.Float4E2M1FN, x_fp4, 32),
+        P(cutlass.Float4E2M1FN, w1, 32),
+        P(cutlass.Float8E4M3FN, x_sf, 16),
+        P(cutlass.Float8E4M3FN, w1_sf, 16),
+        P(cutlass.Float4E2M1FN, h, 32),
+        P(cutlass.Float8E4M3FN, h_sf, 16),
+        P(cutlass.Float32, alpha1),
+        P(cutlass.Int32, tile_idx_to_group_idx),
+        P(cutlass.Int32, tile_idx_to_mn_limit),
+        P(cutlass.Int32, permuted_idx_to_expanded_idx),
+        P(cutlass.Int32, num_non_exiting_tiles),
+        P(cutlass.Float32, fc2_input_scale),
+    ]
+    fc2_ptrs = [
+        P(cutlass.Float4E2M1FN, h, 32),
+        P(cutlass.Float4E2M1FN, w2, 32),
+        P(cutlass.Float8E4M3FN, h_sf, 16),
+        P(cutlass.Float8E4M3FN, w2_sf, 16),
+        P(cutlass.BFloat16, output, 16),
+        P(cutlass.Float32, alpha2),
+        P(cutlass.Int32, tile_idx_to_group_idx),
+        P(cutlass.Int32, tile_idx_to_mn_limit),
+        P(cutlass.Int32, permuted_idx_to_expanded_idx),
+        P(cutlass.Int32, num_non_exiting_tiles),
+        P(cutlass.Float32, token_final_scales),
+    ]
+    use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    base = (_device_index(device), n_tok, n1, k1, top_k, ctas, use_pdl)
+    key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
+    key2 = ("fc2", *base)
+    fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
+    if fc1 is None or fc2 is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "trtllm::k3_moe_nvfp4_lowm_fc12 must run once per configuration outside CUDA-graph capture first"
+            )
+        with _lock:
+            fc1 = _compiled.get(key1)
+            if fc1 is None:
+                kernel = lowm.K3MoeFc1LowMKernel(
+                    n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), use_pdl=use_pdl,
+                    late_trigger=False,
+                )  # fmt: skip
+                fc1 = _compiled[key1] = cute.compile(
+                    kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream
+                )
+            fc2 = _compiled.get(key2)
+            if fc2 is None:
+                kernel = lowm.K3MoeFc2LowMKernel(
+                    n_tok, k1, k2, top_k, use_pdl=use_pdl, early_weights=True
+                )
+                fc2 = _compiled[key2] = cute.compile(
+                    kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream
+                )
+    fc1(*fc1_ptrs, orig_m, m, num_local, stream)
+    fc2(*fc2_ptrs, m, num_local, orig_m, stream)
+
+
+@k3_moe_nvfp4_lowm_fc12.register_fake
+def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
+      permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, h, h_sf, top_k,
+      situ_beta, situ_linear_beta):  # fmt: skip
+    return None
+
+
 def run(
     x_fp4: torch.Tensor,
     x_sf: torch.Tensor,
@@ -230,10 +398,11 @@ def run(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    fc12: Optional[Fc12] = None,
 ) -> torch.Tensor:
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
-    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32)."""
+    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``fc12``: `run_sorted`'s."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
@@ -256,7 +425,7 @@ def run(
     return run_sorted(
         x_fp4, x_sf, (tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                       num_non_exiting_tiles, scales),
-        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas,
+        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas, fc12,
     )  # fmt: skip
 
 
@@ -271,10 +440,13 @@ def run_sorted(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    fc12: Optional[Fc12] = None,
 ) -> torch.Tensor:
     """`k3_moe_nvfp4_lowm` on a routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
     tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales)``, ``moe_sort``'s
-    outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``)."""
+    outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``).
+    ``fc12`` (`new_fc12`): `k3_moe_nvfp4_lowm_fc12` instead, into its buffers, after zeroing ``out`` on the current
+    stream unless ``fc12.zeroed`` (then ``out`` must be given, already zero); ``num_ctas`` does not apply."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     (
         tile_idx_to_group_idx,
@@ -284,6 +456,19 @@ def run_sorted(
         scales,
     ) = sorted_routing
     num_tokens, top_k = scales.shape
+    if fc12 is not None:
+        if out is None:
+            if fc12.zeroed:
+                raise ValueError("run_sorted: fc12.zeroed without the zeroed output")
+            out = torch.empty(num_tokens, w2.shape[1], dtype=torch.bfloat16, device=x_fp4.device)
+        if not fc12.zeroed:
+            out.zero_()
+        torch.ops.trtllm.k3_moe_nvfp4_lowm_fc12(
+            x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, fc12.h, fc12.h_sf, top_k,
+            float(situ_beta), float(situ_linear_beta),
+        )  # fmt: skip
+        return out
     if out is None:
         out = torch.empty(num_tokens, w2.shape[1], dtype=torch.bfloat16, device=x_fp4.device)
     torch.ops.trtllm.k3_moe_nvfp4_lowm(
