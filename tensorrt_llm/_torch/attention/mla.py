@@ -226,6 +226,102 @@ def fp8_block_scaling_bmm_out(
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
 
+# Kimi K3 low-latency switches of the MLA chunked-prefill (context) path. They are read from the environment on
+# every call, because the context server does not load the K3 NVFP4 target's flags module. Each takes 1 (on),
+# 0 (off) or -1 (default: on where the device is in MLA_CTX_FP8_CAPABILITIES):
+# - TRTLLM_K3LL_MLA_CTX_FP8: chunked prefill over cached KV with an FP8 KV cache expands every KV partition with one
+#   FP8 kv_b_proj GEMM writing FP8 K / V (k3_mla_kv_expand), and runs a ragged FP8 FMHA on them. This replaces
+#   kv_b_proj, the [T, H, 192] cat and the attention op's per-partition Q / K / V FP8 copy. Not bit-identical to the
+#   attention op's FMHA.
+# - TRTLLM_K3LL_MLA_CTX_CUTE_FMHA: with TRTLLM_K3LL_MLA_CTX_FP8, that FMHA is the CuTe DSL kernel with exact softmax
+#   correction (k3_mla_ctx_fmha) rather than FlashInfer's trtllm-gen ragged kernel.
+MLA_CTX_FP8_SWITCH = "TRTLLM_K3LL_MLA_CTX_FP8"
+MLA_CTX_CUTE_FMHA_SWITCH = "TRTLLM_K3LL_MLA_CTX_CUTE_FMHA"
+MLA_CTX_FP8_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _mla_ctx_fp8_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_CTX_FP8_CAPABILITIES
+
+
+def _k3ll_ctx_switch_on(name: str, device: torch.device) -> bool:
+    """``name`` (one of the switches above) on ``device``."""
+    raw = os.environ.get(name, "")
+    try:
+        value = -1 if raw == "" else int(raw)
+    except ValueError as err:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from err
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _mla_ctx_fp8_by_default(index)
+
+
+@functools.cache
+def _flashinfer_fp8_ragged_mla():
+    """FlashInfer's trtllm-gen ragged (separate Q / K / V) context FMHA and whether it takes
+    ``skip_all_rows_active_check``, or None."""
+    try:
+        from flashinfer.prefill import trtllm_ragged_attention_deepseek
+    except ImportError:
+        return None
+    import inspect
+
+    params = inspect.signature(trtllm_ragged_attention_deepseek).parameters
+    return trtllm_ragged_attention_deepseek, "skip_all_rows_active_check" in params
+
+
+@functools.cache
+def _mla_ctx_cute_fmha_available() -> bool:
+    try:
+        from ..cute_dsl_kernels.blackwell.k3_mla_ctx_fmha import mla_ctx_cute_fmha_available
+    except ImportError:
+        return False
+    return mla_ctx_cute_fmha_available()
+
+
+_FLASHINFER_WORKSPACE_BYTES = 128 << 20
+_flashinfer_workspaces: Dict[int, torch.Tensor] = {}
+
+
+def _flashinfer_workspace(device: torch.device, min_bytes: int = 0) -> torch.Tensor:
+    """FlashInfer FMHA workspace of at least ``min_bytes`` (128 MiB minimum), grown on demand."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    workspace = _flashinfer_workspaces.get(index)
+    if workspace is None or workspace.numel() < min_bytes:
+        size = max(_FLASHINFER_WORKSPACE_BYTES, -(-min_bytes // (64 << 20)) * (64 << 20))
+        workspace = torch.zeros(size, dtype=torch.uint8, device=device)
+        _flashinfer_workspaces[index] = workspace
+    return workspace
+
+
+_MLA_CTX_FP8_CALLS = [0]
+_mla_ctx_fp8_logged_reasons: set = set()
+
+
+def _count_mla_ctx_fp8(fmha: str, num_tokens: int, num_cached: int, partitions: int) -> None:
+    """Evidence that TRTLLM_K3LL_MLA_CTX_FP8 ran: a log line at powers of two of the layer calls, and the K3 census
+    key ``dispatch:mla_ctx_fp8:<mode>`` where the census is loaded."""
+    from ..pyexecutor.k3ll_flags import k3ll_census_dispatch
+
+    k3ll_census_dispatch("mla_ctx_fp8")
+    _MLA_CTX_FP8_CALLS[0] += 1
+    n = _MLA_CTX_FP8_CALLS[0]
+    if n & (n - 1) == 0:
+        logger.info(
+            f"K3LL mla_ctx_fp8 calls={n} fmha={fmha} new_tokens={num_tokens} "
+            f"cached_tokens={num_cached} kv_partitions={partitions}"
+        )
+
+
+def _log_mla_ctx_fp8_off(reason: str) -> None:
+    """Once per reason: TRTLLM_K3LL_MLA_CTX_FP8 is on but this chunked prefill keeps the attention op's path."""
+    if reason not in _mla_ctx_fp8_logged_reasons:
+        _mla_ctx_fp8_logged_reasons.add(reason)
+        logger.info(f"K3LL mla_ctx_fp8 not taken: {reason}")
+
+
 class MLA(nn.Module):
     def __init__(
         self,
@@ -1131,6 +1227,315 @@ class MLA(nn.Module):
         self._kvbproj_head_weights_cache = (w, w_k, w_v)
         return w_k, w_v
 
+    def _fused_fp8_kv_expand_eligible(self) -> bool:
+        """Whether kv_b_proj can run as k3_mla_kv_expand: an SM100 / SM103 GPU, the K3 / DeepSeek head
+        dimensions and a bias-free FP8 block-scaled kv_b_proj in the DeepGEMM layout (UE8M0-resmoothed weight with
+        the packed int32 scale that fp8_swap_ab_gemm consumes)."""
+        weight = getattr(self.kv_b_proj, "weight", None)
+        cached = getattr(self, "_fused_fp8_kv_expand_cache", None)
+        if cached is not None and cached[0] is weight:
+            return cached[1]
+        scale = getattr(self.kv_b_proj, "weight_scale", None)
+        n = self.num_heads_tp * (self.qk_nope_head_dim + self.v_head_dim)
+        words = math.ceil(self.kv_lora_rank / (128 * 4))
+        eligible = (
+            IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() in (100, 103)
+            and self.qk_nope_head_dim == 128
+            and self.qk_rope_head_dim == 64
+            and self.v_head_dim == 128
+            and self.kv_lora_rank % 128 == 0
+            and getattr(self.kv_b_proj, "bias", None) is None
+            and weight is not None
+            and weight.dtype == torch.float8_e4m3fn
+            and tuple(weight.shape) == (n, self.kv_lora_rank)
+            and scale is not None
+            and scale.dtype == torch.int32
+            and tuple(scale.shape) == (n, words)
+            and scale.stride(0) == 1
+        )
+        self._fused_fp8_kv_expand_cache = (weight, eligible)
+        return eligible
+
+    def _fused_fp8_kv_expand(
+        self, compressed_kv: torch.Tensor, k_pe: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """kv_b_proj + RoPE concat in one FP8 GEMM -> contiguous E4M3 (k [T, H * qk_head_dim], v [T, H * v_head_dim]),
+        the unit-scale conversion of the BF16 K / V of kv_b_proj + cat (what the attention op's FP8 context path
+        quantizes them to)."""
+        from ..cute_dsl_kernels.blackwell import k3_mla_kv_expand  # noqa: F401  (registers the op)
+
+        num_tokens = compressed_kv.shape[0]
+        k = compressed_kv.new_empty(
+            num_tokens, self.num_heads_tp * self.qk_head_dim, dtype=torch.float8_e4m3fn
+        )
+        v = compressed_kv.new_empty(
+            num_tokens, self.num_heads_tp * self.v_head_dim, dtype=torch.float8_e4m3fn
+        )
+        torch.ops.trtllm.k3_mla_kv_expand(
+            compressed_kv.contiguous(),
+            k_pe.reshape(num_tokens, self.qk_rope_head_dim),
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale,
+            k,
+            v,
+            self.num_heads_tp,
+        )
+        return k, v
+
+    def _mla_ctx_fp8_fmha(self, device: torch.device) -> Optional[str]:
+        """The FMHA TRTLLM_K3LL_MLA_CTX_FP8 runs on ``device``: "cute", "trtllm-gen", or None if neither is
+        importable."""
+        if _k3ll_ctx_switch_on(MLA_CTX_CUTE_FMHA_SWITCH, device) and _mla_ctx_cute_fmha_available():
+            return "cute"
+        return "trtllm-gen" if _flashinfer_fp8_ragged_mla() is not None else None
+
+    def _use_fp8_direct_chunked_prefill(self, q: torch.Tensor, output: torch.Tensor) -> bool:
+        """Whether this chunked prefill runs TRTLLM_K3LL_MLA_CTX_FP8 (FP8 K / V from k3_mla_kv_expand + a ragged
+        FP8 FMHA). Needs the switch, the fused expansion, an FP8 KV cache (the attention op would run its FP8 context
+        FMHA with unit KV scales), BF16 Q / output without an output scale, no Helix CP or sparse attention, and an
+        FMHA kernel."""
+        if not _k3ll_ctx_switch_on(MLA_CTX_FP8_SWITCH, q.device):
+            return False
+        mha = self.mha
+        if not self._fused_fp8_kv_expand_eligible():
+            reason = "kv_b_proj is not an FP8 block-scaled DeepGEMM weight (or not SM100 / SM103)"
+        elif not isinstance(mha, TrtllmAttention) or not mha.has_fp8_kv_cache:
+            reason = "no FP8 KV cache"
+        elif mha.uses_fp4_mla_attention or mha.sparse_params is not None:
+            reason = "FP4 MLA or sparse attention"
+        elif self.mapping.has_cp_helix():
+            reason = "Helix CP"
+        elif (
+            self.out_scale is not None
+            or q.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+        ):
+            reason = "output scale or non-BF16 Q / output"
+        elif self._mla_ctx_fp8_fmha(q.device) is None:
+            reason = "no ragged FP8 FMHA (FlashInfer)"
+        else:
+            return True
+        _log_mla_ctx_fp8_off(reason)
+        return False
+
+    _mla_ctx_fp8_warmed: set = set()
+
+    def _warmup_mla_ctx_fp8(self, q: torch.Tensor, output: torch.Tensor) -> None:
+        """Compile the fused expansion (both k_pe layouts) and the FMHA (causal and not) once per process; otherwise
+        the first context step that reads cached KV pays the CuTe DSL compiles."""
+        if not self._use_fp8_direct_chunked_prefill(q, output):
+            return
+        fmha = self._mla_ctx_fp8_fmha(q.device)
+        key = (self.num_heads_tp, self.kv_lora_rank, fmha, q.device)
+        if key in MLA._mla_ctx_fp8_warmed:
+            return
+        MLA._mla_ctx_fp8_warmed.add(key)
+        latent = q.new_zeros(1, self.kv_lora_rank + self.qk_rope_head_dim)
+        compressed_kv = latent[:, : self.kv_lora_rank].contiguous()
+        # Chunk loads give a contiguous k_pe; the last partition slices latent_cache.
+        for k_pe in (latent[:, self.kv_lora_rank :].contiguous(), latent[:, self.kv_lora_rank :]):
+            k, v = self._fused_fp8_kv_expand(compressed_kv, k_pe)
+        heads = self.num_heads_tp
+        cu = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
+        for causal in (True, False):
+            self._fp8_ragged_attention(
+                q.new_zeros(1, heads * self.qk_head_dim, dtype=torch.float8_e4m3fn),
+                k,
+                v,
+                q.new_empty(1, heads * self.v_head_dim),
+                torch.empty(1, heads, dtype=torch.float, device=q.device),
+                cu[1:],
+                cu,
+                cu,
+                1,
+                1,
+                causal=causal,
+            )
+
+    def _fp8_ragged_attention(
+        self,
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        v_fp8: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        kv_lens: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_kv: torch.Tensor,
+        max_q: int,
+        max_kv: int,
+        causal: bool,
+    ) -> None:
+        """Ragged FP8 FMHA over requests that all have query and KV tokens. Writes out [Tq, H * v] (BF16) and the
+        base-2 log-sum-exp of the scaled logits [Tq, H]; ``causal`` is the bottom-right aligned mask."""
+        mha = cast(TrtllmAttention, self.mha)
+        num_tokens = q_fp8.shape[0]
+        heads = self.num_heads_tp
+        softmax_scale = 1.0 / (mha.q_scaling * math.sqrt(self.qk_head_dim))
+        if self._mla_ctx_fp8_fmha(q_fp8.device) == "cute":
+            from ..cute_dsl_kernels.blackwell.k3_mla_ctx_fmha import mla_ctx_cute_fmha
+
+            mla_ctx_cute_fmha(
+                q_fp8.view(num_tokens, heads, self.qk_head_dim),
+                k_fp8.view(k_fp8.shape[0], heads, self.qk_head_dim),
+                v_fp8.view(v_fp8.shape[0], heads, self.v_head_dim),
+                out.view(num_tokens, heads, self.v_head_dim),
+                lse,
+                cu_q,
+                cu_kv,
+                max_q,
+                max_kv,
+                softmax_scale,
+                causal,
+            )
+            return
+        ragged, takes_skip_check = _flashinfer_fp8_ragged_mla()
+        # trtllm-gen keeps float2 softmax stats for heads x requests x round_up(max_q, 256) rows in the workspace
+        # when it returns the LSE; the rest is scratch.
+        stats_bytes = 8 * heads * (cu_q.numel() - 1) * (-(-max_q // 256) * 256)
+        kwargs = {"skip_all_rows_active_check": True} if takes_skip_check else {}
+        ragged(
+            q_fp8.view(num_tokens, heads, self.qk_head_dim),
+            k_fp8.view(k_fp8.shape[0], heads, self.qk_head_dim),
+            v_fp8.view(v_fp8.shape[0], heads, self.v_head_dim),
+            _flashinfer_workspace(q_fp8.device, stats_bytes + (32 << 20)),
+            kv_lens,
+            max_q,
+            max_kv,
+            softmax_scale,
+            1.0,
+            1.0,
+            cu_q.numel() - 1,
+            -1,
+            cu_q,
+            cu_kv,
+            False,
+            causal,
+            True,
+            out=out.view(num_tokens, heads, self.v_head_dim),
+            lse=lse,
+            **kwargs,
+        )
+
+    def forward_context_with_chunked_prefill_fp8(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """forward_context_with_chunked_prefill under TRTLLM_K3LL_MLA_CTX_FP8.
+
+        Q is quantized once (unit scale, as the attention op's FP8 context path does per partition). Every KV
+        partition is expanded to FP8 K / V by k3_mla_kv_expand and attended by the ragged FP8 FMHA, and the
+        partitions merge as in the default path. A KV partition only holds the cached tokens of some requests:
+        the FMHA gets each contiguous run of those requests (zero-copy row slices); the merge skips the rows of the
+        other requests (merge_op 0). The merge takes (max, sum) softmax stats in natural-log units, and
+        (lse * ln 2, 1) is an equivalent pair for the FMHA's base-2 LSE.
+        """
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        num_contexts = attn_metadata.num_contexts
+        num_tokens = q.shape[0]
+        q_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            q, trtllm_attention.kv_scale_orig_quant
+        )
+        self.softmax_stats_tensor = torch.empty(
+            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2), dtype=torch.float, device=q.device
+        )
+        temp_stats = torch.empty_like(self.softmax_stats_tensor)
+        temp_stats[..., 1] = 1.0
+        lse = torch.empty((num_tokens, self.num_heads_tp), dtype=torch.float, device=q.device)
+        temp_out = q.new_empty((num_tokens, self.num_heads_tp * self.v_head_dim))
+        cu_q = attn_metadata.ctx_uncached_token_indptr[: num_contexts + 1]
+        host_cu_q = attn_metadata.host_ctx_uncached_token_indptr[: num_contexts + 1].tolist()
+        q_lens = [host_cu_q[i + 1] - host_cu_q[i] for i in range(num_contexts)]
+
+        def merge(loop_idx: int) -> None:
+            torch.mul(lse, math.log(2.0), out=temp_stats[..., 0])
+            trtllm_attention.merge_attention_for_mla(
+                output,
+                temp_out,
+                self.softmax_stats_tensor,
+                temp_stats,
+                attn_metadata.merge_op_tensor[loop_idx],
+                attn_metadata,
+            )
+
+        num_cached = 0
+        for loop_idx in range(attn_metadata.chunked_loop_num):
+            host_cu_kv = attn_metadata.host_cu_chunked_seq_len[
+                loop_idx, : num_contexts + 1
+            ].tolist()
+            kv_lens = [host_cu_kv[i + 1] - host_cu_kv[i] for i in range(num_contexts)]
+            num_cached += host_cu_kv[num_contexts]
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                num_ctx_cached_tokens=host_cu_kv[num_contexts],
+                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
+                chunked_max_seq_len=attn_metadata.max_chunk_len_per_loop[loop_idx],
+                out_dtype=q.dtype,
+            )
+            k_fp8, v_fp8 = self._fused_fp8_kv_expand(chunked_compressed_kv, chunked_k_pe)
+            chunked_compressed_kv = None
+            chunked_k_pe = None
+            cu_kv = attn_metadata.cu_chunked_seq_len[loop_idx]
+            begin = 0
+            while begin < num_contexts:
+                if kv_lens[begin] == 0 or q_lens[begin] == 0:
+                    begin += 1
+                    continue
+                end = begin + 1
+                while end < num_contexts and kv_lens[end] > 0 and q_lens[end] > 0:
+                    end += 1
+                qs, qe = host_cu_q[begin], host_cu_q[end]
+                ks, ke = host_cu_kv[begin], host_cu_kv[end]
+                self._fp8_ragged_attention(
+                    q_fp8[qs:qe],
+                    k_fp8[ks:ke],
+                    v_fp8[ks:ke],
+                    temp_out[qs:qe],
+                    lse[qs:qe],
+                    attn_metadata.chunked_seq_len[loop_idx, begin:end],
+                    (cu_q[begin : end + 1] - qs).to(torch.int32),
+                    (cu_kv[begin : end + 1] - ks).to(torch.int32),
+                    max(q_lens[begin:end]),
+                    max(kv_lens[begin:end]),
+                    causal=False,
+                )
+                begin = end
+            k_fp8 = None
+            v_fp8 = None
+            merge(loop_idx)
+
+        # The uncached tokens attend to themselves causally.
+        _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], -1
+        )
+        k_fp8, v_fp8 = self._fused_fp8_kv_expand(compressed_kv, k_pe)
+        cu_q32 = cu_q.to(torch.int32)
+        self._fp8_ragged_attention(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            temp_out,
+            lse,
+            cu_q32[1:] - cu_q32[:-1],
+            cu_q32,
+            cu_q32,
+            max(q_lens),
+            max(q_lens),
+            causal=True,
+        )
+        merge(attn_metadata.chunked_loop_num)
+        _count_mla_ctx_fp8(
+            self._mla_ctx_fp8_fmha(q.device), num_tokens, num_cached, attn_metadata.chunked_loop_num
+        )
+        return output
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -1279,6 +1684,10 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if self._use_fp8_direct_chunked_prefill(q, output):
+            return self.forward_context_with_chunked_prefill_fp8(
+                q, compressed_kv, latent_cache, attn_metadata, output
+            )
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
@@ -1540,6 +1949,8 @@ class MLA(nn.Module):
                     q.dtype,
                     q.device,
                 )
+                if attn_metadata.runtime_features.chunked_prefill:
+                    self._warmup_mla_ctx_fp8(q, output)
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
