@@ -101,9 +101,19 @@ def test_sm100_mxfp4_keeps_its_own_model(moe_tp: int, moe_ep: int) -> None:
     assert target.forward is not modeling.ModelingV2KimiK3.forward
 
 
-def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> None:
+def _bare_fp8_mla():
+    """A K3DecodeMLA with only what ``prepare_fp8_decode_weights`` reads: no Helix (TP: the decode head group starts at
+    head 0), one 128-row head, so Q-B's rows are the 128 x 128 test weight."""
     attention = modeling.K3DecodeMLA.__new__(modeling.K3DecodeMLA)
     torch.nn.Module.__init__(attention)
+    attention.mapping = SimpleNamespace(has_cp_helix=lambda: False, cp_rank=0)
+    attention.num_heads_tp_cp = 1
+    attention.qk_head_dim = 128
+    return attention
+
+
+def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> None:
+    attention = _bare_fp8_mla()
     codes = torch.ones(128, 128).to(torch.float8_e4m3fn)
     scales = torch.full((1, 1), 0.125)
     attention.q_b_proj = SimpleNamespace(
@@ -132,8 +142,7 @@ def test_fp8_mla_preserves_raw_query_weights_before_backend_transformation() -> 
     ],
 )
 def test_fp8_mla_query_recipe_handles_weight_read_specialization(monkeypatch, backend, ue8m0):
-    attention = modeling.K3DecodeMLA.__new__(modeling.K3DecodeMLA)
-    torch.nn.Module.__init__(attention)
+    attention = _bare_fp8_mla()
     codes = torch.ones(128, 128).to(torch.float8_e4m3fn)
     scales = torch.full((1, 1), 0.125)
     attention.q_b_proj = SimpleNamespace(
