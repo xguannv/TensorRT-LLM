@@ -5016,3 +5016,82 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+# ===========================================================================
+# Long-prefill demotion (TRTLLM_K3LL_CTX_DEMOTE_*)
+# ===========================================================================
+
+
+class TestLongPrefillDemotion:
+    """A context request with more uncached tokens than the threshold goes to
+    the tail of the iteration's context order; it is reordered, never capped."""
+
+    @staticmethod
+    def _sched(monkeypatch, mgr, threshold=2000, max_iters=0, max_num_tokens=1024):
+        if threshold is not None:
+            monkeypatch.setenv("TRTLLM_K3LL_CTX_DEMOTE_UNCACHED_TOKENS", str(threshold))
+        monkeypatch.setenv("TRTLLM_K3LL_CTX_DEMOTE_MAX_ITERS", str(max_iters))
+        return make_scheduler(mgr, max_num_tokens=max_num_tokens, ctx_chunk_config=(None, 64))
+
+    def test_off_by_default_is_fcfs(self, monkeypatch):
+        mgr = make_kv_cache_manager()
+        sched = self._sched(monkeypatch, mgr, threshold=None)
+        long_req = make_ctx_request(0, context_remaining_length=5000)
+        short_req = make_ctx_request(1, context_remaining_length=100)
+        out = sched.schedule_request([long_req, short_req], set())
+        assert ids(out.context_requests) == [0]
+        assert long_req.context_chunk_size == 1024
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_needs_chunked_prefill(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_K3LL_CTX_DEMOTE_UNCACHED_TOKENS", "2000")
+        sched = make_scheduler(make_kv_cache_manager(), max_num_tokens=1024)
+        assert sched._ctx_demote_uncached_tokens == 0
+
+    def test_long_request_goes_behind_short_one(self, monkeypatch):
+        mgr = make_kv_cache_manager()
+        sched = self._sched(monkeypatch, mgr)
+        long_req = make_ctx_request(0, context_remaining_length=5000)
+        short_req = make_ctx_request(1, context_remaining_length=100)
+        out = sched.schedule_request([long_req, short_req], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert short_req.context_chunk_size == 100
+        # Takes what the short request leaves, rounded down to the chunk unit.
+        assert long_req.context_chunk_size == 896
+
+    def test_cached_prefix_is_not_long(self, monkeypatch):
+        mgr = make_kv_cache_manager()
+        # 4500 of the 5000 prompt tokens are reusable: 500 uncached.
+        mgr.probe_context_reuse.side_effect = lambda req: 4500 if req.py_request_id == 0 else None
+        sched = self._sched(monkeypatch, mgr)
+        long_prompt = make_ctx_request(0, context_remaining_length=5000)
+        short_req = make_ctx_request(1, context_remaining_length=100)
+        out = sched.schedule_request([long_prompt, short_req], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_mid_prefill_uses_exact_remainder(self, monkeypatch):
+        mgr = make_kv_cache_manager()
+        sched = self._sched(monkeypatch, mgr)
+        tail = make_ctx_request(0, context_remaining_length=1500, is_first_context_chunk=False)
+        tail.context_current_position = 3500
+        short_req = make_ctx_request(1, context_remaining_length=100)
+        out = sched.schedule_request([tail, short_req], set())
+        assert ids(out.context_requests) == [0]
+        # Only the request still waiting for its first chunk is probed.
+        assert [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list] == [1]
+
+    def test_aging_bound_lets_request_through(self, monkeypatch):
+        mgr = make_kv_cache_manager()
+        sched = self._sched(monkeypatch, mgr, max_iters=2, max_num_tokens=256)
+        long_req = make_ctx_request(0, context_remaining_length=5000)
+        short_req = make_ctx_request(1, context_remaining_length=256)
+        for _ in range(2):
+            out = sched.schedule_request([long_req, short_req], set())
+            assert ids(out.context_requests) == [1]
+        out = sched.schedule_request([long_req, short_req], set())
+        assert ids(out.context_requests) == [0]
+        # Probed once while waiting, not on every iteration.
+        assert [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list].count(
+            0
+        ) == 1

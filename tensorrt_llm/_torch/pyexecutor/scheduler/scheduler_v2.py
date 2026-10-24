@@ -261,6 +261,36 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
 
+        # Opt-in (default off): long-prefill demotion. Context admission is
+        # FCFS, so a several-hundred-K-token prefill takes the whole chunk
+        # budget for as many iterations as it needs while the short, mostly
+        # cached turns behind it wait. A context request whose uncached prefill
+        # exceeds this many tokens goes to the tail of the iteration's context
+        # order (FCFS within each class) and takes whatever budget the others
+        # leave: reordered, never capped. Before the first chunk the uncached
+        # length is estimated once with a read-only radix probe
+        # (probe_context_reuse: the same tokens, backoff and hybrid-snapshot
+        # truncation as prepare_context_cache); once mid-prefill the exact
+        # remainder is used, which releases the request when less than the
+        # threshold is left. Needs chunked prefill.
+        demote_uncached = int(os.environ.get("TRTLLM_K3LL_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
+        self._ctx_demote_uncached_tokens = max(0, demote_uncached) if self.chunking_enabled else 0
+        # A request demoted this many consecutive iterations is let through in
+        # arrival order until it is scheduled (0 = no bound).
+        self._ctx_demote_max_iters = max(
+            0, int(os.environ.get("TRTLLM_K3LL_CTX_DEMOTE_MAX_ITERS", "0"))
+        )
+        self._ctx_demote_skips: dict[int, int] = {}
+        # request id -> uncached-token estimate from the probe, kept only for
+        # requests still waiting for their first chunk.
+        self._ctx_uncached_estimates: dict[int, int] = {}
+        if self._ctx_demote_uncached_tokens:
+            logger.info(
+                "KVCacheV2Scheduler: demoting context requests with more than "
+                f"{self._ctx_demote_uncached_tokens} uncached tokens left "
+                f"(max consecutive iterations: {self._ctx_demote_max_iters or 'unbounded'})"
+            )
+
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
@@ -566,6 +596,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
+        demoted_ids: set[int] = set()
+        let_through_ids: set[int] = set()
+        if self._ctx_demote_uncached_tokens:
+            pending_ctx, demoted_ids, let_through_ids = self._defer_long_context(pending_ctx)
+
         for req in pending_ctx:
             if budget.requests_full:
                 break
@@ -649,6 +684,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        if self._ctx_demote_uncached_tokens:
+            # Consecutive iterations spent demoted; a let-through request keeps
+            # its count until it is scheduled. Rebuilt every iteration from the
+            # requests seen this iteration, so it cannot leak.
+            scheduled_ids = {req.py_request_id for req in scheduled_ctx}
+            self._ctx_demote_skips = {
+                rid: self._ctx_demote_skips.get(rid, 0) + 1 for rid in demoted_ids
+            } | {
+                rid: self._ctx_demote_skips.get(rid, 0)
+                for rid in let_through_ids
+                if rid not in scheduled_ids
+            }
+
         made_progress = bool(
             scheduled_gen
             or scheduled_ctx
@@ -687,6 +735,65 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    # ---- Long-prefill demotion ----
+
+    def _uncached_context_tokens(self, req: LlmRequest) -> int:
+        """Uncached prefill tokens *req* still has.
+
+        Mid-prefill the cursor already sits past the reused prefix, so the
+        remainder is exact. Before the first chunk the reusable depth comes
+        from one read-only probe, cached until the request starts.
+        """
+        if not req.is_first_context_chunk:
+            return req.context_remaining_length
+        estimate = self._ctx_uncached_estimates.get(req.py_request_id)
+        if estimate is None:
+            reusable = self.kv_cache_manager.probe_context_reuse(req)
+            # None: reuse is off (nothing cached) or the request already holds a
+            # cache claim, whose reuse is reflected in the remaining length.
+            estimate = req.context_remaining_length - (reusable or 0)
+        return estimate
+
+    def _defer_long_context(
+        self, pending_ctx: RequestList
+    ) -> tuple[RequestList, set[int], set[int]]:
+        """Move long context requests to the tail of this iteration's order.
+
+        Returns the new order, the ids demoted and the ids the aging bound let
+        through in arrival order.
+        """
+        keep: RequestList = []
+        deferred: RequestList = []
+        let_through: set[int] = set()
+        estimates: dict[int, int] = {}
+        threshold = self._ctx_demote_uncached_tokens
+        for req in pending_ctx:
+            if req.state_value != self._context_init_state_value:
+                keep.append(req)
+                continue
+            uncached = self._uncached_context_tokens(req)
+            if req.is_first_context_chunk:
+                estimates[req.py_request_id] = uncached
+            if uncached > threshold:
+                aged_out = (
+                    self._ctx_demote_max_iters > 0
+                    and self._ctx_demote_skips.get(req.py_request_id, 0)
+                    >= self._ctx_demote_max_iters
+                )
+                if not aged_out:
+                    if req.py_request_id not in self._ctx_demote_skips:
+                        logger.debug(
+                            f"Demoting context request {req.py_request_id}: "
+                            f"{uncached} uncached tokens > {threshold}"
+                        )
+                    deferred.append(req)
+                    continue
+                let_through.add(req.py_request_id)
+            keep.append(req)
+        # Only requests still waiting for their first chunk keep an estimate.
+        self._ctx_uncached_estimates = estimates
+        return keep + deferred, {req.py_request_id for req in deferred}, let_through
 
     # ---- Prefix-aware skip ----
 
