@@ -37,7 +37,7 @@ Checks:
     ``ColTail`` handed on runs ``tail_col_attn_res`` (the attention's input its ``normed``); with that refused the
     rows are copied out and the torch add + fused attn_res runs (``updated`` the same bits; census key counted once
     per fused call).
-  * graphs (16, 24, 32 rows): two engaged layers with the decode workspace's other users between them
+  * graphs (16, 24, 28, 32 rows): two engaged layers with the decode workspace's other users between them
     (``allreduce_attn_res`` two-shot), captured with multi-stream on (the shared expert on the side stream), replayed
     6 times alternately with new inputs (the Lamport rotation goes round twice per replay), one rank late on every
     other replay, with eager steps in between: bit for bit the eager run, the other users' outputs their eager values.
@@ -66,9 +66,9 @@ SNAPSHOTS = 3
 ATTN_RES_BLOCK = 4
 RES_EPS = 1e-5
 LAT_EPS = 1e-6
-ROWS = (9, 16, 17, 24, 32)
-GRAPH_ROWS = (16, 24, 32)
-REPLAY_ORDER = (16, 32, 24, 16, 24, 32)
+ROWS = (9, 16, 17, 24, 28, 32)  # 28: MTP6 bs4
+GRAPH_ROWS = (16, 24, 28, 32)
+REPLAY_ORDER = (16, 32, 24, 28, 16, 24, 32, 28)
 NORMED_REL = 2e-2  # fast attn_res kernel vs fp32 (as the kernel's own tests)
 LATENT_REL = 1e-2  # the RMSNorm'd latent vs fp32: a bf16 rounding or two
 OUT_ROUND = 2.0**-8  # the published element's bf16 rounding, relative (module docstring)
