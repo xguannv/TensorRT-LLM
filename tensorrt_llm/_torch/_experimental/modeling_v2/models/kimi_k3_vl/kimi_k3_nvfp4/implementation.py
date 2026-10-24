@@ -4358,7 +4358,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
                 # The lowm MoE decode path's bf16 GEMVs (decode_moe_lowm.py): a wide step's head, shared gate_up
                 # and tail, and the replicated tail's latent up projection.
                 sites += ("moe_head", "moe_shared_gate_up", "moe_tail", "moe_up")
-                if _flags.TRTLLM_K3LL_MOE_TAIL_LU:
+                if _moe_tail_lu.enabled():
                     # The shared experts' down projection with its own all-reduce (moe_tail_lu.py).
                     sites += (_moe_tail_lu.SHARED_SITE,)
             if _flags.TRTLLM_K3LL_KDA_BFA_GEMV:
@@ -4614,7 +4614,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         latent workspace) and each MoE layer's FP8 latent_up, built before the latent norm is folded. Returns the
         layers' weights by ``id(moe)``; empty where the switch is off at load or a layer or the target does not take
         it (every rank decides alike: shapes and the TP size)."""
-        if not _flags.TRTLLM_K3LL_MOE_TAIL_LU:
+        if not _moe_tail_lu.enabled():
             return {}
         mapping = self.tp_mapping
         gemvs = self.model.decode_gemvs

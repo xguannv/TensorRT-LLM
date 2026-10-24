@@ -25,11 +25,29 @@ def _sm10x() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-def test_switch_default_off_and_documented():
+def test_switch_default_sm103_and_documented():
     flags = _mod("flags")
     value, default, doc = flags.flags()["TRTLLM_K3LL_MOE_TAIL_LU"]
-    assert default == 0
-    assert "LOSSY" in doc and "MB per layer" in doc
+    assert default == -1
+    assert "LOSSY" in doc and "MB per layer" in doc and "SM103" in doc
+    assert _mod("moe_tail_lu").MOE_TAIL_LU_CAPABILITIES == ((10, 3),)
+
+
+@pytest.mark.parametrize(
+    "value,capability,on",
+    [(1, (10, 3), True), (1, (10, 7), True), (0, (10, 3), False), (-1, (10, 3), True), (-1, (10, 7), False),
+     (-1, (10, 0), False)],
+)
+def test_enabled_value(monkeypatch, value, capability, on):
+    lu = _mod("moe_tail_lu")
+    monkeypatch.setattr(lu._flags, "TRTLLM_K3LL_MOE_TAIL_LU", value)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: capability)
+    lu._on_by_default.cache_clear()
+    try:
+        assert lu.enabled() is on
+    finally:
+        lu._on_by_default.cache_clear()
 
 
 def test_shared_site_is_optional():
