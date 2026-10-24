@@ -249,14 +249,17 @@ def build_k3_mla_fp8_kv(num_heads: int = 96, max_positions: int = 1024, seed: in
 
 
 def context_metadata(manager, mapping, seq_lens, cached_lens, runtime_features=None):
-    """Context-phase metadata of ``seq_lens`` new tokens over ``cached_lens`` cached tokens per request."""
+    """Context-phase metadata of ``seq_lens`` new tokens over ``cached_lens`` cached tokens per request.
+
+    ``prompt_lens`` is the chunk's own length, as the executor sets it for a context chunk (the chunked-prefill path
+    reads it as the query lengths of the last, causal partition)."""
     kwargs = {} if runtime_features is None else {"runtime_features": runtime_features}
     metadata = get_attention_backend("TRTLLM").Metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
         request_ids=list(range(len(seq_lens))),
         max_num_requests=len(seq_lens),
         num_contexts=len(seq_lens),
-        prompt_lens=[s + c for s, c in zip(seq_lens, cached_lens)],
+        prompt_lens=list(seq_lens),
         max_num_tokens=sum(seq_lens),
         kv_cache_manager=manager,
         kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=list(cached_lens)),
