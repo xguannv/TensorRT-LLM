@@ -1310,6 +1310,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             ):
                 unread = k3_markov_op.unread_logits(*base.shape, base.device)
             fast["store_corrected"] = unread is None
+            _census.count(f"dispatch:drafter_markov_fast:{_census.mode()}")
         corrected, tokens, next_new = chain(
             self.mapping,
             base,

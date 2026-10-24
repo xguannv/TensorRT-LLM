@@ -392,7 +392,7 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
 )
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
-    0,
+    1,
     "with TRTLLM_K3LL_DRAFTER_MARKOV_V2: the MMA build's bias fragments by ldmatrix, and no store of the corrected "
     "logits on steps where only its tokens are read (greedy drafts, no lilicorr / DFlash 2 selector); the same "
     "tokens and next_new bit for bit (read at forward time)",
