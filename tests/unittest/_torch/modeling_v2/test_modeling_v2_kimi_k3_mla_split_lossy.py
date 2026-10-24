@@ -157,7 +157,12 @@ def _errors(v, stats, v_ref, lse_ref):
     return rel, lse
 
 
-CASES = {"bs4_150k": (4, 153600), "bs4_500k": (4, 512000), "bs3_64k": (3, 65536)}
+CASES = {
+    "bs4_150k": (4, 153600),
+    "bs4_500k": (4, 512000),
+    "bs3_64k": (3, 65536),
+    "bs2_150k": (2, 153600),
+}
 
 
 @pytest.mark.parametrize("case", list(CASES))
@@ -217,11 +222,13 @@ def test_below_min_batch_and_off_unchanged(monkeypatch):
 def test_softmax_tail_kept(monkeypatch):
     """The lowered bias still keeps oak's softmax tail (the current kernel's bound)."""
     vu = _vu()
-    dcp, _, _, _ = _mods()
+    dcp, _, _, census = _mods()
     monkeypatch.setattr(dcp, "SPLIT_LOSSY_MIN_BATCH", 1)
     for mode in MODES.values():
         with _switch(monkeypatch, mode):
+            count = _lossy_count(census)
             err, _ = vu._tail_error(torch.device("cuda"))
+            assert _lossy_count(census) == count + 1, "the tail case did not take the lossy path"
         print(f"[tail] mode {mode}: V rows vs fp32 {err:.4f}")
         assert err < 0.015, f"mode {mode}: the softmax tail is lost ({err:.4f})"
 

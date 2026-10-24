@@ -104,8 +104,10 @@ def split_pipe_on(device: torch.device) -> bool:
 
 #: ``TRTLLM_K3LL_MLA_SPLIT_LOSSY``: the compute capabilities its -1 turns on, and the fewest requests of a step that
 #: take it.
+#: Measured (GB300, op bench, split + reduce per layer): bs2 -1.7 to -2.8 us, bs4 -1.9 to -3.6 us at 64K-500K; bs1 not
+#: measured.
 MLA_SPLIT_LOSSY_CAPABILITIES = ((10, 3),)
-SPLIT_LOSSY_MIN_BATCH = 3
+SPLIT_LOSSY_MIN_BATCH = 2
 
 
 def split_lossy_bits(device: torch.device, batch: int) -> int:
