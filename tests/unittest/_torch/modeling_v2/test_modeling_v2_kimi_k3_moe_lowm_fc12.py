@@ -111,9 +111,10 @@ def _wide_layer(dm, monkeypatch, calls):
         front_head=lambda rows, front32=None: object(),
         head32=None,
         lu=None,
+        col=None,
         fc12=SimpleNamespace(begin=begin),
     )
-    layer.lu = None
+    layer.lu, layer.col = None, None
     layer.shared_cols = 384
     layer.experts = (None, None, None, torch.zeros(1, 3584, 1))
 
@@ -123,6 +124,7 @@ def _wide_layer(dm, monkeypatch, calls):
 
     layer._front_routed = front_routed
     monkeypatch.setattr(dm._tail_lu, "takes", lambda *args: False)
+    monkeypatch.setattr(dm._tail_col, "takes", lambda *args: False)
     return layer
 
 
