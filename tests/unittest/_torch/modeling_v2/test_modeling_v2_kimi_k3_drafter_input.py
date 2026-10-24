@@ -117,9 +117,91 @@ def _same(a, b, what):
 
 def test_switches_are_registered_on_by_default():
     table = _pkg("flags").flags()
-    for name in ("TRTLLM_K3LL_DRAFTER_PREP_FUSED", "TRTLLM_K3LL_DRAFTER_CTX_SIDE"):
+    for name in (
+        "TRTLLM_K3LL_DRAFTER_PREP_FUSED",
+        "TRTLLM_K3LL_DRAFTER_CTX_SIDE",
+        "TRTLLM_K3LL_DRAFTER_PREP_SPLIT",
+    ):
         assert name in table
         assert table[name][1] == 1, f"{name} must default to 1"
+
+
+@needs_cuda
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("block", [7, 8])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+def test_prep_split_is_bit_identical(batch, block, pdl, monkeypatch):
+    """``TRTLLM_K3LL_DRAFTER_PREP_SPLIT`` on vs off at the K3 hidden size (7168): every `drafter_input_prep` output,
+    the ``ctx_len`` state of every slot and ``seq_lens``, and `noise_block` with and without a trained mask row, bit
+    for bit (a dummy slot among the requests, contexts at the ceiling and one page short, rows in and out of the
+    vocabulary shard)."""
+    prep = _pkg("mla_drafter_prep")
+    flags = _pkg("flags")
+    hidden, shard, page, k, slots, max_ctx = 7168, 4096, 64, 7, 10, 20_000
+    g = torch.Generator(device="cuda").manual_seed(batch * 10 + block)
+    emb = (torch.randn(shard, hidden, generator=g, device="cuda") * 0.02).bfloat16()
+    freqs = torch.polar(
+        torch.ones(max_ctx + 64, 32, device="cuda"),
+        torch.rand(max_ctx + 64, 32, generator=g, device="cuda"),
+    )
+    accepted = torch.randint(
+        0, 2 * shard, (batch, k + 1), generator=g, device="cuda", dtype=torch.int32
+    )
+    num_acc = torch.randint(1, k + 2, (batch,), generator=g, device="cuda", dtype=torch.int32)
+    slot_ids = torch.randperm(slots - 1, generator=torch.Generator().manual_seed(batch))[
+        :batch
+    ].cuda()
+    if batch > 1:
+        slot_ids[-1] = slots - 1  # a padding row on the dummy slot
+    ctx0 = torch.randint(0, max_ctx, (slots,), generator=g, device="cuda", dtype=torch.int64)
+    ctx0[slot_ids[0]] = max_ctx - 2
+    counts = (ctx0[slot_ids] + k + 1 + page - 1) // page
+    counts[0] -= 1  # one page short
+    table = torch.randint(0, 100_000, (batch, 400), generator=g, device="cuda", dtype=torch.int32)
+    out = {}
+    for split in (0, 1):
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_DRAFTER_PREP_SPLIT", split)
+        ctx_len = ctx0.clone()
+        seq_lens = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        o = prep.drafter_input_prep(
+            accepted,
+            num_acc,
+            slot_ids.to(torch.int64),
+            ctx_len,
+            counts,
+            table,
+            seq_lens,
+            freqs,
+            emb,
+            0,
+            shard,
+            3,
+            max_ctx,
+            slots - 1,
+            page,
+            block,
+            (1000, 576),
+            pdl,
+        )
+        reduced = o.lookup.clone()
+        mask_row = (
+            torch.randn(
+                hidden, generator=torch.Generator(device="cuda").manual_seed(5), device="cuda"
+            )
+        ).bfloat16()
+        noise = (
+            prep.noise_block(reduced, block, None, pdl),
+            prep.noise_block(reduced, block, mask_row, pdl),
+        )
+        torch.cuda.synchronize()
+        out[split] = (o, ctx_len, seq_lens, noise)
+    (o0, c0, s0, n0), (o1, c1, s1, n1) = out[0], out[1]
+    for name, a, b in zip(o0._fields, o0, o1):
+        _same(b, a, f"split {name}")
+    _same(c1, c0, "split ctx_len")
+    _same(s1, s0, "split seq_lens")
+    for a, b in zip(n0, n1):
+        _same(b, a, "split noise block")
 
 
 # ----------------------------------------------------------------------------------------------------------------------

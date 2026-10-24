@@ -20,6 +20,9 @@ launches of one or a few elements each. `drafter_input_prep` computes all of the
 * the noise rows' embedding lookup: ``[bonus..., mask_id]`` masked to this rank's vocabulary range exactly as the stock
   ``pre_comm_embedding_ops`` (a row outside the range is +0), the input of the embedding's own all-reduce.
 
+With ``TRTLLM_K3LL_DRAFTER_PREP_SPLIT`` (read per call) the bookkeeping runs in a program of its own beside the lookup
+rows, and both kernels copy a hidden row in one tile; the same values.
+
 `noise_block` then writes the noise block ``[B, block, H]`` from the reduced rows (slot 0 the bonus row, every other
 slot the mask row, or the drafter's trained mask row). Every value is an integer, a copy, or the same arithmetic on the
 same operands as the stock path, so every output is bit for bit the stock one.
@@ -35,6 +38,9 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.multi_stream_utils import _record_stream
+
+from . import census as _census
+from . import flags as _flags
 
 MAX_BATCH = 8
 MAX_WIDTH = 16  # the most block positions or K + 1 store rows per request
@@ -85,28 +91,31 @@ def _k3_drafter_input_prep(
     H: tl.constexpr,
     H_TILE: tl.constexpr,
     PDL: tl.constexpr = False,
+    SPLIT: tl.constexpr = False,
 ):
-    # Program p < B looks up request p's bonus row, program B the mask row; program 0 also runs the bookkeeping.
+    # Program p < B looks up request p's bonus row, program B the mask row. The bookkeeping runs on program 0 after its
+    # row (SPLIT False) or on a program B + 1 of its own (SPLIT True).
     pid = tl.program_id(0)
     if PDL:
         # Every input is a previous kernel's output or state: nothing is read before the wait.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    # The embedding lookup (pre_comm_embedding_ops): in range, the row of this rank's shard; else +0.
-    p = tl.minimum(pid, B - 1)
-    n_p = tl.load(N + p).to(tl.int64)
-    tok = tl.load(ACC + p * ACC_STRIDE + tl.maximum(n_p - 1, 0)).to(tl.int64)
-    tok = tl.where(pid < B, tok, mask_id)
-    in_range = (tok >= vocab_start) & (tok < vocab_end)
-    row = tl.where(in_range, tok - vocab_start, 0)
-    cols = tl.arange(0, H_TILE)
-    for h0 in range(0, H, H_TILE):
-        keep = h0 + cols < H
-        w = tl.load(EMB + row * H + h0 + cols, mask=keep & in_range, other=0)
-        tl.store(LOOKUP + pid * H + h0 + cols, w, mask=keep)
+    if pid <= B:
+        # The embedding lookup (pre_comm_embedding_ops): in range, the row of this rank's shard; else +0.
+        p = tl.minimum(pid, B - 1)
+        n_p = tl.load(N + p).to(tl.int64)
+        tok = tl.load(ACC + p * ACC_STRIDE + tl.maximum(n_p - 1, 0)).to(tl.int64)
+        tok = tl.where(pid < B, tok, mask_id)
+        in_range = (tok >= vocab_start) & (tok < vocab_end)
+        row = tl.where(in_range, tok - vocab_start, 0)
+        cols = tl.arange(0, H_TILE)
+        for h0 in range(0, H, H_TILE):
+            keep = h0 + cols < H
+            w = tl.load(EMB + row * H + h0 + cols, mask=keep & in_range, other=0)
+            tl.store(LOOKUP + pid * H + h0 + cols, w, mask=keep)
 
-    if pid == 0:
+    if pid == (B + 1 if SPLIT else 0):
         b = tl.arange(0, 8)
         lane = b < B
         # Reads: all of them before any write of ctx_len.
@@ -234,8 +243,16 @@ def supports(batch: int, drafts: int, block: int, hidden: int) -> bool:
     )
 
 
-def _h_tile(hidden: int) -> int:
-    return min(triton.next_power_of_2(hidden), 1024)
+#: The row tile of the copies with ``TRTLLM_K3LL_DRAFTER_PREP_SPLIT`` (one tile up to this hidden size).
+SPLIT_H_TILE = 8192
+
+
+def _split() -> bool:
+    return bool(_flags.TRTLLM_K3LL_DRAFTER_PREP_SPLIT)
+
+
+def _h_tile(hidden: int, split: bool = False) -> int:
+    return min(triton.next_power_of_2(hidden), SPLIT_H_TILE if split else 1024)
 
 
 def drafter_input_prep(
@@ -313,7 +330,10 @@ def drafter_input_prep(
     blk_bounds = torch.empty(batch * block, dtype=torch.int32, device=dev)
     blk_slots = torch.empty(batch * block, **i64)
     blk_freqs = torch.empty(batch, block, 32, 2, dtype=torch.float32, device=dev)
-    _k3_drafter_input_prep[(batch + 1,)](
+    split = _split()
+    if split:
+        _census.count(f"dispatch:drafter_prep_split:{_census.mode()}")
+    _k3_drafter_input_prep[(batch + 2 if split else batch + 1,)](
         accepted,
         num_accepted,
         slots,
@@ -352,8 +372,9 @@ def drafter_input_prep(
         block,
         int(page_size),
         hidden,
-        _h_tile(hidden),
+        _h_tile(hidden, split),
         num_warps=4,
+        SPLIT=split,
         **({"PDL": True, "launch_pdl": True} if pdl else {}),
     )
     return DrafterInputs(
@@ -397,7 +418,7 @@ def noise_block(
         batch,
         block,
         hidden,
-        _h_tile(hidden),
+        _h_tile(hidden, _split()),
         trained,
         num_warps=4,
         **({"PDL": True, "launch_pdl": True} if pdl else {}),

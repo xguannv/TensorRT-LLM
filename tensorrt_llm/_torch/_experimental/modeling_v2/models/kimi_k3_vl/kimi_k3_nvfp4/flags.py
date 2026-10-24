@@ -162,6 +162,13 @@ TRTLLM_K3LL_DRAFTER_PREP_FUSED = _flag(
     "block fixup, pool slots and query RoPE rows, the noise rows' lookup), the noise block in one copy kernel, the "
     "store mask in k3_drafter_mla_ctx_kv (the same values; read per step)",
 )
+TRTLLM_K3LL_DRAFTER_PREP_SPLIT = _flag(
+    "TRTLLM_K3LL_DRAFTER_PREP_SPLIT",
+    1,
+    "MLA DSpark worker (with TRTLLM_K3LL_DRAFTER_PREP_FUSED): k3_drafter_input_prep runs its bookkeeping in a program "
+    "of its own instead of after request 0's embedding-row copy, and that kernel and k3_noise_block copy each hidden "
+    "row in one tile instead of 1024-element tiles (the same values; read per call)",
+)
 TRTLLM_K3LL_DRAFTER_CTX_SIDE = _flag(
     "TRTLLM_K3LL_DRAFTER_CTX_SIDE",
     1,
