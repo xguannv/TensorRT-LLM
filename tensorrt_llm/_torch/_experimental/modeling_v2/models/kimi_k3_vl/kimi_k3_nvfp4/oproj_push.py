@@ -51,6 +51,7 @@ do. The device view of the workspace (`K3OprojPush.create`) is a host-to-device 
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple, Union
@@ -75,6 +76,30 @@ HIDDEN = 7168
 EVERY_DECODE_STEP, WIDE_STEPS = 1, 2
 #: Programmatic dependent launch of the finish and gather kernels unless TRTLLM_ENABLE_PDL=0 (the stack-wide switch).
 _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+#: TRTLLM_K3LL_FINISH_FOLD's default (-1) folds the Lamport finish into the attn_res kernel only on these compute
+#: capabilities (measured on GB300 / SM103).
+FINISH_FOLD_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _fold_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in FINISH_FOLD_CAPABILITIES
+
+
+def finish_fold(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_FINISH_FOLD`` on ``device`` (read at forward time): 1 on, 0 off, -1 (default) on where the device
+    is in ``FINISH_FOLD_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_FINISH_FOLD)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _fold_by_default(index)
+
+
+def _census_count(key: str) -> None:
+    from . import census as _census
+
+    _census.count(f"{key}:{_census.mode()}")
 
 
 # The kernels import the CuTe DSL; the decode collectives import this module on hosts that may not have it.
@@ -372,12 +397,45 @@ class K3OprojPush:
         `push_target` of this state's workspace; `finish_takes` holds): the Lamport finish in place (the C++ one-shot
         order), then the attn_res kernel adding the result to ``prefix_sum`` (the zero prefix for None) in the C++
         epilogue's arithmetic, releasing the next kernel at its wait. ``mxfp8_out``: ``(xq, xs)`` that the kernel also
-        fills with the MXFP8 form of ``normed`` (``TRTLLM_K3LL_ATTN_RES_MXFP8``; ``fp8w_lowm.new_mxfp8_input``)."""
+        fills with the MXFP8 form of ``normed`` (``TRTLLM_K3LL_ATTN_RES_MXFP8``; ``fp8w_lowm.new_mxfp8_input``).
+
+        With ``TRTLLM_K3LL_FINISH_FOLD`` (`finish_fold`) the attn_res kernel runs the finish itself (``lamport_fold``
+        of ``k3_attn_res.run_k3_attn_res``): one launch fewer, the same bits."""
         rows = target.shape[0]
-        result = finish_lamport_push(target, in_place=True)
         prefix = self.zeros[:rows] if prefix_sum is None else prefix_sum
         normed = torch.empty_like(prefix)
         updated = torch.empty_like(prefix)
+        if not target.pushed:
+            raise RuntimeError("the producer did not push this all-reduce")
+        ws = target.workspace
+        if not target.one_shot and finish_fold(prefix.device):
+            _census_count("dispatch:finish_fold")
+            _attn_res().run_k3_attn_res(
+                prefix,
+                (),
+                block_residual,
+                res_proj.weight.reshape(-1),
+                res_norm.weight,
+                out_norm.weight,
+                _eps(res_norm),
+                _eps(out_norm),
+                normed,
+                updated,
+                exact=False,
+                early_trigger=True,
+                mnnvl_order=True,
+                mxfp8_out=mxfp8_out,
+                lamport_fold=(
+                    ws.uc_local,
+                    ws.flags.data_ptr(),
+                    ws.mc_base,
+                    ws.world,
+                    ws.rank,
+                    target.cpp_one_shot,
+                ),
+            )
+            return normed, updated
+        result = finish_lamport_push(target, in_place=True)
         # trtllm::k3_attn_res_add_rmsnorm_lamport in the C++ epilogue's arithmetic, releasing the next kernel at its
         # wait (see the module docstring).
         _attn_res().run_k3_attn_res(
@@ -408,6 +466,8 @@ __all__ = [
     "LamportResult",
     "MAX_TOKENS",
     "WIDE_STEPS",
+    "FINISH_FOLD_CAPABILITIES",
+    "finish_fold",
     "finish_lamport_push",
     "lamport_view",
     "push_target",

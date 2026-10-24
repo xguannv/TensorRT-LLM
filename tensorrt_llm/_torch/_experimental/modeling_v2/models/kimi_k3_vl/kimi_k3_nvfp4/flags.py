@@ -236,8 +236,8 @@ TRTLLM_K3LL_MOE_TAIL_LU = _flag(
     "RMSNorm on its own MNNVL workspace (K3LatentArRowKernel, with the latent's MXFP8 form), latent_up replicated on "
     "k3_fp8w_lowm_mxfp8 with an FP8 block-scale weight, and K3AttnResFast adding routed + shared (moe_tail_lu.py). "
     "LOSSY (FP8 latent_up). 1 at launch builds the FP8 latent_up of every MoE layer (+25.9 MB per layer per rank, "
-    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 (default): on "
-    "on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
+    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 "
+    "(default): on on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
 )
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
@@ -399,6 +399,14 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "K tile to the MMA once its scales are folded, not after all of them (bitwise; read at forward time). 1 on, 0 "
     "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
     "SM100 / SM103 only",
+)
+TRTLLM_K3LL_FINISH_FOLD = _flag(
+    "TRTLLM_K3LL_FINISH_FOLD",
+    -1,
+    "pushed two-shot all-reduces finished in place before a K3AttnResFast (TRTLLM_K3LL_OPROJ_PUSH, "
+    "TRTLLM_K3LL_MOE_TAIL_PUSH): the attn_res kernel runs the Lamport finish itself (owner sum, multicast, re-arm, "
+    "rotation update) instead of a K3LamportFinishKernel launch before it (bitwise; read at forward time). 1 on, "
+    "0 off, -1 (default) on SM103 only (oproj_push.FINISH_FOLD_CAPABILITIES)",
 )
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
