@@ -15,6 +15,14 @@ Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
 to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
 ``A[M, K] @ B[K, N]`` problem is swapped internally, so tile dimensions below
 use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
+
+SwiGLU epilogue (:func:`run_splitk_dense_swiglu`, after Dongxu Yang's ll5 kernel): for a gate_up
+projection ``[gate I | up I]``, the weight is read through a view whose 64-row kernel-M tile ``i``
+holds gate rows ``[32 i, 32 i + 32)`` followed by up rows ``[I + 32 i, I + 32 i + 32)`` (no copy and
+no reordering of the weight). The CTA stages its BF16 tile token-major in the dead weight ring and
+stores ``silu(gate) * up`` with the arithmetic of ``trtllm::silu_and_mul``'s Triton kernel
+(``a * (1 / (ex2.approx(a * -log2 e) + 1)) * (b + 0)``, ``div.full``, BF16 round to nearest even):
+bit for bit this GEMM followed by ``silu_and_mul``.
 """
 
 from __future__ import annotations
@@ -256,6 +264,8 @@ __all__ = [
     "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
+    "run_splitk_dense_swiglu",
+    "swiglu_supported",
     "validate_tactic",
 ]
 
@@ -298,6 +308,69 @@ def _bulk_prefetch_l2(addr, nbytes, *, loc=None, ip=None) -> None:
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def _lds_b32(addr, *, loc=None, ip=None):
+    """4 bytes of shared memory at the 32-bit shared address ``addr``."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_b32(addr, value, *, loc=None, ip=None) -> None:
+    """Store 4 bytes to global memory at ``addr``."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(value).ir_value(loc=loc, ip=ip)],
+        "st.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _swiglu_bf16x2(gate, up, *, loc=None, ip=None):
+    """``silu(gate) * up`` of a BF16 pair, as ``trtllm::silu_and_mul``'s Triton kernel computes it
+    (``a * (1 / (ex2.approx(a * -log2 e) + 1)) * (b + 0)`` in FP32, round to nearest even)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(gate).ir_value(loc=loc, ip=ip), Int32(up).ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b32 gl, gh, ul, uh;\n.reg .f32 a0, a1, b0, b1, t, e, d, r, p, q, o0, o1;\n"
+            "shl.b32 gl, $1, 16;\nand.b32 gh, $1, 0xffff0000;\n"
+            "shl.b32 ul, $2, 16;\nand.b32 uh, $2, 0xffff0000;\n"
+            "mov.b32 a0, gl;\nmov.b32 a1, gh;\nmov.b32 b0, ul;\nmov.b32 b1, uh;\n"
+            "mul.f32 t, a0, 0fBFB8AA3B;\nex2.approx.f32 e, t;\nadd.f32 d, e, 0f3F800000;\n"
+            "div.full.f32 r, 0f3F800000, d;\nmul.f32 p, a0, r;\nadd.f32 q, b0, 0f00000000;\n"
+            "mul.f32 o0, q, p;\n"
+            "mul.f32 t, a1, 0fBFB8AA3B;\nex2.approx.f32 e, t;\nadd.f32 d, e, 0f3F800000;\n"
+            "div.full.f32 r, 0f3F800000, d;\nmul.f32 p, a1, r;\nadd.f32 q, b1, 0f00000000;\n"
+            "mul.f32 o1, q, p;\n"
+            "cvt.rn.bf16x2.f32 $0, o1, o0;\n}",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 
@@ -357,7 +430,13 @@ class SplitKDenseGemmKernel:
         has_bias: bool,
         l2_prefetch_tiles: int = 0,
         exact_smem: bool = False,
+        swiglu: bool = False,
     ) -> None:
+        if swiglu and (tactic.mma_m != _SWIGLU_TILE or has_bias):
+            raise ValueError(
+                f"the SwiGLU epilogue needs {_SWIGLU_TILE}-row tiles and no bias: {tactic}"
+            )
+        self.swiglu = swiglu
         self.acc_dtype = cutlass.Float32
         self.exact_smem = exact_smem
         self.smem_bytes = _smem_bytes(tactic, tactic.ab_stages) + _AB_BUFFER_ALIGN_BYTES
@@ -397,7 +476,35 @@ class SplitKDenseGemmKernel:
         stream: _cuda.CUstream,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, cutlass.Int64(0), Int32(0)).launch(
+            grid=(
+                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
+                c.layout.shape[2],
+            ),
+            block=(self.threads_per_cta, 1, 1),
+            cluster=self.cluster_shape,
+            smem=cute.Int64(
+                self.smem_bytes if self.exact_smem else utils.get_smem_capacity_in_bytes("sm_100")
+            ),
+            preferred_smem_carveout=100 if self.exact_smem else None,
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.experimental.jit
+    def call_swiglu(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        out_addr: cutlass.Int64,
+        out_ld: Int32,
+        stream: _cuda.CUstream,
+    ):
+        """Launch of the SwiGLU variant: ``c`` gives the GEMM output shape only (not written); the
+        ``silu(gate) * up`` rows go to ``out_addr`` with ``out_ld`` elements per row."""
+        self.kernel(a, b, c, c, out_addr, out_ld).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -420,6 +527,8 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        out_addr: cutlass.Int64,  # SwiGLU variant: the [tokens, N / 2] output
+        out_ld: Int32,  # SwiGLU variant: its row stride in elements
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -618,6 +727,12 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                sA,
+                bidx * self.cta_m,
+                n_idx * self.cta_n,
+                cute.size(mB, mode=[0]),
+                out_addr,
+                out_ld,
             )
 
     @cute.experimental.jit
@@ -768,6 +883,12 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        ring: cute.Tensor,
+        n_base: cutlass.Int32,
+        tok_base: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        out_addr: cutlass.Int64,
+        out_ld: cutlass.Int32,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -881,10 +1002,64 @@ class SplitKDenseGemmKernel:
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
             rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.swiglu):
+                self._swiglu_store(
+                    thr_t2r,
+                    rD,
+                    ring,
+                    c_dtype,
+                    epi_tile,
+                    epi_tid,
+                    n_base,
+                    tok_base,
+                    num_tokens,
+                    out_addr,
+                    out_ld,
+                )
+            else:
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
+
+    @cute.experimental.jit
+    def _swiglu_store(
+        self,
+        thr_t2r,
+        rD: cute.Tensor,
+        ring,
+        c_dtype: cutlass.Constexpr,
+        epi_tile: cutlass.Constexpr,
+        epi_tid: cutlass.Int32,
+        n_base: cutlass.Int32,
+        tok_base: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        out_addr: cutlass.Int64,
+        out_ld: cutlass.Int32,
+    ):
+        """SwiGLU epilogue: stage the BF16 tile token-major (kernel-M contiguous) in the dead weight
+        ring; the tile's rows ``r < 32`` are gate rows, ``32 + r`` their up rows. Store
+        ``out[token, n_base / 2 + r] = silu(gate) * up`` (``out_ld`` elements per output row)."""
+        stage = cute.make_tensor(
+            cute.recast_ptr(ring.iterator, dtype=c_dtype),
+            cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
+        )
+        cute_ext.partition_and_copy(
+            thr_t2r, rD, cute.flat_divide(stage, epi_tile)[None, None, 0, 0]
+        )
+        cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
+        stage_addr = ring.iterator.toint()
+        half = self.cta_m // 2
+        words = half // 2
+        for p in cutlass.range_constexpr(0, self.cta_n * words, self.epilog_threads):
+            j = epi_tid + p
+            t = j // words
+            w = j - t * words
+            if t < self.cta_n and tok_base + t < num_tokens:
+                g = _lds_b32(stage_addr + (t * self.cta_m + 2 * w) * 2)
+                u = _lds_b32(stage_addr + (t * self.cta_m + half + 2 * w) * 2)
+                dst = out_addr + cutlass.Int64((tok_base + t) * out_ld + n_base // 2 + 2 * w) * 2
+                _stg_b32(dst, _swiglu_bf16x2(g, u))
 
 
 _SUPPORTED_TORCH_DTYPES = (_torch.bfloat16, _torch.float16)
@@ -904,6 +1079,37 @@ def _bmm_no_bias(
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        stream,
+    )
+
+
+@cute.experimental.jit
+def _bmm_swiglu(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    out_addr: cutlass.Int64,
+    out_ld: Int32,
+    stream: _cuda.CUstream,
+):
+    """``a``: the gate_up weight as ``[batch, 2, I / 32, 32, K]`` (gate / up, 32-row group, row, K). Kernel-M
+    row ``64 i + 32 h + j`` reads weight row ``h I + 32 i + j``: tile ``i`` is 32 gate rows then the
+    matching 32 up rows."""
+    sh, st = a.layout.shape, a.layout.stride
+    a_view = cute.make_tensor(
+        a.iterator,
+        cute.make_layout(
+            ((_SWIGLU_TILE // 2, 2, sh[2]), sh[4], sh[0]),
+            stride=((st[3], st[1], st[2]), st[4], st[0]),
+        ),
+    )
+    gemm_op.call_swiglu(
+        a_view,
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
+        out_addr,
+        out_ld,
         stream,
     )
 
@@ -1028,6 +1234,79 @@ def _get_compiled_splitk_kernel(
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
     return compiled
+
+
+#: Kernel-M tile of the SwiGLU variant: 32 gate rows and their 32 up rows.
+_SWIGLU_TILE = 64
+
+
+@functools.cache
+def _get_compiled_swiglu_kernel(dtype, tactic: SplitKTactic, use_pdl: bool, b_leading: int):
+    kernel = SplitKDenseGemmKernel(tactic=tactic, use_pdl=use_pdl, has_bias=False, swiglu=True)
+    groups = 2
+    a_repr = _from_dlpack_dynamic(
+        _torch.empty((1, 2, groups, _SWIGLU_TILE // 2, _CTA_K), dtype=dtype, device="cuda"), 4
+    )
+    _, b_repr, c_repr, _ = _make_compile_repr_tensors(dtype, False, 2, b_leading, 1)
+    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
+    return cute_ext.compile(
+        _bmm_swiglu, kernel, a_repr, b_repr, c_repr, cutlass.Int64(0), Int32(0), stream
+    )
+
+
+def swiglu_supported(a: _torch.Tensor, gate_up: _torch.Tensor, tactic: SplitKTactic) -> bool:
+    """Whether :func:`run_splitk_dense_swiglu` takes ``a [M, K] @ gate_up[2 I, K].T`` at ``tactic``."""
+    if a.dim() != 2 or gate_up.dim() != 2 or not gate_up.is_contiguous() or not a.is_contiguous():
+        return False
+    two_i, k = gate_up.shape
+    if a.shape[1] != k or two_i % _SWIGLU_TILE or tactic.mma_m != _SWIGLU_TILE:
+        return False
+    if a.dtype != gate_up.dtype or a.dtype not in _SUPPORTED_TORCH_DTYPES:
+        return False
+    try:
+        validate_tactic(tactic, a.shape[0], two_i, k)
+    except ValueError:
+        return False
+    return a.shape[0] <= k
+
+
+def run_splitk_dense_swiglu(
+    a: _torch.Tensor,
+    gate_up: _torch.Tensor,
+    out: _torch.Tensor,
+    tactic: SplitKTactic,
+    pdl: bool,
+) -> _torch.Tensor:
+    """``silu_and_mul(a @ gate_up.T)`` into ``out [M, I]`` (contiguous): bit for bit
+    :func:`run_splitk_dense` at the same tactic on the same weight followed by
+    ``trtllm::silu_and_mul``. ``gate_up``: the ``[gate I | up I]`` weight ``[2 I, K]`` as stored
+    (contiguous; read through a view, not copied). Tiles of 64 weight rows (``tactic.mma_m``)."""
+    if not swiglu_supported(a, gate_up, tactic):
+        raise ValueError(
+            f"SwiGLU epilogue: a {tuple(a.shape)}, gate_up {tuple(gate_up.shape)}, {tactic}"
+        )
+    m = a.shape[0]
+    two_i, k = gate_up.shape
+    half = two_i // 2
+    if out.shape != (m, half) or not out.is_contiguous() or out.dtype != a.dtype:
+        raise ValueError(f"SwiGLU epilogue: out {tuple(out.shape)} for {m} x {half}")
+    a_swap = gate_up.view(1, 2, half // (_SWIGLU_TILE // 2), _SWIGLU_TILE // 2, k)
+    b_swap = a.unsqueeze(0).transpose(-2, -1)
+    # The GEMM output layout [2 I, M] (kernel coordinates) that the kernel tiles by; never written. Its view
+    # is taken on the weight's storage (2 I x K >= 2 I x M elements) so nothing is allocated.
+    c_shape = gate_up.as_strided((1, two_i, m), (two_i * m, 1, two_i))
+    b_leading = _detect_leading_dim(b_swap)
+    compiled = _get_compiled_swiglu_kernel(a.dtype, tactic, pdl, b_leading)
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    compiled(
+        _from_dlpack_dynamic(a_swap, 4),
+        _from_dlpack_dynamic(b_swap, b_leading),
+        _from_dlpack_dynamic(c_shape, 1),
+        cutlass.Int64(out.data_ptr()),
+        Int32(out.stride(0)),
+        stream,
+    )
+    return out
 
 
 def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:

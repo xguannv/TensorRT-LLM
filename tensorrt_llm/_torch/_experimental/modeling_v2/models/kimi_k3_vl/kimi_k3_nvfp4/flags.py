@@ -119,6 +119,15 @@ TRTLLM_K3LL_DRAFTER_GEMM = _flag(
     "MLA DSpark drafter (with TRTLLM_K3LL_MLA_DRAFTER_NORMS): [q_a | kv_a] and gate_up above one token tile and q_b "
     "on the low-M split-K GEMM at pinned tactics, not cuBLAS (draft tokens only: split-K partial sums)",
 )
+TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU = _flag(
+    "TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU",
+    -1,
+    "MLA DSpark drafter (with TRTLLM_K3LL_DRAFTER_GEMM): where gate_up runs on its pinned low-M GEMM, the SwiGLU in "
+    "that GEMM's epilogue (low_m_bf16_splitk.run_splitk_dense_swiglu, the weight read through a gate / up interleaving "
+    "view, nothing copied) instead of a separate silu_and_mul launch; bit for bit the two launches. -1 (default): on "
+    "on SM103 only (mla_drafter_gemm.GATE_UP_SWIGLU_CAPABILITIES, where the gate_up tactics are pinned); read per "
+    "call",
+)
 TRTLLM_K3LL_DRAFTER_WIDE_AR = _flag(
     "TRTLLM_K3LL_DRAFTER_WIDE_AR",
     1,

@@ -77,6 +77,22 @@ def ar_ceiling(rows: int) -> int:
     return _decode_comm.DECODE_AR_ONE_SHOT_MAX_BYTES
 
 
+def _plain_swiglu(mlp: nn.Module) -> bool:
+    """A GatedMLP whose ``_apply_activation`` is ``trtllm::silu_and_mul`` on bf16 (plain SiLU, no limit / alpha / beta,
+    a bf16 down projection) and whose gate_up is a plain bf16 projection."""
+    down = getattr(mlp, "down_proj", None)
+    return (
+        getattr(mlp, "activation", None) is torch.nn.functional.silu
+        and not getattr(mlp, "swiglu_limit", None)
+        and getattr(mlp, "swiglu_alpha", None) in (None, 1.0)
+        and getattr(mlp, "swiglu_beta", None) in (None, 0.0)
+        and down is not None
+        and not getattr(down, "has_fp8_qdq", False)
+        and not getattr(down, "has_w4a8_nvfp4_fp8", False)
+        and _plain_linear(getattr(mlp, "gate_up_proj", None))
+    )
+
+
 def _plain_linear(linear: nn.Module) -> bool:
     """A bias-free, unquantized bf16 projection, replicated or column-parallel without its output gather: its forward
     is ``F.linear(x, weight)``."""
@@ -626,6 +642,11 @@ class K3MLADrafterNorms:
             and comm.takes_plain(gate_up, mlp.down_proj.weight, residual, norm, swiglu=True)
         ):
             return comm.sandwich_plain(gate_up, mlp.down_proj.weight, residual, norm, swiglu=True)
+        act = self._gate_up_swiglu(x, mlp)
+        if act is not None:
+            # GatedMLP's unfused bf16 path with gate_up and the SwiGLU as one launch.
+            partial = mlp.down_proj(act, all_reduce_params=_decode_comm.skip_all_reduce())
+            return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
         h1 = self._gemm(x, mlp.gate_up_proj, "gate_up")
         if h1 is not None:
             # GatedMLP's unfused bf16 path with gate_up on the pinned GEMM.
@@ -635,6 +656,22 @@ class K3MLADrafterNorms:
         else:
             partial = mlp(x, final_all_reduce_params=_decode_comm.skip_all_reduce())
         return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
+
+    def _gate_up_swiglu(self, x: torch.Tensor, mlp: nn.Module) -> Optional[torch.Tensor]:
+        """``silu_and_mul(gate_up(x))`` as one launch (the gate_up pin's GEMM with the SwiGLU epilogue) where
+        ``TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU`` and ``TRTLLM_K3LL_DRAFTER_GEMM`` are on, the MLP's activation is the
+        plain bf16 SwiGLU and the kernel takes the call; else None."""
+        if (
+            self.gemm is None
+            or not _flags.TRTLLM_K3LL_DRAFTER_GEMM
+            or not _gemm.swiglu_enabled(x.device)
+            or not _plain_swiglu(mlp)
+        ):
+            return None
+        act = self.gemm.project_swiglu(x, mlp.gate_up_proj.weight)
+        if act is not None:
+            _census.count(f"dispatch:drafter_gemm_gate_up_swiglu:{_census.mode()}")
+        return act
 
     def _gemm(self, x: torch.Tensor, weight, role: str) -> Optional[torch.Tensor]:
         """``x @ W.T`` on the pinned low-M GEMM for ``role`` (``weight``: the weight, or a plain column-parallel

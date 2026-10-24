@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The MLA DSpark drafter's switches on its projections and all-reduces (``kimi_k3_nvfp4/flags.py``:
-``TRTLLM_K3LL_DRAFTER_WIDE_AR``, ``TRTLLM_K3LL_DRAFTER_GEMM``), each arm against the other and the off arm against
-the call it replaced, at W ranks (default 4) with the TP16 per-rank shapes, 8 / 16 / 32 rows.
+``TRTLLM_K3LL_DRAFTER_WIDE_AR``, ``TRTLLM_K3LL_DRAFTER_GEMM``, ``TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU``), each arm
+against the other and the off arm against the call it replaced, at W ranks (default 4) with the TP16 per-rank shapes,
+8 / 16 / 32 rows.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _kimi_k3_drafter_switches_op_matrix.py [--world-size 4]
     srun -n 4 --mpi=pmix python _kimi_k3_drafter_switches_op_matrix.py --launcher srun --world-size 4
@@ -28,6 +29,9 @@ bit the eager call on the same inputs):
     GatedMLP + ``allreduce_norm`` chain. On arm: each role's output against an fp32 product within ``GEMM_TOL`` of
     its largest magnitude and no worse than ``WORSE`` times cuBLAS's; ``_mlp_norm`` within ``MLP_TOL`` of the off
     arm; a ``dispatch:drafter_gemm_<role>`` count per call.
+  * GATE_UP_SWIGLU (with GEMM on; 8, 16, 32 rows; graph at 16, 32): ``_mlp_norm`` bit for bit the GEMM-only arm (the
+    gate_up GEMM with the SwiGLU epilogue against the same GEMM then ``silu_and_mul``), a
+    ``dispatch:drafter_gemm_gate_up_swiglu`` count per call; off: no count.
 """
 
 import sys
@@ -149,9 +153,10 @@ def _replaced(x_o, res_o, x_m, res_m):
     return n1, u1, n2, u2
 
 
-def _set(wide_ar, gemm):
+def _set(wide_ar, gemm, swiglu=0):
     FLAGS.TRTLLM_K3LL_DRAFTER_WIDE_AR = wide_ar
     FLAGS.TRTLLM_K3LL_DRAFTER_GEMM = gemm
+    FLAGS.TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU = swiglu
 
 
 def check_wide_ar():
@@ -215,11 +220,29 @@ def check_gemm():
     _set(0, 0)
 
 
+def check_gate_up_swiglu():
+    owner = _owner(gemm=True)
+    key = "dispatch:drafter_gemm_gate_up_swiglu:eager"
+    for rows in ROWS:
+        ins = _inputs(rows, 450 + rows)
+        _set(0, 1, 0)
+        before = CENSUS.counts().get(key, 0)
+        off = _steps(owner, *ins)
+        assert CENSUS.counts().get(key, 0) == before, f"SWIGLU off, {rows} rows: counted"
+        _set(0, 1, 1)
+        on = _steps(owner, *ins)
+        assert CENSUS.counts().get(key, 0) == before + 1, f"SWIGLU on, {rows} rows: not taken"
+        assert all(_same(a, b) for a, b in zip(on, off)), f"SWIGLU on, {rows} rows: not bit for bit"
+        if R.rank == 0:
+            print(f"[gate_up_swiglu] {rows} rows: bit for bit", flush=True)
+    _set(0, 0)
+
+
 def check_graphs():
-    for wide_ar, gemm in ((0, 0), (1, 0), (0, 1), (1, 1)):
+    for wide_ar, gemm, swiglu in ((0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 1, 1), (1, 1, 1)):
         owner = _owner(gemm=True)
         for rows in GRAPH_ROWS:
-            _set(wide_ar, gemm)
+            _set(wide_ar, gemm, swiglu)
             ins = [t.clone() for t in _inputs(rows, 500 + rows)]
             _steps(owner, *ins)
             torch.cuda.synchronize()
@@ -240,13 +263,13 @@ def check_graphs():
                 got = [o.clone() for o in outs]
                 want = _steps(owner, *ins)
                 assert all(_same(a, b) for a, b in zip(got, want)), (
-                    f"graph WIDE_AR {wide_ar} GEMM {gemm}, {rows} rows, replay {r}: not the eager call"
+                    f"graph WIDE_AR {wide_ar} GEMM {gemm} SWIGLU {swiglu}, {rows} rows, replay {r}: not the eager call"
                 )
             del graph
     _set(0, 0)
 
 
-CHECKS = [check_wide_ar, check_gemm, check_graphs]
+CHECKS = [check_wide_ar, check_gemm, check_gate_up_swiglu, check_graphs]
 
 
 def _run_one_rank(args) -> int:

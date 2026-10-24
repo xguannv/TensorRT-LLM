@@ -206,6 +206,7 @@ l0_b200:
   # The MLA DSpark drafter's pinned low-M GEMMs in its attention step (TRTLLM_K3LL_DRAFTER_GEMM), off arm against
   # the chain it replaced.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter_gemm.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter_swiglu.py
   # The MLA DSpark drafter's PDL launches and glue removals (TRTLLM_K3LL_DRAFTER_PDL / _GLUE), each arm bit for
   # bit the off arm.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drafter_pdl_glue.py
