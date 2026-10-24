@@ -274,7 +274,7 @@ TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
 )
 TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
     "TRTLLM_K3LL_MLA_QNORM_PDL",
-    0,
+    1,
     "Helix all-head MLA queries: the q_a RMSNorm releases q_b at launch and reads its weight before the PDL wait "
     "(modules/kimi_k3_mla/q_norm_pdl.py, bitwise FlashInfer's kernel; read at forward time), for decode steps of 1 "
     "to decode_mla_q.QNORM_PDL_MAX_REQUESTS requests. SM103 only, like "
