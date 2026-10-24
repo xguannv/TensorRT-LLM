@@ -230,10 +230,13 @@ def run(
     situ_linear_beta: float,
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
+    local_num_experts: Optional[int] = None,
 ) -> torch.Tensor:
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
-    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32)."""
+    ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``local_num_experts``: the experts
+    ``[local_expert_offset, local_expert_offset + local_num_experts)`` map to the first weight slots (default: all
+    of them, ``w1.shape[0]``)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
@@ -250,7 +253,7 @@ def run(
         num_experts=num_experts,
         top_k=top_k,
         local_expert_offset=local_expert_offset,
-        local_num_experts=w1.shape[0],
+        local_num_experts=w1.shape[0] if local_num_experts is None else local_num_experts,
         tile_tokens_dim=TILE,
     )
     return run_sorted(

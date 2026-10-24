@@ -166,6 +166,9 @@ def layout_gaps(moe: nn.Module, tp_size: int, max_snapshots: int) -> list:
         or down.shape[0] != moe.hidden_size
     ):
         return ["a shared expert other than bf16 and unbiased"]
+    if getattr(moe, "expert_replicas", None) is not None:
+        # Its sort takes the routed MoE's slot range, not home slot ids (decode_moe_lowm.py takes copies).
+        return ["redundant expert copies (TRTLLM_K3LL_EXPERT_REPLICAS)"]
     names = (
         "w3_w1_weight",
         "w3_w1_weight_scale",

@@ -44,13 +44,18 @@ intermediate 768), as in the TP16 deployment.
           bits of the call without it, the sort (tile count, each tile's local expert, mn limit and rows, the fp32
           weights) moe_sort's on the front's routing over this rank's 224 experts and over all 896, the counter word
           zero again (check_front32; SM100 and SM103);
+  replicas : the sort with redundant expert copies (sort_replicas, 8 copy slots per EP rank, copies of the step's
+          most selected experts) at M in 1..32 over the 8-, 16- and 32-token builds: the routing outputs the bits of
+          the call without the sort, the sort the reference copy choice's (k3_route_tail.replica_choice: each
+          selection in the local slot that computes it), every selection on exactly one EP rank, the counter word
+          zero again (check_replicas; SM100 and SM103);
 front and fused each with run-to-run identical bits and each M's rows bit-identical to the same rows of the 8-token
 call (the fused y within one bf16 ulp: k3_moe's slice FC2 groups a token's expert terms by the step's group count).
 The buffer and scratch checks run between barriers (peers write this rank's buffers in their next call); a failing
 rank's rows are printed after rank 0's.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
-  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front.py [front fused head_flags publish_order front32]
+  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front.py [front fused head_flags publish_order front32 replicas]
 """
 
 import importlib.util
@@ -719,21 +724,138 @@ def check_front32(ctx):
     return results
 
 
+REPLICA_SLOTS = 8
+REPLICA_MS = (1, 7, 8, 9, 15, 16, 17, 24, 32)
+
+
+def _replica_entries(ids, world_ep=4):
+    """Copy entries ``(home expert, copy rank)`` in priority order: the step's most selected experts first (so the
+    choice has work), then a few it did not select, at most REPLICA_SLOTS copies per rank, never on the home rank.
+    The same on every rank (the routing is)."""
+    flat = ids.view(-1).tolist()
+    order = sorted(set(flat), key=lambda e: (-flat.count(e), e))
+    order += [e for e in range(0, EXPERTS, 37) if e not in set(flat)][:6]
+    per_rank = [0] * world_ep
+    entries = []
+    for i, x in enumerate(order):
+        home = x // E_LOCAL
+        for step in range(1, world_ep):
+            r = (home + step + i) % world_ep
+            if r != home and per_rank[r] < REPLICA_SLOTS:
+                per_rank[r] += 1
+                entries.append((x, r))
+                break
+        if len(entries) == 48:
+            break
+    return entries
+
+
+def _replica_reference(ids, entries, rank, offset):
+    """Per selection (expanded index order), the local slot of EP rank ``rank`` that computes it, or -1: the copy
+    choice of ``k3_route_tail.replica_choice``, home slots ``x - offset`` for experts it keeps home, copy slots
+    ``E_LOCAL + n`` (the rank's copies in ascending expert order) for experts it moves to a copy this rank holds."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_route_tail as rt
+
+    flat = ids.view(-1).tolist()
+    choice = rt.replica_choice(flat, entries)
+    moved = {x for (x, _), c in zip(entries, choice) if c}
+    copy_slot = {x: E_LOCAL + n for n, x in enumerate(sorted(x for x, r in entries if r == rank))}
+    local = []
+    for x in flat:
+        if x in moved:
+            local.append(copy_slot.get(x, -1))
+        elif offset <= x < offset + E_LOCAL:
+            local.append(x - offset)
+        else:
+            local.append(-1)
+    return local
+
+
+def check_replicas(ctx):
+    """The sort with redundant expert copies (sort_replicas; TRTLLM_K3LL_EXPERT_REPLICAS) on the 8-, 16- and 32-token
+    builds: the front's routing outputs the bits of the call without the sort; the sort (tile count, each tile's local
+    slot, mn limit, rows in token order, fp32 weights) the reference copy choice's; every selection computed on
+    exactly one EP rank; the counter word zero again."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_route_tail as rt
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import front_op
+
+    f = _front32_context(ctx)
+    ep_rank = ctx.rank % 4
+    offset, num_local = ep_rank * E_LOCAL, E_LOCAL + REPLICA_SLOTS
+    results = []
+
+    def call(x, sort_out=None, table=None):
+        # The 16- and 32-token builds on the 32-token workspace, the 8-token build on the 8-token one.
+        ws = f.ws32 if x.shape[0] > 8 else ctx.ws
+        return _trtllm().k3_moe_front(
+            x, f.front, ctx.bias, RSF, FRONT32_SHARED, GATE_CAP, LINEAR_CAP, ws.uc, ws.mc, ws.flags, ws.rank,
+            ctx.world, nvfp4_gsf=f.gsf, sort_out=sort_out, sort_ctr=f.ctr if sort_out is not None else None,
+            sort_offset=offset, sort_local=num_local, sort_replicas=table,
+        )  # fmt: skip
+
+    for m in REPLICA_MS:
+        x = f.x32[:m].contiguous()
+        plain = call(x)
+        entries = _replica_entries(plain[0])
+        table = torch.tensor(rt.replica_table(entries, ep_rank), dtype=torch.int32, device="cuda")
+        sort_out = torch.full(
+            (front_op.sort_layout(m, num_local)[3],), -7, dtype=torch.int32, device="cuda"
+        )
+        out = call(x, sort_out, table)
+        torch.cuda.synchronize()
+        group, mn_limit, perm, n_tiles, scales = front_op.sort_views(sort_out, m, num_local)
+        local = _replica_reference(out[0], entries, ep_rank, offset)
+        by_slot = {}
+        for j, lx in enumerate(local):
+            if lx >= 0:
+                by_slot.setdefault(lx, []).append(j)
+        ordered = sorted(by_slot.items())
+        nt = int(n_tiles.item())
+        sort_equal = nt == len(ordered)
+        mine = set()
+        for t in range(nt if sort_equal else 0):
+            lim = int(mn_limit[t]) - t * TILE
+            rows = perm[t * TILE : t * TILE + lim].tolist()
+            sort_equal = sort_equal and (int(group[t]), rows) == ordered[t]
+            mine.update(rows)
+        covered = ctx.comm.allgather(sorted(mine))
+        flat_all = [j for rows in covered for j in rows]
+        row = dict(
+            op="k3_moe_front_replicas", case=f"tp{ctx.world}_S{REPLICA_SLOTS}", M=m, entries=len(entries),
+            moved=sum(rt.replica_choice(out[0].view(-1).tolist(), entries)), tiles=nt,
+            front_bits=all(_same(a, b) for a, b in zip(out, plain)), sort_equal=sort_equal,
+            weights_fp32=_same(scales, out[1].float()),
+            once_each=len(covered) < 4 or sorted(flat_all) == list(range(m * TOP_K)),
+            ctr_zero=int(f.ctr.item()) == 0,
+        )  # fmt: skip
+        good = all(
+            row[k] for k in ("front_bits", "sort_equal", "weights_fp32", "once_each", "ctr_zero")
+        )
+        row["rank"], row["good"] = ctx.rank, bool(good)
+        row["ok"] = _all_ranks(ctx, good)
+        results.append(row)
+    return results
+
+
 CHECKS = {
     "front": check_front,
     "fused": check_fused,
     "head_flags": check_head_flags,
     "publish_order": check_publish_order,
     "front32": check_front32,
+    "replicas": check_replicas,
 }
 
 
 def _check_params():
-    """Every check; all but front32 need SM100 (front32 also runs on SM103)."""
+    """Every check; all but front32 and replicas need SM100 (those also run on SM103)."""
     sm100 = pytest.mark.skipif(
         not _supported(), reason=f"needs {WORLD} sm_100 GPUs with MNNVL and mpi4py"
     )
-    return [pytest.param(name, marks=() if name == "front32" else sm100) for name in CHECKS]
+    return [
+        pytest.param(name, marks=() if name in ("front32", "replicas") else sm100)
+        for name in CHECKS
+    ]
 
 
 def _run_checks(names):

@@ -179,6 +179,7 @@ def k3_moe_front(
     sort_ctr: Optional[torch.Tensor] = None,
     sort_offset: int = 0,
     sort_local: int = 0,
+    sort_replicas: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 32, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -193,7 +194,13 @@ def k3_moe_front(
     With ``sort_out`` (int32, at least `sort_layout`'s words; with ``nvfp4_gsf``) the kernel also writes ``moe_sort``
     of the routing over the local experts ``[sort_offset, sort_offset + sort_local)`` with 128-row tiles and the
     routing weights in fp32 there (`sort_views`). ``sort_ctr``: int32 ``[1]``, zero, which every call leaves zero;
-    calls that share it must be stream-ordered."""
+    calls that share it must be stream-ordered.
+
+    With ``sort_replicas`` (redundant expert copies, with the sort): this EP rank's int32 copy-choice table
+    (``k3_route_tail.replica_table``); ``sort_offset`` is then the rank's first home expert and ``sort_local`` its 224
+    home slots plus its copy slots. The kernel chooses, per step, which copy computes each selected two-copy expert
+    (``k3_route_tail.replica_choice``, the same on every rank) and sorts every selection into the local slot that
+    computes it on this rank, if any. The routing outputs are unchanged."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -250,6 +257,21 @@ def k3_moe_front(
             "k3_moe_front: the sort needs the NVFP4 latent, an int32 sort_ctr and a contiguous int32 sort_out of "
             "sort_layout's words over 1 to 896 local experts"
         )
+    rep = sort_replicas is not None
+    if rep:
+        from ..blackwell import k3_route_tail as _rt
+
+        if (
+            not sort
+            or sort_replicas.dtype != torch.int32
+            or sort_replicas.numel() != _rt.REP_TABLE_WORDS
+            or not sort_replicas.is_contiguous()
+            or not _rt.REP_NUM_HOME <= sort_local <= _rt.REP_LOCAL_CAP
+        ):
+            raise ValueError(
+                "k3_moe_front: sort_replicas needs the sort, a contiguous int32 replica_table of "
+                f"{_rt.REP_TABLE_WORDS} words and {_rt.REP_NUM_HOME} to {_rt.REP_LOCAL_CAP} local slots"
+            )
     shared = torch.empty(num_tokens, shared_cols, dtype=torch.bfloat16, device=device)
     # Head-only fronts (shared_cols 0) still hand the kernel an aligned shared-output argument it never writes.
     shared_arg = shared if shared_cols else ag_flags.view(torch.int16).view(-1)
@@ -278,6 +300,8 @@ def k3_moe_front(
         # Without the sort the kernel never touches them: any aligned int32 words.
         arg(sort_out.view(-1) if sort else ag_flags.view(-1)),
         arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
+        # Without copies the kernel never reads it: any aligned int32 words.
+        arg(sort_replicas.view(-1) if rep else ag_flags.view(-1)),
     )
     capacity = max_clusters(device)
     # The 32-token build may run a shallower weight ring than asked (`fit_ring`); the others run ``ring``.
@@ -307,6 +331,7 @@ def k3_moe_front(
         nvfp4,
         sort,
         m_max,
+        rep,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -320,7 +345,7 @@ def k3_moe_front(
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
                     sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
-                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, stream,
+                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, rep, stream,
                 )  # fmt: skip
     fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
     return topk_ids, topk_weights, quantized, scales, shared
@@ -329,7 +354,7 @@ def k3_moe_front(
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
       ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
-      sort_local=0):  # fmt: skip
+      sort_local=0, sort_replicas=None):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

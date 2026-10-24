@@ -165,6 +165,24 @@ def _experts(backend) -> tuple:
     )
 
 
+def _replica_fields(moe: nn.Module, slot_start: int, device: torch.device) -> dict:
+    """``K3DecodeMoeNvfp4Layer``'s ``offset`` / ``home_local`` / ``rep_table`` for ``moe`` (routed MoE slot range
+    from ``slot_start``): the routed MoE's slots without ``TRTLLM_K3LL_EXPERT_REPLICAS``; with it, this EP rank's
+    first home slot, its home slot count and its copy-choice table."""
+    replicas = getattr(moe, "expert_replicas", None)
+    if replicas is None:
+        return {"offset": slot_start}
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_route_tail import replica_table
+
+    rank = slot_start // replicas.num_local
+    table = replica_table(replicas.entries, rank, replicas.num_home)
+    return {
+        "offset": rank * replicas.num_home,
+        "home_local": replicas.num_home,
+        "rep_table": torch.tensor(table, dtype=torch.int32, device=device),
+    }
+
+
 def _scalar(value) -> float:
     """A SiTU constant of the backend (a float, or a tensor holding one value per expert, all equal) as a float."""
     if not torch.is_tensor(value):
@@ -274,6 +292,13 @@ class K3DecodeMoeNvfp4Layer:
     #: ``TRTLLM_K3LL_ROUTING_STATS_DIR``: the recorder this layer's routing is counted into (rank 0), else None.
     stats: Optional[RoutingStats] = None
     layer_idx: int = -1
+    #: ``TRTLLM_K3LL_EXPERT_REPLICAS``: this rank's home slots (224; its local slots are those, then its copy slots),
+    #: 0 without copies (every local slot is a home slot). ``offset`` is then the first home slot id, not the routed
+    #: MoE's ``slot_start``.
+    home_local: int = 0
+    #: ``TRTLLM_K3LL_EXPERT_REPLICAS``: this rank's int32 copy-choice table (``k3_route_tail.replica_table``) for the
+    #: front's sort; None without copies.
+    rep_table: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -314,9 +339,9 @@ class K3DecodeMoeNvfp4Layer:
             experts=_experts(backend),
             input_scale=backend.fc31_input_scale.detach().reshape(1),
             fc2_input_scale=backend.fc2_input_scale.detach().reshape(1),
-            offset=int(backend.slot_start),
             situ=(_scalar(backend.act_alpha), _scalar(backend.act_beta)),
             layer_idx=getattr(moe, "layer_idx", -1),
+            **_replica_fields(moe, int(backend.slot_start), front.device),
         )
 
     def warm_up(self, moe: nn.Module) -> None:
@@ -363,6 +388,7 @@ class K3DecodeMoeNvfp4Layer:
             sort_ctr=self.state.sort_ctr if sort_out is not None else None,
             sort_offset=self.offset,
             sort_local=self.num_local,
+            sort_replicas=self.rep_table if sort_out is not None else None,
         )
 
     @property
@@ -371,9 +397,11 @@ class K3DecodeMoeNvfp4Layer:
         return self.experts[0].shape[0]
 
     def _routed(self, ids, weights, x_q, x_sf) -> torch.Tensor:
+        """``moe_sort`` of the home slot ids ``ids`` over this rank's home slots, then the expert kernel (with copies:
+        home copies only)."""
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, local_num_experts=self.home_local or None,
         )  # fmt: skip
 
     def _front_routed(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):

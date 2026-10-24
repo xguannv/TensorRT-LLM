@@ -71,6 +71,7 @@ import cutlass.experimental.cuda as cuda
 from cutlass import dsl_user_op
 from cutlass.experimental import primitives as prims
 
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_route_tail as _rt
 from tensorrt_llm._torch.cute_dsl_kernels.k3_route_quant import k3_route_quant_kernel as _rq
 
 from . import k3_route_quant_ag as _ag
@@ -482,6 +483,91 @@ def key_words(m_max: int = M_MAX) -> int:
     return max(NUM_EXPERTS, sort_scratch(m_max)[2] + SORT_WORDS)
 
 
+# The sort with redundant expert copies (``rep``): local slots are at most `_rt.REP_LOCAL_CAP` (256), so a token's
+# local bitmap takes REP_WORDS words; the scratch then also holds the step's selected-expert bitmap (SORT_WORDS words),
+# the bitmap of the two-copy experts it computes on their copy (SORT_WORDS) and the rank's copy-choice table
+# (`_rt.replica_table`), all within `key_words`.
+REP_WORDS = _rt.REP_LOCAL_CAP // 32
+REP_HOME_WORDS = _rt.REP_NUM_HOME // 32  # one EP rank's home experts: 7 bitmap words
+
+
+def rep_scratch(m_max: int = M_MAX) -> tuple[int, int, int, int, int, int]:
+    """(bitmaps, union, prefix, selected, moved, table) offsets of the copy sort's scratch in s_key for an
+    m_max-token build."""
+    bits = SORT_IDS + m_max * TOP_K
+    union = bits + m_max * REP_WORDS
+    prefix = union + REP_WORDS
+    selected = prefix + REP_WORDS
+    moved = selected + SORT_WORDS
+    table = moved + SORT_WORDS
+    assert table + _rt.REP_TABLE_WORDS <= key_words(m_max), "the copy sort's scratch exceeds s_key"
+    return bits, union, prefix, selected, moved, table
+
+
+@dsl_user_op
+def _red_or_shared(addr_u32, val, *, loc=None, ip=None):
+    """red.shared.or.b32."""
+    from cutlass._mlir.dialects import llvm as _llvm
+
+    _llvm.inline_asm(
+        None, [cutlass.Int32(addr_u32).ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        "red.shared.or.b32 [$0], $1;", "r,r", has_side_effects=True,
+        is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+@cute.jit
+def _choose_copies(s_key, lane, selected: cutlass.Constexpr[int], moved: cutlass.Constexpr[int],
+                   table: cutlass.Constexpr[int]):  # fmt: skip
+    """One warp (``lane`` 0-31): the step's copy choice (``_rt.replica_choice``) from the selected-expert bitmap at
+    ``selected`` and the copy-choice table at ``table``, OR-ed into the moved-expert bitmap at ``moved`` (all in
+    s_key, ``moved`` zero on entry). ``_rt.K3RouteTailRepKernel.choose``'s arithmetic: lane ``l`` holds entry
+    ``32 c + l`` of chunk ``c``; ballots count each (home rank, copy rank) class and rank the lane's entry in it;
+    three rounds of closed-form rank-pair balances give each class's moved count. Zero table words past the entry
+    count are invalid entries."""
+    base = s_key.data_ptr().toint()
+    word = cutlass.Int32(0)
+    packed = cutlass.Int32(0)
+    if lane < cutlass.Int32(SORT_WORDS):
+        word = s_key.load(idx=selected + lane)
+        single = word & (s_key.load(idx=table + _rt.REP_FLEX_OFF + lane) ^ cutlass.Int32(-1))
+        packed = _popc(single) << ((lane // cutlass.Int32(REP_HOME_WORDS)) * cutlass.Int32(8))
+    counts = _rt._redux_add_u32(packed)
+    pairs = [(h, r) for h in range(4) for r in range(4) if h != r]
+    k = {hr: cutlass.Int32(0) for hr in pairs}
+    lanes = []
+    for c in cutlass.range_constexpr(_rt.REP_MAX_ENTRIES // 32):
+        entry = s_key.load(idx=table + _rt.REP_LIST_OFF + c * 32 + lane)
+        hit, ranks = _rt._replica_lane(
+            entry, _rt._shfl_idx_b32(word, (entry & cutlass.Int32(1023)) >> 5)
+        )
+        cls = (ranks & cutlass.Int32(255)) * cutlass.Int32(4) + (ranks >> 8)
+        pos = cutlass.Int32(0)
+        for h, r in pairs:
+            mask = _rt._ballot_eq(hit, cls, h * 4 + r)
+            if cls == cutlass.Int32(h * 4 + r):
+                pos = k[(h, r)] + _popc(mask & _rt._low_bits_mask(lane))
+            k[(h, r)] = k[(h, r)] + _popc(mask)
+        lanes.append((entry, hit, cls, pos))
+    loads = [(counts >> (8 * g)) & cutlass.Int32(255) for g in range(4)]
+    moves = {}
+    for rnd in _rt.REP_ROUNDS:
+        for a, b in rnd:
+            loads[a], loads[b], moves[(a, b)], moves[(b, a)] = _rt._pair_balance(
+                loads[a], loads[b], k[(a, b)], k[(b, a)]
+            )
+    for entry, hit, cls, pos in lanes:
+        limit = cutlass.Int32(0)
+        for h, r in pairs:
+            if cls == cutlass.Int32(h * 4 + r):
+                limit = moves[(h, r)]
+        if (hit != cutlass.Int32(0)) & (pos < limit):
+            x = entry & cutlass.Int32(1023)
+            _red_or_shared(
+                base + (cutlass.Int32(moved) + (x >> 5)) * cutlass.Int32(4), _rt._bit(x & 31)
+            )
+
+
 def _per_thread(items: int) -> int:
     """Items per thread when THREADS threads take ``items``."""
     return -(-items // THREADS)
@@ -498,12 +584,23 @@ def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
 
 @cute.jit
 def _sort_local(
-    s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx, m_max: cutlass.Constexpr[int]
-):
+    s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx, m_max: cutlass.Constexpr[int],
+    rep_table, rep: cutlass.Constexpr[bool],
+):  # fmt: skip
     """moe_sort of the M tokens' top-16 over the local experts [offset, offset + num_local), 128-row tiles, by all
     THREADS threads of one CTA, into ``sort_words`` (`sort_layout`): one tile per local expert some token selected, in
-    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order."""
-    SORT_BITS, SORT_UNION, SORT_PREFIX = sort_scratch(m_max)
+    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order.
+
+    With ``rep`` (redundant expert copies), ``offset`` is this EP rank's first home expert and ``rep_table`` its
+    copy-choice table (`_rt.replica_table`); local slots [0, 224) are its home experts and [224, num_local) its copies.
+    The step's copy choice (`_choose_copies`) decides, per selected two-copy expert, which copy computes it, and each
+    selection is sorted into the one local slot that computes it on this rank, if any."""
+    if cutlass.const_expr(rep):
+        SORT_BITS, SORT_UNION, SORT_PREFIX, REP_SEL, REP_MOVED, REP_TABLE = rep_scratch(m_max)
+        W = REP_WORDS
+    else:
+        SORT_BITS, SORT_UNION, SORT_PREFIX = sort_scratch(m_max)
+        W = SORT_WORDS
     n = num_tokens * cutlass.Int32(TOP_K)
     tiles = cutlass.min(n, num_local)
     w0 = (cutlass.Int32(2) * tiles + cutlass.Int32(4)) // cutlass.Int32(4) * cutlass.Int32(4)
@@ -513,12 +610,54 @@ def _sort_local(
         j = tx + cutlass.Int32(i * THREADS)
         if j < n:
             s_key.store(topk_ids.load(idx=j, is_volatile=True), idx=SORT_IDS + j)
+    if cutlass.const_expr(rep):
+        if tx < cutlass.Int32(_rt.REP_TABLE_WORDS):
+            s_key.store(rep_table.load(idx=tx), idx=REP_TABLE + tx)
+        if tx < cutlass.Int32(2 * SORT_WORDS):
+            s_key.store(cutlass.Int32(0), idx=REP_SEL + tx)
+        cute.arch.barrier()
+        sel_base = s_key.data_ptr().toint() + cutlass.Int32(REP_SEL * 4)
+        for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
+            j = tx + cutlass.Int32(i * THREADS)
+            if j < n:
+                x = s_key.load(idx=SORT_IDS + j)
+                _red_or_shared(sel_base + (x >> 5) * cutlass.Int32(4), _rt._bit(x & 31))
+        cute.arch.barrier()
+        if tx < cutlass.Int32(32):
+            _choose_copies(s_key, tx, REP_SEL, REP_MOVED, REP_TABLE)
+        cute.arch.barrier()
+        # Each selection's id becomes offset + the local slot that computes it, or offset - 1 (not on this rank).
+        for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
+            j = tx + cutlass.Int32(i * THREADS)
+            if j < n:
+                x = s_key.load(idx=SORT_IDS + j)
+                xw = x >> 5
+                xb = x & cutlass.Int32(31)
+                moved = (s_key.load(idx=REP_MOVED + xw) >> xb) & cutlass.Int32(1)
+                hl = x - offset
+                lx = cutlass.Int32(-1)
+                if (
+                    (hl >= cutlass.Int32(0))
+                    & (hl < cutlass.Int32(_rt.REP_NUM_HOME))
+                    & (moved == cutlass.Int32(0))
+                ):
+                    lx = hl
+                mine = s_key.load(idx=REP_TABLE + _rt.REP_MINE_OFF + xw)
+                if (((mine >> xb) & cutlass.Int32(1)) != cutlass.Int32(0)) & (
+                    moved != cutlass.Int32(0)
+                ):
+                    lx = (
+                        cutlass.Int32(_rt.REP_NUM_HOME)
+                        + s_key.load(idx=REP_TABLE + _rt.REP_PREFIX_OFF + xw)
+                        + _popc(mine & _rt._low_bits_mask(xb))
+                    )
+                s_key.store(lx + offset, idx=SORT_IDS + j)
     cute.arch.barrier()
-    for i in cutlass.range_constexpr(_per_thread(m_max * SORT_WORDS)):
+    for i in cutlass.range_constexpr(_per_thread(m_max * W)):
         j = tx + cutlass.Int32(i * THREADS)
-        if j < num_tokens * cutlass.Int32(SORT_WORDS):
-            t = j // cutlass.Int32(SORT_WORDS)
-            w = j - t * cutlass.Int32(SORT_WORDS)
+        if j < num_tokens * cutlass.Int32(W):
+            t = j // cutlass.Int32(W)
+            w = j - t * cutlass.Int32(W)
             word = cutlass.Int32(0)
             for k in cutlass.range_constexpr(TOP_K):
                 lx = s_key.load(idx=SORT_IDS + t * cutlass.Int32(TOP_K) + k) - offset
@@ -526,19 +665,19 @@ def _sort_local(
                 word = word | cutlass.select_(hit, cutlass.Int32(1) << (lx & 31), cutlass.Int32(0))
             s_key.store(word, idx=SORT_BITS + j)
     cute.arch.barrier()
-    if tx < cutlass.Int32(SORT_WORDS):
+    if tx < cutlass.Int32(W):
         u = cutlass.Int32(0)
         for t in cutlass.range_constexpr(m_max):
             if cutlass.Int32(t) < num_tokens:
-                u = u | s_key.load(idx=SORT_BITS + t * SORT_WORDS + tx)
+                u = u | s_key.load(idx=SORT_BITS + t * W + tx)
         s_key.store(u, idx=SORT_UNION + tx)
     cute.arch.barrier()
-    if tx < cutlass.Int32(SORT_WORDS + 1):
+    if tx < cutlass.Int32(W + 1):
         before = cutlass.Int32(0)
-        for w in cutlass.range_constexpr(SORT_WORDS):
+        for w in cutlass.range_constexpr(W):
             if cutlass.Int32(w) < tx:
                 before = before + _popc(s_key.load(idx=SORT_UNION + w))
-        if tx < cutlass.Int32(SORT_WORDS):
+        if tx < cutlass.Int32(W):
             s_key.store(before, idx=SORT_PREFIX + tx)
         else:
             sort_words.store(before, idx=cutlass.Int32(2) * tiles)
@@ -559,9 +698,7 @@ def _sort_local(
                 count = cutlass.Int32(0)
                 for q in cutlass.range_constexpr(m_max):
                     if cutlass.Int32(q) < num_tokens:
-                        bit = (s_key.load(idx=SORT_BITS + q * SORT_WORDS + w) >> b) & cutlass.Int32(
-                            1
-                        )
+                        bit = (s_key.load(idx=SORT_BITS + q * W + w) >> b) & cutlass.Int32(1)
                         count = count + bit
                         if cutlass.Int32(q) < t:
                             row = row + bit
@@ -729,6 +866,7 @@ def k3_moe_front_kernel(
     gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
     sort_words: cutlass.Array,  # int32 [sort_layout words] (sort)
     sort_ctr: cutlass.Array,  # int32 [1], zero between calls: the route CTAs done (sort)
+    rep_table: cutlass.Array,  # int32 [_rt.REP_TABLE_WORDS]: this rank's copy-choice table (rep)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -748,6 +886,7 @@ def k3_moe_front_kernel(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    rep: cutlass.Constexpr[bool],
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
     # token, a quantization CTA per QT_ tokens).
@@ -1439,6 +1578,8 @@ def k3_moe_front_kernel(
                             sort_local,
                             tx,
                             m_max,
+                            rep_table,
+                            rep,
                         )
                         if tx == 0:
                             sort_ctr.store(cutlass.Int32(0), idx=0)
@@ -1584,6 +1725,7 @@ def k3_moe_front(
     gsf: cute.Tensor,
     sort_words: cute.Tensor,
     sort_ctr: cute.Tensor,
+    rep_table: cute.Tensor,
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -1604,6 +1746,7 @@ def k3_moe_front(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    rep: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1612,9 +1755,9 @@ def k3_moe_front(
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens, m_max)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
-        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
-        sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort, m_max,
+        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, rep_table, num_tokens, tp_rank,
+        routed_scaling_factor, sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in,
+        ring, gate_cap, linear_cap, publish, head_half, nvfp4, sort, m_max, rep,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),

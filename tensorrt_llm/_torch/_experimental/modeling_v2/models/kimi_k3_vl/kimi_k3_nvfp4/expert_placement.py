@@ -24,12 +24,22 @@ File format (``ep4_place.py``'s)::
      "ep_size": 4,
      "expert_of_slot": {"<layer_idx>": [num_experts checkpoint expert ids], ...}}
 
-A ``kimi_k3_expert_placement/v2`` file (v1 plus replica slots) is read as its v1 permutation; its replicas are not
-used here.
+A ``kimi_k3_expert_placement/v2`` file is v1 plus redundant copies::
+
+     "replica_slots": S,
+     "replicas": {"<layer_idx>": [[home slot, copy EP rank], ...], ...}   # priority order
+
+Without ``TRTLLM_K3LL_EXPERT_REPLICAS`` it is read as its v1 permutation. With it (`load_replicas`,
+`ExpertReplicas`), every EP rank holds ``224 + S`` local slots: its home slots, then the copies it holds (ascending
+home slot), unused copy slots repeating its first home slot (never routed to). A copy slot loads its home slot's
+checkpoint expert. Routing keeps returning home slot ids (896 space); the decode front's sort chooses, per step,
+which copy computes each touched two-copy expert (`k3_moe_front`, ``replica_choice``), and every other path maps a
+home slot ``x`` to its home copy ``x + (x // 224) * S`` (`ExpertReplicas.routed_slot_of_home`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -112,3 +122,99 @@ def permute_router_rows(
     with torch.no_grad():
         weight.copy_(weight.index_select(0, index))
         bias.copy_(bias.index_select(0, index.to(bias.device)))
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpertReplicas:
+    """Second copies of some home slots of one MoE layer (the module docstring's v2 layout)."""
+
+    num_experts: int
+    ep_size: int
+    #: Copy slots per EP rank (``S``); every MoE layer has them, used or not.
+    slots_per_rank: int
+    #: ``(home slot, EP rank of the copy)`` in priority order.
+    entries: Tuple[Tuple[int, int], ...]
+
+    @property
+    def num_home(self) -> int:
+        """Home slots per EP rank."""
+        return self.num_experts // self.ep_size
+
+    @property
+    def num_local(self) -> int:
+        """Slots per EP rank: home slots, then copy slots."""
+        return self.num_home + self.slots_per_rank
+
+    @property
+    def num_slots(self) -> int:
+        """Slots of the routed MoE (rank-major)."""
+        return self.ep_size * self.num_local
+
+    def copies_on(self, rank: int) -> Tuple[int, ...]:
+        """Home slots whose copy EP rank ``rank`` holds, in local-slot (ascending) order."""
+        return tuple(sorted(x for x, r in self.entries if r == rank))
+
+    def home_slots_of_local(self, rank: int) -> Tuple[int, ...]:
+        """The home slot whose expert each local slot of ``rank`` holds; copy slots without a copy repeat the rank's
+        first home slot."""
+        home = tuple(range(rank * self.num_home, (rank + 1) * self.num_home))
+        copies = self.copies_on(rank)
+        return home + copies + (home[0],) * (self.slots_per_rank - len(copies))
+
+    def routed_slot_of_home(self) -> Tuple[int, ...]:
+        """Routed-MoE slot of the home copy of each home slot."""
+        return tuple(
+            x + (x // self.num_home) * self.slots_per_rank for x in range(self.num_experts)
+        )
+
+
+@functools.lru_cache(maxsize=4)
+def load_replicas(
+    path: str, num_experts: int, ep_size: int
+) -> Tuple[int, Dict[int, Tuple[Tuple[int, int], ...]]]:
+    """``(replica_slots, {layer_idx: entries})`` of v2 placement file ``path``, layers without copies dropped.
+
+    Raises ``ValueError`` unless the file is v2 for ``num_experts`` experts and ``ep_size`` EP ranks, with
+    ``replica_slots >= 1``, every copy on a rank other than its home, no expert copied twice and at most
+    ``replica_slots`` copies per rank and layer."""
+    with open(path) as f:
+        data = json.load(f)
+    if data.get("format") != FORMAT_V2:
+        raise ValueError(
+            f"{path}: redundant copies need format {FORMAT_V2!r}, got {data.get('format')!r}"
+        )
+    if data.get("num_experts") != num_experts or data.get("ep_size") != ep_size:
+        raise ValueError(
+            f"{path}: copies are for {data.get('num_experts')} experts over ep_size={data.get('ep_size')}, the "
+            f"routed MoE has {num_experts} over ep_size={ep_size}"
+        )
+    slots = int(data.get("replica_slots", 0))
+    if slots < 1 or num_experts % ep_size:
+        raise ValueError(f"{path}: needs replica_slots >= 1 and ep_size dividing {num_experts}")
+    num_home = num_experts // ep_size
+    layers: Dict[int, Tuple[Tuple[int, int], ...]] = {}
+    for layer, raw in data.get("replicas", {}).items():
+        try:
+            layer_idx = int(layer)
+        except ValueError as err:
+            raise ValueError(f"{path}: replicas layer key {layer!r} is not an integer") from err
+        entries = tuple((int(x), int(r)) for x, r in raw)
+        per_rank = [0] * ep_size
+        for x, r in entries:
+            if not (0 <= x < num_experts and 0 <= r < ep_size and r != x // num_home):
+                raise ValueError(f"{path}: layer {layer_idx}: bad copy {[x, r]}")
+            per_rank[r] += 1
+        if len({x for x, _ in entries}) != len(entries) or max(per_rank) > slots:
+            raise ValueError(
+                f"{path}: layer {layer_idx}: an expert copied twice, or more than {slots} copies on one rank"
+            )
+        if entries:
+            layers[layer_idx] = entries
+    return slots, layers
+
+
+def replicas_for_layer(path: str, layer_idx: int, num_experts: int, ep_size: int) -> ExpertReplicas:
+    """``layer_idx``'s copies from v2 file ``path`` (`load_replicas`); a layer without copies still gets the file's
+    ``replica_slots`` (empty) copy slots, so every MoE layer has the same slot layout."""
+    slots, layers = load_replicas(path, num_experts, ep_size)
+    return ExpertReplicas(num_experts, ep_size, slots, layers.get(layer_idx, ()))
