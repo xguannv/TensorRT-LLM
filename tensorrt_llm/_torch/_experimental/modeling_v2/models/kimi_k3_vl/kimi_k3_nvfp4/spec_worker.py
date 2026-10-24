@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import functools
+import os
 import inspect
 from typing import Optional
 
@@ -2079,10 +2080,21 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             pdl,
         )
         attn_metadata._seq_lens[:num_gens] = K + 1
-        reduced = embed.all_reduce(out.lookup) if reduce else out.lookup
-        noise = _prep.noise_block(
-            reduced, block, self._k3_trained_mask(draft_model, mask_token_id), pdl
-        )
+        # THROWAWAY PROBE (oak M4 S3 item 2, never merged): K3_S3_PROBE=1 skips the embedding all-reduce and the noise
+        # block (a persistent tensor of the right shape stands in): the timing ceiling of folding them into the
+        # acceptance. Values are wrong; only meaningful under forced acceptance + replay.
+        if os.environ.get("K3_S3_PROBE", "0") == "1":
+            key = (num_gens, block, out.lookup.shape[1])
+            probe = self.__dict__.setdefault("_k3_s3_probe", {})
+            if key not in probe:
+                probe[key] = out.lookup.new_zeros(num_gens, block, out.lookup.shape[1])
+            noise = probe[key]
+            _census.count(f"dispatch:s3_probe_skip_embed_ar:{_census.mode()}")
+        else:
+            reduced = embed.all_reduce(out.lookup) if reduce else out.lookup
+            noise = _prep.noise_block(
+                reduced, block, self._k3_trained_mask(draft_model, mask_token_id), pdl
+            )
         if step["side"] is not None:
             latents = step["latents"]
             step["side"].join(latents)
