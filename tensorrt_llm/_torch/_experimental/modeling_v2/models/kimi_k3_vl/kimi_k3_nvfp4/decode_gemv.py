@@ -369,6 +369,14 @@ class K3DecodeGemvs:
         row count of the site, the kernel warmed when capturing) and the push variant, compiled at load
         (``compile_push``), takes the shape over ``world`` ranks. Shapes, dtypes and load-time state only, so every
         rank decides alike; with it the push stores the bf16 values ``project`` would return."""
+        if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_cuda:
+            return False
+        return self.takes_push_rows(site, x.shape[0], x.shape[1], weight, world)
+
+    def takes_push_rows(
+        self, site: str, rows: int, width: int, weight: torch.Tensor, world: int
+    ) -> bool:
+        """``takes_push`` of a dense bf16 CUDA input of ``rows`` x ``width`` (decided before the input exists)."""
         spec = SITES[site]
         if (
             not spec.wide
@@ -379,20 +387,16 @@ class K3DecodeGemvs:
             or tuple(weight.shape) != (spec.n, spec.k)
             or not weight.is_contiguous()
             or weight.data_ptr() % 16
-            or x.dtype != torch.bfloat16
-            or x.dim() != 2
-            or x.shape[1] != spec.k
-            or not x.is_cuda
+            or width != spec.k
         ):
             return False
-        rows = x.shape[0]
         if not MAX_ROWS < rows <= spec.wide_rows:
             return False
         if _capturing() and (site, "wide", _wide_tile(rows)) not in self._ran:
             return False
         # The push's config is the plain call's (``wide_config``, which is what ``supports_wide`` checks besides the
         # rows' layout, which ``_dense_rows`` provides on both paths).
-        return _ctm_op.wide_ar_push_compiled(spec.n, spec.k, rows, world, x.device)
+        return _ctm_op.wide_ar_push_compiled(spec.n, spec.k, rows, world, weight.device)
 
     def project_push(self, site: str, x: torch.Tensor, weight: torch.Tensor, lamport) -> None:
         """``x @ weight.T`` on ``site``'s ``k3_ctm_gemv_wide`` (``takes_push`` holds), pushed into the Lamport slots of

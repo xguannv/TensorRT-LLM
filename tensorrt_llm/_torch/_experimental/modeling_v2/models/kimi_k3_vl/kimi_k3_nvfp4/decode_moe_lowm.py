@@ -475,7 +475,7 @@ class K3DecodeMoeNvfp4Layer:
         output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts. With
         ``TRTLLM_K3LL_MOE_TAIL_PUSH`` (read at forward time) the tail's input and weight instead (a `WideTail`), whose
         consumer runs the tail GEMV (``moe_tail_push.py``). With ``TRTLLM_K3LL_MOE_TAIL_LU`` (read at forward time),
-        where ``moe_tail_lu.takes`` holds after the front, the reduced routed and shared outputs (a `LuTail`,
+        where ``moe_tail_lu.takes`` holds, the reduced routed and shared outputs (a `LuTail`,
         ``moe_tail_lu.py``)."""
         x = hidden_states.contiguous()
         front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
@@ -489,15 +489,15 @@ class K3DecodeMoeNvfp4Layer:
             _census.count(f"moe_front32:{_census.mode()}")
         if self.state.front_head(x.shape[0], front32) is not None:
             # The front's 16- or 32-token build: head GEMV, all-gather, routing, NVFP4 latent and shared gate_up + SiTU.
-            routing, shared_act = self._front_only(moe, x, front32)
-            if _tail_lu.takes(self.state.lu, self.lu, shared_act, gemvs):
+            if _tail_lu.takes(self.state.lu, self.lu, x.shape[0], self.shared_cols, gemvs):
                 from . import census as _census
 
                 _census.count(f"dispatch:moe_tail_lu:{_census.mode()}")
+                routing, shared_act = self._front_only(moe, x, front32)
                 return _tail_lu.run(
                     self.state.lu, self.lu, gemvs, shared_act, lambda: self._routed_after(routing)
                 )
-            routed = self._routed_after(routing)
+            routed, shared_act = self._front_routed(moe, x, front32)
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's

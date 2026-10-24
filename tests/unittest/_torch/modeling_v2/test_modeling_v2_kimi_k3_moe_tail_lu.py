@@ -76,8 +76,8 @@ class _Gemvs:
     def __init__(self, ok: bool):
         self.ok, self.asked = ok, []
 
-    def takes_push(self, site, x, weight, world):
-        self.asked.append((site, tuple(x.shape), world))
+    def takes_push_rows(self, site, rows, width, weight, world):
+        self.asked.append((site, rows, width, world))
         return self.ok
 
 
@@ -88,35 +88,31 @@ def _state(ready=True, rows=range(9, 33), buffer=4 << 20, push_buffer=4 << 20, w
 
 
 def test_takes_decision(monkeypatch):
-    """The decision reads the switch, the step's rows and load-time state only."""
+    """The decision reads the switch, the step's rows and load-time state only (before the front runs)."""
     pytest.importorskip("cutlass")
     lu = _mod("moe_tail_lu")
     layer = SimpleNamespace(shared_down=torch.zeros(1))
-
-    def act(rows):
-        return torch.zeros(rows, 384, dtype=torch.bfloat16)
-
     monkeypatch.setattr(lu._flags, "TRTLLM_K3LL_MOE_TAIL_LU", 0)
-    assert not lu.takes(_state(), layer, act(16), _Gemvs(True))
+    assert not lu.takes(_state(), layer, 16, 384, _Gemvs(True))
     monkeypatch.setattr(lu._flags, "TRTLLM_K3LL_MOE_TAIL_LU", 1)
     gemvs = _Gemvs(True)
     for rows in (8, 9, 16, 17, 32, 33):
-        assert lu.takes(_state(), layer, act(rows), gemvs) == (9 <= rows <= 32), rows
-    assert gemvs.asked[0] == (lu.SHARED_SITE, (9, 384), 16)
-    assert not lu.takes(_state(), layer, act(16), _Gemvs(False)), "the shared push refused"
-    assert not lu.takes(_state(ready=False), layer, act(16), gemvs), "not warmed at load"
-    assert not lu.takes(_state(rows=range(9, 17)), layer, act(24), gemvs), (
+        assert lu.takes(_state(), layer, rows, 384, gemvs) == (9 <= rows <= 32), rows
+    assert gemvs.asked[0] == (lu.SHARED_SITE, 9, 384, 16)
+    assert not lu.takes(_state(), layer, 16, 384, _Gemvs(False)), "the shared push refused"
+    assert not lu.takes(_state(ready=False), layer, 16, 384, gemvs), "not warmed at load"
+    assert not lu.takes(_state(rows=range(9, 17)), layer, 24, 384, gemvs), (
         "MXFP8 GEMM not compiled for the rows"
     )
-    assert not lu.takes(None, layer, act(16), gemvs) and not lu.takes(
-        _state(), None, act(16), gemvs
+    assert not lu.takes(None, layer, 16, 384, gemvs) and not lu.takes(
+        _state(), None, 16, 384, gemvs
     )
-    assert not lu.takes(_state(), layer, act(16), None)
+    assert not lu.takes(_state(), layer, 16, 384, None)
     # 32 rows x 16 ranks x 3584 x 2 B = 3.5 MiB: a 3 MiB latent buffer refuses them, keeps 16.
-    assert not lu.takes(_state(buffer=3 << 20), layer, act(32), gemvs)
-    assert lu.takes(_state(buffer=3 << 20), layer, act(16), gemvs)
+    assert not lu.takes(_state(buffer=3 << 20), layer, 32, 384, gemvs)
+    assert lu.takes(_state(buffer=3 << 20), layer, 16, 384, gemvs)
     # The shared all-reduce's two-shot call of 32 rows of 7168 at 16 ranks needs 917504 B.
-    assert not lu.takes(_state(push_buffer=1 << 19), layer, act(32), gemvs)
+    assert not lu.takes(_state(push_buffer=1 << 19), layer, 32, 384, gemvs)
 
 
 class _Stop(Exception):
@@ -129,17 +125,28 @@ def _wide_layer(dm, takes: bool, monkeypatch):
     layer = object.__new__(dm.K3DecodeMoeNvfp4Layer)
     layer.state = SimpleNamespace(front_head=lambda rows, front32=None: object(), lu="state")
     layer.lu = "layer"
+    layer.shared_cols = 384
     shared_act = torch.zeros(16, 384, dtype=torch.bfloat16)
     layer._front_only = lambda moe, x, front32=None: (
         calls.append("front") or ("routing", shared_act)
     )
 
+    def front_routed(moe, x, front32=None):
+        calls.append("front_routed")
+        raise _Stop
+
     def routed_after(routing):
         calls.append(("routed", routing))
         raise _Stop
 
+    layer._front_routed = front_routed
     layer._routed_after = routed_after
-    monkeypatch.setattr(dm._tail_lu, "takes", lambda st, ly, act, gemvs: takes)
+
+    def lu_takes(st, ly, rows, width, gemvs):
+        calls.append(("takes", st, ly, rows, width))
+        return takes
+
+    monkeypatch.setattr(dm._tail_lu, "takes", lu_takes)
 
     def run(st, ly, gemvs, act, routed_fn):
         calls.append(("run", st, ly, act is shared_act))
@@ -155,19 +162,20 @@ def _wide_layer(dm, takes: bool, monkeypatch):
 
 @pytest.mark.parametrize("takes", [False, True])
 def test_wide_dispatch(takes, monkeypatch):
-    """With ``moe_tail_lu.takes`` the wide step hands ``run`` the front's shared activation and the routed experts
-    (after the front, once); without it the step runs the routed experts right after the front, as before."""
+    """The wide step decides before the front. With ``moe_tail_lu.takes`` it hands ``run`` the front's shared
+    activation and the routed experts (after the front, once); without it the step runs ``_front_routed`` as before."""
     pytest.importorskip("cutlass")
     dm = _mod("decode_moe_lowm")
     layer, calls = _wide_layer(dm, takes, monkeypatch)
     x = torch.zeros(16, 7168, dtype=torch.bfloat16)
+    decision = ("takes", "state", "layer", 16, 384)
     if takes:
         assert dm.K3DecodeMoeNvfp4Layer._wide(layer, None, x, gemvs=None) == "tail"
-        assert calls == ["front", ("run", "state", "layer", True), ("routed", "routing")]
+        assert calls == [decision, "front", ("run", "state", "layer", True), ("routed", "routing")]
     else:
         with pytest.raises(_Stop):
             dm.K3DecodeMoeNvfp4Layer._wide(layer, None, x, gemvs=None)
-        assert calls == ["front", ("routed", "routing")]
+        assert calls == [decision, "front_routed"]
 
 
 @pytest.mark.skipif(not _sm10x(), reason="needs an SM100/SM103 GPU")
