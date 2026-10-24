@@ -4983,6 +4983,14 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        # THROWAWAY PROBE (oak M4 S3 item 1b, never merged): K3_S3_STREAM_PROBE=1 makes the execution stream the
+        # loop thread's current stream, so the per-step wait_stream pair (execution -> current -> execution) no
+        # longer round-trips through the legacy NULL stream. Timing probe only.
+        if os.environ.get("K3_S3_STREAM_PROBE", "0") == "1":
+            torch.cuda.set_stream(self.execution_stream)
+            logger.info(
+                "[K3_S3_STREAM_PROBE] executor loop current stream = execution_stream"
+            )
         with self._profiler() as profile_step, self.hang_detector:
             sample_state = None
             iter_start_time = time.time()
@@ -5858,6 +5866,14 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        # THROWAWAY PROBE (oak M4 S3 item 1b, never merged): K3_S3_STREAM_PROBE=1 makes the execution stream the
+        # loop thread's current stream, so the per-step wait_stream pair (execution -> current -> execution) no
+        # longer round-trips through the legacy NULL stream. Timing probe only.
+        if os.environ.get("K3_S3_STREAM_PROBE", "0") == "1":
+            torch.cuda.set_stream(self.execution_stream)
+            logger.info(
+                "[K3_S3_STREAM_PROBE] executor loop current stream = execution_stream"
+            )
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
