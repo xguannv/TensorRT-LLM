@@ -445,6 +445,8 @@ def test_ep4_replica_contributions(num_tokens):
 
     torch.manual_seed(4000 + num_tokens)
     logits = torch.randn(num_tokens, S_EXPERTS, device="cuda")
+    # Skewed toward EP groups 0 and 1, so that even 32 tokens leave the groups unbalanced and the choice moves work.
+    logits[:, : 2 * S_LOCAL] += 3.0
     scales, ids = logits.topk(S_TOP_K, dim=-1)
     ids = ids.to(torch.int32)
     scales = scales.softmax(dim=-1).float()
