@@ -89,6 +89,13 @@ eager call on the same inputs):
     roundings); the routing's experts equal, the weights within one bf16 ulp, the NVFP4 latent and scales bit for bit;
     and the expert kernel on the on arm's routing and latent bit for bit ``CuteDslFusedMoE.run_moe_nvfp4`` on the same
     inputs.
+  * MOE_TAIL_LU (16 and 32 rows, the 16- and 32-token fronts; ``moe_tail_lu.py``, built in ``check_build`` as
+    ``_build_tail_lu`` builds it, from the unfolded stand-in): ``_wide`` with the switch hands on a ``LuTail``; its
+    shared output against the stock all-reduce of ``F.linear`` of the front's shared activation (1e-2 of the largest
+    magnitude: the GEMV's and the all-reduce's sums), and ``routed + shared`` against the off arm's reduced output
+    within ``LU_TOL`` (LOSSY: the FP8 latent_up). The switch on without the shared site's GEMV state runs the off arm,
+    bit for bit. Graphs captured with multi-stream on (the shared expert on the side stream), replayed with
+    rewritten inputs: bit for bit the eager call (in order on one stream).
 
 Outputs the ranks share (routing, latent, reduced outputs, ``updated`` / ``normed``) are also compared bitwise across
 the ranks; the shared activation, the routed partial and the tail are this rank's own.
@@ -153,6 +160,8 @@ ULP_REL = 2.0**-7  # one bf16 ulp, relative
 SHARED_TOL = 2e-2  # the front's shared activation: max |err| / max |ref| (k3_moe_front.md)
 NORMED_TOL = 2e-2  # normed without a prefix sum: max |err| / max |ref| (the attn_res matrix's TOL)
 MOE_TOL = 3e-2  # MOE_LOWM, the on arm's reduced output: max |err| / max |ref|
+LU_TOL = 6e-2  # MOE_TAIL_LU's reduced output vs the off arm's: the FP8 latent_up on top of MOE_TOL's differences
+LU_ROWS = (16, 32)
 STOCK_WIDE_ONE_SHOT_MAX_BYTES = 1 << 20  # the stock MNNVL all-reduce's one-shot ceiling
 
 R = None
@@ -160,6 +169,8 @@ IMPL = None  # kimi_k3_nvfp4/implementation.py
 DC = None  # decode_comm
 DM = None  # decode_moe
 DML = None  # decode_moe_lowm
+DG = None  # decode_gemv
+LU = None  # moe_tail_lu
 FLAGS = None  # flags
 LOWM_OP = None  # cute_dsl_kernels/k3_fused_moe/nvfp4_lowm_op.py
 BUILT = None
@@ -758,6 +769,16 @@ def check_build():
     # The tail stand-in's head is replaced by a fixed partial: its layer is built, never warmed (no front of its width).
     tail = DML.K3DecodeMoeNvfp4Layer.create(moe_tail, wide.state, R.rank, R.world)
     moe_on.decode_moe = on
+    # TRTLLM_K3LL_MOE_TAIL_LU's state and weights as _build_tail_lu builds them (from moe_off: the same weights with
+    # the latent norm not folded), attached to the on arms by check_moe_tail_lu only.
+    assert LU.layer_gaps(moe_off, R.world) == [], LU.layer_gaps(moe_off, R.world)
+    lu = SimpleNamespace(
+        state=LU.K3TailLuState.create(R.mapping, comm.oproj_push.lamport),
+        layer=LU.K3TailLuLayer.create(moe_off),
+        gemvs=DG.K3DecodeGemvs.create(sites=(LU.SHARED_SITE,), device=torch.device("cuda")),
+    )
+    LU.warm_up(lu.state, lu.layer, lu.gemvs, SNAPSHOTS + 1)
+    assert lu.state.ready, "MOE_TAIL_LU warm-up"
     g = _gen(7000)
     with torch.device("cuda"):
         res = SimpleNamespace(
@@ -777,7 +798,7 @@ def check_build():
     torch.cuda.synchronize()
     BUILT = SimpleNamespace(
         comm=comm, all_reduce=all_reduce, moe_on=moe_on, moe_off=moe_off, moe_tail=moe_tail,
-        on=on, plain16=plain16, wide=wide, on32=on32, tail=tail, res=res, refs=refs,
+        on=on, plain16=plain16, wide=wide, on32=on32, tail=tail, res=res, refs=refs, lu=lu,
     )  # fmt: skip
     if R.rank == 0:
         print(
@@ -1442,6 +1463,80 @@ def check_moe_lowm():
         )
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_TAIL_LU
+# ----------------------------------------------------------------------------------------------------------------------
+def _lu_on(layer, moe, x):
+    """``_wide`` with TRTLLM_K3LL_MOE_TAIL_LU on and the shared site's GEMV state: ``(LuTail, shared activation)``."""
+    with _switch("TRTLLM_K3LL_MOE_TAIL_LU", 1), _taps(layer) as seen:
+        tail = layer._wide(moe, x, BUILT.lu.gemvs)
+    assert isinstance(tail, LU.LuTail), type(tail)
+    return tail, seen["_front"][4]
+
+
+def check_moe_tail_lu():
+    """``_wide`` at 16 and 32 rows with TRTLLM_K3LL_MOE_TAIL_LU (module docstring)."""
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    moe, lu = BUILT.moe_on, BUILT.lu
+    layers = {16: BUILT.on, 32: BUILT.on32}
+    for layer in layers.values():
+        layer.lu, layer.state.lu = lu.layer, lu.state
+    try:
+        with _switch("TRTLLM_K3LL_WIDE_LATENT_TAIL", 0), _switch("TRTLLM_K3LL_MOE_FRONT32", 1):
+            for rows in LU_ROWS:
+                where = f"MOE_TAIL_LU {rows} rows"
+                layer = layers[rows]
+                x = _moe_input(1600 + rows, rows)
+                tail, act = _lu_on(layer, moe, x)
+                with _switch("TRTLLM_K3LL_MOE_TAIL_LU", 0):
+                    partial = layer._wide(moe, x, None)
+                with _switch("TRTLLM_K3LL_MOE_TAIL_LU", 1):
+                    partial_no_gemvs = layer._wide(moe, x, None)
+                assert isinstance(partial, torch.Tensor), type(partial)
+                _expect_same(
+                    f"{where}: switch on without GEMV state = off", partial_no_gemvs, partial
+                )
+                off = _stock_wide_all_reduce(BUILT.all_reduce, partial)
+                shared_ref = _stock_wide_all_reduce(
+                    BUILT.all_reduce, F.linear(act, moe.shared_experts.down_proj.weight)
+                )
+                _expect_close(f"{where} shared: vs F.linear + all-reduce", tail.shared, shared_ref, 1e-2,
+                              replicated=True)  # fmt: skip
+                _expect_close(f"MOE_TAIL_LU: {where} routed + shared vs off", tail.reduced(), off, LU_TOL,
+                              replicated=True)  # fmt: skip
+            for rows in LU_ROWS:
+                layer = layers[rows]
+                x = _moe_input(1700 + rows, rows)
+
+                def run(layer=layer, x=x):
+                    with with_multi_stream(True):
+                        return _lu_on(layer, moe, x)[0]
+
+                graph, g = _capture(run)
+                for rep in range(REPLAYS):
+                    x.copy_(_moe_input(1800 + 10 * rows + rep, rows))
+                    _replay(graph)
+                    where = f"MOE_TAIL_LU graph {rows} rows replay {rep}"
+                    eager, _ = _lu_on(layer, moe, x)
+                    _expect_same(
+                        f"{where}: routed vs eager", g.routed, eager.routed, replicated=True
+                    )
+                    _expect_same(
+                        f"{where}: shared vs eager", g.shared, eager.shared, replicated=True
+                    )
+                del graph
+    finally:
+        for layer in layers.values():
+            layer.lu, layer.state.lu = None, None
+    if R.rank == 0:
+        print(
+            f"[rank 0] MOE_TAIL_LU: routed + shared vs off max rel err {STATS.get('MOE_TAIL_LU', 0.0):.2e} "
+            f"(tolerance {LU_TOL}); graphs with the side stream = eager",
+            flush=True,
+        )
+
+
 CHECKS = [
     check_front_sort,
     check_front16,
@@ -1449,11 +1544,12 @@ CHECKS = [
     check_wide_ar_attn_res,
     check_wide_latent_tail,
     check_moe_lowm,
+    check_moe_tail_lu,
 ]
 
 
 def _run_one_rank(args) -> int:
-    global R, IMPL, DC, DM, DML, FLAGS, LOWM_OP
+    global R, IMPL, DC, DM, DML, DG, LU, FLAGS, LOWM_OP
     R = ls.Rank(args)
     import importlib
 
@@ -1462,6 +1558,8 @@ def _run_one_rank(args) -> int:
     DC = importlib.import_module(f"{package}.decode_comm")
     DM = importlib.import_module(f"{package}.decode_moe")
     DML = importlib.import_module(f"{package}.decode_moe_lowm")
+    DG = importlib.import_module(f"{package}.decode_gemv")
+    LU = importlib.import_module(f"{package}.moe_tail_lu")
     FLAGS = importlib.import_module(f"{package}.flags")
     LOWM_OP = importlib.import_module(
         "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.nvfp4_lowm_op"
