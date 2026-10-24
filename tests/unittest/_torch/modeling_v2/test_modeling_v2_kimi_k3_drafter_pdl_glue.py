@@ -365,6 +365,11 @@ def _graph(fn):
 @needs_cuda
 @pytest.mark.parametrize("rows", [7, 24, 56])
 def test_ctx_kv_pdl_bit_identical(rows):
+    # Registers trtllm::k3_drafter_mla_ctx_kv (no other import in this test does).
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (  # noqa: F401
+        mla_drafter_ctx,
+    )
+
     dev = "cuda"
     layers, page, max_pos = 5, 64, 4096
 
