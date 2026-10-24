@@ -298,13 +298,10 @@ def k3_fp8_kda_verify_kernel(
     _, n_grid, _ = cute.arch.grid_dim()
     cta_lin = h + H * (n + n_grid * vs)
 
-    def _mark(k):
-        if cutlass.const_expr(PROFILE):
-            if tidx == 0:
-                prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + k) * 2)
-                prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + k) * 2 + 1)
-
-    _mark(0)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 0) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 0) * 2 + 1)
 
     smem_a = cutlass.Array(
         cutlass.BFloat16, CTA_M * K, space=SMEM, alignment=1024
@@ -423,7 +420,10 @@ def k3_fp8_kda_verify_kernel(
                                 idx=t_h * REC + ROWS + VEC + i)  # fmt: skip
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
-    _mark(1)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 1) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 1) * 2 + 1)
     if cutlass.const_expr(FOLD_FB):
         if warp == 0:
             if prims.elect_sync():
@@ -486,7 +486,10 @@ def k3_fp8_kda_verify_kernel(
             for j in cutlass.range_constexpr(ROWS * VEC):
                 r_st.store(sts_acc[j], idx=j)
 
-    _mark(2)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 2) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 2) * 2 + 1)
     # Conv weights, transposed to [tap][channel]: q by threads 0..127, k by 128..255.
     if tidx < K:
         wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
@@ -531,10 +534,16 @@ def k3_fp8_kda_verify_kernel(
         )
 
     # ---- This step's projection rows.
-    _mark(3)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 3) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 3) * 2 + 1)
     if cutlass.const_expr(USE_PDL):
         prims.griddepcontrol(prims.GridDepAction.WAIT)
-    _mark(4)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 4) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 4) * 2 + 1)
     if cutlass.const_expr(FOLD_FB):
         if warp == 1:
             if prims.elect_sync():
@@ -591,7 +600,10 @@ def k3_fp8_kda_verify_kernel(
                                  alignment=16)  # fmt: skip
             _store8(s_gr, words_g, t_g * K + j_g * CHUNK)
     prims.barrier_cta_sync(0)
-    _mark(5)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 5) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 5) * 2 + 1)
 
     # ---- f_b on the tensor cores (warp 2 issues, warps 4-7 read TMEM) beside the q/k pre-compute (warps 0-3).
     if cutlass.const_expr(FOLD_FB):
@@ -676,7 +688,10 @@ def k3_fp8_kda_verify_kernel(
                 idx=item_v,
             )
     prims.barrier_cta_sync(0)
-    _mark(6)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 6) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 6) * 2 + 1)
 
     # ---- The recurrence's per-token operands: warp t, token t: decay = exp(gate), decay * k, beta * k.
     if warp < NT:
@@ -702,7 +717,10 @@ def k3_fp8_kda_verify_kernel(
             s_bk.store(bk0, idx=tg * K + c0)
             s_bk.store(bk1, idx=tg * K + c1)
     prims.barrier_cta_sync(0)
-    _mark(7)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 7) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 7) * 2 + 1)
 
     # ---- Recurrence over the verify tokens (register-resident state).
     st = [r_st.load(idx=j) for j in range(ROWS * VEC)]
@@ -801,7 +819,10 @@ def k3_fp8_kda_verify_kernel(
 
     # ---- Output gated RMSNorm over V: per-token partial sums of squares to every CTA of the cluster.
     prims.barrier_cta_sync(0)
-    _mark(8)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 8) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 8) * 2 + 1)
     # Whole warps enter (the full-mask shuffles below): with an odd NT, NT * V_CTA ends mid-warp, and the lanes past it
     # carry zeros and store nothing.
     if tidx < (NT * V_CTA + 31) // 32 * 32:
@@ -825,7 +846,10 @@ def k3_fp8_kda_verify_kernel(
     # them; and no CTA exits before its own mailbox has received every peer's partials.
     while not _try_wait_cluster(ss_ready.data_ptr(), 0):
         pass
-    _mark(9)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 9) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 9) * 2 + 1)
     if tidx < NT:
         total = cutlass.Float32(0.0)
         for r in cutlass.range_constexpr(V_SPLIT):
@@ -839,7 +863,10 @@ def k3_fp8_kda_verify_kernel(
         gate = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-z, fastmath=True))
         y = s_o.load(idx=tidx) * s_rs.load(idx=t_y) * s_onw.load(idx=v_y) * gate
         out.store(cutlass.BFloat16(y), idx=((row0 + t_y) * H + h) * V + v0 + v_y)
-    _mark(10)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 10) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 10) * 2 + 1)
 
     # ---- The drafts' per-key records (beta * k and the decay), one CTA per head, after every peer's norm partials
     # have arrived: each peer sends them after its recurrence, i.e. after its prologue read the last round's records.
@@ -876,7 +903,10 @@ def k3_fp8_kda_verify_kernel(
                 s_uv.load(idx=(s_col + 1) * V_CTA + v_col),
                 idx=(slot * S + s_col) * HK + ch0 + v0 + v_col,
             )
-    _mark(11)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            prof.store(_read_u64("globaltimer"), idx=(cta_lin * PROF_MARKS + 11) * 2)
+            prof.store(_read_u64("clock64"), idx=(cta_lin * PROF_MARKS + 11) * 2 + 1)
 
 
 @cute.jit
