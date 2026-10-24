@@ -261,6 +261,7 @@ def k3_fp8_kda_verify_kernel(
     SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
     HOIST_REPLAY: cutlass.Constexpr[bool],
+    ODD_CLAMP: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
     S = CONV_W - 1 + NUM_SPEC  # conv-cache columns
@@ -682,6 +683,20 @@ def k3_fp8_kda_verify_kernel(
             tk = warp * qk_per_warp + sub
             if cutlass.const_expr(NT % 4 == 0):
                 _qk_pre(tk, lane, s_uq, s_wq, s_uk, s_wk, s_q, s_k, scale)
+            elif cutlass.const_expr(ODD_CLAMP):
+                # No branch around the pre-compute: a token slot past the last token recomputes the last one (the
+                # same inputs, so the same bits are stored again; read only after the barrier below).
+                _qk_pre(
+                    cutlass.select_(tk < NT, tk, NT - 1),
+                    lane,
+                    s_uq,
+                    s_wq,
+                    s_uk,
+                    s_wk,
+                    s_q,
+                    s_k,
+                    scale,
+                )
             else:
                 if tk < NT:
                     _qk_pre(tk, lane, s_uq, s_wq, s_uk, s_wk, s_q, s_k, scale)
@@ -952,6 +967,7 @@ def k3_fp8_kda_verify(
     SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
     HOIST_REPLAY: cutlass.Constexpr[bool],
+    ODD_CLAMP: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each."""
@@ -978,7 +994,7 @@ def k3_fp8_kda_verify(
     k3_fp8_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
         slots, pending, out, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
-        SEP_BFA, USE_PDL, HOIST_REPLAY,
+        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip

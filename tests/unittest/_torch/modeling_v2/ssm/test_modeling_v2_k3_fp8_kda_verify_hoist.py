@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 POOL_NAMES = ("cs_q", "cs_k", "cs_v", "ssm", "state_tok")
 # (requests, 1 + num_spec)
-CELLS = [(1, 8), (2, 8), (4, 8), (2, 7), (4, 7), (2, 5), (2, 2)]
+CELLS = [(1, 8), (2, 8), (4, 8), (2, 7), (4, 7), (2, 6), (2, 5), (2, 4), (2, 3), (2, 2)]
 
 
 def _verify(wt, pools, proj, slots, num_spec) -> torch.Tensor:

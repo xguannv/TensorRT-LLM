@@ -96,6 +96,31 @@ def _hoist_replay(device: torch.device) -> bool:
     return _hoist_by_default(index)
 
 
+# TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP's default (-1) builds the branch-free q / k pre-compute for verify widths that are
+# not a multiple of 4 only on these compute capabilities (measured on GB300 / SM103).
+KDA_VERIFY_ODD_CLAMP_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _odd_clamp_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in KDA_VERIFY_ODD_CLAMP_CAPABILITIES
+
+
+def _odd_clamp(device: torch.device, num_spec: int) -> bool:
+    """``TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP`` on ``device`` for ``1 + num_spec`` tokens: never at a multiple of 4 tokens
+    (no branch to remove there); else 1 on, 0 off, -1 (default) on where the device is in
+    ``KDA_VERIFY_ODD_CLAMP_CAPABILITIES``."""
+    if (num_spec + 1) % 4 == 0:
+        return False
+    from . import flags
+
+    value = int(flags.TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _odd_clamp_by_default(index)
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -229,6 +254,7 @@ def k3_fp8_kda_verify(
         sep_bfa,
         pdl,
         _hoist_replay(proj.device),
+        _odd_clamp(proj.device, num_spec),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -244,13 +270,17 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, _hoist_replay(proj.device), stream,
+                    float(eps), fold_fb, sep_bfa, pdl, _hoist_replay(proj.device),
+                    _odd_clamp(proj.device, num_spec), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
-    if key[-1]:
+    if key[-2] or key[-1]:
         from . import census
 
-        census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
+        if key[-2]:
+            census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
+        if key[-1]:
+            census.count(f"dispatch:kda_verify_odd_clamp:{census.mode()}")
     return out
 
 
