@@ -240,9 +240,23 @@ class KimiK3MoeRoutingMethod(DeepSeekV3MoeRoutingMethod):
     rounding boundary. From about a thousand tokens on, ``noaux_tc_op`` takes longer than the kernel's routing.
     """
 
+    #: ``TRTLLM_K3LL_EXPERT_REPLICAS``: int32 ``[num_experts]``, the routed MoE slot of each home slot's home copy
+    #: (``ExpertReplicas.routed_slot_of_home``), set on the routed MoE's instance at construction; None: off.
+    slot_map: Optional[torch.Tensor] = None
+
     @property
     def requires_separated_routing(self) -> bool:
         return True
+
+    def apply(
+        self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ids, weights = super().apply(logits, input_ids)
+        if self.slot_map is not None:
+            if self.slot_map.device != ids.device:
+                self.slot_map = self.slot_map.to(ids.device)
+            ids = torch.index_select(self.slot_map, 0, ids.reshape(-1).long()).view(ids.shape)
+        return ids, weights
 
 
 class KimiK3MoEGate(nn.Module):
@@ -972,6 +986,14 @@ class KimiK3MoERuntime(nn.Module):
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
         )
 
+        # TRTLLM_K3LL_EXPERT_REPLICAS (expert_placement.py, v2 file): ep_size * (224 + S) rank-major slots, each rank's
+        # home slots then its copy slots; routing still returns home slot ids.
+        self.expert_replicas: Optional[_expert_placement.ExpertReplicas] = None
+        if _flags.TRTLLM_K3LL_EXPERT_REPLICAS:
+            self.expert_replicas = self._load_replicas(
+                layer_idx, routed_moe_model_config.mapping.moe_ep_size
+            )
+            routed_moe_kwargs["num_experts"] = self.expert_replicas.num_slots
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
@@ -999,8 +1021,20 @@ class KimiK3MoERuntime(nn.Module):
             self.expert_of_slot = _expert_placement.load_placement(
                 _flags.TRTLLM_K3LL_EXPERT_PLACEMENT, self.num_experts, self.moe_ep_size
             ).get(layer_idx)
+        local_home = local_expert_ids
+        if self.expert_replicas is not None:
+            # Local slots: the rank's home slots, then its copies (each the checkpoint expert of a home slot).
+            # Generic routing results map home slot ids to the home copies; the decode front chooses copies itself.
+            local_home = self.expert_replicas.home_slots_of_local(
+                local_expert_ids[0] // self.expert_replicas.num_local
+            )
+            self.routed_experts.routing_method.slot_map = torch.tensor(
+                self.expert_replicas.routed_slot_of_home(),
+                dtype=torch.int32,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
         self.local_expert_ids = _expert_placement.local_checkpoint_experts(
-            local_expert_ids, self.expert_of_slot
+            local_home, self.expert_of_slot
         )
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
@@ -1149,6 +1183,30 @@ class KimiK3MoERuntime(nn.Module):
             f"exist only for {supported}. Set moe_config.backend to CUTLASS "
             "or MEGAMOE_CUTEDSL."
         )
+
+    def _load_replicas(self, layer_idx: int, ep_size: int) -> "_expert_placement.ExpertReplicas":
+        """This layer's copies from the v2 ``TRTLLM_K3LL_EXPERT_PLACEMENT`` file (``TRTLLM_K3LL_EXPERT_REPLICAS``),
+        within the decode front's copy-choice limits (``k3_route_tail``'s replica table)."""
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_route_tail as _rt
+
+        path = _flags.TRTLLM_K3LL_EXPERT_PLACEMENT
+        if not path:
+            raise ValueError(
+                "TRTLLM_K3LL_EXPERT_REPLICAS=1 needs TRTLLM_K3LL_EXPERT_PLACEMENT=<kimi_k3_expert_placement/v2 file>"
+            )
+        replicas = _expert_placement.replicas_for_layer(path, layer_idx, self.num_experts, ep_size)
+        if (
+            replicas.num_home != _rt.REP_NUM_HOME
+            or replicas.num_local > _rt.REP_LOCAL_CAP
+            or replicas.slots_per_rank > _rt.REP_MAX_COPIES
+            or len(replicas.entries) > _rt.REP_MAX_ENTRIES
+        ):
+            raise ValueError(
+                f"{path}: TRTLLM_K3LL_EXPERT_REPLICAS serves EP4 ({_rt.REP_NUM_HOME} home slots per rank), at most "
+                f"{_rt.REP_MAX_COPIES} copy slots per rank ({_rt.REP_LOCAL_CAP} local slots) and "
+                f"{_rt.REP_MAX_ENTRIES} two-copy experts per layer"
+            )
+        return replicas
 
     @staticmethod
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:

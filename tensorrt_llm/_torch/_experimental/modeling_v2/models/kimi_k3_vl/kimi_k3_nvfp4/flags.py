@@ -480,6 +480,15 @@ TRTLLM_K3LL_EXPERT_PLACEMENT = _path_flag(
     "expert each slot (EP rank slot // 224) holds; the router rows and score bias are permuted to slot order, decode "
     "unchanged (expert_placement.py; not bitwise: the EP groups' partial sums and top-k tie order change)",
 )
+TRTLLM_K3LL_EXPERT_REPLICAS = _flag(
+    "TRTLLM_K3LL_EXPERT_REPLICAS",
+    0,
+    "routed MoE, at load, with a kimi_k3_expert_placement/v2 TRTLLM_K3LL_EXPERT_PLACEMENT file: every EP rank also "
+    "holds replica_slots copy slots with second copies of other ranks' hot experts, and the decode front's sort "
+    "computes each touched two-copy expert on one copy, chosen per step by rank-pair balancing (expert_placement.py, "
+    "k3_moe_front; every other path uses home copies only). Not bitwise: the EP groups' partials and the latent "
+    "all-reduce add in a routing-dependent order",
+)
 TRTLLM_K3LL_ROUTING_STATS_DIR = _path_flag(
     "TRTLLM_K3LL_ROUTING_STATS_DIR",
     "measurement only, rank 0: per-step token counts of every MoE layer's checkpoint experts on the lowm decode path "

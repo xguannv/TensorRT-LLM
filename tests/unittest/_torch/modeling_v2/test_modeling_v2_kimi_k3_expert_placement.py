@@ -24,6 +24,10 @@
                 random placement against the contiguous ones: every (token, expert) contribution bit for bit, the
                 full sum (the ranks' partials hold other experts, so another bf16 summation order) within the bf16
                 accumulation bound of the exact sum.
+  replicas    (host; one GPU, SM100 / SM103) : the v2 file's checks and slot layout (home slots, then copies; every
+                MoE layer keeps the copy slots); four simulated EP ranks with copy slots, each selection on the copy
+                ``replica_choice`` picks: every (token, expert) contribution bit for bit the contiguous ranks', the full
+                sum within the bf16 bound; the generic routing's ``slot_map`` (home slot -> its home copy's slot).
   stats       (one GPU) : the recorder's counts, eagerly and from CUDA-graph replays, mapped back to checkpoint
                 experts through the placement.
   front       (4 GPUs, one process each) : ``k3_moe_front`` with the router rows permuted (each TP rank's 224-row
@@ -133,6 +137,52 @@ def test_load_placement_rejects(tmp_path, fields, match):
     path = _write(tmp_path, "bad.json", **fields)
     with pytest.raises(ValueError, match=match):
         placement.load_placement(path, NUM_EXPERTS, EP)
+
+
+def test_load_replicas(tmp_path):
+    perm = _random_placement(NUM_EXPERTS, 2)
+    entries = [[5, 1], [300, 0], [700, 2], [10, 3]]
+    path = _write(
+        tmp_path, "v2.json", format=placement.FORMAT_V2, replica_slots=8, expert_of_slot={"3": perm},
+        replicas={"3": entries, "4": []},
+    )  # fmt: skip
+    slots, layers = placement.load_replicas(path, NUM_EXPERTS, EP)
+    assert slots == 8 and layers == {3: tuple(map(tuple, entries))}, (
+        "layers without copies are dropped"
+    )
+    rep = placement.replicas_for_layer(path, 3, NUM_EXPERTS, EP)
+    assert (rep.num_home, rep.num_local, rep.num_slots) == (224, 232, 928)
+    assert rep.copies_on(1) == (5,) and rep.copies_on(3) == (10,) and rep.copies_on(0) == (300,)
+    homes = rep.home_slots_of_local(1)
+    assert homes[:224] == tuple(range(224, 448)) and homes[224] == 5 and homes[225:] == (224,) * 7
+    routed = rep.routed_slot_of_home()
+    assert (
+        routed[0] == 0 and routed[223] == 223 and routed[224] == 232 and routed[895] == 895 + 3 * 8
+    )
+    empty = placement.replicas_for_layer(path, 9, NUM_EXPERTS, EP)
+    assert empty.entries == () and empty.num_slots == 928, "every MoE layer keeps the copy slots"
+
+
+@pytest.mark.parametrize(
+    "fields, match",
+    [
+        ({"format": placement.FORMAT_V1}, "need format"),
+        ({"replica_slots": 0}, "replica_slots >= 1"),
+        ({"replicas": {"1": [[5, 0]]}}, "bad copy"),
+        ({"replicas": {"1": [[5, 1], [5, 2]]}}, "copied twice"),
+        ({"replicas": {"1": [[x, 1] for x in range(0, 9 * 16, 16)]}}, "more than 8 copies"),
+        ({"ep_size": 8}, "ep_size=8"),
+    ],
+    ids=["v1", "no_slots", "home_rank", "twice", "too_many", "ep_size"],
+)
+def test_load_replicas_rejects(tmp_path, fields, match):
+    data = dict(
+        format=placement.FORMAT_V2, replica_slots=8, expert_of_slot={}, replicas={"1": [[5, 1]]}
+    )
+    data.update(fields)
+    path = _write(tmp_path, "bad.json", **data)
+    with pytest.raises(ValueError, match=match):
+        placement.load_replicas(path, NUM_EXPERTS, EP)
 
 
 def test_check_layers():
@@ -377,6 +427,108 @@ def test_ep4_contributions(num_tokens):
         total = torch.stack(partials(token_ids, weights, scales)).sum(0).double()
         err = (total - exact).abs()
         assert bool((err <= bound).all()), f"{name}: max err/bound {(err / bound).max()}"
+
+
+S_COPIES = 4
+
+
+@_needs_sm100
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 32])
+def test_ep4_replica_contributions(num_tokens):
+    """Four simulated EP ranks with S_COPIES copy slots each (the small model's experts): each selection computed by
+    the copy ``replica_choice`` picks, in the routed MoE's slot space (rank r: home slots, then its copies); every
+    (token, expert) contribution bit for bit the contiguous ranks', the full sum within the bf16 bound."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_route_tail as rt
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    torch.manual_seed(4000 + num_tokens)
+    logits = torch.randn(num_tokens, S_EXPERTS, device="cuda")
+    scales, ids = logits.topk(S_TOP_K, dim=-1)
+    ids = ids.to(torch.int32)
+    scales = scales.softmax(dim=-1).float()
+    flat = ids.view(-1).tolist()
+    hot = sorted(set(flat), key=lambda e: (-flat.count(e), e))
+    per_rank, entries = [0] * EP, []
+    for i, x in enumerate(hot):
+        r = (x // S_LOCAL + 1 + i % (EP - 1)) % EP
+        if per_rank[r] < S_COPIES:
+            per_rank[r] += 1
+            entries.append((x, r))
+    reps = placement.ExpertReplicas(S_EXPERTS, EP, S_COPIES, tuple(entries))
+    choice = rt.replica_choice(flat, entries, S_LOCAL)
+    moved = {x: r for (x, r), c in zip(entries, choice) if c}
+    assert moved, "the step moves nothing to a copy"
+    routed = reps.routed_slot_of_home()
+    copy_slot = {x: r * reps.num_local + S_LOCAL + reps.copies_on(r).index(x) for x, r in entries}
+    slots = torch.tensor(
+        [copy_slot[x] if x in moved else routed[x] for x in flat], dtype=torch.int32, device="cuda"
+    ).view(ids.shape)
+    x = torch.randn(num_tokens, S_HIDDEN, device="cuda", dtype=torch.bfloat16)
+    x_q, x_sf, x_gsf = _quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, S_HIDDEN)[:num_tokens].contiguous()
+    x_q, x_sf = x_q.view(torch.uint8), x_sf.view(torch.uint8)
+    ex = _checkpoint_experts(5000 + num_tokens)
+    counters = nvfp4_lowm_op.new_counters(torch.device("cuda"))
+    contiguous = [
+        _rank_weights(ex, range(r * S_LOCAL, (r + 1) * S_LOCAL), x_gsf) for r in range(EP)
+    ]
+    with_copies = [_rank_weights(ex, reps.home_slots_of_local(r), x_gsf) for r in range(EP)]
+
+    def partials(token_ids, weights, token_scales, local, num_experts):
+        out = []
+        for r in range(EP):
+            y = nvfp4_lowm_op.run(x_q, x_sf, token_ids, token_scales, weights[r], r * local, num_experts,
+                                  ex.fc2_input_scale, counters, GATE_CAP, LINEAR_CAP)  # fmt: skip
+            out.append(y.float())
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0, "counters not reset"
+        return out
+
+    per_slot = []
+    for slot in range(S_TOP_K):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        ref = torch.stack(partials(ids, contiguous, one_hot, S_LOCAL, S_EXPERTS)).sum(0)
+        new = torch.stack(
+            partials(slots, with_copies, one_hot, reps.num_local, reps.num_slots)
+        ).sum(0)
+        assert torch.equal(new, ref), f"top-k slot {slot}: a (token, expert) contribution differs"
+        per_slot.append(ref.double())
+    exact = torch.stack(per_slot).sum(0)
+    bound = (S_TOP_K + EP) * 2.0**-8 * torch.stack(per_slot).abs().sum(0) + 1e-30
+    total = (
+        torch.stack(partials(slots, with_copies, scales, reps.num_local, reps.num_slots))
+        .sum(0)
+        .double()
+    )
+    err = (total - exact).abs()
+    assert bool((err <= bound).all()), f"with copies: max err/bound {(err / bound).max()}"
+
+
+@_needs_sm100
+def test_routing_slot_map():
+    """The generic routing with ``slot_map`` (TRTLLM_K3LL_EXPERT_REPLICAS): the same selection and weights, each home
+    slot id mapped to its home copy's routed slot."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation,
+    )
+
+    torch.manual_seed(7)
+    bias = torch.randn(NUM_EXPERTS, device="cuda") * 0.01
+    method = implementation.KimiK3MoeRoutingMethod(
+        top_k=TOP_K, n_group=1, topk_group=1, routed_scaling_factor=RSF,
+        callable_e_score_correction_bias=lambda: bias, is_fused=True,
+    )  # fmt: skip
+    logits = torch.randn(12, NUM_EXPERTS, device="cuda")
+    ids, weights = method.apply(logits)
+    rep = placement.ExpertReplicas(NUM_EXPERTS, EP, 8, ((5, 1),))
+    method.slot_map = torch.tensor(rep.routed_slot_of_home(), dtype=torch.int32, device="cuda")
+    mapped, mapped_w = method.apply(logits)
+    assert torch.equal(mapped_w, weights)
+    assert torch.equal(mapped.long(), ids.long() + (ids.long() // 224) * 8)
 
 
 # --------------------------------------------------------------------------------------------------------------------
