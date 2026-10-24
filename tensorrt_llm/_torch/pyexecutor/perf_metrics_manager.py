@@ -8,6 +8,7 @@ and per-request metric bookkeeping.  Extracted from PyExecutor to improve
 readability and separation of concerns.
 """
 
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional
@@ -18,6 +19,25 @@ from tensorrt_llm._utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.logger import logger
 
 from .llm_request import PerfTimingInfo
+
+# THROWAWAY PROBE (oak M4 S3 item 1b, never merged): K3_S3_TIMER_PROBE=1 records the per-step timing events
+# (enable_timing=True) on a side stream that waits on the current stream, instead of on the current stream. A timing
+# record costs ~3 us of device time on its stream (bench_stream_gap), and these sit between one step's graph and the
+# next step's prologue. Timing probe only.
+_TIMER_PROBE = os.environ.get("K3_S3_TIMER_PROBE", "0") == "1"
+_timer_streams = {}
+
+
+def record_timing_event(event) -> None:
+    if not _TIMER_PROBE:
+        event.record()
+        return
+    cur = torch.cuda.current_stream()
+    side = _timer_streams.get(cur.device_index)
+    if side is None:
+        side = _timer_streams[cur.device_index] = torch.cuda.Stream(device=cur.device)
+    side.wait_stream(cur)
+    event.record(side)
 
 
 class PerfMetricsManager:
@@ -99,7 +119,7 @@ class PerfMetricsManager:
 
         # --- Pre-execution: record start ---
         if start_event is not None:
-            start_event.record()
+            record_timing_event(start_event)
         if self.enabled:
             timing.start_time = get_steady_clock_now_in_seconds()
 
@@ -107,7 +127,7 @@ class PerfMetricsManager:
 
         # --- Post-execution: record end ---
         if end_event is not None:
-            end_event.record()
+            record_timing_event(end_event)
         if self.enabled:
             timing.end_time = get_steady_clock_now_in_seconds()
 

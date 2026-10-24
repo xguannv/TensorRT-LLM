@@ -55,6 +55,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
 
+from .perf_metrics_manager import record_timing_event
+
 # Environment-variable names used by both the env-var-driven legacy
 # path and the runtime HTTP-endpoint path. They are duplicated as
 # module-level constants here so callers that only need the manager
@@ -721,12 +723,12 @@ class PyExecutorProfileManager:
             if should_capture_timing and start_time is not None:
                 end_time = time.time()
                 if it % 2 == 0:
-                    end_event_1.record()
+                    record_timing_event(end_event_1)
                     if start_event_2 is not None:
                         end_event_2.synchronize()
                         prev_device_step_time = start_event_2.elapsed_time(end_event_2)
                 else:
-                    end_event_2.record()
+                    record_timing_event(end_event_2)
                     if start_event_1 is not None:
                         end_event_1.synchronize()
                         prev_device_step_time = start_event_1.elapsed_time(end_event_1)
@@ -851,11 +853,11 @@ class PyExecutorProfileManager:
                 if it % 2 == 0:
                     if start_event_1 is None:
                         start_event_1 = torch.cuda.Event(enable_timing=True)
-                    start_event_1.record()
+                    record_timing_event(start_event_1)
                 else:
                     if start_event_2 is None:
                         start_event_2 = torch.cuda.Event(enable_timing=True)
-                    start_event_2.record()
+                    record_timing_event(start_event_2)
 
         try:
             yield profile_step_fn
