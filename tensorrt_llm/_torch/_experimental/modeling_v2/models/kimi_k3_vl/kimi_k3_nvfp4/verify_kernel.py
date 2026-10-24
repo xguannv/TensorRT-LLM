@@ -422,31 +422,42 @@ def k3_fp8_kda_verify_kernel(
                 r_st.store(
                     cutlass.Float32(pool.load(idx=st_base + r * K + i * 32 + lane)), idx=r * VEC + i
                 )
+        assert 3 * S <= 32, "one bulk copy per lane of a warp"
         if warp == 1:
-            if prims.elect_sync():
-                mbar = pro_full.data_ptr().toint()
+            # One bulk copy per lane (q / k / v of a history column, then vn / beta * k / decay of a draft), all
+            # completing on pro_full, whose transaction count lane 0 sets first.
+            mbar = pro_full.data_ptr().toint()
+            if lane == 0:
                 prims.mbarrier_arrive_expect_tx(pro_full, (S * HIST + NUM_SPEC * RECS) * 4)
-                for col in cutlass.range_constexpr(S):
-                    g_col = (slot * S + col) * HK + ch0
-                    d_col = col * HIST
-                    _bulk_g2s(s_hist.subview(d_col).data_ptr().toint(), cs_q.subview(g_col).data_ptr().toint(),
+            cute.arch.sync_warp()
+            kind = lane % 3
+            if lane < 3 * S:
+                col = lane // 3
+                g_col = (slot * S + col) * HK + ch0
+                if kind == 0:
+                    _bulk_g2s(s_hist.subview(col * HIST).data_ptr().toint(), cs_q.subview(g_col).data_ptr().toint(),
                               K * 4, mbar)  # fmt: skip
-                    _bulk_g2s(s_hist.subview(d_col + K).data_ptr().toint(), cs_k.subview(g_col).data_ptr().toint(),
-                              K * 4, mbar)  # fmt: skip
-                    _bulk_g2s(s_hist.subview(d_col + 2 * K).data_ptr().toint(),
+                elif kind == 1:
+                    _bulk_g2s(s_hist.subview(col * HIST + K).data_ptr().toint(),
+                              cs_k.subview(g_col).data_ptr().toint(), K * 4, mbar)  # fmt: skip
+                else:
+                    _bulk_g2s(s_hist.subview(col * HIST + 2 * K).data_ptr().toint(),
                               cs_v.subview(g_col + v0).data_ptr().toint(), V_CTA * 4, mbar)  # fmt: skip
-                for t_h in cutlass.range_constexpr(NUM_SPEC):
-                    d_t = t_h * RECS
+            if lane < 3 * NUM_SPEC:
+                t_h = lane // 3
+                if kind == 0:
                     vn_t = tok.subview((t_h * H + h) * V + CT_VN + v0)
                     _bulk_g2s(
-                        s_rec.subview(d_t).data_ptr().toint(),
+                        s_rec.subview(t_h * RECS).data_ptr().toint(),
                         vn_t.data_ptr().toint(),
                         V_CTA * 4,
                         mbar,
                     )
-                    _bulk_g2s(s_rec.subview(d_t + V_CTA).data_ptr().toint(),
+                elif kind == 1:
+                    _bulk_g2s(s_rec.subview(t_h * RECS + V_CTA).data_ptr().toint(),
                               tok.subview(CT_WB + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
-                    _bulk_g2s(s_rec.subview(d_t + V_CTA + K).data_ptr().toint(),
+                else:
+                    _bulk_g2s(s_rec.subview(t_h * RECS + V_CTA + K).data_ptr().toint(),
                               tok.subview(CT_WD + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
