@@ -282,7 +282,7 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
 
 
-@pytest.mark.parametrize("num_tokens", [17, 24, 32])
+@pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])
 def test_moe_nvfp4_lowm_fc12(num_tokens):
     """trtllm::k3_moe_nvfp4_lowm_fc12 (K3MoeFc1LowMKernel + K3MoeFc2LowMKernel, TRTLLM_K3LL_MOE_LOWM_FC12) against
     trtllm::k3_moe_nvfp4_lowm at K3 shapes: FC1 rows and scales bit for bit, every FC2 partial bit for bit (one
