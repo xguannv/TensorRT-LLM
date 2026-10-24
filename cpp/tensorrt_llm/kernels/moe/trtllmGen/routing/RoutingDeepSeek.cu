@@ -624,7 +624,11 @@ void run(Data& data, void* stream)
         {
             launchClusterKernel(data, numThreadsHist, stream);
         }
-        else if (!routingCustom::coopLaunchDisabled() && (smMajor >= 9) && (data.mNumTokens <= maxTokensCoop))
+        // The coop-launch switch applies only to the precomputed top-k path: with scores input, the
+        // histogram + offsets fallback of this branch does not reproduce the cooperative kernel's
+        // outputs (routingKernelsTest DeviceLevelParallelization384 with the switch set).
+        else if (!(routingCustom::coopLaunchDisabled() && data.mPtrTopKIds != nullptr) && (smMajor >= 9)
+            && (data.mNumTokens <= maxTokensCoop))
         {
             launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
         }

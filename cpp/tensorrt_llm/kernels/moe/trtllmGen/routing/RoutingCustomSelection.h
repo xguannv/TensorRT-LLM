@@ -65,7 +65,8 @@ bool prefersSmallTokenKernel(RoutingPreprocessType preprocessType, RoutingPostpr
 //! persistent collective -- therefore serializes routing behind it. Setting the variable to 1
 //! removes the cooperative launch from every routing path: shapes within the cluster kernel's
 //! capacity keep using it, and the rest take the histogram + offsets pipeline that already
-//! serves launches too large for the cooperative kernel. The DWDP fabric gather
+//! serves launches too large for the cooperative kernel. DeepSeek routing from scores (no
+//! precomputed top-k ids) keeps the cooperative kernel regardless. The DWDP fabric gather
 //! (TRTLLM_K3LL_DWDP_GATHER=1) sets it before the first routing launch. Read once per process.
 //!
 //! It reads the environment itself, because the three dispatch sites it gates live in three
