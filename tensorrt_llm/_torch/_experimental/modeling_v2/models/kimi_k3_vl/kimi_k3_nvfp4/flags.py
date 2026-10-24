@@ -362,6 +362,14 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "k3_fp8w_lowm_mxfp8 (TRTLLM_K3LL_ATTN_RES_MXFP8): where every K tile has its own activation stage, release each "
     "K tile to the MMA once its scales are folded, not after all of them (bitwise; read at forward time)",
 )
+TRTLLM_K3LL_KDA_L2_PREFETCH = _flag(
+    "TRTLLM_K3LL_KDA_L2_PREFETCH",
+    0,
+    "KDA verify of at most 16 rows (b1 / b2 at MTP7), multi-stream steps: once this layer's projections have read "
+    "their weights, a side stream prefetches the next KDA layer's projection weights ([q | k | v | g | f_a | b] or "
+    "QKVG, f_b, o_proj) into L2 (k3_l2_prefetch) under the recurrence and all-reduce; the main stream joins it after "
+    "the last layer. Hints only, no value changes (read at forward time)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:

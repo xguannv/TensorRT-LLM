@@ -188,6 +188,9 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.models.modeling_dflash.DFlashForCausalLM",
     "tensorrt_llm._torch.pyexecutor.config_utils.is_mla",
     "tensorrt_llm.quantization.utils.fp8_utils.resmooth_to_fp8_e8m0",
+    # The stock L2 prefetch kernel (TRTLLM_K3LL_KDA_L2_PREFETCH: the next KDA layer's weights on a side stream).
+    "tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_l2_prefetch",
+    "tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_l2_prefetch.run_k3_l2_prefetch",
 )
 
 # The K3 decode kernels' bounds: the token-count kernels take one tile of DECODE_MAX_TOKENS rows; the request-aware
@@ -2229,6 +2232,7 @@ class KimiLinearModel(DecoderModel):
                 hidden_states, num_snapshots, pending_moe_partial = outputs
             else:
                 (hidden_states, num_snapshots), pending_moe_partial = outputs, None
+        join_kda_l2_prefetch(hidden_states.device)
 
         if isinstance(pending_moe_partial, _decode_comm.WideTail):
             # The last MoE layer's tail handed on before its GEMV (TRTLLM_K3LL_MOE_TAIL_PUSH; see the layer's
@@ -2394,7 +2398,38 @@ class KimiLinearModel(DecoderModel):
 _BFA_FP8_MISSING_LOGGED = [False]
 
 
+#: TRTLLM_K3LL_KDA_L2_PREFETCH: verify row counts up to which the next KDA layer's weights are prefetched (b1 / b2 at
+#: MTP7); from bs4 up the prefetched lines would stay in L2 through the MoE block and slow its weight streams.
+KDA_L2_PREFETCH_MAX_ROWS = 16
+# Per device: the prefetch side stream, the event its last prefetch recorded, and whether the main stream still has to
+# join it.
+_KDA_L2: Dict[int, list] = {}
+
+
+def _kda_l2_state(device: torch.device) -> list:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    state = _KDA_L2.get(index)
+    if state is None:
+        state = _KDA_L2[index] = [torch.cuda.Stream(device=index), torch.cuda.Event(), False]
+    return state
+
+
+def join_kda_l2_prefetch(device: torch.device) -> None:
+    """``TRTLLM_K3LL_KDA_L2_PREFETCH``: the current stream waits for the prefetch side stream's last prefetch, if one
+    is pending (after the last layer of a step: a CUDA-graph capture must join every stream it forked, and there no
+    kernel's early launch matters)."""
+    state = _KDA_L2.get(device.index if device.index is not None else torch.cuda.current_device())
+    if state is not None and state[2]:
+        torch.cuda.current_stream(device).wait_event(state[1])
+        state[2] = False
+
+
 class K3DecodeKDA(KimiKDALinearAttention):
+    #: The next KDA layer of the model (set at load by the target's post_load_weights), for
+    #: TRTLLM_K3LL_KDA_L2_PREFETCH.
+    _k3_next_kda: Optional["K3DecodeKDA"] = None
+    _k3_l2_ranges: Optional[list] = None
+    _k3_l2_start: Optional[torch.cuda.Event] = None
     """FP8 QKVG projection followed by fused gate, convolution and delta recurrence.
 
     Verification consumes the same FP8 projection rows and writes the per-token
@@ -2677,6 +2712,64 @@ class K3DecodeKDA(KimiKDALinearAttention):
             disable_on_compile=True,
         )
 
+    def k3_l2_prefetch_ranges(self) -> list:
+        """``(address, bytes)`` of this layer's decode projection weights (k3_l2_prefetch ranges, at most
+        ``MAX_RANGES``): the fused ``[q | k | v | g | f_a | b]`` weight and scale (else the QKVG module's), f_b and
+        o_proj; built once (the weights do not move after load)."""
+        if self._k3_l2_ranges is None:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_l2_prefetch as l2
+
+            tensors = (
+                list(self._qkvg_bfa_fp8)
+                if self._qkvg_bfa_fp8 is not None
+                else [
+                    getattr(self.qkvg_proj, "weight", None),
+                    getattr(self.qkvg_proj, "weight_scale", None),
+                ]
+            )
+            tensors += [
+                getattr(self.f_b_proj, "weight", None),
+                getattr(self.o_proj, "weight", None),
+                getattr(self.o_proj, "weight_scale", None),
+            ]
+            ranges = []
+            for t in tensors:
+                if isinstance(t, torch.Tensor) and t.is_cuda and t.numel():
+                    try:
+                        ranges.append(l2.tensor_range(t))
+                    except ValueError:
+                        continue
+            self._k3_l2_ranges = ranges[: l2.MAX_RANGES]
+        return self._k3_l2_ranges
+
+    def _k3_issue_l2_prefetch(self, x: torch.Tensor) -> None:
+        """``TRTLLM_K3LL_KDA_L2_PREFETCH``: behind this layer's projections (an event on the calling stream), the
+        prefetch side stream pulls the next KDA layer's weights into L2; `join_kda_l2_prefetch` joins it."""
+        nxt = self._k3_next_kda
+        if (
+            not _flags.TRTLLM_K3LL_KDA_L2_PREFETCH
+            or x.shape[0] > KDA_L2_PREFETCH_MAX_ROWS
+            or nxt is None
+            or not do_multi_stream()
+            or torch.compiler.is_compiling()
+        ):
+            return
+        ranges = nxt.k3_l2_prefetch_ranges()
+        if not ranges:
+            return
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_l2_prefetch import run_k3_l2_prefetch
+
+        state = _kda_l2_state(x.device)
+        if self._k3_l2_start is None:
+            self._k3_l2_start = torch.cuda.Event()
+        self._k3_l2_start.record()
+        with torch.cuda.stream(state[0]):
+            self._k3_l2_start.wait()
+            run_k3_l2_prefetch(ranges)
+            state[1].record()
+        state[2] = True
+        _census.count(f"dispatch:kda_l2_prefetch:{_census.mode()}")
+
     def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
         """Verify N requests of T tokens from FP8 QKVG and BF16 gate projections.
 
@@ -2696,6 +2789,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
                 rows, bfa_rows = qkvg, bfa
             else:
                 rows, bfa_rows = torch.cat((qkvg, bfa), dim=-1), None
+        self._k3_issue_l2_prefetch(x)
         out = k3_fp8_kda_verify(
             rows,
             self.f_b_proj.weight,
@@ -4341,6 +4435,12 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             for layer in layers:
                 if layer.is_kda:
                     layer.linear_attn.fp8_decode_ready = True
+            # TRTLLM_K3LL_KDA_L2_PREFETCH: each KDA layer's next KDA layer.
+            kda_layers = [layer.linear_attn for layer in layers if layer.is_kda]
+            for cur, nxt in zip(kda_layers, kda_layers[1:]):
+                if isinstance(cur, K3DecodeKDA) and isinstance(nxt, K3DecodeKDA):
+                    # Not a submodule: a plain reference (nn.Module.__setattr__ would register it as a child).
+                    object.__setattr__(cur, "_k3_next_kda", nxt)
             comm = None
             if all(layer._mnnvl_allreduce() is not None for layer in layers):
                 comm = _decode_comm.K3DecodeComm.create(self.tp_mapping, None)
