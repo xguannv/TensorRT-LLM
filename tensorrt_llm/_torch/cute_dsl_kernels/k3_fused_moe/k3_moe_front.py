@@ -50,6 +50,8 @@
 # per-token ready words as route_quant_ag's.
 # With `sort`, each route CTA also writes its token's weights in fp32 and counts itself in on sort_ctr; the last one
 # runs moe_sort of every token's routing over this rank's local experts (`_sort_local`) and rearms the counter.
+# With `pad` (and `sort`) the sort leaves out the tokens of the requests a per-request byte mask marks as padding
+# (CUDA-graph padding rows): the routing outputs keep every token, the sorted routing has none of theirs.
 #
 # Token builds (m_max, compile time): 8; 16 and 32 for calls of 9-16 and 17-32 rows, each on a head workspace laid
 # out for it. m_max is tcgen05 N, x's TMA box rows, the mailbox / owner-row widths and the pushes per lane. The
@@ -498,11 +500,25 @@ def sort_layout(num_tokens: int, num_local: int) -> tuple[int, int, int, int]:
 
 @cute.jit
 def _sort_local(
-    s_key, topk_ids, sort_words, num_tokens, offset, num_local, tx, m_max: cutlass.Constexpr[int]
+    s_key,
+    topk_ids,
+    sort_words,
+    num_tokens,
+    offset,
+    num_local,
+    tx,
+    pad_mask,
+    pad_tokens,
+    m_max: cutlass.Constexpr[int],
+    pad: cutlass.Constexpr[bool],
 ):
     """moe_sort of the M tokens' top-16 over the local experts [offset, offset + num_local), 128-row tiles, by all
     THREADS threads of one CTA, into ``sort_words`` (`sort_layout`): one tile per local expert some token selected, in
-    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order."""
+    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order.
+
+    With ``pad``, token t belongs to request ``t // pad_tokens``, and the tokens of a request whose ``pad_mask`` byte is
+    non-zero select no expert here: their ids enter the scratch as -1, below every local expert, so they set no bitmap
+    bit, open no tile and take no row. The other tokens' tiles and rows are those of a sort without them."""
     SORT_BITS, SORT_UNION, SORT_PREFIX = sort_scratch(m_max)
     n = num_tokens * cutlass.Int32(TOP_K)
     tiles = cutlass.min(n, num_local)
@@ -512,7 +528,11 @@ def _sort_local(
     for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
         j = tx + cutlass.Int32(i * THREADS)
         if j < n:
-            s_key.store(topk_ids.load(idx=j, is_volatile=True), idx=SORT_IDS + j)
+            expert = topk_ids.load(idx=j, is_volatile=True)
+            if cutlass.const_expr(pad):
+                dummy = cutlass.Int32(pad_mask.load(idx=j // cutlass.Int32(TOP_K) // pad_tokens))
+                expert = cutlass.select_(dummy != cutlass.Int32(0), cutlass.Int32(-1), expert)
+            s_key.store(expert, idx=SORT_IDS + j)
     cute.arch.barrier()
     for i in cutlass.range_constexpr(_per_thread(m_max * SORT_WORDS)):
         j = tx + cutlass.Int32(i * THREADS)
@@ -729,11 +749,13 @@ def k3_moe_front_kernel(
     gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
     sort_words: cutlass.Array,  # int32 [sort_layout words] (sort)
     sort_ctr: cutlass.Array,  # int32 [1], zero between calls: the route CTAs done (sort)
+    pad_mask: cutlass.Array,  # uint8 [>= M / pad_tokens]: non-zero for a padding request (pad)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
     sort_offset: cutlass.Int32,
     sort_local: cutlass.Int32,
+    pad_tokens: cutlass.Int32,  # tokens per request (pad)
     world: cutlass.Constexpr[int],
     shared_cols: cutlass.Constexpr[int],
     n_head_tiles: cutlass.Constexpr[int],
@@ -747,6 +769,7 @@ def k3_moe_front_kernel(
     head_half: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
+    pad: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
@@ -1438,7 +1461,10 @@ def k3_moe_front_kernel(
                             sort_offset,
                             sort_local,
                             tx,
+                            pad_mask,
+                            pad_tokens,
                             m_max,
+                            pad,
                         )
                         if tx == 0:
                             sort_ctr.store(cutlass.Int32(0), idx=0)
@@ -1584,11 +1610,13 @@ def k3_moe_front(
     gsf: cute.Tensor,
     sort_words: cute.Tensor,
     sort_ctr: cute.Tensor,
+    pad_mask: cute.Tensor,
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
     sort_offset: cutlass.Int32,
     sort_local: cutlass.Int32,
+    pad_tokens: cutlass.Int32,
     world: cutlass.Constexpr[int],
     shared_cols: cutlass.Constexpr[int],
     n_head_tiles: cutlass.Constexpr[int],
@@ -1603,6 +1631,7 @@ def k3_moe_front(
     head_half: cutlass.Constexpr[bool],
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
+    pad: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -1612,9 +1641,9 @@ def k3_moe_front(
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens, m_max)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
-        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
-        sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort, m_max,
+        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, pad_mask, num_tokens, tp_rank,
+        routed_scaling_factor, sort_offset, sort_local, pad_tokens, world, shared_cols, n_head_tiles, n_tiles,
+        gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half, nvfp4, sort, pad, m_max,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),

@@ -236,8 +236,8 @@ TRTLLM_K3LL_MOE_TAIL_LU = _flag(
     "RMSNorm on its own MNNVL workspace (K3LatentArRowKernel, with the latent's MXFP8 form), latent_up replicated on "
     "k3_fp8w_lowm_mxfp8 with an FP8 block-scale weight, and K3AttnResFast adding routed + shared (moe_tail_lu.py). "
     "LOSSY (FP8 latent_up). 1 at launch builds the FP8 latent_up of every MoE layer (+25.9 MB per layer per rank, "
-    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 (default): on "
-    "on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
+    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 (default): "
+    "on on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
 )
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
@@ -396,6 +396,14 @@ TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "with TRTLLM_K3LL_DRAFTER_MARKOV_V2: the MMA build's bias fragments by ldmatrix, and no store of the corrected "
     "logits on steps where only its tokens are read (greedy drafts, no lilicorr / DFlash 2 selector); the same "
     "tokens and next_new bit for bit (read at forward time)",
+)
+TRTLLM_K3LL_MOE_PAD_MASK = _flag(
+    "TRTLLM_K3LL_MOE_PAD_MASK",
+    0,
+    "lowm MoE with TRTLLM_K3LL_MOE_FRONT_SORT on decode steps of at most 32 tokens: k3_moe_front's sort leaves out the "
+    "tokens of the CUDA-graph padding requests (the KV cache manager's per-request dummy mask, read in the kernel), so "
+    "they reach no routed expert and their routed output is zero; the real rows' expert partials the same bits (read "
+    "at forward time)",
 )
 
 

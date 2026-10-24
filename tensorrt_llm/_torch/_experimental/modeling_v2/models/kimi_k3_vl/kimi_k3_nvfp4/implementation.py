@@ -9,7 +9,7 @@ import copy
 import functools
 import math
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -1226,6 +1226,13 @@ class KimiK3MoERuntime(nn.Module):
         ``TRTLLM_K3LL_MOE_TAIL_LU``)."""
         decode = self.decode_moe
         if decode is not None and decode.takes(hidden_states, step, partial_tail):
+            if step.pad_rows is not None and isinstance(
+                decode, _decode_moe_lowm.K3DecodeMoeNvfp4Layer
+            ):
+                return decode.forward(
+                    self, hidden_states, self.decode_gemvs, partial_tail, push=step.latent_push,
+                    pad=step.pad_rows,
+                )  # fmt: skip
             return decode.forward(
                 self, hidden_states, self.decode_gemvs, partial_tail, push=step.latent_push
             )
@@ -1745,9 +1752,10 @@ class KimiLinearDecoderLayer(nn.Module):
             _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
             # TRTLLM_K3LL_ATTN_RES_MXFP8, as in the tail push branch, where the MXFP8 build of the MoE-add kernel
             # compiled at load for this candidate count.
-            if (
-                valid_block_residual.shape[0] + 1 in pending_moe_partial.mx_candidates
-                and _attn_res_mxfp8_on(pending_moe_partial.routed.device)
+            if valid_block_residual.shape[
+                0
+            ] + 1 in pending_moe_partial.mx_candidates and _attn_res_mxfp8_on(
+                pending_moe_partial.routed.device
             ):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.routed.shape[0], pending_moe_partial.routed.device
@@ -2233,6 +2241,13 @@ class KimiLinearModel(DecoderModel):
             return self._generic_forward(attn_metadata, input_ids, inputs_embeds, spec_metadata)
         if self._latent_push(attn_metadata, step):
             step = replace(step, latent_push=True)
+        pad_rows = _decode_moe_lowm.pad_rows(
+            step,
+            getattr(attn_metadata, "kv_cache_manager", None),
+            (input_ids if inputs_embeds is None else inputs_embeds).device,
+        )
+        if pad_rows is not None:
+            step = replace(step, pad_rows=pad_rows)
         # A decode step embeds and norms for layer 0 in one launch, the embedding written as layer 0's first snapshot.
         prenormed = None
         if (
@@ -3971,6 +3986,9 @@ class DecodeStep:
     #: Whether the MoE layers' latent all-reduce is the routed experts' push form plus ``comm/k3_latent_reduce``
     #: (``decode_moe.py``): set by ``KimiLinearModel.forward`` from ``latent_push``.
     latent_push: bool = False
+    #: The step's CUDA-graph padding requests the NVFP4 MoE layers leave out of their routed experts
+    #: (``TRTLLM_K3LL_MOE_PAD_MASK``, ``decode_moe_lowm.pad_rows``): set by ``KimiLinearModel.forward``, else None.
+    pad_rows: Optional["_decode_moe_lowm.PadRows"] = field(default=None, compare=False, repr=False)
 
     @property
     def small(self) -> bool:
@@ -4607,7 +4625,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         gemvs = self.model.decode_gemvs
         if state.lu is not None:
             _moe_tail_lu.warm_up(
-                state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1,
+                state.lu,
+                first.lu,
+                gemvs,
+                self.model.num_attn_res_snapshots + 1,
                 mxfp8=_attn_res_mxfp8_on(first.lu.up_weight.device),
             )
             if mapping.tp_rank == 0:

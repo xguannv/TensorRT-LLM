@@ -179,6 +179,8 @@ def k3_moe_front(
     sort_ctr: Optional[torch.Tensor] = None,
     sort_offset: int = 0,
     sort_local: int = 0,
+    pad_mask: Optional[torch.Tensor] = None,
+    pad_tokens: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 32, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -193,7 +195,13 @@ def k3_moe_front(
     With ``sort_out`` (int32, at least `sort_layout`'s words; with ``nvfp4_gsf``) the kernel also writes ``moe_sort``
     of the routing over the local experts ``[sort_offset, sort_offset + sort_local)`` with 128-row tiles and the
     routing weights in fp32 there (`sort_views`). ``sort_ctr``: int32 ``[1]``, zero, which every call leaves zero;
-    calls that share it must be stream-ordered."""
+    calls that share it must be stream-ordered.
+
+    With ``pad_mask`` (with ``sort_out``; bool or uint8, one entry per request, 16-byte aligned) the rows are requests
+    of ``pad_tokens`` tokens each (row t: request ``t // pad_tokens``), and the sort leaves out every token of a request
+    whose entry is non-zero (a CUDA-graph padding request): it selects no tile and takes no row there, so the experts
+    never see it. The other outputs, and the sort of the remaining tokens, are those of the call without the mask. The
+    kernel reads the mask once the routing is done; its entries must be written (stream-ordered) before the call."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -250,6 +258,20 @@ def k3_moe_front(
             "k3_moe_front: the sort needs the NVFP4 latent, an int32 sort_ctr and a contiguous int32 sort_out of "
             "sort_layout's words over 1 to 896 local experts"
         )
+    pad = pad_mask is not None
+    if pad and (
+        not sort
+        or pad_mask.dtype not in (torch.bool, torch.uint8)
+        or pad_mask.device != device
+        or not pad_mask.is_contiguous()
+        or pad_mask.data_ptr() % 16 != 0
+        or not 0 < pad_tokens
+        or pad_mask.numel() < -(-num_tokens // pad_tokens)
+    ):
+        raise ValueError(
+            "k3_moe_front: the padding mask needs the sort, a contiguous 16-byte-aligned bool / uint8 mask on the "
+            f"input's device with an entry per request of pad_tokens ({pad_tokens}) rows"
+        )
     shared = torch.empty(num_tokens, shared_cols, dtype=torch.bfloat16, device=device)
     # Head-only fronts (shared_cols 0) still hand the kernel an aligned shared-output argument it never writes.
     shared_arg = shared if shared_cols else ag_flags.view(torch.int16).view(-1)
@@ -278,6 +300,8 @@ def k3_moe_front(
         # Without the sort the kernel never touches them: any aligned int32 words.
         arg(sort_out.view(-1) if sort else ag_flags.view(-1)),
         arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
+        # Without the mask the kernel never reads it: any aligned uint8 words.
+        arg(pad_mask.view(-1).view(torch.uint8) if pad else scales.view(-1)),
     )
     capacity = max_clusters(device)
     # The 32-token build may run a shallower weight ring than asked (`fit_ring`); the others run ``ring``.
@@ -306,6 +330,7 @@ def k3_moe_front(
         head_half,
         nvfp4,
         sort,
+        pad,
         m_max,
     )
     fn = _compiled.get(key)
@@ -319,17 +344,26 @@ def k3_moe_front(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
-                    sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
-                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, stream,
+                    sort_local, int(pad_tokens), ag_world, shared_cols, ht, ht + st, clusters, k_in, ring,
+                    float(gate_cap), float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, pad, m_max, stream,
                 )  # fmt: skip
-    fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
+    fn(
+        *args,
+        num_tokens,
+        ag_rank,
+        float(routed_scaling_factor),
+        sort_offset,
+        sort_local,
+        int(pad_tokens),
+        stream,
+    )
     return topk_ids, topk_weights, quantized, scales, shared
 
 
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
       ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
-      sort_local=0):  # fmt: skip
+      sort_local=0, pad_mask=None, pad_tokens=1):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

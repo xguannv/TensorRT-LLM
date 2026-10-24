@@ -17,6 +17,9 @@ runs:
 * the tail, as `decode_moe.py`'s: a `PendingTail` the next layer's pre-attention step reduces with its all-reduce and
   residual update in one `comm/k3_sandwich_tail` kernel, else the replicated tail.
 
+With ``TRTLLM_K3LL_MOE_PAD_MASK`` (`pad_rows`) the front's sort also reads the KV cache manager's per-request dummy mask
+and leaves out the tokens of the CUDA-graph padding requests: they reach no routed expert, their routed partial is zero.
+
 Steps of more tokens keep the generic path. Only SM100 / SM103 take it (`nvfp4_lowm_op.supported`).
 
 `K3DecodeMoeNvfp4` holds what every MoE layer shares (the head workspace, the expert kernel's counters);
@@ -28,7 +31,7 @@ every kernel once there so none compiles under a capture.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import torch
 from torch import nn
@@ -132,6 +135,43 @@ class K3DecodeMoeNvfp4:
         if front32 is None:
             front32 = bool(_flags.TRTLLM_K3LL_MOE_FRONT32)
         return self.head32 if front32 else None
+
+
+class PadRows(NamedTuple):
+    """A decode step's padding requests, for the front's sort: ``mask`` the KV cache manager's per-request dummy mask
+    (bool on the device, batch order, at a fixed address, written before every step and so before every CUDA-graph
+    replay), each request ``tokens_per_request`` consecutive rows."""
+
+    mask: torch.Tensor
+    tokens_per_request: int
+
+
+def pad_rows(step, kv_cache_manager, device: torch.device) -> Optional[PadRows]:
+    """The padding requests of ``step`` (``implementation.DecodeStep``) the MoE layers leave out of their routed experts
+    (``TRTLLM_K3LL_MOE_PAD_MASK``, read here at forward time), or None: the switch is off, the step is not a pure decode
+    step of uniform requests, or ``kv_cache_manager`` keeps no dummy mask covering the step's requests on ``device``.
+
+    The mask is the one ``MambaHybridCacheManager`` refreshes from the step's request ids before the forward (the CUDA
+    graph runner's padding requests appended last, every one marked); the rows of a decode step follow the same order,
+    ``tokens_per_request`` rows per request. Every rank of the group computes the same answer: the switch, the step
+    shape and the manager's buffers are the same on every rank."""
+    if not _flags.TRTLLM_K3LL_MOE_PAD_MASK or step is None or not step.decode:
+        return None
+    requests, tokens = step.num_requests, step.tokens_per_request
+    if tokens is None or tokens <= 0 or requests * tokens != step.num_tokens:
+        return None
+    mask = getattr(kv_cache_manager, "_dummy_request_mask", None)
+    if (
+        not torch.is_tensor(mask)
+        or mask.dtype != torch.bool
+        or mask.dim() != 1
+        or mask.numel() < requests
+        or mask.device != torch.device(device)
+        or not mask.is_contiguous()
+        or mask.data_ptr() % 16 != 0
+    ):
+        return None
+    return PadRows(mask, tokens)
 
 
 def _front_supported(moe: nn.Module, tp_size: int, m_max: int) -> bool:
@@ -323,11 +363,18 @@ class K3DecodeMoeNvfp4Layer:
         32 tokens."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
-        self._front_routed(moe, x)
-        if self.state.head16 is not None:
-            self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]))
-        if self.state.head32 is not None:
-            self._front_routed(moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]), front32=True)
+        # With TRTLLM_K3LL_MOE_PAD_MASK at load, also the sorting front's builds that read the padding mask.
+        pads = [None]
+        if _flags.TRTLLM_K3LL_MOE_PAD_MASK and self.state.sort_ctr is not None:
+            pads.append(PadRows(torch.zeros(FRONT32_TOKENS, dtype=torch.bool, device=device), 1))
+        for pad in pads:
+            self._front_routed(moe, x, pad=pad)
+            if self.state.head16 is not None:
+                self._front_routed(moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]), pad=pad)
+            if self.state.head32 is not None:
+                self._front_routed(
+                    moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]), front32=True, pad=pad
+                )
         for rows in (9, WIDE_MAX_TOKENS):
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
@@ -346,6 +393,7 @@ class K3DecodeMoeNvfp4Layer:
         x: torch.Tensor,
         sort_out: Optional[torch.Tensor] = None,
         front32: Optional[bool] = None,
+        pad: Optional[PadRows] = None,
     ):
         head = self.state.front_head(x.shape[0], front32)
         return k3_moe_front(
@@ -361,6 +409,8 @@ class K3DecodeMoeNvfp4Layer:
             sort_ctr=self.state.sort_ctr if sort_out is not None else None,
             sort_offset=self.offset,
             sort_local=self.num_local,
+            pad_mask=None if pad is None else pad.mask,
+            pad_tokens=1 if pad is None else pad.tokens_per_request,
         )
 
     @property
@@ -374,15 +424,29 @@ class K3DecodeMoeNvfp4Layer:
             self.state.counters, *self.situ,
         )  # fmt: skip
 
-    def _front_routed(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):
+    def _front_routed(
+        self,
+        moe: nn.Module,
+        x: torch.Tensor,
+        front32: Optional[bool] = None,
+        pad: Optional[PadRows] = None,
+    ):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it."""
-        routing, shared_act = self._front_only(moe, x, front32)
+        routing, shared_act = self._front_only(moe, x, front32, pad)
         return self._routed_after(routing), shared_act
 
-    def _front_only(self, moe: nn.Module, x: torch.Tensor, front32: Optional[bool] = None):
-        """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes."""
+    def _front_only(
+        self,
+        moe: nn.Module,
+        x: torch.Tensor,
+        front32: Optional[bool] = None,
+        pad: Optional[PadRows] = None,
+    ):
+        """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes. ``pad``
+        (`pad_rows`): the front's sort leaves out the padding requests' tokens, whose routed partial is then zero
+        (the expert kernel zeroes its output); without the front's sort it is ignored."""
         if self.state.sort_ctr is None:
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
             return (None, ids, weights, x_q, x_sf), shared_act
@@ -390,7 +454,11 @@ class K3DecodeMoeNvfp4Layer:
         sort_out = torch.empty(
             sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
         )
-        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32)
+        if pad is not None:
+            from . import census as _census
+
+            _census.count(f"dispatch:moe_pad_mask:{_census.mode()}")
+        _, _, x_q, x_sf, shared_act = self._front(moe, x, sort_out, front32, pad)
         return (sort_out, rows, None, x_q, x_sf), shared_act
 
     def _routed_after(self, routing) -> torch.Tensor:
@@ -418,15 +486,16 @@ class K3DecodeMoeNvfp4Layer:
         gemvs,
         partial_tail: bool,
         push: bool = False,
+        pad: Optional[PadRows] = None,
     ) -> Union[torch.Tensor, PendingTail, WideTail, LuTail]:
         """The MoE output of ``hidden_states`` (``takes`` holds): with ``partial_tail``, this rank's unreduced share
         (a ``PendingTail``; on a wide step a tensor, a ``WideTail`` with ``TRTLLM_K3LL_MOE_TAIL_PUSH``, or a
         ``LuTail`` with ``TRTLLM_K3LL_MOE_TAIL_LU``); else the
         reduced output. ``push`` is ignored: the latent all-reduce is always the routed
-        experts' all-reduce."""
+        experts' all-reduce. ``pad`` (`pad_rows`): the step's padding requests, which the front's sort leaves out."""
         if hidden_states.shape[0] > MAX_TOKENS:
-            return self._wide(moe, hidden_states, gemvs)
-        routed, shared_act = self._front_routed(moe, hidden_states)
+            return self._wide(moe, hidden_states, gemvs, pad)
+        routed, shared_act = self._front_routed(moe, hidden_states, pad=pad)
         latent = moe.routed_experts.all_reduce(routed)
         if partial_tail:
             return PendingTail(
@@ -469,7 +538,7 @@ class K3DecodeMoeNvfp4Layer:
         )
 
     def _wide(
-        self, moe: nn.Module, hidden_states: torch.Tensor, gemvs
+        self, moe: nn.Module, hidden_states: torch.Tensor, gemvs, pad: Optional[PadRows] = None
     ) -> Union[torch.Tensor, WideTail, LuTail]:
         """A wide decode step's MoE (`MAX_TOKENS` < M <= `WIDE_MAX_TOKENS`): this rank's unreduced share of the
         output, ``[M, hidden]`` bf16, as `decode_moe.py`'s wide step with the NVFP4 latent and experts. With
@@ -493,11 +562,11 @@ class K3DecodeMoeNvfp4Layer:
                 from . import census as _census
 
                 _census.count(f"dispatch:moe_tail_lu:{_census.mode()}")
-                routing, shared_act = self._front_only(moe, x, front32)
+                routing, shared_act = self._front_only(moe, x, front32, pad)
                 return _tail_lu.run(
                     self.state.lu, self.lu, gemvs, shared_act, lambda: self._routed_after(routing)
                 )
-            routed, shared_act = self._front_routed(moe, x, front32)
+            routed, shared_act = self._front_routed(moe, x, front32, pad)
         else:
             routed, shared_act = self._wide_head(moe, x, gemvs)
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's

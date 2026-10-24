@@ -35,8 +35,14 @@ def test_switch_default_sm103_and_documented():
 
 @pytest.mark.parametrize(
     "value,capability,on",
-    [(1, (10, 3), True), (1, (10, 7), True), (0, (10, 3), False), (-1, (10, 3), True), (-1, (10, 7), False),
-     (-1, (10, 0), False)],
+    [
+        (1, (10, 3), True),
+        (1, (10, 7), True),
+        (0, (10, 3), False),
+        (-1, (10, 3), True),
+        (-1, (10, 7), False),
+        (-1, (10, 0), False),
+    ],
 )
 def test_enabled_value(monkeypatch, value, capability, on):
     lu = _mod("moe_tail_lu")
@@ -145,11 +151,11 @@ def _wide_layer(dm, takes: bool, monkeypatch):
     layer.lu = "layer"
     layer.shared_cols = 384
     shared_act = torch.zeros(16, 384, dtype=torch.bfloat16)
-    layer._front_only = lambda moe, x, front32=None: (
+    layer._front_only = lambda moe, x, front32=None, pad=None: (
         calls.append("front") or ("routing", shared_act)
     )
 
-    def front_routed(moe, x, front32=None):
+    def front_routed(moe, x, front32=None, pad=None):
         calls.append("front_routed")
         raise _Stop
 
@@ -255,7 +261,9 @@ def test_attn_res_mxfp8_side_output(rows, snapshots):
     res_norm, out_norm = norm(1 + rnd(lu.HIDDEN, scale=0.1)), norm(1 + rnd(lu.HIDDEN, scale=0.1))
     normed0, updated0 = lu.attn_res(tail, prefix, block, res_proj, res_norm, out_norm)
     xq, xs = fp8w.new_mxfp8_input(rows, lu.HIDDEN, prefix.device)
-    normed1, updated1 = lu.attn_res(tail, prefix, block, res_proj, res_norm, out_norm, mxfp8_out=(xq, xs))
+    normed1, updated1 = lu.attn_res(
+        tail, prefix, block, res_proj, res_norm, out_norm, mxfp8_out=(xq, xs)
+    )
     torch.cuda.synchronize()
     assert torch.equal(normed0, normed1)
     assert torch.equal(updated0, updated1)
