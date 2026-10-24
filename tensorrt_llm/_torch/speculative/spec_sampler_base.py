@@ -32,6 +32,7 @@ from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..cute_dsl_kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.input_commit import scatter_spec_store, spec_sampler_fused_scatter_enabled
+from ..pyexecutor.k3ll_flags import k3ll_census_dispatch
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -474,6 +475,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_new_tokens_lens,
             o_next_draft_tokens,
         ):
+            k3ll_census_dispatch("spec_store_scatter")
             return
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)

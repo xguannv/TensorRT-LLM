@@ -37,7 +37,7 @@ but split over many CTAs instead of one CTA per (pool, sequence).
 
 import os
 from contextlib import contextmanager
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -47,22 +47,85 @@ import triton.language as tl
 from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 from tensorrt_llm.logger import logger
 
-_ENABLED = os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT", "0") == "1"
 # Debug aid: after each of the first N commits (-1: all), synchronize and compare every
 # destination with the staged bytes / a torch reference of the overlap gathers (raises
 # on a mismatch; logs once when the first N commits have matched).
 _VERIFY_COMMITS = int(os.environ.get("TRTLLM_BATCHED_INPUT_COMMIT_VERIFY", "0"))
-# TRTLLM_KV_BLOCK_OFFSETS_TRITON=1: Triton block-offset copy; =2: also one launch for the
-# target and draft KV tables of a step (TrtllmAttentionMetadata.prepare).
-_BLOCK_OFFSETS_TRITON = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") in ("1", "2")
-_BLOCK_OFFSETS_PAIR = os.environ.get("TRTLLM_KV_BLOCK_OFFSETS_TRITON", "0") == "2"
-# TRTLLM_STATE_INDEX_COPY_KERNEL=1: the mamba state-index and dummy-mask uploads of
-# prepare_resources as one SM kernel instead of two copy-engine copies.
-_STATE_INDEX_COPY_KERNEL = os.environ.get("TRTLLM_STATE_INDEX_COPY_KERNEL", "0") == "1"
-# TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1: the one-model spec sampler's four store scatters in
-# one kernel, with the slot tensor kept on the device while the slots do not change.
-_SPEC_SAMPLER_FUSED_SCATTER = os.environ.get("TRTLLM_SPEC_SAMPLER_FUSED_SCATTER", "0") == "1"
 _FUSED_HELIX_PREPROCESS = os.environ.get("TRTLLM_FUSED_HELIX_SPEC_PREPROCESS", "0") == "1"
+
+# The input-chain switches, each read from the environment once, at import:
+#   TRTLLM_BATCHED_INPUT_COMMIT=1: one-launch input commit of a CUDA-graph decode step.
+#   TRTLLM_KV_BLOCK_OFFSETS_TRITON=1: Triton block-offset copy; =2: also one launch for the
+#     target and draft KV tables of a step (TrtllmAttentionMetadata.prepare).
+#   TRTLLM_STATE_INDEX_COPY_KERNEL=1: the mamba state-index and dummy-mask uploads of
+#     prepare_resources as one SM kernel instead of two copy-engine copies.
+#   TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1: the one-model spec sampler's four store scatters in
+#     one kernel, with the slot tensor kept on the device while the slots do not change.
+# A switch that is not set (or empty) takes the model default installed with
+# set_model_defaults (none unless a model installs one), else "0". A set switch always wins.
+INPUT_CHAIN_SWITCHES = (
+    "TRTLLM_BATCHED_INPUT_COMMIT",
+    "TRTLLM_KV_BLOCK_OFFSETS_TRITON",
+    "TRTLLM_STATE_INDEX_COPY_KERNEL",
+    "TRTLLM_SPEC_SAMPLER_FUSED_SCATTER",
+)
+_ENV_SWITCHES: Dict[str, Optional[str]] = {
+    name: (os.environ.get(name) or None) for name in INPUT_CHAIN_SWITCHES
+}
+_MODEL_DEFAULTS: Dict[str, str] = {}
+
+_ENABLED = False
+_BLOCK_OFFSETS_TRITON = False
+_BLOCK_OFFSETS_PAIR = False
+_STATE_INDEX_COPY_KERNEL = False
+_SPEC_SAMPLER_FUSED_SCATTER = False
+
+
+def _switch_value(name: str) -> Tuple[str, str]:
+    """(value, source) of an input-chain switch; source is "env", "model default" or "default"."""
+    env = _ENV_SWITCHES[name]
+    if env is not None:
+        return env, "env"
+    if name in _MODEL_DEFAULTS:
+        return _MODEL_DEFAULTS[name], "model default"
+    return "0", "default"
+
+
+def _resolve_switches() -> None:
+    global _ENABLED, _BLOCK_OFFSETS_TRITON, _BLOCK_OFFSETS_PAIR
+    global _STATE_INDEX_COPY_KERNEL, _SPEC_SAMPLER_FUSED_SCATTER
+    _ENABLED = _switch_value("TRTLLM_BATCHED_INPUT_COMMIT")[0] == "1"
+    block_offsets = _switch_value("TRTLLM_KV_BLOCK_OFFSETS_TRITON")[0]
+    _BLOCK_OFFSETS_TRITON = block_offsets in ("1", "2")
+    _BLOCK_OFFSETS_PAIR = block_offsets == "2"
+    _STATE_INDEX_COPY_KERNEL = _switch_value("TRTLLM_STATE_INDEX_COPY_KERNEL")[0] == "1"
+    _SPEC_SAMPLER_FUSED_SCATTER = _switch_value("TRTLLM_SPEC_SAMPLER_FUSED_SCATTER")[0] == "1"
+
+
+def set_model_defaults(defaults: Mapping[str, str]) -> Dict[str, Tuple[str, str]]:
+    """Install the values the input-chain switches take when they are not set in the environment.
+
+    Called by a model at construction (the Kimi K3 NVFP4 target, for its
+    ``TRTLLM_K3LL_INPUT_CHAIN`` switch), which precedes every consumer: the model engine
+    builds the model before its runner (InputCommit, kernel warmup), and the executor
+    creator builds the sampler and the KV cache managers after the model engine. Replaces
+    any previous defaults; an empty mapping restores the environment-only behavior. Returns
+    ``{switch: (value, source)}`` after the change.
+    """
+    unknown = set(defaults) - set(INPUT_CHAIN_SWITCHES)
+    assert not unknown, f"not input-chain switches: {sorted(unknown)}"
+    _MODEL_DEFAULTS.clear()
+    _MODEL_DEFAULTS.update({name: str(value) for name, value in defaults.items()})
+    _resolve_switches()
+    return input_chain_switches()
+
+
+def input_chain_switches() -> Dict[str, Tuple[str, str]]:
+    """``{switch: (value, source)}`` of the input-chain switches as they apply now."""
+    return {name: _switch_value(name) for name in INPUT_CHAIN_SWITCHES}
+
+
+_resolve_switches()
 
 _ACTIVE: Optional["InputCommit"] = None
 
@@ -977,14 +1040,16 @@ class InputCommit:
             kv_offsets_start=kv_offsets_start,
         )
 
-    def commit(self) -> None:
-        """Launch the commit kernel on the current stream and close the step."""
+    def commit(self) -> bool:
+        """Launch the commit kernel on the current stream and close the step.
+
+        Returns whether a kernel was launched (False: nothing was staged)."""
         assert self._open
         entries = self._entries
         fixup = self._fixup
         if not entries and fixup is None:
             self._open = False
-            return
+            return False
         num_desc = sum(_cdiv(nbytes, _COPY_CHUNK) for _, _, nbytes in entries)
         # Reserving may grow the arena and rebase the recorded host addresses, so the
         # entries and the fixup are read again afterwards.
@@ -1079,6 +1144,7 @@ class InputCommit:
         self._num_commits += 1
         self._entries = []
         self._fixup = None
+        return True
 
     def _verify(self, fixup: Optional[dict]) -> None:
         torch.cuda.current_stream().synchronize()
@@ -1156,7 +1222,7 @@ def warmup_input_commit_kernels(commit: Optional[InputCommit]) -> None:
                     kv_offsets_start=0,
                 )
             commit.commit()
-    if _BLOCK_OFFSETS_TRITON:
+    if block_offsets_triton_enabled():
         host = torch.zeros((1, 2, 2, 4), dtype=torch.int32, pin_memory=prefer_pinned())
         dst = torch.zeros((1, 2, 2, 4), dtype=torch.int32, device=device)
         copy_idx = maybe_pin_memory(torch.tensor([1, 0], dtype=torch.int32))

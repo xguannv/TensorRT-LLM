@@ -71,6 +71,7 @@ from . import decode_moe as _decode_moe
 from . import decode_moe_lowm as _decode_moe_lowm
 from . import flags as _flags
 from . import fp8w_lowm as _fp8w_lowm
+from . import input_chain as _input_chain
 from . import mla_drafter as _mla_drafter
 from . import mla_v_up as _mla_v_up
 from . import moe_tail_lu as _moe_tail_lu
@@ -1745,9 +1746,10 @@ class KimiLinearDecoderLayer(nn.Module):
             _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
             # TRTLLM_K3LL_ATTN_RES_MXFP8, as in the tail push branch, where the MXFP8 build of the MoE-add kernel
             # compiled at load for this candidate count.
-            if (
-                valid_block_residual.shape[0] + 1 in pending_moe_partial.mx_candidates
-                and _attn_res_mxfp8_on(pending_moe_partial.routed.device)
+            if valid_block_residual.shape[
+                0
+            ] + 1 in pending_moe_partial.mx_candidates and _attn_res_mxfp8_on(
+                pending_moe_partial.routed.device
             ):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.routed.shape[0], pending_moe_partial.routed.device
@@ -4186,6 +4188,9 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             model_config, config.text_config, getattr(model_config, "spec_config", None)
         )
         _flags.log_flags()
+        # TRTLLM_K3LL_INPUT_CHAIN: the executor's input-chain switches default to on for this target; installed
+        # here, before the model engine builds its runner and the executor its sampler and KV cache managers.
+        _input_chain.install()
         _census.install_model(KimiLinearModel, decode_step)
         _census.install(
             KimiLinearDecoderLayer, KimiK3MoERuntime, KimiMLARuntime, K3DecodeKDA, K3DecodeMLA
@@ -4607,7 +4612,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         gemvs = self.model.decode_gemvs
         if state.lu is not None:
             _moe_tail_lu.warm_up(
-                state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1,
+                state.lu,
+                first.lu,
+                gemvs,
+                self.model.num_attn_res_snapshots + 1,
                 mxfp8=_attn_res_mxfp8_on(first.lu.up_weight.device),
             )
             if mapping.tp_rank == 0:

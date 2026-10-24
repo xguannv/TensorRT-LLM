@@ -43,6 +43,7 @@ from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.input_commit import (active_input_commit,
                                         block_offsets_pair_enabled,
                                         copy_block_offsets_jobs)
+from ...pyexecutor.k3ll_flags import k3ll_census_dispatch
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
@@ -1006,6 +1007,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if jobs[0][2].data_ptr() == jobs[1][2].data_ptr():
             return False
         copy_block_offsets_jobs(jobs)
+        k3ll_census_dispatch("block_offsets_pair")
         return True
 
     def prepare(self) -> None:

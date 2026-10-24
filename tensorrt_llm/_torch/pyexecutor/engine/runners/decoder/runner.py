@@ -5249,7 +5249,8 @@ class DecoderRunner(ScheduledModelRunner):
                     except BaseException:
                         input_commit.abort()
                         raise
-                    input_commit.commit()
+                    if input_commit.commit():
+                        k3ll_census_dispatch("input_commit")
             if execution_promoted_context_ids:
                 self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
                 self.iter_states["num_ctx_tokens"] = sum(

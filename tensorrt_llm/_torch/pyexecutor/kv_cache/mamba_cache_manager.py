@@ -71,7 +71,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
 # Shared with the KV budget estimator so allocator and budgeting can never
 # diverge on the sharding rule (config_utils is import-cycle-free).
 from ..config_utils import mamba_effective_tp_size
-from ..k3ll_flags import k3ll_flag
+from ..k3ll_flags import k3ll_census_dispatch, k3ll_flag
 
 _KDA_SEED_STACKED_CALLS = [0]
 
@@ -5065,6 +5065,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._state_upload_slot ^= 1
         self._state_indices_buffer.remember(self._host_state_indices)
         self._dummy_request_mask_buffer.remember(self._dummy_request_mask_host)
+        k3ll_census_dispatch("state_index_kernel")
         return True
 
     def get_state_indices(self,

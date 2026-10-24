@@ -110,6 +110,7 @@ from ..input_commit import (
     block_offsets_triton_enabled,
     copy_batch_block_offsets_from_host,
 )
+from ..k3ll_flags import k3ll_census_dispatch
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -6579,6 +6580,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales,
             self.kv_offset,
         ):
+            k3ll_census_dispatch("block_offsets_triton")
             return
 
         copy_batch_block_offsets_to_device(

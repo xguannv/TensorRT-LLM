@@ -416,21 +416,18 @@ TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "tokens and next_new bit for bit (read at forward time)",
 )
 
-# Decode-step input-chain switches of the executor, read once at import by
-# tensorrt_llm/_torch/pyexecutor/input_commit.py (not registered here, so log_flags does not print them; each
-# defaults to 0, off, and the path with all of them at 0 is the one before they were added):
-#   TRTLLM_BATCHED_INPUT_COMMIT=1            a CUDA-graph decode step's H2D input copies and overlap gathers as one
-#                                            _input_commit_kernel before the replay
-#                                            (engine/runners/decoder/runner.py _input_commit_for_step)
-#   TRTLLM_BATCHED_INPUT_COMMIT_VERIFY=<n>   debug: check the first n commits (-1: all) against the staged bytes
-#   TRTLLM_KV_BLOCK_OFFSETS_TRITON=1|2       KVCacheManagerV2 block-offset copy as a Triton kernel; 2: also the target
-#                                            and draft tables in one _copy_block_offsets_pair_kernel
-#   TRTLLM_STATE_INDEX_COPY_KERNEL=1         MambaHybridCacheManagerV2 state indices + dummy mask in one
-#                                            _small_copy_pair_kernel
-#   TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1      spec sampler store scatters as one _spec_store_scatter_kernel, taken
-#                                            before the spec_step_copies scatter (TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X)
-#   TRTLLM_FUSED_HELIX_SPEC_PREPROCESS=1     Helix spec steps the fused head prep (TRTLLM_K3LL_SPEC_HEAD_FUSED) does
-#                                            not take: _preprocess_inputs' corrections in one kernel
+TRTLLM_K3LL_INPUT_CHAIN = _flag(
+    "TRTLLM_K3LL_INPUT_CHAIN",
+    -1,
+    "decode-step input chain (pyexecutor/input_commit.py, set at model construction by input_chain.py): the defaults "
+    "TRTLLM_BATCHED_INPUT_COMMIT=1 (H2D input copies and overlap gathers of a CUDA-graph decode step in one "
+    "_input_commit_kernel), TRTLLM_KV_BLOCK_OFFSETS_TRITON=2 (target and draft block-offset tables in one "
+    "_copy_block_offsets_pair_kernel), TRTLLM_STATE_INDEX_COPY_KERNEL=1 (state indices + dummy mask in one "
+    "_small_copy_pair_kernel) and TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1 (store scatters in one "
+    "_spec_store_scatter_kernel, before the spec_step_copies scatter); each of those set in the environment wins "
+    "(the same values). 1 on, 0 off, -1 (default) on SM103 only (input_chain.INPUT_CHAIN_CAPABILITIES). Not "
+    "covered: TRTLLM_FUSED_HELIX_SPEC_PREPROCESS and TRTLLM_BATCHED_INPUT_COMMIT_VERIFY (environment only)",
+)
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
