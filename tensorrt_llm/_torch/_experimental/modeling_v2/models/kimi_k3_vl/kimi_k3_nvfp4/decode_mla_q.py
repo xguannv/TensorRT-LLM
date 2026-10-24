@@ -206,10 +206,13 @@ def all_head_queries(
     rope: int,
     release_norm: bool = False,
     absorb_prewait: bool = False,
+    before_absorb: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, str, torch.Tensor]:
     """Every head's FP8 query from the q_a columns ``q_a`` (``[tokens, q_lora_rank]`` bf16, any row stride).
 
     ``release_norm`` / ``absorb_prewait``: ``TRTLLM_K3LL_MLA_QNORM_PDL`` / ``TRTLLM_K3LL_MLA_PREWAIT_L2`` (bitwise).
+    ``before_absorb(q, quant_q)``: called once ``q`` (Q-B's output) and ``quant_q`` (allocated, not yet written) exist,
+    right before the absorption is enqueued (``TRTLLM_K3LL_MLA_KV_JOIN_EARLY``: the KV side's run and join).
     Returns ``(quant_q, q, kernel, q_norm)``: ``quant_q`` ``[tokens, heads, kv_lora_rank + rope]`` uint8 (FP8 bytes,
     what the split read takes), ``q`` the BF16 Q-B output viewed ``[tokens, heads, nope + rope]``, the kernels'
     names (absorption, and ``+qnorm_pdl`` when the released norm ran) and Q-B's input (the normalized q_a)."""
@@ -217,6 +220,8 @@ def all_head_queries(
     q_norm, released = q_a_norm(q_a, q_a_layernorm, release_norm)
     q = q_b_proj(q_norm).view(q_a.shape[0], heads, nope + rope)
     quant_q = torch.empty((q_a.shape[0], heads, lora + rope), dtype=torch.uint8, device=q_a.device)
+    if before_absorb is not None:
+        before_absorb(q, quant_q)
     kernel = absorb_queries(q, w_kc, quant_q, nope, rope, prewait=absorb_prewait)
     if released:
         kernel += "+qnorm_pdl"

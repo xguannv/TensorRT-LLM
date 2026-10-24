@@ -278,6 +278,15 @@ TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = _flag(
     "per head, then the gate (mla_v_up.py); 1 at launch builds the BF16 W_UV of all heads (12.6 MB per MLA layer), "
     "on SM103 only (elsewhere the switch-off path)",
 )
+TRTLLM_K3LL_MLA_KV_JOIN_EARLY = _flag(
+    "TRTLLM_K3LL_MLA_KV_JOIN_EARLY",
+    0,
+    "with TRTLLM_K3LL_MLA_KV_SIDE (and so on SM103 only): the main stream joins the KV side stream right before the "
+    "query absorption instead of before the split read, so the split read's only dependency is the absorption and it "
+    "keeps its programmatic early launch; the output gate (TRTLLM_K3LL_MLA_GATE_SIDE, forked after the absorption) "
+    "then runs on the SMs the split read leaves instead of pushing split CTAs out (same kernels and bytes; read at "
+    "forward time)",
+)
 TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
     "TRTLLM_K3LL_MLA_QNORM_PDL",
     1,

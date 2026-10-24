@@ -3138,38 +3138,21 @@ class K3DecodeMLA(KimiK3MLAAttention):
         rows = ag.shape[0]
         # TRTLLM_K3LL_MLA_KV_SIDE: the latent row and KV append read only ag's kv half and the step's positions, so
         # they go on their own stream from here, beside the query path, and the main stream joins them before the
-        # split read (before anything after this point that reads the KV pages). Steps of 1 to
+        # split read (before anything after this point that reads the KV pages; with KV_JOIN_EARLY before the
+        # absorption). Steps of 1 to
         # decode_mla_q.KV_SIDE_MAX_REQUESTS requests only.
         kv_side = bool(_flags.TRTLLM_K3LL_MLA_KV_SIDE) and _decode_mla_q.kv_side_applies(
             metadata.num_generations
         )
         if kv_side:
             self._kv_side.mark(do_multi_stream())
-        quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(
-            ag[:, : self.q_lora_rank],
-            self.q_a_layernorm,
-            self.q_b_proj,
-            self._q_absorb_w_kc,
-            self.qk_nope_head_dim,
-            self.qk_rope_head_dim,
-            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL)
-            and _decode_mla_q.qnorm_pdl_applies(metadata.num_generations),
-            absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
-        )
-        if "+qnorm_pdl" in kernel or "+prewait" in kernel:
-            from . import census as _census
-
-            if "+qnorm_pdl" in kernel:
-                _census.count(f"mla_qnorm_pdl:{_census.mode()}")
-            if "+prewait" in kernel:
-                _census.count(f"mla_prewait_absorb:{_census.mode()}")
         cu_q = torch.empty(metadata.num_seqs + 1, dtype=torch.int32, device=ag.device)
         cu_kv = torch.empty_like(cu_q)
         scheduler = torch.empty(1, dtype=torch.uint32, device=ag.device)
         bmm1 = torch.empty(2, dtype=torch.float32, device=ag.device)
         bmm2 = torch.empty(1, dtype=torch.float32, device=ag.device)
 
-        def latent_and_append() -> None:
+        def latent_and_append(q: torch.Tensor, quant_q: torch.Tensor) -> None:
             # With q_rope_applied the cache kernel reads q / quant_q for their pointers and strides only.
             latent_cache = _fp8_attention.mla_latent(
                 ag, self.kv_a_layernorm.weight, float(self.kv_a_layernorm.variance_epsilon)
@@ -3188,15 +3171,41 @@ class K3DecodeMLA(KimiK3MLAAttention):
                 q_rope_applied=True,
             )
 
-        if kv_side:
+        def kv_side_run_and_join(q: torch.Tensor, quant_q: torch.Tensor) -> None:
             from . import census as _census
 
-            forked = self._kv_side.run(latent_and_append, ag.device)
+            forked = self._kv_side.run(lambda: latent_and_append(q, quant_q), ag.device)
             self._kv_side.join()
             if forked:  # the census counts the side-stream fork, not the switch
                 _census.count(f"mla_kv_side:{_census.mode()}")
-        else:
-            latent_and_append()
+                if join_early:
+                    _census.count(f"mla_kv_join_early:{_census.mode()}")
+
+        # TRTLLM_K3LL_MLA_KV_JOIN_EARLY: the main stream joins the KV side before the absorption instead of before the
+        # split read, so the split read's only dependency is the absorption on its own stream and it keeps its
+        # programmatic early launch; the gate forked after it then takes the SMs the split read leaves.
+        join_early = kv_side and bool(_flags.TRTLLM_K3LL_MLA_KV_JOIN_EARLY)
+        quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(
+            ag[:, : self.q_lora_rank],
+            self.q_a_layernorm,
+            self.q_b_proj,
+            self._q_absorb_w_kc,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL)
+            and _decode_mla_q.qnorm_pdl_applies(metadata.num_generations),
+            absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
+            before_absorb=kv_side_run_and_join if join_early else None,
+        )
+        if "+qnorm_pdl" in kernel or "+prewait" in kernel:
+            from . import census as _census
+
+            if "+qnorm_pdl" in kernel:
+                _census.count(f"mla_qnorm_pdl:{_census.mode()}")
+            if "+prewait" in kernel:
+                _census.count(f"mla_prewait_absorb:{_census.mode()}")
+        if not join_early:
+            (kv_side_run_and_join if kv_side else latent_and_append)(q, quant_q)
         if self.mapping.cp_rank == 0 and rows not in K3DecodeMLA._all_head_logged:
             K3DecodeMLA._all_head_logged.add(rows)
             lowm = bool(
