@@ -29,7 +29,8 @@ whole row, NaNs in two shards, a NaN in the last shard only: the first NaN wins)
 rank but rank 0 launching the last one late (the last call reads the buffer of the first after a 2-row call re-armed
 it), a batch that dips and grows back (64, 64, 64, 16, 56 and 64 rows, then 50 calls of a random B x 8 with one random
 rank late each call), and CUDA graphs of 3 sharded calls replayed 10 times with the logits, drafts and dummy mask
-rewritten in place (the buffer rotation inside a graph).
+rewritten in place (the buffer rotation inside a graph). Sampled calls (``samp_*``, mixed temperatures): the sharded
+kernel with one CTA per column slice and with ``rows_per_cta`` 1 and 2 against the gathered fp32 kernel, bit for bit.
 
 Shapes: the rank's shard V / W of V = 163840 (W exchange slots), and TP16's 10240-column shard with every rank filling
 16 / W slots (the exchange of 16 ranks; ``--copies`` overrides).
@@ -426,6 +427,51 @@ def time_split(env: dict, ws: dict, vocab: int, config: str, batch: int, tokens:
                 base2=statistics.median(per_call[3]) if base is not None else None, identical=identical)  # fmt: skip
 
 
+SAMPLE_SPLITS = [(1, 8), (2, 8), (4, 8), (8, 8), (3, 4)]
+
+
+def check_sample(env: dict, ws: dict, vocab: int, config: str, steps: int = 4) -> list:
+    """Sampled acceptance (temperature 0 / 0.7 / 1.0 / 1.3 rows; ``samp_*``): the sharded kernel, with one CTA per
+    column slice and with ``rows_per_cta`` 1 and 2, against the kernel on the gathered fp32 logits (the noise depends
+    on the global column only, so the shards' draws are the gathered draw), every output and state tensor, ``steps``
+    calls with the state carried."""
+    shard, lo = shard_of(env, vocab)
+    results = []
+    for batch, tokens in SAMPLE_SPLITS:
+        drafts, rows = tokens - 1, batch * tokens
+        gen = torch.Generator(device="cuda").manual_seed(7100 + 10 * batch + tokens)
+        st_g = sharded_state(gen, batch, vocab)
+        sts = [clone_state(st_g) for _ in range(3)]
+        res = new_result(
+            config=config, split=f"{batch}x{tokens}", case="sampled, rows_per_cta 0 / 1 / 2"
+        )
+        for step in range(steps):
+            x = torch.randn(rows, vocab, generator=gen, device="cuda").bfloat16()
+            temp = torch.tensor(
+                [(0.0, 0.7, 1.0, 1.3)[(r + step) % 4] for r in range(rows)], device="cuda"
+            )
+            seed = torch.randint(0, 2**62, (rows,), generator=gen, device="cuda", dtype=torch.int64)
+            offset = torch.randint(
+                0, 2**40, (rows,), generator=gen, device="cuda", dtype=torch.int64
+            )
+            sampling = (temp, seed, offset)
+            draft = drafts_for(gen, x, batch, drafts, step)
+            set_dummies([st_g] + sts, batch, step)
+            tally(res, "logits", same_logits_everywhere(env, x), step)
+            x_shard = x[:, lo : lo + shard].contiguous()
+            ref = fused(st_g, x.float(), draft, 0.0, tokens, sampling=sampling)
+            for rpc, st in zip((0, 1, 2), sts):
+                got = fused(
+                    st, x_shard, draft, 0.0, tokens, (ws, lo), sampling=sampling, rows_per_cta=rpc
+                )
+                record(res, step, {
+                    "outputs": (OUTPUTS, got, ref),
+                    "state": (STATE_KEYS, state_of(st), state_of(st_g)),
+                })  # fmt: skip
+        results.append(finish(res))
+    return results
+
+
 def run_config(env: dict, name: str, vocab: int, copies: int, time_it: bool = False, base=None, rounds: int = 12,
                time_splits=None, checks: bool = True):  # fmt: skip
     """Every check of one shape (and its timing with ``time_it``): (skip reason or None, results, timings)."""
@@ -446,6 +492,7 @@ def run_config(env: dict, name: str, vocab: int, copies: int, time_it: bool = Fa
         results.append(check_transition(env, ws, vocab, config))
         results.append(check_dip_regrow(env, ws, vocab, config))
         results += [check_graph(env, ws, vocab, config, b, t) for b, t in GRAPH_SPLITS]
+        results += check_sample(env, ws, vocab, config)
     timings = []
     if time_it:
         for b, t in time_splits or SPLITS:

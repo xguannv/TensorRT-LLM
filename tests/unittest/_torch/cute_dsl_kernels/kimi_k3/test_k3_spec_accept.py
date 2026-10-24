@@ -36,6 +36,10 @@ rewritten in place and the state carried.
 widths 9361 (one column past the L1 engine's 599040 / 64 = 9360) and 16384 (1M / 64) at every batch, and the
 CUDA-graph replays, against the same reference.
 
+``rows_per_cta`` (``TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT``: each 1024-column slice reduced by several CTAs of a few rows):
+every split and case at 1, 2 and 3 rows per CTA (wide table), CTA 0's table, the engine widths and the CUDA-graph
+replays, against the same reference.
+
 Table: ``python3 test_k3_spec_accept.py report``. Timing: ``python3 test_k3_spec_accept.py time`` (batch 1, then every
 split: CUDA graphs of 20 back-to-back calls of the reference ops and of the kernel, median over 12 replays in
 alternating order). The vocabulary-sharded variant: test_k3_spec_accept_sharded.py (MPI).
@@ -365,20 +369,25 @@ def reference(st: dict, logits, draft, force: float, block: int) -> list:
 
 
 def fused(
-    st: dict, logits, draft, force: float, block: int, shard=None, wide_table: bool = False
-) -> list:
+    st: dict, logits, draft, force: float, block: int, shard=None, wide_table: bool = False,
+    rows_per_cta: int = 0, sampling=None, shard_offset: int = 0,
+) -> list:  # fmt: skip
     """``trtllm::k3_spec_accept`` on the state ``st``; ``shard``: (workspace, first column) when ``logits`` are this
-    rank's bf16 vocabulary shard; ``wide_table``: the block table over every CTA."""
+    rank's bf16 vocabulary shard; ``wide_table``: the block table over every CTA; ``rows_per_cta``: rows per CTA
+    (``TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT``, 0 off); ``sampling``: (temperature, seed, offset) per row, the sampled
+    acceptance (``shard_offset``: the global index of the first column of unsharded ``logits``)."""
     ws_args = ()
     if shard is not None:
         ws, first = shard
         ws_args = (ws["uc"], ws["mc"], ws["flags"])
         ws_args += (ws["rank"], ws["slots"], ws["push_copies"], first)
+    elif sampling is not None:
+        ws_args = (None, None, None, 0, 1, 1, shard_offset)
     return torch.ops.trtllm.k3_spec_accept(
         logits, draft, st["block_off"], st["pool_idx"], st["divisor"], st["block_counts"], st["block_tables"],
         st["prev_acc"], st["state_idx"], st["dummy"], st["kv_lens"], st["batch_to_slot"], st["ctx_len"], MAX_CTX,
         st["embed"], st["mask_row"], st["rng_pool"], st["rng_counter"], force, block, *ws_args,
-        wide_table=wide_table,
+        *(sampling or ()), wide_table=wide_table, rows_per_cta=rows_per_cta,
     )  # fmt: skip
 
 
@@ -431,7 +440,7 @@ def cell(res: dict, check: str) -> str:
 
 
 def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS, wide_table: bool = False,
-            max_blocks=None) -> dict:  # fmt: skip
+            max_blocks=None, rows_per_cta: int = 0) -> dict:  # fmt: skip
     """One case at one split: ``steps`` consecutive steps with the state carried, the kernel against the reference
     (every output and state tensor), its inputs untouched and a rerun on a clone of its state."""
     _op()
@@ -448,8 +457,12 @@ def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS, 
         logits_in, draft_in = logits.clone(), draft.clone()
         st_again = clone_state(st_new)
         want = reference(st_ref, logits, draft, force, block)
-        got = fused(st_new, logits, draft, force, block, wide_table=wide_table)
-        again = fused(st_again, logits, draft, force, block, wide_table=wide_table)
+        got = fused(
+            st_new, logits, draft, force, block, wide_table=wide_table, rows_per_cta=rows_per_cta
+        )
+        again = fused(
+            st_again, logits, draft, force, block, wide_table=wide_table, rows_per_cta=rows_per_cta
+        )
         record(res, step, {
             "outputs": (OUTPUTS, got, want),
             "state": (STATE_KEYS, state_of(st_new), state_of(st_ref)),
@@ -461,8 +474,9 @@ def measure(batch: int, drafts: int, block: int, case: int, steps: int = STEPS, 
 
 
 def measure_graph(
-    batch: int, drafts: int, block: int, forced, replays: int = STEPS, wide_table: bool = False
-) -> dict:
+    batch: int, drafts: int, block: int, forced, replays: int = STEPS, wide_table: bool = False,
+    rows_per_cta: int = 0,
+) -> dict:  # fmt: skip
     """One call captured in a CUDA graph and replayed ``replays`` times with the logits (every kind), drafts, dummy
     mask, block offsets and context lengths rewritten in place and the state carried: every replay against the
     reference."""
@@ -476,12 +490,20 @@ def measure_graph(
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         fused(
-            clone_state(st_new), logits, draft, force, block, wide_table=wide_table
+            clone_state(st_new),
+            logits,
+            draft,
+            force,
+            block,
+            wide_table=wide_table,
+            rows_per_cta=rows_per_cta,
         )  # compiled outside capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        outs = fused(st_new, logits, draft, force, block, wide_table=wide_table)
+        outs = fused(
+            st_new, logits, draft, force, block, wide_table=wide_table, rows_per_cta=rows_per_cta
+        )
     torch.cuda.synchronize()
     name = f"graph x{replays} ({'natural' if forced is None else 'forced ' + forced})"
     res = new_result(split=f"{batch}x{drafts + 1}", block=block, case=name, force=force)
@@ -577,6 +599,73 @@ def test_graph_replay_wide_table(batch, tokens, forced):
     assert res["ok"], failures([res])
 
 
+# rows_per_cta (TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT): 1 (a CTA per row), 2 and 3 (rounded down to a divisor of the row
+# count: 3 rows per CTA at 3 x 8 and 6 x 4, else 1 or 2).
+ROW_SPLITS = (1, 2, 3)
+
+
+@pytest.mark.parametrize("rows_per_cta", ROW_SPLITS)
+@pytest.mark.parametrize("batch,tokens", SPLITS, ids=[f"{b}x{t}" for b, t in SPLITS])
+def test_split_row_split(batch, tokens, rows_per_cta):
+    """``rows_per_cta``: every case at one split (block K + 1, the wide table as on SM103), 8 steps each, against the
+    reference."""
+    with torch.inference_mode():
+        results = [
+            measure(
+                batch, tokens - 1, tokens, c, steps=8, wide_table=True, rows_per_cta=rows_per_cta
+            )
+            for c in range(len(CASES))
+        ]
+    assert not failures(results), failures(results)
+
+
+@pytest.mark.parametrize("batch,tokens", WIDE_SPLITS, ids=[f"{b}x{t}" for b, t in WIDE_SPLITS])
+def test_split_row_split_narrow_table(batch, tokens):
+    """``rows_per_cta`` 1 with CTA 0's block table (block K and 8), every case, against the reference."""
+    with torch.inference_mode():
+        results = [
+            measure(batch, tokens - 1, block, c, steps=8, rows_per_cta=1)
+            for block in (tokens - 1, 8)
+            for c in range(len(CASES))
+        ]
+    assert not failures(results), failures(results)
+
+
+@pytest.mark.parametrize("max_blocks", [9361, 16384])
+@pytest.mark.parametrize("batch", (1, 4, 8))
+def test_row_split_engine_widths(batch, max_blocks):
+    """``rows_per_cta`` 1 with the wide table at engine-like widths, natural and forced-fraction cases at K = 7."""
+    with torch.inference_mode():
+        results = [
+            measure(batch, 7, 8, c, steps=4, wide_table=True, max_blocks=max_blocks, rows_per_cta=1)
+            for c in (0, 5)
+        ]
+    assert not failures(results), failures(results)
+
+
+@pytest.mark.parametrize("wide_table", [True, False], ids=["wide", "cta0"])
+@pytest.mark.parametrize("forced", [None, "frac"], ids=["natural", "forced-frac"])
+@pytest.mark.parametrize("batch,tokens", GRAPH_SPLITS, ids=[f"{b}x{t}" for b, t in GRAPH_SPLITS])
+def test_graph_replay_row_split(batch, tokens, forced, wide_table):
+    """``rows_per_cta`` 1: a captured call replayed 20 times with its inputs rewritten in place, the state carried."""
+    with torch.inference_mode():
+        res = measure_graph(
+            batch, tokens - 1, tokens, forced, wide_table=wide_table, rows_per_cta=1
+        )
+    assert res["ok"], failures([res])
+
+
+def test_rows_per_cta_for():
+    """The rows per CTA the op launches: all rows when off or not below the row count, else the largest divisor of
+    the row count not above the request."""
+    kern = _op()._kernel_module()
+    assert kern.rows_per_cta_for(32, 0) == 32
+    assert kern.rows_per_cta_for(32, -1) == 32
+    assert kern.rows_per_cta_for(8, 8) == 8 and kern.rows_per_cta_for(8, 9) == 8
+    assert [kern.rows_per_cta_for(24, r) for r in range(1, 9)] == [1, 2, 3, 4, 4, 6, 6, 8]
+    assert [kern.rows_per_cta_for(14, r) for r in range(1, 8)] == [1, 2, 2, 2, 2, 2, 7]
+
+
 def test_force_mode():
     """force_mode follows _apply_force_accepted_tokens: (mode, base total, fraction) of a forced value at K drafts."""
     op = _op()
@@ -593,9 +682,9 @@ def test_force_mode():
 
 
 def test_arrival_counter_at_rest_after_back_to_back_calls():
-    """Calls of several splits and block widths launched back to back on one stream, the state carried and no host
-    synchronization between them, as consecutive decode steps run: each grid's arrival counter (``CTAs arrived``,
-    which the last CTA of every call zeroes) is zero once the device is idle."""
+    """Calls of several splits and block widths (rows_per_cta 0, 1, 2 in turn) launched back to back on one stream, the
+    state carried and no host synchronization between them, as consecutive decode steps run: each grid's arrival
+    counter (``CTAs arrived``, which the last CTA of every call zeroes) is zero once the device is idle."""
     op = _op()
     gen = torch.Generator(device="cuda").manual_seed(20261003)
     with torch.inference_mode():
@@ -607,8 +696,8 @@ def test_arrival_counter_at_rest_after_back_to_back_calls():
                 logits, draft = step_inputs(gen, batch, drafts, "plain", step)
                 calls.append((st, logits, draft, drafts + block_delta))
         torch.cuda.synchronize()
-        for st, logits, draft, block in calls:
-            fused(st, logits, draft, 0.0, block)
+        for i, (st, logits, draft, block) in enumerate(calls):
+            fused(st, logits, draft, 0.0, block, rows_per_cta=i % 3)
         torch.cuda.synchronize()
     device = torch.cuda.current_device()
     counters = [scratch[1] for (dev, _), scratch in op._scratch.items() if dev.index == device]

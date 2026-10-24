@@ -364,6 +364,15 @@ TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE = _flag(
     "(default) on SM103 only (spec_worker.SPEC_ACCEPT_WIDE_TABLE_CAPABILITIES; SM107 / Rubin keeps CTA 0's table "
     "unless forced with 1)",
 )
+TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT = _flag(
+    "TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT",
+    0,
+    "trtllm::k3_spec_accept: N > 0 reduces each 1024-column slice of the target logits with B (K + 1) / N CTAs of N "
+    "rows each (N rounded down to a divisor of the row count) instead of one CTA walking all B (K + 1) rows; the "
+    "same bits, greedy or sampled. The TP16 shard has 10 such CTAs, and with temperature sampling every element "
+    "also draws its Gumbel noise: 1 takes the bs4 MTP7 sampled call from 53 to 13 us (read per call, so per CUDA "
+    "graph capture). 0 off",
+)
 TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "TRTLLM_K3LL_SPEC_HEAD_FUSED",
     1,

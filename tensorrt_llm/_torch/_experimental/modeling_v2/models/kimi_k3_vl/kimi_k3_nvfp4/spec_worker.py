@@ -81,6 +81,18 @@ def _k3_wide_table(device: torch.device) -> bool:
     return wide
 
 
+def _k3_rows_per_cta(sample: bool) -> int:
+    """``TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT`` for this ``trtllm::k3_spec_accept`` call (its ``rows_per_cta``; census when
+    on, per greedy / sampled call). Also counts every sampled call, switch on or off."""
+    if sample:
+        _census.count(f"dispatch:spec_accept_sample:{_census.mode()}")
+    value = max(int(_flags.TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT), 0)
+    if value:
+        kind = "sample" if sample else "greedy"
+        _census.count(f"dispatch:spec_accept_row_split_{kind}:{_census.mode()}")
+    return value
+
+
 class KimiK3DFlashWorker(DFlashWorker):
     # Set by a Kimi K3 target running its decode kernels: decode steps then run the acceptance and the drafter's
     # inputs as trtllm::k3_spec_accept, keep the target logits vocabulary-sharded and write the drafter's context
@@ -492,6 +504,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             self._compute_block_size,
             *self._k3_shard_args(shard),
             wide_table=_k3_wide_table(logits.device),
+            rows_per_cta=_k3_rows_per_cta(False),
         )
         self._on_acceptance(accepted, num_acc, attn_metadata, spec_metadata)
         return (
@@ -1838,6 +1851,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             first_column,
             *sampling,
             wide_table=_k3_wide_table(logits.device),
+            rows_per_cta=_k3_rows_per_cta(bool(sampling)),
         )
         return accepted, num_acc, rewind
 

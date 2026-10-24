@@ -20,6 +20,13 @@
   state updates are the greedy reference's (test_k3_spec_accept.reference) on the noised scores, bit for bit.
 * The draws are temperature samples: over many (seed, offset) pairs the token frequencies of a few-candidate row match
   softmax(logits / T).
+* ``rows_per_cta`` (``TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT``) changes no bit of a sampled call: every output and state
+  tensor equals the call with one CTA per column slice, on the same (temperature, seed, offset).
+* Distribution, with and without ``rows_per_cta``: a chi-square goodness-of-fit test of the sampled tokens against
+  softmax(logits / T) over the whole 163840-token vocabulary (equal-mass bins of a spread distribution; the candidate
+  tokens plus the rest of a peaked one), with a negative control (the same counts against another temperature must
+  be rejected), and the mean accepted length of drafts that always propose the top token against its closed form
+  sum_j p^j (p the top token's probability).
 """
 
 import importlib.util
@@ -147,3 +154,188 @@ def test_gumbel_reference_is_a_gumbel():
     )
     assert abs(g.mean().item() - 0.5772) < 0.01
     assert abs(g.var().item() - 1.6449) < 0.02
+
+
+def _sampled_call(base, st, logits, draft, block, sampling, rows_per_cta=0, shard_offset=0):
+    return base.fused(st, logits, draft, 0.0, block, sampling=sampling, shard_offset=shard_offset,
+                      rows_per_cta=rows_per_cta)  # fmt: skip
+
+
+@pytest.mark.parametrize("rows_per_cta", [1, 2, 4])
+@pytest.mark.parametrize("batch,drafts", [(1, 7), (2, 7), (4, 7), (8, 7), (3, 3)])
+@pytest.mark.parametrize("shard_offset", [0, 81920])
+def test_row_split_sampled_bits(batch, drafts, rows_per_cta, shard_offset):
+    """``rows_per_cta``: a sampled call (a third of the rows greedy) gives the bits of the one-CTA-per-slice call on
+    the same inputs, every output and state tensor, over 4 consecutive steps with the state carried."""
+    base = _base()
+    gen = torch.Generator(device="cuda").manual_seed(
+        9000 + 100 * batch + 10 * drafts + rows_per_cta
+    )
+    rows = batch * (drafts + 1)
+    block = drafts + 1
+    st_off = base.make_state(gen, batch)
+    st_on = base.clone_state(st_off)
+    with torch.inference_mode():
+        for step in range(4):
+            logits, _ = base.step_inputs(gen, batch, drafts, "plain", step)
+            temps = [0.0 if (r + step) % 3 == 0 else (0.7, 1.0, 1.3)[r % 3] for r in range(rows)]
+            sampling = _sampling_inputs(gen, rows, temps)
+            draft = base.drafts_for(gen, logits, batch, drafts, step)
+            base.set_dummies((st_off, st_on), batch, step)
+            want = _sampled_call(base, st_off, logits, draft, block, sampling, 0, shard_offset)
+            got = _sampled_call(
+                base, st_on, logits, draft, block, sampling, rows_per_cta, shard_offset
+            )
+            flags = base.same(got + base.state_of(st_on), want + base.state_of(st_off))
+            names = base.OUTPUTS + base.STATE_KEYS
+            assert all(flags), (step, [n for n, f in zip(names, flags) if not f])
+
+
+def _chi_square(counts: torch.Tensor, probs: torch.Tensor):
+    """(statistic, degrees of freedom, upper-tail p-value) of observed ``counts`` against bin probabilities."""
+    counts, probs = counts.double().cpu(), probs.double().cpu()
+    n = counts.sum()
+    expected = n * probs
+    stat = ((counts - expected) ** 2 / expected).sum()
+    df = counts.numel() - 1
+    p_value = torch.special.gammaincc(torch.tensor(df / 2.0, dtype=torch.float64), stat / 2.0)
+    return stat.item(), df, p_value.item()
+
+
+def _draw_tokens(base, logits_row, temperature, calls, gen, rows_per_cta, batch=8, drafts=7):
+    """The sampled target tokens of ``calls`` calls of ``batch x (drafts + 1)`` rows, every row ``logits_row``, each
+    row and call a fresh (seed, offset)."""
+    rows = batch * (drafts + 1)
+    logits = logits_row[None, :].expand(rows, -1).contiguous()
+    draft = torch.zeros(batch, drafts, dtype=torch.int32, device="cuda")
+    tokens = []
+    with torch.inference_mode():
+        for _ in range(calls):
+            sampling = _sampling_inputs(gen, rows, [temperature] * rows)
+            st = base.make_state(gen, batch)
+            out = _sampled_call(base, st, logits, draft, drafts + 1, sampling, rows_per_cta)
+            tokens.append(out[0].view(-1).long())
+    return torch.cat(tokens)
+
+
+def _spread_logits(gen):
+    return torch.randn(_base().V, generator=gen, device="cuda") * 1.5
+
+
+def _peaked_logits(gen, cand):
+    logits = torch.randn(_base().V, generator=gen, device="cuda") - 10.0
+    logits[cand] = torch.linspace(2.5, 0.0, len(cand), device="cuda")
+    return logits
+
+
+def _equal_mass_bins(probs: torch.Tensor, bins: int):
+    """(bin index per token, bin count): tokens sorted by probability, cut into at most ``bins`` runs of about equal
+    total mass; a token heavier than 1 / ``bins`` makes its run alone, and the empty cuts are dropped."""
+    order = torch.argsort(probs, descending=True)
+    cum = torch.cumsum(probs[order].double(), 0)
+    which = torch.clamp((cum * bins).floor().long(), max=bins - 1)
+    which = torch.unique(which, return_inverse=True)[1]
+    index = torch.empty_like(order)
+    index[order] = which
+    return index, int(which.max().item()) + 1
+
+
+@pytest.mark.parametrize("rows_per_cta", [0, 1], ids=["one-cta-per-slice", "row-split"])
+@pytest.mark.parametrize("temperature", [0.6, 1.0])
+def test_chi_square_spread_vocabulary(temperature, rows_per_cta):
+    """A spread distribution over all 163840 tokens (logits ~ N(0, 1.5^2)), up to 24 equal-mass bins, 64 rows x 160
+    calls: the chi-square test does not reject softmax(logits / T) (p > 1e-4); against the softmax at 1.3 T it does
+    (p < 1e-6), so the test can tell temperatures apart at this sample size."""
+    base = _base()
+    gen = torch.Generator(device="cuda").manual_seed(4242)
+    logits_row = _spread_logits(gen)
+    tokens = _draw_tokens(base, logits_row, temperature, 160, gen, rows_per_cta)
+    bins = 24
+    probs = torch.softmax(logits_row.double() / temperature, 0)
+    index, bins = _equal_mass_bins(probs, bins)
+    counts = torch.bincount(index[tokens], minlength=bins)
+    bin_probs = torch.zeros(bins, dtype=torch.float64, device="cuda").index_add_(0, index, probs)
+    stat, df, p_value = _chi_square(counts, bin_probs)
+    wrong = torch.softmax(logits_row.double() / (1.3 * temperature), 0)
+    wrong_bins = torch.zeros(bins, dtype=torch.float64, device="cuda").index_add_(0, index, wrong)
+    stat_w, _, p_w = _chi_square(counts, wrong_bins)
+    print(f"[chi2 spread T={temperature} rows_per_cta={rows_per_cta}] n={tokens.numel()} chi2={stat:.2f} df={df} "
+          f"p={p_value:.4f} | control 1.3T: chi2={stat_w:.1f} p={p_w:.2e}")  # fmt: skip
+    assert p_value > 1e-4, (
+        f"chi2 {stat:.1f} (df {df}) p {p_value:.2e}: draws do not follow softmax(logits / T)"
+    )
+    assert p_w < 1e-6, f"negative control not rejected: chi2 {stat_w:.1f} p {p_w:.2e}"
+
+
+@pytest.mark.parametrize("rows_per_cta", [0, 1], ids=["one-cta-per-slice", "row-split"])
+@pytest.mark.parametrize("temperature", [0.7, 1.0])
+def test_chi_square_peaked_vocabulary(temperature, rows_per_cta):
+    """12 candidate tokens across the vocabulary (CTA and shard boundaries) above a background of every other token,
+    bins = the candidates + the rest, 64 rows x 120 calls: not rejected (p > 1e-4); the softmax at 1.25 T is
+    (p < 1e-6)."""
+    base = _base()
+    gen = torch.Generator(device="cuda").manual_seed(777)
+    cand = torch.tensor([0, 1, 1023, 1024, 10239, 10240, 50000, 81919, 81920, 120000, 163838, 163839],
+                        device="cuda")  # fmt: skip
+    logits_row = _peaked_logits(gen, cand)
+    tokens = _draw_tokens(base, logits_row, temperature, 120, gen, rows_per_cta)
+    index = torch.full((base.V,), len(cand), dtype=torch.long, device="cuda")
+    index[cand] = torch.arange(len(cand), device="cuda")
+    counts = torch.bincount(index[tokens], minlength=len(cand) + 1)
+
+    def binned(t):
+        probs = torch.softmax(logits_row.double() / t, 0)
+        return torch.zeros(len(cand) + 1, dtype=torch.float64, device="cuda").index_add_(
+            0, index, probs
+        )
+
+    stat, df, p_value = _chi_square(counts, binned(temperature))
+    stat_w, _, p_w = _chi_square(counts, binned(1.25 * temperature))
+    print(f"[chi2 peaked T={temperature} rows_per_cta={rows_per_cta}] n={tokens.numel()} chi2={stat:.2f} df={df} "
+          f"p={p_value:.4f} | control 1.25T: chi2={stat_w:.1f} p={p_w:.2e}")  # fmt: skip
+    assert p_value > 1e-4, f"chi2 {stat:.1f} (df {df}) p {p_value:.2e}: counts {counts.tolist()}"
+    assert p_w < 1e-6, f"negative control not rejected: chi2 {stat_w:.1f} p {p_w:.2e}"
+
+
+@pytest.mark.parametrize("rows_per_cta", [0, 1], ids=["one-cta-per-slice", "row-split"])
+def test_acceptance_length_matches_closed_form(rows_per_cta):
+    """Every row the same peaked logits (top token probability p at T = 1), every draft the top token: a request's
+    accepted count n = 1 + the leading rows that sampled the top token, so E[n] = sum_{j <= K} p^j. 8 requests x 200
+    calls: the mean n is within 4.5 standard errors of it, and the per-position acceptance rate within 4.5 standard
+    errors of p^(j + 1)."""
+    base = _base()
+    gen = torch.Generator(device="cuda").manual_seed(31337)
+    batch, drafts, calls, temperature = 8, 7, 200, 1.0
+    rows = batch * (drafts + 1)
+    logits_row = torch.randn(base.V, generator=gen, device="cuda") - 12.0
+    top = 40961
+    logits_row[top] = 2.5
+    logits_row[[7, 90000, 163000]] = torch.tensor([1.0, 0.5, 0.2], device="cuda")
+    p = torch.softmax(logits_row.double() / temperature, 0)[top].item()
+    logits = logits_row[None, :].expand(rows, -1).contiguous()
+    draft = torch.full((batch, drafts), top, dtype=torch.int32, device="cuda")
+    n_all = []
+    with torch.inference_mode():
+        for _ in range(calls):
+            sampling = _sampling_inputs(gen, rows, [temperature] * rows)
+            st = base.make_state(gen, batch)
+            out = _sampled_call(base, st, logits, draft, drafts + 1, sampling, rows_per_cta)
+            n_all.append(out[1].long())
+    n = torch.cat(n_all).double()
+    j = torch.arange(drafts + 1, dtype=torch.float64)
+    pmf = torch.cat([p ** j[:-1] * (1 - p), torch.tensor([p**drafts], dtype=torch.float64)])
+    mean = float((pmf * (j + 1)).sum())
+    var = float((pmf * (j + 1) ** 2).sum()) - mean**2
+    se = (var / n.numel()) ** 0.5
+    rates = [round((n >= k + 2).double().mean().item(), 4) for k in range(drafts)]
+    print(f"[acceptance rows_per_cta={rows_per_cta}] p_top={p:.4f} requests={n.numel()} mean n={n.mean().item():.4f} "
+          f"closed form {mean:.4f} (se {se:.4f}); per-position rate {rates} vs "
+          f"{[round(p ** (k + 1), 4) for k in range(drafts)]}")  # fmt: skip
+    assert abs(n.mean().item() - mean) < 4.5 * se, (
+        f"mean accepted {n.mean().item():.4f} vs {mean:.4f} (se {se:.4f})"
+    )
+    for k in range(drafts):
+        rate = (n >= k + 2).double().mean().item()
+        want = p ** (k + 1)
+        se_k = (want * (1 - want) / n.numel()) ** 0.5
+        assert abs(rate - want) < 4.5 * se_k + 1e-9, f"position {k}: {rate:.4f} vs {want:.4f}"
