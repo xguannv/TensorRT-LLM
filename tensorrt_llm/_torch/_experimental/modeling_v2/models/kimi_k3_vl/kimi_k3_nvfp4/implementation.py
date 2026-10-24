@@ -2743,6 +2743,25 @@ def _head_view_attention(mqa, num_heads: int):
 #: load-time state. On any other GPU neither builds anything and the decode takes the switch-off path.
 HELIX_SWITCH_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
 _helix_switch_skips_logged: set = set()
+# TRTLLM_K3LL_MLA_KV_JOIN_EARLY's default (-1) is on only on these compute capabilities (measured on GB300 / SM103). It
+# acts only with TRTLLM_K3LL_MLA_KV_SIDE on the all-head decode, which needs HELIX_Q_ABSORB's W_UK, built only on
+# HELIX_SWITCH_CAPABILITIES: elsewhere it changes nothing, even when forced with 1.
+MLA_KV_JOIN_EARLY_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _kv_join_early_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_KV_JOIN_EARLY_CAPABILITIES
+
+
+def _kv_join_early_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MLA_KV_JOIN_EARLY`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``MLA_KV_JOIN_EARLY_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MLA_KV_JOIN_EARLY)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _kv_join_early_by_default(index)
 
 
 def helix_switch_unsupported(switch: str) -> Optional[str]:
@@ -3184,7 +3203,7 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # TRTLLM_K3LL_MLA_KV_JOIN_EARLY: the main stream joins the KV side before the absorption instead of before the
         # split read, so the split read's only dependency is the absorption on its own stream and it keeps its
         # programmatic early launch; the gate forked after it then takes the SMs the split read leaves.
-        join_early = kv_side and bool(_flags.TRTLLM_K3LL_MLA_KV_JOIN_EARLY)
+        join_early = kv_side and _kv_join_early_on(ag.device)
         quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(
             ag[:, : self.q_lora_rank],
             self.q_a_layernorm,
