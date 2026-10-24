@@ -374,6 +374,13 @@ TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT = _flag(
     "graph capture). 0 off; -1 (default) 1 on SM103 only (spec_worker.SPEC_ACCEPT_ROW_SPLIT_CAPABILITIES; SM107 / "
     "Rubin keeps one CTA per slice unless set > 0)",
 )
+TRTLLM_K3LL_DRAFTER_AR_MERGED = _flag(
+    "TRTLLM_K3LL_DRAFTER_AR_MERGED",
+    0,
+    "MLA DSpark drafter: each two-shot residual + RMSNorm all-reduce (comm/mnnvl_fusion_allreduce above the one-shot "
+    "ceiling) as one launch instead of twoshotAllreduceKernel + rmsNormLamport; the same bits (read per call, so per "
+    "CUDA graph capture)",
+)
 TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "TRTLLM_K3LL_SPEC_HEAD_FUSED",
     1,

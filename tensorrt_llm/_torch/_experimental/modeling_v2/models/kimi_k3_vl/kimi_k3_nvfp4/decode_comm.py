@@ -555,12 +555,14 @@ class K3DecodeComm:
         residual: torch.Tensor,
         norm: nn.Module,
         one_shot_max_bytes: int = DECODE_AR_ONE_SHOT_MAX_BYTES,
+        two_shot_merged: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` in one ``comm/mnnvl_fusion_allreduce`` call: ``updated = residual +
         allreduce(partial)``, ``normed = norm(updated)`` for a plain RMSNorm ``norm``, sent one-shot up to
         ``one_shot_max_bytes`` (the decode path's `DECODE_AR_ONE_SHOT_MAX_BYTES` by default). ``partial`` is this
         rank's unreduced ``[rows, hidden]`` bf16 output of a row-parallel projection, of a shape
-        ``takes_allreduce_norm`` holds for at that ceiling."""
+        ``takes_allreduce_norm`` holds for at that ceiling. ``two_shot_merged``: a two-shot call runs the all-reduce
+        and the norm in one launch (the same bits)."""
         return mnnvl_fusion_allreduce(
             partial.contiguous(),
             self.mnnvl,
@@ -568,4 +570,5 @@ class K3DecodeComm:
             residual.contiguous(),
             norm.weight,
             _eps(norm),
+            two_shot_merged=two_shot_merged,
         )

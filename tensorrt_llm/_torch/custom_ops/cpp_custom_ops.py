@@ -133,7 +133,8 @@ def _register_fake():
           scale=None,
           fusion_op: int = 0,
           one_shot_max_bytes: int = 1048576,
-          early_trigger: bool = False):
+          early_trigger: bool = False,
+          two_shot_merged: bool = False):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:

@@ -9,8 +9,10 @@ So beyond single calls (every certified shape sent one-shot and two-shot back to
 grows back with Kimi K3's one-shot ceilings flipping the path inside the sequence, a random rank late at every call;
 two workspaces interleaved; the three MNNVL ops interleaved on one workspace; the same mix queued with no host
 synchronization between calls while ranks run ahead of one another; CUDA-graph capture and replay mixed with eager
-calls; ``MnnvlWorkspace.create``'s failure model; and a negative control in which one rank swaps two calls and every
-rank gets a wrong answer without an error. After every eager call the workspace's ``buffer_flags`` are compared with
+calls; ``two_shot_merged`` (the fused two-shot call as one launch) against the two-kernel path bit for bit at every
+certified shape, and mixed into call sequences and a CUDA graph on one workspace; ``MnnvlWorkspace.create``'s
+failure model; and a negative control in which one rank swaps two calls and every rank gets a wrong answer without an
+error. After every eager call the workspace's ``buffer_flags`` are compared with
 this file's model of the rotation (``Rotation``): one turn per call whatever the op, the path the call took, the
 bytes it wrote.
 
@@ -166,9 +168,9 @@ class AR:
     from an earlier call), True (drawn) or None (the plain sum). ``path``: see ``ceiling``. Every rank's input holds
     -0.0 in every NEG_ZERO_STRIDE-th column."""
 
-    def __init__(self, seed, tokens, hidden, residual=None, path="k3"):
+    def __init__(self, seed, tokens, hidden, residual=None, path="k3", merged=False):
         g = torch.Generator(device="cuda").manual_seed(seed)
-        self.tokens, self.hidden, self.path = tokens, hidden, path
+        self.tokens, self.hidden, self.path, self.merged = tokens, hidden, path, merged
         self.one_shot_max_bytes = ceiling(tokens, hidden, path)
         self.inputs = []
         for _ in range(R.world):
@@ -193,7 +195,12 @@ class AR:
     def fresh(self, seed):
         """A call of the same shape, fusion and path with new inputs."""
         return AR(
-            seed, self.tokens, self.hidden, residual=True if self.fused else None, path=self.path
+            seed,
+            self.tokens,
+            self.hidden,
+            residual=True if self.fused else None,
+            path=self.path,
+            merged=self.merged,
         )
 
     def chain_from(self, updated: torch.Tensor) -> None:
@@ -206,7 +213,9 @@ class AR:
         if not self.fused:
             return fusion_allreduce(x, ws, self.one_shot_max_bytes)
         residual = self.residual if residual is None else residual
-        return fusion_allreduce(x, ws, self.one_shot_max_bytes, residual, self.gamma, EPS)
+        return fusion_allreduce(
+            x, ws, self.one_shot_max_bytes, residual, self.gamma, EPS, two_shot_merged=self.merged
+        )
 
     def ref(self):
         """The exact sum (+0.0 where every rank sent -0.0); with a residual ``(normed, updated)``: ``updated`` exact,
@@ -665,6 +674,82 @@ def check_graph_capture_and_replay() -> None:
     del graph
 
 
+def check_two_shot_merged_is_bitwise() -> None:
+    """``two_shot_merged`` (the two-shot all-reduce and the residual add + RMSNorm in one launch): every certified
+    shape, fused and sent two-shot, first through the two kernels and then merged, the same inputs both times on one
+    workspace: the same bits (normed and updated), each against the reference, and the same flags after each call
+    (the merged kernel writes, clears and rotates as the two-kernel path does). The inputs carry -0.0 columns."""
+    for hidden in HIDDENS:
+        for t in TOKENS:
+            outs = []
+            for merged in (False, True):
+                call = AR(
+                    9000 + 37 * t + 3 * hidden, t, hidden, residual=True, path="two", merged=merged
+                )
+                outs.append(
+                    call_and_check(call, WS_A, f"T {t} H {hidden} two-shot merged {merged}")
+                )
+            (n0, u0), (n1, u1) = outs
+            assert bits_equal(n0, n1) and bits_equal(u0, u1), (
+                f"T {t} H {hidden}: merged two-shot differs from the two kernels"
+            )
+
+
+def check_two_shot_merged_mixed_sequence() -> None:
+    """Merged two-shot calls interleaved with two-kernel two-shot, one-shot and all-gather calls on one workspace (the
+    drafter's AR shapes 14 / 28 / 56 rows among them), a random rank 5 ms late at every call; then a CUDA graph of a
+    merged [28, 7168], a two-kernel [28, 7168] and a merged [16, 3584] call replayed 6 times with rewritten inputs and
+    an eager merged call between replays: every result right, the flags after each."""
+    b, f = k3_split()
+    late = random.Random(4242)
+    seq = [
+        lambda s: AR(s, 28, H_MODEL, residual=True, path="two", merged=True),
+        lambda s: AR(s, 8, H_MODEL, residual=True),
+        lambda s: AR(s, 14, H_MODEL, residual=True, path="two", merged=True),
+        lambda s: AG(s, 5, b, f),
+        lambda s: AR(s, 28, H_MODEL, residual=True, path="two"),
+        lambda s: AR(s, 56, H_MODEL, residual=True, path="two", merged=True),
+        lambda s: AR(s, 32, H_LATENT, path="two"),
+        lambda s: AR(s, 3, H_LATENT, residual=True, path="two", merged=True),
+    ]
+    for rnd in range(3):
+        for i, make in enumerate(seq):
+            call_late(make(9500 + 50 * rnd + i), WS_A, f"mixed round {rnd} call {i}", late)
+    calls = [
+        AR(9700, 28, H_MODEL, residual=True, path="two", merged=True),
+        AR(9701, 28, H_MODEL, residual=True, path="two"),
+        AR(9702, 16, H_LATENT, residual=True, path="two", merged=True),
+    ]
+    static_bufs = [c.static() for c in calls]
+
+    def step():
+        return [c.run(WS_B, **st) for c, st in zip(calls, static_bufs)]
+
+    outs = step()
+    for i, (c, got) in enumerate(zip(calls, outs)):
+        c.verify(got, f"merged graph eager call {i}")
+    rot(WS_B).advance(calls[-1].record(), "merged graph eager", calls=len(calls))
+    R.barrier()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outs = step()
+    R.barrier()
+    rot(WS_B).unchanged("merged graph captured, not replayed")
+    for rep in range(6):
+        for i, (c, st) in enumerate(zip(calls, static_bufs)):
+            c.refill(c.fresh(9800 + 100 * rep + i), st)
+        R.barrier()
+        graph.replay()
+        for i, (c, got) in enumerate(zip(calls, outs)):
+            c.verify(got, f"merged replay {rep} call {i}")
+        rot(WS_B).advance(calls[-1].record(), f"merged replay {rep}", calls=len(calls))
+        eager = AR(9900 + rep, 14 + 14 * (rep % 3), H_MODEL, residual=True, path="two", merged=True)
+        call_and_check(eager, WS_B, f"merged eager after replay {rep}")
+    del graph
+
+
 def try_create(capturing: bool):
     """Every rank calls MnnvlWorkspace.create; this one inside a CUDA-graph capture if ``capturing``. Returns the
     RuntimeError's message, or None if it returned a workspace."""
@@ -754,6 +839,8 @@ CHECKS = [
     check_one_workspace_three_ops,
     check_queued_calls_without_host_sync,
     check_graph_capture_and_replay,
+    check_two_shot_merged_is_bitwise,
+    check_two_shot_merged_mixed_sequence,
     check_create_refuses_on_every_rank,
     # Stays last: it deliberately disagrees on call order.
     check_wrong_call_order_is_detected,

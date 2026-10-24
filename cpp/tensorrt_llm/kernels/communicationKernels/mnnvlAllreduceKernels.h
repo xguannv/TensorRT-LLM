@@ -69,7 +69,10 @@ struct AllReduceFusionParams
     float const* scaleFactor = nullptr; //!< Quantization scale factor
     QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED; //!< NVFP4 scale-factor layout
     bool earlyTrigger = false;
-    cudaStream_t stream;                                          //!< CUDA stream for asynchronous kernel execution
+    //! Two-shot with kARResidualRMSNorm: the all-reduce and the residual add + RMSNorm in one launch (same bits as the
+    //! two-kernel path; falls back to it where the one-launch kernel does not apply).
+    bool twoShotMerged = false;
+    cudaStream_t stream; //!< CUDA stream for asynchronous kernel execution
 
     //! @}
 };

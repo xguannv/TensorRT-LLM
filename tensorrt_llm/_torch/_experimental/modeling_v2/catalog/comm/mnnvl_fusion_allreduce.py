@@ -35,12 +35,15 @@ def mnnvl_fusion_allreduce(
     residual: Optional[torch.Tensor] = None,
     norm_weight: Optional[torch.Tensor] = None,
     eps: Optional[float] = None,
+    two_shot_merged: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """The sum of ``input`` over ``workspace``'s TP group (a new tensor of ``input``'s shape), or with ``residual``,
     ``norm_weight`` and ``eps`` the pair ``(RMSNorm(sum + residual) * norm_weight, sum + residual)``. Sent one-shot
     when ``num_tokens * hidden * world * element size <= one_shot_max_bytes``, else two-shot; the workspace's buffers
     must hold the call (:func:`required_buffer_bytes`). Advances ``workspace`` by one call: every rank of the group
-    makes the same MNNVL calls on it in the same order."""
+    makes the same MNNVL calls on it in the same order. ``two_shot_merged``: a two-shot call with the residual add +
+    RMSNorm runs as one launch instead of the all-reduce kernel and the RMSNorm kernel, with the same bits, where the
+    one-launch kernel applies (bf16 / fp16, the RMSNorm's cluster shape, every CTA resident), else as two."""
     fused = residual is not None
     if fused != (norm_weight is not None) or fused != (eps is not None):
         raise ValueError("mnnvl_fusion_allreduce: residual, norm_weight and eps go together")
@@ -76,5 +79,6 @@ def mnnvl_fusion_allreduce(
         int(fusion_op),
         one_shot_max_bytes,
         True,
+        bool(two_shot_merged),
     )
     return (outputs[0], outputs[1]) if fused else outputs[0]

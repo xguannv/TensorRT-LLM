@@ -1745,9 +1745,10 @@ class KimiLinearDecoderLayer(nn.Module):
             _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
             # TRTLLM_K3LL_ATTN_RES_MXFP8, as in the tail push branch, where the MXFP8 build of the MoE-add kernel
             # compiled at load for this candidate count.
-            if (
-                valid_block_residual.shape[0] + 1 in pending_moe_partial.mx_candidates
-                and _attn_res_mxfp8_on(pending_moe_partial.routed.device)
+            if valid_block_residual.shape[
+                0
+            ] + 1 in pending_moe_partial.mx_candidates and _attn_res_mxfp8_on(
+                pending_moe_partial.routed.device
             ):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.routed.shape[0], pending_moe_partial.routed.device
@@ -4607,7 +4608,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         gemvs = self.model.decode_gemvs
         if state.lu is not None:
             _moe_tail_lu.warm_up(
-                state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1,
+                state.lu,
+                first.lu,
+                gemvs,
+                self.model.num_attn_res_snapshots + 1,
                 mxfp8=_attn_res_mxfp8_on(first.lu.up_weight.device),
             )
             if mapping.tp_rank == 0:
@@ -4771,7 +4775,9 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             if rows <= zeros.shape[0] and comm.takes_allreduce_norm(
                 rows, partial.shape[1], ceiling
             ):
-                normed, _ = comm.allreduce_norm(partial, zeros[:rows], drafter.hidden_norm, ceiling)
+                normed, _ = _mla_drafter._allreduce_norm(
+                    comm, partial, zeros[:rows], drafter.hidden_norm
+                )
                 return normed
             if rows == 0:
                 return drafter.hidden_norm(partial)

@@ -24,6 +24,9 @@ With ``TRTLLM_K3LL_DRAFTER_WIDE_AR`` the drafter's fused all-reduces of more row
 ``comm/mnnvl_fusion_allreduce`` calls here and the context projection's, `ar_ceiling`) send two-shot above the wide
 decode steps' one-shot ceiling (``decode_comm.WIDE_AR_ONE_SHOT_MAX_BYTES``), not the decode path's.
 
+With ``TRTLLM_K3LL_DRAFTER_AR_MERGED`` each of those two-shot fused all-reduces (and the context projection's) runs the
+all-reduce and the residual add + RMSNorm as one launch (`_allreduce_norm`), with the same bits.
+
 With ``TRTLLM_K3LL_DRAFTER_PDL`` the drafter's own kernels launch with programmatic dependent launch:
 ``k3_drafter_mla_a_post`` (its norm weights loaded before the dependency wait), the query RoPE
 (``cute_dsl_dspark_rope_into``) and the bf16 block decode's split and reduction (``k3_mla_decode_fp16_pdl``).
@@ -75,6 +78,20 @@ def ar_ceiling(rows: int) -> int:
     if _flags.TRTLLM_K3LL_DRAFTER_WIDE_AR and rows > _decode_comm.SANDWICH_MAX_TOKENS:
         return _decode_comm.WIDE_AR_ONE_SHOT_MAX_BYTES
     return _decode_comm.DECODE_AR_ONE_SHOT_MAX_BYTES
+
+
+def _allreduce_norm(comm, partial: torch.Tensor, residual: torch.Tensor, norm: nn.Module):
+    """``comm.allreduce_norm`` at the drafter's ceiling (`ar_ceiling`), with ``TRTLLM_K3LL_DRAFTER_AR_MERGED`` (read per
+    call; census per two-shot call it applies to)."""
+    rows = partial.shape[0]
+    ceiling = ar_ceiling(rows)
+    merged = bool(_flags.TRTLLM_K3LL_DRAFTER_AR_MERGED)
+    if (
+        merged
+        and rows * partial.shape[-1] * comm.mnnvl.world_size * partial.element_size() > ceiling
+    ):
+        _census.count(f"dispatch:drafter_ar_merged:{_census.mode()}")
+    return comm.allreduce_norm(partial, residual, norm, ceiling, two_shot_merged=merged)
 
 
 def _plain_linear(linear: nn.Module) -> bool:
@@ -607,7 +624,7 @@ class K3MLADrafterNorms:
         if "o_proj" in self.forms and comm.takes_plain(x, linear.weight, residual, norm):
             return comm.sandwich_plain(x, linear.weight, residual, norm)
         partial = linear(x, all_reduce_params=_decode_comm.skip_all_reduce())
-        return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
+        return _allreduce_norm(comm, partial, residual, norm)
 
     def _mlp_norm(
         self, mlp: nn.Module, x: torch.Tensor, residual: torch.Tensor, norm: nn.Module
@@ -634,7 +651,7 @@ class K3MLADrafterNorms:
             )
         else:
             partial = mlp(x, final_all_reduce_params=_decode_comm.skip_all_reduce())
-        return comm.allreduce_norm(partial, residual, norm, ar_ceiling(partial.shape[0]))
+        return _allreduce_norm(comm, partial, residual, norm)
 
     def _gemm(self, x: torch.Tensor, weight, role: str) -> Optional[torch.Tensor]:
         """``x @ W.T`` on the pinned low-M GEMM for ``role`` (``weight``: the weight, or a plain column-parallel
