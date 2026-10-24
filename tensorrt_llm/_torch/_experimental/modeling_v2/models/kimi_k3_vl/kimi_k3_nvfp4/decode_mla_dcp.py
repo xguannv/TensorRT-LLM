@@ -806,6 +806,23 @@ class MlaSplitRead:
         v_part = torch.empty(
             tokens, self.heads, V_HEAD_DIM, dtype=torch.bfloat16, device=stats.device
         )
+        from . import mla_v_up
+
+        fused_exchange = self._a2a_fused is not None and _flags.TRTLLM_K3LL_HELIX_A2A_FUSED
+        empty = plan.empty[:tokens].contiguous()
+        if fused_exchange and mla_v_up.PROTO_A2A_SEND:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell.helix_a2a_fused import record_bytes
+
+            from . import census as _census
+
+            f = self._a2a_fused
+            if tokens * cp * record_bytes(hp, V_HEAD_DIM) > f.half_bytes:
+                raise ValueError(
+                    f"{tokens} tokens do not fit one half of the fused exchange buffer"
+                )
+            _census.count(f"proto_a2a_send:{_census.mode()}")
+            mla_v_up._proto_a2a = (cp, hp, f.ws_addr, f.state.data_ptr(), f.rank_stride, f.half_bytes,
+                                   empty.data_ptr(), f.mapping.cp_rank)  # fmt: skip
         split_read_attention_v_up(
             q_all,
             pages,
@@ -819,9 +836,7 @@ class MlaSplitRead:
             v_up_weight,
             v_part,
         )
-        from . import mla_v_up
-
-        fused_exchange = self._a2a_fused is not None and _flags.TRTLLM_K3LL_HELIX_A2A_FUSED
+        mla_v_up._proto_a2a = None
         if not self._v_up_logged and self.rank == 0:
             from tensorrt_llm.logger import logger
 
@@ -843,7 +858,7 @@ class MlaSplitRead:
             gate = gate()
         if fused_exchange:
             return mla_v_up.exchange_combine_gated(
-                v_part.view(tokens, -1), stats, plan.empty, gate, self._a2a_fused, hp
+                v_part.view(tokens, -1), stats, empty, gate, self._a2a_fused, hp
             )
         from tensorrt_llm._torch.distributed.ops import alltoall_helix
 

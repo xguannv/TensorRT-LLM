@@ -24,6 +24,7 @@ own partials, and the all-to-all carries 128 values per head instead of the 512-
   NCCL exchange, ``TRTLLM_K3LL_HELIX_A2A_FUSED=0``).
 """
 
+import os
 from typing import List, Optional
 
 import torch
@@ -38,6 +39,15 @@ QK_ROPE_DIM = 64
 V_HEAD_DIM = 128
 
 _compiled: dict = {}
+
+#: Prototype (oak/F1 A4): ``K3LL_PROTO_A2A_SEND=1`` sends the projected partials and statistics from the fused
+#: reduction's epilogue into the helix_a2a_fused receive buffers; the gated exchange then only receives.
+PROTO_A2A_SEND = os.environ.get("K3LL_PROTO_A2A_SEND", "0") == "1"
+#: Set by the caller before ``k3_mla_decode_fp8_v_up``: ``(cp, heads_per_rank, ws_addr, state_addr, rank_stride,
+#: half_bytes, mask_addr, cp_rank)``; consumed by the op. ``_proto_sent``: the op took the fused path and sent.
+_proto_a2a = None
+_proto_sent = False
+proto_send_count = 0
 
 
 def max_fused_rows() -> int:
@@ -58,6 +68,7 @@ def _run_fused(
     v_out,
     prewait=False,
     block_split_kvs=None,
+    a2a=None,
 ) -> None:
     """``runner.forward`` with the V up-projection fused into the reduction (``split_kv > 1``, rows <= MAX_ROWS).
     ``prewait``: the split kernel L2-prefetches ``v_weight`` before its PDL wait and releases the fused reduction
@@ -66,6 +77,7 @@ def _run_fused(
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda
+    from cutlass import Int32, Int64
 
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
         BlackwellMlaDecodeFP8VUp,
@@ -110,6 +122,9 @@ def _run_fused(
     )
     split_ws = ws[split_offset : split_offset + split_size]
     stats_k = softmax_stats.view(batch, seq_len_q, heads, 2).permute(2, 1, 0, 3)
+    _, _, ws_addr, state_addr, rank_stride, half_bytes, mask_addr, cp_rank = a2a or (0,) * 8
+    a2a_args = [Int64(ws_addr), Int64(state_addr), Int64(rank_stride), Int64(half_bytes), Int64(mask_addr),
+                Int32(cp_rank)]  # fmt: skip
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     key = runner.unique_id() + (
@@ -127,6 +142,8 @@ def _run_fused(
     var_split = block_split_kvs is not None
     if var_split:
         key = key + ("var_split",)
+    if a2a is not None:
+        key = key + ("a2a_send", a2a[0], a2a[1])
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -154,6 +171,7 @@ def _run_fused(
             var_split_bounded=var_split,
             v_rows=v_rows,
             prewait=prewait,
+            a2a_send=None if a2a is None else (a2a[0], a2a[1]),
         )
 
         def dyn(t, lead, align=16):
@@ -185,6 +203,7 @@ def _run_fused(
             cutlass.Float32(output_scale),
             cute.runtime.from_dlpack(v_weight, assumed_align=16),
             dyn(v_out, 2),
+            *a2a_args,
             stream,
         ]
         compiled = cute.compile(mla.run_with_softmax_stats_v_up, *args, options="--opt-level 2")
@@ -213,6 +232,7 @@ def _run_fused(
         output_scale,
         v_weight,
         v_out,
+        *a2a_args,
         stream,
     )
 
@@ -282,7 +302,10 @@ def mla_decode_fp8_v_up(
         tactic = (tactic[0], tactic[1], var_split, False)
     else:
         block_split_kvs = None
+    global _proto_a2a, _proto_sent
+    a2a, _proto_a2a, _proto_sent = _proto_a2a, None, False
     if int(tactic[2]) > 1 and batch * q_len <= max_fused_rows():
+        _proto_sent = a2a is not None
         _run_fused(
             runner,
             inputs,
@@ -293,6 +316,7 @@ def mla_decode_fp8_v_up(
             v_out,
             prewait,
             block_split_kvs,
+            a2a,
         )
         return
     if block_split_kvs is not None:
@@ -438,6 +462,9 @@ def exchange_combine_gated(
     if tokens * cp * record_bytes(heads_per_rank, V_HEAD_DIM) > fused.half_bytes:
         raise ValueError(f"{tokens} tokens do not fit one half of the fused exchange buffer")
     out = v_part.new_empty((tokens, heads_per_rank * V_HEAD_DIM))
+    global _proto_sent, proto_send_count
+    sent, _proto_sent = _proto_sent, False
+    proto_send_count += int(sent)
     torch.ops.trtllm.k3_helix_a2a_gated(
         v_part,
         softmax_stats.reshape(tokens, -1),
@@ -453,7 +480,7 @@ def exchange_combine_gated(
             fused.ws_addr,
             fused.rank_stride,
             fused.half_bytes,
-            fused.max_send_ctas,
+            0 if sent else fused.max_send_ctas,
             fused.max_recv_ctas,
             int(fused.use_pdl),
         ],

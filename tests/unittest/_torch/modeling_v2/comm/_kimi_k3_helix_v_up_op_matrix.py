@@ -173,11 +173,17 @@ def scales_of(softmax_scale: float):
     return bmm1, bmm2
 
 
-def run_arm(on: int, module, quant_q, meta, ag, bmm, gate_side: bool = True):
+def run_arm(on, module, quant_q, meta, ag, bmm, gate_side: bool = True):
     """``_split_read_output`` with the switch at ``on``. ``gate_side`` (``TRTLLM_K3LL_MLA_GATE_SIDE``, the default):
     the gate comes from the module's side-stream gate (here a stand-in whose join copies ``ag``'s gate columns, so
     both gate forms carry the same values); else from ``ag`` at ``GATE_COL``."""
-    FLAGS.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = on
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        mla_v_up,
+    )
+
+    # "proto": the on arm with the prototype send from the fused reduction (K3LL_PROTO_A2A_SEND)
+    mla_v_up.PROTO_A2A_SEND = on == "proto"
+    FLAGS.TRTLLM_K3LL_HELIX_V_UP_BEFORE_A2A = int(bool(on))
     module._gate_side = SimpleNamespace(
         join=lambda: ag[:, GATE_COL : GATE_COL + HP * V].contiguous()
     )
@@ -311,6 +317,26 @@ def check_arms() -> None:
         )
         R.late(random.Random(100 + i).randrange(R.world))
         on = run_arm(1, module, x.quant_q, x.meta, x.ag, bmm)
+        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+            mla_v_up,
+        )
+
+        sent = mla_v_up.proto_send_count
+        R.late(random.Random(150 + i).randrange(R.world))
+        proto = run_arm("proto", module, x.quant_q, x.meta, x.ag, bmm)
+        assert mla_v_up.proto_send_count == sent + 1, (
+            f"{rows_per_head} rows: the prototype send did not engage"
+        )
+        assert torch.equal(proto, on), (
+            f"{rows_per_head} rows: prototype send differs from the on arm"
+        )
+        again = run_arm(1, module, x.quant_q, x.meta, x.ag, bmm)
+        assert torch.equal(again, on), f"{rows_per_head} rows: on arm after the prototype differs"
+        if R.rank == 0:
+            print(
+                f"[rank 0] {rows_per_head} rows: prototype a2a send = on arm bit for bit",
+                flush=True,
+            )
         # the gate read from ag in place (MLA_GATE_SIDE=0) gives the same bits in both arms
         for arm, want in ((0, off), (1, on)):
             got = run_arm(arm, module, x.quant_q, x.meta, x.ag, bmm, gate_side=False)
@@ -356,7 +382,7 @@ def check_graph() -> None:
         x = case_inputs(rows_per_head, 500 + k)
         modules = [stand_in(layer, x.codes, x.scales, x.w_uv) for layer in range(LAYERS)]
         q_in, ag_in = x.quant_q.clone(), x.ag.clone()
-        for on in (0, 1):
+        for on in (0, 1, "proto"):
 
             def step():
                 return [run_arm(on, m, q_in, x.meta, ag_in, bmm) for m in modules]

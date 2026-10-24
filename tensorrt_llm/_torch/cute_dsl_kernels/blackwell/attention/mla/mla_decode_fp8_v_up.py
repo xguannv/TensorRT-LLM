@@ -59,7 +59,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ...k3_l2_prefetch import CHUNK_BYTES as L2_CHUNK_BYTES
 from ...k3_l2_prefetch import _bulk_prefetch_l2
@@ -99,6 +99,104 @@ def _sts_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
     )
 
 
+def _asm(res, operands, text, constraints, *, loc=None, ip=None):
+    return llvm.inline_asm(
+        res,
+        operands,
+        text,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_vol_u64(addr, *, loc=None, ip=None):
+    return Int64(
+        _asm(T.i64(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.volatile.global.u64 $0, [$1];",
+             "=l,l", loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _ld_u8(addr, *, loc=None, ip=None):
+    return Int32(
+        _asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.nc.u8 $0, [$1];", "=r,l",
+             loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _f32_bits(x, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _shfl_down_f32(x, offset: int, *, loc=None, ip=None):
+    return Float32(
+        _asm(T.f32(), [Float32(x).ir_value(loc=loc, ip=ip)],
+             f"shfl.sync.down.b32 $0, $1, {offset}, 31, -1;", "=f,f", loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _shfl_down_b32(x, offset: int, *, loc=None, ip=None):
+    return Int32(
+        _asm(T.i32(), [Int32(x).ir_value(loc=loc, ip=ip)],
+             f"shfl.sync.down.b32 $0, $1, {offset}, 31, -1;", "=r,r", loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _pack_bf16x2(lo, hi, *, loc=None, ip=None):
+    """Round two FP32 values to BF16 (nearest even), ``lo`` in the low half."""
+    return Int32(
+        _asm(T.i32(), [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+             "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _lamport_word(w, zero, zero_value, *, loc=None, ip=None):
+    """``zero_value`` if ``zero`` else ``w``; the Lamport empty word ``0xffffffff`` sent as ``0x7fffffff`` (the
+    sender rule of ``helix_a2a_fused``)."""
+    return Int32(
+        _asm(T.i32(), [Int32(w).ir_value(loc=loc, ip=ip), Int32(zero).ir_value(loc=loc, ip=ip),
+                       Int32(zero_value).ir_value(loc=loc, ip=ip)],
+             "{\n.reg .pred pz, p;\n.reg .b32 x;\nsetp.ne.u32 pz, $2, 0;\nselp.b32 x, $3, $1, pz;\n"
+             "setp.eq.b32 p, x, -1;\nselp.b32 $0, 0x7fffffff, x, p;\n}", "=r,r,r,r", loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _st_g_v4(addr, w0, w1, w2, w3, *, loc=None, ip=None):
+    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Int32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+         "st.global.v4.b32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r", loc=loc, ip=ip)  # fmt: skip
+
+
+@dsl_user_op
+def _st_g_v2(addr, w0, w1, *, loc=None, ip=None):
+    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(w0).ir_value(loc=loc, ip=ip),
+                Int32(w1).ir_value(loc=loc, ip=ip)],
+         "st.global.v2.b32 [$0], {$1, $2};", "l,r,r", loc=loc, ip=ip)  # fmt: skip
+
+
+#: FP32 bits of -inf (the max of a no-op Helix contribution).
+_NEG_INF_BITS = -8388608  # 0xff800000
+
+
 def v_up_rows_bucket(rows: int) -> int:
     """UMMA N (padded rows per head) of the fused reduction for ``rows`` = batch * seq_len_q."""
     if not 1 <= rows <= MAX_ROWS:
@@ -114,8 +212,11 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     reducer capacity of at most 32 splits (one split per lane).
     """
 
-    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
+    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, a2a_send=None, **kwargs):
         super().__init__(*args, **kwargs)
+        # Prototype (K3LL_PROTO_A2A_SEND): ``(cp, heads_per_rank)``: the epilogue also peer-stores every row's
+        # projected partial and statistics into its owner's helix_a2a_fused receive buffer.
+        self.a2a_cp, self.a2a_hp = a2a_send if a2a_send else (0, 0)
         if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
                 "The fused V up-projection needs the Helix softmax statistics and a fixed query layout."
@@ -159,6 +260,12 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         output_scale: cutlass.Float32,
         v_weight: cute.Tensor,
         v_out: cute.Tensor,
+        a2a_ws: Int64,
+        a2a_state: Int64,
+        a2a_stride: Int64,
+        a2a_half: Int64,
+        a2a_mask: Int64,
+        a2a_rank: Int32,
         stream: cuda.CUstream,
     ):
         """``run_with_softmax_stats`` (fixed query lengths) plus ``v_weight`` (BF16 ``[H, 128, 512]``) and ``v_out``
@@ -167,6 +274,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         None (the scalar ``split_kv``)."""
         self._v_weight = v_weight
         self._v_out = v_out
+        self._a2a_args = (a2a_ws, a2a_state, a2a_stride, a2a_half, a2a_mask, a2a_rank)
         self._v_prefetch = None
         if cutlass.const_expr(self.split_prewait):
             self._v_prefetch = v_weight
@@ -289,6 +397,7 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             a_layout,
             b_layout,
             runtime_batch_size * self.seq_len_q,
+            *self._a2a_args,
         ).launch(
             grid=(self.num_heads, 1, 1),
             block=[self.v_threads, 1, 1],
@@ -315,6 +424,12 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         num_rows: Int32,
+        a2a_ws: Int64,
+        a2a_state: Int64,
+        a2a_stride: Int64,
+        a2a_half: Int64,
+        a2a_mask: Int64,
+        a2a_rank: Int32,
     ):
         """CTA ``h``: rows ``(b, t, h)`` for ``j = b * S_q + t < num_rows``; see the module docstring."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -360,6 +475,20 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
 
+        # Prototype a2a send: this head's slice of record (row, this rank) in its owner's receive buffer, in the
+        # half of the coming helix_a2a launch (the launch counter's parity; every earlier launch has completed).
+        rec_base = Int64(0)
+        a2a_dv = 0
+        if cutlass.const_expr(self.a2a_hp > 0):
+            hp = self.a2a_hp
+            owner = head // hp
+            local_head = head - owner * hp
+            a2a_dv = hp * V_HEAD_DIM // 8
+            half = ((_ld_vol_u64(a2a_state) >> 32) & Int64(1)) * a2a_half
+            rec_base = (
+                a2a_ws + half + Int64(owner) * a2a_stride + Int64(local_head) * (V_HEAD_DIM * 2)
+            )
+
         if warp_idx < COMBINE_WARPS:
             b_base = storage.sB.data_ptr().toint()
             vec = self.latent_dim // self.threads_per_warp
@@ -390,6 +519,24 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                         rPart,
                     )
                     rO.store(rAcc.load().to(cutlass.BFloat16))
+                    if cutlass.const_expr(self.a2a_hp > 0):
+                        if lane == 0:
+                            rv = a2a_dv + self.a2a_hp // 2
+                            zk = _ld_u8(a2a_mask + Int64(j))
+                            s0 = _f32_bits(mSoftmaxStats[head, t, b, 0])
+                            s1 = _f32_bits(mSoftmaxStats[head, t, b, 1])
+                            rec = rec_base + Int64((j * self.a2a_cp + a2a_rank) * rv) * 16
+                            # stats of the 6 heads follow the data: back out the head's data offset
+                            st_addr = (
+                                rec
+                                - Int64(head % self.a2a_hp) * (V_HEAD_DIM * 2)
+                                + Int64(a2a_dv * 16 + (head % self.a2a_hp) * 8)
+                            )
+                            _st_g_v2(
+                                st_addr,
+                                _lamport_word(s0, zk, Int32(_NEG_INF_BITS)),
+                                _lamport_word(s1, zk, Int32(0)),
+                            )
                 words = cute.recast_tensor(rO, Int32)
                 row_addr = b_base + stage * (self.v_rows * 128) + j * 128
                 swz = j & 7
@@ -446,6 +593,28 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                 v, j = tTR_cAcc[i]
                 if j < num_rows:
                     mV[j, head, v] = rV[i].to(cutlass.BFloat16)
+                if cutlass.const_expr(self.a2a_hp > 0):
+                    # thread v holds column v of every row: 8 consecutive lanes make one 16-byte vector
+                    w0 = _pack_bf16x2(rV[i], _shfl_down_f32(rV[i], 1))
+                    w1 = _shfl_down_b32(w0, 2)
+                    w2 = _shfl_down_b32(w0, 4)
+                    w3 = _shfl_down_b32(w0, 6)
+                    if j < num_rows:
+                        if lane % 8 == 0:
+                            rv = a2a_dv + self.a2a_hp // 2
+                            zk = _ld_u8(a2a_mask + Int64(j))
+                            dst = (
+                                rec_base
+                                + Int64((j * self.a2a_cp + a2a_rank) * rv) * 16
+                                + Int64(v) * 2
+                            )
+                            _st_g_v4(
+                                dst,
+                                _lamport_word(w0, zk, Int32(0)),
+                                _lamport_word(w1, zk, Int32(0)),
+                                _lamport_word(w2, zk, Int32(0)),
+                                _lamport_word(w3, zk, Int32(0)),
+                            )
         cute.arch.barrier()
         if warp_idx == self.v_mma_warp:
             cute.arch.dealloc_tmem(acc_tmem_ptr, self.v_tmem_cols)
