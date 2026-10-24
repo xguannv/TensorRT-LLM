@@ -592,6 +592,8 @@ def _run_one_rank(args) -> int:
     DG = importlib.import_module(f"{package}.decode_gemv")
     LU = importlib.import_module(f"{package}.moe_tail_lu")
     FLAGS = importlib.import_module(f"{package}.flags")
+    # the matrix covers MOE_TAIL_LU's whole 9-32 row range; the product default caps it at 16 rows
+    FLAGS.TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = 32
     CENSUS = importlib.import_module(f"{package}.census")
     MSU = importlib.import_module("tensorrt_llm._torch.modules.multi_stream_utils")
     CENSUS.ENABLED = True
