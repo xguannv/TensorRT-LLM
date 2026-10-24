@@ -1745,9 +1745,10 @@ class KimiLinearDecoderLayer(nn.Module):
             _census.count(f"dispatch:moe_tail_lu_attn_res:{_census.mode()}")
             # TRTLLM_K3LL_ATTN_RES_MXFP8, as in the tail push branch, where the MXFP8 build of the MoE-add kernel
             # compiled at load for this candidate count.
-            if (
-                valid_block_residual.shape[0] + 1 in pending_moe_partial.mx_candidates
-                and _attn_res_mxfp8_on(pending_moe_partial.routed.device)
+            if valid_block_residual.shape[
+                0
+            ] + 1 in pending_moe_partial.mx_candidates and _attn_res_mxfp8_on(
+                pending_moe_partial.routed.device
             ):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.routed.shape[0], pending_moe_partial.routed.device
@@ -2838,6 +2839,15 @@ def _kv_join_early_on(device: torch.device) -> bool:
     return _kv_join_early_by_default(index)
 
 
+def _proto_mlaq6_on() -> bool:
+    """PROTOTYPE A3 (oak/F1 1024): K3LL_PROTO_MLAQ6=1 (read at forward time) takes the own-heads query path."""
+    return os.environ.get("K3LL_PROTO_MLAQ6", "0") == "1"
+
+
+def _proto_mlaq6_check() -> bool:
+    return os.environ.get("K3LL_PROTO_MLAQ6_CHECK", "0") == "1"
+
+
 def helix_switch_unsupported(switch: str) -> Optional[str]:
     """Why ``switch`` (a Helix load-time switch at 1) builds nothing on this GPU, or None where it builds. The skip
     is logged once per switch."""
@@ -2881,6 +2891,9 @@ class K3DecodeMLA(KimiK3MLAAttention):
         self._decode_mqa = None
         # TRTLLM_K3LL_HELIX_Q_ABSORB at load (Helix, FP8 cache): every head's W_UK in BF16 (decode_mla_q.absorb_weight).
         self._q_absorb_w_kc: Optional[torch.Tensor] = None
+        # PROTOTYPE (oak/F1 A3, K3LL_PROTO_MLAQ6=1): this CP rank's Q-B rows and W_UK heads, built at the first eager
+        # all-head decode.
+        self._q6: Optional[tuple] = None
         self._gate_side = _decode_mla_q.GateSide()
         self._kv_side = _decode_mla_q.KvSide()
 
@@ -3278,18 +3291,16 @@ class K3DecodeMLA(KimiK3MLAAttention):
         # split read, so the split read's only dependency is the absorption on its own stream and it keeps its
         # programmatic early launch; the gate forked after it then takes the SMs the split read leaves.
         join_early = kv_side and _kv_join_early_on(ag.device)
-        quant_q, q, kernel, q_norm = _decode_mla_q.all_head_queries(
-            ag[:, : self.q_lora_rank],
-            self.q_a_layernorm,
-            self.q_b_proj,
-            self._q_absorb_w_kc,
-            self.qk_nope_head_dim,
-            self.qk_rope_head_dim,
-            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL)
-            and _decode_mla_q.qnorm_pdl_applies(metadata.num_generations),
-            absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
-            before_absorb=kv_side_run_and_join if join_early else None,
-        )
+        if _proto_mlaq6_on() and self._proto_q6_ready():
+            quant_q, q, kernel, q_norm = self._proto_q6_queries(
+                ag,
+                metadata,
+                kv_side_run_and_join if join_early else None,
+            )
+        else:
+            quant_q, q, kernel, q_norm = self._all_head_queries_trunk(
+                ag, metadata, kv_side_run_and_join if join_early else None
+            )
         if "+qnorm_pdl" in kernel or "+prewait" in kernel:
             from . import census as _census
 
@@ -3323,6 +3334,96 @@ class K3DecodeMLA(KimiK3MLAAttention):
             gate_col,
             all_heads=True,
         )
+
+    def _all_head_queries_trunk(self, ag, metadata, before_absorb):
+        """The trunk's all-head query path (``decode_mla_q.all_head_queries``)."""
+        return _decode_mla_q.all_head_queries(
+            ag[:, : self.q_lora_rank],
+            self.q_a_layernorm,
+            self.q_b_proj,
+            self._q_absorb_w_kc,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            release_norm=bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL)
+            and _decode_mla_q.qnorm_pdl_applies(metadata.num_generations),
+            absorb_prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2),
+            before_absorb=before_absorb,
+        )
+
+    def _proto_q6_ready(self) -> bool:
+        """PROTOTYPE A3: this rank's Q-B rows / W_UK heads (built eagerly at the first eligible call) and the MNNVL
+        query all-gather workspace."""
+        sr = self._split_read
+        if sr is None or getattr(sr, "_q_gather_ws", None) is None or self._q_absorb_w_kc is None:
+            return False
+        if self._q6 is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            w, sc = self.q_b_proj.weight, self.q_b_proj.weight_scale
+            hpr, r = sr.heads_per_rank, sr.rank
+            rows = hpr * self.qk_head_dim
+            r0 = r * rows
+            if w.dtype != torch.float8_e4m3fn or rows % 128 or r0 % 128 or sc.stride(0) != 1:
+                return False
+            w_own = w[r0 : r0 + rows].contiguous()
+            # DeepGEMM-packed scale [N, words], column-major (stride (1, N)): keep that layout for the slice.
+            s_own = sc[r0 : r0 + rows].t().contiguous().t()
+            wkc_own = self._q_absorb_w_kc[r * hpr : (r + 1) * hpr].contiguous()
+            self._q6 = (w_own, s_own, wkc_own, hpr, r)
+            if r == 0:
+                logger.info(
+                    f"K3LL_PROTO_MLAQ6: layer {self.mqa.layer_idx} own heads {hpr}, Q-B {tuple(w_own.shape)}, "
+                    f"scale {tuple(s_own.shape)} stride {s_own.stride()}, W_UK {tuple(wkc_own.shape)}"
+                )
+        return True
+
+    def _proto_q6_queries(self, ag, metadata, before_absorb):
+        """PROTOTYPE A3 (K3LL_PROTO_MLAQ6=1, P-a): q_a norm, Q-B and the absorption over this CP rank's heads only (1/16
+        of the bytes), then the MNNVL query all-gather (``decode_mla_dcp.gather_q_mnnvl``). Not bitwise the trunk
+        (another Q-B tactic); K3LL_PROTO_MLAQ6_CHECK=1 compares the gathered query with the trunk's on eager calls."""
+        from . import decode_mla_dcp as _dcp
+
+        w_own, s_own, wkc_own, hpr, r = self._q6
+        rows = ag.shape[0]
+        nope, rope = self.qk_nope_head_dim, self.qk_rope_head_dim
+        lora = wkc_own.shape[1]
+        release = bool(_flags.TRTLLM_K3LL_MLA_QNORM_PDL) and _decode_mla_q.qnorm_pdl_applies(
+            metadata.num_generations
+        )
+        q_norm, released = _decode_mla_q.q_a_norm(
+            ag[:, : self.q_lora_rank], self.q_a_layernorm, release
+        )
+        q_own = torch.ops.trtllm.k3_fp8w_lowm_gemm(q_norm, w_own, s_own).view(
+            rows, hpr, nope + rope
+        )
+        quant_own = torch.empty((rows, hpr, lora + rope), dtype=torch.uint8, device=ag.device)
+        # The KV append (q_rope_applied) reads the query tensors for their pointers and strides only.
+        q_full = torch.empty(
+            (rows, self.num_heads_tp, nope + rope), dtype=torch.bfloat16, device=ag.device
+        )
+        quant_dummy = torch.empty(
+            (rows, self.num_heads_tp, lora + rope), dtype=torch.uint8, device=ag.device
+        )
+        if before_absorb is not None:
+            before_absorb(q_full, quant_dummy)
+        kernel = _decode_mla_q.absorb_queries(
+            q_own, wkc_own, quant_own, nope, rope, prewait=bool(_flags.TRTLLM_K3LL_MLA_PREWAIT_L2)
+        )
+        quant_q = _dcp.gather_q_mnnvl(quant_own, self._split_read._q_gather_ws)
+        _census.count(f"proto_mlaq6:{_census.mode()}")
+        if _proto_mlaq6_check() and not torch.cuda.is_current_stream_capturing():
+            ref, _, _, _ = self._all_head_queries_trunk(ag, metadata, None)
+            a = ref.view(torch.float8_e4m3fn).float()
+            b = quant_q.view(torch.float8_e4m3fn).float()
+            diff = (a - b).abs()
+            logger.info(
+                f"K3LL_PROTO_MLAQ6_CHECK layer {self.mqa.layer_idx} rank {r} rows {rows}: bytes differ "
+                f"{float((ref != quant_q).float().mean()):.4%}, max |d| {float(diff.max()):.4g}, "
+                f"rel L2 {float(diff.norm() / a.norm().clamp_min(1e-30)):.3e}"
+            )
+        if released:
+            kernel += "+qnorm_pdl"
+        return quant_q, q_full, kernel + "+proto_q6_ag", q_norm
 
     def _split_read_output(
         self,
@@ -4607,7 +4708,10 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
         gemvs = self.model.decode_gemvs
         if state.lu is not None:
             _moe_tail_lu.warm_up(
-                state.lu, first.lu, gemvs, self.model.num_attn_res_snapshots + 1,
+                state.lu,
+                first.lu,
+                gemvs,
+                self.model.num_attn_res_snapshots + 1,
                 mxfp8=_attn_res_mxfp8_on(first.lu.up_weight.device),
             )
             if mapping.tp_rank == 0:
