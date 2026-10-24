@@ -34,8 +34,8 @@ Checks (``report``):
 - 40 eager calls with B and K varying, interleaved with MNNVL all-reduces and calls of the off arm (both builds'
   exchange rotations);
 - CUDA graphs of [all-reduce, MMA build, MMA build with the rewind, fast build (ldsm, no store) with the rewind] at
-  (B, K) in (1, 7), (2, 7), (4, 7), replayed with rewritten inputs, each replay bit for bit the eager calls on the
-  same inputs.
+  (B, K) in (1, 7), (2, 7), (4, 7) and MTP6's (1, 6), (2, 6), (4, 6), replayed with rewritten inputs, each replay bit
+  for bit the eager calls on the same inputs.
 
 Timing (``time``): CUDA graphs of back-to-back calls of each build (the other build, the MMA build, the MMA build with
 ``TRTLLM_K3LL_DRAFTER_MARKOV_FAST``'s ldsm and no store) on bf16 logits, (B, K) in (1, 7), (2, 7), (4, 7),
@@ -64,7 +64,7 @@ MARKOV_RANK = 256
 SHARD = VOCAB // 16
 HIDDEN = 7168
 SPLITS = [(b, k) for b in (1, 2, 4, 8) for k in (1, 7, 8)]
-GRAPH_SPLITS = ((1, 7), (2, 7), (4, 7))
+GRAPH_SPLITS = ((1, 7), (2, 7), (4, 7), (1, 6), (2, 6), (4, 6))  # MTP7 and MTP6 blocks
 TIME_SPLITS = ((1, 7), (2, 7), (4, 7))
 WORLD = 4
 DEADLINE_S = 2400
@@ -234,8 +234,8 @@ def report(g: Group) -> int:
     census.ENABLED = True
     cases = [(0, 0, False, False), (1, 0, False, False), (0, 1, False, False), (1, 1, False, False),
              (1, 1, True, False), (1, 1, False, True)]  # fmt: skip
-    for b, k in ((1, 7), (2, 7), (4, 7)):
-        base, first, acc = g.inputs(b, k, 11 + b)
+    for b, k in ((1, 7), (2, 7), (4, 7), (1, 6), (2, 6), (4, 6)):  # MTP7 and MTP6 blocks
+        base, first, acc = g.inputs(b, k, 11 + b + 10 * (7 - k))
         for v2, fast, advanced, lilicorr in cases:
             flags.TRTLLM_K3LL_DRAFTER_MARKOV_V2 = v2
             flags.TRTLLM_K3LL_DRAFTER_MARKOV_FAST = fast

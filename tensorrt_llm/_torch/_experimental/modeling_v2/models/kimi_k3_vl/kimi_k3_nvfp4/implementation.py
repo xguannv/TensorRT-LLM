@@ -2166,14 +2166,14 @@ class KimiLinearModel(DecoderModel):
     def kda_draft_records(self) -> bool:
         """Whether the hybrid cache manager keeps the last verify's draft records (``kda_state_tok``), from which
         ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn`` replay the accepted drafts. The engine reads it once the weights
-        are loaded, to build the manager: DFlash / DSpark drafts of an even verify width up to 8, every KDA layer
-        taking the K3 kernels. Otherwise the KDA verify replays the accepted drafts from the replay caches (the
-        built-in verify)."""
+        are loaded, to build the manager: DFlash / DSpark drafts of a verify width of 2 to 8 (MTP6's 7 included),
+        every KDA layer taking the K3 kernels. Otherwise the KDA verify replays the accepted drafts from the replay
+        caches (the built-in verify)."""
         spec_config = getattr(self.model_config, "spec_config", None)
         return bool(
             spec_config is not None
             and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
-            and spec_config.tokens_per_gen_step in (2, 4, 6, 8)
+            and 2 <= spec_config.tokens_per_gen_step <= 8
             and all(layer.linear_attn.takes_k3_kernels for layer in self.layers if layer.is_kda)
         )
 
@@ -3388,9 +3388,11 @@ class K3DecodeMLA(KimiK3MLAAttention):
 # ----------------------------------------------------------------------------------------------------------------------
 
 #: The (requests, block tokens) splits attention/k3_drafter_attn_qknorm certifies; R x 7 is DSpark's block at
-#: max_draft_len 7.
+#: max_draft_len 7, R x 6 at max_draft_len 6 (MTP6).
 DRAFTER_ATTN_SPLITS = frozenset(
-    {(1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)} | {(r, 7) for r in range(1, 9)}
+    {(1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)}
+    | {(r, 7) for r in range(1, 9)}
+    | {(r, 6) for r in range(1, 9)}
 )
 # The drafter layout it certifies: 6 query heads and 1 KV head of 64 per rank, context pages of 64 rows, the q / k
 # RMSNorm's epsilon and the NeoX RoPE's base.

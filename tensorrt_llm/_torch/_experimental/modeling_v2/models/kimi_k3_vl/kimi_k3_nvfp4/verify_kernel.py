@@ -264,7 +264,9 @@ def k3_fp8_kda_verify_kernel(
     # at the start of a separate [f_a | b] row.
     FA_COL = 0 if SEP_BFA else FA_W * 2  # bf16 column
     B_SRC = K if SEP_BFA else B_COL  # bf16 column
-    assert NT <= WARPS and NT % 2 == 0
+    assert (
+        2 <= NT <= WARPS
+    )  # an odd NT (MTP6: 7) leaves warp 7 idle; the f_b TMA box of 8 rows reads past it
 
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % 32
@@ -706,13 +708,16 @@ def k3_fp8_kda_verify_kernel(
 
     # ---- Output gated RMSNorm over V: per-token partial sums of squares to every CTA of the cluster.
     prims.barrier_cta_sync(0)
-    if tidx < NT * V_CTA:
+    # Whole warps enter (the full-mask shuffles below): with an odd NT, NT * V_CTA ends mid-warp, and the lanes past it
+    # carry zeros and store nothing.
+    if tidx < (NT * V_CTA + 31) // 32 * 32:
         t_out = tidx // V_CTA
-        x_o = s_o.load(idx=tidx)
-        ss = x_o * x_o
+        o_valid = tidx < NT * V_CTA
+        x_o = s_o.load(idx=cutlass.select_(o_valid, tidx, 0))
+        ss = cutlass.select_(o_valid, x_o * x_o, cutlass.Float32(0.0))
         for off_ss in [V_CTA >> d for d in range(1, V_CTA.bit_length()) if V_CTA >> d > 0]:
             ss = ss + cute.arch.shuffle_sync_bfly(ss, offset=off_ss, mask=-1, mask_and_clamp=31)
-        if tidx % V_CTA == 0:
+        if o_valid and tidx % V_CTA == 0:
             # st.async into every CTA of the cluster (this one too), completing on its mailbox barrier: no cluster
             # barrier, so nothing waits for this CTA's state stores to drain.
             for r in cutlass.range_constexpr(V_SPLIT):

@@ -67,11 +67,11 @@ MAX_BLOCKS = (72, 300, 4100)
 PADDING_FROM = 5  # batches of 5 or more end with two CUDA-graph padding requests
 STEPS = 20
 # Forced acceptance per K: (an integer value, a fractional value) of TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS.
-FORCES = {1: (1.0, 0.4), 3: (2.0, 1.6), 7: (5.0, 5.4)}
+FORCES = {1: (1.0, 0.4), 3: (2.0, 1.6), 6: (4.0, 4.6), 7: (5.0, 5.4)}
 
 # (B requests, K + 1 tokens each), batch 1 first.
-SPLITS = [(b, t) for b in range(1, 9) for t in (2, 4, 8)]
-GRAPH_SPLITS = [(b, t) for b in (1, 4, 8) for t in (2, 4, 8)]
+SPLITS = [(b, t) for b in range(1, 9) for t in (2, 4, 7, 8)]  # 7: MTP6
+GRAPH_SPLITS = [(b, t) for b in (1, 4, 8) for t in (2, 4, 7, 8)]
 WIDE_SPLITS = [(b, t) for b in (1, 4, 8) for t in (2, 4)]
 # (name, logits kind, forced acceptance)
 CASES = (
