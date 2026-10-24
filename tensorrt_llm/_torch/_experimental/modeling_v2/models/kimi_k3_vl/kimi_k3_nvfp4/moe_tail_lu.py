@@ -62,6 +62,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace 
 )
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 
+from . import census as _census
 from . import flags as _flags
 from .oproj_push import LamportPushTarget, finish_lamport_push, lamport_view
 
@@ -343,15 +344,24 @@ def run(
     if side:
         main = torch.cuda.current_stream()
         state.fork.record(main)
+        join_late = bool(_flags.TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE)
         with torch.cuda.stream(state.stream):
             state.stream.wait_event(state.fork)
             shared_all_reduce(state, gemvs, layer.shared_down, shared_act, shared)
-            state.join.record(state.stream)
+            if not join_late:
+                state.join.record(state.stream)
     else:
         shared_all_reduce(state, gemvs, layer.shared_down, shared_act, shared)
     _, xq, xs = latent_all_reduce(state, layer, routed_fn())
     routed = latent_up(layer, xq, xs)
     if side:
+        if join_late:
+            # TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE: the join carried by a marker kernel captured on the side stream after
+            # latent_up, so the consumer's attn_res (PDL) keeps its early launch from latent_up.
+            with torch.cuda.stream(state.stream):
+                _attn_res().run_join_marker()
+                state.join.record(state.stream)
+            _census.count(f"dispatch:moe_tail_lu_join_late:{_census.mode()}")
         main.wait_event(state.join)
     return LuTail(routed, shared, state.attn_res_candidates, state.attn_res_mx_candidates)
 
@@ -406,6 +416,7 @@ def warm_up(state: K3TailLuState, layer: K3TailLuLayer, gemvs, max_candidates: i
                 exact=False, early_trigger=True, mnnvl_order=True, mxfp8_out=(xq, xs),
             )  # fmt: skip
             mx_candidates.append(n)
+    _attn_res().run_join_marker()  # compiles the TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE marker outside capture
     torch.cuda.synchronize(device)
     state.mx_rows = frozenset(mx_rows)
     state.attn_res_candidates = frozenset(candidates)

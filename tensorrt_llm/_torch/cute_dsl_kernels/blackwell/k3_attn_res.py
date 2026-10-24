@@ -1553,6 +1553,20 @@ class K3AttnResFastKernel:
             _griddepcontrol_launch_dependents()
 
 
+class K3JoinMarkerKernel:
+    """One thread that does nothing, launched without programmatic dependent launch: a kernel node that carries a
+    cross-stream join into the stream of a PDL kernel (see :func:`run_join_marker`; from Dongxu Yang's
+    ``user/dongxuy/k3_lowlat``)."""
+
+    @cute.jit
+    def __call__(self, stream: cuda.CUstream):
+        self.kernel().launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream, use_pdl=False)
+
+    @cute.kernel
+    def kernel(self):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Host side
 # ---------------------------------------------------------------------------
@@ -1749,6 +1763,23 @@ def run_k3_attn_res(
         Float32(out_eps),
         cuda.CUstream(torch.cuda.current_stream(layer.device).cuda_stream),
     )
+
+
+@functools.cache
+def _compiled_join_marker():
+    return cute.compile(K3JoinMarkerKernel(), cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+
+
+def run_join_marker() -> None:
+    """Launch :class:`K3JoinMarkerKernel` on the current stream (compiled on its first call, outside capture).
+
+    For a side stream that a PDL kernel ``C`` on another stream must wait for: record the join event after this
+    launch, issued once ``C``'s stream-order predecessor ``P`` has been captured, instead of after the side stream's
+    own last kernel. Under CUDA graph capture a PDL kernel whose dependencies include a kernel captured before ``P``
+    on another stream is not launched before ``P`` completes; with the marker captured after ``P`` as that
+    dependency, ``C`` keeps its early launch from ``P``. The marker runs once its stream predecessors completed
+    (no PDL), so ``C``'s ``griddepcontrol.wait`` still covers everything before the join."""
+    _compiled_join_marker()(cuda.CUstream(torch.cuda.current_stream().cuda_stream))
 
 
 @torch.library.custom_op("trtllm::k3_attn_res_rmsnorm", mutates_args=())
@@ -2072,5 +2103,6 @@ __all__ = [
     "k3_attn_res_moe_add_rmsnorm_mx",
     "k3_attn_res_rmsnorm",
     "k3_attn_res_rmsnorm_mx",
+    "run_join_marker",
     "run_k3_attn_res",
 ]

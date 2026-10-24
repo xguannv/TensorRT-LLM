@@ -240,6 +240,15 @@ TRTLLM_K3LL_MOE_TAIL_LU = _flag(
     "on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
 )
 
+TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE",
+    0,
+    "with TRTLLM_K3LL_MOE_TAIL_LU: the main stream joins the shared-expert side stream through a one-thread marker "
+    "kernel issued on it after latent_up (k3_attn_res.run_join_marker), not through the event after the shared "
+    "all-reduce, so the consumer's attn_res keeps its PDL early launch from latent_up; the same kernels and values "
+    "(read per call; Dongxu's TRTLLM_K3_SHARED_JOIN_AFTER_LU)",
+)
+
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",
     1,

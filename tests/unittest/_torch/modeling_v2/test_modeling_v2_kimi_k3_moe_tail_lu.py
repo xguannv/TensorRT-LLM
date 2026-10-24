@@ -262,3 +262,50 @@ def test_attn_res_mxfp8_side_output(rows, snapshots):
     ref_q, ref_s = mx.mxfp8_quantize_reference(normed1)
     assert torch.equal(xs, ref_s)
     assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+
+
+def test_join_late_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE"]
+    assert default == 0 and "marker" in doc
+
+
+@pytest.mark.skipif(not _sm10x(), reason="needs an SM100/SM103 GPU")
+def test_join_marker_in_a_captured_graph():
+    """``k3_attn_res.run_join_marker`` as TRTLLM_K3LL_MOE_TAIL_LU_JOIN_LATE uses it: a side-stream kernel, then the
+    marker and the join event after a main-stream kernel; the main stream's next kernel reads the side stream's
+    output, so a replay must see the side-stream write (the join orders it), eagerly and from a graph."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_attn_res as ar
+
+    main_in = torch.randn(1 << 20, device="cuda")
+    side_out = torch.empty_like(main_in)
+    out = torch.empty_like(main_in)
+    side = torch.cuda.Stream(priority=-1)
+    fork, join = torch.cuda.Event(), torch.cuda.Event()
+    ar.run_join_marker()  # compile outside capture
+
+    def step():
+        fork.record()
+        with torch.cuda.stream(side):
+            side.wait_event(fork)
+            side_out.copy_(main_in * 2)
+        main_mid = main_in + 1
+        with torch.cuda.stream(side):
+            ar.run_join_marker()
+            join.record(side)
+        torch.cuda.current_stream().wait_event(join)
+        out.copy_(side_out + main_mid)
+
+    step()
+    torch.cuda.synchronize()
+    assert torch.equal(out, main_in * 2 + (main_in + 1))
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s):
+        with torch.cuda.graph(g, stream=s):
+            step()
+    torch.cuda.current_stream().wait_stream(s)
+    main_in.copy_(torch.randn_like(main_in))
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, main_in * 2 + (main_in + 1))
