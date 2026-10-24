@@ -71,8 +71,10 @@ SF16 = 16
 TILE = 128
 NVFP4_GSF = 448.0 * 6.0 / 8.0
 # (M rows, T tokens per request, real requests): MTP7 graphs of 1 / 2 / 4 requests (8 / 16 / 32 rows) with every
-# padding a real step can have, the no-MTP graph of 4 requests, every request real, and every request padding.
+# padding a real step can have, the MTP6 graphs (T = 7: 7 / 14 / 28 rows, c84), the no-MTP graph of 4 requests, every
+# request real, and every request padding.
 CASES = [(8, 8, 1), (16, 8, 2), (16, 8, 1), (32, 8, 4), (32, 8, 3), (32, 8, 2), (32, 8, 1), (32, 8, 0),
+         (7, 7, 1), (14, 7, 2), (14, 7, 1), (28, 7, 4), (28, 7, 3), (28, 7, 2),
          (4, 1, 3), (8, 1, 5), (24, 8, 2)]  # fmt: skip
 
 
