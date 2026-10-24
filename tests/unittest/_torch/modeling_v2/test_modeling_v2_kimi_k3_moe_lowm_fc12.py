@@ -26,9 +26,9 @@ def _lowm_op():
     return nvfp4_lowm_op
 
 
-def test_switch_off_by_default_and_documented():
+def test_switch_default_sm103_and_documented():
     _, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_LOWM_FC12"]
-    assert default == 0
+    assert default == -1 and "SM103" in doc
     assert "Not bitwise" in doc and "17-32" in doc and "at most 16" in doc
     op = _lowm_op()
     assert (op.FC12_MIN_TOKENS, op.FC12_MAX_TOKENS) == (17, 32)
@@ -144,3 +144,26 @@ def test_wide_dispatch(monkeypatch, value, rows):
         assert calls == [("begin", rows, 3584), ("front_routed", step)]
     else:
         assert calls == [("front_routed", None)]
+
+
+@pytest.mark.parametrize(
+    "cap,on", [((10, 3), True), ((10, 0), False), ((10, 7), False), ((9, 0), False)]
+)
+def test_default_follows_capability(monkeypatch, cap, on):
+    """-1 (the default): on only on SM103; 1 / 0 override on every device."""
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    assert dm.MOE_LOWM_FC12_CAPABILITIES == ((10, 3),)
+    monkeypatch.setattr(dm.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dm.torch.cuda, "get_device_capability", lambda *a: cap)
+    dm._fc12_on_by_default.cache_clear()
+    try:
+        monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_LOWM_FC12", -1)
+        assert dm.fc12_enabled() is on
+        assert dm.fc12_takes(SimpleNamespace(fc12=object()), 32) is on
+        monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_LOWM_FC12", 1)
+        assert dm.fc12_enabled() is True
+        monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_LOWM_FC12", 0)
+        assert dm.fc12_enabled() is False
+    finally:
+        dm._fc12_on_by_default.cache_clear()

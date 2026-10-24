@@ -35,6 +35,7 @@ every kernel once there so none compiles under a capture.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -145,13 +146,34 @@ class Fc12Step:
         return nvfp4_lowm_op.Fc12(buffers.h, buffers.h_sf, zeroed=self.side)
 
 
+#: Devices where ``TRTLLM_K3LL_MOE_LOWM_FC12`` is on by default (-1): measured on GB300 (SM103) only.
+MOE_LOWM_FC12_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _fc12_on_by_default() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in MOE_LOWM_FC12_CAPABILITIES
+    )
+
+
+def fc12_enabled() -> bool:
+    """``TRTLLM_K3LL_MOE_LOWM_FC12`` (read at load for the state, at forward time for engagement): 1 on, 0 off, -1
+    (default) on where the device is in ``MOE_LOWM_FC12_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_LOWM_FC12)
+    if value >= 0:
+        return value > 0
+    return _fc12_on_by_default()
+
+
 def fc12_takes(state, rows: int) -> bool:
     """Whether a wide step of ``rows`` tokens runs the routed experts as FC1 + FC2: ``TRTLLM_K3LL_MOE_LOWM_FC12``
     (read at forward time) is set, ``rows`` is 17 to 32 (``nvfp4_lowm_op.FC12_MIN_TOKENS`` / ``FC12_MAX_TOKENS``;
     at most 16 rows keep ``K3MoeLowMDynKernel``), and the load built ``state.fc12``. The switch and shapes only, so
     every rank decides alike."""
     return (
-        bool(_flags.TRTLLM_K3LL_MOE_LOWM_FC12)
+        fc12_enabled()
         and nvfp4_lowm_op.FC12_MIN_TOKENS <= rows <= nvfp4_lowm_op.FC12_MAX_TOKENS
         and state.fc12 is not None
     )
@@ -419,7 +441,7 @@ class K3DecodeMoeNvfp4Layer:
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
             self._routed(*self._route_quant(moe, logits, latent))
-        if _flags.TRTLLM_K3LL_MOE_LOWM_FC12 and self.state.fc12 is None:
+        if fc12_enabled() and self.state.fc12 is None:
             w1 = self.experts[0]
             self.state.fc12 = K3MoeFc12.create(device, w1.shape[1], self.num_local, moe.top_k)
         if self.state.fc12 is not None:
