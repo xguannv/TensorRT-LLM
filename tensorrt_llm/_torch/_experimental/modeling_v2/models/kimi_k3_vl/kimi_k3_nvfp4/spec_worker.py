@@ -1463,6 +1463,10 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         )
         if self.k3_mla_ctx and self._k3_ctx is None:
             self._k3_install_ctx(draft_model)
+        # The draft gather's slot table (`_draft_gather_ids`), built here, before any capture of the drafter.
+        self._k3_max_gens = max(self.__dict__.get("_k3_max_gens", 0), int(spec_metadata.max_num_requests))
+        if self._compute_block_size is not None:
+            self._k3_slot_table(draft_model, self._compute_block_size, int(spec_metadata.runtime_draft_len))
         return result
 
     def _k3_install_ctx(self, draft_model) -> None:
@@ -2125,9 +2129,9 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             self._k3_spec_metadata = spec_metadata
         return accepted_tokens, num_accepted_tokens
 
-    def _draft_slot_ids(self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int):
-        """The stock slots; also decides, right before the block logits are computed from them, whether this step's
-        block logits stay sharded for ``k3_markov``."""
+    def _k3_decide_block_logits(self, draft_model, num_gens: int) -> None:
+        """Decide, right before the block logits are computed, whether this step's block logits stay sharded for
+        ``k3_markov``."""
         spec_metadata = self._k3_spec_metadata
         self._k3_sharded_block_logits = bool(
             self.k3_decode
@@ -2135,7 +2139,43 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             and self._k3_acceptance is not None
             and self._keep_draft_logits_sharded(draft_model, spec_metadata, num_gens)
         )
+
+    def _draft_slot_ids(self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int):
+        """The stock slots; also decides whether this step's block logits stay sharded (`_k3_decide_block_logits`)."""
+        self._k3_decide_block_logits(draft_model, num_gens)
         return super()._draft_slot_ids(draft_model, num_gens, block_size, num_draft_tokens)
+
+    def _k3_slot_table(self, draft_model, block_size: int, num_draft_tokens: int) -> Optional[torch.Tensor]:
+        """The stock slot ids for ``_k3_max_gens`` requests (`DSparkWorker._draft_slot_ids`), built once per shape
+        outside CUDA-graph capture; None before that. The ids are request-major, so the slots of ``n`` requests are
+        the table's first ``n * num_draft_tokens`` entries."""
+        key = (block_size, num_draft_tokens, bool(getattr(draft_model, "_dspark_shift_label", False)))
+        tables = self.__dict__.setdefault("_k3_slot_tables", {})
+        table = tables.get(key)
+        max_gens = self.__dict__.get("_k3_max_gens", 0)
+        if table is None and max_gens > 0 and not torch.cuda.is_current_stream_capturing():
+            table = super()._draft_slot_ids(draft_model, max_gens, block_size, num_draft_tokens)
+            tables[key] = table
+        return table
+
+    def _draft_gather_ids(self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int, rows: int):
+        """The stock gather ids as a view of `_k3_slot_table` where no id reaches past ``rows`` (the stock clamp is
+        then the identity): the same ids, without the per-step arange / add / clamp kernels the stock path puts in
+        the drafter's graph (only the gather remains), with ``TRTLLM_K3LL_DRAFT_GATHER_TABLE`` (read per call).
+        Otherwise the stock path."""
+        n = num_gens * num_draft_tokens
+        table = (
+            self._k3_slot_table(draft_model, block_size, num_draft_tokens)
+            if _flags.TRTLLM_K3LL_DRAFT_GATHER_TABLE
+            else None
+        )
+        if table is not None and 0 < n <= table.numel():
+            first = 0 if getattr(draft_model, "_dspark_shift_label", False) else 1
+            if (num_gens - 1) * block_size + first + num_draft_tokens - 1 < rows:
+                self._k3_decide_block_logits(draft_model, num_gens)
+                _census.count(f"dispatch:draft_gather_table:{_census.mode()}")
+                return table[:n]
+        return super()._draft_gather_ids(draft_model, num_gens, block_size, num_draft_tokens, rows)
 
     def sample_draft_tokens(self, logits, spec_metadata, batch_size, *, num_contexts=0, draft_step=None,
                             mapping_lm_head_tp=None):  # fmt: skip

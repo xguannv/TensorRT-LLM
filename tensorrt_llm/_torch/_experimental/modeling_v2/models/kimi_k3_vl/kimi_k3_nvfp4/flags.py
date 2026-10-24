@@ -128,6 +128,12 @@ TRTLLM_K3LL_DRAFTER_GLUE = _flag(
     "arange tensors and block mask, kv_bounds without repeat_interleave, the V up-projection's bmm into the o_proj "
     "input layout); the same values (read per call)",
 )
+TRTLLM_K3LL_DRAFT_GATHER_TABLE = _flag(
+    "TRTLLM_K3LL_DRAFT_GATHER_TABLE",
+    0,
+    "MLA DSpark worker: the draft gather's block-row ids as a view of a slot table built outside capture "
+    "(`_draft_gather_ids`) instead of the stock per-step arange / add / clamp kernels; the same ids (read per call)",
+)
 TRTLLM_K3LL_DRAFTER_PREP_FUSED = _flag(
     "TRTLLM_K3LL_DRAFTER_PREP_FUSED",
     1,
