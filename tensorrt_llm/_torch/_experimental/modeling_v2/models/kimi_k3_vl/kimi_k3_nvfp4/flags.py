@@ -222,6 +222,16 @@ TRTLLM_K3LL_MOE_TAIL_PUSH = _flag(
     "the next pre-attention step's (or final norm's) all-reduce, K3LamportFinish + K3AttnResFast run the rest "
     "(moe_tail_push.py; bitwise; read at forward time)",
 )
+TRTLLM_K3LL_MOE_TAIL_LU = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_LU",
+    0,
+    "wide decode steps of 9-32 tokens on the MoE front's 16- / 32-token builds: the shared expert's down projection "
+    "and its all-reduce on a high-priority side stream under the routed experts, the full latent all-reduce + "
+    "RMSNorm on its own MNNVL workspace (K3LatentArRowKernel, with the latent's MXFP8 form), latent_up replicated on "
+    "k3_fp8w_lowm_mxfp8 with an FP8 block-scale weight, and K3AttnResFast adding routed + shared (moe_tail_lu.py). "
+    "LOSSY (FP8 latent_up). 1 at launch builds the FP8 latent_up of every MoE layer (+25.9 MB per layer per rank, "
+    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time",
+)
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",
