@@ -81,6 +81,12 @@ def _prof_on() -> bool:
     return os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF", "0") == "1"
 
 
+def _hoist_replay() -> bool:
+    from . import flags
+
+    return flags.TRTLLM_K3LL_KDA_VERIFY_HOIST != 0
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -215,6 +221,7 @@ def k3_fp8_kda_verify(
         sep_bfa,
         pdl,
         _prof_on(),
+        _hoist_replay(),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -230,7 +237,7 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, _prof_on(), stream,
+                    float(eps), fold_fb, sep_bfa, pdl, _prof_on(), _hoist_replay(), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
     return out

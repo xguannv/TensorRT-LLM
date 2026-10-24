@@ -60,6 +60,9 @@ V_SPLIT = 8
 V_CTA = V // V_SPLIT  # V rows per CTA
 ROWS = V_CTA // WARPS  # V rows per warp
 VEC = K // 32  # keys per lane
+REC = (
+    ROWS + 2 * VEC
+)  # one draft's record values per thread: vn of its rows, beta * k and the decay of its keys
 BF16_BYTES = 2
 CHUNK = 8  # bf16 per 16-byte load
 SMEM = cutlass.AddressSpace.smem
@@ -262,6 +265,7 @@ def k3_fp8_kda_verify_kernel(
     SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
     PROFILE: cutlass.Constexpr[bool],
+    HOIST_REPLAY: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
     S = CONV_W - 1 + NUM_SPEC  # conv-cache columns
@@ -365,8 +369,58 @@ def k3_fp8_kda_verify_kernel(
             prims.mbarrier_init(ss_ready, 1)
             prims.mbarrier_arrive_expect_tx(ss_ready, V_SPLIT * NT * 4)
     prims.fence_mbarrier_init()
+
+    def _slot_and_records():
+        # This request's slot, the drafts the sampler accepted last round and the views of the slot's pool state and
+        # records (traced inline where it is called).
+        slot = slots.load(idx=n)
+        pend = pending.load(idx=slot)
+        pend = cutlass.Int32(
+            cutlass.select_(pend > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend)
+        )
+        exp_a = cute.math.exp(a_log.load(idx=h), fastmath=True)
+        row_a = v0 + warp * ROWS
+        # The warp owns both rows and lane l keys 32 i + l (the arithmetic of kda_mtp_decode). The drafts' records, in
+        # each slot's region of state_tok: the row innovations vn [NUM_SPEC][H][V], then beta * k and the decay
+        # [NUM_SPEC][H][K]. The state after the accepted drafts is the pool's (the golden token's) with each accepted
+        # draft's update replayed, S = fma(decay, S, vn * (beta * k)): the recurrence's own arithmetic, so it is bit-
+        # identical to the one the drafts reached with an FP32 pool. A BF16 pool rounds the committed golden state
+        # before replay. k3_kda_attn uses the same records.
+        CT_VN = 0
+        CT_WB = NUM_SPEC * H * V
+        CT_WD = CT_WB + NUM_SPEC * H * K
+        CT_SLOT = CT_WD + NUM_SPEC * H * K  # a slot's records
+        # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
+        pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
+        tok = state_tok.subview(cutlass.Int64(slot) * CT_SLOT)
+        st_base = (h * V + row_a) * K
+        return slot, pend, exp_a, row_a, CT_VN, CT_WB, CT_WD, pool, tok, st_base
+
     # Cluster formation: the peers' shared memory is addressable from here on.
     prims.barrier_cluster_arrive_relaxed()
+    if cutlass.const_expr(HOIST_REPLAY):
+        # Every load of the prologue's replay, issued while the cluster forms: the slot, the accepted drafts, the pool
+        # state and the records of every accepted draft (each draft's loads guarded by its own index).
+        slot, pend, exp_a, row_a, CT_VN, CT_WB, CT_WD, pool, tok, st_base = _slot_and_records()
+        r_rec = cutlass.Array(cutlass.Float32, NUM_SPEC * REC, space=RMEM)
+        for r in cutlass.range_constexpr(ROWS):
+            for i in cutlass.range_constexpr(VEC):
+                r_st.store(
+                    cutlass.Float32(pool.load(idx=st_base + r * K + i * 32 + lane)), idx=r * VEC + i
+                )
+        for t_h in cutlass.range_constexpr(NUM_SPEC):
+            if t_h < pend:
+                for r in cutlass.range_constexpr(ROWS):
+                    r_rec.store(
+                        tok.load(idx=(t_h * H + h) * V + CT_VN + row_a + r), idx=t_h * REC + r
+                    )
+                for i in cutlass.range_constexpr(VEC):
+                    r_rec.store(
+                        tok.load(idx=CT_WB + (t_h * H + h) * K + i * 32 + lane),
+                        idx=t_h * REC + ROWS + i,
+                    )
+                    r_rec.store(tok.load(idx=CT_WD + (t_h * H + h) * K + i * 32 + lane),
+                                idx=t_h * REC + ROWS + VEC + i)  # fmt: skip
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
     _mark(1)
@@ -381,50 +435,56 @@ def k3_fp8_kda_verify_kernel(
                     w_full,
                 )
 
-    slot = slots.load(idx=n)
-    pend = pending.load(idx=slot)
-    pend = cutlass.Int32(
-        cutlass.select_(pend > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend)
-    )
-    exp_a = cute.math.exp(a_log.load(idx=h), fastmath=True)
-    row_a = v0 + warp * ROWS
-    # The warp owns both rows and lane l keys 32 i + l (the arithmetic of kda_mtp_decode).
-    # The drafts' records, in each slot's region of state_tok: the row innovations vn [NUM_SPEC][H][V], then beta * k
-    # and the decay [NUM_SPEC][H][K]. The state after the accepted drafts is the pool's (the golden token's) with each
-    # accepted draft's update replayed, S = fma(decay, S, vn * (beta * k)): the recurrence's own arithmetic, so it is
-    # bit-identical to the one the drafts reached with an FP32 pool. A BF16 pool rounds the committed golden state
-    # before replay. k3_kda_attn uses the same records.
-    CT_VN = 0
-    CT_WB = NUM_SPEC * H * V
-    CT_WD = CT_WB + NUM_SPEC * H * K
-    CT_SLOT = CT_WD + NUM_SPEC * H * K  # a slot's records
-    # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
-    pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
-    tok = state_tok.subview(cutlass.Int64(slot) * CT_SLOT)
-    st_base = (h * V + row_a) * K
-    for r in cutlass.range_constexpr(ROWS):
-        for i in cutlass.range_constexpr(VEC):
-            r_st.store(
-                cutlass.Float32(pool.load(idx=st_base + r * K + i * 32 + lane)), idx=r * VEC + i
-            )
-    for t_acc in cutlass.range(pend, unroll=1):
-        rec_acc = (t_acc * H + h) * V
-        vns_acc = [tok.load(idx=rec_acc + CT_VN + row_a + r) for r in range(ROWS)]
-        wbs_acc = [tok.load(idx=CT_WB + (t_acc * H + h) * K + i * 32 + lane) for i in range(VEC)]
-        wds_acc = [tok.load(idx=CT_WD + (t_acc * H + h) * K + i * 32 + lane) for i in range(VEC)]
-        sts_acc = [r_st.load(idx=j) for j in range(ROWS * VEC)]
+    if cutlass.const_expr(not HOIST_REPLAY):
+        slot, pend, exp_a, row_a, CT_VN, CT_WB, CT_WD, pool, tok, st_base = _slot_and_records()
+    if cutlass.const_expr(HOIST_REPLAY):
+        # The replay's arithmetic in draft order on the loads issued before the cluster barrier (as below).
+        for t_h in cutlass.range_constexpr(NUM_SPEC):
+            if t_h < pend:
+                vns_h = [r_rec.load(idx=t_h * REC + r) for r in range(ROWS)]
+                wbs_h = [r_rec.load(idx=t_h * REC + ROWS + i) for i in range(VEC)]
+                wds_h = [r_rec.load(idx=t_h * REC + ROWS + VEC + i) for i in range(VEC)]
+                sts_h = [r_st.load(idx=j) for j in range(ROWS * VEC)]
+                for r in cutlass.range_constexpr(ROWS):
+                    for _pi in cutlass.range_constexpr(VEC // 2):
+                        _p = _pi * 2
+                        vb0_h, vb1_h = cute.arch.mul_packed_f32x2(
+                            (vns_h[r], vns_h[r]), (wbs_h[_p], wbs_h[_p + 1])
+                        )
+                        sts_h[r * VEC + _p], sts_h[r * VEC + _p + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(wds_h[_p], wds_h[_p + 1]), src_b=(sts_h[r * VEC + _p], sts_h[r * VEC + _p + 1]),
+                            src_c=(vb0_h, vb1_h),
+                        )  # fmt: skip
+                for j in cutlass.range_constexpr(ROWS * VEC):
+                    r_st.store(sts_h[j], idx=j)
+    else:
         for r in cutlass.range_constexpr(ROWS):
-            for _pi in cutlass.range_constexpr(VEC // 2):
-                _p = _pi * 2
-                vb0_acc, vb1_acc = cute.arch.mul_packed_f32x2(
-                    (vns_acc[r], vns_acc[r]), (wbs_acc[_p], wbs_acc[_p + 1])
+            for i in cutlass.range_constexpr(VEC):
+                r_st.store(
+                    cutlass.Float32(pool.load(idx=st_base + r * K + i * 32 + lane)), idx=r * VEC + i
                 )
-                sts_acc[r * VEC + _p], sts_acc[r * VEC + _p + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(wds_acc[_p], wds_acc[_p + 1]), src_b=(sts_acc[r * VEC + _p], sts_acc[r * VEC + _p + 1]),
-                    src_c=(vb0_acc, vb1_acc),
-                )  # fmt: skip
-        for j in cutlass.range_constexpr(ROWS * VEC):
-            r_st.store(sts_acc[j], idx=j)
+        for t_acc in cutlass.range(pend, unroll=1):
+            rec_acc = (t_acc * H + h) * V
+            vns_acc = [tok.load(idx=rec_acc + CT_VN + row_a + r) for r in range(ROWS)]
+            wbs_acc = [
+                tok.load(idx=CT_WB + (t_acc * H + h) * K + i * 32 + lane) for i in range(VEC)
+            ]
+            wds_acc = [
+                tok.load(idx=CT_WD + (t_acc * H + h) * K + i * 32 + lane) for i in range(VEC)
+            ]
+            sts_acc = [r_st.load(idx=j) for j in range(ROWS * VEC)]
+            for r in cutlass.range_constexpr(ROWS):
+                for _pi in cutlass.range_constexpr(VEC // 2):
+                    _p = _pi * 2
+                    vb0_acc, vb1_acc = cute.arch.mul_packed_f32x2(
+                        (vns_acc[r], vns_acc[r]), (wbs_acc[_p], wbs_acc[_p + 1])
+                    )
+                    sts_acc[r * VEC + _p], sts_acc[r * VEC + _p + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(wds_acc[_p], wds_acc[_p + 1]), src_b=(sts_acc[r * VEC + _p], sts_acc[r * VEC + _p + 1]),
+                        src_c=(vb0_acc, vb1_acc),
+                    )  # fmt: skip
+            for j in cutlass.range_constexpr(ROWS * VEC):
+                r_st.store(sts_acc[j], idx=j)
 
     _mark(2)
     # Conv weights, transposed to [tap][channel]: q by threads 0..127, k by 128..255.
@@ -853,6 +913,7 @@ def k3_fp8_kda_verify(
     SEP_BFA: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
     PROFILE: cutlass.Constexpr[bool],
+    HOIST_REPLAY: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each."""
@@ -879,7 +940,7 @@ def k3_fp8_kda_verify(
     k3_fp8_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
         slots, pending, out, prof, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
-        SEP_BFA, USE_PDL, PROFILE,
+        SEP_BFA, USE_PDL, PROFILE, HOIST_REPLAY,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip
