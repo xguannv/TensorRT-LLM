@@ -60,9 +60,22 @@ def capture_view(
     ]
 
 
-def _k3_wide_table() -> bool:
-    """``TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE`` for this ``trtllm::k3_spec_accept`` call (census when on)."""
-    wide = bool(_flags.TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE)
+#: The GPUs (compute capability) on which TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE at its default (-1) is on: where it was
+#: measured and tested. Elsewhere the default keeps CTA 0's block table; 1 forces the wide table on any GPU.
+SPEC_ACCEPT_WIDE_TABLE_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _wide_table_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in SPEC_ACCEPT_WIDE_TABLE_CAPABILITIES
+
+
+def _k3_wide_table(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE`` for this ``trtllm::k3_spec_accept`` call on ``device`` (census when on):
+    1 on, 0 off, -1 (default) on where the device is in ``SPEC_ACCEPT_WIDE_TABLE_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    wide = value > 0 or (value < 0 and _wide_table_by_default(index))
     if wide:
         _census.count(f"spec_accept_wide_table:{_census.mode()}")
     return wide
@@ -478,7 +491,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             force,
             self._compute_block_size,
             *self._k3_shard_args(shard),
-            wide_table=_k3_wide_table(),
+            wide_table=_k3_wide_table(logits.device),
         )
         self._on_acceptance(accepted, num_acc, attn_metadata, spec_metadata)
         return (
@@ -1796,7 +1809,7 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             ws["push_copies"],
             first_column,
             *sampling,
-            wide_table=_k3_wide_table(),
+            wide_table=_k3_wide_table(logits.device),
         )
         return accepted, num_acc, rewind
 

@@ -331,10 +331,12 @@ TRTLLM_K3LL_KDA_SEED_STACKED = _flag(
 )
 TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE = _flag(
     "TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE",
-    0,
+    -1,
     "trtllm::k3_spec_accept: the draft pool's block table (B x max_blocks entries, max_blocks = max_seq_len / 64) "
     "written by every CTA over its column slice with all B rows' loads in flight, the counts summed by the last CTA, "
-    "instead of CTA 0 walking it alone; the same bits (read per call, so per CUDA graph capture)",
+    "instead of CTA 0 walking it alone; the same bits (read per call, so per CUDA graph capture). 1 on, 0 off, -1 "
+    "(default) on SM103 only (spec_worker.SPEC_ACCEPT_WIDE_TABLE_CAPABILITIES; SM107 / Rubin keeps CTA 0's table "
+    "unless forced with 1)",
 )
 TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "TRTLLM_K3LL_SPEC_HEAD_FUSED",
