@@ -134,3 +134,7 @@ def test_switch_off_is_the_stock_path(monkeypatch):
         got = worker._draft_gather_ids(drafter, num_gens, 8, 7, num_gens * 8)
         assert torch.equal(got, _stock(num_gens, 8, 7, True, num_gens * 8))
     assert not worker.__dict__.get("_k3_slot_tables")
+
+
+def test_default_is_on():
+    assert flags._FLAGS["TRTLLM_K3LL_DRAFT_GATHER_TABLE"][1] == 1

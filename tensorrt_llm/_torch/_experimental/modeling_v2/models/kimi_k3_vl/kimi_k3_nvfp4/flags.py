@@ -130,7 +130,7 @@ TRTLLM_K3LL_DRAFTER_GLUE = _flag(
 )
 TRTLLM_K3LL_DRAFT_GATHER_TABLE = _flag(
     "TRTLLM_K3LL_DRAFT_GATHER_TABLE",
-    0,
+    1,
     "MLA DSpark worker: the draft gather's block-row ids as a view of a slot table built outside capture "
     "(`_draft_gather_ids`) instead of the stock per-step arange / add / clamp kernels; the same ids (read per call)",
 )
