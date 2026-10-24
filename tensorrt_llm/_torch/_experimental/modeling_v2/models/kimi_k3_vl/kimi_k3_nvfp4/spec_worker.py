@@ -1261,7 +1261,8 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
     ) -> torch.Tensor:
         """The Markov chain as ``trtllm::k3_markov`` on this rank's shard of the block logits.
 
-        Returns the corrected logits (fp32); keeps the kernel's greedy tokens for
+        Returns the corrected logits (fp32; under ``TRTLLM_K3LL_DRAFTER_MARKOV_FAST`` a NaN stand-in on steps where
+        nothing reads them); keeps the kernel's greedy tokens for
         ``sample_draft_tokens`` and its next_new_tokens (built from this step's acceptance) for
         ``_prepare_next_new_tokens``.
         """
@@ -1294,6 +1295,21 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             and k3_markov_op.supports_mma(base, draft_model.markov_w1, w2_shard)
             else k3_markov_op.markov_chain
         )
+        # TRTLLM_K3LL_DRAFTER_MARKOV_FAST (read per call): the MMA build's ldmatrix fragments, and no corrected logits
+        # where nothing reads them: with greedy drafting and neither lilicorr nor a DFlash 2 selector after the chain,
+        # the forward passes them only to sample_draft_tokens, which then returns the kernel's tokens unread (it
+        # reads them only under advanced draft sampling). Those steps get a NaN stand-in of the same shape.
+        fast = {}
+        unread = None
+        if _flags.TRTLLM_K3LL_DRAFTER_MARKOV_FAST and chain is k3_markov_op.markov_chain_mma:
+            fast["ldsm"] = True
+            if (
+                getattr(draft_model, "lilicorr", None) is None
+                and not getattr(draft_model, "has_candidate_selector", False)
+                and not getattr(spec_metadata, "wants_advanced_draft_sampling", True)
+            ):
+                unread = k3_markov_op.unread_logits(*base.shape, base.device)
+            fast["store_corrected"] = unread is None
         corrected, tokens, next_new = chain(
             self.mapping,
             base,
@@ -1307,7 +1323,10 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
             kv_lens=attn_metadata.kv_lens_cuda if fold else None,
             rewind=rewind if fold else None,
             rewind_first=self._kv_rewind_nc if fold else 0,
+            **fast,
         )
+        if unread is not None:
+            corrected = unread
         if chain is k3_markov_op.markov_chain_mma:
             _census.count(f"dispatch:drafter_markov_v2:{_census.mode()}")
         if fold:
@@ -1464,9 +1483,13 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         if self.k3_mla_ctx and self._k3_ctx is None:
             self._k3_install_ctx(draft_model)
         # The draft gather's slot table (`_draft_gather_ids`), built here, before any capture of the drafter.
-        self._k3_max_gens = max(self.__dict__.get("_k3_max_gens", 0), int(spec_metadata.max_num_requests))
+        self._k3_max_gens = max(
+            self.__dict__.get("_k3_max_gens", 0), int(spec_metadata.max_num_requests)
+        )
         if self._compute_block_size is not None:
-            self._k3_slot_table(draft_model, self._compute_block_size, int(spec_metadata.runtime_draft_len))
+            self._k3_slot_table(
+                draft_model, self._compute_block_size, int(spec_metadata.runtime_draft_len)
+            )
         return result
 
     def _k3_install_ctx(self, draft_model) -> None:
@@ -2145,11 +2168,17 @@ class KimiK3MLADSparkWorker(DSparkWorker):
         self._k3_decide_block_logits(draft_model, num_gens)
         return super()._draft_slot_ids(draft_model, num_gens, block_size, num_draft_tokens)
 
-    def _k3_slot_table(self, draft_model, block_size: int, num_draft_tokens: int) -> Optional[torch.Tensor]:
+    def _k3_slot_table(
+        self, draft_model, block_size: int, num_draft_tokens: int
+    ) -> Optional[torch.Tensor]:
         """The stock slot ids for ``_k3_max_gens`` requests (`DSparkWorker._draft_slot_ids`), built once per shape
         outside CUDA-graph capture; None before that. The ids are request-major, so the slots of ``n`` requests are
         the table's first ``n * num_draft_tokens`` entries."""
-        key = (block_size, num_draft_tokens, bool(getattr(draft_model, "_dspark_shift_label", False)))
+        key = (
+            block_size,
+            num_draft_tokens,
+            bool(getattr(draft_model, "_dspark_shift_label", False)),
+        )
         tables = self.__dict__.setdefault("_k3_slot_tables", {})
         table = tables.get(key)
         max_gens = self.__dict__.get("_k3_max_gens", 0)
@@ -2158,7 +2187,9 @@ class KimiK3MLADSparkWorker(DSparkWorker):
             tables[key] = table
         return table
 
-    def _draft_gather_ids(self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int, rows: int):
+    def _draft_gather_ids(
+        self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int, rows: int
+    ):
         """The stock gather ids as a view of `_k3_slot_table` where no id reaches past ``rows`` (the stock clamp is
         then the identity): the same ids, without the per-step arange / add / clamp kernels the stock path puts in
         the drafter's graph (only the gather remains), with ``TRTLLM_K3LL_DRAFT_GATHER_TABLE`` (read per call).

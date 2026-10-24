@@ -20,7 +20,12 @@ Checks (``report``):
 
 - the switch in the model (``KimiK3DSparkWorker._k3_markov_chain`` on a stand-in worker): off, bit for bit the off
   arm's op called directly (corrected, tokens, next_new, the rewound KV lengths); on, bit for bit the MMA build's op
-  called directly, and one ``dispatch:drafter_markov_v2`` count per call;
+  called directly, and one ``dispatch:drafter_markov_v2`` count per call; ``TRTLLM_K3LL_DRAFTER_MARKOV_FAST`` off
+  leaves both arms as they are; on with greedy drafting, tokens, next_new and the rewind bit for bit the MMA build's
+  default and the corrected logits a NaN stand-in of their shape; on under advanced draft sampling (or a lilicorr
+  drafter), the corrected logits too bit for bit the default's;
+- the fast build's variants (``ldsm`` and/or no ``corrected`` store) against the MMA build's default, same inputs:
+  tokens, next_new and the rewind bit for bit, the stored corrected logits bit for bit;
 - MMA build against the off arm, same inputs: tokens equal, or where they part, the two tokens within the bias's
   rounding (one bf16 ulp of the bias plus 2^-16 of the sum of the products' magnitudes) of each other in the off
   arm's corrected logits (a near tie; the rest of that request is not compared, its anchors differ); corrected within
@@ -28,10 +33,12 @@ Checks (``report``):
   rewind identical; the tokens identical on every rank; a rerun bit for bit;
 - 40 eager calls with B and K varying, interleaved with MNNVL all-reduces and calls of the off arm (both builds'
   exchange rotations);
-- CUDA graphs of [all-reduce, MMA build, MMA build with the rewind] at (B, K) in (1, 7), (2, 7), (4, 7), replayed with
-  rewritten inputs, each replay bit for bit the eager calls on the same inputs.
+- CUDA graphs of [all-reduce, MMA build, MMA build with the rewind, fast build (ldsm, no store) with the rewind] at
+  (B, K) in (1, 7), (2, 7), (4, 7), replayed with rewritten inputs, each replay bit for bit the eager calls on the
+  same inputs.
 
-Timing (``time``): CUDA graphs of back-to-back calls of each build on bf16 logits, (B, K) in (1, 7), (2, 7), (4, 7),
+Timing (``time``): CUDA graphs of back-to-back calls of each build (the other build, the MMA build, the MMA build with
+``TRTLLM_K3LL_DRAFTER_MARKOV_FAST``'s ldsm and no store) on bf16 logits, (B, K) in (1, 7), (2, 7), (4, 7),
 markov_w2 cold in L2 (a copy per call), ABBA rounds behind an MPI barrier; the max over the ranks of the median us per
 call. The exchange is over the W ranks only (TP16 has 16 x clusters slots).
 
@@ -154,12 +161,16 @@ class Group:
             kv_lens=kv, rewind=amounts, rewind_first=rf,
         )  # fmt: skip
 
-    def v2(self, base, first, acc, rewind=None):
+    def v2(self, base, first, acc, rewind=None, **fast):
         kv, amounts, rf = (None, None, 0) if rewind is None else rewind
         return self.op.markov_chain_mma(
             self.mapping, base, first, self.w1, self.w2s, self.rank * SHARD, *acc,
-            kv_lens=kv, rewind=amounts, rewind_first=rf,
+            kv_lens=kv, rewind=amounts, rewind_first=rf, **fast,
         )  # fmt: skip
+
+
+#: The fast build's variants: (ldsm, store_corrected).
+FAST_VARIANTS = ((True, True), (True, False), (False, False))
 
 
 def compare(g: Group, base, first, acc, ref, out):
@@ -219,12 +230,15 @@ def report(g: Group) -> int:
         spec_worker,
     )
 
-    # 1. The switch in the model.
+    # 1. The switch in the model: (MARKOV_V2, MARKOV_FAST, advanced draft sampling, lilicorr drafter).
     census.ENABLED = True
-    for b, k in ((1, 7), (4, 7)):
+    cases = [(0, 0, False, False), (1, 0, False, False), (0, 1, False, False), (1, 1, False, False),
+             (1, 1, True, False), (1, 1, False, True)]  # fmt: skip
+    for b, k in ((1, 7), (2, 7), (4, 7)):
         base, first, acc = g.inputs(b, k, 11 + b)
-        for flag in (0, 1):
-            flags.TRTLLM_K3LL_DRAFTER_MARKOV_V2 = flag
+        for v2, fast, advanced, lilicorr in cases:
+            flags.TRTLLM_K3LL_DRAFTER_MARKOV_V2 = v2
+            flags.TRTLLM_K3LL_DRAFTER_MARKOV_FAST = fast
             kv, amounts, rf = g.rewind(b, 5)
             kv2 = kv.clone()
             worker = SimpleNamespace(
@@ -236,7 +250,8 @@ def report(g: Group) -> int:
                     SimpleNamespace(
                         batch_indices_cuda=torch.cat(
                             [torch.zeros(1, dtype=torch.int32, device="cuda"), acc[2]]
-                        )
+                        ),
+                        wants_advanced_draft_sampling=advanced,
                     ),
                     SimpleNamespace(kv_lens_cuda=kv),
                 ),
@@ -247,24 +262,66 @@ def report(g: Group) -> int:
             )
             before = census.counts().get("dispatch:drafter_markov_v2:eager", 0)
             draft_model = SimpleNamespace(markov_w1=g.w1, markov_w2=g.w2)
+            if lilicorr:
+                draft_model.lilicorr = object()
             got = spec_worker.KimiK3DSparkWorker._k3_markov_chain(
                 worker, draft_model, base, first, slice(g.rank * SHARD, (g.rank + 1) * SHARD)
             )
             chain = worker._k3_markov
-            direct = (g.v2 if flag else g.v1)(base, first, acc, rewind=(kv2, amounts, rf))
+            # The reference is always the default build of the arm (the fast build must match it bit for bit).
+            direct = (g.v2 if v2 else g.v1)(base, first, acc, rewind=(kv2, amounts, rf))
             after = census.counts().get("dispatch:drafter_markov_v2:eager", 0)
+            unread = bool(v2 and fast and not advanced and not lilicorr)
+            if unread:
+                corrected_ok = (
+                    tuple(chain[0].shape) == tuple(direct[0].shape)
+                    and chain[0].dtype == torch.float32
+                    and bool(torch.isnan(chain[0]).all())
+                )
+            else:
+                corrected_ok = identical(chain[0], direct[0])
             ok = (
                 got is chain[0]
-                and all(identical(x, y) for x, y in zip(chain[:3], direct))
+                and corrected_ok
+                and all(identical(x, y) for x, y in zip(chain[1:3], direct[1:]))
                 and identical(kv, kv2)
-                and after - before == flag
+                and after - before == v2
             )
+            arm = "MMA build" if v2 else "off arm"
             g.say(
-                f"switch {flag} B {b} K {k}: "
-                + (("bit for bit the " + ("MMA build" if flag else "off arm")) if ok else "FAIL")
-            )
+                f"switch v2 {v2} fast {fast} advanced {int(advanced)} lilicorr {int(lilicorr)} B {b} K {k}: "
+                + (f"bit for bit the {arm}" + (" (corrected unread: NaN stand-in)" if unread else "")
+                   if ok else "FAIL")
+            )  # fmt: skip
             failures += int(not g.all_ranks(ok))
     flags.TRTLLM_K3LL_DRAFTER_MARKOV_V2 = 0
+    flags.TRTLLM_K3LL_DRAFTER_MARKOV_FAST = 0
+
+    # 1b. The fast build's variants against the MMA build's default.
+    g.say("| B | K | ldsm | store | tokens / next_new / rewind | corrected |")
+    g.say("| --: | --: | :-- | :-- | :-- | :-- |")
+    for b, k in SPLITS:
+        base, first, acc = g.inputs(b, k, 3000 + 10 * b + k)
+        kv, amounts, rf = g.rewind(b, 31 + b)
+        kv_ref = kv.clone()
+        ref = g.v2(base, first, acc, rewind=(kv_ref, amounts, rf))
+        for ldsm, store in FAST_VARIANTS:
+            kv_out = kv.clone()
+            out = g.v2(
+                base, first, acc, rewind=(kv_out, amounts, rf), ldsm=ldsm, store_corrected=store
+            )
+            same = (
+                identical(out[1], ref[1])
+                and identical(out[2], ref[2])
+                and identical(kv_out, kv_ref)
+            )
+            if store:
+                corr = identical(out[0], ref[0])
+            else:
+                corr = tuple(out[0].shape) == (b, k, 0)
+            ok = g.all_ranks(same and corr)
+            g.say(f"| {b} | {k} | {ldsm} | {store} | {same} | {corr} |")
+            failures += int(not ok)
 
     # 2. MMA build against the off arm.
     g.say("| B | K | failures | partings (near ties) | rerun | rewind |")
@@ -306,8 +363,11 @@ def report(g: Group) -> int:
     for b, k in GRAPH_SPLITS:
         base, first, acc = g.inputs(b, k, 9000 + b)
         kv, amounts, rf = g.rewind(b, 9)
+        fast = dict(ldsm=True, store_corrected=False)
         g.v2(base, first, acc)
         g.v2(base, first, acc, rewind=(kv.clone(), amounts, rf))
+        g.v2(base, first, acc, rewind=(kv.clone(), amounts, rf), **fast)
+        kv_f = kv.clone()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
@@ -317,6 +377,7 @@ def report(g: Group) -> int:
                 g.all_reduce()
                 o1 = g.v2(base, first, acc)
                 o2 = g.v2(base, first, acc, rewind=(kv, amounts, rf))
+                o3 = g.v2(base, first, acc, rewind=(kv_f, amounts, rf), **fast)
         torch.cuda.current_stream().wait_stream(stream)
         ok = True
         for r in range(5):
@@ -326,14 +387,21 @@ def report(g: Group) -> int:
             for x, y in zip(acc, nacc):
                 x.copy_(y)
             kv0 = kv.clone()
+            kv_f.copy_(kv0)
             graph.replay()
             torch.cuda.synchronize()
-            got = [t.clone() for t in (*o1, *o2)]
+            got = [t.clone() for t in (*o1, *o2, *o3[1:])]
             kv_graph = kv.clone()
+            kv_graph_f = kv_f.clone()
             kv.copy_(kv0)
             e1 = g.v2(base, first, acc)
             e2 = g.v2(base, first, acc, rewind=(kv, amounts, rf))
-            ok &= all(identical(x, y) for x, y in zip(got, (*e1, *e2))) and identical(kv_graph, kv)
+            kv_f.copy_(kv0)
+            e3 = g.v2(base, first, acc, rewind=(kv_f, amounts, rf), **fast)
+            ok &= all(identical(x, y) for x, y in zip(got, (*e1, *e2, *e3[1:])))
+            ok &= identical(kv_graph, kv) and identical(kv_graph_f, kv_f) and identical(kv_f, kv)
+            # The fast build's tokens / next_new are the default build's.
+            ok &= identical(e3[1], e2[1]) and identical(e3[2], e2[2])
         ok = g.all_ranks(ok)
         g.say(f"graph B {b} K {k}: {'PASS' if ok else 'FAIL'}")
         failures += int(not ok)
@@ -343,14 +411,22 @@ def report(g: Group) -> int:
 
 
 def timing(g: Group, rounds: int):
-    g.say("| B | K | k3_markov us | MMA build us | MMA - other |")
-    g.say("| --: | --: | --: | --: | --: |")
+    g.say("| B | K | k3_markov us | MMA build us | MMA fast us | MMA - other | fast - MMA |")
+    g.say("| --: | --: | --: | --: | --: | --: | --: |")
     calls = 8
     for b, k in TIME_SPLITS:
         base, first, acc = g.inputs(b, k, 4242)
         copies = [g.w2s.clone() for _ in range(calls)]
         graphs = {}
-        for name, fn in (("v1", g.op.markov_chain), ("v2", g.op.markov_chain_mma)):
+
+        def fast_fn(*args):
+            return g.op.markov_chain_mma(*args, ldsm=True, store_corrected=False)
+
+        for name, fn in (
+            ("v1", g.op.markov_chain),
+            ("v2", g.op.markov_chain_mma),
+            ("v2f", fast_fn),
+        ):
             for w in copies[:1]:
                 fn(g.mapping, base, first, g.w1, w, g.rank * SHARD, *acc)
             torch.cuda.synchronize()
@@ -363,9 +439,9 @@ def timing(g: Group, rounds: int):
                         fn(g.mapping, base, first, g.w1, w, g.rank * SHARD, *acc)
             torch.cuda.current_stream().wait_stream(stream)
             graphs[name] = graph
-        times = {"v1": [], "v2": []}
+        times = {"v1": [], "v2": [], "v2f": []}
         for r in range(rounds):
-            for name in ("v1", "v2", "v2", "v1"):
+            for name in ("v1", "v2", "v2f", "v2f", "v2", "v1"):
                 g.comm.Barrier()
                 start, end = (
                     torch.cuda.Event(enable_timing=True),
@@ -377,7 +453,10 @@ def timing(g: Group, rounds: int):
                 torch.cuda.synchronize()
                 times[name].append(start.elapsed_time(end) * 1000 / calls)
         med = {n: max(g.comm.allgather(statistics.median(v))) for n, v in times.items()}
-        g.say(f"| {b} | {k} | {med['v1']:.1f} | {med['v2']:.1f} | {med['v2'] - med['v1']:+.1f} |")
+        g.say(
+            f"| {b} | {k} | {med['v1']:.1f} | {med['v2']:.1f} | {med['v2f']:.1f} | "
+            f"{med['v2'] - med['v1']:+.1f} | {med['v2f'] - med['v2']:+.1f} |"
+        )
 
 
 def launch() -> int:
