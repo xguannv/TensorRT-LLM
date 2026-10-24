@@ -72,6 +72,12 @@ def _words(t: torch.Tensor) -> torch.Tensor:
     return _flat(t).view(torch.int32)
 
 
+def _hoist_replay() -> bool:
+    from . import flags
+
+    return flags.TRTLLM_K3LL_KDA_VERIFY_HOIST != 0
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -204,6 +210,7 @@ def k3_fp8_kda_verify(
         fold_fb,
         sep_bfa,
         pdl,
+        _hoist_replay(),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -219,9 +226,13 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, stream,
+                    float(eps), fold_fb, sep_bfa, pdl, _hoist_replay(), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
+    if key[-1]:
+        from . import census
+
+        census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
     return out
 
 
