@@ -43,8 +43,8 @@ def _plan(src: torch.Tensor, dst: torch.Tensor, pieces, rows: int):
 @pytest.mark.parametrize("rows_env", ["0", "3"])
 @pytest.mark.parametrize("blocks", [2, 16])
 def test_gather_copies_exactly_the_planned_bytes(monkeypatch, rows_env, blocks):
-    monkeypatch.setenv("TRTLLM_DWDP_GATHER_ROWS", rows_env)
-    monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", str(blocks))
+    monkeypatch.setenv("TRTLLM_K3LL_DWDP_GATHER_ROWS", rows_env)
+    monkeypatch.setenv("TRTLLM_K3LL_DWDP_GATHER_BLOCKS", str(blocks))
     torch.manual_seed(0)
     src = torch.randint(0, 256, (8 << 20,), dtype=torch.uint8, device="cuda")
     dst = torch.zeros(8 << 20, dtype=torch.uint8, device="cuda")
@@ -73,13 +73,28 @@ def test_unaligned_descriptor_falls_back():
     assert fabric_gather.build_plan(groups, torch.device("cpu")) is None
 
 
-def test_switch_is_opt_in(monkeypatch):
+@pytest.mark.parametrize(
+    "capability,expected", [((10, 3), True), ((10, 0), False), ((9, 0), False)]
+)
+def test_default_is_on_for_sm103_only(monkeypatch, capability, expected):
     monkeypatch.delenv("TRTLLM_K3LL_DWDP_GATHER", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    assert fabric_gather.is_enabled() is expected
+    monkeypatch.setenv("TRTLLM_K3LL_DWDP_GATHER", "-1")
+    assert fabric_gather.is_enabled() is expected
+
+
+def test_explicit_switch_wins(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 3))
+    monkeypatch.setenv("TRTLLM_K3LL_DWDP_GATHER", "0")
     assert not fabric_gather.is_enabled()
-    # Dongxu's switch name, which the K3 sweeps and harness already export, must not turn it on.
-    monkeypatch.setenv("TRTLLM_DWDP_PREFETCH_GATHER", "1")
-    assert not fabric_gather.is_enabled()
+    # Dongxu's switch name, which the K3 sweeps and harness already export, has no effect.
+    monkeypatch.setenv("TRTLLM_DWDP_PREFETCH_GATHER", "0")
     monkeypatch.setenv("TRTLLM_K3LL_DWDP_GATHER", "1")
+    assert fabric_gather.is_enabled()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 0))
     assert fabric_gather.is_enabled()
 
 
@@ -87,7 +102,7 @@ def test_compute_side_defaults_keep_explicit_values(monkeypatch):
     names = [k for k, _ in fabric_gather.compute_side_defaults()]
     for k in names:
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.delenv("TRTLLM_DWDP_GATHER_BLOCKS", raising=False)
+    monkeypatch.delenv("TRTLLM_K3LL_DWDP_GATHER_BLOCKS", raising=False)
     monkeypatch.setenv("TRTLLM_K3LL_DEEPGEMM_SM_RESERVE", "8")
     fabric_gather.apply_compute_side_defaults()
     assert os.environ["TRTLLM_K3LL_CUTEDSL_SM_RESERVE"] == str(fabric_gather.TARGET_BLOCKS)
