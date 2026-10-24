@@ -118,7 +118,9 @@ MOE_TAIL_LU_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
 
 @functools.lru_cache(maxsize=None)
 def _on_by_default() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() in MOE_TAIL_LU_CAPABILITIES
+    return (
+        torch.cuda.is_available() and torch.cuda.get_device_capability() in MOE_TAIL_LU_CAPABILITIES
+    )
 
 
 def enabled() -> bool:
@@ -277,11 +279,14 @@ def takes(
 ) -> bool:
     """Whether `run` takes a wide step of ``rows`` tokens whose front build produces a shared activation ``act_width``
     wide (decided before the front runs): the switch is set, the load-time state exists and compiled the step's
-    kernels, 9 to 32 tokens, the shared site's push takes the rows and both Lamport buffers hold the calls. Shapes,
-    the switch and load-time state only."""
+    kernels, 9 to ``TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS`` (16) tokens, the shared site's push takes the rows and both
+    Lamport buffers hold the calls. Shapes, the switch and load-time state only."""
     if not enabled() or state is None or layer is None or gemvs is None or not state.ready:
         return False
-    if not MIN_ROWS <= rows <= MAX_ROWS or rows not in state.mx_rows:
+    if (
+        not MIN_ROWS <= rows <= min(MAX_ROWS, int(_flags.TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS))
+        or rows not in state.mx_rows
+    ):
         return False
     latent, push = state.latent, state.push
     if rows > _latent_ar().ROW_MAX_M or rows * latent.world * LATENT * 2 > latent.bytes_per_buffer:
@@ -356,7 +361,9 @@ def run(
     return LuTail(routed, shared, state.attn_res_candidates, state.attn_res_mx_candidates)
 
 
-def warm_up(state: K3TailLuState, layer: K3TailLuLayer, gemvs, max_candidates: int, mxfp8: bool = False) -> None:
+def warm_up(
+    state: K3TailLuState, layer: K3TailLuLayer, gemvs, max_candidates: int, mxfp8: bool = False
+) -> None:
     """Compile every kernel of the switch before any capture, whatever the switch says at forward time. Collective:
     every rank makes the same calls (one shared all-reduce and one latent all-reduce on zeros, advancing both
     workspaces alike). ``mxfp8``: also the attn_res kernel with the MXFP8 side output (``TRTLLM_K3LL_ATTN_RES_MXFP8``

@@ -236,8 +236,16 @@ TRTLLM_K3LL_MOE_TAIL_LU = _flag(
     "RMSNorm on its own MNNVL workspace (K3LatentArRowKernel, with the latent's MXFP8 form), latent_up replicated on "
     "k3_fp8w_lowm_mxfp8 with an FP8 block-scale weight, and K3AttnResFast adding routed + shared (moe_tail_lu.py). "
     "LOSSY (FP8 latent_up). 1 at launch builds the FP8 latent_up of every MoE layer (+25.9 MB per layer per rank, "
-    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 (default): on "
-    "on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
+    "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1 "
+    "(default): on on SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES)",
+)
+TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = _flag(
+    "TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS",
+    16,
+    "with TRTLLM_K3LL_MOE_TAIL_LU: the widest step (tokens) it takes, read at forward time; 16 (default) = bs2 at "
+    "MTP7, 32 = up to bs4. At bs4 (32 rows) the switch measured no gain (nsys wall +0.012 ms, ABBA unresolved "
+    "without one outlier round: the tail K3AttnResFast waits on the shared-stream join), so the lossy path stays off "
+    "there",
 )
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(

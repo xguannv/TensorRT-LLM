@@ -1561,6 +1561,8 @@ def _run_one_rank(args) -> int:
     DG = importlib.import_module(f"{package}.decode_gemv")
     LU = importlib.import_module(f"{package}.moe_tail_lu")
     FLAGS = importlib.import_module(f"{package}.flags")
+    # the matrix covers MOE_TAIL_LU's whole 9-32 row range; the product default caps it at 16 rows
+    FLAGS.TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = 32
     LOWM_OP = importlib.import_module(
         "tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.nvfp4_lowm_op"
     )
