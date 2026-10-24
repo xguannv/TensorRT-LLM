@@ -60,9 +60,9 @@ V_SPLIT = 8
 V_CTA = V // V_SPLIT  # V rows per CTA
 ROWS = V_CTA // WARPS  # V rows per warp
 VEC = K // 32  # keys per lane
-REC = (
-    ROWS + 2 * VEC
-)  # one draft's record values per thread: vn of its rows, beta * k and the decay of its keys
+RECS = (
+    V_CTA + 2 * K
+)  # one draft's records staged per CTA: vn of its V rows, then beta * k and the decay
 BF16_BYTES = 2
 CHUNK = 8  # bf16 per 16-byte load
 SMEM = cutlass.AddressSpace.smem
@@ -154,6 +154,18 @@ def _read_u64(reg, *, loc=None, ip=None):
 
 
 PROF_MARKS = 12  # diagnostic profile: (globaltimer, clock64) pairs per CTA
+
+
+@dsl_user_op
+def _bulk_g2s(dst, src, nbytes, mbar, *, loc=None, ip=None):
+    """``nbytes`` (a multiple of 16) from global ``src`` to this CTA's shared ``dst``, completing on ``mbar``."""
+    _llvm.inline_asm(
+        None,
+        [cutlass.Int32(dst).ir_value(loc=loc, ip=ip), cutlass.Int64(src).ir_value(loc=loc, ip=ip),
+         cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip), cutlass.Int32(mbar).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
 
 
 def _lo(word):
@@ -320,8 +332,11 @@ def k3_fp8_kda_verify_kernel(
     s_uk = cutlass.Array(cutlass.Float32, ROWS_U * K, space=SMEM, alignment=16)
     s_uv = cutlass.Array(cutlass.Float32, ROWS_U * V_CTA, space=SMEM, alignment=16)
     if cutlass.const_expr(HOIST_REPLAY):
-        # the raw conv history of every cache column [column][q 128 | k 128 | v 16]
-        s_hist = cutlass.Array(cutlass.Float32, S * (2 * K + V_CTA), space=SMEM, alignment=16)
+        # staged by bulk copies before the cluster wait: the raw conv history of every cache column
+        # [column][q 128 | k 128 | v 16] and every draft's records [draft][vn 16 | beta * k 128 | decay 128]
+        s_hist = cutlass.Array(cutlass.Float32, S * (2 * K + V_CTA), space=SMEM, alignment=128)
+        s_rec = cutlass.Array(cutlass.Float32, NUM_SPEC * RECS, space=SMEM, alignment=128)
+        pro_full = cutlass.Array(cutlass.Int64, 1, space=SMEM, alignment=8)
     s_wq = cutlass.Array(cutlass.Float32, CONV_W * K, space=SMEM, alignment=16)  # [tap][channel]
     s_wk = cutlass.Array(cutlass.Float32, CONV_W * K, space=SMEM, alignment=16)
     s_wv = cutlass.Array(cutlass.Float32, CONV_W * V_CTA, space=SMEM, alignment=16)
@@ -368,6 +383,8 @@ def k3_fp8_kda_verify_kernel(
         if prims.elect_sync():
             prims.mbarrier_init(ss_ready, 1)
             prims.mbarrier_arrive_expect_tx(ss_ready, V_SPLIT * NT * 4)
+            if cutlass.const_expr(HOIST_REPLAY):
+                prims.mbarrier_init(pro_full, 1)
     prims.fence_mbarrier_init()
 
     # This request's slot, the views of its pool state and drafts' records, and the warp's V rows. The warp owns both
@@ -391,9 +408,10 @@ def k3_fp8_kda_verify_kernel(
     prims.barrier_cluster_arrive_relaxed()
     if cutlass.const_expr(HOIST_REPLAY):
         # Every global load of the prologue while the cluster forms, two round trips deep: the slot, then everything
-        # else at once (no load waits for the accepted-draft count): the count, the pool state, every draft's records
-        # (applied below only for the accepted ones), the conv history at every cache column (the rows at the count
-        # are picked below), the conv weights, the output-norm weight, dt_bias and A_log.
+        # else at once (no load waits for the accepted-draft count): the count, the pool state, A_log, the conv
+        # weights, the output-norm weight and dt_bias, and, by bulk copies into shared memory, the conv history at
+        # every cache column (the rows at the count are picked below) and every draft's records (replayed below only
+        # for the accepted ones).
         slot = slots.load(idx=n)
         pend_raw = pending.load(idx=slot)
         a_raw = a_log.load(idx=h)
@@ -404,35 +422,32 @@ def k3_fp8_kda_verify_kernel(
                 r_st.store(
                     cutlass.Float32(pool.load(idx=st_base + r * K + i * 32 + lane)), idx=r * VEC + i
                 )
-        r_rec = cutlass.Array(cutlass.Float32, NUM_SPEC * REC, space=RMEM)
-        for t_h in cutlass.range_constexpr(NUM_SPEC):
-            for r in cutlass.range_constexpr(ROWS):
-                r_rec.store(tok.load(idx=(t_h * H + h) * V + CT_VN + row_a + r), idx=t_h * REC + r)
-            for i in cutlass.range_constexpr(VEC):
-                r_rec.store(
-                    tok.load(idx=CT_WB + (t_h * H + h) * K + i * 32 + lane),
-                    idx=t_h * REC + ROWS + i,
-                )
-                r_rec.store(
-                    tok.load(idx=CT_WD + (t_h * H + h) * K + i * 32 + lane),
-                    idx=t_h * REC + ROWS + VEC + i,
-                )
-        HIST4 = HIST // 4
-        for it in cutlass.range_constexpr((S * HIST4 + THREADS - 1) // THREADS):
-            item = tidx + it * THREADS
-            if item < S * HIST4:
-                col = item // HIST4
-                j4 = (item % HIST4) * 4
-                g_col = (slot * S + col) * HK + ch0
-                if j4 < K:
-                    s_hist.store(cs_q.load(idx=g_col + j4, vector_size=4, alignment=16), idx=col * HIST + j4,
-                                 alignment=16)  # fmt: skip
-                elif j4 < 2 * K:
-                    s_hist.store(cs_k.load(idx=g_col + j4 - K, vector_size=4, alignment=16), idx=col * HIST + j4,
-                                 alignment=16)  # fmt: skip
-                else:
-                    s_hist.store(cs_v.load(idx=g_col + v0 + j4 - 2 * K, vector_size=4, alignment=16),
-                                 idx=col * HIST + j4, alignment=16)  # fmt: skip
+        if warp == 1:
+            if prims.elect_sync():
+                mbar = pro_full.data_ptr().toint()
+                prims.mbarrier_arrive_expect_tx(pro_full, (S * HIST + NUM_SPEC * RECS) * 4)
+                for col in cutlass.range_constexpr(S):
+                    g_col = (slot * S + col) * HK + ch0
+                    d_col = col * HIST
+                    _bulk_g2s(s_hist.subview(d_col).data_ptr().toint(), cs_q.subview(g_col).data_ptr().toint(),
+                              K * 4, mbar)  # fmt: skip
+                    _bulk_g2s(s_hist.subview(d_col + K).data_ptr().toint(), cs_k.subview(g_col).data_ptr().toint(),
+                              K * 4, mbar)  # fmt: skip
+                    _bulk_g2s(s_hist.subview(d_col + 2 * K).data_ptr().toint(),
+                              cs_v.subview(g_col + v0).data_ptr().toint(), V_CTA * 4, mbar)  # fmt: skip
+                for t_h in cutlass.range_constexpr(NUM_SPEC):
+                    d_t = t_h * RECS
+                    vn_t = tok.subview((t_h * H + h) * V + CT_VN + v0)
+                    _bulk_g2s(
+                        s_rec.subview(d_t).data_ptr().toint(),
+                        vn_t.data_ptr().toint(),
+                        V_CTA * 4,
+                        mbar,
+                    )
+                    _bulk_g2s(s_rec.subview(d_t + V_CTA).data_ptr().toint(),
+                              tok.subview(CT_WB + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
+                    _bulk_g2s(s_rec.subview(d_t + V_CTA + K).data_ptr().toint(),
+                              tok.subview(CT_WD + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
         # Conv weights, transposed to [tap][channel]: q by threads 0..127, k by 128..255.
         if tidx < K:
             wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
@@ -478,6 +493,8 @@ def k3_fp8_kda_verify_kernel(
             cutlass.select_(pend_raw > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend_raw)
         )
         exp_a = cute.math.exp(a_raw, fastmath=True)
+        while not cute.arch.mbarrier_try_wait(pro_full.data_ptr(), 0):
+            pass
         # The history rows of this request: cache columns pend .. pend + 2 (positions -3..-1).
         for it in cutlass.range_constexpr((3 * HIST + THREADS - 1) // THREADS):
             item = tidx + it * THREADS
@@ -491,12 +508,12 @@ def k3_fp8_kda_verify_kernel(
                     s_uk.store(x_h, idx=m_h * K + j_h - K)
                 else:
                     s_uv.store(x_h, idx=m_h * V_CTA + j_h - 2 * K)
-        # The replay's arithmetic in draft order, as below, on the records loaded above.
+        # The replay's arithmetic in draft order, as below, on the staged records.
         for t_h in cutlass.range_constexpr(NUM_SPEC):
             if t_h < pend:
-                vns_h = [r_rec.load(idx=t_h * REC + r) for r in range(ROWS)]
-                wbs_h = [r_rec.load(idx=t_h * REC + ROWS + i) for i in range(VEC)]
-                wds_h = [r_rec.load(idx=t_h * REC + ROWS + VEC + i) for i in range(VEC)]
+                vns_h = [s_rec.load(idx=t_h * RECS + warp * ROWS + r) for r in range(ROWS)]
+                wbs_h = [s_rec.load(idx=t_h * RECS + V_CTA + i * 32 + lane) for i in range(VEC)]
+                wds_h = [s_rec.load(idx=t_h * RECS + V_CTA + K + i * 32 + lane) for i in range(VEC)]
                 sts_h = [r_st.load(idx=j) for j in range(ROWS * VEC)]
                 for r in cutlass.range_constexpr(ROWS):
                     for _pi in cutlass.range_constexpr(VEC // 2):
