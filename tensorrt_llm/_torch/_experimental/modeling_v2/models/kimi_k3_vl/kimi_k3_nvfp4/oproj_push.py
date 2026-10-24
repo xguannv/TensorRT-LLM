@@ -366,11 +366,13 @@ class K3OprojPush:
         res_proj: nn.Module,
         res_norm: nn.Module,
         out_norm: nn.Module,
+        mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` of a call every rank's producer has just pushed into ``target`` (an in-place
         `push_target` of this state's workspace; `finish_takes` holds): the Lamport finish in place (the C++ one-shot
         order), then the attn_res kernel adding the result to ``prefix_sum`` (the zero prefix for None) in the C++
-        epilogue's arithmetic, releasing the next kernel at its wait."""
+        epilogue's arithmetic, releasing the next kernel at its wait. ``mxfp8_out``: ``(xq, xs)`` that the kernel also
+        fills with the MXFP8 form of ``normed`` (``TRTLLM_K3LL_ATTN_RES_MXFP8``; ``fp8w_lowm.new_mxfp8_input``)."""
         rows = target.shape[0]
         result = finish_lamport_push(target, in_place=True)
         prefix = self.zeros[:rows] if prefix_sum is None else prefix_sum
@@ -393,6 +395,7 @@ class K3OprojPush:
             lamport_addend=result.lamport_addend,
             early_trigger=True,
             mnnvl_order=True,
+            mxfp8_out=mxfp8_out,
         )
         return normed, updated
 

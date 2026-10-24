@@ -1434,6 +1434,28 @@ class KimiMLARuntime(nn.Module):
         return self._o_allreduce(out) if self._o_allreduce is not None else out
 
 
+def _attn_res_mxfp8_out(
+    layer: nn.Module, rows: int, device: torch.device
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """``TRTLLM_K3LL_ATTN_RES_MXFP8``: new ``(xq, xs)`` (``fp8w_lowm.new_mxfp8_input``) for the MXFP8 form of
+    ``layer``'s attention input of ``rows`` tokens, where the attention's first FP8 projection takes it
+    (``fp8w_lowm.takes_mxfp8_input``): KDA its fused ``[q | k | v | g | f_a | b]`` GEMM (``TRTLLM_K3LL_KDA_BFA_FP8``
+    with the fused weight built) or its QKVG module, MLA its fused q_a / kv_a module. None elsewhere."""
+    if layer.is_kda:
+        kda = layer.linear_attn
+        fused = getattr(kda, "_qkvg_bfa_fp8", None)
+        if _flags.TRTLLM_K3LL_KDA_BFA_FP8 and fused is not None:
+            target = (fused[0], fused[1], True)
+        else:
+            target = getattr(kda, "qkvg_proj", None)
+    else:
+        target = getattr(layer.self_attn.mixer, "kv_a_proj_with_mqa", None)
+    if not _fp8w_lowm.takes_mxfp8_input(target, rows):
+        return None
+    _census.count(f"dispatch:attn_res_mxfp8:{_census.mode()}")
+    return _fp8w_lowm.new_mxfp8_input(rows, layer.hidden_size, device)
+
+
 class KimiLinearDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1642,6 +1664,9 @@ class KimiLinearDecoderLayer(nn.Module):
             if not tail_push:
                 pending_moe_partial = pending_moe_partial.partial()
 
+        # TRTLLM_K3LL_ATTN_RES_MXFP8: the K3AttnResFast that finishes a pushed MoE tail also writes the MXFP8 form of
+        # its output for the attention's first FP8 projection (offered to it below, withdrawn after the attention).
+        mxfp8_out = None
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
             assert pending_moe_partial is None and capture is None
@@ -1659,6 +1684,10 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         elif tail_push:
             _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
+            if _flags.TRTLLM_K3LL_ATTN_RES_MXFP8:
+                mxfp8_out = _attn_res_mxfp8_out(
+                    self, pending_moe_partial.x.shape[0], pending_moe_partial.x.device
+                )
             hidden_states, prefix_sum = self.decode_comm.tail_push_attn_res(
                 pending_moe_partial,
                 prefix_sum,
@@ -1666,6 +1695,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
+                mxfp8_out=mxfp8_out,
             )
         elif (
             pending_moe_partial is not None
@@ -1741,6 +1771,8 @@ class KimiLinearDecoderLayer(nn.Module):
             num_snapshots += 1
             valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
+        if mxfp8_out is not None:
+            _fp8w_lowm.offer_mxfp8(hidden_states, *mxfp8_out)
         attention = self.linear_attn if self.is_kda else self.self_attn
         comm = self.decode_comm
         if _flags.TRTLLM_K3LL_OPROJ_PUSH and self._takes_oproj_push(
@@ -1812,6 +1844,8 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.post_attention_layernorm,
                     attn_res_max_tokens,
                 )
+        if mxfp8_out is not None:
+            _fp8w_lowm.withdraw_mxfp8()
         all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
         if self.is_moe and defer_moe_tail:
             partial = self.block_sparse_moe(

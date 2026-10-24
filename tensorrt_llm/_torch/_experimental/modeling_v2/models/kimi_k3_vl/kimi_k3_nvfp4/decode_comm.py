@@ -290,16 +290,18 @@ class K3DecodeComm:
         res_proj: nn.Module,
         res_norm: nn.Module,
         out_norm: nn.Module,
+        mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)`` as ``allreduce_attn_res(tail.partial(), ..., two_shot=True)``, bit for bit, with the
         tail GEMV pushing its partial into the MNNVL workspace (``takes_tail_push`` holds): the push GEMV, the Lamport
-        finish in place and the attn_res kernel (``moe_tail_push.py``)."""
+        finish in place and the attn_res kernel (``moe_tail_push.py``); ``mxfp8_out`` as in
+        ``K3OprojPush.finish_attn_res``."""
         push = self.oproj_push
         target = push_target(push.lamport, tail.x.shape[0], _PUSH_HIDDEN, in_place=True)
         tail.gemvs.project_push(_tail_push.SITE, tail.x, tail.weight, push.lamport)
         target.pushed = True
         return push.finish_attn_res(
-            target, prefix_sum, block_residual, res_proj, res_norm, out_norm
+            target, prefix_sum, block_residual, res_proj, res_norm, out_norm, mxfp8_out=mxfp8_out
         )
 
     @staticmethod

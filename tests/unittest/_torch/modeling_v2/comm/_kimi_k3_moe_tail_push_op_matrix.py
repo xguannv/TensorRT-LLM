@@ -37,6 +37,14 @@ Checks:
     alternately with new inputs, one rank late on every other replay, with eager steps (both arms) in between: every
     graph's outputs bit for bit every other graph's and the eager arms', the other users' outputs their exact
     references.
+  * ATTN_RES_MXFP8 (``TRTLLM_K3LL_ATTN_RES_MXFP8``, tail push and o_proj push on; 9, 16, 24, 32 rows; KDA with the fused
+    ``[q | k | v | g | f_a | b]`` FP8 weight of the TP16 per-rank shape [3328, 7168], MLA with an FP8 fused q_a / kv_a
+    module [2112, 7168], partial last row tile): the K3AttnResFast that finishes the pushed tail also writes the MXFP8
+    form of its ``normed``, offered to the attention's first FP8 projection (``fp8w_lowm.gemm``), which then runs
+    ``k3_fp8w_lowm_mxfp8``. On vs off: the pre-attention normed and updated, the projection's output and the layer's
+    outputs bit for bit; the offered ``(xq, xs)`` equal ``mxfp8_quantize_reference(normed)``; the on arm's projection
+    ran the MXFP8 GEMM (``fp8w_lowm.MX_STATS``) and the off arm's did not. A CUDA graph of the on arm (compiled
+    eagerly first) replayed with new inputs gives the eager on arm's bits.
 """
 
 import contextlib
@@ -77,6 +85,8 @@ DM = None  # decode_moe
 TP = None  # moe_tail_push
 FLAGS = None
 CENSUS = None
+FW = None  # fp8w_lowm
+MX = None  # k3_fp8w_lowm_mxfp8
 BUILT = None
 STATS = {"tail_push_calls": 0}
 
@@ -600,11 +610,168 @@ def check_graphs():
         )
 
 
-CHECKS = [check_takes, check_eager, check_graphs]
+MX_ROWS = (9, 16, 24, 32)
+N_KDA_FUSED, N_MLA_FUSED_A = 3328, 2112
+
+
+def _fp8_weight(n: int, seed: int):
+    """An FP8 weight-read weight ``[n, H]`` and its packed scale (``prepare_k3_fp8w_lowm_weight``); ``n`` padded to a
+    row tile for the scale blocks, then the weight cut back to ``n`` rows (a partial last tile)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_fp8w_lowm_gemm as lowm
+
+    g = _gen(seed)
+    n_pad = -(-n // 128) * 128
+    w = (torch.randn(n_pad, H, generator=g, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.exp2(
+        torch.randint(-8, -2, (n_pad // 128, H // 128), generator=g, device="cuda").float()
+    )
+    return lowm.prepare_k3_fp8w_lowm_weight(w[:n].contiguous(), scale)
+
+
+class _ProjAttention(_Attention):
+    """``_Attention`` that first runs its first FP8 projection on its input through ``fp8w_lowm.gemm`` (where an
+    offered MXFP8 form is taken) and records the projection's output."""
+
+    def __init__(self, core, o_proj, kind: str, weight, packed):
+        super().__init__(core, o_proj)
+        self.kind, self.weight, self.packed, self.proj = kind, weight, packed, None
+        if kind == "kda":
+            self._qkvg_bfa_fp8 = (weight, packed)
+        else:
+            self.mixer = SimpleNamespace(
+                o_proj=o_proj,
+                kv_a_proj_with_mqa=SimpleNamespace(
+                    weight=weight,
+                    weight_scale=packed,
+                    _k3ll_fp8w_lowm=True,
+                    _k3ll_fp8w_partial_n_tile=True,
+                ),
+            )
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        self.proj = FW.gemm(
+            hidden_states.reshape(-1, hidden_states.shape[-1]), self.weight, self.packed
+        )
+        return super().__call__(hidden_states, *args, **kwargs)
+
+
+def _mx_switches(on: int):
+    return _flag_block(
+        {
+            "TRTLLM_K3LL_ATTN_RES_MXFP8": on,
+            "TRTLLM_K3LL_KDA_BFA_FP8": 1,
+            "TRTLLM_K3LL_FP8W_LOWM_FUSED_A": 1,
+        }
+    )
+
+
+@contextlib.contextmanager
+def _flag_block(values):
+    old = {n: getattr(FLAGS, n) for n in values}
+    for n, v in values.items():
+        setattr(FLAGS, n, int(v))
+    try:
+        yield
+    finally:
+        for n, v in old.items():
+            setattr(FLAGS, n, v)
+
+
+def _mx_layer(call: _Call, kind: str, weights):
+    layer = _decoder(call, kind)
+    attention = _ProjAttention(call.core, BUILT.o_proj, kind, *weights[kind])
+    layer.attention = attention
+    if kind == "kda":
+        layer.linear_attn = attention
+    else:
+        layer.self_attn = attention
+    layer.hidden_size = H
+    return layer
+
+
+def _mx_arm(layer, call: _Call, on: int):
+    with _mx_switches(on):
+        out = _arm(layer, call, 1, 1)
+    out.proj = layer.attention.proj
+    return out
+
+
+def check_attn_res_mxfp8():
+    """ATTN_RES_MXFP8 on vs off on the tail-push path (module docstring)."""
+    weights = {"kda": _fp8_weight(N_KDA_FUSED, 71), "mla": _fp8_weight(N_MLA_FUSED_A, 72)}
+    for rows in MX_ROWS:
+        for kind in ("kda", "mla"):
+            for snapshot_layer in (False, True):
+                where = f"attn_res_mxfp8 {rows} rows {kind} snapshot {snapshot_layer}"
+                seed = 900 + 2 * rows + int(snapshot_layer)
+                call = _Call(seed, rows, snapshot_layer)
+                layer = _mx_layer(call, kind, weights)
+                outs = {}
+                for on in (0, 1):
+                    call.draw(seed)
+                    before = FW.MX_STATS["mxfp8"]
+                    seen_offer = []
+                    real_offer = FW.offer_mxfp8
+
+                    def spy(x, xq, xs, _seen=seen_offer, _real=real_offer):
+                        _seen.append((x.clone(), xq.clone(), xs.clone()))
+                        return _real(x, xq, xs)
+
+                    FW.offer_mxfp8 = spy
+                    try:
+                        outs[on] = _cloned(_mx_arm(layer, call, on))
+                    finally:
+                        FW.offer_mxfp8 = real_offer
+                    ran = FW.MX_STATS["mxfp8"] - before
+                    assert ran == on, f"{where}: on={on} ran the MXFP8 GEMM {ran} times"
+                    assert len(seen_offer) == on, (
+                        f"{where}: on={on} offered {len(seen_offer)} times"
+                    )
+                    if on:
+                        x, xq, xs = seen_offer[0]
+                        rq, rs = MX.mxfp8_quantize_reference(x.reshape(-1, H))
+                        assert torch.equal(xq.view(torch.uint8), rq.view(torch.uint8)), (
+                            f"{where}: xq"
+                        )
+                        assert torch.equal(xs, rs), f"{where}: xs"
+                for name, value in outs[1].items():
+                    _expect_same(
+                        f"{where}: on vs off {name}",
+                        value,
+                        outs[0][name],
+                        replicated=name != "proj",
+                    )
+    # A CUDA graph of the on arm, compiled eagerly above, replayed with new inputs.
+    rows, kind = 16, "kda"
+    call = _Call(950, rows, False)
+    layer = _mx_layer(call, kind, weights)
+    _mx_arm(layer, call, 1)
+    torch.cuda.synchronize()
+    graph, out = _capture(lambda: _mx_arm(layer, call, 1))
+    for i in range(3):
+        call.draw(960 + i)
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = _cloned(out)
+        call.draw(960 + i)
+        eager = _cloned(_mx_arm(layer, call, 1))
+        for name, value in replayed.items():
+            _expect_same(
+                f"attn_res_mxfp8 graph replay {i} {name}",
+                value,
+                eager[name],
+                replicated=name != "proj",
+            )
+    if R.rank == 0:
+        print("[rank 0] attn_res_mxfp8: on = off bit for bit (normed, updated, projection, outputs); xq / xs = "
+              "reference; MXFP8 GEMM ran on the on arm only; graph replay = eager", flush=True)  # fmt: skip
+
+
+CHECKS = [check_takes, check_eager, check_graphs, check_attn_res_mxfp8]
 
 
 def _run_one_rank(args) -> int:
-    global R, IMPL, DC, DG, DM, TP, FLAGS, CENSUS
+    global R, IMPL, DC, DG, DM, TP, FLAGS, CENSUS, FW, MX
     R = ls.Rank(args)
     import importlib
 
@@ -616,6 +783,10 @@ def _run_one_rank(args) -> int:
     TP = importlib.import_module(f"{package}.moe_tail_push")
     FLAGS = importlib.import_module(f"{package}.flags")
     CENSUS = importlib.import_module(f"{package}.census")
+    FW = importlib.import_module(f"{package}.fp8w_lowm")
+    MX = importlib.import_module(
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_fp8w_lowm_mxfp8"
+    )
     CENSUS.ENABLED = True  # the switch's dispatch key is checked as the gates read it
     code = ls.run_checks(R, [check_build])
     if code:
