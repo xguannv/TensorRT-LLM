@@ -157,7 +157,7 @@ def _wide_layer(dm, takes: bool, monkeypatch):
     layer.lu = "layer"
     layer.shared_cols = 384
     shared_act = torch.zeros(16, 384, dtype=torch.bfloat16)
-    layer._front_only = lambda moe, x, front32=None: (
+    layer._front_only = lambda moe, x, front32=None, **_: (
         calls.append("front") or ("routing", shared_act)
     )
 
