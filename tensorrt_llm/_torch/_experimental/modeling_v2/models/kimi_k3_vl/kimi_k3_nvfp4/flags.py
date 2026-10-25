@@ -551,6 +551,14 @@ TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP = _flag(
     "without a branch, the warp's token past the last recomputing the last one (bitwise; read at forward time). 1 "
     "on, 0 off, -1 (default) on SM103 only (verify.KDA_VERIFY_ODD_CLAMP_CAPABILITIES)",
 )
+TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS = _flag(
+    "TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS",
+    -1,
+    "k3_fp8_kda_verify with the hoisted prologue (TRTLLM_K3LL_KDA_VERIFY_HOIST) and the folded f_b: wait for the grid "
+    "dependency and issue this step's projection-row loads before the conv-history pick and the replay of the "
+    "accepted drafts, so the rows' load round trip overlaps them (bitwise; read at forward time). 1 on, 0 off, -1 "
+    "(default) on SM103 only (verify.KDA_VERIFY_EARLY_ROWS_CAPABILITIES)",
+)
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
     1,

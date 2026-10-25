@@ -25,7 +25,8 @@ Before ``griddepcontrol.wait`` (written by the previous verify step, or constant
   -3..-1 before the first new token (conv-cache columns P..P+2) for q and k (128 channels) and v (this CTA's 16);
   the conv weights, dt_bias, A_log and the output-norm weight; the head's W_fb^T block by TMA.
 After the wait (this step's fused projection rows [q | k | v | onorm gate | f_a | b]): the new tokens' raw q, k, v,
-  f_a, b and output gate.
+  f_a, b and output gate. With EARLY_ROWS (hoisted prologue, folded f_b) the wait and these loads come before the
+  history pick and the replay, into registers, and reach shared memory after them.
 f_b:          g[t, c] = bf16(sum_i f_a[t, i] W_fb[128 h + c, i]), rounded as the unfused bf16 GEMV output is.
 Pre-compute:  warp t = verify token t: q, k = l2norm(silu(conv4(u))) (q also scaled), the lower-bound gate, beta and
               this CTA's 16 v channels.
@@ -262,6 +263,7 @@ def k3_fp8_kda_verify_kernel(
     USE_PDL: cutlass.Constexpr[bool],
     HOIST_REPLAY: cutlass.Constexpr[bool],
     ODD_CLAMP: cutlass.Constexpr[bool],
+    EARLY_ROWS: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
     S = CONV_W - 1 + NUM_SPEC  # conv-cache columns
@@ -283,6 +285,14 @@ def k3_fp8_kda_verify_kernel(
     assert (
         2 <= NT <= WARPS
     )  # an odd NT (MTP6: 7) leaves warp 7 idle; the f_b TMA box of 8 rows reads past it
+    CH = K // CHUNK  # 16-byte chunks per 128-channel row
+    VCH = V_CTA // CHUNK  # 16-byte chunks per 16-channel v (or gate) slice
+    n_v = NT * VCH
+    # EARLY_ROWS: one projection-row load per thread for q / k, for v / gate and for b, held in registers across the
+    # history pick and the replay
+    assert not EARLY_ROWS or (
+        HOIST_REPLAY and FOLD_FB and 2 * NT * CH <= THREADS and 2 * n_v <= THREADS
+    )
 
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % 32
@@ -462,6 +472,44 @@ def k3_fp8_kda_verify_kernel(
                     w_full,
                 )
 
+    if cutlass.const_expr(EARLY_ROWS):
+        # The grid dependency and this step's projection rows before the history pick and the replay below: in the model
+        # the predecessor is done by now, so the rows' load round trip overlaps them. The loads land in registers and
+        # reach shared memory after the replay, where the late order stores them (same values, same places).
+        if cutlass.const_expr(USE_PDL):
+            prims.griddepcontrol(prims.GridDepAction.WAIT)
+        if warp == 1:
+            if prims.elect_sync():
+                prims.mbarrier_arrive_expect_tx(x_full, MMA_N * K * BF16_BYTES)
+                for half in cutlass.range_constexpr(TMA_COPY_ITERS):
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        smem_b.subview(half * B_HALF_ELEMS), tma_ptr_x,
+                        (cutlass.Int32(FA_COL + half * TMA_K_BOX), row0), x_full,
+                    )  # fmt: skip
+        # q / k: item = thread (threads past 2 NT CH reload the last item, never stored)
+        e_qk = cutlass.Int32(
+            cutlass.select_(tidx < 2 * NT * CH, tidx, cutlass.Int32(2 * NT * CH - 1))
+        )
+        e_stream = e_qk // (NT * CH)
+        e_t = (e_qk // CH) % NT
+        e_j = e_qk % CH
+        e_words_qk = proj.load(
+            idx=(row0 + e_t) * proj_words + Q_W + ch0 // 2 + e_stream * (K_W - Q_W) + e_j * (CHUNK // 2),
+            vector_size=4, alignment=16,
+        )  # fmt: skip
+        # v, then the output gate: item = thread < 2 n_v
+        e_vo = cutlass.Int32(cutlass.select_(tidx < 2 * n_v, tidx, cutlass.Int32(2 * n_v - 1)))
+        e_is_v = e_vo < n_v
+        e_vi = cutlass.Int32(cutlass.select_(e_is_v, e_vo, e_vo - n_v))
+        e_tv = e_vi // VCH
+        e_jv = e_vi % VCH
+        e_col = cutlass.Int32(cutlass.select_(e_is_v, cutlass.Int32(V_W), cutlass.Int32(OG_W)))
+        e_words_vo = proj.load(idx=(row0 + e_tv) * proj_words + e_col + (ch0 + v0) // 2 + e_jv * (CHUNK // 2),
+                               vector_size=4, alignment=16)  # fmt: skip
+        # b: token = thread < NT
+        e_tb = cutlass.Int32(cutlass.select_(tidx < NT, tidx, cutlass.Int32(NT - 1)))
+        e_word_b = bfa.load(idx=(row0 + e_tb) * bfa_words + (B_SRC + h) // 2)
+
     if cutlass.const_expr(HOIST_REPLAY):
         pend = cutlass.Int32(
             cutlass.select_(pend_raw > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend_raw)
@@ -581,9 +629,9 @@ def k3_fp8_kda_verify_kernel(
             )
 
     # ---- This step's projection rows.
-    if cutlass.const_expr(USE_PDL):
+    if cutlass.const_expr(USE_PDL and not EARLY_ROWS):
         prims.griddepcontrol(prims.GridDepAction.WAIT)
-    if cutlass.const_expr(FOLD_FB):
+    if cutlass.const_expr(FOLD_FB and not EARLY_ROWS):
         if warp == 1:
             if prims.elect_sync():
                 prims.mbarrier_arrive_expect_tx(x_full, MMA_N * K * BF16_BYTES)
@@ -592,8 +640,23 @@ def k3_fp8_kda_verify_kernel(
                         smem_b.subview(half * B_HALF_ELEMS), tma_ptr_x,
                         (cutlass.Int32(FA_COL + half * TMA_K_BOX), row0), x_full,
                     )  # fmt: skip
-    CH = K // CHUNK  # 16-byte chunks per 128-channel row
-    for it in cutlass.range_constexpr((2 * NT * CH + THREADS - 1) // THREADS):
+    if cutlass.const_expr(EARLY_ROWS):
+        if tidx < 2 * NT * CH:
+            if e_stream == 0:
+                _store8(s_uq, e_words_qk, (CONV_W - 1 + e_t) * K + e_j * CHUNK)
+            else:
+                _store8(s_uk, e_words_qk, (CONV_W - 1 + e_t) * K + e_j * CHUNK)
+        if tidx < 2 * n_v:
+            if e_is_v:
+                _store8(s_uv, e_words_vo, (CONV_W - 1 + e_tv) * V_CTA + e_jv * CHUNK)
+            else:
+                _store8(s_og, e_words_vo, e_tv * V_CTA + e_jv * CHUNK)
+        if tidx < NT:
+            e_b = _lo(e_word_b)
+            if (B_SRC + h) % 2 == 1:
+                e_b = _hi(e_word_b)
+            s_braw.store(e_b, idx=tidx)
+    for it in cutlass.range_constexpr(0 if EARLY_ROWS else (2 * NT * CH + THREADS - 1) // THREADS):
         item = tidx + it * THREADS
         if item < 2 * NT * CH:
             stream_qk = item // (NT * CH)
@@ -607,10 +670,10 @@ def k3_fp8_kda_verify_kernel(
                 _store8(s_uq, words_qk, (CONV_W - 1 + t_qk) * K + j_qk * CHUNK)
             else:
                 _store8(s_uk, words_qk, (CONV_W - 1 + t_qk) * K + j_qk * CHUNK)
-    VCH = V_CTA // CHUNK  # 16-byte chunks per 16-channel v (or gate) slice
-    n_v = NT * VCH
     n_g = 0 if FOLD_FB else NT * CH
-    for it in cutlass.range_constexpr((2 * n_v + NT + n_g + THREADS - 1) // THREADS):
+    for it in cutlass.range_constexpr(
+        0 if EARLY_ROWS else (2 * n_v + NT + n_g + THREADS - 1) // THREADS
+    ):
         item = tidx + it * THREADS
         if item < n_v:
             t_v = item // VCH
@@ -968,6 +1031,7 @@ def k3_fp8_kda_verify(
     USE_PDL: cutlass.Constexpr[bool],
     HOIST_REPLAY: cutlass.Constexpr[bool],
     ODD_CLAMP: cutlass.Constexpr[bool],
+    EARLY_ROWS: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each."""
@@ -994,7 +1058,7 @@ def k3_fp8_kda_verify(
     k3_fp8_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
         slots, pending, out, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
-        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP,
+        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP, EARLY_ROWS,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip

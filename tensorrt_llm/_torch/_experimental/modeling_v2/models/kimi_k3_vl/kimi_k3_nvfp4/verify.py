@@ -121,6 +121,32 @@ def _odd_clamp(device: torch.device, num_spec: int) -> bool:
     return _odd_clamp_by_default(index)
 
 
+# TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS's default (-1) issues the grid-dependency wait and this step's projection-row loads
+# before the history pick and the replay of the accepted drafts only on these compute capabilities (measured on GB300 /
+# SM103, where the wait almost never blocks in the model: the predecessor is done before the prologue ends).
+KDA_VERIFY_EARLY_ROWS_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _early_rows_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in KDA_VERIFY_EARLY_ROWS_CAPABILITIES
+
+
+def _early_rows(device: torch.device, hoist: bool, fold_fb: bool) -> bool:
+    """``TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS`` on ``device``: only with the hoisted prologue and the folded f_b (the
+    kernel's other paths keep their order); then 1 on, 0 off, -1 (default) on where the device is in
+    ``KDA_VERIFY_EARLY_ROWS_CAPABILITIES``."""
+    if not (hoist and fold_fb):
+        return False
+    from . import flags
+
+    value = int(flags.TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _early_rows_by_default(index)
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -243,6 +269,9 @@ def k3_fp8_kda_verify(
     runtime = (proj.shape[1] // 2, (bfa if sep_bfa else proj).shape[1] // 2, n_req, ssm.stride(0))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
     pdl = use_pdl()
+    hoist = _hoist_replay(proj.device)
+    odd_clamp = _odd_clamp(proj.device, num_spec)
+    early_rows = _early_rows(proj.device, hoist, fold_fb)
     key = (
         num_heads,
         num_spec,
@@ -253,8 +282,9 @@ def k3_fp8_kda_verify(
         fold_fb,
         sep_bfa,
         pdl,
-        _hoist_replay(proj.device),
-        _odd_clamp(proj.device, num_spec),
+        hoist,
+        odd_clamp,
+        early_rows,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -270,17 +300,18 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, _hoist_replay(proj.device),
-                    _odd_clamp(proj.device, num_spec), stream,
+                    float(eps), fold_fb, sep_bfa, pdl, hoist, odd_clamp, early_rows, stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
-    if key[-2] or key[-1]:
+    if hoist or odd_clamp:
         from . import census
 
-        if key[-2]:
+        if hoist:
             census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
-        if key[-1]:
+        if odd_clamp:
             census.count(f"dispatch:kda_verify_odd_clamp:{census.mode()}")
+        if early_rows:
+            census.count(f"dispatch:kda_verify_early_rows:{census.mode()}")
     return out
 
 
