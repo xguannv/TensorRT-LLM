@@ -367,3 +367,85 @@ def test_graph_replay_pdl_chain(n: int, exact: bool):
         if exact:
             for i, ((u, o), (ru, ro)) in enumerate(zip(outs, chain(cpp, cpp, cpp, cpp))):
                 assert _mismatches(o, ro) == 0, f"replay {seed} stage {i} output vs C++"
+
+
+def _mixture_cpp(row: torch.Tensor, t) -> torch.Tensor:
+    """The pre-norm mixture of ``trtllm::attn_res_fwd`` (what a separate attn_res computes for a tap)."""
+    m, k = row.shape[0], t["block"].shape[0]
+    out, _rsigma, _probs, _logits = torch.ops.trtllm.attn_res_fwd(
+        row.reshape(m, 1, HIDDEN).contiguous(),
+        t["block"].reshape(k, m, 1, HIDDEN).contiguous(),
+        t["proj"],
+        t["norm_w"],
+        EPS,
+    )
+    return out.reshape(m, HIDDEN)
+
+
+@pytest.mark.parametrize("mnnvl_order", [False, True])
+@pytest.mark.parametrize("lamport", [False, True])
+@pytest.mark.parametrize("mx", [False, True])
+@pytest.mark.parametrize("n", [2, 6, 12])
+@pytest.mark.parametrize("m", [1, 14, 32])
+def test_tap(m: int, n: int, mx: bool, lamport: bool, mnnvl_order: bool):
+    """``tap``: the kernel also stores its pre-norm mixture into a strided view (a capture slot).
+    The other outputs are the bits of the launch without it, the columns around the view are
+    untouched, and the tap is the separate C++ attn_res's mixture within the fast kernel's bound."""
+    if lamport:
+        pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_lamport_ar")
+    k3 = _k3()
+    t = _inputs(m, n, 1.0, seed=11 * m + n)
+    addend = t["addend"].clone()
+    addend[addend == 0] = 0
+    kwargs = dict(exact=False, mnnvl_order=mnnvl_order)
+    if lamport:
+        uc, flags, stage = _lamport_workspace(addend, dirty=1)
+        stage.copy_(addend.view(torch.int32).flatten())
+        addends = ()
+        kwargs["lamport_addend"] = (uc.data_ptr(), flags.data_ptr())
+    else:
+        addends = (addend,)
+
+    def run(tap=None):
+        out = torch.empty_like(t["layer"])
+        updated = torch.empty_like(t["layer"])
+        mxo = None
+        if mx:
+            mxo = (
+                torch.empty(m, HIDDEN, dtype=torch.float8_e4m3fn, device="cuda"),
+                torch.empty(m, HIDDEN // 32, dtype=torch.uint8, device="cuda"),
+            )
+        k3.run_k3_attn_res(
+            t["layer"], addends, t["block"], *_weights(t), out, updated, mxfp8_out=mxo, tap=tap,
+            **kwargs,
+        )  # fmt: skip
+        return [out, updated] + (list(mxo) if mx else [])
+
+    ref = run()
+    # The capture buffer of three tapped layers; this layer's slot is the middle one.
+    buf = torch.full((m + 3, 3 * HIDDEN), 7.0, dtype=torch.bfloat16, device="cuda")
+    slot = buf[:m, HIDDEN : 2 * HIDDEN]
+    got = run(slot)
+    for i, (a, b) in enumerate(zip(ref, got)):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"output {i}"
+    rest = buf.clone()
+    rest[:m, HIDDEN : 2 * HIDDEN] = 7.0
+    assert bool((rest == 7.0).all()), "tap wrote outside its view"
+    # The tap is the mixture of the updated row (bf16(layer + addend), output 1).
+    _assert_fast_close(slot, _mixture_cpp(got[1], t), ("tap", mnnvl_order))
+
+
+def test_tap_needs_vectorized_kernel():
+    t = _inputs(2, 3, 1.0)
+    out = torch.empty_like(t["layer"])
+    with pytest.raises(ValueError):
+        _k3().run_k3_attn_res(
+            t["layer"],
+            (),
+            t["block"],
+            *_weights(t),
+            out,
+            None,
+            exact=True,
+            tap=torch.empty_like(out),
+        )

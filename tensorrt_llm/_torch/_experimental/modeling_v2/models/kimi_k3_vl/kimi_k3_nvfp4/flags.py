@@ -298,6 +298,15 @@ TRTLLM_K3LL_MOE_TAIL_COL = _flag(
     "12 MiB MNNVL workspace; engagement is read at forward time. Takes precedence over TRTLLM_K3LL_MOE_TAIL_LU. -1 "
     "(default): on on SM103 only (moe_tail_col.MOE_TAIL_COL_CAPABILITIES)",
 )
+TRTLLM_K3LL_ATTN_RES_TAP = _flag(
+    "TRTLLM_K3LL_ATTN_RES_TAP",
+    0,
+    "a drafter-tapped layer whose pre-attention step is TRTLLM_K3LL_MOE_TAIL_COL's K3AttnResFast: the kernel also "
+    "stores the pre-norm attention-residual mixture into the layer's capture slot (spec_worker.capture_view), and "
+    "the separate attn_res for the tap after the step is skipped. The target's outputs are unchanged; the tap is the "
+    "fast kernel's mixture (the C++ MNNVL epilogue's arithmetic), which can differ from the separate attn_res by one "
+    "bf16 step in a few elements. Read at forward time. 0 (default): off",
+)
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
     "TRTLLM_K3LL_HELIX_Q_AG_MNNVL",
