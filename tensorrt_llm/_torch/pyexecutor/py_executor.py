@@ -76,6 +76,7 @@ from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec, SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
 from ..speculative.utils import update_draft_len
+from . import resp_stamps as _resp_stamps
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
@@ -9214,6 +9215,13 @@ class PyExecutor:
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
         if self.dist.rank == 0 or self.gather_all_responses:
+            if _resp_stamps.ENABLED:
+                for req_id, resp in responses:
+                    result = getattr(resp, "result", None)
+                    _resp_stamps.mark("E",
+                                      req_id,
+                                      bool(getattr(result, "is_final", False)),
+                                      cid=getattr(resp, "client_id", None))
             with self.response_cv:
                 for req_id, resp in responses:
                     if req_id in self.responses.keys():

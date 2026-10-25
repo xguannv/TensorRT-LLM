@@ -30,6 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.pyexecutor import resp_stamps as _resp_stamps
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
@@ -105,6 +106,24 @@ _CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
 # aligned to well under a millisecond, so discarding a noisier estimate is
 # strictly better than applying it.
 _CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
+
+async def _stamped_stream(stream, disagg_request_id, x_request_id):
+    """Yield ``stream`` unchanged, marking hop ``S`` of ``resp_stamps`` as each chunk goes out.
+
+    The chunk carrying ``[DONE]`` (else the end of the stream) is the final one.
+    """
+    done = False
+    async for chunk in stream:
+        if not done:
+            if isinstance(chunk, (bytes, bytearray)):
+                done = b"[DONE]" in chunk
+            else:
+                done = isinstance(chunk, str) and "[DONE]" in chunk
+            _resp_stamps.mark("S", disagg_request_id, done, xrid=x_request_id)
+        yield chunk
+    if not done:
+        _resp_stamps.mark("S", disagg_request_id, True, xrid=x_request_id)
+
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -437,6 +456,10 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
+                    if _resp_stamps.ENABLED:
+                        response_or_generator = _stamped_stream(
+                            response_or_generator, hooks.disagg_request_id,
+                            raw_req.headers.get("x-request-id"))
                     return StreamingResponse(
                         content=response_or_generator,
                         media_type="text/event-stream")

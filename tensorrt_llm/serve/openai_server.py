@@ -38,6 +38,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.pyexecutor import resp_stamps as _resp_stamps
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -2858,6 +2859,12 @@ class OpenAIServer(_VideoRoutesMixin):
                                        params: Optional[PostprocParams]):
             try:
                 async for output in promise:
+                    if _resp_stamps.ENABLED:
+                        _resp_stamps.mark("R",
+                                          stamp_key,
+                                          output.finished,
+                                          cid=getattr(promise, "request_id",
+                                                      None))
                     if not self.postproc_worker_enabled:
                         post_processor, args = params.post_processor, params.postproc_args
                         pp_result = post_processor(output, args)
@@ -2906,10 +2913,16 @@ class OpenAIServer(_VideoRoutesMixin):
             first_response = await anext(generator)
             raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
             )
+            _resp_stamps.mark("G", stamp_key, False)
             yield first_response
             async for output in generator:
                 yield output
+            _resp_stamps.mark("G", stamp_key, True)
             yield "data: [DONE]\n\n"
+
+        stamp_key = None
+        if _resp_stamps.ENABLED and request.disaggregated_params is not None:
+            stamp_key = request.disaggregated_params.disagg_request_id
 
         try:
             if isinstance(request.prompt, list) and not request.prompt:
