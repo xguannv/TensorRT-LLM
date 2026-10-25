@@ -153,6 +153,26 @@ def _bulk_g2s(dst, src, nbytes, mbar, *, loc=None, ip=None):
     )  # fmt: skip
 
 
+@dsl_user_op
+def _read_u64(reg, *, loc=None, ip=None):
+    """%globaltimer or %clock64 (diagnostic profile only)."""
+    return cutlass.Int64(
+        _llvm.inline_asm(
+            _T.i64(), [], f"mov.u64 $0, %{reg};", "=l,~{memory}", has_side_effects=True,
+            is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+#: diagnostic profile (verify.py, TRTLLM_K3LL_KDA_VERIFY_PROF=1): (globaltimer, clock64) pairs per CTA
+PROF_MARKS = 12
+
+
+def _prof_mark(prof, cta, k):
+    prof.store(_read_u64("globaltimer"), idx=(cta * PROF_MARKS + k) * 2)
+    prof.store(_read_u64("clock64"), idx=(cta * PROF_MARKS + k) * 2 + 1)
+
+
 def _lo(word):
     return (word << cutlass.Int32(16)).bitcast(cutlass.Float32)
 
@@ -249,6 +269,7 @@ def k3_fp8_kda_verify_kernel(
     slots: cutlass.Array,  # int32 [N]
     pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [T][H][V]
+    prof: cutlass.Array,  # int64 [CTAs][PROF_MARKS][2] (PROFILE only)
     proj_words: cutlass.Int32,
     bfa_words: cutlass.Int32,  # int32 words per row of bfa
     ssm_stride: cutlass.Int64,  # elements between the pool's slots (the manager interleaves conv states)
@@ -262,6 +283,7 @@ def k3_fp8_kda_verify_kernel(
     USE_PDL: cutlass.Constexpr[bool],
     HOIST_REPLAY: cutlass.Constexpr[bool],
     ODD_CLAMP: cutlass.Constexpr[bool],
+    PROFILE: cutlass.Constexpr[bool],
 ):
     NT = NUM_SPEC + 1  # verify tokens per request
     S = CONV_W - 1 + NUM_SPEC  # conv-cache columns
@@ -288,6 +310,12 @@ def k3_fp8_kda_verify_kernel(
     lane = tidx % 32
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     h, n, vs = cute.arch.block_idx()
+    _, n_grid, _ = cute.arch.grid_dim()
+    prof_cta = h + H * (n + n_grid * vs)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 0)
+            prof.store(cutlass.Int64(n_grid), idx=(prof_cta * PROF_MARKS + PROF_MARKS - 1) * 2)
     v0 = vs * V_CTA
     ch0 = h * K
     row0 = n * NT
@@ -383,6 +411,9 @@ def k3_fp8_kda_verify_kernel(
 
     # Cluster formation: the peers' shared memory is addressable from here on.
     prims.barrier_cluster_arrive_relaxed()
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 1)
     if cutlass.const_expr(HOIST_REPLAY):
         # Every global load of the prologue while the cluster forms, two round trips deep: the slot, then everything
         # else at once (no load waits for the accepted-draft count): the count, the pool state, A_log, the conv
@@ -451,6 +482,9 @@ def k3_fp8_kda_verify_kernel(
                               tok.subview(CT_WD + (t_h * H + h) * K).data_ptr().toint(), K * 4, mbar)  # fmt: skip
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 2)
     if cutlass.const_expr(FOLD_FB):
         if warp == 0:
             if prims.elect_sync():
@@ -581,8 +615,14 @@ def k3_fp8_kda_verify_kernel(
             )
 
     # ---- This step's projection rows.
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 3)
     if cutlass.const_expr(USE_PDL):
         prims.griddepcontrol(prims.GridDepAction.WAIT)
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 4)
     if cutlass.const_expr(FOLD_FB):
         if warp == 1:
             if prims.elect_sync():
@@ -640,6 +680,9 @@ def k3_fp8_kda_verify_kernel(
             _store8(s_gr, words_g, t_g * K + j_g * CHUNK)
     prims.barrier_cta_sync(0)
 
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 5)
     # ---- f_b on the tensor cores (warp 2 issues, warps 4-7 read TMEM) beside the q/k pre-compute (warps 0-3).
     if cutlass.const_expr(FOLD_FB):
         if warp == 2:
@@ -738,6 +781,9 @@ def k3_fp8_kda_verify_kernel(
             )
     prims.barrier_cta_sync(0)
 
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 6)
     # ---- The recurrence's per-token operands: warp t, token t: decay = exp(gate), decay * k, beta * k.
     if warp < NT:
         tg = warp
@@ -763,6 +809,9 @@ def k3_fp8_kda_verify_kernel(
             s_bk.store(bk1, idx=tg * K + c1)
     prims.barrier_cta_sync(0)
 
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 7)
     # ---- Recurrence over the verify tokens (register-resident state).
     st = [r_st.load(idx=j) for j in range(ROWS * VEC)]
     outs = []
@@ -858,6 +907,9 @@ def k3_fp8_kda_verify_kernel(
             s_o.store(_bf16(outs[tr][0]), idx=tr * V_CTA + warp * ROWS + 0)
             s_o.store(_bf16(outs[tr][1]), idx=tr * V_CTA + warp * ROWS + 1)
 
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 8)
     # ---- Output gated RMSNorm over V: per-token partial sums of squares to every CTA of the cluster.
     prims.barrier_cta_sync(0)
     # Whole warps enter (the full-mask shuffles below): with an odd NT, NT * V_CTA ends mid-warp, and the lanes past it
@@ -897,6 +949,9 @@ def k3_fp8_kda_verify_kernel(
         y = s_o.load(idx=tidx) * s_rs.load(idx=t_y) * s_onw.load(idx=v_y) * gate
         out.store(cutlass.BFloat16(y), idx=((row0 + t_y) * H + h) * V + v0 + v_y)
 
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 9)
     # ---- The drafts' per-key records (beta * k and the decay), one CTA per head, after every peer's norm partials
     # have arrived: each peer sends them after its recurrence, i.e. after its prologue read the last round's records.
     if vs == 0:
@@ -914,6 +969,9 @@ def k3_fp8_kda_verify_kernel(
                     idx=CT_WD + (t_r * H + h) * K + key_r,
                 )
 
+    if cutlass.const_expr(PROFILE):
+        if tidx == 0:
+            _prof_mark(prof, prof_cta, 10)
     # ---- Conv caches for the next round: column s = position s - 2 = row s + 1 of the position-indexed inputs.
     if vs == 0:
         if tidx < K:
@@ -954,6 +1012,7 @@ def k3_fp8_kda_verify(
     slots: cute.Tensor,
     pending: cute.Tensor,
     out: cute.Tensor,
+    prof: cute.Tensor,
     proj_words: cutlass.Int32,
     bfa_words: cutlass.Int32,
     n_req: cutlass.Int32,
@@ -968,6 +1027,7 @@ def k3_fp8_kda_verify(
     USE_PDL: cutlass.Constexpr[bool],
     HOIST_REPLAY: cutlass.Constexpr[bool],
     ODD_CLAMP: cutlass.Constexpr[bool],
+    PROFILE: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each."""
@@ -993,8 +1053,8 @@ def k3_fp8_kda_verify(
     )
     k3_fp8_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
-        slots, pending, out, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
-        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP,
+        slots, pending, out, prof, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
+        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP, PROFILE,
     ).launch(
         grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
     )  # fmt: skip

@@ -121,6 +121,57 @@ def _odd_clamp(device: torch.device, num_spec: int) -> bool:
     return _odd_clamp_by_default(index)
 
 
+# Diagnostic profile (prototype; TRTLLM_K3LL_KDA_VERIFY_PROF=1): every CTA writes (globaltimer, clock64) at
+# verify_kernel.PROF_MARKS points into one slice of a device buffer per call position (calls mod PROF_LAYERS, so one
+# slice per KDA layer in a forward); a daemon thread copies the buffer to
+# $TRTLLM_K3LL_KDA_VERIFY_PROF_DIR/kda_verify_prof_rank<R>.pt every 2 s on its own stream (graph replays included).
+PROF_LAYERS = 69
+PROF_MAX_CTAS = 6 * 8 * 8
+_prof = dict(buf=None, calls=0, thread=None)
+
+
+def _prof_on() -> bool:
+    return os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF", "0") == "1"
+
+
+def _prof_dump_loop(device):
+    import time
+
+    rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "0")))
+    path = os.path.join(
+        os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF_DIR", "/tmp"), f"kda_verify_prof_rank{rank}.pt"
+    )
+    stream = torch.cuda.Stream(device=device)
+    from tensorrt_llm._utils import prefer_pinned
+
+    host = torch.empty(_prof["buf"].shape, dtype=torch.int64, pin_memory=prefer_pinned())
+    while True:
+        time.sleep(2.0)
+        with torch.cuda.stream(stream):
+            host.copy_(_prof["buf"], non_blocking=True)
+        stream.synchronize()
+        torch.save(dict(buf=host.clone(), calls=_prof["calls"], layers=PROF_LAYERS), path + ".tmp")
+        os.replace(path + ".tmp", path)
+
+
+def _prof_arg(device) -> torch.Tensor:
+    from . import verify_kernel as kernel
+
+    if not _prof_on():
+        buf = _prof.get("dummy")
+        if buf is None or buf.device != device:
+            buf = _prof["dummy"] = torch.zeros(2, dtype=torch.int64, device=device)
+        return buf
+    if _prof["buf"] is None:
+        _prof["buf"] = torch.zeros(PROF_LAYERS, PROF_MAX_CTAS * kernel.PROF_MARKS * 2, dtype=torch.int64,
+                                   device=device)  # fmt: skip
+        _prof["thread"] = threading.Thread(target=_prof_dump_loop, args=(device,), daemon=True)
+        _prof["thread"].start()
+    i = _prof["calls"] % PROF_LAYERS
+    _prof["calls"] += 1
+    return _prof["buf"][i]
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -239,6 +290,7 @@ def k3_fp8_kda_verify(
         _index_arg(slots),
         _index_arg(pending),
         _arg(_flat(out)),
+        _arg(_prof_arg(proj.device), 8),
     )
     runtime = (proj.shape[1] // 2, (bfa if sep_bfa else proj).shape[1] // 2, n_req, ssm.stride(0))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
@@ -255,6 +307,7 @@ def k3_fp8_kda_verify(
         pdl,
         _hoist_replay(proj.device),
         _odd_clamp(proj.device, num_spec),
+        _prof_on(),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -271,7 +324,7 @@ def k3_fp8_kda_verify(
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
                     float(eps), fold_fb, sep_bfa, pdl, _hoist_replay(proj.device),
-                    _odd_clamp(proj.device, num_spec), stream,
+                    _odd_clamp(proj.device, num_spec), _prof_on(), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
     if key[-2] or key[-1]:
