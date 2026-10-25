@@ -321,9 +321,27 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
                 "self-sort: FC1 output scale factors differ"
             )
     check(lowm_self(scales), "self-sort op")
+    # bf16 routing weights (the front's output) are read by the kernel itself: one-hot slots bit for bit as their
+    # fp32 widening.
+    for slot in (0, top_k - 1):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        one_hot16 = one_hot.bfloat16()
+        wide = lowm_self(one_hot16.float())
+        assert torch.equal(lowm_self(one_hot16).view(torch.int16), wide.view(torch.int16)), (
+            f"self-sort bf16 weights slot {slot}"
+        )
     y = nvfp4_lowm_op.run(*run_args, num_ctas=num_ctas, self_sort=True)
     torch.cuda.synchronize()
     check(y, "run self_sort")
+    bf16_args = run_args[:3] + (scales.bfloat16(),) + run_args[4:]
+    y16 = nvfp4_lowm_op.run(*bf16_args, num_ctas=num_ctas, self_sort=True)
+    torch.cuda.synchronize()
+    exact16 = exact  # the bf16-rounded weights move the result by < 2^-8 relative per partial, inside the bound
+    err16 = (y16.double() - exact16).abs()
+    assert bool((err16 <= 2 * bound).all()), (
+        f"run self_sort bf16: max err/bound {(err16 / bound).max()}"
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         nvfp4_lowm_op.run(*run_args, out=static, num_ctas=num_ctas, self_sort=True)

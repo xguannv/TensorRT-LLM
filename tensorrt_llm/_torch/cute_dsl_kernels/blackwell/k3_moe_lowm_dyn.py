@@ -1528,9 +1528,8 @@ class K3MoeLowMDynKernel:
                                 expanded = permuted_idx_to_expanded_idx[tile * _MMA_M + et]
                                 token = expanded // self.topk
                                 slot_k = expanded - token * self.topk
-                                scale = (
-                                    alpha2[tile_idx_to_expert_idx[tile]]
-                                    * token_final_scales[(token, slot_k)]
+                                scale = alpha2[tile_idx_to_expert_idx[tile]] * Float32(
+                                    token_final_scales[(token, slot_k)]
                                 )
                             # the previous block's reds still read the previous tile's metadata
                             self._wg_barrier(wg)

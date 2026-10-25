@@ -174,8 +174,9 @@ def k3_moe_nvfp4_lowm(
     ``x_fp4`` uint8 ``[M, k1 / 2]`` (E2M1 pairs) and ``x_sf`` uint8 ``[M, k1 / 16]`` (E4M3, linear): the NVFP4 latent;
     ``w1`` / ``w1_sf`` / ``alpha1`` / ``w2`` / ``w2_sf`` / ``alpha2``: the CuteDSL backend's NVFP4 buffers and global
     scales of the local experts; the four ``moe_sort`` outputs for 128-row tiles; ``fc2_input_scale`` fp32 ``[1]``
-    (the FC1 output's NVFP4 global scale); ``token_final_scales`` fp32 ``[M, top_k]``; ``counters`` from
-    `new_counters`. ``num_ctas``: persistent CTAs (0: one per SM). ``h`` / ``h_sf``: uint8 buffers for the FC1 output
+    (the FC1 output's NVFP4 global scale); ``token_final_scales`` fp32 or bf16 ``[M, top_k]`` (bf16 widened in the
+    kernel, exactly); ``counters`` from `new_counters`. ``num_ctas``: persistent CTAs (0: one per SM). ``h`` /
+    ``h_sf``: uint8 buffers for the FC1 output
     (``[m, n1 / 4]`` E2M1 pairs and ``m * n1 / 32`` scale bytes in the 128x4 blocked layout, ``m`` the permuted rows),
     allocated here when not given. ``topk_ids`` int32 ``[M, top_k]`` (at most `SELF_SORT_MAX_TOKENS` tokens): the
     kernel sorts the routing over the local experts ``[local_offset, local_offset + E)`` itself (`run`'s
@@ -225,6 +226,12 @@ def k3_moe_nvfp4_lowm(
             return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem)
         return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
+    if token_final_scales.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"k3_moe_nvfp4_lowm: token_final_scales must be fp32 or bf16, not {token_final_scales.dtype}"
+        )
+    scales_bf16 = token_final_scales.dtype == torch.bfloat16
+    scales_dtype = cutlass.BFloat16 if scales_bf16 else cutlass.Float32
     ptrs = [
         ptr(cutlass.Float4E2M1FN, x_fp4, 32),
         ptr(cutlass.Float4E2M1FN, w1, 32),
@@ -242,14 +249,14 @@ def k3_moe_nvfp4_lowm(
         ptr(cutlass.Int32, permuted_idx_to_expanded_idx),
         ptr(cutlass.Int32, num_non_exiting_tiles),
         ptr(cutlass.Float32, fc2_input_scale),
-        ptr(cutlass.Float32, token_final_scales),
+        ptr(scales_dtype, token_final_scales),
         ptr(cutlass.Int32, counters),
         ptr(cutlass.Int32, topk_ids if self_sort else tile_idx_to_group_idx),
     ]
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (_device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas, stages,
-           use_pdl, num_local if self_sort else 0)  # fmt: skip
+           use_pdl, num_local if self_sort else 0, scales_bf16)  # fmt: skip
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -437,8 +444,13 @@ def run(
     same tiles and rows)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
-    scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
     if self_sort and fc12 is None and self_sort_takes(num_tokens, w1.shape[0]):
+        # The kernel reads fp32 or bf16 weights itself: no conversion kernel between the front and the experts.
+        scales = (
+            topk_weights
+            if topk_weights.dtype in (torch.float32, torch.bfloat16)
+            else topk_weights.float()
+        )
         ids = (topk_ids if topk_ids.dtype == torch.int32 else topk_ids.int()).contiguous()
         if out is None:
             out = torch.empty(num_tokens, w2.shape[1], dtype=torch.bfloat16, device=x_fp4.device)
@@ -448,6 +460,7 @@ def run(
             local_offset=int(local_expert_offset),
         )  # fmt: skip
         return out
+    scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
     (
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
