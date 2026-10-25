@@ -93,7 +93,7 @@ def test_front_sorts_only_where_the_kernel_does_not(monkeypatch, switch, rows):
     monkeypatch.setattr(layer, "_front", front, raising=False)
     monkeypatch.setattr(dm, "sort_layout", lambda rows, local: (0, 0, 0, 16))
     monkeypatch.setattr(
-        layer, "_routed", lambda *a, fc12=None, self_sort=None: runs.append(("routed", self_sort)) or "y",
+        layer, "_routed", lambda *a, fc12=None, self_sort=None, **_: runs.append(("routed", self_sort)) or "y",
         raising=False,
     )  # fmt: skip
     monkeypatch.setattr(
