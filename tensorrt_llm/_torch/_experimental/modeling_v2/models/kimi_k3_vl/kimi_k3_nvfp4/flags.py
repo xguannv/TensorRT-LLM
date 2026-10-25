@@ -391,6 +391,14 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY = _flag(
     "nothing the reduction reads; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(mla_v_up.MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES)",
 )
+TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE = _flag(
+    "TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",
+    1,
+    "with TRTLLM_K3LL_MLA_VAR_SPLIT: the per-request split counts from one Triton program that scores every candidate "
+    "at once (decode_mla_dcp._var_split_counts_tile_kernel) instead of one candidate after the other: the same counts "
+    "(an integer choice; bitwise), ~2 us instead of 3.5 (4 requests) on GB300. 0: the sequential kernel. Read at "
+    "forward time; the counts only run where TRTLLM_K3LL_MLA_VAR_SPLIT does (SM103)",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,

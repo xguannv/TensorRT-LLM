@@ -138,6 +138,44 @@ def _var_split_counts_kernel(
     tl.store(OUT + offs, best.to(tl.int32), mask=live)
 
 
+@triton.jit
+def _var_split_counts_tile_kernel(
+    SEQS,
+    OUT,
+    B: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    GRID: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BUDGET: tl.constexpr,
+    K_TILE: tl.constexpr,
+):
+    """``_var_split_counts_kernel``'s choice with every candidate unit ``ceil(t_b / k)``, indexed ``b * GRID + k - 1``,
+    evaluated at once (a ``[candidates, requests]`` tile) instead of one after the other: the first of the lowest cost
+    wins, all ones if none fits the budget (``TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE``)."""
+    offs = tl.arange(0, BLOCK_B)
+    live = offs < B
+    tiles = tl.maximum(
+        (tl.load(SEQS + offs, mask=live, other=0).to(tl.int64) + (K_TILE - 1)) // K_TILE, 1
+    )
+    cand = tl.arange(0, BLOCK_C)
+    cand_b = cand // GRID
+    cand_k = (cand % GRID + 1).to(tl.int64)
+    cand_live = cand_b < B
+    t_c = tl.maximum(
+        (tl.load(SEQS + cand_b, mask=cand_live, other=0).to(tl.int64) + (K_TILE - 1)) // K_TILE, 1
+    )
+    unit = (t_c + cand_k - 1) // cand_k
+    splits = tl.minimum(tl.maximum((tiles[None, :] + unit[:, None] - 1) // unit[:, None], 1), GRID)
+    largest = tl.max(tl.where(live[None, :], (tiles[None, :] + splits - 1) // splits, 0), axis=1)
+    total = tl.sum(tl.where(live[None, :], splits, 0), axis=1)
+    cost = tl.where(cand_live & (total <= BUDGET), largest * (BUDGET + 1) + total, 2**62)
+    best_cost = tl.min(cost, axis=0)
+    first = tl.min(tl.where(cost == best_cost, cand, BLOCK_C), axis=0)
+    best = tl.sum(tl.where(cand[:, None] == first, splits, 0), axis=0)
+    best = tl.where(best_cost < 2**62, best, 1)
+    tl.store(OUT + offs, best.to(tl.int32), mask=live)
+
+
 def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Optional[torch.Tensor]:
     """``TRTLLM_K3LL_MLA_VAR_SPLIT``: each request's split-KV count from its KV length on this rank, on device
     (one kernel, capturable, no host sync), or None where `var_split_grid` is 0.
@@ -151,6 +189,21 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
         return None
     budget, grid = _var_split_envelope(batch, heads, q_len)
     out = torch.empty(batch, dtype=torch.int32, device=cache_seqs.device)
+    if _flags.TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE:
+        from . import census as _census
+
+        _census.count(f"dispatch:mla_var_split_counts_tile:{_census.mode()}")
+        _var_split_counts_tile_kernel[(1,)](
+            cache_seqs.contiguous(),
+            out,
+            B=batch,
+            BLOCK_B=triton.next_power_of_2(batch),
+            GRID=grid,
+            BLOCK_C=triton.next_power_of_2(batch * grid),
+            BUDGET=budget,
+            K_TILE=_K_TILE,
+        )
+        return out
     _var_split_counts_kernel[(1,)](
         cache_seqs.contiguous(),
         out,
