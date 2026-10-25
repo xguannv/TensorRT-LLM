@@ -300,11 +300,12 @@ TRTLLM_K3LL_MOE_TAIL_COL = _flag(
 )
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
-    0,
+    -1,
     "a snapshot layer (layer_idx % attn_res_block_size == 0) whose pre-attention step is TRTLLM_K3LL_MOE_TAIL_COL's "
     "K3AttnResFast: the kernel stores the updated prefix sum straight into the snapshot bank row, and the bank's "
     "device-to-device copy after the step (a graph memcpy node that also breaks the PDL chain) is skipped. Bitwise. "
-    "Read at forward time. 0 (default): off",
+    "Read at forward time. -1 (default): on on SM103 only "
+    "(implementation.ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES; L1 bs2 -0.033 ms, moss-0411)",
 )
 TRTLLM_K3LL_ATTN_RES_TAP = _flag(
     "TRTLLM_K3LL_ATTN_RES_TAP",

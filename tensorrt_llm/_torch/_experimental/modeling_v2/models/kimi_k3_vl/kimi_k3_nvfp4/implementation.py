@@ -1483,6 +1483,26 @@ def _attn_res_mxfp8_on(device: torch.device) -> bool:
     return _attn_res_mxfp8_by_default(index)
 
 
+# TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE's default (-1) turns it on only on these compute capabilities (measured on
+# GB300 / SM103). It acts only inside TRTLLM_K3LL_MOE_TAIL_COL's fused attn_res step, which runs on SM100 / SM103 only.
+ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _snapshot_inplace_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES
+
+
+def _snapshot_inplace_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _snapshot_inplace_by_default(index)
+
+
 def _attn_res_mxfp8_out(
     layer: nn.Module, rows: int, device: torch.device
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -1817,8 +1837,8 @@ class KimiLinearDecoderLayer(nn.Module):
             # TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE: on a snapshot layer the kernel stores the updated prefix sum
             # straight into the bank row it snapshots (as the sandwich tail does), so no copy follows the step.
             if (
-                _flags.TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE
-                and self.layer_idx % self.attn_res_block_size == 0
+                self.layer_idx % self.attn_res_block_size == 0
+                and _snapshot_inplace_on(pending_moe_partial.lamport.flags.device)
                 and block_residual.shape[1] == pending_moe_partial.rows
             ):
                 _census.count(f"dispatch:attn_res_snapshot_inplace:{_census.mode()}")

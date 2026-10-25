@@ -293,9 +293,25 @@ def test_attn_res_passes_the_tap(monkeypatch):
     assert launched[0]["tap"] is slot and launched[1]["tap"] is None
 
 
-def test_snapshot_inplace_switch_default_off_and_documented():
+def test_snapshot_inplace_switch_default_sm103_and_documented():
     value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE"]
-    assert default == 0 and "bank row" in doc and "Bitwise" in doc
+    assert default == -1 and "bank row" in doc and "Bitwise" in doc and "SM103" in doc
+
+
+def test_snapshot_inplace_default_follows_the_capability(monkeypatch):
+    """-1 resolves by ``ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES`` (SM103 only); 1 / 0 force it either way."""
+    impl = _mod("implementation")
+    flags = _mod("flags")
+    dev = torch.device("cuda", 0)
+    for cap, want in (((10, 3), True), ((10, 0), False), ((10, 7), False)):
+        impl._snapshot_inplace_by_default.cache_clear()
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None, c=cap: c)
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE", -1)
+        assert impl._snapshot_inplace_on(dev) is want, cap
+        for forced in (0, 1):
+            monkeypatch.setattr(flags, "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE", forced)
+            assert impl._snapshot_inplace_on(dev) is bool(forced)
+    impl._snapshot_inplace_by_default.cache_clear()
 
 
 def test_attn_res_stores_updated_into_the_given_row(monkeypatch):
