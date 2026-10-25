@@ -145,6 +145,14 @@ def _run_fused(
     lse_offset, lse_size, split_offset, split_size, need = runner.get_workspace_layout(
         heads, seq_len_q, KV_LORA_RANK, max_batch, cutlass.Float32
     )
+    if block_split_kvs is not None:
+        # Per-request splits (TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS can size the grid past the static split's bound):
+        # the split region holds batch x q_tiles x split_kv 128-row units of (latent + 1) fp32.
+        q_tiles = -(-heads * seq_len_q // 128)
+        flat_bytes = batch * q_tiles * int(split_kv) * 128 * (KV_LORA_RANK + 1) * 4
+        if flat_bytes > split_size:
+            need += flat_bytes - split_size
+            split_size = flat_bytes
     ws = workspace.view(torch.uint8).reshape(-1)
     if ws.numel() < need:
         raise RuntimeError(f"k3_mla_decode_fp8_v_up: workspace {ws.numel()} B < {need} B")

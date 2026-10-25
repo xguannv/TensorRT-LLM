@@ -594,6 +594,16 @@ TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS = _flag(
     "accepted drafts, so the rows' load round trip overlaps them (bitwise; read at forward time). 1 on, 0 off, -1 "
     "(default) on SM103 only (verify.KDA_VERIFY_EARLY_ROWS_CAPABILITIES)",
 )
+TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS = _flag(
+    "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS",
+    -1,
+    "Helix MLA split read with per-request split counts on the FLAT grid (at most 32 rows): size the split workspace "
+    "for every count the budget allows (decode_mla_dcp._flat_units; bs4 MTP7: 216 128-row units, ~17 MB more per "
+    "rank) instead of the static split's bound, so one long request among short ones takes up to budget - B + 1 "
+    "splits (bs4: 9, was 6). Equal-length batches keep their counts (bitwise); mixed ones move split boundaries. "
+    "Read at forward time; widens only where the allocated workspace holds it. 1 on, 0 off, -1 (default) on SM103 "
+    "only (decode_mla_dcp.MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES)",
+)
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
     1,

@@ -125,6 +125,53 @@ def _var_split_min_batch() -> int:
     return _VAR_SPLIT_SMALL_MIN_BATCH if on else _VAR_SPLIT_MIN_BATCH
 
 
+#: ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS``'s default (-1) applies on these compute capabilities (GB300 / SM103).
+MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES = ((10, 3),)
+#: (heads, q_len) -> the 128-row split units the allocated workspace holds beyond the static split's bound
+#: (`workspace_bytes` records them; `_var_split_envelope` widens only up to them).
+_WIDE_WS_UNITS: dict = {}
+
+
+@functools.lru_cache(maxsize=None)
+def _wide_ws_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES
+
+
+def var_split_wide_ws() -> bool:
+    """``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS`` (1 on, 0 off, -1 on where the current device is in
+    ``MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES``): the split workspace holds every per-request split count the budget allows
+    (`_flat_units`) on the FLAT grid's rows, so the largest count is no longer bound by the static split's units."""
+    value = int(_flags.TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS)
+    if value >= 0:
+        return value > 0
+    return _wide_ws_by_default(torch.cuda.current_device())
+
+
+def _static_units(heads: int) -> int:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    blocks = CuteDSLNVMlaDecodeBlackwellRunner._get_max_active_blocks()
+    return 2 * (blocks // 2) * max(heads, _M_TILE) // _M_TILE
+
+
+def _flat_units(heads: int, q_len: int) -> int:
+    """The 128-row split units every FLAT batch (per-request splits, at most `max_fused_rows` rows) needs at the
+    budget's largest count: max over the batch sizes of
+    ``batch * q_tiles * min(_MAX_VAR_SPLIT, budget - batch + 1)``."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    from .mla_v_up import max_fused_rows
+
+    q_tiles = -(-heads * q_len // _M_TILE)
+    budget = (CuteDSLNVMlaDecodeBlackwellRunner._get_max_active_blocks() // 2) // q_tiles
+    best = 0
+    for b in range(_VAR_SPLIT_SMALL_MIN_BATCH, budget + 1):
+        if b * q_len > max_fused_rows():
+            break
+        best = max(best, b * q_tiles * min(_MAX_VAR_SPLIT, budget - b + 1))
+    return best
+
+
 def _var_split_envelope(batch: int, heads: int, q_len: int):
     """``(budget, grid)``: how many splits all requests of the batch may take together (one wave: the GPU's 2-CTA
     clusters over the ``q_tiles`` M tiles of each split), and the largest split count of one request: within that
@@ -136,8 +183,23 @@ def _var_split_envelope(batch: int, heads: int, q_len: int):
     blocks = CuteDSLNVMlaDecodeBlackwellRunner._get_max_active_blocks()
     budget = (blocks // 2) // q_tiles
     units = 2 * (blocks // 2) * max(heads, _M_TILE) // _M_TILE
+    wide = _WIDE_WS_UNITS.get((heads, q_len), 0)
+    if wide > units and batch * q_len <= _max_fused_rows() and var_split_wide_ws() and _flat_on():
+        units = wide  # TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS: the allocated workspace holds these
     grid = min(_MAX_VAR_SPLIT, budget - batch + 1, units // (batch * q_tiles))
     return budget, grid
+
+
+def _max_fused_rows() -> int:
+    from .mla_v_up import max_fused_rows
+
+    return max_fused_rows()
+
+
+def _flat_on() -> bool:
+    from .mla_v_up import var_split_flat
+
+    return var_split_flat(torch.device("cuda", torch.cuda.current_device()))
 
 
 def var_split_grid(batch: int, heads: int, q_len: int) -> int:
@@ -449,13 +511,26 @@ def _make_helix_plan_fused(
 
 
 def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:
+    """The split read's workspace: the runner's (LSE + the static split's bound), and with
+    ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS`` the split units of `_flat_units` for every query length up to ``q_len``
+    (recorded for `_var_split_envelope`)."""
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-    return CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
+    nbytes = CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
         num_heads, q_len, KV_LORA_RANK, max_batch, cutlass.Float32
     )
+    if var_split_wide_ws():
+        static = _static_units(num_heads)
+        extra = 0
+        for q in range(1, q_len + 1):
+            need = _flat_units(num_heads, q)
+            if need > static:
+                _WIDE_WS_UNITS[(num_heads, q)] = need
+                extra = max(extra, need - static)
+        nbytes += extra * _M_TILE * (KV_LORA_RANK + 1) * 4
+    return nbytes
 
 
 def split_read_attention(
