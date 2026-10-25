@@ -1803,6 +1803,17 @@ class KimiLinearDecoderLayer(nn.Module):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.rows, pending_moe_partial.lamport.flags.device
                 )
+            # TRTLLM_K3LL_ATTN_RES_TAP: on a tapped layer the kernel stores the tap (the pre-norm mixture) straight
+            # into the layer's capture slot, and the tap after the step is skipped (tap_view set).
+            col_tap = None
+            if (
+                capture is not None
+                and _flags.TRTLLM_K3LL_ATTN_RES_TAP
+                and _AUX_ATTN_RES_STREAM_ENABLED
+            ):
+                col_tap = _spec_worker.capture_view(
+                    capture[0], capture[1], pending_moe_partial.rows
+                )
             hidden_states, prefix_sum = self.decode_comm.tail_col_attn_res(
                 pending_moe_partial,
                 prefix_sum,
@@ -1811,7 +1822,11 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm,
                 self.input_layernorm,
                 mxfp8_out=mxfp8_out,
+                tap=col_tap,
             )
+            if col_tap is not None:
+                _census.count(f"dispatch:attn_res_tap:{_census.mode()}")
+                tap_view = col_tap
         elif tail_col_reduced is not None:
             prefix_sum, hidden_states = _apply_attn_res_add_and_rmsnorm(
                 prefix_sum,

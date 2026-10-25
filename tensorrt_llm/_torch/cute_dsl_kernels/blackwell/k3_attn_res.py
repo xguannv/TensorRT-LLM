@@ -843,6 +843,8 @@ class K3AttnResKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        tap_addr: Int64,
+        tap_ld: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1171,6 +1173,7 @@ class K3AttnResFastKernel:
         lamport: bool = False,
         early_trigger: bool = _EARLY_TRIGGER,
         mnnvl_order: bool = False,
+        tap: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -1181,6 +1184,7 @@ class K3AttnResFastKernel:
             raise ValueError("the Lamport addend is an ADD_PREFIX variant")
         self.mnnvl_order = mnnvl_order
         self.mxfp8 = mxfp8
+        self.tap = tap
         self.lamport = lamport
         self.early_trigger = early_trigger
         self.n = num_candidates
@@ -1212,6 +1216,8 @@ class K3AttnResFastKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        tap_addr: Int64,
+        tap_ld: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1239,6 +1245,8 @@ class K3AttnResFastKernel:
             upd_addr,
             xq_addr,
             xs_addr,
+            tap_addr,
+            tap_ld,
             m,
             eps,
             out_eps,
@@ -1275,6 +1283,8 @@ class K3AttnResFastKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        tap_addr: Int64,
+        tap_ld: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -1505,6 +1515,10 @@ class K3AttnResFastKernel:
             scale = _mul_ftz(a, inv)
             p_last = _mul_ftz(b, inv)
             mixed = [_round_bf16(_fma(p_last, x[e], _mul_ftz(scale, premix[e]))) for e in range(8)]
+        if cutlass.const_expr(self.tap):
+            # The pre-norm mixture into a bf16 [M, 7168] view of row stride tap_ld (a capture slot).
+            tap_words = [_pack_bf16x2(mixed[2 * i], mixed[2 * i + 1]) for i in range(4)]
+            _stg_v4_if(valid, tap_addr + Int64(token) * Int64(tap_ld) * 2 + col, tap_words)
         out_sq = _zero_f32()
         for e in cutlass.range_constexpr(8):
             out_sq = _fma(mixed[e], mixed[e], out_sq)
@@ -1583,12 +1597,21 @@ def _compiled(
     lamport: bool = False,
     early_trigger: bool = _EARLY_TRIGGER,
     mnnvl_order: bool = False,
+    tap: bool = False,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
         kernel = K3AttnResFastKernel(
-            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, early_trigger, mnnvl_order
+            num_candidates,
+            add_mode,
+            use_pdl,
+            cluster,
+            mxfp8,
+            lamport,
+            early_trigger,
+            mnnvl_order,
+            tap,
         )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1604,6 +1627,8 @@ def _compiled(
         addr,
         addr,
         addr,
+        addr,
+        Int32(HIDDEN_SIZE),
         Int32(1),
         Float32(1e-6),
         Float32(1e-6),
@@ -1641,6 +1666,24 @@ def can_use_k3_attn_res(
     return all(w.numel() == HIDDEN_SIZE for w in weights)
 
 
+def _tap_ld(tap: torch.Tensor | None, layer: torch.Tensor) -> int:
+    if tap is None:
+        return HIDDEN_SIZE
+    ok = (
+        tap.dtype == torch.bfloat16
+        and tap.device == layer.device
+        and tuple(tap.shape) == tuple(layer.shape)
+        and tap.stride(1) == 1
+        and tap.stride(0) % 8 == 0
+        and tap.data_ptr() % 16 == 0
+    )
+    if not ok:
+        raise ValueError(
+            "tap must be a bf16 [M, 7168] view with unit column stride, 16-byte aligned"
+        )
+    return int(tap.stride(0))
+
+
 def run_k3_attn_res(
     layer: torch.Tensor,
     addends: tuple[torch.Tensor, ...],
@@ -1660,6 +1703,7 @@ def run_k3_attn_res(
     lamport_addend: tuple[int, int] | None = None,
     early_trigger: bool | None = None,
     mnnvl_order: bool = False,
+    tap: torch.Tensor | None = None,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1698,6 +1742,9 @@ def run_k3_attn_res(
         mnnvl_order: The vectorized kernel with the arithmetic of the C++ MNNVL all-reduce
             epilogue (``mnnvl_allreduce_attn_res``; see :class:`K3AttnResFastKernel`), its outputs
             bit-identical to that op's for the same reduced row; ``cluster`` must be None.
+        tap: ``bf16 [M, 7168]`` view with unit column stride and a 16-byte aligned base and row
+            stride (e.g. a speculative capture slot): also store the pre-norm mixture ``mixed``
+            there (vectorized kernel only). The other outputs are unchanged.
     """
     if exact is None:
         exact = _EXACT
@@ -1705,8 +1752,10 @@ def run_k3_attn_res(
         if exact or cluster is not None:
             raise ValueError("mnnvl_order is the vectorized kernel at its own topology")
         cluster = MNNVL_CLUSTER
-    if (mxfp8_out is not None or lamport_addend is not None) and exact:
-        raise ValueError("the MXFP8 side output and the Lamport addend need the vectorized kernel")
+    if (mxfp8_out is not None or lamport_addend is not None or tap is not None) and exact:
+        raise ValueError(
+            "the MXFP8 side output, the tap and the Lamport addend need the vectorized kernel"
+        )
     lamport = lamport_addend is not None
     if lamport and addends:
         raise ValueError("pass either addends or lamport_addend")
@@ -1726,6 +1775,7 @@ def run_k3_attn_res(
         lamport,
         early_trigger,
         mnnvl_order,
+        tap is not None,
     )
     if lamport:
         add_addr, add2_addr = lamport_addend
@@ -1744,6 +1794,8 @@ def run_k3_attn_res(
         Int64(updated.data_ptr() if add_mode else 0),
         Int64(mxfp8_out[0].data_ptr() if mxfp8 else 0),
         Int64(mxfp8_out[1].data_ptr() if mxfp8 else 0),
+        Int64(tap.data_ptr() if tap is not None else 0),
+        Int32(_tap_ld(tap, layer)),
         Int32(layer.shape[0]),
         Float32(rms_eps),
         Float32(out_eps),

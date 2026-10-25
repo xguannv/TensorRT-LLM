@@ -267,6 +267,32 @@ def test_attn_res_takes_shapes(monkeypatch):
     assert not col.attn_res_takes(tail, prefix, torch.zeros(3, 16, 7168), w, w, w)
 
 
+def test_tap_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_TAP"]
+    assert default == 0
+    assert "capture slot" in doc and "TRTLLM_K3LL_MOE_TAIL_COL" in doc
+
+
+def test_attn_res_passes_the_tap(monkeypatch):
+    """``K3DecodeComm.tail_col_attn_res`` hands the tap view to the kernel launch, and None without one."""
+    col = _mod("moe_tail_col")
+    dc = _mod("decode_comm")
+    launched = []
+    kernel = SimpleNamespace(run_k3_attn_res=lambda *a, **kw: launched.append(kw))
+    monkeypatch.setattr(col, "_attn_res", lambda: kernel)
+    flags_t = torch.zeros(9, dtype=torch.int32)
+    ws = SimpleNamespace(uc_local=0x1000, flags=flags_t)
+    tail = col.ColTail(ws, 16, frozenset((2, 3, 4)), frozenset())
+    comm = object.__new__(dc.K3DecodeComm)
+    comm.oproj_push = SimpleNamespace(lamport=ws, zeros=torch.zeros(64, 7168, dtype=torch.bfloat16))
+    w = SimpleNamespace(weight=torch.ones(7168, dtype=torch.bfloat16), eps=1e-6)
+    block = torch.zeros(3, 16, 7168, dtype=torch.bfloat16)
+    slot = torch.zeros(16, 3 * 7168, dtype=torch.bfloat16)[:, 7168 : 2 * 7168]
+    comm.tail_col_attn_res(tail, None, block, w, w, w, tap=slot)
+    comm.tail_col_attn_res(tail, None, block, w, w, w)
+    assert launched[0]["tap"] is slot and launched[1]["tap"] is None
+
+
 def test_published_value_rounds_once():
     """The publish's arithmetic on one element, emulated in torch: ``bf16(fp32(sum) + shared)`` is one rounding of
     the exact value of the bf16 operands, within the error bound the op matrix holds the kernel to."""

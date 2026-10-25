@@ -429,17 +429,19 @@ def attn_res(
     res_norm: nn.Module,
     out_norm: nn.Module,
     mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    tap: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(normed, updated)``: ``updated = bf16(prefix + moe)`` with ``moe`` the tail's rows polled from the decode
     workspace, ``normed = out_norm(attn_res(block_residual..., updated))`` (selected with ``res_proj`` and
     ``res_norm``), in one ``K3AttnResFastKernel`` launch with the Lamport addend in the C++ MNNVL epilogue's arithmetic
-    (the push tail's consumer), releasing the next kernel at its wait. ``mxfp8_out``: passed to ``run_k3_attn_res``."""
+    (the push tail's consumer), releasing the next kernel at its wait. ``mxfp8_out``, ``tap`` (a bf16 ``[rows,
+    7168]`` view the kernel also stores the pre-norm mixture into): passed to ``run_k3_attn_res``."""
     normed = torch.empty_like(prefix)
     updated = torch.empty_like(prefix)
     _attn_res().run_k3_attn_res(
         prefix, (), block_residual, res_proj.weight.reshape(-1), res_norm.weight, out_norm.weight, _eps(res_norm),
         _eps(out_norm), normed, updated, exact=False, lamport_addend=tail.lamport_addend, early_trigger=True,
-        mnnvl_order=True, mxfp8_out=mxfp8_out,
+        mnnvl_order=True, mxfp8_out=mxfp8_out, tap=tap,
     )  # fmt: skip
     return normed, updated
 
