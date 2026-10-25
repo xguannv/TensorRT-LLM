@@ -834,7 +834,9 @@ def check_build():
 # TRTLLM_K3LL_MOE_FRONT_SORT
 # ----------------------------------------------------------------------------------------------------------------------
 def _front_sort_arm(layer, moe, x):
-    with _taps(layer) as seen, _sort_tap() as sort:
+    # The front's sort against moe_sort: with the expert kernel's own sort off (check_self_sort covers it), which
+    # would otherwise take these steps on SM103 by default.
+    with _switch("TRTLLM_K3LL_MOE_SELF_SORT", 0), _taps(layer) as seen, _sort_tap() as sort:
         routed, act = layer._front_routed(moe, x)
     return SimpleNamespace(front=seen["_front"], sort=sort["sort"], routed=routed, act=act)
 
