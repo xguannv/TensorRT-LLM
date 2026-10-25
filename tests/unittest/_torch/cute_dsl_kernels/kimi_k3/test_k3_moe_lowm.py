@@ -68,6 +68,7 @@ def _trtllm():
 WORLD = 4
 HIDDEN, LATENT, EXPERTS, TOP_K = 7168, 3584, 896, 16
 SHARED_INTER = 6144
+SHARED_INTER_32 = SHARED_INTER // 16  # the 32-token front's shared width per rank (TP16's)
 GATE_CAP, LINEAR_CAP = 4.0, 25.0
 RSF = 2.827
 I_TP, E_LOCAL = 768, 224  # one rank of the routed experts' TP4 x EP4
@@ -575,9 +576,14 @@ def _context():
     # The 16-token build's own workspace, and 8 more rows for it (drawn after x8, which stays as it was).
     ws16 = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True, m_max=16)
     x16 = torch.cat([x8, torch.randn(8, HIDDEN, device="cuda", generator=gen).bfloat16()])
-    # The 32-token build (bs4's wide step, 17-32 rows), with 16 more rows (drawn after x16).
+    # The 32-token build (bs4's wide step, 17-32 rows), with 16 more rows (drawn after x16). It takes the shared
+    # expert's width of TP16 (its production world) per rank, SHARED_INTER // 16 columns, which also fits 4 ranks; the
+    # 4-rank width does not fit its shared memory.
     ws32 = moe_op.K3MoeHeadWorkspace.create(mapping, fabric_handle=True, m_max=32)
     x32 = torch.cat([x16, torch.randn(16, HIDDEN, device="cuda", generator=gen).bfloat16()])
+    gate_up32 = (
+        torch.randn(2 * SHARED_INTER_32, HIDDEN, device="cuda", generator=wgen) * 0.02
+    ).bfloat16()
     # The latent's calibrated global scale: the largest latent value of a few calls maps to 448 * 6.
     gsf = torch.tensor([448.0 * 6.0 / 0.5], device="cuda")
     ex = _nvfp4_experts(E_LOCAL, LATENT, I_TP, 4000 + rank)
@@ -587,6 +593,7 @@ def _context():
         front=front_op.front_weight(head, gate_up), ws=ws, ag=(ws.uc, ws.mc, ws.flags, ws.rank), gsf=gsf, ex=ex,
         x16=x16, ag16=(ws16.uc, ws16.mc, ws16.flags, ws16.rank), ws16=ws16,
         x32=x32, ag32=(ws32.uc, ws32.mc, ws32.flags, ws32.rank), ws32=ws32,
+        front32=front_op.front_weight(head, gate_up32),
         weights=(ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2), offset=(rank % 4) * E_LOCAL,
         counters=nvfp4_lowm_op.new_counters(torch.device("cuda", torch.cuda.current_device())),
         fc12=nvfp4_lowm_op.new_fc12(torch.device("cuda", torch.cuda.current_device()), 2 * I_TP, E_LOCAL, TOP_K),
@@ -594,8 +601,11 @@ def _context():
 
 
 def _front(ctx, x, nvfp4):
-    ag = ctx.ag32 if x.shape[0] > 16 else ctx.ag16 if x.shape[0] > 8 else ctx.ag
-    return _trtllm().k3_moe_front(x, ctx.front, ctx.bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ag, ctx.world,
+    if x.shape[0] > 16:
+        front, inter, ag = ctx.front32, SHARED_INTER_32, ctx.ag32
+    else:
+        front, inter, ag = ctx.front, ctx.inter, ctx.ag16 if x.shape[0] > 8 else ctx.ag
+    return _trtllm().k3_moe_front(x, front, ctx.bias, RSF, inter, GATE_CAP, LINEAR_CAP, *ag, ctx.world,
                                   nvfp4_gsf=ctx.gsf if nvfp4 else None)  # fmt: skip
 
 
