@@ -2757,6 +2757,47 @@ _TUNED = {
     (18432, 1536, 64): (1, 4, 4, 8, 2),
 }
 
+#: ``TRTLLM_K3LL_FP8W_LOWM_N48``: 1 on, 0 off, -1 (default) on where the device is in
+#: :data:`FP8W_LOWM_N48_CAPABILITIES`; read when a shape's tactic is first chosen. On, the 64-token
+#: tile (33-64 token decode steps) of the shapes below takes these tactics instead of :data:`_TUNED`
+#: or the heuristic. Every smaller token tile keeps its tactic, and each shape keeps its split-K
+#: (only the ring depths and the quantization grouping differ), so the outputs are bitwise those of
+#: the switch off. Tuned on GB300 for the Kimi-K3 Helix16 attention projections at 40 and 48 tokens
+#: (CUDA graph, weights not L2-resident): (N, K) -> (split_k, x_stages, b_stages, quant_warps,
+#: quant_groups), N in whole tiles (:func:`_tile_n`).
+FP8W_LOWM_N48_ENV = "TRTLLM_K3LL_FP8W_LOWM_N48"
+FP8W_LOWM_N48_CAPABILITIES = ((10, 3),)
+_TUNED_N64 = {
+    # kda_qkvg fused with [f_a | b] (3216 rows)
+    (3328, 7168): (5, 8, 2, 8, 2),
+    # kda_qkvg
+    (3072, 7168): (5, 4, 4, 8, 2),
+    # mla_q_a_kv_a
+    (2176, 7168): (6, 8, 2, 8, 2),
+    # kda_o / mla_o (split_k 1 keeps the all-reduce push epilogue)
+    (7168, 768): (1, 6, 4, 8, 2),
+    # mla_q_b
+    (18432, 1536): (1, 8, 2, 8, 2),
+    # mla_g (gate side)
+    (768, 7168): (8, 7, 4, 8, 2),
+}
+
+
+def _n48_on() -> bool:
+    raw = os.environ.get(FP8W_LOWM_N48_ENV, "").strip()
+    try:
+        value = int(raw) if raw else -1
+    except ValueError as err:
+        raise ValueError(f"{FP8W_LOWM_N48_ENV} must be an integer, got {raw!r}") from err
+    if value >= 0:
+        return value > 0
+    if not torch.cuda.is_available():
+        return False
+    return (
+        torch.cuda.get_device_capability(torch.cuda.current_device()) in FP8W_LOWM_N48_CAPABILITIES
+    )
+
+
 #: Minimum weight-ring depth the heuristic keeps when growing the activation ring.
 _MIN_A_STAGES = 6
 
@@ -2780,7 +2821,9 @@ def _heuristic_split(n: int, k: int) -> int:
 def default_tactic(m: int, n: int, k: int) -> K3LowMTactic:
     """Deterministic tactic for ``(M, N, K)``: tuned table first, heuristic otherwise."""
     mma_n = mma_n_for(m)
-    tuned = _TUNED.get((_tile_n(n), k, mma_n))
+    tuned = _TUNED_N64.get((_tile_n(n), k)) if mma_n == 64 and _n48_on() else None
+    if tuned is None:
+        tuned = _TUNED.get((_tile_n(n), k, mma_n))
     if tuned is not None:
         split, x_stages, b_stages, quant_warps, quant_groups = tuned
         base = K3LowMTactic(

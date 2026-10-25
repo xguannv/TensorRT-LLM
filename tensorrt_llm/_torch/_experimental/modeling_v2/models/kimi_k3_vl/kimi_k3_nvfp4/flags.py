@@ -536,6 +536,15 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
     "SM100 / SM103 only",
 )
+TRTLLM_K3LL_FP8W_LOWM_N48 = _flag(
+    "TRTLLM_K3LL_FP8W_LOWM_N48",
+    -1,
+    "k3_fp8w_lowm_gemm / k3_fp8w_lowm_mxfp8 at 33-64 token decode steps (the 64-token tile: bs5 / bs6 at MTP7): the "
+    "Helix16 attention projections take the ring depths and quantization grouping tuned for that tile "
+    "(k3_fp8w_lowm_gemm._TUNED_N64) instead of _TUNED / the heuristic (same split-K: bitwise; read in the kernel "
+    "module when a shape's tactic is first chosen). 1 on, 0 off, -1 (default) on SM103 only "
+    "(k3_fp8w_lowm_gemm.FP8W_LOWM_N48_CAPABILITIES)",
+)
 TRTLLM_K3LL_KDA_VERIFY_HOIST = _flag(
     "TRTLLM_K3LL_KDA_VERIFY_HOIST",
     -1,
