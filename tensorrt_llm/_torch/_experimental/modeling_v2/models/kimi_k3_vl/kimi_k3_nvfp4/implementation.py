@@ -1503,6 +1503,26 @@ def _snapshot_inplace_on(device: torch.device) -> bool:
     return _snapshot_inplace_by_default(index)
 
 
+# TRTLLM_K3LL_ATTN_RES_TAP's default (-1) turns it on only on these compute capabilities (measured on GB300 / SM103).
+# It acts only inside TRTLLM_K3LL_MOE_TAIL_COL's fused attn_res step, which runs on SM100 / SM103 only.
+ATTN_RES_TAP_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _tap_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ATTN_RES_TAP_CAPABILITIES
+
+
+def _tap_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_ATTN_RES_TAP`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``ATTN_RES_TAP_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_ATTN_RES_TAP)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _tap_by_default(index)
+
+
 def _attn_res_mxfp8_out(
     layer: nn.Module, rows: int, device: torch.device
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -1828,8 +1848,8 @@ class KimiLinearDecoderLayer(nn.Module):
             col_tap = None
             if (
                 capture is not None
-                and _flags.TRTLLM_K3LL_ATTN_RES_TAP
                 and _AUX_ATTN_RES_STREAM_ENABLED
+                and _tap_on(pending_moe_partial.lamport.flags.device)
             ):
                 col_tap = _spec_worker.capture_view(
                     capture[0], capture[1], pending_moe_partial.rows

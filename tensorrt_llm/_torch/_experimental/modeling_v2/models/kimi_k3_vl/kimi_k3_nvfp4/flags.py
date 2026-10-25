@@ -309,12 +309,14 @@ TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
 )
 TRTLLM_K3LL_ATTN_RES_TAP = _flag(
     "TRTLLM_K3LL_ATTN_RES_TAP",
-    0,
+    -1,
     "a drafter-tapped layer whose pre-attention step is TRTLLM_K3LL_MOE_TAIL_COL's K3AttnResFast: the kernel also "
     "stores the pre-norm attention-residual mixture into the layer's capture slot (spec_worker.capture_view), and "
     "the separate attn_res for the tap after the step is skipped. The target's outputs are unchanged; the tap is the "
     "fast kernel's mixture (the C++ MNNVL epilogue's arithmetic), which can differ from the separate attn_res by one "
-    "bf16 step in a few elements. Read at forward time. 0 (default): off",
+    "bf16 step in a few elements. Read at forward time. 1 on, 0 off, -1 (default): on on SM103 only "
+    "(implementation.ATTN_RES_TAP_CAPABILITIES; L1 bs2 -0.059 ms, GSM8K PASS, natural AL +0.014 in band: "
+    "moss-0402/0412/0424)",
 )
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
