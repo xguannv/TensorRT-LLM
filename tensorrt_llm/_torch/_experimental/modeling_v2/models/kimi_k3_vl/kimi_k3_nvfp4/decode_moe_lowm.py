@@ -173,9 +173,25 @@ def fc12_enabled() -> bool:
     return _fc12_on_by_default()
 
 
+#: Devices where ``TRTLLM_K3LL_MOE_SELF_SORT`` is on by default (-1): measured on GB300 (SM103) only.
+MOE_SELF_SORT_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _self_sort_on_by_default() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in MOE_SELF_SORT_CAPABILITIES
+    )
+
+
 def self_sort_enabled() -> bool:
-    """``TRTLLM_K3LL_MOE_SELF_SORT`` (read at forward time): 1 on, 0 off."""
-    return int(_flags.TRTLLM_K3LL_MOE_SELF_SORT) > 0
+    """``TRTLLM_K3LL_MOE_SELF_SORT`` (read at forward time): 1 on, 0 off, -1 (default) on where the device is in
+    ``MOE_SELF_SORT_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_SELF_SORT)
+    if value >= 0:
+        return value > 0
+    return _self_sort_on_by_default()
 
 
 def fc12_takes(state, rows: int) -> bool:

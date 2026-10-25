@@ -26,10 +26,32 @@ def _lowm_op():
     return nvfp4_lowm_op
 
 
-def test_switch_default_off_and_documented():
+def test_switch_default_sm103_and_documented():
     _, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_SELF_SORT"]
-    assert default == 0
-    assert "at most 16 tokens" in doc and "k3_moe_front" in doc and "moe_sort" in doc
+    assert default == -1
+    assert (
+        "at most 16 tokens" in doc
+        and "k3_moe_front" in doc
+        and "moe_sort" in doc
+        and "SM103" in doc
+    )
+
+
+@pytest.mark.parametrize("value,capability,on", [
+    (-1, (10, 3), True), (-1, (10, 0), False), (-1, (10, 7), False), (1, (10, 0), True), (0, (10, 3), False),
+])  # fmt: skip
+def test_default_follows_the_capability(monkeypatch, value, capability, on):
+    """-1 resolves by ``MOE_SELF_SORT_CAPABILITIES`` (SM103 only); 1 / 0 force it either way."""
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_SELF_SORT", value)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    dm._self_sort_on_by_default.cache_clear()
+    try:
+        assert dm.self_sort_enabled() is on
+    finally:
+        dm._self_sort_on_by_default.cache_clear()
 
 
 @pytest.mark.parametrize(
