@@ -382,15 +382,26 @@ class K3DecodeComm:
         out_norm: nn.Module,
         mxfp8_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tap: Optional[torch.Tensor] = None,
+        updated_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(normed, updated)``: ``updated = bf16(prefix_sum + moe)`` (``moe`` alone without ``prefix_sum``), ``moe``
         the rows the column publish left in the workspace, ``normed = out_norm(attn_res(block_residual...,
         updated))``, in one ``K3AttnResFastKernel`` launch (``takes_tail_col`` holds; ``moe_tail_col.attn_res``).
         ``mxfp8_out``: passed to the kernel (the MXFP8 form of ``normed``). ``tap``: a bf16 ``[T, H]`` view (a
-        speculative capture slot) the kernel also stores the pre-norm attention-residual mixture into."""
+        speculative capture slot) the kernel also stores the pre-norm attention-residual mixture into. ``updated_out``:
+        a bf16 ``[T, H]`` tensor the kernel stores ``updated`` into (the consumer's snapshot bank row), returned as
+        ``updated``."""
         prefix = self.oproj_push.zeros[: tail.rows] if prefix_sum is None else prefix_sum
         return _tail_col.attn_res(
-            tail, prefix, block_residual, res_proj, res_norm, out_norm, mxfp8_out=mxfp8_out, tap=tap
+            tail,
+            prefix,
+            block_residual,
+            res_proj,
+            res_norm,
+            out_norm,
+            mxfp8_out=mxfp8_out,
+            tap=tap,
+            updated_out=updated_out,
         )
 
     @staticmethod

@@ -1814,6 +1814,15 @@ class KimiLinearDecoderLayer(nn.Module):
                 col_tap = _spec_worker.capture_view(
                     capture[0], capture[1], pending_moe_partial.rows
                 )
+            # TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE: on a snapshot layer the kernel stores the updated prefix sum
+            # straight into the bank row it snapshots (as the sandwich tail does), so no copy follows the step.
+            if (
+                _flags.TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE
+                and self.layer_idx % self.attn_res_block_size == 0
+                and block_residual.shape[1] == pending_moe_partial.rows
+            ):
+                _census.count(f"dispatch:attn_res_snapshot_inplace:{_census.mode()}")
+                snapshot_row = block_residual[num_snapshots]
             hidden_states, prefix_sum = self.decode_comm.tail_col_attn_res(
                 pending_moe_partial,
                 prefix_sum,
@@ -1823,6 +1832,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.input_layernorm,
                 mxfp8_out=mxfp8_out,
                 tap=col_tap,
+                updated_out=snapshot_row,
             )
             if col_tap is not None:
                 _census.count(f"dispatch:attn_res_tap:{_census.mode()}")

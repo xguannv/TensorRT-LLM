@@ -293,6 +293,34 @@ def test_attn_res_passes_the_tap(monkeypatch):
     assert launched[0]["tap"] is slot and launched[1]["tap"] is None
 
 
+def test_snapshot_inplace_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE"]
+    assert default == 0 and "bank row" in doc and "Bitwise" in doc
+
+
+def test_attn_res_stores_updated_into_the_given_row(monkeypatch):
+    """``K3DecodeComm.tail_col_attn_res(updated_out=row)`` launches the kernel with ``row`` as its updated output and
+    returns ``row`` itself; without it a fresh tensor."""
+    col = _mod("moe_tail_col")
+    dc = _mod("decode_comm")
+    launched = []
+    kernel = SimpleNamespace(run_k3_attn_res=lambda *a, **kw: launched.append(a))
+    monkeypatch.setattr(col, "_attn_res", lambda: kernel)
+    flags_t = torch.zeros(9, dtype=torch.int32)
+    ws = SimpleNamespace(uc_local=0x1000, flags=flags_t)
+    tail = col.ColTail(ws, 16, frozenset((2, 3, 4)), frozenset())
+    comm = object.__new__(dc.K3DecodeComm)
+    comm.oproj_push = SimpleNamespace(lamport=ws, zeros=torch.zeros(64, 7168, dtype=torch.bfloat16))
+    w = SimpleNamespace(weight=torch.ones(7168, dtype=torch.bfloat16), eps=1e-6)
+    bank = torch.zeros(4, 16, 7168, dtype=torch.bfloat16)
+    _, updated = comm.tail_col_attn_res(tail, None, bank[:2], w, w, w, updated_out=bank[2])
+    assert (
+        updated.data_ptr() == bank[2].data_ptr() and launched[0][9].data_ptr() == bank[2].data_ptr()
+    )
+    _, fresh = comm.tail_col_attn_res(tail, None, bank[:2], w, w, w)
+    assert fresh.data_ptr() not in {bank[i].data_ptr() for i in range(4)}
+
+
 def test_published_value_rounds_once():
     """The publish's arithmetic on one element, emulated in torch: ``bf16(fp32(sum) + shared)`` is one rounding of
     the exact value of the bf16 operands, within the error bound the op matrix holds the kernel to."""
