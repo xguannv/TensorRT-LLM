@@ -62,11 +62,16 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .k3_fp8w_lowm_gemm import _bf16x2_inv_scale, _quant_bf16x8_to_e4m3, _ue8m0_of_amax
+from .k3_prof import HEADER as _PROF_HEADER
+from .k3_prof import SHAPES as _PROF_SHAPES
+from .k3_prof import SLOTS as _PROF_SLOTS
 from .k3_route_tail import _griddepcontrol_launch_dependents, _griddepcontrol_wait
 
 #: Row width (the latent) and values per thread (one 16-byte access).
 HIDDEN = 3584
 ELTS = 8
+_PROF_CTAS, _PROF_MARKS = _PROF_SHAPES["lar"]
+
 #: Cluster of CTAs per row and threads per CTA, as the C++ launcher picks them for 3584 BF16 values
 #: and ``M <= 38`` rows (adjustGridConfig): 4 x 112.
 CLUSTER = 4
@@ -863,6 +868,56 @@ def _atom_add_acq_rel_gpu(addr, value, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _globaltimer(*, loc=None, ip=None):
+    """%globaltimer (diagnostic marks, k3_prof.py)."""
+    return Int64(_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l,~{memory}", loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _globaltimer_after(value, *, loc=None, ip=None):
+    """%globaltimer read once ``value`` (an int32 register) is available: the read is predicated on it."""
+    return Int64(
+        _asm(
+            T.i64(),
+            [_iv(value, loc=loc, ip=ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0x7fc00001;\nmov.u64 $0, 0;\n"
+            "@p mov.u64 $0, %globaltimer;\n}",
+            "=&l,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _stg_u64(addr, value, *, loc=None, ip=None):
+    """st.global.u64 (diagnostic marks, k3_prof.py)."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+        "st.global.u64 [$0], $1;",
+        "l,l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _atom_add_u64(addr, value, *, loc=None, ip=None):
+    """atom.global.add.u64 (diagnostic marks, k3_prof.py); returns the previous value."""
+    return Int64(
+        _asm(
+            T.i64(),
+            [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+            "atom.global.add.u64 $0, [$1], $2;",
+            "=l,l,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 class K3LatentArRowKernel:
     """:class:`K3LatentArNormKernel` with one 512-thread CTA per row (same result, bit for bit).
 
@@ -891,6 +946,7 @@ class K3LatentArRowKernel:
         early_trigger: bool,
         norm: bool = True,
         mxfp8: bool = False,
+        prof_addr: int = 0,
     ):
         if world_size not in ROW_WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
@@ -902,6 +958,12 @@ class K3LatentArRowKernel:
         self.norm = norm
         self.mxfp8 = mxfp8
         self.rank_chunk = min(RANK_CHUNK, world_size)
+        # Diagnostic marks (k3_prof.py kind "lar"), 0: none. Thread 0 of each CTA keeps %globaltimer at
+        # 0 entry | 1 grid wait returned | 2 flags read | 3 own row pushed | 4 clear done |
+        # 5 first polling round done | 6 every slot arrived | 7 sum done | 8 norm barrier passed | 9 stored,
+        # and two values: 10 = arrival mask after the first round | polling rounds << 32,
+        # 11 = m | rank << 8 | dirty stages << 16 | row 0 rotated early << 24; all written at the end.
+        self.prof_addr = prof_addr
 
     @cute.jit
     def __call__(
@@ -971,11 +1033,17 @@ class K3LatentArRowKernel:
         half = (warp % WARPS) == WARPS - 1
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         warp_sum = storage.warp_sum.data_ptr().toint()
+        prof = self.prof_addr != 0
+        pt = [Int64(0)] * 10
+        if cutlass.const_expr(prof):
+            pt[0] = _globaltimer()
 
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
             if cutlass.const_expr(self.early_trigger):
                 _griddepcontrol_launch_dependents()
+        if cutlass.const_expr(prof):
+            pt[1] = _globaltimer()
 
         f0, f1, f2, f3 = _ld_v4(flags_addr)
         c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
@@ -983,6 +1051,8 @@ class K3LatentArRowKernel:
         cute.arch.sync_warp()
         if lane == 0:
             _red_add_release_gpu(counter, Int32(1))
+        if cutlass.const_expr(prof):
+            pt[2] = _globaltimer_after(f0 ^ c0)
         cur = Int64(f0)
         dirty = Int64(f1)
         buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
@@ -1002,6 +1072,8 @@ class K3LatentArRowKernel:
         if active:
             slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
             _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
+        if cutlass.const_expr(prof):
+            pt[3] = _globaltimer_after(sw[0] ^ sw[3])
 
         # Clear the previous call's buffer if the side-stream re-arm has not.
         n_threads = m * ROW_THREADS
@@ -1014,6 +1086,8 @@ class K3LatentArRowKernel:
                 n_vec = (clear[s] + 15) >> 4
                 for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
                     _st_sentinel_v4(base + Int64(p) * Int64(16))
+        if cutlass.const_expr(prof):
+            pt[4] = _globaltimer()
 
         # Poll every slot; the own slot comes from the registers. Bit r of `have`: slot r arrived.
         row_base = uc_addr + cur_off + Int64((row * ws * HIDDEN + col) * 2)
@@ -1030,6 +1104,10 @@ class K3LatentArRowKernel:
                 _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
                 << rr
             )
+        have_first = have
+        rounds = Int32(0)
+        if cutlass.const_expr(prof):
+            pt[5] = _globaltimer_after(have)
         # CTA 0 rotates the buffers once every warp of the grid has read the flags: here, while it
         # waits for the other ranks, if they all have by the end of its first polling round (as a
         # rule), else at the end.
@@ -1048,6 +1126,8 @@ class K3LatentArRowKernel:
                     rotated = Int32(1)
         full = Int32((1 << ws) - 1)
         while have != full:
+            if cutlass.const_expr(prof):
+                rounds = rounds + Int32(1)
             missing = have
             for rr in cutlass.range_constexpr(ws):
                 w = _ld_vol_v4_pred(
@@ -1065,6 +1145,8 @@ class K3LatentArRowKernel:
                     _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
                     << rr
                 )
+        if cutlass.const_expr(prof):
+            pt[6] = _globaltimer_after(have)
         # Sum in chunks of RANK_CHUNK ranks (each chunk from 0, chunks in rank order).
         acc = [Float32(0.0)] * ELTS
         for rb in cutlass.range_constexpr(0, ws, self.rank_chunk):
@@ -1077,6 +1159,8 @@ class K3LatentArRowKernel:
             for i in cutlass.range_constexpr(ELTS):
                 acc[i] = _fadd(acc[i], chunk[i])
         red = [_pack_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(4)]
+        if cutlass.const_expr(prof):
+            pt[7] = _globaltimer_after(red[0] ^ red[3])
 
         if cutlass.const_expr(self.use_pdl and not self.early_trigger):
             _griddepcontrol_launch_dependents()
@@ -1099,6 +1183,8 @@ class K3LatentArRowKernel:
             if lane == 0:
                 _sts_f32(warp_sum + warp * 4, v)
             _bar_sync()
+            if cutlass.const_expr(prof):
+                pt[8] = _globaltimer()
             # The cluster kernel's butterfly over a group's four warp sums (lanes past them add 0)
             # yields (w0 + w2) + (w1 + w3); every thread forms it for each group and adds the
             # group sums in order, so one CTA barrier is enough.
@@ -1134,6 +1220,26 @@ class K3LatentArRowKernel:
         else:
             if active:
                 _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3])
+        if cutlass.const_expr(prof):
+            pt[9] = _globaltimer()
+            if tidx == 0:
+                pslot = _atom_add_u64(
+                    Int64(self.prof_addr) + Int64(8) * Int64(row), Int64(1)
+                ) % Int64(_PROF_SLOTS)
+                pbase = Int64(self.prof_addr) + Int64(8) * (
+                    Int64(_PROF_HEADER)
+                    + (pslot * Int64(_PROF_CTAS) + Int64(row)) * Int64(_PROF_MARKS)
+                )
+                for k in cutlass.range_constexpr(10):
+                    _stg_u64(pbase + Int64(8 * k), pt[k])
+                _stg_u64(pbase + Int64(80), Int64(have_first) | (Int64(rounds) << Int64(32)))
+                _stg_u64(
+                    pbase + Int64(88),
+                    Int64(m)
+                    | (Int64(rank) << Int64(8))
+                    | (Int64(dirty_stages) << Int64(16))
+                    | (Int64(rotated) << Int64(24)),
+                )
 
         # CTA 0: rotate the buffers now if it could not after its first polling round.
         if tidx == 0:
@@ -1201,8 +1307,10 @@ class K3LamportClearKernel:
 
 
 @functools.cache
-def _compiled_row(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool, mxfp8: bool):
-    kernel = K3LatentArRowKernel(world_size, use_pdl, early_trigger, norm, mxfp8)
+def _compiled_row(
+    world_size: int, use_pdl: bool, early_trigger: bool, norm: bool, mxfp8: bool, prof_addr: int = 0
+):
+    kernel = K3LatentArRowKernel(world_size, use_pdl, early_trigger, norm, mxfp8, prof_addr)
     a = Int64(0)
     return cute.compile(
         kernel,
@@ -1274,7 +1382,12 @@ def run_k3_latent_ar_norm_row(
     every rank (``M x world_size x 3584 x 2`` bytes, as the one-shot sizing of the MNNVL
     workspace guarantees for the one-shot sizes; see :func:`can_run_row`)."""
     mxfp8 = mxfp8_out is not None
-    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8)(
+    from . import k3_prof
+
+    prof_addr = k3_prof.addr("lar")
+    if prof_addr:
+        k3_prof.touch()
+    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8, prof_addr)(
         Int64(x.data_ptr()),
         Int64(gamma.data_ptr()),
         Int64(out.data_ptr()),
