@@ -87,6 +87,7 @@ from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
+from .gen_spill import SPILL_ENV, GenSpillState, spill_wait_s
 from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -1120,6 +1121,29 @@ class PyExecutor:
                 and not self.is_benchmark_disagg):
             self._disagg_gen_prefetch_limit = prefetch_request_limit(
                 self.max_num_active_requests)
+        # TRTLLM_K3LL_GEN_SPILL_WAIT_S: spill seat of a disaggregated
+        # generation worker (see gen_spill.py). The scheduler decodes at most
+        # max_batch_size - 1 requests per step unless a request has waited for
+        # a seat long enough; the time is rank 0's, carried by the request
+        # broadcast. No attention DP or pipeline parallelism.
+        self._gen_spill = None
+        spill_wait = spill_wait_s()
+        if spill_wait is not None:
+            if (self.kv_cache_transceiver is not None
+                    and not self.enable_attention_dp and self.dist.pp_size == 1
+                    and not self.is_benchmark_disagg
+                    and isinstance(self.scheduler, KVCacheV2Scheduler)
+                    and self.max_batch_size >= 2):
+                self._gen_spill = GenSpillState(spill_wait, self.max_batch_size,
+                                                self.dist.rank)
+                self.request_broadcaster.carry_time = True
+                self.scheduler.gen_spill = self._gen_spill
+            elif self.dist.rank == 0:
+                logger.warning(
+                    f"{SPILL_ENV} is set but this worker is not a "
+                    "disaggregated worker on the KV cache manager V2 scheduler "
+                    "without attention DP / pipeline parallelism with "
+                    "max_batch_size >= 2; the spill seat stays off")
         # TRTLLM_DISAGG_GEN_PREFETCH_DEBUG=<n>: with prefetch on, rank 0 logs
         # the running count of transfer-complete requests deferred for want of
         # a sequence slot and, every n consecutive iterations that schedule
@@ -6671,6 +6695,11 @@ class PyExecutor:
                                    or self.dist.cp_size
                                    > 1) and self.dist.rank > 0:
             attach_py_objects_to_requests(new_requests, py_request_objects)
+
+        if self._gen_spill is not None:
+            self._gen_spill.now = self.request_broadcaster.last_time
+            self._gen_spill.stamp(item.id for item in new_requests
+                                  if item.request is not None)
 
         waiting_queue.add_requests(new_requests)
 

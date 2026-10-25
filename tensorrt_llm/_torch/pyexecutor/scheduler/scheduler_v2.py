@@ -264,6 +264,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
+        # Spill seat of a disaggregated generation worker (gen_spill.py); set by PyExecutor when
+        # TRTLLM_K3LL_GEN_SPILL_WAIT_S is on, else None (no change to scheduling).
+        self.gen_spill = None
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -404,6 +408,25 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
 
+        # Spill seat: which generation requests that have not decoded yet may start this step.
+        spill_admitted = None
+        spill_id = None
+        if self.gen_spill is not None:
+            running_ids, new_ids = [], []
+            for req in requests_list:
+                if (
+                    req.request_id in inflight_request_ids
+                    or not self.is_request_in_schedulable_state(req)
+                    or req.state_value
+                    in (self._context_init_state_value, self._encoder_init_state_value)
+                ):
+                    continue
+                if req.py_request_id in self.gen_spill.decoding:
+                    running_ids.append(req.py_request_id)
+                else:
+                    new_ids.append(req.py_request_id)
+            spill_admitted, spill_id, _ = self.gen_spill.plan(running_ids, new_ids)
+
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
         # any context request competes for resources.  This mirrors the
@@ -502,6 +525,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                     self._clear_request_runtime_state(req)
                     req_it += 1
                     continue
+                if (
+                    spill_admitted is not None
+                    and req.py_request_id not in self.gen_spill.decoding
+                    and req.py_request_id not in spill_admitted
+                ):
+                    req_it += 1
+                    continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
@@ -526,6 +556,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 budget.commit(req, tokens, peft_pages)
 
             req_it += 1
+
+        if self.gen_spill is not None:
+            self.gen_spill.record([r.py_request_id for r in scheduled_gen], spill_id)
+            self.gen_spill.forget({r.py_request_id for r in requests_list})
 
         # Requests whose pages were given up during this pass. A victim that is
         # itself a started context request still sits in pending_ctx, so

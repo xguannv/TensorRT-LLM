@@ -464,6 +464,10 @@ class RequestBroadcaster:
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
+        # carry_time (set by the executor; no pipeline parallelism): the request-count probe also carries rank 0's
+        # monotonic time, so every rank reads the same ``last_time`` (seconds) for this iteration.
+        self.carry_time = False
+        self.last_time = 0.0
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
@@ -471,7 +475,10 @@ class RequestBroadcaster:
         # Idle non-root ranks can wait here while rank 0 blocks in the
         # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
         with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count)
+            if self.carry_time:
+                request_count = self._broadcast_request_count_and_time(request_count)
+            else:
+                request_count = self._broadcast_request_count(request_count)
 
         if request_count == 0:
             return [], None
@@ -491,6 +498,16 @@ class RequestBroadcaster:
                 )
 
         return new_requests, py_request_objects
+
+    def _broadcast_request_count_and_time(self, request_count: int) -> int:
+        """Broadcast rank 0's request count and monotonic time (ns); sets ``last_time`` on every rank."""
+        now_ns = time.monotonic_ns() if self.dist.rank == 0 else 0
+        if self.dist.world_size == 1:
+            self.last_time = now_ns * 1e-9
+            return request_count
+        values = self.dist.broadcast_int64([request_count, now_ns], root=0)
+        self.last_time = int(values[1]) * 1e-9
+        return int(values[0])
 
     def _broadcast_request_count(self, request_count: int) -> int:
         """Broadcast rank 0's request count using the same PP route as requests."""
