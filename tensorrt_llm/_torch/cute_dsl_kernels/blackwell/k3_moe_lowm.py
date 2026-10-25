@@ -305,10 +305,12 @@ class _SelfSortMixin:
         self.self_sort = self_sort_local > 0
         self.ss_local = self_sort_local
         self.ss_offset = self_sort_offset
-        self.ss_words = max(1, -(-self_sort_local // 32))
-        self.ss_ids = n_tok * topk
-        self.ss_bits = n_tok * self.ss_words
-        self.ss_lt = SELF_SORT_LOCAL_TILES
+        # the scratch arrays are declared in every build (4 words each without self-sort)
+        self.ss_words = max(1, -(-self_sort_local // 32)) if self.self_sort else 4
+        self.ss_ids = n_tok * topk if self.self_sort else 4
+        self.ss_bits = n_tok * self.ss_words if self.self_sort else 4
+        self.ss_lt = SELF_SORT_LOCAL_TILES if self.self_sort else 4
+        self.ss_perm = self.ss_lt * n_tok if self.self_sort else 4
         words = (
             self.ss_ids + self.ss_bits + 2 * _align4(self.ss_words) + 4 + 2 * _align4(self.ss_lt)
             + self.ss_lt * n_tok
@@ -334,7 +336,7 @@ class _SelfSortMixin:
         """The scratch's per-local-tile views: ``(expert, rows, expanded index of row r at lt * n_tok + r)``."""
         expert = storage.sSsExpert.get_tensor(cute.make_layout(_align4(self.ss_lt)))
         count = storage.sSsCount.get_tensor(cute.make_layout(_align4(self.ss_lt)))
-        perm = storage.sSsPerm.get_tensor(cute.make_layout(self.ss_lt * self.n_tok))
+        perm = storage.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
         return expert, count, perm
 
     @cute.jit
@@ -667,17 +669,14 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             sAcc: cute.struct.Align[
                 cute.struct.MemRange[Float32, self.n_tok * self.sacc_row_floats], 16
             ]
-            if self.self_sort:
-                sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
-                sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
-                sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
-                sSsPrefix: cute.struct.Align[
-                    cute.struct.MemRange[Int32, _align4(self.ss_words)], 16
-                ]
-                sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
-                sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
-                sSsCount: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
-                sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_lt * self.n_tok], 16]
+            sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
+            sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
+            sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
+            sSsPrefix: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
+            sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+            sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+            sSsCount: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+            sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_perm], 16]
 
         self.shared_storage = SharedStorage
 
@@ -1670,17 +1669,14 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
             sScale: cute.struct.Align[
                 cute.struct.MemRange[Float32, self.num_epi_wg * self.n_tok], 16
             ]
-            if self.self_sort:
-                sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
-                sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
-                sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
-                sSsPrefix: cute.struct.Align[
-                    cute.struct.MemRange[Int32, _align4(self.ss_words)], 16
-                ]
-                sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
-                sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
-                sSsCount: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
-                sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_lt * self.n_tok], 16]
+            sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
+            sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
+            sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
+            sSsPrefix: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
+            sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+            sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+            sSsCount: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+            sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_perm], 16]
 
         self.shared_storage = SharedStorage
 
