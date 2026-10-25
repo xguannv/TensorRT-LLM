@@ -483,13 +483,14 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def two_self(token_scales):
+    def two_self(token_scales, mask=True):
         out_fc12.zero_()
         fc12.h.zero_()
         fc12.h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm_fc12(
             _bits(x_q), _bits(x_sf), *weights, out_fc12, ids, ids, ids, ids, ex.fc2_input_scale, token_scales,
             fc12.h, fc12.h_sf, top_k, GATE_CAP, LINEAR_CAP, topk_ids=ids, local_offset=offset,
+            self_sort_mask=mask,
         )  # fmt: skip
         torch.cuda.synchronize()
         return out_fc12.clone()
@@ -502,6 +503,14 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
         assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), (
             f"self-sort FC2 slot {slot}"
         )
+        # the per-(tile, token) scan variant (TRTLLM_K3LL_MOE_SELF_SORT_MASK=0): the same metadata, the same bits
+        h_mask = fc12.h.clone()
+        loops = two_self(one_hot, mask=False)
+        assert torch.equal(ref.view(torch.int16), loops.view(torch.int16)), (
+            f"self-sort (scan) FC2 slot {slot}"
+        )
+        assert torch.equal(h_mask, fc12.h), f"self-sort FC1 output: scan vs masks, slot {slot}"
+        new = two_self(one_hot)
         if slot == 0:
             # Same tiles as moe_sort, the rows of a tile in token order (moe_sort's are in any order).
             assert torch.equal(h_dyn[rows], fc12.h[self_rows]), "self-sort: FC1 output rows differ"

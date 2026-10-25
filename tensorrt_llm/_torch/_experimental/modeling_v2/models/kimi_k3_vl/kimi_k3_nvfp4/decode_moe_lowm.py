@@ -203,6 +203,11 @@ def self_sort_fc12_enabled() -> bool:
     return _self_sort_on_by_default()
 
 
+def self_sort_mask_enabled() -> bool:
+    """``TRTLLM_K3LL_MOE_SELF_SORT_MASK`` (read at forward time): FC1 / FC2's sort variant."""
+    return int(_flags.TRTLLM_K3LL_MOE_SELF_SORT_MASK) > 0
+
+
 def fc12_takes(state, rows: int) -> bool:
     """Whether a wide step of ``rows`` tokens runs the routed experts as FC1 + FC2: ``TRTLLM_K3LL_MOE_LOWM_FC12``
     (read at forward time) is set, ``rows`` is 17 to 32 (``nvfp4_lowm_op.FC12_MIN_TOKENS`` / ``FC12_MAX_TOKENS``;
@@ -500,11 +505,13 @@ class K3DecodeMoeNvfp4Layer:
                 logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
                 latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
                 # both sorts (moe_sort, and FC1 / FC2's own, TRTLLM_K3LL_MOE_SELF_SORT_FC12)
-                for self_sort in (False, True):
+                # and both variants of FC1 / FC2's (TRTLLM_K3LL_MOE_SELF_SORT_MASK)
+                for self_sort, mask in ((False, None), (True, False), (True, True)):
                     step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
                     self._routed(
-                        *self._route_quant(moe, logits, latent), fc12=step, self_sort=self_sort
-                    )
+                        *self._route_quant(moe, logits, latent), fc12=step, self_sort=self_sort,
+                        self_sort_mask=mask,
+                    )  # fmt: skip
             if self.state.head32 is not None:
                 # the 32-token front without its sort (the FC1 / FC2 self-sort's front)
                 rows = FRONT16_TOKENS + 1
@@ -566,18 +573,25 @@ class K3DecodeMoeNvfp4Layer:
         x_sf,
         fc12: Optional[Fc12Step] = None,
         self_sort: Optional[bool] = None,
+        self_sort_mask: Optional[bool] = None,
     ) -> torch.Tensor:
         """``moe_sort`` and the routed experts (the expert kernel's own sort where `self_sort_takes`); ``fc12``: as
-        two kernels into ``fc12.out`` (`Fc12Step`)."""
+        two kernels into ``fc12.out`` (`Fc12Step`); ``self_sort_mask``: their sort variant (default
+        `self_sort_mask_enabled`)."""
         if fc12 is not None:
             self_sort = self.self_sort_takes(ids.shape[0], self_sort, fc12=True)
+            if self_sort_mask is None:
+                self_sort_mask = self_sort_mask_enabled()
             if self_sort:
                 from . import census as _census
 
                 _census.count(f"dispatch:moe_self_sort_fc12:{_census.mode()}")
+                if self_sort_mask:
+                    _census.count(f"dispatch:moe_self_sort_mask:{_census.mode()}")
             return nvfp4_lowm_op.run(
                 x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
                 self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(), self_sort=self_sort,
+                self_sort_mask=self_sort_mask,
             )  # fmt: skip
         self_sort = self.self_sort_takes(ids.shape[0], self_sort)
         if self_sort:

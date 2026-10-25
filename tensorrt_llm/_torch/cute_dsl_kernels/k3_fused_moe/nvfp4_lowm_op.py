@@ -317,6 +317,7 @@ def k3_moe_nvfp4_lowm_fc12(
     situ_linear_beta: float,
     topk_ids: Optional[torch.Tensor] = None,
     local_offset: int = 0,
+    self_sort_mask: bool = True,
 ) -> None:
     """`k3_moe_nvfp4_lowm`'s routed partial as two kernels: ``K3MoeFc1LowMKernel`` into ``h`` / ``h_sf`` (required:
     `new_fc12`), then ``K3MoeFc2LowMKernel`` adding into ``output``, which must be zero (this op does not zero it).
@@ -326,7 +327,8 @@ def k3_moe_nvfp4_lowm_fc12(
     loads FC1's output, so also computes and adds, after it; FC2 triggers its dependents after all of its warps are
     done. ``topk_ids`` int32 ``[M, top_k]``: both kernels sort the routing over the local experts
     ``[local_offset, local_offset + E)`` themselves, per CTA (`run`'s ``self_sort``; the front's tiles and rows), the
-    four sort arguments are not read and ``token_final_scales`` may be bf16."""
+    four sort arguments are not read and ``token_final_scales`` may be bf16. ``self_sort_mask``: the kernels' sort
+    variant (``K3MoeFc1LowMKernel(self_sort_mask=...)``; the same metadata)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -399,7 +401,7 @@ def k3_moe_nvfp4_lowm_fc12(
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     base = (_device_index(device), n_tok, n1, k1, top_k, ctas, use_pdl)
     if self_sort:
-        base = (*base, "self_sort", num_local, int(local_offset))
+        base = (*base, "self_sort", num_local, int(local_offset), bool(self_sort_mask))
     key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
     key2 = ("fc2", *base, scales_bf16)
     fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
@@ -414,7 +416,7 @@ def k3_moe_nvfp4_lowm_fc12(
                 kernel = lowm.K3MoeFc1LowMKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), use_pdl=use_pdl,
                     late_trigger=False, self_sort_local=num_local if self_sort else 0,
-                    self_sort_offset=int(local_offset) if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0, self_sort_mask=bool(self_sort_mask),
                 )  # fmt: skip
                 fc1 = _compiled[key1] = cute.compile(
                     kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream, *tail
@@ -424,7 +426,7 @@ def k3_moe_nvfp4_lowm_fc12(
                 kernel = lowm.K3MoeFc2LowMKernel(
                     n_tok, k1, k2, top_k, use_pdl=use_pdl, early_weights=True,
                     self_sort_local=num_local if self_sort else 0,
-                    self_sort_offset=int(local_offset) if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0, self_sort_mask=bool(self_sort_mask),
                 )  # fmt: skip
                 fc2 = _compiled[key2] = cute.compile(
                     kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream, *tail
@@ -436,7 +438,7 @@ def k3_moe_nvfp4_lowm_fc12(
 @k3_moe_nvfp4_lowm_fc12.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, h, h_sf, top_k,
-      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0):  # fmt: skip
+      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0, self_sort_mask=True):  # fmt: skip
     return None
 
 
@@ -470,12 +472,13 @@ def run(
     num_ctas: int = 0,
     fc12: Optional[Fc12] = None,
     self_sort: bool = False,
+    self_sort_mask: bool = True,
 ) -> torch.Tensor:
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
     ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``fc12``: `run_sorted`'s. ``self_sort``
     (where `self_sort_takes` holds, with ``fc12`` its ``fc12`` form): no ``moe_sort``; the expert kernel(s) sort the
-    ids themselves (the same tiles and rows)."""
+    ids themselves (the same tiles and rows); ``self_sort_mask``: FC1 / FC2's sort variant."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     if self_sort and fc12 is not None and self_sort_takes(num_tokens, w1.shape[0], fc12=True):
@@ -494,7 +497,7 @@ def run(
         torch.ops.trtllm.k3_moe_nvfp4_lowm_fc12(
             x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, ids, ids, ids, ids, fc2_input_scale, scales,
             fc12.h, fc12.h_sf, top_k, float(situ_beta), float(situ_linear_beta), topk_ids=ids,
-            local_offset=int(local_expert_offset),
+            local_offset=int(local_expert_offset), self_sort_mask=bool(self_sort_mask),
         )  # fmt: skip
         return out
     if self_sort and fc12 is None and self_sort_takes(num_tokens, w1.shape[0]):

@@ -197,3 +197,15 @@ def test_fc12_front_sorts_only_where_the_kernels_do_not(monkeypatch, small, fc12
     assert fronts == [not kernels_sort]
     assert runs == ([("run", True)] if kernels_sort else [("sorted",)])
     assert layer.self_sort_takes(rows, fc12=True) is kernels_sort
+
+
+def test_mask_switch_documented_and_read_at_forward_time(monkeypatch):
+    """TRTLLM_K3LL_MOE_SELF_SORT_MASK: off by default, documented, read from the flags module at call time."""
+    flags = _mod("flags")
+    _, default, doc = flags.flags()["TRTLLM_K3LL_MOE_SELF_SORT_MASK"]
+    assert default == 0
+    assert "TRTLLM_K3LL_MOE_SELF_SORT_FC12" in doc and "same metadata" in doc
+    lowm = _mod("decode_moe_lowm")
+    for value, on in ((0, False), (1, True)):
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_SELF_SORT_MASK", value)
+        assert lowm.self_sort_mask_enabled() is on
