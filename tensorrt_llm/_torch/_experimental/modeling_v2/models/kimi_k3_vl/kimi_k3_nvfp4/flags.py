@@ -559,6 +559,12 @@ TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS = _flag(
     "accepted drafts, so the rows' load round trip overlaps them (bitwise; read at forward time). 1 on, 0 off, -1 "
     "(default) on SM103 only (verify.KDA_VERIFY_EARLY_ROWS_CAPABILITIES)",
 )
+TRTLLM_K3LL_SANDWICH_PROF = _flag(
+    "TRTLLM_K3LL_SANDWICH_PROF",
+    0,
+    "diagnostic prototype only: k3_sandwich_tail writes in-situ (globaltimer, clock64) marks per CTA, dumped to "
+    "$TRTLLM_K3LL_SANDWICH_PROF_DIR (cute_dsl_kernels/k3_sandwich/prof.py; read at every call). 0 off (default), 1 on",
+)
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
     1,

@@ -190,6 +190,29 @@ def _clock64(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def _read_u64(reg, *, loc=None, ip=None):
+    """%globaltimer or %clock64 (diagnostic profile only)."""
+    return cutlass.Int64(
+        _llvm.inline_asm(
+            _T.i64(), [], f"mov.u64 $0, %{reg};", "=l,~{memory}", has_side_effects=True,
+            is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+#: diagnostic profile (prof.py, TRTLLM_K3LL_SANDWICH_PROF=1): (globaltimer, clock64) pairs per CTA at these marks:
+#: 0 entry | 1 grid wait returned (epilogue) | 2 MMA done | 3 latent RMS scales in (tail) | 4 pushed + dependents
+#: launched | 5 snapshot statistics in | 6 poll done (every rank's row landed) | 7 slots emptied | 8 updated
+#: statistics in | 9 output sums of squares in | 10 normed stored | 11 unused
+PROF_MARKS = 12
+
+
+def _pmark(prof, cta, k):
+    prof.store(_read_u64("globaltimer"), idx=(cta * PROF_MARKS + k) * 2)
+    prof.store(_read_u64("clock64"), idx=(cta * PROF_MARKS + k) * 2 + 1)
+
+
+@dsl_user_op
 def _pack_bf16x2(hi, lo, *, loc=None, ip=None):
     """(bf16(hi) << 16) | bf16(lo), round to nearest even."""
     return cutlass.Int32(
@@ -498,6 +521,7 @@ def sandwich_role(
     x_slab: cutlass.Array,  # int32 words [SLAB_BUFS, MAX_TOKENS, 3584]: the published normed rows (publish)
     lat_flags: cutlass.Array,  # int32 [LAT_FLAG_WORDS] (x_src 2): the tail's call count and the latent scale slab
     tap: cutlass.Array,  # int32 words of bf16 rows (tap_out), tap_stride words apart: the capture layer's tap, out
+    prof: cutlass.Array,  # PROFILE: int64 [56 x PROF_MARKS x 2] marks (diagnostic)
     smem,  # shared-memory pointer, 1024-byte aligned, at least smem_bytes(k_in, rms_cols) bytes (SmemAllocator)
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
@@ -539,6 +563,7 @@ def sandwich_role(
     ],  # 2: accumulate the even and the odd k-tiles apart, then (0 + even) + odd
     cta_base: cutlass.Constexpr[int],  # grid index of the role's first CTA (a multiple of CLUSTER)
     act_hook: cutlass.Constexpr,  # None: the activation by TMA after the grid wait; else see below
+    PROFILE: cutlass.Constexpr[int] = 0,  # diagnostic marks into ``prof``
 ):
     """One CTA of the sandwich: grid indices cta_base .. cta_base + 55 (8 clusters of 7, 256 threads). A kernel may
     run other roles in other CTAs (their own clusters) as long as they never touch ``ws_flags`` or the all-reduce
@@ -617,6 +642,9 @@ def sandwich_role(
     tma_ptr_w = tma_desc_w.get_ptr()
     tma_ptr_x = tma_desc_x.get_ptr()
     m_offset = bx * cutlass.Int32(CTA_M)
+    if cutlass.const_expr(PROFILE):
+        if tx == cutlass.Int32(EPI_THREADS):
+            _pmark(prof, bx, 0)
 
     tma_ptr_x2 = tma_desc_x2.get_ptr()
     # Views into the role's shared memory (_role_layout order). One-shot mailboxes: the cluster's statistics
@@ -1055,6 +1083,9 @@ def sandwich_role(
         # The flag word, the prefix and the snapshots are written upstream (x_src 1: see the docstring).
         if cutlass.const_expr(x_src == 0):
             prims.griddepcontrol(prims.GridDepAction.WAIT)
+        if cutlass.const_expr(PROFILE):
+            if tid == cutlass.Int32(0):
+                _pmark(prof, bx, 1)
         if cutlass.const_expr(swiglu):
             swiglu_share(smem_b, smem_g, act_full, b_ready, tid, crank)
         # This CTA's call count. The previous call of this CTA has completed (every kernel between two calls waits
@@ -1339,6 +1370,9 @@ def sandwich_role(
         while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
             pass
         cute.arch.sync_warp()
+        if cutlass.const_expr(PROFILE):
+            if tid == cutlass.Int32(0):
+                _pmark(prof, bx, 2)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         acc = prims.tcgen05_ld(
             "32x32b", cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Float32), num=MMA_N
@@ -1388,6 +1422,9 @@ def sandwich_role(
             while not _test_wait_cluster(mb_rms.data_ptr(), 0):
                 pass
             cute.arch.sync_warp()
+            if cutlass.const_expr(PROFILE):
+                if tid == cutlass.Int32(0):
+                    _pmark(prof, bx, 3)
             # Every token's scale at once (rows past the last token are scaled but never pushed).
             for sv in cutlass.range_constexpr(MMA_N // 4):
                 scale_vec = row_scale.load(idx=sv * 4, vector_size=4, alignment=16)
@@ -1440,6 +1477,9 @@ def sandwich_role(
             prims.tcgen05_dealloc(tmem_ptr, TMEM_COLS)
         if tid == 0:
             ws_flags.store(calls + cutlass.Int32(1), idx=bx, is_volatile=True)
+        if cutlass.const_expr(PROFILE):
+            if tid == cutlass.Int32(0):
+                _pmark(prof, bx, 4)
 
         # ---- Phase 2: reduce token `token` over the ranks, then the attn_res + RMSNorm epilogue.
         cute.arch.sync_warp()
@@ -1494,6 +1534,9 @@ def sandwich_role(
                 while not _test_wait_cluster(mb_snap.data_ptr(), 0):
                     pass
                 cute.arch.sync_warp()
+                if cutlass.const_expr(PROFILE):
+                    if tid == cutlass.Int32(0):
+                        _pmark(prof, bx, 5)
                 snap_lane = cutlass.Int32(
                     cutlass.select_(lane < cutlass.Int32(MAX_SNAPSHOTS), lane, cutlass.Int32(0))
                 )
@@ -1557,6 +1600,9 @@ def sandwich_role(
                 a0, a1, a2, a3, a4, a5, a6, a7 = total
                 pending = dirty
             cute.arch.sync_warp()
+            if cutlass.const_expr(PROFILE):
+                if tid == cutlass.Int32(0):
+                    _pmark(prof, bx, 6)
             acc_sum = [a0, a1, a2, a3, a4, a5, a6, a7]
 
             # updated = bf16(prefix + bf16(sum)) (bf16(sum) without the prefix).
@@ -1726,6 +1772,9 @@ def sandwich_role(
                         idx=slot0 + cutlass.Int32(r * WORDS_PER_ROW),
                         alignment=16,
                     )
+                if cutlass.const_expr(PROFILE):
+                    if tid == cutlass.Int32(0):
+                        _pmark(prof, bx, 7)
                 # Candidate n < num_cand - 1 is snapshot n, candidate num_cand - 1 is updated; later ones are masked.
                 cand = []
                 for n in cutlass.range_constexpr(MAX_CANDIDATES):
@@ -1750,6 +1799,9 @@ def sandwich_role(
                 while not _test_wait_cluster(mb_upd.data_ptr(), 0):
                     pass
                 cute.arch.sync_warp()
+                if cutlass.const_expr(PROFILE):
+                    if tid == cutlass.Int32(0):
+                        _pmark(prof, bx, 8)
                 box_u = []
                 for r in cutlass.range_constexpr(CLUSTER):
                     for hv in cutlass.range_constexpr(EPI_WARPS * 2 // 4):
@@ -1836,6 +1888,9 @@ def sandwich_role(
                 while not _test_wait_cluster(mb_sq.data_ptr(), 0):
                     pass
                 cute.arch.sync_warp()
+                if cutlass.const_expr(PROFILE):
+                    if tid == cutlass.Int32(0):
+                        _pmark(prof, bx, 9)
                 box_q = [
                     box_sq.load(idx=r * EPI_WARPS, vector_size=EPI_WARPS, alignment=16)
                     for r in range(CLUSTER)
@@ -1862,6 +1917,9 @@ def sandwich_role(
                     idx=row_word,
                     alignment=16,
                 )
+                if cutlass.const_expr(PROFILE):
+                    if tid == cutlass.Int32(0):
+                        _pmark(prof, bx, 10)
                 if cutlass.const_expr(publish):
                     # The same 16 bytes into the slab, where the next kernel's poll takes them as ready.
                     x_slab.store(
@@ -1908,6 +1966,7 @@ def k3_sandwich_kernel(
     x_slab: cutlass.Array,
     lat_flags: cutlass.Array,
     tap: cutlass.Array,
+    prof: cutlass.Array,
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
     num_cand: cutlass.Int32,
@@ -1929,14 +1988,15 @@ def k3_sandwich_kernel(
     tap_out: cutlass.Constexpr[int],
     swiglu: cutlass.Constexpr[int],
     k_split: cutlass.Constexpr[int],
+    PROFILE: cutlass.Constexpr[int],
 ):
     """The sandwich alone: 56 CTAs, each running ``sandwich_role`` on its own shared memory (arguments as there)."""
     smem = SmemAllocator().allocate(smem_bytes(k_in, rms_cols, swiglu), byte_alignment=1024)
     sandwich_role(
         tma_desc_w, tma_desc_x, tma_desc_x2, rms_src, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
-        updated, normed, x_slab, lat_flags, tap, smem, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
+        updated, normed, x_slab, lat_flags, tap, prof, smem, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
         x_col0, lat_eps, slab_buf, x_buf, tap_stride, world, k_in, x_tiles, rms_cols, publish, x_src, plain, tap_out,
-        swiglu, k_split, 0, None,
+        swiglu, k_split, 0, None, PROFILE,
     )  # fmt: skip
 
 
@@ -2005,9 +2065,9 @@ def k3_sandwich_oproj(
     tma_desc_x = activation_tensor_map(x, K_IN, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, src_slab, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
-        updated, normed, x_slab, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW), world, K_IN,
-        MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1,
+        updated, normed, x_slab, ws_flags, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix, rms_eps,
+        out_eps, cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW), world, K_IN,
+        MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1, 0,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2032,6 +2092,7 @@ def k3_sandwich_tail(
     x_slab: cute.Tensor,
     lat_flags: cute.Tensor,  # x_src 2: int32 [LAT_FLAG_WORDS] (the call count and the scale slab)
     tap: cute.Tensor,  # tap_out: int32 words of the bf16 tap rows [M, 7168], tap_stride words apart
+    prof: cute.Tensor,  # PROFILE: int64 [56 x PROF_MARKS x 2] (diagnostic)
     num_tokens: cutlass.Int32,
     rank: cutlass.Int32,
     num_cand: cutlass.Int32,
@@ -2048,6 +2109,7 @@ def k3_sandwich_tail(
     x_src: cutlass.Constexpr[int],
     tap_out: cutlass.Constexpr[int],  # 1: the pre-norm mixture into ``tap``; 2: updated
     use_pdl: cutlass.Constexpr[bool],
+    PROFILE: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ) -> None:
     """The pre-attention sandwich: phase 1 is the row-parallel MoE tail (x_src 1: ``latent_words`` is the reduced
@@ -2059,9 +2121,9 @@ def k3_sandwich_tail(
     tma_desc_x2 = activation_tensor_map(act, TAIL_ACT, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x2, latent_words, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w,
-        out_w, updated, normed, x_slab, lat_flags, tap, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
-        lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT, publish, x_src, 0,
-        tap_out, 0, 1,
+        out_w, updated, normed, x_slab, lat_flags, tap, prof, num_tokens, rank, num_cand, add_prefix, rms_eps,
+        out_eps, lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT, publish,
+        x_src, 0, tap_out, 0, 1, PROFILE,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2099,9 +2161,10 @@ def k3_sandwich_plain(
     tma_desc_x = activation_tensor_map(x, 2 * k_in if swiglu else k_in, num_tokens)
     k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, ws_flags, ws_uc, ws_mc, ws_flags, residual, residual, norm_w, norm_w,
-        norm_w, updated, normed, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1), cutlass.Int32(1),
-        eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0), cutlass.Int32(0),
-        cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu, 2 if swiglu else 1,
+        norm_w, updated, normed, ws_flags, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1),
+        cutlass.Int32(1), eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0),
+        cutlass.Int32(0), cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu,
+        2 if swiglu else 1, 0,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip

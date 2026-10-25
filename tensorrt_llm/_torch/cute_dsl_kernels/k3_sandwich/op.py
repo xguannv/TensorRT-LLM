@@ -557,16 +557,31 @@ def k3_sandwich_tail(
         _arg(lat_flags if fold else ws_flags),
         _arg(_tap_words(tap) if tap is not None else ws_flags),
     )
+    from . import prof as _prof
+
+    profile = int(_prof.enabled())
+    args = args + (
+        _arg(_prof.arg(latent.device, num_tokens, kernel.NUM_CTAS * kernel.PROF_MARKS * 2)),
+    )
+    if profile:
+        try:
+            from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+                census,
+            )
+        except ImportError:  # pragma: no cover
+            census = None
+        if census is not None:
+            census.count(f"dispatch:sandwich_prof:{census.mode()}")
     stream = cuda_driver.CUstream(torch.cuda.current_stream(latent.device).cuda_stream)
     use_pdl = _use_pdl()
     tap_out = 0 if tap is None else 2 if tap_updated else 1
     tap_stride = tap.stride(0) // 2 if tap is not None else kernel.WORDS_PER_ROW
-    key = ("tail", world, publish, x_src, tap_out, use_pdl)
+    key = ("tail", world, publish, x_src, tap_out, use_pdl, profile)
     runtime = (
         num_tokens, rank, num_snapshots + 1, int(add_prefix), float(rms_eps), float(output_rms_eps), lo,
         float(lat_eps), buf, sbuf, tap_stride,
     )  # fmt: skip
-    consts = (world, publish, x_src, tap_out, use_pdl)
+    consts = (world, publish, x_src, tap_out, use_pdl, profile)
     _compile_and_run(
         kernel.k3_sandwich_tail, key, args, runtime, consts, stream, "k3_sandwich_tail"
     )
