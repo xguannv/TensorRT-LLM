@@ -163,6 +163,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         use_pdl: bool = False,
         var_split_bounded: bool = False,
         var_split_direct: bool = False,
+        var_split_skip_empty: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -238,6 +239,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
         self.is_var_q = is_var_q
+        # With is_var_split_kv on the non-persistent grid: a cluster whose split index is at or past its request's
+        # count (no keys; the grid is sized for the largest count) takes no warp role and exits after the PDL wait.
+        self.var_split_skip_empty = bool(var_split_skip_empty
+                                         and is_var_split_kv
+                                         and not is_persistent)
         if not 1 <= reducer_max_splits <= MAX_SPLITS:
             raise ValueError(
                 f"reducer_max_splits must be in [1, {MAX_SPLITS}], "
@@ -307,6 +313,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.load_tma_k_warp_id = 9
         self.load_tma_v_warp_id = 10
         self.mma_pv_warp_id = 11
+        #: No warp has this index (``var_split_skip_empty``: an empty cluster's warps take no role).
+        self.no_role_warp_id = 32
         self.second_compute_warp_ids = (12, 13, 14, 15)
         self.num_total_compute_warps = self.num_compute_warps + len(
             self.second_compute_warp_ids)
@@ -1539,6 +1547,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.split_prewait):
                 cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.var_split_skip_empty):
+            # Both CTAs of the 2-CTA cluster share blockIdx.y/z, so they read the same count and decide alike;
+            # read after the PDL wait (the count kernel's output is visible). Past the count: no warp role below
+            # (no TMEM allocation, no pipeline traffic, no output: the reduction reads only the first ``count``
+            # splits), so the CTA exits at once.
+            first = create_mla_static_tile_scheduler(
+                tile_sched_params, cute.arch.block_idx(),
+                cute.arch.grid_dim()).initial_work_tile_info().tile_idx
+            warp_idx = cute.arch.make_warp_uniform(
+                cutlass.select_(first[3] < block_split_kvs[first[2]], warp_idx,
+                                cutlass.Int32(self.no_role_warp_id)))
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors

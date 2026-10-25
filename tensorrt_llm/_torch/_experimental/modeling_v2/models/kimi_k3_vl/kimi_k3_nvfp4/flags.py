@@ -382,6 +382,15 @@ TRTLLM_K3LL_MLA_VAR_SPLIT = _flag(
     "takes the counts, and only for 4 or more requests; elsewhere (SM107, the V-up off, or 1-3 requests) the split "
     "read keeps the static split and no counts are computed",
 )
+TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY = _flag(
+    "TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY",
+    -1,
+    "with per-request split-KV counts (TRTLLM_K3LL_MLA_VAR_SPLIT) on the fused V-up path: the split kernel's "
+    "clusters past their request's count (the grid is sized for the largest count) take no warp role and exit "
+    "right after the PDL wait instead of allocating tensor memory and walking an empty tile (bitwise: they write "
+    "nothing the reduction reads; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
+    "(mla_v_up.MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES)",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,

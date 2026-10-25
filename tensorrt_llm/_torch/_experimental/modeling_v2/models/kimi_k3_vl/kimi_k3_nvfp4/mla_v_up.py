@@ -24,6 +24,7 @@ own partials, and the all-to-all carries 128 values per head instead of the 512-
   NCCL exchange, ``TRTLLM_K3LL_HELIX_A2A_FUSED=0``).
 """
 
+import functools
 from typing import List, Optional
 
 import torch
@@ -38,6 +39,29 @@ QK_ROPE_DIM = 64
 V_HEAD_DIM = 128
 
 _compiled: dict = {}
+
+
+#: ``TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY``'s default (-1) applies on these compute capabilities (measured on
+#: GB300 / SM103).
+MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _skip_empty_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES
+
+
+def var_split_skip_empty(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY`` (1 on, 0 off, -1 on where ``device`` is in
+    ``MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES``): with per-request split counts, the split kernel's clusters past their
+    request's count exit right after the PDL wait."""
+    from . import flags
+
+    value = int(flags.TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _skip_empty_by_default(index)
 
 
 def max_fused_rows() -> int:
@@ -127,6 +151,9 @@ def _run_fused(
     var_split = block_split_kvs is not None
     if var_split:
         key = key + ("var_split",)
+    skip_empty = var_split and var_split_skip_empty(cache_seqs.device)
+    if skip_empty:
+        key = key + ("skip_empty",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -152,6 +179,7 @@ def _run_fused(
             emit_softmax_stats=True,
             use_pdl=runner.use_pdl,
             var_split_bounded=var_split,
+            var_split_skip_empty=skip_empty,
             v_rows=v_rows,
             prewait=prewait,
         )

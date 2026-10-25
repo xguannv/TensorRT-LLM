@@ -419,7 +419,7 @@ def split_read_attention_v_up(
         v_out: ``[batch * q_len, heads, 128]`` bf16, the projected partial of every head (written).
     """
     from . import census as _census
-    from . import mla_v_up  # noqa: F401  (registers the op)
+    from . import mla_v_up  # registers the op
 
     if _flags.TRTLLM_K3LL_MLA_DECODE_PDL:
         _census.count(f"mla_decode_pdl:{_census.mode()}")
@@ -428,6 +428,10 @@ def split_read_attention_v_up(
         _census.count(f"mla_prewait_v_up:{_census.mode()}")
     if plan.block_splits is not None and plan.var_split > 1:
         _census.count(f"mla_var_split:{_census.mode()}")
+        if q.shape[0] * q.shape[1] <= mla_v_up.max_fused_rows() and mla_v_up.var_split_skip_empty(
+            q.device
+        ):
+            _census.count(f"dispatch:mla_var_split_skip_empty:{_census.mode()}")
     torch.ops.trtllm.k3_mla_decode_fp8_v_up(
         q,
         kv_pages,
