@@ -130,8 +130,9 @@ MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES = ((10, 3),)
 #: (heads, q_len) -> the 128-row split units the allocated workspace holds beyond the static split's bound
 #: (`workspace_bytes` records them; `_var_split_envelope` widens only up to them).
 _WIDE_WS_UNITS: dict = {}
-#: The widened workspace holds at most this many times the static split's units (MTP7 at bs4 needs 216 / 148-152;
-#: one-token queries would ask for 1024 units, ~270 MB per rank): above it the grid widens only as far as it fits.
+#: The widened workspace holds at most this many times the static split's units (`_static_units`, queried at run
+#: time: 148 or 152 on GB300, so a cap of 222 or 228). MTP7 needs 216 units; one-token queries would ask for 1024
+#: (876 units, ~230 MB per rank beyond the static ones): above the cap the grid widens only as far as it fits.
 _WIDE_WS_MAX_FACTOR = 1.5
 
 
@@ -529,10 +530,13 @@ def _make_helix_plan_fused(
     return SplitReadPlan(pages.t(), seqs, bounds, empty)
 
 
-def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:
-    """The split read's workspace: the runner's (LSE + the static split's bound), and with
-    ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS`` the split units of `_flat_units` for every query length up to ``q_len``,
-    at most ``_WIDE_WS_MAX_FACTOR`` x the static split's (recorded for `_var_split_envelope`)."""
+def workspace_bytes(num_heads: int, q_len: int, max_batch: int, var_split_v_up: bool = True) -> int:
+    """The split read's workspace: the runner's (LSE + the static split's bound), and where
+    ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS`` engages (``var_split_v_up``: the caller's split read takes per-request
+    split counts, i.e. the Helix V-up split read with ``TRTLLM_K3LL_MLA_VAR_SPLIT``; FLAT on) the split units of
+    `_flat_units` for every query length up to ``q_len``, at most ``_WIDE_WS_MAX_FACTOR`` x the static split's
+    (recorded for `_var_split_envelope`). Elsewhere nothing is added, except the units already recorded for
+    ``num_heads`` in this process: `_var_split_envelope` widens to them, so no workspace holds fewer."""
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
@@ -540,17 +544,20 @@ def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:
     nbytes = CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
         num_heads, q_len, KV_LORA_RANK, max_batch, cutlass.Float32
     )
-    if var_split_wide_ws():
-        static = _static_units(num_heads)
+    wide = var_split_v_up and var_split_wide_ws() and _flat_on()
+    held = [_WIDE_WS_UNITS.get((num_heads, q), 0) for q in range(1, q_len + 1)]
+    if not wide and not any(held):
+        return nbytes
+    static = _static_units(num_heads)
+    extra = max(held) - static if any(held) else 0
+    if wide:
         cap = int(_WIDE_WS_MAX_FACTOR * static)
-        extra = 0
         for q in range(1, q_len + 1):
             need = min(_flat_units(num_heads, q), cap)
             if need > static:
                 _WIDE_WS_UNITS[(num_heads, q)] = need
                 extra = max(extra, need - static)
-        nbytes += extra * _M_TILE * (KV_LORA_RANK + 1) * 4
-    return nbytes
+    return nbytes + extra * _M_TILE * (KV_LORA_RANK + 1) * 4
 
 
 def split_read_attention(
@@ -1032,7 +1039,14 @@ class MlaSplitRead:
         pages, block_rows, layer_in_pool, lens = self._layer_inputs(mqa, meta, num_requests)
         if self._workspace is None:
             self._workspace = torch.empty(
-                workspace_bytes(self.heads, MAX_Q_LEN, MAX_REQUESTS),
+                workspace_bytes(
+                    self.heads,
+                    MAX_Q_LEN,
+                    MAX_REQUESTS,
+                    var_split_v_up=self.helix
+                    and bool(_flags.TRTLLM_K3LL_MLA_VAR_SPLIT)
+                    and v_up_weight is not None,
+                ),
                 dtype=torch.uint8,
                 device=quant_q.device,
             )

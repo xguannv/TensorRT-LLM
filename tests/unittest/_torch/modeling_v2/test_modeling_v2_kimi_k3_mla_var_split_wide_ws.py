@@ -21,10 +21,13 @@ the count at the static split's units. One rank's V-up split read on one GPU (he
 * the envelope: ``workspace_bytes`` records the units and adds their bytes; with them a 4-request MTP7 batch takes up
   to ``budget - 3`` splits (9 on GB300, was 6), not without the allocation, with the switch at 0, or past the FLAT
   grid's rows;
-* equal-length batches keep their counts: V rows and softmax statistics bit for bit the switch-off call;
-* one long request among short ones takes more splits: counts as the python reference's on the wider grid, the V
-  rows against fp32 attention x fp32 W_UV within the static split's error bound, eager and replayed from a CUDA
-  graph the same bits; the census line counted only where the grid widened.
+* the allocation only where WIDE_WS engages (a split read with per-request counts, FLAT on, the switch on): the
+  runner's bytes alone elsewhere, and never fewer than the units already recorded;
+* equal-length batches (bs4, bs3) keep their counts: V rows and softmax statistics bit for bit the switch-off call;
+* one long request among short ones takes more splits: counts as the python reference's on the wider grid, eager and
+  replayed from a CUDA graph the same bits; the census line counted only where the grid widened;
+* other mixed batches (MIX4, two long two short): counts as the reference's, bit for bit where they are unchanged;
+* the V rows against fp32 attention x fp32 W_UV within the static split's error bound at 4 / 3 / 2 requests.
 """
 
 import os
@@ -44,6 +47,9 @@ CASES = {
     "bs4_one_long_32k": ([409600, 32768, 32768, 32768], 8, 5),
     "bs3_one_long": ([409600, 40960, 40960], 8, 1),
     "bs4_equal": ([153600] * 4, 8, 2),
+    "bs3_equal": ([153600] * 3, 8, 7),
+    "bs4_mix4": ([597248, 179840, 93568, 39488], 8, 4),
+    "bs4_two_long_two_short": ([409600, 409600, 32768, 32768], 8, 6),
 }
 
 
@@ -113,6 +119,36 @@ def test_envelope(monkeypatch):
           f"+{(wide_bytes - base_bytes) / 2**20:.1f} MiB")  # fmt: skip
 
 
+@gpu
+@pytest.mark.parametrize("off", ["no_var_split_v_up", "flat_off", "wide_ws_off"])
+def test_allocation_only_where_it_engages(monkeypatch, off):
+    """The extra split units are allocated (and recorded) only where WIDE_WS can widen the grid: a split read that
+    takes per-request counts (``var_split_v_up``), FLAT on, the switch on. Elsewhere the runner's bytes alone."""
+    torch.zeros(1, device="cuda")
+    dcp = _dcp()
+    heads = _var()._vu().HEADS
+    monkeypatch.setattr(dcp, "_WIDE_WS_UNITS", {})
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 0)
+    base_bytes = dcp.workspace_bytes(heads, dcp.MAX_Q_LEN, dcp.MAX_REQUESTS)
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 1)
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT", 0 if off == "flat_off" else 1)
+    if off == "wide_ws_off":
+        monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 0)
+    nbytes = dcp.workspace_bytes(
+        heads, dcp.MAX_Q_LEN, dcp.MAX_REQUESTS, var_split_v_up=off != "no_var_split_v_up"
+    )
+    assert nbytes == base_bytes and not dcp._WIDE_WS_UNITS
+    # once a workspace that engages recorded its units, every later one holds them (the envelope widens to them)
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 1)
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT", 1)
+    wide_bytes = dcp.workspace_bytes(heads, dcp.MAX_Q_LEN, dcp.MAX_REQUESTS)
+    assert wide_bytes > base_bytes and dcp._WIDE_WS_UNITS
+    assert (
+        dcp.workspace_bytes(heads, dcp.MAX_Q_LEN, dcp.MAX_REQUESTS, var_split_v_up=False)
+        == wide_bytes
+    )
+
+
 def _run(var, dcp, case, wide, w=None):
     vu, dcp, _, pool, _, _, q, plan = var._setup(case)
     if w is None:
@@ -126,13 +162,14 @@ def _run(var, dcp, case, wide, w=None):
 
 
 @gpu
-def test_equal_lengths_bitwise(monkeypatch):
+@pytest.mark.parametrize("name", ["bs4_equal", "bs3_equal"])
+def test_equal_lengths_bitwise(monkeypatch, name):
     var, dcp = _var(), _dcp()
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT", 1)
     out = {}
     for wide in (0, 1):
         monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", wide)
-        out[wide] = _run(var, dcp, CASES["bs4_equal"], wide)
+        out[wide] = _run(var, dcp, CASES[name], wide)
     (_, plan, q, _, _, v0, s0, g0, c0), (_, _, _, _, _, v1, s1, g1, c1) = out[0], out[1]
     assert g1 > g0 and c0 == c1, (g0, g1, c0, c1)
     keyed = ~var._keyless(plan, q.shape[1])
@@ -180,10 +217,44 @@ def test_one_long_counts_and_replay(monkeypatch, name):
 
 
 @gpu
-@pytest.mark.parametrize("seq_lens", [[25600, 2560, 2560, 2560], [25600, 2048, 2048, 2048]])
+@pytest.mark.parametrize("name", ["bs4_mix4", "bs4_two_long_two_short"])
+def test_mixed_counts(monkeypatch, name):
+    """Mixed lengths beyond one long request: the counts are the python reference's on the (wider) grid; where they
+    equal the switch-off counts the V rows and statistics are bit for bit the switch-off call's."""
+    var, dcp = _var(), _dcp()
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT", 1)
+    out = {}
+    for wide in (0, 1):
+        monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", wide)
+        out[wide] = _run(var, dcp, CASES[name], wide)
+        vu, plan, q, *_, grid, counts = out[wide]
+        budget = dcp._var_split_envelope(q.shape[0], vu.HEADS, q.shape[1])[0]
+        assert counts == var._ref_counts(plan.cache_seqs.tolist(), budget, grid), (wide, counts)
+    (_, plan, q, _, _, v0, s0, g0, c0), (_, _, _, _, _, v1, s1, g1, c1) = out[0], out[1]
+    assert g1 >= g0
+    if c1 == c0:
+        keyed = ~var._keyless(plan, q.shape[1])
+        assert torch.equal(v1[keyed].view(torch.int16), v0[keyed].view(torch.int16))
+        assert torch.equal(s1[keyed], s0[keyed])
+    print(
+        f"[{name}] splits {c0} / grid {g0} -> {c1} / grid {g1}"
+        + (" (bit for bit)" if c1 == c0 else "")
+    )
+
+
+@gpu
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [25600, 2560, 2560, 2560],
+        [25600, 2048, 2048, 2048],
+        [25600, 2560, 2560],
+        [25600, 2560],
+    ],
+)
 def test_one_long_against_fp32(monkeypatch, seq_lens):
-    """WIDE_WS at 4 requests, one long (one rank of 400K + 3 x 40K / 32K under Helix16, whole sequences on one rank):
-    the V rows against fp32 attention x fp32 W_UV within the static split's error bound."""
+    """WIDE_WS at 4 / 3 / 2 requests, one long (one rank of 400K + 40K / 32K under Helix16, whole sequences on one
+    rank): the V rows against fp32 attention x fp32 W_UV within the static split's error bound."""
     var, dcp = _var(), _dcp()
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT", 1)
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 1)

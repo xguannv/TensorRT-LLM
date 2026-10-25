@@ -598,9 +598,12 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS",
     -1,
     "Helix MLA split read with per-request split counts on the FLAT grid (at most 32 rows): size the split workspace "
-    "for every count the budget allows (decode_mla_dcp._flat_units, capped at 1.5x the static split's units; bs4 "
-    "MTP7: 216 128-row units, ~19 MB more per rank) instead of the static split's bound, so one long request among "
-    "short ones takes up to budget - B + 1 splits (bs4: 9, was 6). Equal-length batches keep their counts "
+    "for every count the budget allows (decode_mla_dcp._flat_units) instead of the static split's bound, so one long "
+    "request among short ones takes up to budget - B + 1 splits (bs4 MTP7: 9, was 6). The static split's units are "
+    "queried at run time (148 or 152 on GB300) and the widened units capped at 1.5x them (222 or 228): MTP7 needs "
+    "216 units (+16.8..17.9 MB per rank); the allocation covers query lengths 1..8, whose one-token case reaches the "
+    "cap (+19.4..20.0 MB). Only where the split read takes per-request counts (Helix V-up split read, "
+    "TRTLLM_K3LL_MLA_VAR_SPLIT, FLAT on); elsewhere nothing is allocated. Equal-length batches keep their counts "
     "(bitwise); mixed ones move split boundaries. Read at forward time; widens only where the allocated workspace "
     "holds it. 1 on, 0 off, -1 (default) on SM103 only (decode_mla_dcp.MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES)",
 )
