@@ -95,6 +95,27 @@ def _var_split_small_by_default(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) in MLA_VAR_SPLIT_SMALL_CAPABILITIES
 
 
+#: ``TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED``'s default (-1) applies on these compute capabilities (measured on GB300 /
+#: SM103).
+MLA_HELIX_PLAN_FUSED_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _helix_plan_fused_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_HELIX_PLAN_FUSED_CAPABILITIES
+
+
+def helix_plan_fused_enabled(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED`` (read at forward time): 1 on, 0 off, -1 (default) on where ``device`` is
+    in ``MLA_HELIX_PLAN_FUSED_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED)
+    if value >= 0:
+        return value > 0
+    return _helix_plan_fused_by_default(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+
+
 def _var_split_min_batch() -> int:
     """The fewest requests that take per-request split counts: ``_VAR_SPLIT_SMALL_MIN_BATCH`` with
     ``TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL`` (1 on, 0 off, -1 on where the current device is in
@@ -330,7 +351,7 @@ def make_helix_plan(
             rank owns included.
         positions: ``[batch * q_len]`` global position of every query token of the step.
     """
-    if _flags.TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED and local_block_rows.is_cuda:
+    if local_block_rows.is_cuda and helix_plan_fused_enabled(local_block_rows.device):
         from . import census as _census
 
         _census.count(f"dispatch:mla_helix_plan_fused:{_census.mode()}")

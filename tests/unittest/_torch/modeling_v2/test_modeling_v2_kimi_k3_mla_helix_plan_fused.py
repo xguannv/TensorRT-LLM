@@ -101,7 +101,22 @@ def test_fused_plan_in_graph(monkeypatch):
         monkeypatch.setattr(flags, "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED", 1)
 
 
-def test_switch_default_off_and_documented():
+def test_switch_default_sm103_and_documented():
     _, flags = _mods()
     value, default, doc = flags.flags()["TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED"]
-    assert default == 0 and "bitwise" in doc
+    assert default == -1 and "bitwise" in doc and "SM103" in doc
+
+
+@pytest.mark.parametrize("value,capability,on", [
+    (-1, (10, 3), True), (-1, (10, 0), False), (-1, (10, 7), False), (1, (10, 0), True), (0, (10, 3), False),
+])  # fmt: skip
+def test_default_follows_the_capability(monkeypatch, value, capability, on):
+    """-1 resolves by ``MLA_HELIX_PLAN_FUSED_CAPABILITIES`` (SM103 only); 1 / 0 force it either way."""
+    dcp, flags = _mods()
+    dcp._helix_plan_fused_by_default.cache_clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED", value)
+    try:
+        assert dcp.helix_plan_fused_enabled(torch.device("cuda", 0)) is on
+    finally:
+        dcp._helix_plan_fused_by_default.cache_clear()
