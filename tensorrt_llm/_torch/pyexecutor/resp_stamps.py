@@ -28,7 +28,9 @@ how many it handled. Hops:
   disaggregated request id, ``cid`` = the client-side request id;
 * ``G``: the OpenAI server yields a streamed completion chunk (its last one is ``data: [DONE]``), same key;
 * ``S``: the disaggregated server yields a streamed chunk to its client; key = the disaggregated request id, and
-  ``xrid`` = the client's ``X-Request-ID`` header.
+  ``xrid`` = the client's ``X-Request-ID`` header;
+* ``W``: the disaggregated server's response has sent the first chunk / the final one (``[DONE]``) to the client's
+  socket, same key and ``xrid``.
 
 Within one request a hop's ``final_ns - first_ns`` is a difference on one host's clock, so the time a hop adds between
 the first and the final response (the next hop's span minus this hop's) needs no clock alignment across hosts.

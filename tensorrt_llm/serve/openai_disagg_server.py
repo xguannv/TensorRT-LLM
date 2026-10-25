@@ -110,9 +110,13 @@ _CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
 async def _stamped_stream(stream, disagg_request_id, x_request_id):
     """Yield ``stream`` unchanged, marking hop ``S`` of ``resp_stamps`` as each chunk goes out.
 
-    The chunk carrying ``[DONE]`` (else the end of the stream) is the final one.
+    The chunk carrying ``[DONE]`` (else the end of the stream) is the final one. Hop ``W`` marks when the first and
+    the final chunk have been sent (the generator resumes only after the response wrote the chunk).
     """
     done = False
+    sent_first = False
+    written = False
+    first = False
     async for chunk in stream:
         if not done:
             if isinstance(chunk, (bytes, bytearray)):
@@ -120,7 +124,16 @@ async def _stamped_stream(stream, disagg_request_id, x_request_id):
             else:
                 done = isinstance(chunk, str) and "[DONE]" in chunk
             _resp_stamps.mark("S", disagg_request_id, done, xrid=x_request_id)
+            first = not done and not sent_first
+            sent_first = True
         yield chunk
+        # Resumed by the response only after it has sent the chunk: the time the first chunk and the final one
+        # ([DONE]) went to the client's socket.
+        if first:
+            _resp_stamps.mark("W", disagg_request_id, False, xrid=x_request_id)
+        elif done and not written:
+            written = True
+            _resp_stamps.mark("W", disagg_request_id, True, xrid=x_request_id)
     if not done:
         _resp_stamps.mark("S", disagg_request_id, True, xrid=x_request_id)
 
