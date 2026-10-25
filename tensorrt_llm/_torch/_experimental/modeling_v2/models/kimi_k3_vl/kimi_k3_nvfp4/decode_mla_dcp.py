@@ -539,6 +539,10 @@ def split_read_attention_v_up(
             q.device
         ):
             _census.count(f"dispatch:mla_var_split_skip_empty:{_census.mode()}")
+        if q.shape[0] * q.shape[1] <= mla_v_up.max_fused_rows() and mla_v_up.var_split_flat(
+            q.device
+        ):
+            _census.count(f"dispatch:mla_var_split_flat:{_census.mode()}")
         if plan.block_splits.shape[0] < _VAR_SPLIT_MIN_BATCH:
             _census.count(f"dispatch:mla_var_split_small:{_census.mode()}")
     torch.ops.trtllm.k3_mla_decode_fp8_v_up(

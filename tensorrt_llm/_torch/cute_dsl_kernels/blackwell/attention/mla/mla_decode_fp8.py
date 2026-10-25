@@ -164,6 +164,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         var_split_bounded: bool = False,
         var_split_direct: bool = False,
         var_split_skip_empty: bool = False,
+        var_split_flat_slots: int = 0,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -244,6 +245,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.var_split_skip_empty = bool(var_split_skip_empty
                                          and is_var_split_kv
                                          and not is_persistent)
+        # With is_var_split_kv on the non-persistent grid: ``var_split_flat_slots`` > 0 launches that many split
+        # slots per query tile (blockIdx.z) instead of the largest count per request: slot z runs split
+        # ``z - sum(counts[:b])`` of the request ``b`` it falls in, so the grid holds the batch's splits back to back
+        # (``sum(counts)`` <= slots; the slots past the sum have no keys). Same (request, split) work and partials.
+        self.var_split_flat_slots = (int(var_split_flat_slots)
+                                     if is_var_split_kv and not is_persistent
+                                     else 0)
         if not 1 <= reducer_max_splits <= MAX_SPLITS:
             raise ValueError(
                 f"reducer_max_splits must be in [1, {MAX_SPLITS}], "
@@ -1022,6 +1030,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.max_active_clusters,
             self.is_persistent,
         )
+        if cutlass.const_expr(self.var_split_flat_slots > 0):
+            grid = (grid[0], runtime_num_q_tiles, self.var_split_flat_slots)
 
         @cute.struct
         class SplitKVKernelSharedStorage:
@@ -1547,13 +1557,29 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.split_prewait):
                 cute.arch.griddepcontrol_launch_dependents()
+        sched_blk = cute.arch.block_idx()
+        if cutlass.const_expr(self.var_split_flat_slots > 0):
+            # Slot blockIdx.z of query tile blockIdx.y -> (request, split) by a walk over the counts (read after
+            # the PDL wait); the schedulers below see the static grid's coordinate of that work.
+            blk_x, blk_y, slot = cute.arch.block_idx()
+            flat_b = cutlass.Int32(0)
+            flat_start = cutlass.Int32(0)
+            flat_run = cutlass.Int32(0)
+            for i in cutlass.range(tile_sched_params.problem_shape_b, unroll=1):
+                if slot >= flat_run:
+                    flat_b = i
+                    flat_start = flat_run
+                flat_run = flat_run + block_split_kvs[i]
+            sched_blk = (blk_x,
+                         flat_b * tile_sched_params.problem_shape_s + blk_y,
+                         slot - flat_start)
         if cutlass.const_expr(self.var_split_skip_empty):
             # Both CTAs of the 2-CTA cluster share blockIdx.y/z, so they read the same count and decide alike;
             # read after the PDL wait (the count kernel's output is visible). Past the count: no warp role below
             # (no TMEM allocation, no pipeline traffic, no output: the reduction reads only the first ``count``
             # splits), so the CTA exits at once.
             first = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(),
+                tile_sched_params, sched_blk,
                 cute.arch.grid_dim()).initial_work_tile_info().tile_idx
             warp_idx = cute.arch.make_warp_uniform(
                 cutlass.select_(first[3] < block_split_kvs[first[2]], warp_idx,
@@ -1571,7 +1597,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_k_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_k_stage)
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
@@ -1635,7 +1661,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_v_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_v_stage)
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
@@ -1696,7 +1722,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_s_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_s_stage)
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
@@ -1768,7 +1794,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_o_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_o_stage)
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
@@ -1841,7 +1867,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
@@ -1917,7 +1943,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             mma_s_consumer_state.advance()
             p_mma_producer_state.advance()
@@ -1995,7 +2021,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+                tile_sched_params, sched_blk, cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx

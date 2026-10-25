@@ -51,6 +51,28 @@ def _skip_empty_by_default(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) in MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES
 
 
+#: ``TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT``'s default (-1) applies on these compute capabilities (measured on GB300 / SM103).
+MLA_VAR_SPLIT_FLAT_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _flat_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_VAR_SPLIT_FLAT_CAPABILITIES
+
+
+def var_split_flat(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT`` (1 on, 0 off, -1 on where ``device`` is in
+    ``MLA_VAR_SPLIT_FLAT_CAPABILITIES``): with per-request split counts, the split kernel's grid holds the batch's
+    splits back to back."""
+    from . import flags
+
+    value = int(flags.TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _flat_by_default(index)
+
+
 def var_split_skip_empty(device: torch.device) -> bool:
     """``TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY`` (1 on, 0 off, -1 on where ``device`` is in
     ``MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES``): with per-request split counts, the split kernel's clusters past their
@@ -154,6 +176,12 @@ def _run_fused(
     skip_empty = var_split and var_split_skip_empty(cache_seqs.device)
     if skip_empty:
         key = key + ("skip_empty",)
+    from . import decode_mla_dcp as _dcp
+
+    flat_slots = 0
+    if var_split and var_split_flat(cache_seqs.device):
+        flat_slots = _dcp._var_split_envelope(batch, heads, seq_len_q)[0]
+        key = key + (f"flat{flat_slots}",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -180,6 +208,7 @@ def _run_fused(
             use_pdl=runner.use_pdl,
             var_split_bounded=var_split,
             var_split_skip_empty=skip_empty,
+            var_split_flat_slots=flat_slots,
             v_rows=v_rows,
             prewait=prewait,
         )

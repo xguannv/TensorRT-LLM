@@ -407,6 +407,15 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL = _flag(
     "lengths differ: the split boundaries move; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(decode_mla_dcp.MLA_VAR_SPLIT_SMALL_CAPABILITIES)",
 )
+TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT = _flag(
+    "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT",
+    -1,
+    "with per-request split counts on the fused V-up path: the split kernel's grid holds the batch's splits back to "
+    "back (the one-wave budget of slots per query tile, each mapped to its (request, split) on device after the PDL "
+    "wait) instead of the largest count per request, so no cluster is launched past a request's count (same work "
+    "and partials: bitwise; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
+    "(mla_v_up.MLA_VAR_SPLIT_FLAT_CAPABILITIES)",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,
