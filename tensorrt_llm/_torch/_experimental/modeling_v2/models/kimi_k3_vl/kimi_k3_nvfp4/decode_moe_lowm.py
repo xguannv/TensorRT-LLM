@@ -73,6 +73,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 
 from . import flags as _flags
+from . import front_tl as _front_tl
 from . import moe_tail_col as _tail_col
 from . import moe_tail_lu as _tail_lu
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
@@ -541,6 +542,7 @@ class K3DecodeMoeNvfp4Layer:
             sort_ctr=self.state.sort_ctr if sort_out is not None else None,
             sort_offset=self.offset,
             sort_local=self.num_local,
+            timeline=_front_tl.view(self.layer_idx, x.shape[0], x.device),
         )
 
     @property

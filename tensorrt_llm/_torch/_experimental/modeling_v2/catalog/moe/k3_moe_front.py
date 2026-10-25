@@ -42,6 +42,7 @@ def k3_moe_front(
     sort_ctr: Optional[torch.Tensor] = None,
     sort_offset: int = 0,
     sort_local: int = 0,
+    timeline: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(topk_ids, topk_weights, quantized, scales, shared)`` for the MoE input ``x`` (bf16 ``[M <= 32, 7168]``,
     9-16 rows on a ``K3MoeHeadWorkspace`` created with ``m_max=16``, 17-32 rows on one created with ``m_max=32``, the
@@ -57,7 +58,9 @@ def k3_moe_front(
     uint8 ``[M, 1792]`` E2M1 pairs, ``scales`` uint8 ``[M, 224]`` E4M3, linear; ``fp4_quantize``'s recipe).
 
     ``sort_out`` / ``sort_ctr`` / ``sort_offset`` / ``sort_local`` (with ``nvfp4_gsf``): also ``moe_sort`` of the
-    routing over the local experts and the fp32 weights into ``sort_out`` (``sort_layout``, ``sort_views``)."""
+    routing over the local experts and the fp32 weights into ``sort_out`` (``sort_layout``, ``sort_views``).
+
+    ``timeline`` (measurement build only): the op's per-CTA phase timeline buffer, passed through."""
     return torch.ops.trtllm.k3_moe_front(
         x,
         w_front,
@@ -77,4 +80,5 @@ def k3_moe_front(
         sort_ctr=sort_ctr,
         sort_offset=sort_offset,
         sort_local=sort_local,
+        timeline=timeline,
     )
