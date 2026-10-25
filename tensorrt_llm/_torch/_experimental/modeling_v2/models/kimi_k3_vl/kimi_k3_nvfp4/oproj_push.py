@@ -396,6 +396,7 @@ class K3OprojPush:
             early_trigger=True,
             mnnvl_order=True,
             mxfp8_out=mxfp8_out,
+            prof_addr=_attn_res_prof(rows, prefix.device),
         )
         return normed, updated
 
@@ -412,3 +413,13 @@ __all__ = [
     "lamport_view",
     "push_target",
 ]
+
+
+def _attn_res_prof(rows: int, device) -> int:
+    """Diagnostic prototype (TRTLLM_K3LL_KDA_VERIFY_PROF=1): the address of this call's K3AttnResFast profile slice."""
+    from . import verify
+
+    if not verify._prof_on():
+        return 0
+    marks = _attn_res().PROF_MARKS
+    return verify.prof_slice("attnres_post", rows, 93, rows * 7 * marks * 2, device).data_ptr()

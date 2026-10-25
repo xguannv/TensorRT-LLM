@@ -121,40 +121,64 @@ def _odd_clamp(device: torch.device, num_spec: int) -> bool:
     return _odd_clamp_by_default(index)
 
 
-# Diagnostic profile (prototype; TRTLLM_K3LL_KDA_VERIFY_PROF=1): every CTA writes (globaltimer, clock64) at
-# verify_kernel.PROF_MARKS points into one slice of a device buffer per call position (calls mod PROF_LAYERS, so one
-# slice per KDA layer in a forward); a daemon thread copies the buffer to
+# Diagnostic profile (prototype; TRTLLM_K3LL_KDA_VERIFY_PROF=1): kernels write (globaltimer, clock64) pairs per CTA at
+# their marks into one slice of a device buffer per call position (calls of a kind mod its layers per forward; one
+# buffer per (kind, batch key)); a daemon thread copies every buffer to
 # $TRTLLM_K3LL_KDA_VERIFY_PROF_DIR/kda_verify_prof_rank<R>.pt every 2 s on its own stream (graph replays included).
+# Kinds: "verify" (this kernel, verify_kernel.PROF_MARKS per CTA, 69 per forward) and "attnres_post" (the
+# post-attention K3AttnResFast of oproj_push.py, k3_attn_res.PROF_MARKS per CTA, 93 per forward).
 PROF_LAYERS = 69
-PROF_MAX_CTAS = 6 * 8 * 8
-_prof = dict(buf=None, calls=0, thread=None)
+_prof = dict(bufs={}, calls={}, thread=None)
 
 
 def _prof_on() -> bool:
-    return os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF", "0") == "1"
+    from . import flags
+
+    return bool(flags.TRTLLM_K3LL_KDA_VERIFY_PROF)
 
 
 def _prof_dump_loop(device):
     import time
+
+    from tensorrt_llm._utils import prefer_pinned
 
     rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "0")))
     path = os.path.join(
         os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF_DIR", "/tmp"), f"kda_verify_prof_rank{rank}.pt"
     )
     stream = torch.cuda.Stream(device=device)
-    from tensorrt_llm._utils import prefer_pinned
-
-    host = torch.empty(_prof["buf"].shape, dtype=torch.int64, pin_memory=prefer_pinned())
+    hosts = {}
     while True:
         time.sleep(2.0)
-        with torch.cuda.stream(stream):
-            host.copy_(_prof["buf"], non_blocking=True)
+        for key, buf in list(_prof["bufs"].items()):
+            if key not in hosts:
+                hosts[key] = torch.empty(buf.shape, dtype=torch.int64, pin_memory=prefer_pinned())
+            with torch.cuda.stream(stream):
+                hosts[key].copy_(buf, non_blocking=True)
         stream.synchronize()
-        torch.save(dict(buf=host.clone(), calls=_prof["calls"], layers=PROF_LAYERS), path + ".tmp")
+        torch.save(
+            dict(bufs={k: v.clone() for k, v in hosts.items()}, calls=dict(_prof["calls"])),
+            path + ".tmp",
+        )
         os.replace(path + ".tmp", path)
 
 
-def _prof_arg(device) -> torch.Tensor:
+def prof_slice(kind: str, key: int, layers: int, numel: int, device) -> torch.Tensor:
+    """The profile slice of the next call of ``kind`` (diagnostic prototype)."""
+    buf = _prof["bufs"].get((kind, key))
+    if buf is None:
+        buf = _prof["bufs"][(kind, key)] = torch.zeros(
+            layers, numel, dtype=torch.int64, device=device
+        )
+    if _prof["thread"] is None:
+        _prof["thread"] = threading.Thread(target=_prof_dump_loop, args=(device,), daemon=True)
+        _prof["thread"].start()
+    i = _prof["calls"].get(kind, 0)
+    _prof["calls"][kind] = i + 1
+    return buf[i % layers]
+
+
+def _prof_arg(device, n_req: int) -> torch.Tensor:
     from . import verify_kernel as kernel
 
     if not _prof_on():
@@ -162,14 +186,10 @@ def _prof_arg(device) -> torch.Tensor:
         if buf is None or buf.device != device:
             buf = _prof["dummy"] = torch.zeros(2, dtype=torch.int64, device=device)
         return buf
-    if _prof["buf"] is None:
-        _prof["buf"] = torch.zeros(PROF_LAYERS, PROF_MAX_CTAS * kernel.PROF_MARKS * 2, dtype=torch.int64,
-                                   device=device)  # fmt: skip
-        _prof["thread"] = threading.Thread(target=_prof_dump_loop, args=(device,), daemon=True)
-        _prof["thread"].start()
-    i = _prof["calls"] % PROF_LAYERS
-    _prof["calls"] += 1
-    return _prof["buf"][i]
+    from . import census as _census
+
+    _census.count(f"dispatch:kda_verify_prof:{_census.mode()}")
+    return prof_slice("verify", n_req, PROF_LAYERS, 6 * n_req * 8 * kernel.PROF_MARKS * 2, device)
 
 
 def use_pdl() -> bool:
@@ -290,7 +310,7 @@ def k3_fp8_kda_verify(
         _index_arg(slots),
         _index_arg(pending),
         _arg(_flat(out)),
-        _arg(_prof_arg(proj.device), 8),
+        _arg(_prof_arg(proj.device, n_req), 8),
     )
     runtime = (proj.shape[1] // 2, (bfa if sep_bfa else proj).shape[1] // 2, n_req, ssm.stride(0))
     stream = cuda_driver.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)

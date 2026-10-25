@@ -133,6 +133,23 @@ def _asm_se(res, operands, text, constraints, *, loc=None, ip=None):
     )
 
 
+#: diagnostic profile (oak M2 kdaprof prototype): (globaltimer, clock64) pairs per CTA at PROF_MARKS points
+PROF_MARKS = 8
+
+
+@dsl_user_op
+def _prof_mark(base, cta, k, *, loc=None, ip=None):
+    """Store (%globaltimer, %clock64) at ``base + ((cta * PROF_MARKS + k) * 2) * 8``."""
+    _asm_se(
+        None,
+        [Int64(base + Int64(cta * PROF_MARKS + k) * 16).ir_value(loc=loc, ip=ip)],
+        "{\n.reg .u64 g, c;\nmov.u64 g, %globaltimer;\nmov.u64 c, %clock64;\nst.global.v2.u64 [$0], {g, c};\n}",
+        "l",
+        loc=loc,
+        ip=ip,
+    )
+
+
 def _iv(value, *, loc=None, ip=None):
     return Int32(value).ir_value(loc=loc, ip=ip)
 
@@ -1171,7 +1188,9 @@ class K3AttnResFastKernel:
         lamport: bool = False,
         early_trigger: bool = _EARLY_TRIGGER,
         mnnvl_order: bool = False,
+        profile: bool = False,
     ):
+        self.profile = profile
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
         clusters = (MNNVL_CLUSTER,) if mnnvl_order else (1, 2, 4, 8)
@@ -1215,6 +1234,7 @@ class K3AttnResFastKernel:
         m: Int32,
         eps: Float32,
         out_eps: Float32,
+        prof_addr: Int64,
         stream: cuda.CUstream,
     ):
         parts, nvals = self.parts, self.nvals
@@ -1242,6 +1262,7 @@ class K3AttnResFastKernel:
             m,
             eps,
             out_eps,
+            prof_addr,
         )
         if cutlass.const_expr(self.c > 1):
             kernel.launch(
@@ -1278,6 +1299,7 @@ class K3AttnResFastKernel:
         m: Int32,
         eps: Float32,
         out_eps: Float32,
+        prof_addr: Int64,
     ):
         c, k, parts, nvals = self.c, self.k, self.parts, self.nvals
         n_cand, warps, shift = self.n, self.warps, self.shift
@@ -1291,6 +1313,12 @@ class K3AttnResFastKernel:
         outsq_smem = storage.outsq.data_ptr().toint()
         mbar_smem = storage.mbar.data_ptr().toint()
 
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 0)
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, PROF_MARKS - 1)
         token = bidx // c
         rank = bidx - token * c
         if cutlass.const_expr(c > 1):
@@ -1409,11 +1437,17 @@ class K3AttnResFastKernel:
                 for e in cutlass.range_constexpr(8):
                     premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 1)
         # ---- wait for the previous grid ----
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
             if cutlass.const_expr(self.early_trigger):
                 _griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 2)
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             if cutlass.const_expr(self.lamport):
@@ -1444,6 +1478,9 @@ class K3AttnResFastKernel:
             words = [_pack_bf16x2(x[2 * i], x[2 * i + 1]) for i in range(4)]
             _stg_v4_if(valid, upd_addr + row + col, words)
 
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 3)
         sq = _zero_f32()
         dot = _zero_f32()
         for e in cutlass.range_constexpr(8):
@@ -1477,6 +1514,9 @@ class K3AttnResFastKernel:
             tot = _warp_transpose_sum([part_sq, part_dot], lane)
             tot_sq = _shfl_idx(tot, 0)
             tot_dot = _shfl_idx(tot, 16)
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 4)
         last_logit = mul(tot_dot, rsigma(tot_sq, eps))
 
         if cutlass.const_expr(mo):
@@ -1524,6 +1564,9 @@ class K3AttnResFastKernel:
             if lane < parts:
                 part = _lds_f32(outsq_smem + lane * 4)
             out_total = _warp_sum(part)
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 5)
         out_rs = rsigma(out_total, out_eps)
 
         w_out = unpack(out_w)
@@ -1548,6 +1591,9 @@ class K3AttnResFastKernel:
                 e_a,
             )
 
+        if cutlass.const_expr(self.profile):
+            if tidx == 0:
+                _prof_mark(prof_addr, bidx, 6)
         if cutlass.const_expr(self.use_pdl and not self.early_trigger):
             _bar_sync(4, self.threads)
             _griddepcontrol_launch_dependents()
@@ -1583,12 +1629,21 @@ def _compiled(
     lamport: bool = False,
     early_trigger: bool = _EARLY_TRIGGER,
     mnnvl_order: bool = False,
+    profile: bool = False,
 ):
     if exact:
         kernel = K3AttnResKernel(num_candidates, add_mode, use_pdl, cluster)
     else:
         kernel = K3AttnResFastKernel(
-            num_candidates, add_mode, use_pdl, cluster, mxfp8, lamport, early_trigger, mnnvl_order
+            num_candidates,
+            add_mode,
+            use_pdl,
+            cluster,
+            mxfp8,
+            lamport,
+            early_trigger,
+            mnnvl_order,
+            profile,
         )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1607,6 +1662,7 @@ def _compiled(
         Int32(1),
         Float32(1e-6),
         Float32(1e-6),
+        *(() if exact else (addr,)),
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
 
@@ -1660,6 +1716,7 @@ def run_k3_attn_res(
     lamport_addend: tuple[int, int] | None = None,
     early_trigger: bool | None = None,
     mnnvl_order: bool = False,
+    prof_addr: int = 0,
 ) -> None:
     """Launch on the current stream (inputs are not re-validated; see :func:`can_use_k3_attn_res`).
 
@@ -1726,6 +1783,7 @@ def run_k3_attn_res(
         lamport,
         early_trigger,
         mnnvl_order,
+        *(() if exact else (bool(prof_addr),)),
     )
     if lamport:
         add_addr, add2_addr = lamport_addend
@@ -1747,6 +1805,7 @@ def run_k3_attn_res(
         Int32(layer.shape[0]),
         Float32(rms_eps),
         Float32(out_eps),
+        *(() if exact else (Int64(prof_addr),)),
         cuda.CUstream(torch.cuda.current_stream(layer.device).cuda_stream),
     )
 
