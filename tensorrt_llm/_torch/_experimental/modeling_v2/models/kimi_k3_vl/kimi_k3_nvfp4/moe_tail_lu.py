@@ -200,6 +200,10 @@ class K3TailLuState:
     attn_res_candidates: frozenset = field(default_factory=frozenset)
     #: The same with the MXFP8 side output (``warm_up(..., mxfp8=True)``).
     attn_res_mx_candidates: frozenset = field(default_factory=frozenset)
+    #: ``TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR``: recorded on the side stream after its re-arm of the latent workspace,
+    #: and ``K3LamportClearKernel``'s zeroed CTA counter.
+    cleared: Optional[torch.cuda.Event] = None
+    clear_ctr: Optional[torch.Tensor] = None
 
     @classmethod
     def create(cls, mapping, push) -> "K3TailLuState":
@@ -217,6 +221,8 @@ class K3TailLuState:
             stream=stream,
             fork=torch.cuda.Event(),
             join=torch.cuda.Event(),
+            cleared=torch.cuda.Event(),
+            clear_ctr=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
 

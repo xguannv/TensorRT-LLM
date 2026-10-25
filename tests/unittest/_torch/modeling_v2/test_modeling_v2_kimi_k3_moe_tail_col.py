@@ -293,6 +293,35 @@ def test_attn_res_passes_the_tap(monkeypatch):
     assert launched[0]["tap"] is slot and launched[1]["tap"] is None
 
 
+def test_side_clear_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR"]
+    assert default == 0
+    assert "K3LamportClearKernel" in doc and "bitwise" in doc and "TRTLLM_K3LL_MOE_TAIL_COL" in doc
+
+
+@pytest.mark.parametrize("switch", [0, 1])
+def test_side_clear_only_with_a_side_stream(monkeypatch, switch):
+    """Without multi-stream ``run`` issues no side clear whatever the switch says (the latent all-reduce clears its
+    own buffer), in the order shared all-reduce, routed experts, latent all-reduce, publish."""
+    col = _mod("moe_tail_col")
+    order = []
+    monkeypatch.setattr(col._flags, "TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR", switch)
+    monkeypatch.setattr(col, "do_multi_stream", lambda: False)
+    monkeypatch.setattr(col, "clear_latent_workspace", lambda base: order.append("clear"))
+    monkeypatch.setattr(col._tail_lu, "shared_all_reduce", lambda *a: order.append("shared"))
+    monkeypatch.setattr(
+        col, "latent_all_reduce", lambda base, layer, routed: order.append("latent")
+    )
+    monkeypatch.setattr(col, "publish", lambda *a: order.append("publish"))
+    base = SimpleNamespace(cleared=object(), clear_ctr=object())
+    state = SimpleNamespace(base=base)
+    layer = SimpleNamespace(shared_down=None)
+    act = torch.zeros(16, 384, dtype=torch.bfloat16)
+    col.run(state, layer, None, act, lambda: order.append("routed"))
+    assert order == ["shared", "routed", "latent", "publish"]
+    assert col.side_clear() == bool(switch)
+
+
 def test_snapshot_inplace_switch_default_sm103_and_documented():
     value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE"]
     assert default == -1 and "bank row" in doc and "Bitwise" in doc and "SM103" in doc

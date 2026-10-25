@@ -41,6 +41,8 @@ Checks:
     (``allreduce_attn_res`` two-shot), captured with multi-stream on (the shared expert on the side stream), replayed
     6 times alternately with new inputs (the Lamport rotation goes round twice per replay), one rank late on every
     other replay, with eager steps in between: bit for bit the eager run, the other users' outputs their eager values.
+    Once with ``TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR`` off and once on (each captured layer then re-arms the latent
+    workspace on the side stream: two clears per capture, none eagerly; the same bits).
 """
 
 import contextlib
@@ -509,39 +511,76 @@ def _cloned(ns):
     return {k: v.clone() for k, v in vars(ns).items()}
 
 
+@contextlib.contextmanager
+def _side_clear(value: int):
+    old = FLAGS.TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR
+    FLAGS.TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR = int(value)
+    try:
+        yield
+    finally:
+        FLAGS.TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR = old
+
+
 def check_graphs():
+    with _side_clear(0):
+        _check_graphs(side_clear=False)
+
+
+def check_graphs_side_clear():
+    with _side_clear(1):
+        _check_graphs(side_clear=True)
+
+
+def _check_graphs(side_clear: bool):
     steps = {rows: _Step(rows, 600 + 10 * rows) for rows in GRAPH_ROWS}
     for step in steps.values():
         step.run()
     torch.cuda.synchronize()
     graphs = {}
     streams = []
+    clears = []
     original = LU.shared_all_reduce
+    original_clear = COL.clear_latent_workspace
 
     def tapped(*args, **kwargs):
         streams.append(torch.cuda.current_stream().cuda_stream)
         return original(*args, **kwargs)
 
+    def tapped_clear(*args, **kwargs):
+        clears.append(torch.cuda.current_stream().cuda_stream)
+        return original_clear(*args, **kwargs)
+
     LU.shared_all_reduce = tapped
+    COL.clear_latent_workspace = tapped_clear
     try:
         for rows, step in steps.items():
             R.barrier()
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             graph = torch.cuda.CUDAGraph()
+            counted = _census("dispatch:latent_ar_side_clear", "capture")
             with MSU.with_multi_stream(True), torch.cuda.graph(graph, stream=stream):
                 out = step.run()
             R.barrier()
+            assert _census("dispatch:latent_ar_side_clear", "capture") - counted == (
+                2 if side_clear else 0
+            ), "the side clear's census count per capture"
             graphs[rows] = (graph, out)
             assert streams == [BUILT.state.base.stream.cuda_stream] * 2, (
                 "the captured shared all-reduces' streams"
             )
+            assert clears == [BUILT.state.base.stream.cuda_stream] * (2 if side_clear else 0), (
+                f"the captured side-stream clears (switch {int(side_clear)})"
+            )
             streams.clear()
+            clears.clear()
         step.run()
         current = torch.cuda.current_stream().cuda_stream
         assert streams == [current] * 2, "eagerly the shared all-reduce runs on the current stream"
+        assert not clears, "eagerly the latent all-reduce clears its own buffer"
     finally:
         LU.shared_all_reduce = original
+        COL.clear_latent_workspace = original_clear
     for i, rows in enumerate(REPLAY_ORDER):
         step = steps[rows]
         where = f"graph {rows} rows replay {i}"
@@ -565,12 +604,13 @@ def check_graphs():
     torch.cuda.synchronize()
     if R.rank == 0:
         print(
-            f"[rank 0] graphs {GRAPH_ROWS} (side stream) replayed {len(REPLAY_ORDER)}x = eager",
+            f"[rank 0] graphs {GRAPH_ROWS} (side stream, side clear {int(side_clear)}) replayed "
+            f"{len(REPLAY_ORDER)}x = eager",
             flush=True,
         )
 
 
-CHECKS = [check_takes, check_pieces, check_decoder, check_graphs]
+CHECKS = [check_takes, check_pieces, check_decoder, check_graphs, check_graphs_side_clear]
 
 
 def _run_one_rank(args) -> int:

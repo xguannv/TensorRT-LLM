@@ -298,6 +298,15 @@ TRTLLM_K3LL_MOE_TAIL_COL = _flag(
     "12 MiB MNNVL workspace; engagement is read at forward time. Takes precedence over TRTLLM_K3LL_MOE_TAIL_LU. -1 "
     "(default): on on SM103 only (moe_tail_col.MOE_TAIL_COL_CAPABILITIES)",
 )
+TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR = _flag(
+    "TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR",
+    0,
+    "with TRTLLM_K3LL_MOE_TAIL_COL under multi-stream capture: the side stream, forked after the front, first "
+    "re-arms the latent all-reduce's previous Lamport buffer (K3LamportClearKernel: M x TP x 7 KB of sentinel "
+    "stores) and marks the workspace clean, and the main stream waits for it right before the latent all-reduce, "
+    "which then skips that clear on its own critical path (moe_tail_col.run). The data is unchanged (bitwise). "
+    "1 on, 0 (default) off; read at forward time",
+)
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
     -1,

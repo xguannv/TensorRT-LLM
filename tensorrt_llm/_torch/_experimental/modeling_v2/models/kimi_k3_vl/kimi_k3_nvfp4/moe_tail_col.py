@@ -281,6 +281,21 @@ def latent_all_reduce(
     return latent
 
 
+def side_clear() -> bool:
+    """``TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR`` (read at forward time): 1 on, 0 off."""
+    return int(_flags.TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR) > 0
+
+
+def clear_latent_workspace(base: K3TailLuState) -> None:
+    """On the current stream: re-arm the latent workspace's dirty Lamport buffer (the previous latent all-reduce's,
+    every dirty stage) with the sentinel and mark the state clean (``K3LamportClearKernel``), so the next latent
+    all-reduce skips its own clear. Issue it after the previous all-reduce has completed on this rank and order the
+    next one after it. Every peer's push into that buffer arrived before the previous all-reduce could complete, and
+    a peer writes into it again only in the call after the next, which needs this rank's push of the next call."""
+    view = base.latent
+    _latent_ar().run_k3_lamport_clear(view.uc_local, view.flags, base.clear_ctr)
+
+
 def publish(
     state: K3TailColState, layer: K3TailColLayer, latent: torch.Tensor, shared: torch.Tensor
 ) -> ColTail:
@@ -305,21 +320,33 @@ def run(
     """The tail of a step `takes` holds for, after the front: the shared expert's down projection and all-reduce on
     the side stream (in order on the current stream outside multi-stream capture), ``routed_fn()`` (this rank's routed
     experts' latent partial) and the latent all-reduce + RMSNorm on the current stream, which then joins the side
-    stream and publishes its columns."""
+    stream and publishes its columns. With ``TRTLLM_K3LL_LATENT_AR_SIDE_CLEAR`` on a side stream, the side stream first
+    re-arms the previous latent all-reduce's buffer (`clear_latent_workspace`; the fork follows that all-reduce on
+    the current stream) and the current stream waits for it right before this layer's latent all-reduce."""
     base = state.base
     rows = shared_act.shape[0]
     shared = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=shared_act.device)
     side = do_multi_stream() and not torch.compiler.is_compiling()
+    clear = side and side_clear() and base.cleared is not None
     if side:
         main = torch.cuda.current_stream()
         base.fork.record(main)
         with torch.cuda.stream(base.stream):
             base.stream.wait_event(base.fork)
+            if clear:
+                clear_latent_workspace(base)
+                base.cleared.record(base.stream)
+                from . import census as _census
+
+                _census.count(f"dispatch:latent_ar_side_clear:{_census.mode()}")
             _tail_lu.shared_all_reduce(base, gemvs, layer.shared_down, shared_act, shared)
             base.join.record(base.stream)
     else:
         _tail_lu.shared_all_reduce(base, gemvs, layer.shared_down, shared_act, shared)
-    latent = latent_all_reduce(base, layer, routed_fn())
+    routed = routed_fn()
+    if clear:
+        main.wait_event(base.cleared)
+    latent = latent_all_reduce(base, layer, routed)
     if side:
         main.wait_event(base.join)
     return publish(state, layer, latent, shared)
@@ -353,6 +380,8 @@ def warm_up(
         layer.up_slice, layer.col0, layer.tiles, torch.ones(LATENT, **zeros), 1e-6, weight
     )
     latent_all_reduce(base, probe, torch.zeros(MIN_ROWS, LATENT, **zeros))
+    if base.clear_ctr is not None:
+        clear_latent_workspace(base)
     ran = []
     tail = None
     for rows in (16, 32):
