@@ -24,9 +24,9 @@ how many it handled. Hops:
 
 * ``E``: the executor enqueues a response (``PyExecutor._enqueue_responses``, the rank that enqueues); key = the
   executor request id (the disaggregated request id where the request carries one), ``cid`` = the client id;
-* ``R``: the OpenAI server receives a response output of a completion request (after postprocessing), key = the
-  disaggregated request id, ``cid`` = the client-side request id;
-* ``G``: the OpenAI server yields a streamed completion chunk (its last one is ``data: [DONE]``), same key;
+* ``R``: the OpenAI server receives a response output of a streamed completion / chat completion request (after
+  postprocessing), key = the disaggregated request id, ``cid`` = the client-side request id;
+* ``G``: the OpenAI server yields the first streamed chunk / ``data: [DONE]`` of such a request, same key;
 * ``S``: the disaggregated server yields a streamed chunk to its client; key = the disaggregated request id, and
   ``xrid`` = the client's ``X-Request-ID`` header;
 * ``W``: the disaggregated server's response has sent the first chunk / the final one (``[DONE]``) to the client's

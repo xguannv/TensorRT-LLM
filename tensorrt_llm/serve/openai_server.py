@@ -1952,19 +1952,30 @@ class OpenAIServer(_VideoRoutesMixin):
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
                 )
+                stamp_key = None
+                if (_resp_stamps.ENABLED
+                        and request.disaggregated_params is not None):
+                    stamp_key = request.disaggregated_params.disagg_request_id
+                    _resp_stamps.mark("R",
+                                      stamp_key,
+                                      first_response.finished,
+                                      cid=getattr(promise, "request_id", None))
                 pp_results = first_response.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         first_response, args)
+                _resp_stamps.mark("G", stamp_key, False)
                 for pp_res in pp_results:
                     yield pp_res
                 # Making sure we can handle the situation where there is only one response
                 res = first_response
                 async for res in promise:
+                    _resp_stamps.mark("R", stamp_key, res.finished)
                     pp_results = res.outputs[
                         0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                             res, args)
                     for pp_res in pp_results:
                         yield pp_res
+                _resp_stamps.mark("G", stamp_key, True)
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
