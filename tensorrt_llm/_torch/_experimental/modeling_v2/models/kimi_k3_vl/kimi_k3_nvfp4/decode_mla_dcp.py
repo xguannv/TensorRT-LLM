@@ -172,7 +172,7 @@ def _flat_units(heads: int, q_len: int) -> int:
     return best
 
 
-def _var_split_envelope(batch: int, heads: int, q_len: int):
+def _var_split_envelope(batch: int, heads: int, q_len: int, wide: bool = True):
     """``(budget, grid)``: how many splits all requests of the batch may take together (one wave: the GPU's 2-CTA
     clusters over the ``q_tiles`` M tiles of each split), and the largest split count of one request: within that
     budget with every other request at one split, the split workspace (its 128-row units, sized for the occupancy
@@ -183,9 +183,9 @@ def _var_split_envelope(batch: int, heads: int, q_len: int):
     blocks = CuteDSLNVMlaDecodeBlackwellRunner._get_max_active_blocks()
     budget = (blocks // 2) // q_tiles
     units = 2 * (blocks // 2) * max(heads, _M_TILE) // _M_TILE
-    wide = _WIDE_WS_UNITS.get((heads, q_len), 0)
-    if wide > units and batch * q_len <= _max_fused_rows() and var_split_wide_ws() and _flat_on():
-        units = wide  # TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS: the allocated workspace holds these
+    held = _WIDE_WS_UNITS.get((heads, q_len), 0) if wide else 0
+    if held > units and batch * q_len <= _max_fused_rows() and var_split_wide_ws() and _flat_on():
+        units = held  # TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS: the allocated workspace holds these
     grid = min(_MAX_VAR_SPLIT, budget - batch + 1, units // (batch * q_tiles))
     return budget, grid
 
@@ -358,9 +358,13 @@ def with_var_split(plan: SplitReadPlan, heads: int, q_len: int) -> SplitReadPlan
     counts = var_split_counts(plan.cache_seqs, heads, q_len)
     if counts is None:
         return plan
-    return replace(
-        plan, block_splits=counts, var_split=var_split_grid(counts.shape[0], heads, q_len)
-    )
+    batch = counts.shape[0]
+    grid = var_split_grid(batch, heads, q_len)
+    if grid > _var_split_envelope(batch, heads, q_len, wide=False)[1]:
+        from . import census as _census
+
+        _census.count(f"dispatch:mla_var_split_wide_ws:{_census.mode()}")
+    return replace(plan, block_splits=counts, var_split=grid)
 
 
 def local_block_index(max_blocks: int, cp_size: int, cp_rank: int, device) -> torch.Tensor:
