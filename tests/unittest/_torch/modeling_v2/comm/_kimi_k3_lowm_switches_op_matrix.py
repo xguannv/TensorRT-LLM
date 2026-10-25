@@ -52,6 +52,9 @@ eager call on the same inputs):
     On arm against the off arm: the front's outputs, the tile count, each tile's local expert and mn limit, the
     fp32 weights and the routed partial bit for bit; each tile's rows (expanded indices) equal as a set (the front
     writes them in token order; the kernel's FC1 row of a (token, expert) pair does not depend on its place).
+  * SELF_SORT (1, 8, 9, 12, 16 rows; read at forward time): ``_front_routed`` on the front-sort layer with the expert
+    kernel's own sort and without it: no sorted launch when on; the front's outputs, the routed partial and the
+    shared activation bit for bit.
   * FRONT16 (9, 12, 16 rows): ``_wide`` with and without the 16-token front, with TRTLLM_K3LL_WIDE_LATENT_TAIL off.
     Off arm against ``_ref_wide_head_chain`` + ``_ref_latent_tail_chain``: routing, NVFP4 latent and scales, routed
     partial, shared activation, tail input and output bit for bit. On arm against the off arm: routing, latent,
@@ -941,6 +944,60 @@ def check_front_sort():
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_SELF_SORT
+# ----------------------------------------------------------------------------------------------------------------------
+def _self_sort_arm(layer, moe, x, value: int):
+    with _switch("TRTLLM_K3LL_MOE_SELF_SORT", value), _taps(layer) as seen, _sort_tap() as sort:
+        routed, act = layer._front_routed(moe, x)
+    return SimpleNamespace(front=seen["_front"], sort=sort.get("sort"), routed=routed, act=act)
+
+
+def _verify_self_sort(where, on, off):
+    assert on.sort is None, f"{where}: the on arm launched the experts on a sorted routing"
+    assert off.sort is not None, f"{where}: the off arm did not use the front's sort"
+    _assert_one_hot(where, off.front[1])
+    for name, a, b in zip(_FRONT_NAMES, on.front, off.front):
+        _expect_same(f"{where}: on vs off front {name}", a, b)
+    _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
+    _expect_same(f"{where}: on vs off shared activation", on.act, off.act)
+
+
+def check_self_sort():
+    """``_front_routed`` on the layer built with the front's sort, with the expert kernel's own sort (switch on: the
+    front runs without ``sort_out``, the experts get the ids) and without it, at 1, 8 and 9-16 rows: no sorted
+    launch in the on arm; the front's outputs, the routed partial (one-hot routing) and the shared activation bit for
+    bit; eagerly and from replays of one graph holding both arms."""
+    on, moe = BUILT.on, BUILT.moe_on
+    assert on.state.sort_ctr is not None
+    for rows in FRONT_SORT_ROWS:
+        if rows > DML.MAX_TOKENS and on.state.head16 is None:
+            continue
+        x = _moe_input(400 + rows, rows)
+        _verify_self_sort(
+            f"SELF_SORT {rows} rows", _self_sort_arm(on, moe, x, 1), _self_sort_arm(on, moe, x, 0)
+        )
+    fields = ("front", "routed", "act")
+    for rows in GRAPH_FRONT_SORT_ROWS:
+        if rows > DML.MAX_TOKENS and on.state.head16 is None:
+            continue
+        x = _moe_input(500 + rows, rows)
+        graph, (g_on, g_off) = _capture(
+            lambda: (_self_sort_arm(on, moe, x, 1), _self_sort_arm(on, moe, x, 0))
+        )
+        for rep in range(REPLAYS):
+            x.copy_(_moe_input(600 + 10 * rows + rep, rows))
+            _replay(graph)
+            where = f"SELF_SORT graph {rows} rows replay {rep}"
+            e_on, e_off = _self_sort_arm(on, moe, x, 1), _self_sort_arm(on, moe, x, 0)
+            _same_arm(f"{where} on vs eager", g_on, e_on, fields)
+            _same_arm(f"{where} off vs eager", g_off, e_off, fields)
+            _verify_self_sort(where, g_on, g_off)
+        del graph
+    if R.rank == 0:
+        print("[rank 0] SELF_SORT: on arm = off arm (eager and replays)", flush=True)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # TRTLLM_K3LL_MOE_FRONT16
 # ----------------------------------------------------------------------------------------------------------------------
 def _front16_arm(layer, moe, x):
@@ -1627,6 +1684,7 @@ def check_moe_tail_col():
 
 CHECKS = [
     check_front_sort,
+    check_self_sort,
     check_front16,
     check_front32,
     check_wide_ar_attn_res,

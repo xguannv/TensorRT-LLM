@@ -39,6 +39,10 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   token operand of every FC2 unit).
 * Startup: the weight TMA warp issues its first fetch and loads the experts of the first 32 tiles
   together with the tile count, so the first weight load waits for one memory latency.
+* Self-sort (``self_sort_local``, at most 16 tokens): after the wait every thread of the CTA sorts the
+  step's top-k ids over the local experts into shared memory (``_self_sort``: per-token bitmaps, their
+  union and prefix counts, then each (token, k)'s tile and row), and the kernel reads the tile
+  metadata from there instead of from the previous grid: the routing kernel need not sort it.
 * PDL: every warp waits on the previous grid (tile metadata, tokens and token scales come from it)
   before it reads any of them or the counters; each CTA triggers its dependents after all of its
   warps are done (later than the safe default of right after the wait).
@@ -164,6 +168,14 @@ def _red_add_release(addr, value, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _popc(value, *, loc=None, ip=None):
+    """``popc.b32``."""
+    return Int32(
+        _asm(T.i32(), [_iv(value, loc=loc, ip=ip)], "popc.b32 $0, $1;", "=r,r", loc=loc, ip=ip)
+    )
+
+
 def _align(v: int, a: int) -> int:
     return (v + a - 1) // a * a
 
@@ -185,6 +197,12 @@ class K3MoeLowMDynKernel:
     :param queue_depth: Entries of the shared-memory unit queue.
     :param max_ab_stage: Cap on the weight ring depth (the rest of shared memory sizes it).
     :param use_pdl: Launch with programmatic dependent launch and wait on the previous grid.
+    :param self_sort_local: 0: the tile metadata (``moe_sort``'s four outputs) comes from the
+        previous grid. ``L > 0`` (at most 16 tokens): the kernel sorts the step's routing itself, in
+        every CTA, from the top-k ids of the tokens over the ``L`` local experts at a runtime offset
+        (the same tiles, rows and order as ``k3_moe_front``'s sort: one tile per touched local
+        expert in expert order, its rows the selecting tokens' expanded indices in token order),
+        into shared memory, and reads the metadata from there.
     """
 
     def __init__(
@@ -202,6 +220,7 @@ class K3MoeLowMDynKernel:
         max_ab_stage: int = 16,
         use_pdl: bool = True,
         trace: bool = False,
+        self_sort_local: int = 0,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -220,6 +239,21 @@ class K3MoeLowMDynKernel:
         self.queue_depth = queue_depth
         self.use_pdl = use_pdl
         self.trace = trace
+        # Self-sort scratch (int32 words): the step's ids, per-token bitmaps of the local experts, their
+        # union and prefix counts, the tile count, each tile's expert and row limit, and the rows of
+        # each tile at stride n_tok (the permuted-index view spans 128 more words).
+        self.self_sort = self_sort_local > 0
+        assert not self.self_sort or n_tok <= 16, "self-sort: at most 16 tokens"
+        self.ss_words = max(1, -(-self_sort_local // 32))
+        self.ss_tiles = max(1, min(n_tok * topk, self_sort_local))
+        self.ss_ids = n_tok * topk if self.self_sort else 4
+        self.ss_bits = n_tok * self.ss_words if self.self_sort else 4
+        self.ss_perm = self.ss_tiles * n_tok + _MMA_M if self.self_sort else 4
+        ss_words_total = (
+            self.ss_ids + self.ss_bits + 2 * _align(self.ss_words, 4) + 4 + 2 * _align(self.ss_tiles, 4)
+            + self.ss_perm
+        )  # fmt: skip
+        self.ss_bytes = 4 * ss_words_total + 8 * 16 if self.self_sort else 0
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
         self.acc_cols = n_tok * num_acc
         self.sfa_cols = 16
@@ -265,6 +299,7 @@ class K3MoeLowMDynKernel:
                 + 2 * wgs * n_tok * 4
                 + 2 * queue_depth * 4
                 + 2 * 1024  # barriers, TMEM holder and alignment slack
+                + self.ss_bytes
             )
             self.num_ab_stage = min(max_ab_stage, (_SMEM_CAPACITY - fixed) // self.a_stage_bytes)
             if self.num_ab_stage >= need:
@@ -311,6 +346,9 @@ class K3MoeLowMDynKernel:
         global_sf: cute.Tensor,
         token_final_scales: cute.Tensor,
         ctr_ptr: cute.Pointer,
+        topk_ids: cute.Tensor,
+        local_offset: Int32,
+        num_local: Int32,
         orig_m: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -402,6 +440,14 @@ class K3MoeLowMDynKernel:
             ]
             sTok: cute.struct.Align[cute.struct.MemRange[Int32, NWG * self.n_tok], 16]
             sScale: cute.struct.Align[cute.struct.MemRange[Float32, NWG * self.n_tok], 16]
+            sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
+            sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
+            sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_words, 4)], 16]
+            sSsPrefix: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_words, 4)], 16]
+            sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+            sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
+            sSsLimit: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
+            sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_perm], 16]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -431,6 +477,9 @@ class K3MoeLowMDynKernel:
             global_sf,
             token_final_scales,
             ctr_ptr,
+            topk_ids,
+            local_offset,
+            num_local,
             orig_m,
             trace_ptr,
             a_layout,
@@ -528,6 +577,9 @@ class K3MoeLowMDynKernel:
         global_sf: cute.Tensor,
         token_final_scales: cute.Tensor,
         ctr_ptr: cute.Pointer,
+        topk_ids: cute.Tensor,
+        local_offset: Int32,
+        num_local: Int32,
         orig_m: Int32,
         trace_ptr: Optional[cute.Pointer],
         a_layout: cute.ComposedLayout,
@@ -574,6 +626,13 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
+        if cutlass.const_expr(self.self_sort):
+            (
+                tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+            ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx)
 
         # the CTA's first unit and the experts of the first 32 tiles: both loads are in flight while
         # the tile count loads
@@ -679,6 +738,82 @@ class K3MoeLowMDynKernel:
                 self._stamp(trace_ptr, bid, 12)
         if cutlass.const_expr(self.use_pdl):
             griddepcontrol_launch_dependents()
+
+    # ------------------------------------------------------------------ self-sort
+    @cute.jit
+    def _self_sort(self, st, topk_ids, local_offset: Int32, num_local: Int32, orig_m: Int32, tidx):
+        """The step's tile metadata in shared memory, by every thread of the CTA (``k3_moe_front``'s
+        ``_sort_local``): ``(expert of tile, tile * 128 + rows of tile, permuted -> expanded index,
+        tile count)`` as tensors indexed like ``moe_sort``'s outputs (the permuted view maps
+        ``tile * 128 + r`` to word ``tile * n_tok + r``)."""
+        n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
+        ids = st.sSsIds.get_tensor(cute.make_layout(self.ss_ids))
+        bits = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+        union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
+        prefix = st.sSsPrefix.get_tensor(cute.make_layout(_align(W, 4)))
+        nt = st.sSsNt.get_tensor(cute.make_layout(1))
+        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
+        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
+        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
+        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
+        n = orig_m * Int32(K)
+        for i in cutlass.range_constexpr(-(-(n_tok * K) // nthr)):
+            j = tidx + Int32(i * nthr)
+            if j < n:
+                ids[j] = topk_ids[j]
+        cute.arch.barrier()
+        for i in cutlass.range_constexpr(-(-(n_tok * W) // nthr)):
+            j = tidx + Int32(i * nthr)
+            if j < orig_m * Int32(W):
+                t = j // Int32(W)
+                w = j - t * Int32(W)
+                word = Int32(0)
+                for k in cutlass.range_constexpr(K):
+                    lx = ids[t * Int32(K) + k] - local_offset
+                    hit = (lx >= Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
+                    word = word | cutlass.select_(hit, Int32(1) << (lx & 31), Int32(0))
+                bits[j] = word
+        cute.arch.barrier()
+        if tidx < Int32(W):
+            u = Int32(0)
+            for t in cutlass.range_constexpr(n_tok):
+                if Int32(t) < orig_m:
+                    u = u | bits[t * W + tidx]
+            union[tidx] = u
+        cute.arch.barrier()
+        if tidx < Int32(W + 1):
+            before = Int32(0)
+            for w in cutlass.range_constexpr(W):
+                if Int32(w) < tidx:
+                    before = before + _popc(union[w])
+            if tidx < Int32(W):
+                prefix[tidx] = before
+            else:
+                nt[0] = before
+        cute.arch.barrier()
+        for i in cutlass.range_constexpr(-(-(n_tok * K) // nthr)):
+            j = tidx + Int32(i * nthr)
+            if j < n:
+                t = j // Int32(K)
+                lx = ids[j] - local_offset
+                if (lx >= Int32(0)) & (lx < num_local):
+                    w = lx >> 5
+                    b = lx & 31
+                    tile = prefix[w] + _popc(union[w] & ((Int32(1) << b) - Int32(1)))
+                    row = Int32(0)
+                    count = Int32(0)
+                    for q in cutlass.range_constexpr(n_tok):
+                        if Int32(q) < orig_m:
+                            bit = (bits[q * W + w] >> b) & Int32(1)
+                            count = count + bit
+                            if Int32(q) < t:
+                                row = row + bit
+                    perm_flat[tile * Int32(n_tok) + row] = j
+                    if row == Int32(0):
+                        expert[tile] = lx
+                        limit[tile] = tile * Int32(_MMA_M) + count
+        cute.arch.barrier()
+        return expert, limit, perm, nt
 
     # ------------------------------------------------------------------ producers
     @cute.jit
@@ -1466,16 +1601,20 @@ class K3MoeLowMDynKernel:
         global_sf_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
         ctr_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
         orig_m: Int32,
         m: Int32,
         num_local: Int32,
+        local_offset: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
         trace_ptr: Optional[cute.Pointer] = None,
     ):
         """``x`` [orig_m, k1] tokens and ``x_sf`` their linear scales; ``h`` / ``h_sf`` the FC1
         output buffers in the permuted layout ([m, k2] rows, 128x4-blocked scales); ``out`` the
-        zeroed BF16 [orig_m, k1] output; ``ctr`` int32 [counter_words(m // 128)] zeros."""
+        zeroed BF16 [orig_m, k1] output; ``ctr`` int32 [counter_words(m // 128)] zeros.
+        ``topk_ids`` int32 [orig_m, topk] and ``local_offset``: read only with ``self_sort_local``
+        (then the four tile-metadata pointers are not read)."""
         n1, k1, n2, k2 = self.n1, self.k1, self.n2, self.k2
         L = num_local
         num_tiles = m // _MMA_M
@@ -1516,6 +1655,9 @@ class K3MoeLowMDynKernel:
                 layout=cute.make_ordered_layout((orig_m, self.topk), order=(1, 0)),
             ),
             ctr_ptr,
+            cute.make_tensor(topk_ids_ptr, layout=cute.make_layout((orig_m * self.topk,))),
+            local_offset,
+            num_local,
             orig_m,
             num_ctas,
             stream,

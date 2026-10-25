@@ -53,6 +53,14 @@ TRTLLM_K3LL_MOE_FRONT_SORT = _flag(
     1,
     "with TRTLLM_K3LL_MOE_LOWM: the routing's moe_sort over the local experts in k3_moe_front, not its own kernel",
 )
+TRTLLM_K3LL_MOE_SELF_SORT = _flag(
+    "TRTLLM_K3LL_MOE_SELF_SORT",
+    0,
+    "with TRTLLM_K3LL_MOE_LOWM, steps of at most 16 tokens on K3MoeLowMDynKernel: the expert kernel sorts the step's "
+    "routing over the local experts itself, in every CTA after its wait on the front (the same tiles, rows and "
+    "order as k3_moe_front's sort, in shared memory); the front skips its sort (TRTLLM_K3LL_MOE_FRONT_SORT's last "
+    "route CTA hand-off) and no moe_sort runs. Same results. Read at forward time; 1 on, 0 (default) off",
+)
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
     1,

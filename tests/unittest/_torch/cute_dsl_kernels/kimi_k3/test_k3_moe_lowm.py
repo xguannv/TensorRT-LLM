@@ -21,12 +21,14 @@
                 cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell): FC1 rows and scales bit for bit, every FC2
                 partial bit for bit (one non-zero routing weight per token), the full sum within the bf16 accumulation
                 bound of the exact sum of the partials; through nvfp4_lowm_op.run (moe_sort first) as well, eagerly
-                and from CUDA-graph replays, the counters zero after every launch;
+                and from CUDA-graph replays, the counters zero after every launch; at most 16 tokens the same with
+                the kernel's own sort of the ids (self_sort: no sort arguments read);
   front (4 GPUs, one process each) : trtllm::k3_moe_front with nvfp4_gsf: the routing and the shared activation
                 bit for bit the MXFP8 call's; the NVFP4 latent against fp4_quantize of the unfused chain's bf16
                 latent (> 99.9 % equal codes and scales: the front sums the head in its own split-K order, so a code
                 may move at a rounding tie), within one E2M1 step of the reference; then the routed experts on the
-                front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs.
+                front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs, with
+                moe_sort and with the expert kernel's own sort at the rank's expert offset.
 
 Run under pytest (the front check takes a pool of 4 MPI workers) or directly:
   python3 test_k3_moe_lowm.py route_quant lowm
@@ -280,6 +282,50 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         torch.cuda.synchronize()
         check(static, f"graph replay {replay}")
         assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
+    if not nvfp4_lowm_op.self_sort_takes(num_tokens, num_local):
+        return
+
+    # The kernel's own sort (TRTLLM_K3LL_MOE_SELF_SORT): the ids alone, the sort arguments never read.
+    def lowm_self(token_scales):
+        out.fill_(7.0)
+        h.zero_()
+        h_sf.zero_()
+        _trtllm().k3_moe_nvfp4_lowm(
+            _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
+            token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
+        return out.clone()
+
+    for slot in (0, top_k - 1):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        new = lowm_self(one_hot)
+        assert torch.equal(finalize(one_hot).view(torch.int16), new.view(torch.int16)), (
+            f"self-sort FC2 slot {slot}"
+        )
+        if slot == 0:
+            assert torch.equal(c_ref[rows], h[rows]), "self-sort: FC1 output rows differ"
+            cols = inter_size // SF16
+            sf_ref = unswizzle_sf(c_sf_ref, m, inter_size, SF16).view(m, cols)
+            sf_new = unswizzle_sf(h_sf, m, inter_size, SF16).view(m, cols)
+            assert torch.equal(sf_ref[rows], sf_new[rows]), (
+                "self-sort: FC1 output scale factors differ"
+            )
+    check(lowm_self(scales), "self-sort op")
+    y = nvfp4_lowm_op.run(*run_args, num_ctas=num_ctas, self_sort=True)
+    torch.cuda.synchronize()
+    check(y, "run self_sort")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        nvfp4_lowm_op.run(*run_args, out=static, num_ctas=num_ctas, self_sort=True)
+    for replay in range(3):
+        static.fill_(7.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(static, f"self-sort graph replay {replay}")
+        assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset after a replay"
 
 
 @pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])
@@ -493,6 +539,11 @@ def check_front(ctx):
         torch.cuda.synchronize()
         denom = y_ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
         y_err_ulp = ((y.float() - y_ref.float()).abs() / denom).max().item() / 2.0**-8
+        # The expert kernel's own sort of the front's ids (TRTLLM_K3LL_MOE_SELF_SORT) at this rank's offset.
+        y_self = nvfp4_lowm_op.run(q, s, ids, w, ctx.weights, ctx.offset, EXPERTS, ctx.ex.fc2_input_scale,
+                                   ctx.counters, GATE_CAP, LINEAR_CAP, self_sort=True)  # fmt: skip
+        torch.cuda.synchronize()
+        y_self_ulp = ((y_self.float() - y_ref.float()).abs() / denom).max().item() / 2.0**-8
         again = _front(ctx, x, True)
         gathered = ctx.comm.allgather([_bits(t).cpu() for t in (ids, w, q, s)])
         row = dict(
@@ -500,12 +551,14 @@ def check_front(ctx):
             routing_as_mxfp8=_same(ids, ids8) and _same(w, w8), shared_as_mxfp8=_same(shared, shared8),
             codes_equal=(q == r_q).float().mean().item(), scales_equal=(s == r_s).float().mean().item(),
             latent_err_scale_units=err_steps, experts_vs_regular_ulp=y_err_ulp,
+            experts_self_sort_vs_regular_ulp=y_self_ulp,
             det=all(_same(a, b) for a, b in zip(again, (ids, w, q, s, shared))),
             ranks_agree=all(all(torch.equal(a, b) for a, b in zip(g, gathered[0])) for g in gathered),
             counters_zero=int(ctx.counters.abs().sum().item()) == 0,
         )  # fmt: skip
         good = (row["routing_as_mxfp8"] and row["shared_as_mxfp8"] and row["codes_equal"] > 0.999
-                and row["scales_equal"] > 0.999 and err_steps <= 2.0 and y_err_ulp <= 8.0 and row["det"]
+                and row["scales_equal"] > 0.999 and err_steps <= 2.0 and y_err_ulp <= 8.0 and y_self_ulp <= 8.0
+                and row["det"]
                 and row["ranks_agree"] and row["counters_zero"])  # fmt: skip
         row["rank"], row["good"] = ctx.rank, bool(good)
         row["ok"] = all(ctx.comm.allgather(bool(good)))
