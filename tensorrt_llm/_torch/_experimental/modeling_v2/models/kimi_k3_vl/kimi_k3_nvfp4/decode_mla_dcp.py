@@ -330,11 +330,101 @@ def make_helix_plan(
             rank owns included.
         positions: ``[batch * q_len]`` global position of every query token of the step.
     """
+    if _flags.TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED and local_block_rows.is_cuda:
+        from . import census as _census
+
+        _census.count(f"dispatch:mla_helix_plan_fused:{_census.mode()}")
+        return _make_helix_plan_fused(
+            local_block_rows, local_lens, positions, page_size, cp_size, cp_rank
+        )
     page_table = local_block_rows.to(torch.int32).contiguous().t()
     kv_bounds = helix_local_len_tensor(
         positions.to(torch.int32) + 1, page_size, cp_size, cp_rank
     ).to(torch.int32)
     return SplitReadPlan(page_table, local_lens.to(torch.int32), kv_bounds, kv_bounds == 0)
+
+
+@triton.jit
+def _helix_plan_kernel(
+    ROWS,
+    ROWS_S0,
+    ROWS_S1,
+    LENS,
+    POS,
+    PAGES,
+    SEQS,
+    BOUNDS,
+    EMPTY,
+    LOCAL_BLOCKS,
+    Q_LEN: tl.constexpr,
+    PAGE: tl.constexpr,
+    CP: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
+):
+    """Program ``b``: request ``b``'s row of the int32 page table, its int32 length, and its ``Q_LEN`` query tokens'
+    bounds ``helix_local_len(position + 1)`` (floor division, as ``helix_local_len_tensor``) and empty flags."""
+    b = tl.program_id(0)
+    for start in range(0, LOCAL_BLOCKS, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        live = offs < LOCAL_BLOCKS
+        page = tl.load(ROWS + b * ROWS_S0 + offs * ROWS_S1, mask=live, other=0)
+        tl.store(PAGES + b * LOCAL_BLOCKS + offs, page.to(tl.int32), mask=live)
+    tl.store(SEQS + b, tl.load(LENS + b).to(tl.int32))
+    q = tl.arange(0, Q_BLOCK)
+    qlive = q < Q_LEN
+    g = tl.load(POS + b * Q_LEN + q, mask=qlive, other=0).to(tl.int32) + 1
+    # floor(g / ledger) and its remainder as torch.div(rounding_mode="floor"), on a non-negative dividend (a padded
+    # slot's position can be negative): g + SHIFT * ledger >= 0 for every int32 position the cache can hold.
+    ledger: tl.constexpr = PAGE * CP
+    shift: tl.constexpr = (1 << 30) // ledger
+    g_pos = g + shift * ledger
+    q_pos = g_pos // ledger
+    rem = g_pos - q_pos * ledger
+    full = q_pos - shift
+    bound = full * PAGE + tl.minimum(tl.maximum(rem - RANK * PAGE, 0), PAGE)
+    tl.store(BOUNDS + b * Q_LEN + q, bound, mask=qlive)
+    tl.store(EMPTY + b * Q_LEN + q, (bound == 0).to(tl.int8), mask=qlive)
+
+
+def _make_helix_plan_fused(
+    local_block_rows: torch.Tensor,
+    local_lens: torch.Tensor,
+    positions: torch.Tensor,
+    page_size: int,
+    cp_size: int,
+    cp_rank: int,
+) -> SplitReadPlan:
+    """`make_helix_plan` in one kernel launch (``TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED``): the same tensors, bit for bit."""
+    batch, local_blocks = local_block_rows.shape
+    tokens = positions.shape[0]
+    q_len = tokens // batch
+    assert q_len * batch == tokens and positions.is_contiguous() and local_lens.is_contiguous()
+    device = local_block_rows.device
+    pages = torch.empty(batch, local_blocks, dtype=torch.int32, device=device)
+    seqs = torch.empty(batch, dtype=torch.int32, device=device)
+    bounds = torch.empty(tokens, dtype=torch.int32, device=device)
+    empty = torch.empty(tokens, dtype=torch.bool, device=device)
+    _helix_plan_kernel[(batch,)](
+        local_block_rows,
+        local_block_rows.stride(0),
+        local_block_rows.stride(1),
+        local_lens,
+        positions,
+        pages,
+        seqs,
+        bounds,
+        empty.view(torch.int8),
+        local_blocks,
+        Q_LEN=q_len,
+        PAGE=page_size,
+        CP=cp_size,
+        RANK=cp_rank,
+        BLOCK=256,
+        Q_BLOCK=triton.next_power_of_2(q_len),
+    )
+    return SplitReadPlan(pages.t(), seqs, bounds, empty)
 
 
 def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:

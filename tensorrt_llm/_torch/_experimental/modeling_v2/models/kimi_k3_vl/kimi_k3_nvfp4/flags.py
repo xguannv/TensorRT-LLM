@@ -463,6 +463,13 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT = _flag(
     "and partials: bitwise; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(mla_v_up.MLA_VAR_SPLIT_FLAT_CAPABILITIES)",
 )
+TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED = _flag(
+    "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED",
+    0,
+    "Helix MLA decode: the step's split-read plan (decode_mla_dcp.make_helix_plan: int32 page table, lengths, "
+    "per-token bounds and empty flags, built by the step's first MLA layer) in one Triton launch instead of about ten "
+    "int torch kernels in a row before that layer's split read (bitwise; read at forward time). 0 (default): off",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,
