@@ -128,10 +128,31 @@ def test_routed_passes_the_decision_to_run(monkeypatch, switch):
 
 
 # ``TRTLLM_K3LL_MOE_SELF_SORT_FC12``: the same for the 17-32-token FC1 + FC2 launch.
-def test_fc12_switch_default_off_and_documented():
+def test_fc12_switch_default_sm103_and_documented():
     _, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_SELF_SORT_FC12"]
-    assert default == 0
-    assert "17-32 tokens" in doc and "K3MoeFc1LowMKernel" in doc and "k3_moe_front" in doc
+    assert default == -1
+    assert (
+        "17-32 tokens" in doc
+        and "K3MoeFc1LowMKernel" in doc
+        and "k3_moe_front" in doc
+        and "SM103" in doc
+    )
+
+
+@pytest.mark.parametrize("value,capability,on", [
+    (-1, (10, 3), True), (-1, (10, 0), False), (-1, (10, 7), False), (1, (10, 0), True), (0, (10, 3), False),
+])  # fmt: skip
+def test_fc12_default_follows_the_capability(monkeypatch, value, capability, on):
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_SELF_SORT_FC12", value)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    dm._self_sort_on_by_default.cache_clear()
+    try:
+        assert dm.self_sort_fc12_enabled() is on
+    finally:
+        dm._self_sort_on_by_default.cache_clear()
 
 
 @pytest.mark.parametrize(

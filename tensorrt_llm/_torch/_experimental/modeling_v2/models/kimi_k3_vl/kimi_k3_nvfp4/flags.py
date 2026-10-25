@@ -56,20 +56,26 @@ TRTLLM_K3LL_MOE_FRONT_SORT = _flag(
 TRTLLM_K3LL_MOE_SELF_SORT = _flag(
     "TRTLLM_K3LL_MOE_SELF_SORT",
     -1,
-    "with TRTLLM_K3LL_MOE_LOWM, steps of at most 16 tokens on K3MoeLowMDynKernel: the expert kernel sorts the step's "
-    "routing over the local experts itself, in every CTA after its wait on the front (the same tiles, rows and "
-    "order as k3_moe_front's sort, in shared memory); the front skips its sort (TRTLLM_K3LL_MOE_FRONT_SORT's last "
-    "route CTA hand-off) and no moe_sort runs; the kernel reads the front's bf16 routing weights itself. Same "
-    "results. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 only "
-    "(decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs1 -0.150 ms, bs2 -0.223 ms, moss-0444)",
+    "with TRTLLM_K3LL_MOE_LOWM, steps of at most 16 tokens over at most 256 local experts on K3MoeLowMDynKernel (the "
+    "front's steps, and the wide head's k3_route_quant steps): the expert kernel sorts the step's routing over the "
+    "local experts itself, in every CTA after its wait (the same tiles and rows, in token order, as k3_moe_front's "
+    "sort, in shared memory); the front skips its sort (TRTLLM_K3LL_MOE_FRONT_SORT's last route CTA hand-off), or "
+    "moe_sort does not run; the kernel reads the front's bf16 routing weights itself (widened exactly). FC1 rows "
+    "bit for bit; each (token, expert) partial bit for bit; a token's sum of partials in FC2's red order, as "
+    "without it. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 only "
+    "(decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; the lowm path runs on SM100 / SM103 only; L1 bs1 -0.150 ms, bs2 "
+    "-0.223 ms, moss-0444)",
 )
 TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "TRTLLM_K3LL_MOE_SELF_SORT_FC12",
-    0,
-    "with TRTLLM_K3LL_MOE_LOWM_FC12, wide steps of 17-32 tokens: K3MoeFc1LowMKernel and K3MoeFc2LowMKernel each "
-    "build the tile metadata of their own CTA's tiles from the step's top-k ids (the same tiles and rows as "
-    "k3_moe_front's sort, in shared memory), so the front skips its sort and the kernels read the front's bf16 "
-    "routing weights. Same results. Read at forward time; 1 on, 0 off",
+    -1,
+    "with TRTLLM_K3LL_MOE_LOWM_FC12, wide steps of 17-32 tokens over at most 256 local experts (the front's, and the "
+    "wide head's): K3MoeFc1LowMKernel (after its wait) and K3MoeFc2LowMKernel (at its start) each build the tile "
+    "metadata of their own CTA's tiles from the step's top-k ids (the same tiles and rows, in token order, as "
+    "k3_moe_front's sort, in shared memory), so the front skips its sort (or moe_sort does not run) and FC2 reads "
+    "the front's bf16 routing weights (widened exactly). FC1 rows and each (token, expert) partial bit for bit; a "
+    "token's sum in FC2's red order, as without it. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 "
+    "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452)",
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",

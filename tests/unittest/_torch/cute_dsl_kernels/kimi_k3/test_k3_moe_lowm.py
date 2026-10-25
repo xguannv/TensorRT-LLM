@@ -197,7 +197,7 @@ def _sort(ids, scales, num_experts, top_k, offset, num_local):
     [(LATENT, I_TP, EXPERTS, E_LOCAL, E_LOCAL, TOP_K), (1024, 256, 64, 16, 0, 8)],
     ids=["k3_tp4ep4", "small"],
 )
-@pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 32])
+@pytest.mark.parametrize("num_tokens", [1, 7, 8, 14, 16, 32])
 @pytest.mark.parametrize("num_ctas", [0, 100], ids=["ctas_max", "ctas_100"])
 def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     import tensorrt_llm  # noqa: F401
@@ -662,9 +662,32 @@ def check_front(ctx):
     return results
 
 
+def _experts_ulp(ctx, ids, w, q, s):
+    """This rank's routed partial of the front's outputs through `run` with moe_sort and with the expert kernel's own
+    sort (TRTLLM_K3LL_MOE_SELF_SORT), each against the regular kernels' (max error / row max, in bf16 ulps)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+
+    args = (q, s, ids, w, ctx.weights, ctx.offset, EXPERTS, ctx.ex.fc2_input_scale, ctx.counters, GATE_CAP,
+            LINEAR_CAP)  # fmt: skip
+    y = nvfp4_lowm_op.run(*args)
+    y_self = nvfp4_lowm_op.run(*args, self_sort=True)
+    scales = w.float()
+    t2g, t2lim, _, p2e, _, nnet = _sort(ids, scales, EXPERTS, TOP_K, ctx.offset, E_LOCAL)
+    _, _, finalize = _regular(q, s, ctx.ex, ctx.weights[2], t2g, t2lim, p2e, nnet, scales, EXPERTS, TOP_K,
+                              ctx.offset, I_TP)  # fmt: skip
+    y_ref = finalize(scales)
+    torch.cuda.synchronize()
+    denom = y_ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+    return tuple(
+        ((t.float() - y_ref.float()).abs() / denom).max().item() / 2.0**-8 for t in (y, y_self)
+    )
+
+
 def check_front16(ctx):
     """The 16-token build on 9-16 rows: every output bit for bit as the 8-token build's on rows [0, 8) and [8, M)
-    (each token's head is its own dot products in the same split-K order, its routing and quantization its own)."""
+    (each token's head is its own dot products in the same split-K order, its routing and quantization its own);
+    with the NVFP4 latent, also the routed partial through `run` with moe_sort and with the expert kernel's own sort,
+    each within 8 bf16 ulps of the regular kernels'."""
     results = []
     for m in range(9, 17):
         x = ctx.x16[:m].contiguous()
@@ -684,6 +707,11 @@ def check_front16(ctx):
                 det=all(_same(a, b) for a, b in zip(again, out)),
                 ranks_agree=all(all(torch.equal(a, b) for a, b in zip(g, gathered[0])) for g in gathered),
             )  # fmt: skip
+            if nvfp4:
+                y_ulp, y_self_ulp = _experts_ulp(ctx, *out[:4])
+                row["experts_within_8ulp"] = y_ulp <= 8.0
+                row["experts_self_sort_within_8ulp"] = y_self_ulp <= 8.0
+                row["counters_zero"] = int(ctx.counters.abs().sum().item()) == 0
             good = all(v for k, v in row.items() if k not in ("op", "case", "M"))
             row["rank"], row["good"] = ctx.rank, bool(good)
             row["ok"] = all(ctx.comm.allgather(bool(good)))

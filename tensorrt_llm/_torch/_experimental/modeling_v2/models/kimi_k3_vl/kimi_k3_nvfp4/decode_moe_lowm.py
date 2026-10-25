@@ -195,8 +195,12 @@ def self_sort_enabled() -> bool:
 
 
 def self_sort_fc12_enabled() -> bool:
-    """``TRTLLM_K3LL_MOE_SELF_SORT_FC12`` (read at forward time): 1 on, 0 (default) off."""
-    return int(_flags.TRTLLM_K3LL_MOE_SELF_SORT_FC12) > 0
+    """``TRTLLM_K3LL_MOE_SELF_SORT_FC12`` (read at forward time): 1 on, 0 off, -1 (default) on where the device is in
+    ``MOE_SELF_SORT_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_SELF_SORT_FC12)
+    if value >= 0:
+        return value > 0
+    return _self_sort_on_by_default()
 
 
 def fc12_takes(state, rows: int) -> bool:
