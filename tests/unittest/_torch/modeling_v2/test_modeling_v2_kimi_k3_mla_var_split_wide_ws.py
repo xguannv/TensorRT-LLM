@@ -86,11 +86,19 @@ def test_envelope(monkeypatch):
     wide_bytes = dcp.workspace_bytes(heads, dcp.MAX_Q_LEN, dcp.MAX_REQUESTS)
     units = dcp._WIDE_WS_UNITS[(heads, 8)]
     q_tiles = -(-heads * 8 // 128)
-    assert units == max(
-        b * q_tiles * min(dcp._MAX_VAR_SPLIT, budget - b + 1)
-        for b in range(2, dcp._max_fused_rows() // 8 + 1)
+    static_units = dcp._static_units(heads)
+    cap = int(dcp._WIDE_WS_MAX_FACTOR * static_units)
+    assert units == min(
+        cap,
+        max(
+            b * q_tiles * min(dcp._MAX_VAR_SPLIT, budget - b + 1)
+            for b in range(2, dcp._max_fused_rows() // 8 + 1)
+        ),
     )
-    assert wide_bytes - base_bytes == (units - dcp._static_units(heads)) * 128 * (512 + 1) * 4
+    # the extra bytes: the largest recorded need over the query lengths, at most the cap
+    largest = max(dcp._WIDE_WS_UNITS.values())
+    assert largest <= cap
+    assert wide_bytes - base_bytes == (largest - static_units) * 128 * (512 + 1) * 4
     grid4 = dcp._var_split_envelope(4, heads, 8)[1]
     assert grid4 == min(dcp._MAX_VAR_SPLIT, budget - 3) > static_grid
     # past the FLAT grid's rows (5 requests x 8 = 40 rows): unchanged

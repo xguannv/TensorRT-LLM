@@ -130,6 +130,9 @@ MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES = ((10, 3),)
 #: (heads, q_len) -> the 128-row split units the allocated workspace holds beyond the static split's bound
 #: (`workspace_bytes` records them; `_var_split_envelope` widens only up to them).
 _WIDE_WS_UNITS: dict = {}
+#: The widened workspace holds at most this many times the static split's units (MTP7 at bs4 needs 216 / 148-152;
+#: one-token queries would ask for 1024 units, ~270 MB per rank): above it the grid widens only as far as it fits.
+_WIDE_WS_MAX_FACTOR = 1.5
 
 
 @functools.lru_cache(maxsize=None)
@@ -528,8 +531,8 @@ def _make_helix_plan_fused(
 
 def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:
     """The split read's workspace: the runner's (LSE + the static split's bound), and with
-    ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS`` the split units of `_flat_units` for every query length up to ``q_len``
-    (recorded for `_var_split_envelope`)."""
+    ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS`` the split units of `_flat_units` for every query length up to ``q_len``,
+    at most ``_WIDE_WS_MAX_FACTOR`` x the static split's (recorded for `_var_split_envelope`)."""
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
@@ -539,9 +542,10 @@ def workspace_bytes(num_heads: int, q_len: int, max_batch: int) -> int:
     )
     if var_split_wide_ws():
         static = _static_units(num_heads)
+        cap = int(_WIDE_WS_MAX_FACTOR * static)
         extra = 0
         for q in range(1, q_len + 1):
-            need = _flat_units(num_heads, q)
+            need = min(_flat_units(num_heads, q), cap)
             if need > static:
                 _WIDE_WS_UNITS[(num_heads, q)] = need
                 extra = max(extra, need - static)

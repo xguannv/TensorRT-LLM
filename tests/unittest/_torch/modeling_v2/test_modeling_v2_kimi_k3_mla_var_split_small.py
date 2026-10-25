@@ -196,6 +196,8 @@ def test_census_tally(monkeypatch):
     monkeypatch.setattr(census, "ENABLED", True)
     monkeypatch.setattr(census, "_device_tallies", {})
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL", 1)
+    # the static split's grid (WIDE_WS's slot is test_modeling_v2_kimi_k3_mla_var_split_wide_ws's)
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 0)
     heads = _var()._vu().HEADS
     mixed = torch.tensor([25600, 2048], dtype=torch.int32, device="cuda")
     equal = torch.tensor([9600, 9600], dtype=torch.int32, device="cuda")
@@ -209,7 +211,7 @@ def test_census_tally(monkeypatch):
     graph.replay()
     torch.cuda.synchronize()
     tally = dcp._counts_tally(mixed.device).tolist()
-    assert tally == [4, 3, 1, 1], (
+    assert tally == [4, 3, 1, 1, 0], (
         tally
-    )  # small: 2 eager + 2 replays, 3 unequal; wide: 1 call, unequal
+    )  # small: 2 eager + 2 replays, 3 unequal; wide: 1 call, unequal; none past the static cap
     assert "device:mla_var_split_counts:small_unequal=3" in census._device_tally_text()
