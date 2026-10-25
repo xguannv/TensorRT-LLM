@@ -78,6 +78,7 @@ from .k3_moe_lowm import (
     _ldg_u32,
     _lds_v4_f32,
     _red_add_v8_bf16_from_smem,
+    _red_shared_or,
     _s2t_copy_and_partition,
     _signal_add_release,
     _st_relaxed_u32,
@@ -203,6 +204,10 @@ class K3MoeLowMDynKernel:
         (the same tiles, rows and order as ``k3_moe_front``'s sort: one tile per touched local
         expert in expert order, its rows the selecting tokens' expanded indices in token order),
         into shared memory, and reads the metadata from there.
+    :param self_sort_mask: With ``self_sort_local``: the sort on per-expert token masks (``True``: one
+        ``red.shared.or`` per id, one ballot per 32 experts, each id's tile and row by popc; the masks
+        zeroed before the grid dependency wait) or on per-token expert bitmaps scanned per id over all
+        tokens (``False``); the same metadata.
     """
 
     def __init__(
@@ -221,6 +226,7 @@ class K3MoeLowMDynKernel:
         use_pdl: bool = True,
         trace: bool = False,
         self_sort_local: int = 0,
+        self_sort_mask: bool = True,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -246,12 +252,17 @@ class K3MoeLowMDynKernel:
         assert not self.self_sort or n_tok <= 16, "self-sort: at most 16 tokens"
         self.ss_words = max(1, -(-self_sort_local // 32))
         self.ss_tiles = max(1, min(n_tok * topk, self_sort_local))
-        self.ss_ids = n_tok * topk if self.self_sort else 4
-        self.ss_bits = n_tok * self.ss_words if self.self_sort else 4
+        self.ss_mask = self.self_sort and self_sort_mask
+        loops = self.self_sort and not self_sort_mask
+        self.ss_ids = n_tok * topk if loops else 4
+        self.ss_bits = (
+            32 * self.ss_words if self.ss_mask else n_tok * self.ss_words if loops else 4
+        )  # fmt: skip
+        self.ss_prefix = _align(self.ss_words, 4) if loops else 4
         self.ss_perm = self.ss_tiles * n_tok + _MMA_M if self.self_sort else 4
         ss_words_total = (
-            self.ss_ids + self.ss_bits + 2 * _align(self.ss_words, 4) + 4 + 2 * _align(self.ss_tiles, 4)
-            + self.ss_perm
+            self.ss_ids + self.ss_bits + _align(self.ss_words, 4) + self.ss_prefix + 4
+            + 2 * _align(self.ss_tiles, 4) + self.ss_perm
         )  # fmt: skip
         self.ss_bytes = 4 * ss_words_total + 8 * 16 if self.self_sort else 0
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
@@ -443,7 +454,7 @@ class K3MoeLowMDynKernel:
             sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
             sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
             sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_words, 4)], 16]
-            sSsPrefix: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_words, 4)], 16]
+            sSsPrefix: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_prefix], 16]
             sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
             sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
             sSsLimit: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
@@ -614,6 +625,13 @@ class K3MoeLowMDynKernel:
                 cute.arch.mbarrier_init(st.sfb_full, 4)
                 cute.arch.mbarrier_init(st.tmem_ready, 1)
                 cute.arch.mbarrier_init(st.tmem_free, self.epi_warps)
+        if cutlass.const_expr(self.ss_mask):
+            # the token masks (`_self_sort_masks`) read nothing from the previous grid
+            ss_tok_masks = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+            for i in cutlass.range_constexpr(-(-self.ss_bits // self.threads)):
+                j = tidx + Int32(i * self.threads)
+                if j < Int32(self.ss_bits):
+                    ss_tok_masks[j] = Int32(0)
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
         if cutlass.const_expr(self.trace):
@@ -626,13 +644,20 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
-        if cutlass.const_expr(self.self_sort):
+        if cutlass.const_expr(self.self_sort and not self.ss_mask):
             (
                 tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles,
             ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx)
+        if cutlass.const_expr(self.ss_mask):
+            (
+                tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+            ) = self._self_sort_masks(st, topk_ids, local_offset, num_local, orig_m, tidx)
 
         # the CTA's first unit and the experts of the first 32 tiles: both loads are in flight while
         # the tile count loads
@@ -812,6 +837,75 @@ class K3MoeLowMDynKernel:
                     if row == Int32(0):
                         expert[tile] = lx
                         limit[tile] = tile * Int32(_MMA_M) + count
+        cute.arch.barrier()
+        return expert, limit, perm, nt
+
+    @cute.jit
+    def _self_sort_masks(
+        self, st, topk_ids, local_offset: Int32, num_local: Int32, orig_m: Int32, tidx
+    ):
+        """`_self_sort`'s metadata from per-local-expert token masks (zeroed before the wait): each id ORs
+        its token's bit into its expert's mask; one ballot per 32 experts gives the touched experts; each
+        id's tile is the touched experts below its expert, its row the tokens below its token in the mask.
+        Three CTA barriers."""
+        n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
+        per = -(-(n_tok * K) // nthr)
+        mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+        union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
+        nt = st.sSsNt.get_tensor(cute.make_layout(1))
+        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
+        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
+        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
+        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
+        mask_base = st.sSsBits.data_ptr().toint()
+        n = orig_m * Int32(K)
+        lxs = []
+        for i in cutlass.range_constexpr(per):
+            j = tidx + Int32(i * nthr)
+            lx = Int32(-1)
+            if j < n:
+                e = topk_ids[j] - local_offset
+                if (e >= Int32(0)) & (e < num_local):
+                    lx = e
+                    _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
+            lxs.append(lx)
+        cute.arch.barrier()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        nwarps = nthr // 32
+        for i in cutlass.range_constexpr(-(-W // nwarps)):
+            w = warp + Int32(i * nwarps)
+            if w < Int32(W):
+                b = cute.arch.vote_ballot_sync(mask[w * Int32(32) + lane] != Int32(0))
+                if lane == Int32(0):
+                    union[w] = Int32(b)
+        cute.arch.barrier()
+        u = []
+        for w in cutlass.range_constexpr(W):
+            u.append(union[w])
+        if tidx == Int32(0):
+            ntiles = Int32(0)
+            for w in cutlass.range_constexpr(W):
+                ntiles = ntiles + _popc(u[w])
+            nt[0] = ntiles
+        for i in cutlass.range_constexpr(per):
+            lx = lxs[i]
+            if lx >= Int32(0):
+                j = tidx + Int32(i * nthr)
+                hi = lx >> 5
+                tile = Int32(0)
+                for w in cutlass.range_constexpr(W):
+                    below = cutlass.select_(Int32(w) < hi, u[w], Int32(0))
+                    below = cutlass.select_(
+                        Int32(w) == hi, u[w] & ((Int32(1) << (lx & 31)) - Int32(1)), below
+                    )
+                    tile = tile + _popc(below)
+                tok = mask[lx]
+                row = _popc(tok & ((Int32(1) << (j // Int32(K))) - Int32(1)))
+                perm_flat[tile * Int32(n_tok) + row] = j
+                if row == Int32(0):
+                    expert[tile] = lx
+                    limit[tile] = tile * Int32(_MMA_M) + _popc(tok)
         cute.arch.barrier()
         return expert, limit, perm, nt
 

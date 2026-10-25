@@ -204,7 +204,11 @@ def test_mask_switch_documented_and_read_at_forward_time(monkeypatch):
     flags = _mod("flags")
     _, default, doc = flags.flags()["TRTLLM_K3LL_MOE_SELF_SORT_MASK"]
     assert default == 0
-    assert "TRTLLM_K3LL_MOE_SELF_SORT_FC12" in doc and "same metadata" in doc
+    assert (
+        "TRTLLM_K3LL_MOE_SELF_SORT_FC12" in doc
+        and "K3MoeLowMDynKernel" in doc
+        and "same metadata" in doc
+    )
     lowm = _mod("decode_moe_lowm")
     for value, on in ((0, False), (1, True)):
         monkeypatch.setattr(flags, "TRTLLM_K3LL_MOE_SELF_SORT_MASK", value)

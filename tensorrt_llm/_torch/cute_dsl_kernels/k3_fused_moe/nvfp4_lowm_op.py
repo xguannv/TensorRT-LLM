@@ -168,6 +168,7 @@ def k3_moe_nvfp4_lowm(
     h_sf: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     local_offset: int = 0,
+    self_sort_mask: bool = True,
 ) -> None:
     """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 32`` tokens.
 
@@ -256,7 +257,7 @@ def k3_moe_nvfp4_lowm(
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (_device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas, stages,
-           use_pdl, num_local if self_sort else 0, scales_bf16)  # fmt: skip
+           use_pdl, num_local if self_sort else 0, scales_bf16, self_sort and bool(self_sort_mask))  # fmt: skip
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -269,6 +270,7 @@ def k3_moe_nvfp4_lowm(
                 kernel = dyn.K3MoeLowMDynKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), fc2_chunk=1,
                     max_ab_stage=stages, use_pdl=use_pdl, self_sort_local=num_local if self_sort else 0,
+                    self_sort_mask=bool(self_sort_mask),
                 )  # fmt: skip
                 fn = _compiled[key] = cute.compile(
                     kernel.wrapper, *ptrs, orig_m, m, num_local, local_offset, ctas, stream
@@ -279,7 +281,8 @@ def k3_moe_nvfp4_lowm(
 @k3_moe_nvfp4_lowm.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, counters, top_k,
-      situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, topk_ids=None, local_offset=0):  # fmt: skip
+      situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, topk_ids=None, local_offset=0,
+      self_sort_mask=True):  # fmt: skip
     return None
 
 
@@ -478,7 +481,8 @@ def run(
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
     ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``fc12``: `run_sorted`'s. ``self_sort``
     (where `self_sort_takes` holds, with ``fc12`` its ``fc12`` form): no ``moe_sort``; the expert kernel(s) sort the
-    ids themselves (the same tiles and rows); ``self_sort_mask``: FC1 / FC2's sort variant."""
+    ids themselves (the same tiles and rows); ``self_sort_mask``: that sort's variant (the kernels'
+    ``self_sort_mask``)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     if self_sort and fc12 is not None and self_sort_takes(num_tokens, w1.shape[0], fc12=True):
@@ -513,7 +517,7 @@ def run(
         torch.ops.trtllm.k3_moe_nvfp4_lowm(
             x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, ids, ids, ids, ids, fc2_input_scale, scales,
             counters, top_k, float(situ_beta), float(situ_linear_beta), num_ctas, topk_ids=ids,
-            local_offset=int(local_expert_offset),
+            local_offset=int(local_expert_offset), self_sort_mask=bool(self_sort_mask),
         )  # fmt: skip
         return out
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()

@@ -80,10 +80,10 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
 TRTLLM_K3LL_MOE_SELF_SORT_MASK = _flag(
     "TRTLLM_K3LL_MOE_SELF_SORT_MASK",
     0,
-    "with TRTLLM_K3LL_MOE_SELF_SORT_FC12: FC1 / FC2 sort on per-expert token masks (one red.shared.or per id, one "
-    "ballot per 32 experts, tile and row by popc; the masks zeroed before the grid dependency wait) instead of "
-    "per-token expert bitmaps scanned per (tile, token). The same metadata, so the same outputs. Read at forward "
-    "time; 1 on, 0 off",
+    "the expert kernels' own sort (K3MoeLowMDynKernel with TRTLLM_K3LL_MOE_SELF_SORT, FC1 / FC2 with "
+    "TRTLLM_K3LL_MOE_SELF_SORT_FC12) on per-expert token masks (one red.shared.or per id, one ballot per 32 "
+    "experts, tile and row by popc; the masks zeroed before the grid dependency wait) instead of per-token expert "
+    "bitmaps scanned over all tokens. The same metadata, so the same outputs. Read at forward time; 1 on, 0 off",
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",

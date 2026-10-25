@@ -292,13 +292,14 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def lowm_self(token_scales):
+    def lowm_self(token_scales, mask=True):
         out.fill_(7.0)
         h.zero_()
         h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
+            self_sort_mask=mask,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
@@ -307,10 +308,17 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     for slot in (0, top_k - 1):
         one_hot = torch.zeros_like(scales)
         one_hot[:, slot] = scales[:, slot]
+        # the scan variant (TRTLLM_K3LL_MOE_SELF_SORT_MASK=0): the same metadata, the same bits
+        scan = lowm_self(one_hot, mask=False)
+        h_scan = h.clone()
+        assert torch.equal(finalize(one_hot).view(torch.int16), scan.view(torch.int16)), (
+            f"self-sort (scan) FC2 slot {slot}"
+        )
         new = lowm_self(one_hot)
         assert torch.equal(finalize(one_hot).view(torch.int16), new.view(torch.int16)), (
             f"self-sort FC2 slot {slot}"
         )
+        assert torch.equal(h_scan, h), f"self-sort FC1 output: scan vs masks, slot {slot}"
         if slot == 0:
             # Same tiles as moe_sort, the rows of a tile in token order (moe_sort's are in any order).
             assert torch.equal(c_ref[rows], h[self_rows]), "self-sort: FC1 output rows differ"

@@ -204,7 +204,7 @@ def self_sort_fc12_enabled() -> bool:
 
 
 def self_sort_mask_enabled() -> bool:
-    """``TRTLLM_K3LL_MOE_SELF_SORT_MASK`` (read at forward time): FC1 / FC2's sort variant."""
+    """``TRTLLM_K3LL_MOE_SELF_SORT_MASK`` (read at forward time): the expert kernels' own sort's variant."""
     return int(_flags.TRTLLM_K3LL_MOE_SELF_SORT_MASK) > 0
 
 
@@ -482,21 +482,27 @@ class K3DecodeMoeNvfp4Layer:
         FC1 + FC2 launch at 17 and 32 tokens (its 32-token build)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
-        # Both sorts (the front's or moe_sort, and the expert kernel's own, TRTLLM_K3LL_MOE_SELF_SORT), so the switch
-        # can change at forward time.
-        for self_sort in (False, True):
-            self._front_routed(moe, x, self_sort=self_sort)
+        # Both sorts (the front's or moe_sort, and the expert kernel's own, TRTLLM_K3LL_MOE_SELF_SORT; that one in
+        # both variants, TRTLLM_K3LL_MOE_SELF_SORT_MASK), so the switches can change at forward time.
+        for self_sort, mask in ((False, None), (True, False), (True, True)):
+            self._front_routed(moe, x, self_sort=self_sort, self_sort_mask=mask)
             if self.state.head16 is not None:
                 self._front_routed(
-                    moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]), self_sort=self_sort
-                )
+                    moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]), self_sort=self_sort,
+                    self_sort_mask=mask,
+                )  # fmt: skip
         if self.state.head32 is not None:
             self._front_routed(moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]), front32=True)
         for rows in (9, WIDE_MAX_TOKENS):
             logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
             latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
-            for self_sort in (False, True):
-                self._routed(*self._route_quant(moe, logits, latent), self_sort=self_sort)
+            # both sorts, and both variants of the kernel's own (TRTLLM_K3LL_MOE_SELF_SORT_MASK)
+            for self_sort, mask in ((False, None), (True, False), (True, True)):
+                self._routed(
+                    *self._route_quant(moe, logits, latent),
+                    self_sort=self_sort,
+                    self_sort_mask=mask,
+                )
         if fc12_enabled() and self.state.fc12 is None:
             w1 = self.experts[0]
             self.state.fc12 = K3MoeFc12.create(device, w1.shape[1], self.num_local, moe.top_k)
@@ -513,12 +519,14 @@ class K3DecodeMoeNvfp4Layer:
                         self_sort_mask=mask,
                     )  # fmt: skip
             if self.state.head32 is not None:
-                # the 32-token front without its sort (the FC1 / FC2 self-sort's front)
+                # the 32-token front without its sort (the FC1 / FC2 self-sort's front), bf16 weights: both variants
                 rows = FRONT16_TOKENS + 1
-                step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
-                self._front_routed(
-                    moe, x.new_zeros(rows, x.shape[1]), front32=True, fc12=step, self_sort=True
-                )
+                for mask in (False, True):
+                    step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
+                    self._front_routed(
+                        moe, x.new_zeros(rows, x.shape[1]), front32=True, fc12=step, self_sort=True,
+                        self_sort_mask=mask,
+                    )  # fmt: skip
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):
@@ -576,12 +584,12 @@ class K3DecodeMoeNvfp4Layer:
         self_sort_mask: Optional[bool] = None,
     ) -> torch.Tensor:
         """``moe_sort`` and the routed experts (the expert kernel's own sort where `self_sort_takes`); ``fc12``: as
-        two kernels into ``fc12.out`` (`Fc12Step`); ``self_sort_mask``: their sort variant (default
+        two kernels into ``fc12.out`` (`Fc12Step`); ``self_sort_mask``: the kernels' own sort's variant (default
         `self_sort_mask_enabled`)."""
+        if self_sort_mask is None:
+            self_sort_mask = self_sort_mask_enabled()
         if fc12 is not None:
             self_sort = self.self_sort_takes(ids.shape[0], self_sort, fc12=True)
-            if self_sort_mask is None:
-                self_sort_mask = self_sort_mask_enabled()
             if self_sort:
                 from . import census as _census
 
@@ -598,9 +606,11 @@ class K3DecodeMoeNvfp4Layer:
             from . import census as _census
 
             _census.count(f"dispatch:moe_self_sort:{_census.mode()}")
+            if self_sort_mask:
+                _census.count(f"dispatch:moe_self_sort_mask:{_census.mode()}")
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-            self.state.counters, *self.situ, self_sort=self_sort,
+            self.state.counters, *self.situ, self_sort=self_sort, self_sort_mask=self_sort_mask,
         )  # fmt: skip
 
     def _front_routed(
@@ -610,13 +620,17 @@ class K3DecodeMoeNvfp4Layer:
         front32: Optional[bool] = None,
         fc12: Optional[Fc12Step] = None,
         self_sort: Optional[bool] = None,
+        self_sort_mask: Optional[bool] = None,
     ):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it.
-        ``fc12``: `_routed_after`'s."""
+        ``fc12``: `_routed_after`'s; ``self_sort_mask``: `_routed`'s."""
         routing, shared_act = self._front_only(moe, x, front32, self_sort, fc12=fc12 is not None)
-        return self._routed_after(routing, fc12=fc12, self_sort=self_sort), shared_act
+        routed = self._routed_after(
+            routing, fc12=fc12, self_sort=self_sort, self_sort_mask=self_sort_mask
+        )
+        return routed, shared_act
 
     def _front_only(
         self,
@@ -643,14 +657,20 @@ class K3DecodeMoeNvfp4Layer:
         return (sort_out, rows, None, x_q, x_sf), shared_act
 
     def _routed_after(
-        self, routing, fc12: Optional[Fc12Step] = None, self_sort: Optional[bool] = None
+        self,
+        routing,
+        fc12: Optional[Fc12Step] = None,
+        self_sort: Optional[bool] = None,
+        self_sort_mask: Optional[bool] = None,
     ) -> torch.Tensor:
         """``_front_routed``'s routed experts on the front's ``routing`` (`_front_only`). ``fc12``
         (``TRTLLM_K3LL_MOE_LOWM_FC12``, `K3MoeFc12.begin`): FC1 + FC2 into ``fc12.out`` instead of the single
         kernel."""
         sort_out, a, b, x_q, x_sf = routing
         if sort_out is None:
-            return self._routed(a, b, x_q, x_sf, fc12=fc12, self_sort=self_sort)
+            return self._routed(
+                a, b, x_q, x_sf, fc12=fc12, self_sort=self_sort, self_sort_mask=self_sort_mask
+            )
         if fc12 is not None:
             return nvfp4_lowm_op.run_sorted(
                 x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
