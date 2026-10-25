@@ -28,6 +28,7 @@ from __future__ import annotations
 import functools
 import os
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -128,7 +129,7 @@ def _odd_clamp(device: torch.device, num_spec: int) -> bool:
 # Kinds: "verify" (this kernel, verify_kernel.PROF_MARKS per CTA, 69 per forward) and "attnres_post" (the
 # post-attention K3AttnResFast of oproj_push.py, k3_attn_res.PROF_MARKS per CTA, 93 per forward).
 PROF_LAYERS = 69
-_prof = dict(bufs={}, calls={}, thread=None)
+_prof = dict(bufs={}, calls={}, stamps={}, thread=None, last_call=0.0)
 
 
 def _prof_on() -> bool:
@@ -138,18 +139,27 @@ def _prof_on() -> bool:
 
 
 def _prof_dump_loop(device):
-    import time
-
     from tensorrt_llm._utils import prefer_pinned
 
     rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "0")))
     path = os.path.join(
         os.environ.get("TRTLLM_K3LL_KDA_VERIFY_PROF_DIR", "/tmp"), f"kda_verify_prof_rank{rank}.pt"
     )
+    import cuda.bindings.driver as cuda_driver
+
+    # The runner captures its graphs in global capture mode from another thread: this thread's copies and
+    # synchronize would invalidate a capture, so it runs relaxed and copies only once no slice has been handed out
+    # for 15 s (no warmup / capture in progress; the slices then hold graph replays' marks).
+    torch.cuda.set_device(device)
+    cuda_driver.cuThreadExchangeStreamCaptureMode(
+        cuda_driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+    )
     stream = torch.cuda.Stream(device=device)
     hosts = {}
     while True:
         time.sleep(2.0)
+        if time.time() - _prof["last_call"] < 15.0:
+            continue
         for key, buf in list(_prof["bufs"].items()):
             if key not in hosts:
                 hosts[key] = torch.empty(buf.shape, dtype=torch.int64, pin_memory=prefer_pinned())
@@ -157,7 +167,12 @@ def _prof_dump_loop(device):
                 hosts[key].copy_(buf, non_blocking=True)
         stream.synchronize()
         torch.save(
-            dict(bufs={k: v.clone() for k, v in hosts.items()}, calls=dict(_prof["calls"])),
+            dict(
+                bufs={k: v.clone() for k, v in hosts.items()},
+                calls=dict(_prof["calls"]),
+                stamps=dict(_prof["stamps"]),
+                host_ns=time.time_ns(),
+            ),
             path + ".tmp",
         )
         os.replace(path + ".tmp", path)
@@ -175,12 +190,17 @@ def prof_slice(kind: str, key: int, layers: int, numel: int, device) -> torch.Te
         _prof["thread"].start()
     i = _prof["calls"].get(kind, 0)
     _prof["calls"][kind] = i + 1
+    _prof["last_call"] = time.time()
+    _prof["stamps"][(kind, key)] = time.time_ns()  # marks older than this are warmup / pre-capture
     return buf[i % layers]
 
 
 def _prof_arg(device, n_req: int) -> torch.Tensor:
     from . import verify_kernel as kernel
 
+    _prof["last_call"] = (
+        time.time()
+    )  # a Python forward (warmup / capture) is running: the dump thread waits
     if not _prof_on():
         buf = _prof.get("dummy")
         if buf is None or buf.device != device:
@@ -347,12 +367,12 @@ def k3_fp8_kda_verify(
                     _odd_clamp(proj.device, num_spec), _prof_on(), stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
-    if key[-2] or key[-1]:
+    if key[-3] or key[-2]:  # key ends (..., hoist, odd clamp, profile)
         from . import census
 
-        if key[-2]:
+        if key[-3]:
             census.count(f"dispatch:kda_verify_hoist:{census.mode()}")
-        if key[-1]:
+        if key[-2]:
             census.count(f"dispatch:kda_verify_odd_clamp:{census.mode()}")
     return out
 
