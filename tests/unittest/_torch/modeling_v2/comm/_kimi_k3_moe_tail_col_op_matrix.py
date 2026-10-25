@@ -41,6 +41,14 @@ Checks:
     (``allreduce_attn_res`` two-shot), captured with multi-stream on (the shared expert on the side stream), replayed
     6 times alternately with new inputs (the Lamport rotation goes round twice per replay), one rank late on every
     other replay, with eager steps in between: bit for bit the eager run, the other users' outputs their eager values.
+  * latent all-reduce variants (``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` / ``TRTLLM_K3LL_LAR_PUSH_EARLY``, all four pairs):
+    eager at every row count, bit for bit the plain kernel; a chain of 5 back-to-back latent all-reduces (no other
+    kernel between them: the re-arm CTAs of one call and the push of the next are as close as PDL lets them) captured
+    once per pair and replayed 6 times with new inputs, the pairs' graphs replayed one after the other on the same
+    workspace (so a re-arm by one variant precedes the push of another), one rank late on every other replay: every
+    output bit for bit the plain eager chain; the dispatch census counts each switch once per captured call; and the
+    two-layer step graphs (16 / 32 rows) captured with both switches on, replayed between the plain eager steps: bit
+    for bit.
 """
 
 import contextlib
@@ -570,7 +578,118 @@ def check_graphs():
         )
 
 
-CHECKS = [check_takes, check_pieces, check_decoder, check_graphs]
+LAR_VARIANTS = (
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (1, 1),
+)  # (TRTLLM_K3LL_LAR_CLEAR_SPLIT, TRTLLM_K3LL_LAR_PUSH_EARLY)
+LAR_CHAIN = 5
+
+
+@contextlib.contextmanager
+def _lar(clear: int, push: int):
+    old = (FLAGS.TRTLLM_K3LL_LAR_CLEAR_SPLIT, FLAGS.TRTLLM_K3LL_LAR_PUSH_EARLY)
+    FLAGS.TRTLLM_K3LL_LAR_CLEAR_SPLIT, FLAGS.TRTLLM_K3LL_LAR_PUSH_EARLY = int(clear), int(push)
+    try:
+        yield
+    finally:
+        FLAGS.TRTLLM_K3LL_LAR_CLEAR_SPLIT, FLAGS.TRTLLM_K3LL_LAR_PUSH_EARLY = old
+
+
+def check_lar_variants():
+    st, layer = BUILT.state, BUILT.layer
+    # Eager, every row count: each pair bit for bit the plain kernel (and so within check_pieces' reference bound).
+    for rows in ROWS:
+        call = _Call(900 + rows, rows)
+        outs = {}
+        for v in LAR_VARIANTS:
+            with _lar(*v):
+                outs[v] = COL.latent_all_reduce(st.base, layer, call.routed).clone()
+        for v in LAR_VARIANTS[1:]:
+            _expect_same(f"latent AR {rows} rows eager {v}", outs[v], outs[(0, 0)], replicated=True)
+    # Back-to-back chains under graph capture, the pairs' graphs interleaved on the one workspace.
+    for rows in (16, 24, 32):
+        calls = [_Call(950 + 7 * k + rows, rows) for k in range(LAR_CHAIN)]
+        graphs = {}
+        for v in LAR_VARIANTS:
+            torch.cuda.synchronize()
+            R.barrier()
+            keys = ("dispatch:lar_clear_split", "dispatch:lar_push_early")
+            before = [_census(k, "capture") for k in keys]
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with _lar(*v), torch.cuda.graph(graph, stream=stream):
+                outs = [COL.latent_all_reduce(st.base, layer, c.routed) for c in calls]
+            R.barrier()
+            counted = [_census(k, "capture") - b for k, b in zip(keys, before)]
+            assert counted == [LAR_CHAIN * v[0], LAR_CHAIN * v[1]], (
+                f"latent AR {rows} rows {v}: census {counted}"
+            )
+            graphs[v] = (graph, outs)
+        for i in range(6):
+            for k, c in enumerate(calls):
+                c.draw(1000 + 31 * i + k)
+            got = {}
+            for v in LAR_VARIANTS if i % 2 == 0 else LAR_VARIANTS[::-1]:
+                graph, outs = graphs[v]
+                R.barrier()
+                R.late(i % R.world if i % 2 else None)
+                graph.replay()
+                torch.cuda.synchronize()
+                got[v] = [o.clone() for o in outs]
+            with _lar(0, 0):
+                eager = [COL.latent_all_reduce(st.base, layer, c.routed).clone() for c in calls]
+            for v in LAR_VARIANTS:
+                for k in range(LAR_CHAIN):
+                    _expect_same(
+                        f"latent AR {rows} rows chain replay {i} {v} call {k}",
+                        got[v][k],
+                        eager[k],
+                        replicated=True,
+                    )
+        del graphs
+    # The two-layer step (other users of the decode workspace between the layers, shared expert on the side stream)
+    # captured with both switches on: bit for bit the plain eager step.
+    for rows in (16, 32):
+        step = _Step(rows, 1200 + rows)
+        with _lar(1, 1):
+            step.run()
+        torch.cuda.synchronize()
+        R.barrier()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with _lar(1, 1), MSU.with_multi_stream(True), torch.cuda.graph(graph, stream=stream):
+            out = step.run()
+        R.barrier()
+        for i in range(4):
+            step.draw(1300 + 11 * i)
+            R.barrier()
+            R.late(i % R.world if i % 2 else None)
+            graph.replay()
+            torch.cuda.synchronize()
+            got = _cloned(out)
+            with _lar(0, 0):
+                eager = _cloned(step.run())
+            for name, value in got.items():
+                _expect_same(
+                    f"step {rows} rows replay {i} LAR on: {name}",
+                    value,
+                    eager[name],
+                    replicated=True,
+                )
+        del graph
+    torch.cuda.synchronize()
+    if R.rank == 0:
+        print(
+            f"[rank 0] latent AR variants {LAR_VARIANTS}: eager, {LAR_CHAIN}-call chains and step graphs = plain",
+            flush=True,
+        )
+
+
+CHECKS = [check_takes, check_pieces, check_decoder, check_graphs, check_lar_variants]
 
 
 def _run_one_rank(args) -> int:
