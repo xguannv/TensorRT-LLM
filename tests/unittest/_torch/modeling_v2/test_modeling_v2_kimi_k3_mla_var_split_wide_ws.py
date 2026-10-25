@@ -69,6 +69,9 @@ def test_defaults():
 
 @gpu
 def test_envelope(monkeypatch):
+    torch.zeros(
+        1, device="cuda"
+    )  # a CUDA context first: the envelope queries the device's occupancy
     dcp = _dcp()
     heads = _var()._vu().HEADS
     monkeypatch.setattr(dcp, "_WIDE_WS_UNITS", {})

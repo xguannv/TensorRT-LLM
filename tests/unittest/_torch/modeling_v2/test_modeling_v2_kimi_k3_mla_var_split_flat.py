@@ -102,6 +102,8 @@ def test_flat_bitwise(monkeypatch, name, skip_empty):
     w, _, _ = vu._w_uv(1, q.device)
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL", 1)
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY", skip_empty)
+    # FLAT alone: WIDE_WS widens the grid only with FLAT on, which would move the split boundaries between the arms
+    monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 0)
     counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q.shape[1])
     assert counts is not None
     outs = {}
