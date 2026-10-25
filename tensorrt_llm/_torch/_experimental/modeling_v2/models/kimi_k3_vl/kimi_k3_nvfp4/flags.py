@@ -816,6 +816,12 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS = _flag(
     "holds it. 1 on, 0 off, -1 (default) on SM103 only (decode_mla_dcp.MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES)",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_SANDWICH_PROF = _flag(
+    "TRTLLM_K3LL_SANDWICH_PROF",
+    0,
+    "diagnostic prototype only: k3_sandwich_tail writes in-situ (globaltimer, clock64) marks per CTA, dumped to "
+    "$TRTLLM_K3LL_SANDWICH_PROF_DIR (cute_dsl_kernels/k3_sandwich/prof.py; read at every call). 0 off (default), 1 on",
+)
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
     1,
