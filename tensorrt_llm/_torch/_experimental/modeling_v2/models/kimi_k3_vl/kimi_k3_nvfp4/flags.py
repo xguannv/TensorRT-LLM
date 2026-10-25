@@ -303,8 +303,9 @@ TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     -1,
     "a snapshot layer (layer_idx % attn_res_block_size == 0) whose pre-attention step is TRTLLM_K3LL_MOE_TAIL_COL's "
     "K3AttnResFast: the kernel stores the updated prefix sum straight into the snapshot bank row, and the bank's "
-    "device-to-device copy after the step (a graph memcpy node that also breaks the PDL chain) is skipped. Bitwise. "
-    "Read at forward time. -1 (default): on on SM103 only "
+    "device-to-device copy after the step (a graph memcpy node that also breaks the PDL chain) is skipped. Bitwise "
+    "(the same stores, another destination). Acts only on TAIL_COL's fused steps (9-32 rows; not bs1 / bs8) where the "
+    "bank's row count is the step's. Read at forward time. -1 (default): on on SM103 only "
     "(implementation.ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES; L1 bs2 -0.033 ms, moss-0411)",
 )
 TRTLLM_K3LL_ATTN_RES_TAP = _flag(
@@ -313,8 +314,10 @@ TRTLLM_K3LL_ATTN_RES_TAP = _flag(
     "a drafter-tapped layer whose pre-attention step is TRTLLM_K3LL_MOE_TAIL_COL's K3AttnResFast: the kernel also "
     "stores the pre-norm attention-residual mixture into the layer's capture slot (spec_worker.capture_view), and "
     "the separate attn_res for the tap after the step is skipped. The target's outputs are unchanged; the tap is the "
-    "fast kernel's mixture (the C++ MNNVL epilogue's arithmetic), which can differ from the separate attn_res by one "
-    "bf16 step in a few elements. Read at forward time. 1 on, 0 off, -1 (default): on on SM103 only "
+    "fast kernel's mixture (the C++ MNNVL epilogue's arithmetic), within test_k3_attn_res's fast-kernel bound of the "
+    "separate attn_res (2^-6 relative + 2^-8 of the row RMS, at most 2% of elements differing; test_tap prints the "
+    "measured maximum). Acts only on TAIL_COL's fused steps (9-32 rows) with KIMI_K3_AUX_ATTN_RES_STREAM=1 and a "
+    "drafter capture buffer. Read at forward time. 1 on, 0 off, -1 (default): on on SM103 only "
     "(implementation.ATTN_RES_TAP_CAPABILITIES; L1 bs2 -0.059 ms, GSM8K PASS, natural AL +0.014 in band: "
     "moss-0402/0412/0424)",
 )

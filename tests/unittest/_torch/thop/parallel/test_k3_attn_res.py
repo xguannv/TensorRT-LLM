@@ -432,7 +432,57 @@ def test_tap(m: int, n: int, mx: bool, lamport: bool, mnnvl_order: bool):
     rest[:m, HIDDEN : 2 * HIDDEN] = 7.0
     assert bool((rest == 7.0).all()), "tap wrote outside its view"
     # The tap is the mixture of the updated row (bf16(layer + addend), output 1).
-    _assert_fast_close(slot, _mixture_cpp(got[1], t), ("tap", mnnvl_order))
+    expected = _mixture_cpp(got[1], t)
+    _assert_fast_close(slot, expected, ("tap", mnnvl_order))
+    a, e = slot.float(), expected.float()
+    # One BF16 step of the expected value's binade (2^-7 of its leading power of two).
+    ulp = torch.exp2(torch.floor(torch.log2(e.abs().clamp_min(2.0**-126))) - 7)
+    print(
+        f"TAPDIFF m={m} n={n} mx={mx} lamport={lamport} mnnvl_order={mnnvl_order} "
+        f"max_bf16_steps={float(((a - e).abs() / ulp).max()):.3g} "
+        f"differing={_mismatches(slot, expected)}/{slot.numel()}"
+    )
+
+
+@pytest.mark.parametrize("lamport", [False, True])
+@pytest.mark.parametrize("n", [2, 6, 12])
+@pytest.mark.parametrize("m", [14, 32])
+def test_updated_into_bank_row(m: int, n: int, lamport: bool):
+    """TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE's call: ``block`` is rows ``[0, n - 1)`` of a snapshot bank and
+    ``updated`` its row ``n - 1`` (the snapshot the step takes). Every output is the bits of the launch with a separate
+    ``updated``, the row holds that ``updated``, and the rows the kernel reads are untouched."""
+    if lamport:
+        pytest.importorskip("tensorrt_llm._torch.cute_dsl_kernels.blackwell.k3_lamport_ar")
+    k3 = _k3()
+    t = _inputs(m, n, 1.0, seed=13 * m + n)
+    addend = t["addend"].clone()
+    addend[addend == 0] = 0
+    kwargs = dict(exact=False, mnnvl_order=True)
+    if lamport:
+        uc, flags, stage = _lamport_workspace(addend, dirty=1)
+        stage.copy_(addend.view(torch.int32).flatten())
+        addends = ()
+        kwargs["lamport_addend"] = (uc.data_ptr(), flags.data_ptr())
+    else:
+        addends = (addend,)
+
+    def run(block, updated):
+        out = torch.empty_like(t["layer"])
+        k3.run_k3_attn_res(t["layer"], addends, block, *_weights(t), out, updated, **kwargs)
+        return out
+
+    ref_updated = torch.empty_like(t["layer"])
+    ref_out = run(t["block"], ref_updated)
+    bank = torch.full((n + 1, m, HIDDEN), 7.0, dtype=torch.bfloat16, device="cuda")
+    bank[: n - 1].copy_(t["block"])
+    before = bank[: n - 1].clone()
+    out = run(bank[: n - 1], bank[n - 1])
+    assert torch.equal(out.view(torch.int16), ref_out.view(torch.int16)), "normed"
+    assert torch.equal(bank[n - 1].view(torch.int16), ref_updated.view(torch.int16)), "updated row"
+    assert torch.equal(bank[: n - 1].view(torch.int16), before.view(torch.int16)), (
+        "read rows changed"
+    )
+    assert bool((bank[n] == 7.0).all()), "wrote past the row"
 
 
 def test_tap_needs_vectorized_kernel():

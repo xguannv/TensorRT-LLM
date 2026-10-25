@@ -331,11 +331,13 @@ def warm_up(
     gemvs,
     max_candidates: int,
     mxfp8: bool = False,
+    tap: bool = False,
 ) -> None:
     """Run every kernel of the switch once before any capture, whatever the switch says at forward time. Collective:
     every rank makes the same calls (shared all-reduces, one latent all-reduce and one publish per token tile on
     zeros, advancing both workspaces alike). ``mxfp8``: also the Lamport attn_res kernel with the MXFP8 side output
-    (``TRTLLM_K3LL_ATTN_RES_MXFP8`` on this device at load). Records what ran in ``state``."""
+    (``TRTLLM_K3LL_ATTN_RES_MXFP8`` on this device at load). ``tap``: also its builds with the drafter tap
+    (``TRTLLM_K3LL_ATTN_RES_TAP``, read at forward time; where the tap can engage). Records what ran in ``state``."""
     base = state.base
     device = layer.up_slice.device
     zeros = dict(dtype=torch.bfloat16, device=device)
@@ -377,6 +379,12 @@ def warm_up(
                 lamport_addend=tail.lamport_addend, early_trigger=True, mnnvl_order=True,
             )  # fmt: skip
             candidates.append(n)
+            taps = [torch.empty_like(row)] if tap else []
+            for t in taps:
+                _attn_res().run_k3_attn_res(
+                    row, (), block, ones, ones, ones, 1e-6, 1e-6, *outs, exact=False,
+                    lamport_addend=tail.lamport_addend, early_trigger=True, mnnvl_order=True, tap=t,
+                )  # fmt: skip
             if mxfp8:
                 xq = torch.empty(1, HIDDEN, dtype=torch.float8_e4m3fn, device=device)
                 xs = torch.empty(1, HIDDEN // 32, dtype=torch.uint8, device=device)
@@ -385,6 +393,12 @@ def warm_up(
                     lamport_addend=tail.lamport_addend, early_trigger=True, mnnvl_order=True,
                     mxfp8_out=(xq, xs),
                 )  # fmt: skip
+                for t in taps:
+                    _attn_res().run_k3_attn_res(
+                        row, (), block, ones, ones, ones, 1e-6, 1e-6, *outs, exact=False,
+                        lamport_addend=tail.lamport_addend, early_trigger=True, mnnvl_order=True,
+                        mxfp8_out=(xq, xs), tap=t,
+                    )  # fmt: skip
                 mx_candidates.append(n)
     torch.cuda.synchronize(device)
     state.tiles = frozenset(ran)

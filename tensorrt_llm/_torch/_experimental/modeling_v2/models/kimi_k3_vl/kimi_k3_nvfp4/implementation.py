@@ -4848,7 +4848,7 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             first_col = col_layers[id(takes[0])]
             _moe_tail_col.warm_up(
                 state.col, first_col, gemvs, self.model.num_attn_res_snapshots + 1,
-                mxfp8=_attn_res_mxfp8_on(first_col.up_slice.device),
+                mxfp8=_attn_res_mxfp8_on(first_col.up_slice.device), tap=_AUX_ATTN_RES_STREAM_ENABLED,
             )  # fmt: skip
             if mapping.tp_rank == 0:
                 logger.info(
