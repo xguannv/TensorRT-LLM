@@ -40,9 +40,10 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
 * Startup: the weight TMA warp issues its first fetch and loads the experts of the first 32 tiles
   together with the tile count, so the first weight load waits for one memory latency.
 * Self-sort (``self_sort_local``, at most 16 tokens): after the wait every thread of the CTA sorts the
-  step's top-k ids over the local experts into shared memory (``_self_sort``: per-token bitmaps, their
-  union and prefix counts, then each (token, k)'s tile and row), and the kernel reads the tile
-  metadata from there instead of from the previous grid: the routing kernel need not sort it.
+  step's top-k ids over the local experts into shared memory (``_self_sort``: per local expert the
+  mask of its tokens, zeroed before the wait; one ballot per 32 experts for the touched ones; each
+  (token, k)'s tile and row by popc), and the kernel reads the tile metadata from there instead of
+  from the previous grid: the routing kernel need not sort it.
 * PDL: every warp waits on the previous grid (tile metadata, tokens and token scales come from it)
   before it reads any of them or the counters; each CTA triggers its dependents after all of its
   warps are done (later than the safe default of right after the wait).
@@ -204,10 +205,6 @@ class K3MoeLowMDynKernel:
         (the same tiles, rows and order as ``k3_moe_front``'s sort: one tile per touched local
         expert in expert order, its rows the selecting tokens' expanded indices in token order),
         into shared memory, and reads the metadata from there.
-    :param self_sort_mask: With ``self_sort_local``: the sort on per-expert token masks (``True``: one
-        ``red.shared.or`` per id, one ballot per 32 experts, each id's tile and row by popc; the masks
-        zeroed before the grid dependency wait) or on per-token expert bitmaps scanned per id over all
-        tokens (``False``); the same metadata.
     """
 
     def __init__(
@@ -226,7 +223,6 @@ class K3MoeLowMDynKernel:
         use_pdl: bool = True,
         trace: bool = False,
         self_sort_local: int = 0,
-        self_sort_mask: bool = True,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -245,26 +241,19 @@ class K3MoeLowMDynKernel:
         self.queue_depth = queue_depth
         self.use_pdl = use_pdl
         self.trace = trace
-        # Self-sort scratch (int32 words): the step's ids, per-token bitmaps of the local experts, their
-        # union and prefix counts, the tile count, each tile's expert and row limit, and the rows of
-        # each tile at stride n_tok (the permuted-index view spans 128 more words).
+        # Self-sort scratch (int32 words): per local expert the mask of its tokens, the touched experts'
+        # bits, the tile count, each tile's expert and row limit, and the rows of each tile at stride
+        # n_tok (the permuted-index view spans 128 more words).
         self.self_sort = self_sort_local > 0
         assert not self.self_sort or n_tok <= 16, "self-sort: at most 16 tokens"
         self.ss_words = max(1, -(-self_sort_local // 32))
         self.ss_tiles = max(1, min(n_tok * topk, self_sort_local))
-        self.ss_mask = self.self_sort and self_sort_mask
-        loops = self.self_sort and not self_sort_mask
-        self.ss_ids = n_tok * topk if loops else 4
-        self.ss_bits = (
-            32 * self.ss_words if self.ss_mask else n_tok * self.ss_words if loops else 4
-        )  # fmt: skip
-        self.ss_prefix = _align(self.ss_words, 4) if loops else 4
+        self.ss_bits = 32 * self.ss_words if self.self_sort else 4
         self.ss_perm = self.ss_tiles * n_tok + _MMA_M if self.self_sort else 4
         ss_words_total = (
-            self.ss_ids + self.ss_bits + _align(self.ss_words, 4) + self.ss_prefix + 4
-            + 2 * _align(self.ss_tiles, 4) + self.ss_perm
+            self.ss_bits + _align(self.ss_words, 4) + 4 + 2 * _align(self.ss_tiles, 4) + self.ss_perm
         )  # fmt: skip
-        self.ss_bytes = 4 * ss_words_total + 8 * 16 if self.self_sort else 0
+        self.ss_bytes = 4 * ss_words_total + 6 * 16 if self.self_sort else 0
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
         self.acc_cols = n_tok * num_acc
         self.sfa_cols = 16
@@ -451,10 +440,8 @@ class K3MoeLowMDynKernel:
             ]
             sTok: cute.struct.Align[cute.struct.MemRange[Int32, NWG * self.n_tok], 16]
             sScale: cute.struct.Align[cute.struct.MemRange[Float32, NWG * self.n_tok], 16]
-            sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
             sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
             sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_words, 4)], 16]
-            sSsPrefix: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_prefix], 16]
             sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
             sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
             sSsLimit: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
@@ -625,8 +612,8 @@ class K3MoeLowMDynKernel:
                 cute.arch.mbarrier_init(st.sfb_full, 4)
                 cute.arch.mbarrier_init(st.tmem_ready, 1)
                 cute.arch.mbarrier_init(st.tmem_free, self.epi_warps)
-        if cutlass.const_expr(self.ss_mask):
-            # the token masks (`_self_sort_masks`) read nothing from the previous grid
+        if cutlass.const_expr(self.self_sort):
+            # the token masks (`_self_sort`) read nothing from the previous grid
             ss_tok_masks = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
             for i in cutlass.range_constexpr(-(-self.ss_bits // self.threads)):
                 j = tidx + Int32(i * self.threads)
@@ -644,20 +631,13 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
-        if cutlass.const_expr(self.self_sort and not self.ss_mask):
+        if cutlass.const_expr(self.self_sort):
             (
                 tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles,
             ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx)
-        if cutlass.const_expr(self.ss_mask):
-            (
-                tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit,
-                permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles,
-            ) = self._self_sort_masks(st, topk_ids, local_offset, num_local, orig_m, tidx)
 
         # the CTA's first unit and the experts of the first 32 tiles: both loads are in flight while
         # the tile count loads
@@ -770,84 +750,10 @@ class K3MoeLowMDynKernel:
         """The step's tile metadata in shared memory, by every thread of the CTA (``k3_moe_front``'s
         ``_sort_local``): ``(expert of tile, tile * 128 + rows of tile, permuted -> expanded index,
         tile count)`` as tensors indexed like ``moe_sort``'s outputs (the permuted view maps
-        ``tile * 128 + r`` to word ``tile * n_tok + r``)."""
-        n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
-        ids = st.sSsIds.get_tensor(cute.make_layout(self.ss_ids))
-        bits = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
-        union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
-        prefix = st.sSsPrefix.get_tensor(cute.make_layout(_align(W, 4)))
-        nt = st.sSsNt.get_tensor(cute.make_layout(1))
-        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
-        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
-        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
-        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
-        n = orig_m * Int32(K)
-        for i in cutlass.range_constexpr(-(-(n_tok * K) // nthr)):
-            j = tidx + Int32(i * nthr)
-            if j < n:
-                ids[j] = topk_ids[j]
-        cute.arch.barrier()
-        for i in cutlass.range_constexpr(-(-(n_tok * W) // nthr)):
-            j = tidx + Int32(i * nthr)
-            if j < orig_m * Int32(W):
-                t = j // Int32(W)
-                w = j - t * Int32(W)
-                word = Int32(0)
-                for k in cutlass.range_constexpr(K):
-                    lx = ids[t * Int32(K) + k] - local_offset
-                    hit = (lx >= Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
-                    word = word | cutlass.select_(hit, Int32(1) << (lx & 31), Int32(0))
-                bits[j] = word
-        cute.arch.barrier()
-        if tidx < Int32(W):
-            u = Int32(0)
-            for t in cutlass.range_constexpr(n_tok):
-                if Int32(t) < orig_m:
-                    u = u | bits[t * W + tidx]
-            union[tidx] = u
-        cute.arch.barrier()
-        if tidx < Int32(W + 1):
-            before = Int32(0)
-            for w in cutlass.range_constexpr(W):
-                if Int32(w) < tidx:
-                    before = before + _popc(union[w])
-            if tidx < Int32(W):
-                prefix[tidx] = before
-            else:
-                nt[0] = before
-        cute.arch.barrier()
-        for i in cutlass.range_constexpr(-(-(n_tok * K) // nthr)):
-            j = tidx + Int32(i * nthr)
-            if j < n:
-                t = j // Int32(K)
-                lx = ids[j] - local_offset
-                if (lx >= Int32(0)) & (lx < num_local):
-                    w = lx >> 5
-                    b = lx & 31
-                    tile = prefix[w] + _popc(union[w] & ((Int32(1) << b) - Int32(1)))
-                    row = Int32(0)
-                    count = Int32(0)
-                    for q in cutlass.range_constexpr(n_tok):
-                        if Int32(q) < orig_m:
-                            bit = (bits[q * W + w] >> b) & Int32(1)
-                            count = count + bit
-                            if Int32(q) < t:
-                                row = row + bit
-                    perm_flat[tile * Int32(n_tok) + row] = j
-                    if row == Int32(0):
-                        expert[tile] = lx
-                        limit[tile] = tile * Int32(_MMA_M) + count
-        cute.arch.barrier()
-        return expert, limit, perm, nt
-
-    @cute.jit
-    def _self_sort_masks(
-        self, st, topk_ids, local_offset: Int32, num_local: Int32, orig_m: Int32, tidx
-    ):
-        """`_self_sort`'s metadata from per-local-expert token masks (zeroed before the wait): each id ORs
-        its token's bit into its expert's mask; one ballot per 32 experts gives the touched experts; each
-        id's tile is the touched experts below its expert, its row the tokens below its token in the mask.
-        Three CTA barriers."""
+        ``tile * 128 + r`` to word ``tile * n_tok + r``). From per-local-expert token masks (zeroed
+        before the wait): each id ORs its token's bit into its expert's mask; one ballot per 32
+        experts gives the touched experts; each id's tile is the touched experts below its expert,
+        its row the tokens below its token in the mask. Three CTA barriers."""
         n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
         per = -(-(n_tok * K) // nthr)
         mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))

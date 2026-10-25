@@ -30,7 +30,7 @@
                 front's outputs through nvfp4_lowm_op.run against the regular kernels on the same inputs, with
                 moe_sort and with the expert kernel's own sort at the rank's expert offset; the 16-token build
                 (9-16 rows) as two 8-token calls; the 32-token build (17-32 rows) through FC1 + FC2 with moe_sort
-                and with FC1 / FC2's own sort in both variants (scan, token masks; bit for bit alike).
+                and with FC1 / FC2's own sort.
 
 Run under pytest (the front check takes a pool of 4 MPI workers) or directly:
   python3 test_k3_moe_lowm.py route_quant lowm
@@ -294,14 +294,13 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def lowm_self(token_scales, mask=True):
+    def lowm_self(token_scales):
         out.fill_(7.0)
         h.zero_()
         h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
-            self_sort_mask=mask,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
@@ -310,17 +309,10 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     for slot in (0, top_k - 1):
         one_hot = torch.zeros_like(scales)
         one_hot[:, slot] = scales[:, slot]
-        # the scan variant (TRTLLM_K3LL_MOE_SELF_SORT_MASK=0): the same metadata, the same bits
-        scan = lowm_self(one_hot, mask=False)
-        h_scan = h.clone()
-        assert torch.equal(finalize(one_hot).view(torch.int16), scan.view(torch.int16)), (
-            f"self-sort (scan) FC2 slot {slot}"
-        )
         new = lowm_self(one_hot)
         assert torch.equal(finalize(one_hot).view(torch.int16), new.view(torch.int16)), (
             f"self-sort FC2 slot {slot}"
         )
-        assert torch.equal(h_scan, h), f"self-sort FC1 output: scan vs masks, slot {slot}"
         if slot == 0:
             # Same tiles as moe_sort, the rows of a tile in token order (moe_sort's are in any order).
             assert torch.equal(c_ref[rows], h[self_rows]), "self-sort: FC1 output rows differ"
@@ -493,14 +485,13 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def two_self(token_scales, mask=True):
+    def two_self(token_scales):
         out_fc12.zero_()
         fc12.h.zero_()
         fc12.h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm_fc12(
             _bits(x_q), _bits(x_sf), *weights, out_fc12, ids, ids, ids, ids, ex.fc2_input_scale, token_scales,
             fc12.h, fc12.h_sf, top_k, GATE_CAP, LINEAR_CAP, topk_ids=ids, local_offset=offset,
-            self_sort_mask=mask,
         )  # fmt: skip
         torch.cuda.synchronize()
         return out_fc12.clone()
@@ -513,14 +504,6 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
         assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), (
             f"self-sort FC2 slot {slot}"
         )
-        # the per-(tile, token) scan variant (TRTLLM_K3LL_MOE_SELF_SORT_MASK=0): the same metadata, the same bits
-        h_mask = fc12.h.clone()
-        loops = two_self(one_hot, mask=False)
-        assert torch.equal(ref.view(torch.int16), loops.view(torch.int16)), (
-            f"self-sort (scan) FC2 slot {slot}"
-        )
-        assert torch.equal(h_mask, fc12.h), f"self-sort FC1 output: scan vs masks, slot {slot}"
-        new = two_self(one_hot)
         if slot == 0:
             # Same tiles as moe_sort, the rows of a tile in token order (moe_sort's are in any order).
             assert torch.equal(h_dyn[rows], fc12.h[self_rows]), "self-sort: FC1 output rows differ"
@@ -746,8 +729,7 @@ def check_front16(ctx):
 def check_front32_fc12(ctx):
     """bs4's wide step: 17-32 rows through the 32-token front build (NVFP4 latent, bf16 routing weights), then this
     rank's routed partial through FC1 + FC2 (`run` with ``fc12``) with moe_sort, and with FC1 / FC2's own per-CTA sort
-    (TRTLLM_K3LL_MOE_SELF_SORT_FC12) in both variants (TRTLLM_K3LL_MOE_SELF_SORT_MASK): each within 8 bf16 ulps of the
-    regular kernels', the two self-sort variants bit for bit alike."""
+    (TRTLLM_K3LL_MOE_SELF_SORT_FC12): each within 8 bf16 ulps of the regular kernels'; the self-sort's twice alike."""
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
 
     results = []
@@ -757,12 +739,8 @@ def check_front32_fc12(ctx):
                 LINEAR_CAP)  # fmt: skip
         assert nvfp4_lowm_op.self_sort_takes(m, E_LOCAL, fc12=True)
         y = nvfp4_lowm_op.run(*args, fc12=ctx.fc12).clone()
-        y_scan = nvfp4_lowm_op.run(
-            *args, fc12=ctx.fc12, self_sort=True, self_sort_mask=False
-        ).clone()
-        y_mask = nvfp4_lowm_op.run(
-            *args, fc12=ctx.fc12, self_sort=True, self_sort_mask=True
-        ).clone()
+        y_self = nvfp4_lowm_op.run(*args, fc12=ctx.fc12, self_sort=True).clone()
+        y_again = nvfp4_lowm_op.run(*args, fc12=ctx.fc12, self_sort=True).clone()
         scales = w.float()
         t2g, t2lim, _, p2e, _, nnet = _sort(ids, scales, EXPERTS, TOP_K, ctx.offset, E_LOCAL)
         _, _, finalize = _regular(q, s, ctx.ex, ctx.weights[2], t2g, t2lim, p2e, nnet, scales, EXPERTS, TOP_K,
@@ -777,8 +755,8 @@ def check_front32_fc12(ctx):
         gathered = ctx.comm.allgather([_bits(t).cpu() for t in (ids, w, q, s)])
         row = dict(
             op="k3_moe_front32_fc12", case=f"tp{ctx.world}", M=m,
-            experts_within_8ulp=ulp(y) <= 8.0, self_sort_scan_within_8ulp=ulp(y_scan) <= 8.0,
-            self_sort_mask_within_8ulp=ulp(y_mask) <= 8.0, scan_mask_same=_same(y_scan, y_mask),
+            experts_within_8ulp=ulp(y) <= 8.0, self_sort_within_8ulp=ulp(y_self) <= 8.0,
+            self_sort_det=_same(y_self, y_again),
             local_rows=bool(((ids >= ctx.offset) & (ids < ctx.offset + E_LOCAL)).any()),
             ranks_agree=all(all(torch.equal(a, b) for a, b in zip(g, gathered[0])) for g in gathered),
         )  # fmt: skip
