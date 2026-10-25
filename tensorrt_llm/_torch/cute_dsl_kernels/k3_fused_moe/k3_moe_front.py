@@ -748,6 +748,7 @@ def k3_moe_front_kernel(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    sort_release: cutlass.Constexpr[bool],
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
     # token, a quantization CTA per QT_ tokens).
@@ -1410,8 +1411,11 @@ def k3_moe_front_kernel(
                                         (cutlass.Int32(weight_bits) & cutlass.Int32(0xFFFF)) << 16,
                                         idx=w_off + out,
                                     )
-                                    # The last route CTA reads these ids.
-                                    cute.arch.fence_acq_rel_gpu()
+                                    # The last route CTA reads these ids. With sort_release they are released by
+                                    # thread 0's acq_rel add on sort_ctr after the CTA barrier below (release is
+                                    # cumulative over the barrier), not by a gpu-scope fence of every writer.
+                                    if cutlass.const_expr(not sort_release):
+                                        cute.arch.fence_acq_rel_gpu()
                                 if cutlass.const_expr(publish):
                                     cute.arch.fence_acq_rel_gpu()
                             if cutlass.const_expr(publish):
@@ -1604,6 +1608,7 @@ def k3_moe_front(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    sort_release: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1614,7 +1619,7 @@ def k3_moe_front(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
         quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
         sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort, m_max,
+        linear_cap, publish, head_half, nvfp4, sort, m_max, sort_release,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),

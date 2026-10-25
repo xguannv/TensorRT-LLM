@@ -290,6 +290,8 @@ def k3_moe_front(
     )
     publish = ag_ready is not None
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    # The sort's hand-off without the route CTAs' gpu-scope fence (prototype switch, read when a build is chosen).
+    sort_release = sort and os.environ.get("TRTLLM_K3LL_MOE_FRONT_SORT_RELEASE", "0") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (
         device.index if device.index is not None else torch.cuda.current_device(),
@@ -307,6 +309,7 @@ def k3_moe_front(
         nvfp4,
         sort,
         m_max,
+        sort_release,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -320,7 +323,7 @@ def k3_moe_front(
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
                     sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
-                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, stream,
+                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, sort_release, stream,
                 )  # fmt: skip
     fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
     return topk_ids, topk_weights, quantized, scales, shared
