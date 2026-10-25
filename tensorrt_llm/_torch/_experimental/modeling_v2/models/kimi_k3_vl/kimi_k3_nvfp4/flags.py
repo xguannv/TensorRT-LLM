@@ -64,7 +64,8 @@ TRTLLM_K3LL_MOE_SELF_SORT = _flag(
     "bit for bit; each (token, expert) partial bit for bit; a token's sum of partials in FC2's red order, as "
     "without it. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 only "
     "(decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; the lowm path runs on SM100 / SM103 only; L1 bs1 -0.150 ms, bs2 "
-    "-0.223 ms, moss-0444)",
+    "-0.223 ms, moss-0444; the token-mask sort, here and in FC1 / FC2, vs the earlier scan sort: L1 1x -0.049 ms, "
+    "2x -0.061 ms, 4x -0.142 ms, moss-0471)",
 )
 TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "TRTLLM_K3LL_MOE_SELF_SORT_FC12",
@@ -75,7 +76,8 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "k3_moe_front's sort, in shared memory), so the front skips its sort (or moe_sort does not run) and FC2 reads "
     "the front's bf16 routing weights (widened exactly). FC1 rows and each (token, expert) partial bit for bit; a "
     "token's sum in FC2's red order, as without it. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 "
-    "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452)",
+    "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452; the token-mask sort, here and in "
+    "K3MoeLowMDynKernel, vs the earlier scan sort: L1 1x -0.049 ms, 2x -0.061 ms, 4x -0.142 ms, moss-0471)",
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
