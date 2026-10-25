@@ -4644,13 +4644,42 @@ def _adjust_torch_mem_fraction():
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
-    safety_margin = 32 * 1024**2
+    safety_margin = _torch_mem_safety_margin_bytes()
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(
-        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
+        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB), "
+        f"safety margin {safety_margin / 1024**3:.3f} GiB left outside the PyTorch cap"
     )
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
+
+
+TORCH_MEM_SAFETY_MARGIN_GIB_ENV = "TRTLLM_TORCH_MEM_SAFETY_MARGIN_GIB"
+_DEFAULT_TORCH_MEM_SAFETY_MARGIN_BYTES = 32 * 1024**2
+
+
+def _torch_mem_safety_margin_bytes() -> int:
+    """Device memory kept outside the PyTorch cap set by ``_adjust_torch_mem_fraction``.
+
+    The cap is ``free + reserved - margin`` after the KV cache pool exists, so the PyTorch
+    caching allocator may hold all but ``margin`` of the remaining device memory. CUDA
+    allocations made later outside PyTorch (e.g. UCX streams created lazily by KV transfers,
+    library workspaces) only have the margin. ``TRTLLM_TORCH_MEM_SAFETY_MARGIN_GIB`` (GiB,
+    non-negative) sets it; unset keeps 32 MiB.
+    """
+    value = os.environ.get(TORCH_MEM_SAFETY_MARGIN_GIB_ENV)
+    if value is None or value.strip() == "":
+        return _DEFAULT_TORCH_MEM_SAFETY_MARGIN_BYTES
+    try:
+        gib = float(value)
+    except ValueError as e:
+        raise ValueError(
+            f"{TORCH_MEM_SAFETY_MARGIN_GIB_ENV}={value!r} is not a number of GiB"
+        ) from e
+    if not gib >= 0:
+        raise ValueError(
+            f"{TORCH_MEM_SAFETY_MARGIN_GIB_ENV}={value!r} must be >= 0")
+    return int(gib * 1024**3)
 
 
 def validate_feature_combination(llm_args, model_engine):
