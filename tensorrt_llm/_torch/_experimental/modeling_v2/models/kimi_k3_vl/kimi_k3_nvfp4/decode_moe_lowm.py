@@ -194,6 +194,11 @@ def self_sort_enabled() -> bool:
     return _self_sort_on_by_default()
 
 
+def self_sort_fc12_enabled() -> bool:
+    """``TRTLLM_K3LL_MOE_SELF_SORT_FC12`` (read at forward time): 1 on, 0 (default) off."""
+    return int(_flags.TRTLLM_K3LL_MOE_SELF_SORT_FC12) > 0
+
+
 def fc12_takes(state, rows: int) -> bool:
     """Whether a wide step of ``rows`` tokens runs the routed experts as FC1 + FC2: ``TRTLLM_K3LL_MOE_LOWM_FC12``
     (read at forward time) is set, ``rows`` is 17 to 32 (``nvfp4_lowm_op.FC12_MIN_TOKENS`` / ``FC12_MAX_TOKENS``;
@@ -490,8 +495,19 @@ class K3DecodeMoeNvfp4Layer:
             for rows in (nvfp4_lowm_op.FC12_MIN_TOKENS, nvfp4_lowm_op.FC12_MAX_TOKENS):
                 logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
                 latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
+                # both sorts (moe_sort, and FC1 / FC2's own, TRTLLM_K3LL_MOE_SELF_SORT_FC12)
+                for self_sort in (False, True):
+                    step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
+                    self._routed(
+                        *self._route_quant(moe, logits, latent), fc12=step, self_sort=self_sort
+                    )
+            if self.state.head32 is not None:
+                # the 32-token front without its sort (the FC1 / FC2 self-sort's front)
+                rows = FRONT16_TOKENS + 1
                 step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
-                self._routed(*self._route_quant(moe, logits, latent), fc12=step)
+                self._front_routed(
+                    moe, x.new_zeros(rows, x.shape[1]), front32=True, fc12=step, self_sort=True
+                )
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):
@@ -528,12 +544,15 @@ class K3DecodeMoeNvfp4Layer:
         """This rank's routed experts."""
         return self.experts[0].shape[0]
 
-    def self_sort_takes(self, rows: int, self_sort: Optional[bool] = None) -> bool:
-        """Whether the expert kernel sorts a step of ``rows`` tokens itself (``TRTLLM_K3LL_MOE_SELF_SORT``, read at
-        forward time unless ``self_sort`` says): then neither the front nor ``moe_sort`` sorts it."""
+    def self_sort_takes(
+        self, rows: int, self_sort: Optional[bool] = None, fc12: bool = False
+    ) -> bool:
+        """Whether the expert kernel sorts a step of ``rows`` tokens itself (``TRTLLM_K3LL_MOE_SELF_SORT``, or with
+        ``fc12`` FC1 / FC2 each per CTA, ``TRTLLM_K3LL_MOE_SELF_SORT_FC12``; read at forward time unless
+        ``self_sort`` says): then neither the front nor ``moe_sort`` sorts it."""
         if self_sort is None:
-            self_sort = self_sort_enabled()
-        return self_sort and nvfp4_lowm_op.self_sort_takes(rows, self.num_local)
+            self_sort = self_sort_fc12_enabled() if fc12 else self_sort_enabled()
+        return self_sort and nvfp4_lowm_op.self_sort_takes(rows, self.num_local, fc12=fc12)
 
     def _routed(
         self,
@@ -547,9 +566,14 @@ class K3DecodeMoeNvfp4Layer:
         """``moe_sort`` and the routed experts (the expert kernel's own sort where `self_sort_takes`); ``fc12``: as
         two kernels into ``fc12.out`` (`Fc12Step`)."""
         if fc12 is not None:
+            self_sort = self.self_sort_takes(ids.shape[0], self_sort, fc12=True)
+            if self_sort:
+                from . import census as _census
+
+                _census.count(f"dispatch:moe_self_sort_fc12:{_census.mode()}")
             return nvfp4_lowm_op.run(
                 x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-                self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(),
+                self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(), self_sort=self_sort,
             )  # fmt: skip
         self_sort = self.self_sort_takes(ids.shape[0], self_sort)
         if self_sort:
@@ -573,7 +597,7 @@ class K3DecodeMoeNvfp4Layer:
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it.
         ``fc12``: `_routed_after`'s."""
-        routing, shared_act = self._front_only(moe, x, front32, self_sort)
+        routing, shared_act = self._front_only(moe, x, front32, self_sort, fc12=fc12 is not None)
         return self._routed_after(routing, fc12=fc12, self_sort=self_sort), shared_act
 
     def _front_only(
@@ -582,10 +606,11 @@ class K3DecodeMoeNvfp4Layer:
         x: torch.Tensor,
         front32: Optional[bool] = None,
         self_sort: Optional[bool] = None,
+        fc12: bool = False,
     ):
         """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes. Where
-        `self_sort_takes` the front does not sort (the expert kernel does)."""
-        if self.state.sort_ctr is None or self.self_sort_takes(x.shape[0], self_sort):
+        `self_sort_takes` the front does not sort (the expert kernel does); ``fc12``: the experts run as FC1 + FC2."""
+        if self.state.sort_ctr is None or self.self_sort_takes(x.shape[0], self_sort, fc12=fc12):
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
             if self.stats is not None:
                 self.stats.record(self.layer_idx, ids)
@@ -723,7 +748,7 @@ class K3DecodeMoeNvfp4Layer:
                 from . import census as _census
 
                 _census.count(f"dispatch:moe_tail_col:{_census.mode()}")
-                routing, shared_act = self._front_only(moe, x, front32)
+                routing, shared_act = self._front_only(moe, x, front32, fc12=fc12 is not None)
                 return _tail_col.run(
                     self.state.col,
                     self.col,
@@ -735,7 +760,7 @@ class K3DecodeMoeNvfp4Layer:
                 from . import census as _census
 
                 _census.count(f"dispatch:moe_tail_lu:{_census.mode()}")
-                routing, shared_act = self._front_only(moe, x, front32)
+                routing, shared_act = self._front_only(moe, x, front32, fc12=fc12 is not None)
                 return _tail_lu.run(
                     self.state.lu,
                     self.lu,

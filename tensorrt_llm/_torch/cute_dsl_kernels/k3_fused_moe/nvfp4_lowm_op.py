@@ -315,6 +315,8 @@ def k3_moe_nvfp4_lowm_fc12(
     top_k: int,
     situ_beta: float,
     situ_linear_beta: float,
+    topk_ids: Optional[torch.Tensor] = None,
+    local_offset: int = 0,
 ) -> None:
     """`k3_moe_nvfp4_lowm`'s routed partial as two kernels: ``K3MoeFc1LowMKernel`` into ``h`` / ``h_sf`` (required:
     `new_fc12`), then ``K3MoeFc2LowMKernel`` adding into ``output``, which must be zero (this op does not zero it).
@@ -322,7 +324,9 @@ def k3_moe_nvfp4_lowm_fc12(
     (``TRTLLM_ENABLE_PDL``, as `k3_moe_nvfp4_lowm`): FC1 waits on the previous grid and then triggers FC2 at once;
     FC2 streams its weights before its wait (it reads only the tile metadata, which the kernel before FC1 wrote) and
     loads FC1's output, so also computes and adds, after it; FC2 triggers its dependents after all of its warps are
-    done."""
+    done. ``topk_ids`` int32 ``[M, top_k]``: both kernels sort the routing over the local experts
+    ``[local_offset, local_offset + E)`` themselves, per CTA (`run`'s ``self_sort``; the front's tiles and rows), the
+    four sort arguments are not read and ``token_final_scales`` may be bf16."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -332,11 +336,32 @@ def k3_moe_nvfp4_lowm_fc12(
     num_local, n1 = w1.shape[0], w1.shape[1]
     k1 = w2.shape[1]
     k2 = n1 // 2
-    m = permuted_idx_to_expanded_idx.shape[0]
+    self_sort = topk_ids is not None
+    if self_sort:
+        if (
+            orig_m > MAX_TOKENS
+            or num_local > SELF_SORT_MAX_LOCAL
+            or topk_ids.dtype != torch.int32
+            or not topk_ids.is_contiguous()
+        ):
+            raise ValueError(
+                "k3_moe_nvfp4_lowm_fc12: self-sort takes contiguous int32 ids of at most 32 tokens"
+            )
+        m = max_permuted_rows(orig_m, top_k, num_local)
+    else:
+        m = permuted_idx_to_expanded_idx.shape[0]
     if h.numel() < m * k2 // 2 or h_sf.numel() < m * k2 // SF_VEC:
         raise ValueError(
             "k3_moe_nvfp4_lowm_fc12: h / h_sf hold fewer than the permuted rows' FC1 output"
         )
+    if token_final_scales.dtype not in (torch.float32, torch.bfloat16) or (
+        token_final_scales.dtype == torch.bfloat16 and not self_sort
+    ):
+        raise ValueError(
+            "k3_moe_nvfp4_lowm_fc12: token_final_scales must be fp32 (or bf16 with topk_ids), "
+            f"not {token_final_scales.dtype}"
+        )
+    scales_bf16 = token_final_scales.dtype == torch.bfloat16
     n_tok = lowm.n_tok_for(orig_m)
     device = x_fp4.device
     ctas = _num_sms(_device_index(device))
@@ -366,13 +391,17 @@ def k3_moe_nvfp4_lowm_fc12(
         P(cutlass.Int32, tile_idx_to_mn_limit),
         P(cutlass.Int32, permuted_idx_to_expanded_idx),
         P(cutlass.Int32, num_non_exiting_tiles),
-        P(cutlass.Float32, token_final_scales),
+        P(cutlass.BFloat16 if scales_bf16 else cutlass.Float32, token_final_scales),
     ]
+    # the optional (tile_ready, trace) pointers stay None; the ids pointer only with self-sort
+    tail = (None, None, P(cutlass.Int32, topk_ids)) if self_sort else ()
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     base = (_device_index(device), n_tok, n1, k1, top_k, ctas, use_pdl)
+    if self_sort:
+        base = (*base, "self_sort", num_local, int(local_offset))
     key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
-    key2 = ("fc2", *base)
+    key2 = ("fc2", *base, scales_bf16)
     fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
     if fc1 is None or fc2 is None:
         if torch.cuda.is_current_stream_capturing():
@@ -384,27 +413,30 @@ def k3_moe_nvfp4_lowm_fc12(
             if fc1 is None:
                 kernel = lowm.K3MoeFc1LowMKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), use_pdl=use_pdl,
-                    late_trigger=False,
+                    late_trigger=False, self_sort_local=num_local if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0,
                 )  # fmt: skip
                 fc1 = _compiled[key1] = cute.compile(
-                    kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream
+                    kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream, *tail
                 )
             fc2 = _compiled.get(key2)
             if fc2 is None:
                 kernel = lowm.K3MoeFc2LowMKernel(
-                    n_tok, k1, k2, top_k, use_pdl=use_pdl, early_weights=True
-                )
+                    n_tok, k1, k2, top_k, use_pdl=use_pdl, early_weights=True,
+                    self_sort_local=num_local if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0,
+                )  # fmt: skip
                 fc2 = _compiled[key2] = cute.compile(
-                    kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream
+                    kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream, *tail
                 )
-    fc1(*fc1_ptrs, orig_m, m, num_local, stream)
-    fc2(*fc2_ptrs, m, num_local, orig_m, stream)
+    fc1(*fc1_ptrs, orig_m, m, num_local, stream, *tail)
+    fc2(*fc2_ptrs, m, num_local, orig_m, stream, *tail)
 
 
 @k3_moe_nvfp4_lowm_fc12.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, h, h_sf, top_k,
-      situ_beta, situ_linear_beta):  # fmt: skip
+      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0):  # fmt: skip
     return None
 
 
@@ -415,9 +447,11 @@ SELF_SORT_MAX_TOKENS = 16
 SELF_SORT_MAX_LOCAL = 256
 
 
-def self_sort_takes(num_tokens: int, num_local: int) -> bool:
-    """Whether `run`'s ``self_sort`` serves ``num_tokens`` tokens over ``num_local`` local experts."""
-    return 0 < num_tokens <= SELF_SORT_MAX_TOKENS and 0 < num_local <= SELF_SORT_MAX_LOCAL
+def self_sort_takes(num_tokens: int, num_local: int, fc12: bool = False) -> bool:
+    """Whether `run`'s ``self_sort`` serves ``num_tokens`` tokens over ``num_local`` local experts (``fc12``: with
+    `run`'s ``fc12``, i.e. FC1 + FC2 each sorting per CTA, up to `MAX_TOKENS` tokens)."""
+    max_tokens = MAX_TOKENS if fc12 else SELF_SORT_MAX_TOKENS
+    return 0 < num_tokens <= max_tokens and 0 < num_local <= SELF_SORT_MAX_LOCAL
 
 
 def run(
@@ -440,10 +474,29 @@ def run(
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
     ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``fc12``: `run_sorted`'s. ``self_sort``
-    (where `self_sort_takes` holds, without ``fc12``): no ``moe_sort``; the expert kernel sorts the ids itself (the
-    same tiles and rows)."""
+    (where `self_sort_takes` holds, with ``fc12`` its ``fc12`` form): no ``moe_sort``; the expert kernel(s) sort the
+    ids themselves (the same tiles and rows)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
+    if self_sort and fc12 is not None and self_sort_takes(num_tokens, w1.shape[0], fc12=True):
+        scales = (
+            topk_weights
+            if topk_weights.dtype in (torch.float32, torch.bfloat16)
+            else topk_weights.float()
+        )
+        ids = (topk_ids if topk_ids.dtype == torch.int32 else topk_ids.int()).contiguous()
+        if out is None:
+            if fc12.zeroed:
+                raise ValueError("run: fc12.zeroed without the zeroed output")
+            out = torch.empty(num_tokens, w2.shape[1], dtype=torch.bfloat16, device=x_fp4.device)
+        if not fc12.zeroed:
+            out.zero_()
+        torch.ops.trtllm.k3_moe_nvfp4_lowm_fc12(
+            x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, ids, ids, ids, ids, fc2_input_scale, scales,
+            fc12.h, fc12.h_sf, top_k, float(situ_beta), float(situ_linear_beta), topk_ids=ids,
+            local_offset=int(local_expert_offset),
+        )  # fmt: skip
+        return out
     if self_sort and fc12 is None and self_sort_takes(num_tokens, w1.shape[0]):
         # The kernel reads fp32 or bf16 weights itself: no conversion kernel between the front and the experts.
         scales = (

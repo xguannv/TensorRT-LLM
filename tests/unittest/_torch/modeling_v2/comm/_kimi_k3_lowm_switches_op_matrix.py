@@ -55,6 +55,7 @@ eager call on the same inputs):
   * SELF_SORT (1, 8, 9, 12, 16 rows; read at forward time): ``_front_routed`` on the front-sort layer with the expert
     kernel's own sort and without it: no sorted launch when on; the front's outputs, the routed partial and the
     shared activation bit for bit.
+  * SELF_SORT_FC12 (17, 24, 32 rows; read at forward time): the same with FC1 + FC2 on the 32-token front.
   * FRONT16 (9, 12, 16 rows): ``_wide`` with and without the 16-token front, with TRTLLM_K3LL_WIDE_LATENT_TAIL off.
     Off arm against ``_ref_wide_head_chain`` + ``_ref_latent_tail_chain``: routing, NVFP4 latent and scales, routed
     partial, shared activation, tail input and output bit for bit. On arm against the off arm: routing, latent,
@@ -1000,6 +1001,59 @@ def check_self_sort():
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_SELF_SORT_FC12
+# ----------------------------------------------------------------------------------------------------------------------
+def _self_sort_fc12_arm(layer, moe, x, value: int):
+    step = layer.state.fc12.begin(x.shape[0], layer.experts[3].shape[1], x.device)
+    with (
+        _switch("TRTLLM_K3LL_MOE_SELF_SORT_FC12", value),
+        _taps(layer) as seen,
+        _sort_tap() as sort,
+    ):
+        routed, act = layer._front_routed(moe, x, front32=True, fc12=step)
+    return SimpleNamespace(front=seen["_front"], sort=sort.get("sort"), routed=routed, act=act)
+
+
+def check_self_sort_fc12():
+    """``_front_routed`` with FC1 + FC2 (``K3MoeFc12``) on the 32-token front with the front's sort, with FC1 / FC2's
+    own per-CTA sort (switch on: the front runs without ``sort_out``, the kernels get the ids) and without it, at
+    17, 24 and 32 rows: no sorted launch in the on arm; the front's outputs, the routed partial (one-hot routing)
+    and the shared activation bit for bit; eagerly and from replays of one graph holding both arms."""
+    on, moe = BUILT.on32, BUILT.moe_on
+    if on.state.head32 is None or on.state.fc12 is None:
+        if R.rank == 0:
+            print(
+                "[rank 0] SELF_SORT_FC12: skipped (no 32-token front or no FC12 state)", flush=True
+            )
+        return
+    assert on.state.sort_ctr is not None
+    for rows in FRONT32_ROWS:
+        x = _moe_input(700 + rows, rows)
+        _verify_self_sort(
+            f"SELF_SORT_FC12 {rows} rows",
+            _self_sort_fc12_arm(on, moe, x, 1),
+            _self_sort_fc12_arm(on, moe, x, 0),
+        )
+    fields = ("front", "routed", "act")
+    for rows in GRAPH_FRONT32_ROWS:
+        x = _moe_input(800 + rows, rows)
+        graph, (g_on, g_off) = _capture(
+            lambda: (_self_sort_fc12_arm(on, moe, x, 1), _self_sort_fc12_arm(on, moe, x, 0))
+        )
+        for rep in range(REPLAYS):
+            x.copy_(_moe_input(900 + 10 * rows + rep, rows))
+            _replay(graph)
+            where = f"SELF_SORT_FC12 graph {rows} rows replay {rep}"
+            e_on, e_off = _self_sort_fc12_arm(on, moe, x, 1), _self_sort_fc12_arm(on, moe, x, 0)
+            _same_arm(f"{where} on vs eager", g_on, e_on, fields)
+            _same_arm(f"{where} off vs eager", g_off, e_off, fields)
+            _verify_self_sort(where, g_on, g_off)
+        del graph
+    if R.rank == 0:
+        print("[rank 0] SELF_SORT_FC12: on arm = off arm (eager and replays)", flush=True)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # TRTLLM_K3LL_MOE_FRONT16
 # ----------------------------------------------------------------------------------------------------------------------
 def _front16_arm(layer, moe, x):
@@ -1687,6 +1741,7 @@ def check_moe_tail_col():
 CHECKS = [
     check_front_sort,
     check_self_sort,
+    check_self_sort_fc12,
     check_front16,
     check_front32,
     check_wide_ar_attn_res,

@@ -125,3 +125,54 @@ def test_routed_passes_the_decision_to_run(monkeypatch, switch):
     seen.clear()
     layer._routed(torch.zeros(8, 16, dtype=torch.int32), None, None, None, self_sort=not switch)
     assert seen == [not switch]
+
+
+# ``TRTLLM_K3LL_MOE_SELF_SORT_FC12``: the same for the 17-32-token FC1 + FC2 launch.
+def test_fc12_switch_default_off_and_documented():
+    _, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_SELF_SORT_FC12"]
+    assert default == 0
+    assert "17-32 tokens" in doc and "K3MoeFc1LowMKernel" in doc and "k3_moe_front" in doc
+
+
+@pytest.mark.parametrize(
+    "tokens,local,takes",
+    [(0, 224, False), (1, 224, True), (17, 224, True), (32, 224, True), (33, 224, False), (32, 256, True),
+     (32, 257, False)],
+)  # fmt: skip
+def test_fc12_takes_by_tokens_and_local_experts(tokens, local, takes):
+    assert _lowm_op().self_sort_takes(tokens, local, fc12=True) is takes
+
+
+@pytest.mark.parametrize("small,fc12_switch", [(0, 0), (0, 1), (1, 0), (1, 1)])
+@pytest.mark.parametrize("rows", [16, 24, 32])
+def test_fc12_front_sorts_only_where_the_kernels_do_not(monkeypatch, small, fc12_switch, rows):
+    """On an FC1 + FC2 step the front skips its sort exactly where the FC12 switch is on (the 16-token switch does
+    not reach it), and `_routed` passes the same decision to ``run``."""
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_SELF_SORT", small)
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_SELF_SORT_FC12", fc12_switch)
+    layer = _layer(dm)
+    fronts, runs = [], []
+
+    def front(moe, x, sort_out=None, front32=None):
+        fronts.append(sort_out is not None)
+        return torch.zeros(x.shape[0], 16, dtype=torch.int32), "weights", "x_q", "x_sf", "shared"
+
+    monkeypatch.setattr(layer, "_front", front, raising=False)
+    monkeypatch.setattr(dm, "sort_layout", lambda rows, local: (0, 0, 0, 16))
+    monkeypatch.setattr(
+        dm.nvfp4_lowm_op,
+        "run",
+        lambda *a, self_sort=False, fc12=None, **k: runs.append(("run", self_sort)) or "y",
+    )
+    monkeypatch.setattr(
+        dm.nvfp4_lowm_op, "run_sorted", lambda *a, **k: runs.append(("sorted",)) or "y"
+    )
+    monkeypatch.setattr(dm, "sort_views", lambda *a: ())
+    step = SimpleNamespace(out=None, launch=lambda: "fc12")
+    layer._front_routed(None, torch.zeros(rows, 4), fc12=step)
+    kernels_sort = bool(fc12_switch)
+    assert fronts == [not kernels_sort]
+    assert runs == ([("run", True)] if kernels_sort else [("sorted",)])
+    assert layer.self_sort_takes(rows, fc12=True) is kernels_sort

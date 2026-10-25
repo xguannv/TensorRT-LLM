@@ -278,7 +278,176 @@ def _s2t_copy_and_partition(sSF: cute.Tensor, tSF: cute.Tensor, sf_dtype):
     return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
 
-class K3MoeFc1LowMKernel:
+@dsl_user_op
+def _popc(value, *, loc=None, ip=None):
+    """``popc.b32``."""
+    return Int32(
+        _asm(T.i32(), [_iv(value, loc=loc, ip=ip)], "popc.b32 $0, $1;", "=r,r", loc=loc, ip=ip)
+    )
+
+
+def _align4(v: int) -> int:
+    return (v + 3) // 4 * 4
+
+
+#: Most tiles one CTA's contiguous unit range may meet under self-sort (its scratch holds their metadata).
+SELF_SORT_LOCAL_TILES = 8
+
+
+class _SelfSortMixin:
+    """Self-sort of FC1 / FC2 (``self_sort_local`` > 0): every CTA builds, from the step's top-k ids, the tile
+    metadata ``moe_sort`` (or ``k3_moe_front``'s sort) would write, but only for the tiles its own unit range meets:
+    the tiles are the touched local experts in increasing order, a tile's rows its tokens in increasing order (the
+    front's sort, row for row). Shared-memory scratch: the ids, per-token bitmaps of the local experts, their union
+    and prefix counts, and per local tile its expert, row count and ``token * topk + slot`` per row."""
+
+    def _init_self_sort(self, n_tok: int, topk: int, self_sort_local: int, self_sort_offset: int):
+        self.self_sort = self_sort_local > 0
+        self.ss_local = self_sort_local
+        self.ss_offset = self_sort_offset
+        self.ss_words = max(1, -(-self_sort_local // 32))
+        self.ss_ids = n_tok * topk
+        self.ss_bits = n_tok * self.ss_words
+        self.ss_lt = SELF_SORT_LOCAL_TILES
+        words = (
+            self.ss_ids + self.ss_bits + 2 * _align4(self.ss_words) + 4 + 2 * _align4(self.ss_lt)
+            + self.ss_lt * n_tok
+        )  # fmt: skip
+        # 8 arrays, each 16-byte aligned
+        self.ss_bytes = 4 * words + 8 * 16 if self.self_sort else 0
+
+    def _check_self_sort_grid(self, num_ctas: int):
+        """The CTA ranges of ``num_ctas`` CTAs each meet at most `SELF_SORT_LOCAL_TILES` tiles."""
+        if not self.self_sort:
+            return
+        tiles = min(self.n_tok * self.topk, self.ss_local)
+        units = -(-tiles * self.nblk // num_ctas)
+        need = -(-units // self.nblk) + 1
+        if need > self.ss_lt:
+            raise ValueError(
+                f"self-sort: {num_ctas} CTAs over {tiles} x {self.nblk} units meet up to {need} tiles per CTA "
+                f"(scratch holds {self.ss_lt})"
+            )
+
+    @cute.jit
+    def _ss_tensors(self, storage):
+        """The scratch's per-local-tile views: ``(expert, rows, expanded index of row r at lt * n_tok + r)``."""
+        expert = storage.sSsExpert.get_tensor(cute.make_layout(_align4(self.ss_lt)))
+        count = storage.sSsCount.get_tensor(cute.make_layout(_align4(self.ss_lt)))
+        perm = storage.sSsPerm.get_tensor(cute.make_layout(self.ss_lt * self.n_tok))
+        return expert, count, perm
+
+    @cute.jit
+    def _self_sort(
+        self,
+        storage,
+        topk_ids_ptr: cute.Pointer,
+        orig_m: Int32,
+        tidx,
+        bid,
+        nctas,
+        nthr: cutlass.Constexpr,
+    ):
+        """Run by all ``nthr`` threads of the CTA (full-CTA barriers). Returns the tile count; the local tiles
+        are ``[w_lo // nblk, ...)`` for this CTA's unit range ``[w_lo, w_hi)`` of ``tile count * nblk`` units."""
+        n_tok, K, W, LT, NBLK = self.n_tok, self.topk, self.ss_words, self.ss_lt, self.nblk
+        off = Int32(self.ss_offset)
+        num_local = Int32(self.ss_local)
+        topk_ids = cute.make_tensor(topk_ids_ptr, cute.make_layout(n_tok * K))
+        ids = storage.sSsIds.get_tensor(cute.make_layout(self.ss_ids))
+        bits = storage.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+        union = storage.sSsUnion.get_tensor(cute.make_layout(_align4(W)))
+        prefix = storage.sSsPrefix.get_tensor(cute.make_layout(_align4(W)))
+        nt = storage.sSsNt.get_tensor(cute.make_layout(4))
+        expert, count, perm = self._ss_tensors(storage)
+        n = orig_m * Int32(K)
+        for i in cutlass.range_constexpr(-(-(n_tok * K) // nthr)):
+            j = tidx + Int32(i * nthr)
+            if j < n:
+                ids[j] = topk_ids[j]
+        cute.arch.barrier()
+        for i in cutlass.range_constexpr(-(-(n_tok * W) // nthr)):
+            j = tidx + Int32(i * nthr)
+            if j < orig_m * Int32(W):
+                t = j // Int32(W)
+                w = j - t * Int32(W)
+                word = Int32(0)
+                for k in cutlass.range_constexpr(K):
+                    lx = ids[t * Int32(K) + k] - off
+                    hit = (lx >= Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
+                    word = word | cutlass.select_(hit, Int32(1) << (lx & 31), Int32(0))
+                bits[j] = word
+        cute.arch.barrier()
+        if tidx < Int32(W):
+            u = Int32(0)
+            for t in cutlass.range_constexpr(n_tok):
+                if Int32(t) < orig_m:
+                    u = u | bits[t * W + tidx]
+            union[tidx] = u
+        cute.arch.barrier()
+        if tidx < Int32(W + 1):
+            before = Int32(0)
+            for w in cutlass.range_constexpr(W):
+                if Int32(w) < tidx:
+                    before = before + _popc(union[w])
+            if tidx < Int32(W):
+                prefix[tidx] = before
+            else:
+                nt[0] = before
+        cute.arch.barrier()
+        ntiles = nt[0]
+        total = ntiles * NBLK
+        w_lo = (Int32(bid) * total) // Int32(nctas)
+        w_hi = ((Int32(bid) + 1) * total) // Int32(nctas)
+        tile_lo = w_lo // NBLK
+        tile_end = (w_hi + NBLK - 1) // NBLK
+        # thread (lt, q): token q's row in local tile lt, if q routes to the tile's expert
+        for i in cutlass.range_constexpr(-(-(LT * n_tok) // nthr)):
+            j = tidx + Int32(i * nthr)
+            if j < Int32(LT * n_tok):
+                lt = j // Int32(n_tok)
+                q = j - lt * Int32(n_tok)
+                tile = tile_lo + lt
+                if tile < tile_end:
+                    # the tile's expert: bit (tile - prefix[w]) of union[w], counting set bits from 0
+                    w = Int32(0)
+                    base = Int32(0)
+                    for ww in cutlass.range_constexpr(W):
+                        pre = prefix[ww]
+                        if (pre <= tile) & (tile < pre + _popc(union[ww])):
+                            w = Int32(ww)
+                            base = pre
+                    word = union[w]
+                    nth = tile - base
+                    pos = Int32(0)
+                    for s in cutlass.range_constexpr(5):
+                        step = 16 >> s
+                        if _popc(word & ((Int32(1) << (pos + step)) - Int32(1))) <= nth:
+                            pos = pos + step
+                    lx = w * Int32(32) + pos
+                    if q < orig_m:
+                        if ((bits[q * Int32(W) + w] >> pos) & Int32(1)) != Int32(0):
+                            row = Int32(0)
+                            for p in cutlass.range_constexpr(n_tok):
+                                if Int32(p) < q:
+                                    row = row + ((bits[p * W + w] >> pos) & Int32(1))
+                            slot = Int32(0)
+                            for k in cutlass.range_constexpr(K):
+                                if ids[q * Int32(K) + k] - off == lx:
+                                    slot = Int32(k)
+                            perm[lt * Int32(n_tok) + row] = q * Int32(K) + slot
+                    if q == Int32(0):
+                        cnt = Int32(0)
+                        for p in cutlass.range_constexpr(n_tok):
+                            if Int32(p) < orig_m:
+                                cnt = cnt + ((bits[p * W + w] >> pos) & Int32(1))
+                        expert[lt] = lx
+                        count[lt] = cnt
+        cute.arch.barrier()
+        return ntiles
+
+
+class K3MoeFc1LowMKernel(_SelfSortMixin):
     """Swap-AB NVFP4 gate_up GEMM + SiTU + NVFP4 quantization for at most 32 tokens.
 
     :param n_tok: Token tile (MMA N): 8, 16 or 32; the step's token count must not exceed it.
@@ -299,6 +468,10 @@ class K3MoeFc1LowMKernel:
         right after ``griddepcontrol.wait`` (``False``); ``None`` follows ``share_sm``.
     :param prefetch_experts: The weight TMA warp loads the experts of the first 32 tiles together
         with the tile count (one memory latency less before the first weight load).
+    :param self_sort_local: 0: the tile metadata comes from the previous grid (``moe_sort``'s
+        outputs). Else the number of local experts: every CTA sorts the step's top-k ids itself after
+        its wait (`_SelfSortMixin`) and the four metadata arguments are not read.
+    :param self_sort_offset: First local expert id (with ``self_sort_local``).
     """
 
     def __init__(
@@ -319,6 +492,8 @@ class K3MoeFc1LowMKernel:
         share_sm: bool = False,
         late_trigger: Optional[bool] = None,
         prefetch_experts: bool = True,
+        self_sort_local: int = 0,
+        self_sort_offset: int = 0,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % (2 * 64) == 0 and n % _MMA_M == 0, f"n {n} must be a multiple of 128"
@@ -361,11 +536,14 @@ class K3MoeFc1LowMKernel:
         self.a_stage_bytes = _MMA_M * _KBLK // 2 + _SF_KBLK_BYTES
         self.x_bytes = self.nkb * n_tok * _KBLK // 2
         self.sacc_row_floats = _MMA_M + _SACC_PAD
+        self._init_self_sort(n_tok, topk, self_sort_local, self_sort_offset)
+        assert not (self.self_sort and prefetch_tail), "self-sort: no tail prefetch"
         fixed = (
             self.x_bytes
             + self.nkb * _SF_KBLK_BYTES
             + n_tok * self.sacc_row_floats * 4
             + 4 * 1024  # barriers, TMEM holder and alignment slack
+            + self.ss_bytes
         )
         smem_capacity = min(smem_capacity, _SMEM_CAPACITY)
         self.num_ab_stage = min(max_ab_stage, (smem_capacity - fixed) // self.a_stage_bytes)
@@ -391,7 +569,9 @@ class K3MoeFc1LowMKernel:
         stream: cuda.CUstream,
         tile_ready_ptr: Optional[cute.Pointer] = None,
         trace_ptr: Optional[cute.Pointer] = None,
+        topk_ids_ptr: Optional[cute.Pointer] = None,
     ):
+        self._check_self_sort_grid(num_ctas)
         self.a_dtype = w.element_type
         w_raw = w.iterator
         w_sf_raw = w_sf.iterator
@@ -487,6 +667,17 @@ class K3MoeFc1LowMKernel:
             sAcc: cute.struct.Align[
                 cute.struct.MemRange[Float32, self.n_tok * self.sacc_row_floats], 16
             ]
+            if self.self_sort:
+                sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
+                sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
+                sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
+                sSsPrefix: cute.struct.Align[
+                    cute.struct.MemRange[Int32, _align4(self.ss_words)], 16
+                ]
+                sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+                sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+                sSsCount: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+                sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_lt * self.n_tok], 16]
 
         self.shared_storage = SharedStorage
 
@@ -512,6 +703,7 @@ class K3MoeFc1LowMKernel:
             w_sf_raw,
             tile_ready_ptr,
             trace_ptr,
+            topk_ids_ptr,
             a_smem_layout_staged,
             b_smem_layout_staged,
             sfa_smem_layout_staged,
@@ -552,6 +744,7 @@ class K3MoeFc1LowMKernel:
         w_sf_raw: cute.Pointer,
         tile_ready_ptr: Optional[cute.Pointer],
         trace_ptr: Optional[cute.Pointer],
+        topk_ids_ptr: Optional[cute.Pointer],
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
@@ -609,13 +802,20 @@ class K3MoeFc1LowMKernel:
                 self._stamp(trace_ptr, bid, 1)
 
         t2e_pre = Int32(0)
-        if cutlass.const_expr(self.prefetch_experts):
-            if warp_idx == _TMA_WARP:
-                t2e_pre = tile_idx_to_expert_idx[
-                    cutlass.min(cute.arch.lane_idx(), cute.size(tile_idx_to_expert_idx) - 1)
-                ]
+        total = Int32(0)
+        if cutlass.const_expr(self.self_sort):
+            total = (
+                self._self_sort(storage, topk_ids_ptr, orig_m, tidx, bid, nctas, self.threads)
+                * NBLK
+            )
+        else:
+            if cutlass.const_expr(self.prefetch_experts):
+                if warp_idx == _TMA_WARP:
+                    t2e_pre = tile_idx_to_expert_idx[
+                        cutlass.min(cute.arch.lane_idx(), cute.size(tile_idx_to_expert_idx) - 1)
+                    ]
+            total = Int32(num_non_exiting_tiles[0]) * NBLK
         # This CTA's contiguous range of work units (tile, 128-row block of W1).
-        total = Int32(num_non_exiting_tiles[0]) * NBLK
         w_lo = (Int32(bid) * total) // Int32(nctas)
         w_hi = ((Int32(bid) + 1) * total) // Int32(nctas)
         num_units = w_hi - w_lo
@@ -665,13 +865,17 @@ class K3MoeFc1LowMKernel:
                 tile = w_idx // NBLK
                 blk = w_idx - tile * NBLK
                 expert = Int32(0)
-                if cutlass.const_expr(self.prefetch_experts):
-                    if tile < 32:
-                        expert = cute.arch.shuffle_sync(t2e_pre, tile)
+                if cutlass.const_expr(self.self_sort):
+                    ss_expert = self._ss_tensors(storage)[0]
+                    expert = ss_expert[tile - w_lo // NBLK]
+                else:
+                    if cutlass.const_expr(self.prefetch_experts):
+                        if tile < 32:
+                            expert = cute.arch.shuffle_sync(t2e_pre, tile)
+                        else:
+                            expert = tile_idx_to_expert_idx[tile]
                     else:
                         expert = tile_idx_to_expert_idx[tile]
-                else:
-                    expert = tile_idx_to_expert_idx[tile]
                 for kb in cutlass.range(NKB, unroll=1):
                     stage = g % S
                     if g >= S:
@@ -1035,13 +1239,21 @@ class K3MoeFc1LowMKernel:
             blk = w_idx - tile * NBLK
             if tile != prev_tile:
                 prev_tile = tile
-                n_valid = cutlass.min(
-                    cutlass.max(tile_idx_to_mn_limit[tile] - tile * _MMA_M, Int32(0)),
-                    Int32(n_tok),
-                )
-                alpha_val = alpha[tile_idx_to_expert_idx[tile]]
-                if r < n_valid:
-                    tok = permuted_idx_to_expanded_idx[tile * _MMA_M + r] // self.topk
+                if cutlass.const_expr(self.self_sort):
+                    ss_expert, ss_count, ss_perm = self._ss_tensors(storage)
+                    lt = tile - w_lo // NBLK
+                    n_valid = ss_count[lt]
+                    alpha_val = alpha[ss_expert[lt]]
+                    if r < n_valid:
+                        tok = ss_perm[lt * n_tok + r] // self.topk
+                else:
+                    n_valid = cutlass.min(
+                        cutlass.max(tile_idx_to_mn_limit[tile] - tile * _MMA_M, Int32(0)),
+                        Int32(n_tok),
+                    )
+                    alpha_val = alpha[tile_idx_to_expert_idx[tile]]
+                    if r < n_valid:
+                        tok = permuted_idx_to_expanded_idx[tile * _MMA_M + r] // self.topk
             acc_stage = j % NACC
             cute.arch.mbarrier_wait(acc_full + acc_stage, (j // NACC) & 1)
             if cutlass.const_expr(self.trace):
@@ -1145,10 +1357,12 @@ class K3MoeFc1LowMKernel:
         stream: cuda.CUstream,
         tile_ready_ptr: Optional[cute.Pointer] = None,
         trace_ptr: Optional[cute.Pointer] = None,
+        topk_ids_ptr: Optional[cute.Pointer] = None,
     ):
         """Same pointers as ``BlockScaledContiguousGatherGroupedGemmKernel.wrapper``
         (``a`` = the step's tokens [orig_m, k], ``a_sf`` their linear [orig_m, k / 16] scales,
-        ``m`` = permuted rows)."""
+        ``m`` = permuted rows). ``topk_ids_ptr``: int32 [orig_m, topk], read with
+        ``self_sort_local`` only."""
         n, k = self.n, self.k
         num_tiles = m // _MMA_M
         x = cute.make_tensor(
@@ -1193,6 +1407,7 @@ class K3MoeFc1LowMKernel:
             stream,
             tile_ready_ptr,
             trace_ptr,
+            topk_ids_ptr,
         )
 
 
@@ -1240,7 +1455,7 @@ def _bulk_g2s(dst_smem, src_gmem, nbytes, mbar, *, loc=None, ip=None):
     )
 
 
-class K3MoeFc2LowMKernel:
+class K3MoeFc2LowMKernel(_SelfSortMixin):
     """Swap-AB NVFP4 down GEMM + MoE finalize (weighted scatter-add) for at most 32 tokens.
 
     Computes, like ``Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel``,
@@ -1260,6 +1475,10 @@ class K3MoeFc2LowMKernel:
       (FC1): the tile metadata comes from the kernel before FC1, so with ``early_weights`` the CTA
       streams weights as soon as it is resident, and only the token-operand loads (and the MMAs
       and the epilogue behind them) wait for FC1 to complete.
+    * Self-sort (``self_sort_local``): every CTA builds its tiles' metadata from the step's top-k
+      ids at its start (`_SelfSortMixin`, the same tiles and rows as FC1's), before the early
+      weights: the ids, like the metadata otherwise, come from the kernel before FC1.
+      ``token_final_scales`` may then be the front's bf16 weights (widened exactly).
     """
 
     def __init__(
@@ -1277,6 +1496,8 @@ class K3MoeFc2LowMKernel:
         wait_tiles: bool = False,
         tile_units: int = 12,
         trace: bool = False,
+        self_sort_local: int = 0,
+        self_sort_offset: int = 0,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % _MMA_M == 0 and k % _KBLK == 0
@@ -1319,11 +1540,13 @@ class K3MoeFc2LowMKernel:
         self.b_data_bytes = self.nkb * n_tok * _KBLK // 2
         self.b_sf_bytes = self.nkb * _SF_KBLK_BYTES
         self.out_row_bytes = _MMA_M * 2
+        self._init_self_sort(n_tok, topk, self_sort_local, self_sort_offset)
         fixed = (
             num_b_stage * (self.b_data_bytes + self.b_sf_bytes)
             + 2 * num_epi_wg * n_tok * self.out_row_bytes
             + 2 * num_epi_wg * n_tok * 4
             + 4 * 1024
+            + self.ss_bytes
         )
         self.num_ab_stage = min(max_ab_stage, (_SMEM_CAPACITY - fixed) // self.a_stage_bytes)
         assert self.num_ab_stage >= 2
@@ -1346,7 +1569,9 @@ class K3MoeFc2LowMKernel:
         stream: cuda.CUstream,
         tile_ready_ptr: Optional[cute.Pointer] = None,
         trace_ptr: Optional[cute.Pointer] = None,
+        topk_ids_ptr: Optional[cute.Pointer] = None,
     ):
+        self._check_self_sort_grid(num_ctas)
         self.a_dtype = w.element_type
         self.b_dtype = h.element_type
         self.sf_dtype = w_sf.element_type
@@ -1445,6 +1670,17 @@ class K3MoeFc2LowMKernel:
             sScale: cute.struct.Align[
                 cute.struct.MemRange[Float32, self.num_epi_wg * self.n_tok], 16
             ]
+            if self.self_sort:
+                sSsIds: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_ids], 16]
+                sSsBits: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_bits], 16]
+                sSsUnion: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_words)], 16]
+                sSsPrefix: cute.struct.Align[
+                    cute.struct.MemRange[Int32, _align4(self.ss_words)], 16
+                ]
+                sSsNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+                sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+                sSsCount: cute.struct.Align[cute.struct.MemRange[Int32, _align4(self.ss_lt)], 16]
+                sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_lt * self.n_tok], 16]
 
         self.shared_storage = SharedStorage
 
@@ -1466,6 +1702,7 @@ class K3MoeFc2LowMKernel:
             token_final_scales,
             tile_ready_ptr,
             trace_ptr,
+            topk_ids_ptr,
             a_smem_layout_staged,
             b_smem_layout_staged,
             sfa_smem_layout_staged,
@@ -1527,6 +1764,7 @@ class K3MoeFc2LowMKernel:
         token_final_scales: cute.Tensor,
         tile_ready_ptr: Optional[cute.Pointer],
         trace_ptr: Optional[cute.Pointer],
+        topk_ids_ptr: Optional[cute.Pointer],
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
@@ -1579,8 +1817,17 @@ class K3MoeFc2LowMKernel:
         if cutlass.const_expr(self.use_pdl and not self.early_weights and not self.wait_tiles):
             griddepcontrol_wait()
 
-        # Tile metadata comes from the kernel before FC1 (complete once FC1 is resident).
-        total = Int32(num_non_exiting_tiles[0]) * NBLK
+        # Tile metadata (or the ids it is sorted from) comes from the kernel before FC1 (complete once
+        # FC1 is resident).
+        total = Int32(0)
+        if cutlass.const_expr(self.self_sort):
+            orig_m = Int32(cute.size(token_final_scales, mode=[0]))
+            total = (
+                self._self_sort(storage, topk_ids_ptr, orig_m, tidx, bid, nctas, self.threads)
+                * NBLK
+            )
+        else:
+            total = Int32(num_non_exiting_tiles[0]) * NBLK
         w_lo = (Int32(bid) * total) // Int32(nctas)
         w_hi = ((Int32(bid) + 1) * total) // Int32(nctas)
         num_units = w_hi - w_lo
@@ -1621,7 +1868,12 @@ class K3MoeFc2LowMKernel:
                 w_idx = w_lo + j
                 tile = w_idx // NBLK
                 blk = w_idx - tile * NBLK
-                expert = tile_idx_to_expert_idx[tile]
+                expert = Int32(0)
+                if cutlass.const_expr(self.self_sort):
+                    ss_expert = self._ss_tensors(storage)[0]
+                    expert = ss_expert[tile - w_lo // NBLK]
+                else:
+                    expert = tile_idx_to_expert_idx[tile]
                 for kb in cutlass.range(NKB, unroll=1):
                     stage = g % S
                     if g >= S:
@@ -1908,19 +2160,30 @@ class K3MoeFc2LowMKernel:
             buf = k % 2
             if tile != prev_tile:
                 prev_tile = tile
-                n_valid = cutlass.min(
-                    cutlass.max(tile_idx_to_mn_limit[tile] - tile * _MMA_M, Int32(0)),
-                    Int32(n_tok),
-                )
                 alpha_val = Float32(0.0)
                 token = Int32(0)
                 slot = Int32(0)
-                if epi_tidx < n_valid:
-                    alpha_val = alpha[tile_idx_to_expert_idx[tile]]
-                    expanded = permuted_idx_to_expanded_idx[tile * _MMA_M + epi_tidx]
-                    token = expanded // self.topk
-                    slot = expanded - token * self.topk
-                    alpha_val = alpha_val * token_final_scales[(token, slot)]
+                if cutlass.const_expr(self.self_sort):
+                    ss_expert, ss_count, ss_perm = self._ss_tensors(storage)
+                    lt = tile - w_lo // NBLK
+                    n_valid = ss_count[lt]
+                    if epi_tidx < n_valid:
+                        alpha_val = alpha[ss_expert[lt]]
+                        expanded = ss_perm[lt * n_tok + epi_tidx]
+                        token = expanded // self.topk
+                        slot = expanded - token * self.topk
+                        alpha_val = alpha_val * Float32(token_final_scales[(token, slot)])
+                else:
+                    n_valid = cutlass.min(
+                        cutlass.max(tile_idx_to_mn_limit[tile] - tile * _MMA_M, Int32(0)),
+                        Int32(n_tok),
+                    )
+                    if epi_tidx < n_valid:
+                        alpha_val = alpha[tile_idx_to_expert_idx[tile]]
+                        expanded = permuted_idx_to_expanded_idx[tile * _MMA_M + epi_tidx]
+                        token = expanded // self.topk
+                        slot = expanded - token * self.topk
+                        alpha_val = alpha_val * token_final_scales[(token, slot)]
                 # the previous unit's reds still read the metadata of the previous tile
                 self._wg_barrier(wg)
                 if epi_tidx < n_valid:
@@ -1985,10 +2248,12 @@ class K3MoeFc2LowMKernel:
         stream: cuda.CUstream,
         tile_ready_ptr: Optional[cute.Pointer] = None,
         trace_ptr: Optional[cute.Pointer] = None,
+        topk_ids_ptr: Optional[cute.Pointer] = None,
     ):
         """Same pointers as ``Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.wrapper``
         (``a`` = FC1's permuted output [m, k], ``a_sf`` its 128x4-blocked scales, ``c`` = the
-        BF16 [num_tokens, n] output that is added to)."""
+        BF16 [num_tokens, n] output that is added to). ``topk_ids_ptr``: int32 [num_tokens, topk],
+        read with ``self_sort_local`` only (``token_final_scales_ptr`` then fp32 or bf16)."""
         n, k = self.n, self.k
         num_tiles = m // _MMA_M
         h = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))
@@ -2032,6 +2297,7 @@ class K3MoeFc2LowMKernel:
             stream,
             tile_ready_ptr,
             trace_ptr,
+            topk_ids_ptr,
         )
 
 

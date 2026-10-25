@@ -475,6 +475,77 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
         torch.cuda.synchronize()
         check(captured, f"graph replay {replay}")
 
+    # FC1 and FC2's own per-CTA sort (TRTLLM_K3LL_MOE_SELF_SORT_FC12): the ids alone, the sort arguments never read.
+    assert nvfp4_lowm_op.self_sort_takes(num_tokens, num_local, fc12=True)
+    expanded = p2e.tolist()
+    self_rows = torch.tensor(
+        [t * 128 + sorted(expanded[t * 128 : limits[t]]).index(expanded[r]) for t in range(tiles)
+         for r in range(t * 128, limits[t])], device="cuda",
+    )  # fmt: skip
+
+    def two_self(token_scales):
+        out_fc12.zero_()
+        fc12.h.zero_()
+        fc12.h_sf.zero_()
+        _trtllm().k3_moe_nvfp4_lowm_fc12(
+            _bits(x_q), _bits(x_sf), *weights, out_fc12, ids, ids, ids, ids, ex.fc2_input_scale, token_scales,
+            fc12.h, fc12.h_sf, top_k, GATE_CAP, LINEAR_CAP, topk_ids=ids, local_offset=offset,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return out_fc12.clone()
+
+    for slot in (0, 1, top_k - 1):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        ref = dyn(one_hot)
+        new = two_self(one_hot)
+        assert torch.equal(ref.view(torch.int16), new.view(torch.int16)), (
+            f"self-sort FC2 slot {slot}"
+        )
+        if slot == 0:
+            # Same tiles as moe_sort, the rows of a tile in token order (moe_sort's are in any order).
+            assert torch.equal(h_dyn[rows], fc12.h[self_rows]), "self-sort: FC1 output rows differ"
+            cols = inter_size // SF16
+            sf_ref = unswizzle_sf(h_sf_dyn, m, inter_size, SF16).view(m, cols)
+            sf_new = unswizzle_sf(fc12.h_sf[: m * cols], m, inter_size, SF16).view(m, cols)
+            assert torch.equal(sf_ref[rows], sf_new[self_rows]), (
+                "self-sort: FC1 output scale factors differ"
+            )
+        # bf16 routing weights (the front's output) read by FC2 itself: bit for bit as their fp32 widening
+        one_hot16 = one_hot.bfloat16()
+        wide = two_self(one_hot16.float())
+        assert torch.equal(two_self(one_hot16).view(torch.int16), wide.view(torch.int16)), (
+            f"self-sort bf16 weights slot {slot}"
+        )
+    check(two_self(scales), "self-sort op")
+    run_args = (_bits(x_q), _bits(x_sf), ids, scales, weights, offset, num_experts, ex.fc2_input_scale, counters,
+                GATE_CAP, LINEAR_CAP)  # fmt: skip
+    static.fill_(7.0)
+    y = nvfp4_lowm_op.run(*run_args, out=static, fc12=fc12, self_sort=True)
+    torch.cuda.synchronize()
+    check(y, "run self_sort fc12")
+    bf16_args = run_args[:3] + (scales.bfloat16(),) + run_args[4:]
+    static.fill_(7.0)
+    y16 = nvfp4_lowm_op.run(*bf16_args, out=static, fc12=fc12, self_sort=True)
+    torch.cuda.synchronize()
+    err16 = (y16.double() - exact).abs()
+    assert bool((err16 <= 2 * bound).all()), (
+        f"run self_sort fc12 bf16: max err/bound {(err16 / bound).max()}"
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), with_multi_stream(True):
+        step = state.begin(num_tokens, hidden, torch.device("cuda"))
+        captured = nvfp4_lowm_op.run(*bf16_args, out=step.out, fc12=step.launch(), self_sort=True)
+    for replay in range(3):
+        captured.fill_(7.0)
+        fc12.h.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        err16 = (captured.double() - exact).abs()
+        assert bool((err16 <= 2 * bound).all()), (
+            f"self-sort graph replay {replay}: {(err16 / bound).max()}"
+        )
+
 
 # --------------------------------------------------------------------------------------------------------------------
 # front (4 GPUs)

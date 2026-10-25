@@ -63,6 +63,14 @@ TRTLLM_K3LL_MOE_SELF_SORT = _flag(
     "results. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 only "
     "(decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs1 -0.150 ms, bs2 -0.223 ms, moss-0444)",
 )
+TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
+    "TRTLLM_K3LL_MOE_SELF_SORT_FC12",
+    0,
+    "with TRTLLM_K3LL_MOE_LOWM_FC12, wide steps of 17-32 tokens: K3MoeFc1LowMKernel and K3MoeFc2LowMKernel each "
+    "build the tile metadata of their own CTA's tiles from the step's top-k ids (the same tiles and rows as "
+    "k3_moe_front's sort, in shared memory), so the front skips its sort and the kernels read the front's bf16 "
+    "routing weights. Same results. Read at forward time; 1 on, 0 off",
+)
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
     1,
