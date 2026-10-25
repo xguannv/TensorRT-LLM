@@ -286,6 +286,12 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         return
 
     # The kernel's own sort (TRTLLM_K3LL_MOE_SELF_SORT): the ids alone, the sort arguments never read.
+    expanded = p2e.tolist()
+    self_rows = torch.tensor(
+        [t * 128 + sorted(expanded[t * 128 : limits[t]]).index(expanded[r]) for t in range(tiles)
+         for r in range(t * 128, limits[t])], device="cuda",
+    )  # fmt: skip
+
     def lowm_self(token_scales):
         out.fill_(7.0)
         h.zero_()
@@ -306,11 +312,12 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
             f"self-sort FC2 slot {slot}"
         )
         if slot == 0:
-            assert torch.equal(c_ref[rows], h[rows]), "self-sort: FC1 output rows differ"
+            # Same tiles as moe_sort, the rows of a tile in token order (moe_sort's are in any order).
+            assert torch.equal(c_ref[rows], h[self_rows]), "self-sort: FC1 output rows differ"
             cols = inter_size // SF16
             sf_ref = unswizzle_sf(c_sf_ref, m, inter_size, SF16).view(m, cols)
             sf_new = unswizzle_sf(h_sf, m, inter_size, SF16).view(m, cols)
-            assert torch.equal(sf_ref[rows], sf_new[rows]), (
+            assert torch.equal(sf_ref[rows], sf_new[self_rows]), (
                 "self-sort: FC1 output scale factors differ"
             )
     check(lowm_self(scales), "self-sort op")
