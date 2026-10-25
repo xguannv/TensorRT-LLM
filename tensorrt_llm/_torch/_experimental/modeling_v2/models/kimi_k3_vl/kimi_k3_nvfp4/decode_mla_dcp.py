@@ -254,6 +254,7 @@ def _var_split_counts_tile_kernel(
     K_TILE: tl.constexpr,
     TALLY=None,
     TALLY_AT: tl.constexpr = 0,
+    STATIC_GRID: tl.constexpr = 0,
 ):
     """``_var_split_counts_kernel``'s choice with every candidate unit ``ceil(t_b / k)``, indexed ``b * GRID + k - 1``,
     evaluated at once (a ``[candidates, requests]`` tile) instead of one after the other: the first of the lowest cost
@@ -288,12 +289,19 @@ def _var_split_counts_tile_kernel(
         )
         tl.atomic_add(TALLY + TALLY_AT, 1)
         tl.atomic_add(TALLY + TALLY_AT + 1, differ.to(tl.int64))
+        if (
+            STATIC_GRID > 0
+        ):  # TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS: a count past the static split units' cap
+            above = tl.max(tl.where(live, best, 0), axis=0) > STATIC_GRID
+            tl.atomic_add(TALLY + 4, above.to(tl.int64))
 
 
 def _counts_tally(device: torch.device) -> Optional[torch.Tensor]:
     """``TRTLLM_K3LL_CENSUS``: the device tally of the count kernel (graph replays included): calls and calls with
     unequal counts, below ``_VAR_SPLIT_MIN_BATCH`` requests (``TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL``) and from it on,
-    logged with the census lines as ``device:mla_var_split_counts:{small,wide}_{calls,unequal}``; None without it."""
+    logged with the census lines as ``device:mla_var_split_counts:{small,wide}_{calls,unequal}``, and the calls whose
+    largest count passes the static split units' cap (``wide_ws_above_static``, ``TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS``);
+    None without it."""
     from . import census as _census
 
     if not _census.ENABLED:
@@ -304,9 +312,11 @@ def _counts_tally(device: torch.device) -> Optional[torch.Tensor]:
     )
     tally = _census.device_tally(key)
     if tally is None:
-        tally = torch.zeros(4, dtype=torch.int64, device=device)
+        tally = torch.zeros(5, dtype=torch.int64, device=device)
         _census.register_device_tally(
-            key, tally, ("small_calls", "small_unequal", "wide_calls", "wide_unequal")
+            key,
+            tally,
+            ("small_calls", "small_unequal", "wide_calls", "wide_unequal", "wide_ws_above_static"),
         )
     return tally
 
@@ -328,6 +338,7 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
         from . import census as _census
 
         _census.count(f"dispatch:mla_var_split_counts_tile:{_census.mode()}")
+        static = _var_split_envelope(batch, heads, q_len, wide=False)[1]
         _var_split_counts_tile_kernel[(1,)](
             cache_seqs.contiguous(),
             out,
@@ -339,6 +350,7 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
             K_TILE=_K_TILE,
             TALLY=_counts_tally(cache_seqs.device),
             TALLY_AT=0 if batch < _VAR_SPLIT_MIN_BATCH else 2,
+            STATIC_GRID=static if static < grid else 0,
         )
         return out
     _var_split_counts_kernel[(1,)](

@@ -143,12 +143,18 @@ def test_one_long_counts_and_replay(monkeypatch, name):
     *_, g_off, c_off = _run(var, dcp, CASES[name], 0)
     monkeypatch.setattr(dcp._flags, "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS", 1)
     monkeypatch.setattr(census, "ENABLED", True)
+    monkeypatch.setattr(census, "_device_tallies", {})
     census._counts.clear()
     try:
         vu, plan, q, run, w, v_eager, s_eager, grid, counts = _run(var, dcp, CASES[name], 1)
         seen = dict(census.counts())
+        tally = census._device_tally_text()
     finally:
         census.ENABLED = False
+    import re
+
+    above = re.search(r"device:mla_var_split_counts:wide_ws_above_static=(\d+)", tally)
+    assert above is not None and int(above.group(1)) >= 1, tally
     assert grid > g_off and max(counts) > max(c_off), (g_off, grid, c_off, counts)
     budget = dcp._var_split_envelope(q.shape[0], vu.HEADS, q.shape[1])[0]
     assert counts == var._ref_counts(plan.cache_seqs.tolist(), budget, grid)
