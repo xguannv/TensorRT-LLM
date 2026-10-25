@@ -570,7 +570,30 @@ def check_graphs():
         )
 
 
-CHECKS = [check_takes, check_pieces, check_decoder, check_graphs]
+def check_pre_clear():
+    """TRTLLM_K3LL_LATENT_AR_PRE_CLEAR on: the latent all-reduce clears the previous call's buffer before its PDL wait;
+    the pieces (the all-reduce against its fp32 reference) and the graphs (replays with a late rank, bit for bit the
+    eager run) again, and the switch counted in both modes."""
+    old = FLAGS.TRTLLM_K3LL_LATENT_AR_PRE_CLEAR
+    FLAGS.TRTLLM_K3LL_LATENT_AR_PRE_CLEAR = 1
+    try:
+        eager0, capture0 = (
+            _census("dispatch:latent_ar_pre_clear", "eager"),
+            _census("dispatch:latent_ar_pre_clear", "capture"),
+        )
+        check_pieces()
+        check_graphs()
+        assert _census("dispatch:latent_ar_pre_clear", "eager") > eager0, (
+            "pre_clear: eager calls not counted"
+        )
+        assert _census("dispatch:latent_ar_pre_clear", "capture") > capture0, (
+            "pre_clear: captured calls not counted"
+        )
+    finally:
+        FLAGS.TRTLLM_K3LL_LATENT_AR_PRE_CLEAR = old
+
+
+CHECKS = [check_takes, check_pieces, check_decoder, check_graphs, check_pre_clear]
 
 
 def _run_one_rank(args) -> int:

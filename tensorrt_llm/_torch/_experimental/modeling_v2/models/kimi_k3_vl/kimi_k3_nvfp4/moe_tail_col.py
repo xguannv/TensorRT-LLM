@@ -276,7 +276,7 @@ def latent_all_reduce(
     view = base.latent
     _latent_ar().run_k3_latent_ar_norm_row(
         routed, layer.gamma, layer.eps, latent, uc_addr=view.uc_local, mc_addr=view.mc_base, flags=view.flags,
-        rank=view.rank, world_size=view.world, early_trigger=True,
+        rank=view.rank, world_size=view.world, early_trigger=True, pre_clear=_tail_lu.pre_clear(),
     )  # fmt: skip
     return latent
 
@@ -353,6 +353,7 @@ def warm_up(
         layer.up_slice, layer.col0, layer.tiles, torch.ones(LATENT, **zeros), 1e-6, weight
     )
     latent_all_reduce(base, probe, torch.zeros(MIN_ROWS, LATENT, **zeros))
+    _tail_lu.compile_pre_clear(base.latent.world, mxfp8=False)
     ran = []
     tail = None
     for rows in (16, 32):

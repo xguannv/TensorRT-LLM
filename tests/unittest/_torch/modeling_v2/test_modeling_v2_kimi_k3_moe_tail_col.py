@@ -267,6 +267,32 @@ def test_attn_res_takes_shapes(monkeypatch):
     assert not col.attn_res_takes(tail, prefix, torch.zeros(3, 16, 7168), w, w, w)
 
 
+def test_pre_clear_switch_default_off_and_documented():
+    value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_LATENT_AR_PRE_CLEAR"]
+    assert default == 0
+    assert "griddepcontrol.wait" in doc and "Bitwise" in doc and "TRTLLM_K3LL_MOE_TAIL_COL" in doc
+
+
+@pytest.mark.parametrize("switch", [0, 1])
+def test_pre_clear_reaches_the_latent_all_reduce(monkeypatch, switch):
+    """Both tails' latent all-reduce pass the switch (read per call) to K3LatentArRowKernel's launch."""
+    lu = _mod("moe_tail_lu")
+    col = _mod("moe_tail_col")
+    monkeypatch.setattr(lu._flags, "TRTLLM_K3LL_LATENT_AR_PRE_CLEAR", switch)
+    seen = []
+    fake = SimpleNamespace(
+        run_k3_latent_ar_norm_row=lambda *a, pre_clear=False, **k: seen.append(pre_clear)
+    )
+    monkeypatch.setattr(lu, "_latent_ar", lambda: fake)
+    monkeypatch.setattr(col, "_latent_ar", lambda: fake)
+    view = SimpleNamespace(uc_local=0, mc_base=0, flags=None, rank=0, world=4)
+    layer = SimpleNamespace(gamma=None, eps=1e-6)
+    routed = torch.zeros(9, lu.LATENT, dtype=torch.bfloat16)
+    col.latent_all_reduce(SimpleNamespace(latent=view), layer, routed)
+    lu.latent_all_reduce(SimpleNamespace(latent=view), layer, routed)
+    assert seen == [bool(switch)] * 2
+
+
 def test_tap_switch_default_sm103_and_documented():
     value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_TAP"]
     assert default == -1

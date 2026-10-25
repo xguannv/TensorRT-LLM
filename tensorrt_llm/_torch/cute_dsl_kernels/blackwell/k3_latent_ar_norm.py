@@ -882,6 +882,12 @@ class K3LatentArRowKernel:
     * CTA 0 rotates the buffers right after its first polling round when every warp of the grid
       has counted itself by then (as a rule), so that the acquire load and the state stores are
       not on the grid's tail; otherwise it waits for the count at the end, like the cluster kernel.
+    * ``pre_clear``: the flag read, the count and the clear run before ``griddepcontrol.wait`` (in
+      the PDL prologue, beside the previous kernel's tail), so the clear is off the push -> poll
+      path. The dirty buffer is the one the previous call on the workspace polled: no rank writes
+      it again before the call after this one, and that previous call has completed once a kernel
+      that triggers its dependents only after its own wait ran between the two calls (the
+      decode step's attn_res kernels do).
     """
 
     def __init__(
@@ -891,6 +897,7 @@ class K3LatentArRowKernel:
         early_trigger: bool,
         norm: bool = True,
         mxfp8: bool = False,
+        pre_clear: bool = False,
     ):
         if world_size not in ROW_WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
@@ -901,6 +908,7 @@ class K3LatentArRowKernel:
         self.early_trigger = early_trigger
         self.norm = norm
         self.mxfp8 = mxfp8
+        self.pre_clear = pre_clear
         self.rank_chunk = min(RANK_CHUNK, world_size)
 
     @cute.jit
@@ -944,6 +952,17 @@ class K3LatentArRowKernel:
             use_pdl=self.use_pdl,
         )
 
+    @cute.jit
+    def _clear_dirty(self, uc_addr, dirty, buf_bytes, dirty_stages, clear, gtid, n_threads):
+        """Re-arm every stage of the dirty buffer the previous call used with the sentinel, grid-strided."""
+        for s in cutlass.range_constexpr(4):
+            if s < dirty_stages:
+                stage_bytes = buf_bytes // Int64(dirty_stages)
+                base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
+                n_vec = (clear[s] + 15) >> 4
+                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                    _st_sentinel_v4(base + Int64(p) * Int64(16))
+
     @cute.kernel
     def kernel(
         self,
@@ -972,7 +991,7 @@ class K3LatentArRowKernel:
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         warp_sum = storage.warp_sum.data_ptr().toint()
 
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and not self.pre_clear):
             _griddepcontrol_wait()
             if cutlass.const_expr(self.early_trigger):
                 _griddepcontrol_launch_dependents()
@@ -993,6 +1012,17 @@ class K3LatentArRowKernel:
             tc = t - (ROW_GROUP_THREADS - THREADS)
         col = (grp * THREADS + tc) * ELTS
         cur_off = cur * buf_bytes
+        n_threads = m * ROW_THREADS
+        gtid = row * ROW_THREADS + tidx
+        clear = (c0, c1, c2, c3)
+
+        if cutlass.const_expr(self.pre_clear):
+            # Clear the previous call's buffer before the wait (class docstring).
+            self._clear_dirty(uc_addr, dirty, buf_bytes, dirty_stages, clear, gtid, n_threads)
+            if cutlass.const_expr(self.use_pdl):
+                _griddepcontrol_wait()
+                if cutlass.const_expr(self.early_trigger):
+                    _griddepcontrol_launch_dependents()
 
         # Broadcast this rank's eight values into slot (row, rank) of every rank's buffer.
         xw = _ld_v4(x_addr + Int64((row * HIDDEN + col) * 2))
@@ -1003,17 +1033,9 @@ class K3LatentArRowKernel:
             slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
             _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
 
-        # Clear the previous call's buffer if the side-stream re-arm has not.
-        n_threads = m * ROW_THREADS
-        gtid = row * ROW_THREADS + tidx
-        clear = (c0, c1, c2, c3)
-        for s in cutlass.range_constexpr(4):
-            if s < dirty_stages:
-                stage_bytes = buf_bytes // Int64(dirty_stages)
-                base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
-                n_vec = (clear[s] + 15) >> 4
-                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
-                    _st_sentinel_v4(base + Int64(p) * Int64(16))
+        if cutlass.const_expr(not self.pre_clear):
+            # Clear the previous call's buffer if the side-stream re-arm has not.
+            self._clear_dirty(uc_addr, dirty, buf_bytes, dirty_stages, clear, gtid, n_threads)
 
         # Poll every slot; the own slot comes from the registers. Bit r of `have`: slot r arrived.
         row_base = uc_addr + cur_off + Int64((row * ws * HIDDEN + col) * 2)
@@ -1201,8 +1223,15 @@ class K3LamportClearKernel:
 
 
 @functools.cache
-def _compiled_row(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool, mxfp8: bool):
-    kernel = K3LatentArRowKernel(world_size, use_pdl, early_trigger, norm, mxfp8)
+def _compiled_row(
+    world_size: int,
+    use_pdl: bool,
+    early_trigger: bool,
+    norm: bool,
+    mxfp8: bool,
+    pre_clear: bool = False,
+):
+    kernel = K3LatentArRowKernel(world_size, use_pdl, early_trigger, norm, mxfp8, pre_clear)
     a = Int64(0)
     return cute.compile(
         kernel,
@@ -1268,13 +1297,14 @@ def run_k3_latent_ar_norm_row(
     early_trigger: bool = True,
     norm: bool = True,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    pre_clear: bool = False,
 ) -> None:
     """:func:`run_k3_latent_ar_norm` with :class:`K3LatentArRowKernel` (same result, bit for bit,
     for up to :data:`ROW_MAX_M` rows). Each Lamport buffer of the workspace must hold the rows of
     every rank (``M x world_size x 3584 x 2`` bytes, as the one-shot sizing of the MNNVL
     workspace guarantees for the one-shot sizes; see :func:`can_run_row`)."""
     mxfp8 = mxfp8_out is not None
-    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8)(
+    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8, pre_clear)(
         Int64(x.data_ptr()),
         Int64(gamma.data_ptr()),
         Int64(out.data_ptr()),

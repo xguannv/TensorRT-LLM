@@ -319,9 +319,26 @@ def latent_all_reduce(
     view = state.latent
     _latent_ar().run_k3_latent_ar_norm_row(
         routed, layer.gamma, layer.eps, latent, uc_addr=view.uc_local, mc_addr=view.mc_base, flags=view.flags,
-        rank=view.rank, world_size=view.world, early_trigger=True, mxfp8_out=(xq, xs),
+        rank=view.rank, world_size=view.world, early_trigger=True, mxfp8_out=(xq, xs), pre_clear=pre_clear(),
     )  # fmt: skip
     return latent, xq, xs
+
+
+def compile_pre_clear(world: int, mxfp8: bool) -> None:
+    """Compile (no launch) the latent all-reduce's ``TRTLLM_K3LL_LATENT_AR_PRE_CLEAR`` build, whatever the switch says
+    at load, so a capture after flipping it finds the kernel."""
+    _latent_ar()._compiled_row(world, True, True, True, mxfp8, True)
+
+
+def pre_clear() -> bool:
+    """``TRTLLM_K3LL_LATENT_AR_PRE_CLEAR`` (read at forward time): the latent all-reduce clears the previous call's
+    buffer before its PDL wait. Counted in the census as ``dispatch:latent_ar_pre_clear:{mode}``."""
+    on = int(_flags.TRTLLM_K3LL_LATENT_AR_PRE_CLEAR) > 0
+    if on:
+        from . import census as _census
+
+        _census.count(f"dispatch:latent_ar_pre_clear:{_census.mode()}")
+    return on
 
 
 def latent_up(layer: K3TailLuLayer, xq: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
@@ -384,6 +401,7 @@ def warm_up(
         layer.up_weight, layer.up_scale, torch.ones(LATENT, **zeros), 1e-6, weight
     )
     latent_all_reduce(state, probe, torch.zeros(MIN_ROWS, LATENT, **zeros))
+    compile_pre_clear(state.latent.world, mxfp8=True)
     mx_rows = []
     up_zero = torch.zeros_like(layer.up_weight)
     for rows in range(MIN_ROWS, MAX_ROWS + 1):

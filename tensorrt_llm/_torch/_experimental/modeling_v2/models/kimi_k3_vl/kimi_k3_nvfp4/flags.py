@@ -287,6 +287,13 @@ TRTLLM_K3LL_MOE_LOWM_FC12 = _flag(
     "kernels; engagement is read at forward time. -1 (default): on on SM103 only "
     "(decode_moe_lowm.MOE_LOWM_FC12_CAPABILITIES; L1 bs4 -0.229 ms, moss-0361)",
 )
+TRTLLM_K3LL_LATENT_AR_PRE_CLEAR = _flag(
+    "TRTLLM_K3LL_LATENT_AR_PRE_CLEAR",
+    0,
+    "TRTLLM_K3LL_MOE_TAIL_COL / TRTLLM_K3LL_MOE_TAIL_LU's latent all-reduce (K3LatentArRowKernel) clears the previous "
+    "call's Lamport buffer before its griddepcontrol.wait, beside the routed experts' tail, instead of between its "
+    "push and its poll. Bitwise. Read at forward time",
+)
 TRTLLM_K3LL_MOE_TAIL_COL = _flag(
     "TRTLLM_K3LL_MOE_TAIL_COL",
     -1,
