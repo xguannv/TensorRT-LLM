@@ -61,10 +61,16 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cutlass_dsl import dsl_user_op
 
+from ...helix_a2a_fused import _atom_add_u64, _globaltimer, _stg_u64
 from ...k3_l2_prefetch import CHUNK_BYTES as L2_CHUNK_BYTES
 from ...k3_l2_prefetch import _bulk_prefetch_l2
+from ...k3_prof import HEADER as _PROF_HEADER
+from ...k3_prof import SHAPES as _PROF_SHAPES
+from ...k3_prof import SLOTS as _PROF_SLOTS
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from .mla_helpers import LOG2_E
+
+_PROF_CTAS, _PROF_MARKS = _PROF_SHAPES["vup"]
 
 #: V up-projection outputs per head (UMMA M).
 V_HEAD_DIM = 128
@@ -114,8 +120,11 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     reducer capacity of at most 32 splits (one split per lane).
     """
 
-    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
+    def __init__(
+        self, *args, v_rows: int = 16, prewait: bool = False, prof_addr: int = 0, **kwargs
+    ):
         super().__init__(*args, **kwargs)
+        self.prof_addr = prof_addr  # diagnostic marks of the fused reduction (k3_prof.py), 0: none
         if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
                 "The fused V up-projection needs the Helix softmax statistics and a fixed query layout."
@@ -325,6 +334,13 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         storage = utils.SmemAllocator().allocate(self.v_storage)
         a_full = storage.a_full
         acc_full = storage.acc_full
+        # diagnostic marks (k3_prof.py, prof_addr != 0): thread 0, %globaltimer at 0 entry | 1 grid wait returned |
+        # 2 combine done (rows in shared memory) | 3 accumulator ready (MMA done) | 4 stored
+        t_entry = Int64(0)
+        pbase = Int64(0)
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                t_entry = _globaltimer()
         if warp_idx == self.v_mma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
             with cute.arch.elect_one():
@@ -359,6 +375,18 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         if cutlass.const_expr(self.v_up_use_pdl):
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                t_wait = _globaltimer()
+                slot = _atom_add_u64(
+                    Int64(self.prof_addr) + Int64(8) * Int64(head), Int64(1)
+                ) % Int64(_PROF_SLOTS)
+                pbase = Int64(self.prof_addr) + Int64(8) * (
+                    Int64(_PROF_HEADER)
+                    + (slot * Int64(_PROF_CTAS) + Int64(head)) * Int64(_PROF_MARKS)
+                )
+                _stg_u64(pbase, t_entry)
+                _stg_u64(pbase + Int64(8), t_wait)
 
         if warp_idx < COMBINE_WARPS:
             b_base = storage.sB.data_ptr().toint()
@@ -403,6 +431,9 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                     )
             cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier()
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                _stg_u64(pbase + Int64(16), _globaltimer())
 
         acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
             Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
@@ -440,6 +471,9 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             tTR_cAcc = thr_t2r.partition_D(cute.make_identity_tensor((V_HEAD_DIM, self.v_rows)))
             rV = cute.make_rmem_tensor(tTR_cAcc.shape, Float32)
             cute.arch.mbarrier_wait(acc_full, 0)
+            if cutlass.const_expr(self.prof_addr != 0):
+                if tidx == 0:
+                    _stg_u64(pbase + Int64(24), _globaltimer())
             cute.copy(tiled_t2r, tTR_tAcc, rV)
             cute.arch.fence_view_async_tmem_load()
             for i in cutlass.range_constexpr(cute.size(rV)):
@@ -447,6 +481,9 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                 if j < num_rows:
                     mV[j, head, v] = rV[i].to(cutlass.BFloat16)
         cute.arch.barrier()
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                _stg_u64(pbase + Int64(32), _globaltimer())
         if warp_idx == self.v_mma_warp:
             cute.arch.dealloc_tmem(acc_tmem_ptr, self.v_tmem_cols)
 

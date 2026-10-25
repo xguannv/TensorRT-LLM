@@ -135,6 +135,25 @@ def _sts_b64(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _globaltimer(*, loc=None, ip=None):
+    """%globaltimer (diagnostic marks, k3_prof.py)."""
+    return Int64(_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l,~{memory}", loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _stg_u64(addr, value, *, loc=None, ip=None):
+    """st.global.u64 (diagnostic marks, k3_prof.py)."""
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _lv(value, loc=loc, ip=ip)],
+        "st.global.u64 [$0], $1;",
+        "l,l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _lds_b64(addr, *, loc=None, ip=None):
     return Int64(
         _asm(

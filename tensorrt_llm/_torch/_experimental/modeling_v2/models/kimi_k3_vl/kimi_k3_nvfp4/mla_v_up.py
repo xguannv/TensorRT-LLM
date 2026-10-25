@@ -190,6 +190,12 @@ def _run_fused(
     if var_split and var_split_flat(cache_seqs.device):
         flat_slots = _dcp._var_split_envelope(batch, heads, seq_len_q)[0]
         key = key + (f"flat{flat_slots}",)
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_prof
+
+    prof_addr = k3_prof.addr("vup")
+    if prof_addr:
+        key = key + (f"prof{prof_addr}",)
+        k3_prof.touch()
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -219,6 +225,7 @@ def _run_fused(
             var_split_flat_slots=flat_slots,
             v_rows=v_rows,
             prewait=prewait,
+            prof_addr=prof_addr,
         )
 
         def dyn(t, lead, align=16):

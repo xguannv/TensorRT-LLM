@@ -42,6 +42,7 @@ from .helix_a2a_fused import (
     _fmax,
     _fmul,
     _fv,
+    _globaltimer,
     _griddepcontrol_launch_dependents,
     _griddepcontrol_wait,
     _iv,
@@ -56,10 +57,16 @@ from .helix_a2a_fused import (
     _st_sentinel_v2,
     _st_sentinel_v4,
     _st_v4,
+    _stg_u64,
     _sts_b64,
     _unpack,
     supports,
 )
+from .k3_prof import HEADER as _PROF_HEADER
+from .k3_prof import SHAPES as _PROF_SHAPES
+from .k3_prof import SLOTS as _PROF_SLOTS
+
+_PROF_CTAS, _PROF_MARKS = _PROF_SHAPES["a2a"]
 
 
 @dsl_user_op
@@ -95,6 +102,10 @@ def _sigmoid(x, *, loc=None, ip=None):
 
 class HelixA2AGatedKernel(HelixA2AFusedKernel):
     """Exchange + combine + output gate of one Helix MLA layer (see the module docstring)."""
+
+    def __init__(self, *args, prof_addr: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prof_addr = prof_addr  # diagnostic marks (k3_prof.py), 0: none
 
     @cute.jit
     def __call__(
@@ -168,8 +179,20 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
         bidx, _, _ = cute.arch.block_idx()
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         half_slot = storage.half.data_ptr().toint()
+        # diagnostic marks (k3_prof.py, prof_addr != 0): thread 0 of each CTA, %globaltimer at
+        # 0 entry | 1 grid wait returned | 2 ticket taken | 3 sender: send returned (bulk reads drained) |
+        # 6 receiver: first token's gate loaded | 7 first token's poll done | 8 receive loop done
+        t_entry = Int64(0)
+        t_wait = Int64(0)
+        pbase = Int64(0)
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                t_entry = _globaltimer()
         if cutlass.const_expr(self.use_pdl):
             _griddepcontrol_wait()
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                t_wait = _globaltimer()
         # The ticket protocol of HelixA2AFusedKernel.kernel.
         if tidx == 0:
             n_ctas = Int64(n_send + n_recv)
@@ -179,11 +202,23 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
             _sts_b64(half_slot, ((ticket >> 32) & Int64(1)) * half_bytes)
             if cutlass.const_expr(self.use_pdl):
                 _griddepcontrol_launch_dependents()
+            if cutlass.const_expr(self.prof_addr != 0):
+                slot = (ticket >> 32) % Int64(_PROF_SLOTS)
+                pbase = Int64(self.prof_addr) + Int64(8) * (
+                    Int64(_PROF_HEADER)
+                    + (slot * Int64(_PROF_CTAS) + Int64(bidx)) * Int64(_PROF_MARKS)
+                )
+                _stg_u64(pbase, t_entry)
+                _stg_u64(pbase + Int64(8), t_wait)
+                _stg_u64(pbase + Int64(16), _globaltimer())
         if bidx < n_send:
             self.send(
                 tidx, bidx, o_addr, s_addr, mask_addr, ws_addr, half_slot, rank_stride,
                 num_tokens, rank, n_send, storage.stage.data_ptr().toint(),
             )  # fmt: skip
+            if cutlass.const_expr(self.prof_addr != 0):
+                if tidx == 0:
+                    _stg_u64(pbase + Int64(24), _globaltimer())
         else:
             cute.arch.barrier()
             self.receive_gated(
@@ -195,6 +230,7 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
                 n_recv,
                 gate_addr,
                 gate_stride,
+                pbase,
             )
 
     @cute.jit
@@ -208,10 +244,11 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
         n_recv: Int32,
         gate_addr: Int64,
         gate_stride: Int32,
+        pbase: Int64,
     ):
         """``HelixA2AFusedKernel.receive`` with the gate applied to each rounded output before the store.
         ``gate_addr``: the first gate value of token 0 (BF16, this rank's heads, head-major); ``gate_stride``: the
-        gate rows' stride in elements."""
+        gate rows' stride in elements. ``pbase``: thread 0's mark slot (diagnostic, prof_addr != 0)."""
         P, RV, DV, CPH = self.P, self.RV, self.DV, self.CPH
         slot_t = tidx // self.tok_threads
         c = tidx - slot_t * self.tok_threads
@@ -223,6 +260,7 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
         valid = Int32(c < DV)
         has_stats = valid * Int32(src_l < P)
         owns_stats = has_stats * Int32(col < 16)
+        t_first = rcta * self.tpb
         for t in cutlass.range(rcta * self.tpb + slot_t, num_tokens, n_recv * self.tpb, unroll=1):
             rec0 = recv_base + Int64(t * (P * RV)) * 16
             st_addr = rec0 + Int64(src_l * RV + DV) * 16 + Int64(h * 8)
@@ -237,6 +275,10 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
                 g = _ld_nc_v4(gate_addr + (Int64(t) * Int64(gate_stride) + Int64(c * 8)) * 2)
                 for e in cutlass.range_constexpr(4):
                     gw[e] = g[e]
+                if cutlass.const_expr(self.prof_addr != 0):
+                    if tidx == 0:
+                        if t == t_first:
+                            _stg_u64(pbase + Int64(48), _globaltimer())
                 ready = Int32(0)
                 while ready == 0:
                     ready = Int32(1)
@@ -250,6 +292,10 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
                         for e in cutlass.range_constexpr(4):
                             vals[s * 4 + e] = w[e]
                         ready = ready & _all_valid4(*w)
+                if cutlass.const_expr(self.prof_addr != 0):
+                    if tidx == 0:
+                        if t == t_first:
+                            _stg_u64(pbase + Int64(56), _globaltimer())
 
             mx = _as_f32(stats[0])
             gmax = mx
@@ -276,6 +322,9 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
                     _st_sentinel_v4(d_addr + Int64(s * RV * 16))
             if owns_stats != 0:
                 _st_sentinel_v2(st_addr)
+        if cutlass.const_expr(self.prof_addr != 0):
+            if tidx == 0:
+                _stg_u64(pbase + Int64(64), _globaltimer())
 
     @cute.jit
     def _gated_pair(self, lo: Float32, hi: Float32, gate_word: Int32) -> Int32:
@@ -286,8 +335,12 @@ class HelixA2AGatedKernel(HelixA2AFusedKernel):
 
 
 @functools.cache
-def _compiled(cp_size: int, num_heads: int, head_dim: int, has_mask: bool, use_pdl: bool):
-    kernel = HelixA2AGatedKernel(cp_size, num_heads, head_dim, has_mask, use_pdl)
+def _compiled(
+    cp_size: int, num_heads: int, head_dim: int, has_mask: bool, use_pdl: bool, prof_addr: int = 0
+):
+    kernel = HelixA2AGatedKernel(
+        cp_size, num_heads, head_dim, has_mask, use_pdl, prof_addr=prof_addr
+    )
     addr = Int64(1 << 20)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(
@@ -325,12 +378,21 @@ def helix_a2a_gated(
         return
     assert gate.dtype == torch.bfloat16 and gate.stride(1) == 1 and gate.stride(0) % 8 == 0
     assert gate.data_ptr() % 16 == 0 and gate.shape[1] == num_heads * head_dim
-    kernel, compiled = _compiled(cp_size, num_heads, head_dim, zero_kv_mask is not None, use_pdl)
+    from . import k3_prof
+
+    prof_addr = k3_prof.addr("a2a")
+    if prof_addr:
+        k3_prof.touch()
+    kernel, compiled = _compiled(
+        cp_size, num_heads, head_dim, zero_kv_mask is not None, use_pdl, prof_addr
+    )
     n_chunks = _ceil_div(num_tokens * cp_size, _CHUNK_RECORDS)
     n_send = (
         max_send_ctas if n_chunks >= max_send_ctas else min(n_chunks, max(1, max_send_ctas // 2))
     )
     n_recv = min(max_recv_ctas, _ceil_div(num_tokens, kernel.tpb))
+    if prof_addr and n_send + n_recv > _PROF_CTAS:
+        raise ValueError(f"k3_prof a2a: {n_send + n_recv} CTAs > {_PROF_CTAS}")
     mask_addr = zero_kv_mask.data_ptr() if zero_kv_mask is not None else 0
     compiled(
         Int64(partial_o.data_ptr()),
