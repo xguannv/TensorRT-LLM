@@ -155,9 +155,23 @@ def sort_views(sort_out: torch.Tensor, num_tokens: int, num_local: int) -> Tuple
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _no_timeline(device: torch.device) -> torch.Tensor:
+    """The timeline argument of builds without one: any aligned int64 words (never read or written)."""
+    return torch.zeros(2, dtype=torch.int64, device=device)
+
+
+def timeline_words(num_tokens: int) -> int:
+    """int64 words of a ``timeline`` for ``num_tokens`` rows on this device: the grid times TL_SLOTS (an upper bound
+    over the geometries)."""
+    kernel = _kernel()
+    m_max = m_build(num_tokens)
+    return (256 + kernel.role_clusters(m_max)) * kernel.SPLIT * kernel.TL_SLOTS
+
+
 @torch.library.custom_op(
     "trtllm::k3_moe_front",
-    mutates_args=("ag_uc", "ag_mc", "ag_flags", "ag_ready", "sort_out", "sort_ctr"),
+    mutates_args=("ag_uc", "ag_mc", "ag_flags", "ag_ready", "sort_out", "sort_ctr", "timeline"),
 )
 def k3_moe_front(
     x: torch.Tensor,
@@ -179,6 +193,7 @@ def k3_moe_front(
     sort_ctr: Optional[torch.Tensor] = None,
     sort_offset: int = 0,
     sort_local: int = 0,
+    timeline: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 32, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -193,7 +208,10 @@ def k3_moe_front(
     With ``sort_out`` (int32, at least `sort_layout`'s words; with ``nvfp4_gsf``) the kernel also writes ``moe_sort``
     of the routing over the local experts ``[sort_offset, sort_offset + sort_local)`` with 128-row tiles and the
     routing weights in fp32 there (`sort_views`). ``sort_ctr``: int32 ``[1]``, zero, which every call leaves zero;
-    calls that share it must be stream-ordered."""
+    calls that share it must be stream-ordered.
+
+    ``timeline`` (a measurement build): int64, at least ``timeline_words(x.shape[0])`` words, zero; the kernel writes
+    %globaltimer at its phase boundaries per CTA (``k3_moe_front.TL_SLOTS`` words per CTA, see there)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -278,6 +296,7 @@ def k3_moe_front(
         # Without the sort the kernel never touches them: any aligned int32 words.
         arg(sort_out.view(-1) if sort else ag_flags.view(-1)),
         arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
+        arg(timeline.view(-1) if timeline is not None else _no_timeline(device)),
     )
     capacity = max_clusters(device)
     # The 32-token build may run a shallower weight ring than asked (`fit_ring`); the others run ``ring``.
@@ -307,6 +326,7 @@ def k3_moe_front(
         nvfp4,
         sort,
         m_max,
+        timeline is not None,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -320,7 +340,7 @@ def k3_moe_front(
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
                     sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
-                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, stream,
+                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, timeline is not None, stream,
                 )  # fmt: skip
     fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
     return topk_ids, topk_weights, quantized, scales, shared
@@ -329,7 +349,7 @@ def k3_moe_front(
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
       ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
-      sort_local=0):  # fmt: skip
+      sort_local=0, timeline=None):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

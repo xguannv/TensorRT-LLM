@@ -446,6 +446,33 @@ def _atom_add_acq_rel(addr_i64, val, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _globaltimer(*, loc=None, ip=None):
+    """%globaltimer (ns)."""
+    from cutlass._mlir.dialects import llvm as _llvm
+    from cutlass._mlir.extras import types as _T
+
+    return cutlass.Int64(
+        _llvm.inline_asm(
+            _T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", has_side_effects=True,
+            is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )  # fmt: skip
+
+
+# Timeline (``timeline``, a measurement build): int64 [grid, TL_SLOTS] %globaltimer per CTA; 0 where not reached.
+#   GEMV CTA: 0 setup done, 1 grid dependency met (warp 1), 2 x's k-tiles landed (warp 2), 3 last round's accumulator
+#             ready (warp 4), 4 last round's mailbox complete (owner warp), 5 epilogue done (warp 4).
+#   route CTA: 0 setup done, 1 grid dependency met, 2 pass 0 done, 3 the 8 x 16 logit partials arrived, 4 top-16 done,
+#              5 sort done (the last route CTA).
+#   quantization CTA: 0, 1 as above, 3 its first token's 16 slices arrived, 4 quantized.
+TL_SLOTS = 8
+
+
+def _stamp(tl, bx, slot: int):
+    tl.store(_globaltimer(), idx=bx * cutlass.Int32(TL_SLOTS) + cutlass.Int32(slot))
+
+
+@dsl_user_op
 def _popc(v, *, loc=None, ip=None):
     """popc.b32."""
     from cutlass._mlir.dialects import llvm as _llvm
@@ -729,6 +756,7 @@ def k3_moe_front_kernel(
     gsf: cutlass.Array,  # fp32 [1]: the NVFP4 latent's global scale (nvfp4)
     sort_words: cutlass.Array,  # int32 [sort_layout words] (sort)
     sort_ctr: cutlass.Array,  # int32 [1], zero between calls: the route CTAs done (sort)
+    tl: cutlass.Array,  # int64 [grid * TL_SLOTS] (timeline)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -748,6 +776,7 @@ def k3_moe_front_kernel(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    timeline: cutlass.Constexpr[bool],
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
     # token, a quantization CTA per QT_ tokens).
@@ -871,6 +900,9 @@ def k3_moe_front_kernel(
     prims.barrier_cluster_arrive_relaxed()
     prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
+    if cutlass.const_expr(timeline):
+        if tx == 0:
+            _stamp(tl, bx, 0)
     if is_gemv:
         tmem_ptr = cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Int32)
         if warp_id == 0:
@@ -967,6 +999,9 @@ def k3_moe_front_kernel(
             # Grid dependency, the head workspace's flags, then x's k-tiles.
             # =================================================================
             prims.griddepcontrol(prims.GridDepAction.WAIT)
+            if cutlass.const_expr(timeline):
+                if lane == 0:
+                    _stamp(tl, bx, 1)
             if prims.elect_sync():
                 prims.mbarrier_arrive_expect_tx(act_full, my_tiles * MMA_N_ * CTA_K * ELEM_BYTES)
                 for i in range(my_tiles):
@@ -1034,6 +1069,9 @@ def k3_moe_front_kernel(
                             prims.tcgen05_cp(prims.Tcgen05CpShape.SHAPE_128X256B, a_dst, desc_c)
             while not cute.arch.mbarrier_try_wait(act_full.data_ptr(), 0):
                 pass
+            if cutlass.const_expr(timeline):
+                if lane == 0:
+                    _stamp(tl, bx, 2)
             if head_cta:
                 # A head half-tile: A from TMEM (staged before the wait), B (x) from shared memory. The MMA is M 128:
                 # rows 64-127 are the aliased garbage and land in accumulator rows nobody reads.
@@ -1129,6 +1167,9 @@ def k3_moe_front_kernel(
                 if (tile < cutlass.Int32(n_tiles)) & live:
                     while not cute.arch.mbarrier_try_wait(acc_done.subview(rd).data_ptr(), 0):
                         pass
+                    if cutlass.const_expr(timeline):
+                        if (lane == 0) & (w == cutlass.Int32(0)):
+                            _stamp(tl, bx, 3)
                     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
                     acc = prims.tcgen05_ld(
                         "32x32b",
@@ -1209,6 +1250,9 @@ def k3_moe_front_kernel(
                         # Completed by the peers' st.async: acquire at cluster scope.
                         while not _test_wait_cluster(mail_full.subview(rd).data_ptr(), 0):
                             pass
+                        if cutlass.const_expr(timeline):
+                            if lane == 0:
+                                _stamp(tl, bx, 4)
                         tot = [cutlass.Float32(0.0)] * MMA_N_
                         for t in cutlass.range_constexpr(MMA_N_):
                             total = cutlass.Float32(0.0)
@@ -1285,6 +1329,9 @@ def k3_moe_front_kernel(
                                             idx=cutlass.Int32(t * shared_cols) + col,
                                         )
             prims.barrier_cta_sync(1, thread_count=128)
+            if cutlass.const_expr(timeline):
+                if tx == cutlass.Int32(4 * 32):
+                    _stamp(tl, bx, 5)
             if warp_id == 4:
                 prims.tcgen05_dealloc(tmem_ptr, HALF_TMEM_COLS if head_half else TMEM_COLS_)
     else:
@@ -1306,6 +1353,9 @@ def k3_moe_front_kernel(
             e0 = cutlass.select_(polls_logits, tx * cutlass.Int32(4), cutlass.Int32(0))
             bias4 = bias.load(idx=e0, vector_size=4, alignment=16)
             prims.griddepcontrol(prims.GridDepAction.WAIT)
+            if cutlass.const_expr(timeline):
+                if tx == 0:
+                    _stamp(tl, bx, 1)
             if cutlass.const_expr(not publish):
                 prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
             if tx == 0:
@@ -1375,6 +1425,12 @@ def k3_moe_front_kernel(
                             )
                             s_key.store(_rq.selection_key(sig + key_bias), idx=e0 + q)
                     cute.arch.barrier()
+                    if cutlass.const_expr(timeline):
+                        if tx == 0:
+                            if real:
+                                _stamp(tl, bx, 3)
+                            else:
+                                _stamp(tl, bx, 2)
                     expert, weight_bits = _top16_cta(
                         s_key,
                         s_sigmoid,
@@ -1422,6 +1478,9 @@ def k3_moe_front_kernel(
                                     )
                     # Pass 0's readers of the keys and of the selection's scratch are done before pass 1 rewrites them.
                     cute.arch.barrier()
+                    if cutlass.const_expr(timeline):
+                        if (tx == 0) & real:
+                            _stamp(tl, bx, 4)
                 if cutlass.const_expr(sort):
                     # The last route CTA to finish sorts every token's routing over the local experts.
                     if tx == 0:
@@ -1442,6 +1501,8 @@ def k3_moe_front_kernel(
                         )
                         if tx == 0:
                             sort_ctr.store(cutlass.Int32(0), idx=0)
+                            if cutlass.const_expr(timeline):
+                                _stamp(tl, bx, 5)
             else:
                 for qj in cutlass.range_constexpr(QT_):
                     # Token qtok of this quantization CTA (QT_ 1: its token q).
@@ -1454,6 +1515,10 @@ def k3_moe_front_kernel(
                             + (tx % cutlass.Int32(LV)) * cutlass.Int32(4)
                         )
                         w0, w1, w2, w3 = _ag._poll4(buf_uc, addr)
+                        if cutlass.const_expr(timeline and qj == 0):
+                            cute.arch.barrier()
+                            if tx == 0:
+                                _stamp(tl, bx, 3)
                         buf_uc.store((empty, empty, empty, empty), idx=addr, alignment=16)
                         if cutlass.const_expr(nvfp4):
                             # NVFP4 (fp4_quantize's recipe): 8 E2M1 codes per thread, one E4M3 scale per thread
@@ -1497,6 +1562,9 @@ def k3_moe_front_kernel(
                                     epoch + cutlass.Int32(1),
                                 )
             cute.arch.barrier()
+            if cutlass.const_expr(timeline):
+                if (tx == 0) & (role >= num_tokens):
+                    _stamp(tl, bx, 4)
         else:
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
 
@@ -1584,6 +1652,7 @@ def k3_moe_front(
     gsf: cute.Tensor,
     sort_words: cute.Tensor,
     sort_ctr: cute.Tensor,
+    tl: cute.Tensor,
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -1604,6 +1673,7 @@ def k3_moe_front(
     nvfp4: cutlass.Constexpr[bool],
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
+    timeline: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1612,9 +1682,9 @@ def k3_moe_front(
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens, m_max)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
-        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, num_tokens, tp_rank, routed_scaling_factor,
+        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, tl, num_tokens, tp_rank, routed_scaling_factor,
         sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort, m_max,
+        linear_cap, publish, head_half, nvfp4, sort, m_max, timeline,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),
