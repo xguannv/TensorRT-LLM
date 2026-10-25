@@ -20,8 +20,8 @@ helpers of ``test_modeling_v2_kimi_k3_mla_var_split``):
 * the value: 1 on, 0 off, the default (-1) on only on ``mla_v_up.MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES`` (SM103; the
   capability is patched, no GPU needed);
 * on against off where counts sit below the grid's split count (empty clusters: mixed lengths, and equal lengths at
-  half the grid): the V rows and softmax statistics bit for bit, eager and replayed from a CUDA graph (counts and
-  split read captured together).
+  half the grid; 4 requests, the fewest that take counts): the V rows and softmax statistics bit for bit, eager and
+  replayed from a CUDA graph (counts and split read captured together).
 """
 
 import os
@@ -40,7 +40,6 @@ CASES = {
     "bs4_one_long": ([32768, 32768, 32768, 409600], 8, 2),
     "bs4_spread": ([32768, 153600, 409600, 65536], 8, 5),
     "bs4_equal": ([153600] * 4, 8, 3),
-    "bs3_mixed": ([409600, 32768, 153600], 8, 1),
 }
 
 
