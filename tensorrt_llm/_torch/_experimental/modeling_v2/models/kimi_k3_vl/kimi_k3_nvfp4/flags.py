@@ -399,6 +399,14 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE = _flag(
     "(an integer choice; bitwise), ~2 us instead of 3.5 (4 requests) on GB300. 0: the sequential kernel. Read at "
     "forward time; the counts only run where TRTLLM_K3LL_MLA_VAR_SPLIT does (SM103)",
 )
+TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL = _flag(
+    "TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL",
+    -1,
+    "with TRTLLM_K3LL_MLA_VAR_SPLIT: per-request split-KV counts from 2 requests on instead of 4, so a short request "
+    "beside a long one gives its splits to the long one (equal lengths keep the static split; not bitwise when the "
+    "lengths differ: the split boundaries move; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
+    "(decode_mla_dcp.MLA_VAR_SPLIT_SMALL_CAPABILITIES)",
+)
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
     0,

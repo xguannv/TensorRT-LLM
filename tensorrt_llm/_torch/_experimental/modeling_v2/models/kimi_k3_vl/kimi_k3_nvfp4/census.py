@@ -28,6 +28,7 @@ from . import flags as _flags
 ENABLED = bool(_flags.TRTLLM_K3LL_CENSUS)
 
 _counts: Counter = Counter()
+_device_tallies: dict = {}
 _decode_depth = 0
 _installed = set()
 
@@ -44,7 +45,9 @@ def _bump(key: str) -> None:
         rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         if rank0:
             logger.info(
-                "Kimi K3 census: " + " ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+                "Kimi K3 census: "
+                + " ".join(f"{k}={v}" for k, v in sorted(_counts.items()))
+                + _device_tally_text()
             )
 
 
@@ -126,3 +129,24 @@ def count(key: str) -> None:
 
 def counts() -> dict:
     return dict(_counts)
+
+
+def register_device_tally(key, tensor: torch.Tensor, names) -> None:
+    """A device-side int64 tally (kernels add to it, CUDA graph replays included), appended to the census line as
+    ``device:<key[0]>:<name>=<value>`` (read when a line is logged outside a capture)."""
+    _device_tallies[key] = (tensor, tuple(names))
+
+
+def device_tally(key) -> Optional[torch.Tensor]:
+    entry = _device_tallies.get(key)
+    return None if entry is None else entry[0]
+
+
+def _device_tally_text() -> str:
+    if not _device_tallies or _mode() == "capture":
+        return ""
+    parts = []
+    for key, (tensor, names) in sorted(_device_tallies.items(), key=lambda kv: str(kv[0])):
+        for name, value in zip(names, tensor.tolist()):
+            parts.append(f"device:{key[0]}:{name}={value}")
+    return " " + " ".join(parts)

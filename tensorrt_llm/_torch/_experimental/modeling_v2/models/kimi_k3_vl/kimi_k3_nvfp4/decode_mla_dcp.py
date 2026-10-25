@@ -29,6 +29,7 @@ combine). The caller owns the collectives so the pieces can be tested on one GPU
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Union
@@ -81,6 +82,26 @@ _MAX_VAR_SPLIT = 32
 #: Fewest requests that take per-request split counts. Below it the static split: a grid sized for the largest
 #: count launches more empty clusters than balancing two or three requests saves.
 _VAR_SPLIT_MIN_BATCH = 4
+#: ``TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL``: the fewest requests that take per-request split counts when it is on (two
+#: requests of very different lengths: the long one no longer waits on the static split while the short one's
+#: clusters idle).
+_VAR_SPLIT_SMALL_MIN_BATCH = 2
+#: ``TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL``'s default (-1) applies on these compute capabilities (measured on GB300 / SM103).
+MLA_VAR_SPLIT_SMALL_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _var_split_small_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_VAR_SPLIT_SMALL_CAPABILITIES
+
+
+def _var_split_min_batch() -> int:
+    """The fewest requests that take per-request split counts: ``_VAR_SPLIT_SMALL_MIN_BATCH`` with
+    ``TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL`` (1 on, 0 off, -1 on where the current device is in
+    ``MLA_VAR_SPLIT_SMALL_CAPABILITIES``), else ``_VAR_SPLIT_MIN_BATCH``."""
+    value = int(_flags.TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL)
+    on = value > 0 if value >= 0 else _var_split_small_by_default(torch.cuda.current_device())
+    return _VAR_SPLIT_SMALL_MIN_BATCH if on else _VAR_SPLIT_MIN_BATCH
 
 
 def _var_split_envelope(batch: int, heads: int, q_len: int):
@@ -100,10 +121,10 @@ def _var_split_envelope(batch: int, heads: int, q_len: int):
 
 def var_split_grid(batch: int, heads: int, q_len: int) -> int:
     """``TRTLLM_K3LL_MLA_VAR_SPLIT``: the split count the decode grid is sized for (every request's own count is at
-    most this), or 0 where per-request splits do not apply: fewer than `_VAR_SPLIT_MIN_BATCH` requests, or one split
+    most this), or 0 where per-request splits do not apply: fewer than `_var_split_min_batch` requests, or one split
     each fills the budget."""
     budget, grid = _var_split_envelope(batch, heads, q_len)
-    return grid if grid > 1 and _VAR_SPLIT_MIN_BATCH <= batch <= budget else 0
+    return grid if grid > 1 and _var_split_min_batch() <= batch <= budget else 0
 
 
 @triton.jit
@@ -148,6 +169,8 @@ def _var_split_counts_tile_kernel(
     BLOCK_C: tl.constexpr,
     BUDGET: tl.constexpr,
     K_TILE: tl.constexpr,
+    TALLY=None,
+    TALLY_AT: tl.constexpr = 0,
 ):
     """``_var_split_counts_kernel``'s choice with every candidate unit ``ceil(t_b / k)``, indexed ``b * GRID + k - 1``,
     evaluated at once (a ``[candidates, requests]`` tile) instead of one after the other: the first of the lowest cost
@@ -174,6 +197,35 @@ def _var_split_counts_tile_kernel(
     best = tl.sum(tl.where(cand[:, None] == first, splits, 0), axis=0)
     best = tl.where(best_cost < 2**62, best, 1)
     tl.store(OUT + offs, best.to(tl.int32), mask=live)
+    if (
+        TALLY is not None
+    ):  # census: (calls, calls whose counts differ) at TALLY[TALLY_AT:TALLY_AT + 2]
+        differ = tl.max(tl.where(live, best, 0), axis=0) != tl.min(
+            tl.where(live, best, 2**62), axis=0
+        )
+        tl.atomic_add(TALLY + TALLY_AT, 1)
+        tl.atomic_add(TALLY + TALLY_AT + 1, differ.to(tl.int64))
+
+
+def _counts_tally(device: torch.device) -> Optional[torch.Tensor]:
+    """``TRTLLM_K3LL_CENSUS``: the device tally of the count kernel (graph replays included): calls and calls with
+    unequal counts, below ``_VAR_SPLIT_MIN_BATCH`` requests (``TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL``) and from it on,
+    logged with the census lines as ``device:mla_var_split_counts:{small,wide}_{calls,unequal}``; None without it."""
+    from . import census as _census
+
+    if not _census.ENABLED:
+        return None
+    key = (
+        "mla_var_split_counts",
+        device.index if device.index is not None else torch.cuda.current_device(),
+    )
+    tally = _census.device_tally(key)
+    if tally is None:
+        tally = torch.zeros(4, dtype=torch.int64, device=device)
+        _census.register_device_tally(
+            key, tally, ("small_calls", "small_unequal", "wide_calls", "wide_unequal")
+        )
+    return tally
 
 
 def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Optional[torch.Tensor]:
@@ -202,6 +254,8 @@ def var_split_counts(cache_seqs: torch.Tensor, heads: int, q_len: int) -> Option
             BLOCK_C=triton.next_power_of_2(batch * grid),
             BUDGET=budget,
             K_TILE=_K_TILE,
+            TALLY=_counts_tally(cache_seqs.device),
+            TALLY_AT=0 if batch < _VAR_SPLIT_MIN_BATCH else 2,
         )
         return out
     _var_split_counts_kernel[(1,)](
@@ -485,6 +539,8 @@ def split_read_attention_v_up(
             q.device
         ):
             _census.count(f"dispatch:mla_var_split_skip_empty:{_census.mode()}")
+        if plan.block_splits.shape[0] < _VAR_SPLIT_MIN_BATCH:
+            _census.count(f"dispatch:mla_var_split_small:{_census.mode()}")
     torch.ops.trtllm.k3_mla_decode_fp8_v_up(
         q,
         kv_pages,

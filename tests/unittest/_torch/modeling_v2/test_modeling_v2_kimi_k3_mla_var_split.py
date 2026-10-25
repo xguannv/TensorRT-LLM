@@ -148,7 +148,7 @@ def test_counts(name):
     batch, q_len = q.shape[:2]
     budget, grid = dcp._var_split_envelope(batch, vu.HEADS, q_len)
     counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q_len)
-    if batch < dcp._VAR_SPLIT_MIN_BATCH:  # the static split, no counts
+    if batch < dcp._var_split_min_batch():  # the static split, no counts
         assert counts is None and dcp.var_split_grid(batch, vu.HEADS, q_len) == 0
         return
     assert counts is not None and dcp.var_split_grid(batch, vu.HEADS, q_len) == grid > 1
@@ -165,7 +165,7 @@ def test_counts(name):
 @pytest.mark.parametrize("batch", range(1, 9))
 def test_counts_random(batch):
     """The one-kernel selection against the python reference on random per-rank lengths (0 included: a request
-    with no page on the rank), 200 batches per size; below ``_VAR_SPLIT_MIN_BATCH`` requests, no counts."""
+    with no page on the rank), 200 batches per size; below ``_var_split_min_batch()`` requests, no counts."""
     vu = _vu()
     dcp = vu._mods()[0]
     budget, grid = dcp._var_split_envelope(batch, vu.HEADS, 8)
@@ -174,7 +174,7 @@ def test_counts_random(batch):
         lens = torch.randint(0, 40000, (batch,), generator=g)
         lens[torch.rand(batch, generator=g) < 0.1] = 0
         counts = dcp.var_split_counts(lens.to(torch.int32).cuda(), vu.HEADS, 8)
-        if batch < dcp._VAR_SPLIT_MIN_BATCH:
+        if batch < dcp._var_split_min_batch():
             assert counts is None
             continue
         assert counts is not None and counts.dtype == torch.int32
@@ -211,7 +211,7 @@ def test_on_close_to_off(name):
     counts = dcp.var_split_counts(plan.cache_seqs, vu.HEADS, q.shape[1])
     if (
         counts is None
-    ):  # below _VAR_SPLIT_MIN_BATCH: the switch-on call is the static split, bit for bit
+    ):  # below _var_split_min_batch(): the switch-on call is the static split, bit for bit
         assert torch.equal(v_on.view(torch.int16), v_off.view(torch.int16)) and torch.equal(
             s_on, s_off
         )
