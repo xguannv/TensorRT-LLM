@@ -63,6 +63,7 @@ from ...inputs import (
     register_input_processor,
 )
 from ...sampling_params import SamplingParams
+from ...tokenizer.tokenizer import drop_out_of_vocab_added_tokens
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PredefinedAttentionMask
@@ -1093,6 +1094,11 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast,
         )
+        # Every tokenizer this processor encodes text with: no added token past the
+        # model's embedding rows (the LLM's tokenizer is shared with it).
+        text_vocab = getattr(config, "text_config", config).vocab_size
+        drop_out_of_vocab_added_tokens(self._tokenizer, text_vocab)
+        drop_out_of_vocab_added_tokens(getattr(self._processor, "tokenizer", None), text_vocab)
         self._model_path = model_path
 
         # Resolve dtype from text_config

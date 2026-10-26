@@ -204,6 +204,57 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
                                                    **fast_kwargs)
 
 
+def drop_out_of_vocab_added_tokens(tokenizer, vocab_size: int):
+    """Unregister a tokenizer's added tokens whose id is ``>= vocab_size`` (the model's embedding rows).
+
+    Such a token can never be a model input: a prompt that contains its string
+    literally is rejected at admission ("Token ID out of range"). The Kimi
+    checkpoints' ``TikTokenTokenizer`` produces seven of them under Transformers
+    5.x: built without ``additional_special_tokens`` (Transformers 5.x reads that
+    tokenizer_config.json key as ``extra_special_tokens``), it falls back to a
+    built-in ChatML-style list (``<|im_end|>``, ``<|im_user|>``, ...) whose
+    strings are not in its vocabulary, and Hugging Face registers them at ids
+    163840..163846, past the model's 163840 rows.
+
+    After removal those strings tokenize as plain text, as the Kimi tokenizer's
+    native ``encode`` does. Added tokens below ``vocab_size`` are kept, so text
+    without the removed strings tokenizes exactly as before. ``tokenizer`` is a
+    Hugging Face slow tokenizer or a ``TransformersTokenizer`` wrapping one (its
+    cached special-token sets are refreshed); anything else is left as is.
+    Returns the names removed.
+    """
+    wrapper = tokenizer if isinstance(tokenizer,
+                                      TransformersTokenizer) else None
+    hf = wrapper.tokenizer if wrapper is not None else tokenizer
+    decoder = getattr(hf, "_added_tokens_decoder", None)
+    if not vocab_size or not decoder or not hasattr(hf, "tokens_trie"):
+        return []
+    stray = {i: str(t) for i, t in decoder.items() if i >= vocab_size}
+    if not stray:
+        return []
+    for i, content in stray.items():
+        del decoder[i]
+        hf._added_tokens_encoder.pop(content, None)
+    names = set(stray.values())
+    hf._extra_special_tokens = [
+        t for t in getattr(hf, "_extra_special_tokens", [])
+        if str(t) not in names
+    ]
+    hf.tokens_trie = type(hf.tokens_trie)()
+    hf._update_trie()
+    if hasattr(hf, "_update_total_vocab_size"):
+        hf._update_total_vocab_size()
+    if hasattr(hf, "all_special_ids_set"):
+        hf.all_special_ids_set = set(hf.all_special_ids)
+    if wrapper is not None:
+        wrapper._all_special_tokens_set = set(hf.all_special_tokens)
+        wrapper._all_special_ids_set = set(hf.all_special_ids)
+    logger.warning(
+        f"Tokenizer: unregistered added tokens with ids >= the model vocabulary "
+        f"({vocab_size}), now tokenized as plain text: {sorted(names)}")
+    return sorted(names)
+
+
 def _hf_remote_code_guard(trust_remote_code: bool):
     """Return the remote-code lock, or a no-op when nothing can be written.
 
