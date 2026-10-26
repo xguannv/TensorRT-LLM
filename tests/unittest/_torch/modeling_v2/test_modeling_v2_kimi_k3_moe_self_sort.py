@@ -54,6 +54,29 @@ def test_default_follows_the_capability(monkeypatch, value, capability, on):
         dm._self_sort_on_by_default.cache_clear()
 
 
+def test_lowm_dyn_fast_flag_default():
+    _, default, doc = _mod("flags").flags()["TRTLLM_K3LL_MOE_LOWM_DYN_FAST"]
+    assert default == -1
+    assert "static_first" in doc and "fast_tok" in doc and "SM103" in doc
+
+
+@pytest.mark.parametrize("value,capability,on", [
+    (-1, (10, 3), True), (-1, (10, 0), False), (-1, (10, 7), False), (1, (10, 0), True), (0, (10, 3), False),
+])  # fmt: skip
+def test_lowm_dyn_fast_default_follows_the_capability(monkeypatch, value, capability, on):
+    """-1 resolves by ``MOE_LOWM_DYN_FAST_CAPABILITIES`` (SM103 only); 1 / 0 force it either way."""
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_LOWM_DYN_FAST", value)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    dm._lowm_dyn_fast_on_by_default.cache_clear()
+    try:
+        assert dm.lowm_dyn_fast() is on
+    finally:
+        dm._lowm_dyn_fast_on_by_default.cache_clear()
+
+
 @pytest.mark.parametrize(
     "tokens,local,takes",
     [(0, 224, False), (1, 224, True), (8, 224, True), (9, 224, True), (16, 224, True), (17, 224, False),
