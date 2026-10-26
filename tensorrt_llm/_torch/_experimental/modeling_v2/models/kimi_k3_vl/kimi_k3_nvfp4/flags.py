@@ -48,6 +48,14 @@ TRTLLM_K3LL_MOE_LOWM = _flag(
     1,
     "MoE decode path: NVFP4-latent front + k3_moe_lowm_dyn on CuteDSL NVFP4 buffers (decode_moe_lowm.py)",
 )
+TRTLLM_K3LL_MOE_PRESORTED = _flag(
+    "TRTLLM_K3LL_MOE_PRESORTED",
+    0,
+    "diagnostic (user-0048 (2), moss-0591 confirmatory ABBA): with TRTLLM_K3LL_MOE_LOWM_FC12 and the front's sort, "
+    "wide steps of 17-32 tokens skip FC1 / FC2's self-sort: the front sorts (token-mask sort, no fp32 weight words, no "
+    "per-thread fence before the hand-off) and writes FC1's token-scale SMEM image, FC1 runs presorted_layout and FC2 "
+    "widens the bf16 weights. 1 on, 0 off. Read at forward time",
+)
 TRTLLM_K3LL_MOE_FRONT_SORT = _flag(
     "TRTLLM_K3LL_MOE_FRONT_SORT",
     1,

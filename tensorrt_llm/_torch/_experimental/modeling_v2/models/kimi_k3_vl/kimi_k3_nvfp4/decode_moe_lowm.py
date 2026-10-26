@@ -296,6 +296,8 @@ class K3DecodeMoeNvfp4:
     fc12: Optional[K3MoeFc12] = None
     #: ``TRTLLM_K3LL_MOE_TAIL_COL``'s shared state (``moe_tail_col.py``), built where the switch is set at load.
     col: Optional[_tail_col.K3TailColState] = None
+    #: ``TRTLLM_K3LL_MOE_PRESORTED``'s FC1 token-scale image (zero where no scale lands), with the front's sort.
+    presorted_image: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -315,7 +317,7 @@ class K3DecodeMoeNvfp4:
         sort_ctr = torch.zeros(1, dtype=torch.int32, device=device) if front_sort else None
         head16 = K3MoeHeadWorkspace.create(mapping, m_max=FRONT16_TOKENS) if front16 else None
         head32 = K3MoeHeadWorkspace.create(mapping, m_max=FRONT32_TOKENS) if front32 else None
-        return cls(
+        state = cls(
             K3MoeHeadWorkspace.create(mapping),
             nvfp4_lowm_op.new_counters(device),
             mnnvl,
@@ -323,6 +325,17 @@ class K3DecodeMoeNvfp4:
             head16,
             head32,
         )
+        if front_sort and front32:
+            from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import (
+                k3_moe_front as _front_kernel,
+            )
+
+            # one image for every layer: a layer's front writes it only after every earlier kernel has completed
+            # (each kernel's grid-dependency wait), so the previous layer's FC1 has read it
+            state.presorted_image = torch.zeros(
+                _front_kernel.IMAGE_BYTES, dtype=torch.uint8, device=device
+            )
+        return state
 
     def front_head(self, rows: int, front32: Optional[bool] = None) -> Optional[K3MoeHeadWorkspace]:
         """The head workspace of the front build that runs a step of ``rows`` tokens, or None: the wide head runs
@@ -599,6 +612,7 @@ class K3DecodeMoeNvfp4Layer:
         x: torch.Tensor,
         sort_out: Optional[torch.Tensor] = None,
         front32: Optional[bool] = None,
+        presorted: bool = False,
     ):
         head = self.state.front_head(x.shape[0], front32)
         return k3_moe_front(
@@ -614,6 +628,20 @@ class K3DecodeMoeNvfp4Layer:
             sort_ctr=self.state.sort_ctr if sort_out is not None else None,
             sort_offset=self.offset,
             sort_local=self.num_local,
+            sf_image=self.state.presorted_image if presorted else None,
+            sort_weights=not presorted,
+            sort_fence=not presorted,
+        )
+
+    def presorted_takes(self, rows: int, fc12: bool) -> bool:
+        """``TRTLLM_K3LL_MOE_PRESORTED`` (read at forward time) on a wide FC1 + FC2 step of 17-32 tokens with the
+        front's sort and the 32-token build's image."""
+        return (
+            fc12
+            and int(_flags.TRTLLM_K3LL_MOE_PRESORTED) > 0
+            and self.state.sort_ctr is not None
+            and self.state.presorted_image is not None
+            and FRONT16_TOKENS < rows <= FRONT32_TOKENS
         )
 
     @property
@@ -703,6 +731,24 @@ class K3DecodeMoeNvfp4Layer:
     ):
         """``_front_routed``'s front: ``(routing, shared_act)``, ``routing`` what `_routed_after` takes. Where
         `self_sort_takes` the front does not sort (the expert kernel does); ``fc12``: the experts run as FC1 + FC2."""
+        rows = x.shape[0]
+        if (
+            self.presorted_takes(rows, fc12)
+            and self.state.front_head(rows, front32) is self.state.head32
+        ):
+            from . import census as _census
+
+            _census.count(f"dispatch:moe_presorted:{_census.mode()}")
+            sort_out = torch.empty(
+                sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
+            )
+            ids, weights, x_q, _, shared_act = self._front(
+                moe, x, sort_out, front32, presorted=True
+            )
+            if self.stats is not None:
+                self.stats.record(self.layer_idx, ids)
+            # the bf16 weights in the routing's third field, the image in place of the linear scales
+            return (sort_out, rows, weights, x_q, self.state.presorted_image), shared_act
         if self.state.sort_ctr is None or self.self_sort_takes(x.shape[0], self_sort, fc12=fc12):
             ids, weights, x_q, x_sf, shared_act = self._front(moe, x, front32=front32)
             if self.stats is not None:
@@ -731,9 +777,14 @@ class K3DecodeMoeNvfp4Layer:
         if sort_out is None:
             return self._routed(a, b, x_q, x_sf, fc12=fc12, self_sort=self_sort, fast=fast)
         if fc12 is not None:
+            views = sort_views(sort_out, a, self.num_local)
+            if (
+                b is not None
+            ):  # TRTLLM_K3LL_MOE_PRESORTED (`_front_only`): the bf16 weights, x_sf the image
+                views = (*views[:4], b)
             return nvfp4_lowm_op.run_sorted(
-                x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
-                self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(),
+                x_q, x_sf, views, self.experts, self.fc2_input_scale,
+                self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(), presorted_layout=b is not None,
             )  # fmt: skip
         return nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,

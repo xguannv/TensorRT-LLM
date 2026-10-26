@@ -587,13 +587,15 @@ def run_sorted(
     num_ctas: int = 0,
     fc12: Optional[Fc12] = None,
     fast: bool = False,
+    presorted_layout: bool = False,
 ) -> torch.Tensor:
     """`k3_moe_nvfp4_lowm` on a routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
     tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales)``, ``moe_sort``'s
     outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``).
     ``fc12`` (`new_fc12`): `k3_moe_nvfp4_lowm_fc12` instead, into its buffers, after zeroing ``out`` on the current
     stream unless ``fc12.zeroed`` (then ``out`` must be given, already zero); ``num_ctas`` and ``fast`` do not apply.
-    ``fast`` (the single kernel only): `k3_moe_nvfp4_lowm`'s ``static_first`` and ``fast_tok``, the same results."""
+    ``fast`` (the single kernel only): `k3_moe_nvfp4_lowm`'s ``static_first`` and ``fast_tok``, the same results.
+    ``presorted_layout`` (``fc12`` only): ``x_sf`` is k3_moe_front's FC1 token-scale image (its ``sf_image``)."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     (
         tile_idx_to_group_idx,
@@ -614,6 +616,7 @@ def run_sorted(
             x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, fc12.h, fc12.h_sf, top_k,
             float(situ_beta), float(situ_linear_beta), fc2_ceil_chunk=fc12.fc2_ceil_chunk,
+            presorted_layout=presorted_layout,
         )  # fmt: skip
         return out
     if out is None:
