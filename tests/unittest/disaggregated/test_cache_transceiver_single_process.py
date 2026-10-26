@@ -735,7 +735,11 @@ def _create_transceiver_in_thread(
 ):
     """Thread target: create one KvCacheTransceiverV2 (with a draft manager when given)."""
     draft_kwargs = (
-        {"draft_kv_cache_manager": draft_manager, "draft_prompt_window": draft_prompt_window}
+        {
+            "draft_kv_cache_manager": draft_manager,
+            "draft_prompt_window": draft_prompt_window,
+            "draft_context_renumber": _draft_context_renumber(),
+        }
         if draft_manager is not None
         else {}
     )
@@ -1876,6 +1880,24 @@ DRAFT_HEAD_DIM = 576  # one dense MLA latent per token per drafter layer
 DRAFTER_REQUEST_LENGTHS = [203, 64]
 
 
+def _draft_context_renumber():
+    """The MLA drafter's position shift, with the K3 DSpark rope parameters (latent 512 + rope 64)."""
+    from tensorrt_llm._torch.models.modeling_dspark import DSparkMLAContextRenumber
+
+    rope = {
+        "theta": 50000.0,
+        "scaling_factor": 32.0,
+        "original_max_positions": 32768,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+    }
+    renumber = DSparkMLAContextRenumber(rope, 512, 64)
+    assert renumber.row_elems == DRAFT_HEAD_DIM
+    return renumber
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "prompt_len,window,tokens_per_block,expected",
@@ -2043,9 +2065,11 @@ def _verify_drafter_window(
     """Compare every generation rank's drafter window with the context's, byte for byte.
 
     Per request and drafter layer, the generation pages [0, ceil(L / tpb)) must equal the
-    context pages [s / tpb, ceil(P / tpb)).
+    context pages [s / tpb, ceil(P / tpb)) moved by -s (``_draft_context_renumber``; none when
+    s == 0), as the generation transceiver moves them when the receive completes.
     """
     tpb = TOKENS_PER_BLOCK
+    renumber = _draft_context_renumber()
     for req_idx, req_len in enumerate(request_lengths):
         start, length = drafter_window(req_len, window, tpb)
         num_pages = (length + tpb - 1) // tpb
@@ -2055,9 +2079,11 @@ def _verify_drafter_window(
                 ctx_draft, ctx_request_ids[req_idx], layer_idx, True
             )
             assert ctx_pages is not None and ctx_pages.shape[0] >= prompt_pages
-            expected = ctx_pages[start // tpb : prompt_pages].contiguous()
+            expected = ctx_pages[start // tpb : prompt_pages].clone().contiguous()
             assert expected.shape[0] == num_pages
             assert expected.float().abs().sum() > 0, "the context draft pages hold no pattern"
+            if start > 0:
+                renumber.renumber_rows_(expected, start)
             for cp_rank, gen_draft in enumerate(gen_drafts):
                 got = _get_block_data_for_layer(
                     gen_draft, gen_request_ids[req_idx], layer_idx, True
@@ -2166,8 +2192,11 @@ def run_drafter_window_transfer_test(
                 per_rank.append(req)
             gen_requests.append(per_rank)
 
-        # Generation receives first: target sized off the global prompt, draft pages for the
-        # window only.
+        # Generation receives first: target sized off the global prompt, the draft mirror for
+        # the window only, through the draft manager's own admission step (what the V2
+        # scheduler calls for a disaggregated generation request).
+        for gen_draft in gen_drafts:
+            gen_draft.drafter_prompt_window = draft_prompt_window
         for req_idx, req_len in enumerate(request_lengths):
             _, length = drafter_window(req_len, draft_prompt_window, TOKENS_PER_BLOCK)
             for cp_rank, req in enumerate(gen_requests[req_idx]):
@@ -2176,11 +2205,10 @@ def run_drafter_window_transfer_test(
                         gen_managers[cp_rank], req.py_request_id, req_len, True, is_generation=True
                     )
                 )
-                kv_caches.append(
-                    _add_sequence(
-                        gen_drafts[cp_rank], req.py_request_id, length, True, is_generation=True
-                    )
-                )
+                assert gen_drafts[cp_rank].prepare_drafter_window_receive(req, length)
+                mirror = gen_drafts[cp_rank].kv_cache_map[req.py_request_id]
+                assert mirror.capacity >= length
+                kv_caches.append(mirror)
                 gen_tcs[cp_rank].request_and_receive_async(req)
 
         # Context sends after; its draft cache holds the whole prompt at absolute positions.
@@ -2205,6 +2233,10 @@ def run_drafter_window_transfer_test(
                 # Write verification covers the draft bytes too: what the receiver published
                 # (target stride + whole draft window) must equal what the sender attested.
                 assert req.py_kv_transfer_verified, (req_idx, cp_rank)
+                start, length = drafter_window(
+                    request_lengths[req_idx], draft_prompt_window, TOKENS_PER_BLOCK
+                )
+                assert (req.py_drafter_ctx_start, req.py_drafter_ctx_len) == (start, length)
 
         verify_all_requests_helix(
             request_lengths=request_lengths,

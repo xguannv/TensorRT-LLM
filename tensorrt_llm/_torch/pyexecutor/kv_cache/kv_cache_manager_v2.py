@@ -1247,6 +1247,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Draft managers: the drafter prompt window in tokens (TRTLLM_K3LL_DRAFTER_PROMPT_CTX), set
+    # where the transceiver is built. Positive means a disaggregated generation request receives
+    # that window into its draft mirror (prepare_drafter_window_receive). 0 means no draft transfer.
+    drafter_prompt_window: int = 0
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -4045,6 +4049,32 @@ class KVCacheManagerV2(BaseResourceManager):
         ready = torch.cuda.Event()
         ready.record(self._stream)
         self._disagg_receive_ready[req.py_request_id] = ready
+        return True
+
+    def prepare_drafter_window_receive(self, req: LlmRequest, length: int) -> bool:
+        """Size a disaggregated generation request's draft mirror to its drafter prompt window.
+
+        Draft managers only (``drafter_prompt_window`` > 0, TRTLLM_K3LL_DRAFTER_PROMPT_CTX).
+        The receive writes the window's ``length`` latents into the mirror's pages
+        ``[0, ceil(length / tpb))``, so they must exist before the receive is published. Capacity
+        is ``length`` plus the draft growth, and the history is ``length``. Later generation
+        steps grow the mirror from there (``_prepare_draft_resources``).
+
+        Call it before the target's ``prepare_disagg_gen_init`` on the same stream. The target's
+        readiness event then also covers this resize: both managers run on the executor stream,
+        and a different stream is made to wait. Returns False when the mirror cannot be created,
+        resumed or resized; the request is retried like a target refusal.
+        """
+        assert self.is_draft and self.drafter_prompt_window > 0
+        kv_cache = self._mirror_draft_kv_cache(req)
+        if kv_cache is None or not self._resume_and_restore(req.py_request_id, kv_cache):
+            return False
+        capacity = max(
+            kv_cache.capacity, length + get_draft_token_length(req) + self.num_extra_kv_tokens
+        )
+        if not kv_cache.resize(capacity, length):
+            return False
+        self._fill_fresh_kv_pages(req.py_request_id)
         return True
 
     def take_disagg_receive_ready(self, req: LlmRequest) -> torch.cuda.Event | None:
