@@ -170,6 +170,42 @@ def _bf16_ulp_distance(a, b):
     return (ordered(a) - ordered(b)).abs()
 
 
+def _pair_ulps(got, ref):
+    """Error of each rope pair component in bf16 ulps of the reference pair's modulus.
+
+    The per-element ulp is the wrong yardstick for a rotation. Rotating an already-rounded bf16 pair moves that
+    rounding error between the two components, so a component near zero carries an error of the pair's scale. That
+    error can be many of its own ulps, even for an exact rotation. The pair's modulus is rotation invariant, so its
+    ulp is the scale the error belongs to.
+    """
+    g = got.double().unflatten(-1, (-1, 2))
+    r = ref.double().unflatten(-1, (-1, 2))
+    modulus = r.square().sum(-1, keepdim=True).sqrt().clamp_min(1e-30)
+    ulp = torch.exp2(torch.floor(torch.log2(modulus)) - 7)
+    return ((g - r).abs() / ulp).flatten(-2)
+
+
+def _exact_move(rope, shift, inv_freq):
+    """``rope`` (bf16 adjacent pairs) rotated by ``-shift * inv_freq`` in float64, unrounded."""
+    angle = -float(shift) * inv_freq.to(rope.device)
+    phase = torch.polar(torch.ones_like(angle), angle)
+    xc = torch.view_as_complex(rope.double().contiguous().unflatten(-1, (-1, 2)))
+    return torch.view_as_real(xc * phase).flatten(-2)
+
+
+def _summary(name, got, ref):
+    pair = _pair_ulps(got, ref)
+    elem = _bf16_ulp_distance(got, ref.to(got.dtype)) if ref.dtype == got.dtype else None
+    line = (
+        f"{name}: pair-ulp max {pair.max().item():.3f} mean {pair.mean().item():.4f} "
+        f"p99.9 {np.percentile(pair.cpu().numpy(), 99.9):.3f}"
+    )
+    if elem is not None:
+        line += f"; element-ulp max {int(elem.max())} frac>1 {(elem > 1).float().mean().item():.5f}"
+    print(line)
+    return pair
+
+
 @needs_cuda
 def test_capture_only_store_is_bitwise_the_full_drafters():
     """The agg reference: the worker's own context store, a whole prompt and a chunked one, with the capture-only
@@ -217,9 +253,13 @@ def test_switch_default_off_and_documented():
 
 @needs_cuda
 def test_renumbered_window_matches_a_store_at_window_positions():
-    """The interface to the generation half: the context stores the prompt at 0 .. P-1 and sends rows s .. P-1;
-    moved by -s, they equal the drafter's own store of the same tokens at 0 .. L-1 -- the latent half bitwise, the
-    rope half within one bf16 ulp. Both stores run in one forward, so they share one latent GEMM."""
+    """The interface to the generation half. The context stores the prompt at 0 .. P-1 and sends rows s .. P-1.
+    Moved by -s, they equal the drafter's own store of the same tokens at 0 .. L-1: the latent half bitwise, the
+    rope half within 2 ulps of each pair's modulus. Both stores run in one forward, so they share one latent GEMM.
+
+    The 2 is the double-rounding floor: the stored pair's rounding (<= 0.71 ulp after rotation) + the move's own
+    rounding (0.5) + the reference's rounding (0.5). The move itself is held to its single rounding: within 1 ulp
+    of the pair modulus of the exact float64 rotation of the same stored bits."""
     from tensorrt_llm._torch.disaggregation.transceiver import drafter_window
 
     sem = _semantics()
@@ -248,13 +288,15 @@ def test_renumbered_window_matches_a_store_at_window_positions():
     assert renumber.row_elems == received.size(-1) == sem.MLA_LATENT
 
     # Unmoved, the rope half is far off: the shift is what the test measures.
-    assert _bf16_ulp_distance(received[..., kv_lora:], reference[..., kv_lora:]).max() > 1
+    assert _pair_ulps(received[..., kv_lora:], reference[..., kv_lora:]).max() > 8
+    exact = _exact_move(received[..., kv_lora:], start, renumber.inv_freq)
     renumber.renumber_rows_(received, start)
     assert torch.equal(
         received[..., :kv_lora].view(torch.int16), reference[..., :kv_lora].view(torch.int16)
     )
-    ulps = _bf16_ulp_distance(received[..., kv_lora:], reference[..., kv_lora:])
-    assert ulps.max() <= 1, f"max {int(ulps.max())} ulp, {(ulps > 1).sum().item()} elements > 1"
+    moved = received[..., kv_lora:]
+    assert _summary(f"RENUMBER s={start} move vs exact", moved, exact).max() <= 1.0
+    assert _summary(f"RENUMBER s={start} vs store", moved, reference[..., kv_lora:]).max() <= 2.0
     # A zero shift leaves the rows bitwise unchanged.
     again = reference.clone()
     renumber.renumber_rows_(again, 0)
@@ -264,10 +306,14 @@ def test_renumbered_window_matches_a_store_at_window_positions():
 @needs_cuda
 @pytest.mark.parametrize("shift", [8192, 32768, 150000, 600000])
 def test_renumber_at_long_shift(shift):
-    """Measured at real shifts with the real K3 DSpark rope parameters. The context's store at s + j, moved by -s,
-    is compared with the store at j. Two moves are compared: the float64 angle (DSparkMLAContextRenumber) and the
-    float32 table's own phase at s (conj of the _mla_freqs_cis row). The printed lines are the report. The bound
-    is on the float64 move."""
+    """Measured at real shifts with the real K3 DSpark rope parameters: the context's store at s + j, moved by -s,
+    against the store at j. Two moves are measured: the float64 angle (DSparkMLAContextRenumber) and the float32
+    table's own phase at s (the conj of the _mla_freqs_cis row). Both are also measured against the exact rotation of
+    the same stored bits. The printed lines are the report.
+
+    The move holds its single rounding at every shift. Against the store, a residual remains that grows with s:
+    the store's own float32 angle rounding at s + j (up to about (s + j) * inv_freq * 2^-24 rad), which no move can
+    undo. That residual is reported."""
     sem = _semantics()
     drafter = _build(MLADSparkForCausalLM, sem._tiny_mla_weights(), rope_parameters=K3_DSPARK_ROPE)
     n = 256
@@ -286,27 +332,22 @@ def test_renumber_at_long_shift(shift):
     assert torch.equal(
         at_shift[..., :kv_lora].view(torch.int16), at_zero[..., :kv_lora].view(torch.int16)
     )
+    stored = at_shift[..., kv_lora:]
+    exact = _exact_move(stored, shift, renumber.inv_freq)
 
     moved64 = at_shift.clone()
     renumber.renumber_rows_(moved64, shift)
+    moved64 = moved64[..., kv_lora:]
     table_phase = torch.conj(drafter._mla_freqs_cis(torch.device("cuda"))[shift])
-    xc = torch.view_as_complex(at_shift[..., kv_lora:].float().contiguous().unflatten(-1, (-1, 2)))
+    xc = torch.view_as_complex(stored.float().contiguous().unflatten(-1, (-1, 2)))
     moved32 = torch.view_as_real(xc * table_phase).flatten(-2).to(at_shift.dtype)
 
-    stats = {}
-    for name, moved in (("fp64-angle", moved64[..., kv_lora:]), ("fp32-table", moved32)):
-        ulps = _bf16_ulp_distance(moved, reference).float()
-        stats[name] = (
-            int(ulps.max()),
-            float(ulps.mean()),
-            float((ulps > 1).float().mean()),
-            float(np.percentile(ulps.cpu().numpy(), 99.9)),
-        )
-        print(
-            f"RENUMBER shift={shift} {name}: max {stats[name][0]} ulp, mean {stats[name][1]:.4f}, "
-            f"frac>1 {stats[name][2]:.5f}, p99.9 {stats[name][3]:.1f}"
-        )
-    assert stats["fp64-angle"][0] <= stats["fp32-table"][0]
+    move64 = _summary(f"RENUMBER s={shift} fp64-angle move vs exact", moved64, exact)
+    _summary(f"RENUMBER s={shift} fp32-table move vs exact", moved32, exact)
+    e2e64 = _summary(f"RENUMBER s={shift} fp64-angle vs store", moved64, reference)
+    e2e32 = _summary(f"RENUMBER s={shift} fp32-table vs store", moved32, reference)
+    assert move64.max() <= 1.0
+    assert e2e64.mean() <= e2e32.mean() + 1e-9
 
 
 @needs_cuda
