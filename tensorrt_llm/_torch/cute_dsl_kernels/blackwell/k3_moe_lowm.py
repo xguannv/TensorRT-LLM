@@ -392,8 +392,11 @@ class _SelfSortMixin:
         bid,
         nctas,
         nthr: cutlass.Constexpr,
+        trace_ptr: Optional[cute.Pointer] = None,
     ):
         """Run by all ``nthr`` threads of the CTA (full-CTA barriers), the token masks zeroed by `_ss_clear`.
+        With ``trace`` and a ``trace_ptr`` (diagnostic): thread 0 stamps trace slots 12 (its ids loaded), 13 / 14
+        (after barriers 1 / 2) and 15 (sort done).
         Returns the tile count; the local tiles are ``[w_lo // nblk, ...)`` for this CTA's unit range
         ``[w_lo, w_hi)`` of ``tile count * nblk`` units."""
         n_tok, K, W, NBLK = self.n_tok, self.topk, self.ss_words, self.nblk
@@ -425,7 +428,13 @@ class _SelfSortMixin:
                 lx = e
                 _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
             lxs.append(lx)
+        if cutlass.const_expr(self.trace and trace_ptr is not None):
+            if tidx == 0:
+                self._stamp(trace_ptr, bid, 12)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace and trace_ptr is not None):
+            if tidx == 0:
+                self._stamp(trace_ptr, bid, 13)
         # 2. union bit lx = the expert is touched; warp w ballots experts [32 w, 32 w + 32)
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
@@ -437,6 +446,9 @@ class _SelfSortMixin:
                 if lane == Int32(0):
                     union[w] = Int32(b)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace and trace_ptr is not None):
+            if tidx == 0:
+                self._stamp(trace_ptr, bid, 14)
         # 3. tiles: id j's tile = the touched experts below lx, its row = the tokens below j's in lx's mask
         u = []
         for w in cutlass.range_constexpr(W):
@@ -470,6 +482,9 @@ class _SelfSortMixin:
                         expert[lt] = lx
                         count[lt] = _popc(tok)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace and trace_ptr is not None):
+            if tidx == 0:
+                self._stamp(trace_ptr, bid, 15)
         return ntiles
 
 
@@ -827,7 +842,9 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         total = Int32(0)
         if cutlass.const_expr(self.self_sort):
             total = (
-                self._self_sort(storage, topk_ids_ptr, orig_m, tidx, bid, nctas, self.threads)
+                self._self_sort(
+                    storage, topk_ids_ptr, orig_m, tidx, bid, nctas, self.threads, trace_ptr
+                )
                 * NBLK
             )
         else:
