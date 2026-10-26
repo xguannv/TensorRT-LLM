@@ -37,6 +37,7 @@ same epilogue instruction sequence), written in the same permuted layout (``c`` 
   launched dependent grid whose CTAs wait for SM space holds back the CTAs of every other kernel.
 """
 
+import os
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -323,6 +324,10 @@ class _SelfSortMixin:
     #: ranges of ``ceil(total / nctas)`` units (the CTAs past the end get none).
     ceil_chunk = False
 
+    #: Diagnostic A / B only (never trunk): ``K3LL_DIAG_IDS_FUSED=1`` at import builds step 1 as before the ids batching
+    #: (each id's load, use and red in one loop iteration).
+    ids_fused = os.environ.get("K3LL_DIAG_IDS_FUSED", "0") == "1"
+
     @cute.jit
     def _unit_range(self, total: Int32, bid, nctas):
         """This CTA's contiguous range ``[w_lo, w_hi)`` of the ``total`` work units (`ceil_chunk`)."""
@@ -412,22 +417,33 @@ class _SelfSortMixin:
         # 1. id j = token * K + slot: its token's bit into its local expert's mask (lx = -1: not local / no id).
         # All of this thread's ids are loaded before the first red: the red is a volatile asm, so a load after it
         # would wait for the previous one's round trip.
-        es = []
-        for i in cutlass.range_constexpr(per):
-            j = tidx + Int32(i * nthr)
-            e = Int32(-1)
-            if j < n:
-                e = topk_ids[j] - off
-            es.append(e)
         lxs = []
-        for i in cutlass.range_constexpr(per):
-            j = tidx + Int32(i * nthr)
-            e = es[i]
-            lx = Int32(-1)
-            if (e >= Int32(0)) & (e < num_local):
-                lx = e
-                _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
-            lxs.append(lx)
+        if cutlass.const_expr(self.ids_fused):
+            for i in cutlass.range_constexpr(per):
+                j = tidx + Int32(i * nthr)
+                lx = Int32(-1)
+                if j < n:
+                    e = topk_ids[j] - off
+                    if (e >= Int32(0)) & (e < num_local):
+                        lx = e
+                        _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
+                lxs.append(lx)
+        else:
+            es = []
+            for i in cutlass.range_constexpr(per):
+                j = tidx + Int32(i * nthr)
+                e = Int32(-1)
+                if j < n:
+                    e = topk_ids[j] - off
+                es.append(e)
+            for i in cutlass.range_constexpr(per):
+                j = tidx + Int32(i * nthr)
+                e = es[i]
+                lx = Int32(-1)
+                if (e >= Int32(0)) & (e < num_local):
+                    lx = e
+                    _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
+                lxs.append(lx)
         if cutlass.const_expr(self.trace and trace_ptr is not None):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 12)
