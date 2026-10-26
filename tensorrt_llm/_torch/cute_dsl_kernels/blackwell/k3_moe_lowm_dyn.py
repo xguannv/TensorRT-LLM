@@ -46,6 +46,10 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   from the previous grid: the routing kernel need not sort it.
 * Static first unit (``static_first``): CTA ``b`` takes unit ``b`` first and the work counter hands out
   units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip.
+* Fast token operand (``fast_tok``): the token warp polls a tile's counter only for the first FC2
+  unit of that tile in a row (a tile seen ready stays ready), and instead of every FC2 block adding
+  to the counter (an atomic whose result it waits for) the last token warp of the grid to finish
+  zeroes all tile counters (a third counter word), so an FC2 unit costs it no round trip.
 * PDL: every warp waits on the previous grid (tile metadata, tokens and token scales come from it)
   before it reads any of them or the counters; each CTA triggers its dependents after all of its
   warps are done (later than the safe default of right after the wait).
@@ -97,7 +101,8 @@ from .utils import fmin, griddepcontrol_launch_dependents, griddepcontrol_wait
 _SACC_PAD = 4
 #: Named barrier of epilogue warpgroup ``wg``: ``_EPI_BARRIER_BASE + wg``.
 _EPI_BARRIER_BASE = 1
-#: int32 words of the counter buffer before the per-tile counters: [0] work, [1] exited CTAs.
+#: int32 words of the counter buffer before the per-tile counters: [0] work, [1] exited CTAs, [2] token
+#: warps done (``fast_tok``).
 CTR_TILE_BASE = 16
 #: Bytes of the weight part of one ring stage (128 x 256 NVFP4).
 _SLOT_BYTES = _MMA_M * _KBLK // 2
@@ -228,6 +233,7 @@ class K3MoeLowMDynKernel:
         trace: bool = False,
         self_sort_local: int = 0,
         static_first: bool = False,
+        fast_tok: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -247,6 +253,7 @@ class K3MoeLowMDynKernel:
         self.use_pdl = use_pdl
         self.trace = trace
         self.static_first = static_first
+        self.fast_tok = fast_tok
         # Self-sort scratch (int32 words): per local expert the mask of its tokens, the touched experts'
         # bits, the tile count, each tile's expert and row limit, and the rows of each tile at stride
         # n_tok (the permuted-index view spans 128 more words).
@@ -1077,6 +1084,7 @@ class K3MoeLowMDynKernel:
                 for off in cutlass.range(lane * 16, out_bytes, 32 * 16, unroll=1):
                     _stg_v4_zero(out_base + Int64(off))
         e = Int32(0)
+        last_ready = Int32(-1)
         u, slot = self._q_read(st, e)
         while u >= 0:
             if u < _ZERO_SLICES:
@@ -1099,10 +1107,19 @@ class K3MoeLowMDynKernel:
                     tt = trace_ptr.toint() + (Int64(nct) * 16 + Int64(tile) * 4) * 8
                     with cute.arch.elect_one():
                         _atom_min_u64(tt + 8, t_poll)
-                ready = _ld_acquire_u32(ready_addr)
-                while ready < self.nblk1 + _ZERO_SLICES:
+                if cutlass.const_expr(self.fast_tok):
+                    # a tile once seen ready stays ready for the rest of the launch
+                    if tile != last_ready:
+                        ready = _ld_acquire_u32(ready_addr)
+                        while ready < self.nblk1 + _ZERO_SLICES:
+                            ready = _ld_acquire_u32(ready_addr)
+                        cute.arch.fence_proxy("async.global")
+                        last_ready = tile
+                else:
                     ready = _ld_acquire_u32(ready_addr)
-                cute.arch.fence_proxy("async.global")
+                    while ready < self.nblk1 + _ZERO_SLICES:
+                        ready = _ld_acquire_u32(ready_addr)
+                    cute.arch.fence_proxy("async.global")
                 if cutlass.const_expr(self.trace):
                     t_done = _globaltimer()
                     w_poll += t_done - t_poll
@@ -1139,12 +1156,27 @@ class K3MoeLowMDynKernel:
                         tma_bar_ptr=a_full + slot,
                     )
                 # counter reset: every FC2 block of the tile adds 1 after the wait; the last zeroes it
-                if lane == 0:
-                    old = _atom_add_relaxed(ready_addr, self.fc2_chunk)
-                    if old + self.fc2_chunk == self.nblk1 + _ZERO_SLICES + self.nblk2:
-                        _st_relaxed_u32(ready_addr, 0)
+                if cutlass.const_expr(not self.fast_tok):
+                    if lane == 0:
+                        old = _atom_add_relaxed(ready_addr, self.fc2_chunk)
+                        if old + self.fc2_chunk == self.nblk1 + _ZERO_SLICES + self.nblk2:
+                            _st_relaxed_u32(ready_addr, 0)
             e += 1
             u, slot = self._q_read(st, e)
+        if cutlass.const_expr(self.fast_tok):
+            # counter reset: every token warp counts itself once its polls are done; the last one (its
+            # acquire sees every poll and every release before it) zeroes the tile counters
+            nct, _, _ = cute.arch.grid_dim()
+            last = Int32(0)
+            if lane == 0:
+                if _atom_add_acq_rel(ctr + 8, 1) == Int32(nct) - 1:
+                    last = Int32(1)
+            last = cute.arch.shuffle_sync(last, 0)
+            if last == 1:
+                for t in cutlass.range(lane, nt, 32, unroll=1):
+                    _st_relaxed_u32(ctr + Int64(CTR_TILE_BASE + t) * 4, 0)
+                if lane == 0:
+                    _st_relaxed_u32(ctr + 8, 0)
         if cutlass.const_expr(self.trace):
             with cute.arch.elect_one():
                 _stg_u64(trace_ptr.toint() + Int64(bid * 16 + 8) * 8, w_poll)
