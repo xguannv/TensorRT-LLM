@@ -194,9 +194,25 @@ def self_sort_enabled() -> bool:
     return _self_sort_on_by_default()
 
 
+#: Devices where ``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` is on by default (-1): measured on GB300 (SM103) only.
+MOE_LOWM_DYN_FAST_CAPABILITIES = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _lowm_dyn_fast_on_by_default() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in MOE_LOWM_DYN_FAST_CAPABILITIES
+    )
+
+
 def lowm_dyn_fast() -> bool:
-    """``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (read at forward time): `nvfp4_lowm_op.run`'s ``fast``."""
-    return int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_FAST) > 0
+    """``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (read at forward time): `nvfp4_lowm_op.run`'s ``fast``. 1 on, 0 off, -1
+    (default) on where the device is in ``MOE_LOWM_DYN_FAST_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_FAST)
+    if value >= 0:
+        return value > 0
+    return _lowm_dyn_fast_on_by_default()
 
 
 def self_sort_fc12_enabled() -> bool:
