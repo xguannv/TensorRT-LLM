@@ -791,6 +791,9 @@ class DFlashWorker(SpecWorkerBase):
         # makes a reused prefix's drafter K/V still addressable. Set in
         # _lazy_init_ctx_buffers; read by _store_prefill_context.
         self._ctx_reuse_addressable = False
+        # True when the ctx cache is the draft KV cache manager's pool rather
+        # than a private arena. Set in _lazy_init_ctx_buffers.
+        self._ctx_pool_bound = False
         self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
@@ -1089,6 +1092,8 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
         self._ctx_block_counts = None
+        self._ctx_pool_bound = False
+        self._ctx_reuse_addressable = False
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
@@ -1259,6 +1264,7 @@ class DFlashWorker(SpecWorkerBase):
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
                 self._ctx_kv_buf = pool
+                self._ctx_pool_bound = True
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.
@@ -1292,6 +1298,8 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
+        if getattr(draft_model, "CAPTURE_ONLY", False):
+            self._check_capture_only_ctx_cache(getattr(attn_metadata, "kv_cache_manager", None))
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
@@ -1299,6 +1307,29 @@ class DFlashWorker(SpecWorkerBase):
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
         )
+
+    def _check_capture_only_ctx_cache(self, target_kv_cache_manager) -> None:
+        """A capture-only drafter exists to fill the draft KV cache manager's pages, which the KV
+        transceiver sends to the generation workers as the drafter prompt window. Its ctx cache must
+        therefore be that pool, and with KV-block reuse on it must be reuse-addressable: otherwise a
+        request that reuses a prefix stores only its new tail, and the window sent would hold pages
+        that the drafter never wrote. Either case corrupts the generation drafter's context silently,
+        so it is an error."""
+        if not self._ctx_pool_bound:
+            raise RuntimeError(
+                "DFlash: the capture-only drafter's ctx cache is a private arena, not the draft KV "
+                "cache manager's pool, so the drafter prompt window would be sent from pages it never "
+                "wrote. See the preceding DFlash warnings for why the pool was not bound."
+            )
+        if getattr(target_kv_cache_manager, "enable_block_reuse", False) and (
+            not self._ctx_reuse_addressable
+        ):
+            raise RuntimeError(
+                "DFlash: KV-block reuse is on but the capture-only drafter's pages are not "
+                "reuse-addressable (the draft KV cache manager is not paired with the target's "
+                "reuse), so a request reusing a prefix would send a drafter prompt window whose "
+                "reused part the drafter never wrote."
+            )
 
     def _ctx_paged_index_args(self):
         """(kv_indices, kv_indptr) for the append op, and what ``rows`` means.

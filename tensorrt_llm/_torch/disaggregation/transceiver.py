@@ -329,6 +329,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
         draft_prompt_window: int = 0,
         draft_context_renumber: Optional[Callable] = None,
+        draft_capture_only: bool = False,
     ):
         """Create the transceiver for one rank.
 
@@ -350,6 +351,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 positions s .. P-1; a generation rank applies the shift once per request
                 when its receive completes (``_finish_draft_window_receive``), so the drafter
                 reads the window at positions 0 .. L-1.
+            draft_capture_only: Whether this rank's drafter is the capture-only one of a context
+                worker. A context-only request's window is sent only from such a rank: any other
+                drafter on a context worker means the context role did not reach this rank.
         """
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
@@ -361,6 +365,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._draft_context_renumber = (
             draft_context_renumber if draft_kv_cache_manager is not None else None
         )
+        self._draft_capture_only = draft_capture_only
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
             raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
@@ -730,6 +735,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         draft = self._draft_kv_cache_manager
         adapter = self._draft_reuse_adapter
         assert draft is not None and adapter is not None and self._page_table is not None
+        if req.is_context_only_request and not self._draft_capture_only:
+            raise RuntimeError(
+                "TRTLLM_K3LL_DRAFTER_PROMPT_CTX > 0: a context-only request's drafter prompt window "
+                "would be sent from a rank whose drafter is not the capture-only one. The context "
+                "role (TRTLLM_DISAGG_ROLE=context) did not reach this rank's model build."
+            )
         tpb = draft.tokens_per_block
         start, length = drafter_window(req.total_input_len_cp, self._draft_prompt_window, tpb)
         num_pages = (length + tpb - 1) // tpb

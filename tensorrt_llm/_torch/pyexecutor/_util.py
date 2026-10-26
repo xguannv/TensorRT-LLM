@@ -4378,7 +4378,9 @@ def create_py_executor_instance(
             draft_transfer_kwargs = dict(
                 draft_kv_cache_manager=transfer_draft_manager,
                 draft_prompt_window=draft_prompt_window,
-                draft_context_renumber=context_renumber())
+                draft_context_renumber=context_renumber(),
+                draft_capture_only=getattr(drafter_model, "CAPTURE_ONLY",
+                                           False))
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config, mamba_cache_manager, **draft_transfer_kwargs)
