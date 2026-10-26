@@ -476,12 +476,13 @@ def run(
     num_ctas: int = 0,
     fc12: Optional[Fc12] = None,
     self_sort: bool = False,
+    fast: bool = False,
 ) -> torch.Tensor:
     """``moe_sort`` of ``topk_ids`` over this rank's experts, then `k3_moe_nvfp4_lowm`: this rank's routed partial
     bf16 ``[M, k1]``. ``weights``: ``(w1, w1_sf, alpha1, w2, w2_sf, alpha2)`` (an ``NvFp4WeightView``'s order);
     ``topk_weights`` any float dtype ``[M, top_k]`` (converted to fp32). ``fc12``: `run_sorted`'s. ``self_sort``
     (where `self_sort_takes` holds, with ``fc12`` its ``fc12`` form): no ``moe_sort``; the expert kernel(s) sort the
-    ids themselves (the same tiles and rows)."""
+    ids themselves (the same tiles and rows). ``fast``: `run_sorted`'s."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     num_tokens, top_k = topk_ids.shape
     if self_sort and fc12 is not None and self_sort_takes(num_tokens, w1.shape[0], fc12=True):
@@ -516,7 +517,7 @@ def run(
         torch.ops.trtllm.k3_moe_nvfp4_lowm(
             x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, ids, ids, ids, ids, fc2_input_scale, scales,
             counters, top_k, float(situ_beta), float(situ_linear_beta), num_ctas, topk_ids=ids,
-            local_offset=int(local_expert_offset),
+            local_offset=int(local_expert_offset), static_first=fast, fast_tok=fast,
         )  # fmt: skip
         return out
     scales = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
@@ -539,7 +540,7 @@ def run(
     return run_sorted(
         x_fp4, x_sf, (tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
                       num_non_exiting_tiles, scales),
-        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas, fc12,
+        weights, fc2_input_scale, counters, situ_beta, situ_linear_beta, out, num_ctas, fc12, fast,
     )  # fmt: skip
 
 
@@ -555,12 +556,14 @@ def run_sorted(
     out: Optional[torch.Tensor] = None,
     num_ctas: int = 0,
     fc12: Optional[Fc12] = None,
+    fast: bool = False,
 ) -> torch.Tensor:
     """`k3_moe_nvfp4_lowm` on a routing already sorted: ``sorted_routing`` = ``(tile_idx_to_group_idx,
     tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales)``, ``moe_sort``'s
     outputs for 128-row tiles and the fp32 ``[M, top_k]`` weights (e.g. ``k3_moe_front``'s ``sort_views``).
     ``fc12`` (`new_fc12`): `k3_moe_nvfp4_lowm_fc12` instead, into its buffers, after zeroing ``out`` on the current
-    stream unless ``fc12.zeroed`` (then ``out`` must be given, already zero); ``num_ctas`` does not apply."""
+    stream unless ``fc12.zeroed`` (then ``out`` must be given, already zero); ``num_ctas`` and ``fast`` do not apply.
+    ``fast`` (the single kernel only): `k3_moe_nvfp4_lowm`'s ``static_first`` and ``fast_tok``, the same results."""
     w1, w1_sf, alpha1, w2, w2_sf, alpha2 = weights
     (
         tile_idx_to_group_idx,
@@ -588,6 +591,6 @@ def run_sorted(
     torch.ops.trtllm.k3_moe_nvfp4_lowm(
         x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, counters, top_k,
-        float(situ_beta), float(situ_linear_beta), num_ctas,
+        float(situ_beta), float(situ_linear_beta), num_ctas, static_first=fast, fast_tok=fast,
     )  # fmt: skip
     return out

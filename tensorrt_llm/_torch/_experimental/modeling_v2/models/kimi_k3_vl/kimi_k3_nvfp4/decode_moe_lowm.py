@@ -194,6 +194,11 @@ def self_sort_enabled() -> bool:
     return _self_sort_on_by_default()
 
 
+def lowm_dyn_fast() -> bool:
+    """``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (read at forward time): `nvfp4_lowm_op.run`'s ``fast``."""
+    return int(_flags.TRTLLM_K3LL_MOE_LOWM_DYN_FAST) > 0
+
+
 def self_sort_fc12_enabled() -> bool:
     """``TRTLLM_K3LL_MOE_SELF_SORT_FC12`` (read at forward time): 1 on, 0 off, -1 (default) on where the device is in
     ``MOE_SELF_SORT_CAPABILITIES``."""
@@ -580,14 +585,25 @@ class K3DecodeMoeNvfp4Layer:
                 self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(), self_sort=self_sort,
             )  # fmt: skip
         self_sort = self.self_sort_takes(ids.shape[0], self_sort)
+        fast = self._dyn_fast()
         if self_sort:
             from . import census as _census
 
             _census.count(f"dispatch:moe_self_sort:{_census.mode()}")
         return nvfp4_lowm_op.run(
             x_q, x_sf, ids, weights, self.experts, self.offset, NUM_EXPERTS, self.fc2_input_scale,
-            self.state.counters, *self.situ, self_sort=self_sort,
+            self.state.counters, *self.situ, self_sort=self_sort, fast=fast,
         )  # fmt: skip
+
+    @staticmethod
+    def _dyn_fast() -> bool:
+        """`lowm_dyn_fast`, counted (``dispatch:moe_lowm_dyn_fast``) where it engages: the single expert kernel."""
+        fast = lowm_dyn_fast()
+        if fast:
+            from . import census as _census
+
+            _census.count(f"dispatch:moe_lowm_dyn_fast:{_census.mode()}")
+        return fast
 
     def _front_routed(
         self,
@@ -644,7 +660,7 @@ class K3DecodeMoeNvfp4Layer:
             )  # fmt: skip
         return nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
-            self.state.counters, *self.situ,
+            self.state.counters, *self.situ, fast=self._dyn_fast(),
         )  # fmt: skip
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:

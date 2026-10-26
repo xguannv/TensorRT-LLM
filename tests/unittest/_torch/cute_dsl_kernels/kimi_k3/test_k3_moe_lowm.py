@@ -234,11 +234,11 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
     weights = (ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2)
 
-    def lowm(token_scales):
+    def lowm(token_scales, fast=False):
         out.fill_(7.0)  # the kernel zeroes the output itself
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, t2g, t2lim, p2e, nnet, ex.fc2_input_scale,
-            token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf,
+            token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, static_first=fast, fast_tok=fast,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "counters not reset"
@@ -285,6 +285,40 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         torch.cuda.synchronize()
         check(static, f"graph replay {replay}")
         assert int(counters.abs().sum().item()) == 0, "counters not reset after a replay"
+
+    def check_fast(op, self_sort):
+        """``fast`` (TRTLLM_K3LL_MOE_LOWM_DYN_FAST: static_first + fast_tok): each one-hot slot bit for bit as the
+        regular build, the op and `run` inside the bound, back to back (the last CTA resets the tile counters) and
+        under graph replay."""
+        tag = "self-sort fast" if self_sort else "fast"
+        for slot in (0, top_k - 1):
+            one_hot = torch.zeros_like(scales)
+            one_hot[:, slot] = scales[:, slot]
+            assert torch.equal(
+                op(one_hot).view(torch.int16), op(one_hot, fast=True).view(torch.int16)
+            ), f"{tag}: FC2 slot {slot}"
+        for rep in range(3):
+            check(op(scales, fast=True), f"{tag} op, call {rep}")
+        for rep in range(2):
+            y = nvfp4_lowm_op.run(*run_args, num_ctas=num_ctas, self_sort=self_sort, fast=True)
+            torch.cuda.synchronize()
+            assert int(counters.abs().sum().item()) == 0, f"{tag}: counters not reset"
+            check(y, f"{tag} run, call {rep}")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            nvfp4_lowm_op.run(
+                *run_args, out=static, num_ctas=num_ctas, self_sort=self_sort, fast=True
+            )
+        for replay in range(3):
+            static.fill_(7.0)
+            graph.replay()
+            torch.cuda.synchronize()
+            check(static, f"{tag} graph replay {replay}")
+            assert int(counters.abs().sum().item()) == 0, (
+                f"{tag}: counters not reset after a replay"
+            )
+
+    check_fast(lowm, self_sort=False)
     if not nvfp4_lowm_op.self_sort_takes(num_tokens, num_local):
         return
 
@@ -295,13 +329,14 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def lowm_self(token_scales):
+    def lowm_self(token_scales, fast=False):
         out.fill_(7.0)
         h.zero_()
         h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
+            static_first=fast, fast_tok=fast,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
@@ -354,6 +389,7 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         torch.cuda.synchronize()
         check(static, f"self-sort graph replay {replay}")
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset after a replay"
+    check_fast(lowm_self, self_sort=True)
 
 
 @pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])
