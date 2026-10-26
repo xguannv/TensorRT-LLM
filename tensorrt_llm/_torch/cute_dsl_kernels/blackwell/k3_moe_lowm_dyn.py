@@ -119,6 +119,10 @@ _SLOT_BYTES = _MMA_M * _KBLK // 2
 _ZERO_SLICES = 4
 #: ``trace``: u64 words of per-tile records (4 per tile) before the per-unit records.
 TRACE_UNIT_BASE = 4 * 4096
+#: S-1d (``replicas``): the rounds of group pairs of the per-step copy choice (4 EP groups), as
+#: ``k3_route_tail.replica_choice`` / moss ``s1d_sim.py``'s ``pair`` rule.
+_REP_ROUNDS = (((0, 2), (1, 3)), ((0, 1), (2, 3)), ((0, 3), (1, 2)))
+
 #: Extra per-CTA stamps (``trace``): 16 u64 per CTA at this many words past the per-CTA records (`_xstamp`).
 TRACE_X_BASE = 2 * 4096
 
@@ -225,6 +229,15 @@ class K3MoeLowMDynKernel:
         (the same tiles, rows and order as ``k3_moe_front``'s sort: one tile per touched local
         expert in expert order, its rows the selecting tokens' expanded indices in token order),
         into shared memory, and reads the metadata from there.
+    :param replicas: ``R > 0`` (with ``self_sort_local``; S-1d): each of the ``groups`` EP groups holds
+        ``L = self_sort_local`` home experts (global slots ``[g L, g L + L)``, ``L`` a multiple of 32)
+        and ``R`` copies of other groups' experts (local slots ``[L, L + R)``), listed in the
+        ``replica_ids`` table (``groups * R`` int32 global slots, entry ``g R + c`` = the expert in
+        group ``g``'s copy slot ``c``). Every CTA of every rank chooses per step, from the step's ids
+        alone, which touched copied experts run on their copy instead of at home (`_REP_ROUNDS`:
+        three rounds of group pairs, each moving up to half its load gap from the busier group),
+        so every rank makes the same choice; the rank sorts its touched home experts that stay
+        plus the copies moved in.
     """
 
     def __init__(
@@ -245,6 +258,8 @@ class K3MoeLowMDynKernel:
         self_sort_local: int = 0,
         static_first: bool = False,
         fast_tok: bool = False,
+        replicas: int = 0,
+        groups: int = 4,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -270,12 +285,26 @@ class K3MoeLowMDynKernel:
         # n_tok (the permuted-index view spans 128 more words).
         self.self_sort = self_sort_local > 0
         assert not self.self_sort or n_tok <= 16, "self-sort: at most 16 tokens"
-        self.ss_words = max(1, -(-self_sort_local // 32))
-        self.ss_tiles = max(1, min(n_tok * topk, self_sort_local))
+        self.replicas = replicas
+        self.ss_groups = groups if replicas else 1
+        if replicas:
+            assert self.self_sort and self_sort_local % 32 == 0, (
+                "replicas: self-sort over whole words"
+            )
+            assert groups == 4 and 0 < groups * replicas <= 32, (
+                "replicas: 4 groups, one lane per copy"
+            )
+        self.ss_home = self_sort_local
+        self.ss_home_words = max(1, -(-self_sort_local // 32))
+        # token masks: per local expert, or (replicas) per global slot of every group
+        self.ss_words = max(1, -(-(self_sort_local * self.ss_groups) // 32))
+        self.ss_tiles = max(1, min(n_tok * topk, self_sort_local + replicas))
         self.ss_bits = 32 * self.ss_words if self.self_sort else 4
         self.ss_perm = self.ss_tiles * n_tok + _MMA_M if self.self_sort else 4
+        self.ss_away = _align(self.ss_home_words, 4) if replicas else 4
         ss_words_total = (
             self.ss_bits + _align(self.ss_words, 4) + 4 + 2 * _align(self.ss_tiles, 4) + self.ss_perm
+            + self.ss_away + 4
         )  # fmt: skip
         self.ss_bytes = 4 * ss_words_total + 6 * 16 if self.self_sort else 0
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
@@ -377,6 +406,7 @@ class K3MoeLowMDynKernel:
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
         trace_ptr: Optional[cute.Pointer] = None,
+        replica_ids: Optional[cute.Tensor] = None,
     ):
         self.ab_dtype = w1.element_type
         self.sf_dtype = w1_sf.element_type
@@ -470,6 +500,8 @@ class K3MoeLowMDynKernel:
             sSsExpert: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
             sSsLimit: cute.struct.Align[cute.struct.MemRange[Int32, _align(self.ss_tiles, 4)], 16]
             sSsPerm: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_perm], 16]
+            sSsAway: cute.struct.Align[cute.struct.MemRange[Int32, self.ss_away], 16]
+            sSsMoved: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -504,6 +536,7 @@ class K3MoeLowMDynKernel:
             num_local,
             orig_m,
             trace_ptr,
+            replica_ids,
             a_layout,
             b_layout,
             sfa_layout,
@@ -628,6 +661,7 @@ class K3MoeLowMDynKernel:
         num_local: Int32,
         orig_m: Int32,
         trace_ptr: Optional[cute.Pointer],
+        replica_ids: Optional[cute.Tensor],
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
@@ -667,6 +701,13 @@ class K3MoeLowMDynKernel:
                 j = tidx + Int32(i * self.threads)
                 if j < Int32(self.ss_bits):
                     ss_tok_masks[j] = Int32(0)
+        rep_pre = None
+        if cutlass.const_expr(self.replicas > 0):
+            # the copy table is static (not from the previous grid): read it before the wait
+            ss_away = st.sSsAway.get_tensor(cute.make_layout(self.ss_away))
+            if tidx < Int32(self.ss_away):
+                ss_away[tidx] = Int32(0)
+            rep_pre = self._rep_preload(replica_ids, local_offset)
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
         if cutlass.const_expr(self.trace):
@@ -685,7 +726,15 @@ class K3MoeLowMDynKernel:
                 tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles,
-            ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx, trace_ptr, bid)
+            ) = (
+                self._self_sort_rep(
+                    st, topk_ids, local_offset, orig_m, tidx, rep_pre, trace_ptr, bid
+                )
+                if cutlass.const_expr(self.replicas > 0)
+                else self._self_sort(
+                    st, topk_ids, local_offset, num_local, orig_m, tidx, trace_ptr, bid
+                )
+            )
             if cutlass.const_expr(self.trace):
                 if tidx == 0:
                     self._xstamp(trace_ptr, bid, 0)
@@ -883,6 +932,192 @@ class K3MoeLowMDynKernel:
                     )
                     tile = tile + _popc(below)
                 tok = mask[lx]
+                row = _popc(tok & ((Int32(1) << (j // Int32(K))) - Int32(1)))
+                perm_flat[tile * Int32(n_tok) + row] = j
+                if row == Int32(0):
+                    expert[tile] = lx
+                    limit[tile] = tile * Int32(_MMA_M) + _popc(tok)
+        cute.arch.barrier()
+        return expert, limit, perm, nt
+
+    @cute.jit
+    def _rep_preload(self, replica_ids, local_offset: Int32):
+        """S-1d, before the wait (the table is static): every thread's own group's ``R`` copied
+        experts (global slots), and per lane ``c < groups * R`` of every warp the copy's expert,
+        home group and copy group, the lane mask of its (home, copy) pair and the pair masks."""
+        R, G, L = self.replicas, self.ss_groups, self.ss_home
+        g_me = local_offset // Int32(L)
+        mine = []
+        for c in cutlass.range_constexpr(R):
+            mine.append(replica_ids[g_me * Int32(R) + Int32(c)])
+        lane = cute.arch.lane_idx()
+        e = Int32(-1)
+        if lane < Int32(G * R):
+            e = replica_ids[lane]
+        h = cutlass.select_(e >= Int32(0), e // Int32(L), Int32(-1))
+        r = lane // Int32(R)
+        pm = {}
+        mine_pair = Int32(0)
+        for a in range(G):
+            for b in range(G):
+                if a != b:
+                    pm[(a, b)] = Int32(
+                        cute.arch.vote_ballot_sync((h == Int32(a)) & (r == Int32(b)))
+                    )
+                    mine_pair = cutlass.select_(
+                        (h == Int32(a)) & (r == Int32(b)), pm[(a, b)], mine_pair
+                    )
+        return mine, e, h, r, pm, mine_pair
+
+    @cute.jit
+    def _self_sort_rep(
+        self,
+        st,
+        topk_ids,
+        local_offset: Int32,
+        orig_m: Int32,
+        tidx,
+        rep_pre,
+        trace_ptr=None,
+        bid=None,
+    ):
+        """`_self_sort` with S-1d copies (``replicas``): the same outputs over this group's local
+        slots ``[0, L + R)``. 1. every id ORs its token's bit into its global slot's mask (all
+        groups); 2. one ballot per 32 slots gives the touched slots; 3. warp 0 chooses which touched
+        copied experts move to their copy (`_REP_ROUNDS` on the groups' touched counts without the
+        copied experts; within a (home, copy) pair the lowest copy entries move) and marks this
+        group's home experts that moved away; 4. this group's tiles: its touched home experts that
+        stay (slot order), then the copies moved in (copy order). Four CTA barriers."""
+        n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
+        R, G, L, HW = self.replicas, self.ss_groups, self.ss_home, self.ss_home_words
+        mine, e_l, h_l, r_l, pm, mine_pair = rep_pre
+        per = -(-(n_tok * K) // nthr)
+        mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+        union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
+        nt = st.sSsNt.get_tensor(cute.make_layout(1))
+        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
+        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
+        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
+        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
+        away = st.sSsAway.get_tensor(cute.make_layout(self.ss_away))
+        moved = st.sSsMoved.get_tensor(cute.make_layout(4))
+        mask_base = st.sSsBits.data_ptr().toint()
+        away_base = st.sSsAway.data_ptr().toint()
+        n = orig_m * Int32(K)
+        g_me = local_offset // Int32(L)
+        # 1. every id's token bit into its global slot's mask
+        sls = []
+        for i in cutlass.range_constexpr(per):
+            j = tidx + Int32(i * nthr)
+            sl = Int32(-1)
+            if j < n:
+                sl = topk_ids[j]
+                _red_shared_or(mask_base + sl * Int32(4), Int32(1) << (j // Int32(K)))
+            sls.append(sl)
+        cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 7)
+        # 2. touched slots
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
+        nwarps = nthr // 32
+        for i in cutlass.range_constexpr(-(-W // nwarps)):
+            w = warp + Int32(i * nwarps)
+            if w < Int32(W):
+                b = cute.arch.vote_ballot_sync(mask[w * Int32(32) + lane] != Int32(0))
+                if lane == Int32(0):
+                    union[w] = Int32(b)
+        cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 8)
+        # 3. the copy choice (warp 0; lane c = copy entry c)
+        if warp == Int32(0):
+            hit = Int32(0)
+            if e_l >= Int32(0):
+                hit = (union[e_l >> 5] >> (e_l & 31)) & Int32(1)
+            H = Int32(cute.arch.vote_ballot_sync(hit != Int32(0)))
+            tot = []
+            for g in range(G):
+                t = Int32(0)
+                for w in range(HW):
+                    t = t + _popc(union[g * HW + w])
+                tot.append(t)
+            k = {}
+            for ab, m_ab in pm.items():
+                k[ab] = _popc(H & m_ab)
+            ld = []
+            for g in range(G):
+                hb = Int32(0)
+                for b2 in range(G):
+                    if b2 != g:
+                        hb = hb + k[(g, b2)]
+                ld.append(tot[g] - hb)
+            mv = {}
+            for rnd in _REP_ROUNDS:
+                for a, b in rnd:
+                    k_ab, k_ba = k[(a, b)], k[(b, a)]
+                    la, lb = ld[a] + k_ab, ld[b] + k_ba
+                    m_ab = cutlass.select_(la >= lb, cutlass.min(k_ab, (la - lb) >> 1), Int32(0))
+                    m_ba = cutlass.select_(lb > la, cutlass.min(k_ba, (lb - la) >> 1), Int32(0))
+                    ld[a] = la - m_ab + m_ba
+                    ld[b] = lb - m_ba + m_ab
+                    mv[(a, b)] = m_ab
+                    mv[(b, a)] = m_ba
+            m_mine = Int32(0)
+            for ab, m_ab in mv.items():
+                m_mine = cutlass.select_(
+                    (h_l == Int32(ab[0])) & (r_l == Int32(ab[1])), m_ab, m_mine
+                )
+            below = (Int32(1) << lane) - Int32(1)
+            go = (hit != Int32(0)) & (_popc(H & mine_pair & below) < m_mine)
+            mvd = Int32(cute.arch.vote_ballot_sync(go))
+            if go & (h_l == g_me):
+                da = e_l - g_me * Int32(L)
+                _red_shared_or(away_base + (da >> 5) * Int32(4), Int32(1) << (da & 31))
+            if lane == Int32(0):
+                moved[0] = mvd
+        cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 12)
+        # 4. this group's tiles
+        M = moved[0]
+        inm = M & (((Int32(1) << Int32(R)) - Int32(1)) << (g_me * Int32(R)))
+        hu = []
+        for w in cutlass.range_constexpr(HW):
+            hu.append(union[g_me * Int32(HW) + Int32(w)] & (away[w] ^ Int32(-1)))
+        n_home = Int32(0)
+        for w in cutlass.range_constexpr(HW):
+            n_home = n_home + _popc(hu[w])
+        if tidx == Int32(0):
+            nt[0] = n_home + _popc(inm)
+        for i in cutlass.range_constexpr(per):
+            sl = sls[i]
+            j = tidx + Int32(i * nthr)
+            lx = Int32(-1)
+            tile = Int32(0)
+            if sl >= Int32(0):
+                d = sl - g_me * Int32(L)
+                if (d >= Int32(0)) & (d < Int32(L)):
+                    hi = d >> 5
+                    word = Int32(0)
+                    t = Int32(0)
+                    for w in cutlass.range_constexpr(HW):
+                        word = cutlass.select_(Int32(w) == hi, hu[w], word)
+                        t = t + _popc(cutlass.select_(Int32(w) < hi, hu[w], Int32(0)))
+                    if ((word >> (d & 31)) & Int32(1)) != Int32(0):
+                        lx = d
+                        tile = t + _popc(word & ((Int32(1) << (d & 31)) - Int32(1)))
+                else:
+                    for c in cutlass.range_constexpr(R):
+                        bit = g_me * Int32(R) + Int32(c)
+                        if (sl == mine[c]) & (((inm >> bit) & Int32(1)) != Int32(0)):
+                            lx = Int32(L + c)
+                            tile = n_home + _popc(inm & ((Int32(1) << bit) - Int32(1)))
+            if lx >= Int32(0):
+                tok = mask[sl]
                 row = _popc(tok & ((Int32(1) << (j // Int32(K))) - Int32(1)))
                 perm_flat[tile * Int32(n_tok) + row] = j
                 if row == Int32(0):
@@ -1766,6 +2001,7 @@ class K3MoeLowMDynKernel:
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
         trace_ptr: Optional[cute.Pointer] = None,
+        replica_ptr: Optional[cute.Pointer] = None,
     ):
         """``x`` [orig_m, k1] tokens and ``x_sf`` their linear scales; ``h`` / ``h_sf`` the FC1
         output buffers in the permuted layout ([m, k2] rows, 128x4-blocked scales); ``out`` the
@@ -1819,6 +2055,11 @@ class K3MoeLowMDynKernel:
             num_ctas,
             stream,
             trace_ptr,
+            cute.make_tensor(
+                replica_ptr, layout=cute.make_layout((self.ss_groups * self.replicas,))
+            )
+            if cutlass.const_expr(self.replicas > 0)
+            else None,
         )
 
 

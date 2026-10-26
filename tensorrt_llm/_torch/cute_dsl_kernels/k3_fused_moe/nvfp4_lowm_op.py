@@ -172,6 +172,8 @@ def k3_moe_nvfp4_lowm(
     local_offset: int = 0,
     static_first: bool = False,
     fast_tok: bool = False,
+    replica_ids: Optional[torch.Tensor] = None,
+    replicas: int = 0,
 ) -> None:
     """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 32`` tokens.
 
@@ -186,7 +188,11 @@ def k3_moe_nvfp4_lowm(
     kernel sorts the routing over the local experts ``[local_offset, local_offset + E)`` itself (`run`'s
     ``self_sort``) and the four sort arguments are not read. ``static_first``: CTA ``b`` takes unit ``b`` first
     (``K3MoeLowMDynKernel``'s static first unit; same results). ``fast_tok``: the kernel's fast token operand
-    (no per-FC2-unit counter round trip; same results)."""
+    (no per-FC2-unit counter round trip; same results). ``replicas`` ``R > 0`` with ``topk_ids`` and ``replica_ids``
+    (S-1d): the last ``R`` of the ``E`` local experts are copies of other EP groups' experts, ``replica_ids`` int32
+    ``[groups * R]`` the global slot of each group's copies (entry ``g R + c``: group ``g``'s copy slot ``c``), the
+    ids global slots of ``groups`` groups of ``E - R`` home experts, this rank's at ``local_offset``; the kernel
+    chooses per step which touched copied experts run on their copy (``K3MoeLowMDynKernel``'s ``replicas``)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -199,6 +205,15 @@ def k3_moe_nvfp4_lowm(
     k1 = w2.shape[1]
     k2 = n1 // 2
     self_sort = topk_ids is not None
+    if replicas and (
+        not self_sort
+        or replica_ids is None
+        or replica_ids.dtype != torch.int32
+        or replica_ids.numel() != 4 * replicas
+    ):
+        raise ValueError(
+            "k3_moe_nvfp4_lowm: replicas take topk_ids and int32 replica_ids [4 * replicas]"
+        )
     if self_sort:
         if (
             orig_m > SELF_SORT_MAX_TOKENS
@@ -259,10 +274,12 @@ def k3_moe_nvfp4_lowm(
         ptr(cutlass.Int32, counters),
         ptr(cutlass.Int32, topk_ids if self_sort else tile_idx_to_group_idx),
     ]
+    tail = (None, ptr(cutlass.Int32, replica_ids)) if replicas else ()
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (_device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas, stages,
-           use_pdl, num_local if self_sort else 0, scales_bf16, bool(static_first), bool(fast_tok))  # fmt: skip
+           use_pdl, num_local if self_sort else 0, scales_bf16, bool(static_first), bool(fast_tok),
+           int(replicas))  # fmt: skip
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -274,20 +291,21 @@ def k3_moe_nvfp4_lowm(
             if fn is None:
                 kernel = dyn.K3MoeLowMDynKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), fc2_chunk=1,
-                    max_ab_stage=stages, use_pdl=use_pdl, self_sort_local=num_local if self_sort else 0,
-                    static_first=bool(static_first), fast_tok=bool(fast_tok),
+                    max_ab_stage=stages, use_pdl=use_pdl,
+                    self_sort_local=(num_local - replicas) if self_sort else 0,
+                    static_first=bool(static_first), fast_tok=bool(fast_tok), replicas=int(replicas),
                 )  # fmt: skip
                 fn = _compiled[key] = cute.compile(
-                    kernel.wrapper, *ptrs, orig_m, m, num_local, local_offset, ctas, stream
+                    kernel.wrapper, *ptrs, orig_m, m, num_local, local_offset, ctas, stream, *tail
                 )
-    fn(*ptrs, orig_m, m, num_local, local_offset, stream)
+    fn(*ptrs, orig_m, m, num_local, local_offset, stream, *tail)
 
 
 @k3_moe_nvfp4_lowm.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, counters, top_k,
       situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, topk_ids=None, local_offset=0,
-      static_first=False, fast_tok=False):  # fmt: skip
+      static_first=False, fast_tok=False, replica_ids=None, replicas=0):  # fmt: skip
     return None
 
 

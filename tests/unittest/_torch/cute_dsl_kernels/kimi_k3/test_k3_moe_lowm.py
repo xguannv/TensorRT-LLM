@@ -410,6 +410,147 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         assert int(counters.abs().sum().item()) == 0, f"no local expert (fast {fast}): counters"
 
 
+_REP_ROUNDS = (((0, 2), (1, 3)), ((0, 1), (2, 3)), ((0, 3), (1, 2)))
+
+
+def _replica_choice(touched, table, home, replicas, groups=4):
+    """S-1d's per-step choice, as ``K3MoeLowMDynKernel(replicas=...)`` and moss ``s1d_sim.py``'s ``pair`` rule:
+    ``table[g R + c]`` the global slot copied into group ``g``'s copy slot ``c``; returns the moved entries."""
+    hit = [e in touched for e in table]
+    hg = [e // home for e in table]
+    rg = [i // replicas for i in range(len(table))]
+    k = {(a, b): sum(1 for i in range(len(table)) if hit[i] and hg[i] == a and rg[i] == b)
+         for a in range(groups) for b in range(groups) if a != b}  # fmt: skip
+    ld = [sum(1 for e in touched if e // home == g) - sum(k[(g, b)] for b in range(groups) if b != g)
+          for g in range(groups)]  # fmt: skip
+    mv = {}
+    for rnd in _REP_ROUNDS:
+        for a, b in rnd:
+            la, lb = ld[a] + k[(a, b)], ld[b] + k[(b, a)]
+            m_ab = min(k[(a, b)], (la - lb) // 2) if la >= lb else 0
+            m_ba = min(k[(b, a)], (lb - la) // 2) if lb > la else 0
+            ld[a], ld[b] = la - m_ab + m_ba, lb - m_ba + m_ab
+            mv[(a, b)], mv[(b, a)] = m_ab, m_ba
+    moved, taken = set(), {}
+    for i in range(len(table)):
+        if hit[i]:
+            pair = (hg[i], rg[i])
+            if taken.get(pair, 0) < mv[pair]:
+                taken[pair] = taken.get(pair, 0) + 1
+                moved.add(i)
+    return moved
+
+
+@pytest.mark.parametrize("home,top_k", [(224, 16), (32, 8)], ids=["k3_ep4", "small"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 13, 16])
+@pytest.mark.parametrize("fast", [False, True], ids=["base", "fast"])
+def test_moe_nvfp4_lowm_replicas(home, top_k, num_tokens, fast):
+    """S-1d (``K3MoeLowMDynKernel(replicas=8)``): per EP group, the replica kernel (global ids, the group's home
+    experts + 8 copies) bit for bit (one-hot routing slots) as the plain self-sort on the ids the reference choice
+    (`_replica_choice`) assigns to the group, remapped to its local slots; FC1 rows bit for bit; summed over the 4
+    groups, bit for bit the copy-free EP4 (each (token, expert) runs once)."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    hidden, inter_size, groups, R = 1024, 256, 4, 8
+    num_experts = groups * home
+    ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * inter_size, hidden, num_tokens)
+    assert ok, why
+    gen = torch.Generator().manual_seed(7000 + 31 * num_tokens + home)
+    # copies: group r holds R experts of other groups, biased to group 0 (the loaded one) so moves happen
+    table, used = [], set()
+    for r in range(groups):
+        while len(table) < (r + 1) * R:
+            src = (
+                0
+                if (r != 0 and torch.rand(1, generator=gen).item() < 0.6)
+                else (r + 1 + int(torch.randint(groups - 1, (1,), generator=gen).item())) % groups
+            )
+            e = src * home + int(torch.randint(home, (1,), generator=gen).item())
+            if src != r and e not in used:
+                used.add(e)
+                table.append(e)
+    # routing: about half of each token's experts in group 0 (copied ones favoured), the rest anywhere
+    hot = [e for e in table if e < home] + list(range(home))
+    ids = torch.empty(num_tokens, top_k, dtype=torch.int32)
+    for t in range(num_tokens):
+        pick = []
+        while len(pick) < top_k:
+            if len(pick) < top_k // 2:
+                e = hot[int(torch.randint(len(hot), (1,), generator=gen).item())]
+            else:
+                e = int(torch.randint(num_experts, (1,), generator=gen).item())
+            if e not in pick:
+                pick.append(e)
+        ids[t] = torch.tensor(pick, dtype=torch.int32)
+    scales = torch.rand(num_tokens, top_k, generator=gen).softmax(-1).float().cuda()
+    ids = ids.cuda()
+    touched = set(ids.flatten().tolist())
+    moved = _replica_choice(touched, table, home, R)
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    x_q, x_sf, x_gsf = _quantize(x)
+    x_sf = unswizzle_sf(x_sf, (num_tokens + 127) // 128 * 128, hidden)[:num_tokens].contiguous()
+    ex = _nvfp4_experts(num_experts, hidden, inter_size, 8000 + home)
+    alpha1 = (ex.spread * (x_gsf * ex.w1_gsf)).float()
+    counters = nvfp4_lowm_op.new_counters(torch.device("cuda"))
+    tab = torch.tensor(table, dtype=torch.int32, device="cuda")
+
+    def weights_of(slots):
+        idx = torch.tensor(slots, device="cuda")
+        return (ex.w1[idx].contiguous(), ex.w1_sf[idx].contiguous(), alpha1[idx].contiguous(), ex.w2[idx].contiguous(),
+                ex.w2_sf[idx].contiguous(), ex.alpha2[idx].contiguous())  # fmt: skip
+
+    def call(w, topk, token_scales, offset, replicas=0):
+        n_local = w[0].shape[0]
+        m = nvfp4_lowm_op.max_permuted_rows(num_tokens, top_k, n_local)
+        out = torch.full((num_tokens, hidden), 7.0, dtype=torch.bfloat16, device="cuda")
+        h = torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda")
+        h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
+        _trtllm().k3_moe_nvfp4_lowm(
+            _bits(x_q), _bits(x_sf), *w, out, topk, topk, topk, topk, ex.fc2_input_scale, token_scales, counters,
+            top_k, GATE_CAP, LINEAR_CAP, 0, h, h_sf, topk_ids=topk, local_offset=offset, static_first=fast,
+            fast_tok=fast, replica_ids=tab if replicas else None, replicas=replicas,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0, "counters not reset"
+        return out, h, h_sf
+
+    far = num_experts + home + R  # an id no local slot takes
+    sums_rep, sums_ep = None, None
+    for slot in (0, top_k - 1, None):
+        token_scales = scales
+        if slot is not None:
+            token_scales = torch.zeros_like(scales)
+            token_scales[:, slot] = scales[:, slot]
+        for g in range(groups):
+            w = weights_of(list(range(g * home, (g + 1) * home)) + table[g * R : (g + 1) * R])
+            y_rep, h_rep, hsf_rep = call(w, ids, token_scales, g * home, replicas=R)
+            # reference: the group's share under the reference choice, remapped to its local slots
+            away = {table[i] for i in moved if table[i] // home == g}
+            local = {e: e - g * home for e in range(g * home, (g + 1) * home) if e not in away}
+            local.update({table[g * R + c]: home + c for c in range(R) if g * R + c in moved})
+            remap = ids.cpu().apply_(lambda e: local.get(e, far)).cuda()
+            y_ref, h_ref, hsf_ref = call(w, remap.contiguous(), token_scales, 0)
+            where = f"group {g} slot {slot} moved {sorted(moved)}"
+            if slot is None:
+                # several partials per token: bf16 reds in arrival order on both sides
+                err = (y_rep.double() - y_ref.double()).abs().amax(-1)
+                scale = y_ref.double().abs().amax(-1) + 1e-6
+                assert bool((err <= top_k * 2.0**-7 * scale).all()), f"{where}: all slots"
+                continue
+            assert torch.equal(y_rep.view(torch.int16), y_ref.view(torch.int16)), f"{where}: output"
+            assert torch.equal(h_rep, h_ref) and torch.equal(hsf_rep, hsf_ref), f"{where}: FC1 rows"
+            y_ep, _, _ = call(
+                weights_of(list(range(g * home, (g + 1) * home))), ids, token_scales, g * home
+            )
+            sums_rep = y_rep.float() if g == 0 else sums_rep + y_rep.float()
+            sums_ep = y_ep.float() if g == 0 else sums_ep + y_ep.float()
+        if slot is not None:
+            assert torch.equal(sums_rep, sums_ep), f"slot {slot}: groups' sum vs copy-free EP4"
+    assert moved or num_tokens == 1, "no copy moved: the routing does not exercise the choice"
+
+
 @pytest.mark.parametrize("ceil_chunk", [False, True], ids=["fc2_equal_ranges", "fc2_ceil_chunk"])
 @pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])
 def test_moe_nvfp4_lowm_fc12(num_tokens, ceil_chunk, monkeypatch):
