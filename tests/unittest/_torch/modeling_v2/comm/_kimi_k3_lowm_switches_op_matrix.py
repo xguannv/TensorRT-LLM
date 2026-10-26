@@ -56,6 +56,9 @@ eager call on the same inputs):
     kernel's own sort and without it: no sorted launch when on; the front's outputs, the routed partial and the
     shared activation bit for bit.
   * SELF_SORT_FC12 (17, 24, 32 rows; read at forward time): the same with FC1 + FC2 on the 32-token front.
+  * LOWM_DYN_FAST (1, 8, 9, 12, 16 rows, each with SELF_SORT off and on; read at forward time): ``_front_routed`` on
+    the front-sort layer with the single expert kernel's static first unit + fast token operand and without: the
+    front's outputs, the routed partial (one-hot routing) and the shared activation bit for bit.
   * FC2_CEIL_CHUNK (17, 24, 32 rows; read at forward time): ``_front_routed`` with FC1 + FC2 on the 32-token front
     (the production sort switches), FC2's units in ceil chunks and in equal ranges: the front's outputs, the routed
     partial (one-hot routing) and the shared activation bit for bit.
@@ -1057,6 +1060,69 @@ def check_self_sort_fc12():
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_LOWM_DYN_FAST
+# ----------------------------------------------------------------------------------------------------------------------
+def _dyn_fast_arm(layer, moe, x, value: int, self_sort: int):
+    with (
+        _switch("TRTLLM_K3LL_MOE_LOWM_DYN_FAST", value),
+        _switch("TRTLLM_K3LL_MOE_SELF_SORT", self_sort),
+        _taps(layer) as seen,
+    ):
+        routed, act = layer._front_routed(moe, x)
+    return SimpleNamespace(front=seen["_front"], routed=routed, act=act)
+
+
+def _verify_dyn_fast(where, on, off):
+    _assert_one_hot(where, off.front[1])
+    for name, a, b in zip(_FRONT_NAMES, on.front, off.front):
+        _expect_same(f"{where}: on vs off front {name}", a, b)
+    _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
+    _expect_same(f"{where}: on vs off shared activation", on.act, off.act)
+
+
+def check_dyn_fast():
+    """``_front_routed`` on the layer built with the front's sort, the single expert kernel with its static first unit
+    and fast token operand (switch on) and without, at 1, 8 and 9-16 rows, with the expert kernel's own sort off and
+    on: the front's outputs, the routed partial (one-hot routing: one partial per output element, so the red order,
+    which the switch changes, does not matter) and the shared activation bit for bit; eagerly and from replays of
+    one graph holding both arms. Several non-zero weights per token are not bit-reproducible on either arm."""
+    on, moe = BUILT.on, BUILT.moe_on
+    for self_sort in (0, 1):
+        for rows in FRONT_SORT_ROWS:
+            if rows > DML.MAX_TOKENS and on.state.head16 is None:
+                continue
+            x = _moe_input(3100 + rows, rows)
+            _verify_dyn_fast(
+                f"LOWM_DYN_FAST self_sort {self_sort} {rows} rows",
+                _dyn_fast_arm(on, moe, x, 1, self_sort),
+                _dyn_fast_arm(on, moe, x, 0, self_sort),
+            )
+        fields = ("front", "routed", "act")
+        for rows in GRAPH_FRONT_SORT_ROWS:
+            if rows > DML.MAX_TOKENS and on.state.head16 is None:
+                continue
+            x = _moe_input(3200 + rows, rows)
+            graph, (g_on, g_off) = _capture(
+                lambda: (
+                    _dyn_fast_arm(on, moe, x, 1, self_sort),
+                    _dyn_fast_arm(on, moe, x, 0, self_sort),
+                )
+            )
+            for rep in range(REPLAYS):
+                x.copy_(_moe_input(3300 + 10 * rows + rep, rows))
+                _replay(graph)
+                where = f"LOWM_DYN_FAST self_sort {self_sort} graph {rows} rows replay {rep}"
+                e_on = _dyn_fast_arm(on, moe, x, 1, self_sort)
+                e_off = _dyn_fast_arm(on, moe, x, 0, self_sort)
+                _same_arm(f"{where} on vs eager", g_on, e_on, fields)
+                _same_arm(f"{where} off vs eager", g_off, e_off, fields)
+                _verify_dyn_fast(where, g_on, g_off)
+            del graph
+    if R.rank == 0:
+        print("[rank 0] LOWM_DYN_FAST: on arm = off arm (eager and replays)", flush=True)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK
 # ----------------------------------------------------------------------------------------------------------------------
 def _fc2_ceil_chunk_arm(layer, moe, x, value: int):
@@ -1801,6 +1867,7 @@ CHECKS = [
     check_front_sort,
     check_self_sort,
     check_self_sort_fc12,
+    check_dyn_fast,
     check_fc2_ceil_chunk,
     check_front16,
     check_front32,

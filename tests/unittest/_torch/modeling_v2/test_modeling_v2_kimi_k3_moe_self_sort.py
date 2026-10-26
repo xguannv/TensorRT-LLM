@@ -100,6 +100,49 @@ def test_fc2_ceil_chunk_default_follows_the_capability(monkeypatch, value, capab
         dm._fc2_ceil_chunk_on_by_default.cache_clear()
 
 
+@pytest.mark.parametrize("value", [0, 1, -1])
+def test_warm_up_compiles_both_dyn_fast_builds(monkeypatch, value):
+    """``warm_up`` runs every single-kernel expert call with and without ``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (read at
+    forward time, so neither build may first compile under capture), whatever the switch says at load."""
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_LOWM_DYN_FAST", value)
+    monkeypatch.setattr(dm, "fc12_enabled", lambda: False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    layer = _layer(dm)
+    layer.front_weight = torch.zeros(1)
+    layer.state = SimpleNamespace(head16=object(), head32=None, fc12=None, sort_ctr=None)
+    moe = SimpleNamespace(hidden_size=4, num_experts=8, moe_hidden_size=4)
+    calls = []
+    monkeypatch.setattr(
+        layer, "_front_routed",
+        lambda moe, x, front32=None, fc12=None, self_sort=None, fast=None: calls.append(
+            ("front", x.shape[0], self_sort, fast)),
+        raising=False,
+    )  # fmt: skip
+    monkeypatch.setattr(
+        layer, "_route_quant", lambda moe, logits, latent: (logits.shape[0],), raising=False
+    )
+    monkeypatch.setattr(
+        layer, "_routed", lambda rows, fc12=None, self_sort=None, fast=None: calls.append(
+            ("routed", rows, self_sort, fast)),
+        raising=False,
+    )  # fmt: skip
+    layer.warm_up(moe)
+    for kind, rows in (
+        ("front", 1),
+        ("front", dm.MAX_TOKENS + 1),
+        ("routed", 9),
+        ("routed", dm.WIDE_MAX_TOKENS),
+    ):
+        got = {(c[2], c[3]) for c in calls if c[:2] == (kind, rows)}
+        assert got == {(False, False), (False, True), (True, False), (True, True)}, (
+            kind,
+            rows,
+            got,
+        )
+
+
 @pytest.mark.parametrize(
     "tokens,local,takes",
     [(0, 224, False), (1, 224, True), (8, 224, True), (9, 224, True), (16, 224, True), (17, 224, False),
@@ -139,7 +182,7 @@ def test_front_sorts_only_where_the_kernel_does_not(monkeypatch, switch, rows):
     monkeypatch.setattr(layer, "_front", front, raising=False)
     monkeypatch.setattr(dm, "sort_layout", lambda rows, local: (0, 0, 0, 16))
     monkeypatch.setattr(
-        layer, "_routed", lambda *a, fc12=None, self_sort=None: runs.append(("routed", self_sort)) or "y",
+        layer, "_routed", lambda *a, fc12=None, self_sort=None, fast=None: runs.append(("routed", self_sort)) or "y",
         raising=False,
     )  # fmt: skip
     monkeypatch.setattr(

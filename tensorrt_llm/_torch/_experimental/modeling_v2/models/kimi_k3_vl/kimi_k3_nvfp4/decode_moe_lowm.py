@@ -524,25 +524,31 @@ class K3DecodeMoeNvfp4Layer:
     def warm_up(self, moe: nn.Module) -> None:
         """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
         (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens. With ``TRTLLM_K3LL_MOE_LOWM_FC12`` set at launch, also builds the shared `K3MoeFc12` and runs the
-        FC1 + FC2 launch at 17 and 32 tokens (its 32-token build)."""
+        32 tokens, each with and without ``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (read at forward time). With
+        ``TRTLLM_K3LL_MOE_LOWM_FC12`` set at launch, also builds the shared `K3MoeFc12` and runs the FC1 + FC2 launch
+        at 17 and 32 tokens (its 32-token build)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
-        # Both sorts (the front's or moe_sort, and the expert kernel's own, TRTLLM_K3LL_MOE_SELF_SORT), so the switch
-        # can change at forward time.
-        for self_sort in (False, True):
-            self._front_routed(moe, x, self_sort=self_sort)
-            if self.state.head16 is not None:
-                self._front_routed(
-                    moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]), self_sort=self_sort
-                )
-        if self.state.head32 is not None:
-            self._front_routed(moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]), front32=True)
-        for rows in (9, WIDE_MAX_TOKENS):
-            logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
-            latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
+        # Both sorts (the front's or moe_sort, and the expert kernel's own, TRTLLM_K3LL_MOE_SELF_SORT) and both
+        # expert-kernel builds of TRTLLM_K3LL_MOE_LOWM_DYN_FAST, so either switch can change at forward time.
+        for fast in (False, True):
             for self_sort in (False, True):
-                self._routed(*self._route_quant(moe, logits, latent), self_sort=self_sort)
+                self._front_routed(moe, x, self_sort=self_sort, fast=fast)
+                if self.state.head16 is not None:
+                    self._front_routed(
+                        moe, x.new_zeros(MAX_TOKENS + 1, x.shape[1]), self_sort=self_sort, fast=fast
+                    )
+            if self.state.head32 is not None:
+                self._front_routed(
+                    moe, x.new_zeros(FRONT16_TOKENS + 1, x.shape[1]), front32=True, fast=fast
+                )
+            for rows in (9, WIDE_MAX_TOKENS):
+                logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
+                latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
+                for self_sort in (False, True):
+                    self._routed(
+                        *self._route_quant(moe, logits, latent), self_sort=self_sort, fast=fast
+                    )
         if fc12_enabled() and self.state.fc12 is None:
             w1 = self.experts[0]
             self.state.fc12 = K3MoeFc12.create(device, w1.shape[1], self.num_local, moe.top_k)
@@ -617,9 +623,11 @@ class K3DecodeMoeNvfp4Layer:
         x_sf,
         fc12: Optional[Fc12Step] = None,
         self_sort: Optional[bool] = None,
+        fast: Optional[bool] = None,
     ) -> torch.Tensor:
         """``moe_sort`` and the routed experts (the expert kernel's own sort where `self_sort_takes`); ``fc12``: as
-        two kernels into ``fc12.out`` (`Fc12Step`)."""
+        two kernels into ``fc12.out`` (`Fc12Step`). ``fast``: the single kernel's `lowm_dyn_fast` (None: read the
+        switch, as the forward path does)."""
         if fc12 is not None:
             self_sort = self.self_sort_takes(ids.shape[0], self_sort, fc12=True)
             if self_sort:
@@ -631,7 +639,7 @@ class K3DecodeMoeNvfp4Layer:
                 self.state.counters, *self.situ, out=fc12.out, fc12=fc12.launch(), self_sort=self_sort,
             )  # fmt: skip
         self_sort = self.self_sort_takes(ids.shape[0], self_sort)
-        fast = self._dyn_fast()
+        fast = self._dyn_fast(fast)
         if self_sort:
             from . import census as _census
 
@@ -642,9 +650,11 @@ class K3DecodeMoeNvfp4Layer:
         )  # fmt: skip
 
     @staticmethod
-    def _dyn_fast() -> bool:
-        """`lowm_dyn_fast`, counted (``dispatch:moe_lowm_dyn_fast``) where it engages: the single expert kernel."""
-        fast = lowm_dyn_fast()
+    def _dyn_fast(fast: Optional[bool] = None) -> bool:
+        """`lowm_dyn_fast` (or ``fast`` where given), counted (``dispatch:moe_lowm_dyn_fast``) where it engages: the
+        single expert kernel."""
+        if fast is None:
+            fast = lowm_dyn_fast()
         if fast:
             from . import census as _census
 
@@ -658,13 +668,14 @@ class K3DecodeMoeNvfp4Layer:
         front32: Optional[bool] = None,
         fc12: Optional[Fc12Step] = None,
         self_sort: Optional[bool] = None,
+        fast: Optional[bool] = None,
     ):
         """The front and this rank's routed partial of ``x`` (at most `MAX_TOKENS` rows, or a wide step a front build
         takes, ``K3DecodeMoeNvfp4.front_head``): ``(routed, shared_act)``.
         With the front's sort the expert kernel reads the front's sorted routing; else ``moe_sort`` sorts it.
         ``fc12``: `_routed_after`'s."""
         routing, shared_act = self._front_only(moe, x, front32, self_sort, fc12=fc12 is not None)
-        return self._routed_after(routing, fc12=fc12, self_sort=self_sort), shared_act
+        return self._routed_after(routing, fc12=fc12, self_sort=self_sort, fast=fast), shared_act
 
     def _front_only(
         self,
@@ -691,14 +702,18 @@ class K3DecodeMoeNvfp4Layer:
         return (sort_out, rows, None, x_q, x_sf), shared_act
 
     def _routed_after(
-        self, routing, fc12: Optional[Fc12Step] = None, self_sort: Optional[bool] = None
+        self,
+        routing,
+        fc12: Optional[Fc12Step] = None,
+        self_sort: Optional[bool] = None,
+        fast: Optional[bool] = None,
     ) -> torch.Tensor:
         """``_front_routed``'s routed experts on the front's ``routing`` (`_front_only`). ``fc12``
         (``TRTLLM_K3LL_MOE_LOWM_FC12``, `K3MoeFc12.begin`): FC1 + FC2 into ``fc12.out`` instead of the single
         kernel."""
         sort_out, a, b, x_q, x_sf = routing
         if sort_out is None:
-            return self._routed(a, b, x_q, x_sf, fc12=fc12, self_sort=self_sort)
+            return self._routed(a, b, x_q, x_sf, fc12=fc12, self_sort=self_sort, fast=fast)
         if fc12 is not None:
             return nvfp4_lowm_op.run_sorted(
                 x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
@@ -706,7 +721,7 @@ class K3DecodeMoeNvfp4Layer:
             )  # fmt: skip
         return nvfp4_lowm_op.run_sorted(
             x_q, x_sf, sort_views(sort_out, a, self.num_local), self.experts, self.fc2_input_scale,
-            self.state.counters, *self.situ, fast=self._dyn_fast(),
+            self.state.counters, *self.situ, fast=self._dyn_fast(fast),
         )  # fmt: skip
 
     def takes(self, hidden_states: torch.Tensor, step, partial_tail: bool) -> bool:

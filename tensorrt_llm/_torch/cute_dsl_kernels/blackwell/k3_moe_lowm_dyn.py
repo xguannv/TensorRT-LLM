@@ -28,7 +28,13 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   reaches ``n1 / 128 + _ZERO_SLICES`` (every FC1 unit of the tile stored, the whole output zeroed;
   acquire, then a generic-to-async proxy fence before the TMA). FC1 units have no dependencies, the
   zeroing slices belong to the first FC1 units, and every CTA finishes its FC1 units before its FC2
-  units, so the grid cannot deadlock, also when not all CTAs are resident at once.
+  units. With the work counter alone, every unit is taken by a CTA already running, so the grid
+  cannot deadlock, also when not all CTAs are resident at once. With ``static_first`` unit ``b``
+  belongs to CTA ``b`` before that CTA runs: when the first grid-size units include FC2 units (few
+  FC1 units), a running CTA can wait on an FC1 unit of a CTA not yet resident. That wait ends once
+  every CTA becomes resident, which the grid (at most the SM count, one CTA per SM) gets as long as
+  no other grid that waits on this one holds the SMs it needs (a PDL dependent launches only after
+  every CTA of this grid has triggered).
 * Counter reset (CUDA graph replays reuse the buffer): every FC2 block adds 1 more to its tile's counter
   after the wait; the add that brings it to ``n1 / 128 + _ZERO_SLICES + n2 / 128`` stores zero. Every
   CTA adds 1 to an exit counter (acquire-release) after its last fetch; the CTA that brings it to the
@@ -45,7 +51,10 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   (token, k)'s tile and row by popc), and the kernel reads the tile metadata from there instead of
   from the previous grid: the routing kernel need not sort it.
 * Static first unit (``static_first``): CTA ``b`` takes unit ``b`` first and the work counter hands out
-  units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip.
+  units from the grid size on, so the CTA's first unit costs no atomic. The fetch of its next unit
+  (one ahead) still precedes the first weight load, and the startup stamps show the sort-to-first-
+  fetch gap unchanged; isolated, the fixed cost per call still drops 0.3-0.4 us (moss-0484), from a
+  source not pinned down.
 * Fast token operand (``fast_tok``): the token warp polls a tile's counter only for the first FC2
   unit of that tile in a row (a tile seen ready stays ready), and instead of every FC2 block adding
   to the counter (an atomic whose result it waits for) the last token warp of the grid to finish
