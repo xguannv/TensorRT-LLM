@@ -1375,8 +1375,9 @@ def run_splitk_dense(
         l2_prefetch_tiles: With ``pdl``, the weight warp prefetches up to this many K tiles
            beyond its ring into L2 before the dependency resolves (0: off). Same values.
         exact_smem: Launch with the shared memory the tactic uses (instead of all of it) and
-           the max-shared carveout, so a CTA can become resident next to small CTAs of the
-           previous grid. Same values.
+           request the max-shared carveout, so a CTA can become resident next to small CTAs of the
+           previous grid. Same values. The request is ``launch(preferred_smem_carveout=100)``, which
+           CuteDSL's CUDA-dialect executor does not apply; ``k3_carveout.apply`` sets it on a build.
 
     Returns:
         The ``out`` tensor, filled with the GEMM result.

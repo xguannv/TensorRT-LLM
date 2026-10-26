@@ -226,6 +226,14 @@ COVERAGE = {
             f"{_NVFP4}/mla_drafter_gemm.py::fallback:drafter_swiglu_not_compiled",
         ),
     ),
+    # launch configuration
+    "TRTLLM_K3LL_MAXCARVE": (
+        (
+            NOT_FORWARD,
+            "read once at import by cute_dsl_kernels/k3_carveout.py; k3_carveout.apply sets the kernel attribute on "
+            "each AttnResFast / ctm_gemv_wide build when it is compiled, before any capture",
+        ),
+    ),
     # executor
     "TRTLLM_K3LL_INPUT_CHAIN": (
         (

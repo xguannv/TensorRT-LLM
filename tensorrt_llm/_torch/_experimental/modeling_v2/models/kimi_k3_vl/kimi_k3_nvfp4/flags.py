@@ -259,6 +259,15 @@ TRTLLM_K3LL_QKVG_BS1_SPLIT = _flag(
     "forward time. 0: the heuristic's split; -1 (default): 4 on SM103 only (fp8w_lowm.QKVG_BS1_SPLIT_CAPABILITIES; "
     "L1 bs1 -0.043 / -0.049 ms, GSM8K 0.9613 -> 0.9659 at gen bs1), else 0",
 )
+TRTLLM_K3LL_MAXCARVE = _flag(
+    "TRTLLM_K3LL_MAXCARVE",
+    -1,
+    "K3AttnResFastKernel and the k3_ctm_gemv_wide kernels run at the max-shared carveout (k3_carveout.apply: the "
+    "attribute set on each build's kernels when it is compiled; a placement hint, the same results), so their SMs need "
+    "no drain before a CTA of a 200+ KB successor (the mxfp8 QKVG / fused_a GEMMs, the MoE front) becomes resident and "
+    "streams its weights before its wait. Read once, at import, by k3_carveout.py, not at forward time. 1 on, 0 off, "
+    "-1 (default): on where the device is in k3_carveout.MAXCARVE_CAPABILITIES (SM103)",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

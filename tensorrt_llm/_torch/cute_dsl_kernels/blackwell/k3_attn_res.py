@@ -56,6 +56,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .. import k3_carveout
 from . import k3_fp8w_lowm_mxfp8 as mx_ops
 
 #: Hidden size the kernel is specialized for.
@@ -1624,7 +1625,7 @@ def _compiled(
             tap,
         )
     addr = Int64(1 << 20)
-    return cute.compile(
+    compiled = cute.compile(
         kernel,
         addr,
         addr,
@@ -1644,6 +1645,11 @@ def _compiled(
         Float32(1e-6),
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
+    if not exact:
+        # TRTLLM_K3LL_MAXCARVE: the vectorized kernel needs 1-2 KB of shared memory; at the max-shared carveout its
+        # SMs can take a CTA of the 200+ KB successor (QKVG / fused_a GEMM, MoE front) before they drain.
+        k3_carveout.apply(compiled)
+    return compiled
 
 
 @functools.cache

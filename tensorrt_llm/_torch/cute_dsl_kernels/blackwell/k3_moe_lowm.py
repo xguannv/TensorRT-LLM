@@ -35,6 +35,8 @@ same epilogue instruction sequence), written in the same permuted layout (``c`` 
   max-shared carveout, so each SM keeps the shared memory FC1 leaves free for a CTA of a kernel
   on another stream, and triggers its dependents only when a CTA starts its last work unit: a
   launched dependent grid whose CTAs wait for SM space holds back the CTAs of every other kernel.
+  The carveout is passed as ``launch(preferred_smem_carveout=100)``, which CuteDSL's CUDA-dialect executor does
+  not apply (the build keeps the runtime's carveout); ``k3_carveout.apply`` sets it on a build.
 """
 
 from typing import Optional, Tuple
@@ -488,8 +490,8 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
     :param use_pdl: Launch with programmatic dependent launch and wait on the previous grid.
     :param smem_capacity: Shared memory one CTA may use (bytes); the weight ring gets what the
         other buffers leave. Below the device maximum, a CTA of a concurrent kernel can share the SM.
-    :param share_sm: Launch with the max-shared carveout and trigger dependents at the start of each
-        CTA's last work unit (see the module docstring), for use with a reduced ``smem_capacity``.
+    :param share_sm: Launch with the max-shared carveout (requested only: see the module docstring) and trigger
+        dependents at the start of each CTA's last work unit, for use with a reduced ``smem_capacity``.
     :param late_trigger: Trigger dependents at the start of each CTA's last work unit (``True``) or
         right after ``griddepcontrol.wait`` (``False``); ``None`` follows ``share_sm``.
     :param prefetch_experts: The weight TMA warp loads the experts of the first 32 tiles together

@@ -47,6 +47,8 @@ from typing import Dict, Optional
 
 import torch
 
+from .. import k3_carveout
+
 MAX_TOKENS = 8
 WIDE_MAX_TOKENS = 64
 
@@ -83,8 +85,24 @@ def _compile(key, entry, *args):
         with _lock:
             fn = _compiled.get(key)
             if fn is None:
-                fn = _compiled[key] = cute.compile(entry, *args)
+                fn = cute.compile(entry, *args)
+                if entry in _wide_entries():
+                    # TRTLLM_K3LL_MAXCARVE: the small CTAs of the next kernel (the tail AttnResFast) start on these
+                    # SMs before they empty and keep their configuration; at the max-shared carveout a 200+ KB
+                    # CTA after them does not wait for a drain.
+                    k3_carveout.apply(fn)
+                _compiled[key] = fn
     return fn
+
+
+def _wide_entries() -> tuple:
+    from . import k3_ctm_gemv_kernel as kernel
+
+    return (
+        kernel.k3_ctm_gemv_wide,
+        kernel.k3_ctm_gemv_wide_ar_push,
+        kernel.k3_ctm_gemv_wide_col_publish,
+    )
 
 
 def supports(x: torch.Tensor, weight: torch.Tensor, split: int = 1) -> bool:
