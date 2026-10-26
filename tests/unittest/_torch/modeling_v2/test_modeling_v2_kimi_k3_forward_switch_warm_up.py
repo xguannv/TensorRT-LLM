@@ -22,6 +22,11 @@ switch, one entry per build family its value selects, each of one of these kinds
 * ``PENDING``: a known gap and its owner, until the owner's fix makes it one of the kinds above.
 
 A new -1 switch fails `test_every_default_minus_one_switch_is_covered` until it has an entry.
+
+Every value a switch accepts must map to a registered family (`test_every_accepted_value_maps_to_a_family`): a
+binary switch's entries cover 0 and 1 (-1 resolves to one of them per device); a switch in ``ACCEPTED_VALUES`` takes
+more values, and each of its entries names the values whose builds it covers (``Values``), so a family that only a
+default moved per arch selects cannot go unregistered.
 """
 
 import ast
@@ -45,6 +50,16 @@ WARM_UP, LAZY_RAISE, FALLBACK_COUNTED, TRITON_EAGER, NO_BUILD, NOT_FORWARD, PEND
 )
 KINDS = (WARM_UP, LAZY_RAISE, FALLBACK_COUNTED, TRITON_EAGER, NO_BUILD, NOT_FORWARD, PENDING)
 
+
+class Values(tuple):
+    """The switch values whose builds a ``COVERAGE`` entry covers (an entry without one covers every value)."""
+
+
+#: Switches that accept more than 0 / 1, and the values they accept.
+ACCEPTED_VALUES = {
+    "TRTLLM_K3LL_QKVG_BS1_SPLIT": (0, 3, 4),
+}
+
 #: Switches covered here although their default is not -1 (read at forward time, on by default).
 NON_DEFAULT = ("TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",)
 
@@ -60,7 +75,8 @@ _COUNTS_KERNEL = (
 )
 _V_UP = (LAZY_RAISE, f"{_NVFP4}/mla_v_up.py::not compiled before capture")
 
-#: switch -> entries, each (kind, evidence) or (TRITON_EAGER, evidence, constexprs). WARM_UP: "<test file in
+#: switch -> entries, each (kind, evidence) or (TRITON_EAGER, evidence, constexprs), optionally followed by ``Values``
+#: (required for every entry of an ``ACCEPTED_VALUES`` switch). WARM_UP: "<test file in
 #: modeling_v2>::<test function>"; LAZY_RAISE / FALLBACK_COUNTED: "<repo-relative source file>::<text of the raise
 #: message / counter in it>"; TRITON_EAGER: "<repo-relative source file>::<kernel name>" and the kernel's constexpr
 #: parameters; the others: the reason (PENDING: "<owner>: <the gap>").
@@ -156,7 +172,19 @@ COVERAGE = {
     # KDA fused QKVG at bs1: splits 3 and 4 compile at load whatever the value (fp8w_lowm.compile_qkvg_bs1_splits);
     # test_modeling_v2_kimi_k3_qkvg_bs1_split.py::test_capture covers the fallback
     "TRTLLM_K3LL_QKVG_BS1_SPLIT": (
-        (FALLBACK_COUNTED, f"{_NVFP4}/fp8w_lowm.py::fallback:qkvg_bs1_split_not_compiled"),
+        # every value's build (split 5 default tactic for 0, forced splits 3 / 4) compiles at load
+        # (fp8w_lowm.compile_qkvg_bs1_splits, recorded in _QKVG_BS1_COMPILED)
+        (
+            WARM_UP,
+            "test_modeling_v2_kimi_k3_qkvg_bs1_split.py::test_capture",
+            Values((0, 3, 4)),
+        ),
+        # a forced split not compiled for this device falls back to the default tactic, counted
+        (
+            FALLBACK_COUNTED,
+            f"{_NVFP4}/fp8w_lowm.py::fallback:qkvg_bs1_split_not_compiled",
+            Values((3, 4)),
+        ),
     ),
     # KDA verify
     "TRTLLM_K3LL_KDA_VERIFY_HOIST": (
@@ -275,4 +303,43 @@ def test_coverage_evidence_resolves(name):
             # the listed constexprs are the kernel's: a new one must be checked against the eager forward's shapes
             assert set(entry[2]) == constexprs, (name, kernel, sorted(constexprs))
         else:
-            assert len(entry) == 2 and evidence.strip(), (name, kind)
+            assert (
+                len([x for x in entry[2:] if not isinstance(x, Values)]) == 0 and evidence.strip()
+            ), (
+                name,
+                kind,
+            )
+
+
+def _entry_values(entry):
+    for x in entry[2:]:
+        if isinstance(x, Values):
+            return set(x)
+    return None
+
+
+@pytest.mark.parametrize("name", sorted(COVERAGE))
+def test_every_accepted_value_maps_to_a_family(name):
+    accepted = set(ACCEPTED_VALUES.get(name, (0, 1)))
+    covered = set()
+    for entry in COVERAGE[name]:
+        values = _entry_values(entry)
+        if name in ACCEPTED_VALUES:
+            assert values is not None, (
+                f"{name}: every entry of a multi-valued switch names the values it covers"
+            )
+        if values is None:
+            values = accepted
+        assert values <= accepted, (name, sorted(values - accepted))
+        covered |= values
+    assert accepted <= covered, (
+        f"{name}: values {sorted(accepted - covered)} select a family with no entry"
+    )
+
+
+def test_accepted_values_include_the_default():
+    flags = _flags()
+    for name, accepted in ACCEPTED_VALUES.items():
+        assert name in flags and name in COVERAGE, name
+        default = flags[name][1]
+        assert default == -1 or default in accepted, (name, default)
