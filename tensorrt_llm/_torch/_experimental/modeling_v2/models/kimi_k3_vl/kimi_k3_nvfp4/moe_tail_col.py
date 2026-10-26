@@ -300,6 +300,10 @@ def latent_all_reduce(
     clear_ctas = lar.ROW_CLEAR_CTAS if _lar_clear_split_on(routed.device) else 0
     if clear_ctas:
         _census.count(f"dispatch:lar_clear_split:{_census.mode()}")
+        wide = max(1, int(_flags.TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE))
+        if routed.shape[0] > 16 and wide != lar.ROW_CLEAR_CTAS:
+            clear_ctas = wide
+            _census.count(f"dispatch:lar_clear_ctas_wide:{_census.mode()}")
     lar.run_k3_latent_ar_norm_row(
         routed, layer.gamma, layer.eps, latent, uc_addr=view.uc_local, mc_addr=view.mc_base, flags=view.flags,
         rank=view.rank, world_size=view.world, early_trigger=True, clear_ctas=clear_ctas,

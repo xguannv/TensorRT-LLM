@@ -334,6 +334,13 @@ TRTLLM_K3LL_LAR_CLEAR_SPLIT = _flag(
     "1 on, 0 off, -1 (default): on on SM103 only (moe_tail_col.LAR_CLEAR_SPLIT_CAPABILITIES; L1 bs2 -0.147 ms, bs4 "
     "-0.038 ms, oak-1038)",
 )
+TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE = _flag(
+    "TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE",
+    32,
+    "with TRTLLM_K3LL_LAR_CLEAR_SPLIT on: the number of re-arm CTAs of a latent all-reduce of more than 16 rows "
+    "(k3_latent_ar_norm.ROW_CLEAR_CTAS at 16 rows or fewer). Bitwise for any value >= 1. Read at forward time. "
+    "32 (default): ROW_CLEAR_CTAS",
+)
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
     -1,
