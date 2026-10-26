@@ -299,6 +299,7 @@ TRTLLM_K3LL_DRAFTER_PROMPT_CTX = _flag(
     "(context_proj, context_norm and the latent projection + norm, no draft forward) that keeps the drafter K/V of "
     "every prompt position in a draft pool reused jointly with the target's. Read at load (ctx) and per received "
     "request (gen)",
+    accepted=Range(0),  # 0 off; W > 0 the window in tokens
 )
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",

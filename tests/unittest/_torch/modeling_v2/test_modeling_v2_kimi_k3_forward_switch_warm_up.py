@@ -65,8 +65,12 @@ class AllValues(Values):
 _FLAGS_PATH = _ROOT / _NVFP4 / "flags.py"
 _ON_OFF = Values((0, 1))
 
-#: Switches covered here although their default is not -1 (read at forward time, on by default).
-NON_DEFAULT = ("TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",)
+#: Switches covered here although their default is not -1: read at forward time (on by default), or a count whose
+#: every value must be registered (DRAFTER_PROMPT_CTX).
+NON_DEFAULT = (
+    "TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",
+    "TRTLLM_K3LL_DRAFTER_PROMPT_CTX",
+)
 
 _COUNTS_KERNELS = (
     TRITON_EAGER,
@@ -267,6 +271,16 @@ COVERAGE = {
             "k3_carveout.apply sets the kernel attribute on each vectorized AttnResFast / ctm_gemv wide build when "
             "it is compiled, before any capture; 0 and 1 compile the same kernels",
             Values((0, 1)),
+        ),
+    ),
+    # disaggregated serving
+    "TRTLLM_K3LL_DRAFTER_PROMPT_CTX": (
+        (
+            NOT_FORWARD,
+            "read at load on a ctx worker (dspark_capture_only builds the capture-only drafter and the joint "
+            "draft pool) and per received request on a gen worker (the window's receive and admission, outside "
+            "any forward); no value selects a build compiled at forward time",
+            AllValues(()),
         ),
     ),
     # executor
