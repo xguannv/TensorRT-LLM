@@ -1583,6 +1583,9 @@ def k3_moe_front_kernel(
                                         ready.data_ptr(tok).toint(), epoch + cutlass.Int32(1)
                                     )
                     # Pass 0's readers of the keys and of the selection's scratch are done before pass 1 rewrites them.
+                    # With `sort`, this full bar.sync also carries the hand-off ordering of the route CTA's topk_ids
+                    # stores to thread 0's sort_ctr release below: making it a named / partial barrier, or moving the
+                    # sort_ctr add above it, silently breaks sort_fence=False.
                     cute.arch.barrier()
                     if cutlass.const_expr(timeline):
                         if (tx == 0) & real:
@@ -1590,6 +1593,8 @@ def k3_moe_front_kernel(
                 if cutlass.const_expr(sort):
                     # The last route CTA to finish sorts every token's routing over the local experts.
                     _sort_masks_clear(s_key, tx)
+                    # The gpu-scope release that publishes every thread's topk_ids stores (ordered before it by the
+                    # full bar.sync above; cumulative in PTX's causality order), and the last CTA's acquire.
                     if tx == 0:
                         s_cnt.store(
                             _atom_add_acq_rel(sort_ctr.data_ptr(0).toint(), cutlass.Int32(1)), idx=0
