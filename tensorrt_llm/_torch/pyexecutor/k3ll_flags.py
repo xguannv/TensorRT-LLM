@@ -22,6 +22,15 @@ def k3ll_flag(name: str) -> int:
     return int(getattr(flags, name, 0)) if flags is not None else 0
 
 
+def k3ll_flag_any_target(name: str) -> int:
+    """``k3ll_flag`` for a switch read in a process that may not load the K3 NVFP4 target (e.g. a disaggregated
+    ctx worker on the built-in model): imports the flags module (environment reads only) if it is not loaded."""
+    import importlib
+
+    flags = sys.modules.get(K3LL_FLAGS_MODULE) or importlib.import_module(K3LL_FLAGS_MODULE)
+    return int(getattr(flags, name, 0))
+
+
 def k3ll_census_dispatch(path: str) -> None:
     """Count the census key ``dispatch:<path>:<mode>`` (``mode``: ``capture`` under CUDA graph capture, else
     ``eager``; a graph replay runs no Python and is not counted)."""
