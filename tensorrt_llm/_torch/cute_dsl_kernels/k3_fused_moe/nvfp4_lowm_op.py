@@ -377,11 +377,9 @@ def k3_moe_nvfp4_lowm_fc12(
         raise ValueError(
             "k3_moe_nvfp4_lowm_fc12: h / h_sf hold fewer than the permuted rows' FC1 output"
         )
-    if token_final_scales.dtype not in (torch.float32, torch.bfloat16) or (
-        token_final_scales.dtype == torch.bfloat16 and not self_sort
-    ):
+    if token_final_scales.dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(
-            "k3_moe_nvfp4_lowm_fc12: token_final_scales must be fp32 (or bf16 with topk_ids), "
+            f"k3_moe_nvfp4_lowm_fc12: token_final_scales must be fp32 or bf16 (widened exactly), "
             f"not {token_final_scales.dtype}"
         )
     scales_bf16 = token_final_scales.dtype == torch.bfloat16

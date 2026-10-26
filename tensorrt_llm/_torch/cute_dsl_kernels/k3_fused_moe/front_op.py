@@ -207,6 +207,8 @@ def k3_moe_front(
     pf_w1: Optional[torch.Tensor] = None,
     pf_w1_sf: Optional[torch.Tensor] = None,
     pf_ctas: int = 0,
+    sort_fence: bool = True,
+    sort_weights: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 32, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -230,7 +232,11 @@ def k3_moe_front(
     ``k3_moe_front.IMAGE_BYTES``, zero where no token scale lands (rows past 32 of each atom): the kernel also writes
     the token scales there in K3MoeFc1LowMKernel's SMEM image (its ``presorted_layout``). With ``pf_w1`` / ``pf_w1_sf``
     (the local experts' FC1 weight uint8 ``[E, n1, 1792]`` and its 128x4-blocked scales) and ``pf_ctas`` (FC1's CTA
-    count), the sorting CTA then prefetches into L2 the first weight stage of each FC1 CTA's first unit."""
+    count), the sorting CTA then prefetches into L2 the first weight stage of each FC1 CTA's first unit.
+
+    ``sort_weights`` / ``sort_fence`` (diagnostic switches, both on by default): off, the route CTAs skip the fp32
+    weight words of `sort_views` (its ``token_final_scales`` view is then not written: pass the bf16 ``topk_weights``
+    to the experts) / each route CTA's gpu fence after its ids before the sort_ctr hand-off."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -345,7 +351,7 @@ def k3_moe_front(
         arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
         arg(timeline.view(-1) if timeline is not None else _no_timeline(device)),
         # Without layout the kernel never writes it: any aligned uint8 words.
-        arg(sf_image.view(-1) if layout else scales.view(-1)),
+        arg(sf_image.view(-1).view(torch.int32) if layout else ag_flags.view(-1)),
     )
     capacity = max_clusters(device)
     # The 32-token build may run a shallower weight ring than asked (`fit_ring`); the others run ``ring``.
@@ -379,6 +385,8 @@ def k3_moe_front(
         layout,
         int(pf_ctas),
         pf_n1,
+        bool(sort_fence),
+        bool(sort_weights),
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -393,7 +401,7 @@ def k3_moe_front(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
                     sort_local, *pf_addr, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
                     float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, timeline is not None, layout,
-                    int(pf_ctas), pf_n1, stream,
+                    int(pf_ctas), pf_n1, bool(sort_fence), bool(sort_weights), stream,
                 )  # fmt: skip
     fn(
         *args,
@@ -411,7 +419,8 @@ def k3_moe_front(
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
       ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
-      sort_local=0, timeline=None, sf_image=None, pf_w1=None, pf_w1_sf=None, pf_ctas=0):  # fmt: skip
+      sort_local=0, timeline=None, sf_image=None, pf_w1=None, pf_w1_sf=None, pf_ctas=0, sort_fence=True,
+      sort_weights=True):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

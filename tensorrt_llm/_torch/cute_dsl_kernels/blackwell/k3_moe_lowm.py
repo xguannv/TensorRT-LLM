@@ -2295,7 +2295,7 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
                         expanded = permuted_idx_to_expanded_idx[tile * _MMA_M + epi_tidx]
                         token = expanded // self.topk
                         slot = expanded - token * self.topk
-                        alpha_val = alpha_val * token_final_scales[(token, slot)]
+                        alpha_val = alpha_val * Float32(token_final_scales[(token, slot)])
                 # the previous unit's reds still read the metadata of the previous tile
                 self._wg_barrier(wg)
                 if epi_tidx < n_valid:
@@ -2365,7 +2365,7 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
         """Same pointers as ``Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.wrapper``
         (``a`` = FC1's permuted output [m, k], ``a_sf`` its 128x4-blocked scales, ``c`` = the
         BF16 [num_tokens, n] output that is added to). ``topk_ids_ptr``: int32 [num_tokens, topk],
-        read with ``self_sort_local`` only (``token_final_scales_ptr`` then fp32 or bf16)."""
+        read with ``self_sort_local`` only (``token_final_scales_ptr`` fp32 or bf16, widened exactly)."""
         n, k = self.n, self.k
         num_tiles = m // _MMA_M
         h = cute.make_tensor(a_ptr, layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)))

@@ -48,7 +48,8 @@
 # right after the read; thread 0 of the first quantization CTA waits for all of them and flips the index for the next
 # call, long before the data it polls arrives, so no count sits on the role CTAs' output path. With `publish`,
 # per-token ready words as route_quant_ag's.
-# With `sort`, each route CTA also writes its token's weights in fp32 and counts itself in on sort_ctr; the last one
+# With `sort`, each route CTA also writes its token's weights in fp32 (`sort_weights`, a diagnostic switch: off, the
+# consumer reads the bf16 weights) and counts itself in on sort_ctr (after a gpu fence, `sort_fence`); the last one
 # runs moe_sort of every token's routing over this rank's local experts (`_sort_local`) and rearms the counter.
 # With `layout` (a diagnostic build: sort, NVFP4, the 32-token build), the quantization CTAs also write each token
 # scale into `sf_image`, K3MoeFc1LowMKernel's SMEM image of the token scales (presorted_layout), and the sorting CTA,
@@ -852,7 +853,7 @@ def k3_moe_front_kernel(
     sort_words: cutlass.Array,  # int32 [sort_layout words] (sort)
     sort_ctr: cutlass.Array,  # int32 [1], zero between calls: the route CTAs done (sort)
     tl: cutlass.Array,  # int64 [grid * TL_SLOTS] (timeline)
-    sf_image: cutlass.Array,  # uint8 [IMAGE_BYTES]: FC1's token-scale image (layout)
+    sf_image: cutlass.Array,  # int32 [IMAGE_BYTES / 4]: FC1's token-scale image (layout)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
@@ -878,6 +879,8 @@ def k3_moe_front_kernel(
     layout: cutlass.Constexpr[bool],
     pf_ctas: cutlass.Constexpr[int],  # FC1's CTAs (0: no prefetch)
     pf_n1: cutlass.Constexpr[int],  # W1 rows per expert
+    sort_fence: cutlass.Constexpr[bool],  # each route CTA's gpu fence after its ids (sort)
+    sort_weights: cutlass.Constexpr[bool],  # the fp32 weight words of sort_views (sort)
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
     # token, a quantization CTA per QT_ tokens).
@@ -1551,7 +1554,7 @@ def k3_moe_front_kernel(
                                 out = tok * cutlass.Int32(TOP_K) + tx
                                 topk_ids.store(expert, idx=out)
                                 topk_weight_bits.store(weight_bits, idx=out)
-                                if cutlass.const_expr(sort):
+                                if cutlass.const_expr(sort and sort_weights):
                                     # The weight in fp32 (the bf16 bits widened), after the sort's tile words.
                                     w_off = (
                                         (
@@ -1568,6 +1571,7 @@ def k3_moe_front_kernel(
                                         (cutlass.Int32(weight_bits) & cutlass.Int32(0xFFFF)) << 16,
                                         idx=w_off + out,
                                     )
+                                if cutlass.const_expr(sort and sort_fence):
                                     # The last route CTA reads these ids.
                                     cute.arch.fence_acq_rel_gpu()
                                 if cutlass.const_expr(publish):
@@ -1662,12 +1666,18 @@ def k3_moe_front_kernel(
                                     idx=qtok * cutlass.Int32(HIDDEN_SIZE // NVFP4_SF_VEC)
                                     + tx // cutlass.Int32(NVFP4_SF_VEC // 8),
                                 )
-                                if cutlass.const_expr(layout):
+                            if cutlass.const_expr(layout):
+                                # Scales 4a..4a+3 (threads 8a, 8a + 2, 8a + 4, 8a + 6) are 4 consecutive image bytes:
+                                # one word store by thread 8a (sf_image as int32 words).
+                                sfi = cutlass.Int32(sf_byte) & cutlass.Int32(0xFF)
+                                b1 = cute.arch.shuffle_sync_down(sfi, 2)
+                                b2 = cute.arch.shuffle_sync_down(sfi, 4)
+                                b3 = cute.arch.shuffle_sync_down(sfi, 6)
+                                if tx % cutlass.Int32(8) == cutlass.Int32(0):
                                     sf_image.store(
-                                        cutlass.Uint8(sf_byte),
-                                        idx=image_offset(
-                                            qtok, tx // cutlass.Int32(NVFP4_SF_VEC // 8)
-                                        ),
+                                        sfi | (b1 << 8) | (b2 << 16) | (b3 << 24),
+                                        idx=image_offset(qtok, tx // cutlass.Int32(2))
+                                        // cutlass.Int32(4),
                                     )
                         else:
                             q_lo, q_hi, sf_byte = _rq.mxfp8_quant_vec8([w0, w1, w2, w3])
@@ -1821,6 +1831,8 @@ def k3_moe_front(
     layout: cutlass.Constexpr[bool],
     pf_ctas: cutlass.Constexpr[int],
     pf_n1: cutlass.Constexpr[int],
+    sort_fence: cutlass.Constexpr[bool],
+    sort_weights: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1837,7 +1849,7 @@ def k3_moe_front(
         quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, tl, sf_image, num_tokens, tp_rank,
         routed_scaling_factor, sort_offset, sort_local, pf_w1, pf_w1_sf, world, shared_cols, n_head_tiles, n_tiles,
         gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half, nvfp4, sort, m_max, timeline, layout,
-        pf_ctas, pf_n1,
+        pf_ctas, pf_n1, sort_fence, sort_weights,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),
