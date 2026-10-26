@@ -16,7 +16,8 @@
 [q | k | v | g | f_a | b] weight (3216 x 7168, a partial last row tile) at 8 or fewer rows runs ``k3_fp8w_lowm_gemm`` at
 the forced split-K (3 or 4) instead of the default tactic's split 5. One GPU (SM100 / SM103).
 
-* 0 (the default): ``gemm`` is bit for bit ``trtllm::k3_fp8w_lowm_gemm`` at every row count and shape, and counts
+* -1 (the default) resolves to 4 on SM103 and to 0 elsewhere (``qkvg_bs1_split``).
+* 0: ``gemm`` is bit for bit ``trtllm::k3_fp8w_lowm_gemm`` at every row count and shape, and counts
   nothing.
 * 3 / 4, 1-8 rows of the fused shape: that split (census ``dispatch:qkvg_bs1_split<S>_rows<M>``), within 1e-4
   (relative norm) of the default split (another FP32 summation order), bit for bit ``run_k3_fp8w_lowm_gemm`` at
@@ -50,10 +51,35 @@ def _modules():
     return fp8w_lowm, flags, lowm
 
 
-def test_default_is_off():
+def test_default_is_auto():
     fp8w_lowm, flags, _ = _modules()
-    assert flags._FLAGS["TRTLLM_K3LL_QKVG_BS1_SPLIT"][1] == 0
+    assert flags._FLAGS["TRTLLM_K3LL_QKVG_BS1_SPLIT"][1] == -1
     assert fp8w_lowm.QKVG_BS1_SPLITS == SPLITS
+    assert fp8w_lowm.QKVG_BS1_SPLIT_CAPABILITIES == ((10, 3),)
+    assert fp8w_lowm.QKVG_BS1_DEFAULT_SPLIT == 4
+
+
+@pytest.mark.parametrize(
+    "value,capability,split",
+    [
+        (-1, (10, 3), 4),
+        (-1, (10, 0), 0),
+        (-1, (10, 7), 0),
+        (0, (10, 3), 0),
+        (3, (10, 3), 3),
+        (4, (10, 7), 4),
+    ],
+)
+def test_split_value(monkeypatch, value, capability, split):
+    """The switch's resolution, no GPU needed (the device capability is patched)."""
+    fp8w_lowm, flags, _ = _modules()
+    monkeypatch.setattr(flags, "TRTLLM_K3LL_QKVG_BS1_SPLIT", value)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: capability)
+    fp8w_lowm._qkvg_bs1_split_by_default.cache_clear()
+    try:
+        assert fp8w_lowm.qkvg_bs1_split(torch.device("cuda", 0)) == split
+    finally:
+        fp8w_lowm._qkvg_bs1_split_by_default.cache_clear()
 
 
 gpu = pytest.mark.skipif(

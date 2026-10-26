@@ -61,11 +61,11 @@ kernel (the same bits) and logs it. ``MX_STATS`` counts what happened (tests).
 
 ``TRTLLM_K3LL_QKVG_BS1_SPLIT`` (read at every call): `gemm` runs the fused KDA weight (`QKVG_BS1_SHAPE`) at 8 or
 fewer rows at the split-K the switch forces (one of `QKVG_BS1_SPLITS`, `qkvg_bs1_tactic`) where no MXFP8 input is
-offered for it; 0 keeps the default tactic. Not the same bits as the default split. The KDA layer compiles every
-forced split at load (`compile_qkvg_bs1_splits`); a capture that finds one not compiled keeps the default split
-(census ``fallback:qkvg_bs1_split_not_compiled``). Census: every forced-split call counts
-``dispatch:qkvg_bs1_split<S>_rows<M>``, a call of the fused shape above 8 rows with the switch set
-``qkvg_bs1_split_skip_rows<M>``.
+offered for it; 0 keeps the default tactic, -1 (default) resolves by `qkvg_bs1_split` (4 on SM103, else 0). Not the
+same bits as the default split. The KDA layer compiles every forced split at load (`compile_qkvg_bs1_splits`); a
+capture that finds one not compiled keeps the default split (census ``fallback:qkvg_bs1_split_not_compiled``).
+Census: every forced-split call counts ``dispatch:qkvg_bs1_split<S>_rows<M>``, a call of the fused shape above 8 rows
+with a split in force ``qkvg_bs1_split_skip_rows<M>``.
 """
 
 from __future__ import annotations
@@ -120,6 +120,10 @@ MX_SF_EARLY_RELEASE_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
 QKVG_BS1_SHAPE: Tuple[int, int] = (3216, 7168)
 QKVG_BS1_MMA_N = 8
 QKVG_BS1_SPLITS: Tuple[int, ...] = (3, 4)
+#: TRTLLM_K3LL_QKVG_BS1_SPLIT's default (-1) forces `QKVG_BS1_DEFAULT_SPLIT` only on these compute capabilities
+#: (measured on GB300 / SM103); elsewhere it keeps the heuristic's split.
+QKVG_BS1_SPLIT_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+QKVG_BS1_DEFAULT_SPLIT = 4
 #: ``(device index, N, K, split)`` of the forced-split kernels compiled in this process (`compile_qkvg_bs1_splits`,
 #: or an eager call).
 _QKVG_BS1_COMPILED: set = set()
@@ -176,13 +180,29 @@ def compile_qkvg_bs1_splits(weight: torch.Tensor) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=None)
+def _qkvg_bs1_split_by_default(device_index: int) -> int:
+    on = torch.cuda.get_device_capability(device_index) in QKVG_BS1_SPLIT_CAPABILITIES
+    return QKVG_BS1_DEFAULT_SPLIT if on else 0
+
+
+def qkvg_bs1_split(device: torch.device) -> int:
+    """``TRTLLM_K3LL_QKVG_BS1_SPLIT`` on ``device``: the forced split-K (0 = the heuristic's). A value >= 0 is used as
+    given; -1 (default) is `QKVG_BS1_DEFAULT_SPLIT` where ``device`` is in `QKVG_BS1_SPLIT_CAPABILITIES`, else 0."""
+    value = int(_flags.TRTLLM_K3LL_QKVG_BS1_SPLIT)
+    if value >= 0:
+        return value
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _qkvg_bs1_split_by_default(index)
+
+
 def _qkvg_bs1_split(
     x2d: torch.Tensor, weight: torch.Tensor, packed_scale: torch.Tensor
 ) -> Optional[torch.Tensor]:
     """`TRTLLM_K3LL_QKVG_BS1_SPLIT`: the fused KDA GEMM at the forced split-K where the switch is set, the weight is
     `QKVG_BS1_SHAPE` and ``x2d`` has at most `QKVG_BS1_MMA_N` rows (the caller checked ``can_run``); else None. In
     a capture an uncompiled kernel keeps the default split (census ``fallback:qkvg_bs1_split_not_compiled``)."""
-    split = int(_flags.TRTLLM_K3LL_QKVG_BS1_SPLIT)
+    split = qkvg_bs1_split(x2d.device)
     if not split:
         return None
     if split not in QKVG_BS1_SPLITS:
@@ -569,9 +589,9 @@ def gemm(
     ):
         return None
     if (
-        _flags.TRTLLM_K3LL_QKVG_BS1_SPLIT
-        and tuple(weight.shape) == QKVG_BS1_SHAPE
+        tuple(weight.shape) == QKVG_BS1_SHAPE
         and x2d.shape[0] > QKVG_BS1_MMA_N
+        and qkvg_bs1_split(x2d.device)
     ):
         _census_count(f"qkvg_bs1_split_skip_rows{x2d.shape[0]}")
     out = _offered_gemm(x2d, weight, packed_scale, True)

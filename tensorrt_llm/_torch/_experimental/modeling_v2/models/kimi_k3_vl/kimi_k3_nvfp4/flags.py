@@ -251,12 +251,13 @@ TRTLLM_K3LL_KDA_BFA_FP8 = _flag(
 )
 TRTLLM_K3LL_QKVG_BS1_SPLIT = _flag(
     "TRTLLM_K3LL_QKVG_BS1_SPLIT",
-    0,
+    -1,
     "TRTLLM_K3LL_KDA_BFA_FP8's fused [q | k | v | g | f_a | b] GEMM (3216 x 7168) at 8 or fewer rows (bs1 MTP7) on "
     "k3_fp8w_lowm_gemm at this split-K: 4 (104 CTAs, clusters of 4) or 3 (78 CTAs) instead of the heuristic's 5 (130 "
     "CTAs), whose prefetch behind bs1's k3_sandwich (56 SMs) is bimodal (fp8w_lowm.QKVG_BS1_SHAPE). Not bitwise "
     "(split-K changes the FP32 summation order). Splits 3 and 4 compile at load whatever the switch says; read at "
-    "forward time. 0 (default): the heuristic's split",
+    "forward time. 0: the heuristic's split; -1 (default): 4 on SM103 only (fp8w_lowm.QKVG_BS1_SPLIT_CAPABILITIES; "
+    "L1 bs1 -0.043 / -0.049 ms, GSM8K 0.9613 -> 0.9659 at gen bs1), else 0",
 )
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
