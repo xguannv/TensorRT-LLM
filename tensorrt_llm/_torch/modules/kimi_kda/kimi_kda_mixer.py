@@ -1101,7 +1101,21 @@ class KimiKDALinearAttention(nn.Module):
           manager's batch-row-indexed intermediate scratch buffers and
           ``update_mamba_states()`` promotes the accepted step's state
           after sampling.
+
+        Raises if the manager provisioned neither, as on a capture-only context
+        worker (TRTLLM_K3LL_DRAFTER_PROMPT_CTX), where no request may carry
+        draft tokens.
         """
+        if not self._has_kda_replay_caches(layer_cache) and not hasattr(
+            layer_cache, "intermediate_conv_window"
+        ):
+            raise RuntimeError(
+                f"KDA layer {self.layer_idx}: a generation request with {num_steps} tokens "
+                "reached the target's speculative verify step, but the cache manager "
+                "provisioned no verify state (no KDA replay caches, no intermediate "
+                "buffers). A capture-only context worker (TRTLLM_K3LL_DRAFTER_PROMPT_CTX) "
+                "must not schedule a request with draft tokens."
+            )
         if self._has_kda_replay_caches(layer_cache):
             assert self._dispatch.verify_kernel_path == "optimized", (
                 "KDA replay caches are allocated but the fused verify "
