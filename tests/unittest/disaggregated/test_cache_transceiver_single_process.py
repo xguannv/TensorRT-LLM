@@ -2210,6 +2210,13 @@ def run_drafter_window_transfer_test(
                 assert gen_drafts[cp_rank].prepare_drafter_window_receive(req, length)
                 mirror = gen_drafts[cp_rank].kv_cache_map[req.py_request_id]
                 assert mirror.capacity >= length
+                # The executor then prepares the gen-init request's resources as a last context
+                # chunk (_prepare_disagg_gen_resources); the window's mirror is left as admitted.
+                capacity, history = mirror.capacity, mirror.history_length
+                gen_init = ScheduledRequests()
+                gen_init.context_requests_last_chunk = [req]
+                gen_drafts[cp_rank].prepare_resources(gen_init)
+                assert (mirror.capacity, mirror.history_length) == (capacity, history)
                 kv_caches.append(mirror)
                 gen_tcs[cp_rank].request_and_receive_async(req)
 

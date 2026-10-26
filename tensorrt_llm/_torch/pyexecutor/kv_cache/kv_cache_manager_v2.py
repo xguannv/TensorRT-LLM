@@ -4743,6 +4743,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # separate draft engine still uses the legacy draft request view.
         with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
             for req in scheduled_batch.context_requests:
+                if self.drafter_prompt_window > 0 and req.is_generation_only_request:
+                    # A disaggregated generation request's mirror holds its drafter prompt
+                    # window: prepare_drafter_window_receive created and sized it at admission
+                    # (history = window length), and generation steps grow it from there.
+                    continue
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     # Pre-existing behaviour, kept deliberately: skipping does NOT buy a
