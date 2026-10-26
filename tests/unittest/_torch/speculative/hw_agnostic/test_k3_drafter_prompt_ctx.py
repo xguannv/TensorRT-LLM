@@ -304,16 +304,18 @@ def test_renumbered_window_matches_a_store_at_window_positions():
 
 
 @needs_cuda
-@pytest.mark.parametrize("shift", [8192, 32768, 150000, 600000])
+@pytest.mark.parametrize("shift", [8192, 32768, 150000, 300000, 600000])
 def test_renumber_at_long_shift(shift):
     """Measured at real shifts with the real K3 DSpark rope parameters: the context's store at s + j, moved by -s,
     against the store at j. Two moves are measured: the float64 angle (DSparkMLAContextRenumber) and the float32
     table's own phase at s (the conj of the _mla_freqs_cis row). Both are also measured against the exact rotation of
     the same stored bits. The printed lines are the report.
 
-    The move holds its single rounding at every shift. Against the store, a residual remains that grows with s:
-    the store's own float32 angle rounding at s + j (up to about (s + j) * inv_freq * 2^-24 rad), which no move can
-    undo. That residual is reported."""
+    The move holds its single rounding at every shift (<= 1 pair ulp against the exact rotation). Against the store
+    it is held to the double-rounding floor (<= 2 pair ulps) up to 150K, the longest bin where the drafter's
+    acceptance with the window shift is measured. Above that, a residual that grows with s is reported, not
+    asserted: the store's own float32 angle rounding at s + j (up to about (s + j) * inv_freq * 2^-24 rad). No move
+    can undo it, and a store at absolute positions carries it too."""
     sem = _semantics()
     drafter = _build(MLADSparkForCausalLM, sem._tiny_mla_weights(), rope_parameters=K3_DSPARK_ROPE)
     n = 256
@@ -348,6 +350,8 @@ def test_renumber_at_long_shift(shift):
     e2e32 = _summary(f"RENUMBER s={shift} fp32-table vs store", moved32, reference)
     assert move64.max() <= 1.0
     assert e2e64.mean() <= e2e32.mean() + 1e-9
+    if shift <= 150000:
+        assert e2e64.max() <= 2.0
 
 
 @needs_cuda
