@@ -457,6 +457,13 @@ def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
     return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
 
 
+#: Token rows per ``trtllm::attn_res_fwd`` call. Larger inputs are processed in
+#: slices of this many tokens: the mixture is per token, so slicing is exact,
+#: and the fp32 reference would otherwise materialize several
+#: ``[M, K + 1, H]`` fp32 tensors (27.5 GiB at M = 32768, K = 8).
+_ATTN_RES_FWD_MAX_TOKENS = 16384
+
+
 def _apply_attn_res_fused(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
 ) -> Optional[torch.Tensor]:
@@ -466,7 +473,8 @@ def _apply_attn_res_fused(
     contract (dtype/shape/arch) so the caller can use the exact fp32 reference
     instead. ``block_residual`` is kept in the kernel-native ``[K, M, H]``
     layout. Candidate order matches the reference: snapshots first, the
-    running prefix sum last.
+    running prefix sum last. More than ``_ATTN_RES_FWD_MAX_TOKENS`` tokens are
+    run in token slices of that size.
     """
     if (
         prefix_sum.dtype is not torch.bfloat16
@@ -476,22 +484,32 @@ def _apply_attn_res_fused(
         return None
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
-    if K + 1 > 12 or M > 16384 or not (4096 <= H <= 8192 and H % 1024 == 0):
+    if K + 1 > 12 or not (4096 <= H <= 8192 and H % 1024 == 0):
         return None
     try:
         attn_res_op = torch.ops.trtllm.attn_res_fwd
     except (AttributeError, RuntimeError):
         return None
-    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
-    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output, _rsigma, _probs, _logits = attn_res_op(
-        layer_kernel,
-        block_kernel,
-        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
-        norm.weight.to(torch.bfloat16).contiguous(),
-        float(norm.eps),
-    )
-    return output.reshape(M, H)
+    proj_weight = proj.weight.reshape(-1).to(torch.bfloat16).contiguous()
+    norm_weight = norm.weight.to(torch.bfloat16).contiguous()
+
+    def run(layer: torch.Tensor, block: torch.Tensor, m: int) -> torch.Tensor:
+        output, _rsigma, _probs, _logits = attn_res_op(
+            layer.reshape(m, 1, H).contiguous(),
+            block.reshape(K, m, 1, H).contiguous(),
+            proj_weight,
+            norm_weight,
+            float(norm.eps),
+        )
+        return output.reshape(m, H)
+
+    if M <= _ATTN_RES_FWD_MAX_TOKENS:
+        return run(prefix_sum, block_residual, M)
+    out = prefix_sum.new_empty(M, H)
+    for start in range(0, M, _ATTN_RES_FWD_MAX_TOKENS):
+        end = min(M, start + _ATTN_RES_FWD_MAX_TOKENS)
+        out[start:end] = run(prefix_sum[start:end], block_residual[:, start:end], end - start)
+    return out
 
 
 def _rms_norm_eps(norm: nn.Module) -> float:
