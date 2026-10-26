@@ -257,7 +257,9 @@ def _run_mx(
     early = _sf_early_release(xq.device)
     if torch.cuda.is_current_stream_capturing() and not kernel.is_compiled(m, n, k, True, early):
         # Compiling under capture is not allowed; the low-M kernel gives the same bits. Warm-up runs eagerly first.
+        # Counted in the census too, so an A/B whose B arm recaptured into this fallback shows it (tools/gates).
         MX_STATS["not_compiled"] += 1
+        _census_count("fallback:mx_not_compiled")
         key = (m, n, k, early)
         if key not in _MX_LOGGED:
             _MX_LOGGED.add(key)
