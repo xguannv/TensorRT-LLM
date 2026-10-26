@@ -840,10 +840,47 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Cache-transceiver mode disables the separate one-model draft manager,
         # so disagg generation init has no paired-reuse path. Supporting one
         # would also require draft KV transfer and history_length=prompt_len.
+        # The exception is the drafter prompt window (TRTLLM_K3LL_DRAFTER_PROMPT_CTX):
+        # the draft mirror is sized to the window here, before the target's
+        # readiness event is recorded, so that event covers both pools.
+        if not self._prepare_drafter_window_receive(req):
+            logger.debug("prepare_drafter_window_receive failed for request %s", req.py_request_id)
+            return ScheduleAction.SKIP, 0
         if not self.kv_cache_manager.prepare_disagg_gen_init(req):
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
+
+    def _prepare_drafter_window_receive(self, req: LlmRequest) -> bool:
+        """Size the draft mirror for the request's drafter prompt window, if the draft manager
+        receives one (``drafter_prompt_window`` > 0); True when there is nothing to do.
+
+        The window is ``drafter_window`` of the global prompt length, which is what the
+        transceiver lists. If the draft manager runs on another stream, the target's stream
+        waits for it, so the target's readiness event covers the draft resize too.
+        """
+        draft = self.draft_kv_cache_manager
+        window = getattr(draft, "drafter_prompt_window", 0) if draft is not None else 0
+        if window <= 0:
+            return True
+        import torch
+
+        from ...disaggregation.transceiver import drafter_window
+
+        _, length = drafter_window(req.total_input_len_cp, window, draft.tokens_per_block)
+        if not draft.prepare_drafter_window_receive(req, length):
+            return False
+        target_stream = getattr(self.kv_cache_manager, "_stream", None)
+        draft_stream = getattr(draft, "_stream", None)
+        if (
+            target_stream is not None
+            and draft_stream is not None
+            and target_stream.cuda_stream != draft_stream.cuda_stream
+        ):
+            event = torch.cuda.Event()
+            event.record(draft_stream)
+            target_stream.wait_event(event)
+        return True
 
     def _try_schedule_context(
         self,

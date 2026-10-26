@@ -4363,9 +4363,22 @@ def create_py_executor_instance(
         draft_prompt_window = k3ll_flag_any_target(
             "TRTLLM_K3LL_DRAFTER_PROMPT_CTX")
         if draft_prompt_window > 0:
+            # The drafter's own position shift, which a generation rank applies
+            # to the received window; a drafter without one cannot take part.
+            drafter_model = getattr(model_engine.model, "draft_model", None)
+            context_renumber = getattr(drafter_model, "context_renumber", None)
+            if context_renumber is None:
+                raise ValueError(
+                    "TRTLLM_K3LL_DRAFTER_PROMPT_CTX > 0 needs a drafter with "
+                    "context_renumber (the MLA DSpark drafter), got "
+                    f"{type(drafter_model).__name__}")
+            # The scheduler sizes a generation request's draft mirror to the
+            # window before its receive is published.
+            transfer_draft_manager.drafter_prompt_window = draft_prompt_window
             draft_transfer_kwargs = dict(
                 draft_kv_cache_manager=transfer_draft_manager,
-                draft_prompt_window=draft_prompt_window)
+                draft_prompt_window=draft_prompt_window,
+                draft_context_renumber=context_renumber())
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config, mamba_cache_manager, **draft_transfer_kwargs)

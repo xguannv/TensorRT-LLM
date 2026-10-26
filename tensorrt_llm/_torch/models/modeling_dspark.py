@@ -2223,6 +2223,64 @@ def build_dspark_mla_yarn_freqs_cis(*, device: str = "cuda", **kwargs) -> torch.
     return torch.complex(cos[..., :half], sin[..., :half]).contiguous()
 
 
+class DSparkMLAContextRenumber:
+    """Moves stored MLA drafter context latents from position ``p`` to ``p - shift``.
+
+    A stored row is ``[kv_lora_rank | qk_rope_head_dim]``. ``precompute_context_kv`` writes its
+    rope slice as adjacent (re, im) pairs, multiplied by ``mscale * exp(i * p * inv_freq)``. That is
+    the :func:`build_dspark_mla_yarn_freqs_cis` row at ``p``, the convention the fused RMSNorm+RoPE
+    kernel and :func:`apply_dspark_rotary` share. Multiplying the slice by the unit phase
+    ``exp(-i * shift * inv_freq)`` moves it to ``p - shift``; ``mscale`` lives in the modulus and
+    stays. The latent half does not depend on the position and is not touched.
+
+    Precision:
+    - ``inv_freq`` is the drafter table's own float32 frequency vector, from the same YaRN
+      utility and the same parameters as ``_mla_freqs_cis``.
+    - The angle ``shift * inv_freq`` is taken in float64, and its cos / sin are rounded to float32.
+    - The product is formed in float32 and rounded to the cache dtype once.
+
+    Against a store made directly at ``p - shift``, what remains is that store's own float32
+    angle rounding at ``p``.
+    """
+
+    def __init__(self, rope_params: dict, kv_lora_rank: int, rope_head_dim: int):
+        inv_freq, _ = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            num_pos=1,
+            dim=rope_head_dim,
+            base=rope_params["theta"],
+            scaling_factor=rope_params["scaling_factor"],
+            original_max_position_embeddings=rope_params["original_max_positions"],
+            beta_fast=rope_params["beta_fast"],
+            beta_slow=rope_params["beta_slow"],
+            mscale=rope_params["mscale"],
+            mscale_all_dim=rope_params["mscale_all_dim"],
+            duplicate_data=True,
+        )
+        # float32 values, held exactly in float64 for the angle product.
+        self.inv_freq = torch.from_numpy(inv_freq).to(torch.float64)
+        assert self.inv_freq.numel() * 2 == rope_head_dim
+        self.rope_head_dim = rope_head_dim
+        self.rope_offset = kv_lora_rank
+        self.row_elems = kv_lora_rank + rope_head_dim
+
+    def phases(self, shift: int, device) -> torch.Tensor:
+        """``exp(-i * shift * inv_freq)`` as complex64 ``[rope_head_dim // 2]`` on ``device``."""
+        angle = -float(shift) * self.inv_freq
+        return torch.polar(torch.ones_like(angle), angle).to(torch.complex64).to(device)
+
+    def __call__(self, rope: torch.Tensor, shift: int) -> torch.Tensor:
+        """The rope slices ``rope`` (``[..., rope_head_dim]``) moved by ``-shift``, same dtype."""
+        xc = torch.view_as_complex(rope.float().contiguous().unflatten(-1, (-1, 2)))
+        out = torch.view_as_real(xc * self.phases(shift, rope.device)).flatten(-2)
+        return out.to(rope.dtype)
+
+    def renumber_rows_(self, rows: torch.Tensor, shift: int) -> None:
+        """In place on full rows ``[..., kv_lora_rank + rope_head_dim]``."""
+        assert rows.shape[-1] == self.row_elems, (tuple(rows.shape), self.row_elems)
+        rope = rows[..., self.rope_offset :]
+        rope.copy_(self(rope, shift))
+
+
 def apply_dspark_mla_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Rotate the trailing ``qk_rope_head_dim`` of ``x`` the HF DeepSeek way.
 
@@ -3263,6 +3321,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
 
     # -- context cache -----------------------------------------------------
+
+    def context_renumber(self) -> DSparkMLAContextRenumber:
+        """Shifts this drafter's stored context latents to new positions, under its own RoPE convention.
+
+        Used on a disaggregated generation worker: the received drafter prompt window was stored
+        by the context worker at absolute positions s .. P-1 and is moved to 0 .. L-1.
+        """
+        return DSparkMLAContextRenumber(
+            self._mla_rope_params, self.kv_lora_rank, self.qk_rope_head_dim
+        )
 
     def precompute_context_kv(self, projected_hidden, positions):
         """Post-norm / post-RoPE MLA latent for ALL drafter layers in one GEMM.

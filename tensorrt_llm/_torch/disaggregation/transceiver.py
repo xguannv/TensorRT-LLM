@@ -55,7 +55,10 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_pool_view_slot_bytes,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.k3ll_flags import k3ll_flag
@@ -69,7 +72,15 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
-from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
+from tensorrt_llm._utils import (
+    ENABLE_MULTI_DEVICE,
+    TensorWrapper,
+    binding_to_torch_dtype,
+    convert_to_torch_tensor,
+    mpi_comm,
+    mpi_disabled,
+    nvtx_range,
+)
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -257,12 +268,48 @@ def _validate_fp4_mla_bridge_profile(
     return True
 
 
+def _renumber_pool_rows(
+    pool, buffer_entries: np.ndarray, pages: np.ndarray, dtype: torch.dtype, renumber, shift: int
+) -> None:
+    """Apply ``renumber.renumber_rows_(rows, shift)`` to every row of ``pages`` in one pool.
+
+    A page's buffers are ``buffer_entries`` (byte ``offset`` / ``size`` within the slot at
+    ``base + page * slot_stride``), the same addressing the transfer's mappers use. Each buffer
+    must be whole rows of ``renumber.row_elems`` elements of ``dtype``, starting on a row
+    boundary. The rows are gathered, shifted and scattered back with one index.
+    """
+    row_bytes = renumber.row_elems * torch.empty((), dtype=dtype).element_size()
+    offsets = buffer_entries["offset"].astype(np.int64)
+    sizes = buffer_entries["size"].astype(np.int64)
+    starts = pages.astype(np.int64)[:, None] * int(pool.slot_stride_bytes) + offsets[None, :]
+    if np.any(sizes % row_bytes) or np.any(starts % row_bytes):
+        raise ValueError(
+            f"draft pool buffers are not whole {row_bytes}-byte rows "
+            f"(sizes {sorted(set(sizes.tolist()))}, slot stride {pool.slot_stride_bytes})"
+        )
+    rows = np.concatenate(
+        [
+            (starts[:, e] // row_bytes)[:, None] + np.arange(sizes[e] // row_bytes)[None, :]
+            for e in range(len(sizes))
+        ],
+        axis=None,
+    )
+    view = convert_to_torch_tensor(
+        TensorWrapper(int(pool.base_address), dtype, [int(rows.max()) + 1, renumber.row_elems])
+    )
+    index = torch.from_numpy(rows).to(view.device)
+    picked = view.index_select(0, index)
+    renumber.renumber_rows_(picked, shift)
+    view.index_copy_(0, index, picked)
+
+
 class KvCacheTransceiverV2(KvCacheTransceiver):
     # No draft KV cache transfer unless __init__ is given a draft manager; declared on the class so
     # an instance built without running __init__ transfers the target manager alone.
     _draft_kv_cache_manager: Optional[KVCacheManagerV2] = None
     _draft_reuse_adapter: Optional[CacheReuseAdapter] = None
     _draft_prompt_window: int = 0
+    _draft_context_renumber: Optional[Callable] = None
     # Leading page-table layer groups that belong to the target manager; the draft groups follow.
     _num_target_layer_groups: int = 0
 
@@ -278,6 +325,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cache_transceiver_config: CacheTransceiverConfig,
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
         draft_prompt_window: int = 0,
+        draft_context_renumber: Optional[Callable] = None,
     ):
         """Create the transceiver for one rank.
 
@@ -292,6 +340,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 Helix CP ranks included.
             draft_prompt_window: The drafter prompt window in tokens; required
                 (> 0) with ``draft_kv_cache_manager`` and ignored without it.
+            draft_context_renumber: Required with ``draft_kv_cache_manager``. It is the
+                drafter's position shift for stored context rows
+                (``DSparkMLAContextRenumber``: ``row_elems``, ``rope_offset`` and
+                ``renumber_rows_(rows, shift)``). The context stores the window at absolute
+                positions s .. P-1; a generation rank applies the shift once per request
+                when its receive completes (``_finish_draft_window_receive``), so the drafter
+                reads the window at positions 0 .. L-1.
         """
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
@@ -300,6 +355,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._mapping = mapping
         self._draft_kv_cache_manager = draft_kv_cache_manager
         self._draft_prompt_window = draft_prompt_window if draft_kv_cache_manager is not None else 0
+        self._draft_context_renumber = (
+            draft_context_renumber if draft_kv_cache_manager is not None else None
+        )
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
             raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
@@ -682,6 +740,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             window[: held.size] = held
             groups.append(window)
         return groups
+
+    def _finish_draft_window_receive(self, req: LlmRequest) -> None:
+        """Move a completed receive's drafter window to positions 0 .. L-1 and record it on ``req``.
+
+        The window's latents arrive as the context stored them, at absolute positions s .. P-1
+        (``drafter_window``). They are shifted by -s once, in place in this rank's draft pages
+        ``[0, ceil(L / tpb))``, on the current stream, which the drafter's later reads follow.
+        Every row of those pages is shifted; rows past L hold nothing yet and are overwritten
+        by the generation appends. The request then carries
+        ``py_drafter_ctx_len`` = L (the context length the drafter admits it with; column ==
+        position) and ``py_drafter_ctx_start`` = s (diagnostics only).
+        """
+        draft = self._draft_kv_cache_manager
+        if draft is None:
+            return
+        start, length = drafter_window(
+            req.total_input_len_cp, self._draft_prompt_window, draft.tokens_per_block
+        )
+        if start > 0:
+            renumber = self._draft_context_renumber
+            dtype = binding_to_torch_dtype(draft.dtype)
+            table = self._page_table
+            for group_idx, pages in enumerate(self._describe_draft_window(req)):
+                lg_idx = self._num_target_layer_groups + group_idx
+                pages = pages[pages >= 0]
+                if pages.size == 0:
+                    continue
+                for view in table.layer_groups[lg_idx].pool_views:
+                    _renumber_pool_rows(
+                        get_physical_pool(table, lg_idx, view.pool_idx),
+                        view.buffer_entries,
+                        pages,
+                        dtype,
+                        renumber,
+                        start,
+                    )
+        req.py_drafter_ctx_start = start
+        req.py_drafter_ctx_len = length
 
     @staticmethod
     def _positional_window(
@@ -1248,6 +1344,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
+                self._finish_draft_window_receive(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1534,6 +1631,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
             self._close_session_or_raise(session, rid, "completed")
+            self._finish_draft_window_receive(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
@@ -1751,6 +1849,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise ValueError(
                 "KvCacheTransceiverV2: the draft KV cache transfer requires pp_size == 1, "
                 f"got {self._mapping.pp_size}"
+            )
+        if self._draft_context_renumber is None:
+            raise ValueError(
+                "KvCacheTransceiverV2: the draft KV cache transfer requires draft_context_renumber "
+                "(the drafter's position shift that moves a received window to positions 0 .. L-1)"
             )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:

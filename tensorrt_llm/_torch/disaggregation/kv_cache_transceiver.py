@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from os import environ, getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -151,12 +151,15 @@ def create_kv_cache_transceiver(
     mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     draft_prompt_window: int = 0,
+    draft_context_renumber: Optional[Callable] = None,
 ) -> Optional["KvCacheTransceiver"]:
     """Create the KV cache transceiver selected by ``cache_transceiver_config``, or None.
 
     ``draft_kv_cache_manager`` (with ``draft_prompt_window`` > 0) additionally
     transfers each request's drafter prompt window from the draft manager; only
-    the Python transceiver (``KvCacheTransceiverV2``) supports it.
+    the Python transceiver (``KvCacheTransceiverV2``) supports it, and it needs
+    ``draft_context_renumber``, the drafter's position shift that a generation
+    rank applies to the received window.
     """
     resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
@@ -245,7 +248,8 @@ def create_kv_cache_transceiver(
             kv_cache_manager,
             cache_transceiver_config,
             draft_kv_cache_manager=draft_kv_cache_manager,
-            draft_prompt_window=draft_prompt_window)
+            draft_prompt_window=draft_prompt_window,
+            draft_context_renumber=draft_context_renumber)
 
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
