@@ -234,12 +234,11 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
     weights = (ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2)
 
-    def lowm(token_scales, fast=False, late=False):
+    def lowm(token_scales, fast=False):
         out.fill_(7.0)  # the kernel zeroes the output itself
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, t2g, t2lim, p2e, nnet, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, static_first=fast, fast_tok=fast,
-            late_atom=late,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "counters not reset"
@@ -300,12 +299,6 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
             ), f"{tag}: FC2 slot {slot}"
         for rep in range(3):
             check(op(scales, fast=True), f"{tag} op, call {rep}")
-        # late_atom: the second unit taken after the first unit's stages are issued
-        assert torch.equal(
-            op(one_hot).view(torch.int16), op(one_hot, fast=True, late=True).view(torch.int16)
-        ), f"{tag} late_atom: FC2 slot {top_k - 1}"
-        for rep in range(2):
-            check(op(scales, fast=True, late=True), f"{tag} late_atom op, call {rep}")
         for rep in range(2):
             y = nvfp4_lowm_op.run(*run_args, num_ctas=num_ctas, self_sort=self_sort, fast=True)
             torch.cuda.synchronize()
@@ -336,14 +329,14 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def lowm_self(token_scales, fast=False, late=False):
+    def lowm_self(token_scales, fast=False):
         out.fill_(7.0)
         h.zero_()
         h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
-            static_first=fast, fast_tok=fast, late_atom=late,
+            static_first=fast, fast_tok=fast,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
