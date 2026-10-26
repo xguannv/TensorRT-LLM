@@ -119,6 +119,8 @@ _SLOT_BYTES = _MMA_M * _KBLK // 2
 _ZERO_SLICES = 4
 #: ``trace``: u64 words of per-tile records (4 per tile) before the per-unit records.
 TRACE_UNIT_BASE = 4 * 4096
+#: Extra per-CTA stamps (``trace``): 16 u64 per CTA at this many words past the per-CTA records (`_xstamp`).
+TRACE_X_BASE = 2 * 4096
 
 
 def counter_words(max_tiles: int) -> int:
@@ -532,6 +534,18 @@ class K3MoeLowMDynKernel:
         _stg_u64(trace_ptr.toint() + Int64(bid * 16 + ev) * 8, _globaltimer())
 
     @cute.jit
+    def _xstamp(self, trace_ptr, bid, ev: int):
+        """Extra per-CTA stamp (``trace``) at ``TRACE_X_BASE``: 0 self-sort done, 1 FC1 token TMA issued, 2 / 3
+        the MMA sees the tokens / token scales, 4 the MMA sees its first weight stage, 5 epilogue WG0 past the
+        TMEM wait, 6 token scales stored, 7 / 8 self-sort past its first / second barrier, 9 weight warp in
+        its producer loop, 10 its first unit queued, 11 past the next-unit atomic of its first unit."""
+        nct, _, _ = cute.arch.grid_dim()
+        _stg_u64(
+            trace_ptr.toint() + (Int64(nct) * 16 + Int64(TRACE_X_BASE) + Int64(bid) * 16 + ev) * 8,
+            _globaltimer(),
+        )
+
+    @cute.jit
     def _unit_stamp(self, trace_ptr, unit, field: int, value):
         """Per-unit trace record (``trace``): 4 u64 per unit at ``TRACE_UNIT_BASE`` words past the per-CTA
         and per-tile records: [0] the weight warp takes it, [1] its last stage issued, [2] its last MMA issued,
@@ -671,7 +685,10 @@ class K3MoeLowMDynKernel:
                 tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles,
-            ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx)
+            ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx, trace_ptr, bid)
+            if cutlass.const_expr(self.trace):
+                if tidx == 0:
+                    self._xstamp(trace_ptr, bid, 0)
 
         # the CTA's first unit and the experts of the first 32 tiles: both loads are in flight while
         # the tile count loads
@@ -742,12 +759,18 @@ class K3MoeLowMDynKernel:
             wg = tidx // 128
             et = tidx % 128
             cute.arch.mbarrier_wait(st.tmem_ready, 0)
+            if cutlass.const_expr(self.trace):
+                if tidx == 0:
+                    self._xstamp(trace_ptr, bid, 5)
             acc_ptr = cute.arch.retrieve_tmem_ptr(
                 Float32, alignment=16, ptr_to_buffer_holding_addr=st.tmem_holding_buf
             )
             if wg == 0:
                 if w1 > 0:
                     self._token_scales_to_smem(st, x_sf_ptr, orig_m, et)
+            if cutlass.const_expr(self.trace):
+                if tidx == 0:
+                    self._xstamp(trace_ptr, bid, 6)
             self._epilogue(
                 st,
                 tiled_mma,
@@ -783,7 +806,17 @@ class K3MoeLowMDynKernel:
 
     # ------------------------------------------------------------------ self-sort
     @cute.jit
-    def _self_sort(self, st, topk_ids, local_offset: Int32, num_local: Int32, orig_m: Int32, tidx):
+    def _self_sort(
+        self,
+        st,
+        topk_ids,
+        local_offset: Int32,
+        num_local: Int32,
+        orig_m: Int32,
+        tidx,
+        trace_ptr=None,
+        bid=None,
+    ):
         """The step's tile metadata in shared memory, by every thread of the CTA (``k3_moe_front``'s
         ``_sort_local``): ``(expert of tile, tile * 128 + rows of tile, permuted -> expanded index,
         tile count)`` as tensors indexed like ``moe_sort``'s outputs (the permuted view maps
@@ -813,6 +846,9 @@ class K3MoeLowMDynKernel:
                     _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
             lxs.append(lx)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 7)
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         nwarps = nthr // 32
@@ -823,6 +859,9 @@ class K3MoeLowMDynKernel:
                 if lane == Int32(0):
                     union[w] = Int32(b)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 8)
         u = []
         for w in cutlass.range_constexpr(W):
             u.append(union[w])
@@ -949,6 +988,9 @@ class K3MoeLowMDynKernel:
         lane = cute.arch.lane_idx()
         ctr = ctr_ptr.toint()
         cur = cute.arch.shuffle_sync(first, 0)
+        if cutlass.const_expr(self.trace):
+            with cute.arch.elect_one():
+                self._xstamp(trace_ptr, bid, 9)
         g = Int32(0)
         j = Int32(0)
         n1u = Int32(0)
@@ -959,11 +1001,19 @@ class K3MoeLowMDynKernel:
                 if cutlass.const_expr(self.static_first):
                     nxt = nxt + nctas
             if cutlass.const_expr(self.trace):
+                if j == 0:
+                    with cute.arch.elect_one():
+                        self._xstamp(trace_ptr, bid, 11)
+            if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 0, _globaltimer())
                     self._unit_stamp(trace_ptr, cur, 3, Int64(bid))
             if cur < w1:
                 self._q_write(st, j, cur, Int32(-1))
+                if cutlass.const_expr(self.trace):
+                    if j == 0:
+                        with cute.arch.elect_one():
+                            self._xstamp(trace_ptr, bid, 10)
                 tile = cur // self.nblk1
                 blk = cur - tile * self.nblk1
                 expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
@@ -1032,6 +1082,28 @@ class K3MoeLowMDynKernel:
                 _st_relaxed_u32(ctr + 4, 0)
 
     @cute.jit
+    def _issue_tokens(self, st, thr_mma, cl, b_layout, tma_b1, mB1):
+        """FC1's token operand (the step's tokens, all K blocks) by TMA into its slot past the ring, on
+        ``tok_full`` (one warp)."""
+        b_cta = cute.make_layout(cute.slice_(cl, (0, None, 0, 0)).shape)
+        tiler = cute.slice_(self.mma_tiler, (0, None, None))
+        sB = self._view(st, b_layout, self.ab_dtype)
+        tCgB1 = thr_mma.partition_B(cute.local_tile(mB1, tiler, (None, None, None)))
+        tBsB1, tBgB1 = cpasync.tma_partition(
+            tma_b1, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB1, 0, 3)
+        )
+        x_stage0 = self.num_ab_stage * self.b_per_slot
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(st.tok_full, self.x_bytes)
+        for kb in cutlass.range(self.nkb1, unroll=1):
+            cute.copy(
+                tma_b1,
+                tBgB1[(None, 0, kb, 0)],
+                tBsB1[(None, x_stage0 + kb)],
+                tma_bar_ptr=st.tok_full,
+            )
+
+    @cute.jit
     def _token_producer(
         self,
         st,
@@ -1059,25 +1131,15 @@ class K3MoeLowMDynKernel:
         b_cta = cute.make_layout(cute.slice_(cl, (0, None, 0, 0)).shape)
         tiler = cute.slice_(self.mma_tiler, (0, None, None))
         sB = self._view(st, b_layout, self.ab_dtype)
-        tCgB1 = thr_mma.partition_B(cute.local_tile(mB1, tiler, (None, None, None)))
-        tBsB1, tBgB1 = cpasync.tma_partition(
-            tma_b1, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB1, 0, 3)
-        )
         tCgB2 = thr_mma.partition_B(cute.local_tile(mB2, tiler, (None, None, None)))
         tBsB2, tBgB2 = cpasync.tma_partition(
             tma_b2, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB2, 0, 3)
         )
-        x_stage0 = S * self.b_per_slot
         if w1 > 0:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(st.tok_full, self.x_bytes)
-            for kb in cutlass.range(self.nkb1, unroll=1):
-                cute.copy(
-                    tma_b1,
-                    tBgB1[(None, 0, kb, 0)],
-                    tBsB1[(None, x_stage0 + kb)],
-                    tma_bar_ptr=st.tok_full,
-                )
+            self._issue_tokens(st, thr_mma, cl, b_layout, tma_b1, mB1)
+            if cutlass.const_expr(self.trace):
+                with cute.arch.elect_one():
+                    self._xstamp(trace_ptr, bid, 1)
         a_full = st.a_full.data_ptr()
         slot_base = st.sA.data_ptr().toint()
         h_sf_base = h_sf_ptr.toint()
@@ -1253,7 +1315,13 @@ class K3MoeLowMDynKernel:
                 if first1 > 0:
                     first1 = Int32(0)
                     cute.arch.mbarrier_wait(st.tok_full, 0)
+                    if cutlass.const_expr(self.trace):
+                        with cute.arch.elect_one():
+                            self._xstamp(trace_ptr, bid, 2)
                     cute.arch.mbarrier_wait(st.sfb_full, 0)
+                    if cutlass.const_expr(self.trace):
+                        with cute.arch.elect_one():
+                            self._xstamp(trace_ptr, bid, 3)
             else:
                 if cutlass.const_expr(self.trace):
                     if in_fc2 == 0:
@@ -1291,6 +1359,9 @@ class K3MoeLowMDynKernel:
                     cute.arch.mbarrier_wait(a_full + stage, (g // S) & 1)
                     if cutlass.const_expr(self.trace):
                         w_a += _globaltimer() - t_w
+                        if g == 0:
+                            with cute.arch.elect_one():
+                                self._xstamp(trace_ptr, bid, 4)
                     cute.copy(s2t_sfa, tCsSFA[(None, None, None, None, stage)], tCtSFA_s2t)
                     cute.copy(s2t_sfb, tCsSFB[(None, None, None, None, sf0 + kb)], tCtSFB_s2t)
                     for kp in cutlass.range_constexpr(nkp):
@@ -1336,12 +1407,16 @@ class K3MoeLowMDynKernel:
     def _token_scales_to_smem(self, st, x_sf_ptr, orig_m: Int32, tidx: Int32):
         """Token scales, linear [orig_m, k1 / 16], into the MMA's 128x4-blocked SMEM layout (rows
         past orig_m zero), every load in flight before the first store."""
+        self._token_scales_store(st, self._token_scales_load(x_sf_ptr, orig_m, tidx), orig_m, tidx)
+
+    @cute.jit
+    def _token_scales_load(self, x_sf_ptr, orig_m: Int32, tidx: Int32):
+        """`_token_scales_to_smem`'s loads (thread ``tidx`` of 128) into registers."""
         n_tok = self.n_tok
         nwords = self.nkb1 * 4 * n_tok
         per_thread = (nwords + 127) // 128
         sf_row_bytes = self.k1 // _SF_VEC
         x_sf_base = x_sf_ptr.toint()
-        sfb_base = self._region_addr(st, self.sfb_off)
         vals = cute.make_rmem_tensor((per_thread,), Int32)
         for t in cutlass.range_constexpr(per_thread):
             i = tidx + t * 128
@@ -1351,6 +1426,15 @@ class K3MoeLowMDynKernel:
             kb = cutlass.min(rest // 4, self.nkb1 - 1)
             rr = cutlass.min(r, orig_m - 1)
             vals[t] = _ldg_u32(x_sf_base + Int64(rr * sf_row_bytes + kb * 16 + atom * 4))
+        return vals
+
+    @cute.jit
+    def _token_scales_store(self, st, vals, orig_m: Int32, tidx: Int32):
+        """`_token_scales_to_smem`'s stores of ``vals`` (`_token_scales_load`'s) and WG0's arrive."""
+        n_tok = self.n_tok
+        nwords = self.nkb1 * 4 * n_tok
+        per_thread = (nwords + 127) // 128
+        sfb_base = self._region_addr(st, self.sfb_off)
         for t in cutlass.range_constexpr(per_thread):
             i = tidx + t * 128
             r = i % n_tok

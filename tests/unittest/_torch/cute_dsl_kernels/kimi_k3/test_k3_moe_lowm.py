@@ -390,6 +390,24 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         check(static, f"self-sort graph replay {replay}")
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset after a replay"
     check_fast(lowm_self, self_sort=True)
+    # no local expert: the output zeroed, the counters reset
+    far = (
+        ((offset + num_local + torch.arange(top_k, device="cuda")) % num_experts)
+        .int()
+        .expand(num_tokens, top_k)
+    )
+    for fast in (False, True):
+        out.fill_(7.0)
+        _trtllm().k3_moe_nvfp4_lowm(
+            _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
+            scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=far.contiguous(),
+            local_offset=offset, static_first=fast, fast_tok=fast,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        assert int(out.view(torch.int16).abs().sum().item()) == 0, (
+            f"no local expert (fast {fast}): output"
+        )
+        assert int(counters.abs().sum().item()) == 0, f"no local expert (fast {fast}): counters"
 
 
 @pytest.mark.parametrize("ceil_chunk", [False, True], ids=["fc2_equal_ranges", "fc2_ceil_chunk"])
