@@ -1348,6 +1348,13 @@ class SpecMetadata:
         self.group_all_greedy_sample = None
         self._scan_one_model_sampling(requests)
 
+    def populate_request_state(self, requests: list["LlmRequest"]) -> None:
+        """Read per-request state ``prepare`` needs beyond ``request_ids``.
+
+        Called with the step's scheduled requests right before ``prepare``.
+        The base class reads nothing.
+        """
+
     def populate_sampling_params_for_one_model(
             self, requests: list["LlmRequest"]) -> None:
         """
