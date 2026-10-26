@@ -406,16 +406,24 @@ class _SelfSortMixin:
         expert, count, perm = self._ss_tensors(storage)
         mask_base = storage.sSsBits.data_ptr().toint()
         n = orig_m * Int32(K)
-        # 1. id j = token * K + slot: its token's bit into its local expert's mask (lx = -1: not local / no id)
+        # 1. id j = token * K + slot: its token's bit into its local expert's mask (lx = -1: not local / no id).
+        # All of this thread's ids are loaded before the first red: the red is a volatile asm, so a load after it
+        # would wait for the previous one's round trip.
+        es = []
+        for i in cutlass.range_constexpr(per):
+            j = tidx + Int32(i * nthr)
+            e = Int32(-1)
+            if j < n:
+                e = topk_ids[j] - off
+            es.append(e)
         lxs = []
         for i in cutlass.range_constexpr(per):
             j = tidx + Int32(i * nthr)
+            e = es[i]
             lx = Int32(-1)
-            if j < n:
-                e = topk_ids[j] - off
-                if (e >= Int32(0)) & (e < num_local):
-                    lx = e
-                    _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
+            if (e >= Int32(0)) & (e < num_local):
+                lx = e
+                _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
             lxs.append(lx)
         cute.arch.barrier()
         # 2. union bit lx = the expert is touched; warp w ballots experts [32 w, 32 w + 32)
