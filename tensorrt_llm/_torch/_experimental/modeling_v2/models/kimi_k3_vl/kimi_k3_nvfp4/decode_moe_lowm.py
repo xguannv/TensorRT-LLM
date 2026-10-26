@@ -275,6 +275,18 @@ def fc12_takes(state, rows: int) -> bool:
     )
 
 
+_PRESORTED_LOGGED = False
+
+
+def _log_presorted(rows: int) -> None:
+    """One line per process where ``TRTLLM_K3LL_MOE_PRESORTED`` first engages (an A/B's proof the arm runs it)."""
+    global _PRESORTED_LOGGED
+    _PRESORTED_LOGGED = True
+    from tensorrt_llm.logger import logger
+
+    logger.info(f"K3 decode MoE: TRTLLM_K3LL_MOE_PRESORTED engaged (first step: {rows} tokens)")
+
+
 @dataclass(eq=False)
 class K3DecodeMoeNvfp4:
     """What every MoE layer's NVFP4 decode path shares on one device: the TP group's ``K3MoeHeadWorkspace`` (the
@@ -739,6 +751,8 @@ class K3DecodeMoeNvfp4Layer:
             from . import census as _census
 
             _census.count(f"dispatch:moe_presorted:{_census.mode()}")
+            if not _PRESORTED_LOGGED:
+                _log_presorted(rows)
             sort_out = torch.empty(
                 sort_layout(rows, self.num_local)[3], dtype=torch.int32, device=x.device
             )
