@@ -44,6 +44,8 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   mask of its tokens, zeroed before the wait; one ballot per 32 experts for the touched ones; each
   (token, k)'s tile and row by popc), and the kernel reads the tile metadata from there instead of
   from the previous grid: the routing kernel need not sort it.
+* Static first unit (``static_first``): CTA ``b`` takes unit ``b`` first and the work counter hands out
+  units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip.
 * PDL: every warp waits on the previous grid (tile metadata, tokens and token scales come from it)
   before it reads any of them or the counters; each CTA triggers its dependents after all of its
   warps are done (later than the safe default of right after the wait).
@@ -101,6 +103,8 @@ CTR_TILE_BASE = 16
 _SLOT_BYTES = _MMA_M * _KBLK // 2
 #: Slices of the output zeroed by the kernel (the CTAs that run FC1 units 0 .. _ZERO_SLICES - 1).
 _ZERO_SLICES = 4
+#: ``trace``: u64 words of per-tile records (4 per tile) before the per-unit records.
+TRACE_UNIT_BASE = 4 * 4096
 
 
 def counter_words(max_tiles: int) -> int:
@@ -223,6 +227,7 @@ class K3MoeLowMDynKernel:
         use_pdl: bool = True,
         trace: bool = False,
         self_sort_local: int = 0,
+        static_first: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -241,6 +246,7 @@ class K3MoeLowMDynKernel:
         self.queue_depth = queue_depth
         self.use_pdl = use_pdl
         self.trace = trace
+        self.static_first = static_first
         # Self-sort scratch (int32 words): per local expert the mask of its tokens, the touched experts'
         # bits, the tile count, each tile's expert and row limit, and the rows of each tile at stride
         # n_tok (the permuted-index view spans 128 more words).
@@ -510,6 +516,18 @@ class K3MoeLowMDynKernel:
         _stg_u64(trace_ptr.toint() + Int64(bid * 16 + ev) * 8, _globaltimer())
 
     @cute.jit
+    def _unit_stamp(self, trace_ptr, unit, field: int, value):
+        """Per-unit trace record (``trace``): 4 u64 per unit at ``TRACE_UNIT_BASE`` words past the per-CTA
+        and per-tile records: [0] the weight warp takes it, [1] its last stage issued, [2] its last MMA issued,
+        [3] the CTA."""
+        nct, _, _ = cute.arch.grid_dim()
+        _stg_u64(
+            trace_ptr.toint()
+            + (Int64(nct) * 16 + Int64(TRACE_UNIT_BASE) + Int64(unit) * 4 + field) * 8,
+            Int64(value),
+        )
+
+    @cute.jit
     def _wg_barrier(self, wg: Int32):
         for i in cutlass.range_constexpr(self.num_epi_wg):
             if wg == i:
@@ -645,8 +663,11 @@ class K3MoeLowMDynKernel:
         t2e_pre = Int32(0)
         if warp_idx == self.tma_warp:
             lane = cute.arch.lane_idx()
-            if lane == 0:
-                first = _atom_add_relaxed(ctr_ptr.toint(), 1)
+            if cutlass.const_expr(self.static_first):
+                first = Int32(bid)
+            else:
+                if lane == 0:
+                    first = _atom_add_relaxed(ctr_ptr.toint(), 1)
             t2e_pre = tile_idx_to_expert_idx[
                 cutlass.min(lane, cute.size(tile_idx_to_expert_idx) - 1)
             ]
@@ -919,6 +940,12 @@ class K3MoeLowMDynKernel:
             nxt = Int32(0)
             if lane == 0:
                 nxt = _atom_add_relaxed(ctr, 1)
+                if cutlass.const_expr(self.static_first):
+                    nxt = nxt + nctas
+            if cutlass.const_expr(self.trace):
+                with cute.arch.elect_one():
+                    self._unit_stamp(trace_ptr, cur, 0, _globaltimer())
+                    self._unit_stamp(trace_ptr, cur, 3, Int64(bid))
             if cur < w1:
                 self._q_write(st, j, cur, Int32(-1))
                 tile = cur // self.nblk1
@@ -972,6 +999,9 @@ class K3MoeLowMDynKernel:
                             a_empty,
                             g,
                         )
+            if cutlass.const_expr(self.trace):
+                with cute.arch.elect_one():
+                    self._unit_stamp(trace_ptr, cur, 1, _globaltimer())
             cur = cute.arch.shuffle_sync(nxt, 0)
             j += 1
         self._q_write(st, j, Int32(-1), Int32(-1))
@@ -1245,6 +1275,9 @@ class K3MoeLowMDynKernel:
                     tcgen05.commit(a_empty + slot)
                     if cutlass.const_expr(self.b2_slots > 1):
                         tcgen05.commit(a_empty + (slot + 1) % S)
+            if cutlass.const_expr(self.trace):
+                with cute.arch.elect_one():
+                    self._unit_stamp(trace_ptr, u, 2, _globaltimer())
             e += 1
             u, slot = self._q_read(st, e)
         if cutlass.const_expr(self.trace):
