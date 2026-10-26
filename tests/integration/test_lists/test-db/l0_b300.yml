@@ -106,6 +106,7 @@ l0_b300:
   # K3 drafter prompt ctx (TRTLLM_K3LL_DRAFTER_PROMPT_CTX): the capture-only DSpark drafter on the
   # disaggregated context worker stores bitwise what the full drafter stores.
   - unittest/_torch/speculative/hw_agnostic/test_k3_drafter_prompt_ctx.py
+  - unittest/_torch/speculative/hw_agnostic/test_k3_drafter_prompt_ctx_admission.py
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_megamoe_overrides_finalize_streamed_expert
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_mega_format_transform_is_slot_blockwise
   # ------------- MoE: test_moe_backend (by backend) ---------------

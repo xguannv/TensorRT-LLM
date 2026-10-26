@@ -4770,6 +4770,7 @@ class DecoderRunner(ScheduledModelRunner):
                 spec_metadata.populate_context_prompt_lookahead(context_prompt_lookahead)
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
+            spec_metadata.populate_request_state(scheduled_requests.all_requests())
             spec_metadata.prepare()
             # One-model rejection: one-hot the stale draft_probs rows of gen
             # requests that produced no draft tokens this step, so the (possibly

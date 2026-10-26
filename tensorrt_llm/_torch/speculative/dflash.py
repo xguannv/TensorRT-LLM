@@ -582,6 +582,21 @@ class DFlashSpecMetadata(SpecMetadata):
             self._capture_layer_set = frozenset()
             self._layer_to_idx = {}
 
+    def populate_request_state(self, requests) -> None:
+        """Record each generation request's received drafter prompt window.
+
+        With ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` > 0 a disaggregated generation
+        request carries ``py_drafter_ctx_len`` = L once its receive completes:
+        the draft pages hold the last L prompt tokens' context latents at
+        columns and positions 0 .. L-1. ``prepare`` admits it with that context
+        length. Requests without a window are not recorded.
+        """
+        self._drafter_ctx_lens = {
+            r.py_request_id: r.py_drafter_ctx_len
+            for r in requests
+            if getattr(r, "py_drafter_ctx_len", 0)
+        }
+
     def prepare(self):
         assert self.request_ids is not None
 
@@ -609,19 +624,29 @@ class DFlashSpecMetadata(SpecMetadata):
             # prefilling, so _store_prefill_context -- the only other assigner --
             # never runs and every request would land on the dummy slot.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            # A request that received its drafter prompt window
+            # (populate_request_state) starts from those L tokens instead of 0;
+            # generated tokens append at column L.
+            received = getattr(self, "_drafter_ctx_lens", None) or {}
+            admitted = {}
             for rid in self.request_ids[num_contexts:]:
                 if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    if worker._assign_slot(rid) is None:
+                    slot = worker._assign_slot(rid, updates=admitted if rid in received else None)
+                    if slot is None:
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
+                    elif rid in received:
+                        admitted[slot] = received[rid]
+            if admitted:
+                worker._write_ctx_len(admitted)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
