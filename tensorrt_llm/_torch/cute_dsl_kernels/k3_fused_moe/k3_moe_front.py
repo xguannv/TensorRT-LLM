@@ -50,6 +50,9 @@
 # per-token ready words as route_quant_ag's.
 # With `sort`, each route CTA also writes its token's weights in fp32 and counts itself in on sort_ctr; the last one
 # runs moe_sort of every token's routing over this rank's local experts (`_sort_local`) and rearms the counter.
+# With `layout` (a diagnostic build: sort, NVFP4, the 32-token build), the quantization CTAs also write each token
+# scale into `sf_image`, K3MoeFc1LowMKernel's SMEM image of the token scales (presorted_layout), and the sorting CTA,
+# after the sort, prefetches into L2 the first weight stage of each FC1 CTA's first unit (`_prefetch_first_stages`).
 #
 # Token builds (m_max, compile time): 8; 16 and 32 for calls of 9-16 and 17-32 rows, each on a head workspace laid
 # out for it. m_max is tcgen05 N, x's TMA box rows, the mailbox / owner-row widths and the pushes per lane. The
@@ -459,11 +462,84 @@ def _globaltimer(*, loc=None, ip=None):
     )  # fmt: skip
 
 
+@dsl_user_op
+def _prefetch_l2_bulk(addr_i64, nbytes, *, loc=None, ip=None):
+    """cp.async.bulk.prefetch.L2 of ``nbytes`` (a multiple of 16) global bytes at ``addr_i64`` (16-byte aligned)."""
+    from cutlass._mlir.dialects import llvm as _llvm
+
+    _llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr_i64).ir_value(loc=loc, ip=ip), cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;", "l,r",
+        has_side_effects=True, is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+# FC1's weight stage (K3MoeFc1LowMKernel): 128 W1 rows x 256 K (NVFP4: 128 bytes of each 1792-byte row) and the
+# block's first 2048 bytes of 128x4-blocked E4M3 scales (four 512-byte atoms, one per 64 K).
+PF_ROW_BYTES = 128
+PF_SF_BYTES = 2048
+W1_ROW_BYTES = HIDDEN_SIZE // 2
+W1_SF_BLOCK_BYTES = CTA_M * (HIDDEN_SIZE // NVFP4_SF_VEC)
+IMAGE_KBLK = 256  # the token-scale image: per 256 K four 512-byte 32x4x4 atoms
+IMAGE_BYTES = HIDDEN_SIZE // IMAGE_KBLK * 2048
+
+
+def image_offset(row, scale):
+    """Byte of token ``row``'s scale ``scale`` (of HIDDEN_SIZE / 16) in the FC1 token-scale image."""
+    kb = scale // cutlass.Int32(IMAGE_KBLK // NVFP4_SF_VEC)
+    s16 = scale - kb * cutlass.Int32(IMAGE_KBLK // NVFP4_SF_VEC)
+    return (
+        kb * cutlass.Int32(2048)
+        + (s16 // cutlass.Int32(4)) * cutlass.Int32(512)
+        + (row % cutlass.Int32(32)) * cutlass.Int32(16)
+        + (row // cutlass.Int32(32)) * cutlass.Int32(4)
+        + s16 % cutlass.Int32(4)
+    )
+
+
+@cute.jit
+def _prefetch_first_stages(
+    sort_words,
+    num_tokens,
+    num_local,
+    w1,
+    w1_sf,
+    tx,
+    ctas: cutlass.Constexpr[int],
+    n1: cutlass.Constexpr[int],
+):
+    """After `_sort_local` (all THREADS threads, behind a CTA barrier): for each of FC1's ``ctas`` CTAs its first
+    unit (``b * total // ctas`` of ``total`` = tiles x n1 / 128, the kernel's assignment), the L2 prefetch of that
+    unit's first weight stage: W1 rows [blk 128, +128) of the tile's local expert (128 bytes each) and the block's
+    first 2048 scale bytes. ``w1`` / ``w1_sf``: the local experts' W1 [E, n1, 1792] and its scales (byte addresses)."""
+    nblk = n1 // CTA_M
+    cap = cutlass.min(num_tokens * cutlass.Int32(TOP_K), num_local)
+    total = sort_words.load(idx=cutlass.Int32(2) * cap, is_volatile=True) * cutlass.Int32(nblk)
+    per = CTA_M + 1
+    for i in cutlass.range(tx, cutlass.Int32(ctas * per), cutlass.Int32(THREADS), unroll=1):
+        b = i // cutlass.Int32(per)
+        r = i - b * cutlass.Int32(per)
+        w = b * total // cutlass.Int32(ctas)
+        if w < (b + cutlass.Int32(1)) * total // cutlass.Int32(ctas):
+            tile = w // cutlass.Int32(nblk)
+            blk = w - tile * cutlass.Int32(nblk)
+            e = sort_words.load(idx=tile, is_volatile=True)
+            if r < cutlass.Int32(CTA_M):
+                row = cutlass.Int64(e) * cutlass.Int64(n1) + cutlass.Int64(
+                    blk * cutlass.Int32(CTA_M) + r
+                )
+                _prefetch_l2_bulk(w1 + row * cutlass.Int64(W1_ROW_BYTES), PF_ROW_BYTES)
+            else:
+                blk_idx = cutlass.Int64(e) * cutlass.Int64(nblk) + cutlass.Int64(blk)
+                _prefetch_l2_bulk(w1_sf + blk_idx * cutlass.Int64(W1_SF_BLOCK_BYTES), PF_SF_BYTES)
+
+
 # Timeline (``timeline``, a measurement build): int64 [grid, TL_SLOTS] %globaltimer per CTA; 0 where not reached.
 #   GEMV CTA: 0 setup done, 1 grid dependency met (warp 1), 2 x's k-tiles landed (warp 2), 3 last round's accumulator
 #             ready (warp 4), 4 last round's mailbox complete (owner warp), 5 epilogue done (warp 4).
 #   route CTA: 0 setup done, 1 grid dependency met, 2 pass 0 done, 3 the 8 x 16 logit partials arrived, 4 top-16 done,
-#              5 sort done (the last route CTA).
+#              5 sort done (the last route CTA), 6 its L2 prefetch of FC1's first weight stages issued (layout).
 #   quantization CTA: 0, 1 as above, 3 its first token's 16 slices arrived, 4 quantized.
 TL_SLOTS = 8
 
@@ -757,11 +833,14 @@ def k3_moe_front_kernel(
     sort_words: cutlass.Array,  # int32 [sort_layout words] (sort)
     sort_ctr: cutlass.Array,  # int32 [1], zero between calls: the route CTAs done (sort)
     tl: cutlass.Array,  # int64 [grid * TL_SLOTS] (timeline)
+    sf_image: cutlass.Array,  # uint8 [IMAGE_BYTES]: FC1's token-scale image (layout)
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
     sort_offset: cutlass.Int32,
     sort_local: cutlass.Int32,
+    pf_w1: cutlass.Int64,  # the local experts' W1 (layout with pf_ctas)
+    pf_w1_sf: cutlass.Int64,  # its scales
     world: cutlass.Constexpr[int],
     shared_cols: cutlass.Constexpr[int],
     n_head_tiles: cutlass.Constexpr[int],
@@ -777,6 +856,9 @@ def k3_moe_front_kernel(
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
     timeline: cutlass.Constexpr[bool],
+    layout: cutlass.Constexpr[bool],
+    pf_ctas: cutlass.Constexpr[int],  # FC1's CTAs (0: no prefetch)
+    pf_n1: cutlass.Constexpr[int],  # W1 rows per expert
 ):
     # The token tile: tcgen05 N, x's TMA box rows, the mailbox and owner-row widths, the role CTAs (a route CTA per
     # token, a quantization CTA per QT_ tokens).
@@ -1503,6 +1585,23 @@ def k3_moe_front_kernel(
                             sort_ctr.store(cutlass.Int32(0), idx=0)
                             if cutlass.const_expr(timeline):
                                 _stamp(tl, bx, 5)
+                        if cutlass.const_expr(layout and pf_ctas > 0):
+                            # The sort's tile words, written by this CTA's threads, are read back after the barrier.
+                            cute.arch.barrier()
+                            _prefetch_first_stages(
+                                sort_words,
+                                num_tokens,
+                                sort_local,
+                                pf_w1,
+                                pf_w1_sf,
+                                tx,
+                                pf_ctas,
+                                pf_n1,
+                            )
+                            if cutlass.const_expr(timeline):
+                                cute.arch.barrier()
+                                if tx == 0:
+                                    _stamp(tl, bx, 6)
             else:
                 for qj in cutlass.range_constexpr(QT_):
                     # Token qtok of this quantization CTA (QT_ 1: its token q).
@@ -1539,6 +1638,13 @@ def k3_moe_front_kernel(
                                     idx=qtok * cutlass.Int32(HIDDEN_SIZE // NVFP4_SF_VEC)
                                     + tx // cutlass.Int32(NVFP4_SF_VEC // 8),
                                 )
+                                if cutlass.const_expr(layout):
+                                    sf_image.store(
+                                        cutlass.Uint8(sf_byte),
+                                        idx=image_offset(
+                                            qtok, tx // cutlass.Int32(NVFP4_SF_VEC // 8)
+                                        ),
+                                    )
                         else:
                             q_lo, q_hi, sf_byte = _rq.mxfp8_quant_vec8([w0, w1, w2, w3])
                             quant_words.store(
@@ -1653,11 +1759,14 @@ def k3_moe_front(
     sort_words: cute.Tensor,
     sort_ctr: cute.Tensor,
     tl: cute.Tensor,
+    sf_image: cute.Tensor,
     num_tokens: cutlass.Int32,
     tp_rank: cutlass.Int32,
     routed_scaling_factor: cutlass.Float64,
     sort_offset: cutlass.Int32,
     sort_local: cutlass.Int32,
+    pf_w1: cutlass.Int64,  # the local experts' W1 (layout with pf_ctas)
+    pf_w1_sf: cutlass.Int64,  # its scales
     world: cutlass.Constexpr[int],
     shared_cols: cutlass.Constexpr[int],
     n_head_tiles: cutlass.Constexpr[int],
@@ -1674,6 +1783,9 @@ def k3_moe_front(
     sort: cutlass.Constexpr[bool],
     m_max: cutlass.Constexpr[int],
     timeline: cutlass.Constexpr[bool],
+    layout: cutlass.Constexpr[bool],
+    pf_ctas: cutlass.Constexpr[int],
+    pf_n1: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ) -> None:
     rows = _weight_rows(world, n_head_tiles, n_tiles, head_half)
@@ -1682,9 +1794,10 @@ def k3_moe_front(
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens, m_max)
     k3_moe_front_kernel(
         tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
-        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, tl, num_tokens, tp_rank, routed_scaling_factor,
-        sort_offset, sort_local, world, shared_cols, n_head_tiles, n_tiles, gemv_clusters, k_in, ring, gate_cap,
-        linear_cap, publish, head_half, nvfp4, sort, m_max, timeline,
+        quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, tl, sf_image, num_tokens, tp_rank,
+        routed_scaling_factor, sort_offset, sort_local, pf_w1, pf_w1_sf, world, shared_cols, n_head_tiles, n_tiles,
+        gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half, nvfp4, sort, m_max, timeline, layout,
+        pf_ctas, pf_n1,
     ).launch(
         grid=((gemv_clusters + role_clusters(m_max)) * SPLIT, 1, 1),
         block=(THREADS, 1, 1),

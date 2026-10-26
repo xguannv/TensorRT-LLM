@@ -171,7 +171,16 @@ def timeline_words(num_tokens: int) -> int:
 
 @torch.library.custom_op(
     "trtllm::k3_moe_front",
-    mutates_args=("ag_uc", "ag_mc", "ag_flags", "ag_ready", "sort_out", "sort_ctr", "timeline"),
+    mutates_args=(
+        "ag_uc",
+        "ag_mc",
+        "ag_flags",
+        "ag_ready",
+        "sort_out",
+        "sort_ctr",
+        "timeline",
+        "sf_image",
+    ),
 )
 def k3_moe_front(
     x: torch.Tensor,
@@ -194,6 +203,10 @@ def k3_moe_front(
     sort_offset: int = 0,
     sort_local: int = 0,
     timeline: Optional[torch.Tensor] = None,
+    sf_image: Optional[torch.Tensor] = None,
+    pf_w1: Optional[torch.Tensor] = None,
+    pf_w1_sf: Optional[torch.Tensor] = None,
+    pf_ctas: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``x`` bf16 ``[M <= 32, 7168]`` (the MoE input, the same on every rank), ``w_front`` from ``front_weight``,
     ``bias`` the routing bias fp32 ``[896]``, ``ag_*`` the fields of the TP group's ``K3MoeHeadWorkspace``. Returns
@@ -211,7 +224,13 @@ def k3_moe_front(
     calls that share it must be stream-ordered.
 
     ``timeline`` (a measurement build): int64, at least ``timeline_words(x.shape[0])`` words, zero; the kernel writes
-    %globaltimer at its phase boundaries per CTA (``k3_moe_front.TL_SLOTS`` words per CTA, see there)."""
+    %globaltimer at its phase boundaries per CTA (``k3_moe_front.TL_SLOTS`` words per CTA, see there).
+
+    ``sf_image`` (a diagnostic build; with the sort, the NVFP4 latent and 17-32 rows): uint8, at least
+    ``k3_moe_front.IMAGE_BYTES``, zero where no token scale lands (rows past 32 of each atom): the kernel also writes
+    the token scales there in K3MoeFc1LowMKernel's SMEM image (its ``presorted_layout``). With ``pf_w1`` / ``pf_w1_sf``
+    (the local experts' FC1 weight uint8 ``[E, n1, 1792]`` and its 128x4-blocked scales) and ``pf_ctas`` (FC1's CTA
+    count), the sorting CTA then prefetches into L2 the first weight stage of each FC1 CTA's first unit."""
     import cuda.bindings.driver as cuda_driver
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -268,6 +287,34 @@ def k3_moe_front(
             "k3_moe_front: the sort needs the NVFP4 latent, an int32 sort_ctr and a contiguous int32 sort_out of "
             "sort_layout's words over 1 to 896 local experts"
         )
+    layout = sf_image is not None
+    if layout and (
+        not sort
+        or m_max != 32
+        or sf_image.dtype != torch.uint8
+        or not sf_image.is_contiguous()
+        or sf_image.numel() < kernel.IMAGE_BYTES
+    ):
+        raise ValueError(
+            "k3_moe_front: sf_image needs the sort, the 32-token build and contiguous uint8 of IMAGE_BYTES"
+        )
+    pf_n1 = 0
+    if pf_ctas:
+        if (
+            not layout
+            or pf_w1 is None
+            or pf_w1_sf is None
+            or pf_w1.dim() != 3
+            or pf_w1.shape[0] < sort_local
+            or pf_w1.shape[2] * 2 != HIDDEN_SIZE
+            or pf_w1.shape[1] % kernel.CTA_M
+            or pf_w1_sf.numel() < pf_w1.shape[0] * pf_w1.shape[1] * (HIDDEN_SIZE // NVFP4_SF_VEC)
+        ):
+            raise ValueError(
+                "k3_moe_front: the prefetch needs sf_image and the local experts' W1 [E, n1, 1792] + scales"
+            )
+        pf_n1 = int(pf_w1.shape[1])
+    pf_addr = (pf_w1.data_ptr(), pf_w1_sf.data_ptr()) if pf_ctas else (0, 0)
     shared = torch.empty(num_tokens, shared_cols, dtype=torch.bfloat16, device=device)
     # Head-only fronts (shared_cols 0) still hand the kernel an aligned shared-output argument it never writes.
     shared_arg = shared if shared_cols else ag_flags.view(torch.int16).view(-1)
@@ -297,6 +344,8 @@ def k3_moe_front(
         arg(sort_out.view(-1) if sort else ag_flags.view(-1)),
         arg(sort_ctr.view(-1) if sort else ag_flags.view(-1)),
         arg(timeline.view(-1) if timeline is not None else _no_timeline(device)),
+        # Without layout the kernel never writes it: any aligned uint8 words.
+        arg(sf_image.view(-1) if layout else scales.view(-1)),
     )
     capacity = max_clusters(device)
     # The 32-token build may run a shallower weight ring than asked (`fit_ring`); the others run ``ring``.
@@ -327,6 +376,9 @@ def k3_moe_front(
         sort,
         m_max,
         timeline is not None,
+        layout,
+        int(pf_ctas),
+        pf_n1,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -339,17 +391,27 @@ def k3_moe_front(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_moe_front, *args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset,
-                    sort_local, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
-                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, timeline is not None, stream,
+                    sort_local, *pf_addr, ag_world, shared_cols, ht, ht + st, clusters, k_in, ring, float(gate_cap),
+                    float(linear_cap), publish, use_pdl, head_half, nvfp4, sort, m_max, timeline is not None, layout,
+                    int(pf_ctas), pf_n1, stream,
                 )  # fmt: skip
-    fn(*args, num_tokens, ag_rank, float(routed_scaling_factor), sort_offset, sort_local, stream)
+    fn(
+        *args,
+        num_tokens,
+        ag_rank,
+        float(routed_scaling_factor),
+        sort_offset,
+        sort_local,
+        *pf_addr,
+        stream,
+    )
     return topk_ids, topk_weights, quantized, scales, shared
 
 
 @k3_moe_front.register_fake
 def _(x, w_front, bias, routed_scaling_factor, shared_cols, gate_cap, linear_cap, ag_uc, ag_mc, ag_flags, ag_rank,
       ag_world, ring=DEFAULT_RING, ag_ready=None, nvfp4_gsf=None, sort_out=None, sort_ctr=None, sort_offset=0,
-      sort_local=0, timeline=None):  # fmt: skip
+      sort_local=0, timeline=None, sf_image=None, pf_w1=None, pf_w1_sf=None, pf_ctas=0):  # fmt: skip
     num_tokens = x.shape[0]
     if nvfp4_gsf is not None:
         quantized = x.new_empty((num_tokens, HIDDEN_SIZE // 2), dtype=torch.uint8)

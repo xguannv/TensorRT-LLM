@@ -301,7 +301,9 @@ def _gmem_ptr(dtype, t: torch.Tensor, align: Optional[int] = None):
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
 
-@torch.library.custom_op("trtllm::k3_moe_nvfp4_lowm_fc12", mutates_args=("output", "h", "h_sf"))
+@torch.library.custom_op(
+    "trtllm::k3_moe_nvfp4_lowm_fc12", mutates_args=("output", "h", "h_sf", "trace1", "trace2")
+)
 def k3_moe_nvfp4_lowm_fc12(
     x_fp4: torch.Tensor,
     x_sf: torch.Tensor,
@@ -326,6 +328,9 @@ def k3_moe_nvfp4_lowm_fc12(
     topk_ids: Optional[torch.Tensor] = None,
     local_offset: int = 0,
     fc2_ceil_chunk: bool = False,
+    presorted_layout: bool = False,
+    trace1: Optional[torch.Tensor] = None,
+    trace2: Optional[torch.Tensor] = None,
 ) -> None:
     """`k3_moe_nvfp4_lowm`'s routed partial as two kernels: ``K3MoeFc1LowMKernel`` into ``h`` / ``h_sf`` (required:
     `new_fc12`), then ``K3MoeFc2LowMKernel`` adding into ``output``, which must be zero (this op does not zero it).
@@ -336,7 +341,11 @@ def k3_moe_nvfp4_lowm_fc12(
     done. ``topk_ids`` int32 ``[M, top_k]``: both kernels sort the routing over the local experts
     ``[local_offset, local_offset + E)`` themselves, per CTA (`run`'s ``self_sort``; the front's tiles and rows), the
     four sort arguments are not read and ``token_final_scales`` may be bf16. ``fc2_ceil_chunk``: FC2 splits its units
-    in chunks of ``ceil(units / CTAs)`` (``K3MoeFc2LowMKernel``'s ``ceil_chunk``; the same output)."""
+    in chunks of ``ceil(units / CTAs)`` (``K3MoeFc2LowMKernel``'s ``ceil_chunk``; the same output).
+
+    Diagnostic: ``presorted_layout`` (sorted metadata only): ``x_sf`` is FC1's SMEM image of the token scales
+    (``k3_moe_front``'s ``sf_image``; ``K3MoeFc1LowMKernel``'s ``presorted_layout``). ``trace1`` / ``trace2``: int64
+    ``[CTAs * 16]``, the kernels' per-CTA %globaltimer stamps (trace builds)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -347,6 +356,10 @@ def k3_moe_nvfp4_lowm_fc12(
     k1 = w2.shape[1]
     k2 = n1 // 2
     self_sort = topk_ids is not None
+    if presorted_layout and topk_ids is not None:
+        raise ValueError(
+            "k3_moe_nvfp4_lowm_fc12: presorted_layout reads the sorted metadata, not topk_ids"
+        )
     if self_sort:
         if (
             orig_m > MAX_TOKENS
@@ -403,15 +416,27 @@ def k3_moe_nvfp4_lowm_fc12(
         P(cutlass.Int32, num_non_exiting_tiles),
         P(cutlass.BFloat16 if scales_bf16 else cutlass.Float32, token_final_scales),
     ]
-    # the optional (tile_ready, trace) pointers stay None; the ids pointer only with self-sort
-    tail = (None, None, P(cutlass.Int32, topk_ids)) if self_sort else ()
+    # the optional tile_ready pointer stays None; the trace pointers with trace1 / trace2; the ids pointer only with
+    # self-sort
+    ids_ptr = P(cutlass.Int32, topk_ids) if self_sort else None
+    tr1 = P(cutlass.Int64, trace1) if trace1 is not None else None
+    tr2 = P(cutlass.Int64, trace2) if trace2 is not None else None
+    tail1 = (None, tr1, ids_ptr) if (self_sort or tr1 is not None) else ()
+    tail2 = (None, tr2, ids_ptr) if (self_sort or tr2 is not None) else ()
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     base = (_device_index(device), n_tok, n1, k1, top_k, ctas, use_pdl)
     if self_sort:
         base = (*base, "self_sort", num_local, int(local_offset))
-    key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
-    key2 = ("fc2", *base, scales_bf16, bool(fc2_ceil_chunk))
+    key1 = (
+        "fc1",
+        *base,
+        float(situ_beta),
+        float(situ_linear_beta),
+        bool(presorted_layout),
+        tr1 is not None,
+    )
+    key2 = ("fc2", *base, scales_bf16, bool(fc2_ceil_chunk), tr2 is not None)
     fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
     if fc1 is None or fc2 is None:
         if torch.cuda.is_current_stream_capturing():
@@ -424,10 +449,11 @@ def k3_moe_nvfp4_lowm_fc12(
                 kernel = lowm.K3MoeFc1LowMKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), use_pdl=use_pdl,
                     late_trigger=False, self_sort_local=num_local if self_sort else 0,
-                    self_sort_offset=int(local_offset) if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0, presorted_layout=bool(presorted_layout),
+                    trace=tr1 is not None,
                 )  # fmt: skip
                 fc1 = _compiled[key1] = cute.compile(
-                    kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream, *tail
+                    kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream, *tail1
                 )
             fc2 = _compiled.get(key2)
             if fc2 is None:
@@ -435,18 +461,20 @@ def k3_moe_nvfp4_lowm_fc12(
                     n_tok, k1, k2, top_k, use_pdl=use_pdl, early_weights=True,
                     self_sort_local=num_local if self_sort else 0,
                     self_sort_offset=int(local_offset) if self_sort else 0, ceil_chunk=bool(fc2_ceil_chunk),
+                    trace=tr2 is not None,
                 )  # fmt: skip
                 fc2 = _compiled[key2] = cute.compile(
-                    kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream, *tail
+                    kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream, *tail2
                 )
-    fc1(*fc1_ptrs, orig_m, m, num_local, stream, *tail)
-    fc2(*fc2_ptrs, m, num_local, orig_m, stream, *tail)
+    fc1(*fc1_ptrs, orig_m, m, num_local, stream, *tail1)
+    fc2(*fc2_ptrs, m, num_local, orig_m, stream, *tail2)
 
 
 @k3_moe_nvfp4_lowm_fc12.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, h, h_sf, top_k,
-      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0, fc2_ceil_chunk=False):  # fmt: skip
+      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0, fc2_ceil_chunk=False, presorted_layout=False,
+      trace1=None, trace2=None):  # fmt: skip
     return None
 
 
