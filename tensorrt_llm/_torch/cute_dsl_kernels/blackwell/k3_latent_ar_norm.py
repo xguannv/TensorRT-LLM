@@ -43,12 +43,13 @@ boundaries and reduction trees; every thread forms the group sums after one CTA 
 a cluster barrier); the rank's own slot is summed from registers instead of being polled back
 from the multicast loopback, after the first polling round only the slots that have not arrived
 are loaded again, and CTA 0 rotates the buffers while it waits for the other ranks instead of at
-the end. :class:`K3LamportClearKernel` (``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``) re-arms the
-buffer a call used on a side stream and marks the state clean, so that the next call skips the
-clear (M x world x 7 KB of sentinel stores) on its critical path. With ``clear_ctas`` the row
-kernel instead launches that many extra CTAs that re-arm the dirty buffer after the grid wait
-while the row CTAs push and poll (``TRTLLM_K3LL_LAR_CLEAR_SPLIT``), bit for bit the plain row
-kernel.
+the end. The row kernel re-arms the previous call's buffer (M x world x 7 KB of sentinel stores)
+inside its own grid: in the row CTAs between their push and their poll, or, with ``clear_ctas``
+(``TRTLLM_K3LL_LAR_CLEAR_SPLIT``, on by default on SM103), in that many extra CTAs that do it
+after the grid wait while the row CTAs push and poll; bit for bit the same. The standalone
+:class:`K3LamportClearKernel` re-arms a workspace's dirty buffer and marks the state clean, after
+which the row kernel clears nothing; the decode path does not launch it (a side-stream re-arm
+measured slower, RANKED 9a).
 """
 
 from __future__ import annotations
@@ -811,7 +812,7 @@ def run_k3_latent_ar_norm(
 
 
 # ---------------------------------------------------------------------------
-# One CTA per row (TRTLLM_K3_LATENT_AR_ROW) and the side-stream re-arm of the Lamport buffer
+# One CTA per row (TRTLLM_K3_LATENT_AR_ROW), its in-grid re-arm CTAs, and a standalone re-arm kernel
 # ---------------------------------------------------------------------------
 
 #: Row kernel: four groups of 128 threads per CTA; threads ``t < 112`` of group ``g`` play thread
@@ -882,9 +883,10 @@ class K3LatentArRowKernel:
       summed from its registers, so the last rank to arrive does not wait for its own data to
       come back from the switch. After the first round only the slots that have not arrived are
       loaded again (predicated loads).
-    * The previous call's buffer is re-armed by :class:`K3LamportClearKernel` on a side stream,
-      which marks the state clean; if the state still says the buffer is dirty, this kernel clears
-      it itself after its push, like the C++ kernels.
+    * The previous call's buffer (the state's dirty stages) is re-armed inside this grid: by the
+      row CTAs after their push, like the C++ kernels (``clear_ctas`` = 0), or by the re-arm CTAs
+      (``clear_ctas`` > 0, below). If the state is already clean (a standalone
+      :class:`K3LamportClearKernel` ran), nothing is cleared.
     * CTA 0 rotates the buffers right after its first polling round when every warp of the grid
       has counted itself by then (as a rule), so that the acquire load and the state stores are
       not on the grid's tail; otherwise it waits for the count at the end, like the cluster kernel.
@@ -1025,8 +1027,8 @@ class K3LatentArRowKernel:
                 slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
                 _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
 
-            # Clear the previous call's buffer if the side-stream re-arm has not (with clear_ctas the
-            # re-arm CTAs do it).
+            # Clear the previous call's buffer (its dirty stages; none if the state is clean) here, unless
+            # the re-arm CTAs of this grid do it (clear_ctas > 0).
             if cutlass.const_expr(self.clear_ctas == 0):
                 n_threads = m * ROW_THREADS
                 gtid = row * ROW_THREADS + tidx

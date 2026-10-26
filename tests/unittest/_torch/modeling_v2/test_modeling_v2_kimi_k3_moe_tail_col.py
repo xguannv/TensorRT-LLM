@@ -330,6 +330,38 @@ def test_lar_clear_split_default_follows_the_capability(monkeypatch):
     col._lar_clear_split_by_default.cache_clear()
 
 
+def test_warm_up_compiles_both_latent_ar_builds(monkeypatch):
+    """``warm_up`` runs the latent all-reduce with and without the re-arm CTAs (``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` is read
+    at forward time, so neither build may first compile under capture), whatever the switch says."""
+    col = _mod("moe_tail_col")
+    flags = _mod("flags")
+    calls = []
+    kernel = SimpleNamespace(
+        ROW_CLEAR_CTAS=32, run_k3_latent_ar_norm_row=lambda *a, **kw: calls.append(kw["clear_ctas"])
+    )
+    monkeypatch.setattr(col, "_latent_ar", lambda: kernel)
+    monkeypatch.setattr(col._tail_lu, "shared_all_reduce", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        col, "_ctm_op", lambda: SimpleNamespace(compile_wide_col_publish=lambda *a, **kw: False)
+    )
+    gemvs = SimpleNamespace(compile_push=lambda *a, **kw: [16, 32], project=lambda *a, **kw: None)
+    dev = torch.device("cuda", 0)
+    view = SimpleNamespace(uc_local=0, mc_base=0, flags=None, rank=0, world=16)
+    base = SimpleNamespace(latent=view, push=SimpleNamespace(world=16))
+    state = SimpleNamespace(base=base)
+    layer = SimpleNamespace(
+        up_slice=torch.zeros(448, 3584, dtype=torch.bfloat16, device=dev),
+        col0=0,
+        tiles=(),
+        shared_down=torch.zeros(7168, 384, dtype=torch.bfloat16, device=dev),
+    )
+    for value in (0, 1, -1):
+        calls.clear()
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_LAR_CLEAR_SPLIT", value)
+        col.warm_up(state, layer, gemvs, max_candidates=4)
+        assert sorted(calls) == [0, 32], (value, calls)
+
+
 def test_snapshot_inplace_switch_default_sm103_and_documented():
     value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE"]
     assert default == -1 and "bank row" in doc and "Bitwise" in doc and "SM103" in doc

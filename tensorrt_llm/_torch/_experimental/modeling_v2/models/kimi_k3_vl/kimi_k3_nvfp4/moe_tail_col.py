@@ -288,18 +288,23 @@ def takes(
 
 
 def latent_all_reduce(
-    base: K3TailLuState, layer: K3TailColLayer, routed: torch.Tensor
+    base: K3TailLuState,
+    layer: K3TailColLayer,
+    routed: torch.Tensor,
+    clear_split: Optional[bool] = None,
 ) -> torch.Tensor:
     """RMSNorm(gamma) of the sum over the ranks of ``routed`` (bf16 ``[T, 3584]``) on the latent workspace
-    (``K3LatentArRowKernel``, TAIL_LU's kernel without the MXFP8 form; ``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` picks its
-    bitwise variant, read here at every call)."""
+    (``K3LatentArRowKernel``, TAIL_LU's kernel without the MXFP8 form). ``clear_split``: the kernel's bitwise
+    re-arm variant; None (the forward path) reads ``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` here at every call."""
     routed = routed.contiguous()
     latent = torch.empty_like(routed)
     view = base.latent
     lar = _latent_ar()
-    clear_ctas = lar.ROW_CLEAR_CTAS if _lar_clear_split_on(routed.device) else 0
-    if clear_ctas:
-        _census.count(f"dispatch:lar_clear_split:{_census.mode()}")
+    if clear_split is None:
+        clear_split = _lar_clear_split_on(routed.device)
+        if clear_split:
+            _census.count(f"dispatch:lar_clear_split:{_census.mode()}")
+    clear_ctas = lar.ROW_CLEAR_CTAS if clear_split else 0
     lar.run_k3_latent_ar_norm_row(
         routed, layer.gamma, layer.eps, latent, uc_addr=view.uc_local, mc_addr=view.mc_base, flags=view.flags,
         rank=view.rank, world_size=view.world, early_trigger=True, clear_ctas=clear_ctas,
@@ -380,7 +385,12 @@ def warm_up(
     probe = K3TailColLayer(
         layer.up_slice, layer.col0, layer.tiles, torch.ones(LATENT, **zeros), 1e-6, weight
     )
-    latent_all_reduce(base, probe, torch.zeros(MIN_ROWS, LATENT, **zeros))
+    # Both builds of the latent all-reduce (TRTLLM_K3LL_LAR_CLEAR_SPLIT is read at forward time, so either may be
+    # captured later); every rank makes both calls, advancing the latent workspace alike.
+    for clear_split in (False, True):
+        latent_all_reduce(
+            base, probe, torch.zeros(MIN_ROWS, LATENT, **zeros), clear_split=clear_split
+        )
     ran = []
     tail = None
     for rows in (16, 32):
