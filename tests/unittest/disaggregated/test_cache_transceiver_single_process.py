@@ -2246,6 +2246,14 @@ def run_drafter_window_transfer_test(
                     request_lengths[req_idx], draft_prompt_window, TOKENS_PER_BLOCK
                 )
                 assert (req.py_drafter_ctx_start, req.py_drafter_ctx_len) == (start, length)
+                # A generation step's update keeps the window's history: the mirror holds the
+                # window from position 0, not the request's (global or CP-local) token count.
+                mirror = gen_drafts[cp_rank].kv_cache_map[req.py_request_id]
+                history = mirror.history_length
+                step = ScheduledRequests()
+                step.generation_requests = [req]
+                gen_drafts[cp_rank].update_resources(step)
+                assert mirror.history_length == history == length, (req_idx, cp_rank)
 
         verify_all_requests_helix(
             request_lengths=request_lengths,

@@ -6547,7 +6547,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 None
                 # Reuse (history's consumer) is disabled under helix, and
                 # max_beam_num_tokens mixes rank-local and global counts.
-                if self.kv_compression_manages_history or self._has_cp_helix
+                # A drafter prompt window's mirror holds the window from
+                # position 0, not the request's tokens, and is never reused.
+                if self.kv_compression_manages_history
+                or self._has_cp_helix
+                or (self.drafter_prompt_window > 0 and req.is_generation_only_request)
                 else req.max_beam_num_tokens - 1
             )
             success = kv_cache.resize(new_capacity, history_length)
