@@ -44,12 +44,6 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   mask of its tokens, zeroed before the wait; one ballot per 32 experts for the touched ones; each
   (token, k)'s tile and row by popc), and the kernel reads the tile metadata from there instead of
   from the previous grid: the routing kernel need not sort it.
-* Unit prefetch (``unit_prefetch``): a unit's weights and their scale block are each one contiguous
-  range (an FC1 unit's 128 rows of W1 over the whole K, 224 KB + 28 KB at K3's shapes; an FC2 block
-  48 KB + 6 KB). The weight TMA warp prefetches its first unit whole into L2
-  (``cp.async.bulk.prefetch.L2``) as it starts it, and every next unit once the current one has
-  filled the ring, so a unit's later stages find their lines in L2 (or in flight) instead of
-  waiting a full memory latency each round of the ring. Hints only: the results are the same.
 * PDL: every warp waits on the previous grid (tile metadata, tokens and token scales come from it)
   before it reads any of them or the counters; each CTA triggers its dependents after all of its
   warps are done (later than the safe default of right after the wait).
@@ -84,7 +78,6 @@ from .k3_moe_lowm import (
     _ld_acquire_u32,
     _ldg_u32,
     _lds_v4_f32,
-    _prefetch_l2,
     _red_add_v8_bf16_from_smem,
     _red_shared_or,
     _s2t_copy_and_partition,
@@ -230,7 +223,6 @@ class K3MoeLowMDynKernel:
         use_pdl: bool = True,
         trace: bool = False,
         self_sort_local: int = 0,
-        unit_prefetch: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -249,8 +241,6 @@ class K3MoeLowMDynKernel:
         self.queue_depth = queue_depth
         self.use_pdl = use_pdl
         self.trace = trace
-        self.unit_prefetch = unit_prefetch
-        assert not unit_prefetch or fc2_chunk == 1, "unit prefetch: one 128-row block per FC2 unit"
         # Self-sort scratch (int32 words): per local expert the mask of its tokens, the touched experts'
         # bits, the tile count, each tile's expert and row limit, and the rows of each tile at stride
         # n_tok (the permuted-index view spans 128 more words).
@@ -490,10 +480,6 @@ class K3MoeLowMDynKernel:
             num_local,
             orig_m,
             trace_ptr,
-            w1.iterator,
-            w1_sf.iterator,
-            w2.iterator,
-            w2_sf.iterator,
             a_layout,
             b_layout,
             sfa_layout,
@@ -594,10 +580,6 @@ class K3MoeLowMDynKernel:
         num_local: Int32,
         orig_m: Int32,
         trace_ptr: Optional[cute.Pointer],
-        pf_w1: cute.Pointer,
-        pf_sf1: cute.Pointer,
-        pf_w2: cute.Pointer,
-        pf_sf2: cute.Pointer,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
@@ -697,7 +679,6 @@ class K3MoeLowMDynKernel:
                 nctas,
                 trace_ptr,
                 bid,
-                (pf_w1.toint(), pf_sf1.toint(), pf_w2.toint(), pf_sf2.toint()),
             )
         elif warp_idx == self.tok_warp:
             self._token_producer(
@@ -878,57 +859,6 @@ class K3MoeLowMDynKernel:
         return expert
 
     @cute.jit
-    def _prefetch_unit(
-        self, pf_bases, unit: Int32, w1: Int32, tile_idx_to_expert_idx, t2e_pre: Int32, lane
-    ):
-        """L2 prefetch of ``unit``'s weights and scale block (whole warp; each is one contiguous range):
-        lanes ``i < n`` issue the weight range's ``i``-th 32 KB (16 KB for FC2's 48 KB) piece, lane ``n``
-        the scale range in one piece."""
-        base_w1, base_sf1, base_w2, base_sf2 = pf_bases
-        w_base = Int64(0)
-        sf_base = Int64(0)
-        is_fc1 = unit < w1
-        tile = Int32(0)
-        blk = Int32(0)
-        if is_fc1:
-            tile = unit // self.nblk1
-            blk = unit - tile * self.nblk1
-        else:
-            tile = (unit - w1) // self.nchunk2
-            blk = (unit - w1) - tile * self.nchunk2
-        expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
-        if is_fc1:
-            w_base = base_w1 + (Int64(expert) * self.n1 + Int64(blk) * _MMA_M) * (self.k1 // 2)
-            sf_base = base_sf1 + (Int64(expert) * self.nblk1 + Int64(blk)) * (self.k1 // 64 * 512)
-        else:
-            w_base = base_w2 + (Int64(expert) * self.n2 + Int64(blk) * _MMA_M) * (self.k2 // 2)
-            sf_base = base_sf2 + (Int64(expert) * self.nblk2 + Int64(blk)) * (self.k2 // 64 * 512)
-        if is_fc1:
-            piece1 = self._pf_piece(_MMA_M * self.k1 // 2)
-            n1 = _MMA_M * self.k1 // 2 // piece1
-            if lane < n1:
-                _prefetch_l2(w_base + Int64(lane) * piece1, Int32(piece1))
-            elif lane == n1:
-                _prefetch_l2(sf_base, Int32(self.k1 // 64 * 512))
-        else:
-            piece2 = self._pf_piece(_MMA_M * self.k2 // 2)
-            n2 = _MMA_M * self.k2 // 2 // piece2
-            if lane < n2:
-                _prefetch_l2(w_base + Int64(lane) * piece2, Int32(piece2))
-            elif lane == n2:
-                _prefetch_l2(sf_base, Int32(self.k2 // 64 * 512))
-
-    @staticmethod
-    def _pf_piece(nbytes: int) -> int:
-        """The prefetch piece for a ``nbytes`` weight range: 32 KB, or the largest power of two >= 16 B that
-        divides it, in at most 31 pieces."""
-        piece = 32 * 1024
-        while nbytes % piece:
-            piece //= 2
-        assert piece >= 16 and nbytes // piece <= 31, (nbytes, piece)
-        return piece
-
-    @cute.jit
     def _weight_producer(
         self,
         st,
@@ -953,7 +883,6 @@ class K3MoeLowMDynKernel:
         nctas: Int32,
         trace_ptr,
         bid,
-        pf_bases,
     ):
         """Fetches the CTA's units from the work counter (one ahead; ``first``: lane 0's first
         fetch; ``t2e_pre``: lane i holds the expert of tile i), reserves the ring slot(s) of an FC2
@@ -999,19 +928,7 @@ class K3MoeLowMDynKernel:
                     if j == 0:
                         with cute.arch.elect_one():
                             self._stamp(trace_ptr, bid, 2)
-                if cutlass.const_expr(self.unit_prefetch):
-                    if j == 0:
-                        self._prefetch_unit(
-                            pf_bases, cur, w1, tile_idx_to_expert_idx, t2e_pre, lane
-                        )
                 for kb in cutlass.range(self.nkb1, unroll=1):
-                    if cutlass.const_expr(self.unit_prefetch):
-                        if kb == min(self.num_ab_stage, self.nkb1) - 1:
-                            nb = cute.arch.shuffle_sync(nxt, 0)
-                            if nb < total:
-                                self._prefetch_unit(
-                                    pf_bases, nb, w1, tile_idx_to_expert_idx, t2e_pre, lane
-                                )
                     g = self._load_stage(
                         tma_a1,
                         tma_sfa1,
@@ -1039,11 +956,6 @@ class K3MoeLowMDynKernel:
                 tile = v // self.nchunk2
                 c = v - tile * self.nchunk2
                 expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
-                if cutlass.const_expr(self.unit_prefetch):
-                    if j == 0:
-                        self._prefetch_unit(
-                            pf_bases, cur, w1, tile_idx_to_expert_idx, t2e_pre, lane
-                        )
                 for sb in cutlass.range(self.fc2_chunk, unroll=1):
                     for kb in cutlass.range(self.nkb2, unroll=1):
                         g = self._load_stage(
@@ -1060,10 +972,6 @@ class K3MoeLowMDynKernel:
                             a_empty,
                             g,
                         )
-                if cutlass.const_expr(self.unit_prefetch):
-                    nb = cute.arch.shuffle_sync(nxt, 0)
-                    if nb < total:
-                        self._prefetch_unit(pf_bases, nb, w1, tile_idx_to_expert_idx, t2e_pre, lane)
             cur = cute.arch.shuffle_sync(nxt, 0)
             j += 1
         self._q_write(st, j, Int32(-1), Int32(-1))

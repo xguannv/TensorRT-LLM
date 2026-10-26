@@ -168,7 +168,6 @@ def k3_moe_nvfp4_lowm(
     h_sf: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     local_offset: int = 0,
-    unit_prefetch: bool = False,
 ) -> None:
     """This rank's routed partial into ``output`` bf16 ``[M, k1]`` (zeroed by the kernel) for ``M <= 32`` tokens.
 
@@ -181,8 +180,7 @@ def k3_moe_nvfp4_lowm(
     (``[m, n1 / 4]`` E2M1 pairs and ``m * n1 / 32`` scale bytes in the 128x4 blocked layout, ``m`` the permuted rows),
     allocated here when not given. ``topk_ids`` int32 ``[M, top_k]`` (at most `SELF_SORT_MAX_TOKENS` tokens): the
     kernel sorts the routing over the local experts ``[local_offset, local_offset + E)`` itself (`run`'s
-    ``self_sort``) and the four sort arguments are not read. ``unit_prefetch``: the weight TMA warp prefetches each
-    unit's weight and scale ranges into L2 ahead of its ring (``K3MoeLowMDynKernel``'s unit prefetch; same results)."""
+    ``self_sort``) and the four sort arguments are not read."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -258,7 +256,7 @@ def k3_moe_nvfp4_lowm(
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     key = (_device_index(device), n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), ctas, stages,
-           use_pdl, num_local if self_sort else 0, scales_bf16, bool(unit_prefetch))  # fmt: skip
+           use_pdl, num_local if self_sort else 0, scales_bf16)  # fmt: skip
     fn = _compiled.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -271,7 +269,6 @@ def k3_moe_nvfp4_lowm(
                 kernel = dyn.K3MoeLowMDynKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), fc2_chunk=1,
                     max_ab_stage=stages, use_pdl=use_pdl, self_sort_local=num_local if self_sort else 0,
-                    unit_prefetch=bool(unit_prefetch),
                 )  # fmt: skip
                 fn = _compiled[key] = cute.compile(
                     kernel.wrapper, *ptrs, orig_m, m, num_local, local_offset, ctas, stream
@@ -282,8 +279,7 @@ def k3_moe_nvfp4_lowm(
 @k3_moe_nvfp4_lowm.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, counters, top_k,
-      situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, topk_ids=None, local_offset=0,
-      unit_prefetch=False):  # fmt: skip
+      situ_beta, situ_linear_beta, num_ctas=0, h=None, h_sf=None, topk_ids=None, local_offset=0):  # fmt: skip
     return None
 
 
