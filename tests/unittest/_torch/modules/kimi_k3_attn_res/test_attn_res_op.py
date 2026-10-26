@@ -104,21 +104,38 @@ def _attn_res_inputs(num_tokens: int, num_snapshots: int):
     return prefix_sum, block_residual, projection, norm
 
 
+def _attn_res_module(name: str):
+    """The modules that carry ``_apply_attn_res_fused``: the stock model and the staircase K3 implementation (whose
+    context-only target runs prefill chunks past one call's token cap)."""
+    if name == "modeling_kimi_linear":
+        return kimi_modeling
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation,
+    )
+
+    return implementation
+
+
+_ATTN_RES_MODULES = ["modeling_kimi_linear", "kimi_k3_nvfp4.implementation"]
+
+
 @pytest.mark.skipif(
     not _has_supported_gpu(),
     reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
 )
+@pytest.mark.parametrize("module_name", _ATTN_RES_MODULES)
 @pytest.mark.parametrize(("num_tokens", "slice_tokens"), [(4096, 1000), (16384, 4096)])
 @pytest.mark.parametrize("num_snapshots", [1, 8, 11])
 @torch.no_grad()
 def test_fused_attn_res_token_slices_are_bitwise(
-    monkeypatch, num_tokens: int, slice_tokens: int, num_snapshots: int
+    monkeypatch, module_name: str, num_tokens: int, slice_tokens: int, num_snapshots: int
 ) -> None:
     """The mixture is per token: running the fused op in token slices changes no bit."""
+    module = _attn_res_module(module_name)
     prefix_sum, block_residual, projection, norm = _attn_res_inputs(num_tokens, num_snapshots)
-    whole = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
-    monkeypatch.setattr(kimi_modeling, "_ATTN_RES_FWD_MAX_TOKENS", slice_tokens)
-    sliced = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+    whole = module._apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+    monkeypatch.setattr(module, "_ATTN_RES_FWD_MAX_TOKENS", slice_tokens)
+    sliced = module._apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
     assert whole is not None and sliced is not None
     torch.testing.assert_close(sliced, whole, rtol=0, atol=0)
 
@@ -127,14 +144,16 @@ def test_fused_attn_res_token_slices_are_bitwise(
     not _has_supported_gpu(),
     reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
 )
+@pytest.mark.parametrize("module_name", _ATTN_RES_MODULES)
 @torch.no_grad()
-def test_fused_attn_res_above_one_call_matches_torch_reference() -> None:
+def test_fused_attn_res_above_one_call_matches_torch_reference(module_name: str) -> None:
     """A prefill chunk past one call's token cap (32768 tokens, 8 snapshots: K3's deepest layers) takes the fused
     op in slices rather than the fp32 reference, at the reference's tolerance."""
+    module = _attn_res_module(module_name)
     num_tokens, num_snapshots = 32768, 8
-    assert num_tokens > kimi_modeling._ATTN_RES_FWD_MAX_TOKENS
+    assert num_tokens > module._ATTN_RES_FWD_MAX_TOKENS
     prefix_sum, block_residual, projection, norm = _attn_res_inputs(num_tokens, num_snapshots)
-    actual = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+    actual = module._apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
     assert actual is not None
     # The reference is per token too; two halves keep its fp32 temporaries near 14 GiB instead of 28.
     half = num_tokens // 2
