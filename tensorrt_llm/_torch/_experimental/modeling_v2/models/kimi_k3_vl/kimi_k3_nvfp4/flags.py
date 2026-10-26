@@ -67,6 +67,15 @@ TRTLLM_K3LL_MOE_SELF_SORT = _flag(
     "-0.223 ms, moss-0444; the token-mask sort, here and in FC1 / FC2, vs the earlier scan sort: L1 1x -0.049 ms, "
     "2x -0.061 ms, 4x -0.142 ms, moss-0471)",
 )
+TRTLLM_K3LL_MOE_LOWM_DYN_FAST = _flag(
+    "TRTLLM_K3LL_MOE_LOWM_DYN_FAST",
+    0,
+    "K3MoeLowMDynKernel (the single-kernel lowm experts, steps of at most 16 tokens): each CTA takes its first "
+    "work unit by its block index instead of the work counter (static_first), and the token warp polls an FC1 "
+    "tile's counter only when the tile changes, the counters reset once by the last CTA to finish (fast_tok). Same "
+    "results bit for bit; read at forward time (isolated kernel, clean read-only L2 flush: fixed cost per call M8 "
+    "8.11 -> 7.28 us, M16 8.64 -> 7.72 us, moss-0486)",
+)
 TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "TRTLLM_K3LL_MOE_SELF_SORT_FC12",
     -1,
