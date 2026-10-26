@@ -3618,6 +3618,10 @@ class MLADSparkCaptureOnly(MLADSparkForCausalLM):
 
     def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        # No head either: the wrapper's own lm_head ([vocab, hidden], 2.35 GB for K3) would be materialized and kept
+        # alive, and a context worker never computes draft logits (see load_weights_from_target_model).
+        self.draft_model_full.lm_head = None
+        self.lm_head = None
         # None, not deleted: the worker reads draft_model_full.model.embed_tokens before it checks for generation
         # requests (prepare_1st_drafter_inputs).
         self.model.embed_tokens = None
@@ -3645,6 +3649,9 @@ class MLADSparkCaptureOnly(MLADSparkForCausalLM):
         renames = {"context_proj.weight": "fc.weight", "context_norm.weight": "hidden_norm.weight"}
         kept = {renames.get(k, k): v for k, v in weights.items() if self._kept_key(k)}
         return DFlashForCausalLM.load_weights(self, kept, weight_mapper=weight_mapper, **kwargs)
+
+    def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
+        """Share nothing: the capture reads neither the embedding nor the head."""
 
     def dflash_forward(self, *args, **kwargs):
         raise RuntimeError(
