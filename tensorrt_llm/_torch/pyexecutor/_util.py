@@ -4349,9 +4349,26 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # TRTLLM_K3LL_DRAFTER_PROMPT_CTX = W > 0 with a separate draft KV cache
+    # manager: the Python transceiver also sends each request's drafter K/V of
+    # its last W prompt tokens (see drafter_window in disaggregation/transceiver.py).
+    draft_transfer_kwargs = {}
+    transfer_draft_manager = resources.get(
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if (transfer_draft_manager is not None
+            and transfer_draft_manager is not kv_cache_manager
+            and cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        from .k3ll_flags import k3ll_flag_any_target
+        draft_prompt_window = k3ll_flag_any_target(
+            "TRTLLM_K3LL_DRAFTER_PROMPT_CTX")
+        if draft_prompt_window > 0:
+            draft_transfer_kwargs = dict(
+                draft_kv_cache_manager=transfer_draft_manager,
+                draft_prompt_window=draft_prompt_window)
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        cache_transceiver_config, mamba_cache_manager, **draft_transfer_kwargs)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

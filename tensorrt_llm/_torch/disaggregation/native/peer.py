@@ -584,8 +584,13 @@ class PeerRegistrar:
         (independent of attention's duplicate-head logic):
         - If mamba_tp == 1 (attention_dp enabled): fan-in election (one sender)
         - Otherwise: always send (each rank owns unique TP-sharded state)
+
+        A replicated attention group (every rank holds it whole) uses fan-in
+        election for all of its views, independent of the target's heads.
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
+        if getattr(layer_group, "replicated", False):
+            return self._owns_tp_fan_in(peer_rank_info)
         pool_view = layer_group.pool_views[pool_idx]
         # Delegate to the policy's should_send. None means fan-in election.
         policy = self._get_policy(layer_group.kind)

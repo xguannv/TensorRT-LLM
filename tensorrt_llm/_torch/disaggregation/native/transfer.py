@@ -1771,11 +1771,16 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                if (
+                    peer_ri.cp_size > 1
+                    and self_ri.cp_size == 1
+                    and not getattr(lg_info, "replicated", False)
+                ):
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
-                    # rejected under helix.
+                    # rejected under helix. A replicated group is held whole
+                    # by every CP rank, so its table pairs unstrided.
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
                 tpb = extractor.page_table.tokens_per_block
                 dst_start_block = (
@@ -4513,6 +4518,10 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    # Optional drafter KV cache manager whose layer groups ride in the same page
+    # table, registration and transfers as replicated groups (see
+    # RankInfo.from_kv_cache_manager). None transfers the target manager alone.
+    draft_kv_cache_manager: Optional[KVCacheManager] = None
 
 
 class TransferWorker:
@@ -4537,6 +4546,7 @@ class TransferWorker:
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+            draft_kv_cache_manager=config.draft_kv_cache_manager,
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
@@ -4600,7 +4610,9 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
+        # The extractor and the advertised rank info share one page table, so
+        # the registrar resolves exactly the groups that are registered and sent.
+        self._kv_extractor = KVRegionExtractorV1(self._rank_info.page_table)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):

@@ -783,6 +783,58 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     )
 
 
+# Added to the synthetic global layer ids of a draft manager's layer groups when
+# they join the target's page table: both managers number their layers from 0,
+# and peers match pool views by global layer id.
+DRAFT_GLOBAL_LAYER_ID_OFFSET = 1 << 20
+
+
+def append_draft_page_table(target: KVCachePageTable, draft: KVCachePageTable) -> KVCachePageTable:
+    """Return ``target`` with the draft manager's layer groups appended as replicated groups.
+
+    The draft groups follow every target group (so the target's layer-group
+    indices are unchanged), point at the draft pool groups appended after the
+    target's, carry global layer ids shifted by ``DRAFT_GLOBAL_LAYER_ID_OFFSET``,
+    and are marked ``replicated`` (see :class:`AttentionLayerGroup`). Both
+    tables must use the same ``tokens_per_block`` and the draft table must hold
+    attention (PAGED) groups only.
+    """
+    if draft.tokens_per_block != target.tokens_per_block:
+        raise ValueError(
+            "draft KV cache tokens_per_block must equal the target's: "
+            f"draft={draft.tokens_per_block}, target={target.tokens_per_block}"
+        )
+    pool_group_offset = len(target.pool_groups)
+    draft_groups: List[LayerGroup] = []
+    for idx, lg in enumerate(draft.layer_groups):
+        if not isinstance(lg, AttentionLayerGroup):
+            raise ValueError(
+                f"draft KV cache layer group {idx} is {lg.kind.name}; only attention groups "
+                "can be appended to the target page table"
+            )
+        draft_groups.append(
+            AttentionLayerGroup(
+                pool_group_idx=lg.pool_group_idx + pool_group_offset,
+                local_layers=[
+                    LocalLayer(
+                        local_layer_id=ll.local_layer_id,
+                        global_layer_id=ll.global_layer_id + DRAFT_GLOBAL_LAYER_ID_OFFSET,
+                    )
+                    for ll in lg.local_layers
+                ],
+                pool_views=lg.pool_views,
+                kv_head_num_per_rank=lg.kv_head_num_per_rank,
+                sliding_window_size=lg.sliding_window_size,
+                replicated=True,
+            )
+        )
+    return KVCachePageTable(
+        tokens_per_block=target.tokens_per_block,
+        layer_groups=list(target.layer_groups) + draft_groups,
+        pool_groups=list(target.pool_groups) + list(draft.pool_groups),
+    )
+
+
 def _is_kv_cache_manager_v2(obj) -> bool:
     return hasattr(obj, "impl") and hasattr(obj.impl, "layer_grouping")
 
