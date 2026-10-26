@@ -93,6 +93,12 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452; the token-mask sort, here and in "
     "K3MoeLowMDynKernel, vs the earlier scan sort: L1 1x -0.049 ms, 2x -0.061 ms, 4x -0.142 ms, moss-0471)",
 )
+TRTLLM_K3LL_DIAG_IDS_FUSED = _flag(
+    "TRTLLM_K3LL_DIAG_IDS_FUSED",
+    0,
+    "Diagnostic branch only, never trunk: 1 builds the FC1 / FC2 self-sort's ids loop as before the ids batching "
+    "(each id's load, use and red in one iteration), for an A / B of the batching in one process. Read per call",
+)
 TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK = _flag(
     "TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK",
     -1,

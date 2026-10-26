@@ -408,8 +408,20 @@ def k3_moe_nvfp4_lowm_fc12(
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     base = (_device_index(device), n_tok, n1, k1, top_k, ctas, use_pdl)
+    # Diagnostic only (never trunk): TRTLLM_K3LL_DIAG_IDS_FUSED, read per call, builds the self-sort's fused ids loop.
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        flags as _k3_flags,
+    )
+
+    ids_fused = bool(int(_k3_flags.TRTLLM_K3LL_DIAG_IDS_FUSED))
+    if self_sort and not ids_fused:
+        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+            census as _k3_census,
+        )
+
+        _k3_census.count(f"dispatch:moe_self_sort_ids_batched:{_k3_census.mode()}")
     if self_sort:
-        base = (*base, "self_sort", num_local, int(local_offset))
+        base = (*base, "self_sort", num_local, int(local_offset), ids_fused)
     key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
     key2 = ("fc2", *base, scales_bf16, bool(fc2_ceil_chunk))
     fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
@@ -426,6 +438,7 @@ def k3_moe_nvfp4_lowm_fc12(
                     late_trigger=False, self_sort_local=num_local if self_sort else 0,
                     self_sort_offset=int(local_offset) if self_sort else 0,
                 )  # fmt: skip
+                kernel.ids_fused = ids_fused
                 fc1 = _compiled[key1] = cute.compile(
                     kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream, *tail
                 )
@@ -436,6 +449,7 @@ def k3_moe_nvfp4_lowm_fc12(
                     self_sort_local=num_local if self_sort else 0,
                     self_sort_offset=int(local_offset) if self_sort else 0, ceil_chunk=bool(fc2_ceil_chunk),
                 )  # fmt: skip
+                kernel.ids_fused = ids_fused
                 fc2 = _compiled[key2] = cute.compile(
                     kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream, *tail
                 )
