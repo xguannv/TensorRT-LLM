@@ -24,8 +24,9 @@ the forced split-K (3 or 4) instead of the default tactic's split 5. One GPU (SM
   `qkvg_bs1_tactic`.
 * 3 / 4, more rows: bit for bit the off arm, counted as ``qkvg_bs1_split_skip_rows<M>``; another shape: the off arm,
   nothing counted. Any other value raises.
-* Load-time compile (``compile_qkvg_bs1_splits``, as the KDA layer calls it whatever the switch says): both splits;
-  then a CUDA-graph capture at either value replays bit for bit the eager call (the warm-up coverage of the switch).
+* Load-time compile (``compile_qkvg_bs1_splits``, as the KDA layer calls it whatever the switch says): both splits and
+  value 0's default tactic, and nothing compiles after it; then a CUDA-graph capture at 0, 3 or 4 replays bit for bit
+  the eager call (the warm-up coverage of the switch).
   Not compiled, the capture keeps the default split (bit for bit the off arm) and counts
   ``fallback:qkvg_bs1_split_not_compiled``.
 """
@@ -175,35 +176,48 @@ def test_switch_arms(monkeypatch, census, split, m, n):
 @gpu
 @pytest.mark.parametrize("compiled", [True, False])
 def test_capture(monkeypatch, census, compiled):
-    fp8w_lowm, flags, _ = _modules()
+    fp8w_lowm, flags, lowm = _modules()
     w, s = _weight(N_FUSED)
     x = _x(8)
+    index = torch.cuda.current_device()
     monkeypatch.setattr(fp8w_lowm, "_QKVG_BS1_COMPILED", set())
     if compiled:
+        # The load-time compile covers every value, value 0's default tactic included: nothing else compiles here.
+        lowm._compiled_kernel.cache_clear()
         assert fp8w_lowm.compile_qkvg_bs1_splits(w)
-        index = torch.cuda.current_device()
-        assert {(index, N_FUSED, K, split) for split in SPLITS} <= fp8w_lowm._QKVG_BS1_COMPILED
+        assert fp8w_lowm._QKVG_BS1_COMPILED == {
+            (index, N_FUSED, K, split) for split in (0,) + SPLITS
+        }
+        assert lowm._compiled_kernel.cache_info().currsize == 1 + len(SPLITS)
+        values = (0,) + SPLITS
+    else:
+        # Value 0's kernel compiles on this eager call; the forced splits stay uncompiled.
+        torch.ops.trtllm.k3_fp8w_lowm_gemm(x, w, s)
+        torch.cuda.synchronize()
+        values = SPLITS
     assert not fp8w_lowm.compile_qkvg_bs1_splits(_weight(3072)[0])
-    torch.ops.trtllm.k3_fp8w_lowm_gemm(
-        x, w, s
-    )  # the default split compiles eagerly, as the engine's warm-up does
-    torch.cuda.synchronize()
-    for split in SPLITS:
+    for value in values:
         census.clear()
-        monkeypatch.setattr(flags, "TRTLLM_K3LL_QKVG_BS1_SPLIT", split)
+        monkeypatch.setattr(flags, "TRTLLM_K3LL_QKVG_BS1_SPLIT", value)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             out = fp8w_lowm.gemm(x, w, s)
+        if compiled:
+            assert lowm._compiled_kernel.cache_info().currsize == 1 + len(SPLITS)
         for seed in (1, 2):
             x.copy_(_x(8, seed))
             g.replay()
             torch.cuda.synchronize()
             ref = (
-                _forced(x, w, s, split) if compiled else torch.ops.trtllm.k3_fp8w_lowm_gemm(x, w, s)
+                _forced(x, w, s, value)
+                if compiled and value
+                else torch.ops.trtllm.k3_fp8w_lowm_gemm(x, w, s)
             )
             torch.cuda.synchronize()
             assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
-        if compiled:
-            assert census == [f"dispatch:qkvg_bs1_split{split}_rows8"]
+        if not value:
+            assert census == []
+        elif compiled:
+            assert census == [f"dispatch:qkvg_bs1_split{value}_rows8"]
         else:
             assert census == ["fallback:qkvg_bs1_split_not_compiled"]

@@ -62,8 +62,9 @@ kernel (the same bits) and logs it. ``MX_STATS`` counts what happened (tests).
 ``TRTLLM_K3LL_QKVG_BS1_SPLIT`` (read at every call): `gemm` runs the fused KDA weight (`QKVG_BS1_SHAPE`) at 8 or
 fewer rows at the split-K the switch forces (one of `QKVG_BS1_SPLITS`, `qkvg_bs1_tactic`) where no MXFP8 input is
 offered for it; 0 keeps the default tactic, -1 (default) resolves by `qkvg_bs1_split` (4 on SM103, else 0). Not the
-same bits as the default split. The KDA layer compiles every forced split at load (`compile_qkvg_bs1_splits`); a
-capture that finds one not compiled keeps the default split (census ``fallback:qkvg_bs1_split_not_compiled``).
+same bits as the default split. The KDA layer compiles every value's kernel at load (`compile_qkvg_bs1_splits`: the
+forced splits and value 0's default tactic); a capture that finds a forced split not compiled keeps the default split
+(census ``fallback:qkvg_bs1_split_not_compiled``).
 Census: every forced-split call counts ``dispatch:qkvg_bs1_split<S>_rows<M>``, a call of the fused shape above 8 rows
 with a split in force ``qkvg_bs1_split_skip_rows<M>``.
 """
@@ -116,7 +117,8 @@ MX_SF_EARLY_RELEASE_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
 #: TRTLLM_K3LL_QKVG_BS1_SPLIT: the KDA fused [q | k | v | g | f_a | b] weight (``(N, K)``, built at load by
 #: append_rows) at the 8-row tile (bs1 at MTP7) and the split-K values the switch may force. The heuristic's split 5
 #: makes 130 CTAs in clusters of 5; behind bs1's k3_sandwich (56 SMs, launching its dependents ~6 us before it ends)
-#: more than half of those calls finish ~2-3 us later than the rest. Splits 4 (104 CTAs) and 3 (78) do not.
+#: 44% / 40% of those calls (in situ, two bs1 traces) finish ~2-3 us later than the rest (58% in a single-GPU bench
+#: with a sandwich-shaped occupier). Splits 4 (104 CTAs) and 3 (78) do not.
 QKVG_BS1_SHAPE: Tuple[int, int] = (3216, 7168)
 QKVG_BS1_MMA_N = 8
 QKVG_BS1_SPLITS: Tuple[int, ...] = (3, 4)
@@ -124,8 +126,8 @@ QKVG_BS1_SPLITS: Tuple[int, ...] = (3, 4)
 #: (measured on GB300 / SM103); elsewhere it keeps the heuristic's split.
 QKVG_BS1_SPLIT_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
 QKVG_BS1_DEFAULT_SPLIT = 4
-#: ``(device index, N, K, split)`` of the forced-split kernels compiled in this process (`compile_qkvg_bs1_splits`,
-#: or an eager call).
+#: ``(device index, N, K, split)`` of the kernels compiled in this process (`compile_qkvg_bs1_splits`, or an eager
+#: forced-split call); split 0 is the default tactic's.
 _QKVG_BS1_COMPILED: set = set()
 
 
@@ -165,17 +167,24 @@ def _device_index(t: torch.Tensor) -> int:
 
 
 def compile_qkvg_bs1_splits(weight: torch.Tensor) -> bool:
-    """Compile (no launch) every `QKVG_BS1_SPLITS` kernel of `TRTLLM_K3LL_QKVG_BS1_SPLIT` for ``weight`` (the fused KDA
-    weight) if its shape is `QKVG_BS1_SHAPE`, whatever the switch says, so a capture after flipping it finds them.
-    Returns whether it did."""
+    """Compile (no launch) the kernel of every value of `TRTLLM_K3LL_QKVG_BS1_SPLIT` for ``weight`` (the fused KDA
+    weight) at up to `QKVG_BS1_MMA_N` rows if its shape is `QKVG_BS1_SHAPE`, whatever the switch says, so a capture
+    after flipping it finds them: each `QKVG_BS1_SPLITS` kernel (`qkvg_bs1_tactic`) and value 0's, the default tactic
+    ``trtllm::k3_fp8w_lowm_gemm`` runs (recorded with split 0). Returns whether it did."""
     n, k = weight.shape
     if (n, k) != QKVG_BS1_SHAPE:
         return False
     index = _device_index(weight)
+    kernel = _kernel()
     with torch.cuda.device(index):
-        for split in QKVG_BS1_SPLITS:
+        for split in (0,) + QKVG_BS1_SPLITS:
             if (index, n, k, split) not in _QKVG_BS1_COMPILED:
-                _kernel()._compiled_kernel(n, k, qkvg_bs1_tactic(n, k, split), True)
+                tactic = (
+                    qkvg_bs1_tactic(n, k, split)
+                    if split
+                    else kernel.default_tactic(QKVG_BS1_MMA_N, n, k)
+                )
+                kernel._compiled_kernel(n, k, tactic, True)
                 _QKVG_BS1_COMPILED.add((index, n, k, split))
     return True
 
