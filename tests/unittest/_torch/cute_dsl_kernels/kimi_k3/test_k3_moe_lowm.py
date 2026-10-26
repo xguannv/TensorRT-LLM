@@ -329,14 +329,14 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def lowm_self(token_scales, fast=False):
+    def lowm_self(token_scales, fast=False, early=False):
         out.fill_(7.0)
         h.zero_()
         h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
-            static_first=fast, fast_tok=fast,
+            static_first=fast, fast_tok=fast, early_first=early,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
@@ -390,6 +390,16 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         check(static, f"self-sort graph replay {replay}")
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset after a replay"
     check_fast(lowm_self, self_sort=True)
+    # early_first: the first unit's first stages issued before the sort's last step, the same results
+    for slot in (0, top_k - 1):
+        one_hot = torch.zeros_like(scales)
+        one_hot[:, slot] = scales[:, slot]
+        assert torch.equal(
+            lowm_self(one_hot, fast=True).view(torch.int16),
+            lowm_self(one_hot, fast=True, early=True).view(torch.int16),
+        ), f"self-sort early_first: FC2 slot {slot}"
+    for rep in range(2):
+        check(lowm_self(scales, fast=True, early=True), f"self-sort early_first op, call {rep}")
     # no local expert: the output zeroed, the counters reset
     far = (
         ((offset + num_local + torch.arange(top_k, device="cuda")) % num_experts)
@@ -443,17 +453,20 @@ def _replica_choice(touched, table, home, replicas, groups=4):
 
 @pytest.mark.parametrize("home,top_k", [(224, 16), (32, 8)], ids=["k3_ep4", "small"])
 @pytest.mark.parametrize("num_tokens", [1, 8, 13, 16])
-@pytest.mark.parametrize("fast", [False, True], ids=["base", "fast"])
-def test_moe_nvfp4_lowm_replicas(home, top_k, num_tokens, fast):
-    """S-1d (``K3MoeLowMDynKernel(replicas=8)``): per EP group, the replica kernel (global ids, the group's home
-    experts + 8 copies) bit for bit (one-hot routing slots) as the plain self-sort on the ids the reference choice
-    (`_replica_choice`) assigns to the group, remapped to its local slots; FC1 rows bit for bit; summed over the 4
-    groups, bit for bit the copy-free EP4 (each (token, expert) runs once)."""
+@pytest.mark.parametrize("mode", ["base", "fast", "fast_early"])
+def test_moe_nvfp4_lowm_replicas(home, top_k, num_tokens, mode):
+    """S-1d (``K3MoeLowMDynKernel(replicas=8)``, ``fast_early``: with ``early_first``): per EP group, the replica
+    kernel (global ids, the group's home experts + 8 copies) bit for bit (one-hot routing slots) as the plain
+    self-sort on the ids the reference choice (`_replica_choice`) assigns to the group, remapped to its local slots;
+    FC1 rows bit for bit per tile (the replica kernel's tiles: home experts without a copy, copied home experts that
+    stay, copies moved in); summed over the 4 groups, bit for bit the copy-free EP4 (each (token, expert) runs
+    once)."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import nvfp4_lowm_op
     from tensorrt_llm._torch.utils import unswizzle_sf
 
     hidden, inter_size, groups, R = 1024, 256, 4, 8
+    fast, early = mode != "base", mode == "fast_early"
     num_experts = groups * home
     ok, why = nvfp4_lowm_op.supported(torch.device("cuda"), 2 * inter_size, hidden, num_tokens)
     assert ok, why
@@ -511,6 +524,7 @@ def test_moe_nvfp4_lowm_replicas(home, top_k, num_tokens, fast):
             _bits(x_q), _bits(x_sf), *w, out, topk, topk, topk, topk, ex.fc2_input_scale, token_scales, counters,
             top_k, GATE_CAP, LINEAR_CAP, 0, h, h_sf, topk_ids=topk, local_offset=offset, static_first=fast,
             fast_tok=fast, replica_ids=tab if replicas else None, replicas=replicas,
+            early_first=early and bool(replicas),
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "counters not reset"
@@ -540,7 +554,24 @@ def test_moe_nvfp4_lowm_replicas(home, top_k, num_tokens, fast):
                 assert bool((err <= top_k * 2.0**-7 * scale).all()), f"{where}: all slots"
                 continue
             assert torch.equal(y_rep.view(torch.int16), y_ref.view(torch.int16)), f"{where}: output"
-            assert torch.equal(h_rep, h_ref) and torch.equal(hsf_rep, hsf_ref), f"{where}: FC1 rows"
+            # tiles: the reference's in local slot order; the replica kernel's choice-free home experts first
+            copied = {e - g * home for e in table if e // home == g}
+            homes = sorted(e - g * home for e in touched if e // home == g and e not in away)
+            rep_order = [d for d in homes if d not in copied] + [d for d in homes if d in copied]
+            rep_order += [
+                home + c for c in range(R) if g * R + c in moved and table[g * R + c] in touched
+            ]
+            ref_order = sorted(rep_order)
+            sf_rows = 128 * inter_size // SF16
+            for j, s_ in enumerate(rep_order):
+                i = ref_order.index(s_)
+                assert torch.equal(
+                    h_rep[j * 128 : (j + 1) * 128], h_ref[i * 128 : (i + 1) * 128]
+                ), f"{where}: FC1 rows of slot {s_}"
+                assert torch.equal(
+                    hsf_rep[j * sf_rows : (j + 1) * sf_rows],
+                    hsf_ref[i * sf_rows : (i + 1) * sf_rows],
+                ), f"{where}: FC1 scales of slot {s_}"
             y_ep, _, _ = call(
                 weights_of(list(range(g * home, (g + 1) * home))), ids, token_scales, g * home
             )

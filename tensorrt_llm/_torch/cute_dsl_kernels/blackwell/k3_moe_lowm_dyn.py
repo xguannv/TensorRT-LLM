@@ -202,6 +202,21 @@ def _popc(value, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _fns(mask, n, *, loc=None, ip=None):
+    """Bit position of the ``n``-th (1-based) set bit of ``mask`` (``fns.b32`` from bit 0; -1 if fewer)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(mask, loc=loc, ip=ip), _iv(n, loc=loc, ip=ip)],
+            "fns.b32 $0, $1, 0, $2;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _align(v: int, a: int) -> int:
     return (v + a - 1) // a * a
 
@@ -236,8 +251,13 @@ class K3MoeLowMDynKernel:
         group ``g``'s copy slot ``c``). Every CTA of every rank chooses per step, from the step's ids
         alone, which touched copied experts run on their copy instead of at home (`_REP_ROUNDS`:
         three rounds of group pairs, each moving up to half its load gap from the busier group),
-        so every rank makes the same choice; the rank sorts its touched home experts that stay
-        plus the copies moved in.
+        so every rank makes the same choice. Tiles: the touched home experts that have no copy
+        (independent of the choice), then the touched copied home experts that stay, then the
+        copies moved in (each part in slot order).
+    :param early_first: (with ``self_sort_local`` and ``static_first``) when the CTA's first unit is
+        FC1 of a tile known before the rest of the sort (every touched expert without ``replicas``;
+        the touched home experts that have no copy with them), the weight warp issues that unit's
+        first ring stages right after the sort's second barrier instead of after the whole sort.
     """
 
     def __init__(
@@ -260,6 +280,7 @@ class K3MoeLowMDynKernel:
         fast_tok: bool = False,
         replicas: int = 0,
         groups: int = 4,
+        early_first: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -286,6 +307,10 @@ class K3MoeLowMDynKernel:
         self.self_sort = self_sort_local > 0
         assert not self.self_sort or n_tok <= 16, "self-sort: at most 16 tokens"
         self.replicas = replicas
+        self.early_first = early_first
+        assert not early_first or (self.self_sort and static_first), (
+            "early_first: self-sort with static_first"
+        )
         self.ss_groups = groups if replicas else 1
         if replicas:
             assert self.self_sort and self_sort_local % 32 == 0, (
@@ -571,7 +596,9 @@ class K3MoeLowMDynKernel:
         """Extra per-CTA stamp (``trace``) at ``TRACE_X_BASE``: 0 self-sort done, 1 FC1 token TMA issued, 2 / 3
         the MMA sees the tokens / token scales, 4 the MMA sees its first weight stage, 5 epilogue WG0 past the
         TMEM wait, 6 token scales stored, 7 / 8 self-sort past its first / second barrier, 9 weight warp in
-        its producer loop, 10 its first unit queued, 11 past the next-unit atomic of its first unit."""
+        its producer loop, 10 its first unit queued, 11 past the next-unit atomic of its first unit, 12 (``replicas``)
+        the copy choice and the choice-free tiles done, 13 (``early_first``) the first unit's early stages
+        issued."""
         nct, _, _ = cute.arch.grid_dim()
         _stg_u64(
             trace_ptr.toint() + (Int64(nct) * 16 + Int64(TRACE_X_BASE) + Int64(bid) * 16 + ev) * 8,
@@ -720,20 +747,40 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
+        pre = Int32(0)
         if cutlass.const_expr(self.self_sort):
+            ids = (
+                self._self_sort_rep_masks(st, topk_ids, orig_m, tidx, trace_ptr, bid)
+                if cutlass.const_expr(self.replicas > 0)
+                else self._self_sort_masks(
+                    st, topk_ids, local_offset, num_local, orig_m, tidx, trace_ptr, bid
+                )
+            )
+            if cutlass.const_expr(self.early_first):
+                if warp_idx == self.tma_warp:
+                    pre = self._early_first_stages(
+                        st,
+                        tiled_mma.get_slice(0),
+                        cl,
+                        a_layout,
+                        sfa_layout,
+                        tma_a1,
+                        mA1,
+                        tma_sfa1,
+                        mSFA1,
+                        self._fixed_words(st, local_offset, rep_pre),
+                        bid,
+                        trace_ptr,
+                    )
             (
                 tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles,
             ) = (
-                self._self_sort_rep(
-                    st, topk_ids, local_offset, orig_m, tidx, rep_pre, trace_ptr, bid
-                )
+                self._self_sort_rep(st, ids, local_offset, tidx, rep_pre, trace_ptr, bid)
                 if cutlass.const_expr(self.replicas > 0)
-                else self._self_sort(
-                    st, topk_ids, local_offset, num_local, orig_m, tidx, trace_ptr, bid
-                )
+                else self._self_sort(st, ids, tidx)
             )
             if cutlass.const_expr(self.trace):
                 if tidx == 0:
@@ -780,6 +827,7 @@ class K3MoeLowMDynKernel:
                 w1,
                 total,
                 nctas,
+                pre,
                 trace_ptr,
                 bid,
             )
@@ -855,7 +903,7 @@ class K3MoeLowMDynKernel:
 
     # ------------------------------------------------------------------ self-sort
     @cute.jit
-    def _self_sort(
+    def _self_sort_masks(
         self,
         st,
         topk_ids,
@@ -866,22 +914,13 @@ class K3MoeLowMDynKernel:
         trace_ptr=None,
         bid=None,
     ):
-        """The step's tile metadata in shared memory, by every thread of the CTA (``k3_moe_front``'s
-        ``_sort_local``): ``(expert of tile, tile * 128 + rows of tile, permuted -> expanded index,
-        tile count)`` as tensors indexed like ``moe_sort``'s outputs (the permuted view maps
-        ``tile * 128 + r`` to word ``tile * n_tok + r``). From per-local-expert token masks (zeroed
-        before the wait): each id ORs its token's bit into its expert's mask; one ballot per 32
-        experts gives the touched experts; each id's tile is the touched experts below its expert,
-        its row the tokens below its token in the mask. Three CTA barriers."""
+        """Steps 1-2 of `_self_sort` (two CTA barriers): every id ORs its token's bit into its local
+        expert's mask (zeroed before the wait), then one ballot per 32 experts gives the touched
+        experts. Returns each of the thread's ids' local expert (-1: not local)."""
         n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
         per = -(-(n_tok * K) // nthr)
         mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
         union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
-        nt = st.sSsNt.get_tensor(cute.make_layout(1))
-        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
-        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
-        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
-        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
         mask_base = st.sSsBits.data_ptr().toint()
         n = orig_m * Int32(K)
         lxs = []
@@ -911,6 +950,25 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == Int32(0):
                 self._xstamp(trace_ptr, bid, 8)
+        return lxs
+
+    @cute.jit
+    def _self_sort(self, st, lxs, tidx):
+        """The step's tile metadata in shared memory, by every thread of the CTA (``k3_moe_front``'s
+        ``_sort_local``): ``(expert of tile, tile * 128 + rows of tile, permuted -> expanded index,
+        tile count)`` as tensors indexed like ``moe_sort``'s outputs (the permuted view maps
+        ``tile * 128 + r`` to word ``tile * n_tok + r``). After `_self_sort_masks` (``lxs``): each
+        id's tile is the touched experts below its expert, its row the tokens below its token in
+        the mask. One more CTA barrier."""
+        n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
+        per = -(-(n_tok * K) // nthr)
+        mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+        union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
+        nt = st.sSsNt.get_tensor(cute.make_layout(1))
+        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
+        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
+        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
+        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
         u = []
         for w in cutlass.range_constexpr(W):
             u.append(union[w])
@@ -943,9 +1001,10 @@ class K3MoeLowMDynKernel:
     @cute.jit
     def _rep_preload(self, replica_ids, local_offset: Int32):
         """S-1d, before the wait (the table is static): every thread's own group's ``R`` copied
-        experts (global slots), and per lane ``c < groups * R`` of every warp the copy's expert,
-        home group and copy group, the lane mask of its (home, copy) pair and the pair masks."""
-        R, G, L = self.replicas, self.ss_groups, self.ss_home
+        experts (global slots), per lane ``c < groups * R`` of every warp the copy's expert, home
+        group and copy group, the lane mask of its (home, copy) pair and the pair masks, and the
+        words of this group's home experts that have a copy."""
+        R, G, L, HW = self.replicas, self.ss_groups, self.ss_home, self.ss_home_words
         g_me = local_offset // Int32(L)
         mine = []
         for c in cutlass.range_constexpr(R):
@@ -967,45 +1026,28 @@ class K3MoeLowMDynKernel:
                     mine_pair = cutlass.select_(
                         (h == Int32(a)) & (r == Int32(b)), pm[(a, b)], mine_pair
                     )
-        return mine, e, h, r, pm, mine_pair
+        d = cutlass.select_(h == g_me, e - g_me * Int32(L), Int32(-1))
+        cp = []
+        for w in cutlass.range_constexpr(HW):
+            v = cutlass.select_(
+                (d >= Int32(0)) & ((d >> 5) == Int32(w)), Int32(1) << (d & 31), Int32(0)
+            )
+            for o in cutlass.range_constexpr(5):
+                v = v | cute.arch.shuffle_sync_bfly(v, offset=1 << o)
+            cp.append(v)
+        return mine, e, h, r, pm, mine_pair, cp
 
     @cute.jit
-    def _self_sort_rep(
-        self,
-        st,
-        topk_ids,
-        local_offset: Int32,
-        orig_m: Int32,
-        tidx,
-        rep_pre,
-        trace_ptr=None,
-        bid=None,
-    ):
-        """`_self_sort` with S-1d copies (``replicas``): the same outputs over this group's local
-        slots ``[0, L + R)``. 1. every id ORs its token's bit into its global slot's mask (all
-        groups); 2. one ballot per 32 slots gives the touched slots; 3. warp 0 chooses which touched
-        copied experts move to their copy (`_REP_ROUNDS` on the groups' touched counts without the
-        copied experts; within a (home, copy) pair the lowest copy entries move) and marks this
-        group's home experts that moved away; 4. this group's tiles: its touched home experts that
-        stay (slot order), then the copies moved in (copy order). Four CTA barriers."""
+    def _self_sort_rep_masks(self, st, topk_ids, orig_m: Int32, tidx, trace_ptr=None, bid=None):
+        """Steps 1-2 of `_self_sort_rep` (two CTA barriers): every id ORs its token's bit into its
+        global slot's mask (all groups), then one ballot per 32 slots gives the touched slots.
+        Returns the thread's ids' global slots (-1: none)."""
         n_tok, K, W, nthr = self.n_tok, self.topk, self.ss_words, self.threads
-        R, G, L, HW = self.replicas, self.ss_groups, self.ss_home, self.ss_home_words
-        mine, e_l, h_l, r_l, pm, mine_pair = rep_pre
         per = -(-(n_tok * K) // nthr)
         mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
         union = st.sSsUnion.get_tensor(cute.make_layout(_align(W, 4)))
-        nt = st.sSsNt.get_tensor(cute.make_layout(1))
-        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
-        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
-        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
-        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
-        away = st.sSsAway.get_tensor(cute.make_layout(self.ss_away))
-        moved = st.sSsMoved.get_tensor(cute.make_layout(4))
         mask_base = st.sSsBits.data_ptr().toint()
-        away_base = st.sSsAway.data_ptr().toint()
         n = orig_m * Int32(K)
-        g_me = local_offset // Int32(L)
-        # 1. every id's token bit into its global slot's mask
         sls = []
         for i in cutlass.range_constexpr(per):
             j = tidx + Int32(i * nthr)
@@ -1018,7 +1060,6 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == Int32(0):
                 self._xstamp(trace_ptr, bid, 7)
-        # 2. touched slots
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         nwarps = nthr // 32
@@ -1032,6 +1073,52 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == Int32(0):
                 self._xstamp(trace_ptr, bid, 8)
+        return sls
+
+    @cute.jit
+    def _fixed_words(self, st, local_offset: Int32, rep_pre):
+        """After the sort's second barrier: the bit words of the touched local slots whose tiles
+        come first and do not depend on the copy choice (tile ``t`` = the ``t``-th set bit): every
+        touched local expert, or (``replicas``) this group's touched home experts without a copy."""
+        union = st.sSsUnion.get_tensor(cute.make_layout(_align(self.ss_words, 4)))
+        fw = []
+        if cutlass.const_expr(self.replicas > 0):
+            cp = rep_pre[6]
+            g_me = local_offset // Int32(self.ss_home)
+            for w in cutlass.range_constexpr(self.ss_home_words):
+                fw.append(union[g_me * Int32(self.ss_home_words) + Int32(w)] & (cp[w] ^ Int32(-1)))
+        else:
+            for w in cutlass.range_constexpr(self.ss_words):
+                fw.append(union[w])
+        return fw
+
+    @cute.jit
+    def _self_sort_rep(self, st, sls, local_offset: Int32, tidx, rep_pre, trace_ptr=None, bid=None):
+        """`_self_sort` with S-1d copies (``replicas``): the same outputs over this group's local
+        slots ``[0, L + R)``, after `_self_sort_rep_masks` (``sls``). 3. warp 0 chooses which touched
+        copied experts move to their copy (`_REP_ROUNDS` on the groups' touched counts without the
+        copied experts; within a (home, copy) pair the lowest copy entries move) and marks this
+        group's home experts that moved away, while every thread places its ids on the touched
+        home experts without a copy (the first tiles, slot order); 4. the touched copied home
+        experts that stay (slot order), then the copies moved in (copy order). Two more CTA
+        barriers."""
+        n_tok, K, nthr = self.n_tok, self.topk, self.threads
+        R, G, L, HW = self.replicas, self.ss_groups, self.ss_home, self.ss_home_words
+        mine, e_l, h_l, r_l, pm, mine_pair, cp = rep_pre
+        per = -(-(n_tok * K) // nthr)
+        mask = st.sSsBits.get_tensor(cute.make_layout(self.ss_bits))
+        union = st.sSsUnion.get_tensor(cute.make_layout(_align(self.ss_words, 4)))
+        nt = st.sSsNt.get_tensor(cute.make_layout(1))
+        expert = st.sSsExpert.get_tensor(cute.make_layout(self.ss_tiles))
+        limit = st.sSsLimit.get_tensor(cute.make_layout(self.ss_tiles))
+        perm = st.sSsPerm.get_tensor(cute.make_layout((_MMA_M, self.ss_tiles), stride=(1, n_tok)))
+        perm_flat = st.sSsPerm.get_tensor(cute.make_layout(self.ss_perm))
+        away = st.sSsAway.get_tensor(cute.make_layout(self.ss_away))
+        moved = st.sSsMoved.get_tensor(cute.make_layout(4))
+        away_base = st.sSsAway.data_ptr().toint()
+        g_me = local_offset // Int32(L)
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
         # 3. the copy choice (warp 0; lane c = copy entry c)
         if warp == Int32(0):
             hit = Int32(0)
@@ -1078,19 +1165,46 @@ class K3MoeLowMDynKernel:
                 _red_shared_or(away_base + (da >> 5) * Int32(4), Int32(1) << (da & 31))
             if lane == Int32(0):
                 moved[0] = mvd
+        # 3'. the ids on touched home experts without a copy: the first tiles
+        hf = []
+        for w in cutlass.range_constexpr(HW):
+            hf.append(union[g_me * Int32(HW) + Int32(w)] & (cp[w] ^ Int32(-1)))
+        n_fix = Int32(0)
+        for w in cutlass.range_constexpr(HW):
+            n_fix = n_fix + _popc(hf[w])
+        for i in cutlass.range_constexpr(per):
+            sl = sls[i]
+            d = sl - g_me * Int32(L)
+            if (sl >= Int32(0)) & (d >= Int32(0)) & (d < Int32(L)):
+                hi = d >> 5
+                word = Int32(0)
+                t = Int32(0)
+                for w in cutlass.range_constexpr(HW):
+                    word = cutlass.select_(Int32(w) == hi, hf[w], word)
+                    t = t + _popc(cutlass.select_(Int32(w) < hi, hf[w], Int32(0)))
+                if ((word >> (d & 31)) & Int32(1)) != Int32(0):
+                    j = tidx + Int32(i * nthr)
+                    tile = t + _popc(word & ((Int32(1) << (d & 31)) - Int32(1)))
+                    tok = mask[sl]
+                    row = _popc(tok & ((Int32(1) << (j // Int32(K))) - Int32(1)))
+                    perm_flat[tile * Int32(n_tok) + row] = j
+                    if row == Int32(0):
+                        expert[tile] = d
+                        limit[tile] = tile * Int32(_MMA_M) + _popc(tok)
         cute.arch.barrier()
         if cutlass.const_expr(self.trace):
             if tidx == Int32(0):
                 self._xstamp(trace_ptr, bid, 12)
-        # 4. this group's tiles
+        # 4. the copied home experts that stay, then the copies moved in
         M = moved[0]
         inm = M & (((Int32(1) << Int32(R)) - Int32(1)) << (g_me * Int32(R)))
-        hu = []
+        hs = []
         for w in cutlass.range_constexpr(HW):
-            hu.append(union[g_me * Int32(HW) + Int32(w)] & (away[w] ^ Int32(-1)))
-        n_home = Int32(0)
+            hs.append(union[g_me * Int32(HW) + Int32(w)] & cp[w] & (away[w] ^ Int32(-1)))
+        n_stay = Int32(0)
         for w in cutlass.range_constexpr(HW):
-            n_home = n_home + _popc(hu[w])
+            n_stay = n_stay + _popc(hs[w])
+        n_home = n_fix + n_stay
         if tidx == Int32(0):
             nt[0] = n_home + _popc(inm)
         for i in cutlass.range_constexpr(per):
@@ -1105,11 +1219,11 @@ class K3MoeLowMDynKernel:
                     word = Int32(0)
                     t = Int32(0)
                     for w in cutlass.range_constexpr(HW):
-                        word = cutlass.select_(Int32(w) == hi, hu[w], word)
-                        t = t + _popc(cutlass.select_(Int32(w) < hi, hu[w], Int32(0)))
+                        word = cutlass.select_(Int32(w) == hi, hs[w], word)
+                        t = t + _popc(cutlass.select_(Int32(w) < hi, hs[w], Int32(0)))
                     if ((word >> (d & 31)) & Int32(1)) != Int32(0):
                         lx = d
-                        tile = t + _popc(word & ((Int32(1) << (d & 31)) - Int32(1)))
+                        tile = n_fix + t + _popc(word & ((Int32(1) << (d & 31)) - Int32(1)))
                 else:
                     for c in cutlass.range_constexpr(R):
                         bit = g_me * Int32(R) + Int32(c)
@@ -1125,6 +1239,67 @@ class K3MoeLowMDynKernel:
                     limit[tile] = tile * Int32(_MMA_M) + _popc(tok)
         cute.arch.barrier()
         return expert, limit, perm, nt
+
+    @cute.jit
+    def _early_first_stages(
+        self,
+        st,
+        thr_mma,
+        cl,
+        a_layout,
+        sfa_layout,
+        tma_a1,
+        mA1,
+        tma_sfa1,
+        mSFA1,
+        fw,
+        bid,
+        trace_ptr,
+    ):
+        """``early_first`` (weight warp, after the sort's second barrier): if the CTA's first unit
+        (``bid``, ``static_first``) is FC1 of a tile in the choice-free part (``fw``,
+        `_fixed_words`), issue its first ring stages (as many as the ring holds, no slot waits).
+        Returns the stages issued (0: none)."""
+        a_full, a_empty = st.a_full.data_ptr(), st.a_empty.data_ptr()
+        P = min(self.nkb1, self.num_ab_stage)
+        n_fix = Int32(0)
+        for w in cutlass.range_constexpr(len(fw)):
+            n_fix = n_fix + _popc(fw[w])
+        tile = bid // Int32(self.nblk1)
+        issued = Int32(0)
+        if tile < n_fix:
+            exp = Int32(0)
+            acc = Int32(0)
+            for w in cutlass.range_constexpr(len(fw)):
+                c = _popc(fw[w])
+                hit = (tile >= acc) & (tile < acc + c)
+                exp = cutlass.select_(hit, Int32(w * 32) + _fns(fw[w], tile - acc + Int32(1)), exp)
+                acc = acc + c
+            blk = bid - tile * Int32(self.nblk1)
+            tAsA1, tAgA1, tAsSFA1, tAgSFA1 = self._weight_parts(
+                st, thr_mma, cl, a_layout, sfa_layout, mA1, mSFA1, tma_a1, tma_sfa1
+            )
+            if cutlass.const_expr(self.trace):
+                with cute.arch.elect_one():
+                    self._stamp(trace_ptr, bid, 2)
+                    self._xstamp(trace_ptr, bid, 13)
+            for kb in cutlass.range_constexpr(P):
+                self._load_stage(
+                    tma_a1,
+                    tma_sfa1,
+                    tAsA1,
+                    tAgA1,
+                    tAsSFA1,
+                    tAgSFA1,
+                    blk,
+                    Int32(kb),
+                    exp,
+                    a_full,
+                    a_empty,
+                    Int32(kb),
+                )
+            issued = Int32(P)
+        return issued
 
     # ------------------------------------------------------------------ producers
     @cute.jit
@@ -1170,6 +1345,23 @@ class K3MoeLowMDynKernel:
         return expert
 
     @cute.jit
+    def _weight_parts(self, st, thr_mma, cl, a_layout, sfa_layout, mA, mSFA, tma_a, tma_sfa):
+        """TMA partitions of one GEMM's weights and weight scales over the ring."""
+        sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+        sSFA = st.sSFA.get_tensor(sfa_layout)
+        a_cta = cute.make_layout(cute.slice_(cl, (0, 0, None, 0)).shape)
+        tiler = cute.slice_(self.mma_tiler, (None, 0, None))
+        tCgA = thr_mma.partition_A(cute.local_tile(mA, tiler, (None, None, None)))
+        tCgSFA = thr_mma.partition_A(cute.local_tile(mSFA, tiler, (None, None, None)))
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_a, 0, a_cta, cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3)
+        )
+        tAsSFA, tAgSFA = cpasync.tma_partition(
+            tma_sfa, 0, a_cta, cute.group_modes(sSFA, 0, 3), cute.group_modes(tCgSFA, 0, 3)
+        )
+        return tAsA, tAgA, cute.filter_zeros(tAsSFA), cute.filter_zeros(tAgSFA)
+
+    @cute.jit
     def _weight_producer(
         self,
         st,
@@ -1192,41 +1384,29 @@ class K3MoeLowMDynKernel:
         w1: Int32,
         total: Int32,
         nctas: Int32,
+        pre: Int32,
         trace_ptr,
         bid,
     ):
         """Fetches the CTA's units from the work counter (one ahead; ``first``: lane 0's first
         fetch; ``t2e_pre``: lane i holds the expert of tile i), reserves the ring slot(s) of an FC2
         unit's token operand, publishes the unit and streams its weight stages through the ring;
-        the CTA that exits last resets the work counter."""
+        the CTA that exits last resets the work counter. ``pre``: stages of the first (FC1) unit
+        already issued (`_early_first_stages`)."""
         a_full, a_empty = st.a_full.data_ptr(), st.a_empty.data_ptr()
-        sA = st.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
-        sSFA = st.sSFA.get_tensor(sfa_layout)
-        a_cta = cute.make_layout(cute.slice_(cl, (0, 0, None, 0)).shape)
-        tiler = cute.slice_(self.mma_tiler, (None, 0, None))
-        parts = []
-        for mA, mSFA, tma_a, tma_sfa in (
-            (mA1, mSFA1, tma_a1, tma_sfa1),
-            (mA2, mSFA2, tma_a2, tma_sfa2),
-        ):
-            tCgA = thr_mma.partition_A(cute.local_tile(mA, tiler, (None, None, None)))
-            tCgSFA = thr_mma.partition_A(cute.local_tile(mSFA, tiler, (None, None, None)))
-            tAsA, tAgA = cpasync.tma_partition(
-                tma_a, 0, a_cta, cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3)
-            )
-            tAsSFA, tAgSFA = cpasync.tma_partition(
-                tma_sfa, 0, a_cta, cute.group_modes(sSFA, 0, 3), cute.group_modes(tCgSFA, 0, 3)
-            )
-            parts.append((tAsA, tAgA, cute.filter_zeros(tAsSFA), cute.filter_zeros(tAgSFA)))
-        tAsA1, tAgA1, tAsSFA1, tAgSFA1 = parts[0]
-        tAsA2, tAgA2, tAsSFA2, tAgSFA2 = parts[1]
+        tAsA1, tAgA1, tAsSFA1, tAgSFA1 = self._weight_parts(
+            st, thr_mma, cl, a_layout, sfa_layout, mA1, mSFA1, tma_a1, tma_sfa1
+        )
+        tAsA2, tAgA2, tAsSFA2, tAgSFA2 = self._weight_parts(
+            st, thr_mma, cl, a_layout, sfa_layout, mA2, mSFA2, tma_a2, tma_sfa2
+        )
         lane = cute.arch.lane_idx()
         ctr = ctr_ptr.toint()
         cur = cute.arch.shuffle_sync(first, 0)
         if cutlass.const_expr(self.trace):
             with cute.arch.elect_one():
                 self._xstamp(trace_ptr, bid, 9)
-        g = Int32(0)
+        g = pre
         j = Int32(0)
         n1u = Int32(0)
         while cur < total:
@@ -1253,10 +1433,11 @@ class K3MoeLowMDynKernel:
                 blk = cur - tile * self.nblk1
                 expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
                 if cutlass.const_expr(self.trace):
-                    if j == 0:
+                    if (j == 0) & (pre == 0):
                         with cute.arch.elect_one():
                             self._stamp(trace_ptr, bid, 2)
-                for kb in cutlass.range(self.nkb1, unroll=1):
+                kb0 = cutlass.select_(j == 0, pre, Int32(0))
+                for kb in cutlass.range(kb0, self.nkb1, 1, unroll=1):
                     g = self._load_stage(
                         tma_a1,
                         tma_sfa1,
