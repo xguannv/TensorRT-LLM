@@ -91,6 +91,70 @@ def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: 
     assert relative_l2 < 3e-2
 
 
+def _attn_res_inputs(num_tokens: int, num_snapshots: int):
+    torch.manual_seed(0)
+    projection = nn.Linear(HIDDEN_SIZE, 1, bias=False, dtype=torch.bfloat16, device="cuda")
+    norm = KimiK3RMSNorm(HIDDEN_SIZE, eps=RMS_EPS).to(device="cuda", dtype=torch.bfloat16)
+    projection.weight.mul_(0.02)
+    prefix_sum = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
+    block_residual = (
+        torch.randn(num_snapshots, num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        * 0.05
+    )
+    return prefix_sum, block_residual, projection, norm
+
+
+@pytest.mark.skipif(
+    not _has_supported_gpu(),
+    reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
+)
+@pytest.mark.parametrize(("num_tokens", "slice_tokens"), [(4096, 1000), (16384, 4096)])
+@pytest.mark.parametrize("num_snapshots", [1, 8, 11])
+@torch.no_grad()
+def test_fused_attn_res_token_slices_are_bitwise(
+    monkeypatch, num_tokens: int, slice_tokens: int, num_snapshots: int
+) -> None:
+    """The mixture is per token: running the fused op in token slices changes no bit."""
+    prefix_sum, block_residual, projection, norm = _attn_res_inputs(num_tokens, num_snapshots)
+    whole = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+    monkeypatch.setattr(kimi_modeling, "_ATTN_RES_FWD_MAX_TOKENS", slice_tokens)
+    sliced = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+    assert whole is not None and sliced is not None
+    torch.testing.assert_close(sliced, whole, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not _has_supported_gpu(),
+    reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
+)
+@torch.no_grad()
+def test_fused_attn_res_above_one_call_matches_torch_reference() -> None:
+    """A prefill chunk past one call's token cap (32768 tokens, 8 snapshots: K3's deepest layers) takes the fused
+    op in slices rather than the fp32 reference, at the reference's tolerance."""
+    num_tokens, num_snapshots = 32768, 8
+    assert num_tokens > kimi_modeling._ATTN_RES_FWD_MAX_TOKENS
+    prefix_sum, block_residual, projection, norm = _attn_res_inputs(num_tokens, num_snapshots)
+    actual = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
+    assert actual is not None
+    # The reference is per token too; two halves keep its fp32 temporaries near 14 GiB instead of 28.
+    half = num_tokens // 2
+    expected = torch.cat(
+        [
+            apply_attn_res_reference(
+                prefix_sum[s : s + half],
+                block_residual[:, s : s + half].transpose(0, 1),
+                projection.weight,
+                norm.weight,
+                RMS_EPS,
+            )
+            for s in (0, half)
+        ]
+    )
+    cosine, relative_l2 = _similarity(actual, expected)
+    assert cosine > 0.999
+    assert relative_l2 < 3e-2
+
+
 class _AddConstant(nn.Module):
     def __init__(self, value: float) -> None:
         super().__init__()
