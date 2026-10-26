@@ -262,11 +262,16 @@ TRTLLM_K3LL_QKVG_BS1_SPLIT = _flag(
 TRTLLM_K3LL_MAXCARVE = _flag(
     "TRTLLM_K3LL_MAXCARVE",
     -1,
-    "K3AttnResFastKernel and the k3_ctm_gemv_wide kernels run at the max-shared carveout (k3_carveout.apply: the "
-    "attribute set on each build's kernels when it is compiled; a placement hint, the same results), so their SMs need "
-    "no drain before a CTA of a 200+ KB successor (the mxfp8 QKVG / fused_a GEMMs, the MoE front) becomes resident and "
-    "streams its weights before its wait. Read once, at import, by k3_carveout.py, not at forward time. 1 on, 0 off, "
-    "-1 (default): on where the device is in k3_carveout.MAXCARVE_CAPABILITIES (SM103)",
+    "Every vectorized K3AttnResFastKernel build (not the exact kernel) and every k3_ctm_gemv wide build (plain, "
+    "ar_push, col_publish) run at the max-shared carveout (k3_carveout.apply: the attribute set on each build's "
+    "kernels when it is compiled; a placement hint, bitwise the same results), so their SMs need no drain before a CTA "
+    "of a 200+ KB successor (the mxfp8 QKVG / fused_a GEMMs, the MoE front) becomes resident and streams its weights "
+    "before its wait. Off, in situ, AttnResFast ran at a 32 / 64 KB carveout and the wide builds at 132-228 KB; on, "
+    "both at 228 KB. GB300 4-process ABBA (L1 ms/step): bs1 +0.010, bs2 -0.048, bs4 -0.016 (within the A-vs-A null, "
+    "pair -0.024); nsys: AttnResFast starts as early after ctm_gemv_wide as off but runs ~1.7 us longer (consistent "
+    "with co-residency on the GEMV's SMs; a span-only trace cannot settle it). "
+    "Read once, at import, by k3_carveout.py, not at forward time; any value outside -1 / 0 / 1 raises there. 1 on, "
+    "0 off, -1 (default): on where the device is in k3_carveout.MAXCARVE_CAPABILITIES (SM103)",
 )
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",

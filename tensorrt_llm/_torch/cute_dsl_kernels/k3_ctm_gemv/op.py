@@ -87,9 +87,10 @@ def _compile(key, entry, *args):
             if fn is None:
                 fn = cute.compile(entry, *args)
                 if entry in _wide_entries():
-                    # TRTLLM_K3LL_MAXCARVE: the small CTAs of the next kernel (the tail AttnResFast) start on these
-                    # SMs before they empty and keep their configuration; at the max-shared carveout a 200+ KB
-                    # CTA after them does not wait for a drain.
+                    # TRTLLM_K3LL_MAXCARVE: the small CTAs of the kernel after a wide build (AttnResFast after the
+                    # column publish, K3LamportFinish after the side stream's ar_push) start on these SMs before they
+                    # empty and keep their configuration; at the max-shared carveout a 200+ KB CTA after them does not
+                    # wait for a drain.
                     k3_carveout.apply(fn)
                 _compiled[key] = fn
     return fn

@@ -58,6 +58,8 @@ class Values(tuple):
 #: Switches that accept more than 0 / 1, and the values they accept.
 ACCEPTED_VALUES = {
     "TRTLLM_K3LL_QKVG_BS1_SPLIT": (0, 3, 4),
+    # -1 resolves to 0 or 1 per device; any other value raises at import (k3_carveout.MAXCARVE_VALUES)
+    "TRTLLM_K3LL_MAXCARVE": (0, 1),
 }
 
 #: Switches covered here although their default is not -1 (read at forward time, on by default).
@@ -230,8 +232,10 @@ COVERAGE = {
     "TRTLLM_K3LL_MAXCARVE": (
         (
             NOT_FORWARD,
-            "read once at import by cute_dsl_kernels/k3_carveout.py; k3_carveout.apply sets the kernel attribute on "
-            "each AttnResFast / ctm_gemv_wide build when it is compiled, before any capture",
+            "read once at import by cute_dsl_kernels/k3_carveout.py (other values than -1 / 0 / 1 raise there); "
+            "k3_carveout.apply sets the kernel attribute on each vectorized AttnResFast / ctm_gemv wide build when "
+            "it is compiled, before any capture; 0 and 1 compile the same kernels",
+            Values((0, 1)),
         ),
     ),
     # executor

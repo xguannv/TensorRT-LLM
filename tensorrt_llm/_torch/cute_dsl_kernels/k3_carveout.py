@@ -26,8 +26,12 @@ successor needs.
 (loaded by ``compiled.library``, without a launch), once per build, before any launch: CUDA graphs captured afterwards
 launch the kernels with it.
 
+Callers: every vectorized ``K3AttnResFastKernel`` build (``k3_attn_res._compiled`` without ``exact``: the o_proj push
+finish, the MoE tail LU / COL consumers, the torch ops; the per-element exact kernel keeps the runtime's carveout) and
+every ``k3_ctm_gemv`` wide build (``k3_ctm_gemv_wide``, ``_wide_ar_push``, ``_wide_col_publish``).
+
 The variable is read once, at import, never at forward time: 1 on, 0 off, -1 (default) on where the device is in
-:data:`MAXCARVE_CAPABILITIES`.
+:data:`MAXCARVE_CAPABILITIES`; any other value raises at import.
 """
 
 import functools
@@ -36,8 +40,12 @@ import os
 import torch
 from cuda.bindings import runtime as _rt
 
+#: The values ``TRTLLM_K3LL_MAXCARVE`` takes.
+MAXCARVE_VALUES = (-1, 0, 1)
 #: ``TRTLLM_K3LL_MAXCARVE`` (``kimi_k3_nvfp4/flags.py`` logs it), read here once.
 MAXCARVE = int(os.environ.get("TRTLLM_K3LL_MAXCARVE") or -1)
+if MAXCARVE not in MAXCARVE_VALUES:
+    raise ValueError(f"TRTLLM_K3LL_MAXCARVE must be one of {MAXCARVE_VALUES}, got {MAXCARVE}")
 #: Where -1 turns it on: SM103 (measured on GB300).
 MAXCARVE_CAPABILITIES = ((10, 3),)
 #: The preferred carveout set, in percent of the maximum shared memory per SM.
