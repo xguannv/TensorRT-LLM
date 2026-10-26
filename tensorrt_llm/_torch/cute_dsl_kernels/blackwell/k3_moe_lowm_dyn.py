@@ -960,7 +960,7 @@ class K3MoeLowMDynKernel:
         mine_pair = Int32(0)
         for a in range(G):
             for b in range(G):
-                if a != b:
+                if cutlass.const_expr(a != b):
                     pm[(a, b)] = Int32(
                         cute.arch.vote_ballot_sync((h == Int32(a)) & (r == Int32(b)))
                     )
@@ -1051,7 +1051,7 @@ class K3MoeLowMDynKernel:
             for g in range(G):
                 hb = Int32(0)
                 for b2 in range(G):
-                    if b2 != g:
+                    if cutlass.const_expr(b2 != g):
                         hb = hb + k[(g, b2)]
                 ld.append(tot[g] - hb)
             mv = {}
