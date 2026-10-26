@@ -4684,10 +4684,14 @@ class TransferWorker:
         memory_descs = get_unique_pool_memory_descs(
             self._rank_info.page_table, self._rank_info.device_id
         )
-        if memory_descs:
-            reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
+        # One registration per pool: the agent requires every descriptor of a single registration to
+        # share one VMM chunk size, and the chunk size follows each pool's own quota (a target pool and
+        # an external drafter pool of different sizes get different ones). Splitting, deregistration and
+        # transfers all use the per-region chunk size.
+        for memory_desc in memory_descs:
+            reg_memory_desc = RegMemoryDescs("VRAM", [memory_desc])
             self._agent.register_memory(reg_memory_desc)
-            logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
+            logger.debug(f"Registered KV cache memory with transfer agent: {memory_desc}")
             self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):
