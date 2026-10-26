@@ -604,6 +604,18 @@ def check_lar_variants():
             _expect_same(
                 f"latent AR {rows} rows eager switch {v}", outs[v], outs[0], replicated=True
             )
+        # TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE: another re-arm CTA count above 16 rows, the same bits.
+        old_wide = FLAGS.TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE
+        try:
+            for wide in (8, 16, 64):
+                FLAGS.TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE = wide
+                with _lar(1):
+                    got = COL.latent_all_reduce(st.base, layer, call.routed).clone()
+                _expect_same(
+                    f"latent AR {rows} rows re-arm CTAs {wide}", got, outs[0], replicated=True
+                )
+        finally:
+            FLAGS.TRTLLM_K3LL_LAR_CLEAR_CTAS_WIDE = old_wide
     # Back-to-back chains under graph capture, the pairs' graphs interleaved on the one workspace.
     for rows in (16, 24, 32):
         calls = [_Call(950 + 7 * k + rows, rows) for k in range(LAR_CHAIN)]
