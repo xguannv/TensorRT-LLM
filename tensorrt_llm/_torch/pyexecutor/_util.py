@@ -3362,6 +3362,12 @@ def _create_kv_cache_manager(
             kda_extra_kwargs["pretrained_config"] = config
         kda_replay_manager_types = (MixedMambaHybridCacheManager,
                                     MambaHybridCacheManagerV2)
+        if (spec_config is not None
+                and not _target_verifies_drafts(spec_config, model_engine) and
+                issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)):
+            # No verify state at all (neither the replay caches nor the
+            # intermediate states they replace).
+            kda_extra_kwargs["target_verifies_drafts"] = False
         if (_target_verifies_drafts(spec_config, model_engine)
                 and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
             from ..modules.kimi_kda._kda_kernels import \

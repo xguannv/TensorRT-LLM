@@ -417,6 +417,33 @@ def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
     assert kwargs.get("kda_draft_records", False) is backbone_asks
 
 
+def test_kimi_v2_manager_of_a_capture_only_context_keeps_no_verify_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A context worker whose drafter is the capture-only one never verifies: the factory asks the V2 manager for no
+    Mamba verify state (target_verifies_drafts False), and for neither the replay caches nor the draft records."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        lambda: True,
+    )
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(kda_draft_records=True),
+            draft_model=SimpleNamespace(CAPTURE_ONLY=True),
+        ),
+        _max_cuda_graph_batch_size=4,
+        is_multimodal=True,
+    )
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(
+        monkeypatch, MTPDecodingConfig(max_draft_len=3), model_engine
+    )
+
+    assert kwargs["target_verifies_drafts"] is False
+    assert "kda_replay_num_spec" not in kwargs
+    assert "kda_draft_records" not in kwargs
+
+
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2427,6 +2454,7 @@ def _build_v2_hybrid_with_mamba_layer(
     kda_replay_num_spec=None,
     enable_kv_pool_rebalance=False,
     kda_draft_records=False,
+    target_verifies_drafts=True,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2483,6 +2511,7 @@ def _build_v2_hybrid_with_mamba_layer(
         conv_state_layout=conv_state_layout,
         kda_replay_num_spec=kda_replay_num_spec,
         kda_draft_records=kda_draft_records,
+        target_verifies_drafts=target_verifies_drafts,
     )
 
 
@@ -3708,6 +3737,36 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         assert layer_cache.kda_state_tok is None
         assert not mgr.keeps_kda_draft_records
         assert layer_cache.has_kda_replay_caches
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("target_verifies_drafts", [True, False])
+def test_v2_target_without_verify_keeps_no_mamba_verify_state(target_verifies_drafts):
+    """With a speculative config but no KDA replay caches, a verifying target keeps the intermediate verify states;
+    a target that never verifies (target_verifies_drafts False) keeps none, as without speculative decoding."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        target_verifies_drafts=target_verifies_drafts,
+    )
+    try:
+        if target_verifies_drafts:
+            assert mgr.intermediate_ssm_states is not None
+            assert mgr.is_speculative()
+            return
+        assert mgr.intermediate_ssm_states is None
+        assert mgr.intermediate_conv_states is None
+        assert not mgr.is_speculative()
+        assert getattr(mgr, "kda_qkg_cache", None) is None
+        assert getattr(mgr, "kda_state_tok", None) is None
     finally:
         mgr.shutdown()
 

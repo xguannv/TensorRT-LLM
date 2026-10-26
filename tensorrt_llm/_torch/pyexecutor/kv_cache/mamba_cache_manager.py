@@ -3109,8 +3109,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         kda_replay_num_spec: Optional[int] = None,
         qwen4_exp_ple_cache_params: Optional["Qwen4ExpPLECacheParams"] = None,
         kda_draft_records: bool = False,
+        target_verifies_drafts: bool = True,
         **kwargs,
     ) -> None:
+        # A target that never verifies a draft (a context worker with the
+        # capture-only drafter, TRTLLM_K3LL_DRAFTER_PROMPT_CTX) keeps no Mamba
+        # verify state in either form (intermediate states or replay caches):
+        # its recurrent state is set up as without speculative decoding. The
+        # attention KV cache still takes spec_config.
+        self._state_spec_config = spec_config if target_verifies_drafts else None
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(
                 f"Unsupported convolution state layout: {conv_state_layout!r}")
@@ -3286,7 +3293,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if is_mamba:
                 per_layer_kv_heads[i] = 0
 
-        self._setup_mtp_intermediate_states(spec_config, max_batch_size)
+        self._setup_mtp_intermediate_states(self._state_spec_config,
+                                            max_batch_size)
 
         self._attention_cache_layout_policy = None
         if dtype == DataType.NVFP4 and kv_cache_type == CacheTypeCpp.SELFKONLY:
@@ -3383,7 +3391,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._setup_states()
             # PLE pools use exactly the state-slot capacity resolved above.
             self._setup_ple_states(num_ssm_slots)
-            self._setup_replay_buffers(spec_config)
+            self._setup_replay_buffers(self._state_spec_config)
             if self._use_gdn_cached_replay_all_layer_commit:
                 state_layout = ("affine"
                                 if self._gdn_cached_replay_state_strides
@@ -3401,7 +3409,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.all_conv_states = []
             self._stacked_ssm_states = None
             self._stacked_conv_states = None
-            self._setup_replay_buffers(spec_config)
+            self._setup_replay_buffers(self._state_spec_config)
 
     def _init_qwen4_exp_ple_geometry(
         self,
