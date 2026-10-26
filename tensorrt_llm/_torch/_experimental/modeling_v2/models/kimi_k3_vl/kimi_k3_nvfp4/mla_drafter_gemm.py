@@ -134,6 +134,11 @@ class DrafterGemm:
         key = ("gate_up_swiglu", pin[0], tuple(gate_up.shape), pdl)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and key not in self._ran:
+            # Not compiled for this shape: the caller's GEMM + silu_and_mul (the same bits). Counted, so an A / B of
+            # TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU can tell that it measured the fallback, not the switch.
+            from . import census as _census
+
+            _census.count(f"fallback:drafter_swiglu_not_compiled:{_census.mode()}")
             return None
         out = torch.empty((m, gate_up.shape[0] // 2), dtype=x.dtype, device=x.device)
         run_splitk_dense_swiglu(x2d, gate_up, out, tactic, pdl)

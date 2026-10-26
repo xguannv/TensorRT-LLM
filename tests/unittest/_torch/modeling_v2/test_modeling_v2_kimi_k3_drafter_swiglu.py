@@ -18,8 +18,9 @@
 * Kernel: bit for bit the pinned GEMM (``run_splitk_dense``, same tactic, same weight) then ``silu_and_mul``, at the
   drafter's gate_up shape [1792, 7168] and the gate_up pins' row counts (7 / 8 / 14 / 16 / 28 / 32), with and without
   PDL, and at another shape (I 512, K 1024); the weight is read, never written.
-* ``DrafterGemm.project_swiglu``: bit for bit as above; under capture it refuses a build that never ran eagerly; a
-  captured graph replayed with rewritten inputs is bit for bit the eager call.
+* ``DrafterGemm.project_swiglu``: bit for bit as above; under capture it refuses a build that never ran eagerly and
+  counts the fallback (``fallback:drafter_swiglu_not_compiled``); a captured graph replayed with rewritten inputs is
+  bit for bit the eager call.
 * The switch: 1 on, 0 off, -1 on SM103 only.
 """
 
@@ -27,6 +28,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+    census,
     flags,
     mla_drafter_gemm,
 )
@@ -105,8 +107,12 @@ def test_kernel_bitwise_other_shape(rows):
 
 @needs_sm100
 @pytest.mark.parametrize("rows", (14, 32))
-def test_project_swiglu_eager_and_graph(rows):
+def test_project_swiglu_eager_and_graph(rows, monkeypatch):
     import tensorrt_llm  # noqa: F401
+
+    monkeypatch.setattr(census, "ENABLED", True)
+    fallback = "fallback:drafter_swiglu_not_compiled:capture"
+    before = census.counts().get(fallback, 0)
 
     w, g = _weights(INTER, HIDDEN, 200 + rows)
     gemm = mla_drafter_gemm.DrafterGemm()
@@ -121,6 +127,7 @@ def test_project_swiglu_eager_and_graph(rows):
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         refused = gemm.project_swiglu(x, w)
     assert refused is None
+    assert census.counts().get(fallback, 0) == before + 1
     del graph
 
     got = gemm.project_swiglu(x, w)
@@ -132,6 +139,7 @@ def test_project_swiglu_eager_and_graph(rows):
         out = gemm.project_swiglu(x, w)
     torch.cuda.current_stream().wait_stream(stream)
     assert out is not None
+    assert census.counts().get(fallback, 0) == before + 1, "a compiled build counted as a fallback"
     for r in range(3):
         x.copy_(torch.randn(rows, HIDDEN, generator=g, device="cuda").bfloat16())
         graph.replay()
