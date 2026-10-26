@@ -528,7 +528,8 @@ class K3MoeLowMDynKernel:
     def _xstamp(self, trace_ptr, bid, ev: int):
         """Extra per-CTA stamp (``trace``) at ``TRACE_X_BASE``: 0 self-sort done, 1 FC1 token TMA issued, 2 / 3
         the MMA sees the tokens / token scales, 4 the MMA sees its first weight stage, 5 epilogue WG0 past the
-        TMEM wait, 6 token scales stored."""
+        TMEM wait, 6 token scales stored, 7 / 8 self-sort past its first / second barrier, 9 weight warp in
+        its producer loop, 10 its first unit queued."""
         nct, _, _ = cute.arch.grid_dim()
         _stg_u64(
             trace_ptr.toint() + (Int64(nct) * 16 + Int64(TRACE_X_BASE) + Int64(bid) * 16 + ev) * 8,
@@ -675,7 +676,7 @@ class K3MoeLowMDynKernel:
                 tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx,
                 num_non_exiting_tiles,
-            ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx)
+            ) = self._self_sort(st, topk_ids, local_offset, num_local, orig_m, tidx, trace_ptr, bid)
             if cutlass.const_expr(self.trace):
                 if tidx == 0:
                     self._xstamp(trace_ptr, bid, 0)
@@ -796,7 +797,17 @@ class K3MoeLowMDynKernel:
 
     # ------------------------------------------------------------------ self-sort
     @cute.jit
-    def _self_sort(self, st, topk_ids, local_offset: Int32, num_local: Int32, orig_m: Int32, tidx):
+    def _self_sort(
+        self,
+        st,
+        topk_ids,
+        local_offset: Int32,
+        num_local: Int32,
+        orig_m: Int32,
+        tidx,
+        trace_ptr=None,
+        bid=None,
+    ):
         """The step's tile metadata in shared memory, by every thread of the CTA (``k3_moe_front``'s
         ``_sort_local``): ``(expert of tile, tile * 128 + rows of tile, permuted -> expanded index,
         tile count)`` as tensors indexed like ``moe_sort``'s outputs (the permuted view maps
@@ -826,6 +837,9 @@ class K3MoeLowMDynKernel:
                     _red_shared_or(mask_base + e * Int32(4), Int32(1) << (j // Int32(K)))
             lxs.append(lx)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 7)
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         nwarps = nthr // 32
@@ -836,6 +850,9 @@ class K3MoeLowMDynKernel:
                 if lane == Int32(0):
                     union[w] = Int32(b)
         cute.arch.barrier()
+        if cutlass.const_expr(self.trace):
+            if tidx == Int32(0):
+                self._xstamp(trace_ptr, bid, 8)
         u = []
         for w in cutlass.range_constexpr(W):
             u.append(union[w])
@@ -962,6 +979,9 @@ class K3MoeLowMDynKernel:
         lane = cute.arch.lane_idx()
         ctr = ctr_ptr.toint()
         cur = cute.arch.shuffle_sync(first, 0)
+        if cutlass.const_expr(self.trace):
+            with cute.arch.elect_one():
+                self._xstamp(trace_ptr, bid, 9)
         g = Int32(0)
         j = Int32(0)
         n1u = Int32(0)
@@ -977,6 +997,10 @@ class K3MoeLowMDynKernel:
                     self._unit_stamp(trace_ptr, cur, 3, Int64(bid))
             if cur < w1:
                 self._q_write(st, j, cur, Int32(-1))
+                if cutlass.const_expr(self.trace):
+                    if j == 0:
+                        with cute.arch.elect_one():
+                            self._xstamp(trace_ptr, bid, 10)
                 tile = cur // self.nblk1
                 blk = cur - tile * self.nblk1
                 expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
