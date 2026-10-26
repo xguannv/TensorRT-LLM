@@ -306,13 +306,21 @@ class LayerGroup:
 
 @dataclass
 class AttentionLayerGroup(LayerGroup):
-    """Layer group for attention KV cache."""
+    """Layer group for attention KV cache.
+
+    ``replicated`` marks a group every rank holds whole: its pages are neither
+    split across Helix CP ranks (a CP generation rank receives every page, not
+    its ``[cp_rank::cp_size]`` stride) nor head-sharded across TP ranks (one
+    sender per destination copies each page intact). It is serialized only
+    when set, and a table without the field reads it as ``False``.
+    """
 
     kv_head_num_per_rank: int = 0
     sliding_window_size: Optional[int] = None
+    replicated: bool = False
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
             "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
@@ -320,6 +328,9 @@ class AttentionLayerGroup(LayerGroup):
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
         }
+        if self.replicated:
+            data["replicated"] = True
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "AttentionLayerGroup":
@@ -329,6 +340,7 @@ class AttentionLayerGroup(LayerGroup):
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
             kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
             sliding_window_size=data.get("sliding_window_size"),
+            replicated=bool(data.get("replicated", False)),
         )
 
 

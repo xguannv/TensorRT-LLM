@@ -43,6 +43,8 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+import msgpack
+import numpy as np
 import pytest
 import torch
 
@@ -54,9 +56,24 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    DRAFT_GLOBAL_LAYER_ID_OFFSET,
+    KVRegionExtractorV1,
+    append_draft_page_table,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
+    KVCachePageTable,
+    LayerGroup,
+    LocalLayer,
+    MapperKind,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
-from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2, drafter_window
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorEffects,
     PyExecutorRequestRegistry,
@@ -705,15 +722,30 @@ def _add_sequence(
 # Transceiver creation (threaded)
 # ---------------------------------------------------------------------------
 def _create_transceiver_in_thread(
-    rank, mapping, cache_manager, dist_mock, attention_type, config, results, errors
+    rank,
+    mapping,
+    cache_manager,
+    dist_mock,
+    attention_type,
+    config,
+    results,
+    errors,
+    draft_manager=None,
+    draft_prompt_window=0,
 ):
-    """Thread target: create one KvCacheTransceiverV2."""
+    """Thread target: create one KvCacheTransceiverV2 (with a draft manager when given)."""
+    draft_kwargs = (
+        {"draft_kv_cache_manager": draft_manager, "draft_prompt_window": draft_prompt_window}
+        if draft_manager is not None
+        else {}
+    )
     try:
         tc = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_mock,
             kv_cache_manager=cache_manager,
             cache_transceiver_config=config,
+            **draft_kwargs,
         )
         results[rank] = tc
     except Exception as e:
@@ -728,9 +760,13 @@ def create_instance_transceivers(
     config: CacheTransceiverConfig,
     is_mla: bool,
     cp_size: int = 1,
+    draft_managers: Optional[List] = None,
+    draft_prompt_window: int = 0,
 ) -> List[KvCacheTransceiverV2]:
     """Create KvCacheTransceiverV2 for all ranks via threaded init.
 
+    draft_managers (one per rank) adds each rank's draft KV cache manager with
+    draft_prompt_window; None creates target-only transceivers.
     cp_size > 1 builds a helix-CP instance (see _create_managers_for_instance).
     Ranks are enumerated (pp_rank * tp + tp_rank) * cp_size + cp_rank, matching
     the manager order so cache_managers[rank] lines up.
@@ -783,6 +819,8 @@ def create_instance_transceivers(
                 config,
                 results,
                 errors,
+                draft_managers[rank] if draft_managers is not None else None,
+                draft_prompt_window,
             ),
         )
         threads.append(t)
@@ -1828,6 +1866,396 @@ def test_cache_transceiver_helix_cp(gen_cp, is_mla):
     )
 
     print("PASSED")
+
+
+# ---------------------------------------------------------------------------
+# Drafter prompt window: a draft KV cache manager transferred next to the target
+# ---------------------------------------------------------------------------
+DRAFT_NUM_LAYERS = 2
+DRAFT_HEAD_DIM = 576  # one dense MLA latent per token per drafter layer
+DRAFTER_REQUEST_LENGTHS = [203, 64]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prompt_len,window,tokens_per_block,expected",
+    [
+        (200, 100, 32, (96, 104)),
+        (203, 100, 8, (96, 107)),
+        (64, 32, 32, (32, 32)),
+        (65, 32, 32, (32, 33)),
+        (100, 100, 32, (0, 100)),
+        (50, 100, 32, (0, 50)),
+        (1, 4096, 32, (0, 1)),
+    ],
+)
+def test_drafter_window(prompt_len, window, tokens_per_block, expected):
+    assert drafter_window(prompt_len, window, tokens_per_block) == expected
+
+
+@pytest.mark.cpu_only
+def test_drafter_window_page_lists_pair():
+    """Both sides list the same number of pages, and the window covers the last W positions."""
+    for tpb in (1, 8, 32):
+        for prompt_len in range(1, 130):
+            for window in (1, 7, 8, 31, 32, 33, 100, 200):
+                start, length = drafter_window(prompt_len, window, tpb)
+                assert start % tpb == 0 and start + length == prompt_len
+                assert length >= min(window, prompt_len)
+                if prompt_len > window:
+                    assert length - window < tpb
+                ctx_pages = (prompt_len + tpb - 1) // tpb - start // tpb
+                gen_pages = (length + tpb - 1) // tpb
+                assert ctx_pages == gen_pages, (tpb, prompt_len, window)
+
+
+def _attention_layer_group(replicated: bool) -> AttentionLayerGroup:
+    return AttentionLayerGroup(
+        pool_group_idx=0,
+        local_layers=[LocalLayer(local_layer_id=0, global_layer_id=3)],
+        pool_views=[
+            PoolView(
+                pool_idx=0,
+                buffer_entries=np.array([(0, 0, 64)], dtype=BUFFER_ENTRY_DTYPE),
+                pool_role=frozenset({"key"}),
+                mapper_kind=MapperKind.INDEXED,
+                bytes_per_layer=64,
+            )
+        ],
+        kv_head_num_per_rank=1,
+        sliding_window_size=None,
+        replicated=replicated,
+    )
+
+
+@pytest.mark.cpu_only
+def test_attention_layer_group_replicated_round_trip():
+    plain = _attention_layer_group(replicated=False)
+    plain_dict = plain.to_dict()
+    # Unset, the marker stays off the wire so the serialized table is unchanged.
+    assert "replicated" not in plain_dict
+    assert LayerGroup.from_dict(plain_dict).replicated is False
+
+    replicated = _attention_layer_group(replicated=True)
+    replicated_dict = replicated.to_dict()
+    assert replicated_dict["replicated"] is True
+    restored = LayerGroup.from_dict(replicated_dict)
+    assert isinstance(restored, AttentionLayerGroup) and restored.replicated is True
+    assert restored.to_dict() == replicated_dict
+
+    # A peer that never writes the field parses as not replicated.
+    legacy = dict(replicated_dict)
+    del legacy["replicated"]
+    assert LayerGroup.from_dict(legacy).replicated is False
+
+    # Through the whole page table and the msgpack wire format.
+    table = KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[plain, replicated],
+        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(0x1000, 64, 4)])],
+    )
+    wire = KVCachePageTable.from_dict(
+        msgpack.unpackb(msgpack.packb(table.to_dict()), strict_map_key=False)
+    )
+    assert [lg.replicated for lg in wire.layer_groups] == [False, True]
+
+
+@pytest.mark.cpu_only
+def test_append_draft_page_table():
+    target = KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[_attention_layer_group(replicated=False)],
+        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(0x1000, 64, 4)])],
+    )
+    draft = KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[_attention_layer_group(replicated=False)],
+        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(0x9000, 64, 4)])],
+    )
+    merged = append_draft_page_table(target, draft)
+    assert merged.tokens_per_block == 8
+    assert merged.layer_groups[0] is target.layer_groups[0]
+    appended = merged.layer_groups[1]
+    assert appended.replicated is True
+    assert appended.pool_group_idx == 1
+    assert merged.pool_groups[1].pools[0].base_address == 0x9000
+    assert [ll.global_layer_id for ll in appended.local_layers] == [
+        3 + DRAFT_GLOBAL_LAYER_ID_OFFSET
+    ]
+    assert [ll.local_layer_id for ll in appended.local_layers] == [0]
+    # The target table itself is untouched.
+    assert len(target.layer_groups) == 1 and len(target.pool_groups) == 1
+
+    with pytest.raises(ValueError, match="tokens_per_block"):
+        append_draft_page_table(
+            target,
+            KVCachePageTable(
+                tokens_per_block=16, layer_groups=draft.layer_groups, pool_groups=draft.pool_groups
+            ),
+        )
+
+
+def _create_draft_cache_manager(max_batch_size: int) -> KVCacheManagerV2:
+    """A dense MLA drafter cache: one bf16 latent of DRAFT_HEAD_DIM elements per token per layer.
+
+    Every rank builds it on a single-rank mapping, Helix generation ranks included: such a rank
+    holds the whole drafter prompt window locally, and KVCacheManagerV2 rejects a draft manager
+    under a Helix mapping.
+    """
+    return KVCacheManagerV2(
+        KvCacheConfigV2(
+            max_tokens=2048,
+            enable_block_reuse=False,
+            max_attention_window=[MAX_SEQ_LEN],
+        ),
+        CacheTypeCpp.SELFKONLY,
+        num_layers=DRAFT_NUM_LAYERS,
+        num_kv_heads=1,
+        head_dim=DRAFT_HEAD_DIM,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=max_batch_size,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.BF16,
+        vocab_size=VOCAB_SIZE,
+        is_draft=True,
+    )
+
+
+def _verify_drafter_window(
+    request_lengths: List[int],
+    window: int,
+    ctx_draft,
+    gen_drafts: List,
+    ctx_request_ids: List[int],
+    gen_request_ids: List[int],
+) -> None:
+    """Compare every generation rank's drafter window with the context's, byte for byte.
+
+    Per request and drafter layer, the generation pages [0, ceil(L / tpb)) must equal the
+    context pages [s / tpb, ceil(P / tpb)).
+    """
+    tpb = TOKENS_PER_BLOCK
+    for req_idx, req_len in enumerate(request_lengths):
+        start, length = drafter_window(req_len, window, tpb)
+        num_pages = (length + tpb - 1) // tpb
+        prompt_pages = (req_len + tpb - 1) // tpb
+        for layer_idx in range(DRAFT_NUM_LAYERS):
+            ctx_pages = _get_block_data_for_layer(
+                ctx_draft, ctx_request_ids[req_idx], layer_idx, True
+            )
+            assert ctx_pages is not None and ctx_pages.shape[0] >= prompt_pages
+            expected = ctx_pages[start // tpb : prompt_pages].contiguous()
+            assert expected.shape[0] == num_pages
+            assert expected.float().abs().sum() > 0, "the context draft pages hold no pattern"
+            for cp_rank, gen_draft in enumerate(gen_drafts):
+                got = _get_block_data_for_layer(
+                    gen_draft, gen_request_ids[req_idx], layer_idx, True
+                )
+                where = (
+                    f"req={req_idx} (P={req_len}, s={start}, L={length}) "
+                    f"layer={layer_idx} gen_rank={cp_rank}"
+                )
+                assert got is not None and got.shape[0] >= num_pages, where
+                got = got[:num_pages].contiguous()
+                assert got.shape == expected.shape, where
+                assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8)), (
+                    f"drafter window mismatch at {where}"
+                )
+
+
+def run_drafter_window_transfer_test(
+    gen_cp: int,
+    is_mla: bool,
+    draft_prompt_window: int,
+    request_lengths: List[int] = DRAFTER_REQUEST_LENGTHS,
+) -> None:
+    """Context (cp 1) -> generation (cp ``gen_cp``) with a draft KV cache manager on every rank.
+
+    The target transfers as in test_cache_transceiver_helix_cp (each generation CP rank gets its
+    [cp_rank::cp_size] stride); the draft manager's drafter prompt window reaches every generation
+    rank whole. The generation side allocates its draft pages [0, ceil(L / tpb)) before the receive.
+    """
+    max_batch_size = max(MAX_BATCH_SIZE, len(request_lengths))
+    ctx_managers = _create_managers_for_instance(
+        1, 1, False, is_mla, True, None, NUM_LAYERS, max_batch_size
+    )
+    gen_managers = _create_managers_for_instance(
+        1, 1, False, is_mla, True, None, NUM_LAYERS, max_batch_size, cp_size=gen_cp
+    )
+    ctx_drafts = [_create_draft_cache_manager(max_batch_size)]
+    gen_drafts = [_create_draft_cache_manager(max_batch_size) for _ in range(gen_cp)]
+    _init_pool_data(ctx_managers, 1, is_mla, True, fill_random=True, seed_base=1000)
+    _init_pool_data(gen_managers, gen_cp, is_mla, True, fill_random=False)
+    _init_pool_data_v2(ctx_drafts, 1, True, fill_random=True, seed_base=5000)
+    _init_pool_data_v2(gen_drafts, gen_cp, True, fill_random=False)
+
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+    )
+    ctx_tcs = create_instance_transceivers(
+        1,
+        1,
+        False,
+        ctx_managers,
+        config,
+        is_mla,
+        draft_managers=ctx_drafts,
+        draft_prompt_window=draft_prompt_window,
+    )
+    gen_tcs = create_instance_transceivers(
+        1,
+        1,
+        False,
+        gen_managers,
+        config,
+        is_mla,
+        cp_size=gen_cp,
+        draft_managers=gen_drafts,
+        draft_prompt_window=draft_prompt_window,
+    )
+    kv_caches: List = []
+
+    try:
+        ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
+        sampling_params = SamplingParams()
+        ctx_request_ids: List[int] = []
+        gen_request_ids: List[int] = []
+        ctx_requests: List[LlmRequest] = []
+        gen_requests: List[List[LlmRequest]] = []
+
+        for req_idx, req_len in enumerate(request_lengths):
+            unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+            ctx_rid = req_idx * 2
+            gen_rid = req_idx * 2 + 1
+            ctx_request_ids.append(ctx_rid)
+            gen_request_ids.append(gen_rid)
+            ctx_request = LlmRequest(
+                request_id=ctx_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            )
+            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            ctx_requests.append(ctx_request)
+            per_rank = []
+            for cp_rank in range(gen_cp):
+                req = _make_gen_request(
+                    gen_rid, req_len, unique_rid, ctx_rid, 0, ctx_info_endpoint, sampling_params
+                )
+                # The target's rank-local prompt (see run_transfer_test); the drafter window is
+                # cut from the global prompt length.
+                local_len = _helix_local_len(req_len, cp_rank, gen_cp)
+                req.prompt_len = local_len
+                req.py_prompt_len = local_len
+                req.total_input_len_cp = req_len
+                per_rank.append(req)
+            gen_requests.append(per_rank)
+
+        # Generation receives first: target sized off the global prompt, draft pages for the
+        # window only.
+        for req_idx, req_len in enumerate(request_lengths):
+            _, length = drafter_window(req_len, draft_prompt_window, TOKENS_PER_BLOCK)
+            for cp_rank, req in enumerate(gen_requests[req_idx]):
+                kv_caches.append(
+                    _add_sequence(
+                        gen_managers[cp_rank], req.py_request_id, req_len, True, is_generation=True
+                    )
+                )
+                kv_caches.append(
+                    _add_sequence(
+                        gen_drafts[cp_rank], req.py_request_id, length, True, is_generation=True
+                    )
+                )
+                gen_tcs[cp_rank].request_and_receive_async(req)
+
+        # Context sends after; its draft cache holds the whole prompt at absolute positions.
+        for req_idx, req_len in enumerate(request_lengths):
+            req = ctx_requests[req_idx]
+            kv_caches.append(_add_sequence(ctx_managers[0], req.py_request_id, req_len, True))
+            kv_caches.append(_add_sequence(ctx_drafts[0], req.py_request_id, req_len, True))
+            ctx_tcs[0].respond_and_send_async(req)
+
+        run_concurrent(
+            ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
+        )
+        run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
+
+        for req_idx, per_rank in enumerate(gen_requests):
+            for cp_rank, req in enumerate(per_rank):
+                assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE, (
+                    req_idx,
+                    cp_rank,
+                    req.state,
+                )
+                # Write verification covers the draft bytes too: what the receiver published
+                # (target stride + whole draft window) must equal what the sender attested.
+                assert req.py_kv_transfer_verified, (req_idx, cp_rank)
+
+        verify_all_requests_helix(
+            request_lengths=request_lengths,
+            ctx_managers=ctx_managers,
+            gen_managers=gen_managers,
+            ctx_request_ids=ctx_request_ids,
+            gen_request_ids=gen_request_ids,
+            is_mla=is_mla,
+            gen_cp=gen_cp,
+        )
+        _verify_drafter_window(
+            request_lengths,
+            draft_prompt_window,
+            ctx_drafts[0],
+            gen_drafts,
+            ctx_request_ids,
+            gen_request_ids,
+        )
+    finally:
+        # Same teardown order as run_transfer_test: drain GPU work, close kv caches, shut down.
+        try:
+            torch.cuda.current_stream().synchronize()
+        except Exception:
+            pass
+        for kv in kv_caches:
+            try:
+                kv.close()
+            except Exception:
+                pass
+        for tc in ctx_tcs + gen_tcs:
+            try:
+                tc.shutdown()
+            except Exception:
+                pass
+        tc = None
+        ctx_tcs = gen_tcs = None
+        try:
+            gc.collect()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+@pytest.mark.parametrize("gen_cp", [1, 2, 4], ids=["cp1", "cp2", "cp4"])
+@pytest.mark.parametrize(
+    "draft_prompt_window", [100, MAX_SEQ_LEN], ids=["window_lt_prompt", "window_ge_prompt"]
+)
+def test_cache_transceiver_drafter_window(gen_cp, is_mla, draft_prompt_window):
+    """Draft KV cache transfer of the drafter prompt window next to the (Helix) target.
+
+    Context cp 1, generation cp ``gen_cp``, tp = pp = 1, V2 managers, full attention. Per request
+    (DRAFTER_REQUEST_LENGTHS, tokens_per_block TOKENS_PER_BLOCK) the window starts at
+    s = ((P - W) // tpb) * tpb when P > W (else 0): for P = 203, W = 100, s = 96 and L = 107, so
+    the context's pages [12, 26) land in every generation rank's pages [0, 14). The target KV
+    still verifies per CP stride, and every generation rank holds the whole window.
+    """
+    run_drafter_window_transfer_test(
+        gen_cp=gen_cp, is_mla=is_mla, draft_prompt_window=draft_prompt_window
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -180,6 +180,32 @@ def _retirement_executor_comm(mapping: Mapping) -> "MPI.Comm":
     return communicator
 
 
+def drafter_window(prompt_len: int, window: int, tokens_per_block: int) -> tuple[int, int]:
+    """The drafter prompt window of one request: its start position and length.
+
+    The window covers at least the last ``window`` prompt positions and starts
+    on a page boundary, so it moves whole draft pages: ``start`` is
+    ``prompt_len - window`` rounded down to a multiple of ``tokens_per_block``
+    (0 when the prompt is not longer than the window) and ``length`` is
+    ``prompt_len - start``. The context side sends its draft pages
+    ``[start / tokens_per_block, ceil(prompt_len / tokens_per_block))``; the
+    generation side receives them into its pages ``[0, ceil(length /
+    tokens_per_block))``.
+
+    Args:
+        prompt_len: Global prompt length (the whole prompt, not a CP rank's share).
+        window: Number of trailing prompt positions the drafter needs (> 0).
+        tokens_per_block: Draft KV cache tokens per page.
+
+    Returns:
+        ``(start, length)`` in tokens.
+    """
+    start = (
+        (prompt_len - window) // tokens_per_block * tokens_per_block if prompt_len > window else 0
+    )
+    return start, prompt_len - start
+
+
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
     consensus = []
@@ -232,6 +258,14 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # No draft KV cache transfer unless __init__ is given a draft manager; declared on the class so
+    # an instance built without running __init__ transfers the target manager alone.
+    _draft_kv_cache_manager: Optional[KVCacheManagerV2] = None
+    _draft_reuse_adapter: Optional[CacheReuseAdapter] = None
+    _draft_prompt_window: int = 0
+    # Leading page-table layer groups that belong to the target manager; the draft groups follow.
+    _num_target_layer_groups: int = 0
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -242,12 +276,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+        draft_prompt_window: int = 0,
     ):
+        """Create the transceiver for one rank.
+
+        Args:
+            mapping: This rank's parallel mapping.
+            dist: Collectives over the executor world.
+            kv_cache_manager: The (target) KV cache manager whose pages are transferred.
+            cache_transceiver_config: Transfer configuration.
+            draft_kv_cache_manager: Optional drafter KV cache manager. When set,
+                each request also transfers the draft pages of its drafter
+                prompt window (``drafter_window``) to every generation rank,
+                Helix CP ranks included.
+            draft_prompt_window: The drafter prompt window in tokens; required
+                (> 0) with ``draft_kv_cache_manager`` and ignored without it.
+        """
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
+        self._draft_kv_cache_manager = draft_kv_cache_manager
+        self._draft_prompt_window = draft_prompt_window if draft_kv_cache_manager is not None else 0
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
             raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
@@ -262,6 +314,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
+        self._check_draft_compatible()
         enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
             mapping, kv_cache_manager, cache_transceiver_config
         )
@@ -270,6 +323,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             _retirement_executor_comm(mapping) if enforce_physical_ownership else None
         )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
+        self._draft_reuse_adapter: Optional[CacheReuseAdapter] = (
+            create_cache_reuse_adapter(draft_kv_cache_manager)
+            if draft_kv_cache_manager is not None
+            else None
+        )
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
@@ -318,6 +376,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         )
         if enforce_physical_ownership:
@@ -346,6 +405,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        # The draft manager's layer groups follow the target's in the page table.
+        self._num_target_layer_groups = len(self._page_table.layer_groups) - (
+            len(draft_kv_cache_manager.impl.layer_grouping)
+            if draft_kv_cache_manager is not None
+            else 0
+        )
         try:
             self._enable_pipelined_transfer = self._resolve_pipelined_transfer(
                 cache_transceiver_config
@@ -537,12 +602,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         speculative tail and the ctx first-token block (num_extra_kv_tokens slots are not
         transferred; both sides use prompt_len, so the ranges stay consistent). On the receiver
         the already-cached prefix is masked so the sender skips it. A STATE group carries one
-        slot, or nothing when this rank has none.
+        slot, or nothing when this rank has none. The draft manager's groups, when present, follow
+        the target's and carry the drafter prompt window (``_describe_draft_window``).
         """
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
+        if self._draft_kv_cache_manager is not None:
+            layer_groups = layer_groups[: self._num_target_layer_groups]
         remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
         transfer_len = remote_tail_start if remote_tail_start is not None else req.prompt_len
         prompt_blocks = (transfer_len + tpb - 1) // tpb
@@ -575,6 +643,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 ordinals = adapter.get_block_ordinals(req, idx, lg)
                 group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
             groups.append(group)
+        if self._draft_kv_cache_manager is not None:
+            draft_groups = self._describe_draft_window(req)
+            groups.extend(draft_groups)
+            kinds.extend([CacheKind.PAGED] * len(draft_groups))
 
         return Chunk(
             block_ids_per_layer_groups=groups,
@@ -583,6 +655,33 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             is_last=True,
             excluded_pool_views=excluded_pool_views,
         )
+
+    def _describe_draft_window(self, req: LlmRequest) -> List[np.ndarray]:
+        """Draft-manager pages of the request's drafter prompt window, one array per draft group.
+
+        The window is ``drafter_window`` of the global prompt length (``total_input_len_cp``,
+        which is ``prompt_len`` without Helix CP). Both sides list ``ceil(length / tpb)`` pages:
+        the context side holds the prompt at absolute positions, so its entry ``i`` is its page
+        ``start / tpb + i``; the generation side holds the window from position 0, so its entry
+        ``i`` is its page ``i``. An entry is -1 where the manager holds no page. Every generation
+        CP rank lists the whole window (the groups are replicated, never CP-strided).
+        """
+        draft = self._draft_kv_cache_manager
+        adapter = self._draft_reuse_adapter
+        assert draft is not None and adapter is not None and self._page_table is not None
+        tpb = draft.tokens_per_block
+        start, length = drafter_window(req.total_input_len_cp, self._draft_prompt_window, tpb)
+        num_pages = (length + tpb - 1) // tpb
+        first_page = 0 if req.is_generation_only_request else start // tpb
+        groups = []
+        draft_layer_groups = self._page_table.layer_groups[self._num_target_layer_groups :]
+        for group_idx, lg in enumerate(draft_layer_groups):
+            ordinals = adapter.get_block_ordinals(req, group_idx, lg)
+            window = np.full(num_pages, -1, dtype=np.int64)
+            held = ordinals[first_page : first_page + num_pages]
+            window[: held.size] = held
+            groups.append(window)
+        return groups
 
     @staticmethod
     def _positional_window(
@@ -1622,6 +1721,38 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"only cp_size == 1 or helix CP is supported"
             )
 
+    def _check_draft_compatible(self) -> None:
+        """Validate the draft KV cache manager, if any, before the transfer worker registers it.
+
+        The draft groups share the target's page table (one ``tokens_per_block``), are listed
+        from a ``KVCacheManagerV2`` block table, and sit outside the target's PP layer ranges, so
+        they need a V2 draft manager, equal page sizes, PP 1 and a positive window.
+        """
+        draft = self._draft_kv_cache_manager
+        if draft is None:
+            return
+        if not isinstance(draft, KVCacheManagerV2):
+            raise ValueError(
+                "KvCacheTransceiverV2: the draft KV cache transfer requires a KVCacheManagerV2 "
+                f"draft manager, got {type(draft).__name__}"
+            )
+        if self._draft_prompt_window <= 0:
+            raise ValueError(
+                "KvCacheTransceiverV2: the draft KV cache transfer requires draft_prompt_window "
+                f"> 0, got {self._draft_prompt_window}"
+            )
+        if draft.tokens_per_block != self._kv_cache_manager.tokens_per_block:
+            raise ValueError(
+                "KvCacheTransceiverV2: the draft KV cache transfer requires equal tokens_per_block "
+                f"(draft={draft.tokens_per_block}, "
+                f"target={self._kv_cache_manager.tokens_per_block})"
+            )
+        if self._mapping.pp_size != 1:
+            raise ValueError(
+                "KvCacheTransceiverV2: the draft KV cache transfer requires pp_size == 1, "
+                f"got {self._mapping.pp_size}"
+            )
+
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
         """Return whether this rank supports pipelined KV transfer."""
         if not cfg.enable_pipelined_transfer:
@@ -1642,6 +1773,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
         if self._mapping.cp_size > 1:
             blockers.append(f"context parallelism (cp_size={self._mapping.cp_size})")
+        # The drafter prompt window is listed whole, at different page offsets on the two sides,
+        # so it has no per-chunk projection.
+        if self._draft_kv_cache_manager is not None:
+            blockers.append("a draft KV cache transfer (draft_kv_cache_manager)")
         # Policies other than all_reusable defer the whole prompt's commit to the final
         # chunk. Committing a prefix block that a concurrent request already committed
         # rebases it onto that request's page and frees ours, which an earlier chunk's

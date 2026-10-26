@@ -673,7 +673,8 @@ class AttentionPolicy:
 
         Head-matched views of any kind collapse into IntactMapper,
         whose run merging degrades to a single whole-region copy per block
-        when the selected layers are contiguous on both sides.
+        when the selected layers are contiguous on both sides. So do views of
+        a replicated layer group, whose pages every rank holds whole.
         """
         if mapper_kind == MapperKind.REPLICATED:
             return ReplicatedMapper(
@@ -684,7 +685,7 @@ class AttentionPolicy:
             )
 
         head_match, _ = self.head_match(peer_ri)
-        if head_match:
+        if head_match or getattr(self_lg, "replicated", False):
             return IntactMapper(
                 self_layer_offsets,
                 peer_layer_offsets,

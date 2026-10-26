@@ -148,8 +148,16 @@ def create_kv_cache_transceiver(
     kv_cache_manager: KVCacheManager,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
-    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    draft_prompt_window: int = 0,
 ) -> Optional["KvCacheTransceiver"]:
+    """Create the KV cache transceiver selected by ``cache_transceiver_config``, or None.
+
+    ``draft_kv_cache_manager`` (with ``draft_prompt_window`` > 0) additionally
+    transfers each request's drafter prompt window from the draft manager; only
+    the Python transceiver (``KvCacheTransceiverV2``) supports it.
+    """
     resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
@@ -202,6 +210,10 @@ def create_kv_cache_transceiver(
             "To use the C++ transceiver, set "
             "kv_cache_config.use_kv_cache_manager_v2=False for a model "
             "that supports V1.")
+    if draft_kv_cache_manager is not None and not use_python_transceiver:
+        raise ValueError(
+            "The draft KV cache transfer requires transceiver_runtime='PYTHON' "
+            "with backend='NIXL'; the C++ transceiver cannot send it.")
 
     if use_python_transceiver:
         if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
@@ -224,8 +236,16 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        if draft_kv_cache_manager is None:
+            return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                        cache_transceiver_config)
+        return KvCacheTransceiverV2(
+            mapping,
+            dist,
+            kv_cache_manager,
+            cache_transceiver_config,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            draft_prompt_window=draft_prompt_window)
 
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
