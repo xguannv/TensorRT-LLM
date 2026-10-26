@@ -7,18 +7,73 @@ import, from the environment of every rank; ``log_flags`` prints every switch's 
 built, so a log always states which variant ran. With every switch at its default the target behaves as before the
 switch was added. A switch whose value is a path is a ``_path_flag(...)``: unset, empty or ``0`` is off (so a
 harness that sets a switch's off arm to 0 works for it too).
+
+A switch registered with ``accepted`` (every switch whose default is -1, every switch that takes more than on / off,
+and the read-at-forward-time switches of the warm-up registry) takes only those values or its default; any other
+value raises when the switch is read, rather than silently selecting a path (most resolvers treat any value >= 0 as
+on / off by ``value > 0`` and any value < 0 as the default). ``accepted`` is a tuple of the values, or a `Range` for
+a switch whose value is a count.
 """
 
 import os
-from typing import Dict, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple, Union
 
 from tensorrt_llm.logger import logger
 
+
+class Range(NamedTuple):
+    """The integers ``lo`` .. ``hi`` (inclusive; ``hi`` None: no upper bound)."""
+
+    lo: int
+    hi: Optional[int] = None
+
+    def contains(self, value: int) -> bool:
+        return value >= self.lo and (self.hi is None or value <= self.hi)
+
+    def __str__(self) -> str:
+        return (
+            f"an integer >= {self.lo}"
+            if self.hi is None
+            else f"an integer in [{self.lo}, {self.hi}]"
+        )
+
+
+AcceptedValues = Union[Tuple[int, ...], Range]
+
 _FLAGS: Dict[str, Tuple[int, int, str]] = {}
 _PATH_FLAGS: Dict[str, Tuple[str, str]] = {}
+_ACCEPTED: Dict[str, AcceptedValues] = {}
+
+#: The values of a switch that is only on or off.
+ON_OFF = (0, 1)
 
 
-def _flag(name: str, default: int, doc: str) -> int:
+def _is_accepted(value: int, default: int, accepted: AcceptedValues) -> bool:
+    if value == default:
+        return True
+    if isinstance(accepted, Range):
+        return accepted.contains(value)
+    return value in accepted
+
+
+def _describe(default: int, accepted: AcceptedValues) -> str:
+    values = str(accepted) if isinstance(accepted, Range) else " / ".join(str(v) for v in accepted)
+    in_set = accepted.contains(default) if isinstance(accepted, Range) else default in accepted
+    return values if in_set else f"{values}, or {default} (the default)"
+
+
+def check_value(name: str, value: int) -> None:
+    """Raise ``ValueError`` if ``value`` is not one ``name`` accepts (no-op for a switch registered without
+    ``accepted``). For anything that sets a switch after import, e.g. a runtime switch flip."""
+    accepted = _ACCEPTED.get(name)
+    if accepted is None:
+        return
+    default = _FLAGS[name][1]
+    if not _is_accepted(value, default, accepted):
+        raise ValueError(f"{name}={value} is not accepted: expected {_describe(default, accepted)}")
+
+
+def _flag(name: str, default: int, doc: str, accepted: Optional[AcceptedValues] = None) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         value = default
@@ -28,6 +83,9 @@ def _flag(name: str, default: int, doc: str) -> int:
         except ValueError as err:
             raise ValueError(f"{name} must be an integer, got {raw!r}") from err
     _FLAGS[name] = (value, default, doc)
+    if accepted is not None:
+        _ACCEPTED[name] = accepted
+        check_value(name, value)
     return value
 
 
@@ -66,6 +124,7 @@ TRTLLM_K3LL_MOE_SELF_SORT = _flag(
     "(decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; the lowm path runs on SM100 / SM103 only; L1 bs1 -0.150 ms, bs2 "
     "-0.223 ms, moss-0444; the token-mask sort, here and in FC1 / FC2, vs the earlier scan sort: L1 1x -0.049 ms, "
     "2x -0.061 ms, 4x -0.142 ms, moss-0471)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MOE_LOWM_DYN_FAST = _flag(
     "TRTLLM_K3LL_MOE_LOWM_DYN_FAST",
@@ -80,6 +139,7 @@ TRTLLM_K3LL_MOE_LOWM_DYN_FAST = _flag(
     "decode_moe_lowm.MOE_LOWM_DYN_FAST_CAPABILITIES (SM103 only, measured on GB300; isolated kernel, clean read-only "
     "L2 flush: fixed cost per call M8 8.11 -> 7.28 us, M16 8.64 -> 7.72 us, moss-0486; L1 ABBA 1x -0.082 ms "
     "(-1.20%), 2x -0.050 ms (-0.60%), 4x n.s., moss-0494)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "TRTLLM_K3LL_MOE_SELF_SORT_FC12",
@@ -92,6 +152,7 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "token's sum in FC2's red order, as without it. Read at forward time; 1 on, 0 off, -1 (default): on on SM103 "
     "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452; the token-mask sort, here and in "
     "K3MoeLowMDynKernel, vs the earlier scan sort: L1 1x -0.049 ms, 2x -0.061 ms, 4x -0.142 ms, moss-0471)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK = _flag(
     "TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK",
@@ -101,11 +162,13 @@ TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK = _flag(
     "more while most of the grid has finished; the same partials. Read at forward time; 1 on, 0 off, -1 (default): "
     "on on SM103 only (decode_moe_lowm.MOE_FC2_CEIL_CHUNK_CAPABILITIES; L1 bs4 -0.081 ms; fc12 runs at 17-32 "
     "rows only, so bs1 / bs2 are unchanged)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
     1,
     "FP8-cache MLA decode attention: 0 stock, 1 CuTe DSL kernel on this rank's heads, 2 split-read DCP over TP",
+    accepted=(0, 1, 2),
 )
 TRTLLM_K3LL_DRAFTER_FC_TP = _flag(
     "TRTLLM_K3LL_DRAFTER_FC_TP",
@@ -176,6 +239,7 @@ TRTLLM_K3LL_DRAFTER_GATE_UP_SWIGLU = _flag(
     "view, nothing copied) instead of a separate silu_and_mul launch; bit for bit the two launches. -1 (default): on "
     "on SM103 only (mla_drafter_gemm.GATE_UP_SWIGLU_CAPABILITIES, where the gate_up tactics are pinned); read per "
     "call",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_DRAFTER_WIDE_AR = _flag(
     "TRTLLM_K3LL_DRAFTER_WIDE_AR",
@@ -258,6 +322,7 @@ TRTLLM_K3LL_QKVG_BS1_SPLIT = _flag(
     "(split-K changes the FP32 summation order). Splits 3 and 4 compile at load whatever the switch says; read at "
     "forward time. 0: the heuristic's split; -1 (default): 4 on SM103 only (fp8w_lowm.QKVG_BS1_SPLIT_CAPABILITIES; "
     "L1 bs1 -0.043 / -0.049 ms, GSM8K 0.9613 -> 0.9659 at gen bs1), else 0",
+    accepted=(0, 3, 4),  # 0: the heuristic's split; 3 / 4: fp8w_lowm.QKVG_BS1_SPLITS
 )
 TRTLLM_K3LL_MAXCARVE = _flag(
     "TRTLLM_K3LL_MAXCARVE",
@@ -272,6 +337,7 @@ TRTLLM_K3LL_MAXCARVE = _flag(
     "with co-residency on the GEMV's SMs; a span-only trace cannot settle it). "
     "Read once, at import, by k3_carveout.py, not at forward time; any value outside -1 / 0 / 1 raises there. 1 on, "
     "0 off, -1 (default): on where the device is in k3_carveout.MAXCARVE_CAPABILITIES (SM103)",
+    accepted=ON_OFF,  # k3_carveout.MAXCARVE_VALUES
 )
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
@@ -320,6 +386,7 @@ TRTLLM_K3LL_OPROJ_PUSH = _flag(
     1,
     "decode steps up to 64 tokens (1; 2: wide steps only): o_proj's GEMM pushes its partial into the post-attention "
     "all-reduce, K3LamportFinish + K3AttnResFast run the rest (oproj_push.py; read at forward time)",
+    accepted=(0, 1, 2),  # 0 off, 1 every decode step, 2 wide steps only
 )
 TRTLLM_K3LL_MOE_TAIL_PUSH = _flag(
     "TRTLLM_K3LL_MOE_TAIL_PUSH",
@@ -339,6 +406,7 @@ TRTLLM_K3LL_MOE_TAIL_LU = _flag(
     "~2.4 GB per rank over 92 layers) and a 12 MiB MNNVL workspace; engagement is read at forward time. -1: on on "
     "SM103 only (moe_tail_lu.MOE_TAIL_LU_CAPABILITIES). 0 (default): off; TRTLLM_K3LL_MOE_TAIL_COL takes the same "
     "steps losslessly",
+    accepted=(-1, 0, 1),
 )
 TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = _flag(
     "TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS",
@@ -347,6 +415,7 @@ TRTLLM_K3LL_MOE_TAIL_LU_MAX_ROWS = _flag(
     "MTP7, 32 = up to bs4. At bs4 (32 rows) the switch measured no gain (nsys wall +0.012 ms, ABBA unresolved "
     "without one outlier round; the tail K3AttnResFast runs longer there, cause not isolated), so the lossy path "
     "stays off there",
+    accepted=Range(9, 32),  # moe_tail_lu.MIN_ROWS .. MAX_ROWS
 )
 TRTLLM_K3LL_MOE_LOWM_FC12 = _flag(
     "TRTLLM_K3LL_MOE_LOWM_FC12",
@@ -359,6 +428,7 @@ TRTLLM_K3LL_MOE_LOWM_FC12 = _flag(
     "in both). 1 at launch builds the FC1 output buffer (12.5 MB per rank at K3 TP4 x EP4) and compiles both "
     "kernels; engagement is read at forward time. -1 (default): on on SM103 only "
     "(decode_moe_lowm.MOE_LOWM_FC12_CAPABILITIES; L1 bs4 -0.229 ms, moss-0361)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MOE_TAIL_COL = _flag(
     "TRTLLM_K3LL_MOE_TAIL_COL",
@@ -370,6 +440,7 @@ TRTLLM_K3LL_MOE_TAIL_COL = _flag(
     "sums). 1 at launch builds the latent_up row slice of every MoE layer (+3.2 MB per layer per rank) and TAIL_LU's "
     "12 MiB MNNVL workspace; engagement is read at forward time. Takes precedence over TRTLLM_K3LL_MOE_TAIL_LU. -1 "
     "(default): on on SM103 only (moe_tail_col.MOE_TAIL_COL_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_LAR_CLEAR_SPLIT = _flag(
     "TRTLLM_K3LL_LAR_CLEAR_SPLIT",
@@ -380,6 +451,7 @@ TRTLLM_K3LL_LAR_CLEAR_SPLIT = _flag(
     "same stores, other CTAs, the same window between the grid's wait and its completion). Read at forward time. "
     "1 on, 0 off, -1 (default): on on SM103 only (moe_tail_col.LAR_CLEAR_SPLIT_CAPABILITIES; L1 bs2 -0.147 ms, bs4 "
     "-0.038 ms, oak-1038)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
@@ -390,6 +462,7 @@ TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "(the same stores, another destination). Acts only on TAIL_COL's fused steps (9-32 rows; not bs1 / bs8) where the "
     "bank's row count is the step's. Read at forward time. -1 (default): on on SM103 only "
     "(implementation.ATTN_RES_SNAPSHOT_INPLACE_CAPABILITIES; L1 bs2 -0.033 ms, moss-0411)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_ATTN_RES_TAP = _flag(
     "TRTLLM_K3LL_ATTN_RES_TAP",
@@ -403,6 +476,7 @@ TRTLLM_K3LL_ATTN_RES_TAP = _flag(
     "drafter capture buffer. Read at forward time. 1 on, 0 off, -1 (default): on on SM103 only "
     "(implementation.ATTN_RES_TAP_CAPABILITIES; L1 bs2 -0.059 ms, GSM8K PASS, natural AL +0.014 in band: "
     "moss-0402/0412/0424)",
+    accepted=ON_OFF,
 )
 
 TRTLLM_K3LL_HELIX_Q_AG_MNNVL = _flag(
@@ -462,6 +536,7 @@ TRTLLM_K3LL_MLA_KV_JOIN_EARLY = _flag(
     "keeps its programmatic early launch; the output gate (TRTLLM_K3LL_MLA_GATE_SIDE, forked after the absorption) "
     "then runs on the SMs the split read leaves instead of pushing split CTAs out (same kernels and bytes; read at "
     "forward time). 1 on, 0 off, -1 (default) on SM103 only (implementation.MLA_KV_JOIN_EARLY_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_QNORM_PDL = _flag(
     "TRTLLM_K3LL_MLA_QNORM_PDL",
@@ -496,6 +571,7 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_SKIP_EMPTY = _flag(
     "right after the PDL wait instead of allocating tensor memory and walking an empty tile (bitwise: they write "
     "nothing the reduction reads; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(mla_v_up.MLA_VAR_SPLIT_SKIP_EMPTY_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",
@@ -504,6 +580,7 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE = _flag(
     "at once (decode_mla_dcp._var_split_counts_tile_kernel) instead of one candidate after the other: the same counts "
     "(an integer choice; bitwise), ~2 us instead of 3.5 (4 requests) on GB300. 0: the sequential kernel. Read at "
     "forward time; the counts only run where TRTLLM_K3LL_MLA_VAR_SPLIT does (SM103)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL",
@@ -512,6 +589,7 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_SMALL = _flag(
     "beside a long one gives its splits to the long one (equal lengths keep the static split; not bitwise when the "
     "lengths differ: the split boundaries move; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(decode_mla_dcp.MLA_VAR_SPLIT_SMALL_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT",
@@ -521,6 +599,7 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT = _flag(
     "wait) instead of the largest count per request, so no cluster is launched past a request's count (same work "
     "and partials: bitwise; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(mla_v_up.MLA_VAR_SPLIT_FLAT_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED = _flag(
     "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED",
@@ -529,6 +608,7 @@ TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED = _flag(
     "per-token bounds and empty flags, built by the step's first MLA layer) in one Triton launch instead of about ten "
     "int torch kernels in a row before that layer's split read (bitwise; read at forward time). 1 on, 0 off, -1 "
     "(default): on on SM103 only (decode_mla_dcp.MLA_HELIX_PLAN_FUSED_CAPABILITIES; L1 2x -0.023 ms, 4x -0.029 ms)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_FORCE_REPLAY = _flag(
     "TRTLLM_K3LL_FORCE_REPLAY",
@@ -555,6 +635,7 @@ TRTLLM_K3LL_SPEC_STEP_COPIES_SM10X = _flag(
     "the speculative step's overlap gathers and sampler store scatters as the two spec_step_copies kernels (one "
     "launch each, bit for bit the torch ops): 1 on SM 103, 2 on SM 103 and SM 107 (SM 100 always uses them; read per "
     "step)",
+    accepted=(0, 1, 2),  # 0 off (SM100 always on), 1 SM103, 2 SM103 and SM107
 )
 TRTLLM_K3LL_KDA_SEED_STACKED = _flag(
     "TRTLLM_K3LL_KDA_SEED_STACKED",
@@ -570,6 +651,7 @@ TRTLLM_K3LL_SPEC_ACCEPT_WIDE_TABLE = _flag(
     "instead of CTA 0 walking it alone; the same bits (read per call, so per CUDA graph capture). 1 on, 0 off, -1 "
     "(default) on SM103 only (spec_worker.SPEC_ACCEPT_WIDE_TABLE_CAPABILITIES; SM107 / Rubin keeps CTA 0's table "
     "unless forced with 1)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT = _flag(
     "TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT",
@@ -580,6 +662,7 @@ TRTLLM_K3LL_SPEC_ACCEPT_ROW_SPLIT = _flag(
     "also draws its Gumbel noise: 1 takes the bs4 MTP7 sampled call from 53 to 13 us (read per call, so per CUDA "
     "graph capture). 0 off; -1 (default) 1 on SM103 only (spec_worker.SPEC_ACCEPT_ROW_SPLIT_CAPABILITIES; SM107 / "
     "Rubin keeps one CTA per slice unless set > 0)",
+    accepted=Range(0),  # rows per CTA, rounded down to a divisor of the row count
 )
 TRTLLM_K3LL_SPEC_HEAD_FUSED = _flag(
     "TRTLLM_K3LL_SPEC_HEAD_FUSED",
@@ -605,11 +688,13 @@ TRTLLM_K3LL_ROUTING_STATS_STRIDE = _flag(
     0,
     "with TRTLLM_K3LL_ROUTING_STATS_DIR: tokens per request of a decode step (1 + draft length); > 0 adds a second "
     "count plane of every request's first token",
+    accepted=Range(0),
 )
 TRTLLM_K3LL_ROUTING_STATS_CHUNK = _flag(
     "TRTLLM_K3LL_ROUTING_STATS_CHUNK",
     1024,
     "with TRTLLM_K3LL_ROUTING_STATS_DIR: steps per .npz chunk (one is also written every 30 s and at exit)",
+    accepted=Range(1),
 )
 
 TRTLLM_K3LL_ATTN_RES_MXFP8 = _flag(
@@ -621,6 +706,7 @@ TRTLLM_K3LL_ATTN_RES_MXFP8 = _flag(
     "quantizing inside k3_fp8w_lowm_gemm (bitwise; read at forward time). 1 on, 0 off, -1 (default) on SM103 only "
     "(implementation.ATTN_RES_MXFP8_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes SM100 / SM103 only, so on SM107 / "
     "Rubin nothing changes even with 1",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "TRTLLM_K3LL_MX_SF_EARLY_RELEASE",
@@ -629,6 +715,7 @@ TRTLLM_K3LL_MX_SF_EARLY_RELEASE = _flag(
     "K tile to the MMA once its scales are folded, not after all of them (bitwise; read at forward time). 1 on, 0 "
     "off, -1 (default) on SM103 only (fp8w_lowm.MX_SF_EARLY_RELEASE_CAPABILITIES); k3_fp8w_lowm_mxfp8 itself takes "
     "SM100 / SM103 only",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_KDA_VERIFY_HOIST = _flag(
     "TRTLLM_K3LL_KDA_VERIFY_HOIST",
@@ -637,6 +724,7 @@ TRTLLM_K3LL_KDA_VERIFY_HOIST = _flag(
     "accepted-draft count, pool state, weights and, by bulk copies into shared memory, the conv history at every "
     "cache column and every draft's records), instead of one load round trip per accepted draft (bitwise; read at "
     "forward time). 1 on, 0 off, -1 (default) on SM103 only (verify.KDA_VERIFY_HOIST_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP = _flag(
     "TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP",
@@ -644,6 +732,7 @@ TRTLLM_K3LL_KDA_VERIFY_ODD_CLAMP = _flag(
     "k3_fp8_kda_verify at a verify width that is not a multiple of 4 (MTP6: 7 tokens): run the q / k pre-compute "
     "without a branch, the warp's token past the last recomputing the last one (bitwise; read at forward time). 1 "
     "on, 0 off, -1 (default) on SM103 only (verify.KDA_VERIFY_ODD_CLAMP_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS = _flag(
     "TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS",
@@ -652,6 +741,7 @@ TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS = _flag(
     "dependency and issue this step's projection-row loads before the conv-history pick and the replay of the "
     "accepted drafts, so the rows' load round trip overlaps them (bitwise; read at forward time). 1 on, 0 off, -1 "
     "(default) on SM103 only (verify.KDA_VERIFY_EARLY_ROWS_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS",
@@ -665,6 +755,7 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT, FLAT on); elsewhere nothing is allocated. Equal-length batches keep their counts "
     "(bitwise); mixed ones move split boundaries. Read at forward time; widens only where the allocated workspace "
     "holds it. 1 on, 0 off, -1 (default) on SM103 only (decode_mla_dcp.MLA_VAR_SPLIT_WIDE_WS_CAPABILITIES)",
+    accepted=ON_OFF,
 )
 TRTLLM_K3LL_DRAFTER_MARKOV_FAST = _flag(
     "TRTLLM_K3LL_DRAFTER_MARKOV_FAST",
@@ -685,12 +776,19 @@ TRTLLM_K3LL_INPUT_CHAIN = _flag(
     "_spec_store_scatter_kernel, before the spec_step_copies scatter); each of those set in the environment wins "
     "(the same values). 1 on, 0 off, -1 (default) on SM103 only (input_chain.INPUT_CHAIN_CAPABILITIES). Not "
     "covered: TRTLLM_FUSED_HELIX_SPEC_PREPROCESS and TRTLLM_BATCHED_INPUT_COMMIT_VERIFY (environment only)",
+    accepted=ON_OFF,
 )
 
 
 def flags() -> Dict[str, Tuple[int, int, str]]:
     """Every integer switch: name -> (value, default, doc)."""
     return dict(_FLAGS)
+
+
+def accepted_values() -> Dict[str, AcceptedValues]:
+    """Every switch registered with ``accepted``: name -> its values (a tuple or a `Range`; the default is accepted
+    too)."""
+    return dict(_ACCEPTED)
 
 
 def path_flags() -> Dict[str, Tuple[str, str]]:
