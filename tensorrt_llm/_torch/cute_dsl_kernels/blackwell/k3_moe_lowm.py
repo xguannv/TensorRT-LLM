@@ -515,6 +515,9 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         outputs). Else the number of local experts: every CTA sorts the step's top-k ids itself after
         its wait (`_SelfSortMixin`) and the four metadata arguments are not read.
     :param self_sort_offset: First local expert id (with ``self_sort_local``).
+    :param presorted_layout: Diagnostic (moe_sort's metadata only): ``x_sf_ptr`` holds the token scales already in
+        the MMA's SMEM layout (``nkb`` x 2048 bytes, `token_scales_to_smem`'s image), copied with one bulk copy;
+        the token TMA and that copy are issued right after ``griddepcontrol.wait``, before the tile count is read.
     """
 
     def __init__(
@@ -537,6 +540,7 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         prefetch_experts: bool = True,
         self_sort_local: int = 0,
         self_sort_offset: int = 0,
+        presorted_layout: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % (2 * 64) == 0 and n % _MMA_M == 0, f"n {n} must be a multiple of 128"
@@ -581,6 +585,10 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         self.sacc_row_floats = _MMA_M + _SACC_PAD
         self._init_self_sort(n_tok, topk, self_sort_local, self_sort_offset)
         assert not (self.self_sort and prefetch_tail), "self-sort: no tail prefetch"
+        self.presorted_layout = presorted_layout
+        assert not (self.self_sort and presorted_layout), (
+            "presorted_layout: moe_sort's metadata only"
+        )
         fixed = (
             self.x_bytes
             + self.nkb * _SF_KBLK_BYTES
@@ -820,7 +828,7 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
                     cute.arch.mbarrier_init(acc_full + i, 1)
                     cute.arch.mbarrier_init(acc_empty + i, _EPI_WARPS)
                 cute.arch.mbarrier_init(tok_full, 1)
-                cute.arch.mbarrier_init(sfb_full, _EPI_WARPS)
+                cute.arch.mbarrier_init(sfb_full, 1 if self.presorted_layout else _EPI_WARPS)
                 cute.arch.mbarrier_init(tmem_ready, 1)
                 cute.arch.mbarrier_init(tmem_free, _EPI_WARPS)
         if cutlass.const_expr(self.self_sort):
@@ -839,6 +847,19 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
+        if cutlass.const_expr(self.presorted_layout):
+            if warp_idx == _TOK_WARP:
+                self._issue_tokens_and_scales(
+                    tiled_mma,
+                    tma_atom_b,
+                    mB_mkl,
+                    storage,
+                    b_smem_layout_staged,
+                    cluster_layout_vmnk,
+                    x_sf_ptr,
+                    tok_full,
+                    sfb_full,
+                )
 
         t2e_pre = Int32(0)
         total = Int32(0)
@@ -946,34 +967,35 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
                 with cute.arch.elect_one():
                     self._stamp(trace_ptr, bid, 3)
         elif warp_idx == _TOK_WARP:
-            if num_units > 0:
-                sB = storage.sB.get_tensor(
-                    b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
-                )
-                # (bN, bK, loopM, loopK, 1)
-                gB = cute.local_tile(
-                    mB_mkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-                )
-                tCgB = thr_mma.partition_B(gB)
-                b_cta_layout = cute.make_layout(
-                    cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-                )
-                tBsB, tBgB = cpasync.tma_partition(
-                    tma_atom_b,
-                    0,
-                    b_cta_layout,
-                    cute.group_modes(sB, 0, 3),
-                    cute.group_modes(tCgB, 0, 3),
-                )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(tok_full, self.x_bytes)
-                for kb in cutlass.range(NKB, unroll=1):
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB[(None, 0, kb, 0)],
-                        tBsB[(None, kb)],
-                        tma_bar_ptr=tok_full,
+            if cutlass.const_expr(not self.presorted_layout):
+                if num_units > 0:
+                    sB = storage.sB.get_tensor(
+                        b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
                     )
+                    # (bN, bK, loopM, loopK, 1)
+                    gB = cute.local_tile(
+                        mB_mkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+                    )
+                    tCgB = thr_mma.partition_B(gB)
+                    b_cta_layout = cute.make_layout(
+                        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+                    )
+                    tBsB, tBgB = cpasync.tma_partition(
+                        tma_atom_b,
+                        0,
+                        b_cta_layout,
+                        cute.group_modes(sB, 0, 3),
+                        cute.group_modes(tCgB, 0, 3),
+                    )
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(tok_full, self.x_bytes)
+                    for kb in cutlass.range(NKB, unroll=1):
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB[(None, 0, kb, 0)],
+                            tBsB[(None, kb)],
+                            tma_bar_ptr=tok_full,
+                        )
         elif warp_idx == _MMA_WARP:
             cute.arch.alloc_tmem(self.tmem_cols, tmem_holding_buf)
             cute.arch.relinquish_tmem_alloc_permit()
@@ -1018,9 +1040,14 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             tCrB = tiled_mma.make_fragment_B(sB)
             num_kphases = cute.size(tCrA, mode=[2])
 
-            if num_units > 0:
+            if cutlass.const_expr(self.presorted_layout):
+                # issued by every CTA: wait for the copies even without units
                 cute.arch.mbarrier_wait(tok_full, 0)
                 cute.arch.mbarrier_wait(sfb_full, 0)
+            else:
+                if num_units > 0:
+                    cute.arch.mbarrier_wait(tok_full, 0)
+                    cute.arch.mbarrier_wait(sfb_full, 0)
             if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._stamp(trace_ptr, bid, 5)
@@ -1062,11 +1089,17 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             cute.arch.mbarrier_wait(tmem_free, 0)
             cute.arch.dealloc_tmem(acc_tmem_ptr, self.tmem_cols)
         elif warp_idx < _EPI_WARPS:
-            if num_units > 0:
-                self.token_scales_to_smem(storage, x_sf_ptr, orig_m, tidx, sfb_full)
+            if cutlass.const_expr(self.presorted_layout):
                 if cutlass.const_expr(self.trace):
                     if tidx == 0:
+                        cute.arch.mbarrier_wait(sfb_full, 0)
                         self._stamp(trace_ptr, bid, 4)
+            else:
+                if num_units > 0:
+                    self.token_scales_to_smem(storage, x_sf_ptr, orig_m, tidx, sfb_full)
+                    if cutlass.const_expr(self.trace):
+                        if tidx == 0:
+                            self._stamp(trace_ptr, bid, 4)
             self.epilogue(
                 tiled_mma,
                 storage,
@@ -1112,6 +1145,42 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             else:
                 off = (c - w_chunks) * _PREFETCH_CHUNK
                 _prefetch_l2(sf_addr + off, cutlass.min(Int32(_PREFETCH_CHUNK), sf_bytes - off))
+
+    @cute.jit
+    def _issue_tokens_and_scales(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_b: cute.CopyAtom,
+        mB_mkl: cute.Tensor,
+        storage,
+        b_smem_layout_staged: cute.ComposedLayout,
+        cluster_layout_vmnk: cute.Layout,
+        x_sf_ptr: cute.Pointer,
+        tok_full,
+        sfb_full,
+    ):
+        """``presorted_layout``: the token TMA (``tok_full``) and one bulk copy of the token scales, already in
+        the MMA's SMEM layout, into ``sSFB`` (``sfb_full``). Run by the token warp."""
+        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        gB = cute.local_tile(
+            mB_mkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
+        tCgB = tiled_mma.get_slice(0).partition_B(gB)
+        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            b_cta_layout,
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+        sf_bytes = self.nkb * _SF_KBLK_BYTES
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(sfb_full, sf_bytes)
+            _bulk_g2s(storage.sSFB.data_ptr().toint(), x_sf_ptr.toint(), sf_bytes, sfb_full.toint())
+            cute.arch.mbarrier_arrive_and_expect_tx(tok_full, self.x_bytes)
+        for kb in cutlass.range(self.nkb, unroll=1):
+            cute.copy(tma_atom_b, tBgB[(None, 0, kb, 0)], tBsB[(None, kb)], tma_bar_ptr=tok_full)
 
     @cute.jit
     def token_scales_to_smem(
