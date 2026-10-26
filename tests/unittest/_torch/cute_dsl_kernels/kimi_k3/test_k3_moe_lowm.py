@@ -356,9 +356,11 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset after a replay"
 
 
+@pytest.mark.parametrize("early_tokens", [False, True], ids=["tokens_after_sort", "early_tokens"])
 @pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])
-def test_moe_nvfp4_lowm_fc12(num_tokens):
-    """trtllm::k3_moe_nvfp4_lowm_fc12 (K3MoeFc1LowMKernel + K3MoeFc2LowMKernel, TRTLLM_K3LL_MOE_LOWM_FC12) against
+def test_moe_nvfp4_lowm_fc12(num_tokens, early_tokens, monkeypatch):
+    """trtllm::k3_moe_nvfp4_lowm_fc12 (K3MoeFc1LowMKernel + K3MoeFc2LowMKernel, TRTLLM_K3LL_MOE_LOWM_FC12; FC1 with
+    and without its early token loads, TRTLLM_K3LL_MOE_FC1_EARLY_TOKENS) against
     trtllm::k3_moe_nvfp4_lowm at K3 shapes: FC1 rows and scales bit for bit, every FC2 partial bit for bit (one
     non-zero routing weight per token), the full sum within the bf16 accumulation bound of the exact sum of the
     partials (both add a token's partials in hardware order); through run_sorted with the persistent buffers
@@ -373,6 +375,8 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
     from tensorrt_llm._torch.utils import unswizzle_sf
 
+    monkeypatch.setenv("TRTLLM_K3LL_MOE_FC1_EARLY_TOKENS", "1" if early_tokens else "0")
+    assert nvfp4_lowm_op.fc1_early_tokens() == early_tokens
     hidden, inter_size, num_experts, num_local, offset, top_k = (
         LATENT,
         I_TP,

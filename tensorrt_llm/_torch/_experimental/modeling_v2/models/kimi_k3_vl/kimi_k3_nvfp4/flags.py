@@ -79,6 +79,13 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452; the token-mask sort, here and in "
     "K3MoeLowMDynKernel, vs the earlier scan sort: L1 1x -0.049 ms, 2x -0.061 ms, 4x -0.142 ms, moss-0471)",
 )
+TRTLLM_K3LL_MOE_FC1_EARLY_TOKENS = _flag(
+    "TRTLLM_K3LL_MOE_FC1_EARLY_TOKENS",
+    0,
+    "with TRTLLM_K3LL_MOE_LOWM_FC12: K3MoeFc1LowMKernel issues its token operand's TMA and its token scale loads "
+    "right after its wait, before its self-sort, instead of after it behind every CTA's first weight loads "
+    "(nvfp4_lowm_op.fc1_early_tokens, read by the op at each call); the same output bit for bit",
+)
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
     1,

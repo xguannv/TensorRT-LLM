@@ -473,6 +473,10 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         outputs). Else the number of local experts: every CTA sorts the step's top-k ids itself after
         its wait (`_SelfSortMixin`) and the four metadata arguments are not read.
     :param self_sort_offset: First local expert id (with ``self_sort_local``).
+    :param early_tokens: Issue the token operand's TMA and the token scales' loads right after the
+        wait, before the tile count (and the self-sort), and store the scales after it: the token
+        loads then run ahead of the weight stream instead of queueing behind every CTA's first
+        weight stages.
     """
 
     def __init__(
@@ -495,6 +499,7 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         prefetch_experts: bool = True,
         self_sort_local: int = 0,
         self_sort_offset: int = 0,
+        early_tokens: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % (2 * 64) == 0 and n % _MMA_M == 0, f"n {n} must be a multiple of 128"
@@ -524,6 +529,7 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         self.prefetch_tail = prefetch_tail
         # development aid: per-CTA globaltimer stamps into trace_ptr[cta * 16 + event]
         self.trace = trace
+        self.early_tokens = early_tokens
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
         self.acc_cols = n_tok * num_acc_stage
         # SFA: 128 rows / 32 * 4 MMAs per stage; SFB: round_up(n_tok, 128) / 32 * 4
@@ -798,6 +804,23 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
 
+        # early_tokens: the token warp's TMA and the epilogue warps' scale loads (stored after the
+        # tile count) go out before any weight load of the grid
+        sf_vals = cute.make_rmem_tensor((self._token_sf_per_thread(),), Int32)
+        if cutlass.const_expr(self.early_tokens):
+            if warp_idx == _TOK_WARP:
+                self._load_tokens(
+                    tiled_mma,
+                    tma_atom_b,
+                    mB_mkl,
+                    storage,
+                    b_smem_layout_staged,
+                    cluster_layout_vmnk,
+                    tok_full,
+                )
+            elif warp_idx < _EPI_WARPS:
+                self._token_scales_load(x_sf_ptr, orig_m, tidx, sf_vals)
+
         t2e_pre = Int32(0)
         total = Int32(0)
         if cutlass.const_expr(self.self_sort):
@@ -902,33 +925,16 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
                 with cute.arch.elect_one():
                     self._stamp(trace_ptr, bid, 3)
         elif warp_idx == _TOK_WARP:
-            if num_units > 0:
-                sB = storage.sB.get_tensor(
-                    b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
-                )
-                # (bN, bK, loopM, loopK, 1)
-                gB = cute.local_tile(
-                    mB_mkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-                )
-                tCgB = thr_mma.partition_B(gB)
-                b_cta_layout = cute.make_layout(
-                    cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-                )
-                tBsB, tBgB = cpasync.tma_partition(
-                    tma_atom_b,
-                    0,
-                    b_cta_layout,
-                    cute.group_modes(sB, 0, 3),
-                    cute.group_modes(tCgB, 0, 3),
-                )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(tok_full, self.x_bytes)
-                for kb in cutlass.range(NKB, unroll=1):
-                    cute.copy(
+            if cutlass.const_expr(not self.early_tokens):
+                if num_units > 0:
+                    self._load_tokens(
+                        tiled_mma,
                         tma_atom_b,
-                        tBgB[(None, 0, kb, 0)],
-                        tBsB[(None, kb)],
-                        tma_bar_ptr=tok_full,
+                        mB_mkl,
+                        storage,
+                        b_smem_layout_staged,
+                        cluster_layout_vmnk,
+                        tok_full,
                     )
         elif warp_idx == _MMA_WARP:
             cute.arch.alloc_tmem(self.tmem_cols, tmem_holding_buf)
@@ -974,9 +980,14 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             tCrB = tiled_mma.make_fragment_B(sB)
             num_kphases = cute.size(tCrA, mode=[2])
 
-            if num_units > 0:
+            # with early_tokens every CTA loaded them: also one without units waits for its TMA
+            if cutlass.const_expr(self.early_tokens):
                 cute.arch.mbarrier_wait(tok_full, 0)
                 cute.arch.mbarrier_wait(sfb_full, 0)
+            else:
+                if num_units > 0:
+                    cute.arch.mbarrier_wait(tok_full, 0)
+                    cute.arch.mbarrier_wait(sfb_full, 0)
             if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._stamp(trace_ptr, bid, 5)
@@ -1018,11 +1029,17 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             cute.arch.mbarrier_wait(tmem_free, 0)
             cute.arch.dealloc_tmem(acc_tmem_ptr, self.tmem_cols)
         elif warp_idx < _EPI_WARPS:
-            if num_units > 0:
-                self.token_scales_to_smem(storage, x_sf_ptr, orig_m, tidx, sfb_full)
+            if cutlass.const_expr(self.early_tokens):
+                self._token_scales_store(storage, orig_m, tidx, sfb_full, sf_vals)
                 if cutlass.const_expr(self.trace):
                     if tidx == 0:
                         self._stamp(trace_ptr, bid, 4)
+            else:
+                if num_units > 0:
+                    self.token_scales_to_smem(storage, x_sf_ptr, orig_m, tidx, sfb_full)
+                    if cutlass.const_expr(self.trace):
+                        if tidx == 0:
+                            self._stamp(trace_ptr, bid, 4)
             self.epilogue(
                 tiled_mma,
                 storage,
@@ -1077,15 +1094,23 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         block four 512-byte 32x4x4 atoms (row r, scale s at (s // 4) * 512 + (r % 32) * 16
         + (r // 32) * 4 + s % 4); rows past orig_m are zero. Every load is issued before the
         first store so the 128 epilogue threads pay one memory latency."""
+        vals = cute.make_rmem_tensor((self._token_sf_per_thread(),), Int32)
+        self._token_scales_load(x_sf_ptr, orig_m, tidx, vals)
+        self._token_scales_store(storage, orig_m, tidx, sfb_full, vals)
+
+    def _token_sf_per_thread(self) -> int:
+        """Scale words each of the 128 epilogue threads moves (`token_scales_to_smem`)."""
+        nthreads = _EPI_WARPS * 32
+        return (self.nkb * 4 * self.n_tok + nthreads - 1) // nthreads
+
+    @cute.jit
+    def _token_scales_load(self, x_sf_ptr: cute.Pointer, orig_m: Int32, tidx: Int32, vals):
+        """`token_scales_to_smem`'s loads, into ``vals`` (`_token_sf_per_thread` words)."""
         n_tok = self.n_tok
         nthreads = _EPI_WARPS * 32
-        nwords = self.nkb * 4 * n_tok
-        per_thread = (nwords + nthreads - 1) // nthreads
         sf_row_bytes = self.k // _SF_VEC
         x_sf_base = x_sf_ptr.toint()
-        sfb_base = storage.sSFB.data_ptr().toint()
-        vals = cute.make_rmem_tensor((per_thread,), Int32)
-        for t in cutlass.range_constexpr(per_thread):
+        for t in cutlass.range_constexpr(self._token_sf_per_thread()):
             i = tidx + t * nthreads
             r = i % n_tok
             rest = i // n_tok
@@ -1094,6 +1119,15 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
             rr = cutlass.min(r, orig_m - 1)
             kb = cutlass.min(kb, self.nkb - 1)
             vals[t] = _ldg_u32(x_sf_base + Int64(rr * sf_row_bytes + kb * 16 + atom * 4))
+
+    @cute.jit
+    def _token_scales_store(self, storage, orig_m: Int32, tidx: Int32, sfb_full, vals):
+        """`token_scales_to_smem`'s stores of ``vals`` and the arrival on ``sfb_full``."""
+        n_tok = self.n_tok
+        nthreads = _EPI_WARPS * 32
+        nwords = self.nkb * 4 * n_tok
+        per_thread = self._token_sf_per_thread()
+        sfb_base = storage.sSFB.data_ptr().toint()
         for t in cutlass.range_constexpr(per_thread):
             i = tidx + t * nthreads
             r = i % n_tok
@@ -1112,6 +1146,44 @@ class K3MoeFc1LowMKernel(_SelfSortMixin):
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive(sfb_full)
+
+    @cute.jit
+    def _load_tokens(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_b: cute.CopyAtom,
+        mB_mkl: cute.Tensor,
+        storage,
+        b_smem_layout_staged: cute.ComposedLayout,
+        cluster_layout_vmnk: cute.Layout,
+        tok_full,
+    ):
+        """The token warp's TMA of the step's ``n_tok`` token rows over the whole K into ``sB``
+        (completes ``tok_full``)."""
+        thr_mma = tiled_mma.get_slice(0)
+        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        # (bN, bK, loopM, loopK, 1)
+        gB = cute.local_tile(
+            mB_mkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
+        tCgB = thr_mma.partition_B(gB)
+        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            b_cta_layout,
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(tok_full, self.x_bytes)
+        for kb in cutlass.range(self.nkb, unroll=1):
+            cute.copy(
+                tma_atom_b,
+                tBgB[(None, 0, kb, 0)],
+                tBsB[(None, kb)],
+                tma_bar_ptr=tok_full,
+            )
 
     @cute.jit
     def _stamp(self, trace_ptr, bid, ev: int):

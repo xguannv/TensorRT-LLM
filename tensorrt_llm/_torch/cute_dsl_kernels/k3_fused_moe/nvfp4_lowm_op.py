@@ -79,6 +79,13 @@ def _num_sms(device_index: int) -> int:
     return HardwareInfo(device_index).get_max_active_clusters(1)
 
 
+def fc1_early_tokens() -> bool:
+    """``TRTLLM_K3LL_MOE_FC1_EARLY_TOKENS`` (flags.py; 1 on, else off): `k3_moe_nvfp4_lowm_fc12`'s FC1 issues its
+    token operand and token scale loads right after its wait, before its self-sort (``K3MoeFc1LowMKernel``'s
+    ``early_tokens``); the same output bit for bit."""
+    return os.environ.get("TRTLLM_K3LL_MOE_FC1_EARLY_TOKENS", "0") == "1"
+
+
 def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
@@ -397,10 +404,11 @@ def k3_moe_nvfp4_lowm_fc12(
     tail = (None, None, P(cutlass.Int32, topk_ids)) if self_sort else ()
     use_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    early_tokens = fc1_early_tokens()
     base = (_device_index(device), n_tok, n1, k1, top_k, ctas, use_pdl)
     if self_sort:
         base = (*base, "self_sort", num_local, int(local_offset))
-    key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
+    key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta), early_tokens)
     key2 = ("fc2", *base, scales_bf16)
     fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
     if fc1 is None or fc2 is None:
@@ -414,7 +422,7 @@ def k3_moe_nvfp4_lowm_fc12(
                 kernel = lowm.K3MoeFc1LowMKernel(
                     n_tok, n1, k1, top_k, float(situ_beta), float(situ_linear_beta), use_pdl=use_pdl,
                     late_trigger=False, self_sort_local=num_local if self_sort else 0,
-                    self_sort_offset=int(local_offset) if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0, early_tokens=early_tokens,
                 )  # fmt: skip
                 fc1 = _compiled[key1] = cute.compile(
                     kernel.wrapper, *fc1_ptrs, orig_m, m, num_local, ctas, stream, *tail
