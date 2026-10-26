@@ -394,6 +394,18 @@ def _bf16_rn(v):
 
 
 @dsl_user_op
+def _red_shared_or(addr_u32, val, *, loc=None, ip=None):
+    """red.shared.or.b32 (no round trip)."""
+    from cutlass._mlir.dialects import llvm as _llvm
+
+    _llvm.inline_asm(
+        None, [cutlass.Int32(addr_u32).ir_value(loc=loc, ip=ip), cutlass.Int32(val).ir_value(loc=loc, ip=ip)],
+        "red.shared.or.b32 [$0], $1;", "r,r", has_side_effects=True,
+        is_align_stack=False, asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+@dsl_user_op
 def _atom_add_shared(addr_u32, val, *, loc=None, ip=None):
     """atom.shared.add.u32; returns the old value."""
     from cutlass._mlir.dialects import llvm as _llvm
@@ -564,23 +576,25 @@ def _popc(v, *, loc=None, ip=None):
 # experts, [T, 2 T) their mn limits, [2 T] the tile count, from SORT_W (2 T + 1 rounded up to 4) the fp32 routing
 # weights [M, 16], then [T * 128] permuted rows. moe_sort's outputs for 128-row tiles, as k3_moe_nvfp4_lowm reads them.
 SORT_WORDS = NUM_EXPERTS // 32  # bitmap words of the experts
-# _sort_local's scratch in s_key (int32 `key_words`): the ids, the tokens' expert bitmaps, their union, its prefix
-# counts.
-SORT_IDS = 0
-
-
-def sort_scratch(m_max: int = M_MAX) -> tuple[int, int, int]:
-    """(bitmaps, union, prefix) offsets of _sort_local's scratch in s_key for an m_max-token build."""
-    bits = SORT_IDS + m_max * TOP_K
-    union = bits + m_max * SORT_WORDS
-    prefix = union + SORT_WORDS
-    return bits, union, prefix
+# _sort_local's scratch in s_key (int32 `key_words`): per expert the mask of the tokens routed to it (bit t: token t;
+# at most 32 tokens), one union bit per expert (touched), and the union words' exclusive popc prefix (+ the total).
+SORT_MASKS = 0
+SORT_UNION = SORT_MASKS + NUM_EXPERTS
+SORT_PREFIX = SORT_UNION + SORT_WORDS
 
 
 def key_words(m_max: int = M_MAX) -> int:
-    """Int32 words of s_key: the routing keys of the experts, or the sort's scratch where it is larger (the 32-token
-    build: 1464)."""
-    return max(NUM_EXPERTS, sort_scratch(m_max)[2] + SORT_WORDS)
+    """Int32 words of s_key: the routing keys of the experts, or the sort's scratch where it is larger."""
+    return max(NUM_EXPERTS, SORT_PREFIX + SORT_WORDS + 1)
+
+
+@cute.jit
+def _sort_masks_clear(s_key, tx):
+    """Zero the sort's token masks (every route CTA, before the sort_ctr hand-off's CTA barrier)."""
+    for i in cutlass.range_constexpr(_per_thread(NUM_EXPERTS)):
+        j = tx + cutlass.Int32(i * THREADS)
+        if j < cutlass.Int32(NUM_EXPERTS):
+            s_key.store(cutlass.Int32(0), idx=SORT_MASKS + j)
 
 
 def _per_thread(items: int) -> int:
@@ -603,73 +617,77 @@ def _sort_local(
 ):
     """moe_sort of the M tokens' top-16 over the local experts [offset, offset + num_local), 128-row tiles, by all
     THREADS threads of one CTA, into ``sort_words`` (`sort_layout`): one tile per local expert some token selected, in
-    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order."""
-    SORT_BITS, SORT_UNION, SORT_PREFIX = sort_scratch(m_max)
+    expert order, its rows the selecting tokens' expanded indices (token * 16 + k) in token order. The token masks
+    zeroed by `_sort_masks_clear`; three CTA barriers: each id ORs its token's bit into its expert's mask; one ballot
+    per 32 experts gives the union, one warp its prefix; each id then knows its tile (the touched experts below it)
+    and row (the tokens below it in the mask)."""
+    PER = _per_thread(m_max * TOP_K)
     n = num_tokens * cutlass.Int32(TOP_K)
     tiles = cutlass.min(n, num_local)
     w0 = (cutlass.Int32(2) * tiles + cutlass.Int32(4)) // cutlass.Int32(4) * cutlass.Int32(4)
     p0 = w0 + n
-    # The 32-token build has more ids (512) and bitmap words (896) than threads: two per thread.
-    for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
+    mask_base = s_key.data_ptr().toint() + cutlass.Int32(SORT_MASKS * 4)
+    # 1. every id's load first (the red is a volatile asm: a load after it would wait for the previous round trip)
+    es = []
+    for i in cutlass.range_constexpr(PER):
         j = tx + cutlass.Int32(i * THREADS)
+        e = cutlass.Int32(-1)
         if j < n:
-            s_key.store(topk_ids.load(idx=j, is_volatile=True), idx=SORT_IDS + j)
-    cute.arch.barrier()
-    for i in cutlass.range_constexpr(_per_thread(m_max * SORT_WORDS)):
+            e = topk_ids.load(idx=j, is_volatile=True) - offset
+        es.append(e)
+    lxs = []
+    for i in cutlass.range_constexpr(PER):
         j = tx + cutlass.Int32(i * THREADS)
-        if j < num_tokens * cutlass.Int32(SORT_WORDS):
-            t = j // cutlass.Int32(SORT_WORDS)
-            w = j - t * cutlass.Int32(SORT_WORDS)
-            word = cutlass.Int32(0)
-            for k in cutlass.range_constexpr(TOP_K):
-                lx = s_key.load(idx=SORT_IDS + t * cutlass.Int32(TOP_K) + k) - offset
-                hit = (lx >= cutlass.Int32(0)) & (lx < num_local) & ((lx >> 5) == w)
-                word = word | cutlass.select_(hit, cutlass.Int32(1) << (lx & 31), cutlass.Int32(0))
-            s_key.store(word, idx=SORT_BITS + j)
+        e = es[i]
+        lx = cutlass.Int32(-1)
+        if (j < n) & (e >= cutlass.Int32(0)) & (e < num_local):
+            lx = e
+            _red_shared_or(
+                mask_base + e * cutlass.Int32(4), cutlass.Int32(1) << (j // cutlass.Int32(TOP_K))
+            )
+        lxs.append(lx)
     cute.arch.barrier()
-    if tx < cutlass.Int32(SORT_WORDS):
-        u = cutlass.Int32(0)
-        for t in cutlass.range_constexpr(m_max):
-            if cutlass.Int32(t) < num_tokens:
-                u = u | s_key.load(idx=SORT_BITS + t * SORT_WORDS + tx)
-        s_key.store(u, idx=SORT_UNION + tx)
+    # 2. union word w: warp w % 14 ballots experts [32 w, 32 w + 32)
+    warp = tx // cutlass.Int32(32)
+    lane = tx % cutlass.Int32(32)
+    for i in cutlass.range_constexpr(-(-SORT_WORDS // (THREADS // 32))):
+        w = warp + cutlass.Int32(i * (THREADS // 32))
+        if w < cutlass.Int32(SORT_WORDS):
+            b = prims.vote_sync(
+                _rq.FULL_MASK,
+                s_key.load(idx=SORT_MASKS + w * cutlass.Int32(32) + lane) != cutlass.Int32(0),
+                prims.VoteSync.BALLOT,
+            )
+            if lane == cutlass.Int32(0):
+                s_key.store(cutlass.Int32(b), idx=SORT_UNION + w)
     cute.arch.barrier()
+    # 3. warp 0: lane w's exclusive popc prefix of the union words (lane SORT_WORDS: the tile count)
     if tx < cutlass.Int32(SORT_WORDS + 1):
         before = cutlass.Int32(0)
         for w in cutlass.range_constexpr(SORT_WORDS):
             if cutlass.Int32(w) < tx:
                 before = before + _popc(s_key.load(idx=SORT_UNION + w))
-        if tx < cutlass.Int32(SORT_WORDS):
-            s_key.store(before, idx=SORT_PREFIX + tx)
-        else:
+        s_key.store(before, idx=SORT_PREFIX + tx)
+        if tx == cutlass.Int32(SORT_WORDS):
             sort_words.store(before, idx=cutlass.Int32(2) * tiles)
     cute.arch.barrier()
-    for i in cutlass.range_constexpr(_per_thread(m_max * TOP_K)):
-        j = tx + cutlass.Int32(i * THREADS)
-        if j < n:
+    # 4. id j's tile and row
+    for i in cutlass.range_constexpr(PER):
+        lx = lxs[i]
+        if lx >= cutlass.Int32(0):
+            j = tx + cutlass.Int32(i * THREADS)
+            w = lx >> 5
+            below = s_key.load(idx=SORT_UNION + w) & (
+                (cutlass.Int32(1) << (lx & 31)) - cutlass.Int32(1)
+            )
+            tile = s_key.load(idx=SORT_PREFIX + w) + _popc(below)
+            tok = s_key.load(idx=SORT_MASKS + lx)
             t = j // cutlass.Int32(TOP_K)
-            lx = s_key.load(idx=SORT_IDS + j) - offset
-            if (lx >= cutlass.Int32(0)) & (lx < num_local):
-                w = lx >> 5
-                b = lx & 31
-                below = s_key.load(idx=SORT_UNION + w) & (
-                    (cutlass.Int32(1) << b) - cutlass.Int32(1)
-                )
-                tile = s_key.load(idx=SORT_PREFIX + w) + _popc(below)
-                row = cutlass.Int32(0)
-                count = cutlass.Int32(0)
-                for q in cutlass.range_constexpr(m_max):
-                    if cutlass.Int32(q) < num_tokens:
-                        bit = (s_key.load(idx=SORT_BITS + q * SORT_WORDS + w) >> b) & cutlass.Int32(
-                            1
-                        )
-                        count = count + bit
-                        if cutlass.Int32(q) < t:
-                            row = row + bit
-                sort_words.store(j, idx=p0 + tile * cutlass.Int32(CTA_M) + row)
-                if row == cutlass.Int32(0):
-                    sort_words.store(lx, idx=tile)
-                    sort_words.store(tile * cutlass.Int32(CTA_M) + count, idx=tiles + tile)
+            row = _popc(tok & ((cutlass.Int32(1) << t) - cutlass.Int32(1)))
+            sort_words.store(j, idx=p0 + tile * cutlass.Int32(CTA_M) + row)
+            if row == cutlass.Int32(0):
+                sort_words.store(lx, idx=tile)
+                sort_words.store(tile * cutlass.Int32(CTA_M) + _popc(tok), idx=tiles + tile)
 
 
 @cute.jit
@@ -1567,6 +1585,7 @@ def k3_moe_front_kernel(
                             _stamp(tl, bx, 4)
                 if cutlass.const_expr(sort):
                     # The last route CTA to finish sorts every token's routing over the local experts.
+                    _sort_masks_clear(s_key, tx)
                     if tx == 0:
                         s_cnt.store(
                             _atom_add_acq_rel(sort_ctr.data_ptr(0).toint(), cutlass.Int32(1)), idx=0
