@@ -326,12 +326,13 @@ TRTLLM_K3LL_MOE_TAIL_COL = _flag(
 )
 TRTLLM_K3LL_LAR_CLEAR_SPLIT = _flag(
     "TRTLLM_K3LL_LAR_CLEAR_SPLIT",
-    0,
+    -1,
     "TRTLLM_K3LL_MOE_TAIL_COL's latent all-reduce (K3LatentArRowKernel): the previous call's Lamport buffer is "
     "re-armed by extra CTAs of the same grid after its griddepcontrol.wait (k3_latent_ar_norm.ROW_CLEAR_CTAS) instead "
     "of by the row CTAs between their push and their poll, which is on the last rank's critical path. Bitwise (the "
     "same stores, other CTAs, the same window between the grid's wait and its completion). Read at forward time. "
-    "0 (default): off; 1: on",
+    "1 on, 0 off, -1 (default): on on SM103 only (moe_tail_col.LAR_CLEAR_SPLIT_CAPABILITIES; L1 bs2 -0.147 ms, bs4 "
+    "-0.038 ms, oak-1038)",
 )
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",

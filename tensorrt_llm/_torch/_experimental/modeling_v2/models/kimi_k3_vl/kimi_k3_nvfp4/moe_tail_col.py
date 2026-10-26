@@ -137,6 +137,26 @@ def enabled() -> bool:
     return _on_by_default()
 
 
+#: ``TRTLLM_K3LL_LAR_CLEAR_SPLIT``'s default (-1) turns it on only on these compute capabilities (measured on GB300 /
+#: SM103). It acts only inside this switch's latent all-reduce, whose kernel runs on SM100 / SM103 only.
+LAR_CLEAR_SPLIT_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _lar_clear_split_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in LAR_CLEAR_SPLIT_CAPABILITIES
+
+
+def _lar_clear_split_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` on ``device``: 1 on, 0 off, -1 (default) on where the device is in
+    ``LAR_CLEAR_SPLIT_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_LAR_CLEAR_SPLIT)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _lar_clear_split_by_default(index)
+
+
 def slice_width(world: int) -> int:
     """Output columns per rank."""
     return HIDDEN // world
@@ -277,7 +297,7 @@ def latent_all_reduce(
     latent = torch.empty_like(routed)
     view = base.latent
     lar = _latent_ar()
-    clear_ctas = lar.ROW_CLEAR_CTAS if int(_flags.TRTLLM_K3LL_LAR_CLEAR_SPLIT) == 1 else 0
+    clear_ctas = lar.ROW_CLEAR_CTAS if _lar_clear_split_on(routed.device) else 0
     if clear_ctas:
         _census.count(f"dispatch:lar_clear_split:{_census.mode()}")
     lar.run_k3_latent_ar_norm_row(
