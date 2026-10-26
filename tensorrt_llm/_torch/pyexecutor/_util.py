@@ -3362,7 +3362,7 @@ def _create_kv_cache_manager(
             kda_extra_kwargs["pretrained_config"] = config
         kda_replay_manager_types = (MixedMambaHybridCacheManager,
                                     MambaHybridCacheManagerV2)
-        if (spec_config is not None
+        if (_target_verifies_drafts(spec_config, model_engine)
                 and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
@@ -3970,6 +3970,19 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
         "time (nvbug 6627795). The seat pool must come from "
         "_util.compute_max_num_sequences and the index pool must cover it; a "
         "shortfall means one of them was re-derived from max_batch_size.")
+
+
+def _target_verifies_drafts(spec_config, model_engine) -> bool:
+    """Whether the target runs a speculative verify step, so needs its KDA replay state.
+
+    False without a speculative config, and on a context worker whose drafter is
+    the capture-only one (``CAPTURE_ONLY``, TRTLLM_K3LL_DRAFTER_PROMPT_CTX): it
+    stores the prompt's drafter context and never verifies a draft.
+    """
+    if spec_config is None:
+        return False
+    drafter = getattr(getattr(model_engine, "model", None), "draft_model", None)
+    return not getattr(drafter, "CAPTURE_ONLY", False)
 
 
 def create_py_executor_instance(

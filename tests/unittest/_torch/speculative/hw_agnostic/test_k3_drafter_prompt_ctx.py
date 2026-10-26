@@ -339,6 +339,21 @@ def test_capture_only_context_warms_up_no_generation_shape():
     assert not prop(SimpleNamespace(model=SimpleNamespace()))
 
 
+def test_capture_only_context_allocates_no_kda_replay_state():
+    """The KDA replay caches serve the target's verify step, which a capture-only context worker never runs."""
+    from tensorrt_llm._torch.pyexecutor._util import _target_verifies_drafts
+
+    spec = object()
+
+    def engine(drafter):
+        return SimpleNamespace(model=SimpleNamespace(draft_model=drafter))
+
+    assert not _target_verifies_drafts(None, engine(None))
+    assert _target_verifies_drafts(spec, engine(SimpleNamespace()))
+    assert _target_verifies_drafts(spec, SimpleNamespace(model=SimpleNamespace()))
+    assert not _target_verifies_drafts(spec, engine(SimpleNamespace(CAPTURE_ONLY=True)))
+
+
 def test_switch_default_off_and_documented():
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
 
