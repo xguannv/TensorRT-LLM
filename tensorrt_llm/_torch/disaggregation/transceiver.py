@@ -77,6 +77,7 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
     convert_to_torch_tensor,
+    maybe_pin_memory,
     mpi_comm,
     mpi_disabled,
     nvtx_range,
@@ -297,7 +298,9 @@ def _renumber_pool_rows(
     view = convert_to_torch_tensor(
         TensorWrapper(int(pool.base_address), dtype, [int(rows.max()) + 1, renumber.row_elems])
     )
-    index = torch.from_numpy(rows).to(view.device)
+    # Pinned and non-blocking: a pageable copy would hold the executor thread until the stream drains,
+    # i.e. until the in-flight forward finishes.
+    index = maybe_pin_memory(torch.from_numpy(rows)).to(view.device, non_blocking=True)
     picked = view.index_select(0, index)
     renumber.renumber_rows_(picked, shift)
     view.index_copy_(0, index, picked)

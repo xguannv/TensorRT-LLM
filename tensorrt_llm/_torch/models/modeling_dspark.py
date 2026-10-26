@@ -95,7 +95,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f, maybe_pin_memory
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
@@ -2264,9 +2264,16 @@ class DSparkMLAContextRenumber:
         self.row_elems = kv_lora_rank + rope_head_dim
 
     def phases(self, shift: int, device) -> torch.Tensor:
-        """``exp(-i * shift * inv_freq)`` as complex64 ``[rope_head_dim // 2]`` on ``device``."""
+        """``exp(-i * shift * inv_freq)`` as complex64 ``[rope_head_dim // 2]`` on ``device``.
+
+        Built on the host, then copied without a host sync. A pageable copy would block the
+        caller until the stream drains, i.e. until the in-flight forward finishes.
+        """
         angle = -float(shift) * self.inv_freq
-        return torch.polar(torch.ones_like(angle), angle).to(torch.complex64).to(device)
+        phase = torch.polar(torch.ones_like(angle), angle).to(torch.complex64)
+        if torch.device(device).type != "cuda":
+            return phase.to(device)
+        return maybe_pin_memory(phase).to(device, non_blocking=True)
 
     def __call__(self, rope: torch.Tensor, shift: int) -> torch.Tensor:
         """The rope slices ``rope`` (``[..., rope_head_dim]``) moved by ``-shift``, same dtype."""
