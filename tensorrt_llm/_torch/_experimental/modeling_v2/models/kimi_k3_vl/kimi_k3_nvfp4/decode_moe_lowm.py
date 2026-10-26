@@ -233,8 +233,8 @@ def self_sort_fc12_enabled() -> bool:
     return _self_sort_on_by_default()
 
 
-#: Devices where ``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` is on by default (-1): none until its L1 gates.
-MOE_FC2_CEIL_CHUNK_CAPABILITIES = ()
+#: Devices where ``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` is on by default (-1): measured on GB300 (SM103) only.
+MOE_FC2_CEIL_CHUNK_CAPABILITIES = ((10, 3),)
 
 
 @functools.lru_cache(maxsize=None)

@@ -92,11 +92,12 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
 )
 TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK = _flag(
     "TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK",
-    0,
+    -1,
     "with TRTLLM_K3LL_MOE_LOWM_FC12: K3MoeFc2LowMKernel gives every CTA ceil(units / CTAs) contiguous work units "
     "(the last CTAs fewer or none) instead of ranges of equal size to within one unit, so no CTA streams one unit "
-    "more while most of the grid has finished; the same partials. Read at forward time; 1 on, 0 off, -1 on where "
-    "the device is in decode_moe_lowm.MOE_FC2_CEIL_CHUNK_CAPABILITIES",
+    "more while most of the grid has finished; the same partials. Read at forward time; 1 on, 0 off, -1 (default): "
+    "on on SM103 only (decode_moe_lowm.MOE_FC2_CEIL_CHUNK_CAPABILITIES; L1 bs4 -0.081 ms; fc12 runs at 17-32 "
+    "rows only, so bs1 / bs2 are unchanged)",
 )
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
