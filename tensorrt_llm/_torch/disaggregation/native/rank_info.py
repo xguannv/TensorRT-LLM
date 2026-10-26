@@ -86,7 +86,9 @@ class RankInfo:
         page_table = build_page_table_from_manager(kvm)
         if draft_kv_cache_manager is not None:
             page_table = append_draft_page_table(
-                page_table, build_page_table_from_manager(draft_kv_cache_manager)
+                page_table,
+                build_page_table_from_manager(draft_kv_cache_manager),
+                target_physical_tokens_per_block=kvm.tokens_per_block,
             )
         enable_attention_dp = m.enable_attention_dp
         # Keep AttentionInfo on attention-free PP stages so it can still carry
