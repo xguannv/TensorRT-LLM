@@ -14,8 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator,
+                    List, Literal, Optional, Tuple, Union)
 
 import torch
 from strenum import StrEnum
@@ -413,6 +413,21 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+def _adp_dummy_draft_kwargs(executor) -> Dict[str, Any]:
+    """Extra `add_dummy_requests` arguments for an attention-DP padding dummy.
+
+    On a capture-only context worker the dummy's draft mirror is allocated with
+    it: that worker's draft pool fills with its target pool, and a shortfall
+    then fails the allocation (empty batch, retried next iteration) instead of
+    the draft resize in `_prepare_draft_resources`.
+    """
+    draft_manager = getattr(executor, "draft_kv_cache_manager", None)
+    if not getattr(executor, "_capture_only_context",
+                   False) or draft_manager is None:
+        return {}
+    return {"draft_kv_cache_manager": draft_manager}
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -537,6 +552,16 @@ class PyExecutor:
             model_engine, "_enable_scheduler_aware_adp_dummy", False)
         self._enable_non_overlap_adp_forward_intent = getattr(
             model_engine, "_enable_non_overlap_adp_forward_intent", False)
+        # A context worker with the capture-only drafter
+        # (TRTLLM_K3LL_DRAFTER_PROMPT_CTX) provisions no state for the target's
+        # verify step, so none of its requests, the attention-DP padding
+        # dummies included, may be a generation request (see
+        # `_adp_dummy_is_gen`).
+        from ._util import _target_verifies_drafts
+        spec_config = getattr(model_engine, "spec_config", None)
+        self._capture_only_context = (
+            spec_config is not None
+            and not _target_verifies_drafts(spec_config, model_engine))
         # Compatibility checks and MultimodalScheduler wrapping live in
         # `create_py_executor_instance`; the executor only keeps the flag
         # its loop paths branch on.
@@ -801,7 +826,7 @@ class PyExecutor:
         self._pending_iter_stats_dict: Optional[Dict] = None
         # Legacy ADP dummy role for overlap and PP fallback paths. The generic
         # non-overlap path derives its role from fresh per-iteration intent.
-        self._adp_dummy_is_gen: bool = True
+        self._adp_dummy_gen_role: bool = True
         # Dummy allocated by the current scheduling iteration. It is committed
         # to the normal forward/termination lifecycle only after every ADP rank
         # can queue; otherwise only this exact allocation is rolled back.
@@ -7880,6 +7905,21 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
+    @property
+    def _adp_dummy_is_gen(self) -> bool:
+        """Whether the attention-DP padding dummy is a generation request.
+
+        Never on a capture-only context worker: a generation dummy carries the
+        draft tokens of the target's verify step, whose state that worker does
+        not provision; its dummies are one-token context requests.
+        """
+        return (self._adp_dummy_gen_role
+                and not getattr(self, "_capture_only_context", False))
+
+    @_adp_dummy_is_gen.setter
+    def _adp_dummy_is_gen(self, value: bool) -> None:
+        self._adp_dummy_gen_role = value
+
     def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
         if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
@@ -7986,6 +8026,7 @@ class PyExecutor:
                     is_gen=self._adp_dummy_is_gen,
                     prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    **_adp_dummy_draft_kwargs(self),
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -8022,6 +8063,7 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                **_adp_dummy_draft_kwargs(self),
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -8062,8 +8104,10 @@ class PyExecutor:
         Padding is rank-local because `_schedule()` allgathers inside
         `_balance_adp_requests`. A generation dummy is used rather than the
         context dummy the pre-schedule path would pick, since this rank is empty
-        precisely because it is short of KV cache. Not reached under pipeline
-        parallelism, which does not call `_prepare_and_schedule_batch`.
+        precisely because it is short of KV cache -- except on a capture-only
+        context worker (`_adp_dummy_is_gen`), which pads with a one-token
+        context dummy. Not reached under pipeline parallelism, which does not
+        call `_prepare_and_schedule_batch`.
         """
         if not self.enable_attention_dp:
             return
@@ -8092,7 +8136,9 @@ class PyExecutor:
         if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
                for request in self.active_requests):
             return
-        if not self._has_adp_dummy_kv_capacity(None):
+        is_gen = not getattr(self, "_capture_only_context", False)
+        token_nums = None if is_gen else [1]
+        if not self._has_adp_dummy_kv_capacity(token_nums):
             logger.warning_once(
                 "attention-DP rank scheduled an empty batch and cannot afford "
                 "even a padding dummy; the forward pass is vetoed fleet-wide "
@@ -8107,10 +8153,11 @@ class PyExecutor:
             # peers in the collectives that follow.
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
-                token_nums=None,
-                is_gen=True,
+                token_nums=token_nums,
+                is_gen=is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                **_adp_dummy_draft_kwargs(self),
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -8135,7 +8182,10 @@ class PyExecutor:
         # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
         dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
-        scheduled_batch.generation_requests.append(dummy_request)
+        if is_gen:
+            scheduled_batch.append_generation_request(dummy_request)
+        else:
+            scheduled_batch.append_context_request(dummy_request)
         # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
         # cannot queue: no forward runs then, so the usual dummy teardown in
         # `_handle_responses` is not reached this iteration.

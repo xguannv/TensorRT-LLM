@@ -357,6 +357,110 @@ def test_capture_only_context_allocates_no_kda_replay_state():
     assert not _target_verifies_drafts(spec, engine(SimpleNamespace(CAPTURE_ONLY=True)))
 
 
+def _starved_adp_rank(capture_only):
+    """An attention-DP rank that holds an active request but scheduled none (short of KV cache), as
+    ``_pad_empty_attention_dp_batch`` finds it."""
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = PyExecutor.__new__(PyExecutor)
+    dummy = SimpleNamespace(py_request_id=0, is_last_context_chunk=True)
+    executor.__dict__.update(
+        enable_attention_dp=True,
+        active_requests=[SimpleNamespace(py_request_id=11)],
+        expected_num_active_requests=1,
+        max_num_active_requests=8,
+        max_total_draft_tokens=7,
+        _capture_only_context=capture_only,
+        _adp_dummy_gen_role=True,
+        _pending_adp_dummy_request=None,
+        _should_skip_dummy_for_benchmark_disagg=lambda num_active: False,
+        _count_schedulable_active_requests=lambda: 1,
+        _has_adp_dummy_kv_capacity=MagicMock(return_value=True),
+        kv_cache_manager=MagicMock(**{"add_dummy_requests.return_value": [dummy]}),
+        draft_kv_cache_manager=MagicMock(name="draft_kv_cache_manager"),
+        resource_manager=MagicMock(**{"get_resource_manager.return_value": None}),
+    )
+    return executor, dummy
+
+
+@pytest.mark.parametrize("capture_only", [True, False])
+def test_capture_only_context_pads_attention_dp_with_a_context_dummy(capture_only):
+    """A starved attention-DP rank is padded with a dummy. On a capture-only context worker it is a one-token
+    context request: a generation dummy carries 1 + max_draft_len tokens, which routes the KDA layers into the
+    target's verify step, whose state that worker does not provision (16p3d c84 on, jhb 1297305: HTTP 400
+    "'State' object has no attribute 'intermediate_conv_window'"). Elsewhere it stays a generation dummy."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+
+    executor, dummy = _starved_adp_rank(capture_only)
+    batch = ScheduledRequests()
+    PyExecutor._pad_empty_attention_dp_batch(executor, batch)
+
+    kwargs = executor.kv_cache_manager.add_dummy_requests.call_args.kwargs
+    executor._has_adp_dummy_kv_capacity.assert_called_once_with(kwargs["token_nums"])
+    if capture_only:
+        assert kwargs["is_gen"] is False and kwargs["token_nums"] == [1]
+        assert kwargs["draft_kv_cache_manager"] is executor.draft_kv_cache_manager
+        assert batch.generation_requests == [] and batch.context_requests == [dummy]
+    else:
+        assert kwargs["is_gen"] is True and kwargs["token_nums"] is None
+        assert "draft_kv_cache_manager" not in kwargs
+        assert batch.generation_requests == [dummy] and batch.context_requests == []
+    assert executor._pending_adp_dummy_request is dummy and dummy.is_attention_dp_dummy
+
+
+def test_capture_only_context_dummy_short_of_draft_pages_retries():
+    """On a capture-only context worker the padding dummy's draft mirror is allocated with it. When the draft
+    pool cannot hold it the allocation returns nothing (as ``add_dummy_requests`` does on a failed draft resize)
+    and the rank schedules an empty batch to retry, rather than failing the draft resize later in
+    ``_prepare_draft_resources``."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+
+    executor, _ = _starved_adp_rank(capture_only=True)
+    full_draft_pool = executor.draft_kv_cache_manager
+
+    def add_dummy_requests(**kwargs):
+        return None if kwargs.get("draft_kv_cache_manager") is full_draft_pool else [object()]
+
+    executor.kv_cache_manager.add_dummy_requests.side_effect = add_dummy_requests
+    active_before = list(executor.active_requests)
+    batch = ScheduledRequests()
+    PyExecutor._pad_empty_attention_dp_batch(executor, batch)
+
+    assert batch.batch_size == 0
+    assert executor.active_requests == active_before
+    assert executor._pending_adp_dummy_request is None
+
+
+def test_capture_only_context_never_picks_a_generation_dummy_role():
+    """The pre-schedule pad's role (`_adp_dummy_is_gen`) is generation by default and follows the requests seen;
+    on a capture-only context worker it reads as context whatever was set."""
+    executor, _ = _starved_adp_rank(capture_only=True)
+    executor._adp_dummy_is_gen = True
+    assert executor._adp_dummy_is_gen is False
+    executor._capture_only_context = False
+    assert executor._adp_dummy_is_gen is True
+
+
+def test_kda_verify_without_verify_state_raises():
+    """A verify step that reaches a KDA layer whose cache manager provisioned no verify state raises a named
+    error rather than a missing attribute deep in the sequential path."""
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+
+    layer = SimpleNamespace(
+        layer_idx=2,
+        _has_kda_replay_caches=lambda cache: KimiKDALinearAttention._has_kda_replay_caches(
+            None, cache
+        ),
+    )
+    cache = SimpleNamespace(has_kda_replay_caches=False, conv=None, temporal=None)
+    with pytest.raises(RuntimeError, match="capture-only context worker"):
+        KimiKDALinearAttention.forward_verify(layer, torch.zeros(8, 4), 8, cache, None, None, None)
+
+
 def test_switch_default_off_and_documented():
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
 
