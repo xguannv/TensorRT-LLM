@@ -260,10 +260,14 @@ def _pushes(o_proj: nn.Module, rows: int, gated: bool) -> bool:
 class K3OprojPush:
     """The switch's state on the TP group's ``MnnvlWorkspace``: its device view and a bf16 zero prefix ``[MAX_TOKENS,
     HIDDEN]`` (never written) for a layer that has just snapshotted its prefix sum. Built by `create` with the decode
-    collectives (``K3DecodeComm.create``); the workspace's rotation state is its own (device side)."""
+    collectives (``K3DecodeComm.create``); the workspace's rotation state is its own (device side). ``mx_candidates``:
+    the candidate counts (snapshots + 1) whose `finish_attn_res` build with the MXFP8 side output compiled at load
+    (`compile_attn_res`); ``TRTLLM_K3LL_ATTN_RES_MXFP8`` is read at forward time, so the caller asks for the side output
+    only for these."""
 
     lamport: LamportWorkspace
     zeros: torch.Tensor
+    mx_candidates: frozenset = frozenset()
 
     @classmethod
     def create(cls, workspace: MnnvlWorkspace) -> "K3OprojPush":
@@ -273,6 +277,18 @@ class K3OprojPush:
             MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=workspace.buffer_flags.device
         )
         return cls(view, zeros)
+
+    def compile_attn_res(self, max_candidates: int, mxfp8: bool) -> None:
+        """Compile (no launch) `finish_attn_res`'s attn_res builds for every candidate count up to ``max_candidates``
+        before any capture, without the MXFP8 side output, and with it where ``mxfp8`` (``TRTLLM_K3LL_ATTN_RES_MXFP8``
+        on this device at load); records the latter in ``mx_candidates``. Rank-local."""
+        kernel = _attn_res()
+        counts = range(kernel.MIN_CANDIDATES, min(max_candidates, kernel.MAX_CANDIDATES) + 1)
+        for n in counts:
+            kernel.compile_lamport_mnnvl(n)
+            if mxfp8:
+                kernel.compile_lamport_mnnvl(n, mxfp8=True)
+        self.mx_candidates = frozenset(counts) if mxfp8 else frozenset()
 
     @staticmethod
     def enabled(step) -> bool:

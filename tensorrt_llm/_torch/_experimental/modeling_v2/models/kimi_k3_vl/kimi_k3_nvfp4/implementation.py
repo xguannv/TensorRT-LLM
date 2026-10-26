@@ -1819,7 +1819,12 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         elif tail_push:
             _census.count(f"dispatch:moe_tail_push:{_census.mode()}")
-            if _attn_res_mxfp8_on(pending_moe_partial.x.device):
+            # where the MXFP8 build of the push consumer's kernel compiled at load for this candidate count
+            # (K3OprojPush.compile_attn_res; the switch is read at forward time)
+            candidates = valid_block_residual.shape[0] + 1
+            if candidates in self.decode_comm.oproj_push.mx_candidates and _attn_res_mxfp8_on(
+                pending_moe_partial.x.device
+            ):
                 mxfp8_out = _attn_res_mxfp8_out(
                     self, pending_moe_partial.x.shape[0], pending_moe_partial.x.device
                 )
@@ -4864,6 +4869,12 @@ class ModelingV2KimiK3(KimiLinearForCausalLM):
             # (compile only, no launch), so a capture after flipping it finds the kernel.
             tiles = gemvs.compile_push(
                 _moe_tail_push.SITE, first.tail_weight, comm.oproj_push.lamport.world
+            )
+            # and its consumer's attn_res builds (K3OprojPush.finish_attn_res), with the MXFP8 side output where
+            # TRTLLM_K3LL_ATTN_RES_MXFP8 is on at load: the push branch asks for it only where that build compiled
+            comm.oproj_push.compile_attn_res(
+                self.model.num_attn_res_snapshots + 1,
+                mxfp8=_attn_res_mxfp8_on(first.tail_weight.device),
             )
             if mapping.tp_rank == 0:
                 logger.info(

@@ -362,6 +362,105 @@ def test_warm_up_compiles_both_latent_ar_builds(monkeypatch):
         assert sorted(calls) == [0, 32], (value, calls)
 
 
+@pytest.mark.parametrize("tap", [False, True])
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_warm_up_runs_the_tap_and_mxfp8_attn_res_builds(monkeypatch, tap, mxfp8):
+    """``warm_up`` runs the Lamport attn_res kernel for every candidate count, with the drafter tap where ``tap``
+    (``TRTLLM_K3LL_ATTN_RES_TAP`` is read at forward time) and with the MXFP8 side output where ``mxfp8``, each tap
+    build also with the MXFP8 output; records the counts it ran (the forward asks for MXFP8 only for those)."""
+    col = _mod("moe_tail_col")
+    runs = []
+    attn_res = SimpleNamespace(
+        MIN_CANDIDATES=2, MAX_CANDIDATES=12,
+        run_k3_attn_res=lambda row, adds, block, *a, **kw: runs.append(
+            (block.shape[0] + 1, kw.get("tap") is not None, kw.get("mxfp8_out") is not None)),
+    )  # fmt: skip
+    monkeypatch.setattr(col, "_attn_res", lambda: attn_res)
+    monkeypatch.setattr(
+        col,
+        "_latent_ar",
+        lambda: SimpleNamespace(ROW_CLEAR_CTAS=32, run_k3_latent_ar_norm_row=lambda *a, **kw: None),
+    )
+    monkeypatch.setattr(col, "latent_all_reduce", lambda *a, **kw: None)
+    monkeypatch.setattr(col._tail_lu, "shared_all_reduce", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        col, "_ctm_op", lambda: SimpleNamespace(compile_wide_col_publish=lambda *a, **kw: True)
+    )
+    monkeypatch.setattr(col, "_ctm_kernel", lambda: SimpleNamespace(wide_tile=lambda rows: rows))
+    monkeypatch.setattr(col, "publish", lambda *a, **kw: SimpleNamespace(lamport_addend=(0, 0)))
+    gemvs = SimpleNamespace(compile_push=lambda *a, **kw: [16, 32], project=lambda *a, **kw: None)
+    dev = torch.device("cuda", 0)
+    base = SimpleNamespace(latent=None, push=SimpleNamespace(world=16))
+    state = SimpleNamespace(base=base)
+    layer = SimpleNamespace(
+        up_slice=torch.zeros(448, 3584, dtype=torch.bfloat16, device=dev),
+        col0=0,
+        tiles=(),
+        shared_down=torch.zeros(7168, 384, dtype=torch.bfloat16, device=dev),
+    )
+    col.warm_up(state, layer, gemvs, max_candidates=4, mxfp8=mxfp8, tap=tap)
+    want = {(n, t, m) for n in (2, 3, 4) for t in {False, tap} for m in {False, mxfp8}}
+    assert set(runs) == want, sorted(runs)
+    assert state.attn_res_candidates == frozenset({2, 3, 4})
+    assert state.attn_res_mx_candidates == (frozenset({2, 3, 4}) if mxfp8 else frozenset())
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_push_attn_res_compiles_at_load(monkeypatch, mxfp8):
+    """``K3OprojPush.compile_attn_res`` (the lowm load, next to the tail push GEMV): every candidate count's
+    ``finish_attn_res`` build, with the MXFP8 side output where ``TRTLLM_K3LL_ATTN_RES_MXFP8`` is on at load, recorded
+    in ``mx_candidates`` (the tail push branch asks for MXFP8 only for those: the switch is read at forward time)."""
+    op = _mod("oproj_push")
+    built = []
+    stub = SimpleNamespace(
+        MIN_CANDIDATES=2, MAX_CANDIDATES=12,
+        compile_lamport_mnnvl=lambda n, mxfp8=False, tap=False: built.append((n, mxfp8, tap)),
+    )  # fmt: skip
+    monkeypatch.setattr(op, "_attn_res", lambda: stub)
+    push = op.K3OprojPush(None, None)
+    assert push.mx_candidates == frozenset()
+    push.compile_attn_res(20, mxfp8=mxfp8)
+    counts = range(2, 13)
+    assert sorted(built) == sorted(
+        [(n, False, False) for n in counts] + [(n, True, False) for n in counts if mxfp8]
+    )
+    assert push.mx_candidates == (frozenset(counts) if mxfp8 else frozenset())
+
+
+def test_push_attn_res_compile_is_finish_attn_res_build(monkeypatch):
+    """``compile_lamport_mnnvl`` compiles the very build ``K3OprojPush.finish_attn_res``'s launch looks up (rows do not
+    enter its key), with and without the MXFP8 side output."""
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import k3_attn_res as kar
+
+    op = _mod("oproj_push")
+    keys = []
+    monkeypatch.setattr(kar, "_compiled", lambda *key: keys.append(key) or (lambda *a: None))
+    monkeypatch.setattr(op, "_attn_res", lambda: kar)
+    monkeypatch.setattr(
+        op, "finish_lamport_push", lambda target, in_place: SimpleNamespace(lamport_addend=(0, 0))
+    )
+    dev = torch.device("cuda", 0)
+    push = op.K3OprojPush(None, torch.zeros(32, 7168, dtype=torch.bfloat16, device=dev))
+    norm = SimpleNamespace(weight=torch.ones(7168, dtype=torch.bfloat16, device=dev), eps=1e-6)
+    proj = SimpleNamespace(weight=torch.ones(1, 7168, dtype=torch.bfloat16, device=dev))
+    for mx in (False, True):
+        for rows in (9, 32):
+            keys.clear()
+            kar.compile_lamport_mnnvl(3, mxfp8=mx)
+            mxfp8_out = None
+            if mx:
+                mxfp8_out = (
+                    torch.empty(rows, 7168, dtype=torch.float8_e4m3fn, device=dev),
+                    torch.empty(rows, 7168 // 32, dtype=torch.uint8, device=dev),
+                )
+            push.finish_attn_res(
+                SimpleNamespace(shape=(rows, 7168)), None, torch.zeros(2, rows, 7168, dtype=torch.bfloat16, device=dev),
+                proj, norm, norm, mxfp8_out=mxfp8_out,
+            )  # fmt: skip
+            assert len(keys) == 2 and keys[0] == keys[1], (mx, rows, keys)
+
+
 def test_snapshot_inplace_switch_default_sm103_and_documented():
     value, default, doc = _mod("flags").flags()["TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE"]
     assert default == -1 and "bank row" in doc and "Bitwise" in doc and "SM103" in doc

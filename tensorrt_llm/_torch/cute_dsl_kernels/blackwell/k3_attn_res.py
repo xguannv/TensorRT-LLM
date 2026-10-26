@@ -1586,6 +1586,16 @@ def fast_cluster_size(num_tokens: int, num_candidates: int) -> int:
     return 8 if num_tokens <= 16 and num_candidates >= 4 else 4
 
 
+def compile_lamport_mnnvl(num_candidates: int, mxfp8: bool = False, tap: bool = False) -> None:
+    """Compile (no launch) the build :func:`run_k3_attn_res` uses for a Lamport addend in the MNNVL order with the
+    early trigger and the default PDL (``K3OprojPush.finish_attn_res``'s call), with or without the MXFP8 side output
+    and the tap, so a later CUDA-graph capture finds it. Rows do not enter the build (the MNNVL topology fixes the
+    cluster)."""
+    _compiled(
+        num_candidates, ADD_PREFIX, _USE_PDL, MNNVL_CLUSTER, False, mxfp8, True, True, True, tap
+    )
+
+
 @functools.cache
 def _compiled(
     num_candidates: int,
