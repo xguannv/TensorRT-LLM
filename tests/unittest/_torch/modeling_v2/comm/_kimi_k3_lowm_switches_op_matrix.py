@@ -56,6 +56,9 @@ eager call on the same inputs):
     kernel's own sort and without it: no sorted launch when on; the front's outputs, the routed partial and the
     shared activation bit for bit.
   * SELF_SORT_FC12 (17, 24, 32 rows; read at forward time): the same with FC1 + FC2 on the 32-token front.
+  * FC2_CEIL_CHUNK (17, 24, 32 rows; read at forward time): ``_front_routed`` with FC1 + FC2 on the 32-token front
+    (the production sort switches), FC2's units in ceil chunks and in equal ranges: the front's outputs, the routed
+    partial (one-hot routing) and the shared activation bit for bit.
   * FRONT16 (9, 12, 16 rows): ``_wide`` with and without the 16-token front, with TRTLLM_K3LL_WIDE_LATENT_TAIL off.
     Off arm against ``_ref_wide_head_chain`` + ``_ref_latent_tail_chain``: routing, NVFP4 latent and scales, routed
     partial, shared activation, tail input and output bit for bit. On arm against the off arm: routing, latent,
@@ -1054,6 +1057,62 @@ def check_self_sort_fc12():
 
 
 # ----------------------------------------------------------------------------------------------------------------------
+# TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK
+# ----------------------------------------------------------------------------------------------------------------------
+def _fc2_ceil_chunk_arm(layer, moe, x, value: int):
+    step = layer.state.fc12.begin(x.shape[0], layer.experts[3].shape[1], x.device)
+    with _switch("TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK", value), _taps(layer) as seen:
+        routed, act = layer._front_routed(moe, x, front32=True, fc12=step)
+    return SimpleNamespace(front=seen["_front"], routed=routed, act=act)
+
+
+def _verify_fc2_ceil_chunk(where, on, off):
+    _assert_one_hot(where, off.front[1])
+    for name, a, b in zip(_FRONT_NAMES, on.front, off.front):
+        _expect_same(f"{where}: on vs off front {name}", a, b)
+    _expect_same(f"{where}: on vs off routed partial", on.routed, off.routed)
+    _expect_same(f"{where}: on vs off shared activation", on.act, off.act)
+
+
+def check_fc2_ceil_chunk():
+    """``_front_routed`` with FC1 + FC2 (``K3MoeFc12``) on the 32-token front, FC2's units in ceil chunks (switch on)
+    and in equal ranges, at 17, 24 and 32 rows: the front's outputs, the routed partial (one-hot routing: one partial
+    per output element, so the red order does not matter) and the shared activation bit for bit; eagerly and from
+    replays of one graph holding both arms."""
+    on, moe = BUILT.on32, BUILT.moe_on
+    if on.state.head32 is None or on.state.fc12 is None:
+        if R.rank == 0:
+            print(
+                "[rank 0] FC2_CEIL_CHUNK: skipped (no 32-token front or no FC12 state)", flush=True
+            )
+        return
+    for rows in FRONT32_ROWS:
+        x = _moe_input(2700 + rows, rows)
+        _verify_fc2_ceil_chunk(
+            f"FC2_CEIL_CHUNK {rows} rows",
+            _fc2_ceil_chunk_arm(on, moe, x, 1),
+            _fc2_ceil_chunk_arm(on, moe, x, 0),
+        )
+    fields = ("front", "routed", "act")
+    for rows in GRAPH_FRONT32_ROWS:
+        x = _moe_input(2800 + rows, rows)
+        graph, (g_on, g_off) = _capture(
+            lambda: (_fc2_ceil_chunk_arm(on, moe, x, 1), _fc2_ceil_chunk_arm(on, moe, x, 0))
+        )
+        for rep in range(REPLAYS):
+            x.copy_(_moe_input(2900 + 10 * rows + rep, rows))
+            _replay(graph)
+            where = f"FC2_CEIL_CHUNK graph {rows} rows replay {rep}"
+            e_on, e_off = _fc2_ceil_chunk_arm(on, moe, x, 1), _fc2_ceil_chunk_arm(on, moe, x, 0)
+            _same_arm(f"{where} on vs eager", g_on, e_on, fields)
+            _same_arm(f"{where} off vs eager", g_off, e_off, fields)
+            _verify_fc2_ceil_chunk(where, g_on, g_off)
+        del graph
+    if R.rank == 0:
+        print("[rank 0] FC2_CEIL_CHUNK: on arm = off arm (eager and replays)", flush=True)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
 # TRTLLM_K3LL_MOE_FRONT16
 # ----------------------------------------------------------------------------------------------------------------------
 def _front16_arm(layer, moe, x):
@@ -1742,6 +1801,7 @@ CHECKS = [
     check_front_sort,
     check_self_sort,
     check_self_sort_fc12,
+    check_fc2_ceil_chunk,
     check_front16,
     check_front32,
     check_wide_ar_attn_res,

@@ -119,11 +119,13 @@ def max_permuted_rows(num_tokens: int, top_k: int, num_local: int) -> int:
 
 class Fc12(NamedTuple):
     """`run` / `run_sorted`'s two-kernel launch (``k3_moe_nvfp4_lowm_fc12``): the FC1 output buffers (`new_fc12`) and
-    whether the caller already zeroed the output (stream-ordered before the call; else the call zeroes it first)."""
+    whether the caller already zeroed the output (stream-ordered before the call; else the call zeroes it first); and
+    `k3_moe_nvfp4_lowm_fc12`'s ``fc2_ceil_chunk``."""
 
     h: torch.Tensor
     h_sf: torch.Tensor
     zeroed: bool = False
+    fc2_ceil_chunk: bool = False
 
 
 def new_fc12(
@@ -323,6 +325,7 @@ def k3_moe_nvfp4_lowm_fc12(
     situ_linear_beta: float,
     topk_ids: Optional[torch.Tensor] = None,
     local_offset: int = 0,
+    fc2_ceil_chunk: bool = False,
 ) -> None:
     """`k3_moe_nvfp4_lowm`'s routed partial as two kernels: ``K3MoeFc1LowMKernel`` into ``h`` / ``h_sf`` (required:
     `new_fc12`), then ``K3MoeFc2LowMKernel`` adding into ``output``, which must be zero (this op does not zero it).
@@ -332,7 +335,8 @@ def k3_moe_nvfp4_lowm_fc12(
     loads FC1's output, so also computes and adds, after it; FC2 triggers its dependents after all of its warps are
     done. ``topk_ids`` int32 ``[M, top_k]``: both kernels sort the routing over the local experts
     ``[local_offset, local_offset + E)`` themselves, per CTA (`run`'s ``self_sort``; the front's tiles and rows), the
-    four sort arguments are not read and ``token_final_scales`` may be bf16."""
+    four sort arguments are not read and ``token_final_scales`` may be bf16. ``fc2_ceil_chunk``: FC2 splits its units
+    in chunks of ``ceil(units / CTAs)`` (``K3MoeFc2LowMKernel``'s ``ceil_chunk``; the same output)."""
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
@@ -407,7 +411,7 @@ def k3_moe_nvfp4_lowm_fc12(
     if self_sort:
         base = (*base, "self_sort", num_local, int(local_offset))
     key1 = ("fc1", *base, float(situ_beta), float(situ_linear_beta))
-    key2 = ("fc2", *base, scales_bf16)
+    key2 = ("fc2", *base, scales_bf16, bool(fc2_ceil_chunk))
     fc1, fc2 = _compiled.get(key1), _compiled.get(key2)
     if fc1 is None or fc2 is None:
         if torch.cuda.is_current_stream_capturing():
@@ -430,7 +434,7 @@ def k3_moe_nvfp4_lowm_fc12(
                 kernel = lowm.K3MoeFc2LowMKernel(
                     n_tok, k1, k2, top_k, use_pdl=use_pdl, early_weights=True,
                     self_sort_local=num_local if self_sort else 0,
-                    self_sort_offset=int(local_offset) if self_sort else 0,
+                    self_sort_offset=int(local_offset) if self_sort else 0, ceil_chunk=bool(fc2_ceil_chunk),
                 )  # fmt: skip
                 fc2 = _compiled[key2] = cute.compile(
                     kernel.wrapper, *fc2_ptrs, m, num_local, orig_m, ctas, stream, *tail
@@ -442,7 +446,7 @@ def k3_moe_nvfp4_lowm_fc12(
 @k3_moe_nvfp4_lowm_fc12.register_fake
 def _(x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, output, tile_idx_to_group_idx, tile_idx_to_mn_limit,
       permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, token_final_scales, h, h_sf, top_k,
-      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0):  # fmt: skip
+      situ_beta, situ_linear_beta, topk_ids=None, local_offset=0, fc2_ceil_chunk=False):  # fmt: skip
     return None
 
 
@@ -501,7 +505,7 @@ def run(
         torch.ops.trtllm.k3_moe_nvfp4_lowm_fc12(
             x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, ids, ids, ids, ids, fc2_input_scale, scales,
             fc12.h, fc12.h_sf, top_k, float(situ_beta), float(situ_linear_beta), topk_ids=ids,
-            local_offset=int(local_expert_offset),
+            local_offset=int(local_expert_offset), fc2_ceil_chunk=fc12.fc2_ceil_chunk,
         )  # fmt: skip
         return out
     if self_sort and fc12 is None and self_sort_takes(num_tokens, w1.shape[0]):
@@ -583,7 +587,7 @@ def run_sorted(
         torch.ops.trtllm.k3_moe_nvfp4_lowm_fc12(
             x_fp4, x_sf, w1, w1_sf, alpha1, w2, w2_sf, alpha2, out, tile_idx_to_group_idx, tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx, num_non_exiting_tiles, fc2_input_scale, scales, fc12.h, fc12.h_sf, top_k,
-            float(situ_beta), float(situ_linear_beta),
+            float(situ_beta), float(situ_linear_beta), fc2_ceil_chunk=fc12.fc2_ceil_chunk,
         )  # fmt: skip
         return out
     if out is None:

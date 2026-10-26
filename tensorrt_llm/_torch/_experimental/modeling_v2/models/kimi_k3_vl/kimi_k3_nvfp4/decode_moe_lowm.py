@@ -149,7 +149,16 @@ class Fc12Step:
         if self.side:
             torch.cuda.current_stream().wait_event(self.state.join)
         buffers = self.state.buffers
-        return nvfp4_lowm_op.Fc12(buffers.h, buffers.h_sf, zeroed=self.side)
+        ceil_chunk = fc2_ceil_chunk_enabled()
+        if ceil_chunk:
+            from . import census as _census
+
+            _census.count(f"dispatch:moe_fc2_ceil_chunk:{_census.mode()}")
+            # per step size: which captured graphs (rows = batch x (1 + draft)) take it
+            _census.count(f"dispatch:moe_fc2_ceil_chunk_rows{self.out.shape[0]}:{_census.mode()}")
+        return nvfp4_lowm_op.Fc12(
+            buffers.h, buffers.h_sf, zeroed=self.side, fc2_ceil_chunk=ceil_chunk
+        )
 
 
 #: Devices where ``TRTLLM_K3LL_MOE_LOWM_FC12`` is on by default (-1): measured on GB300 (SM103) only.
@@ -222,6 +231,27 @@ def self_sort_fc12_enabled() -> bool:
     if value >= 0:
         return value > 0
     return _self_sort_on_by_default()
+
+
+#: Devices where ``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` is on by default (-1): none until its L1 gates.
+MOE_FC2_CEIL_CHUNK_CAPABILITIES = ()
+
+
+@functools.lru_cache(maxsize=None)
+def _fc2_ceil_chunk_on_by_default() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in MOE_FC2_CEIL_CHUNK_CAPABILITIES
+    )
+
+
+def fc2_ceil_chunk_enabled() -> bool:
+    """``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` (read at forward time): 1 on, 0 off, -1 on where the device is in
+    ``MOE_FC2_CEIL_CHUNK_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK)
+    if value >= 0:
+        return value > 0
+    return _fc2_ceil_chunk_on_by_default()
 
 
 def fc12_takes(state, rows: int) -> bool:

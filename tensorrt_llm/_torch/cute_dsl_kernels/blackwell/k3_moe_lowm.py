@@ -319,6 +319,24 @@ class _SelfSortMixin:
     takes three CTA barriers: each id ORs its token's bit into its expert's mask; one ballot per 32 experts gives the
     union; each id then knows its tile (the touched experts below it) and row (the tokens below it in the mask)."""
 
+    #: `_unit_range`'s split: ``False`` contiguous ranges of equal size (to within one unit), ``True`` contiguous
+    #: ranges of ``ceil(total / nctas)`` units (the CTAs past the end get none).
+    ceil_chunk = False
+
+    @cute.jit
+    def _unit_range(self, total: Int32, bid, nctas):
+        """This CTA's contiguous range ``[w_lo, w_hi)`` of the ``total`` work units (`ceil_chunk`)."""
+        w_lo = Int32(0)
+        w_hi = Int32(0)
+        if cutlass.const_expr(self.ceil_chunk):
+            per = (total + Int32(nctas) - Int32(1)) // Int32(nctas)
+            w_lo = cutlass.min(Int32(bid) * per, total)
+            w_hi = cutlass.min((Int32(bid) + Int32(1)) * per, total)
+        else:
+            w_lo = (Int32(bid) * total) // Int32(nctas)
+            w_hi = ((Int32(bid) + 1) * total) // Int32(nctas)
+        return w_lo, w_hi
+
     def _init_self_sort(self, n_tok: int, topk: int, self_sort_local: int, self_sort_offset: int):
         self.self_sort = self_sort_local > 0
         self.ss_local = self_sort_local
@@ -419,8 +437,7 @@ class _SelfSortMixin:
         for w in cutlass.range_constexpr(W):
             ntiles = ntiles + _popc(u[w])
         total = ntiles * NBLK
-        w_lo = (Int32(bid) * total) // Int32(nctas)
-        w_hi = ((Int32(bid) + 1) * total) // Int32(nctas)
+        w_lo, w_hi = self._unit_range(total, bid, nctas)
         tile_lo = w_lo // NBLK
         tile_end = (w_hi + NBLK - 1) // NBLK
         for i in cutlass.range_constexpr(per):
@@ -1476,6 +1493,9 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
       ids at its start (`_SelfSortMixin`, the same tiles and rows as FC1's), before the early
       weights: the ids, like the metadata otherwise, come from the kernel before FC1.
       ``token_final_scales`` may then be the front's bf16 weights (widened exactly).
+    * ``ceil_chunk``: every CTA takes ``ceil(units / CTAs)`` contiguous units (the last ones fewer or
+      none) instead of ranges of equal size to within one unit, so no CTA carries one unit more than
+      the others while most of the grid has finished (the same units, so the same partials).
     """
 
     def __init__(
@@ -1495,6 +1515,7 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
         trace: bool = False,
         self_sort_local: int = 0,
         self_sort_offset: int = 0,
+        ceil_chunk: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n % _MMA_M == 0 and k % _KBLK == 0
@@ -1523,6 +1544,9 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
         self.wait_tiles = wait_tiles
         self.tile_units = tile_units
         self.trace = trace
+        # _tile_readers counts a tile's readers from the equal-size ranges
+        assert not (ceil_chunk and wait_tiles), "ceil_chunk: no wait_tiles"
+        self.ceil_chunk = ceil_chunk
         self.mma_tiler = (_MMA_M, n_tok, _KBLK)
         self.acc_cols = n_tok * num_acc_stage
         self.sfa_cols = 16
@@ -1821,8 +1845,7 @@ class K3MoeFc2LowMKernel(_SelfSortMixin):
             )
         else:
             total = Int32(num_non_exiting_tiles[0]) * NBLK
-        w_lo = (Int32(bid) * total) // Int32(nctas)
-        w_hi = ((Int32(bid) + 1) * total) // Int32(nctas)
+        w_lo, w_hi = self._unit_range(total, bid, nctas)
         num_units = w_hi - w_lo
         thr_mma = tiled_mma.get_slice(0)
 

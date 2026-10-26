@@ -392,9 +392,11 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     check_fast(lowm_self, self_sort=True)
 
 
+@pytest.mark.parametrize("ceil_chunk", [False, True], ids=["fc2_equal_ranges", "fc2_ceil_chunk"])
 @pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])
-def test_moe_nvfp4_lowm_fc12(num_tokens):
-    """trtllm::k3_moe_nvfp4_lowm_fc12 (K3MoeFc1LowMKernel + K3MoeFc2LowMKernel, TRTLLM_K3LL_MOE_LOWM_FC12) against
+def test_moe_nvfp4_lowm_fc12(num_tokens, ceil_chunk, monkeypatch):
+    """trtllm::k3_moe_nvfp4_lowm_fc12 (K3MoeFc1LowMKernel + K3MoeFc2LowMKernel, TRTLLM_K3LL_MOE_LOWM_FC12; FC2's units
+    in equal ranges or ceil chunks, TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK) against
     trtllm::k3_moe_nvfp4_lowm at K3 shapes: FC1 rows and scales bit for bit, every FC2 partial bit for bit (one
     non-zero routing weight per token), the full sum within the bf16 accumulation bound of the exact sum of the
     partials (both add a token's partials in hardware order); through run_sorted with the persistent buffers
@@ -402,6 +404,9 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
     zeroing on its side stream (decode_moe_lowm.K3MoeFc12, forked before the experts as before the front, joined
     before FC1)."""
     import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        flags as k3ll_flags,
+    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4.decode_moe_lowm import (
         K3MoeFc12,
     )
@@ -409,6 +414,7 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
     from tensorrt_llm._torch.utils import unswizzle_sf
 
+    monkeypatch.setattr(k3ll_flags, "TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK", int(ceil_chunk))
     hidden, inter_size, num_experts, num_local, offset, top_k = (
         LATENT,
         I_TP,
@@ -443,6 +449,7 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
     h_dyn = torch.zeros(m, inter_size // 2, dtype=torch.uint8, device="cuda")
     h_sf_dyn = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
     fc12 = nvfp4_lowm_op.new_fc12(torch.device("cuda"), 2 * inter_size, num_local, top_k)
+    fc12 = fc12._replace(fc2_ceil_chunk=ceil_chunk)
     sorted_args = (t2g, t2lim, p2e, nnet, ex.fc2_input_scale)
 
     def dyn(token_scales):
@@ -458,7 +465,7 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
         out_fc12.zero_()  # FC2 adds into its output
         _trtllm().k3_moe_nvfp4_lowm_fc12(
             _bits(x_q), _bits(x_sf), *weights, out_fc12, *sorted_args, token_scales, fc12.h, fc12.h_sf, top_k,
-            GATE_CAP, LINEAR_CAP,
+            GATE_CAP, LINEAR_CAP, fc2_ceil_chunk=ceil_chunk,
         )  # fmt: skip
         torch.cuda.synchronize()
         return out_fc12.clone()
@@ -504,9 +511,13 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
     with torch.cuda.graph(graph, stream=stream), with_multi_stream(True):
         step = state.begin(num_tokens, hidden, torch.device("cuda"))
         assert step.side
+        launch = step.launch()
+        assert launch.fc2_ceil_chunk == ceil_chunk, (
+            "the decode launch reads TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK"
+        )
         captured = nvfp4_lowm_op.run_sorted(
             _bits(x_q), _bits(x_sf), (t2g, t2lim, p2e, nnet, scales), weights, ex.fc2_input_scale, counters,
-            GATE_CAP, LINEAR_CAP, out=step.out, fc12=step.launch(),
+            GATE_CAP, LINEAR_CAP, out=step.out, fc12=launch,
         )  # fmt: skip
     for replay in range(3):
         captured.fill_(7.0)
@@ -529,6 +540,7 @@ def test_moe_nvfp4_lowm_fc12(num_tokens):
         _trtllm().k3_moe_nvfp4_lowm_fc12(
             _bits(x_q), _bits(x_sf), *weights, out_fc12, ids, ids, ids, ids, ex.fc2_input_scale, token_scales,
             fc12.h, fc12.h_sf, top_k, GATE_CAP, LINEAR_CAP, topk_ids=ids, local_offset=offset,
+            fc2_ceil_chunk=ceil_chunk,
         )  # fmt: skip
         torch.cuda.synchronize()
         return out_fc12.clone()

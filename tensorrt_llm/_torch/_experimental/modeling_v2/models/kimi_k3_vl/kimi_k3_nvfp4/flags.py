@@ -90,6 +90,14 @@ TRTLLM_K3LL_MOE_SELF_SORT_FC12 = _flag(
     "only (decode_moe_lowm.MOE_SELF_SORT_CAPABILITIES; L1 bs4 -0.102 ms, moss-0452; the token-mask sort, here and in "
     "K3MoeLowMDynKernel, vs the earlier scan sort: L1 1x -0.049 ms, 2x -0.061 ms, 4x -0.142 ms, moss-0471)",
 )
+TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK = _flag(
+    "TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK",
+    0,
+    "with TRTLLM_K3LL_MOE_LOWM_FC12: K3MoeFc2LowMKernel gives every CTA ceil(units / CTAs) contiguous work units "
+    "(the last CTAs fewer or none) instead of ranges of equal size to within one unit, so no CTA streams one unit "
+    "more while most of the grid has finished; the same partials. Read at forward time; 1 on, 0 off, -1 on where "
+    "the device is in decode_moe_lowm.MOE_FC2_CEIL_CHUNK_CAPABILITIES",
+)
 TRTLLM_K3LL_MLA_DCP = _flag(
     "TRTLLM_K3LL_MLA_DCP",
     1,
