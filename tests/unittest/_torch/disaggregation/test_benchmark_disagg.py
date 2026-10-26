@@ -939,6 +939,8 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
         ex._fill_admit_cap = 0
+        # PyExecutor.__init__ leaves it 0 under attention DP or benchmark disagg (generation prefetch off).
+        ex._disagg_gen_prefetch_limit = 0
         ex.benchmark_req_queues_size = 32
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = 8
@@ -1666,6 +1668,8 @@ class TestFillPhaseEndToEnd:
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
         ex._fill_admit_cap = 0
+        # PyExecutor.__init__ leaves it 0 under attention DP or benchmark disagg (generation prefetch off).
+        ex._disagg_gen_prefetch_limit = 0
         ex.enable_attention_dp = True
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
