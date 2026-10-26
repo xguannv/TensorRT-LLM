@@ -58,10 +58,19 @@ is bit for bit the low-M kernel's on the bf16 input. The API (stable; the other 
 tile to the MMA once its scales are folded (the same bits). ``k3_fp8w_lowm_mxfp8`` compiles on its first call of each
 shape (outside a capture: the engine's warm-up steps run first); a capture that finds it not compiled keeps the low-M
 kernel (the same bits) and logs it. ``MX_STATS`` counts what happened (tests).
+
+``TRTLLM_K3LL_QKVG_BS1_SPLIT`` (read at every call): `gemm` runs the fused KDA weight (`QKVG_BS1_SHAPE`) at 8 or
+fewer rows at the split-K the switch forces (one of `QKVG_BS1_SPLITS`, `qkvg_bs1_tactic`) where no MXFP8 input is
+offered for it; 0 keeps the default tactic. Not the same bits as the default split. The KDA layer compiles every
+forced split at load (`compile_qkvg_bs1_splits`); a capture that finds one not compiled keeps the default split
+(census ``fallback:qkvg_bs1_split_not_compiled``). Census: every forced-split call counts
+``dispatch:qkvg_bs1_split<S>_rows<M>``, a call of the fused shape above 8 rows with the switch set
+``qkvg_bs1_split_skip_rows<M>``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections import Counter
 from typing import Callable, Iterable, NamedTuple, Optional, Tuple
@@ -102,6 +111,99 @@ _MX_LOGGED: set = set()
 # TRTLLM_K3LL_MX_SF_EARLY_RELEASE's default (-1) picks the early-release build only on these compute capabilities
 # (measured on GB300 / SM103). k3_fp8w_lowm_mxfp8 itself runs only where can_take_rows passes (SM100 / SM103).
 MX_SF_EARLY_RELEASE_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+#: TRTLLM_K3LL_QKVG_BS1_SPLIT: the KDA fused [q | k | v | g | f_a | b] weight (``(N, K)``, built at load by
+#: append_rows) at the 8-row tile (bs1 at MTP7) and the split-K values the switch may force. The heuristic's split 5
+#: makes 130 CTAs in clusters of 5; behind bs1's k3_sandwich (56 SMs, launching its dependents ~6 us before it ends)
+#: more than half of those calls finish ~2-3 us later than the rest. Splits 4 (104 CTAs) and 3 (78) do not.
+QKVG_BS1_SHAPE: Tuple[int, int] = (3216, 7168)
+QKVG_BS1_MMA_N = 8
+QKVG_BS1_SPLITS: Tuple[int, ...] = (3, 4)
+#: ``(device index, N, K, split)`` of the forced-split kernels compiled in this process (`compile_qkvg_bs1_splits`,
+#: or an eager call).
+_QKVG_BS1_COMPILED: set = set()
+
+
+@functools.lru_cache(maxsize=None)
+def qkvg_bs1_tactic(n: int, k: int, split: int):
+    """``k3_fp8w_lowm_gemm.default_tactic``'s heuristic branch for the 8-row tile at split-K ``split``: every
+    activation tile in flight if the weight ring keeps at least 6 stages, else 8 / 4 activation stages; the weight
+    ring takes the rest of shared memory."""
+    kernel = _kernel()
+    base = kernel.default_tactic(QKVG_BS1_MMA_N, n, k)
+    kt_max = -(-(k // kernel.CTA_K) // split)
+    tactic = None
+    for x_stages in (kt_max, 8, 4):
+        candidate = kernel.K3LowMTactic(
+            mma_n=QKVG_BS1_MMA_N,
+            split_k=split,
+            a_stages=1,
+            x_stages=min(x_stages, kt_max),
+            b_stages=min(4, kt_max),
+            quant_warps=base.quant_warps,
+            quant_groups=4,
+        )
+        try:
+            kernel.validate_tactic(n, k, candidate)
+        except ValueError:
+            continue
+        tactic = dataclasses.replace(candidate, a_stages=kernel.max_a_stages(n, k, candidate))
+        if tactic.a_stages >= min(6, kt_max):
+            break
+    if tactic is None:
+        raise ValueError(f"no split-{split} tactic for N={n}, K={k}")
+    return tactic
+
+
+def _device_index(t: torch.Tensor) -> int:
+    return t.device.index if t.device.index is not None else torch.cuda.current_device()
+
+
+def compile_qkvg_bs1_splits(weight: torch.Tensor) -> bool:
+    """Compile (no launch) every `QKVG_BS1_SPLITS` kernel of `TRTLLM_K3LL_QKVG_BS1_SPLIT` for ``weight`` (the fused KDA
+    weight) if its shape is `QKVG_BS1_SHAPE`, whatever the switch says, so a capture after flipping it finds them.
+    Returns whether it did."""
+    n, k = weight.shape
+    if (n, k) != QKVG_BS1_SHAPE:
+        return False
+    index = _device_index(weight)
+    with torch.cuda.device(index):
+        for split in QKVG_BS1_SPLITS:
+            if (index, n, k, split) not in _QKVG_BS1_COMPILED:
+                _kernel()._compiled_kernel(n, k, qkvg_bs1_tactic(n, k, split), True)
+                _QKVG_BS1_COMPILED.add((index, n, k, split))
+    return True
+
+
+def _qkvg_bs1_split(
+    x2d: torch.Tensor, weight: torch.Tensor, packed_scale: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """`TRTLLM_K3LL_QKVG_BS1_SPLIT`: the fused KDA GEMM at the forced split-K where the switch is set, the weight is
+    `QKVG_BS1_SHAPE` and ``x2d`` has at most `QKVG_BS1_MMA_N` rows (the caller checked ``can_run``); else None. In
+    a capture an uncompiled kernel keeps the default split (census ``fallback:qkvg_bs1_split_not_compiled``)."""
+    split = int(_flags.TRTLLM_K3LL_QKVG_BS1_SPLIT)
+    if not split:
+        return None
+    if split not in QKVG_BS1_SPLITS:
+        raise ValueError(
+            f"TRTLLM_K3LL_QKVG_BS1_SPLIT={split}: expected 0 or one of {QKVG_BS1_SPLITS}"
+        )
+    m = x2d.shape[0]
+    n, k = weight.shape
+    if (n, k) != QKVG_BS1_SHAPE or m > QKVG_BS1_MMA_N:
+        return None
+    key = (_device_index(x2d), n, k, split)
+    if torch.cuda.is_current_stream_capturing() and key not in _QKVG_BS1_COMPILED:
+        _census_count("fallback:qkvg_bs1_split_not_compiled")
+        return None
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x2d.device)
+    _kernel().run_k3_fp8w_lowm_gemm(
+        x2d, weight, packed_scale, out, tactic=qkvg_bs1_tactic(n, k, split)
+    )
+    _QKVG_BS1_COMPILED.add(key)
+    _census_count(f"dispatch:qkvg_bs1_split{split}_rows{m}")
+    return out
 
 
 @functools.lru_cache(maxsize=None)
@@ -466,7 +568,17 @@ def gemm(
         x2d, weight, packed_scale, allow_partial_n_tile=True
     ):
         return None
+    if (
+        _flags.TRTLLM_K3LL_QKVG_BS1_SPLIT
+        and tuple(weight.shape) == QKVG_BS1_SHAPE
+        and x2d.shape[0] > QKVG_BS1_MMA_N
+    ):
+        _census_count(f"qkvg_bs1_split_skip_rows{x2d.shape[0]}")
     out = _offered_gemm(x2d, weight, packed_scale, True)
+    if out is not None:
+        return out
+    # An offered MXFP8 input (AttnResFast writes one; bs1's k3_sandwich does not) keeps its kernel above.
+    out = _qkvg_bs1_split(x2d, weight, packed_scale)
     if out is not None:
         return out
     return torch.ops.trtllm.k3_fp8w_lowm_gemm(x2d, weight, packed_scale)

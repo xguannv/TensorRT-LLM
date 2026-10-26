@@ -249,6 +249,15 @@ TRTLLM_K3LL_KDA_BFA_FP8 = _flag(
     "to FP8 128x128 blocks and appended to the QKVG weight (changes numerics); the fused weight is built at load "
     "(the target's post_load_weights) when 1; launched at 0, switching it on later keeps the unfused path",
 )
+TRTLLM_K3LL_QKVG_BS1_SPLIT = _flag(
+    "TRTLLM_K3LL_QKVG_BS1_SPLIT",
+    0,
+    "TRTLLM_K3LL_KDA_BFA_FP8's fused [q | k | v | g | f_a | b] GEMM (3216 x 7168) at 8 or fewer rows (bs1 MTP7) on "
+    "k3_fp8w_lowm_gemm at this split-K: 4 (104 CTAs, clusters of 4) or 3 (78 CTAs) instead of the heuristic's 5 (130 "
+    "CTAs), whose prefetch behind bs1's k3_sandwich (56 SMs) is bimodal (fp8w_lowm.QKVG_BS1_SHAPE). Not bitwise "
+    "(split-K changes the FP32 summation order). Splits 3 and 4 compile at load whatever the switch says; read at "
+    "forward time. 0 (default): the heuristic's split",
+)
 TRTLLM_K3LL_FP8W_LOWM = _flag(
     "TRTLLM_K3LL_FP8W_LOWM",
     1,

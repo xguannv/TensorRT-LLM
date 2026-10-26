@@ -2732,6 +2732,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
                     del weight
                     self._qkvg_bfa_fp8 = fused
                     self._bfa_fp8_extra_bytes = extra
+                    # TRTLLM_K3LL_QKVG_BS1_SPLIT is read at forward time: its kernels compile here (once per
+                    # process, no launch) whatever the switch says, so a capture after flipping it finds them.
+                    _fp8w_lowm.compile_qkvg_bs1_splits(fused[0])
         return self._qkvg_bfa_fp8 is not None
 
     def _k3_fused_rows(self, x: torch.Tensor) -> Optional[torch.Tensor]:
