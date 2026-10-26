@@ -3247,9 +3247,12 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._use_fused_qk_norm_rope = False
 
         # Split kv_b_proj into the absorption operands once. K absorbs into the
-        # query, V un-absorbs the attention output.
+        # query, V un-absorbs the attention output. A capture-only drafter
+        # (MLADSparkCaptureOnly) has no kv_b_proj and never decodes.
         nh = attn0.num_heads_tp
         for a in layers_attn:
+            if getattr(a, "kv_b_proj", None) is None:
+                continue
             w = a.kv_b_proj.weight.view(nh, self.qk_nope_head_dim + self.v_head_dim, -1)
             a._k_b_proj = w[:, : self.qk_nope_head_dim].contiguous()
             a._v_b_proj = w[:, self.qk_nope_head_dim :].contiguous()
@@ -3515,6 +3518,73 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self.lm_head = target_model.lm_head
 
 
+class MLADSparkCaptureOnly(MLADSparkForCausalLM):
+    """The MLA DSpark drafter of a disaggregated context worker: it only stores the prompt's context K/V.
+
+    ``DFlashWorker._store_prefill_context`` reads ``fc`` / ``hidden_norm`` (``project_target_hidden``) and the
+    per-layer latent projection and norm (``precompute_context_kv``). A context worker never drafts (its batches
+    have no generation requests), so everything else -- the embedding, q / kv_b / o projections, MLP, layer norms,
+    final norm and the DSpark heads -- is dropped before the weights are materialized and is not loaded. The stored
+    latents are those of ``MLADSparkForCausalLM`` with the same weights: the same modules, buffers and calls.
+    """
+
+    #: Per-layer modules the context store reads (``_build_fused_kv_buffers``).
+    KEPT_ATTENTION_MODULES = ("kv_a_proj_with_mqa", "kv_a_layernorm")
+    #: Checkpoint tensors the capture needs, in the TorchSpec and the SpecForge spellings.
+    KEPT_WRAPPER_WEIGHTS = (
+        "context_proj.weight",
+        "context_norm.weight",
+        "fc.weight",
+        "hidden_norm.weight",
+    )
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
+        super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        # None, not deleted: the worker reads draft_model_full.model.embed_tokens before it checks for generation
+        # requests (prepare_1st_drafter_inputs).
+        self.model.embed_tokens = None
+        if getattr(self.model, "norm", None) is not None:
+            self.model.norm = None
+        for layer in self.model.layers:
+            for name in list(layer._modules):
+                if name != "self_attn":
+                    layer._modules[name] = None
+            attn = layer.self_attn
+            for name in list(attn._modules):
+                if name not in self.KEPT_ATTENTION_MODULES:
+                    attn._modules[name] = None
+        self._dspark_markov_rank = 0
+
+    @staticmethod
+    def _kept_key(key: str) -> bool:
+        return key in MLADSparkCaptureOnly.KEPT_WRAPPER_WEIGHTS or any(
+            f".self_attn.{name}." in f".{key}"
+            for name in MLADSparkCaptureOnly.KEPT_ATTENTION_MODULES
+        )
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Load only the capture's tensors (the rest of the checkpoint is ignored, not loaded)."""
+        renames = {"context_proj.weight": "fc.weight", "context_norm.weight": "hidden_norm.weight"}
+        kept = {renames.get(k, k): v for k, v in weights.items() if self._kept_key(k)}
+        return DFlashForCausalLM.load_weights(self, kept, weight_mapper=weight_mapper, **kwargs)
+
+    def dflash_forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "MLADSparkCaptureOnly is the capture-only drafter of a disaggregated context worker; it does not draft"
+        )
+
+
+def dspark_capture_only() -> bool:
+    """Whether this process builds the capture-only MLA DSpark drafter: a disaggregated context worker
+    (``TRTLLM_DISAGG_ROLE=context``) with ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` > 0 (the K3 low-latency switch that
+    sends the prompt's drafter K/V to the generation workers)."""
+    if os.environ.get("TRTLLM_DISAGG_ROLE") != "context":
+        return False
+    from ..pyexecutor.k3ll_flags import k3ll_flag_any_target
+
+    return k3ll_flag_any_target("TRTLLM_K3LL_DRAFTER_PROMPT_CTX") > 0
+
+
 def draft_is_embedded_in_target(model_config) -> bool:
     """True when the DSpark draft weights live inside the target checkpoint.
 
@@ -3574,7 +3644,8 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     # model registry, so keying on model_type a second time would force a new
     # entry for every GQA family that already works.
     if is_mla(draft_config.pretrained_config):
-        return MLADSparkForCausalLM(
+        draft_cls = MLADSparkCaptureOnly if dspark_capture_only() else MLADSparkForCausalLM
+        return draft_cls(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
         )
@@ -3594,6 +3665,7 @@ __all__ = [
     # Standalone flavour.
     "GQADSparkForCausalLM",
     "MLADSparkForCausalLM",
+    "MLADSparkCaptureOnly",
     # MLA drafter backbone (a weight container for the block decode).
     "K3DsparkForCausalLM",
     "K3DsparkModel",

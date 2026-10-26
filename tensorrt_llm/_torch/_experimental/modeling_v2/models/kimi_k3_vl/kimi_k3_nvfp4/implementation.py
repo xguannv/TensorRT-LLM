@@ -4277,9 +4277,14 @@ def _check_construction(model_config: ModelConfig, target: K3TargetSpec) -> None
             f"the {parallel} target needs moe_tensor_parallel_size {target.moe_tp} and "
             f"moe_expert_parallel_size {target.moe_ep} set explicitly"
         )
-        assert getattr(model_config, "spec_config", None) is None, (
-            f"the {parallel} target is context-only (a disaggregated ctx worker); it builds no drafter"
-        )
+        if getattr(model_config, "spec_config", None) is not None:
+            from tensorrt_llm._torch.models.modeling_dspark import dspark_capture_only
+
+            assert dspark_capture_only(), (
+                f"the {parallel} target is context-only (a disaggregated ctx worker); it builds no drafter, except "
+                "the capture-only DSpark drafter of TRTLLM_K3LL_DRAFTER_PROMPT_CTX > 0 (with TRTLLM_DISAGG_ROLE="
+                "context)"
+            )
     if target.moe_tp == 16:
         assert mapping.moe_tp_ep_user_specified, (
             f"the {parallel} target needs moe_tensor_parallel_size 16 and "

@@ -289,6 +289,17 @@ TRTLLM_K3LL_DRAFTER_CTX_SIDE = _flag(
     "(fc and its all-reduce + hidden_norm) and the latent GEMM on a side stream forked before the target LM head, "
     "joined before the context store (the same values; read per step)",
 )
+TRTLLM_K3LL_DRAFTER_PROMPT_CTX = _flag(
+    "TRTLLM_K3LL_DRAFTER_PROMPT_CTX",
+    0,
+    "disaggregated serving with the MLA DSpark drafter: the gen drafter's context starts with the drafter K/V of the "
+    "last W prompt tokens (whole pages), computed on the ctx and sent with the target KV. 0 (default): off, the gen "
+    "drafter sees generated tokens only; W > 0: that window (a W at least the prompt length sends the whole prompt). "
+    "On a ctx worker (TRTLLM_DISAGG_ROLE=context) with a DSpark speculative_config it loads a capture-only drafter "
+    "(context_proj, context_norm and the latent projection + norm, no draft forward) that keeps the drafter K/V of "
+    "every prompt position in a draft pool reused jointly with the target's. Read at load (ctx) and per received "
+    "request (gen)",
+)
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",
     1,
