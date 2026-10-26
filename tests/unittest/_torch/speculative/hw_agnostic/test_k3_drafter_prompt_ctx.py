@@ -82,19 +82,22 @@ def test_capture_only_drafter_holds_and_loads_only_the_capture():
 
     names = {name for name, _ in capture.named_parameters()}
     assert names, "the capture-only drafter lost its parameters"
-    # lm_head is the target's (load_weights_from_target_model), never loaded from the drafter checkpoint
     kept = (
         "fc.",
         "hidden_norm.",
         ".self_attn.kv_a_proj_with_mqa.",
         ".self_attn.kv_a_layernorm.",
-        "lm_head.",
     )
     assert all(any(k in f".{name}" for k in kept) for name in names), sorted(names)
     assert (
         sum(p.numel() for p in capture.parameters()) < sum(p.numel() for p in full.parameters()) / 2
     )
     assert capture.draft_model_full.model.embed_tokens is None
+    # No head, not even after the target's is offered: no [vocab, hidden] tensor (2.35 GB on K3) survives.
+    capture.load_weights_from_target_model(SimpleNamespace(lm_head=full.lm_head, model=full.model))
+    assert capture.lm_head is None and capture.draft_model_full.lm_head is None
+    head_shape = full.lm_head.weight.shape
+    assert all(t.shape != head_shape for t in [*capture.parameters(), *capture.buffers()])
     for name in ("fc", "hidden_norm"):
         torch.testing.assert_close(
             getattr(capture, name).weight, getattr(full, name).weight, rtol=0, atol=0
