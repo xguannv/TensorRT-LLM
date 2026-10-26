@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """In-situ MoE front phase timeline (diagnostic measurement build, never for trunk).
 
-``TRTLLM_K3LL_FRONT_TL_DIR=<dir>`` at process start: every decode front call passes ``k3_moe_front`` a timeline slice
-of one device buffer, keyed by (MoE layer, token build 8 / 16 / 32), so each captured call of a CUDA graph writes its
-own slice on every replay. The kernel writes %globaltimer at its phase boundaries per CTA (``k3_moe_front.TL_SLOTS``
-words per CTA; slot meanings there). A daemon thread snapshots the whole buffer on its own stream (relaxed capture
-mode) every ``TRTLLM_K3LL_FRONT_TL_PERIOD`` seconds (default 1.0) once no Python front call has run for 15 s (warm-up
-and capture done; graph replays only), keeps the last ``TRTLLM_K3LL_FRONT_TL_SNAPS`` (default 120) and writes them to
-``<dir>/fronttl_rank<R>.pt`` (with the slot index and every key's geometry); an atexit hook writes a last copy. A
-snapshot can tear across a step: a reader checks each slice's stamps for one call (monotone slots, span < 100 us).
+``TRTLLM_K3LL_FRONT_TL_DIR=<dir>`` at process start: every decode front call passes ``k3_moe_front``
+a timeline slice of one device buffer, keyed by (MoE layer, token build 8 / 16 / 32), so each
+captured call of a CUDA graph writes its own slice on every replay. The kernel writes %globaltimer
+at its phase boundaries per CTA (``k3_moe_front.TL_SLOTS`` words per CTA; slot meanings there). A
+daemon thread snapshots the whole buffer on its own stream (relaxed capture mode) every
+``TRTLLM_K3LL_FRONT_TL_PERIOD`` seconds (default 1.0) once no Python front call has run for 15 s
+(warm-up and capture done; graph replays only), keeps the last ``TRTLLM_K3LL_FRONT_TL_SNAPS``
+(default 3: ~50 MB each, and after the replay the snapshots repeat) and writes them to
+``<dir>/fronttl_rank<R>.pt`` (with the slot index and every key's geometry); an atexit hook writes a
+last copy. A snapshot can tear across a step: a reader checks each slice's stamps for one call
+(monotone slots, span < 100 us).
 """
 
 from __future__ import annotations
@@ -75,7 +78,7 @@ def _snap(stream) -> None:
         cpu = _st["buf"].to("cpu", non_blocking=True)
     stream.synchronize()
     _st["snaps"].append((time.time_ns(), cpu))
-    del _st["snaps"][: -int(os.environ.get("TRTLLM_K3LL_FRONT_TL_SNAPS", "120"))]
+    del _st["snaps"][: -int(os.environ.get("TRTLLM_K3LL_FRONT_TL_SNAPS", "3"))]
 
 
 def _save() -> None:
