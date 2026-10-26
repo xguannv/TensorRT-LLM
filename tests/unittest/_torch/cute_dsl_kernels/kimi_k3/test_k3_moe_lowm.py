@@ -234,12 +234,11 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
     h_sf = torch.zeros(m * inter_size // SF16, dtype=torch.uint8, device="cuda")
     weights = (ex.w1, ex.w1_sf, alpha1, ex.w2, ex.w2_sf, ex.alpha2)
 
-    def lowm(token_scales, fast=False, early=False):
+    def lowm(token_scales, fast=False):
         out.fill_(7.0)  # the kernel zeroes the output itself
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, t2g, t2lim, p2e, nnet, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, static_first=fast, fast_tok=fast,
-            early_tok=early,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "counters not reset"
@@ -300,15 +299,6 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
             ), f"{tag}: FC2 slot {slot}"
         for rep in range(3):
             check(op(scales, fast=True), f"{tag} op, call {rep}")
-        # early_tok: the tokens and their scales loaded before the sort (and with no local tile, drained)
-        for slot in (0, top_k - 1):
-            one_hot = torch.zeros_like(scales)
-            one_hot[:, slot] = scales[:, slot]
-            assert torch.equal(
-                op(one_hot).view(torch.int16), op(one_hot, fast=True, early=True).view(torch.int16)
-            ), f"{tag} early_tok: FC2 slot {slot}"
-        for rep in range(2):
-            check(op(scales, fast=True, early=True), f"{tag} early_tok op, call {rep}")
         for rep in range(2):
             y = nvfp4_lowm_op.run(*run_args, num_ctas=num_ctas, self_sort=self_sort, fast=True)
             torch.cuda.synchronize()
@@ -339,14 +329,14 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
          for r in range(t * 128, limits[t])], device="cuda",
     )  # fmt: skip
 
-    def lowm_self(token_scales, fast=False, early=False):
+    def lowm_self(token_scales, fast=False):
         out.fill_(7.0)
         h.zero_()
         h_sf.zero_()
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             token_scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=ids, local_offset=offset,
-            static_first=fast, fast_tok=fast, early_tok=early,
+            static_first=fast, fast_tok=fast,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset"
@@ -400,24 +390,24 @@ def test_moe_nvfp4_lowm(shape, num_tokens, num_ctas):
         check(static, f"self-sort graph replay {replay}")
         assert int(counters.abs().sum().item()) == 0, "self-sort: counters not reset after a replay"
     check_fast(lowm_self, self_sort=True)
-    # no local expert: the output zeroed, the tokens loaded before the sort drained, the counters reset
+    # no local expert: the output zeroed, the counters reset
     far = (
         ((offset + num_local + torch.arange(top_k, device="cuda")) % num_experts)
         .int()
         .expand(num_tokens, top_k)
     )
-    for fast, early in ((False, False), (True, True)):
+    for fast in (False, True):
         out.fill_(7.0)
         _trtllm().k3_moe_nvfp4_lowm(
             _bits(x_q), _bits(x_sf), *weights[:3], *weights[3:], out, ids, ids, ids, ids, ex.fc2_input_scale,
             scales, counters, top_k, GATE_CAP, LINEAR_CAP, num_ctas, h, h_sf, topk_ids=far.contiguous(),
-            local_offset=offset, static_first=fast, fast_tok=fast, early_tok=early,
+            local_offset=offset, static_first=fast, fast_tok=fast,
         )  # fmt: skip
         torch.cuda.synchronize()
         assert int(out.view(torch.int16).abs().sum().item()) == 0, (
-            f"no local expert (early {early}): output"
+            f"no local expert (fast {fast}): output"
         )
-        assert int(counters.abs().sum().item()) == 0, f"no local expert (early {early}): counters"
+        assert int(counters.abs().sum().item()) == 0, f"no local expert (fast {fast}): counters"
 
 
 @pytest.mark.parametrize("num_tokens", [17, 24, 28, 32])

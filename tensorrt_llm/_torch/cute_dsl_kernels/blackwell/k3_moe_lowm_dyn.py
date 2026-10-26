@@ -45,7 +45,9 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   (token, k)'s tile and row by popc), and the kernel reads the tile metadata from there instead of
   from the previous grid: the routing kernel need not sort it.
 * Static first unit (``static_first``): CTA ``b`` takes unit ``b`` first and the work counter hands out
-  units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip.
+  units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip;
+  the next unit's atomic is predicated on lane 0 rather than branched, so the weight warp waits for it
+  only at the unit's end (a branch made the warp reconverge on it: ~0.5 us before the first fetch).
 * Fast token operand (``fast_tok``): the token warp polls a tile's counter only for the first FC2
   unit of that tile in a row (a tile seen ready stays ready), and instead of every FC2 block adding
   to the counter (an atomic whose result it waits for) the last token warp of the grid to finish
@@ -127,6 +129,27 @@ def _atom_add_acq_rel(addr, value, *, loc=None, ip=None):
             [Int64(addr).ir_value(loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
             "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
             "=r,l,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _atom_add_relaxed_lane0(addr, value, lane, *, loc=None, ip=None):
+    """Relaxed atomic add by the lane whose ``lane`` is 0 (others get 0), predicated, without a branch: the
+    warp does not reconverge on the atomic's return, so it waits only where the value is used."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                _iv(value, loc=loc, ip=ip),
+                _iv(lane, loc=loc, ip=ip),
+            ],
+            "{\n.reg .pred p;\nsetp.eq.s32 p, $3, 0;\nmov.b32 $0, 0;\n"
+            "@p atom.relaxed.gpu.global.add.s32 $0, [$1], $2;\n}",
+            "=r,l,r,r",
             loc=loc,
             ip=ip,
         )
@@ -236,7 +259,6 @@ class K3MoeLowMDynKernel:
         self_sort_local: int = 0,
         static_first: bool = False,
         fast_tok: bool = False,
-        early_tok: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -257,7 +279,6 @@ class K3MoeLowMDynKernel:
         self.trace = trace
         self.static_first = static_first
         self.fast_tok = fast_tok
-        self.early_tok = early_tok
         # Self-sort scratch (int32 words): per local expert the mask of its tokens, the touched experts'
         # bits, the tile count, each tile's expert and row limit, and the rows of each tile at stride
         # n_tok (the permuted-index view spans 128 more words).
@@ -671,15 +692,6 @@ class K3MoeLowMDynKernel:
         if cutlass.const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, bid, 1)
-        if cutlass.const_expr(self.early_tok):
-            # FC1's token operand and token scales depend on nothing the sort makes: the token TMA and the
-            # scale loads are in flight while the CTA sorts (the scales stored by epilogue WG0 after it)
-            if warp_idx == self.tok_warp:
-                self._issue_tokens(st, tiled_mma.get_slice(0), cl, b_layout, tma_b1, mB1)
-                if cutlass.const_expr(self.trace):
-                    with cute.arch.elect_one():
-                        self._xstamp(trace_ptr, bid, 1)
-            sf_vals = self._token_scales_load(x_sf_ptr, orig_m, tidx % 128)
         if cutlass.const_expr(self.self_sort):
             (
                 tile_idx_to_expert_idx,
@@ -759,10 +771,6 @@ class K3MoeLowMDynKernel:
         else:
             wg = tidx // 128
             et = tidx % 128
-            if cutlass.const_expr(self.early_tok):
-                if wg == 0:
-                    if w1 > 0:
-                        self._token_scales_store(st, sf_vals, orig_m, et)
             cute.arch.mbarrier_wait(st.tmem_ready, 0)
             if cutlass.const_expr(self.trace):
                 if tidx == 0:
@@ -770,10 +778,9 @@ class K3MoeLowMDynKernel:
             acc_ptr = cute.arch.retrieve_tmem_ptr(
                 Float32, alignment=16, ptr_to_buffer_holding_addr=st.tmem_holding_buf
             )
-            if cutlass.const_expr(not self.early_tok):
-                if wg == 0:
-                    if w1 > 0:
-                        self._token_scales_to_smem(st, x_sf_ptr, orig_m, et)
+            if wg == 0:
+                if w1 > 0:
+                    self._token_scales_to_smem(st, x_sf_ptr, orig_m, et)
             if cutlass.const_expr(self.trace):
                 if tidx == 0:
                     self._xstamp(trace_ptr, bid, 6)
@@ -983,10 +990,13 @@ class K3MoeLowMDynKernel:
         n1u = Int32(0)
         while cur < total:
             nxt = Int32(0)
-            if lane == 0:
-                nxt = _atom_add_relaxed(ctr, 1)
-                if cutlass.const_expr(self.static_first):
-                    nxt = nxt + nctas
+            if cutlass.const_expr(self.static_first):
+                # predicated, no branch: the first unit's stages issue while the (contended) atomic returns; its
+                # value (+ nctas) is used at the unit's end
+                nxt = _atom_add_relaxed_lane0(ctr, 1, lane)
+            else:
+                if lane == 0:
+                    nxt = _atom_add_relaxed(ctr, 1)
             if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 0, _globaltimer())
@@ -1048,6 +1058,8 @@ class K3MoeLowMDynKernel:
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 1, _globaltimer())
             cur = cute.arch.shuffle_sync(nxt, 0)
+            if cutlass.const_expr(self.static_first):
+                cur = cur + nctas
             j += 1
         self._q_write(st, j, Int32(-1), Int32(-1))
         if cutlass.const_expr(self.trace):
@@ -1114,16 +1126,11 @@ class K3MoeLowMDynKernel:
         tBsB2, tBgB2 = cpasync.tma_partition(
             tma_b2, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB2, 0, 3)
         )
-        if cutlass.const_expr(self.early_tok):
-            if w1 == 0:
-                # no FC1 unit consumes the tokens issued before the sort: they land before the CTA exits
-                cute.arch.mbarrier_wait(st.tok_full, 0)
-        else:
-            if w1 > 0:
-                self._issue_tokens(st, thr_mma, cl, b_layout, tma_b1, mB1)
-                if cutlass.const_expr(self.trace):
-                    with cute.arch.elect_one():
-                        self._xstamp(trace_ptr, bid, 1)
+        if w1 > 0:
+            self._issue_tokens(st, thr_mma, cl, b_layout, tma_b1, mB1)
+            if cutlass.const_expr(self.trace):
+                with cute.arch.elect_one():
+                    self._xstamp(trace_ptr, bid, 1)
         a_full = st.a_full.data_ptr()
         slot_base = st.sA.data_ptr().toint()
         h_sf_base = h_sf_ptr.toint()
