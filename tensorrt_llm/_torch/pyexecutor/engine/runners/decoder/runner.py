@@ -1499,7 +1499,7 @@ class DecoderRunner(ScheduledModelRunner):
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
-        if self.guided_decoder is None:
+        if self.guided_decoder is None and not self._capture_only_context:
             # doesn't support guided decoding
             warmup_requests_configs.append(
                 (1 + self._config.max_total_draft_tokens, 1)
@@ -1569,6 +1569,16 @@ class DecoderRunner(ScheduledModelRunner):
         release_megamoe_scratch = getattr(_megamoe_op, "release_megamoe_profiling_scratch", None)
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
+
+    @property
+    def _capture_only_context(self) -> bool:
+        """Whether this is a context worker with the capture-only drafter (``TRTLLM_K3LL_DRAFTER_PROMPT_CTX``).
+
+        Its batches never hold a generation request and its drafter does not draft, so no generation shape is
+        warmed up: with the speculative config a generation warmup would run the target's verify step, which such a
+        worker neither runs nor provisions (its state pool and KDA verify buffers are the context worker's).
+        """
+        return bool(getattr(getattr(self.model, "draft_model", None), "CAPTURE_ONLY", False))
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
@@ -1703,7 +1713,11 @@ class DecoderRunner(ScheduledModelRunner):
         )
 
         warmup_configs = [(curr_max_num_tokens, 0)]
-        if self.guided_decoder is None and not self.mapping.has_pp():
+        if (
+            self.guided_decoder is None
+            and not self.mapping.has_pp()
+            and not self._capture_only_context
+        ):
             # Add generation request to warmup the autotuner cache.
             warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
