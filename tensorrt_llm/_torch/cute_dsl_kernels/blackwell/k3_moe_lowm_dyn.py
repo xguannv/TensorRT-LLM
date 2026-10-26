@@ -45,9 +45,7 @@ FC2 partial bit-identical and added with ``red.global.add.noftz.v4.bf16x2`` in h
   (token, k)'s tile and row by popc), and the kernel reads the tile metadata from there instead of
   from the previous grid: the routing kernel need not sort it.
 * Static first unit (``static_first``): CTA ``b`` takes unit ``b`` first and the work counter hands out
-  units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip;
-  the next unit's atomic is predicated on lane 0 rather than branched, so the weight warp waits for it
-  only at the unit's end (a branch made the warp reconverge on it: ~0.5 us before the first fetch).
+  units from the grid size on, so the CTA's first weight load does not wait for an atomic round trip.
 * Fast token operand (``fast_tok``): the token warp polls a tile's counter only for the first FC2
   unit of that tile in a row (a tile seen ready stays ready), and instead of every FC2 block adding
   to the counter (an atomic whose result it waits for) the last token warp of the grid to finish
@@ -129,27 +127,6 @@ def _atom_add_acq_rel(addr, value, *, loc=None, ip=None):
             [Int64(addr).ir_value(loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
             "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
             "=r,l,r",
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _atom_add_relaxed_lane0(addr, value, lane, *, loc=None, ip=None):
-    """Relaxed atomic add by the lane whose ``lane`` is 0 (others get 0), predicated, without a branch: the
-    warp does not reconverge on the atomic's return, so it waits only where the value is used."""
-    return Int32(
-        _asm(
-            T.i32(),
-            [
-                Int64(addr).ir_value(loc=loc, ip=ip),
-                _iv(value, loc=loc, ip=ip),
-                _iv(lane, loc=loc, ip=ip),
-            ],
-            "{\n.reg .pred p;\nsetp.eq.s32 p, $3, 0;\nmov.b32 $0, 0;\n"
-            "@p atom.relaxed.gpu.global.add.s32 $0, [$1], $2;\n}",
-            "=r,l,r,r",
             loc=loc,
             ip=ip,
         )
@@ -990,13 +967,10 @@ class K3MoeLowMDynKernel:
         n1u = Int32(0)
         while cur < total:
             nxt = Int32(0)
-            if cutlass.const_expr(self.static_first):
-                # predicated, no branch: the first unit's stages issue while the (contended) atomic returns; its
-                # value (+ nctas) is used at the unit's end
-                nxt = _atom_add_relaxed_lane0(ctr, 1, lane)
-            else:
-                if lane == 0:
-                    nxt = _atom_add_relaxed(ctr, 1)
+            if lane == 0:
+                nxt = _atom_add_relaxed(ctr, 1)
+                if cutlass.const_expr(self.static_first):
+                    nxt = nxt + nctas
             if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 0, _globaltimer())
@@ -1058,8 +1032,6 @@ class K3MoeLowMDynKernel:
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 1, _globaltimer())
             cur = cute.arch.shuffle_sync(nxt, 0)
-            if cutlass.const_expr(self.static_first):
-                cur = cur + nctas
             j += 1
         self._q_write(st, j, Int32(-1), Int32(-1))
         if cutlass.const_expr(self.trace):
