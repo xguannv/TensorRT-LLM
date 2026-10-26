@@ -536,7 +536,8 @@ def _prefetch_first_stages(
 #   GEMV CTA: 0 setup done, 1 grid dependency met (warp 1), 2 x's k-tiles landed (warp 2), 3 last round's accumulator
 #             ready (warp 4), 4 last round's mailbox complete (owner warp), 5 epilogue done (warp 4).
 #   route CTA: 0 setup done, 1 grid dependency met, 2 pass 0 done, 3 the 8 x 16 logit partials arrived, 4 top-16 done,
-#              5 sort done (the last route CTA), 6 its L2 prefetch of FC1's first weight stages issued (layout).
+#              5 sort done (the last route CTA), 6 its L2 prefetch of FC1's first weight stages issued (layout),
+#              7 the last route CTA knows it is the last (its sort_ctr add returned, after the CTA barrier).
 #   quantization CTA: 0, 1 as above, 3 its first token's 16 slices arrived, 4 quantized.
 TL_SLOTS = 8
 
@@ -1572,6 +1573,9 @@ def k3_moe_front_kernel(
                         )
                     cute.arch.barrier()
                     if s_cnt.load(idx=0) == num_tokens - cutlass.Int32(1):
+                        if cutlass.const_expr(timeline):
+                            if tx == 0:
+                                _stamp(tl, bx, 7)
                         _sort_local(
                             s_key,
                             topk_ids,
