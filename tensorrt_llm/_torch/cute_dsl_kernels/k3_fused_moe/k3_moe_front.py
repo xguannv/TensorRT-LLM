@@ -503,36 +503,33 @@ def _prefetch_first_stages(
     sort_words,
     num_tokens,
     num_local,
-    w1,
+    tma_ptr_pf,
     w1_sf,
     tx,
     ctas: cutlass.Constexpr[int],
     n1: cutlass.Constexpr[int],
 ):
-    """After `_sort_local` (all THREADS threads, behind a CTA barrier): for each of FC1's ``ctas`` CTAs its first
-    unit (``b * total // ctas`` of ``total`` = tiles x n1 / 128, the kernel's assignment), the L2 prefetch of that
-    unit's first weight stage: W1 rows [blk 128, +128) of the tile's local expert (128 bytes each) and the block's
-    first 2048 scale bytes. ``w1`` / ``w1_sf``: the local experts' W1 [E, n1, 1792] and its scales (byte addresses)."""
+    """After `_sort_local` (behind a CTA barrier): thread b < ``ctas`` takes FC1 CTA b's first unit (``b * total //
+    ctas`` of ``total`` = tiles x n1 / 128, the kernel's assignment) and prefetches its first weight stage into L2:
+    one 2-D tensor prefetch of W1 rows [blk 128, +128) x the first 128 bytes of the tile's local expert (``tma_ptr_pf``:
+    W1 [E n1 rows, 1792 bytes], box 128 x 128) and one bulk prefetch of the block's first 2048 scale bytes (``w1_sf``,
+    a byte address). One load of the tile's expert per thread, all threads at once."""
     nblk = n1 // CTA_M
     cap = cutlass.min(num_tokens * cutlass.Int32(TOP_K), num_local)
     total = sort_words.load(idx=cutlass.Int32(2) * cap, is_volatile=True) * cutlass.Int32(nblk)
-    per = CTA_M + 1
-    for i in cutlass.range(tx, cutlass.Int32(ctas * per), cutlass.Int32(THREADS), unroll=1):
-        b = i // cutlass.Int32(per)
-        r = i - b * cutlass.Int32(per)
+    for b in cutlass.range(tx, cutlass.Int32(ctas), cutlass.Int32(THREADS), unroll=1):
         w = b * total // cutlass.Int32(ctas)
         if w < (b + cutlass.Int32(1)) * total // cutlass.Int32(ctas):
             tile = w // cutlass.Int32(nblk)
             blk = w - tile * cutlass.Int32(nblk)
             e = sort_words.load(idx=tile, is_volatile=True)
-            if r < cutlass.Int32(CTA_M):
-                row = cutlass.Int64(e) * cutlass.Int64(n1) + cutlass.Int64(
-                    blk * cutlass.Int32(CTA_M) + r
-                )
-                _prefetch_l2_bulk(w1 + row * cutlass.Int64(W1_ROW_BYTES), PF_ROW_BYTES)
-            else:
-                blk_idx = cutlass.Int64(e) * cutlass.Int64(nblk) + cutlass.Int64(blk)
-                _prefetch_l2_bulk(w1_sf + blk_idx * cutlass.Int64(W1_SF_BLOCK_BYTES), PF_SF_BYTES)
+            prims.cp_async_bulk_tensor_prefetch(
+                tma_ptr_pf,
+                [cutlass.Int32(0), e * cutlass.Int32(n1) + blk * cutlass.Int32(CTA_M)],
+                [],
+            )
+            blk_idx = cutlass.Int64(e) * cutlass.Int64(nblk) + cutlass.Int64(blk)
+            _prefetch_l2_bulk(w1_sf + blk_idx * cutlass.Int64(W1_SF_BLOCK_BYTES), PF_SF_BYTES)
 
 
 # Timeline (``timeline``, a measurement build): int64 [grid, TL_SLOTS] %globaltimer per CTA; 0 where not reached.
@@ -819,6 +816,9 @@ def k3_moe_front_kernel(
         cuda.TensorMap
     ],  # the same W with a 64-row box (head half-tiles)
     tma_desc_x: cutlass.GridConstant[cuda.TensorMap],  # x [M, K] bf16, box 64 x 8
+    tma_desc_pf: cutlass.GridConstant[
+        cuda.TensorMap
+    ],  # FC1's W1 as [rows, 1792] bytes, box 128 x 128 (prefetch)
     bias: cutlass.Array,  # fp32 [896]
     buf_uc: cutlass.Array,  # int32 words of this rank's head buffers
     buf_mc: cutlass.Array,  # int32 words of their multicast mapping
@@ -898,6 +898,7 @@ def k3_moe_front_kernel(
     cluster = role_or_gemv - cutlass.Int32(ROLE_CLUSTERS_)
     tma_ptr_w = tma_desc_w.get_ptr()
     tma_ptr_w64 = tma_desc_w64.get_ptr()
+    tma_ptr_pf = tma_desc_pf.get_ptr()
     # A GEMV CTA of a head half-tile (head_half: one round, the head in 64-row tiles on the first clusters).
     head_cta = cutlass.Boolean(False)
     stream_cta = cutlass.Boolean(True)  # its k-tiles stream through the ring
@@ -1592,7 +1593,7 @@ def k3_moe_front_kernel(
                                 sort_words,
                                 num_tokens,
                                 sort_local,
-                                pf_w1,
+                                tma_ptr_pf,
                                 pf_w1_sf,
                                 tx,
                                 pf_ctas,
@@ -1729,6 +1730,17 @@ def _weight_tensor_map(w, n_out, k_in, box_rows=CTA_M):
     )
 
 
+def _w1_rows_tensor_map(address, rows):
+    """FC1's W1 (NVFP4, [rows, W1_ROW_BYTES] bytes) for the L2 prefetch of a weight stage: box 128 bytes x 128 rows."""
+    return cuda.create_tensor_map_tiled(
+        global_address=address,
+        dtype=cutlass.Uint8,
+        global_dims=[W1_ROW_BYTES, rows],
+        global_strides=[W1_ROW_BYTES // 16],
+        box_dims=[PF_ROW_BYTES, CTA_M],
+    )
+
+
 def _activation_tensor_map(x, cols, num_tokens, m_max=M_MAX):
     """x [M, cols] as (cols, M) with an m_max-row box: rows past num_tokens arrive as zeros."""
     return cuda.create_tensor_map_tiled(
@@ -1792,8 +1804,13 @@ def k3_moe_front(
     tma_desc_w = _weight_tensor_map(w, rows, k_in)
     tma_desc_w64 = _weight_tensor_map(w, rows, k_in, box_rows=HALF_M)
     tma_desc_x = _activation_tensor_map(x, k_in, num_tokens, m_max)
+    if cutlass.const_expr(pf_ctas > 0):
+        tma_desc_pf = _w1_rows_tensor_map(pf_w1, sort_local * cutlass.Int32(pf_n1))
+    else:
+        tma_desc_pf = _w1_rows_tensor_map(w.iterator.toint(), cutlass.Int32(CTA_M))  # never used
     k3_moe_front_kernel(
-        tma_desc_w, tma_desc_w64, tma_desc_x, bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
+        tma_desc_w, tma_desc_w64, tma_desc_x, tma_desc_pf,
+        bias, buf_uc, buf_mc, flags, ready, topk_ids, topk_weight_bits,
         quant_words, scales, shared_bits, gsf, sort_words, sort_ctr, tl, sf_image, num_tokens, tp_rank,
         routed_scaling_factor, sort_offset, sort_local, pf_w1, pf_w1_sf, world, shared_cols, n_head_tiles, n_tiles,
         gemv_clusters, k_in, ring, gate_cap, linear_cap, publish, head_half, nvfp4, sort, m_max, timeline, layout,
