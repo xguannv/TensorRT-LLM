@@ -236,6 +236,7 @@ class K3MoeLowMDynKernel:
         self_sort_local: int = 0,
         static_first: bool = False,
         fast_tok: bool = False,
+        late_atom: bool = False,
     ):
         assert n_tok in SUPPORTED_N_TOK, f"n_tok {n_tok} not in {SUPPORTED_N_TOK}"
         assert n1 % (2 * _MMA_M) == 0 and k1 % _KBLK == 0 and (n1 // 2) % _KBLK == 0
@@ -256,6 +257,9 @@ class K3MoeLowMDynKernel:
         self.trace = trace
         self.static_first = static_first
         self.fast_tok = fast_tok
+        # with static_first: the CTA's second unit is fetched from the counter after its first unit's stages
+        # are issued, not before (the contended atomic's round trip off the first weight fetch)
+        self.late_atom = late_atom and static_first
         # Self-sort scratch (int32 words): per local expert the mask of its tokens, the touched experts'
         # bits, the tile count, each tile's expert and row limit, and the rows of each tile at stride
         # n_tok (the permuted-index view spans 128 more words).
@@ -529,7 +533,7 @@ class K3MoeLowMDynKernel:
         """Extra per-CTA stamp (``trace``) at ``TRACE_X_BASE``: 0 self-sort done, 1 FC1 token TMA issued, 2 / 3
         the MMA sees the tokens / token scales, 4 the MMA sees its first weight stage, 5 epilogue WG0 past the
         TMEM wait, 6 token scales stored, 7 / 8 self-sort past its first / second barrier, 9 weight warp in
-        its producer loop, 10 its first unit queued."""
+        its producer loop, 10 its first unit queued, 11 past the next-unit atomic of its first unit."""
         nct, _, _ = cute.arch.grid_dim()
         _stg_u64(
             trace_ptr.toint() + (Int64(nct) * 16 + Int64(TRACE_X_BASE) + Int64(bid) * 16 + ev) * 8,
@@ -987,10 +991,19 @@ class K3MoeLowMDynKernel:
         n1u = Int32(0)
         while cur < total:
             nxt = Int32(0)
-            if lane == 0:
-                nxt = _atom_add_relaxed(ctr, 1)
-                if cutlass.const_expr(self.static_first):
-                    nxt = nxt + nctas
+            if cutlass.const_expr(self.late_atom):
+                if j > 0:
+                    if lane == 0:
+                        nxt = _atom_add_relaxed(ctr, 1) + nctas
+            else:
+                if lane == 0:
+                    nxt = _atom_add_relaxed(ctr, 1)
+                    if cutlass.const_expr(self.static_first):
+                        nxt = nxt + nctas
+            if cutlass.const_expr(self.trace):
+                if j == 0:
+                    with cute.arch.elect_one():
+                        self._xstamp(trace_ptr, bid, 11)
             if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 0, _globaltimer())
@@ -1055,6 +1068,10 @@ class K3MoeLowMDynKernel:
             if cutlass.const_expr(self.trace):
                 with cute.arch.elect_one():
                     self._unit_stamp(trace_ptr, cur, 1, _globaltimer())
+            if cutlass.const_expr(self.late_atom):
+                if j == 0:
+                    if lane == 0:
+                        nxt = _atom_add_relaxed(ctr, 1) + nctas
             cur = cute.arch.shuffle_sync(nxt, 0)
             j += 1
         self._q_write(st, j, Int32(-1), Int32(-1))
