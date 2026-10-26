@@ -152,6 +152,7 @@ def create_kv_cache_transceiver(
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     draft_prompt_window: int = 0,
     draft_context_renumber: Optional[Callable] = None,
+    draft_capture_only: bool = False,
 ) -> Optional["KvCacheTransceiver"]:
     """Create the KV cache transceiver selected by ``cache_transceiver_config``, or None.
 
@@ -249,7 +250,8 @@ def create_kv_cache_transceiver(
             cache_transceiver_config,
             draft_kv_cache_manager=draft_kv_cache_manager,
             draft_prompt_window=draft_prompt_window,
-            draft_context_renumber=draft_context_renumber)
+            draft_context_renumber=draft_context_renumber,
+            draft_capture_only=draft_capture_only)
 
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,

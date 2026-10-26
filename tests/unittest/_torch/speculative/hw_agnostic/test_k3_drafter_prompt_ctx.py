@@ -121,6 +121,9 @@ def _store(drafter, chunks, hidden_width, seed=7, hidden=None, keep_worker=False
         DFlashDecodingConfig(max_draft_len=sem.MLA_BLOCK - 1, attention_backend="TRTLLM"), Mapping()
     )
     worker.set_draft_model(drafter)
+    # The store's bytes are compared on the private arena. The draft-manager pool a capture-only drafter needs on a
+    # context worker is test_capture_only_ctx_cache_must_be_the_reuse_addressable_pool's.
+    drafter.CAPTURE_ONLY = False
     worker._lazy_init_ctx_buffers(
         drafter, SimpleNamespace(max_num_requests=4), SimpleNamespace(max_seq_len=256)
     )
@@ -241,6 +244,75 @@ def test_capture_only_needs_the_context_role_and_the_switch(monkeypatch):
     assert calls == ["TRTLLM_K3LL_DRAFTER_PROMPT_CTX"]
     monkeypatch.setattr(k3ll_flags, "k3ll_flag_any_target", lambda name: 0, raising=True)
     assert not modeling_dspark.dspark_capture_only()
+
+
+def test_serve_carries_the_role_to_the_model_ranks(monkeypatch):
+    """The model ranks get the role through env_overrides, which every rank applies before its build."""
+    from tensorrt_llm.commands import serve
+
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    args = {"env_overrides": None}
+    serve._carry_disagg_role_to_model_ranks(args)
+    assert args["env_overrides"] == {"TRTLLM_DISAGG_ROLE": "context"}
+    args = {"env_overrides": {"A": "1", "TRTLLM_DISAGG_ROLE": "generation"}}
+    serve._carry_disagg_role_to_model_ranks(args)
+    assert args["env_overrides"] == {"A": "1", "TRTLLM_DISAGG_ROLE": "generation"}
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE")
+    args = {}
+    serve._carry_disagg_role_to_model_ranks(args)
+    assert args == {}
+
+
+def test_capture_only_ctx_keeps_no_kda_draft_records(monkeypatch):
+    """A context worker with the capture-only drafter never verifies: no draft records, so block reuse stays."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        implementation,
+    )
+
+    mode = SimpleNamespace(is_dflash=lambda: False, is_dspark=lambda: True)
+    backbone = SimpleNamespace(
+        model_config=SimpleNamespace(
+            spec_config=SimpleNamespace(spec_dec_mode=mode, tokens_per_gen_step=8)
+        ),
+        layers=[],
+    )
+    records = implementation.KimiLinearModel.kda_draft_records.fget
+    monkeypatch.setattr(implementation, "dspark_capture_only", lambda: False)
+    assert records(backbone)
+    monkeypatch.setattr(implementation, "dspark_capture_only", lambda: True)
+    assert not records(backbone)
+
+
+def test_capture_only_ctx_cache_must_be_the_reuse_addressable_pool():
+    """The window is sent from the draft manager's pages: a capture-only drafter on a private arena, or on pages a
+    reused prefix left unwritten, would send pages it never wrote. Both raise."""
+    check = DFlashWorker._check_capture_only_ctx_cache
+    reuse_on, reuse_off = (
+        SimpleNamespace(enable_block_reuse=True),
+        SimpleNamespace(enable_block_reuse=False),
+    )
+    with pytest.raises(RuntimeError, match="private arena"):
+        check(SimpleNamespace(_ctx_pool_bound=False, _ctx_reuse_addressable=False), reuse_off)
+    with pytest.raises(RuntimeError, match="not reuse-addressable"):
+        check(SimpleNamespace(_ctx_pool_bound=True, _ctx_reuse_addressable=False), reuse_on)
+    check(SimpleNamespace(_ctx_pool_bound=True, _ctx_reuse_addressable=False), reuse_off)
+    check(SimpleNamespace(_ctx_pool_bound=True, _ctx_reuse_addressable=True), reuse_on)
+
+
+def test_context_window_needs_the_capture_only_drafter():
+    """A context-only request's window from a rank whose drafter is not capture-only means the role was lost."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    rank = SimpleNamespace(
+        _draft_kv_cache_manager=object(),
+        _draft_reuse_adapter=object(),
+        _page_table=object(),
+        _draft_capture_only=False,
+    )
+    with pytest.raises(RuntimeError, match="capture-only"):
+        KvCacheTransceiverV2._describe_draft_window(
+            rank, SimpleNamespace(is_context_only_request=True)
+        )
 
 
 def test_switch_default_off_and_documented():

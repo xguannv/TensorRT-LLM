@@ -739,6 +739,8 @@ def _create_transceiver_in_thread(
             "draft_kv_cache_manager": draft_manager,
             "draft_prompt_window": draft_prompt_window,
             "draft_context_renumber": _draft_context_renumber(),
+            # The context side stands in for a capture-only drafter's rank.
+            "draft_capture_only": True,
         }
         if draft_manager is not None
         else {}

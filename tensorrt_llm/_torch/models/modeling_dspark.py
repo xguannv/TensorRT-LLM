@@ -3603,6 +3603,9 @@ class MLADSparkCaptureOnly(MLADSparkForCausalLM):
     latents are those of ``MLADSparkForCausalLM`` with the same weights: the same modules, buffers and calls.
     """
 
+    #: Read by ``DFlashWorker`` (its ctx cache must be the draft manager's reuse-addressable pool) and by the KV
+    #: transceiver (a context worker that sends the drafter prompt window must run this class).
+    CAPTURE_ONLY = True
     #: Per-layer modules the context store reads (``_build_fused_kv_buffers``).
     KEPT_ATTENTION_MODULES = ("kv_a_proj_with_mqa", "kv_a_layernorm")
     #: Checkpoint tensors the capture needs, in the TorchSpec and the SpecForge spellings.

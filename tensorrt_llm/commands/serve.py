@@ -517,6 +517,23 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
+def _carry_disagg_role_to_model_ranks(llm_args: dict) -> None:
+    """Add this process's ``TRTLLM_DISAGG_ROLE`` to ``llm_args["env_overrides"]``.
+
+    The model ranks are not necessarily children of this process: under
+    trtllm-llmapi-launch or an MPI session they were started with their own
+    environment. ``env_overrides`` is applied on every rank before its engine is
+    built, so the role reaches the code that reads it there. A role already in
+    ``env_overrides`` is kept.
+    """
+    disagg_role = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE)
+    if not disagg_role:
+        return
+    env_overrides = dict(llm_args.get("env_overrides") or {})
+    env_overrides.setdefault(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, disagg_role)
+    llm_args["env_overrides"] = env_overrides
+
+
 def launch_server(
         host: str,
         port: int,
@@ -543,6 +560,7 @@ def launch_server(
     if server_role is not None:
         os.environ[
             DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
+    _carry_disagg_role_to_model_ranks(llm_args)
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]

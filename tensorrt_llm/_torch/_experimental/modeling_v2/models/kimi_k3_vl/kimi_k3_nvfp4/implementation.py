@@ -30,6 +30,7 @@ from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_dspark import (
     GQADSparkForCausalLM,
     draft_is_embedded_in_target,
+    dspark_capture_only,
 )
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
@@ -2335,10 +2336,12 @@ class KimiLinearModel(DecoderModel):
         ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn`` replay the accepted drafts. The engine reads it once the weights
         are loaded, to build the manager: DFlash / DSpark drafts of a verify width of 2 to 8 (MTP6's 7 included),
         every KDA layer taking the K3 kernels. Otherwise the KDA verify replays the accepted drafts from the replay
-        caches (the built-in verify)."""
+        caches (the built-in verify). A context worker with the capture-only drafter (``dspark_capture_only``) never
+        verifies, keeps none, and so keeps KV-block reuse."""
         spec_config = getattr(self.model_config, "spec_config", None)
         return bool(
             spec_config is not None
+            and not dspark_capture_only()
             and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
             and 2 <= spec_config.tokens_per_gen_step <= 8
             and all(layer.linear_attn.takes_k3_kernels for layer in self.layers if layer.is_kda)
