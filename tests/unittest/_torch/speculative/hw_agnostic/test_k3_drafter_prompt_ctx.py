@@ -326,6 +326,19 @@ def test_context_window_needs_the_capture_only_drafter():
         )
 
 
+def test_capture_only_context_warms_up_no_generation_shape():
+    """A context worker with the capture-only drafter runs no generation step: the runner skips the generation
+    warmup shapes, which with the speculative config would run the target's verify step."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner
+
+    prop = runner.DecoderRunner._capture_only_context.fget
+    assert prop(
+        SimpleNamespace(model=SimpleNamespace(draft_model=SimpleNamespace(CAPTURE_ONLY=True)))
+    )
+    assert not prop(SimpleNamespace(model=SimpleNamespace(draft_model=SimpleNamespace())))
+    assert not prop(SimpleNamespace(model=SimpleNamespace()))
+
+
 def test_switch_default_off_and_documented():
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
 
