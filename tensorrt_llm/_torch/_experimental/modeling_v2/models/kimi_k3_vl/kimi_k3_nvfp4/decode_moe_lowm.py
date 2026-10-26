@@ -33,7 +33,9 @@ output follows FC2 on the main stream, as it followed the single kernel.
 `K3DecodeMoeNvfp4` holds what every MoE layer shares (the head workspace, the expert kernel's counters);
 `K3DecodeMoeNvfp4Layer` holds one layer's decode weights and handles. The target builds both in
 `post_load_weights` when ``TRTLLM_K3LL_MOE_LOWM`` (flags.py) is set, before any CUDA-graph capture, and runs
-every kernel once there so none compiles under a capture.
+every kernel build the path can select once there (`K3DecodeMoeNvfp4Layer.warm_up`), so none compiles under a
+capture. A switch read at forward time selects among builds warm-up has already run: every build of each of its
+values, not just the one its value at load picks.
 """
 
 from __future__ import annotations
@@ -119,9 +121,12 @@ class K3MoeFc12:
             torch.cuda.Event(),
         )
 
-    def begin(self, rows: int, cols: int, device) -> "Fc12Step":
+    def begin(
+        self, rows: int, cols: int, device, fc2_ceil_chunk: Optional[bool] = None
+    ) -> "Fc12Step":
         """A step's routed output, bf16 ``[rows, cols]``, being zeroed: under multi-stream capture on the side stream
-        forked here (call it before the front), else not yet (``Fc12Step.launch`` zeroes it on the main stream)."""
+        forked here (call it before the front), else not yet (``Fc12Step.launch`` zeroes it on the main stream).
+        ``fc2_ceil_chunk``: `Fc12Step`'s."""
         out = torch.empty(rows, cols, dtype=torch.bfloat16, device=device)
         side = do_multi_stream() and not torch.compiler.is_compiling()
         if side:
@@ -131,17 +136,19 @@ class K3MoeFc12:
                 self.stream.wait_event(self.fork)
                 out.zero_()
                 self.join.record(self.stream)
-        return Fc12Step(self, out, side)
+        return Fc12Step(self, out, side, fc2_ceil_chunk)
 
 
 @dataclass(eq=False)
 class Fc12Step:
-    """One wide step's ``TRTLLM_K3LL_MOE_LOWM_FC12`` launch (`K3MoeFc12.begin`): the routed output and whether the
-    side stream zeroes it."""
+    """One wide step's ``TRTLLM_K3LL_MOE_LOWM_FC12`` launch (`K3MoeFc12.begin`): the routed output, whether the
+    side stream zeroes it and FC2's ``fc2_ceil_chunk`` (None: read ``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` at launch, as
+    the forward path does)."""
 
     state: K3MoeFc12
     out: torch.Tensor
     side: bool
+    fc2_ceil_chunk: Optional[bool] = None
 
     def launch(self) -> nvfp4_lowm_op.Fc12:
         """`nvfp4_lowm_op.run_sorted`'s ``fc12`` for this step, called on the main stream right before the experts:
@@ -149,7 +156,9 @@ class Fc12Step:
         if self.side:
             torch.cuda.current_stream().wait_event(self.state.join)
         buffers = self.state.buffers
-        ceil_chunk = fc2_ceil_chunk_enabled()
+        ceil_chunk = self.fc2_ceil_chunk
+        if ceil_chunk is None:
+            ceil_chunk = fc2_ceil_chunk_enabled()
         if ceil_chunk:
             from . import census as _census
 
@@ -522,11 +531,13 @@ class K3DecodeMoeNvfp4Layer:
         )
 
     def warm_up(self, moe: nn.Module) -> None:
-        """One call of every kernel of the path on zero inputs (M = 1), so none compiles under a capture: the front
-        (collective: every rank makes the same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and
-        32 tokens, each with and without ``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (read at forward time). With
+        """One call of every kernel build the path can select, on zero inputs (M = 1), so none compiles under a
+        capture, whatever the switches read at forward time say then: the front (collective: every rank makes the
+        same call), ``k3_route_quant`` and the expert kernel's builds for 8, 16 and 32 tokens, each with and without
+        the expert kernel's own sort and ``TRTLLM_K3LL_MOE_LOWM_DYN_FAST`` (both read at forward time). With
         ``TRTLLM_K3LL_MOE_LOWM_FC12`` set at launch, also builds the shared `K3MoeFc12` and runs the FC1 + FC2 launch
-        at 17 and 32 tokens (its 32-token build)."""
+        at 17 and 32 tokens (its 32-token build), each with and without ``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` (read at
+        forward time)."""
         device = self.front_weight.device
         x = torch.zeros(1, moe.hidden_size, dtype=torch.bfloat16, device=device)
         # Both sorts (the front's or moe_sort, and the expert kernel's own, TRTLLM_K3LL_MOE_SELF_SORT) and both
@@ -553,22 +564,27 @@ class K3DecodeMoeNvfp4Layer:
             w1 = self.experts[0]
             self.state.fc12 = K3MoeFc12.create(device, w1.shape[1], self.num_local, moe.top_k)
         if self.state.fc12 is not None:
-            for rows in (nvfp4_lowm_op.FC12_MIN_TOKENS, nvfp4_lowm_op.FC12_MAX_TOKENS):
-                logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
-                latent = torch.zeros(rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device)
-                # both sorts (moe_sort, and FC1 / FC2's own, TRTLLM_K3LL_MOE_SELF_SORT_FC12)
-                for self_sort in (False, True):
-                    step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
-                    self._routed(
-                        *self._route_quant(moe, logits, latent), fc12=step, self_sort=self_sort
+            cols = self.experts[3].shape[1]
+            # both FC2 builds of TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK, so the switch can change at forward time
+            for ceil_chunk in (False, True):
+                for rows in (nvfp4_lowm_op.FC12_MIN_TOKENS, nvfp4_lowm_op.FC12_MAX_TOKENS):
+                    logits = torch.zeros(rows, moe.num_experts, dtype=torch.float32, device=device)
+                    latent = torch.zeros(
+                        rows, moe.moe_hidden_size, dtype=torch.bfloat16, device=device
                     )
-            if self.state.head32 is not None:
-                # the 32-token front without its sort (the FC1 / FC2 self-sort's front)
-                rows = FRONT16_TOKENS + 1
-                step = self.state.fc12.begin(rows, self.experts[3].shape[1], device)
-                self._front_routed(
-                    moe, x.new_zeros(rows, x.shape[1]), front32=True, fc12=step, self_sort=True
-                )
+                    # both sorts (moe_sort, and FC1 / FC2's own, TRTLLM_K3LL_MOE_SELF_SORT_FC12)
+                    for self_sort in (False, True):
+                        step = self.state.fc12.begin(rows, cols, device, fc2_ceil_chunk=ceil_chunk)
+                        self._routed(
+                            *self._route_quant(moe, logits, latent), fc12=step, self_sort=self_sort
+                        )
+                if self.state.head32 is not None:
+                    # the 32-token front without its sort (the FC1 / FC2 self-sort's front)
+                    rows = FRONT16_TOKENS + 1
+                    step = self.state.fc12.begin(rows, cols, device, fc2_ceil_chunk=ceil_chunk)
+                    self._front_routed(
+                        moe, x.new_zeros(rows, x.shape[1]), front32=True, fc12=step, self_sort=True
+                    )
         torch.cuda.synchronize(device)
 
     def _route_quant(self, moe: nn.Module, logits: torch.Tensor, latent: torch.Tensor):

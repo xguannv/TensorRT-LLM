@@ -143,6 +143,72 @@ def test_warm_up_compiles_both_dyn_fast_builds(monkeypatch, value):
         )
 
 
+@pytest.mark.parametrize("value", [0, 1, -1])
+def test_warm_up_compiles_both_fc2_ceil_chunk_builds(monkeypatch, value):
+    """``warm_up`` runs every FC1 + FC2 launch (17 and 32 rows, both sorts, and the 32-token front) with FC2 in ceil
+    chunks and in equal ranges: ``TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK`` is read at forward time, so neither FC2 build may
+    first compile under capture, whatever the switch says at load. Without an explicit value the step still reads
+    the switch."""
+    pytest.importorskip("cutlass")
+    dm = _mod("decode_moe_lowm")
+    census = _mod("census")
+    op = _lowm_op()
+    monkeypatch.setattr(dm._flags, "TRTLLM_K3LL_MOE_FC2_CEIL_CHUNK", value)
+    monkeypatch.setattr(dm, "fc12_enabled", lambda: True)
+    monkeypatch.setattr(census, "mode", lambda: "eager")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    layer = _layer(dm)
+    layer.experts = tuple(torch.zeros(224, 1) for _ in range(4))
+    layer.front_weight = torch.zeros(1)
+    buffers = SimpleNamespace(h=None, h_sf=None)
+
+    def begin(rows, cols, device, fc2_ceil_chunk=None):
+        state = SimpleNamespace(buffers=buffers)
+        return dm.Fc12Step(state, torch.zeros(rows, cols), False, fc2_ceil_chunk)
+
+    layer.state = SimpleNamespace(
+        head16=None, head32=object(), fc12=SimpleNamespace(begin=begin), sort_ctr=None
+    )
+    moe = SimpleNamespace(hidden_size=4, num_experts=8, moe_hidden_size=4)
+    launched = []
+
+    def record(kind, rows, fc12, self_sort):
+        if fc12 is not None:
+            launched.append((kind, rows, self_sort, fc12.launch().fc2_ceil_chunk))
+
+    monkeypatch.setattr(
+        layer, "_front_routed",
+        lambda moe, x, front32=None, fc12=None, self_sort=None, fast=None: record(
+            "front", x.shape[0], fc12, self_sort),
+        raising=False,
+    )  # fmt: skip
+    monkeypatch.setattr(
+        layer, "_route_quant", lambda moe, logits, latent: (logits.shape[0],), raising=False
+    )
+    monkeypatch.setattr(
+        layer, "_routed", lambda rows, fc12=None, self_sort=None, fast=None: record(
+            "routed", rows, fc12, self_sort),
+        raising=False,
+    )  # fmt: skip
+    layer.warm_up(moe)
+    for kind, rows, self_sort in (
+        ("routed", op.FC12_MIN_TOKENS, False),
+        ("routed", op.FC12_MIN_TOKENS, True),
+        ("routed", op.FC12_MAX_TOKENS, False),
+        ("routed", op.FC12_MAX_TOKENS, True),
+        ("front", dm.FRONT16_TOKENS + 1, True),
+    ):
+        got = {c[3] for c in launched if c[:3] == (kind, rows, self_sort)}
+        assert got == {False, True}, (kind, rows, self_sort, got)
+    assert op.FC12_MAX_TOKENS == 32
+    dm._fc2_ceil_chunk_on_by_default.cache_clear()
+    try:
+        step = begin(32, 1, None)
+        assert step.launch().fc2_ceil_chunk is dm.fc2_ceil_chunk_enabled()
+    finally:
+        dm._fc2_ceil_chunk_on_by_default.cache_clear()
+
+
 @pytest.mark.parametrize(
     "tokens,local,takes",
     [(0, 224, False), (1, 224, True), (8, 224, True), (9, 224, True), (16, 224, True), (17, 224, False),
