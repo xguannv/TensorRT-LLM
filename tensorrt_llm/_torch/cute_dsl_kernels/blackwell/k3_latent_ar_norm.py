@@ -45,7 +45,10 @@ from the multicast loopback, after the first polling round only the slots that h
 are loaded again, and CTA 0 rotates the buffers while it waits for the other ranks instead of at
 the end. :class:`K3LamportClearKernel` (``TRTLLM_K3_LATENT_AR_SIDE_CLEAR``) re-arms the
 buffer a call used on a side stream and marks the state clean, so that the next call skips the
-clear (M x world x 7 KB of sentinel stores) on its critical path.
+clear (M x world x 7 KB of sentinel stores) on its critical path. With ``clear_ctas`` the row
+kernel instead launches that many extra CTAs that re-arm the dirty buffer after the grid wait
+while the row CTAs push and poll (``TRTLLM_K3LL_LAR_CLEAR_SPLIT``), bit for bit the plain row
+kernel.
 """
 
 from __future__ import annotations
@@ -824,6 +827,9 @@ ROW_MAX_M = 64
 ROW_WORLD_SIZES = (2, 4, 8, 16)
 #: CTAs x threads of :class:`K3LamportClearKernel`.
 CLEAR_CTAS = 64
+#: Extra re-arm CTAs of :class:`K3LatentArRowKernel` with ``clear_ctas`` (``TRTLLM_K3LL_LAR_CLEAR_SPLIT``):
+#: 1.8 / 3.7 MB of sentinel stores (16 / 32 rows of 16 ranks) over 32 SMs.
+ROW_CLEAR_CTAS = 32
 CLEAR_THREADS = 256
 
 assert ROW_GROUP_THREADS - THREADS == 16
@@ -882,6 +888,17 @@ class K3LatentArRowKernel:
     * CTA 0 rotates the buffers right after its first polling round when every warp of the grid
       has counted itself by then (as a rule), so that the acquire load and the state stores are
       not on the grid's tail; otherwise it waits for the count at the end, like the cluster kernel.
+    * ``clear_ctas`` > 0: CTAs ``m ..`` of the grid are re-arm CTAs. After their own
+      ``griddepcontrol.wait`` (and early trigger) they read the state, count their warps on the same
+      arrival counter as the row CTAs (so CTA 0 rotates only after they have read it), and clear the
+      dirty buffer's dirty stages between them; the row CTAs skip the clear. The buffer cleared is the
+      previous call's (current - 1 of 3): every slot of it arrived during that call (every rank's
+      every row polled all of them) and that call completed before this grid's wait returned; the
+      other ranks write it again only in call + 2, which they reach after their call + 1 polled this
+      rank's call + 1 push, which this rank makes after its call + 1 wait, i.e. after this grid (with
+      its re-arm CTAs) completed. The same bound holds for the row CTAs' own clear (it too runs
+      between this grid's wait and its completion), so the switch changes where the stores run, not
+      when they may run.
     """
 
     def __init__(
@@ -891,11 +908,15 @@ class K3LatentArRowKernel:
         early_trigger: bool,
         norm: bool = True,
         mxfp8: bool = False,
+        clear_ctas: int = 0,
     ):
         if world_size not in ROW_WORLD_SIZES:
             raise ValueError(f"unsupported world size {world_size}")
         if mxfp8 and not norm:
             raise ValueError("the MXFP8 output is the normalized output's")
+        if clear_ctas < 0:
+            raise ValueError("clear_ctas must be >= 0")
+        self.clear_ctas = clear_ctas
         self.world_size = world_size
         self.use_pdl = use_pdl
         self.early_trigger = early_trigger
@@ -937,7 +958,7 @@ class K3LatentArRowKernel:
             m,
             eps,
         ).launch(
-            grid=(m, 1, 1),
+            grid=(m + self.clear_ctas, 1, 1),
             block=(ROW_THREADS, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
@@ -977,179 +998,217 @@ class K3LatentArRowKernel:
             if cutlass.const_expr(self.early_trigger):
                 _griddepcontrol_launch_dependents()
 
-        f0, f1, f2, f3 = _ld_v4(flags_addr)
-        c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
-        counter = flags_addr + Int64(32)
-        cute.arch.sync_warp()
-        if lane == 0:
-            _red_add_release_gpu(counter, Int32(1))
-        cur = Int64(f0)
-        dirty = Int64(f1)
-        buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
-        dirty_stages = f3
-        # An inactive thread loads and polls the columns of lane t - 16 of its half warp.
-        tc = t
-        if t >= THREADS:
-            tc = t - (ROW_GROUP_THREADS - THREADS)
-        col = (grp * THREADS + tc) * ELTS
-        cur_off = cur * buf_bytes
+        if row < m:
+            # An inactive thread loads and polls the columns of lane t - 16 of its half warp.
+            tc = t
+            if t >= THREADS:
+                tc = t - (ROW_GROUP_THREADS - THREADS)
+            col = (grp * THREADS + tc) * ELTS
+            f0, f1, f2, f3 = _ld_v4(flags_addr)
+            c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
+            counter = flags_addr + Int64(32)
+            cute.arch.sync_warp()
+            if lane == 0:
+                _red_add_release_gpu(counter, Int32(1))
+            cur = Int64(f0)
+            dirty = Int64(f1)
+            buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
+            dirty_stages = f3
+            cur_off = cur * buf_bytes
 
-        # Broadcast this rank's eight values into slot (row, rank) of every rank's buffer.
-        xw = _ld_v4(x_addr + Int64((row * HIDDEN + col) * 2))
-        if cutlass.const_expr(self.norm):
-            gw = _ld_v4(gamma_addr + Int64(col * 2))
-        sw = [_sanitize(w) for w in xw]
-        if active:
-            slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
-            _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
+            # Broadcast this rank's eight values into slot (row, rank) of every rank's buffer.
+            xw = _ld_v4(x_addr + Int64((row * HIDDEN + col) * 2))
+            if cutlass.const_expr(self.norm):
+                gw = _ld_v4(gamma_addr + Int64(col * 2))
+            sw = [_sanitize(w) for w in xw]
+            if active:
+                slot = Int64(((row * ws + rank) * HIDDEN + col) * 2)
+                _st_v4(mc_addr + cur_off + slot, sw[0], sw[1], sw[2], sw[3])
 
-        # Clear the previous call's buffer if the side-stream re-arm has not.
-        n_threads = m * ROW_THREADS
-        gtid = row * ROW_THREADS + tidx
-        clear = (c0, c1, c2, c3)
-        for s in cutlass.range_constexpr(4):
-            if s < dirty_stages:
-                stage_bytes = buf_bytes // Int64(dirty_stages)
-                base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
-                n_vec = (clear[s] + 15) >> 4
-                for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
-                    _st_sentinel_v4(base + Int64(p) * Int64(16))
+            # Clear the previous call's buffer if the side-stream re-arm has not (with clear_ctas the
+            # re-arm CTAs do it).
+            if cutlass.const_expr(self.clear_ctas == 0):
+                n_threads = m * ROW_THREADS
+                gtid = row * ROW_THREADS + tidx
+                clear = (c0, c1, c2, c3)
+                for s in cutlass.range_constexpr(4):
+                    if s < dirty_stages:
+                        stage_bytes = buf_bytes // Int64(dirty_stages)
+                        base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
+                        n_vec = (clear[s] + 15) >> 4
+                        for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                            _st_sentinel_v4(base + Int64(p) * Int64(16))
 
-        # Poll every slot; the own slot comes from the registers. Bit r of `have`: slot r arrived.
-        row_base = uc_addr + cur_off + Int64((row * ws * HIDDEN + col) * 2)
-        words = cute.make_rmem_tensor((ws * 4,), Int32)
-        have = Int32(0)
-        for rr in cutlass.range_constexpr(ws):
-            w = _ld_vol_v4(row_base + Int64(rr * HIDDEN * 2))
-            for e in cutlass.range_constexpr(4):
-                words[rr * 4 + e] = w[e]
-            if rr == rank:
-                for e in cutlass.range_constexpr(4):
-                    words[rr * 4 + e] = sw[e]
-            have = have | (
-                _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
-                << rr
-            )
-        # CTA 0 rotates the buffers once every warp of the grid has read the flags: here, while it
-        # waits for the other ranks, if they all have by the end of its first polling round (as a
-        # rule), else at the end.
-        rotated = Int32(0)
-        if tidx == 0:
-            if row == 0:
-                if _ld_acquire_gpu_u32(counter) >= m * ROW_WARPS:
-                    nxt0 = f0 + 1
-                    if nxt0 == NUM_LAMPORT_BUFFERS:
-                        nxt0 = Int32(0)
-                    _st_v4(flags_addr, nxt0, f0, f2, Int32(1))
-                    _st_v4(
-                        flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0)
-                    )
-                    _st_u32(counter, Int32(0))
-                    rotated = Int32(1)
-        full = Int32((1 << ws) - 1)
-        while have != full:
-            missing = have
+            # Poll every slot; the own slot comes from the registers. Bit r of `have`: slot r arrived.
+            row_base = uc_addr + cur_off + Int64((row * ws * HIDDEN + col) * 2)
+            words = cute.make_rmem_tensor((ws * 4,), Int32)
+            have = Int32(0)
             for rr in cutlass.range_constexpr(ws):
-                w = _ld_vol_v4_pred(
-                    row_base + Int64(rr * HIDDEN * 2),
-                    ((missing >> rr) & Int32(1)) ^ Int32(1),
-                    words[rr * 4],
-                    words[rr * 4 + 1],
-                    words[rr * 4 + 2],
-                    words[rr * 4 + 3],
-                )
+                w = _ld_vol_v4(row_base + Int64(rr * HIDDEN * 2))
                 for e in cutlass.range_constexpr(4):
                     words[rr * 4 + e] = w[e]
-            for rr in cutlass.range_constexpr(ws):
+                if rr == rank:
+                    for e in cutlass.range_constexpr(4):
+                        words[rr * 4 + e] = sw[e]
                 have = have | (
                     _clean4(words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3])
                     << rr
                 )
-        # Sum in chunks of RANK_CHUNK ranks (each chunk from 0, chunks in rank order).
-        acc = [Float32(0.0)] * ELTS
-        for rb in cutlass.range_constexpr(0, ws, self.rank_chunk):
-            chunk = [Float32(0.0)] * ELTS
-            for rr in cutlass.range_constexpr(self.rank_chunk):
-                for j in cutlass.range_constexpr(4):
-                    lo, hi = _bf16x2_f32(words[(rb + rr) * 4 + j])
-                    chunk[2 * j] = _fadd(chunk[2 * j], lo)
-                    chunk[2 * j + 1] = _fadd(chunk[2 * j + 1], hi)
-            for i in cutlass.range_constexpr(ELTS):
-                acc[i] = _fadd(acc[i], chunk[i])
-        red = [_pack_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(4)]
-
-        if cutlass.const_expr(self.use_pdl and not self.early_trigger):
-            _griddepcontrol_launch_dependents()
-
-        if cutlass.const_expr(self.norm):
-            thread_sum = Float32(0.0)
-            for j in cutlass.range_constexpr(4):
-                lo, hi = _bf16x2_f32(_sq_bf16x2(red[j]))
-                thread_sum = _fadd(thread_sum, lo)
-                thread_sum = _fadd(thread_sum, hi)
-            v = thread_sum
-            if half:
-                if lane < 16:
-                    v = _fadd(v, Float32(0.0))
-                    for off in (8, 4, 2, 1):
-                        v = _fadd(v, _shfl_bfly(v, off, 0xFFFF))
-            else:
-                for off in (16, 8, 4, 2, 1):
-                    v = _fadd(v, _shfl_bfly(v, off, 0xFFFFFFFF))
-            if lane == 0:
-                _sts_f32(warp_sum + warp * 4, v)
-            _bar_sync()
-            # The cluster kernel's butterfly over a group's four warp sums (lanes past them add 0)
-            # yields (w0 + w2) + (w1 + w3); every thread forms it for each group and adds the
-            # group sums in order, so one CTA barrier is enough.
-            total = Float32(0.0)
-            for c in cutlass.range_constexpr(ROW_GROUPS):
-                w4 = [_lds_f32(warp_sum + (c * WARPS + k) * 4) for k in range(WARPS)]
-                total = _fadd(total, _fadd(_fadd(w4[0], w4[2]), _fadd(w4[1], w4[3])))
-            scale = _rms_scale(total, eps)
-            if active:
-                ow = []
-                for j in cutlass.range_constexpr(4):
-                    x_lo, x_hi = _bf16x2_f32(red[j])
-                    g_lo, g_hi = _bf16x2_f32(gw[j])
-                    ow.append(
-                        _pack_bf16x2(
-                            _fmul(_fmul(x_lo, scale), g_lo), _fmul(_fmul(x_hi, scale), g_hi)
+            # CTA 0 rotates the buffers once every warp of the grid has read the flags: here, while it
+            # waits for the other ranks, if they all have by the end of its first polling round (as a
+            # rule), else at the end.
+            rotated = Int32(0)
+            if tidx == 0:
+                if row == 0:
+                    if _ld_acquire_gpu_u32(counter) >= (m + self.clear_ctas) * ROW_WARPS:
+                        nxt0 = f0 + 1
+                        if nxt0 == NUM_LAMPORT_BUFFERS:
+                            nxt0 = Int32(0)
+                        _st_v4(flags_addr, nxt0, f0, f2, Int32(1))
+                        _st_v4(
+                            flags_addr + Int64(16),
+                            m * (HIDDEN * ws * 2),
+                            Int32(0),
+                            Int32(0),
+                            Int32(0),
                         )
+                        _st_u32(counter, Int32(0))
+                        rotated = Int32(1)
+            full = Int32((1 << ws) - 1)
+            while have != full:
+                missing = have
+                for rr in cutlass.range_constexpr(ws):
+                    w = _ld_vol_v4_pred(
+                        row_base + Int64(rr * HIDDEN * 2),
+                        ((missing >> rr) & Int32(1)) ^ Int32(1),
+                        words[rr * 4],
+                        words[rr * 4 + 1],
+                        words[rr * 4 + 2],
+                        words[rr * 4 + 3],
                     )
-                _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), ow[0], ow[1], ow[2], ow[3])
-                if cutlass.const_expr(self.mxfp8):
-                    amax = _amax_bf16x8(ow[0], ow[1], ow[2], ow[3])
-                    if half:
-                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFF))
-                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFF))
-                    else:
-                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFFFFFF))
-                        amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFFFFFF))
-                    e = _ue8m0_of_amax(amax)
-                    q0, q1 = _quant_bf16x8_to_e4m3(ow[0], ow[1], ow[2], ow[3], _bf16x2_inv_scale(e))
-                    _st_v2(xq_addr + Int64(row * HIDDEN + col), q0, q1)
-                    if (t & 3) == 0:
-                        _st_u8(xs_addr + Int64(row * (HIDDEN // 32) + (col >> 5)), e)
-        else:
-            if active:
-                _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3])
+                    for e in cutlass.range_constexpr(4):
+                        words[rr * 4 + e] = w[e]
+                for rr in cutlass.range_constexpr(ws):
+                    have = have | (
+                        _clean4(
+                            words[rr * 4], words[rr * 4 + 1], words[rr * 4 + 2], words[rr * 4 + 3]
+                        )
+                        << rr
+                    )
+            # Sum in chunks of RANK_CHUNK ranks (each chunk from 0, chunks in rank order).
+            acc = [Float32(0.0)] * ELTS
+            for rb in cutlass.range_constexpr(0, ws, self.rank_chunk):
+                chunk = [Float32(0.0)] * ELTS
+                for rr in cutlass.range_constexpr(self.rank_chunk):
+                    for j in cutlass.range_constexpr(4):
+                        lo, hi = _bf16x2_f32(words[(rb + rr) * 4 + j])
+                        chunk[2 * j] = _fadd(chunk[2 * j], lo)
+                        chunk[2 * j + 1] = _fadd(chunk[2 * j + 1], hi)
+                for i in cutlass.range_constexpr(ELTS):
+                    acc[i] = _fadd(acc[i], chunk[i])
+            red = [_pack_bf16x2(acc[2 * j], acc[2 * j + 1]) for j in range(4)]
 
-        # CTA 0: rotate the buffers now if it could not after its first polling round.
-        if tidx == 0:
-            if row == 0:
-                if rotated == 0:
-                    arrived = _ld_acquire_gpu_u32(counter)
-                    while arrived < m * ROW_WARPS:
-                        arrived = _ld_acquire_gpu_u32(counter)
-                    nxt = f0 + 1
-                    if nxt == NUM_LAMPORT_BUFFERS:
-                        nxt = Int32(0)
-                    _st_v4(flags_addr, nxt, f0, f2, Int32(1))
+            if cutlass.const_expr(self.use_pdl and not self.early_trigger):
+                _griddepcontrol_launch_dependents()
+
+            if cutlass.const_expr(self.norm):
+                thread_sum = Float32(0.0)
+                for j in cutlass.range_constexpr(4):
+                    lo, hi = _bf16x2_f32(_sq_bf16x2(red[j]))
+                    thread_sum = _fadd(thread_sum, lo)
+                    thread_sum = _fadd(thread_sum, hi)
+                v = thread_sum
+                if half:
+                    if lane < 16:
+                        v = _fadd(v, Float32(0.0))
+                        for off in (8, 4, 2, 1):
+                            v = _fadd(v, _shfl_bfly(v, off, 0xFFFF))
+                else:
+                    for off in (16, 8, 4, 2, 1):
+                        v = _fadd(v, _shfl_bfly(v, off, 0xFFFFFFFF))
+                if lane == 0:
+                    _sts_f32(warp_sum + warp * 4, v)
+                _bar_sync()
+                # The cluster kernel's butterfly over a group's four warp sums (lanes past them add 0)
+                # yields (w0 + w2) + (w1 + w3); every thread forms it for each group and adds the
+                # group sums in order, so one CTA barrier is enough.
+                total = Float32(0.0)
+                for c in cutlass.range_constexpr(ROW_GROUPS):
+                    w4 = [_lds_f32(warp_sum + (c * WARPS + k) * 4) for k in range(WARPS)]
+                    total = _fadd(total, _fadd(_fadd(w4[0], w4[2]), _fadd(w4[1], w4[3])))
+                scale = _rms_scale(total, eps)
+                if active:
+                    ow = []
+                    for j in cutlass.range_constexpr(4):
+                        x_lo, x_hi = _bf16x2_f32(red[j])
+                        g_lo, g_hi = _bf16x2_f32(gw[j])
+                        ow.append(
+                            _pack_bf16x2(
+                                _fmul(_fmul(x_lo, scale), g_lo), _fmul(_fmul(x_hi, scale), g_hi)
+                            )
+                        )
+                    _st_v4(out_addr + Int64((row * HIDDEN + col) * 2), ow[0], ow[1], ow[2], ow[3])
+                    if cutlass.const_expr(self.mxfp8):
+                        amax = _amax_bf16x8(ow[0], ow[1], ow[2], ow[3])
+                        if half:
+                            amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFF))
+                            amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFF))
+                        else:
+                            amax = _amax_pair(amax, _shfl_bfly_b32(amax, 1, 0xFFFFFFFF))
+                            amax = _amax_pair(amax, _shfl_bfly_b32(amax, 2, 0xFFFFFFFF))
+                        e = _ue8m0_of_amax(amax)
+                        q0, q1 = _quant_bf16x8_to_e4m3(
+                            ow[0], ow[1], ow[2], ow[3], _bf16x2_inv_scale(e)
+                        )
+                        _st_v2(xq_addr + Int64(row * HIDDEN + col), q0, q1)
+                        if (t & 3) == 0:
+                            _st_u8(xs_addr + Int64(row * (HIDDEN // 32) + (col >> 5)), e)
+            else:
+                if active:
                     _st_v4(
-                        flags_addr + Int64(16), m * (HIDDEN * ws * 2), Int32(0), Int32(0), Int32(0)
+                        out_addr + Int64((row * HIDDEN + col) * 2), red[0], red[1], red[2], red[3]
                     )
-                    _st_u32(counter, Int32(0))
+
+            # CTA 0: rotate the buffers now if it could not after its first polling round.
+            if tidx == 0:
+                if row == 0:
+                    if rotated == 0:
+                        arrived = _ld_acquire_gpu_u32(counter)
+                        while arrived < (m + self.clear_ctas) * ROW_WARPS:
+                            arrived = _ld_acquire_gpu_u32(counter)
+                        nxt = f0 + 1
+                        if nxt == NUM_LAMPORT_BUFFERS:
+                            nxt = Int32(0)
+                        _st_v4(flags_addr, nxt, f0, f2, Int32(1))
+                        _st_v4(
+                            flags_addr + Int64(16),
+                            m * (HIDDEN * ws * 2),
+                            Int32(0),
+                            Int32(0),
+                            Int32(0),
+                        )
+                        _st_u32(counter, Int32(0))
+        else:
+            # Re-arm CTA: read the state, count this warp, clear its share of the dirty stages.
+            f0, f1, f2, f3 = _ld_v4(flags_addr)
+            c0, c1, c2, c3 = _ld_v4(flags_addr + Int64(16))
+            counter = flags_addr + Int64(32)
+            cute.arch.sync_warp()
+            if lane == 0:
+                _red_add_release_gpu(counter, Int32(1))
+            dirty = Int64(f1)
+            buf_bytes = Int64(f2) & Int64(0xFFFFFFFF)
+            dirty_stages = f3
+            n_threads = self.clear_ctas * ROW_THREADS
+            gtid = (row - m) * ROW_THREADS + tidx
+            clear = (c0, c1, c2, c3)
+            for s in cutlass.range_constexpr(4):
+                if s < dirty_stages:
+                    stage_bytes = buf_bytes // Int64(dirty_stages)
+                    base = uc_addr + (dirty * Int64(dirty_stages) + Int64(s)) * stage_bytes
+                    n_vec = (clear[s] + 15) >> 4
+                    for p in cutlass.range(gtid, n_vec, n_threads, unroll=1):
+                        _st_sentinel_v4(base + Int64(p) * Int64(16))
 
 
 class K3LamportClearKernel:
@@ -1201,8 +1260,17 @@ class K3LamportClearKernel:
 
 
 @functools.cache
-def _compiled_row(world_size: int, use_pdl: bool, early_trigger: bool, norm: bool, mxfp8: bool):
-    kernel = K3LatentArRowKernel(world_size, use_pdl, early_trigger, norm, mxfp8)
+def _compiled_row(
+    world_size: int,
+    use_pdl: bool,
+    early_trigger: bool,
+    norm: bool,
+    mxfp8: bool,
+    clear_ctas: int = 0,
+):
+    kernel = K3LatentArRowKernel(
+        world_size, use_pdl, early_trigger, norm, mxfp8, clear_ctas=clear_ctas
+    )
     a = Int64(0)
     return cute.compile(
         kernel,
@@ -1268,13 +1336,15 @@ def run_k3_latent_ar_norm_row(
     early_trigger: bool = True,
     norm: bool = True,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    clear_ctas: int = 0,
 ) -> None:
     """:func:`run_k3_latent_ar_norm` with :class:`K3LatentArRowKernel` (same result, bit for bit,
     for up to :data:`ROW_MAX_M` rows). Each Lamport buffer of the workspace must hold the rows of
     every rank (``M x world_size x 3584 x 2`` bytes, as the one-shot sizing of the MNNVL
-    workspace guarantees for the one-shot sizes; see :func:`can_run_row`)."""
+    workspace guarantees for the one-shot sizes; see :func:`can_run_row`). ``clear_ctas``:
+    see :class:`K3LatentArRowKernel` (same result, bit for bit)."""
     mxfp8 = mxfp8_out is not None
-    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8)(
+    _compiled_row(world_size, use_pdl, early_trigger, norm, mxfp8, clear_ctas)(
         Int64(x.data_ptr()),
         Int64(gamma.data_ptr()),
         Int64(out.data_ptr()),
@@ -1307,6 +1377,7 @@ def run_k3_lamport_clear(
 __all__ = [
     "HIDDEN",
     "MAX_M",
+    "ROW_CLEAR_CTAS",
     "ROW_MAX_M",
     "ROW_WORLD_SIZES",
     "WORLD_SIZES",

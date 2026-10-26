@@ -74,6 +74,7 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 
+from . import census as _census
 from . import flags as _flags
 from . import moe_tail_lu as _tail_lu
 from .moe_tail_lu import HIDDEN, LATENT, MAX_ROWS, MIN_ROWS, SHARED_SITE, K3TailLuState
@@ -270,13 +271,18 @@ def latent_all_reduce(
     base: K3TailLuState, layer: K3TailColLayer, routed: torch.Tensor
 ) -> torch.Tensor:
     """RMSNorm(gamma) of the sum over the ranks of ``routed`` (bf16 ``[T, 3584]``) on the latent workspace
-    (``K3LatentArRowKernel``, TAIL_LU's kernel without the MXFP8 form)."""
+    (``K3LatentArRowKernel``, TAIL_LU's kernel without the MXFP8 form; ``TRTLLM_K3LL_LAR_CLEAR_SPLIT`` picks its
+    bitwise variant, read here at every call)."""
     routed = routed.contiguous()
     latent = torch.empty_like(routed)
     view = base.latent
-    _latent_ar().run_k3_latent_ar_norm_row(
+    lar = _latent_ar()
+    clear_ctas = lar.ROW_CLEAR_CTAS if int(_flags.TRTLLM_K3LL_LAR_CLEAR_SPLIT) == 1 else 0
+    if clear_ctas:
+        _census.count(f"dispatch:lar_clear_split:{_census.mode()}")
+    lar.run_k3_latent_ar_norm_row(
         routed, layer.gamma, layer.eps, latent, uc_addr=view.uc_local, mc_addr=view.mc_base, flags=view.flags,
-        rank=view.rank, world_size=view.world, early_trigger=True,
+        rank=view.rank, world_size=view.world, early_trigger=True, clear_ctas=clear_ctas,
     )  # fmt: skip
     return latent
 
