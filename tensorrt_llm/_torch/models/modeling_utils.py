@@ -1549,6 +1549,29 @@ FUSED_MODULE_COMPONENTS = {
     'gate_up_proj': ['gate_proj', 'up_proj'],
 }
 
+_logged_loading_device_mismatch = False
+
+
+def _weight_loading_device(model: nn.Module) -> int:
+    """The CUDA device the per-module load threads must run on: the model's.
+
+    The device of the model's first CUDA parameter, else the calling thread's
+    current device (where the model's buffers are created). ``local_mpi_rank()``
+    is not that device when the launcher assigns devices itself (the MPI world
+    rank modulo the device count need not be the device a rank was given), and a
+    load thread on another device fails its device-to-device copies.
+    """
+    global _logged_loading_device_mismatch
+    device_id = next((p.device.index for p in model.parameters() if p.is_cuda),
+                     None)
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+    if not _logged_loading_device_mismatch and device_id != local_mpi_rank():
+        _logged_loading_device_mismatch = True
+        logger.info(f"Weight loading on cuda:{device_id}, the model's device "
+                    f"(local_mpi_rank() is {local_mpi_rank()}).")
+    return device_id
+
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
@@ -1577,7 +1600,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
     params_map = dict(FUSED_MODULE_COMPONENTS)
-    device_id = local_mpi_rank()
+    device_id = _weight_loading_device(model)
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
@@ -1728,7 +1751,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     if params_map is not None:
         weights = weight_mapper.rename_by_params_map(params_map, weights)
         logger.info(f"Renamed weights with params_map: {params_map}")
-    device_id = local_mpi_rank()
+    device_id = _weight_loading_device(model)
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
