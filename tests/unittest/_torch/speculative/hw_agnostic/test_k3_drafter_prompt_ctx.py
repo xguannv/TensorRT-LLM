@@ -247,16 +247,27 @@ def test_capture_only_needs_the_context_role_and_the_switch(monkeypatch):
 
 
 def test_serve_carries_the_role_to_the_model_ranks(monkeypatch):
-    """The model ranks get the role through env_overrides, which every rank applies before its build."""
+    """With the switch on, the model ranks get the role through env_overrides, which every rank applies before its
+    build. With it off, nothing is carried: other readers of the role on the model ranks see what they did before."""
     from tensorrt_llm.commands import serve
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    monkeypatch.setenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX", "16384")
     args = {"env_overrides": None}
     serve._carry_disagg_role_to_model_ranks(args)
     assert args["env_overrides"] == {"TRTLLM_DISAGG_ROLE": "context"}
     args = {"env_overrides": {"A": "1", "TRTLLM_DISAGG_ROLE": "generation"}}
     serve._carry_disagg_role_to_model_ranks(args)
     assert args["env_overrides"] == {"A": "1", "TRTLLM_DISAGG_ROLE": "generation"}
+    for off in ("0", ""):
+        monkeypatch.setenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX", off)
+        args = {"env_overrides": None}
+        serve._carry_disagg_role_to_model_ranks(args)
+        assert args == {"env_overrides": None}
+    monkeypatch.delenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX")
+    serve._carry_disagg_role_to_model_ranks(args)
+    assert args == {"env_overrides": None}
+    monkeypatch.setenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX", "16384")
     monkeypatch.delenv("TRTLLM_DISAGG_ROLE")
     args = {}
     serve._carry_disagg_role_to_model_ranks(args)

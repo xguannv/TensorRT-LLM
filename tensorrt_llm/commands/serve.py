@@ -518,16 +518,23 @@ def _provision_kv_cache_pool(llm_args: dict,
 
 
 def _carry_disagg_role_to_model_ranks(llm_args: dict) -> None:
-    """Add this process's ``TRTLLM_DISAGG_ROLE`` to ``llm_args["env_overrides"]``.
+    """Carry ``TRTLLM_DISAGG_ROLE`` to the model ranks when the K3 switch is on.
 
-    The model ranks are not necessarily children of this process: under
+    Adds this process's role to ``llm_args["env_overrides"]`` when
+    ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` > 0. The model ranks are not necessarily children of this process: under
     trtllm-llmapi-launch or an MPI session they were started with their own
     environment. ``env_overrides`` is applied on every rank before its engine is
-    built, so the role reaches the code that reads it there. A role already in
-    ``env_overrides`` is kept.
+    built, so the role reaches the code that reads it there: the K3 drafter
+    prompt-context switch builds its capture-only drafter only on a context
+    rank. Only with the switch on, so that other readers of the role on the
+    model ranks see what they did before. A role already in ``env_overrides``
+    is kept.
     """
     disagg_role = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE)
     if not disagg_role:
+        return
+    if os.environ.get("TRTLLM_K3LL_DRAFTER_PROMPT_CTX",
+                      "0").strip() in ("", "0"):
         return
     env_overrides = dict(llm_args.get("env_overrides") or {})
     env_overrides.setdefault(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, disagg_role)
