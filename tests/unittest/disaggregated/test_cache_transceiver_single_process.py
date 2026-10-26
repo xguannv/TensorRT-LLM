@@ -1994,6 +1994,16 @@ def test_append_draft_page_table():
             ),
         )
 
+    # A Helix V2 target's table carries the ledger page size (physical 8 x cp 2): the draft is
+    # checked against the physical size, and the merged table keeps the target's.
+    helix_target = KVCachePageTable(
+        tokens_per_block=16, layer_groups=target.layer_groups, pool_groups=target.pool_groups
+    )
+    merged = append_draft_page_table(helix_target, draft, target_physical_tokens_per_block=8)
+    assert merged.tokens_per_block == 16 and merged.layer_groups[1].replicated is True
+    with pytest.raises(ValueError, match="physical page size"):
+        append_draft_page_table(helix_target, draft)
+
 
 def _create_draft_cache_manager(max_batch_size: int) -> KVCacheManagerV2:
     """A dense MLA drafter cache: one bf16 latent of DRAFT_HEAD_DIM elements per token per layer.

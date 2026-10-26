@@ -789,20 +789,34 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 DRAFT_GLOBAL_LAYER_ID_OFFSET = 1 << 20
 
 
-def append_draft_page_table(target: KVCachePageTable, draft: KVCachePageTable) -> KVCachePageTable:
+def append_draft_page_table(
+    target: KVCachePageTable,
+    draft: KVCachePageTable,
+    target_physical_tokens_per_block: Optional[int] = None,
+) -> KVCachePageTable:
     """Return ``target`` with the draft manager's layer groups appended as replicated groups.
 
     The draft groups follow every target group (so the target's layer-group
     indices are unchanged), point at the draft pool groups appended after the
     target's, carry global layer ids shifted by ``DRAFT_GLOBAL_LAYER_ID_OFFSET``,
-    and are marked ``replicated`` (see :class:`AttentionLayerGroup`). Both
-    tables must use the same ``tokens_per_block`` and the draft table must hold
-    attention (PAGED) groups only.
+    and are marked ``replicated`` (see :class:`AttentionLayerGroup`). The draft
+    table must hold attention (PAGED) groups only, and its page size must equal
+    the target manager's physical page size,
+    ``target_physical_tokens_per_block`` (default ``target.tokens_per_block``).
+    Pass it explicitly for a Helix V2 target: that table carries the ledger page
+    size, ``tokens_per_block * cp_size``. The draft manager is never Helix-mapped,
+    so its table carries the physical size. The merged table keeps the target's
+    ``tokens_per_block``.
     """
-    if draft.tokens_per_block != target.tokens_per_block:
+    physical = (
+        target.tokens_per_block
+        if target_physical_tokens_per_block is None
+        else int(target_physical_tokens_per_block)
+    )
+    if draft.tokens_per_block != physical:
         raise ValueError(
-            "draft KV cache tokens_per_block must equal the target's: "
-            f"draft={draft.tokens_per_block}, target={target.tokens_per_block}"
+            "draft KV cache tokens_per_block must equal the target's physical page size: "
+            f"draft={draft.tokens_per_block}, target={physical}"
         )
     pool_group_offset = len(target.pool_groups)
     draft_groups: List[LayerGroup] = []
