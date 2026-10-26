@@ -958,8 +958,8 @@ class K3MoeLowMDynKernel:
         r = lane // Int32(R)
         pm = {}
         mine_pair = Int32(0)
-        for a in range(G):
-            for b in range(G):
+        for a in cutlass.range_constexpr(G):
+            for b in cutlass.range_constexpr(G):
                 if cutlass.const_expr(a != b):
                     pm[(a, b)] = Int32(
                         cute.arch.vote_ballot_sync((h == Int32(a)) & (r == Int32(b)))
@@ -1039,18 +1039,18 @@ class K3MoeLowMDynKernel:
                 hit = (union[e_l >> 5] >> (e_l & 31)) & Int32(1)
             H = Int32(cute.arch.vote_ballot_sync(hit != Int32(0)))
             tot = []
-            for g in range(G):
+            for g in cutlass.range_constexpr(G):
                 t = Int32(0)
-                for w in range(HW):
+                for w in cutlass.range_constexpr(HW):
                     t = t + _popc(union[g * HW + w])
                 tot.append(t)
             k = {}
             for ab, m_ab in pm.items():
                 k[ab] = _popc(H & m_ab)
             ld = []
-            for g in range(G):
+            for g in cutlass.range_constexpr(G):
                 hb = Int32(0)
-                for b2 in range(G):
+                for b2 in cutlass.range_constexpr(G):
                     if cutlass.const_expr(b2 != g):
                         hb = hb + k[(g, b2)]
                 ld.append(tot[g] - hb)
