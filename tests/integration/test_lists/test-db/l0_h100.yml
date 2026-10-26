@@ -141,6 +141,8 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   # Helix CP
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_helix_cp
+  # Drafter prompt window: a replicated draft pool, context cp 1 -> generation cp 1/2/4.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_drafter_window
   # V1 host offload: the send path must address primary slots, not block IDs.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_sends_primary_slots_under_host_offload
   # Real scheduler/resource lifecycle: pending pins, capacity recovery and host-prefix replay.

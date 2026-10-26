@@ -66,6 +66,11 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_drift.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
+  # K3 drafter prompt ctx: the window arithmetic and the replicated draft page table, no device.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_drafter_window
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_drafter_window_page_lists_pair
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_attention_layer_group_replicated_round_trip
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_append_draft_page_table
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
