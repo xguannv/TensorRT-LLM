@@ -76,8 +76,25 @@ def _call(case, monkeypatch, value, seed=11):
 def test_defaults():
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
 
-    assert flags._FLAGS["TRTLLM_K3LL_MLA_PARTIAL_F16"][1] == 0
+    assert flags._FLAGS["TRTLLM_K3LL_MLA_PARTIAL_F16"][1] == -1
     assert flags.accepted_values()["TRTLLM_K3LL_MLA_PARTIAL_F16"] == (0, 1)
+
+
+def test_default_resolves_per_arch(monkeypatch):
+    """-1 is on only where the device's compute capability is in MLA_PARTIAL_F16_CAPABILITIES (SM103); 0 / 1 are the
+    same on every device."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        mla_v_up,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    expected = torch.cuda.get_device_capability(device) in mla_v_up.MLA_PARTIAL_F16_CAPABILITIES
+    assert mla_v_up.MLA_PARTIAL_F16_CAPABILITIES == ((10, 3),)
+    _set(monkeypatch, -1)
+    assert mla_v_up.flags_partial_f16(device) is expected
+    for value in (0, 1):
+        _set(monkeypatch, value)
+        assert mla_v_up.flags_partial_f16(device) is bool(value)
 
 
 @pytest.mark.parametrize("name", list(CASES))

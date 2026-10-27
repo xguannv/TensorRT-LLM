@@ -62,8 +62,26 @@ def _set(monkeypatch, name, value):
 def test_defaults():
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
 
-    assert flags._FLAGS["TRTLLM_K3LL_MLA_COMBINE_EARLY"][1] == 0
+    assert flags._FLAGS["TRTLLM_K3LL_MLA_COMBINE_EARLY"][1] == -1
     assert flags.accepted_values()["TRTLLM_K3LL_MLA_COMBINE_EARLY"] == (0, 2, 4, 8)
+
+
+@pytest.mark.parametrize("partial_f16", [-1, 0, 1])
+def test_default_follows_partial_f16(partial_f16, monkeypatch):
+    """-1 is COMBINE_EARLY_DEFAULT (8) exactly where FP16 partials resolve on, else 0; explicit values pass through."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
+        mla_v_up,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    _set(monkeypatch, "TRTLLM_K3LL_MLA_PARTIAL_F16", partial_f16)
+    _set(monkeypatch, "TRTLLM_K3LL_MLA_COMBINE_EARLY", -1)
+    assert mla_v_up.COMBINE_EARLY_DEFAULT == 8
+    expected = mla_v_up.COMBINE_EARLY_DEFAULT if mla_v_up.flags_partial_f16(device) else 0
+    assert mla_v_up.flags_combine_early(device) == expected
+    for value in (0, 2, 4, 8):
+        _set(monkeypatch, "TRTLLM_K3LL_MLA_COMBINE_EARLY", value)
+        assert mla_v_up.flags_combine_early(device) == value
 
 
 @pytest.mark.parametrize("early", [2, 4, 8])

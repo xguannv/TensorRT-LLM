@@ -86,21 +86,43 @@ def var_split_skip_empty(device: torch.device) -> bool:
     return _skip_empty_by_default(index)
 
 
-def flags_partial_f16() -> bool:
-    """``TRTLLM_K3LL_MLA_PARTIAL_F16`` (read at every call): the fused V-up path's split kernel stores its partial O as
-    FP16 (``BlackwellMlaDecodeFP8VUp(partial_f16=True)``), a build of its own."""
+# TRTLLM_K3LL_MLA_PARTIAL_F16's and TRTLLM_K3LL_MLA_COMBINE_EARLY's defaults (-1) turn the stack (FP16 partials, the
+# first COMBINE_EARLY_DEFAULT splits loaded early) on only on these compute capabilities (measured on GB300 / SM103).
+MLA_PARTIAL_F16_CAPABILITIES = ((10, 3),)
+#: The early splits ``TRTLLM_K3LL_MLA_COMBINE_EARLY=-1`` takes where FP16 partials are on (with FP32 partials it is 0:
+#: eight early FP32 partials spill registers).
+COMBINE_EARLY_DEFAULT = 8
+
+
+@functools.lru_cache(maxsize=None)
+def _partial_f16_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in MLA_PARTIAL_F16_CAPABILITIES
+
+
+def flags_partial_f16(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_MLA_PARTIAL_F16`` (read at every call; 1 on, 0 off, -1 on where ``device`` is in
+    ``MLA_PARTIAL_F16_CAPABILITIES``): the fused V-up path's split kernel stores its partial O as FP16
+    (``BlackwellMlaDecodeFP8VUp(partial_f16=True)``), a build of its own."""
     from . import flags
 
-    return int(flags.TRTLLM_K3LL_MLA_PARTIAL_F16) > 0
+    value = int(flags.TRTLLM_K3LL_MLA_PARTIAL_F16)
+    if value >= 0:
+        return value > 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _partial_f16_by_default(index)
 
 
-def flags_combine_early() -> int:
+def flags_combine_early(device: torch.device) -> int:
     """``TRTLLM_K3LL_MLA_COMBINE_EARLY`` (read at every call): the number of first splits whose partials the fused V-up
     reduction loads, with its LSE, before the split-count reads are used (``BlackwellMlaDecodeFP8VUp(combine_early=n)``,
-    a build per value); 0 off."""
+    a build per value); 0 off; -1 ``COMBINE_EARLY_DEFAULT`` where FP16 partials are on (``flags_partial_f16``), else
+    0."""
     from . import flags
 
-    return int(flags.TRTLLM_K3LL_MLA_COMBINE_EARLY)
+    value = int(flags.TRTLLM_K3LL_MLA_COMBINE_EARLY)
+    if value >= 0:
+        return value
+    return COMBINE_EARLY_DEFAULT if flags_partial_f16(device) else 0
 
 
 def max_fused_rows() -> int:
@@ -207,10 +229,10 @@ def _run_fused(
     if var_split and var_split_flat(cache_seqs.device):
         flat_slots = _dcp._var_split_envelope(batch, heads, seq_len_q)[0]
         key = key + (f"flat{flat_slots}",)
-    partial_f16 = bool(flags_partial_f16())
+    partial_f16 = flags_partial_f16(cache_seqs.device)
     if partial_f16:
         key = key + ("partial_f16",)
-    combine_early = flags_combine_early()
+    combine_early = flags_combine_early(cache_seqs.device)
     if combine_early:
         key = key + (f"combine_early{combine_early}",)
     compiled = _compiled.get(key)

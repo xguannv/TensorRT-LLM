@@ -66,11 +66,7 @@ _FLAGS_PATH = _ROOT / _NVFP4 / "flags.py"
 _ON_OFF = Values((0, 1))
 
 #: Switches covered here although their default is not -1 (read at forward time, on by default).
-NON_DEFAULT = (
-    "TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",
-    "TRTLLM_K3LL_MLA_PARTIAL_F16",
-    "TRTLLM_K3LL_MLA_COMBINE_EARLY",
-)
+NON_DEFAULT = ("TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",)
 
 _COUNTS_KERNELS = (
     TRITON_EAGER,
