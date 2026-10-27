@@ -601,6 +601,14 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT = _flag(
     "(mla_v_up.MLA_VAR_SPLIT_FLAT_CAPABILITIES)",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_MLA_COMBINE_UNROLL = _flag(
+    "TRTLLM_K3LL_MLA_COMBINE_UNROLL",
+    0,
+    "the fused V-up reduction (k3_mla_decode_fp8_v_up): each combine warp loads this many splits' partials before "
+    "multiplying any of them, instead of one split at a time (the same products and sums in the same order: bitwise; "
+    "read at forward time, a build per value, compiled on its first eager call). 0 (default): one at a time; 2 / 4",
+    accepted=(0, 2, 4),  # mla_decode_fp8_v_up.COMBINE_UNROLLS beyond 1
+)
 TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED = _flag(
     "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED",
     -1,

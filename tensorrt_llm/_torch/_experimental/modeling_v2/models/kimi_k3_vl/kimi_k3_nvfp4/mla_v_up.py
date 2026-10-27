@@ -86,6 +86,16 @@ def var_split_skip_empty(device: torch.device) -> bool:
     return _skip_empty_by_default(index)
 
 
+def combine_unroll() -> int:
+    """``TRTLLM_K3LL_MLA_COMBINE_UNROLL`` (read at every call): how many splits' partials each combine warp of the
+    fused reduction loads before multiplying any of them (``COMBINE_UNROLLS``); 0 is 1, one split at a time. The
+    products and sums are the same in the same order whatever the value, so the output is the same bits."""
+    from . import flags
+
+    value = int(flags.TRTLLM_K3LL_MLA_COMBINE_UNROLL)
+    return 1 if value <= 0 else value
+
+
 def max_fused_rows() -> int:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
         MAX_ROWS,
@@ -190,6 +200,9 @@ def _run_fused(
     if var_split and var_split_flat(cache_seqs.device):
         flat_slots = _dcp._var_split_envelope(batch, heads, seq_len_q)[0]
         key = key + (f"flat{flat_slots}",)
+    unroll = combine_unroll()
+    if unroll > 1:
+        key = key + (f"combine_u{unroll}",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -219,6 +232,7 @@ def _run_fused(
             var_split_flat_slots=flat_slots,
             v_rows=v_rows,
             prewait=prewait,
+            combine_unroll=unroll,
         )
 
         def dyn(t, lead, align=16):

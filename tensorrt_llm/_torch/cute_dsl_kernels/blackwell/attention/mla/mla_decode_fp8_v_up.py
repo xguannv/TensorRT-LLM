@@ -44,6 +44,10 @@ request's count have no K tiles, and the reduction combines that request's parti
 split kernel L2-prefetches ``w_uv`` (one warp per CTA, the chunks spread over the grid), and after the wait it
 releases the fused reduction, whose CTAs then take SMs as they free up and load their ``w_uv[h]`` from L2 while the
 split kernel still runs. Prefetch hints and trigger placement only: the bytes are the same.
+
+``combine_unroll`` (``TRTLLM_K3LL_MLA_COMBINE_UNROLL``): a combine warp loads the partials of that many splits
+before it multiplies any of them, so their L2 round trips overlap; the multiply-adds are the same, in split order,
+so the output is the same bits.
 """
 
 from __future__ import annotations
@@ -76,6 +80,8 @@ MAX_ROWS = 32
 #: Warps that combine rows (warps 0-3 also read the accumulator); the next warp loads the weight and
 #: issues the MMA.
 COMBINE_WARPS = 16
+#: Splits whose partials a combine warp loads before multiplying any of them (1: one split at a time).
+COMBINE_UNROLLS = (1, 2, 4)
 
 
 @dsl_user_op
@@ -114,8 +120,15 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     reducer capacity of at most 32 splits (one split per lane).
     """
 
-    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
+    def __init__(
+        self, *args, v_rows: int = 16, prewait: bool = False, combine_unroll: int = 1, **kwargs
+    ):
         super().__init__(*args, **kwargs)
+        if combine_unroll not in COMBINE_UNROLLS:
+            raise ValueError(
+                f"combine_unroll must be one of {COMBINE_UNROLLS}, got {combine_unroll}"
+            )
+        self.combine_unroll = combine_unroll
         if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
                 "The fused V up-projection needs the Helix softmax statistics and a fixed query layout."
@@ -512,11 +525,30 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
 
         gAccO = mAccO[r, None, None, q_tile, b]
         rAcc.fill(0.0)
-        for i in range(local_split_kv):
-            scale = cute.arch.shuffle_sync(weight, i)
-            cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rPart)
-            for e in cutlass.range_constexpr(vec):
-                rAcc[e] += rPart[e] * scale
+        if cutlass.const_expr(self.combine_unroll == 1):
+            for i in range(local_split_kv):
+                scale = cute.arch.shuffle_sync(weight, i)
+                cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rPart)
+                for e in cutlass.range_constexpr(vec):
+                    rAcc[e] += rPart[e] * scale
+        else:
+            # The same products and sums in the same split order; only the loads of a group of
+            # ``combine_unroll`` splits are all issued before the group's first multiply-add.
+            parts = [
+                cute.make_rmem_tensor(cute.make_layout(vec), self.acc_dtype)
+                for _ in range(self.combine_unroll)
+            ]
+            for i0 in cutlass.range(0, local_split_kv, self.combine_unroll, unroll=1):
+                for u in cutlass.range_constexpr(self.combine_unroll):
+                    if i0 + u < local_split_kv:
+                        cute.autovec_copy(
+                            cute.local_tile(gAccO[i0 + u, None], (vec,), (lane,)), parts[u]
+                        )
+                for u in cutlass.range_constexpr(self.combine_unroll):
+                    if i0 + u < local_split_kv:
+                        scale = cute.arch.shuffle_sync(weight, i0 + u)
+                        for e in cutlass.range_constexpr(vec):
+                            rAcc[e] += parts[u][e] * scale
 
 
 __all__ = ["BlackwellMlaDecodeFP8VUp", "MAX_ROWS", "V_HEAD_DIM", "v_up_rows_bucket"]
