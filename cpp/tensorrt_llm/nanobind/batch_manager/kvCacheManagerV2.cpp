@@ -2039,6 +2039,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release release;
                 self.setTextOnly(textOnly);
             })
+        .def_prop_rw("absent_before", &kv::KvCache::absentBefore,
+            [](kv::KvCache& self, int absentBefore)
+            {
+                nb::gil_scoped_release release;
+                self.setAbsentBefore(absentBefore);
+            })
         .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)

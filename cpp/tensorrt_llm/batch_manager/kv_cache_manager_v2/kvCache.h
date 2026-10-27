@@ -575,6 +575,20 @@ public:
     // requires the already-committed tokens to be digest-free (verified by a scan).
     void setTextOnly(bool textOnly);
 
+    // Tokens before this block-aligned position are absent: this cache never holds, writes or
+    // commits pages for them. Each attention life cycle treats [0, absentBefore) as stale on
+    // top of its own window, so those blocks are created unallocated and their tree nodes carry
+    // no page from this cache. 0 (the default) leaves every path unchanged.
+    int absentBefore() const noexcept
+    {
+        return mAbsentBefore;
+    }
+
+    // Set before the cache holds any block, history or committed token. Requires every life
+    // cycle to be a dense, sink-free sliding-window attention life cycle with REQUIRED reuse,
+    // and SWA scratch reuse disabled on this cache. Throws std::invalid_argument otherwise.
+    void setAbsentBefore(int absentBefore);
+
     // Whether the given page index mode is supported (SHARED requires no scratch slots).
     bool supportsIndexMode(PageIndexMode mode) const;
 
@@ -637,7 +651,8 @@ private:
     // Snapshot a partial (non-full) final block at `ordinal` into the radix tree,
     // copying partial attention pages and optionally the SSM snapshot.
     void _snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm);
-    // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
+    // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle, extended to
+    // cover the absent prefix [0, mAbsentBefore) when one is set.
     HalfOpenRange<BlockOrdinal> _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
     // Backup entry for rollback after _unlockStaleBlocks.
@@ -818,6 +833,9 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+
+    // Block-aligned token count with no pages in this cache (see absentBefore()).
+    int mAbsentBefore = 0;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

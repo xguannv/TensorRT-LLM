@@ -98,6 +98,13 @@ target_include_directories(
   kvCacheManagerV2DigestPoolTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(
+  kvCacheManagerV2AbsentPrefixTest
+  "kvCacheManagerV2AbsentPrefixTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2AbsentPrefixTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
 add_gtest(llmRequestTest llmRequestTest.cpp)
 add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
