@@ -2195,13 +2195,19 @@ class KvCacheCreator:
         the switch is off, outside a joint-reuse KVCacheManagerV2 pair, for
         another drafter, or when the window reaches ``max_seq_len``.
         """
+        # The switch and the drafter kind come first: anything that is not the
+        # capture-only DSpark context drafter returns before the manager state
+        # is read.
         spec = self._speculative_config
-        if (not self._is_kv_cache_manager_v2 or not self._joint_kv_cache_reuse
-                or spec is None or not spec.spec_dec_mode.is_dspark()
+        if (spec is None or not spec.spec_dec_mode.is_dspark()
                 or getattr(spec, "draft_is_embedded_in_target", False)):
             return 0
         from ..models.modeling_dspark import dspark_capture_only
-        if not dspark_capture_only() or not config_utils.is_mla(
+        if not dspark_capture_only():
+            return 0
+        if not self._is_kv_cache_manager_v2 or not self._joint_kv_cache_reuse:
+            return 0
+        if not config_utils.is_mla(
                 self._get_effective_draft_config().pretrained_config):
             return 0
         from . import k3ll_flags
