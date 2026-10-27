@@ -24,10 +24,13 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
+#include "tensorrt_llm/common/assert.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <functional>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -39,6 +42,8 @@ namespace
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeHybridTieredConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 
 constexpr int kTokensPerBlock = 4;
 constexpr int kWindow = 12;
@@ -63,12 +68,48 @@ protected:
         EXPECT_EQ(cudaStreamDestroy(mStream), cudaSuccess);
     }
 
-    static std::shared_ptr<KvCacheManager> makeSwaManager(std::optional<int> window = kWindow)
+    static std::shared_ptr<KvCacheManager> makeSwaManager(
+        std::optional<int> window = kWindow, std::function<void(KVCacheManagerConfig&)> const& edit = {})
     {
         auto config = makeConfig();
         EXPECT_EQ(config.tokensPerBlock, kTokensPerBlock);
         std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = window;
+        if (edit)
+        {
+            edit(config);
+        }
         return std::make_shared<KvCacheManager>(config);
+    }
+
+    // The absent blocks of a cache claimed to kLength read as bad page indices, the rest as pages.
+    static void expectAbsentIndices(KvCacheManager& manager, KvCache const& cache)
+    {
+        auto const indices = cache.getBasePageIndices(manager.getLayerGroupId(LayerId{0}));
+        for (int ord = 0; ord < kLength / kTokensPerBlock; ++ord)
+        {
+            SCOPED_TRACE(ord);
+            EXPECT_EQ(indices[ord] == kBadPageIndex.value(), ord < kAbsent / kTokensPerBlock);
+        }
+    }
+
+    // The whole prompt matches through its window, and its absent blocks carry no page.
+    void expectAbsentTree(KvCacheManager& manager, bool windowOnly = false) const
+    {
+        auto const [hasPage, matched] = treePages(manager, span(0, kLength));
+        EXPECT_EQ(matched, kLength);
+        ASSERT_EQ(hasPage.size(), static_cast<size_t>(kLength / kTokensPerBlock));
+        for (size_t ord = 0; ord < hasPage.size(); ++ord)
+        {
+            SCOPED_TRACE(ord);
+            if (ord < static_cast<size_t>(kAbsent / kTokensPerBlock))
+            {
+                EXPECT_FALSE(hasPage[ord]);
+            }
+            else if (!windowOnly || ord >= static_cast<size_t>((kLength + 1 - kWindow) / kTokensPerBlock))
+            {
+                EXPECT_TRUE(hasPage[ord]);
+            }
+        }
     }
 
     TokenSpan span(int begin, int end) const
@@ -165,9 +206,10 @@ TEST_F(AbsentPrefixTest, UnusedOptionLeavesSlidingWindowUnchanged)
     manager->shutdown();
 }
 
-// History advances in two chunks with a commit after each. Each commit publishes the written
-// blocks only; after the second, the full prompt is reusable through its window.
-TEST_F(AbsentPrefixTest, CommitAfterPartialWritesPublishesOnlyWrittenPages)
+// History advances in two chunks with a commit after each. Neither commit gives an absent block a
+// page (checked by block index; no KV data is written); after the second, the full prompt is
+// reusable through its window.
+TEST_F(AbsentPrefixTest, TwoChunkCommitsLeaveEveryAbsentBlockPageless)
 {
     auto manager = makeSwaManager();
     auto cache = manager->createKvCache({}, {}, 1);
@@ -207,6 +249,143 @@ TEST_F(AbsentPrefixTest, CommitAfterPartialWritesPublishesOnlyWrittenPages)
     manager->shutdown();
 }
 
+// A capacity below the absent prefix adds no block (the new-block count would be negative), and
+// the pool's accounting stays exact through growth and close.
+TEST_F(AbsentPrefixTest, CapacityBelowAbsent)
+{
+    auto manager = makeSwaManager();
+    auto const freeBefore = manager->storage().getStatistics().free;
+    {
+        auto cache = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(cache->resume(mStream));
+        cache->setAbsentBefore(kAbsent);
+        ASSERT_TRUE(cache->resize(8));
+        EXPECT_EQ(manager->storage().getStatistics().free, freeBefore);
+        ASSERT_TRUE(cache->resize(kLength));
+        EXPECT_EQ(freeBefore - manager->storage().getStatistics().free, (kLength - kAbsent) / kTokensPerBlock);
+        expectAbsentIndices(*manager, *cache);
+        cache->close();
+        EXPECT_EQ(manager->storage().getStatistics().free, freeBefore);
+    }
+    {
+        auto cache = manager->createKvCache({}, {}, 2);
+        ASSERT_TRUE(cache->resume(mStream));
+        cache->setAbsentBefore(kAbsent);
+        ASSERT_TRUE(cache->resize(8));
+        cache->close();
+        EXPECT_EQ(manager->storage().getStatistics().free, freeBefore);
+    }
+    auto cache = manager->createKvCache({}, {}, 3);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(kLength));
+    EXPECT_EQ(freeBefore - manager->storage().getStatistics().free, kLength / kTokensPerBlock);
+    cache->close();
+    manager->shutdown();
+}
+
+// A commit that ends inside the absent prefix leaves committed and uncommitted absent blocks side
+// by side. Run this binary with TLLM_DEBUG_MODE=1 too: the cache's sanity check then runs after
+// every resize and commit (the mode is read once, when the library loads).
+TEST_F(AbsentPrefixTest, PartialCommitInsideAbsentPrefix)
+{
+    bool const debugChecks = tensorrt_llm::DebugConfig::isCheckDebugEnabled();
+    std::cout << "[ absent ] debug checks " << (debugChecks ? "on" : "off") << std::endl;
+    RecordProperty("debug_checks", debugChecks ? "on" : "off");
+    auto manager = makeSwaManager();
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    cache->setAbsentBefore(kAbsent);
+    ASSERT_TRUE(cache->resize(kLength));
+    cache->commit(span(0, kTokensPerBlock));
+    EXPECT_EQ(cache->numCommittedTokens(), kTokensPerBlock);
+    EXPECT_EQ(cache->historyLength(), kTokensPerBlock);
+    expectAbsentIndices(*manager, *cache);
+    cache->commit(span(kTokensPerBlock, kAbsent + 2));
+    cache->commit(span(kAbsent + 2, kLength));
+    cache->stopCommitting();
+    expectAbsentTree(*manager);
+    cache->close();
+    manager->shutdown();
+}
+
+// commit_min_snapshot (the manager config when block reuse is not ALL_REUSABLE): stale pages are
+// released rather than held for commit, and the absent prefix stays page-less either way.
+TEST_F(AbsentPrefixTest, CommitMinSnapshot)
+{
+    auto manager = makeSwaManager(kWindow, [](KVCacheManagerConfig& config) { config.commitMinSnapshot = true; });
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    cache->setAbsentBefore(kAbsent);
+    ASSERT_TRUE(cache->resize(kLength));
+    expectAbsentIndices(*manager, *cache);
+    ASSERT_TRUE(cache->resize(std::nullopt, kLength));
+    cache->commit(span(0, kLength));
+    cache->stopCommitting();
+    expectAbsentTree(*manager, /*windowOnly=*/true);
+    cache->close();
+    manager->shutdown();
+}
+
+TEST_F(AbsentPrefixTest, SuspendAndResumeKeepThePrefixAbsent)
+{
+    auto manager = makeSwaManager();
+    auto const freeBefore = manager->storage().getStatistics().free;
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    cache->setAbsentBefore(kAbsent);
+    ASSERT_TRUE(cache->resize(kLength));
+    cache->suspend();
+    ASSERT_TRUE(cache->resume(mStream));
+    EXPECT_EQ(cache->absentBefore(), kAbsent);
+    EXPECT_EQ(freeBefore - manager->storage().getStatistics().free, (kLength - kAbsent) / kTokensPerBlock);
+    expectAbsentIndices(*manager, *cache);
+    ASSERT_TRUE(cache->resize(std::nullopt, kLength));
+    cache->commit(span(0, kLength));
+    cache->suspend();
+    ASSERT_TRUE(cache->resume(mStream));
+    cache->stopCommitting();
+    expectAbsentTree(*manager);
+    cache->close();
+    manager->shutdown();
+}
+
+// A request without the option computes [0, kAbsent) and commits it; an absent cache then commits
+// the whole prompt on top. The tree path carries the first request's pages before kAbsent and the
+// absent cache's after it, so a match ending anywhere in the prompt finds a whole window.
+TEST_F(AbsentPrefixTest, AbsentCacheCommitsOnTopOfAWrittenPrefix)
+{
+    auto manager = makeSwaManager();
+    {
+        auto first = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(first->resume(mStream));
+        ASSERT_TRUE(first->resize(kAbsent));
+        first->commit(span(0, kAbsent));
+        first->stopCommitting();
+        first->close();
+    }
+    auto cache = manager->createKvCache({}, {}, 2);
+    ASSERT_TRUE(cache->resume(mStream));
+    cache->setAbsentBefore(kAbsent);
+    ASSERT_TRUE(cache->resize(kLength));
+    expectAbsentIndices(*manager, *cache);
+    ASSERT_TRUE(cache->resize(std::nullopt, kLength));
+    cache->commit(span(0, kLength));
+    cache->stopCommitting();
+
+    auto const [hasPage, matched] = treePages(*manager, span(0, kLength));
+    EXPECT_EQ(matched, kLength);
+    ASSERT_EQ(hasPage.size(), static_cast<size_t>(kLength / kTokensPerBlock));
+    for (size_t ord = 0; ord < hasPage.size(); ++ord)
+    {
+        SCOPED_TRACE(ord);
+        EXPECT_TRUE(hasPage[ord]);
+    }
+    // The window at 24 spans the first request's block 3 and the absent cache's blocks 4-5.
+    EXPECT_EQ(manager->radixTree().match({}, span(0, 24), false, true).numTokens, 24);
+    cache->close();
+    manager->shutdown();
+}
+
 TEST_F(AbsentPrefixTest, RejectsInvalidUse)
 {
     {
@@ -219,14 +398,84 @@ TEST_F(AbsentPrefixTest, RejectsInvalidUse)
         EXPECT_THROW(cache->setAbsentBefore(kAbsent), std::invalid_argument);
         EXPECT_EQ(cache->absentBefore(), 0);
         cache->close();
+        EXPECT_ANY_THROW(cache->setAbsentBefore(kAbsent));
         manager->shutdown();
     }
     {
-        // Full attention needs every block, so it cannot have an absent prefix.
-        auto manager = makeSwaManager(std::nullopt);
+        // Once set: no beam width change and no SWA scratch reuse.
+        auto manager = makeSwaManager(
+            kWindow, [](KVCacheManagerConfig& config) { config.swaScratchReuse = SwaScratchReuseConfig{}; });
+        auto cache = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(cache->resume(mStream));
+        // A scratch-enabled cache is rejected until scratch reuse is turned off.
+        ASSERT_TRUE(cache->isSwaScratchReuseEnabled());
+        EXPECT_THROW(cache->setAbsentBefore(kAbsent), std::invalid_argument);
+        cache->setEnableSwaScratchReuse(false);
+        cache->setAbsentBefore(kAbsent);
+        EXPECT_THROW(cache->setEnableSwaScratchReuse(true), std::invalid_argument);
+        EXPECT_THROW(cache->setBeamWidth(BeamIndex{2}), std::invalid_argument);
+        EXPECT_EQ(cache->absentBefore(), kAbsent);
+        cache->close();
+        manager->shutdown();
+    }
+    // Life cycles that cannot have an absent prefix: full attention, sinks, OPTIONAL / PRIVATE
+    // reuse beside a REQUIRED window, sparse, and recurrent state.
+    std::vector<std::pair<char const*, std::function<KVCacheManagerConfig()>>> const rejected{
+        {"full_attention",
+            []
+            {
+                auto config = makeConfig();
+                std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = std::nullopt;
+                return config;
+            }},
+        {"sinks",
+            []
+            {
+                auto config = makeConfig();
+                auto& layer = std::get<AttentionLayerConfig>(config.layers.front());
+                layer.slidingWindowSize = kWindow;
+                layer.numSinkTokens = kTokensPerBlock;
+                return config;
+            }},
+        {"optional",
+            []
+            {
+                auto config = makeConfig();
+                std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = kWindow;
+                auto layer = std::get<AttentionLayerConfig>(config.layers.front());
+                layer.layerId = 1;
+                layer.reusePolicy = AttentionReusePolicy::OPTIONAL;
+                config.layers.emplace_back(layer);
+                return config;
+            }},
+        {"private",
+            []
+            {
+                auto config = makeConfig();
+                std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = kWindow;
+                auto layer = std::get<AttentionLayerConfig>(config.layers.front());
+                layer.layerId = 1;
+                layer.reusePolicy = AttentionReusePolicy::PRIVATE;
+                config.layers.emplace_back(layer);
+                return config;
+            }},
+        {"sparse",
+            []
+            {
+                auto config = makeTieredConfig();
+                std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = true;
+                return config;
+            }},
+        {"ssm", [] { return makeHybridTieredConfig(); }},
+    };
+    for (auto const& [name, make] : rejected)
+    {
+        SCOPED_TRACE(name);
+        auto manager = std::make_shared<KvCacheManager>(make());
         auto cache = manager->createKvCache({}, {}, 1);
         ASSERT_TRUE(cache->resume(mStream));
         EXPECT_THROW(cache->setAbsentBefore(kAbsent), std::invalid_argument);
+        EXPECT_EQ(cache->absentBefore(), 0);
         cache->close();
         manager->shutdown();
     }

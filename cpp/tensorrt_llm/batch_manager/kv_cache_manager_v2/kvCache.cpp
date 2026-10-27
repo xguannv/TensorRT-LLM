@@ -1912,7 +1912,9 @@ void KvCache::setBeamWidth(BeamIndex beamWidth)
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change beam_width after close()");
     if (mAbsentBefore > 0)
+    {
         throw std::invalid_argument("beam_width changes are not supported on a cache with an absent prefix");
+    }
     auto const apiLock = mManager->lockExclusive();
     if (mManager->enablePartialCommit())
         throw AssertionError("beam_width changes are not supported with partial commit");
@@ -2098,17 +2100,31 @@ HalfOpenRange<BlockOrdinal> KvCache::_getStaleRange(int historyLength, LifeCycle
 void KvCache::setAbsentBefore(int absentBefore)
 {
     KVCM2_REJECT_IF_POISONED();
+    if (mStatus == Status::CLOSED)
+    {
+        throw LogicError("Cannot set absent_before after close()");
+    }
     auto const apiLock = mManager->lockExclusive();
     if (absentBefore == mAbsentBefore)
+    {
         return;
+    }
     if (absentBefore < 0 || absentBefore % mTokensPerBlock != 0)
+    {
         throw std::invalid_argument("absent_before must be a non-negative multiple of tokens_per_block");
+    }
     if (mBlocks.size() != BlockOrdinal{0} || mHistoryLength != 0 || numCommittedTokens() != 0 || mCapacity != 0)
+    {
         throw std::invalid_argument("absent_before can only be set on a cache with no blocks, history or commits");
+    }
     if (mEnableSwaScratchReuse)
+    {
         throw std::invalid_argument("absent_before requires SWA scratch reuse to be disabled on this cache");
+    }
     if (mBeamWidth != BeamIndex{1})
+    {
         throw std::invalid_argument("absent_before requires beam width 1");
+    }
     for (auto const& [lcId, lc] : mManager->lifeCycles())
     {
         auto const* attn = std::get_if<AttnLifeCycle>(&lc);
@@ -2724,7 +2740,7 @@ void KvCache::_onStopCommitting()
         auto staleRange = _getStaleRange(mHistoryLength, lc);
         BlockOrdinal start = std::max(staleRange.beg, BlockOrdinal{mNumCommittedBlocks});
         // Only an absent prefix can reach past the allocated blocks.
-        TLLM_CHECK_DEBUG(staleRange.end <= mBlocks.size() || mAbsentBefore > 0);
+        TLLM_CHECK_DEBUG(staleRange.end <= std::max(mBlocks.size(), BlockOrdinal{mAbsentBefore / mTokensPerBlock}));
         BlockOrdinal end = std::min(staleRange.end, mBlocks.size());
         for (BlockOrdinal ord = start; ord < end; ++ord)
         {
@@ -3599,7 +3615,9 @@ void KvCache::setEnableSwaScratchReuse(bool enable)
     if (enable)
     {
         if (mAbsentBefore > 0)
+        {
             throw std::invalid_argument("Cannot enable SWA scratch reuse on a cache with an absent prefix");
+        }
         if (!mManager->isSwaScratchReuseEnabled())
             throw std::invalid_argument(
                 "Cannot enable SWA scratch reuse for a request when it is disabled in KV cache manager config");

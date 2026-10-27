@@ -579,12 +579,16 @@ public:
     // commits pages for them. Each attention life cycle treats [0, absentBefore) as stale on
     // top of its own window, so those blocks are created unallocated and their tree nodes carry
     // no page from this cache. 0 (the default) leaves every path unchanged.
+    // Blocks before absentBefore hold no data: their page indices read as bad, and the caller must
+    // not attend to those positions (an SWA reader whose window reaches below absentBefore would
+    // read nothing valid there). It suits a writer that stores per-token state from absentBefore on
+    // without reading earlier positions, such as a drafter that only captures the prompt's K/V.
     int absentBefore() const noexcept
     {
         return mAbsentBefore;
     }
 
-    // Set before the cache holds any block, history or committed token. Requires every life
+    // Set on an open cache before it holds any block, history or committed token. Requires every life
     // cycle to be a dense, sink-free sliding-window attention life cycle with REQUIRED reuse,
     // and SWA scratch reuse disabled on this cache. Throws std::invalid_argument otherwise.
     void setAbsentBefore(int absentBefore);
