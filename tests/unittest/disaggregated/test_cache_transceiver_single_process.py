@@ -2112,6 +2112,7 @@ def run_drafter_window_transfer_test(
     draft_prompt_window: int,
     request_lengths: List[int] = DRAFTER_REQUEST_LENGTHS,
     gen_draft_prompt_window: Optional[int] = None,
+    forward_report: bool = True,
 ) -> None:
     """Context (cp 1) -> generation (cp ``gen_cp``), each side with or without the drafter prompt window.
 
@@ -2126,7 +2127,9 @@ def run_drafter_window_transfer_test(
     The target always transfers as in test_cache_transceiver_helix_cp (each generation CP rank gets its
     [cp_rank::cp_size] stride). With both sides on, the reported window reaches every generation rank
     whole and the request is admitted at its length. Otherwise no draft page is reserved or moved,
-    and the request carries no drafter window.
+    and the request carries no drafter window. ``forward_report`` False drops the report on the way
+    to the generation (a generation-first schedule, or a front end that does not carry it): the
+    generation then lists no draft page and the context's sender moves none.
     """
     if gen_draft_prompt_window is None:
         gen_draft_prompt_window = draft_prompt_window
@@ -2221,7 +2224,7 @@ def run_drafter_window_transfer_test(
                     gen_rid, req_len, unique_rid, ctx_rid, 0, ctx_info_endpoint, sampling_params
                 )
                 req.py_disaggregated_params.drafter_ctx_window = (
-                    list(window) if window is not None else None
+                    list(window) if window is not None and forward_report else None
                 )
                 # The target's rank-local prompt (see run_transfer_test); the drafter window is
                 # cut from the global prompt length.
@@ -2248,7 +2251,7 @@ def run_drafter_window_transfer_test(
                 if gen_on:
                     gen_draft = gen_drafts[cp_rank]
                     window = received_drafter_window(req, gen_draft.tokens_per_block)
-                    assert window == reported[req_idx]
+                    assert window == (reported[req_idx] if forward_report else None)
                     if window is not None:
                         start, length = window
                         assert gen_draft.prepare_drafter_window_receive(req, start, length)
@@ -2288,7 +2291,7 @@ def run_drafter_window_transfer_test(
                 # (target stride + whole draft window, or no draft page) must equal what the
                 # sender attested.
                 assert req.py_kv_transfer_verified, (req_idx, cp_rank)
-                if not (ctx_on and gen_on):
+                if not (ctx_on and gen_on and forward_report):
                     assert getattr(req, "py_drafter_ctx_len", None) is None, (req_idx, cp_rank)
                     continue
                 start, length = reported[req_idx]
@@ -2311,7 +2314,7 @@ def run_drafter_window_transfer_test(
             is_mla=is_mla,
             gen_cp=gen_cp,
         )
-        if ctx_on and gen_on:
+        if ctx_on and gen_on and forward_report:
             _verify_drafter_window(
                 request_lengths,
                 draft_prompt_window,
@@ -2367,11 +2370,17 @@ def test_cache_transceiver_drafter_window(gen_cp, is_mla, draft_prompt_window):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "ctx_window,gen_window",
-    [(0, 0), (0, 100), (100, 0), (100, 100)],
-    ids=["ctx_off-gen_off", "ctx_off-gen_on", "ctx_on-gen_off", "ctx_on-gen_on"],
+    "ctx_window,gen_window,forward_report",
+    [(0, 0, True), (0, 100, True), (100, 0, True), (100, 100, True), (100, 100, False)],
+    ids=[
+        "ctx_off-gen_off",
+        "ctx_off-gen_on",
+        "ctx_on-gen_off",
+        "ctx_on-gen_on",
+        "ctx_on-gen_on-report_lost",
+    ],
 )
-def test_cache_transceiver_drafter_window_pairings(ctx_window, gen_window):
+def test_cache_transceiver_drafter_window_pairings(ctx_window, gen_window, forward_report):
     """TRTLLM_K3LL_DRAFTER_PROMPT_CTX on / off on each side (MLA, generation Helix cp 2).
 
     * both off: today's transfer, no drafter window anywhere;
@@ -2380,7 +2389,9 @@ def test_cache_transceiver_drafter_window_pairings(ctx_window, gen_window):
       sees generated tokens only);
     * context on, generation off: the context sends its window and reports it; the generation has
       no draft group to receive it into, ignores the report, and the target transfer verifies;
-    * both on: the generation admits exactly the reported window, received byte for byte.
+    * both on: the generation admits exactly the reported window, received byte for byte;
+    * both on, the report lost on the way: the generation lists no draft page, the context's sender
+      skips the draft groups, and the request is admitted without a window.
 
     No pairing hangs: every request completes its transfer with verified writes.
     """
@@ -2389,6 +2400,7 @@ def test_cache_transceiver_drafter_window_pairings(ctx_window, gen_window):
         is_mla=True,
         draft_prompt_window=ctx_window,
         gen_draft_prompt_window=gen_window,
+        forward_report=forward_report,
     )
 
 
