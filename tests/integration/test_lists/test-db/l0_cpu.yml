@@ -72,6 +72,7 @@ l0_cpu:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_attention_layer_group_replicated_round_trip
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_append_draft_page_table
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_received_drafter_window_reads_only_a_whole_page_report
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_context_reports_exactly_the_drafter_window_it_sends
   # TRTLLM_K3LL_DRAFTER_PROMPT_CTX's spelling, default (-1: on on SM103 only) and serve / transceiver wiring.
   - unittest/_torch/speculative/hw_agnostic/test_k3_drafter_prompt_ctx_default.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order

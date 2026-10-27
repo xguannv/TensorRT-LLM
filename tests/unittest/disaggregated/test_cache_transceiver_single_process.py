@@ -2438,6 +2438,67 @@ def test_received_drafter_window_reads_only_a_whole_page_report():
     assert received_drafter_window(req, 8) is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "missing, sent",
+    [
+        ((), (64, 64)),
+        ((2,), (64, 64)),  # before the window: not sent anyway
+        ((4,), (80, 48)),
+        ((4, 5), (96, 32)),
+        ((5,), (96, 32)),
+        ((7,), None),
+    ],
+    ids=[
+        "whole",
+        "missing_before",
+        "missing_first",
+        "missing_two",
+        "missing_second",
+        "missing_last",
+    ],
+)
+def test_context_reports_exactly_the_drafter_window_it_sends(missing, sent):
+    """A context sends and reports the drafter window pages its draft pool holds.
+
+    Prompt 128, W 64, 16-token pages: the window is pages 4-7. With a page missing the context
+    sends the held pages after it and reports that shorter window (``window_short``), so the
+    generation admits exactly what arrives; with the last page missing it sends and reports none
+    (``window_not_held``). A report always ends at the prompt length on a page boundary.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import _DrafterWindowCounters
+
+    ordinals = np.array([-1 if i in missing else 100 + i for i in range(8)], dtype=np.int64)
+    tx = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
+    tx._draft_kv_cache_manager = SimpleNamespace(tokens_per_block=16)
+    tx._draft_reuse_adapter = SimpleNamespace(get_block_ordinals=lambda req, idx, lg: ordinals)
+    tx._page_table = SimpleNamespace(layer_groups=["target", "draft"])
+    tx._num_target_layer_groups = 1
+    tx._draft_capture_only = True
+    tx._draft_prompt_window = 64
+    tx._draft_window_counters = _DrafterWindowCounters("ctx", 0)
+    req = SimpleNamespace(
+        py_request_id=7,
+        is_context_only_request=True,
+        is_generation_only_request=False,
+        total_input_len_cp=128,
+    )
+
+    (pages,) = tx._describe_draft_window(req)
+
+    assert req.py_drafter_ctx_window == sent
+    counts = tx._draft_window_counters._counts
+    if sent is None:
+        assert pages.size == 0 and counts["window_not_held"] == 1
+        return
+    start, length = sent
+    assert pages.tolist() == [100 + i for i in range(start // 16, 8)]
+    assert counts["window_short"] == (1 if sent != (64, 64) else 0)
+    params = DisaggregatedParams(drafter_ctx_window=list(sent))
+    gen = SimpleNamespace(py_request_id=7, total_input_len_cp=128, py_disaggregated_params=params)
+    assert received_drafter_window(gen, 16) == sent
+
+
 # ---------------------------------------------------------------------------
 # Boundary request-length tests
 # ---------------------------------------------------------------------------

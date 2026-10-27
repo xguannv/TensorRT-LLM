@@ -806,9 +806,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         are replicated, never CP-strided). A side without a window lists no pages (empty arrays),
         and the sender skips a draft group the receiver lists no pages for.
 
-        On the context side the window is sent only if the draft manager holds every page of it;
-        the request then carries ``py_drafter_ctx_window`` = ``(start, length)``, which its context
-        response reports to the generation worker. Otherwise nothing is sent and nothing reported.
+        On the context side the request then carries ``py_drafter_ctx_window`` = ``(start,
+        length)`` of what is sent, which its context response reports to the generation worker.
+        The draft manager normally holds every page of the window (the scheduler's pairing rule
+        starts an absent draft prefix no later than the window start). If it does not, the held
+        suffix after the last missing page is sent and reported as a shorter window (counted as
+        ``window_short``); with the last page missing nothing is sent or reported
+        (``window_not_held``).
         """
         draft = self._draft_kv_cache_manager
         adapter = self._draft_reuse_adapter
@@ -836,14 +840,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             pages[: held.size] = held
             groups.append(pages)
         if req.is_context_only_request:
-            if any((pages < 0).any() for pages in groups):
+            # Pages after the last one missing in any group: the longest window the pool holds.
+            keep_from = max(
+                (int(np.flatnonzero(pages < 0)[-1]) + 1 for pages in groups if (pages < 0).any()),
+                default=0,
+            )
+            if keep_from >= num_pages:
                 req.py_drafter_ctx_window = None
                 self._draft_window_counters.count("window_not_held")
                 logger.warning(
-                    f"request {req.py_request_id}: the draft pool does not hold its whole drafter "
-                    f"prompt window (start {start}, length {length}); none is sent or reported"
+                    f"request {req.py_request_id}: the draft pool does not hold the last page of its "
+                    f"drafter prompt window (start {start}, length {length}); none is sent or reported"
                 )
                 return none
+            if keep_from > 0:
+                # Report what is sent, so the generation admits exactly that.
+                short_start = (first_page + keep_from) * tpb
+                length -= short_start - start
+                start = short_start
+                groups = [pages[keep_from:] for pages in groups]
+                self._draft_window_counters.count("window_short", length)
+                logger.warning(
+                    f"request {req.py_request_id}: the draft pool holds its drafter prompt window "
+                    f"only from {start}; a short window (start {start}, length {length}) is sent "
+                    "and reported"
+                )
             req.py_drafter_ctx_window = (start, length)
             self._draft_window_counters.count("windows_sent", length)
         return groups

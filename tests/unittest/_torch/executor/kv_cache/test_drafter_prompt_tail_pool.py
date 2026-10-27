@@ -273,3 +273,36 @@ def test_window_complete_on_linear_growth_after_eviction(pairs):
     # is a draft hit at its full length.
     extended = grown + list(range(9000, 9000 + TPB))
     assert pair.probes(extended) == (len(grown), len(grown))
+
+
+@pytest.mark.parametrize("draft_evicted", [False, True], ids=["draft_hit", "draft_lost"])
+def test_branch_hit_past_the_window_start_keeps_the_window_whole(pairs, draft_evicted):
+    """A branch hit at c > s (P - c < W): the window starts before the branch point.
+
+    With the draft holding the stored prompt's pages at c, both pools reuse c and the draft's
+    reused pages cover [s, c). With the draft having lost them, the target is held at s (the
+    rule's floor) and the draft recomputes [s, P) from an absent prefix. Either way the draft
+    holds every page of [s, P), so the context sends and reports the whole window.
+    """
+    pair = pairs(tail=True)
+    stored = list(range(8 * TPB))
+    branch_point = 7 * TPB
+    branch = stored[:branch_point] + list(range(8000, 8000 + TPB))
+    window_start, _ = drafter_window(len(branch), WINDOW, TPB)
+    assert branch_point > window_start
+    pair.prefill(stored)
+    if draft_evicted:
+        pair.evict_draft_until(lambda: pair.probes(branch)[0] < window_start)
+    draft_match, target_match = pair.probes(branch)
+    assert target_match == branch_point
+
+    req, reused = pair.prefill(branch, keep=True)
+    kv_cache = pair.draft.kv_cache_map[req.py_request_id]
+    if draft_evicted:
+        assert reused == window_start and kv_cache.absent_before == window_start
+    else:
+        assert draft_match == branch_point
+        assert reused == branch_point and kv_cache.absent_before == 0
+    pages = _draft_pages(pair, req)
+    assert all(p != BAD_PAGE_INDEX for p in pages[window_start // TPB : len(branch) // TPB]), pages
+    pair.free(req)
