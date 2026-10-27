@@ -2162,6 +2162,9 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
     ) -> Optional[List[int]]:
         """Derive the draft manager's per-layer attention windows."""
+        tail = self._drafter_prompt_tail_window(max_seq_len)
+        if tail > 0:
+            return [tail] * self._get_num_draft_layers()
         effective_draft_config = self._get_effective_draft_config()
         return _derive_draft_max_attention_window(
             kv_cache_config,
@@ -2169,6 +2172,33 @@ class KvCacheCreator:
             max_seq_len,
             self._get_num_draft_layers(),
         )
+
+    def _drafter_prompt_tail_window(self, max_seq_len: int) -> int:
+        """The draft pool's sliding window on a TRTLLM_K3LL_DRAFTER_PROMPT_CTX context worker, or 0.
+
+        A context worker running the capture-only MLA DSpark drafter
+        (``dspark_capture_only``) only stores the prompt's drafter K/V and
+        sends its window ``[s, P)``, ``s = drafter_window(P, W).start``, the
+        page boundary at or below ``P - W``. A sliding window of W + 1 tokens
+        (the core keeps ``[h + 1 - window, h]`` live at history ``h``) holds
+        exactly the pages from ``s`` on at the prompt's end: W plus at most
+        one page per request. Older drafter pages are committed and then
+        evictable like any sliding-window page. 0 (a full-length pool) when
+        the switch is off, outside a joint-reuse KVCacheManagerV2 pair, for
+        another drafter, or when the window reaches ``max_seq_len``.
+        """
+        spec = self._speculative_config
+        if (not self._is_kv_cache_manager_v2 or not self._joint_kv_cache_reuse
+                or spec is None or not spec.spec_dec_mode.is_dspark()
+                or getattr(spec, "draft_is_embedded_in_target", False)):
+            return 0
+        from ..models.modeling_dspark import dspark_capture_only
+        if not dspark_capture_only() or not config_utils.is_mla(
+                self._get_effective_draft_config().pretrained_config):
+            return 0
+        from . import k3ll_flags
+        tail = k3ll_flags.drafter_prompt_window() + 1
+        return tail if tail < max_seq_len else 0
 
     def _get_one_model_draft_kv_cache_config(
         self,
@@ -2259,7 +2289,7 @@ class KvCacheCreator:
         draft_mapping = self._mapping
         if draft_mapping.has_cp_helix():
             draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
-        return _create_kv_cache_manager(
+        draft_manager = _create_kv_cache_manager(
             model_engine=None,
             max_cuda_graph_batch_size=self._model_engine.
             _max_cuda_graph_batch_size,
@@ -2289,6 +2319,18 @@ class KvCacheCreator:
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
+        tail = (0 if estimating_kv_cache else
+                self._drafter_prompt_tail_window(max_seq_len))
+        windows = getattr(draft_manager, "max_attention_window_vec", None)
+        if tail > 0 and windows and all(w is not None and w < max_seq_len
+                                        for w in windows):
+            # Read by the scheduler's joint claim (see _prepare_context_pair).
+            draft_manager.drafter_prompt_tail = tail - 1
+            logger.info(
+                "TRTLLM_K3LL_DRAFTER_PROMPT_CTX: tail-only context draft pool, "
+                f"sliding window {min(windows)} tokens (W={tail - 1} plus at most "
+                f"one {self._tokens_per_block}-token page per request)")
+        return draft_manager
 
     def _get_target_and_draft_cache_costs(
         self,

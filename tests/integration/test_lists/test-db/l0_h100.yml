@@ -146,6 +146,8 @@ l0_h100:
   # Drafter prompt window on / off per side, and differing windows: the generation admits what the context reported.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_drafter_window_pairings
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_drafter_window_size_mismatch
+  # Drafter prompt window: the context's tail-only draft pool (eviction, the pairing rule, window completeness).
+  - unittest/_torch/executor/kv_cache/test_drafter_prompt_tail_pool.py
   # V1 host offload: the send path must address primary slots, not block IDs.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_sends_primary_slots_under_host_offload
   # Real scheduler/resource lifecycle: pending pins, capacity recovery and host-prefix replay.

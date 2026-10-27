@@ -300,9 +300,12 @@ TRTLLM_K3LL_DRAFTER_PROMPT_CTX = _flag(
     "prompt length sends the whole prompt); 0: off, the ctx loads no drafter (a DSpark speculative_config on a ctx "
     "is dropped there) and the gen drafter sees generated tokens only. Resolved in one place, k3ll_flags."
     "drafter_prompt_window. On a ctx worker (TRTLLM_DISAGG_ROLE=context) with a DSpark speculative_config it loads a "
-    "capture-only drafter (context_proj, context_norm and the latent projection + norm, no draft forward) that keeps "
-    "the drafter K/V of every prompt position in a draft pool reused jointly with the target's; a ctx without a "
-    "DSpark speculative_config is unchanged. Read at load (ctx) and per received request (gen)",
+    "capture-only drafter (context_proj, context_norm and the latent projection + norm, no draft forward) whose draft "
+    "pool, reused jointly with the target's, keeps only each prompt's window (a W + 1 sliding window: W plus at most "
+    "one page per request; older drafter pages are evicted first). Where that pool lost a prompt's drafter pages "
+    "the target still reuses up to the window start (the draft starts there with no pages before it), so the "
+    "drafter never cuts the target's reuse below the window; a ctx without a DSpark speculative_config is "
+    "unchanged. Read at load (ctx) and per received request (gen)",
     accepted=Range(-1),  # -1 default (SM103 on); 0 off; 1 on at 16384; W >= 2 the window in tokens
 )
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(

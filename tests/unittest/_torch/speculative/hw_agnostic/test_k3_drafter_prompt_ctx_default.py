@@ -12,6 +12,8 @@
   manager arguments. A context server without a DSpark ``speculative_config`` is untouched at any value.
 * Transceiver wiring (``_util._drafter_prompt_window_transfer_kwargs``): off, no draft argument, so the transceiver
   is built as without the switch; at the default a deployment that cannot take part stays off rather than raising.
+* Context draft pool (``KvCacheCreator._drafter_prompt_tail_window``): tail-only (a W + 1 sliding window) exactly
+  where the capture-only drafter runs on a joint-reuse KVCacheManagerV2 pair.
 """
 
 import importlib.util
@@ -267,3 +269,49 @@ def test_capture_only_build_follows_the_resolved_window(monkeypatch):
     _switch(monkeypatch, 0)
     monkeypatch.setattr(k3ll_flags, "_device_capability", lambda: SM103)
     assert not modeling_dspark.dspark_capture_only()
+
+
+def _tail_creator(monkeypatch, *, v2=True, joint=True, dspark=True, embedded=False, mla=True):
+    """A KvCacheCreator carrying only what ``_drafter_prompt_tail_window`` reads."""
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    creator = _util.KvCacheCreator.__new__(_util.KvCacheCreator)
+    creator._is_kv_cache_manager_v2 = v2
+    creator._joint_kv_cache_reuse = joint
+    creator._tokens_per_block = 32
+    creator._speculative_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_dspark=lambda: dspark),
+        draft_is_embedded_in_target=embedded,
+    )
+    creator._get_effective_draft_config = lambda: SimpleNamespace(pretrained_config=object())
+    monkeypatch.setattr(_util.config_utils, "is_mla", lambda config: mla)
+    return creator
+
+
+def test_context_draft_pool_is_tail_only_where_the_capture_only_drafter_runs(monkeypatch):
+    """The capture-only context drafter's joint V2 draft pool is a W + 1 sliding window (W plus at most one page
+    per request); every other draft pool keeps its full length."""
+    monkeypatch.setattr(k3ll_flags, "_device_capability", lambda: SM103)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    _switch(monkeypatch, -1)
+    assert _tail_creator(monkeypatch)._drafter_prompt_tail_window(1 << 20) == 16384 + 1
+    _switch(monkeypatch, 4096)
+    assert _tail_creator(monkeypatch)._drafter_prompt_tail_window(1 << 20) == 4096 + 1
+    # The window reaching max_seq_len is a full-length pool.
+    assert _tail_creator(monkeypatch)._drafter_prompt_tail_window(4097) == 0
+    for kwargs in (
+        dict(v2=False),
+        dict(joint=False),
+        dict(dspark=False),
+        dict(embedded=True),
+        dict(mla=False),
+    ):
+        assert _tail_creator(monkeypatch, **kwargs)._drafter_prompt_tail_window(1 << 20) == 0, (
+            kwargs
+        )
+    # Off, or not a context worker: no capture-only drafter, a full-length pool.
+    _switch(monkeypatch, 0)
+    assert _tail_creator(monkeypatch)._drafter_prompt_tail_window(1 << 20) == 0
+    _switch(monkeypatch, -1)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    assert _tail_creator(monkeypatch)._drafter_prompt_tail_window(1 << 20) == 0

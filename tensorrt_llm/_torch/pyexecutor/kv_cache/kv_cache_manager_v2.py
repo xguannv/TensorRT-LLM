@@ -1259,6 +1259,11 @@ class KVCacheManagerV2(BaseResourceManager):
     # disaggregated generation request whose context reported a window receives it into its draft
     # mirror (prepare_drafter_window_receive). 0 means no draft transfer.
     drafter_prompt_window: int = 0
+    # Draft managers on a TRTLLM_K3LL_DRAFTER_PROMPT_CTX context worker: the drafter prompt window
+    # W when this pool keeps only W plus one page per request (a sliding-window pool, set by
+    # KvCacheCreator). The scheduler's joint claim then lets the target reuse down to the window
+    # start even where the draft holds less (claim_absent_prefix_draft_cache). 0: a full pool.
+    drafter_prompt_tail: int = 0
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -3993,6 +3998,31 @@ class KVCacheManagerV2(BaseResourceManager):
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
+    def prepare_absent_prefix_context_cache(self, req: LlmRequest, absent_before: int) -> bool:
+        """Create the request's draft cache with ``[0, absent_before)`` absent.
+
+        Tail-only draft pools (``drafter_prompt_tail`` > 0) only. The cache
+        claims no reuse and never allocates, writes or commits pages before
+        ``absent_before`` (the core's ``absent_before``): the drafter stores
+        the prompt from there, where the shared cursor starts. Its commit
+        still names the whole prompt, so the tree keeps one path per prompt;
+        the absent blocks carry no page from this cache. False on a failed
+        create or resume, as ``prepare_context_cache``.
+        """
+        assert self.is_draft and self.drafter_prompt_tail > 0
+        assert absent_before % self.tokens_per_block == 0, absent_before
+        reused = self.prepare_context_cache(req, 0)
+        if reused is None:
+            return False
+        if reused != 0:
+            raise RuntimeError(
+                f"request {req.py_request_id}: a zero-limit draft claim matched {reused} tokens"
+            )
+        kv_cache = self.kv_cache_map[req.py_request_id]
+        kv_cache.enable_swa_scratch_reuse = False
+        kv_cache.absent_before = absent_before
+        return True
+
     def try_allocate_draft_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize a draft context cache during admission. Joint reuse shares one
         cursor; the draft manager owns only its radix tree and capacity.
@@ -6722,16 +6752,20 @@ class KVCacheManagerV2(BaseResourceManager):
         salt_int = 0 if is_dummy else self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
+        # A tail-only draft pool keeps each stored prompt's window at its endpoint: the pages
+        # before it are evicted first, so pressure frees them before any stored prompt's window.
+        tail_draft = self.is_draft and self.drafter_prompt_tail > 0
         if (
-            self._swa_endpoint_rewind > 0
+            ((self._swa_endpoint_rewind > 0 and not self.is_draft) or tail_draft)
             and self.enable_block_reuse
             and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
             and not is_dummy
-            and not self.is_draft
             and expected_prompt_length is not None
         ):
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
-                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
+                expected_prompt_length,
+                self.tokens_per_block,
+                0 if tail_draft else self._swa_endpoint_rewind,
             )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),

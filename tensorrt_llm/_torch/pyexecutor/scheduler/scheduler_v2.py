@@ -1130,7 +1130,20 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
 
-    def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
+    def _probe_pair(self, req: LlmRequest) -> tuple[int, int] | None:
+        """``(draft, target)`` reusable depths of the joint pools, or None when either has none to probe."""
+        draft_manager = self._joint_draft_manager
+        if draft_manager is None:
+            return None
+        draft_match = draft_manager.probe_context_reuse(req)
+        target_match = self.kv_cache_manager.probe_context_reuse(req)
+        if draft_match is None or target_match is None:
+            return None
+        return draft_match, target_match
+
+    def _reuse_claim_limit(
+        self, req: LlmRequest, probes: tuple[int, int] | None = None
+    ) -> int | None:
         """Pair the two pools on one depth before either claims.
 
         Each probe matches through the D-token lookahead and applies its backoff
@@ -1140,14 +1153,91 @@ class KVCacheV2Scheduler(RequestScheduler):
         Doing this up front rather than claim-then-reconcile keeps the mismatch
         path (free the draft pages and re-claim shallower) off the common case.
         """
+        if probes is None:
+            probes = self._probe_pair(req)
+        return None if probes is None else min(probes)
+
+    def _drafter_tail_claim(self, req: LlmRequest, probes: tuple[int, int] | None) -> int | None:
+        """Target claim depth where a tail-only draft pool must not limit the target, else None.
+
+        A context worker's tail-only draft pool (``drafter_prompt_tail`` = W,
+        TRTLLM_K3LL_DRAFTER_PROMPT_CTX) only needs the prompt's drafter window,
+        which starts at ``s = drafter_window(prompt_len, W).start``. Its draft
+        reuse ``d`` therefore may stop the joint depth at ``min(t, max(d, s))``
+        but no lower: the target keeps its reuse ``t`` up to the window start.
+        Returns that depth when it exceeds ``d`` (the draft then starts with
+        an absent prefix, ``_prepare_absent_draft_pair``); None when the draft
+        holds it (the ordinary joint claim).
+        """
         draft_manager = self._joint_draft_manager
-        if draft_manager is None:
+        if probes is None or draft_manager is None or draft_manager.drafter_prompt_tail <= 0:
             return None
-        draft_match = draft_manager.probe_context_reuse(req)
-        target_match = self.kv_cache_manager.probe_context_reuse(req)
-        if draft_match is None or target_match is None:
+        from ...disaggregation.transceiver import drafter_window
+
+        draft_match, target_match = probes
+        window_start, _ = drafter_window(
+            req.total_input_len_cp,
+            draft_manager.drafter_prompt_tail,
+            draft_manager.tokens_per_block,
+        )
+        depth = min(target_match, max(draft_match, window_start))
+        counters = self._drafter_tail_counters()
+        counters.count("claims", tokens=target_match)
+        if depth <= draft_match:
             return None
-        return min(draft_match, target_match)
+        # A prefix served from outside the pools settles the cursor on its own.
+        if req.py_served_prefix_end > 0:
+            counters.count("served_prefix_kept_joint")
+            return None
+        counters.count("tail_rule", tokens=depth - min(draft_match, target_match))
+        return depth
+
+    def _prepare_absent_draft_pair(self, req: LlmRequest, depth: int) -> bool:
+        """Claim the target at ``depth`` and start the draft there with no pages before it.
+
+        The draft cache's prefix ``[0, h0)`` is absent (``absent_before``):
+        never allocated, written or committed with pages, so a page the draft
+        did not compute never reaches its radix tree. ``h0`` is the target's
+        claim on a draft page boundary; an unaligned claim is re-claimed one
+        partial page shallower.
+        """
+        from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
+
+        draft_manager = self._joint_draft_manager
+        tokens_per_block = draft_manager.tokens_per_block
+        limit = depth
+        for _ in range(2):
+            common_reuse = self.kv_cache_manager.prepare_context_cache(req, limit)
+            if common_reuse is None:
+                self._free_kv_caches(req)
+                return False
+            if common_reuse % tokens_per_block == 0:
+                break
+            self.kv_cache_manager.free_resources(req)
+            limit = common_reuse // tokens_per_block * tokens_per_block
+        else:
+            # An eviction between the claims left another partial page: no reuse.
+            common_reuse = self.kv_cache_manager.prepare_context_cache(req, 0)
+            if common_reuse is None:
+                self._free_kv_caches(req)
+                return False
+        if not draft_manager.prepare_absent_prefix_context_cache(req, common_reuse):
+            self._free_kv_caches(req)
+            return False
+        _settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
+        self._drafter_tail_counters().count("absent_claims", tokens=common_reuse)
+        return True
+
+    def _drafter_tail_counters(self):
+        """Periodic INFO counters of the tail-only draft pool's joint claims (never per step)."""
+        counters = getattr(self, "_drafter_tail_counter_log", None)
+        if counters is None:
+            from ...disaggregation.transceiver import _DrafterWindowCounters
+
+            rank = getattr(getattr(self.kv_cache_manager, "mapping", None), "rank", 0)
+            counters = _DrafterWindowCounters("ctx_claim", rank)
+            self._drafter_tail_counter_log = counters
+        return counters
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
         """Create and resume an unpaired draft mirror as part of admitting *req*.
@@ -1198,10 +1288,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._suspend_request(req)
             return False
 
+        probes = self._probe_pair(req)
+        tail_depth = self._drafter_tail_claim(req, probes)
+        if tail_depth is not None:
+            return self._prepare_absent_draft_pair(req, tail_depth)
+
         # Both pools claim the depth paired above, so they normally agree first
         # time; the target claim still caps to the draft's in case an eviction
         # landed between the probe and the claim.
-        draft_reuse = draft_manager.prepare_context_cache(req, self._reuse_claim_limit(req))
+        draft_reuse = draft_manager.prepare_context_cache(req, self._reuse_claim_limit(req, probes))
         if draft_reuse is None:
             self._free_kv_caches(req)
             return False
