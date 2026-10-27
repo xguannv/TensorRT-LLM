@@ -105,6 +105,16 @@ target_include_directories(
   kvCacheManagerV2AbsentPrefixTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+# The partial-commit case again with debug checks on (TLLM_DEBUG_MODE is read
+# once, at library load), so the KvCache sanity check runs after every resize
+# and commit.
+add_test(
+  NAME AbsentPrefixTest.PartialCommitInsideAbsentPrefix.debug_mode
+  COMMAND kvCacheManagerV2AbsentPrefixTest
+          --gtest_filter=AbsentPrefixTest.PartialCommitInsideAbsentPrefix)
+set_tests_properties(
+  AbsentPrefixTest.PartialCommitInsideAbsentPrefix.debug_mode
+  PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY;TLLM_DEBUG_MODE=1")
 add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
 add_gtest(llmRequestTest llmRequestTest.cpp)
 add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)

@@ -21,6 +21,7 @@
 
 #include "kvCacheManagerV2TestUtils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/exceptions.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
@@ -29,11 +30,13 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -128,6 +131,21 @@ protected:
             hasPage.push_back(block->getPage(lc) != nullptr);
         }
         return {hasPage, match.numTokens};
+    }
+
+    // setAbsentBefore(kAbsent) throws std::invalid_argument naming ``reason``, and leaves the cache unchanged.
+    static void expectRejected(KvCache& cache, std::string const& reason)
+    {
+        try
+        {
+            cache.setAbsentBefore(kAbsent);
+            ADD_FAILURE() << "setAbsentBefore did not throw; expected: " << reason;
+        }
+        catch (std::invalid_argument const& e)
+        {
+            EXPECT_NE(std::string(e.what()).find(reason), std::string::npos) << e.what();
+        }
+        EXPECT_EQ(cache.absentBefore(), 0);
     }
 
     cudaStream_t mStream{};
@@ -284,13 +302,19 @@ TEST_F(AbsentPrefixTest, CapacityBelowAbsent)
 }
 
 // A commit that ends inside the absent prefix leaves committed and uncommitted absent blocks side
-// by side. Run this binary with TLLM_DEBUG_MODE=1 too: the cache's sanity check then runs after
-// every resize and commit (the mode is read once, when the library loads).
+// by side. A second ctest entry runs this test with TLLM_DEBUG_MODE=1 (CMakeLists.txt): the
+// cache's sanity check then runs after every resize and commit (the mode is read once, at load).
 TEST_F(AbsentPrefixTest, PartialCommitInsideAbsentPrefix)
 {
     bool const debugChecks = tensorrt_llm::DebugConfig::isCheckDebugEnabled();
     std::cout << "[ absent ] debug checks " << (debugChecks ? "on" : "off") << std::endl;
     RecordProperty("debug_checks", debugChecks ? "on" : "off");
+    // The debug ctest entry sets TLLM_DEBUG_MODE=1; prove the checks really run there.
+    char const* debugEnv = std::getenv("TLLM_DEBUG_MODE");
+    if (debugEnv != nullptr && std::string(debugEnv) == "1")
+    {
+        EXPECT_TRUE(debugChecks);
+    }
     auto manager = makeSwaManager();
     auto cache = manager->createKvCache({}, {}, 1);
     ASSERT_TRUE(cache->resume(mStream));
@@ -395,21 +419,31 @@ TEST_F(AbsentPrefixTest, RejectsInvalidUse)
         EXPECT_THROW(cache->setAbsentBefore(kTokensPerBlock + 1), std::invalid_argument);
         EXPECT_THROW(cache->setAbsentBefore(-kTokensPerBlock), std::invalid_argument);
         ASSERT_TRUE(cache->resize(8));
-        EXPECT_THROW(cache->setAbsentBefore(kAbsent), std::invalid_argument);
-        EXPECT_EQ(cache->absentBefore(), 0);
+        expectRejected(*cache, "no blocks, history or commits");
         cache->close();
-        EXPECT_ANY_THROW(cache->setAbsentBefore(kAbsent));
         manager->shutdown();
     }
     {
-        // Once set: no beam width change and no SWA scratch reuse.
+        // A closed cache that never held a block: only the CLOSED guard can fire. Setting the
+        // current value stays a no-op.
+        auto manager = makeSwaManager();
+        auto cache = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(cache->resume(mStream));
+        cache->close();
+        EXPECT_THROW(cache->setAbsentBefore(kAbsent), LogicError);
+        EXPECT_NO_THROW(cache->setAbsentBefore(0));
+        EXPECT_EQ(cache->absentBefore(), 0);
+        manager->shutdown();
+    }
+    {
+        // A scratch-enabled cache is rejected until scratch reuse is turned off. Once set: no
+        // beam width change and no SWA scratch reuse.
         auto manager = makeSwaManager(
             kWindow, [](KVCacheManagerConfig& config) { config.swaScratchReuse = SwaScratchReuseConfig{}; });
         auto cache = manager->createKvCache({}, {}, 1);
         ASSERT_TRUE(cache->resume(mStream));
-        // A scratch-enabled cache is rejected until scratch reuse is turned off.
         ASSERT_TRUE(cache->isSwaScratchReuseEnabled());
-        EXPECT_THROW(cache->setAbsentBefore(kAbsent), std::invalid_argument);
+        expectRejected(*cache, "SWA scratch reuse");
         cache->setEnableSwaScratchReuse(false);
         cache->setAbsentBefore(kAbsent);
         EXPECT_THROW(cache->setEnableSwaScratchReuse(true), std::invalid_argument);
@@ -418,64 +452,50 @@ TEST_F(AbsentPrefixTest, RejectsInvalidUse)
         cache->close();
         manager->shutdown();
     }
-    // Life cycles that cannot have an absent prefix: full attention, sinks, OPTIONAL / PRIVATE
-    // reuse beside a REQUIRED window, sparse, and recurrent state.
-    std::vector<std::pair<char const*, std::function<KVCacheManagerConfig()>>> const rejected{
-        {"full_attention",
-            []
-            {
-                auto config = makeConfig();
-                std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = std::nullopt;
-                return config;
-            }},
-        {"sinks",
-            []
-            {
-                auto config = makeConfig();
-                auto& layer = std::get<AttentionLayerConfig>(config.layers.front());
-                layer.slidingWindowSize = kWindow;
-                layer.numSinkTokens = kTokensPerBlock;
-                return config;
-            }},
-        {"optional",
-            []
-            {
-                auto config = makeConfig();
-                std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = kWindow;
-                auto layer = std::get<AttentionLayerConfig>(config.layers.front());
-                layer.layerId = 1;
-                layer.reusePolicy = AttentionReusePolicy::OPTIONAL;
-                config.layers.emplace_back(layer);
-                return config;
-            }},
-        {"private",
-            []
-            {
-                auto config = makeConfig();
-                std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = kWindow;
-                auto layer = std::get<AttentionLayerConfig>(config.layers.front());
-                layer.layerId = 1;
-                layer.reusePolicy = AttentionReusePolicy::PRIVATE;
-                config.layers.emplace_back(layer);
-                return config;
-            }},
-        {"sparse",
-            []
-            {
-                auto config = makeTieredConfig();
-                std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = true;
-                return config;
-            }},
-        {"ssm", [] { return makeHybridTieredConfig(); }},
-    };
-    for (auto const& [name, make] : rejected)
+    // Life cycles that cannot have an absent prefix. Every case but full attention gives its
+    // attention layers the sliding window, so the check named by the reason is the one that fires.
+    auto withWindow = [](KVCacheManagerConfig config)
     {
-        SCOPED_TRACE(name);
-        auto manager = std::make_shared<KvCacheManager>(make());
+        for (auto& layer : config.layers)
+        {
+            if (auto* attention = std::get_if<AttentionLayerConfig>(&layer))
+            {
+                attention->slidingWindowSize = kWindow;
+            }
+        }
+        return config;
+    };
+    auto withSecondLayer = [&](AttentionReusePolicy policy)
+    {
+        auto config = withWindow(makeConfig());
+        auto layer = std::get<AttentionLayerConfig>(config.layers.front());
+        layer.layerId = 1;
+        layer.reusePolicy = policy;
+        config.layers.emplace_back(layer);
+        return config;
+    };
+    std::vector<std::pair<std::string, KVCacheManagerConfig>> rejected;
+    rejected.emplace_back("full attention", makeConfig());
+    {
+        auto config = withWindow(makeConfig());
+        std::get<AttentionLayerConfig>(config.layers.front()).numSinkTokens = kTokensPerBlock;
+        rejected.emplace_back("sink tokens", config);
+    }
+    rejected.emplace_back("REQUIRED reuse", withSecondLayer(AttentionReusePolicy::OPTIONAL));
+    rejected.emplace_back("REQUIRED reuse", withSecondLayer(AttentionReusePolicy::PRIVATE));
+    {
+        auto config = withWindow(makeTieredConfig());
+        std::get<AttentionLayerConfig>(config.layers.front()).buffers.front().isSparse = true;
+        rejected.emplace_back("not sparse", config);
+    }
+    rejected.emplace_back("recurrent state", withWindow(makeHybridTieredConfig()));
+    for (auto const& [reason, config] : rejected)
+    {
+        SCOPED_TRACE(reason);
+        auto manager = std::make_shared<KvCacheManager>(config);
         auto cache = manager->createKvCache({}, {}, 1);
         ASSERT_TRUE(cache->resume(mStream));
-        EXPECT_THROW(cache->setAbsentBefore(kAbsent), std::invalid_argument);
-        EXPECT_EQ(cache->absentBefore(), 0);
+        expectRejected(*cache, reason);
         cache->close();
         manager->shutdown();
     }

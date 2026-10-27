@@ -590,7 +590,8 @@ public:
 
     // Set on an open cache before it holds any block, history or committed token. Requires every life
     // cycle to be a dense, sink-free sliding-window attention life cycle with REQUIRED reuse,
-    // and SWA scratch reuse disabled on this cache. Throws std::invalid_argument otherwise.
+    // and SWA scratch reuse disabled on this cache. Throws std::invalid_argument otherwise, and
+    // LogicError on a closed cache (setting the current value is always a no-op).
     void setAbsentBefore(int absentBefore);
 
     // Whether the given page index mode is supported (SHARED requires no scratch slots).

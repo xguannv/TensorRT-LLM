@@ -2100,14 +2100,14 @@ HalfOpenRange<BlockOrdinal> KvCache::_getStaleRange(int historyLength, LifeCycle
 void KvCache::setAbsentBefore(int absentBefore)
 {
     KVCM2_REJECT_IF_POISONED();
-    if (mStatus == Status::CLOSED)
-    {
-        throw LogicError("Cannot set absent_before after close()");
-    }
     auto const apiLock = mManager->lockExclusive();
     if (absentBefore == mAbsentBefore)
     {
         return;
+    }
+    if (mStatus == Status::CLOSED)
+    {
+        throw LogicError("Cannot set absent_before after close()");
     }
     if (absentBefore < 0 || absentBefore % mTokensPerBlock != 0)
     {
@@ -2128,11 +2128,25 @@ void KvCache::setAbsentBefore(int absentBefore)
     for (auto const& [lcId, lc] : mManager->lifeCycles())
     {
         auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-        if (!attn || !attn->windowSize.has_value() || attn->numSinkBlocks != 0 || attn->isSparse
-            || attn->reusePolicy != AttentionReusePolicy::REQUIRED)
+        if (!attn)
         {
-            throw std::invalid_argument(
-                "absent_before requires dense, sink-free sliding-window attention life cycles with REQUIRED reuse");
+            throw std::invalid_argument("absent_before requires attention life cycles only, not recurrent state");
+        }
+        if (!attn->windowSize.has_value())
+        {
+            throw std::invalid_argument("absent_before requires sliding-window attention, not full attention");
+        }
+        if (attn->numSinkBlocks != 0)
+        {
+            throw std::invalid_argument("absent_before requires attention without sink tokens");
+        }
+        if (attn->isSparse)
+        {
+            throw std::invalid_argument("absent_before requires dense attention, not sparse");
+        }
+        if (attn->reusePolicy != AttentionReusePolicy::REQUIRED)
+        {
+            throw std::invalid_argument("absent_before requires REQUIRED reuse, not OPTIONAL or PRIVATE");
         }
     }
     mAbsentBefore = absentBefore;
@@ -2744,7 +2758,8 @@ void KvCache::_onStopCommitting()
         BlockOrdinal end = std::min(staleRange.end, mBlocks.size());
         for (BlockOrdinal ord = start; ord < end; ++ord)
         {
-            auto& sb = mBlocks[ord];
+            // Checked: an absent prefix can put the stale end past the allocated blocks.
+            auto& sb = mBlocks.at(ord);
             TLLM_CHECK_DEBUG(!sb.isCommitted());
             for (auto& beamPages : sb.pages)
             {
