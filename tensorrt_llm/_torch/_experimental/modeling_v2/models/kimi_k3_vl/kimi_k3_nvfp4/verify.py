@@ -147,6 +147,15 @@ def _early_rows(device: torch.device, hoist: bool, fold_fb: bool) -> bool:
     return _early_rows_by_default(index)
 
 
+def _v_split(n_req: int) -> int:
+    """``TRTLLM_K3LL_KDA_VERIFY_VSPLIT4``: 4 CTAs per (head, request) at launches of at least that many requests, else
+    8 (``verify_kernel.V_SPLITS``)."""
+    from . import flags
+
+    least = int(flags.TRTLLM_K3LL_KDA_VERIFY_VSPLIT4)
+    return 4 if 0 < least <= n_req else 8
+
+
 def use_pdl() -> bool:
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
@@ -272,6 +281,7 @@ def k3_fp8_kda_verify(
     hoist = _hoist_replay(proj.device)
     odd_clamp = _odd_clamp(proj.device, num_spec)
     early_rows = _early_rows(proj.device, hoist, fold_fb)
+    v_split = _v_split(n_req)
     key = (
         num_heads,
         num_spec,
@@ -285,6 +295,7 @@ def k3_fp8_kda_verify(
         hoist,
         odd_clamp,
         early_rows,
+        v_split,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -300,7 +311,7 @@ def k3_fp8_kda_verify(
             if fn is None:
                 fn = _compiled[key] = cute.compile(
                     kernel.k3_fp8_kda_verify, *args, *runtime, num_heads, num_spec, float(lower_bound), float(scale),
-                    float(eps), fold_fb, sep_bfa, pdl, hoist, odd_clamp, early_rows, stream,
+                    float(eps), fold_fb, sep_bfa, pdl, hoist, odd_clamp, early_rows, v_split, stream,
                 )  # fmt: skip
     fn(*args, *runtime, stream)
     if hoist or odd_clamp:
@@ -312,6 +323,10 @@ def k3_fp8_kda_verify(
             census.count(f"dispatch:kda_verify_odd_clamp:{census.mode()}")
         if early_rows:
             census.count(f"dispatch:kda_verify_early_rows:{census.mode()}")
+    if v_split != 8:
+        from . import census
+
+        census.count(f"dispatch:kda_verify_vsplit4:{census.mode()}")
     return out
 
 

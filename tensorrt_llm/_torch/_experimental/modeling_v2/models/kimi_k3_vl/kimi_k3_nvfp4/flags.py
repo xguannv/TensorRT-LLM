@@ -761,6 +761,16 @@ TRTLLM_K3LL_KDA_VERIFY_EARLY_ROWS = _flag(
     "(default) on SM103 only (verify.KDA_VERIFY_EARLY_ROWS_CAPABILITIES)",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_KDA_VERIFY_VSPLIT4 = _flag(
+    "TRTLLM_K3LL_KDA_VERIFY_VSPLIT4",
+    0,
+    "k3_fp8_kda_verify at launches of at least this many requests: 4 CTAs of 512 threads per (head, request) cluster "
+    "(32 V rows each) instead of 8 of 256 (16 each), so bs3 / bs4 fit one wave of clusters on GB300 (15 co-resident "
+    "8-CTA clusters; bs3 / bs4 launch 18 / 24). Every warp keeps its two V rows and the output norm its 16-row "
+    "partial sums, so the same bits. Read at forward time, a build per split, compiled on its first eager call. 0 "
+    "(default) off, 1..4 the smallest request count that uses it",
+    accepted=(0, 1, 2, 3, 4),
+)
 TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS = _flag(
     "TRTLLM_K3LL_MLA_VAR_SPLIT_WIDE_WS",
     -1,

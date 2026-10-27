@@ -16,8 +16,11 @@
 the delta-rule recurrence over the 1 + NUM_SPEC verify tokens. It commits the golden token's state and each draft's
 records (vn, beta * k, decay), from which the next round replays the accepted drafts.
 
-Grid (H, N, 8), cluster (1, 1, 8), 256 threads. CTA (h, n, s) owns V rows [16 s, 16 s + 16) of local head h for
-request n; warp w owns rows 16 s + 2 w and 16 s + 2 w + 1, and lane l keys k = 32 i + l (i < 4) of each.
+Grid (H, N, V_SPLIT), cluster (1, 1, V_SPLIT), 16 V rows per warp pair: V_SPLIT 8 (the default) runs 256 threads and
+CTA (h, n, s) owns V rows [16 s, 16 s + 16) of local head h for request n; V_SPLIT 4 runs 512 threads over [32 s,
+32 s + 32), so a launch needs half the clusters (bs3 / bs4 fit one wave on GB300: 15 co-resident 8-CTA clusters). Warp
+w owns rows V_CTA s + 2 w and V_CTA s + 2 w + 1, and lane l keys k = 32 i + l (i < 4) of each: the per-row arithmetic,
+and the output norm's partial sums (one per 16 V rows, summed in row order), do not depend on V_SPLIT.
 
 Before ``griddepcontrol.wait`` (written by the previous verify step, or constant):
   the slot and P, the drafts the sampler accepted last round; the starting state into registers (the pool state,
@@ -63,6 +66,10 @@ ROWS = V_CTA // WARPS  # V rows per warp
 VEC = K // 32  # keys per lane
 # one draft's records as the HOIST prologue stages them per CTA: vn of its V rows, then beta * k and the decay
 RECS = V_CTA + 2 * K
+#: The V splits a launch may use (``V_SPLIT``: CTAs per (head, request) cluster); every warp keeps ROWS V rows.
+V_SPLITS = (8, 4)
+#: V rows per output-norm partial sum, whatever the split: the sums and their total keep one grouping.
+NORM_ROWS = 16
 BF16_BYTES = 2
 CHUNK = 8  # bf16 per 16-byte load
 SMEM = cutlass.AddressSpace.smem
@@ -264,7 +271,15 @@ def k3_fp8_kda_verify_kernel(
     HOIST_REPLAY: cutlass.Constexpr[bool],
     ODD_CLAMP: cutlass.Constexpr[bool],
     EARLY_ROWS: cutlass.Constexpr[bool],
+    VSPLIT: cutlass.Constexpr[int],
 ):
+    # The split's CTA shape: V_CTA V rows per CTA, two per warp.
+    V_SPLIT = VSPLIT
+    V_CTA = V // V_SPLIT
+    WARPS = V_CTA // ROWS
+    THREADS = WARPS * 32
+    RECS = V_CTA + 2 * K
+    NORM_GROUPS = V // NORM_ROWS  # norm partials per token, from every CTA of the cluster
     NT = NUM_SPEC + 1  # verify tokens per request
     S = CONV_W - 1 + NUM_SPEC  # conv-cache columns
     HK = H * K
@@ -345,8 +360,8 @@ def k3_fp8_kda_verify_kernel(
         cutlass.Float32, NT * V_CTA, space=SMEM, alignment=16
     )  # bf16-rounded raw outputs
     s_ss = cutlass.Array(
-        cutlass.Float32, V_SPLIT * NT, space=SMEM, alignment=16
-    )  # [source CTA][token]
+        cutlass.Float32, NORM_GROUPS * NT, space=SMEM, alignment=16
+    )  # [16-row group][token]
     s_rs = cutlass.Array(cutlass.Float32, NT, space=SMEM, alignment=16)
     r_st = cutlass.Array(cutlass.Float32, ROWS * VEC, space=RMEM)
 
@@ -369,7 +384,7 @@ def k3_fp8_kda_verify_kernel(
     if warp == 3:
         if prims.elect_sync():
             prims.mbarrier_init(ss_ready, 1)
-            prims.mbarrier_arrive_expect_tx(ss_ready, V_SPLIT * NT * 4)
+            prims.mbarrier_arrive_expect_tx(ss_ready, NORM_GROUPS * NT * 4)
             if cutlass.const_expr(HOIST_REPLAY):
                 prims.mbarrier_init(pro_full, 1)
     prims.fence_mbarrier_init()
@@ -407,7 +422,7 @@ def k3_fp8_kda_verify_kernel(
             wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
             for w in cutlass.range_constexpr(CONV_W):
                 s_wq.store(cutlass.Float32(wq4[w]), idx=w * K + tidx)
-        else:
+        elif tidx < 2 * K:
             ck_w = tidx - K
             wk4 = w_k.load(idx=(ch0 + ck_w) * CONV_W, vector_size=CONV_W, alignment=16)
             for w in cutlass.range_constexpr(CONV_W):
@@ -592,7 +607,7 @@ def k3_fp8_kda_verify_kernel(
             wq4 = w_q.load(idx=(ch0 + tidx) * CONV_W, vector_size=CONV_W, alignment=16)
             for w in cutlass.range_constexpr(CONV_W):
                 s_wq.store(cutlass.Float32(wq4[w]), idx=w * K + tidx)
-        else:
+        elif tidx < 2 * K:
             ck_w = tidx - K
             wk4 = w_k.load(idx=(ch0 + ck_w) * CONV_W, vector_size=CONV_W, alignment=16)
             for w in cutlass.range_constexpr(CONV_W):
@@ -765,23 +780,24 @@ def k3_fp8_kda_verify_kernel(
                     _qk_pre(tk, lane, s_uq, s_wq, s_uk, s_wk, s_q, s_k, scale)
     else:
         if cutlass.const_expr(FOLD_FB):
-            while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
-                pass
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            acc = prims.tcgen05_ld(
-                "32x32b", cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Float32), num=MMA_N
-            )
-            prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-            c_fb = (warp - 4) * 32 + lane
-            for t_fb in cutlass.range_constexpr(NT):
-                s_gr.store(_bf16(cutlass.Float32(acc[t_fb])), idx=t_fb * K + c_fb)
-            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            prims.barrier_cta_sync(1, thread_count=128)
-            if warp == 4:
-                prims.tcgen05_dealloc(
-                    cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Int32), TMEM_COLS
+            if warp < 8:  # warps 4-7: TMEM lanes 0-127
+                while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
+                    pass
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                acc = prims.tcgen05_ld(
+                    "32x32b", cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Float32), num=MMA_N
                 )
-        # v (this CTA's 16 channels) and beta, one (token, channel) per thread of warps 4-7.
+                prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                c_fb = (warp - 4) * 32 + lane
+                for t_fb in cutlass.range_constexpr(NT):
+                    s_gr.store(_bf16(cutlass.Float32(acc[t_fb])), idx=t_fb * K + c_fb)
+                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                prims.barrier_cta_sync(1, thread_count=128)
+                if warp == 4:
+                    prims.tcgen05_dealloc(
+                        cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Int32), TMEM_COLS
+                    )
+        # v (this CTA's V_CTA channels) and beta, one (token, channel) per thread from warp 4 on.
         item_v = tidx - 128
         if item_v < NT * V_CTA:
             t_cv = item_v // V_CTA
@@ -930,14 +946,20 @@ def k3_fp8_kda_verify_kernel(
         o_valid = tidx < NT * V_CTA
         x_o = s_o.load(idx=cutlass.select_(o_valid, tidx, 0))
         ss = cutlass.select_(o_valid, x_o * x_o, cutlass.Float32(0.0))
-        for off_ss in [V_CTA >> d for d in range(1, V_CTA.bit_length()) if V_CTA >> d > 0]:
+        # one partial per NORM_ROWS rows (lanes of one 16-lane group), whatever V_CTA is
+        for off_ss in [
+            NORM_ROWS >> d for d in range(1, NORM_ROWS.bit_length()) if NORM_ROWS >> d > 0
+        ]:
             ss = ss + cute.arch.shuffle_sync_bfly(ss, offset=off_ss, mask=-1, mask_and_clamp=31)
-        if o_valid and tidx % V_CTA == 0:
+        if o_valid and tidx % NORM_ROWS == 0:
+            g_ss = (
+                vs * (V_CTA // NORM_ROWS) + (tidx % V_CTA) // NORM_ROWS
+            )  # the group's first row / NORM_ROWS
             # st.async into every CTA of the cluster (this one too), completing on its mailbox barrier: no cluster
             # barrier, so nothing waits for this CTA's state stores to drain.
             for r in cutlass.range_constexpr(V_SPLIT):
                 _st_async_f32(
-                    _mapa_u32(s_ss.subview(vs * NT + t_out).data_ptr(), r),
+                    _mapa_u32(s_ss.subview(g_ss * NT + t_out).data_ptr(), r),
                     ss,
                     _mapa_u32(ss_ready.data_ptr(), r),
                 )
@@ -948,7 +970,7 @@ def k3_fp8_kda_verify_kernel(
         pass
     if tidx < NT:
         total = cutlass.Float32(0.0)
-        for r in cutlass.range_constexpr(V_SPLIT):
+        for r in cutlass.range_constexpr(NORM_GROUPS):
             total = total + s_ss.load(idx=r * NT + tidx)
         s_rs.store(cute.math.rsqrt(total / V + eps), idx=tidx)
     prims.barrier_cta_sync(0)
@@ -982,7 +1004,7 @@ def k3_fp8_kda_verify_kernel(
         if tidx < K:
             for s in cutlass.range_constexpr(S):
                 cs_q.store(s_uq.load(idx=(s + 1) * K + tidx), idx=(slot * S + s) * HK + ch0 + tidx)
-        else:
+        elif tidx < 2 * K:
             ck_c = tidx - K
             for s in cutlass.range_constexpr(S):
                 cs_k.store(s_uk.load(idx=(s + 1) * K + ck_c), idx=(slot * S + s) * HK + ch0 + ck_c)
@@ -1032,9 +1054,12 @@ def k3_fp8_kda_verify(
     HOIST_REPLAY: cutlass.Constexpr[bool],
     ODD_CLAMP: cutlass.Constexpr[bool],
     EARLY_ROWS: cutlass.Constexpr[bool],
+    VSPLIT: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ) -> None:
-    """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each."""
+    """One launch of the verify kernel for ``n_req`` requests of 1 + NUM_SPEC tokens each, ``VSPLIT`` CTAs per
+    (head, request) (one of ``V_SPLITS``)."""
+    assert VSPLIT in V_SPLITS, VSPLIT
     # W_fb [H K, K] as five TMA dimensions (64-element column chunk, row, chunk index, 1, 1): one call lands the
     # head's 128 rows, both 128-byte-swizzled halves; strides in 16-byte units.
     tma_wfb = cuda.create_tensor_map_tiled(
@@ -1058,7 +1083,8 @@ def k3_fp8_kda_verify(
     k3_fp8_kda_verify_kernel(
         tma_wfb, tma_fa, proj, g_ext, bfa, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok,
         slots, pending, out, proj_words, bfa_words, ssm_stride, H, NUM_SPEC, lower_bound, scale, eps, FOLD_FB,
-        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP, EARLY_ROWS,
+        SEP_BFA, USE_PDL, HOIST_REPLAY, ODD_CLAMP, EARLY_ROWS, VSPLIT,
     ).launch(
-        grid=(H, n_req, V_SPLIT), block=(THREADS, 1, 1), cluster=(1, 1, V_SPLIT), stream=stream, use_pdl=USE_PDL,
+        grid=(H, n_req, VSPLIT), block=(32 * (V // VSPLIT) // ROWS, 1, 1), cluster=(1, 1, VSPLIT), stream=stream,
+        use_pdl=USE_PDL,
     )  # fmt: skip

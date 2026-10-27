@@ -70,6 +70,7 @@ NON_DEFAULT = (
     "TRTLLM_K3LL_MLA_VAR_SPLIT_COUNTS_TILE",
     "TRTLLM_K3LL_MLA_PARTIAL_F16",
     "TRTLLM_K3LL_MLA_COMBINE_EARLY",
+    "TRTLLM_K3LL_KDA_VERIFY_VSPLIT4",
 )
 
 _COUNTS_KERNELS = (
@@ -237,6 +238,13 @@ COVERAGE = {
             LAZY_RAISE,
             f"{_NVFP4}/verify.py::must run once per configuration outside CUDA-graph capture first",
             _ON_OFF,
+        ),
+    ),
+    "TRTLLM_K3LL_KDA_VERIFY_VSPLIT4": (
+        (
+            LAZY_RAISE,
+            f"{_NVFP4}/verify.py::must run once per configuration outside CUDA-graph capture first",
+            Values((0, 1, 2, 3, 4)),
         ),
     ),
     # speculative decoding / drafter
