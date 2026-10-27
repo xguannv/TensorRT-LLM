@@ -302,7 +302,7 @@ TEST_F(AbsentPrefixTest, CapacityBelowAbsent)
 }
 
 // A commit that ends inside the absent prefix leaves committed and uncommitted absent blocks side
-// by side. A second ctest entry runs this test with TLLM_DEBUG_MODE=1 (CMakeLists.txt): the
+// by side. A second ctest entry runs this suite with TLLM_DEBUG_MODE=1 (CMakeLists.txt): the
 // cache's sanity check then runs after every resize and commit (the mode is read once, at load).
 TEST_F(AbsentPrefixTest, PartialCommitInsideAbsentPrefix)
 {
