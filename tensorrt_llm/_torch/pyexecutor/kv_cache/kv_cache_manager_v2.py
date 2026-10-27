@@ -1238,7 +1238,7 @@ def _holds_drafter_window(req: LlmRequest) -> bool:
     """Whether ``req``'s draft mirror holds a received drafter prompt window
     (``prepare_drafter_window_receive``, TRTLLM_K3LL_DRAFTER_PROMPT_CTX) rather than the request's
     own tokens."""
-    return req.is_generation_only_request and getattr(req, "py_drafter_window", None) is not None
+    return getattr(req, "py_drafter_window", None) is not None and req.is_generation_only_request
 
 
 class KVCacheManagerV2(BaseResourceManager):
