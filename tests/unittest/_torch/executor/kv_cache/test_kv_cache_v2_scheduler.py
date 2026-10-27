@@ -625,6 +625,8 @@ def make_kv_cache_manager(
     # and both feed _spec_recompute_tail/is_draft into the reuse-claim cap.
     mgr._spec_recompute_tail = 0
     mgr.is_draft = False
+    # No tail-only drafter pool (TRTLLM_K3LL_DRAFTER_PROMPT_CTX): the joint claim pairs as usual.
+    mgr.drafter_prompt_tail = 0
     mgr.context_replay_tokens.side_effect = lambda req: (
         encoder_replay_tokens(req) if isinstance(req.py_ced_replay, EncoderReplay) else None
     )

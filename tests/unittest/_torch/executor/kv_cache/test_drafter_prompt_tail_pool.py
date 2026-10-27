@@ -254,7 +254,9 @@ def test_window_complete_on_linear_growth_after_eviction(pairs):
     stored = list(range(6 * TPB))
     grown = stored + list(range(7000, 7000 + 2 * TPB))
     pair.prefill(stored)
-    pair.evict_draft_until(lambda: pair.probes(stored)[0] == 0)
+    # Probe with the grown prompt: its window at len(stored) needs only the stored prompt's last
+    # pages, which the draft can keep after the stored prompt's own (shorter) match is gone.
+    pair.evict_draft_until(lambda: pair.probes(grown)[0] == 0)
     draft_match, target_match = pair.probes(grown)
     assert draft_match == 0 and target_match == len(stored)
 
