@@ -1020,6 +1020,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # cannot reconstruct it.
         self.py_served_prefix_end = 0
 
+        # A tail-only draft pool's absent-prefix claim (TRTLLM_K3LL_DRAFTER_PROMPT_CTX): the first
+        # prompt position whose drafter rows this request computes; 0 otherwise. Off a page
+        # boundary, the draft cache commits nothing and the window sent starts at the next page.
+        self.py_drafter_valid_from = 0
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,

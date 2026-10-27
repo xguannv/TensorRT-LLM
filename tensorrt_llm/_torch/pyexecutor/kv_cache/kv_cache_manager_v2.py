@@ -4006,8 +4006,12 @@ class KVCacheManagerV2(BaseResourceManager):
         ``absent_before`` (the core's ``absent_before``): the drafter stores
         the prompt from there, where the shared cursor starts. Its commit
         still names the whole prompt, so the tree keeps one path per prompt;
-        the absent blocks carry no page from this cache. False on a failed
-        create or resume, as ``prepare_context_cache``.
+        the absent blocks carry no page from this cache. When the shared
+        cursor starts inside the page at ``absent_before`` (the request's
+        ``py_drafter_valid_from`` is not on a page boundary), the page's
+        leading rows are never written and ``try_commit_blocks`` commits
+        nothing for this cache. False on a failed create or resume, as
+        ``prepare_context_cache``.
         """
         assert self.is_draft and self.drafter_prompt_tail > 0
         assert absent_before % self.tokens_per_block == 0, absent_before
@@ -5749,6 +5753,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         commit_end = request.context_current_position
+        if self.is_draft and getattr(request, "py_drafter_valid_from", 0) % self.tokens_per_block:
+            # The draft started inside a page it did not fill
+            # (prepare_absent_prefix_context_cache): publish none of it.
+            commit_end = kv_cache.num_committed_tokens
         if commit_end > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),

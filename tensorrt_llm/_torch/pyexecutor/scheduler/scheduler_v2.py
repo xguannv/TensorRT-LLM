@@ -1192,7 +1192,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         counters.count("tail_rule", tokens=depth - min(draft_match, target_match))
         return depth
 
-    def _prepare_absent_draft_pair(self, req: LlmRequest, depth: int) -> bool:
+    def _claim_target(self, req: LlmRequest, limit: int) -> int | None:
+        """Claim the target at most ``limit`` deep, dropping any earlier claim of this request."""
+        if req.py_request_id in self.kv_cache_manager.kv_cache_map:
+            self.kv_cache_manager.free_resources(req)
+        return self.kv_cache_manager.prepare_context_cache(req, limit)
+
+    def _prepare_absent_draft_pair(self, req: LlmRequest, depth: int, target_match: int) -> bool:
         """Claim the target at ``depth`` and start the draft there with no pages before it.
 
         The draft cache's prefix ``[0, h0)`` is absent (``absent_before``):
@@ -1200,28 +1206,41 @@ class KVCacheV2Scheduler(RequestScheduler):
         did not compute never reaches its radix tree. ``h0`` is the target's
         claim on a draft page boundary; an unaligned claim is re-claimed one
         partial page shallower.
+
+        A target that resumes only at recorded points (a hybrid model's
+        recurrent-state snapshots, usually earlier prompt ends) can match less
+        than either depth: then the target keeps its own match
+        ``target_match`` (or what it holds of it) as it would without a
+        drafter, unaligned if need be. On an unaligned claim ``c`` the draft's
+        page ``floor(c)`` starts with rows the draft never computes, so that
+        draft cache commits nothing, and the request carries
+        ``py_drafter_valid_from = c``: the window sent starts at the first
+        whole page from ``c`` (``_describe_draft_window``).
         """
         from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
 
         draft_manager = self._joint_draft_manager
         tokens_per_block = draft_manager.tokens_per_block
-        limit = depth
-        for _ in range(2):
-            common_reuse = self.kv_cache_manager.prepare_context_cache(req, limit)
-            if common_reuse is None:
-                self._free_kv_caches(req)
-                return False
-            if common_reuse % tokens_per_block == 0:
-                break
-            self.kv_cache_manager.free_resources(req)
-            limit = common_reuse // tokens_per_block * tokens_per_block
-        else:
-            # An eviction between the claims left another partial page: no reuse.
-            common_reuse = self.kv_cache_manager.prepare_context_cache(req, 0)
-            if common_reuse is None:
-                self._free_kv_caches(req)
-                return False
-        if not draft_manager.prepare_absent_prefix_context_cache(req, common_reuse):
+        common_reuse = self._claim_target(req, depth)
+        if common_reuse is not None and common_reuse < depth and common_reuse < target_match:
+            # The target cannot resume at the rule's depth: keep its own match.
+            self._drafter_tail_counters().count("target_kept", tokens=target_match)
+            common_reuse = self._claim_target(req, target_match)
+        if common_reuse is not None and common_reuse % tokens_per_block:
+            unaligned = common_reuse
+            aligned = unaligned // tokens_per_block * tokens_per_block
+            common_reuse = self._claim_target(req, aligned)
+            if common_reuse is not None and common_reuse != aligned:
+                # No resume point at the page boundary either: keep the unaligned claim.
+                self._drafter_tail_counters().count("unaligned_claims", tokens=unaligned)
+                common_reuse = self._claim_target(req, unaligned)
+        if common_reuse is None:
+            self._free_kv_caches(req)
+            return False
+        absent_before = common_reuse // tokens_per_block * tokens_per_block
+        req.py_drafter_valid_from = common_reuse
+        if not draft_manager.prepare_absent_prefix_context_cache(req, absent_before):
+            req.py_drafter_valid_from = 0
             self._free_kv_caches(req)
             return False
         _settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
@@ -1288,10 +1307,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._suspend_request(req)
             return False
 
+        req.py_drafter_valid_from = 0
         probes = self._probe_pair(req)
         tail_depth = self._drafter_tail_claim(req, probes)
         if tail_depth is not None:
-            return self._prepare_absent_draft_pair(req, tail_depth)
+            return self._prepare_absent_draft_pair(req, tail_depth, probes[1])
 
         # Both pools claim the depth paired above, so they normally agree first
         # time; the target claim still caps to the draft's in case an eviction

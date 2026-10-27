@@ -277,6 +277,69 @@ def test_window_complete_on_linear_growth_after_eviction(pairs):
     assert pair.probes(extended) == (len(grown), len(grown))
 
 
+def _resume_only_at(pair, points, monkeypatch):
+    """Make the target resume only at ``points`` (and 0), as a hybrid model's recurrent-state
+    snapshots do: its probe and its claims snap down to the deepest point at or below what the
+    attention pages would allow."""
+    target = pair.target
+    claim, probe = target.prepare_context_cache, target.probe_context_reuse
+
+    def snap(depth):
+        return max((p for p in points if p <= depth), default=0)
+
+    def snapped_claim(req, reuse_limit=None):
+        reused = claim(req, reuse_limit)
+        if reused is None or snap(reused) == reused:
+            return reused
+        target.free_resources(req)
+        return claim(req, snap(reused))
+
+    def snapped_probe(req):
+        depth = probe(req)
+        return None if depth is None else snap(depth)
+
+    monkeypatch.setattr(target, "prepare_context_cache", snapped_claim)
+    monkeypatch.setattr(target, "probe_context_reuse", snapped_probe)
+
+
+@pytest.mark.parametrize("new_tokens", [TPB, WINDOW + TPB], ids=["turn_lt_W", "turn_ge_W"])
+@pytest.mark.parametrize("stored_len", [6 * TPB + 5, 6 * TPB], ids=["end_unaligned", "end_aligned"])
+def test_target_resuming_only_at_snapshots_keeps_its_reuse(
+    pairs, monkeypatch, stored_len, new_tokens
+):
+    """A target that resumes only at snapshot points (the stored prompt's end) keeps that reuse
+    after the draft lost the stored prompt, whether or not the end is on a page boundary and
+    whether or not the new turn is shorter than W.
+
+    The rule's depth (the window start, or the end's page floor) has no snapshot below it, so
+    the target keeps its own match, as without a drafter. The draft starts at that position:
+    absent before its page floor, the window sent from the first whole page from it, and when
+    the claim is inside a page the draft commits nothing (its first page has rows it never
+    wrote); on a page boundary it commits as before.
+    """
+    pair = pairs(tail=True)
+    stored = list(range(stored_len))
+    grown = stored + list(range(7000, 7000 + new_tokens))
+    _resume_only_at(pair, {stored_len}, monkeypatch)
+    pair.prefill(stored)
+    pair.evict_draft_until(lambda: pair.probes(grown)[0] == 0)
+    assert pair.probes(grown) == (0, stored_len)
+
+    req, reused = pair.prefill(grown, keep=True)
+    assert reused == stored_len
+    assert req.py_drafter_valid_from == stored_len
+    kv_cache = pair.draft.kv_cache_map[req.py_request_id]
+    assert kv_cache.absent_before == stored_len // TPB * TPB
+    pages = _draft_pages(pair, req)
+    first, end = -(-stored_len // TPB), -(-len(grown) // TPB)
+    assert all(p != BAD_PAGE_INDEX for p in pages[first:end]), pages
+    pair.free(req)
+
+    extended = grown + list(range(9000, 9000 + TPB))
+    draft_match, _ = pair.probes(extended)
+    assert draft_match == (0 if stored_len % TPB else len(grown))
+
+
 @pytest.mark.parametrize("draft_evicted", [False, True], ids=["draft_hit", "draft_lost"])
 def test_branch_hit_past_the_window_start_keeps_the_window_whole(pairs, draft_evicted):
     """A branch hit at c > s (P - c < W): the window starts before the branch point.

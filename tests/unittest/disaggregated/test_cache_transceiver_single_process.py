@@ -2499,6 +2499,48 @@ def test_context_reports_exactly_the_drafter_window_it_sends(missing, sent):
     assert received_drafter_window(gen, 16) == sent
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "valid_from, sent",
+    [(40, (64, 64)), (64, (64, 64)), (70, (80, 48)), (120, None)],
+    ids=["before_window", "on_window_start", "inside_first_page", "inside_last_page"],
+)
+def test_context_sends_no_page_before_the_drafter_rows_it_computed(valid_from, sent):
+    """A context sends no drafter page before the first row its drafter computed.
+
+    An absent-prefix claim inside a page (``py_drafter_valid_from``) leaves that page's leading
+    rows unwritten, so the window sent and reported starts at the next page boundary. Prompt 128,
+    W 64, 16-token pages, every page held: the window is pages 4-7.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import _DrafterWindowCounters
+
+    ordinals = np.array([100 + i for i in range(8)], dtype=np.int64)
+    tx = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
+    tx._draft_kv_cache_manager = SimpleNamespace(tokens_per_block=16)
+    tx._draft_reuse_adapter = SimpleNamespace(get_block_ordinals=lambda req, idx, lg: ordinals)
+    tx._page_table = SimpleNamespace(layer_groups=["target", "draft"])
+    tx._num_target_layer_groups = 1
+    tx._draft_capture_only = True
+    tx._draft_prompt_window = 64
+    tx._draft_window_counters = _DrafterWindowCounters("ctx", 0)
+    req = SimpleNamespace(
+        py_request_id=7,
+        is_context_only_request=True,
+        is_generation_only_request=False,
+        total_input_len_cp=128,
+        py_drafter_valid_from=valid_from,
+    )
+
+    (pages,) = tx._describe_draft_window(req)
+
+    assert req.py_drafter_ctx_window == sent
+    if sent is None:
+        assert pages.size == 0
+        return
+    start, _ = sent
+    assert pages.tolist() == [100 + i for i in range(start // 16, 8)]
+
+
 # ---------------------------------------------------------------------------
 # Boundary request-length tests
 # ---------------------------------------------------------------------------

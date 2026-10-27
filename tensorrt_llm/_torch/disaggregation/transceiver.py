@@ -845,6 +845,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 (int(np.flatnonzero(pages < 0)[-1]) + 1 for pages in groups if (pages < 0).any()),
                 default=0,
             )
+            # Nor a page with rows before the first one this request's drafter computes (an
+            # absent-prefix claim inside a page, py_drafter_valid_from).
+            valid_from = getattr(req, "py_drafter_valid_from", 0)
+            keep_from = max(keep_from, -(-valid_from // tpb) - first_page)
             if keep_from >= num_pages:
                 req.py_drafter_ctx_window = None
                 self._draft_window_counters.count("window_not_held")
