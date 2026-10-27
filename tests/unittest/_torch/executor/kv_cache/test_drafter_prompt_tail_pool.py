@@ -313,9 +313,10 @@ def test_target_resuming_only_at_snapshots_keeps_its_reuse(
 
     The rule's depth (the window start, or the end's page floor) has no snapshot below it, so
     the target keeps its own match, as without a drafter. The draft starts at that position:
-    absent before its page floor, the window sent from the first whole page from it, and when
-    the claim is inside a page the draft commits nothing (its first page has rows it never
-    wrote); on a page boundary it commits as before.
+    absent before its page floor, holding every window page from the first whole page from it,
+    and when the claim is inside a page it commits nothing (its first page has rows it never
+    wrote). A later prompt finds the draft at this prompt's end only when the draft computed a
+    whole sliding window there: a claim on a page boundary and a turn of at least W tokens.
     """
     pair = pairs(tail=True)
     stored = list(range(stored_len))
@@ -330,14 +331,17 @@ def test_target_resuming_only_at_snapshots_keeps_its_reuse(
     assert req.py_drafter_valid_from == stored_len
     kv_cache = pair.draft.kv_cache_map[req.py_request_id]
     assert kv_cache.absent_before == stored_len // TPB * TPB
+    window_start, _ = drafter_window(len(grown), WINDOW, TPB)
     pages = _draft_pages(pair, req)
-    first, end = -(-stored_len // TPB), -(-len(grown) // TPB)
+    first = max(-(-stored_len // TPB), window_start // TPB)
+    end = -(-len(grown) // TPB)
     assert all(p != BAD_PAGE_INDEX for p in pages[first:end]), pages
     pair.free(req)
 
     extended = grown + list(range(9000, 9000 + TPB))
     draft_match, _ = pair.probes(extended)
-    assert draft_match == (0 if stored_len % TPB else len(grown))
+    whole_window = stored_len % TPB == 0 and new_tokens >= WINDOW
+    assert draft_match == (len(grown) if whole_window else 0)
 
 
 @pytest.mark.parametrize("draft_evicted", [False, True], ids=["draft_hit", "draft_lost"])
