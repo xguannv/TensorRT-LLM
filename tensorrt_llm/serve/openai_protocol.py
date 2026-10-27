@@ -312,6 +312,11 @@ class DisaggregatedParams(OpenAIBaseModel):
         default=None,
         description=
         "Prompt-token boundary transferred by a remote-tail context worker.")
+    drafter_ctx_window: Optional[List[NonNegativeInt]] = Field(
+        default=None,
+        description=
+        "[start, length] of the drafter prompt window a context worker sent "
+        "with the KV cache.")
     multimodal_positions: Optional[List[NonNegativeInt]] = Field(
         default=None,
         description="Prompt-token offset of each multimodal item.")
@@ -1996,6 +2001,7 @@ def to_disaggregated_params(
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
         remote_tail_start=tllm_disagg_params.remote_tail_start,
+        drafter_ctx_window=tllm_disagg_params.drafter_ctx_window,
         multimodal_positions=tllm_disagg_params.multimodal_positions,
         multimodal_lengths=tllm_disagg_params.multimodal_lengths,
     )
@@ -2023,6 +2029,7 @@ def to_llm_disaggregated_params(
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
         remote_tail_start=disaggregated_params.remote_tail_start,
+        drafter_ctx_window=disaggregated_params.drafter_ctx_window,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
     )

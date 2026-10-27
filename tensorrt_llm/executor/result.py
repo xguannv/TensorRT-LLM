@@ -228,6 +228,16 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
+def _drafter_ctx_window(response_result) -> Optional[List[int]]:
+    """``[start, length]`` of the drafter prompt window a context worker sent, or None.
+
+    Read from the Python ``LlmResult`` (TRTLLM_K3LL_DRAFTER_PROMPT_CTX); None when it sent none,
+    and for the C++ ``Result``, which has no such field.
+    """
+    window = getattr(response_result, "drafter_ctx_window", None)
+    return None if window is None else [int(window[0]), int(window[1])]
+
+
 class GenerationResultBase:
     """This holds the core logic of the GenerationResult class."""
 
@@ -688,6 +698,7 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
+                    drafter_ctx_window=_drafter_ctx_window(response_result),
                     multimodal_embedding_handles=None,
                 )
 

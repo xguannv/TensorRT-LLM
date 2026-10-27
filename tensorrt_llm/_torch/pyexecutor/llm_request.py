@@ -793,6 +793,9 @@ class LlmResult:
         self.ctx_usage = None
         # Explicit context-to-generation remote-tail replay boundary.
         self.remote_tail_start: Optional[int] = None
+        # The drafter prompt window (start, length) a context worker sent
+        # (TRTLLM_K3LL_DRAFTER_PROMPT_CTX); None when it sent none.
+        self.drafter_ctx_window: Optional[tuple] = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -1282,6 +1285,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         )
         if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
             llm_result.remote_tail_start = self.py_csa2_remote_tail_start
+        llm_result.drafter_ctx_window = getattr(self, "py_drafter_ctx_window",
+                                                None)
         llm_result.cached_tokens = self.cached_tokens
         return LlmResponse(
             request_id=self.py_request_id

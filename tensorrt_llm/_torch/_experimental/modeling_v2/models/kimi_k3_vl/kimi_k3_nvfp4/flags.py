@@ -291,15 +291,19 @@ TRTLLM_K3LL_DRAFTER_CTX_SIDE = _flag(
 )
 TRTLLM_K3LL_DRAFTER_PROMPT_CTX = _flag(
     "TRTLLM_K3LL_DRAFTER_PROMPT_CTX",
-    0,
+    -1,
     "disaggregated serving with the MLA DSpark drafter: the gen drafter's context starts with the drafter K/V of the "
-    "last W prompt tokens (whole pages), computed on the ctx and sent with the target KV. 0 (default): off, the gen "
-    "drafter sees generated tokens only; W > 0: that window (a W at least the prompt length sends the whole prompt). "
-    "On a ctx worker (TRTLLM_DISAGG_ROLE=context) with a DSpark speculative_config it loads a capture-only drafter "
-    "(context_proj, context_norm and the latent projection + norm, no draft forward) that keeps the drafter K/V of "
-    "every prompt position in a draft pool reused jointly with the target's. Read at load (ctx) and per received "
-    "request (gen)",
-    accepted=Range(0),  # 0 off; W > 0 the window in tokens
+    "last W prompt tokens (whole pages), computed on the ctx and sent with the target KV; the ctx reports the window "
+    "it sent (start, length) in the context response's disaggregated params, and the gen admits exactly that (none "
+    "reported: generated tokens only). -1 (default): W = 16384 on SM103 only (k3ll_flags."
+    "DRAFTER_PROMPT_CTX_CAPABILITIES), elsewhere off; 1: W = 16384 on any arch; W >= 2: that window (a W at least the "
+    "prompt length sends the whole prompt); 0: off, the ctx loads no drafter (a DSpark speculative_config on a ctx "
+    "is dropped there) and the gen drafter sees generated tokens only. Resolved in one place, k3ll_flags."
+    "drafter_prompt_window. On a ctx worker (TRTLLM_DISAGG_ROLE=context) with a DSpark speculative_config it loads a "
+    "capture-only drafter (context_proj, context_norm and the latent projection + norm, no draft forward) that keeps "
+    "the drafter K/V of every prompt position in a draft pool reused jointly with the target's; a ctx without a "
+    "DSpark speculative_config is unchanged. Read at load (ctx) and per received request (gen)",
+    accepted=Range(-1),  # -1 default (SM103 on); 0 off; 1 on at 16384; W >= 2 the window in tokens
 )
 TRTLLM_K3LL_KDA_BFA_OVERLAP = _flag(
     "TRTLLM_K3LL_KDA_BFA_OVERLAP",

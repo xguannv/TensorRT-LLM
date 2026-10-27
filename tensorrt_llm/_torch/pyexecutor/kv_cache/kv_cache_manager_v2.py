@@ -1234,6 +1234,13 @@ def _spec_recompute_claim_limit(
     return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
+def _holds_drafter_window(req: LlmRequest) -> bool:
+    """Whether ``req``'s draft mirror holds a received drafter prompt window
+    (``prepare_drafter_window_receive``, TRTLLM_K3LL_DRAFTER_PROMPT_CTX) rather than the request's
+    own tokens."""
+    return req.is_generation_only_request and getattr(req, "py_drafter_window", None) is not None
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
@@ -1248,8 +1255,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
     # Draft managers: the drafter prompt window in tokens (TRTLLM_K3LL_DRAFTER_PROMPT_CTX), set
-    # where the transceiver is built. Positive means a disaggregated generation request receives
-    # that window into its draft mirror (prepare_drafter_window_receive). 0 means no draft transfer.
+    # where the transceiver is built. Positive means the draft pool takes part in the transfer: a
+    # disaggregated generation request whose context reported a window receives it into its draft
+    # mirror (prepare_drafter_window_receive). 0 means no draft transfer.
     drafter_prompt_window: int = 0
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
@@ -4051,14 +4059,16 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
 
-    def prepare_drafter_window_receive(self, req: LlmRequest, length: int) -> bool:
+    def prepare_drafter_window_receive(self, req: LlmRequest, start: int, length: int) -> bool:
         """Size a disaggregated generation request's draft mirror to its drafter prompt window.
 
-        Draft managers only (``drafter_prompt_window`` > 0, TRTLLM_K3LL_DRAFTER_PROMPT_CTX).
-        The receive writes the window's ``length`` latents into the mirror's pages
-        ``[0, ceil(length / tpb))``, so they must exist before the receive is published. Capacity
-        is ``length`` plus the draft growth, and the history is ``length``. Later generation
-        steps grow the mirror from there (``_prepare_draft_resources``).
+        Draft managers only (``drafter_prompt_window`` > 0, TRTLLM_K3LL_DRAFTER_PROMPT_CTX), for
+        the window ``(start, length)`` the request's context reported. The receive writes the
+        window's ``length`` latents into the mirror's pages ``[0, ceil(length / tpb))``, so they
+        must exist before the receive is published. Capacity is ``length`` plus the draft growth,
+        and the history is ``length``. Later generation steps grow the mirror from there
+        (``_prepare_draft_resources``). On success the request carries ``py_drafter_window`` =
+        ``(start, length)``, which the transceiver lists and the draft resource steps key on.
 
         Call it before the target's ``prepare_disagg_gen_init`` on the same stream. The target's
         readiness event then also covers this resize: both managers run on the executor stream,
@@ -4075,6 +4085,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if not kv_cache.resize(capacity, length):
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
+        req.py_drafter_window = (start, length)
         return True
 
     def take_disagg_receive_ready(self, req: LlmRequest) -> torch.cuda.Event | None:
@@ -4743,7 +4754,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # separate draft engine still uses the legacy draft request view.
         with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
             for req in scheduled_batch.context_requests:
-                if self.drafter_prompt_window > 0 and req.is_generation_only_request:
+                if _holds_drafter_window(req):
                     # A disaggregated generation request's mirror holds its drafter prompt
                     # window: prepare_drafter_window_receive created and sized it at admission
                     # (history = window length), and generation steps grow it from there.
@@ -6551,7 +6562,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 # position 0, not the request's tokens, and is never reused.
                 if self.kv_compression_manages_history
                 or self._has_cp_helix
-                or (self.drafter_prompt_window > 0 and req.is_generation_only_request)
+                or _holds_drafter_window(req)
                 else req.max_beam_num_tokens - 1
             )
             success = kv_cache.resize(new_capacity, history_length)

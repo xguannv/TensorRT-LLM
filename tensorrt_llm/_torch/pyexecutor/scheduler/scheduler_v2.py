@@ -852,12 +852,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.SCHEDULED, 0
 
     def _prepare_drafter_window_receive(self, req: LlmRequest) -> bool:
-        """Size the draft mirror for the request's drafter prompt window, if the draft manager
-        receives one (``drafter_prompt_window`` > 0); True when there is nothing to do.
+        """Size the draft mirror for the drafter prompt window the request's context reported, if
+        the draft manager takes part in the draft transfer (``drafter_prompt_window`` > 0); True
+        when there is nothing to do.
 
-        The window is ``drafter_window`` of the global prompt length, which is what the
-        transceiver lists. If the draft manager runs on another stream, the target's stream
-        waits for it, so the target's readiness event covers the draft resize too.
+        The window is the ``(start, length)`` the context sent (``received_drafter_window``), not
+        one computed from this worker's own switch, so a context with another window, or one that
+        sent none, is received as it was sent. Without a reported window no draft page is taken
+        for it, and the request's drafter sees generated tokens only. If the draft manager runs on
+        another stream, the target's stream waits for it, so the target's readiness event covers
+        the draft resize too.
         """
         draft = self.draft_kv_cache_manager
         window = getattr(draft, "drafter_prompt_window", 0) if draft is not None else 0
@@ -865,10 +869,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             return True
         import torch
 
-        from ...disaggregation.transceiver import drafter_window
+        from ...disaggregation.transceiver import received_drafter_window
 
-        _, length = drafter_window(req.total_input_len_cp, window, draft.tokens_per_block)
-        if not draft.prepare_drafter_window_receive(req, length):
+        reported = received_drafter_window(req, draft.tokens_per_block)
+        if reported is None:
+            return True
+        start, length = reported
+        if not draft.prepare_drafter_window_receive(req, start, length):
             return False
         target_stream = getattr(self.kv_cache_manager, "_stream", None)
         draft_stream = getattr(draft, "_stream", None)

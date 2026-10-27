@@ -8,8 +8,9 @@
 * Agg reference: ``DFlashWorker._store_prefill_context`` -- the worker's own store, chunked prefill included --
   writes bitwise the same latents into the context cache with it as with the full ``MLADSparkForCausalLM`` of the
   same weights.
-* It is built only on a context worker (``TRTLLM_DISAGG_ROLE=context``) with the switch > 0; the switch at 0 (the
-  default) builds the full drafter, as before.
+* It is built only on a context worker (``TRTLLM_DISAGG_ROLE=context``) where the switch resolves to a window > 0;
+  elsewhere the full drafter is built, as before. The switch's spelling, default and serve-side handling are in
+  ``test_k3_drafter_prompt_ctx_default.py``.
 
 The generation worker's half of the interface: the received window, stored by the context at absolute positions
 s .. P-1, is moved to 0 .. L-1 once (``DSparkMLAContextRenumber``, applied in the draft pool by the transceiver's
@@ -249,34 +250,6 @@ def test_capture_only_needs_the_context_role_and_the_switch(monkeypatch):
     assert not modeling_dspark.dspark_capture_only()
 
 
-def test_serve_carries_the_role_to_the_model_ranks(monkeypatch):
-    """With the switch on, the model ranks get the role through env_overrides, which every rank applies before its
-    build. With it off, nothing is carried: other readers of the role on the model ranks see what they did before."""
-    from tensorrt_llm.commands import serve
-
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
-    monkeypatch.setenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX", "16384")
-    args = {"env_overrides": None}
-    serve._carry_disagg_role_to_model_ranks(args)
-    assert args["env_overrides"] == {"TRTLLM_DISAGG_ROLE": "context"}
-    args = {"env_overrides": {"A": "1", "TRTLLM_DISAGG_ROLE": "generation"}}
-    serve._carry_disagg_role_to_model_ranks(args)
-    assert args["env_overrides"] == {"A": "1", "TRTLLM_DISAGG_ROLE": "generation"}
-    for off in ("0", ""):
-        monkeypatch.setenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX", off)
-        args = {"env_overrides": None}
-        serve._carry_disagg_role_to_model_ranks(args)
-        assert args == {"env_overrides": None}
-    monkeypatch.delenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX")
-    serve._carry_disagg_role_to_model_ranks(args)
-    assert args == {"env_overrides": None}
-    monkeypatch.setenv("TRTLLM_K3LL_DRAFTER_PROMPT_CTX", "16384")
-    monkeypatch.delenv("TRTLLM_DISAGG_ROLE")
-    args = {}
-    serve._carry_disagg_role_to_model_ranks(args)
-    assert args == {}
-
-
 def test_capture_only_ctx_keeps_no_kda_draft_records(monkeypatch):
     """A context worker with the capture-only drafter never verifies: no draft records, so block reuse stays."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import (
@@ -459,14 +432,6 @@ def test_kda_verify_without_verify_state_raises():
     cache = SimpleNamespace(has_kda_replay_caches=False, conv=None, temporal=None)
     with pytest.raises(RuntimeError, match="capture-only context worker"):
         KimiKDALinearAttention.forward_verify(layer, torch.zeros(8, 4), 8, cache, None, None, None)
-
-
-def test_switch_default_off_and_documented():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4 import flags
-
-    _, default, doc = flags.flags()["TRTLLM_K3LL_DRAFTER_PROMPT_CTX"]
-    assert default == 0
-    assert "0 (default): off" in doc and "TRTLLM_DISAGG_ROLE=context" in doc
 
 
 @needs_cuda

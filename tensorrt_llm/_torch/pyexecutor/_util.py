@@ -3991,6 +3991,76 @@ def _target_verifies_drafts(spec_config, model_engine) -> bool:
     return not getattr(drafter, "CAPTURE_ONLY", False)
 
 
+def _drafter_prompt_window_transfer_kwargs(draft_kv_cache_manager,
+                                           kv_cache_manager,
+                                           cache_transceiver_config,
+                                           model_engine, mapping) -> dict:
+    """The draft arguments of ``create_kv_cache_transceiver`` for TRTLLM_K3LL_DRAFTER_PROMPT_CTX.
+
+    With the switch's window W > 0 (``k3ll_flags.drafter_prompt_window``) and a
+    separate draft KV cache manager, the Python transceiver also moves each
+    request's drafter prompt window (see ``drafter_window`` in
+    disaggregation/transceiver.py): a context worker sends the last W prompt
+    tokens' drafter K/V, a generation worker receives the window its context
+    reports. Empty (no draft transfer, the transceiver as without the switch)
+    when the switch resolves to 0, or without a transceiver or a separate draft
+    manager. At the default (-1) a deployment that cannot take part (a drafter
+    without ``context_renumber``, i.e. not the MLA DSpark drafter, a draft
+    manager that is not a KVCacheManagerV2, the C++ transceiver, or PP > 1)
+    stays off; a value set explicitly raises there instead.
+    """
+    if (draft_kv_cache_manager is None
+            or draft_kv_cache_manager is kv_cache_manager
+            or cache_transceiver_config is None
+            or cache_transceiver_config.backend is None):
+        return {}
+    from . import k3ll_flags
+    window = k3ll_flags.drafter_prompt_window()
+    if window <= 0:
+        return {}
+    drafter_model = getattr(getattr(model_engine, "model", None), "draft_model",
+                            None)
+    context_renumber = getattr(drafter_model, "context_renumber", None)
+    if k3ll_flags.k3ll_flag_any_target(k3ll_flags.DRAFTER_PROMPT_CTX) == -1:
+        blockers = []
+        if context_renumber is None:
+            blockers.append(
+                f"drafter {type(drafter_model).__name__} has no context_renumber"
+            )
+        if not isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+            blockers.append(f"draft KV cache manager "
+                            f"{type(draft_kv_cache_manager).__name__}")
+        if cache_transceiver_config.transceiver_runtime != "PYTHON":
+            blockers.append("transceiver_runtime "
+                            f"{cache_transceiver_config.transceiver_runtime}")
+        if getattr(mapping, "pp_size", 1) != 1:
+            blockers.append(f"pp_size {mapping.pp_size}")
+        if blockers:
+            logger.info(
+                "TRTLLM_K3LL_DRAFTER_PROMPT_CTX at its default stays off here: "
+                + "; ".join(blockers))
+            return {}
+    if context_renumber is None:
+        # The drafter's own position shift, which a generation rank applies to
+        # the received window; a drafter without one cannot take part.
+        raise ValueError(
+            "TRTLLM_K3LL_DRAFTER_PROMPT_CTX > 0 needs a drafter with "
+            "context_renumber (the MLA DSpark drafter), got "
+            f"{type(drafter_model).__name__}")
+    # The scheduler sizes a generation request's draft mirror to a received
+    # window before its receive is published; > 0 marks the manager as one that
+    # takes part.
+    draft_kv_cache_manager.drafter_prompt_window = window
+    logger.info(f"TRTLLM_K3LL_DRAFTER_PROMPT_CTX: drafter prompt window "
+                f"W={window} (capture_only="
+                f"{getattr(drafter_model, 'CAPTURE_ONLY', False)})")
+    return dict(draft_kv_cache_manager=draft_kv_cache_manager,
+                draft_prompt_window=window,
+                draft_context_renumber=context_renumber(),
+                draft_capture_only=getattr(drafter_model, "CAPTURE_ONLY",
+                                           False))
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -4368,38 +4438,9 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
-    # TRTLLM_K3LL_DRAFTER_PROMPT_CTX = W > 0 with a separate draft KV cache
-    # manager: the Python transceiver also sends each request's drafter K/V of
-    # its last W prompt tokens (see drafter_window in disaggregation/transceiver.py).
-    draft_transfer_kwargs = {}
-    transfer_draft_manager = resources.get(
-        ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-    if (transfer_draft_manager is not None
-            and transfer_draft_manager is not kv_cache_manager
-            and cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None):
-        from .k3ll_flags import k3ll_flag_any_target
-        draft_prompt_window = k3ll_flag_any_target(
-            "TRTLLM_K3LL_DRAFTER_PROMPT_CTX")
-        if draft_prompt_window > 0:
-            # The drafter's own position shift, which a generation rank applies
-            # to the received window; a drafter without one cannot take part.
-            drafter_model = getattr(model_engine.model, "draft_model", None)
-            context_renumber = getattr(drafter_model, "context_renumber", None)
-            if context_renumber is None:
-                raise ValueError(
-                    "TRTLLM_K3LL_DRAFTER_PROMPT_CTX > 0 needs a drafter with "
-                    "context_renumber (the MLA DSpark drafter), got "
-                    f"{type(drafter_model).__name__}")
-            # The scheduler sizes a generation request's draft mirror to the
-            # window before its receive is published.
-            transfer_draft_manager.drafter_prompt_window = draft_prompt_window
-            draft_transfer_kwargs = dict(
-                draft_kv_cache_manager=transfer_draft_manager,
-                draft_prompt_window=draft_prompt_window,
-                draft_context_renumber=context_renumber(),
-                draft_capture_only=getattr(drafter_model, "CAPTURE_ONLY",
-                                           False))
+    draft_transfer_kwargs = _drafter_prompt_window_transfer_kwargs(
+        resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
+        kv_cache_manager, cache_transceiver_config, model_engine, mapping)
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config, mamba_cache_manager, **draft_transfer_kwargs)

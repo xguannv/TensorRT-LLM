@@ -1771,6 +1771,12 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
+                if getattr(lg_info, "replicated", False) and (
+                    src_block_ids.size == 0 or dst_block_ids.size == 0
+                ):
+                    # A replicated draft group (the drafter prompt window) that one side lists no
+                    # pages for: that side has no window for this request, so nothing moves.
+                    continue
                 if (
                     peer_ri.cp_size > 1
                     and self_ri.cp_size == 1

@@ -73,7 +73,11 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
-from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2, drafter_window
+from tensorrt_llm._torch.disaggregation.transceiver import (
+    KvCacheTransceiverV2,
+    drafter_window,
+    received_drafter_window,
+)
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorEffects,
     PyExecutorRequestRegistry,
@@ -2107,13 +2111,27 @@ def run_drafter_window_transfer_test(
     is_mla: bool,
     draft_prompt_window: int,
     request_lengths: List[int] = DRAFTER_REQUEST_LENGTHS,
+    gen_draft_prompt_window: Optional[int] = None,
 ) -> None:
-    """Context (cp 1) -> generation (cp ``gen_cp``) with a draft KV cache manager on every rank.
+    """Context (cp 1) -> generation (cp ``gen_cp``), each side with or without the drafter prompt window.
 
-    The target transfers as in test_cache_transceiver_helix_cp (each generation CP rank gets its
-    [cp_rank::cp_size] stride); the draft manager's drafter prompt window reaches every generation
-    rank whole. The generation side allocates its draft pages [0, ceil(L / tpb)) before the receive.
+    ``draft_prompt_window`` is the context's window (0: the context has no draft KV cache manager,
+    the switch off there); ``gen_draft_prompt_window`` the generation's (0: off; None: the context's).
+    A side that is on has a draft KV cache manager on every rank. The context describes each request's
+    send first, which records the window it sends (``py_drafter_ctx_window``); that is what its context
+    response reports, and the generation request carries it in its disaggregated params
+    (``drafter_ctx_window``). The generation admits the reported window (``received_drafter_window``
+    and ``prepare_drafter_window_receive``, the V2 scheduler's admission step), not its own.
+
+    The target always transfers as in test_cache_transceiver_helix_cp (each generation CP rank gets its
+    [cp_rank::cp_size] stride). With both sides on, the reported window reaches every generation rank
+    whole and the request is admitted at its length. Otherwise no draft page is reserved or moved,
+    and the request carries no drafter window.
     """
+    if gen_draft_prompt_window is None:
+        gen_draft_prompt_window = draft_prompt_window
+    ctx_on = draft_prompt_window > 0
+    gen_on = gen_draft_prompt_window > 0
     max_batch_size = max(MAX_BATCH_SIZE, len(request_lengths))
     ctx_managers = _create_managers_for_instance(
         1, 1, False, is_mla, True, None, NUM_LAYERS, max_batch_size
@@ -2121,12 +2139,16 @@ def run_drafter_window_transfer_test(
     gen_managers = _create_managers_for_instance(
         1, 1, False, is_mla, True, None, NUM_LAYERS, max_batch_size, cp_size=gen_cp
     )
-    ctx_drafts = [_create_draft_cache_manager(max_batch_size)]
-    gen_drafts = [_create_draft_cache_manager(max_batch_size) for _ in range(gen_cp)]
+    ctx_drafts = [_create_draft_cache_manager(max_batch_size)] if ctx_on else None
+    gen_drafts = (
+        [_create_draft_cache_manager(max_batch_size) for _ in range(gen_cp)] if gen_on else None
+    )
     _init_pool_data(ctx_managers, 1, is_mla, True, fill_random=True, seed_base=1000)
     _init_pool_data(gen_managers, gen_cp, is_mla, True, fill_random=False)
-    _init_pool_data_v2(ctx_drafts, 1, True, fill_random=True, seed_base=5000)
-    _init_pool_data_v2(gen_drafts, gen_cp, True, fill_random=False)
+    if ctx_on:
+        _init_pool_data_v2(ctx_drafts, 1, True, fill_random=True, seed_base=5000)
+    if gen_on:
+        _init_pool_data_v2(gen_drafts, gen_cp, True, fill_random=False)
 
     config = CacheTransceiverConfig(
         backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
@@ -2150,7 +2172,7 @@ def run_drafter_window_transfer_test(
         is_mla,
         cp_size=gen_cp,
         draft_managers=gen_drafts,
-        draft_prompt_window=draft_prompt_window,
+        draft_prompt_window=gen_draft_prompt_window,
     )
     kv_caches: List = []
 
@@ -2161,6 +2183,7 @@ def run_drafter_window_transfer_test(
         gen_request_ids: List[int] = []
         ctx_requests: List[LlmRequest] = []
         gen_requests: List[List[LlmRequest]] = []
+        reported: List = []
 
         for req_idx, req_len in enumerate(request_lengths):
             unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
@@ -2180,10 +2203,25 @@ def run_drafter_window_transfer_test(
             )
             ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
             ctx_requests.append(ctx_request)
+            kv_caches.append(_add_sequence(ctx_managers[0], ctx_rid, req_len, True))
+            if ctx_on:
+                kv_caches.append(_add_sequence(ctx_drafts[0], ctx_rid, req_len, True))
+            # The context's description of its send records the window it sends; its context
+            # response reports exactly that (LlmResult.drafter_ctx_window).
+            ctx_tcs[0]._create_cache_extent(ctx_request)
+            window = getattr(ctx_request, "py_drafter_ctx_window", None)
+            if ctx_on:
+                assert window == drafter_window(req_len, draft_prompt_window, TOKENS_PER_BLOCK)
+            else:
+                assert window is None
+            reported.append(window)
             per_rank = []
             for cp_rank in range(gen_cp):
                 req = _make_gen_request(
                     gen_rid, req_len, unique_rid, ctx_rid, 0, ctx_info_endpoint, sampling_params
+                )
+                req.py_disaggregated_params.drafter_ctx_window = (
+                    list(window) if window is not None else None
                 )
                 # The target's rank-local prompt (see run_transfer_test); the drafter window is
                 # cut from the global prompt length.
@@ -2195,36 +2233,43 @@ def run_drafter_window_transfer_test(
             gen_requests.append(per_rank)
 
         # Generation receives first: target sized off the global prompt, the draft mirror for
-        # the window only, through the draft manager's own admission step (what the V2
+        # the reported window only, through the draft manager's own admission step (what the V2
         # scheduler calls for a disaggregated generation request).
-        for gen_draft in gen_drafts:
-            gen_draft.drafter_prompt_window = draft_prompt_window
+        if gen_on:
+            for gen_draft in gen_drafts:
+                gen_draft.drafter_prompt_window = gen_draft_prompt_window
         for req_idx, req_len in enumerate(request_lengths):
-            _, length = drafter_window(req_len, draft_prompt_window, TOKENS_PER_BLOCK)
             for cp_rank, req in enumerate(gen_requests[req_idx]):
                 kv_caches.append(
                     _add_sequence(
                         gen_managers[cp_rank], req.py_request_id, req_len, True, is_generation=True
                     )
                 )
-                assert gen_drafts[cp_rank].prepare_drafter_window_receive(req, length)
-                mirror = gen_drafts[cp_rank].kv_cache_map[req.py_request_id]
-                assert mirror.capacity >= length
-                # The executor then prepares the gen-init request's resources as a last context
-                # chunk (_prepare_disagg_gen_resources); the window's mirror is left as admitted.
-                capacity, history = mirror.capacity, mirror.history_length
-                gen_init = ScheduledRequests()
-                gen_init.context_requests_last_chunk = [req]
-                gen_drafts[cp_rank].prepare_resources(gen_init)
-                assert (mirror.capacity, mirror.history_length) == (capacity, history)
-                kv_caches.append(mirror)
+                if gen_on:
+                    gen_draft = gen_drafts[cp_rank]
+                    window = received_drafter_window(req, gen_draft.tokens_per_block)
+                    assert window == reported[req_idx]
+                    if window is not None:
+                        start, length = window
+                        assert gen_draft.prepare_drafter_window_receive(req, start, length)
+                        mirror = gen_draft.kv_cache_map[req.py_request_id]
+                        assert mirror.capacity >= length
+                        # The executor then prepares the gen-init request's resources as a last
+                        # context chunk (_prepare_disagg_gen_resources); the window's mirror is left
+                        # as admitted.
+                        capacity, history = mirror.capacity, mirror.history_length
+                        gen_init = ScheduledRequests()
+                        gen_init.context_requests_last_chunk = [req]
+                        gen_draft.prepare_resources(gen_init)
+                        assert (mirror.capacity, mirror.history_length) == (capacity, history)
+                        kv_caches.append(mirror)
+                    else:
+                        # Nothing reported: no draft page is taken for a window.
+                        assert req.py_request_id not in gen_draft.kv_cache_map
                 gen_tcs[cp_rank].request_and_receive_async(req)
 
         # Context sends after; its draft cache holds the whole prompt at absolute positions.
-        for req_idx, req_len in enumerate(request_lengths):
-            req = ctx_requests[req_idx]
-            kv_caches.append(_add_sequence(ctx_managers[0], req.py_request_id, req_len, True))
-            kv_caches.append(_add_sequence(ctx_drafts[0], req.py_request_id, req_len, True))
+        for req in ctx_requests:
             ctx_tcs[0].respond_and_send_async(req)
 
         run_concurrent(
@@ -2240,11 +2285,13 @@ def run_drafter_window_transfer_test(
                     req.state,
                 )
                 # Write verification covers the draft bytes too: what the receiver published
-                # (target stride + whole draft window) must equal what the sender attested.
+                # (target stride + whole draft window, or no draft page) must equal what the
+                # sender attested.
                 assert req.py_kv_transfer_verified, (req_idx, cp_rank)
-                start, length = drafter_window(
-                    request_lengths[req_idx], draft_prompt_window, TOKENS_PER_BLOCK
-                )
+                if not (ctx_on and gen_on):
+                    assert getattr(req, "py_drafter_ctx_len", None) is None, (req_idx, cp_rank)
+                    continue
+                start, length = reported[req_idx]
                 assert (req.py_drafter_ctx_start, req.py_drafter_ctx_len) == (start, length)
                 # A generation step's update keeps the window's history: the mirror holds the
                 # window from position 0, not the request's (global or CP-local) token count.
@@ -2264,14 +2311,15 @@ def run_drafter_window_transfer_test(
             is_mla=is_mla,
             gen_cp=gen_cp,
         )
-        _verify_drafter_window(
-            request_lengths,
-            draft_prompt_window,
-            ctx_drafts[0],
-            gen_drafts,
-            ctx_request_ids,
-            gen_request_ids,
-        )
+        if ctx_on and gen_on:
+            _verify_drafter_window(
+                request_lengths,
+                draft_prompt_window,
+                ctx_drafts[0],
+                gen_drafts,
+                ctx_request_ids,
+                gen_request_ids,
+            )
     finally:
         # Same teardown order as run_transfer_test: drain GPU work, close kv caches, shut down.
         try:
@@ -2315,6 +2363,67 @@ def test_cache_transceiver_drafter_window(gen_cp, is_mla, draft_prompt_window):
     run_drafter_window_transfer_test(
         gen_cp=gen_cp, is_mla=is_mla, draft_prompt_window=draft_prompt_window
     )
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_window,gen_window",
+    [(0, 0), (0, 100), (100, 0), (100, 100)],
+    ids=["ctx_off-gen_off", "ctx_off-gen_on", "ctx_on-gen_off", "ctx_on-gen_on"],
+)
+def test_cache_transceiver_drafter_window_pairings(ctx_window, gen_window):
+    """TRTLLM_K3LL_DRAFTER_PROMPT_CTX on / off on each side (MLA, generation Helix cp 2).
+
+    * both off: today's transfer, no drafter window anywhere;
+    * context off, generation on: the context reports no window, so the generation reserves no draft
+      page, nothing but the target moves, and the request is admitted without a window (its drafter
+      sees generated tokens only);
+    * context on, generation off: the context sends its window and reports it; the generation has
+      no draft group to receive it into, ignores the report, and the target transfer verifies;
+    * both on: the generation admits exactly the reported window, received byte for byte.
+
+    No pairing hangs: every request completes its transfer with verified writes.
+    """
+    run_drafter_window_transfer_test(
+        gen_cp=2,
+        is_mla=True,
+        draft_prompt_window=ctx_window,
+        gen_draft_prompt_window=gen_window,
+    )
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("gen_window", [40, MAX_SEQ_LEN], ids=["gen_smaller", "gen_larger"])
+def test_cache_transceiver_drafter_window_size_mismatch(gen_window):
+    """The two sides' windows differ: the generation admits the context's report.
+
+    Context W = 100, generation W = ``gen_window``: the generation receives and admits the window the
+    context reported (P = 203: s = 96, L = 107), never one cut from its own W.
+    """
+    run_drafter_window_transfer_test(
+        gen_cp=2,
+        is_mla=True,
+        draft_prompt_window=100,
+        gen_draft_prompt_window=gen_window,
+    )
+
+
+@pytest.mark.cpu_only
+def test_received_drafter_window_reads_only_a_whole_page_report():
+    """``received_drafter_window`` takes only a whole-page report ending at the prompt length.
+
+    Anything else (or no report) is no window.
+    """
+    params = DisaggregatedParams()
+    req = SimpleNamespace(py_request_id=1, total_input_len_cp=203, py_disaggregated_params=params)
+    assert received_drafter_window(req, 8) is None
+    params.drafter_ctx_window = [96, 107]
+    assert received_drafter_window(req, 8) == (96, 107)
+    for bad in ([97, 106], [96, 100], [0, 0], [-8, 211], ["x", 1], [96]):
+        params.drafter_ctx_window = bad
+        assert received_drafter_window(req, 8) is None, bad
+    req.py_disaggregated_params = None
+    assert received_drafter_window(req, 8) is None
 
 
 # ---------------------------------------------------------------------------

@@ -3661,13 +3661,14 @@ class MLADSparkCaptureOnly(MLADSparkForCausalLM):
 
 def dspark_capture_only() -> bool:
     """Whether this process builds the capture-only MLA DSpark drafter: a disaggregated context worker
-    (``TRTLLM_DISAGG_ROLE=context``) with ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` > 0 (the K3 low-latency switch that
-    sends the prompt's drafter K/V to the generation workers)."""
+    (``TRTLLM_DISAGG_ROLE=context``) where ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` resolves to a window > 0 (the K3
+    low-latency switch that sends the prompt's drafter K/V to the generation workers; ``k3ll_flags.
+    drafter_prompt_window``)."""
     if os.environ.get("TRTLLM_DISAGG_ROLE") != "context":
         return False
-    from ..pyexecutor.k3ll_flags import k3ll_flag_any_target
+    from ..pyexecutor import k3ll_flags
 
-    return k3ll_flag_any_target("TRTLLM_K3LL_DRAFTER_PROMPT_CTX") > 0
+    return k3ll_flags.drafter_prompt_window() > 0
 
 
 def draft_is_embedded_in_target(model_config) -> bool:

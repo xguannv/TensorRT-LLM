@@ -218,6 +218,57 @@ def drafter_window(prompt_len: int, window: int, tokens_per_block: int) -> tuple
     return start, prompt_len - start
 
 
+def received_drafter_window(req: LlmRequest, tokens_per_block: int) -> Optional[tuple[int, int]]:
+    """The drafter prompt window a generation request's context reported, or None.
+
+    The context worker reports ``(start, length)`` of the window it sent in the context response's
+    disaggregated params (``DisaggregatedParams.drafter_ctx_window``); a context that sent none
+    reports nothing. A report that does not describe whole draft pages ending at the global prompt
+    length (``total_input_len_cp``) is ignored with a warning, so the request receives no window.
+    """
+    params = getattr(req, "py_disaggregated_params", None)
+    reported = getattr(params, "drafter_ctx_window", None) if params is not None else None
+    if not reported:
+        return None
+    try:
+        start, length = (int(x) for x in reported)
+    except (TypeError, ValueError):
+        start, length = -1, 0
+    prompt_len = req.total_input_len_cp
+    if start < 0 or length <= 0 or start % tokens_per_block or start + length != prompt_len:
+        logger.warning(
+            f"request {req.py_request_id}: ignoring the reported drafter prompt window {reported!r} "
+            f"(prompt length {prompt_len}, tokens_per_block {tokens_per_block}); it receives none"
+        )
+        return None
+    return start, length
+
+
+class _DrafterWindowCounters:
+    """Periodic INFO counters of the drafter prompt windows a rank sent or admitted
+    (TRTLLM_K3LL_DRAFTER_PROMPT_CTX): one line at the first event and then at most every
+    ``period_s`` seconds, never per step."""
+
+    def __init__(self, side: str, rank: int, period_s: float = 60.0):
+        self._side = side
+        self._rank = rank
+        self._period_s = period_s
+        self._counts: Counter = Counter()
+        self._last_log: Optional[float] = None
+
+    def count(self, key: str, tokens: int = 0) -> None:
+        self._counts[key] += 1
+        if tokens:
+            self._counts[f"{key}_tokens"] += tokens
+        now = time.monotonic()
+        if self._last_log is None or now - self._last_log >= self._period_s:
+            self._last_log = now
+            logger.info(
+                f"[drafter_prompt_ctx] {self._side} rank {self._rank}: "
+                + " ".join(f"{k}={v}" for k, v in sorted(self._counts.items()))
+            )
+
+
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
     consensus = []
@@ -313,6 +364,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     _draft_reuse_adapter: Optional[CacheReuseAdapter] = None
     _draft_prompt_window: int = 0
     _draft_context_renumber: Optional[Callable] = None
+    _draft_capture_only: bool = False
+    _draft_window_counters: "_DrafterWindowCounters" = _DrafterWindowCounters("draft", -1)
     # Leading page-table layer groups that belong to the target manager; the draft groups follow.
     _num_target_layer_groups: int = 0
 
@@ -366,6 +419,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             draft_context_renumber if draft_kv_cache_manager is not None else None
         )
         self._draft_capture_only = draft_capture_only
+        self._draft_window_counters = _DrafterWindowCounters(
+            "ctx" if draft_capture_only else "gen", mapping.rank
+        )
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
             raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
@@ -722,15 +778,37 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             excluded_pool_views=excluded_pool_views,
         )
 
+    def _draft_window(self, req: LlmRequest) -> Optional[tuple[int, int]]:
+        """``(start, length)`` of the request's drafter prompt window on this side, or None.
+
+        Context side: ``drafter_window`` of the global prompt length with this worker's window.
+        Generation side: the window its context reported, as admitted by the draft manager
+        (``req.py_drafter_window``, set by ``prepare_drafter_window_receive``); None when the
+        context reported none.
+        """
+        if req.is_context_only_request:
+            return drafter_window(
+                req.total_input_len_cp,
+                self._draft_prompt_window,
+                self._draft_kv_cache_manager.tokens_per_block,
+            )
+        if req.is_generation_only_request:
+            return getattr(req, "py_drafter_window", None)
+        return None
+
     def _describe_draft_window(self, req: LlmRequest) -> List[np.ndarray]:
         """Draft-manager pages of the request's drafter prompt window, one array per draft group.
 
-        The window is ``drafter_window`` of the global prompt length (``total_input_len_cp``,
-        which is ``prompt_len`` without Helix CP). Both sides list ``ceil(length / tpb)`` pages:
-        the context side holds the prompt at absolute positions, so its entry ``i`` is its page
-        ``start / tpb + i``; the generation side holds the window from position 0, so its entry
-        ``i`` is its page ``i``. An entry is -1 where the manager holds no page. Every generation
-        CP rank lists the whole window (the groups are replicated, never CP-strided).
+        The window is ``(start, length)`` of ``_draft_window``. Both sides list ``ceil(length /
+        tpb)`` pages: the context side holds the prompt at absolute positions, so its entry ``i`` is
+        its page ``start / tpb + i``; the generation side holds the window from position 0, so its
+        entry ``i`` is its page ``i``. Every generation CP rank lists the whole window (the groups
+        are replicated, never CP-strided). A side without a window lists no pages (empty arrays),
+        and the sender skips a draft group the receiver lists no pages for.
+
+        On the context side the window is sent only if the draft manager holds every page of it;
+        the request then carries ``py_drafter_ctx_window`` = ``(start, length)``, which its context
+        response reports to the generation worker. Otherwise nothing is sent and nothing reported.
         """
         draft = self._draft_kv_cache_manager
         adapter = self._draft_reuse_adapter
@@ -741,23 +819,40 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 "would be sent from a rank whose drafter is not the capture-only one. The context "
                 "role (TRTLLM_DISAGG_ROLE=context) did not reach this rank's model build."
             )
+        draft_layer_groups = self._page_table.layer_groups[self._num_target_layer_groups :]
+        none = [np.empty(0, dtype=np.int64) for _ in draft_layer_groups]
+        window = self._draft_window(req)
+        if window is None:
+            return none
+        start, length = window
         tpb = draft.tokens_per_block
-        start, length = drafter_window(req.total_input_len_cp, self._draft_prompt_window, tpb)
         num_pages = (length + tpb - 1) // tpb
         first_page = 0 if req.is_generation_only_request else start // tpb
         groups = []
-        draft_layer_groups = self._page_table.layer_groups[self._num_target_layer_groups :]
         for group_idx, lg in enumerate(draft_layer_groups):
             ordinals = adapter.get_block_ordinals(req, group_idx, lg)
-            window = np.full(num_pages, -1, dtype=np.int64)
+            pages = np.full(num_pages, -1, dtype=np.int64)
             held = ordinals[first_page : first_page + num_pages]
-            window[: held.size] = held
-            groups.append(window)
+            pages[: held.size] = held
+            groups.append(pages)
+        if req.is_context_only_request:
+            if any((pages < 0).any() for pages in groups):
+                req.py_drafter_ctx_window = None
+                self._draft_window_counters.count("window_not_held")
+                logger.warning(
+                    f"request {req.py_request_id}: the draft pool does not hold its whole drafter "
+                    f"prompt window (start {start}, length {length}); none is sent or reported"
+                )
+                return none
+            req.py_drafter_ctx_window = (start, length)
+            self._draft_window_counters.count("windows_sent", length)
         return groups
 
     def _finish_draft_window_receive(self, req: LlmRequest) -> None:
         """Move a completed receive's drafter window to positions 0 .. L-1 and record it on ``req``.
 
+        Only for a request admitted with a reported window (``_draft_window``); without one the
+        request carries no ``py_drafter_ctx_len`` and its drafter sees generated tokens only.
         The window's latents arrive as the context stored them, at absolute positions s .. P-1
         (``drafter_window``). They are shifted by -s once, in place in this rank's draft pages
         ``[0, ceil(L / tpb))``, on the current stream, which the drafter's later reads follow.
@@ -769,9 +864,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         draft = self._draft_kv_cache_manager
         if draft is None:
             return
-        start, length = drafter_window(
-            req.total_input_len_cp, self._draft_prompt_window, draft.tokens_per_block
-        )
+        window = self._draft_window(req)
+        if window is None:
+            self._draft_window_counters.count("no_window")
+            return
+        start, length = window
         if start > 0:
             renumber = self._draft_context_renumber
             dtype = binding_to_torch_dtype(draft.dtype)
@@ -792,6 +889,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     )
         req.py_drafter_ctx_start = start
         req.py_drafter_ctx_len = length
+        self._draft_window_counters.count("windows_admitted", length)
+        if not getattr(req, "py_kv_transfer_verified", True):
+            self._draft_window_counters.count("admitted_unverified")
 
     @staticmethod
     def _positional_window(

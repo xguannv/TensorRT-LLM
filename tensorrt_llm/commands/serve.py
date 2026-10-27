@@ -517,28 +517,55 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
-def _carry_disagg_role_to_model_ranks(llm_args: dict) -> None:
-    """Carry ``TRTLLM_DISAGG_ROLE`` to the model ranks when the K3 switch is on.
+def _is_dspark_speculative_config(spec_config) -> bool:
+    """Whether ``spec_config`` (a dict from YAML or a decoding config object) is DSpark's."""
+    if spec_config is None:
+        return False
+    if isinstance(spec_config, dict):
+        return spec_config.get("decoding_type") == "DSpark"
+    return getattr(spec_config, "decoding_type", None) == "DSpark"
 
-    Adds this process's role to ``llm_args["env_overrides"]`` when
-    ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` > 0. The model ranks are not necessarily children of this process: under
-    trtllm-llmapi-launch or an MPI session they were started with their own
-    environment. ``env_overrides`` is applied on every rank before its engine is
-    built, so the role reaches the code that reads it there: the K3 drafter
-    prompt-context switch builds its capture-only drafter only on a context
-    rank. Only with the switch on, so that other readers of the role on the
-    model ranks see what they did before. A role already in ``env_overrides``
-    is kept.
+
+def _carry_disagg_role_to_model_ranks(llm_args: dict, capability=None) -> None:
+    """Apply ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX`` to a serving process's ``llm_args``.
+
+    Only a process with a disaggregated role and a DSpark ``speculative_config``
+    is touched; ``capability`` is the GPU's (default: this node's, read only
+    when the switch is at its default -1, see ``k3ll_flags.drafter_prompt_window``).
+
+    * The switch resolves to a window > 0: this process's role is added to
+      ``llm_args["env_overrides"]``. The model ranks are not necessarily
+      children of this process: under trtllm-llmapi-launch or an MPI session
+      they were started with their own environment. ``env_overrides`` is
+      applied on every rank before its engine is built, so the role reaches
+      the code that reads it there: the switch builds its capture-only drafter
+      only on a context rank. A role already in ``env_overrides`` is kept.
+    * It resolves to 0 (off) on a context server: the DSpark
+      ``speculative_config`` is dropped, so the context worker is exactly one
+      built without it (no drafter, no draft KV cache manager, the target's KV
+      capacity unchanged). One INFO line says so.
+
+    Anything else (no role, no DSpark speculative_config: an aggregated server,
+    a context server without a drafter) is left as it is, and other readers of
+    the role on the model ranks see what they did before.
     """
     disagg_role = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE)
-    if not disagg_role:
+    if not disagg_role or not _is_dspark_speculative_config(
+            llm_args.get("speculative_config")):
         return
-    if os.environ.get("TRTLLM_K3LL_DRAFTER_PROMPT_CTX",
-                      "0").strip() in ("", "0"):
-        return
-    env_overrides = dict(llm_args.get("env_overrides") or {})
-    env_overrides.setdefault(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, disagg_role)
-    llm_args["env_overrides"] = env_overrides
+    from tensorrt_llm._torch.pyexecutor import k3ll_flags
+    window = k3ll_flags.drafter_prompt_window(capability)
+    if window > 0:
+        env_overrides = dict(llm_args.get("env_overrides") or {})
+        env_overrides.setdefault(DisaggLauncherEnvs.TLLM_DISAGG_ROLE,
+                                 disagg_role)
+        llm_args["env_overrides"] = env_overrides
+    elif disagg_role == "context":
+        llm_args.pop("speculative_config")
+        logger.info(
+            "TRTLLM_K3LL_DRAFTER_PROMPT_CTX is off on this context server: its "
+            "DSpark speculative_config is dropped, the context worker loads no "
+            "drafter and keeps no draft KV cache")
 
 
 def launch_server(
