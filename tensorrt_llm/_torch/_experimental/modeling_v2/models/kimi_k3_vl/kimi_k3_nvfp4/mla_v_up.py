@@ -94,6 +94,15 @@ def flags_partial_f16() -> bool:
     return int(flags.TRTLLM_K3LL_MLA_PARTIAL_F16) > 0
 
 
+def flags_combine_early() -> int:
+    """``TRTLLM_K3LL_MLA_COMBINE_EARLY`` (read at every call): the number of first splits whose partials the fused V-up
+    reduction loads, with its LSE, before the split-count reads are used (``BlackwellMlaDecodeFP8VUp(combine_early=n)``,
+    a build per value); 0 off."""
+    from . import flags
+
+    return int(flags.TRTLLM_K3LL_MLA_COMBINE_EARLY)
+
+
 def max_fused_rows() -> int:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
         MAX_ROWS,
@@ -201,6 +210,9 @@ def _run_fused(
     partial_f16 = bool(flags_partial_f16())
     if partial_f16:
         key = key + ("partial_f16",)
+    combine_early = flags_combine_early()
+    if combine_early:
+        key = key + (f"combine_early{combine_early}",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -231,6 +243,7 @@ def _run_fused(
             v_rows=v_rows,
             prewait=prewait,
             partial_f16=partial_f16,
+            combine_early=combine_early,
         )
 
         def dyn(t, lead, align=16):

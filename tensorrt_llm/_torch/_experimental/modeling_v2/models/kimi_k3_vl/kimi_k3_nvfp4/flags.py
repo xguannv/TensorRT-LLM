@@ -610,6 +610,15 @@ TRTLLM_K3LL_MLA_PARTIAL_F16 = _flag(
     "forward time, a build per value, compiled on its first eager call. 1 on, 0 (default) off",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_MLA_COMBINE_EARLY = _flag(
+    "TRTLLM_K3LL_MLA_COMBINE_EARLY",
+    0,
+    "the fused V-up MLA decode (k3_mla_decode_fp8_v_up): each combine warp issues its row's LSE load and the partial "
+    "loads of this many first splits together with the split-count reads, before any of them is used, instead of "
+    "after them; the multiply-adds are the same in split order, so the same bits. Read at forward time, a build per "
+    "value, compiled on its first eager call. 0 (default) off, 2 / 4 / 8 early splits",
+    accepted=(0, 2, 4, 8),
+)
 TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED = _flag(
     "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED",
     -1,

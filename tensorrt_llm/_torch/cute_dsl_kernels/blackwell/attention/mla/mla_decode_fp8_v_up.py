@@ -49,6 +49,12 @@ split kernel still runs. Prefetch hints and trigger placement only: the bytes ar
 of FP32 (half the bytes its epilogue writes and the combine reads; the LSE stays FP32), and the combine widens each
 partial to FP32 before the same multiply-adds. Not the same bits: each partial is rounded once to FP16 (11-bit
 significand) before the combine, below the BF16 rounding of the result.
+
+``combine_early`` (``TRTLLM_K3LL_MLA_COMBINE_EARLY``): a combine warp issues its row's LSE load (lanes below the grid's
+split count) and the partial loads of its first ``combine_early`` splits (one of ``COMBINE_EARLY_SPLITS``) before it
+reads the request's split count and K length, so those loads share one round trip; the LSE beyond the request's splits
+is then replaced by ``-inf`` and only the request's splits are added, the same multiply-adds in split order, so the
+output is the same bits.
 """
 
 from __future__ import annotations
@@ -81,6 +87,8 @@ MAX_ROWS = 32
 #: Warps that combine rows (warps 0-3 also read the accumulator); the next warp loads the weight and
 #: issues the MMA.
 COMBINE_WARPS = 16
+#: The values of ``combine_early`` (splits whose partials a combine warp loads before the split count is known; 0 off).
+COMBINE_EARLY_SPLITS = (2, 4, 8)
 
 
 @dsl_user_op
@@ -120,11 +128,25 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     """
 
     def __init__(
-        self, *args, v_rows: int = 16, prewait: bool = False, partial_f16: bool = False, **kwargs
+        self,
+        *args,
+        v_rows: int = 16,
+        prewait: bool = False,
+        partial_f16: bool = False,
+        combine_early: int = 0,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # The LSE and first partial loads issued before the split count is read (``TRTLLM_K3LL_MLA_COMBINE_EARLY``).
+        if combine_early and combine_early not in COMBINE_EARLY_SPLITS:
+            raise ValueError(
+                f"combine_early must be 0 or one of {COMBINE_EARLY_SPLITS}, got {combine_early}"
+            )
+        self.combine_early = combine_early > 0
         # The split partials' O as FP16 in the workspace (``TRTLLM_K3LL_MLA_PARTIAL_F16``); the LSE stays FP32.
         self.partial_o_dtype = cutlass.Float16 if partial_f16 else None
+        self.combine_load_dtype = cutlass.Float16 if partial_f16 else cutlass.Float32
+        self.combine_early_splits = combine_early
         if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
                 "The fused V up-projection needs the Helix softmax statistics and a fixed query layout."
@@ -512,6 +534,24 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         flat_q_row = t * self.num_heads + head
         q_tile = flat_q_row >> 7
         r = flat_q_row & 127
+        gLSE = mAccLSE[r, None, q_tile, b]
+        gAccO = mAccO[r, None, None, q_tile, b]
+        early = self.combine_early_splits
+        early_lse = self.lse_dtype(0.0)
+        early_parts = [
+            cute.make_rmem_tensor(cute.make_layout(vec), self.combine_load_dtype)
+            for _ in range(early)
+        ]
+        if cutlass.const_expr(self.combine_early):
+            # Before the split count: every split of the grid has an LSE slot and a partial row, stale where the
+            # request has fewer splits; those are masked below and never added.
+            grid_split_kv = split_kv
+            early_lse = gLSE[lane] if cute.elem_less(lane, grid_split_kv) else -self.lse_dtype.inf
+            for u in cutlass.range_constexpr(early):
+                if u < grid_split_kv:
+                    cute.autovec_copy(
+                        cute.local_tile(gAccO[u, None], (vec,), (lane,)), early_parts[u]
+                    )
         has_local_kv = cache_seqs[b] > 0
         if cutlass.const_expr(kv_bounds is not None):
             has_local_kv = kv_bounds[b * self.seq_len_q + t] > 0
@@ -523,9 +563,15 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
             k_tile_per_cta = cutlass.max(k_tile_per_cta, 1)
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
-        gLSE = mAccLSE[r, None, q_tile, b]
         local_lse = cute.make_rmem_tensor(cute.make_layout(1), self.lse_dtype)
-        local_lse[0] = gLSE[lane] if cute.elem_less(lane, local_split_kv) else -self.lse_dtype.inf
+        if cutlass.const_expr(self.combine_early):
+            local_lse[0] = (
+                early_lse if cute.elem_less(lane, local_split_kv) else -self.lse_dtype.inf
+            )
+        else:
+            local_lse[0] = (
+                gLSE[lane] if cute.elem_less(lane, local_split_kv) else -self.lse_dtype.inf
+            )
         lse_max = -self.lse_dtype.inf
         lse_max = cute.arch.fmax(lse_max, local_lse[0])
         lse_max = cute.arch.warp_reduction_max(lse_max)
@@ -547,17 +593,26 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
                 mSoftmaxStats[head, t, b, 1] = 0.0
         weight = cute.math.exp2(local_lse[0] - global_lse, fastmath=True)
 
-        gAccO = mAccO[r, None, None, q_tile, b]
         rAcc.fill(0.0)
+        for u in cutlass.range_constexpr(early):
+            if u < local_split_kv:
+                scale = cute.arch.shuffle_sync(weight, u)
+                if cutlass.const_expr(self.partial_o_dtype is None):
+                    for e in cutlass.range_constexpr(vec):
+                        rAcc[e] += early_parts[u][e] * scale
+                else:
+                    rPart.store(early_parts[u].load().to(self.acc_dtype))
+                    for e in cutlass.range_constexpr(vec):
+                        rAcc[e] += rPart[e] * scale
         if cutlass.const_expr(self.partial_o_dtype is None):
-            for i in range(local_split_kv):
+            for i in range(early, local_split_kv):
                 scale = cute.arch.shuffle_sync(weight, i)
                 cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rPart)
                 for e in cutlass.range_constexpr(vec):
                     rAcc[e] += rPart[e] * scale
         else:
             rHalf = cute.make_rmem_tensor(cute.make_layout(vec), self.partial_o_dtype)
-            for i in range(local_split_kv):
+            for i in range(early, local_split_kv):
                 scale = cute.arch.shuffle_sync(weight, i)
                 cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rHalf)
                 rPart.store(rHalf.load().to(self.acc_dtype))
