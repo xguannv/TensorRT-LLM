@@ -74,6 +74,9 @@ MNNVL_CLUSTER = HIDDEN_SIZE // 1024
 
 #: Programmatic dependent launch unless TRTLLM_ENABLE_PDL=0 (the stack-wide switch).
 _USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+# DIAGNOSTIC ONLY (moss 10-27 probe, never merged): the fast kernel's second cluster round (the output sum of squares)
+# replaced by its CTA's own warps x cluster size -- wrong numerics, the timing of a one-round kernel.
+_DEBUG_LOCAL_OUTSQ = os.environ.get("K3LL_DEBUG_ATTNRES_LOCAL_OUTSQ") == "1"
 #: TRTLLM_K3_ATTN_RES_EARLY_TRIGGER=1: release the dependent grid right after ``griddepcontrol.wait``
 #: instead of after the last store, so the next kernel (a decode projection) can become resident and
 #: stream its weights while this one finishes.
@@ -1524,7 +1527,11 @@ class K3AttnResFastKernel:
         for e in cutlass.range_constexpr(8):
             out_sq = _fma(mixed[e], mixed[e], out_sq)
         out_sq = _warp_sum(out_sq)
-        if cutlass.const_expr(c == 1):
+        if cutlass.const_expr(_DEBUG_LOCAL_OUTSQ and c > 1):
+            if lane == 0:
+                _sts_f32(outsq_smem + (rank * warps + warp) * 4, out_sq)
+            _bar_sync(3, self.threads)
+        elif cutlass.const_expr(c == 1):
             if lane == 0:
                 _sts_f32(outsq_smem + warp * 4, out_sq)
             _bar_sync(3, self.threads)
@@ -1532,7 +1539,12 @@ class K3AttnResFastKernel:
             if lane < c:
                 _st_async_b32(outsq_smem + (rank * warps + warp) * 4, lane, mbar_smem + 16, out_sq)
             _mbar_wait_cluster(mbar_smem + 16)
-        if cutlass.const_expr(mo):
+        if cutlass.const_expr(_DEBUG_LOCAL_OUTSQ and c > 1):
+            part = _zero_f32()
+            if lane < warps:
+                part = _lds_f32(outsq_smem + (rank * warps + lane) * 4)
+            out_total = _mul(_warp_sum(part), Float32(float(c)))
+        elif cutlass.const_expr(mo):
             out_total = _cluster_total(outsq_smem, lane, c, warps, 1, 0, 0)
         else:
             part = _zero_f32()
