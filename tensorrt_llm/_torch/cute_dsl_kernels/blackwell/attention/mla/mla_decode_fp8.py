@@ -139,6 +139,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     #: Subclass hook: the split kernel calls ``_split_prewait_loads(v_prefetch)`` from one warp
     #: before ``griddepcontrol.wait`` and releases its dependent right after the wait. Off here.
     split_prewait = False
+    #: Subclass hook: the element type of the split partials' O in the workspace (None: ``acc_dtype``).
+    partial_o_dtype = None
     #: The tensor handed to ``_split_prewait_loads`` (None: none).
     _v_prefetch = None
 
@@ -4307,9 +4309,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
             # using final output dtype for o
             tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
-        else:
+        elif cutlass.const_expr(self.partial_o_dtype is None):
             # using accumulate dtype for o
             tR2G_rO_src = tTR_rAcc
+        else:
+            # the workspace's partial dtype (``partial_o_dtype``)
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.partial_o_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.partial_o_dtype))
 
         if cute.elem_less(tTR_cO[0][0], common_params.H):
             if cutlass.const_expr(direct_split):

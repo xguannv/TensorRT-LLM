@@ -601,6 +601,15 @@ TRTLLM_K3LL_MLA_VAR_SPLIT_FLAT = _flag(
     "(mla_v_up.MLA_VAR_SPLIT_FLAT_CAPABILITIES)",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_MLA_PARTIAL_F16 = _flag(
+    "TRTLLM_K3LL_MLA_PARTIAL_F16",
+    0,
+    "the fused V-up MLA decode (k3_mla_decode_fp8_v_up): the split kernel stores its normalized partial O as FP16 "
+    "instead of FP32 (half the bytes written by its epilogue and read by the combine; the LSE stays FP32) and the "
+    "combine widens it back before the same multiply-adds. Changes numerics (one FP16 rounding per partial). Read at "
+    "forward time, a build per value, compiled on its first eager call. 1 on, 0 (default) off",
+    accepted=ON_OFF,
+)
 TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED = _flag(
     "TRTLLM_K3LL_MLA_HELIX_PLAN_FUSED",
     -1,

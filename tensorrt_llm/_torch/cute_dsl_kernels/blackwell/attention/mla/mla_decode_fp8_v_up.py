@@ -44,6 +44,11 @@ request's count have no K tiles, and the reduction combines that request's parti
 split kernel L2-prefetches ``w_uv`` (one warp per CTA, the chunks spread over the grid), and after the wait it
 releases the fused reduction, whose CTAs then take SMs as they free up and load their ``w_uv[h]`` from L2 while the
 split kernel still runs. Prefetch hints and trigger placement only: the bytes are the same.
+
+``partial_f16`` (``TRTLLM_K3LL_MLA_PARTIAL_F16``): the split kernel stores its normalized partial O as FP16 instead
+of FP32 (half the bytes its epilogue writes and the combine reads; the LSE stays FP32), and the combine widens each
+partial to FP32 before the same multiply-adds. Not the same bits: each partial is rounded once to FP16 (11-bit
+significand) before the combine, below the BF16 rounding of the result.
 """
 
 from __future__ import annotations
@@ -114,8 +119,12 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
     reducer capacity of at most 32 splits (one split per lane).
     """
 
-    def __init__(self, *args, v_rows: int = 16, prewait: bool = False, **kwargs):
+    def __init__(
+        self, *args, v_rows: int = 16, prewait: bool = False, partial_f16: bool = False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
+        # The split partials' O as FP16 in the workspace (``TRTLLM_K3LL_MLA_PARTIAL_F16``); the LSE stays FP32.
+        self.partial_o_dtype = cutlass.Float16 if partial_f16 else None
         if not self.emit_softmax_stats or self.is_var_q:
             raise ValueError(
                 "The fused V up-projection needs the Helix softmax statistics and a fixed query layout."
@@ -138,6 +147,34 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
         self.v_threads = 32 * (COMBINE_WARPS + 1)
         # The split kernel's pre-wait W_UV L2 prefetch and early release of the fused reduction (needs its PDL wait).
         self.split_prewait = bool(prewait and self.use_pdl)
+
+    def initialize_workspace(self, H, D, S, B, split_kv, acc_dtype, workspace):
+        """The base class's workspace views; with ``partial_o_dtype`` the partial O is stored in that type and the
+        LSE (``acc_dtype``) starts right after it."""
+        if cutlass.const_expr(self.partial_o_dtype is None or workspace is None):
+            return super().initialize_workspace(H, D, S, B, split_kv, acc_dtype, workspace)
+        workspace_rows = cutlass.max(H, cutlass.Int32(128))
+        align = 256 // self.q_dtype.width
+        acc_o_layout = cute.make_layout(
+            (workspace_rows, split_kv, D, S, B),
+            stride=(
+                cute.assume(split_kv * D, align),
+                cute.assume(D, align),
+                1,
+                cute.assume(split_kv * workspace_rows * D, align),
+                cute.assume(workspace_rows * split_kv * S * D, align),
+            ),
+        )
+        acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=self.partial_o_dtype)
+        acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
+        acc_lse_layout = cute.make_layout(
+            (workspace_rows, split_kv, S, B),
+            stride=(split_kv, 1, workspace_rows * split_kv, workspace_rows * split_kv * S),
+        )
+        # D is a multiple of 2, so the LSE (4-byte elements) starts 4-byte aligned after the 2-byte partials.
+        acc_lse_iter = cute.recast_ptr(acc_o_iter + cute.cosize(acc_o_layout), dtype=acc_dtype)
+        acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
+        return acc_o, acc_lse
 
     @cute.jit
     def run_with_softmax_stats_v_up(
@@ -512,11 +549,20 @@ class BlackwellMlaDecodeFP8VUp(BlackwellMultiHeadLatentAttentionForwardFP8):
 
         gAccO = mAccO[r, None, None, q_tile, b]
         rAcc.fill(0.0)
-        for i in range(local_split_kv):
-            scale = cute.arch.shuffle_sync(weight, i)
-            cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rPart)
-            for e in cutlass.range_constexpr(vec):
-                rAcc[e] += rPart[e] * scale
+        if cutlass.const_expr(self.partial_o_dtype is None):
+            for i in range(local_split_kv):
+                scale = cute.arch.shuffle_sync(weight, i)
+                cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rPart)
+                for e in cutlass.range_constexpr(vec):
+                    rAcc[e] += rPart[e] * scale
+        else:
+            rHalf = cute.make_rmem_tensor(cute.make_layout(vec), self.partial_o_dtype)
+            for i in range(local_split_kv):
+                scale = cute.arch.shuffle_sync(weight, i)
+                cute.autovec_copy(cute.local_tile(gAccO[i, None], (vec,), (lane,)), rHalf)
+                rPart.store(rHalf.load().to(self.acc_dtype))
+                for e in cutlass.range_constexpr(vec):
+                    rAcc[e] += rPart[e] * scale
 
 
 __all__ = ["BlackwellMlaDecodeFP8VUp", "MAX_ROWS", "V_HEAD_DIM", "v_up_rows_bucket"]

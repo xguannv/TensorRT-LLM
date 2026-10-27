@@ -86,6 +86,14 @@ def var_split_skip_empty(device: torch.device) -> bool:
     return _skip_empty_by_default(index)
 
 
+def flags_partial_f16() -> bool:
+    """``TRTLLM_K3LL_MLA_PARTIAL_F16`` (read at every call): the fused V-up path's split kernel stores its partial O as
+    FP16 (``BlackwellMlaDecodeFP8VUp(partial_f16=True)``), a build of its own."""
+    from . import flags
+
+    return int(flags.TRTLLM_K3LL_MLA_PARTIAL_F16) > 0
+
+
 def max_fused_rows() -> int:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8_v_up import (
         MAX_ROWS,
@@ -190,6 +198,9 @@ def _run_fused(
     if var_split and var_split_flat(cache_seqs.device):
         flat_slots = _dcp._var_split_envelope(batch, heads, seq_len_q)[0]
         key = key + (f"flat{flat_slots}",)
+    partial_f16 = bool(flags_partial_f16())
+    if partial_f16:
+        key = key + ("partial_f16",)
     compiled = _compiled.get(key)
     if compiled is None:
         from tensorrt_llm.logger import logger
@@ -219,6 +230,7 @@ def _run_fused(
             var_split_flat_slots=flat_slots,
             v_rows=v_rows,
             prewait=prewait,
+            partial_f16=partial_f16,
         )
 
         def dyn(t, lead, align=16):
