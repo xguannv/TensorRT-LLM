@@ -315,3 +315,50 @@ def test_context_draft_pool_is_tail_only_where_the_capture_only_drafter_runs(mon
     _switch(monkeypatch, -1)
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
     assert _tail_creator(monkeypatch)._drafter_prompt_tail_window(1 << 20) == 0
+
+
+def _draft_cost_kwargs(monkeypatch, creator):
+    """The keyword arguments ``_get_draft_cache_cost`` costs the external drafter's pool with."""
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    recorded = {}
+    creator._draft_model_engine = None
+    creator._mapping = SimpleNamespace(has_cp_helix=lambda: False)
+    creator._max_seq_len = 1 << 20
+    creator._is_disagg = True
+    creator._cache_transceiver_config = None
+    creator._speculative_config.spec_dec_mode.is_external_drafter = lambda: True
+    creator._get_draft_kv_model_config = lambda: SimpleNamespace(pretrained_config=object())
+    creator._get_one_model_draft_kv_cache_config = lambda config, max_seq_len: config
+    creator._validate_or_fallback_kv_cache_manager_v2 = lambda cls, *args: cls
+    monkeypatch.setattr(_util, "get_kv_cache_manager_cls", lambda *args, **kwargs: object)
+
+    def cost(manager_cls, model_config, kv_cache_config, **kwargs):
+        recorded.update(kwargs)
+        return _util.CacheCost.from_raw((1, 1))
+
+    creator._per_manager_cache_cost = cost
+    creator._get_draft_cache_cost(
+        object(), use_separate_draft_kv_cache=True, include_request_cost=True
+    )
+    return recorded
+
+
+def test_tail_only_draft_pool_is_budgeted_by_its_window(monkeypatch):
+    """The budget split's per-request estimates cost the tail-only context draft pool by its window
+    (``draft_retention_windowed``), not as a full-length mirror; every other draft pool keeps the
+    full-length estimate."""
+    monkeypatch.setattr(k3ll_flags, "_device_capability", lambda: SM103)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    _switch(monkeypatch, -1)
+    assert _draft_cost_kwargs(monkeypatch, _tail_creator(monkeypatch)).get(
+        "draft_retention_windowed"
+    )
+    _switch(monkeypatch, 0)
+    assert "draft_retention_windowed" not in _draft_cost_kwargs(
+        monkeypatch, _tail_creator(monkeypatch)
+    )
+    _switch(monkeypatch, -1)
+    assert "draft_retention_windowed" not in _draft_cost_kwargs(
+        monkeypatch, _tail_creator(monkeypatch, joint=False)
+    )

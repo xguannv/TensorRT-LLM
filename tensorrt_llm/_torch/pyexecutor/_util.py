@@ -1241,7 +1241,14 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls, effective_draft_config,
                 draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
-                # External drafter: layers start from 0, normal PP distribution
+                # External drafter: layers start from 0, normal PP distribution.
+                # The tail-only context draft pool holds only its window per
+                # request, so its per-request estimates follow the window
+                # instead of a full-length mirror.
+                windowed = ({
+                    "draft_retention_windowed": True
+                } if self._drafter_prompt_tail_window(self._max_seq_len) > 0
+                            else {})
                 return scaled(
                     self._per_manager_cache_cost(
                         draft_kv_cache_manager_cls,
@@ -1249,7 +1256,8 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         is_draft=True,
-                        include_request_cost=include_request_cost))
+                        include_request_cost=include_request_cost,
+                        **windowed))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 return scaled(

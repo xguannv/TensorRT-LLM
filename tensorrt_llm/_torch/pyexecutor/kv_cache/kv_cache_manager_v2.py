@@ -6223,6 +6223,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
+        draft_retention_windowed: bool = False,
     ) -> Optional[tuple[List[tuple[int, int, int]], int]]:
         """Per-local-layer ``(layer_size, retained_tokens, intercept_tokens)``
         plus the block-rounded full-sequence token count.
@@ -6233,6 +6234,11 @@ class KVCacheManagerV2(BaseResourceManager):
         length regardless of the drafter's own windows — resize with
         ``history = full token count`` is the cache's contract, see
         ``update_resources``), the retention window otherwise.
+        ``draft_retention_windowed`` marks a draft pool whose configured
+        windows DO bound what a request holds: the tail-only context draft
+        pool of ``TRTLLM_K3LL_DRAFTER_PROMPT_CTX``, where pages before the
+        window start are absent rather than reserved
+        (``KvCache.setAbsentBefore``). Its retention is the configured window.
         ``intercept_tokens`` is the part of that retention the affine
         intercept of ``get_cache_size_per_token`` already reserves per request
         (its SWA fixed cost uses the same window accounting), so callers can
@@ -6284,7 +6290,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
             backoff = draft_prompt_lookahead(spec_config) or 0
             covered_windows = _extend_swa_windows_for_reuse(covered_windows, backoff, max_seq_len)
-        if is_draft:
+        if is_draft and draft_retention_windowed:
+            retained_windows = list(covered_windows)
+        elif is_draft:
             # Draft mirrors are reserved at the request's full context length
             # (measured: a 41k-token context charges 41k tokens per mirror
             # against the draft pool), so the drafter's own windows do not
@@ -6363,6 +6371,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
+        draft_retention_windowed: bool = False,
         **kwargs,
     ) -> Optional[int]:
         """Slope-funded pool bytes ONE max-length request pins in this manager.
@@ -6395,6 +6404,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             spec_config=spec_config,
             is_draft=is_draft,
+            draft_retention_windowed=draft_retention_windowed,
         )
         if layer_tokens is None:
             return None
@@ -6423,6 +6433,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_len: Optional[int] = None,
         spec_config=None,
         is_draft: bool = False,
+        draft_retention_windowed: bool = False,
         **kwargs,
     ) -> Optional[int]:
         """Allocator quota ONE max-length request makes this manager insist on.
@@ -6457,6 +6468,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             spec_config=spec_config,
             is_draft=is_draft,
+            draft_retention_windowed=draft_retention_windowed,
         )
         if layer_tokens is None:
             return None

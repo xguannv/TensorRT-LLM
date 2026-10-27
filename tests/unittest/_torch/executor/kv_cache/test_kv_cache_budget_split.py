@@ -1419,6 +1419,36 @@ class TestCacheBytesPerRequest:
         )
         assert bytes_per_request == expected
 
+    def test_windowed_draft_retention_is_intercept_covered(self):
+        """A draft pool whose window bounds what a request holds (the tail-only
+        context draft pool) retains only its window, and the affine intercept
+        already reserves that window: nothing is slope-funded per request."""
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_attention_window=[128]),
+            is_draft=True,
+            draft_retention_windowed=True,
+        )
+        assert bytes_per_request == 0
+
+    def test_windowed_draft_keeps_unwindowed_layers_full_length(self):
+        """Only windowed layers are bounded; a full-attention draft layer still
+        grows with the request."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            BASE_GENERATION_TOKEN_COUNT,
+        )
+
+        bytes_per_request = self._call(
+            _v2_model_config(),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, max_attention_window=[128, self.MSL]
+            ),
+            is_draft=True,
+            draft_retention_windowed=True,
+        )
+        headroom = BASE_GENERATION_TOKEN_COUNT
+        assert bytes_per_request == 12 * self.LAYER_BYTES * self._full_tokens(self.MSL, headroom)
+
     def test_uniform_full_attention_declines(self):
         """Per-request spend proportional to the slope reports None so the
         split keeps its per-token weighting."""
@@ -1488,6 +1518,26 @@ class TestCacheQuotaPerRequest:
         1 / float32(0.95) (1025 -> 1079 blocks, 67.4375 MiB) and rounds the
         pool up to the 2 MiB allocation granularity: it insists on 68 MiB."""
         assert self._call(_v2_model_config(num_layers=1)) == 68 * (1 << 20)
+
+    def test_windowed_draft_floor_is_one_window(self):
+        """The tail-only context draft pool insists on one request's window,
+        not a full-length mirror: 128 + headroom tokens round to a few blocks,
+        and the pool rounds up to one 2 MiB allocation granule."""
+        windowed = self._call(
+            _v2_model_config(num_layers=1),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, avg_seq_len=8192, max_attention_window=[128]
+            ),
+            draft_retention_windowed=True,
+        )
+        full_length = self._call(
+            _v2_model_config(num_layers=1),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, avg_seq_len=8192, max_attention_window=[128]
+            ),
+        )
+        assert windowed == 2 * (1 << 20)
+        assert full_length == 68 * (1 << 20)
 
     def test_declines_without_runtime_constraints(self):
         """No avg_seq_len (or an explicit pool_ratio) means the runtime builds
