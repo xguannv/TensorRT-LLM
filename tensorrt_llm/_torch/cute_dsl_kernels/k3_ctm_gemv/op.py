@@ -688,6 +688,13 @@ def col_publish_config(
     return None if config is None else (*config, n_tile)
 
 
+def _prof_pub() -> int:
+    """The diagnostic marks buffer of the publish (k3_prof kind "pub"), 0 when off."""
+    from ..blackwell import k3_prof
+
+    return k3_prof.addr("pub")
+
+
 def _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, addend_early) -> tuple:
     return (
         "k3_ctm_gemv_wide_col_publish",
@@ -698,6 +705,7 @@ def _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, addend_ear
         hidden,
         use_pdl,
         addend_early,
+        _prof_pub(),
     )
 
 
@@ -725,7 +733,7 @@ def compile_wide_col_publish(
         _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, addend_early),
         kernel.k3_ctm_gemv_wide_col_publish, _arg(weight), _arg(x), _arg(x.view(-1)), num_tokens, addr, addr, addr,
         addr, Int32(0), n_out, k_in, split, ring, x_ring, n_tile, row_tiles, hidden, use_pdl, addend_early,
-        _stream(x),
+        _prof_pub(), _stream(x),
     )  # fmt: skip
     return True
 
@@ -818,8 +826,12 @@ def run_k3_ctm_gemv_wide_col_publish(
     fn = _compile(
         _col_publish_key(n_out, k_in, config, row_tiles, hidden, use_pdl, bool(addend_early)),
         kernel.k3_ctm_gemv_wide_col_publish, *args, num_tokens, *lamport, n_out, k_in, split, ring, x_ring, n_tile,
-        row_tiles, hidden, use_pdl, bool(addend_early), stream,
+        row_tiles, hidden, use_pdl, bool(addend_early), _prof_pub(), stream,
     )  # fmt: skip
+    if _prof_pub():
+        from ..blackwell import k3_prof
+
+        k3_prof.touch()
     fn(*args, num_tokens, *lamport, stream)
 
 

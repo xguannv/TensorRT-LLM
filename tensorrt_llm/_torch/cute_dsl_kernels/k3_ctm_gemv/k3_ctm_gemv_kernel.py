@@ -67,6 +67,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from ..blackwell import k3_lamport_ar as _lamport
+from ..blackwell import k3_prof as _prof
 
 CTA_M = 128  # weight rows (output features) per cluster = the MMA's M
 MMA_N = 8  # token columns
@@ -1278,6 +1279,10 @@ def k3_ctm_gemv_wide_kernel(
     # Column publish: load the addend right after the grid wait (overlapping the activation load and the MMA)
     # instead of after the split-K reduce; the same values, so the same bits.
     pub_addend_early: cutlass.Constexpr[bool],
+    # Diagnostic marks (k3_prof.py kind "pub"; 0: none): the first epilogue thread of each CTA stores %globaltimer at
+    # 0 epilogue entry | 1 grid wait returned | 2 rotation state read | 3 MMA done | 4 split-K mailbox full |
+    # 5 addend in registers | 6 slice pushed | 7 re-arm done, and 8 = CTA | owned tokens << 16 | addend early << 31.
+    prof_addr: cutlass.Constexpr[int],
 ):
     """One 128-row tile per cluster of `split` CTAs; a weight ring filled before the grid wait, an x ring after it."""
     k_tiles = num_k_tiles(k_in)
@@ -1543,10 +1548,22 @@ def k3_ctm_gemv_wide_kernel(
         lane = tx % 32
         w = warp_id - 4  # TMEM lanes 32 w .. 32 w + 31: tile rows 32 w + lane
         row = w * cutlass.Int32(LONG_ROWS_PER_WARP) + lane
+        pslot = cutlass.Int64(0)
+        if cutlass.const_expr(prof_addr != 0):
+            if tx == cutlass.Int32(4 * 32):
+                pslot = _prof.slot_base(prof_addr, "pub", bx)
+                _prof.st_u64(pslot, _prof.globaltimer())
+                info = cutlass.Int64(bx) | (cutlass.Int64(my_owned) << cutlass.Int64(16))
+                if cutlass.const_expr(pub_addend_early):
+                    info = info | (cutlass.Int64(1) << cutlass.Int64(31))
+                _prof.st_u64(pslot + cutlass.Int64(64), info)
         if cutlass.const_expr(ar_world > 0 or pub_hidden > 0):
             # The push reads the Lamport rotation state, which the previous grids leave final; the publish reads the
             # addend, which the previous grids wrote.
             prims.griddepcontrol(prims.GridDepAction.WAIT)
+            if cutlass.const_expr(prof_addr != 0):
+                if tx == cutlass.Int32(4 * 32):
+                    _prof.st_u64(pslot + cutlass.Int64(8), _prof.globaltimer())
         # The column publish's addend vectors of this lane (the publish loop's indices below), loaded here with
         # pub_addend_early so the loads overlap the activation TMA and the MMA instead of following the split-K
         # reduce. A vector the lane does not publish reads a clamped in-bounds address (token 0, the slice's first
@@ -1583,6 +1600,9 @@ def k3_ctm_gemv_wide_kernel(
             pub_cur, pub_dirty, pub_nbytes, pub_dstages, pub_c0, pub_c1, pub_c2, pub_c3 = (
                 _lamport.lamport_state(pub_flags)
             )
+            if cutlass.const_expr(prof_addr != 0):
+                if tx == cutlass.Int32(4 * 32):
+                    _prof.st_u64(pslot + cutlass.Int64(16), _prof.globaltimer_after(pub_cur))
             prims.barrier_cta_sync(2, thread_count=EPI_THREADS)
             if tx == cutlass.Int32(4 * 32):
                 arrivals = pub_flags + cutlass.Int64(_lamport.FLAG_ARRIVALS * 4)
@@ -1600,6 +1620,9 @@ def k3_ctm_gemv_wide_kernel(
                     _lamport.st_u32(arrivals, cutlass.Int32(0))
         while not cute.arch.mbarrier_try_wait(acc_done.data_ptr(), 0):
             pass
+        if cutlass.const_expr(prof_addr != 0):
+            if tx == cutlass.Int32(4 * 32):
+                _prof.st_u64(pslot + cutlass.Int64(24), _prof.globaltimer())
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         acc = prims.tcgen05_ld(
             "32x32b", cutlass.inttoptr(tmem_ptr_i32.load(), 6, cutlass.Float32), num=n_tile
@@ -1648,6 +1671,9 @@ def k3_ctm_gemv_wide_kernel(
             # cluster scope).
             while not _test_wait_cluster(mail_full.data_ptr(), 0):
                 pass
+            if cutlass.const_expr(prof_addr != 0):
+                if tx == cutlass.Int32(4 * 32):
+                    _prof.st_u64(pslot + cutlass.Int64(32), _prof.globaltimer())
             # This row's owned tokens over the SPLIT slots in rank order, as the long kernel.
             totals = [cutlass.Float32(0.0)] * owned
             for q in cutlass.range_constexpr(split):
@@ -1739,6 +1765,12 @@ def k3_ctm_gemv_wide_kernel(
                                     add = early_adds[p]
                                 else:
                                     add = _lamport.ld_v4(pub_addend + off)
+                                if cutlass.const_expr(prof_addr != 0 and p == 0):
+                                    if tx == cutlass.Int32(4 * 32):
+                                        _prof.st_u64(
+                                            pslot + cutlass.Int64(40),
+                                            _prof.globaltimer_after(add[0] | 1),
+                                        )
                                 words = []
                                 for q in cutlass.range_constexpr(4):
                                     s_lo, s_hi = _lamport.acc_bf16x2(
@@ -1748,6 +1780,9 @@ def k3_ctm_gemv_wide_kernel(
                                     )
                                     words.append(_lamport.pack_bf16x2(s_lo, s_hi))
                                 _lamport.push_v4(bcast + off, *words, True)
+                if cutlass.const_expr(prof_addr != 0):
+                    if tx == cutlass.Int32(4 * 32):
+                        _prof.st_u64(pslot + cutlass.Int64(48), _prof.globaltimer())
             elif cutlass.const_expr(row_tiles > 0):
                 # Row tiles: this row's owned tokens below M, plain stores.
                 if row < cutlass.Int32(tile_rows):
@@ -1825,6 +1860,9 @@ def k3_ctm_gemv_wide_kernel(
                         gtid,
                         cutlass.Int32(pub_threads),
                     )
+            if cutlass.const_expr(prof_addr != 0):
+                if tx == cutlass.Int32(4 * 32):
+                    _prof.st_u64(pslot + cutlass.Int64(56), _prof.globaltimer())
         prims.barrier_cta_sync(1, thread_count=EPI_THREADS)
         if warp_id == 4:
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols)
@@ -1890,6 +1928,7 @@ def k3_ctm_gemv_wide(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_y, tma_desc_y_tail, y, num_tokens, sig_row0, n_out, k_in, split, ring, x_ring,
         n_tile, out_fp32, trigger_early, row_tiles, 0, None, None, None, None, 0, None, None, None, None, None, False,
+        0,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1927,7 +1966,7 @@ def k3_ctm_gemv_wide_ar_push(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
         ring, x_ring, n_tile, False, False, 0, ar_world, peer_ptrs, mc_base, flags, rank, 0, None, None, None, None,
-        None, False,
+        None, False, 0,
     ).launch(
         grid=((n_out // CTA_M) * split, 1, 1),
         block=(THREADS, 1, 1),
@@ -1958,6 +1997,7 @@ def k3_ctm_gemv_wide_col_publish(
     hidden: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     addend_early: cutlass.Constexpr[bool],
+    prof_addr: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
 ) -> None:
     """``x @ w^T`` (fp32 sums as ``k3_ctm_gemv_wide``'s) plus the bf16 ``addend [M, hidden]``'s columns
@@ -1974,7 +2014,7 @@ def k3_ctm_gemv_wide_col_publish(
     k3_ctm_gemv_wide_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x, tma_desc_x, x_flat, num_tokens, cutlass.Int32(n_out), n_out, k_in, split,
         ring, x_ring, n_tile, False, False, row_tiles, 0, None, None, None, None, hidden, uc_local, mc_base, flags,
-        addend, col0, addend_early,
+        addend, col0, addend_early, prof_addr,
     ).launch(
         grid=(clusters * split, 1, 1),
         block=(THREADS, 1, 1),

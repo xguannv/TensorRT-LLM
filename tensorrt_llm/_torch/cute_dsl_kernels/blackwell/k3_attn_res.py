@@ -58,6 +58,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .. import k3_carveout
 from . import k3_fp8w_lowm_mxfp8 as mx_ops
+from . import k3_prof as _prof
 
 #: Hidden size the kernel is specialized for.
 HIDDEN_SIZE = 7168
@@ -1175,6 +1176,7 @@ class K3AttnResFastKernel:
         early_trigger: bool = _EARLY_TRIGGER,
         mnnvl_order: bool = False,
         tap: bool = False,
+        prof_addr: int = 0,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -1187,6 +1189,10 @@ class K3AttnResFastKernel:
         self.mxfp8 = mxfp8
         self.tap = tap
         self.lamport = lamport
+        # Diagnostic marks (k3_prof.py kind "tar"; 0: none): thread 0 of each CTA stores %globaltimer at 0 entry |
+        # 1 grid wait returned | 2 own vector polled | 3 round 1 done | 4 round 2 done | 5 stores issued, and
+        # 6 = token | rank << 16 | m << 24.
+        self.prof_addr = prof_addr
         self.early_trigger = early_trigger
         self.n = num_candidates
         self.k = num_candidates - 1
@@ -1304,6 +1310,16 @@ class K3AttnResFastKernel:
 
         token = bidx // c
         rank = bidx - token * c
+        prof = self.prof_addr
+        pslot = Int64(0)
+        if cutlass.const_expr(prof != 0):
+            if tidx == 0:
+                pslot = _prof.slot_base(prof, "tar", bidx)
+                _prof.st_u64(pslot, _prof.globaltimer())
+                _prof.st_u64(
+                    pslot + Int64(48),
+                    Int64(token) | (Int64(rank) << Int64(16)) | (Int64(m) << Int64(24)),
+                )
         if cutlass.const_expr(c > 1):
             if tidx == 0:
                 for r in cutlass.range_constexpr(3):
@@ -1425,6 +1441,9 @@ class K3AttnResFastKernel:
             _griddepcontrol_wait()
             if cutlass.const_expr(self.early_trigger):
                 _griddepcontrol_launch_dependents()
+        if cutlass.const_expr(prof != 0):
+            if tidx == 0:
+                _prof.st_u64(pslot + Int64(8), _prof.globaltimer())
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             if cutlass.const_expr(self.lamport):
@@ -1437,6 +1456,11 @@ class K3AttnResFastKernel:
                 polled = _lamport_ops().poll_result_v4(
                     add_addr, add2_addr, Int32(token), off, HIDDEN_SIZE
                 )
+                if cutlass.const_expr(prof != 0):
+                    if tidx == 0:
+                        _prof.st_u64(
+                            pslot + Int64(16), _prof.globaltimer_after(polled[0] | Int32(1))
+                        )
                 addend = unpack([_selp_b32(valid, w, Int32(0)) for w in polled])
             else:
                 addend = unpack(load(add_addr + row + col, False))
@@ -1476,6 +1500,9 @@ class K3AttnResFastKernel:
                     pair,
                 )
             _mbar_wait_cluster(mbar_smem + 8)
+        if cutlass.const_expr(prof != 0):
+            if tidx == 0:
+                _prof.st_u64(pslot + Int64(24), _prof.globaltimer())
         if cutlass.const_expr(mo):
             tot_sq = _cluster_total(last_smem, lane, c, warps, 2, 0, 0)
             tot_dot = _cluster_total(last_smem, lane, c, warps, 2, 1, 16)
@@ -1532,6 +1559,9 @@ class K3AttnResFastKernel:
             if lane < c:
                 _st_async_b32(outsq_smem + (rank * warps + warp) * 4, lane, mbar_smem + 16, out_sq)
             _mbar_wait_cluster(mbar_smem + 16)
+        if cutlass.const_expr(prof != 0):
+            if tidx == 0:
+                _prof.st_u64(pslot + Int64(32), _prof.globaltimer())
         if cutlass.const_expr(mo):
             out_total = _cluster_total(outsq_smem, lane, c, warps, 1, 0, 0)
         else:
@@ -1562,6 +1592,9 @@ class K3AttnResFastKernel:
                 xs_addr + Int64(token) * (HIDDEN_SIZE // 32) + (chan >> 5),
                 e_a,
             )
+        if cutlass.const_expr(prof != 0):
+            if tidx == 0:
+                _prof.st_u64(pslot + Int64(40), _prof.globaltimer())
 
         if cutlass.const_expr(self.use_pdl and not self.early_trigger):
             _bar_sync(4, self.threads)
@@ -1623,6 +1656,7 @@ def _compiled(
             early_trigger,
             mnnvl_order,
             tap,
+            prof_addr=_prof.addr("tar") if lamport else 0,
         )
     addr = Int64(1 << 20)
     compiled = cute.compile(
@@ -1795,6 +1829,8 @@ def run_k3_attn_res(
     )
     if lamport:
         add_addr, add2_addr = lamport_addend
+        if "tar" in _prof.kinds():
+            _prof.touch()
     else:
         add_addr = addends[0].data_ptr() if add_mode >= 1 else 0
         add2_addr = addends[1].data_ptr() if add_mode == 2 else 0
