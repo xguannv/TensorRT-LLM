@@ -539,10 +539,18 @@ def sandwich_role(
     ],  # 2: accumulate the even and the odd k-tiles apart, then (0 + even) + odd
     cta_base: cutlass.Constexpr[int],  # grid index of the role's first CTA (a multiple of CLUSTER)
     act_hook: cutlass.Constexpr,  # None: the activation by TMA after the grid wait; else see below
+    act_early: cutlass.Constexpr[
+        int
+    ] = 0,  # tail, x_src 0: accumulator 1's k-tiles and MMAs before the grid wait
 ):
     """One CTA of the sandwich: grid indices cta_base .. cta_base + 55 (8 clusters of 7, 256 threads). A kernel may
     run other roles in other CTAs (their own clusters) as long as they never touch ``ws_flags`` or the all-reduce
     buffer.
+
+    ``act_early`` (tail form, x_src 0): warp 1 loads the shared-expert activation (accumulator 1's k-tiles, complete
+    at launch) by TMA before its grid wait, and the MMA warp issues accumulator 1's MMAs first, then the latent ones
+    once their TMA (after the wait, on ``lat_full``) lands. The two accumulators and each one's k-tile order are
+    unchanged, so the results are the same bits.
 
     ``act_hook`` (post-attention form only): warp 1 calls ``act_hook(smem_b_words, act_full, grid_bx, lane)`` (all 32
     lanes; grid_bx the CTA's grid index) instead of waiting on the grid and loading the activation by TMA. The hook
@@ -605,6 +613,9 @@ def sandwich_role(
     ring = stages < k_tiles
     acc_pair = split_acc or k_split == 2
     assert not (ring and (x_src != 0 or hooked)), "the weight ring serves the plain form only"
+    assert not act_early or (tail and x_src == 0 and split_acc and not hooked and not swiglu), (
+        "act_early: the tail form reading its latent by TMA"
+    )
     assert not swiglu or (plain and k_split == 2 and k_tiles == CLUSTER), (
         "swiglu: the plain form, split 2's order, K 896"
     )
@@ -670,6 +681,9 @@ def sandwich_role(
                     prims.mbarrier_arrive_expect_tx(mb_rms, num_tokens * cutlass.Int32(4))
                 for rj in cutlass.range_constexpr(LATENT_ROWS_PER_CTA):
                     prims.mbarrier_init(rms_full.subview(rj), 1)
+            if cutlass.const_expr(act_early):
+                # The latent k-tiles (TMA after the grid wait); act_full then counts only accumulator 1's k-tiles.
+                prims.mbarrier_init(lat_full, 1)
             if cutlass.const_expr(x_src == 2):
                 # The live rows' slice vectors from the cluster's reducers, and (CTA 0 of a live token's cluster) the
                 # token's whole summed row.
@@ -876,6 +890,24 @@ def sandwich_role(
         elif cutlass.const_expr(hooked):
             act_hook(smem_b_words, act_full, grid_bx, tx % cutlass.Int32(32))
         else:
+            if cutlass.const_expr(act_early):
+                # The shared-expert activation (accumulator 1's k-tiles) is complete at launch (the front, two kernels
+                # back, completed before the producer's grid wait returned): load it before the wait.
+                if prims.elect_sync():
+                    prims.mbarrier_arrive_expect_tx(
+                        act_full, (k_tiles - x_tiles) * MMA_N * CTA_K * ELEM_BYTES
+                    )
+                    for k in cutlass.range_constexpr(x_tiles, k_tiles):
+                        for half in cutlass.range_constexpr(TMA_COPY_ITERS):
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                smem_b.subview(k * MMA_N * CTA_K + half * B_HALF_ELEMS),
+                                tma_ptr_x2,
+                                (
+                                    cutlass.Int32((k - x_tiles) * CTA_K + half * TMA_K_BOX),
+                                    cutlass.Int32(0),
+                                ),
+                                act_full,
+                            )
             prims.griddepcontrol(prims.GridDepAction.WAIT)
         if cutlass.const_expr(tail and x_src == 0):
             # The whole latent row of each token this CTA takes the RMS of, one bulk copy each (the TMA engine, not
@@ -924,9 +956,13 @@ def sandwich_role(
                             ),
                             act_full,
                         )
+                elif cutlass.const_expr(act_early):
+                    prims.mbarrier_arrive_expect_tx(lat_full, x_tiles * MMA_N * CTA_K * ELEM_BYTES)
                 else:
                     prims.mbarrier_arrive_expect_tx(act_full, k_tiles * MMA_N * CTA_K * ELEM_BYTES)
-                for k in cutlass.range_constexpr(0 if swiglu else k_tiles):
+                for k in cutlass.range_constexpr(
+                    0 if swiglu else (x_tiles if act_early else k_tiles)
+                ):
                     for half in cutlass.range_constexpr(TMA_COPY_ITERS):
                         if cutlass.const_expr(k < x_tiles):
                             prims.cp_async_bulk_tensor_shared_cta_global(
@@ -936,7 +972,7 @@ def sandwich_role(
                                     x_col0 + cutlass.Int32(k * CTA_K + half * TMA_K_BOX),
                                     cutlass.Int32(0),
                                 ),
-                                act_full,
+                                lat_full if act_early else act_full,
                             )
                         else:
                             prims.cp_async_bulk_tensor_shared_cta_global(
@@ -1013,7 +1049,7 @@ def sandwich_role(
         # x_src 2: the shared-expert k-tiles first; the latent ones once the reducers' slice vectors are in.
         mma_order = (
             list(range(x_tiles, k_tiles)) + list(range(x_tiles))
-            if x_src == 2
+            if x_src == 2 or act_early
             else list(range(k_tiles))
         )
         for ki in cutlass.range_constexpr(k_tiles):
@@ -1026,6 +1062,11 @@ def sandwich_role(
                 while not _test_wait_cluster(lat_full.data_ptr(), 0):
                     pass
                 prims.fence_proxy("async_shared", space=prims.SharedSpace.shared_cta)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+            if cutlass.const_expr(act_early and k == 0):
+                # Accumulator 1's MMAs are issued; the latent k-tiles land by TMA after the grid wait.
+                while not cute.arch.mbarrier_try_wait(lat_full.data_ptr(), 0):
+                    pass
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             for kb in cutlass.range_constexpr(TMA_COPY_ITERS * K_BLOCKS_PER_HALF):
                 box = kb // K_BLOCKS_PER_HALF
@@ -1929,6 +1970,7 @@ def k3_sandwich_kernel(
     tap_out: cutlass.Constexpr[int],
     swiglu: cutlass.Constexpr[int],
     k_split: cutlass.Constexpr[int],
+    act_early: cutlass.Constexpr[int],
 ):
     """The sandwich alone: 56 CTAs, each running ``sandwich_role`` on its own shared memory (arguments as there)."""
     smem = SmemAllocator().allocate(smem_bytes(k_in, rms_cols, swiglu), byte_alignment=1024)
@@ -1936,7 +1978,7 @@ def k3_sandwich_kernel(
         tma_desc_w, tma_desc_x, tma_desc_x2, rms_src, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
         updated, normed, x_slab, lat_flags, tap, smem, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
         x_col0, lat_eps, slab_buf, x_buf, tap_stride, world, k_in, x_tiles, rms_cols, publish, x_src, plain, tap_out,
-        swiglu, k_split, 0, None,
+        swiglu, k_split, 0, None, act_early,
     )  # fmt: skip
 
 
@@ -2007,7 +2049,7 @@ def k3_sandwich_oproj(
         tma_desc_w, tma_desc_x, tma_desc_x, src_slab, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w, out_w,
         updated, normed, x_slab, ws_flags, ws_flags, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
         cutlass.Int32(0), cutlass.Float32(0.0), slab_buf, src_buf, cutlass.Int32(WORDS_PER_ROW), world, K_IN,
-        MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1,
+        MAX_K_TILES, 0, publish, x_src, 0, 0, 0, 1, 0,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2047,6 +2089,9 @@ def k3_sandwich_tail(
     publish: cutlass.Constexpr[int],
     x_src: cutlass.Constexpr[int],
     tap_out: cutlass.Constexpr[int],  # 1: the pre-norm mixture into ``tap``; 2: updated
+    act_early: cutlass.Constexpr[
+        int
+    ],  # x_src 0: the shared-expert k-tiles and their MMAs before the grid wait
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ) -> None:
@@ -2061,7 +2106,7 @@ def k3_sandwich_tail(
         tma_desc_w, tma_desc_x, tma_desc_x2, latent_words, ws_uc, ws_mc, ws_flags, prefix, snapshots, res_w, rms_w,
         out_w, updated, normed, x_slab, lat_flags, tap, num_tokens, rank, num_cand, add_prefix, rms_eps, out_eps,
         lat_col0, lat_eps, slab_buf, src_buf, tap_stride, world, k_in, TAIL_LAT // CTA_K, LATENT, publish, x_src, 0,
-        tap_out, 0, 1,
+        tap_out, 0, 1, act_early,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip
@@ -2101,7 +2146,7 @@ def k3_sandwich_plain(
         tma_desc_w, tma_desc_x, tma_desc_x, ws_flags, ws_uc, ws_mc, ws_flags, residual, residual, norm_w, norm_w,
         norm_w, updated, normed, ws_flags, ws_flags, ws_flags, num_tokens, rank, cutlass.Int32(1), cutlass.Int32(1),
         eps, eps, cutlass.Int32(k_in if swiglu else 0), cutlass.Float32(0.0), cutlass.Int32(0), cutlass.Int32(0),
-        cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu, 2 if swiglu else 1,
+        cutlass.Int32(WORDS_PER_ROW), world, k_in, k_in // CTA_K, 0, 0, 0, order, 0, swiglu, 2 if swiglu else 1, 0,
     ).launch(
         grid=(NUM_CTAS, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1), stream=stream, use_pdl=use_pdl,
     )  # fmt: skip

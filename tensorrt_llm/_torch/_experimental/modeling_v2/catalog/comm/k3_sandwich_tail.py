@@ -31,12 +31,15 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    act_early: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return ``(normed, updated)``: ``updated = prefix + allreduce([rmsnorm(latent)[:, lo:lo+224] | act] @
     tail_weight^T)`` over ``workspace``'s TP group (the sum alone without ``prefix``), ``normed`` =
     RMSNorm(attn_res(block_residual..., updated)). ``tap``: also store the pre-norm attention-residual mixture there
     (``updated`` with ``tap_updated``). ``updated_out``: store ``updated`` there; it is then the returned ``updated``.
-    Advances ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
+    ``act_early``: the kernel loads ``act`` before its grid wait (``act`` complete before the call's producer); the
+    same results. Advances ``workspace`` by one call: every rank of the group makes the same calls on it in the same
+    order."""
     normed, updated = torch.ops.trtllm.k3_sandwich_tail(
         latent,
         act,
@@ -57,5 +60,6 @@ def k3_sandwich_tail(
         tap=tap,
         tap_updated=tap_updated,
         updated_out=updated_out,
+        act_early=act_early,
     )
     return normed, (updated if updated_out is None else updated_out)

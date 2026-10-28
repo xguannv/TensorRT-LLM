@@ -566,8 +566,78 @@ def check_fold_wrap(ctx):
     return [row]
 
 
+def check_act_early(ctx):
+    """``act_early`` (the shared-expert activation and its MMAs before the grid wait): bit for bit the default build at
+    every M, snapshot count and prefix choice, in the tap / tap_updated / bank-row forms, and as graphs of [tail off,
+    tail on] replayed with refilled inputs against the eager default."""
+    results = []
+    for snapshots in SNAPSHOTS:
+        for with_prefix in (True, False):
+            latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(
+                ctx, snapshots, 300 + snapshots
+            )
+            for m in M_ALL:
+                latent, act = latent8[:m].contiguous(), act8[:m].contiguous()
+                pre, block = _first(m, prefix8, block8, with_prefix)
+                args = (latent, act, w, lo, pre, block, res_w, rms_w, out_w)
+                n0, u0 = _tail(ctx, *args)
+                n1, u1 = _tail(ctx, *args, act_early=True)
+                same = _same(n1, n0) and _same(u1, u0)
+                results.append(dict(op="k3_sandwich_tail", case=f"act_early_S{snapshots}_"
+                                    f"{'prefix' if with_prefix else 'noprefix'}", M=m, eq_default=same,
+                                    ok=_all_ranks(ctx, same)))  # fmt: skip
+    latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(ctx, 3, 390)
+    for m in M_ALL:
+        latent, act = latent8[:m].contiguous(), act8[:m].contiguous()
+        pre, block = _first(m, prefix8, block8, True)
+        args = (latent, act, w, lo, pre, block, res_w, rms_w, out_w)
+        same = True
+        for key, extra in (("tap", {}), ("tap", {"tap_updated": True}), ("updated_out", {})):
+            side = [_nan(m, H), _nan(m, H)]
+            want = _tail(ctx, *args, **{key: side[0]}, **extra)
+            got = _tail(ctx, *args, act_early=True, **{key: side[1]}, **extra)
+            torch.cuda.synchronize()
+            same = same and _same(side[1], side[0]) and all(_same(a, b) for a, b in zip(got, want))
+        results.append(dict(op="k3_sandwich_tail", case="act_early_forms", M=m, eq_default=same,
+                            ok=_all_ranks(ctx, same)))  # fmt: skip
+    graphs = {}
+    stream = torch.cuda.Stream()
+    for m in M_ALL:
+        latent8, act8, w, lo, prefix8, block8, res_w, rms_w, out_w = _tail_inputs(ctx, 3, 410)
+        b_in = [latent8[:m].clone(), act8[:m].clone(), w, lo, prefix8[:m].clone(), block8[:, :m].clone(), res_w,
+                rms_w, out_w]  # fmt: skip
+        _tail(ctx, *b_in)
+        _tail(ctx, *b_in, act_early=True)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(graph, stream=stream):
+                outs = [_tail(ctx, *b_in), _tail(ctx, *b_in, act_early=True)]
+        torch.cuda.synchronize()
+        graphs[m] = (graph, b_in, outs)
+    for it, m in enumerate(REPLAY_ORDER):
+        graph, b_in, outs = graphs[m]
+        seed = 9500 + 89 * it
+        b_in[0].copy_(_rand(tuple(b_in[0].shape), seed + 3000, 0.8))
+        b_in[1].copy_(_rand(tuple(b_in[1].shape), seed + 4000 + ctx.rank, 0.5))
+        b_in[4].copy_(_rand(tuple(b_in[4].shape), seed + 5000))
+        torch.cuda.synchronize()
+        ctx.comm.Barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        got = [[t.clone() for t in o] for o in outs]
+        want = _tail(ctx, *b_in)
+        torch.cuda.synchronize()
+        same = all(_same(g, x) for go in got for g, x in zip(go, want))
+        results.append(dict(op="k3_sandwich_tail", case=f"act_early_replay{it}", M=m, eq_eager=same,
+                            ok=_all_ranks(ctx, same)))  # fmt: skip
+    del graphs
+    return results
+
+
 CHECKS = {"oproj": check_oproj, "tail": check_tail, "plain": check_plain, "swiglu": check_swiglu,
-          "replay": check_replay, "wrap": check_wrap, "fold_wrap": check_fold_wrap}  # fmt: skip
+          "replay": check_replay, "wrap": check_wrap, "fold_wrap": check_fold_wrap,
+          "act_early": check_act_early}  # fmt: skip
 
 
 def _run_checks(names):

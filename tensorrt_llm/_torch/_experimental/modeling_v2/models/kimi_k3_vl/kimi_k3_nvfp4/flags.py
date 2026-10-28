@@ -482,6 +482,16 @@ TRTLLM_K3LL_MOE_TAIL_COL_ADDEND_EARLY = _flag(
     "moe_tail_col.ADDEND_EARLY_CAPABILITIES",
     accepted=ON_OFF,
 )
+TRTLLM_K3LL_SANDWICH_ACT_EARLY = _flag(
+    "TRTLLM_K3LL_SANDWICH_ACT_EARLY",
+    0,
+    "the narrow (at most 8 tokens) MoE tail, comm/k3_sandwich_tail: the kernel loads the shared-expert activation and "
+    "runs its k-tiles' MMAs before its grid wait (the activation is complete before the latent all-reduce, its "
+    "producer), so only the latent k-tiles follow the wait. Bitwise (separate accumulators, the same order in each). "
+    "Read at forward time, a build per value. 1 on, 0 (default) off, -1 on where the device is in "
+    "decode_comm.SANDWICH_ACT_EARLY_CAPABILITIES",
+    accepted=ON_OFF,
+)
 TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE = _flag(
     "TRTLLM_K3LL_ATTN_RES_SNAPSHOT_INPLACE",
     -1,

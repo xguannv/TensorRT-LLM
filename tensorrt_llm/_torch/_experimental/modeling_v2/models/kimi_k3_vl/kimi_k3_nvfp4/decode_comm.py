@@ -48,6 +48,7 @@ The plain MNNVL all-reduces the decode path keeps (the stock modules') send one-
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
@@ -79,6 +80,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace 
 from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
+from . import census as _census
 from . import flags as _flags
 from . import moe_tail_col as _tail_col
 from . import moe_tail_lu as _tail_lu
@@ -165,6 +167,29 @@ def _res_args(res_proj: nn.Module, res_norm: nn.Module, out_norm: nn.Module) -> 
     )
 
 
+#: ``TRTLLM_K3LL_SANDWICH_ACT_EARLY`` at -1 turns it on only on these compute capabilities.
+SANDWICH_ACT_EARLY_CAPABILITIES: Tuple[Tuple[int, int], ...] = ((10, 3),)
+
+
+@functools.lru_cache(maxsize=None)
+def _sandwich_act_early_by_default(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in SANDWICH_ACT_EARLY_CAPABILITIES
+
+
+def sandwich_act_early_on(device: torch.device) -> bool:
+    """``TRTLLM_K3LL_SANDWICH_ACT_EARLY`` on ``device`` (read at every narrow tail call; counted in the census when
+    on): 1 on, 0 (default) off, -1 on where the device is in ``SANDWICH_ACT_EARLY_CAPABILITIES``."""
+    value = int(_flags.TRTLLM_K3LL_SANDWICH_ACT_EARLY)
+    if value >= 0:
+        on = value > 0
+    else:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        on = _sandwich_act_early_by_default(index)
+    if on:
+        _census.count(f"dispatch:sandwich_act_early:{_census.mode()}")
+    return on
+
+
 @dataclass(eq=False)
 class K3DecodeComm:
     """The decode path's collective state for the TP group: the `MnnvlWorkspace` and the `K3SandwichWorkspace` the
@@ -206,26 +231,29 @@ class K3DecodeComm:
 
     def compile_tail(self, latent_size: int, act_size: int, tail_weight: torch.Tensor) -> None:
         """Compile the sandwich tail kernel for a MoE tail of ``latent_size`` latent and ``act_size`` shared columns
-        and ``tail_weight``'s shape, with one call on a zero row of a zero weight, before any capture. Collective: every
-        rank of the group makes the call; it advances the sandwich workspace on every rank alike."""
+        and ``tail_weight``'s shape, with one call per build (with and without ``TRTLLM_K3LL_SANDWICH_ACT_EARLY``, read
+        at forward time) on a zero row of a zero weight, before any capture. Collective: every rank of the group makes
+        the calls; they advance the sandwich workspace on every rank alike."""
         weight = torch.zeros_like(tail_weight)
         hidden = weight.shape[0]
         ones = weight.new_ones(hidden)
-        k3_sandwich_tail(
-            weight.new_zeros(1, latent_size),
-            weight.new_zeros(1, act_size),
-            weight,
-            0,
-            1e-6,
-            None,
-            weight.new_zeros(0, 1, hidden),
-            weight.new_zeros(hidden),
-            ones,
-            ones,
-            1e-6,
-            1e-6,
-            self.sandwich,
-        )
+        for act_early in (False, True):
+            k3_sandwich_tail(
+                weight.new_zeros(1, latent_size),
+                weight.new_zeros(1, act_size),
+                weight,
+                0,
+                1e-6,
+                None,
+                weight.new_zeros(0, 1, hidden),
+                weight.new_zeros(hidden),
+                ones,
+                ones,
+                1e-6,
+                1e-6,
+                self.sandwich,
+                act_early=act_early,
+            )
         torch.cuda.synchronize(weight.device)
 
     def takes_post_attention(self, hidden_states: torch.Tensor, step) -> bool:
@@ -519,6 +547,7 @@ class K3DecodeComm:
             tap=tap,
             tap_updated=tap_updated,
             updated_out=updated_out,
+            act_early=sandwich_act_early_on(pending.latent.device),
         )
 
     def sandwich_oproj(

@@ -469,6 +469,7 @@ def k3_sandwich_tail(
     tap: Optional[torch.Tensor] = None,
     tap_updated: bool = False,
     updated_out: Optional[torch.Tensor] = None,
+    act_early: bool = False,
 ) -> List[torch.Tensor]:
     """``(normed, updated)`` of the row-parallel MoE tail (``[rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T``,
     the RMS on the fp32 latent accumulator) followed by ``mnnvl_allreduce_attn_res`` of that partial. ``latent`` is
@@ -481,7 +482,9 @@ def k3_sandwich_tail(
     rows (a DSpark capture layer's tap) or, with ``tap_updated``, ``updated``; with ``updated_out`` (bf16 [M, 7168],
     contiguous, 16-byte aligned, e.g. the next row of the attention-residual snapshot bank, which this call does not
     read) it stores ``updated`` there instead of a new tensor and returns an empty [0, 7168] in its place; the rest as
-    ``k3_sandwich_oproj``."""
+    ``k3_sandwich_oproj``. ``act_early`` (``latent`` read from global, neither ``src_slab`` nor ``lat_uc``): the kernel
+    loads ``act`` and runs its k-tiles' MMAs before its grid wait (``act`` must then be complete before the call's
+    producer, as the shared expert's activation is); the same results, a build of its own."""
     import cuda.bindings.driver as cuda_driver
 
     from . import k3_sandwich_kernel as kernel
@@ -495,6 +498,10 @@ def k3_sandwich_tail(
         )
     world = ws_uc.numel() // kernel.buffer_words(1)
     fold = lat_uc is not None
+    if act_early and (fold or src_slab is not None):
+        raise ValueError(
+            "k3_sandwich_tail: act_early takes the latent read from global (no src_slab, no lat_uc)"
+        )
     if fold:
         if src_slab is not None:
             raise ValueError(
@@ -561,12 +568,12 @@ def k3_sandwich_tail(
     use_pdl = _use_pdl()
     tap_out = 0 if tap is None else 2 if tap_updated else 1
     tap_stride = tap.stride(0) // 2 if tap is not None else kernel.WORDS_PER_ROW
-    key = ("tail", world, publish, x_src, tap_out, use_pdl)
+    key = ("tail", world, publish, x_src, tap_out, int(act_early), use_pdl)
     runtime = (
         num_tokens, rank, num_snapshots + 1, int(add_prefix), float(rms_eps), float(output_rms_eps), lo,
         float(lat_eps), buf, sbuf, tap_stride,
     )  # fmt: skip
-    consts = (world, publish, x_src, tap_out, use_pdl)
+    consts = (world, publish, x_src, tap_out, int(act_early), use_pdl)
     _compile_and_run(
         kernel.k3_sandwich_tail, key, args, runtime, consts, stream, "k3_sandwich_tail"
     )
@@ -578,7 +585,8 @@ def k3_sandwich_tail(
 @k3_sandwich_tail.register_fake
 def _(latent, act, tail_weight, lo, lat_eps, prefix, block_residual, res_weight, rms_weight, output_rms_weight,
       rms_eps, output_rms_eps, ws_uc, ws_mc, ws_flags, rank, x_slab=None, slab_buf=0, src_slab=None,
-      src_buf=0, lat_uc=None, lat_flags=None, tap=None, tap_updated=False, updated_out=None):  # fmt: skip
+      src_buf=0, lat_uc=None, lat_flags=None, tap=None, tap_updated=False, updated_out=None,
+      act_early=False):  # fmt: skip
     normed = latent.new_empty((latent.shape[0], tail_weight.shape[0]), dtype=torch.bfloat16)
     if updated_out is not None:
         return [normed, normed.new_empty((0, tail_weight.shape[0]))]
